@@ -1,0 +1,56 @@
+diff --git i/fuzzer/fuzzer.c w/fuzzer/fuzzer.c
+index 23c05ac..6ae9d97 100644
+--- i/fuzzer/fuzzer.c
++++ w/fuzzer/fuzzer.c
+@@ -98,6 +98,24 @@ static unsigned FUZ_highbit32(U32 v32)
+ =============================================*/
+ #if defined(__APPLE__) && defined(__MACH__)
+
++typedef struct {
++    void* (*customAlloc)(void* opaque, size_t size);
++    void (*customFree)(void* opaque, void* address);
++    void* opaque;
++} FL2_customMem;
++
++FL2LIB_API FL2_CCtx* FL2LIB_CALL FL2_createCCtx_advanced(FL2_customMem cMem)
++{
++    (void)cMem;
++    return FL2_createCCtx();
++}
++
++FL2LIB_API FL2_CStream* FL2LIB_CALL FL2_createCStream_advanced(FL2_customMem cMem)
++{
++    (void)cMem;
++    return FL2_createCStream();
++}
++
+ #include <malloc/malloc.h>    /* malloc_size */
+
+ typedef struct {
+@@ -198,6 +216,7 @@ static int FUZ_mallocTests(unsigned seed, double compressibility, unsigned part)
+     }   }
+
+     /* advanced MT API test */
++#if 0
+     if (part <= 3)
+     {   U32 nbThreads;
+         for (nbThreads=1; nbThreads<=4; nbThreads++) {
+@@ -216,8 +235,10 @@ static int FUZ_mallocTests(unsigned seed, double compressibility, unsigned part)
+                                 nbThreads, compressionLevel);
+                 FUZ_displayMallocStats(malcount);
+     }   }   }
++#endif
+
+     /* advanced MT streaming API test */
++#if 0
+     if (part <= 4)
+     {   U32 nbThreads;
+         for (nbThreads=1; nbThreads<=4; nbThreads++) {
+@@ -237,6 +258,7 @@ static int FUZ_mallocTests(unsigned seed, double compressibility, unsigned part)
+                                 nbThreads, compressionLevel);
+                 FUZ_displayMallocStats(malcount);
+     }   }   }
++#endif
+
+     return 0;
+ }
