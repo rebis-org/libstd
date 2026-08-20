@@ -1,0 +1,53 @@
+#ifndef STDK_H
+#define STDK_H
+#include <stddef.h>
+#include <stdint.h>
+#ifdef __cplusplus
+extern "C" {
+#endif
+@STDK_STATUS@
+typedef struct stdk_id {
+    uint64_t low;
+    uint64_t high;
+} stdk_id;
+typedef struct stdk_node stdk_node;
+typedef struct stdk_call_envelope stdk_call_envelope;
+typedef uint32_t (*stdk_callback)(stdk_call_envelope* call);
+struct stdk_node {
+    uint32_t structure_size;
+    uint32_t flags;
+    stdk_id id;
+    uint64_t value_low;
+    uint64_t value_high;
+    uint8_t* bytes;
+    uint64_t byte_capacity;
+    uint64_t byte_length;
+    stdk_node* child;
+    stdk_node* next;
+    uint64_t reserved[2];
+};
+struct stdk_call_envelope {
+    uint32_t structure_size;
+    uint32_t flags;
+    stdk_id operation;
+    stdk_node* request;
+    stdk_node* response;
+    stdk_node* diagnostic;
+    uint8_t* workspace;
+    uint64_t workspace_capacity;
+    stdk_callback callback;
+    void* callback_context;
+    uint64_t reserved[4];
+};
+@STDK_LAYOUT@
+#ifdef __cplusplus
+    #define STDK_STATIC_ASSERT(condition, message) static_assert(condition, message)
+#else
+    #define STDK_STATIC_ASSERT(condition, message) _Static_assert(condition, message)
+#endif
+@STDK_ASSERT@
+@STDK_CALL@
+#ifdef __cplusplus
+}
+#endif
+#endif

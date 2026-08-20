@@ -1,0 +1,13 @@
+const corpus_01 = "Squdgy fez, blank jimp crwth vox!";
+const corpus_02 = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.";
+const corpus_03 = "I have a friend who is always full of ideas, good ideas and bad ideas, fine ideas and crude ideas, old ideas and new ideas. Before putting his new ideas into practice, he usually sleeps over them to let them mature and ripen. However, when he is in a hurry, he sometimes puts his ideas into practice before they are quite ripe, in other words, while they are still green. Some of his green ideas are quite lively and colorful, but not always, some being quite plain and colorless.  When he remembers that some of his colorless ideas are still too green to use, he will sleep over them, or let them sleep, as he puts it. But some of those ideas may be mutually conflicting and contradictory, and when they sleep together in the same night they get into furious fights and turn the sleep into a nightmare. Thus my friend often complains that his colorless green ideas sleep furiously.";
+const corpus_04 = "天地玄黃宇宙洪荒日月盈昃辰宿列張寒來暑往秋收冬藏閏餘成歲律召調陽雲騰致雨露結爲霜金生麗水玉出崐崗劍號巨闕珠稱夜光菓珎李柰菜重芥薑海鹹河淡鱗潛羽翔龍師火帝鳥官人皇始制文字乃服衣裳推位讓國有虞陶唐弔民伐罪周發殷湯坐朝問道垂拱平章愛育黎首臣伏戎羌遐迩壹體率賓歸王鳴鳳在樹白駒食場化被草木賴及萬方盖此身髮四大五常恭惟鞠養豈敢毀傷女慕貞絜男效才良知過必改得能莫忘罔談彼短靡恃己長信使可覆器欲難量墨悲絲淬詩讚羔羊景行維賢剋念作聖德建名立形端表正空谷傳聲虛堂習聽禍因惡積福緣善慶尺璧非寶寸陰是竸資父事君曰嚴與敬孝當竭力忠則盡命臨深履薄夙興溫清似蘭斯馨如松之盛川流不息淵澄取暎容止若思言辭安定篤初誠美慎終宜令榮業所基籍甚無竟學優登仕攝職從政存以甘棠去而益詠樂殊貴賤禮別尊卑上和下睦夫唱婦随外受傅訓入奉母儀諸姑伯叔猶子比兒孔懷兄弟同氣連枝交友投分切磨箴規仁慈隱惻造次弗離節義廉退顛沛匪虧性靜情逸心動神疲守眞志滿逐物意移堅持雅撡好爵自縻都邑華夏東西二京背芒面洛浮渭據涇宮殿盤鬱樓觀飛驚圖寫禽獸畫綵仙靈丙舍傍啟甲帳對楹肆筵設席鼓瑟吹笙升階納陛弁轉疑星右通廣內左達承明既集墳典亦聚羣英杜稾鍾隸漆書壁經府羅將相路俠槐卿戶封八縣家給千兵高冠陪輦驅轂振纓世祿侈富車駕肥輕策功茂實勒碑刻銘磻溪伊尹佐時阿衡奄宅曲阜微旦孰營桓公匡合濟弱扶傾綺廻漢惠說感武丁俊乂密勿多士寔寧晉楚更霸趙魏困橫假途滅虢踐土會盟何遵約法韓弊煩刑起翦頗牧用軍最精宣威沙漠馳譽丹青九州禹跡百郡秦并嶽宗恆岱禪主云亭雁門紫塞雞田赤城昆池碣石鉅野洞庭曠遠緜邈巖岫杳冥治本於農務茲稼穡俶載南畝我藝黍稷稅熟貢新勸賞黜陟孟軻敦素史魚秉直庶幾中庸勞謙謹勑聆音察理鑑貌辯色貽厥嘉猷勉其祗植省躬譏誡寵增抗極殆辱近恥林睾幸即兩䟽見機解組誰逼索居閑處沈默寂寥求古尋論散慮逍遙欣奏累遣慼謝歡招渠荷的歷園莽抽條枇杷晚翠梧桐早雕陳根委翳落葉飄颻游鵾獨運凌摩絳霄耽讀翫市寓目囊箱易輶攸畏屬耳垣𡓜具膳飡飯適口充腸飽飫享宰飢厭糟糠親戚故舊老少異粮妾御績紡侍巾帷房紈扇員潔銀燭瑋煌晝眠夕寐籃笋象床絃歌酒讌接杯舉觴矯手頓足悅豫且康嫡後嗣續祭祀烝嘗稽顙再拜悚懼恐惶牋牒簡要顧答審詳骸垢想浴執熱願涼驢騾犢特駭躍超驤誅斬賊盜捕獲叛亡布射遼丸嵇琴阮嘯恬筆倫紙鈞巧任釣釋紛利俗並皆佳妙毛施淑姿工嚬研笑年矢每催羲暉朗曜璇璣懸斡晦魄環照指薪脩祜永綏吉劭矩步引領俯仰廊廟束帶矜莊徘徊瞻眺孤陋寡聞愚蒙等誚謂語助者焉哉乎也";
+const corpus_data = [_][]const u8{ corpus_01, corpus_02, corpus_03, corpus_04 };
+
+pub fn select(index: usize, dst: []u8) void {
+    const src = corpus_data[index % corpus_data.len];
+    if (src.len == 0) return;
+    for (dst, 0..) |*byte, i| {
+        byte.* = src[i % src.len];
+    }
+}

@@ -1,0 +1,4 @@
+module @STDK_MODULE_NAME@ {
+  header "stdk.h"
+  export *
+}

@@ -1,0 +1,27 @@
+[submodule "vendor/7zip"]
+	path = vendor/7zip
+	url = https://github.com/ip7z/7zip.git
+[submodule "vendor/gzip"]
+	path = vendor/gzip
+	url = https://git.savannah.gnu.org/git/gzip.git
+[submodule "vendor/bzip2"]
+	path = vendor/bzip2
+	url = https://gitlab.com/federicomenaquintero/bzip2.git
+[submodule "vendor/tar"]
+	path = vendor/tar
+	url = https://git.savannah.gnu.org/git/tar.git
+[submodule "vendor/xz"]
+	path = vendor/xz
+	url = https://github.com/tukaani-project/xz.git
+[submodule "vendor/libzip"]
+	path = vendor/libzip
+	url = https://github.com/nih-at/libzip.git
+[submodule "vendor/zstd"]
+	path = vendor/zstd
+	url = https://github.com/facebook/zstd.git
+[submodule "vendor/fast-lzma2"]
+	path = vendor/fast-lzma2
+	url = https://github.com/conor42/fast-lzma2.git
+[submodule "vendor/unrar"]
+	path = vendor/unrar
+	url = https://github.com/pmachapman/unrar.git
