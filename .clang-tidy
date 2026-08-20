@@ -1,0 +1,45 @@
+---
+Checks: >
+  bugprone-*,
+  cert-*,
+  clang-analyzer-*,
+  concurrency-*,
+  misc-*,
+  performance-*,
+  portability-*,
+  readability-*,
+  -bugprone-command-processor,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-implicit-widening-of-multiplication-result,
+  -cert-env33-c,
+  -cert-err33-c,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
+  -concurrency-mt-unsafe,
+  -misc-include-cleaner,
+  -misc-no-recursion,
+  -misc-use-anonymous-namespace,
+  -misc-use-internal-linkage,
+  -readability-avoid-nested-conditional-operator,
+  -readability-braces-around-statements,
+  -readability-function-cognitive-complexity,
+  -readability-function-size,
+  -readability-identifier-length,
+  -readability-identifier-naming,
+  -readability-isolate-declaration,
+  -readability-magic-numbers,
+  -readability-named-parameter,
+  -readability-redundant-access-specifiers,
+  -readability-redundant-inline-specifier,
+  -readability-redundant-string-cstr,
+  -readability-redundant-string-init,
+  -readability-uppercase-literal-suffix,
+  -readability-use-std-min-max,
+WarningsAsErrors: '*'
+HeaderFilterRegex: 'build/acceptance/.*'
+FormatStyle: file
+CheckOptions:
+  readability-identifier-length.IgnoredVariableNames: '^[a-z]$'
+  readability-identifier-length.IgnoredFunctionNames: '^[a-z]+$'
+  readability-identifier-length.IgnoredParameterNames: '^[a-z]$'
+  readability-simplify-boolean-expr.ChainedConditionalReturn: false
+  readability-simplify-boolean-expr.ChainedConditionalAssignment: false

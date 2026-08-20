@@ -1,0 +1,123 @@
+name: Build
+
+on:
+  workflow_call:
+    inputs:
+      publish:
+        type: boolean
+        required: false
+        default: false
+      benchmark:
+        type: boolean
+        required: false
+        default: false
+
+jobs:
+  build:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          submodules: recursive
+      - uses: actions/cache@v6.1.0
+        with:
+          path: .zig-cache
+          key: zig-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig', 'build.zig.zon', 'build/**', 'src/**') }}
+          restore-keys: |
+            zig-${{ runner.os }}-${{ runner.arch }}-
+      - uses: actions/cache@v6.1.0
+        if: inputs.benchmark
+        with:
+          path: |
+            zig-out/benchmark/bin/pkgs
+            zig-out/benchmark/corpus
+          key: benchmark-${{ runner.os }}-${{ hashFiles('build/acceptance/benchmark/command.zig', 'build/acceptance/benchmark/env.zig') }}
+          restore-keys: |
+            benchmark-${{ runner.os }}-
+      - uses: mlugg/setup-zig@v2.2.1
+      - run: zig fmt --check --ast-check build.zig build src
+      - run: zig fmt --check --zon build.zig.zon
+      - run: git diff --check
+      - run: zig build exe -Doptimize=Debug
+      - run: zig build exe -Doptimize=ReleaseSafe
+      - run: zig build -Doptimize=ReleaseFast
+      - run: zig build -Doptimize=ReleaseSmall
+      - run: zig build oracles -Doptimize=ReleaseSafe
+      - run: zig build abi
+      - run: brew install autoconf automake bison
+      - if: inputs.benchmark
+        run: zig build benchmark -Doptimize=ReleaseFast
+      - run: |
+          brew install llvm
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+      - run: zig build fmt
+      - run: zig build lint
+      - run: zig build dist -Doptimize=ReleaseFast
+      - run: zig build package -Doptimize=ReleaseFast
+      - id: provenance
+        uses: actions/attest@v4
+        if: inputs.publish
+        with:
+          subject-path: |
+            zig-out/libstd.zip
+            zig-out/stdk.aar
+            zig-out/StdK.XCFramework.zip
+          show-summary: false
+      - id: version
+        if: inputs.publish
+        run: |
+          version=""
+          while IFS= read -r line; do
+            if [[ $line =~ \.version[[:space:]]*=[[:space:]]*\"([^\"]+)\" ]]; then
+              version="${BASH_REMATCH[1]}"
+              break
+            fi
+          done < build.zig.zon
+          if [[ -z "$version" ]]; then
+            exit 1
+          fi
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
+            exit 1
+          fi
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+      - id: snapshot
+        if: inputs.publish
+        run: |
+          version="${{ steps.version.outputs.value }}"
+          echo "value=$version-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+      - if: inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ steps.version.outputs.value }}
+          SNAPSHOT_TAG: ${{ steps.snapshot.outputs.value }}
+          PROVENANCE_URL: ${{ steps.provenance.outputs.attestation-url }}
+        run: |
+          short_sha="${GITHUB_SHA:0:7}"
+          title="$RELEASE_VERSION-$short_sha"
+          notes="Snapshot from $GITHUB_SHA (provenance: $PROVENANCE_URL)."
+          gh release create "$SNAPSHOT_TAG" \
+            --target "$GITHUB_SHA" \
+            --title "$title" \
+            --notes "$notes" \
+            --prerelease \
+            --latest=false \
+            zig-out/libstd.zip \
+            zig-out/stdk.aar \
+            zig-out/StdK.XCFramework.zip
+      - if: inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SNAPSHOT_TAG: ${{ steps.snapshot.outputs.value }}
+        run: |
+          if [[ "$(gh release view "$SNAPSHOT_TAG" --json isImmutable --jq '.isImmutable')" != true ]]; then
+            gh release delete "$SNAPSHOT_TAG" --yes --cleanup-tag
+            exit 1
+          fi
+      - if: inputs.publish
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.value }}
+          SNAPSHOT_TAG: ${{ steps.snapshot.outputs.value }}
+        run: |
+          canary_tag="Stage"
+          git tag -f -a "$canary_tag" -m "Staging $RELEASE_VERSION (tag: $SNAPSHOT_TAG)." "$GITHUB_SHA"
+          git push --force origin "refs/tags/$canary_tag"

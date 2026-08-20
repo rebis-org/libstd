@@ -1,0 +1,43 @@
+diff --git i/tests/playTests.sh w/tests/playTests.sh
+index 5435ff5b..039b5ee3 100755
+--- i/tests/playTests.sh
++++ w/tests/playTests.sh
+@@ -126,20 +126,23 @@ case "$UNAME" in
+ esac
+ 
+ MTIME="stat -c %Y"
++FMT=""
+ case "$UNAME" in
+-    Darwin | FreeBSD | OpenBSD | NetBSD) MTIME="stat -f %m" ;;
++    Darwin) MTIME="date -r"; FMT=" +%s" ;;
++    FreeBSD | OpenBSD | NetBSD) MTIME="stat -f %m" ;;
+ esac
+ 
+ assertSameMTime() {
+-    MT1=$($MTIME "$1")
+-    MT2=$($MTIME "$2")
++    MT1=$($MTIME "$1"$FMT)
++    MT2=$($MTIME "$2"$FMT)
+     echo MTIME $MT1 $MT2
+     [ "$MT1" = "$MT2" ] || die "mtime on $1 doesn't match mtime on $2 ($MT1 != $MT2)"
+ }
+ 
+ GET_PERMS="stat -c %a"
+ case "$UNAME" in
+-    Darwin | FreeBSD | OpenBSD | NetBSD) GET_PERMS="stat -f %Lp" ;;
++    Darwin) GET_PERMS='perl -eprintf"%o\n",(stat(shift))[2]&0777' ;;
++    FreeBSD | OpenBSD | NetBSD) GET_PERMS="stat -f %Lp" ;;
+ esac
+ 
+ assertFilePermissions() {
+@@ -389,8 +392,8 @@ datagen $size > precompressedFilterTestDir/input.8
+ zstd --exclude-compressed --long --rm -r precompressedFilterTestDir
+ test ! -f precompressedFilterTestDir/input.5.zst.zst
+ test ! -f precompressedFilterTestDir/input.6.zst.zst
+-file1timestamp=`$MTIME precompressedFilterTestDir/input.5.zst`
+-file2timestamp=`$MTIME precompressedFilterTestDir/input.7.zst`
++file1timestamp=`$MTIME precompressedFilterTestDir/input.5.zst$FMT`
++file2timestamp=`$MTIME precompressedFilterTestDir/input.7.zst$FMT`
+ if [ $file2timestamp -ge $file1timestamp ]; then
+   println "Test is successful. input.5.zst is precompressed and therefore not compressed/modified again."
+ else
