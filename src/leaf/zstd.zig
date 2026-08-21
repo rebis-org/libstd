@@ -2531,7 +2531,7 @@ const Decoder = struct {
             .raw => {
                 const data = literals.streams.one[start..][0..dest.len];
                 if (comptime vector_match_copy) {
-                    if (dest.len > 512) @memcpy(dest, data) else copyShort16(dest, data);
+                    if (dest.len > 512) @memcpy(dest, data) else kernels.copyShort16(dest, data);
                 } else {
                     @memcpy(dest, data);
                 }
@@ -2626,44 +2626,19 @@ const Decoder = struct {
         const src = write_base - offset;
         const history = d.history;
         if (comptime vector_match_copy) {
-            if (offset >= length) {
-                if (length > 512) {
-                    @memcpy(history[write_base..][0..length], history[src..][0..length]);
-                } else {
-                    copyShort16(history[write_base..][0..length], history[src..][0..length]);
-                }
-            } else if (offset >= 16) {
-                // Chunks read only finalized bytes; the last chunk overlaps.
-                var i: usize = 0;
-                while (i + 16 <= length) : (i += 16) {
-                    history[write_base + i ..][0..16].* = history[src + i ..][0..16].*;
-                }
-                if (i < length) {
-                    history[write_base + length - 16 ..][0..16].* = history[src + length - 16 ..][0..16].*;
-                }
-            } else if (offset >= 8) {
-                var i: usize = 0;
-                while (i + 8 <= length) : (i += 8) {
-                    history[write_base + i ..][0..8].* = history[src + i ..][0..8].*;
-                }
-                if (i < length) {
-                    history[write_base + length - 8 ..][0..8].* = history[src + length - 8 ..][0..8].*;
-                }
-            } else if (offset == 1) {
-                if (length >= 16) {
-                    const v: @Vector(16, u8) = @splat(history[src]);
-                    var i: usize = 0;
-                    while (i + 16 <= length) : (i += 16) {
-                        history[write_base + i ..][0..16].* = v;
-                    }
-                    if (i < length) history[write_base + length - 16 ..][0..16].* = v;
-                } else {
-                    @memset(history[write_base..][0..length], history[src]);
-                }
-            } else {
-                copyMatchPeriodWiden(history, write_base, offset, length);
+            if (offset >= length and length > 512) {
+                @memcpy(history[write_base..][0..length], history[src..][0..length]);
+                return;
             }
-        } else if (offset == 1) {
+            kernels.copyMatchCore(.{
+                .cap = 512,
+                .Ret = void,
+                .short_one = .memset,
+                .overlap_unbounded = true,
+            }, history, write_base, offset, length);
+            return;
+        }
+        if (offset == 1) {
             @memset(history[write_base..][0..length], history[src]);
         } else if (offset >= length) {
             @memcpy(history[write_base..][0..length], history[src..][0..length]);
@@ -2934,50 +2909,6 @@ fn copyMatchOverlap(history: []u8, src: usize, dst: usize, offset: usize, length
         while (j < take) : (j += 1) history[chunk_dst + j] = history[chunk_src + j];
         copied += take;
     }
-}
-
-// Exact short copies that never call into the platform library: small
-// per-sequence copies dominate the sequence loop.
-inline fn copyShort16(dst: []u8, src: []const u8) void {
-    const length = dst.len;
-    if (length >= 16) {
-        var i: usize = 0;
-        while (i + 16 <= length) : (i += 16) {
-            dst[i..][0..16].* = src[i..][0..16].*;
-        }
-        if (i < length) {
-            dst[length - 16 ..][0..16].* = src[length - 16 ..][0..16].*;
-        }
-    } else if (length >= 8) {
-        dst[0..8].* = src[0..8].*;
-        dst[length - 8 ..][0..8].* = src[length - 8 ..][0..8].*;
-    } else if (length >= 4) {
-        dst[0..4].* = src[0..4].*;
-        dst[length - 4 ..][0..4].* = src[length - 4 ..][0..4].*;
-    } else {
-        for (dst, src) |*dst_byte, src_byte| dst_byte.* = src_byte;
-    }
-}
-
-// Small-offset overlap copy: byte-widen the period to a multiple of offset
-// that is at least one word wide, then finish with word-at-a-time copies
-// that read only finalized bytes.
-fn copyMatchPeriodWiden(history: []u8, dst: usize, offset: usize, length: usize) void {
-    var done: usize = 0;
-    var period: usize = offset;
-    while (period < 8 and done < length) {
-        const take = @min(period, length - done);
-        var j: usize = 0;
-        while (j < take) : (j += 1) history[dst + done + j] = history[dst + done + j - period];
-        done += take;
-        period += take;
-    }
-    var i: usize = done;
-    while (i + 8 <= length) : (i += 8) {
-        const word = std.mem.readInt(u64, history[dst + i - period ..][0..8], .little);
-        std.mem.writeInt(u64, history[dst + i ..][0..8], word, .little);
-    }
-    while (i < length) : (i += 1) history[dst + i] = history[dst + i - period];
 }
 
 fn litStreamCount(literals: *const LiteralsSection) usize {

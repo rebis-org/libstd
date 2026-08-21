@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const build_options = @import("options");
 
 const huffman = @import("../common/primitive/huffman.zig");
+const kernels = @import("kernels.zig");
 
 // NEON is baseline on aarch64, so the wide match-copy path needs no extra
 // target feature; other targets keep the portable word-at-a-time path.
@@ -1091,29 +1092,6 @@ inline fn matchLength(history: []const u8, at: usize, s: usize, available: usize
     return len;
 }
 
-// Exact short copies that never call into the platform library: small
-// per-match copies dominate the inflate loop.
-inline fn copyShort16(dst: []u8, src: []const u8) void {
-    const length = dst.len;
-    if (length >= 16) {
-        var i: usize = 0;
-        while (i + 16 <= length) : (i += 16) {
-            dst[i..][0..16].* = src[i..][0..16].*;
-        }
-        if (i < length) {
-            dst[length - 16 ..][0..16].* = src[length - 16 ..][0..16].*;
-        }
-    } else if (length >= 8) {
-        dst[0..8].* = src[0..8].*;
-        dst[length - 8 ..][0..8].* = src[length - 8 ..][0..8].*;
-    } else if (length >= 4) {
-        dst[0..4].* = src[0..4].*;
-        dst[length - 4 ..][0..4].* = src[length - 4 ..][0..4].*;
-    } else {
-        for (dst, src) |*dst_byte, src_byte| dst_byte.* = src_byte;
-    }
-}
-
 // Bit buffer over a slice input for the inflate hot loop: identical
 // semantics to the decoder's own refill/take/decode, but over local state so
 // the per-symbol path stays in registers.
@@ -1181,59 +1159,18 @@ const SliceBits = struct {
 // platform memcpy/memset call overhead lands in the inflate loop.
 inline fn copyMatchBuf(buf: []u8, end: usize, distance: u32, length: u32) usize {
     const len: usize = length;
-    const src = end - distance;
-
     if (comptime vector_match_copy) {
         if (len <= 512) {
-            if (distance >= len) {
-                copyShort16(buf[end..][0..len], buf[src..][0..len]);
-            } else if (distance >= 16) {
-                // Chunks read only finalized bytes; the last chunk overlaps.
-                var i: usize = 0;
-                while (i + 16 <= len) : (i += 16) {
-                    buf[end + i ..][0..16].* = buf[src + i ..][0..16].*;
-                }
-                if (i < len) {
-                    buf[end + len - 16 ..][0..16].* = buf[src + len - 16 ..][0..16].*;
-                }
-            } else if (distance >= 8) {
-                var i: usize = 0;
-                while (i + 8 <= len) : (i += 8) {
-                    buf[end + i ..][0..8].* = buf[src + i ..][0..8].*;
-                }
-                if (i < len) {
-                    buf[end + len - 8 ..][0..8].* = buf[src + len - 8 ..][0..8].*;
-                }
-            } else if (distance == 1) {
-                if (len >= 16) {
-                    const v: @Vector(16, u8) = @splat(buf[src]);
-                    var i: usize = 0;
-                    while (i + 16 <= len) : (i += 16) {
-                        buf[end + i ..][0..16].* = v;
-                    }
-                    if (i < len) buf[end + len - 16 ..][0..16].* = v;
-                } else {
-                    // Short runs widen the byte into a word; a platform
-                    // memset call costs more than the copy at this size.
-                    const w: u64 = @as(u64, buf[src]) * 0x0101_0101_0101_0101;
-                    if (len >= 8) {
-                        std.mem.writeInt(u64, buf[end..][0..8], w, .little);
-                        std.mem.writeInt(u64, buf[end + len - 8 ..][0..8], w, .little);
-                    } else if (len >= 4) {
-                        const w32: u32 = @truncate(w);
-                        std.mem.writeInt(u32, buf[end..][0..4], w32, .little);
-                        std.mem.writeInt(u32, buf[end + len - 4 ..][0..4], w32, .little);
-                    } else {
-                        for (0..len) |i| buf[end + i] = buf[src];
-                    }
-                }
-            } else {
-                copyMatchPeriodWiden(buf, end, distance, len);
-            }
-            return end + len;
+            return kernels.copyMatchCore(.{
+                .cap = 512,
+                .Ret = usize,
+                .short_one = .byte_widen,
+                .overlap_unbounded = false,
+            }, buf, end, distance, len);
         }
     }
 
+    const src = end - distance;
     var rest = len;
     if (distance >= rest) {
         @memcpy(buf[end..][0..rest], buf[src..][0..rest]);
@@ -1270,27 +1207,6 @@ inline fn copyMatchBuf(buf: []u8, end: usize, distance: u32, length: u32) usize 
         covered += chunk;
     }
     return out;
-}
-
-// Small-offset overlap copy: byte-widen the period to a multiple of offset
-// that is at least one word wide, then finish with word-at-a-time copies
-// that read only finalized bytes.
-fn copyMatchPeriodWiden(history: []u8, dst: usize, offset: usize, length: usize) void {
-    var done: usize = 0;
-    var period: usize = offset;
-    while (period < 8 and done < length) {
-        const take = @min(period, length - done);
-        var j: usize = 0;
-        while (j < take) : (j += 1) history[dst + done + j] = history[dst + done + j - period];
-        done += take;
-        period += take;
-    }
-    var i: usize = done;
-    while (i + 8 <= length) : (i += 8) {
-        const word = std.mem.readInt(u64, history[dst + i - period ..][0..8], .little);
-        std.mem.writeInt(u64, history[dst + i ..][0..8], word, .little);
-    }
-    while (i < length) : (i += 1) history[dst + i] = history[dst + i - period];
 }
 
 // Header share of a dynamic block's bit cost: HLIT/HDIST/HCLEN, the

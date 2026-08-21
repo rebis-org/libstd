@@ -17,41 +17,50 @@ pub fn matchLen8(buf: []const u8, a: usize, b: usize, max: usize) usize {
     return len;
 }
 
+pub const CopyMatchCfg = struct {
+    cap: u32, // max non-overlap length handled by the inline vector path
+    Ret: type, // void or usize; usize returns dst + len
+    short_one: enum { byte_widen, memset } = .byte_widen,
+    overlap_unbounded: bool = false, // true => overlap branches run for any length
+};
+
 // LZ77 match copy ending at `dst` (exclusive): replicates buf[dst-dist..]
 // forward, so overlapping ranges with dist < len repeat with period dist.
-// Short copies dominate the lzma decoder; the gated path uses exact inline
-// ladders so no platform memcpy/memmove call overhead lands in the loop.
-pub inline fn copyMatch(buf: []u8, dst: usize, dist: u32, len: u32) void {
+// Short copies dominate the decoders; the gated path uses exact inline
+// ladders so no platform memcpy/memset call overhead lands in the loop.
+// Wrappers gate the fast path by cap and supply their own fallback semantics.
+pub inline fn copyMatchCore(comptime cfg: CopyMatchCfg, buf: []u8, dst: usize, dist: u32, len: usize) cfg.Ret {
     const src = dst - dist;
-    if (comptime vector_match_copy) {
-        if (len <= 273) {
-            if (dist >= len) {
-                copyShort16(buf[dst..][0..len], buf[src..][0..len]);
-            } else if (dist >= 16) {
-                var i: usize = 0;
-                while (i + 16 <= len) : (i += 16) {
-                    buf[dst + i ..][0..16].* = buf[src + i ..][0..16].*;
-                }
-                if (i < len) {
-                    buf[dst + len - 16 ..][0..16].* = buf[src + len - 16 ..][0..16].*;
-                }
-            } else if (dist >= 8) {
-                var i: usize = 0;
-                while (i + 8 <= len) : (i += 8) {
-                    buf[dst + i ..][0..8].* = buf[src + i ..][0..8].*;
-                }
-                if (i < len) {
-                    buf[dst + len - 8 ..][0..8].* = buf[src + len - 8 ..][0..8].*;
-                }
-            } else if (dist == 1) {
-                if (len >= 16) {
-                    const v: @Vector(16, u8) = @splat(buf[src]);
-                    var i: usize = 0;
-                    while (i + 16 <= len) : (i += 16) {
-                        buf[dst + i ..][0..16].* = v;
-                    }
-                    if (i < len) buf[dst + len - 16 ..][0..16].* = v;
-                } else {
+    if (dist >= len) {
+        copyShort16(buf[dst..][0..len], buf[src..][0..len]);
+    } else if (dist >= 16) {
+        // Chunks read only finalized bytes; the last chunk overlaps.
+        var i: usize = 0;
+        while (i + 16 <= len) : (i += 16) {
+            buf[dst + i ..][0..16].* = buf[src + i ..][0..16].*;
+        }
+        if (i < len) {
+            buf[dst + len - 16 ..][0..16].* = buf[src + len - 16 ..][0..16].*;
+        }
+    } else if (dist >= 8) {
+        var i: usize = 0;
+        while (i + 8 <= len) : (i += 8) {
+            buf[dst + i ..][0..8].* = buf[src + i ..][0..8].*;
+        }
+        if (i < len) {
+            buf[dst + len - 8 ..][0..8].* = buf[src + len - 8 ..][0..8].*;
+        }
+    } else if (dist == 1) {
+        if (len >= 16) {
+            const v: @Vector(16, u8) = @splat(buf[src]);
+            var i: usize = 0;
+            while (i + 16 <= len) : (i += 16) {
+                buf[dst + i ..][0..16].* = v;
+            }
+            if (i < len) buf[dst + len - 16 ..][0..16].* = v;
+        } else {
+            switch (cfg.short_one) {
+                .byte_widen => {
                     // Short runs widen the byte into a word; a platform
                     // memset call costs more than the copy at this size.
                     const w: u64 = @as(u64, buf[src]) * 0x0101_0101_0101_0101;
@@ -65,14 +74,33 @@ pub inline fn copyMatch(buf: []u8, dst: usize, dist: u32, len: u32) void {
                     } else {
                         for (0..len) |i| buf[dst + i] = buf[src];
                     }
-                }
-            } else {
-                copyMatchPeriodWiden(buf, dst, dist, len);
+                },
+                .memset => {
+                    @memset(buf[dst..][0..len], buf[src]);
+                },
             }
-            return;
+        }
+    } else {
+        copyMatchPeriodWiden(buf, dst, dist, len);
+    }
+    if (cfg.Ret == usize) return dst + len;
+}
+
+// Default wrapper used by lzma (cap 273, scalar fallback for non-aarch64 or
+// long matches). The fast path is the same core the other callers use.
+pub inline fn copyMatch(buf: []u8, dst: usize, dist: u32, len: u32) void {
+    if (comptime vector_match_copy) {
+        if (len <= 273) {
+            return copyMatchCore(.{
+                .cap = 273,
+                .Ret = void,
+                .short_one = .byte_widen,
+                .overlap_unbounded = false,
+            }, buf, dst, dist, len);
         }
     }
 
+    const src = dst - dist;
     if (dist >= len) {
         @memcpy(buf[dst..][0..len], buf[src..][0..len]);
         return;
@@ -89,7 +117,7 @@ pub inline fn copyMatch(buf: []u8, dst: usize, dist: u32, len: u32) void {
     }
 }
 
-fn copyShort16(dst: []u8, src: []const u8) void {
+pub inline fn copyShort16(dst: []u8, src: []const u8) void {
     const length = dst.len;
     if (length >= 16) {
         var i: usize = 0;
