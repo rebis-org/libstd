@@ -3,6 +3,9 @@ const builtin = @import("builtin");
 const options = @import("options");
 
 extern fn stdk_crc32_le(crc: u32, data: [*]const u8, len: usize) u32;
+extern fn stdk_crc32_le_pmull(crc: u32, data: [*]const u8, len: usize) u32;
+
+const crc32_pmull_threshold = 256; // bytes; derived from synthetic sweep (see u2_verdict.txt)
 
 pub const Crc32 = TableCrc(u32, 0xedb8_8320, true);
 
@@ -132,7 +135,11 @@ fn TableCrc(comptime T: type, comptime poly: T, comptime reflected: bool) type {
         pub fn update(self: *@This(), input: []const u8) void {
             if (comptime T == u32 and reflected) {
                 if (comptime !options.force_fallback and builtin.cpu.arch == .aarch64) {
-                    self.state = stdk_crc32_le(self.state, input.ptr, input.len);
+                    if (input.len >= crc32_pmull_threshold) {
+                        self.state = stdk_crc32_le_pmull(self.state, input.ptr, input.len);
+                    } else {
+                        self.state = stdk_crc32_le(self.state, input.ptr, input.len);
+                    }
                     return;
                 }
                 var crc = self.state;

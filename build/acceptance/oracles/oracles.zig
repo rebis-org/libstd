@@ -2,6 +2,7 @@ const std = @import("std");
 
 const archive = @import("archive.zig");
 const bound = @import("bound.zig");
+const checksum = @import("checksum.zig");
 const harness = @import("harness.zig");
 const lib = @import("lib.zig");
 const lzma = @import("lzma.zig");
@@ -22,6 +23,7 @@ const scenarios = blk: {
         &bound.scenarios,
         &.{registry_checks.scenario},
         &.{primitives.scenario},
+        &checksum.scenarios,
         &archive.scenarios,
         &tar.scenarios,
         &zip.scenarios,
