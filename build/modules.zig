@@ -68,9 +68,12 @@ pub fn createFor(
 ) *std.Build.Module {
     var adjusted = target;
     if (!ctx.force_fallback and spec.crc_kernel and adjusted.result.cpu.arch == .aarch64) {
-        const feature = @intFromEnum(std.Target.aarch64.Feature.crc);
-        adjusted.query.cpu_features_add.addFeature(feature);
-        adjusted.result.cpu.features.addFeature(feature);
+        const crc_feature = @intFromEnum(std.Target.aarch64.Feature.crc);
+        adjusted.query.cpu_features_add.addFeature(crc_feature);
+        adjusted.result.cpu.features.addFeature(crc_feature);
+        const crypto_feature = @intFromEnum(std.Target.aarch64.Feature.crypto);
+        adjusted.query.cpu_features_add.addFeature(crypto_feature);
+        adjusted.result.cpu.features.addFeature(crypto_feature);
     }
     const module = b.createModule(.{
         .root_source_file = b.path(spec.root),
