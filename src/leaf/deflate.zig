@@ -1162,10 +1162,8 @@ inline fn copyMatchBuf(buf: []u8, end: usize, distance: u32, length: u32) usize 
     if (comptime vector_match_copy) {
         if (len <= 512) {
             return kernels.copyMatchCore(.{
-                .cap = 512,
                 .Ret = usize,
                 .short_one = .byte_widen,
-                .overlap_unbounded = false,
             }, buf, end, distance, len);
         }
     }

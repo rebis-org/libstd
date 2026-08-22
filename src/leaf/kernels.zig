@@ -18,17 +18,15 @@ pub fn matchLen8(buf: []const u8, a: usize, b: usize, max: usize) usize {
 }
 
 pub const CopyMatchCfg = struct {
-    cap: u32, // max non-overlap length handled by the inline vector path
     Ret: type, // void or usize; usize returns dst + len
     short_one: enum { byte_widen, memset } = .byte_widen,
-    overlap_unbounded: bool = false, // true => overlap branches run for any length
 };
 
 // LZ77 match copy ending at `dst` (exclusive): replicates buf[dst-dist..]
 // forward, so overlapping ranges with dist < len repeat with period dist.
 // Short copies dominate the decoders; the gated path uses exact inline
 // ladders so no platform memcpy/memset call overhead lands in the loop.
-// Wrappers gate the fast path by cap and supply their own fallback semantics.
+// Wrappers gate the fast path by length and supply their own fallback semantics.
 pub inline fn copyMatchCore(comptime cfg: CopyMatchCfg, buf: []u8, dst: usize, dist: u32, len: usize) cfg.Ret {
     const src = dst - dist;
     if (dist >= len) {
@@ -92,10 +90,8 @@ pub inline fn copyMatch(buf: []u8, dst: usize, dist: u32, len: u32) void {
     if (comptime vector_match_copy) {
         if (len <= 273) {
             return copyMatchCore(.{
-                .cap = 273,
                 .Ret = void,
                 .short_one = .byte_widen,
-                .overlap_unbounded = false,
             }, buf, dst, dist, len);
         }
     }
