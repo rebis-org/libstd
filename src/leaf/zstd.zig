@@ -2631,10 +2631,8 @@ const Decoder = struct {
                 return;
             }
             kernels.copyMatchCore(.{
-                .cap = 512,
                 .Ret = void,
                 .short_one = .memset,
-                .overlap_unbounded = true,
             }, history, write_base, offset, length);
             return;
         }
