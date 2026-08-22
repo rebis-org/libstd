@@ -81,6 +81,16 @@ pub fn addHostLibraries(
     force_fallback: bool,
     options: *std.Build.Module,
 ) HostLibraries {
+    return addHostLibrariesWithOptions(b, target, optimize, force_fallback, options);
+}
+
+pub fn addHostLibrariesWithOptions(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    force_fallback: bool,
+    options: *std.Build.Module,
+) HostLibraries {
     var ctx = Context{
         .target = target,
         .optimize = optimize,
