@@ -6,6 +6,7 @@ const harness = @import("harness.zig");
 const Runner = harness.Runner;
 const lib = @import("lib.zig");
 const steps = @import("steps.zig");
+const catalog = @import("catalog.zig");
 
 var lzma_file_input: [48]u8 = undefined;
 
@@ -492,6 +493,605 @@ pub fn runMixedChunks(r: *Runner) anyerror!void {
     if (fc != 0xC0 and fc != 0xE0) return error.UnexpectedChunkControl;
 }
 
+const lzma_alone_header_size = 13;
+
+fn lzmaAloneEncode(r: *Runner, input: []const u8, declared_size: ?usize, out: []u8) !usize {
+    const dict: u64 = @max(input.len, 4096);
+    const saved_profile = r.profile_id;
+    const saved_extra = r.extra;
+    const saved_extra2 = r.extra2;
+    defer {
+        r.profile_id = saved_profile;
+        r.extra = saved_extra;
+        r.extra2 = saved_extra2;
+    }
+    r.profile_id = harness.ids.lzma;
+    r.extra = dict;
+    r.extra2 = null;
+    const payload_buf = out[lzma_alone_header_size..];
+    const nodes = steps.build(&lzmaParams, r, &.{
+        harness.sourceSpan(input),
+        harness.sinkSpan(payload_buf),
+    });
+    _ = harness.call(r, harness.ids.write, nodes.items[0..nodes.len], .{ .ctx = true });
+    try harness.requireStatus(r, abi.Status.ok);
+    const payload_len: usize = @intCast(r.response.byte_length);
+    out[0] = 0x5d;
+    std.mem.writeInt(u32, out[1..5], @intCast(dict), .little);
+    const size = declared_size orelse std.math.maxInt(u64);
+    std.mem.writeInt(u64, out[5..13], size, .little);
+    return lzma_alone_header_size + payload_len;
+}
+
+fn runLzmaFileDeclaredEqual(r: *Runner) !void {
+    const input = "AE1 equal-size declared-size lzma-alone path";
+    var encoded: [512]u8 = undefined;
+    setupLzma(r, harness.ids.lzma_file, 4096);
+    const encoded_len = try lzmaAloneEncode(r, input, input.len, &encoded);
+    _ = harness.call(r, harness.ids.query, &.{
+        harness.paramTargetCommand(harness.ids.read),
+        harness.sourceSpan(encoded[0..encoded_len]),
+        harness.cap(r.caps_query),
+        harness.pln(r.planning),
+        harness.dlv(r.delivery_read),
+    }, .{});
+    try harness.requireStatus(r, abi.Status.ok);
+    if (r.response.byte_length != input.len) return error.EqualQueryLength;
+    var output: [input.len]u8 = undefined;
+    _ = harness.call(r, harness.ids.read, &.{
+        harness.sourceSpan(encoded[0..encoded_len]),
+        harness.sinkSpan(&output),
+    }, .{ .ctx = true });
+    try harness.requireStatus(r, abi.Status.ok);
+    if (r.response.byte_length != input.len or !std.mem.eql(u8, &output, input)) {
+        return error.EqualReadMismatch;
+    }
+}
+
+fn runLzmaFileDeclaredGreater(r: *Runner) !void {
+    const input = "AE1 declared greater than actual decoded count pattern";
+    const actual = input.len;
+    const declared = actual + 100;
+    var encoded: [512]u8 = undefined;
+    setupLzma(r, harness.ids.lzma_file, 4096);
+    const encoded_len = try lzmaAloneEncode(r, input, declared, &encoded);
+    var output: [declared]u8 = undefined;
+    @memset(&output, 0xa5);
+    _ = harness.call(r, harness.ids.read, &.{
+        harness.sourceSpan(encoded[0..encoded_len]),
+        harness.sinkSpan(&output),
+    }, .{ .ctx = true });
+    try harness.requireStatus(r, abi.Status.ok);
+    if (r.response.byte_length != declared) return error.GreaterByteLength;
+    if (!std.mem.eql(u8, output[0..actual], input)) return error.GreaterPrefixMismatch;
+    if (!harness.allBytesEqual(output[actual..declared], 0xa5)) return error.GreaterTailChanged;
+}
+
+fn runLzmaFileDeclaredLess(r: *Runner) !void {
+    const input = "AE1 declared less than actual decoded count pattern";
+    const actual = input.len;
+    const declared = actual - 1;
+    var encoded: [512]u8 = undefined;
+    setupLzma(r, harness.ids.lzma_file, 4096);
+    const encoded_len = try lzmaAloneEncode(r, input, declared, &encoded);
+    var output: [declared]u8 = undefined;
+    @memset(&output, 0xa5);
+    _ = harness.call(r, harness.ids.read, &.{
+        harness.sourceSpan(encoded[0..encoded_len]),
+        harness.sinkSpan(&output),
+    }, .{ .ctx = true });
+    try harness.requireStatus(r, abi.Status.ok);
+    if (r.response.byte_length != declared) return error.LessByteLength;
+    if (!std.mem.eql(u8, &output, input[0..declared])) return error.LessPrefixMismatch;
+}
+
+const CountingSourceContext = struct {
+    data: []const u8,
+    offset: usize = 0,
+    size_calls: usize = 0,
+    read_calls: usize = 0,
+    rewind_calls: usize = 0,
+};
+
+fn countingSourceCallback(c: *harness.Call) callconv(.c) u32 {
+    const ctx: *CountingSourceContext = @ptrCast(@alignCast(c.callback_context orelse return abi.Status.unsupported));
+    const response = c.response orelse return abi.Status.unsupported;
+    if (abi.idEqual(c.operation, catalog.callback_size)) {
+        ctx.size_calls += 1;
+        response.value_low = ctx.data.len;
+        return abi.Status.ok;
+    }
+    if (abi.idEqual(c.operation, catalog.callback_rewind)) {
+        ctx.rewind_calls += 1;
+        ctx.offset = 0;
+        return abi.Status.ok;
+    }
+    if (abi.idEqual(c.operation, catalog.callback_read)) {
+        ctx.read_calls += 1;
+        const remaining = ctx.data.len - ctx.offset;
+        const capacity: usize = @intCast(response.byte_capacity);
+        const n = @min(capacity, remaining);
+        if (n > 0) {
+            const dst = response.bytes orelse return abi.Status.unsupported;
+            @memcpy(dst[0..n], ctx.data[ctx.offset .. ctx.offset + n]);
+        }
+        ctx.offset += n;
+        response.byte_length = n;
+        return abi.Status.ok;
+    }
+    return abi.Status.unsupported;
+}
+
+fn runLzmaFileSourceOnce(r: *Runner) !void {
+    const input = "AE1 callback source consumed exactly once";
+    var encoded: [512]u8 = undefined;
+    setupLzma(r, harness.ids.lzma_file, 4096);
+    const encoded_len = try lzmaAloneEncode(r, input, input.len, &encoded);
+    var output: [input.len]u8 = undefined;
+    var ctx = CountingSourceContext{ .data = encoded[0..encoded_len] };
+    _ = harness.call(r, harness.ids.read, &.{
+        harness.sourceCallbackNode(0, 0),
+        harness.sinkSpan(&output),
+    }, .{ .ctx = true, .callback = countingSourceCallback, .context = &ctx });
+    try harness.requireStatus(r, abi.Status.ok);
+    if (r.response.byte_length != input.len or !std.mem.eql(u8, &output, input)) {
+        return error.SourceOnceMismatch;
+    }
+    if (ctx.size_calls != 1 or ctx.read_calls < 1 or ctx.rewind_calls != 0) {
+        return error.SourceOnceCount;
+    }
+}
+
+fn runLzmaFileMarkerMode(r: *Runner) !void {
+    const input = "AE2 marker-mode lzma-alone two-pass route";
+    var encoded: [512]u8 = undefined;
+    setupLzma(r, harness.ids.lzma_file, 4096);
+    const encoded_len = try lzmaAloneEncode(r, input, null, &encoded);
+    _ = harness.call(r, harness.ids.query, &.{
+        harness.paramTargetCommand(harness.ids.read),
+        harness.sourceSpan(encoded[0..encoded_len]),
+        harness.cap(r.caps_query),
+        harness.pln(r.planning),
+        harness.dlv(r.delivery_read),
+    }, .{});
+    try harness.requireStatus(r, abi.Status.ok);
+    if (r.response.byte_length != input.len) return error.MarkerQueryLength;
+    var output: [input.len]u8 = undefined;
+    _ = harness.call(r, harness.ids.read, &.{
+        harness.sourceSpan(encoded[0..encoded_len]),
+        harness.sinkSpan(&output),
+    }, .{ .ctx = true });
+    try harness.requireStatus(r, abi.Status.ok);
+    if (r.response.byte_length != input.len or !std.mem.eql(u8, &output, input)) {
+        return error.MarkerDirectMismatch;
+    }
+    var callback_output: [input.len]u8 = undefined;
+    var sink_ctx = harness.SinkBufferContext{ .buffer = &callback_output, .accept_limit = std.math.maxInt(usize) };
+    _ = harness.call(r, harness.ids.read, &.{
+        harness.sourceSpan(encoded[0..encoded_len]),
+        harness.sinkCallbackNode(0, 0),
+    }, .{ .ctx = true, .callback = harness.sinkBufferCallback, .context = &sink_ctx });
+    try harness.requireStatus(r, abi.Status.ok);
+    if (r.response.byte_length != input.len or !std.mem.eql(u8, &callback_output, input)) {
+        return error.MarkerCallbackMismatch;
+    }
+    var small: [1]u8 = undefined;
+    try harness.reject(r, harness.ids.read, &.{
+        harness.sourceSpan(encoded[0..encoded_len]),
+        harness.sinkSpan(&small),
+    }, .{ .ctx = true }, abi.Status.insufficient_capacity, &small);
+}
+
+fn runLzma2Empty(r: *Runner) !void {
+    setupLzma(r, harness.ids.lzma2, 4096);
+    const stream = [_]u8{0x00};
+    const query_nodes = steps.build(&lzmaParams, r, &.{
+        harness.paramTargetCommand(harness.ids.read),
+        harness.sourceSpan(&stream),
+    });
+    _ = harness.call(r, harness.ids.query, query_nodes.items[0..query_nodes.len], .{ .ctx = true });
+    try harness.requireStatus(r, abi.Status.ok);
+    if (r.response.byte_length != 0) return error.EmptyQueryLength;
+    const sink = [_]u8{};
+    const read_nodes = steps.build(&lzmaParams, r, &.{
+        harness.sourceSpan(&stream),
+        harness.sinkSpan(&sink),
+    });
+    _ = harness.call(r, harness.ids.read, read_nodes.items[0..read_nodes.len], .{ .ctx = true });
+    try harness.requireStatus(r, abi.Status.ok);
+    if (r.response.byte_length != 0) return error.EmptyReadLength;
+}
+
+fn runLzma2TrailingGarbage(r: *Runner) !void {
+    const input = "trailing garbage after control_end";
+    setupLzma(r, harness.ids.lzma2, 4096);
+    r.input = input;
+    try steps.queryWrite(&lzmaParams, r);
+    try steps.writeSpan(&lzmaParams, r);
+    var stream: [512]u8 = undefined;
+    @memcpy(stream[0..r.encoded_len], r.encoded[0..r.encoded_len]);
+    stream[r.encoded_len] = 0xde;
+    stream[r.encoded_len + 1] = 0xad;
+    const stream_len = r.encoded_len + 2;
+    const query_nodes = steps.build(&lzmaParams, r, &.{
+        harness.paramTargetCommand(harness.ids.read),
+        harness.sourceSpan(stream[0..stream_len]),
+    });
+    _ = harness.call(r, harness.ids.query, query_nodes.items[0..query_nodes.len], .{ .ctx = true });
+    try harness.requireStatus(r, abi.Status.ok);
+    if (r.response.byte_length != input.len) return error.TrailingQueryLength;
+    var output: [input.len]u8 = undefined;
+    const read_nodes = steps.build(&lzmaParams, r, &.{
+        harness.sourceSpan(stream[0..stream_len]),
+        harness.sinkSpan(&output),
+    });
+    _ = harness.call(r, harness.ids.read, read_nodes.items[0..read_nodes.len], .{ .ctx = true });
+    try harness.requireStatus(r, abi.Status.ok);
+    if (r.response.byte_length != input.len or !std.mem.eql(u8, &output, input)) {
+        return error.TrailingReadMismatch;
+    }
+}
+
+fn runLzma2SingleByte(r: *Runner) !void {
+    setupLzma(r, harness.ids.lzma2, 4096);
+    const stream = [_]u8{ 0x01, 0x00, 0x00, 'X', 0x00 };
+    var output: [1]u8 = undefined;
+    const nodes = steps.build(&lzmaParams, r, &.{
+        harness.sourceSpan(&stream),
+        harness.sinkSpan(&output),
+    });
+    _ = harness.call(r, harness.ids.read, nodes.items[0..nodes.len], .{ .ctx = true });
+    try harness.requireStatus(r, abi.Status.ok);
+    if (r.response.byte_length != 1 or output[0] != 'X') return error.SingleByteMismatch;
+}
+
+fn runLzma2PackBounds(r: *Runner) !void {
+    var input: [512]u8 = undefined;
+    corpus.select(r.corpus_index, &input);
+    setupLzma(r, harness.ids.lzma2, 4096);
+    r.input = &input;
+    try steps.queryWrite(&lzmaParams, r);
+    try steps.writeSpan(&lzmaParams, r);
+    var pos: usize = 0;
+    while (true) {
+        if (pos >= r.encoded_len) return error.BoundsWalkOverflow;
+        const control = r.encoded[pos];
+        if (control == 0x00) break;
+        if (control & 0x80 != 0) {
+            if (pos + 5 > r.encoded_len) return error.BoundsHeaderTruncated;
+            const pack = ((@as(usize, r.encoded[pos + 3]) << 8) | r.encoded[pos + 4]) + 1;
+            if (pack < 5 or pack > 65536) return error.BoundsPackSize;
+            const header_len: usize = if (control >= 0xC0) 6 else 5;
+            pos += header_len + pack;
+        } else {
+            if (pos + 3 > r.encoded_len) return error.BoundsCopyTruncated;
+            const unpack = ((@as(usize, r.encoded[pos + 1]) << 8) | r.encoded[pos + 2]) + 1;
+            if (unpack > 1 << 20) return error.BoundsUnpackSize;
+            pos += 3 + unpack;
+        }
+    }
+    if (pos + 1 != r.encoded_len) return error.BoundsLayoutMismatch;
+}
+
+fn runLzma2BadPackSize(r: *Runner) !void {
+    setupLzma(r, harness.ids.lzma2, 4096);
+    const stream = [_]u8{ 0xC0, 0x00, 0x00, 0x00, 0x02, 0x5d };
+    var output: [16]u8 = undefined;
+    const nodes = steps.build(&lzmaParams, r, &.{
+        harness.sourceSpan(&stream),
+        harness.sinkSpan(&output),
+    });
+    try harness.reject(r, harness.ids.read, nodes.items[0..nodes.len], .{ .ctx = true }, abi.Status.invalid_data, &output);
+}
+
+fn runLzma2TruncatedHeader(r: *Runner) !void {
+    setupLzma(r, harness.ids.lzma2, 4096);
+    const stream = [_]u8{ 0xC0, 0x00 };
+    var output: [16]u8 = undefined;
+    const nodes = steps.build(&lzmaParams, r, &.{
+        harness.sourceSpan(&stream),
+        harness.sinkSpan(&output),
+    });
+    try harness.reject(r, harness.ids.read, nodes.items[0..nodes.len], .{ .ctx = true }, abi.Status.invalid_data, &output);
+}
+
+fn runLzma2CorruptPayload(r: *Runner) !void {
+    var input: [48]u8 = undefined;
+    corpus.select(r.corpus_index, &input);
+    setupLzma(r, harness.ids.lzma2, 4096);
+    r.input = &input;
+    try steps.queryWrite(&lzmaParams, r);
+    try steps.writeSpan(&lzmaParams, r);
+    var pos: usize = 0;
+    while (true) {
+        if (pos >= r.encoded_len) return error.CorruptNoCompressedChunk;
+        const control = r.encoded[pos];
+        if (control == 0x00) return error.CorruptNoCompressedChunk;
+        if (control & 0x80 != 0) break;
+        const unpack = ((@as(usize, r.encoded[pos + 1]) << 8) | r.encoded[pos + 2]) + 1;
+        pos += 3 + unpack;
+    }
+    const header_len: usize = if (r.encoded[pos] >= 0xC0) 6 else 5;
+    if (r.encoded_len <= pos + header_len) return error.CorruptNoCompressedChunk;
+    r.encoded[pos + header_len] ^= 0xff;
+    var output: [48]u8 = undefined;
+    @memset(&output, 0xa5);
+    const nodes = steps.build(&lzmaParams, r, &.{
+        harness.sourceSpan(r.encoded[0..r.encoded_len]),
+        harness.sinkSpan(&output),
+    });
+    _ = harness.call(r, harness.ids.read, nodes.items[0..nodes.len], .{ .ctx = true });
+    if (r.status == abi.Status.ok) return error.CorruptPayloadAccepted;
+}
+
+const Timespec = extern struct { sec: c_long, nsec: c_long };
+extern "c" fn clock_gettime(clk_id: c_int, tp: *Timespec) c_int;
+const CLOCK_REALTIME = 0;
+
+fn nowNs() u64 {
+    var ts: Timespec = undefined;
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) return 0;
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
+
+fn scanSize(input: []const u8) !?usize {
+    const control_end_byte: u8 = 0x00;
+    const control_copy_reset_dic: u8 = 0x01;
+    const control_copy: u8 = 0x02;
+    const control_lzma_new_props: u8 = 0xC0;
+    const control_lzma_new_props_reset_dic: u8 = 0xE0;
+    const max_pack_size = 1 << 16;
+    const chunk_max_unpacked_local = 1 << 20;
+    var pos: usize = 0;
+    var total: usize = 0;
+    var need_properties = true;
+    var need_dictionary_reset = true;
+    while (pos < input.len) {
+        const control = input[pos];
+        pos += 1;
+        if (control == control_end_byte) return total;
+        if (control >= control_lzma_new_props_reset_dic or control == control_copy_reset_dic) {
+            need_properties = true;
+            need_dictionary_reset = true;
+        } else if (need_dictionary_reset) {
+            return error.InvalidData;
+        }
+        if (control & 0x80 != 0) {
+            if (pos + 2 > input.len) return error.InvalidData;
+            const unpack_size = (((@as(usize, control & 0x0F) << 16) | (@as(usize, input[pos]) << 8) | input[pos + 1]) + 1);
+            pos += 2;
+            if (pos + 2 > input.len) return error.InvalidData;
+            const pack_size = ((@as(usize, input[pos]) << 8) | input[pos + 1]) + 1;
+            pos += 2;
+            if (unpack_size > chunk_max_unpacked_local or pack_size < 5 or pack_size > max_pack_size) return error.InvalidData;
+            if (control >= control_lzma_new_props) {
+                if (pos >= input.len) return error.InvalidData;
+                pos += 1;
+                need_properties = false;
+                if (control >= control_lzma_new_props_reset_dic) need_dictionary_reset = false;
+            } else {
+                if (need_properties) return error.InvalidData;
+            }
+            pos += pack_size;
+            if (pos > input.len) return error.InvalidData;
+            total = std.math.add(usize, total, unpack_size) catch return error.ResourceLimit;
+        } else {
+            if (control != control_copy_reset_dic and control != control_copy) return error.InvalidData;
+            if (pos + 2 > input.len) return error.InvalidData;
+            const unpack_size = ((@as(usize, input[pos]) << 8) | input[pos + 1]) + 1;
+            pos += 2;
+            if (unpack_size > chunk_max_unpacked_local) return error.InvalidData;
+            if (need_dictionary_reset) need_dictionary_reset = false;
+            pos += unpack_size;
+            if (pos > input.len) return error.InvalidData;
+            total = std.math.add(usize, total, unpack_size) catch return error.ResourceLimit;
+        }
+    }
+    return error.InvalidData;
+}
+
+pub fn runScanTiming(r: *Runner) !void {
+    const input_len = 4 << 20;
+    const chunk_size = 1 << 16;
+    const chunks = input_len / chunk_size;
+    const stream_len = chunks * (3 + chunk_size) + 1;
+    const stream = try r.gpa.alloc(u8, stream_len);
+    defer r.gpa.free(stream);
+    var pos: usize = 0;
+    for (0..chunks) |i| {
+        stream[pos] = if (i == 0) 0x01 else 0x02;
+        pos += 1;
+        const size_minus_1 = chunk_size - 1;
+        stream[pos] = @truncate(size_minus_1 >> 8);
+        stream[pos + 1] = @truncate(size_minus_1);
+        pos += 2;
+        const base = i * chunk_size;
+        for (0..chunk_size) |j| stream[pos + j] = @truncate((base + j) & 0xff);
+        pos += chunk_size;
+    }
+    stream[pos] = 0x00;
+    setupLzma(r, harness.ids.lzma2, 4096);
+    const scan_size = try scanSize(stream[0..stream_len]);
+    if (scan_size != input_len) return error.ScanSizeMismatch;
+    const iterations: usize = 1000;
+    const scan_start = nowNs();
+    for (0..iterations) |_| _ = try scanSize(stream[0..stream_len]);
+    const scan_end = nowNs();
+    const scan_total_ns = @as(u64, @intCast(scan_end - scan_start));
+    const scan_ns = scan_total_ns / iterations;
+    const decode_start = nowNs();
+    const read_nodes = steps.build(&lzmaParams, r, &.{
+        harness.sourceSpan(stream[0..stream_len]),
+        harness.sinkSpan(r.output[0..input_len]),
+    });
+    _ = harness.call(r, harness.ids.read, read_nodes.items[0..read_nodes.len], .{ .ctx = true });
+    const decode_end = nowNs();
+    try harness.requireStatus(r, abi.Status.ok);
+    const decode_ns = @as(u64, @intCast(decode_end - decode_start));
+    if (r.response.byte_length != input_len) return error.ScanDecodeLength;
+    for (0..input_len) |i| {
+        if (r.output[i] != @as(u8, @truncate(i & 0xff))) return error.ScanDecodeMismatch;
+    }
+    const scan_ms = @as(f64, @floatFromInt(scan_ns)) / 1.0e6;
+    const decode_ms = @as(f64, @floatFromInt(decode_ns)) / 1.0e6;
+    std.debug.print("U4 scanSize timing: input_len={d} iterations={d} scan_per_call_ns={d} ({d:.3} ms) decode_ns={d} ({d:.3} ms) fraction={d:.4}%\n", .{
+        input_len,
+        iterations,
+        scan_ns,
+        scan_ms,
+        decode_ns,
+        decode_ms,
+        @as(f64, @floatFromInt(scan_ns)) * 100.0 / @as(f64, @floatFromInt(decode_ns)),
+    });
+}
+
+const ab_variant = @import("ab_variant");
+
+fn abEncodeAndWrite(r: *Runner, profile_id: harness.Id, dictionary: u64, finder: ?u64, input: []const u8, label: []const u8) !void {
+    const mode = if (abi.idEqual(profile_id, harness.ids.xz)) harness.mode_xz else harness.mode_stream;
+    harness.setup(r, profile_id, mode);
+    r.extra = dictionary;
+    r.input = input;
+    r.extra2 = finder;
+    steps.queryWrite(&lzmaParams, r) catch |err| {
+        std.debug.print("abEncodeAndWrite query failed {s} status={d}\n", .{ label, r.status });
+        return err;
+    };
+    steps.writeSpan(&lzmaParams, r) catch |err| {
+        std.debug.print("abEncodeAndWrite write failed {s} status={d}\n", .{ label, r.status });
+        return err;
+    };
+    const encoded_len: usize = r.encoded_len;
+
+    const dir = try std.fs.path.join(r.gpa, &.{
+        "zig-out", "oracles", "ab", ab_variant.name, r.scenario_name,
+    });
+    defer r.gpa.free(dir);
+    const path = try std.fs.path.join(r.gpa, &.{ dir, label });
+    defer r.gpa.free(path);
+    if (std.fs.path.dirname(path)) |parent| {
+        try std.Io.Dir.cwd().createDirPath(harness.io, parent);
+    }
+    try std.Io.Dir.cwd().writeFile(harness.io, .{
+        .sub_path = path,
+        .data = r.encoded[0..encoded_len],
+    });
+}
+
+fn runLzmaAbCorpus(r: *Runner) !void {
+    var input: [48]u8 = undefined;
+    for (0..4) |corpus_index| {
+        corpus.select(corpus_index, &input);
+        const suffix = try std.fmt.allocPrint(r.gpa, "corpus_{d}", .{corpus_index});
+        defer r.gpa.free(suffix);
+        const dict: u64 = @max(input.len, 4096);
+        const lzma_hc = try std.fmt.allocPrint(r.gpa, "{s}/lzma_hc.bin", .{suffix});
+        defer r.gpa.free(lzma_hc);
+        const lzma_bt4 = try std.fmt.allocPrint(r.gpa, "{s}/lzma_bt4.bin", .{suffix});
+        defer r.gpa.free(lzma_bt4);
+        const lzma2_hc = try std.fmt.allocPrint(r.gpa, "{s}/lzma2_hc.bin", .{suffix});
+        defer r.gpa.free(lzma2_hc);
+        const lzma2_bt4 = try std.fmt.allocPrint(r.gpa, "{s}/lzma2_bt4.bin", .{suffix});
+        defer r.gpa.free(lzma2_bt4);
+        const xz_hc = try std.fmt.allocPrint(r.gpa, "{s}/xz_hc.bin", .{suffix});
+        defer r.gpa.free(xz_hc);
+        const xz_bt4 = try std.fmt.allocPrint(r.gpa, "{s}/xz_bt4.bin", .{suffix});
+        defer r.gpa.free(xz_bt4);
+        try abEncodeAndWrite(r, harness.ids.lzma, dict, 0, &input, lzma_hc);
+        try abEncodeAndWrite(r, harness.ids.lzma, dict, 1, &input, lzma_bt4);
+        try abEncodeAndWrite(r, harness.ids.lzma2, dict, 0, &input, lzma2_hc);
+        try abEncodeAndWrite(r, harness.ids.lzma2, dict, 1, &input, lzma2_bt4);
+        try abEncodeAndWrite(r, harness.ids.xz, dict, 0, &input, xz_hc);
+        try abEncodeAndWrite(r, harness.ids.xz, dict, 1, &input, xz_bt4);
+    }
+}
+
+fn runLzmaAbZeros(r: *Runner) !void {
+    const input = [_]u8{0} ** 1024;
+    try abEncodeAndWrite(r, harness.ids.lzma, 4096, 0, &input, "lzma_hc.bin");
+    try abEncodeAndWrite(r, harness.ids.lzma, 4096, 1, &input, "lzma_bt4.bin");
+}
+
+fn runLzmaAbSameByte(r: *Runner) !void {
+    const input = [_]u8{0xa5} ** 1024;
+    try abEncodeAndWrite(r, harness.ids.lzma, 4096, 0, &input, "lzma_hc.bin");
+    try abEncodeAndWrite(r, harness.ids.lzma, 4096, 1, &input, "lzma_bt4.bin");
+    try abEncodeAndWrite(r, harness.ids.lzma2, 4096, 0, &input, "lzma2_hc.bin");
+    try abEncodeAndWrite(r, harness.ids.lzma2, 4096, 1, &input, "lzma2_bt4.bin");
+    try abEncodeAndWrite(r, harness.ids.xz, 4096, 0, &input, "xz_hc.bin");
+    try abEncodeAndWrite(r, harness.ids.xz, 4096, 1, &input, "xz_bt4.bin");
+}
+
+fn runLzmaAbRandom(r: *Runner) !void {
+    var input: [1024]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(0xc09f10);
+    prng.fill(&input);
+    try abEncodeAndWrite(r, harness.ids.lzma, 4096, 0, &input, "lzma_hc.bin");
+    try abEncodeAndWrite(r, harness.ids.lzma, 4096, 1, &input, "lzma_bt4.bin");
+    try abEncodeAndWrite(r, harness.ids.lzma2, 4096, 0, &input, "lzma2_hc.bin");
+    try abEncodeAndWrite(r, harness.ids.lzma2, 4096, 1, &input, "lzma2_bt4.bin");
+    try abEncodeAndWrite(r, harness.ids.xz, 4096, 0, &input, "xz_hc.bin");
+    try abEncodeAndWrite(r, harness.ids.xz, 4096, 1, &input, "xz_bt4.bin");
+}
+
+fn runLzmaAbSparseRuns(r: *Runner) !void {
+    var input: [2048]u8 = undefined;
+    var i: usize = 0;
+    while (i < input.len) : (i += 64) {
+        const byte: u8 = @truncate((i / 64) + 1);
+        @memset(input[i..][0..@min(64, input.len - i)], byte);
+    }
+    try abEncodeAndWrite(r, harness.ids.lzma, 4096, 0, &input, "lzma_hc.bin");
+    try abEncodeAndWrite(r, harness.ids.lzma, 4096, 1, &input, "lzma_bt4.bin");
+    try abEncodeAndWrite(r, harness.ids.lzma2, 4096, 0, &input, "lzma2_hc.bin");
+    try abEncodeAndWrite(r, harness.ids.lzma2, 4096, 1, &input, "lzma2_bt4.bin");
+    try abEncodeAndWrite(r, harness.ids.xz, 4096, 0, &input, "xz_hc.bin");
+    try abEncodeAndWrite(r, harness.ids.xz, 4096, 1, &input, "xz_bt4.bin");
+}
+
+fn runLzmaAbText(r: *Runner) !void {
+    const pattern = "the quick brown fox jumps over the lazy dog 0123456789 ";
+    var input: [2000]u8 = undefined;
+    for (&input, 0..) |*b, i| b.* = pattern[i % pattern.len];
+    try abEncodeAndWrite(r, harness.ids.lzma, 4096, 0, &input, "lzma_hc.bin");
+    try abEncodeAndWrite(r, harness.ids.lzma, 4096, 1, &input, "lzma_bt4.bin");
+    try abEncodeAndWrite(r, harness.ids.lzma2, 4096, 0, &input, "lzma2_hc.bin");
+    try abEncodeAndWrite(r, harness.ids.lzma2, 4096, 1, &input, "lzma2_bt4.bin");
+    try abEncodeAndWrite(r, harness.ids.xz, 4096, 0, &input, "xz_hc.bin");
+    try abEncodeAndWrite(r, harness.ids.xz, 4096, 1, &input, "xz_bt4.bin");
+}
+
+fn runLzmaAbAlternating(r: *Runner) !void {
+    var input: [2048]u8 = undefined;
+    var i: usize = 0;
+    while (i < input.len) : (i += 32) {
+        const byte: u8 = if ((i / 32) & 1 == 0) @as(u8, 'a') + @as(u8, @truncate((i / 64) % 26)) else 0;
+        @memset(input[i..][0..@min(32, input.len - i)], byte);
+    }
+    try abEncodeAndWrite(r, harness.ids.lzma, 4096, 0, &input, "lzma_hc.bin");
+    try abEncodeAndWrite(r, harness.ids.lzma, 4096, 1, &input, "lzma_bt4.bin");
+    try abEncodeAndWrite(r, harness.ids.lzma2, 4096, 0, &input, "lzma2_hc.bin");
+    try abEncodeAndWrite(r, harness.ids.lzma2, 4096, 1, &input, "lzma2_bt4.bin");
+    try abEncodeAndWrite(r, harness.ids.xz, 4096, 0, &input, "xz_hc.bin");
+    try abEncodeAndWrite(r, harness.ids.xz, 4096, 1, &input, "xz_bt4.bin");
+}
+
+fn runLzmaAbZerosChunkBoundary(r: *Runner) !void {
+    var input: [(1 << 20) + 1024]u8 = undefined;
+    @memset(&input, 0);
+    try abEncodeAndWrite(r, harness.ids.lzma2, 1 << 20, 0, &input, "lzma2_hc.bin");
+    try abEncodeAndWrite(r, harness.ids.lzma2, 1 << 20, 1, &input, "lzma2_bt4.bin");
+    try abEncodeAndWrite(r, harness.ids.xz, 1 << 20, 0, &input, "xz_hc.bin");
+    try abEncodeAndWrite(r, harness.ids.xz, 1 << 20, 1, &input, "xz_bt4.bin");
+}
+
+fn runLzmaAbZerosDictionaryWrap(r: *Runner) !void {
+    var input: [(64 << 10) + 1]u8 = undefined;
+    @memset(&input, 0);
+    try abEncodeAndWrite(r, harness.ids.lzma, 64 << 10, 0, &input, "lzma_hc.bin");
+    try abEncodeAndWrite(r, harness.ids.lzma, 64 << 10, 1, &input, "lzma_bt4.bin");
+}
+
 pub const scenarios = harness.scenarios(
     "lzma",
     &.{
@@ -501,6 +1101,18 @@ pub const scenarios = harness.scenarios(
         .{ .label = "lzma large dictionary", .run = runLzmaLarge, .workspace_size = 680 * 1024 * 1024, .output_size = 1 << 20, .encoded_size = (1 << 20) + 65536 },
     },
     &.{
+        .{ .name = "lzma file declared equal", .run = runLzmaFileDeclaredEqual, .workspace_size = 1310720, .output_size = 256, .encoded_size = 512 },
+        .{ .name = "lzma file declared greater", .run = runLzmaFileDeclaredGreater, .workspace_size = 1310720, .output_size = 256, .encoded_size = 512 },
+        .{ .name = "lzma file declared less", .run = runLzmaFileDeclaredLess, .workspace_size = 1310720, .output_size = 256, .encoded_size = 512 },
+        .{ .name = "lzma file source once", .run = runLzmaFileSourceOnce, .workspace_size = 1310720, .output_size = 256, .encoded_size = 512 },
+        .{ .name = "lzma file marker mode", .run = runLzmaFileMarkerMode, .workspace_size = 1310720, .output_size = 256, .encoded_size = 512 },
+        .{ .name = "lzma2 empty", .run = runLzma2Empty, .workspace_size = 3670016, .output_size = 16, .encoded_size = 64 },
+        .{ .name = "lzma2 trailing garbage", .run = runLzma2TrailingGarbage, .workspace_size = 3670016, .output_size = 256, .encoded_size = 512 },
+        .{ .name = "lzma2 single byte", .run = runLzma2SingleByte, .workspace_size = 3670016, .output_size = 16, .encoded_size = 16 },
+        .{ .name = "lzma2 pack bounds", .run = runLzma2PackBounds, .workspace_size = 3670016, .output_size = 512, .encoded_size = 1024 },
+        .{ .name = "lzma2 bad pack size", .run = runLzma2BadPackSize, .workspace_size = 3670016, .output_size = 16, .encoded_size = 16 },
+        .{ .name = "lzma2 truncated header", .run = runLzma2TruncatedHeader, .workspace_size = 3670016, .output_size = 16, .encoded_size = 16 },
+        .{ .name = "lzma2 corrupt payload", .run = runLzma2CorruptPayload, .workspace_size = 3670016, .output_size = 48, .encoded_size = 512 },
         .{ .name = "lzma2 incompressible", .run = runIncompressible, .workspace_size = 3 * 1024 * 1024, .output_size = 1 << 20, .encoded_size = (1 << 20) + 4096 },
         .{ .name = "lzma2 multichunk", .run = runMultichunk, .workspace_size = 8 * 1024 * 1024, .output_size = (1 << 20) + 1024, .encoded_size = 65536 },
         .{ .name = "lzma2 midstream reset", .run = runMidstreamReset, .workspace_size = 3670016, .output_size = 4096, .encoded_size = 1024 },
@@ -510,5 +1122,15 @@ pub const scenarios = harness.scenarios(
         .{ .name = "lzma dictionary cap provisional", .run = runLzmaCap, .workspace_size = 1310720, .output_size = 16, .encoded_size = 256 },
         .{ .name = "lzma2 dictionary cap provisional", .run = runLzma2Cap, .workspace_size = 3670016, .output_size = 16, .encoded_size = 256 },
         .{ .name = "xz dictionary cap verified", .run = runXzCap, .workspace_size = 8 * 1024 * 1024, .output_size = 16, .encoded_size = 256 },
+        .{ .name = "lzma2 scan timing", .run = runScanTiming, .workspace_size = 4 * 1024 * 1024, .output_size = 4 << 20, .encoded_size = 64 },
+        .{ .name = "lzma ab corpus", .run = runLzmaAbCorpus, .workspace_size = 680 * 1024 * 1024, .output_size = 16, .encoded_size = 1 << 20, .suite = "lzma_ab" },
+        .{ .name = "lzma ab zeros", .run = runLzmaAbZeros, .workspace_size = 680 * 1024 * 1024, .output_size = 16, .encoded_size = 1 << 20, .suite = "lzma_ab" },
+        .{ .name = "lzma ab same byte", .run = runLzmaAbSameByte, .workspace_size = 680 * 1024 * 1024, .output_size = 16, .encoded_size = 1 << 20, .suite = "lzma_ab" },
+        .{ .name = "lzma ab random", .run = runLzmaAbRandom, .workspace_size = 680 * 1024 * 1024, .output_size = 16, .encoded_size = 1 << 20, .suite = "lzma_ab" },
+        .{ .name = "lzma ab sparse runs", .run = runLzmaAbSparseRuns, .workspace_size = 680 * 1024 * 1024, .output_size = 16, .encoded_size = 1 << 20, .suite = "lzma_ab" },
+        .{ .name = "lzma ab text", .run = runLzmaAbText, .workspace_size = 680 * 1024 * 1024, .output_size = 16, .encoded_size = 1 << 20, .suite = "lzma_ab" },
+        .{ .name = "lzma ab alternating", .run = runLzmaAbAlternating, .workspace_size = 680 * 1024 * 1024, .output_size = 16, .encoded_size = 1 << 20, .suite = "lzma_ab" },
+        .{ .name = "lzma ab zeros chunk boundary", .run = runLzmaAbZerosChunkBoundary, .workspace_size = 680 * 1024 * 1024, .output_size = 16, .encoded_size = 1 << 20, .suite = "lzma_ab" },
+        .{ .name = "lzma ab zeros dictionary wrap", .run = runLzmaAbZerosDictionaryWrap, .workspace_size = 680 * 1024 * 1024, .output_size = 16, .encoded_size = 1 << 20, .suite = "lzma_ab" },
     },
 );
