@@ -4,6 +4,7 @@ const archive = @import("archive.zig");
 const bound = @import("bound.zig");
 const checksum = @import("checksum.zig");
 const harness = @import("harness.zig");
+const inflate = @import("inflate.zig");
 const lib = @import("lib.zig");
 const lzma = @import("lzma.zig");
 const primitives = @import("primitives.zig");
@@ -31,6 +32,7 @@ const scenarios = blk: {
         &lzma.scenarios,
         &xz.scenarios,
         &zstd.scenarios,
+        &inflate.scenarios,
     };
     var total: usize = 0;
     for (groups) |group| total += group.len;
