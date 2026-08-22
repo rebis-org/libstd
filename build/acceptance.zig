@@ -123,9 +123,14 @@ fn addBenchmark(b: *std.Build, ctx: *common.Context, refs: cmd.Refs) void {
     refs.link(b, app.exe.root_module);
     app.exe.root_module.addCSourceFile(.{ .file = b.path("build/acceptance/benchmark/ref/libzip.c") });
     app.exe.root_module.addCSourceFile(.{ .file = b.path("build/acceptance/benchmark/ref/unrar.c") });
-    const macos_sdk_usr_lib = macosSdkUsrLib(b, ctx) orelse
-        @panic("benchmark build needs the macOS SDK: run `xcode-select` to point at an Xcode install");
-    app.exe.root_module.addLibraryPath(.{ .cwd_relative = macos_sdk_usr_lib });
+    // Expansion runs for every -Dtarget; the SDK path only exists when the
+    // benchmark app itself targets Darwin, so look it up only there.
+    const macos_sdk_usr_lib: ?[]const u8 = if (ref_target.result.os.tag.isDarwin())
+        macosSdkUsrLib(b, ctx) orelse
+            @panic("benchmark build needs the macOS SDK: run `xcode-select` to point at an Xcode install")
+    else
+        null;
+    if (macos_sdk_usr_lib) |sdk_usr_lib| app.exe.root_module.addLibraryPath(.{ .cwd_relative = sdk_usr_lib });
     app.exe.root_module.linkSystemLibrary("c++", .{});
     app.exe.root_module.linkSystemLibrary("z", .{});
     app.exe.step.dependOn(&refs.libzip_build.step);
@@ -143,7 +148,7 @@ fn addBenchmark(b: *std.Build, ctx: *common.Context, refs: cmd.Refs) void {
     refs.link(b, skip_app.exe.root_module);
     skip_app.exe.root_module.addCSourceFile(.{ .file = b.path("build/acceptance/benchmark/ref/libzip.c") });
     skip_app.exe.root_module.addCSourceFile(.{ .file = b.path("build/acceptance/benchmark/ref/unrar.c") });
-    skip_app.exe.root_module.addLibraryPath(.{ .cwd_relative = macos_sdk_usr_lib });
+    if (macos_sdk_usr_lib) |sdk_usr_lib| skip_app.exe.root_module.addLibraryPath(.{ .cwd_relative = sdk_usr_lib });
     skip_app.exe.root_module.linkSystemLibrary("c++", .{});
     skip_app.exe.root_module.linkSystemLibrary("z", .{});
     skip_app.exe.step.dependOn(&refs.libzip_build.step);
