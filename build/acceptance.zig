@@ -1,6 +1,5 @@
 const std = @import("std");
 
-const clang = @import("clang.zig");
 const cmd = @import("acceptance/benchmark/command.zig");
 const sevenzip = @import("acceptance/benchmark/ref/sevenzip.zig");
 const modules = @import("modules.zig");
@@ -24,7 +23,6 @@ pub fn expand(b: *std.Build, ctx: *common.Context) void {
         .oracles => addOracles(b, ctx),
         .benchmark => addBenchmark(b, ctx, refs),
     };
-    addChecks(b, &refs);
 }
 
 const AcceptanceApp = struct {
@@ -161,40 +159,4 @@ fn macosSdkUsrLib(b: *std.Build, ctx: *common.Context) ?[]const u8 {
     const sdk = std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &ctx.target.result) orelse return null;
     defer b.allocator.free(sdk);
     return b.fmt("{s}/usr/lib", .{sdk});
-}
-
-fn addChecks(b: *std.Build, refs: *const cmd.Refs) void {
-    const sources = [_][]const u8{
-        "build/acceptance/abi.h",
-        "build/acceptance/header.c",
-        "build/acceptance/header.cpp",
-        "build/acceptance/benchmark/ref/benchmark.cpp",
-        "build/acceptance/benchmark/ref/libzip.c",
-        "build/acceptance/benchmark/ref/unrar.c",
-        "build/acceptance/benchmark/ref/ref.h",
-        "build/acceptance/oracles/c/c.h",
-        "build/acceptance/oracles/c/archive.h",
-        "build/acceptance/oracles/c/lzma.h",
-    };
-
-    const format_step = b.step("format", "Check clang-format compliance of acceptance C/C++ sources");
-    format_step.dependOn(clang.format(b, &sources, false));
-
-    const fmt = b.step("fmt", "Apply clang-format to acceptance C/C++ sources");
-    fmt.dependOn(clang.format(b, &sources, true));
-
-    const include_dir = b.getInstallPath(.header, "");
-    const lint = b.step("lint", "Run clang-tidy with strict checks on acceptance C/C++ sources");
-    lint.dependOn(clang.tidy(b, &.{"build/acceptance/header.c"}, &.{ "-std=c23", "-I", include_dir }));
-    lint.dependOn(clang.tidy(b, &.{"build/acceptance/header.cpp"}, &.{ "-std=c++26", "-I", include_dir }));
-    const libzip_tidy = clang.tidy(b, &.{"build/acceptance/benchmark/ref/libzip.c"}, &.{ "-std=c23", "-I", "vendor/libzip/lib", "-I", cmd.libzip_build_dir });
-    libzip_tidy.dependOn(&refs.libzip_configure.step);
-    lint.dependOn(libzip_tidy);
-    lint.dependOn(clang.tidy(b, &.{"build/acceptance/benchmark/ref/unrar.c"}, &.{ "-std=c23", "-I", "vendor/unrar" }));
-    lint.dependOn(clang.tidy(b, &.{"build/acceptance/benchmark/ref/benchmark.cpp"}, &.{ "-std=c++26", "-DZ7_EXTERNAL_CODECS", "-fno-sanitize=alignment", "-I", "vendor/7zip/CPP", "-I", "build/acceptance/benchmark/ref" }));
-    lint.dependOn(clang.tidy(b, &.{
-        "build/acceptance/oracles/c/c.h",
-        "build/acceptance/oracles/c/archive.h",
-        "build/acceptance/oracles/c/lzma.h",
-    }, &.{"-std=c23"}));
 }

@@ -57,7 +57,7 @@ int ref_unrar_extract(const unsigned char* data,
             result = status;
             break;
         }
-        const int operation = (header.Flags & RHDF_DIRECTORY) ? RAR_OM_LIST : RAR_OM_EXTRACT;
+        const int operation = (header.Flags & (unsigned int) RHDF_DIRECTORY) ? RAR_OM_LIST : RAR_OM_EXTRACT;
         result = RARProcessFile(handle, operation, (char*) dest_dir, NULL);
         if (result != ERAR_SUCCESS) {
             break;

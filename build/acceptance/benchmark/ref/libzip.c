@@ -13,7 +13,7 @@ int ref_zip_create(const unsigned char* data,
                    size_t* out_size) {
     *out_size = 0;
     int error = 0;
-    zip_t* za = zip_open(tmp_path, ZIP_CREATE | ZIP_TRUNCATE, &error);
+    zip_t* za = zip_open(tmp_path, (int) ((unsigned int) ZIP_CREATE | (unsigned int) ZIP_TRUNCATE), &error);
     if (za == NULL) {
         return REF_FAIL;
     }
