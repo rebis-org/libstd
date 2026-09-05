@@ -2351,16 +2351,55 @@ pub const Encoder = struct {
         var best_len: usize = if (count > 0) matches[count - 1].len else 0;
         const cm_check = if (abs_pos < self.chain_window) 0 else abs_pos - self.chain_window;
         var depth: u32 = self.match_finder_depth;
+        const input = self.input;
+        const input_base = self.input_base;
         while (cur != 0 and depth != 0 and cm_check < cur) : (depth -= 1) {
             if (cur == abs_pos) break;
             const delta = abs_pos - cur;
             const pair_slot = if (cyc >= delta) cyc - delta else self.chain_window + cyc - delta;
             const pb = cur;
             var len = @min(len0, len1);
-            if (self.byteAt(pb + len) == self.byteAt(abs_pos + len)) {
+            if (pb >= input_base) {
+                const pb_off = @as(usize, pb) - input_base;
+                if (input[pb_off + len] == input[pos + len]) {
+                    len += 1;
+                    if (len != len_limit and input[pb_off + len] == input[pos + len]) {
+                        len = self.matchLen(pb, abs_pos, len_limit);
+                    }
+                    if (best_len < len) {
+                        best_len = len;
+                        if (count < matches.len) {
+                            matches[count] = .{ .len = @intCast(len), .dist = @intCast(delta) };
+                            count += 1;
+                        }
+                        if (len == len_limit) {
+                            ptr1.* = self.left[pair_slot];
+                            ptr0.* = self.right[pair_slot];
+                            return count;
+                        }
+                    }
+                }
+                if (input[pb_off + len] < input[pos + len]) {
+                    ptr1.* = cur;
+                    cur = self.right[pair_slot];
+                    ptr1 = &self.right[pair_slot];
+                    len1 = len;
+                } else {
+                    ptr0.* = cur;
+                    cur = self.left[pair_slot];
+                    ptr0 = &self.left[pair_slot];
+                    len0 = len;
+                }
+                continue;
+            }
+            const abs_b0 = input[pos + len];
+            if (self.byteAt(pb + len) == abs_b0) {
                 len += 1;
-                if (len != len_limit and self.byteAt(pb + len) == self.byteAt(abs_pos + len)) {
-                    len = self.matchLen(pb, abs_pos, len_limit);
+                if (len != len_limit) {
+                    const abs_b1 = input[pos + len];
+                    if (self.byteAt(pb + len) == abs_b1) {
+                        len = self.matchLen(pb, abs_pos, len_limit);
+                    }
                 }
                 if (best_len < len) {
                     best_len = len;
@@ -2375,7 +2414,8 @@ pub const Encoder = struct {
                     }
                 }
             }
-            if (self.byteAt(pb + len) < self.byteAt(abs_pos + len)) {
+            const abs_b = input[pos + len];
+            if (self.byteAt(pb + len) < abs_b) {
                 ptr1.* = cur;
                 cur = self.right[pair_slot];
                 ptr1 = &self.right[pair_slot];
@@ -2404,7 +2444,8 @@ pub const Encoder = struct {
         if (abs_pos >= std.math.maxInt(u32)) return 0;
         const max_len: usize = @min(self.input.len - pos, max_match_len);
         const hash = self.hash4(pos);
-        const slot = abs_pos % self.chain_window;
+        const window = self.chain_window;
+        const slot = abs_pos % window;
         var prev_stored = self.head[hash];
         self.head[hash] = @intCast(abs_pos + 1);
         self.chain[slot] = prev_stored;
@@ -2414,7 +2455,7 @@ pub const Encoder = struct {
         while (prev_stored != 0 and depth != 0) : (depth -= 1) {
             const prev = @as(usize, prev_stored - 1);
             const delta = abs_pos - prev;
-            if (delta >= self.chain_window) break;
+            if (delta >= window) break;
             const len = self.matchLen(prev, abs_pos, max_len);
             if (len > best_len) {
                 best_len = len;
@@ -2424,7 +2465,8 @@ pub const Encoder = struct {
                 }
                 if (len == max_len or len >= self.nice_len) break;
             }
-            prev_stored = self.chain[prev % self.chain_window];
+            const prev_slot = if (slot >= delta) slot - delta else window + slot - delta;
+            prev_stored = self.chain[prev_slot];
         }
         return count;
     }
