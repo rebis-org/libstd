@@ -364,79 +364,77 @@ pub const ids = struct {
     pub const workspace_available_capacity = idByName("workspace_available_capacity");
 };
 
+const ParamEntry = struct {
+    profile: []const u8,
+    name: []const u8,
+    ordinal: u32,
+};
+
+const param_table = [_]ParamEntry{
+    .{ .profile = "zip", .name = "password", .ordinal = 1 },
+    .{ .profile = "zip", .name = "algorithm", .ordinal = 2 },
+    .{ .profile = "zip", .name = "kdf_rounds_limit", .ordinal = 3 },
+    .{ .profile = "zip", .name = "password_lifetime", .ordinal = 4 },
+    .{ .profile = "tar", .name = "ordinal", .ordinal = 1 },
+    .{ .profile = "tar", .name = "entry_count", .ordinal = 2 },
+    .{ .profile = "tar", .name = "entry_name", .ordinal = 3 },
+    .{ .profile = "tar", .name = "entry_size", .ordinal = 4 },
+    .{ .profile = "tar", .name = "entry", .ordinal = 5 },
+    .{ .profile = "tar", .name = "entry_data", .ordinal = 6 },
+    .{ .profile = "tar", .name = "entry_method", .ordinal = 7 },
+    .{ .profile = "tar", .name = "comment", .ordinal = 8 },
+    .{ .profile = "tar", .name = "entry_typeflag", .ordinal = 9 },
+    .{ .profile = "tar", .name = "entry_link_name", .ordinal = 10 },
+    .{ .profile = "tar", .name = "entry_uid", .ordinal = 11 },
+    .{ .profile = "tar", .name = "entry_mtime", .ordinal = 12 },
+    .{ .profile = "gzip", .name = "modification_time", .ordinal = 1 },
+    .{ .profile = "gzip", .name = "extra_flags", .ordinal = 2 },
+    .{ .profile = "gzip", .name = "operating_system", .ordinal = 3 },
+    .{ .profile = "gzip", .name = "text", .ordinal = 4 },
+    .{ .profile = "gzip", .name = "header_crc", .ordinal = 5 },
+    .{ .profile = "gzip", .name = "extra", .ordinal = 6 },
+    .{ .profile = "gzip", .name = "name", .ordinal = 7 },
+    .{ .profile = "gzip", .name = "comment", .ordinal = 8 },
+    .{ .profile = "zstd", .name = "window", .ordinal = 1 },
+    .{ .profile = "zstd", .name = "dictionary", .ordinal = 2 },
+    .{ .profile = "zstd", .name = "hash_bits", .ordinal = 3 },
+    .{ .profile = "zstd", .name = "max_chain", .ordinal = 4 },
+    .{ .profile = "zstd", .name = "nice_len", .ordinal = 5 },
+    .{ .profile = "zstd", .name = "search_window", .ordinal = 6 },
+    .{ .profile = "zstd", .name = "lazy", .ordinal = 7 },
+    .{ .profile = "zstd", .name = "skip_interior_insert", .ordinal = 8 },
+    .{ .profile = "zstd", .name = "double_hash", .ordinal = 9 },
+    .{ .profile = "zstd", .name = "row_match", .ordinal = 10 },
+    .{ .profile = "bzip2", .name = "block_size", .ordinal = 1 },
+    .{ .profile = "lzma", .name = "dictionary", .ordinal = 1 },
+    .{ .profile = "lzma", .name = "match_finder_depth", .ordinal = 2 },
+    .{ .profile = "lzma", .name = "lazy", .ordinal = 3 },
+    .{ .profile = "lzma", .name = "nice_len", .ordinal = 4 },
+    .{ .profile = "lzma", .name = "match_finder", .ordinal = 5 },
+    .{ .profile = "deflate", .name = "good", .ordinal = 1 },
+    .{ .profile = "deflate", .name = "nice", .ordinal = 2 },
+    .{ .profile = "deflate", .name = "lazy", .ordinal = 3 },
+    .{ .profile = "deflate", .name = "chain", .ordinal = 4 },
+    .{ .profile = "deflate", .name = "optimal", .ordinal = 5 },
+    .{ .profile = "xz", .name = "check", .ordinal = 1 },
+    .{ .profile = "xz", .name = "filters", .ordinal = 2 },
+};
+
 fn paramOrdinal(comptime profile_name: []const u8, comptime param_name: []const u8) u32 {
-    if (std.mem.eql(u8, profile_name, "zip")) {
-        if (std.mem.eql(u8, param_name, "password")) return 1;
-        if (std.mem.eql(u8, param_name, "algorithm")) return 2;
-        if (std.mem.eql(u8, param_name, "kdf_rounds_limit")) return 3;
-        if (std.mem.eql(u8, param_name, "password_lifetime")) return 4;
-        @compileError("unknown zip parameter");
-    }
-    if (std.mem.eql(u8, profile_name, "tar")) {
-        if (std.mem.eql(u8, param_name, "ordinal")) return 1;
-        if (std.mem.eql(u8, param_name, "entry_count")) return 2;
-        if (std.mem.eql(u8, param_name, "entry_name")) return 3;
-        if (std.mem.eql(u8, param_name, "entry_size")) return 4;
-        if (std.mem.eql(u8, param_name, "entry")) return 5;
-        if (std.mem.eql(u8, param_name, "entry_data")) return 6;
-        if (std.mem.eql(u8, param_name, "entry_method")) return 7;
-        if (std.mem.eql(u8, param_name, "comment")) return 8;
-        if (std.mem.eql(u8, param_name, "entry_typeflag")) return 9;
-        if (std.mem.eql(u8, param_name, "entry_link_name")) return 10;
-        if (std.mem.eql(u8, param_name, "entry_uid")) return 11;
-        if (std.mem.eql(u8, param_name, "entry_mtime")) return 12;
-        @compileError("unknown tar parameter");
-    }
-    if (std.mem.eql(u8, profile_name, "gzip")) {
-        if (std.mem.eql(u8, param_name, "modification_time")) return 1;
-        if (std.mem.eql(u8, param_name, "extra_flags")) return 2;
-        if (std.mem.eql(u8, param_name, "operating_system")) return 3;
-        if (std.mem.eql(u8, param_name, "text")) return 4;
-        if (std.mem.eql(u8, param_name, "header_crc")) return 5;
-        if (std.mem.eql(u8, param_name, "extra")) return 6;
-        if (std.mem.eql(u8, param_name, "name")) return 7;
-        if (std.mem.eql(u8, param_name, "comment")) return 8;
-        @compileError("unknown gzip parameter");
-    }
-    if (std.mem.eql(u8, profile_name, "zstd")) {
-        if (std.mem.eql(u8, param_name, "window")) return 1;
-        if (std.mem.eql(u8, param_name, "dictionary")) return 2;
-        if (std.mem.eql(u8, param_name, "hash_bits")) return 3;
-        if (std.mem.eql(u8, param_name, "max_chain")) return 4;
-        if (std.mem.eql(u8, param_name, "nice_len")) return 5;
-        if (std.mem.eql(u8, param_name, "search_window")) return 6;
-        if (std.mem.eql(u8, param_name, "lazy")) return 7;
-        if (std.mem.eql(u8, param_name, "skip_interior_insert")) return 8;
-        if (std.mem.eql(u8, param_name, "double_hash")) return 9;
-        if (std.mem.eql(u8, param_name, "row_match")) return 10;
-        @compileError("unknown zstd parameter");
-    }
-    if (std.mem.eql(u8, profile_name, "bzip2")) {
-        if (std.mem.eql(u8, param_name, "block_size")) return 1;
-        @compileError("unknown bzip2 parameter");
-    }
-    if (std.mem.eql(u8, profile_name, "lzma")) {
-        if (std.mem.eql(u8, param_name, "dictionary")) return 1;
-        if (std.mem.eql(u8, param_name, "match_finder_depth")) return 2;
-        if (std.mem.eql(u8, param_name, "lazy")) return 3;
-        if (std.mem.eql(u8, param_name, "nice_len")) return 4;
-        if (std.mem.eql(u8, param_name, "match_finder")) return 5;
-        @compileError("unknown lzma parameter");
-    }
-    if (std.mem.eql(u8, profile_name, "deflate")) {
-        if (std.mem.eql(u8, param_name, "good")) return 1;
-        if (std.mem.eql(u8, param_name, "nice")) return 2;
-        if (std.mem.eql(u8, param_name, "lazy")) return 3;
-        if (std.mem.eql(u8, param_name, "chain")) return 4;
-        if (std.mem.eql(u8, param_name, "optimal")) return 5;
-        @compileError("unknown deflate parameter");
-    }
-    if (std.mem.eql(u8, profile_name, "xz")) {
-        if (std.mem.eql(u8, param_name, "check")) return 1;
-        if (std.mem.eql(u8, param_name, "filters")) return 2;
-        @compileError("unknown xz parameter");
+    inline for (param_table) |entry| {
+        if (std.mem.eql(u8, entry.profile, profile_name) and std.mem.eql(u8, entry.name, param_name)) return entry.ordinal;
     }
     @compileError("unknown parameter " ++ param_name ++ " for " ++ profile_name);
+}
+
+fn maxParamOrdinal(comptime profile_name: []const u8) u32 {
+    var max: u32 = 0;
+    inline for (param_table) |entry| {
+        if (std.mem.eql(u8, entry.profile, profile_name)) {
+            if (entry.ordinal > max) max = entry.ordinal;
+        }
+    }
+    return max;
 }
 
 pub const crypto_parameter = struct {
@@ -631,17 +629,18 @@ pub fn commandPolicyFor(id: Id, command: u32, target: u32) ?CommandPolicy {
 
 pub fn selectorKnown(sel: Selector) bool {
     if (sel.family == parameter_family_protocol) return sel.ordinal >= protocol_parameter.workspace_hint and sel.ordinal <= protocol_parameter.delivery_mode;
-    return switch (sel.family) {
-        parameter_family_crypto => sel.ordinal >= 1 and sel.ordinal <= 4,
-        parameter_family_archive => sel.ordinal >= 1 and sel.ordinal <= 12,
-        parameter_family_gzip => sel.ordinal >= 1 and sel.ordinal <= 8,
-        parameter_family_zstd => sel.ordinal >= 1 and sel.ordinal <= 10,
-        parameter_family_bzip2 => sel.ordinal == 1,
-        parameter_family_lzma => sel.ordinal >= 1 and sel.ordinal <= 5,
-        parameter_family_xz => sel.ordinal >= 1 and sel.ordinal <= 2,
-        parameter_family_deflate => sel.ordinal >= 1 and sel.ordinal <= 5,
-        else => false,
+    const max: u32 = switch (sel.family) {
+        parameter_family_crypto => maxParamOrdinal("zip"),
+        parameter_family_archive => maxParamOrdinal("tar"),
+        parameter_family_gzip => maxParamOrdinal("gzip"),
+        parameter_family_zstd => maxParamOrdinal("zstd"),
+        parameter_family_bzip2 => maxParamOrdinal("bzip2"),
+        parameter_family_lzma => maxParamOrdinal("lzma"),
+        parameter_family_xz => maxParamOrdinal("xz"),
+        parameter_family_deflate => maxParamOrdinal("deflate"),
+        else => return false,
     };
+    return sel.ordinal >= 1 and sel.ordinal <= max;
 }
 
 pub fn knownId(id: Id) bool {

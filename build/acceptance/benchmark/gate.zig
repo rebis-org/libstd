@@ -3,6 +3,7 @@ const std = @import("std");
 const env_mod = @import("env.zig");
 const matrix = @import("matrix.zig");
 const metric = @import("metric.zig");
+const tsv = @import("tsv.zig");
 
 pub const Class = enum { pass, fail, noisy, unmeasurable, unhealthy };
 
@@ -136,27 +137,13 @@ pub fn summarize(results: []const Result) Summary {
     return summary;
 }
 
-fn gapCell(buf: *[16]u8, gap: ?f64) []const u8 {
-    const g = gap orelse return "missing";
-    return std.fmt.bufPrint(buf, "{d:.1}", .{g * 100.0}) catch "missing";
-}
-
 pub fn row(report: *std.ArrayList(u8), allocator: std.mem.Allocator, result: Result) !void {
     var cells: [4][16]u8 = undefined;
     const values = [_][]const u8{
-        gapCell(&cells[0], result.worst_gap),
-        gapCell(&cells[1], result.ratio_gap),
-        gapCell(&cells[2], result.compress_gap),
-        gapCell(&cells[3], result.decompress_gap),
+        tsv.gap(&cells[0], result.worst_gap),
+        tsv.gap(&cells[1], result.ratio_gap),
+        tsv.gap(&cells[2], result.compress_gap),
+        tsv.gap(&cells[3], result.decompress_gap),
     };
-    try report.appendSlice(allocator, @tagName(result.class));
-    try report.appendSlice(allocator, "\t");
-    try report.appendSlice(allocator, values[0]);
-    try report.appendSlice(allocator, "\t");
-    try report.appendSlice(allocator, result.name);
-    for (values[1..]) |value| {
-        try report.appendSlice(allocator, "\t");
-        try report.appendSlice(allocator, value);
-    }
-    try report.appendSlice(allocator, "\n");
+    try tsv.emitRow(report, allocator, &.{ @tagName(result.class), values[0], result.name }, values[1..]);
 }
