@@ -669,16 +669,19 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
             var best_dist: u32 = 0;
             var count: u8 = 0;
             var candidate = head_candidate;
+            const history = c.history;
+            const prev: []const u32 = c.prev[0..];
+            const good = c.options.good;
             while (candidate != no_position and budget > 0) : (budget -= 1) {
                 const distance = position -% candidate;
                 if (distance == 0 or distance > cfg.window_size) break;
                 const at = s - distance;
-                if (best < available and c.history[at + best] == c.history[s + best] and c.history[at + best - 1] == c.history[s + best - 1]) {
-                    const len = matchLength(c.history, at, s, available);
+                if (best < available and history[at + best] == history[s + best] and history[at + best - 1] == history[s + best - 1]) {
+                    const len = matchLength(history, at, s, available);
                     if (len > best) {
                         best = len;
                         best_dist = distance;
-                        if (best >= c.options.good and budget > good_budget) budget = good_budget;
+                        if (best >= good and budget > good_budget) budget = good_budget;
                         const l = @min(len, clip);
                         if (l >= min_match) {
                             const entry = (@as(u32, @intCast(l - 1)) << 16) | (distance - 1);
@@ -692,7 +695,7 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
                         if (best >= nice) break;
                     }
                 }
-                candidate = c.prev[at & (cfg.window_size - 1)];
+                candidate = prev[at & (cfg.window_size - 1)];
             }
             return .{ .count = count, .len = @min(best, clip), .dist = best_dist };
         }
@@ -835,19 +838,21 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
             var best: usize = min_match - 1;
             var best_dist: u32 = 0;
             var candidate = head_candidate;
+            const history = c.history;
+            const prev: []const u32 = c.prev[0..];
             while (candidate != no_position and budget > 0) : (budget -= 1) {
                 const distance = position -% candidate;
                 if (distance == 0 or distance > cfg.window_size) break;
                 const at = s - distance;
-                if (best < available and c.history[at + best] == c.history[s + best] and c.history[at + best - 1] == c.history[s + best - 1]) {
-                    const len = matchLength(c.history, at, s, available);
+                if (best < available and history[at + best] == history[s + best] and history[at + best - 1] == history[s + best - 1]) {
+                    const len = matchLength(history, at, s, available);
                     if (len > best) {
                         best = len;
                         best_dist = distance;
                         if (best >= nice) break;
                     }
                 }
-                candidate = c.prev[at & (cfg.window_size - 1)];
+                candidate = prev[at & (cfg.window_size - 1)];
             }
             return .{ .len = best, .dist = best_dist };
         }

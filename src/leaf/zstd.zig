@@ -261,9 +261,8 @@ fn encodeFrame(output: *std.Io.Writer, content: []const u8, workspace: []u32, op
     try writeU32le(&counted.writer, frame_magic);
     const frame_len = content.len - content_start;
     try writeFrameHeader(&counted.writer, frame_len, options.window_size);
-    try encodeBlocks(&counted.writer, content, content_start, workspace, options);
     var hasher = checksum.XxHash64.init(0);
-    hasher.update(content[content_start..]);
+    try encodeBlocks(&counted.writer, content, content_start, workspace, options, &hasher);
     try writeU32le(&counted.writer, @truncate(hasher.final()));
     return std.math.cast(usize, counted.written()) orelse error.ResourceLimit;
 }
@@ -304,7 +303,7 @@ fn encodeWindowDescriptor(window_size: u32) u8 {
     return (@as(u8, exponent) << 3) | mantissa;
 }
 
-fn encodeBlocks(output: *std.Io.Writer, content: []const u8, content_start: usize, workspace: []u32, options: Options) EncodeError!void {
+fn encodeBlocks(output: *std.Io.Writer, content: []const u8, content_start: usize, workspace: []u32, options: Options, hasher: *checksum.XxHash64) EncodeError!void {
     var literal_table: [1 << 6]FseEntry = undefined;
     var match_table: [1 << 6]FseEntry = undefined;
     var offset_table: [1 << 5]FseEntry = undefined;
@@ -326,6 +325,7 @@ fn encodeBlocks(output: *std.Io.Writer, content: []const u8, content_start: usiz
     while (offset < frame_len) {
         const block_end = @min(offset + encoder_block_size_max, frame_len);
         const is_last = block_end == frame_len;
+        hasher.update(content[content_start + offset .. content_start + block_end]);
         try encodeBlock(output, content, content_start + offset, content_start + block_end, head, chain, &literal_table, &match_table, &offset_table, is_last, options, block_workspace, &repeat_offsets, &prev);
         offset = block_end;
     }
