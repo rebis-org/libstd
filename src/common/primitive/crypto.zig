@@ -36,7 +36,7 @@ pub const Sha256 = struct {
     }
 
     fn rotr(value: u32, amount: u32) u32 {
-        return std.math.rotl(u32, value, 32 - amount);
+        return std.math.rotr(u32, value, amount);
     }
 
     fn compress(self: *Sha256, block: *const [64]u8) void {

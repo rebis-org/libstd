@@ -1,5 +1,3 @@
-const std = @import("std");
-
 const abi = @import("../abi/contract.zig");
 const registry = @import("../catalog/registry.zig");
 const Failure = registry.Failure;

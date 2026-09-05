@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const matrix = @import("matrix.zig");
+const tsv = @import("tsv.zig");
 
 pub const Side = enum { ours, cmd, lib, bin };
 
@@ -102,17 +103,12 @@ pub fn ratio(bytes: usize, encoded: usize) f64 {
     return @as(f64, @floatFromInt(bytes)) / @as(f64, @floatFromInt(encoded));
 }
 
-fn cell(buf: *[16]u8, comptime fmt: []const u8, value: f64, show: bool) []const u8 {
-    if (!show) return "missing";
-    return std.fmt.bufPrint(buf, fmt, .{value}) catch "missing";
-}
-
 fn cellRatio(buf: *[16]u8, totals: Totals, side: Side, show: bool) []const u8 {
-    return cell(buf, "{d:.3}", ratio(totals.input_bytes, totals.encoded[@intFromEnum(side)]), show);
+    return tsv.cell(buf, "{d:.3}", ratio(totals.input_bytes, totals.encoded[@intFromEnum(side)]), show);
 }
 
 fn cellMibps(buf: *[16]u8, bytes: usize, ns: u64, show: bool) []const u8 {
-    return cell(buf, "{d:.1}", mibps(bytes, ns), show);
+    return tsv.cell(buf, "{d:.1}", mibps(bytes, ns), show);
 }
 
 fn coverage(allocator: std.mem.Allocator, totals: Totals, available: [4]bool) ![]const u8 {
@@ -155,14 +151,5 @@ pub fn row(report: *std.ArrayList(u8), allocator: std.mem.Allocator, r: matrix.R
         cellMibps(&cells[11], totals.input_bytes, totals.decode_ns[3], available[3]),
         coverage_text,
     };
-    try report.appendSlice(allocator, r.row_type);
-    try report.appendSlice(allocator, "\t");
-    try report.appendSlice(allocator, r.ref_params);
-    try report.appendSlice(allocator, "\t");
-    try report.appendSlice(allocator, r.name);
-    for (values) |value| {
-        try report.appendSlice(allocator, "\t");
-        try report.appendSlice(allocator, value);
-    }
-    try report.appendSlice(allocator, "\n");
+    try tsv.emitRow(report, allocator, &.{ r.row_type, r.ref_params, r.name }, &values);
 }

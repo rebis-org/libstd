@@ -24,7 +24,8 @@ pub const ReadCursor = struct {
     }
 
     pub fn readU32le(self: *ReadCursor) error{ InvalidData, ResourceLimit }!u32 {
-        return @bitCast(try self.readBytes(4));
+        const bytes = try self.readBytes(4);
+        return std.mem.readInt(u32, &bytes, .little);
     }
 
     pub fn readULEB128(self: *ReadCursor) error{ InvalidData, ResourceLimit }!u64 {

@@ -1,5 +1,3 @@
-const std = @import("std");
-
 const max_alphabet = 288;
 const max_nodes = 2 * max_alphabet;
 const max_code_len = 15;
