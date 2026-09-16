@@ -1,5 +1,3 @@
-const std = @import("std");
-
 pub const max_distance: u8 = 255;
 
 pub fn decode(data: []u8, distance: u8) void {

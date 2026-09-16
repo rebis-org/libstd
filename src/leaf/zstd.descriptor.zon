@@ -1,0 +1,82 @@
+// Component descriptor (zstd, class streaming).
+// Identity and policy are frozen ABI: rename or re-id is a breaking
+// change, caught by the comptime assertions in kernel/catalog.zig.
+.{
+    .id = .{ .low = "0x6e6b82f08d910407", .high = "0xa7a351053d6d4007" },
+    .name = "zstd",
+    .class = "streaming",
+    .verbs = .{ "encode_stream", "decode_stream", "decoded_size", "encoded_size_bound" },
+    .parameters = .{
+        .{ .name = "window", .family = 4, .ordinal = 1, .representation = "scalar_words" },
+        .{ .name = "dictionary", .family = 4, .ordinal = 2, .representation = "scalar_words" },
+        .{ .name = "hash_bits", .family = 4, .ordinal = 3, .representation = "scalar_words" },
+        .{ .name = "max_chain", .family = 4, .ordinal = 4, .representation = "scalar_words" },
+        .{ .name = "nice_len", .family = 4, .ordinal = 5, .representation = "scalar_words" },
+        .{ .name = "search_window", .family = 4, .ordinal = 6, .representation = "scalar_words" },
+        .{ .name = "lazy", .family = 4, .ordinal = 7, .representation = "scalar_words" },
+        .{ .name = "skip_interior_insert", .family = 4, .ordinal = 8, .representation = "scalar_words" },
+        .{ .name = "double_hash", .family = 4, .ordinal = 9, .representation = "scalar_words" },
+        .{ .name = "row_match", .family = 4, .ordinal = 10, .representation = "scalar_words" },
+    },
+    .capabilities = .{ "read", "replay" },
+    .sizing = "measured",
+    .commit = "confirmed",
+    .limits = .{ .window = 8388608, .block = 0, .history = 0 },
+    .benchmark = .{
+        .row = "zstd",
+        .params = "",
+        .kind = "zstd",
+        .ext = "zst",
+        .cmd = "zstd",
+        .lib = "zstd",
+        .tunings = .{
+            .{
+                .params = .{
+                    .{ .family = 4, .ordinal = 1, .value = 4194304 },
+                    .{ .family = 4, .ordinal = 3, .value = 17 },
+                    .{ .family = 4, .ordinal = 9, .value = 1 },
+                },
+                .ref_params = "zstd level 3, window 4 MiB, dfast",
+                .cmd_args = .{"--long=22"},
+            },
+            .{
+                .name = "lazy",
+                .params = .{
+                    .{ .family = 4, .ordinal = 1, .value = 1048576 },
+                    .{ .family = 4, .ordinal = 10, .value = 1 },
+                },
+                .ref_params = "zstd --lazy, row matchfinder",
+                .cmd_args = .{"--long=20"},
+            },
+            .{
+                .name = "fast",
+                .params = .{
+                    .{ .family = 4, .ordinal = 1, .value = 1048576 },
+                    .{ .family = 4, .ordinal = 8, .value = 1 },
+                },
+                .ref_params = "zstd --fast=1",
+                .cmd_args = .{"--fast=1"},
+                .lib_level = -1,
+            },
+            .{
+                .name = "dfast",
+                .params = .{
+                    .{ .family = 4, .ordinal = 1, .value = 2097152 },
+                    .{ .family = 4, .ordinal = 9, .value = 1 },
+                },
+                .ref_params = "zstd dfast",
+                .cmd_args = .{"--long=21"},
+            },
+            .{
+                .name = "bypass",
+                .bypass = true,
+                .params = .{
+                    .{ .family = 4, .ordinal = 1, .value = 4194304 },
+                    .{ .family = 4, .ordinal = 3, .value = 17 },
+                    .{ .family = 4, .ordinal = 9, .value = 1 },
+                },
+                .ref_params = "zstd level 3, window 4 MiB, dfast, kernel bypass",
+            },
+        },
+    },
+}

@@ -87,13 +87,8 @@ pub fn encode(input: []const u8, output: []u8, scratch: []u8, options: Options) 
     return fixed_writer.end;
 }
 
-// No stored fallback exists, so the bound is structural on the symbol
-// alphabet: RLE1 expands at most 5/4 (a 4-run gains one count symbol), every
-// post-RLE1 symbol costs at most max_code_len bits, and per-block structures
-// (selectors at 6 bits per 50-symbol group worst case, six table
-// descriptions, CRCs) stay under 8 KiB per 100k-symbol minimum block.
-// 13/4 covers the symbol bits plus the per-block trickle; the constant
-// absorbs one block's tables for tiny inputs. Loose by design.
+// No stored fallback: RLE1 expands at most 5/4 and symbols cost at most 20 bits.
+// 13/4 covers symbols plus per-block tables; loose by design.
 pub fn encodedSizeBound(input_len: usize) usize {
     return (input_len *| 13) / 4 +| 16384;
 }
@@ -192,8 +187,8 @@ fn decodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8) Failure
                 tables[t] = try buildHuffTable(&lens[t], alpha_size);
             }
         }
-        var ws = try io.Workspace.init(scratch.ptr, scratch.len);
-        const bwt_buffer = try ws.take(u8, max_block + max_block / 4 + 8);
+        var workspace = try io.Workspace.init(scratch.ptr, scratch.len);
+        const bwt_buffer = try workspace.take(u8, max_block + max_block / 4 + 8);
         var nblock: u32 = 0;
         var mtf: [256]u8 = undefined;
         {
@@ -253,7 +248,7 @@ fn decodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8) Failure
             cftab[i] = sum;
             sum += count;
         }
-        const fwd = try ws.take(u32, nblock);
+        const fwd = try workspace.take(u32, nblock);
         {
             var occ: [256]u32 = @splat(0);
             i = 0;
@@ -263,9 +258,7 @@ fn decodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8) Failure
                 occ[b] += 1;
             }
         }
-        // The packed forward successor yields one load per output byte, and
-        // the RLE expansion rides the traversal instead of re-reading a
-        // reconstructed buffer.
+        // Packed successor gives one load per output byte; RLE rides the traversal.
         var block_crc = Bzip2Crc32.init();
         var out_buf: [4096]u8 = undefined;
         var out_len: usize = 0;
@@ -330,17 +323,17 @@ fn decodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8) Failure
 fn encodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options: Options) Failure!void {
     if (options.block_size < block_size_min or options.block_size > block_size_max) return error.InvalidCall;
     const max_block = options.block_size;
-    var bw = BitWriter.init(writer);
-    try bw.writeByte('B');
-    try bw.writeByte('Z');
-    try bw.writeByte('h');
+    var bit_writer = BitWriter.init(writer);
+    try bit_writer.writeByte('B');
+    try bit_writer.writeByte('Z');
+    try bit_writer.writeByte('h');
     const digit: u8 = @intCast(@max(1, @min(9, (max_block + 99_999) / 100_000)));
-    try bw.writeByte('0' + digit);
+    try bit_writer.writeByte('0' + digit);
     var combined_crc: u32 = 0;
     var offset: usize = 0;
     while (offset < input.len) {
-        var ws = try io.Workspace.init(scratch.ptr, scratch.len);
-        const rle_buffer = try ws.take(u8, max_block + max_block / 4 + 8);
+        var workspace = try io.Workspace.init(scratch.ptr, scratch.len);
+        const rle_buffer = try workspace.take(u8, max_block + max_block / 4 + 8);
         const chunk_input = input[offset..];
         var rle_len: usize = 0;
         var consumed: usize = 0;
@@ -365,9 +358,7 @@ fn encodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options
             consumed = scan;
             if (rle_len >= max_block - 19) {
                 full = true;
-                // Match the historic block split exactly: a flush crossing the
-                // threshold also absorbed the first byte of the next run,
-                // unless the run closed at the 259 cap or at the input end.
+                // Historic split: a threshold-crossing flush also absorbs the next run's first byte.
                 if (j - run_start < 259 and j < chunk_input.len) {
                     try appendRun(rle_buffer, &rle_len, chunk_input[j], 1);
                     scan += 1;
@@ -376,21 +367,19 @@ fn encodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options
                 break;
             }
         }
-        // The block CRC covers the raw input, so one pass over the consumed
-        // range replaces a per-byte update inside the RLE scan.
+        // Block CRC covers raw input, so batch it over the consumed range.
         var block_crc = Bzip2Crc32.init();
         block_crc.update(chunk_input[0..consumed]);
         if (rle_len == 0) break;
         offset += consumed;
-        try encodeBlock(rle_buffer[0..rle_len], block_crc.final(), &bw, &ws, options);
+        try encodeBlock(rle_buffer[0..rle_len], block_crc.final(), &bit_writer, &workspace, options);
         combined_crc = (combined_crc << 1) | (combined_crc >> 31);
         combined_crc ^= block_crc.final();
         if (!full and offset < input.len) return error.InternalFailure;
     }
-    // End-of-stream marker continues the last block's bit stream.
-    for (eos_magic) |b| try bw.writeByte(b);
-    try bw.writeU32be(combined_crc);
-    try bw.flush();
+    for (eos_magic) |b| try bit_writer.writeByte(b);
+    try bit_writer.writeU32be(combined_crc);
+    try bit_writer.flush();
 }
 
 fn appendRun(buffer: []u8, len: *usize, byte: u8, count: usize) Failure!void {
@@ -418,10 +407,8 @@ fn appendRun(buffer: []u8, len: *usize, byte: u8, count: usize) Failure!void {
 const sais_empty = std.math.maxInt(u32);
 const sais_type_s: u8 = 1;
 
-// SA-IS suffix sort (Nong, Zhang, Chan 2009). text must end with the unique
-// smallest symbol. The workspace arrays are shared across recursion levels:
-// types uses disjoint per-level regions (each level at most halves), while
-// pname/hist/bptr are dead in the parent while a child runs.
+// SA-IS sort requires the unique smallest trailing symbol; levels share workspace
+// via disjoint `types` regions while pname/hist/bptr are dead in the parent.
 fn saisIsLms(types: []const u8, i: usize) bool {
     return i > 0 and types[i] == sais_type_s and types[i - 1] != sais_type_s;
 }
@@ -485,7 +472,6 @@ fn sais(comptime T: type, text: []const T, sa: []u32, alphabet: u32, types: []u8
         sa[0] = 0;
         return;
     }
-    // Classify S/L from the end while histogramming symbols.
     @memset(hist[0..alphabet], 0);
     {
         types[m - 1] = sais_type_s;
@@ -517,8 +503,7 @@ fn sais(comptime T: type, text: []const T, sa: []u32, alphabet: u32, types: []u8
         }
     }
     saisInduce(T, text, sa, alphabet, types, hist, bptr);
-    // Name the LMS substrings in sorted order. pname[p / 2] cannot collide:
-    // two LMS positions are never adjacent.
+    // pname[p/2] cannot collide: LMS positions are never adjacent.
     var name: u32 = 0;
     var prev: u32 = sais_empty;
     for (sa) |p| {
@@ -546,7 +531,7 @@ fn sais(comptime T: type, text: []const T, sa: []u32, alphabet: u32, types: []u8
     } else {
         sais(u32, sa[m - n1 .. m], sa[0..n1], num_names, types[m..], pname, hist, bptr);
     }
-    // Rebuild hist (the recursion clobbers it) and relist LMS in text order.
+    // Recursion clobbers hist, so rebuild it here.
     @memset(hist[0..alphabet], 0);
     for (text) |c| hist[c] += 1;
     {
@@ -559,9 +544,7 @@ fn sais(comptime T: type, text: []const T, sa: []u32, alphabet: u32, types: []u8
             }
         }
     }
-    // sa1 (sorted LMS order as text-order indices) sits in sa[0..n1]. Read it
-    // in reverse with clear-on-read: placements into bucket ends then only
-    // land in slots already consumed, so no stale sa1 entry can survive.
+    // Reverse clear-on-read keeps placements in already-consumed slots only.
     @memset(sa[n1..m], sais_empty);
     {
         var sum: u32 = 0;
@@ -583,11 +566,10 @@ fn sais(comptime T: type, text: []const T, sa: []u32, alphabet: u32, types: []u8
     saisInduce(T, text, sa, alphabet, types, hist, bptr);
 }
 
-fn encodeBlock(block: []const u8, block_crc: u32, bw: *BitWriter, ws: *io.Workspace, options: Options) Failure!void {
+fn encodeBlock(block: []const u8, block_crc: u32, bit_writer: *BitWriter, workspace: *io.Workspace, options: Options) Failure!void {
     const nblock = block.len;
     if (nblock == 0) return;
-    // Enforce the caller-selected codec work budget against the BWT sort. The
-    // constant bounds the linear-time SA-IS passes with room to spare.
+    // Bounds the linear-time SA-IS passes against the caller work budget.
     const log_n = std.math.log2_int_ceil(u32, @as(u32, @intCast(@max(2, nblock))));
     const estimate = @as(u64, nblock) * @as(u64, log_n) * 4;
     if (estimate > options.max_work) return error.ResourceLimit;
@@ -605,18 +587,15 @@ fn encodeBlock(block: []const u8, block_crc: u32, bw: *BitWriter, ws: *io.Worksp
     if (n_in_use == 0) return error.InternalFailure;
     const alpha_size = n_in_use + 2;
     const eob = alpha_size - 1;
-    // BWT via SA-IS on the doubled block: suffixes of (block+1)(block+1) plus
-    // a zero sentinel that start below nblock are exactly the block rotations
-    // in sorted order. Equal rotations share their preceding byte, so the
-    // resulting L is independent of the tie order the suffix sort picks.
+    // Doubled block plus sentinel makes sub-nblock suffixes exactly the rotations; L is tie-order independent.
     const doubled: usize = 2 * nblock + 1;
-    const t16 = try ws.take(u16, doubled);
-    const sa = try ws.take(u32, doubled);
-    const types = try ws.take(u8, 2 * doubled);
-    const pname = try ws.take(u32, doubled / 2 + 1);
+    const t16 = try workspace.take(u16, doubled);
+    const sa = try workspace.take(u32, doubled);
+    const types = try workspace.take(u8, 2 * doubled);
+    const pname = try workspace.take(u32, doubled / 2 + 1);
     const bucket_len = @max(doubled / 2 + 2, 258);
-    const hist = try ws.take(u32, bucket_len);
-    const bptr = try ws.take(u32, bucket_len);
+    const hist = try workspace.take(u32, bucket_len);
+    const bptr = try workspace.take(u32, bucket_len);
     for (block, 0..) |b, i| {
         const v: u16 = @as(u16, b) + 1;
         t16[i] = v;
@@ -626,7 +605,7 @@ fn encodeBlock(block: []const u8, block_crc: u32, bw: *BitWriter, ws: *io.Worksp
     sais(u16, t16, sa, 257, types, pname, hist, bptr);
     var orig_ptr: u32 = 0;
     var found_orig = false;
-    const l = try ws.take(u8, nblock);
+    const l = try workspace.take(u8, nblock);
     var out_rank: usize = 0;
     for (sa) |pos| {
         if (pos >= nblock) continue;
@@ -639,7 +618,7 @@ fn encodeBlock(block: []const u8, block_crc: u32, bw: *BitWriter, ws: *io.Worksp
         out_rank += 1;
     }
     if (!found_orig or out_rank != nblock) return error.InternalFailure;
-    const mtfv = try ws.take(u16, ws.remaining() / @sizeOf(u16));
+    const mtfv = try workspace.take(u16, workspace.remaining() / @sizeOf(u16));
     var mtf: [256]u8 = undefined;
     {
         var i: u32 = 0;
@@ -670,12 +649,13 @@ fn encodeBlock(block: []const u8, block_crc: u32, bw: *BitWriter, ws: *io.Worksp
     var group_lens: [max_groups][max_alpha_size]u8 = undefined;
     var group_codes: [max_groups][max_alpha_size]u32 = undefined;
     var selectors: [max_selectors]u8 = undefined;
+    // Written through the pointer below, so `undefined` is safe.
     var n_groups: u32 = undefined;
     buildHuffmanGroups(mtfv[0..n_mtf], n_mtf, alpha_size, &group_lens, &group_codes, &selectors, &n_groups);
-    for (block_magic) |b| try bw.writeByte(b);
-    try bw.writeU32be(block_crc);
-    try bw.writeBit(0); // randomised
-    try bw.writeBits(24, orig_ptr);
+    for (block_magic) |b| try bit_writer.writeByte(b);
+    try bit_writer.writeU32be(block_crc);
+    try bit_writer.writeBit(0);
+    try bit_writer.writeBits(24, orig_ptr);
     {
         var map16: u16 = 0;
         var g: u32 = 0;
@@ -687,7 +667,7 @@ fn encodeBlock(block: []const u8, block_crc: u32, bw: *BitWriter, ws: *io.Worksp
             }
             if (used) map16 |= @as(u16, 1) << @intCast(15 - g);
         }
-        try bw.writeBits(16, map16);
+        try bit_writer.writeBits(16, map16);
         g = 0;
         while (g < 16) : (g += 1) {
             var used = false;
@@ -701,12 +681,11 @@ fn encodeBlock(block: []const u8, block_crc: u32, bw: *BitWriter, ws: *io.Worksp
             while (b < 16) : (b += 1) {
                 if (in_use[g * 16 + b]) bits |= @as(u16, 1) << @intCast(15 - b);
             }
-            try bw.writeBits(16, bits);
+            try bit_writer.writeBits(16, bits);
         }
     }
-    try bw.writeBits(3, n_groups);
-    try bw.writeBits(15, n_selectors);
-    // Selector indices are unary-coded after move-to-front over the group list.
+    try bit_writer.writeBits(3, n_groups);
+    try bit_writer.writeBits(15, n_selectors);
     {
         var sel_pos: [max_groups]u8 = undefined;
         for (0..n_groups) |i| sel_pos[i] = @intCast(i);
@@ -714,8 +693,8 @@ fn encodeBlock(block: []const u8, block_crc: u32, bw: *BitWriter, ws: *io.Worksp
             const sel = selectors[s];
             var idx: usize = 0;
             while (sel_pos[idx] != sel) idx += 1;
-            for (0..idx) |_| try bw.writeBit(1);
-            try bw.writeBit(0);
+            for (0..idx) |_| try bit_writer.writeBit(1);
+            try bit_writer.writeBit(0);
             const moved = sel_pos[idx];
             var j = idx;
             while (j > 0) : (j -= 1) sel_pos[j] = sel_pos[j - 1];
@@ -725,7 +704,7 @@ fn encodeBlock(block: []const u8, block_crc: u32, bw: *BitWriter, ws: *io.Worksp
     {
         var t: u32 = 0;
         while (t < n_groups) : (t += 1) {
-            try writeHuffmanTable(bw, group_lens[t][0..alpha_size], alpha_size);
+            try writeHuffmanTable(bit_writer, group_lens[t][0..alpha_size], alpha_size);
         }
     }
     {
@@ -733,7 +712,7 @@ fn encodeBlock(block: []const u8, block_crc: u32, bw: *BitWriter, ws: *io.Worksp
         while (i < n_mtf) : (i += 1) {
             const sym = mtfv[i];
             const group = selectors[i / group_size];
-            try bw.writeBits(@intCast(group_lens[group][sym]), group_codes[group][sym]);
+            try bit_writer.writeBits(@intCast(group_lens[group][sym]), group_codes[group][sym]);
         }
     }
 }
@@ -747,7 +726,7 @@ fn buildHuffmanGroups(mtfv: []const u16, n_mtf: usize, alpha_size: u32, group_le
         for (0..alpha_size) |s| group_freq[g][s] = 1;
     }
     for (0..n_selectors) |s| {
-        const group = @as(usize, s % n_groups);
+        const group: usize = s % n_groups;
         const chunk = mtfv[s * group_size .. @min((s + 1) * group_size, n_mtf)];
         for (chunk) |sym| group_freq[group][sym] += 1;
     }
@@ -760,8 +739,7 @@ fn buildHuffmanGroups(mtfv: []const u16, n_mtf: usize, alpha_size: u32, group_le
         }
         for (0..n_selectors) |s| {
             const chunk = mtfv[s * group_size .. @min((s + 1) * group_size, n_mtf)];
-            // One pass over the chunk with independent accumulators; six
-            // separate passes would serialize on the single cost register.
+            // One pass with independent accumulators; separate passes serialize on one register.
             var costs: [max_groups]u32 = @splat(0);
             for (chunk) |sym| {
                 var g: usize = 0;
@@ -789,9 +767,9 @@ fn emitRun(wr: *usize, mtfv: []u16, z_pend: *u32) Failure!void {
     while (true) {
         if (mtfv.len - wr.* < 1) return error.ResourceLimit;
         if (z_pend.* & 1 != 0) {
-            mtfv[wr.*] = 1; // RUNB
+            mtfv[wr.*] = 1;
         } else {
-            mtfv[wr.*] = 0; // RUNA
+            mtfv[wr.*] = 0;
         }
         wr.* += 1;
         if (z_pend.* < 2) break;
@@ -904,27 +882,27 @@ fn downHeap(heap: *[max_alpha_size + 2]u32, weight: *const [max_alpha_size * 2]u
     heap[zz] = tmp;
 }
 
-fn writeHuffmanTable(bw: *BitWriter, lens: []const u8, alpha_size: u32) Failure!void {
+fn writeHuffmanTable(bit_writer: *BitWriter, lens: []const u8, alpha_size: u32) Failure!void {
     var curr: i32 = lens[0];
-    try bw.writeBits(5, @intCast(curr));
+    try bit_writer.writeBits(5, @intCast(curr));
     var sym: u32 = 0;
     while (sym < alpha_size) : (sym += 1) {
         const target: i32 = lens[sym];
         while (curr < target) {
-            try bw.writeBits(2, 2); // 10 -> increment
+            try bit_writer.writeBits(2, 2);
             curr += 1;
         }
         while (curr > target) {
-            try bw.writeBits(2, 3); // 11 -> decrement
+            try bit_writer.writeBits(2, 3);
             curr -= 1;
         }
-        try bw.writeBit(0); // end of delta for this symbol
+        try bit_writer.writeBit(0);
     }
 }
 
 fn mtfFindAndMove(mtf: *[256]u8, n_in_use: u32, seq: u8) u16 {
     var idx: u16 = 0;
-    // Vector scan: one 32-byte compare per step instead of per-byte tests.
+    // One 32-byte compare per step instead of per-byte tests.
     while (idx + 32 <= n_in_use) {
         const chunk: @Vector(32, u8) = mtf[idx..][0..32].*;
         const hits: u32 = @bitCast(chunk == @as(@Vector(32, u8), @splat(seq)));
@@ -939,7 +917,7 @@ fn mtfFindAndMove(mtf: *[256]u8, n_in_use: u32, seq: u8) u16 {
     }
     const uc = mtf[idx];
     var i = idx;
-    // Backward 8-byte overlapping stores move the prefix without a byte loop.
+    // Overlapping 8-byte stores move the prefix without a byte loop.
     while (i >= 8) {
         const w = std.mem.readInt(u64, mtf[i - 8 ..][0..8], .little);
         std.mem.writeInt(u64, mtf[i - 7 ..][0..8], w, .little);
@@ -1011,13 +989,13 @@ const BitWriter = struct {
     writer: *std.Io.Writer,
     buffer: u32,
     bits: u5,
-    // Bytes are batched locally so the writer vtable is hit once per buffer
-    // instead of once per byte.
-    pending: [512]u8 = undefined,
+    // Batched locally so the writer vtable fires once per buffer, not per byte.
+    pending: [512]u8,
     pending_len: usize = 0,
 
     fn init(writer: *std.Io.Writer) BitWriter {
-        return .{ .writer = writer, .buffer = 0, .bits = 0 };
+        // Filled by batched paths before any flush reads it.
+        return .{ .writer = writer, .buffer = 0, .bits = 0, .pending = undefined };
     }
 
     fn emit(self: *BitWriter, byte: u8) Failure!void {
@@ -1085,6 +1063,7 @@ const HuffTable = struct {
 };
 
 fn buildHuffTable(lens: []const u8, alpha_size: u32) Failure!HuffTable {
+    // Tables filled below before any decode, so `undefined` is safe.
     var table: HuffTable = undefined;
     @memset(&table.limit, 0);
     @memset(&table.base, 0);

@@ -33,7 +33,7 @@ pub const header = "class\tworst_gap_pct\tformat\tratio_gap_pct\tc_mibps_gap_pct
 fn bestRatio(totals: metric.Totals, available: [4]bool) ?f64 {
     var best: f64 = 0;
     for (1..4) |side| {
-        // A failed reference has partial totals and must not lower the target.
+        // Failed references carry partial totals and must not lower the target.
         if (!available[side] or !totals.ok[side]) continue;
         best = @max(best, metric.ratio(totals.input_bytes, totals.encoded[side]));
     }
@@ -87,7 +87,7 @@ pub fn classify(r: matrix.Row, totals: metric.Totals, available: [4]bool, cfg: e
         if (gap) |g| result.worst_gap = @max(result.worst_gap orelse g, g);
     }
     if (ref_failed) {
-        // A broken reference outranks the never-fatal store rows: it must not mask a regression.
+        // Broken references must not mask a regression, outranking never-fatal store rows.
         result.class = .unhealthy;
     } else if (r.archive and !r.decode_only) {
         result.class = .noisy;

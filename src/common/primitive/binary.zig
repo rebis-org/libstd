@@ -52,9 +52,9 @@ pub const ReadCursor = struct {
     }
 
     pub fn advance(self: *ReadCursor, count: u64) error{ InvalidData, ResourceLimit }!void {
-        const n = std.math.cast(usize, count) orelse return error.ResourceLimit;
-        if (n > self.buffer.len - self.pos) return error.InvalidData;
-        self.pos += n;
+        const byte_count = std.math.cast(usize, count) orelse return error.ResourceLimit;
+        if (byte_count > self.buffer.len - self.pos) return error.InvalidData;
+        self.pos += byte_count;
     }
 
     pub fn readBytes(self: *ReadCursor, comptime length: u8) error{ InvalidData, ResourceLimit }![length]u8 {

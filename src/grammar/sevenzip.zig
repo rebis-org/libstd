@@ -107,7 +107,6 @@ const default_bzip2_block: u32 = 100_000;
 const default_deflate_options: deflate.Options = .{ .good = 8, .nice = 128, .lazy = 16, .chain = 128 };
 const default_ppmd_order: u32 = 8;
 const default_ppmd_mem: u32 = 4 << 20;
-const default_ppmd_restore: u32 = 0;
 
 fn methodId(method: CoderMethod) []const u8 {
     return switch (method) {

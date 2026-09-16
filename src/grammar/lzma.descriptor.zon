@@ -1,0 +1,29 @@
+// Component descriptor (lzma-file, class grammar).
+// Identity and policy are frozen ABI: rename or re-id is a breaking
+// change, caught by the comptime assertions in kernel/catalog.zig.
+.{
+    .id = .{ .low = "0x6e6b82f08d91040b", .high = "0xa7a351053d6d400b" },
+    .name = "lzma-file",
+    .class = "grammar",
+    .verbs = .{ "inspect", "decode_ordinal", "decoded_size" },
+    .parameters = .{},
+    .capabilities = .{ "read", "replay" },
+    .sizing = "measured",
+    .commit = "tentative",
+    .limits = .{ .window = 0, .block = 0, .history = 0 },
+    .benchmark = .{
+        .row = "lzma_file",
+        .params = "decode-only",
+        .kind = "lzma_file",
+        .ext = "lzma",
+        .cmd = "lzma",
+        .lib = "lzma7z",
+        .bin = "sevenzz",
+        .fmt = 10,
+        .decode_only = true,
+        .ref_params = "decode-only",
+        .tunings = .{
+            .{},
+        },
+    },
+}

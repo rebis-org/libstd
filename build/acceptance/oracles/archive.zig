@@ -6,20 +6,32 @@ const harness = @import("harness.zig");
 const Runner = harness.Runner;
 const lib = @import("lib.zig");
 
+const arc_caps: u64 = harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay;
+
 const ArcFixture = struct {
-    archive: [4096]u8 = undefined,
+    archive: [4096]u8,
     archive_size: usize = 0,
-    data1: [32]u8 = undefined,
-    data2: [445]u8 = undefined,
-    name1: harness.Node = undefined,
-    data_node1: harness.Node = undefined,
-    entry1: harness.Node = undefined,
-    name2: harness.Node = undefined,
-    data_node2: harness.Node = undefined,
-    entry2: harness.Node = undefined,
+    data1: [32]u8,
+    data2: [445]u8,
+    name1: harness.Node,
+    data_node1: harness.Node,
+    entry1: harness.Node,
+    name2: harness.Node,
+    data_node2: harness.Node,
+    entry2: harness.Node,
 };
 
-var arc_state: ArcFixture = .{};
+var arc_state: ArcFixture = .{
+    .archive = undefined,
+    .data1 = undefined,
+    .data2 = undefined,
+    .name1 = undefined,
+    .data_node1 = undefined,
+    .entry1 = undefined,
+    .name2 = undefined,
+    .data_node2 = undefined,
+    .entry2 = undefined,
+};
 
 fn arcBuildEntries(index: usize) void {
     corpus.select(index, &arc_state.data1);
@@ -48,9 +60,9 @@ fn arcQueryWrite(r: *Runner) !void {
     _ = harness.call(r, harness.ids.query, &.{
         harness.paramTargetCommand(harness.ids.write),
         harness.scalarNode(harness.ids.source),
-        harness.cap(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay),
-        harness.pln(harness.plan_metadata_exact),
-        harness.dlv(harness.delivery_verified),
+        harness.capabilityParam(arc_caps),
+        harness.sizingModeParam(harness.size_metadata_exact),
+        harness.commitModeParam(harness.commit_confirmed),
         arc_state.entry1,
     }, .{});
     try harness.requireStatus(r, abi.Status.ok);
@@ -63,9 +75,9 @@ fn arcWrite(r: *Runner) !void {
     _ = harness.call(r, harness.ids.write, &.{
         harness.scalarNode(harness.ids.source),
         harness.sinkSpan(arc_state.archive[0..arc_state.archive_size]),
-        harness.cap(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay),
-        harness.pln(harness.plan_metadata_exact),
-        harness.dlv(r.delivery_write),
+        harness.capabilityParam(arc_caps),
+        harness.sizingModeParam(harness.size_metadata_exact),
+        harness.commitModeParam(r.commit_write),
         arc_state.entry1,
     }, .{});
     try harness.requireStatus(r, abi.Status.ok);
@@ -76,9 +88,9 @@ fn arcQueryRead(r: *Runner) !void {
     _ = harness.call(r, harness.ids.query, &.{
         harness.paramTargetCommand(harness.ids.read),
         harness.sourceSpan(arc_state.archive[0..arc_state.archive_size]),
-        harness.cap(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay),
-        harness.pln(harness.plan_metadata_exact),
-        harness.dlv(r.delivery_read),
+        harness.capabilityParam(arc_caps),
+        harness.sizingModeParam(harness.size_metadata_exact),
+        harness.commitModeParam(r.commit_read),
     }, .{});
     try harness.requireStatus(r, abi.Status.ok);
     if (r.response.byte_length != 2) return error.ArchiveEntryCountMismatch;
@@ -86,7 +98,7 @@ fn arcQueryRead(r: *Runner) !void {
 
 fn arcReadOrdinal(r: *Runner, ordinal: u64, expected: []const u8) !void {
     _ = harness.call(r, harness.ids.read, &.{
-        harness.ord(ordinal),
+        harness.archiveOrdinalParam(ordinal),
         harness.sourceSpan(arc_state.archive[0..arc_state.archive_size]),
         harness.sinkSpan(r.output),
     }, .{ .ctx = true });
@@ -99,7 +111,7 @@ fn arcReadOrdinal(r: *Runner, ordinal: u64, expected: []const u8) !void {
 fn arcReadCallback0(r: *Runner) !void {
     var source_ctx = harness.SourceCallbackContext{ .data = arc_state.archive[0..arc_state.archive_size] };
     _ = harness.call(r, harness.ids.read, &.{
-        harness.ord(0),
+        harness.archiveOrdinalParam(0),
         harness.sourceCallbackNode(0, 0),
         harness.sinkSpan(r.output),
     }, .{ .ctx = true, .callback = harness.sourceCallback, .context = &source_ctx });
@@ -115,9 +127,9 @@ fn arcWriteCallbackSource(r: *Runner) !void {
         harness.paramProfile(r.profile_id),
         harness.sourceCallbackNode(0, 0),
         harness.sinkSpan(arc_state.archive[0..arc_state.archive_size]),
-        harness.cap(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay),
-        harness.pln(harness.plan_metadata_exact),
-        harness.dlv(r.delivery_write),
+        harness.capabilityParam(arc_caps),
+        harness.sizingModeParam(harness.size_metadata_exact),
+        harness.commitModeParam(r.commit_write),
         arc_state.entry1,
     }, .{ .profile = false, .callback = harness.sourceCallback, .context = &source_ctx });
     try harness.requireStatus(r, abi.Status.ok);
@@ -127,7 +139,7 @@ fn arcWriteCallbackSource(r: *Runner) !void {
 fn arcReadCallbackSink(r: *Runner) !void {
     var sink_ctx = harness.SinkBufferContext{ .buffer = r.output, .accept_limit = std.math.maxInt(usize) };
     _ = harness.call(r, harness.ids.read, &.{
-        harness.ord(0),
+        harness.archiveOrdinalParam(0),
         harness.sourceSpan(arc_state.archive[0..arc_state.archive_size]),
         harness.sinkCallbackNode(0, 0),
     }, .{ .ctx = true, .callback = harness.sinkBufferCallback, .context = &sink_ctx });
@@ -142,11 +154,11 @@ fn arcCapacity(r: *Runner) !void {
         harness.paramProfile(r.profile_id),
         harness.scalarNode(harness.ids.source),
         harness.sinkSpan(r.output[0..1]),
-        harness.cap(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay),
-        harness.pln(harness.plan_metadata_exact),
-        harness.dlv(r.delivery_write),
+        harness.capabilityParam(arc_caps),
+        harness.sizingModeParam(harness.size_metadata_exact),
+        harness.commitModeParam(r.commit_write),
         arc_state.entry1,
-    }, .{ .profile = false }, harness.ids.diagnostic_required_capacity, harness.ids.diagnostic_available_capacity, arc_state.archive_size, 1, r.output[0..1]);
+    }, .{ .profile = false }, arc_state.archive_size, 1, r.output[0..1]);
 }
 
 fn arcCorrupt(r: *Runner) !void {
@@ -165,7 +177,7 @@ fn arcLimit(r: *Runner) !void {
     try harness.reject(r, harness.ids.read, &.{
         harness.sourceSpan(arc_state.archive[0..arc_state.archive_size]),
         harness.sinkSpan(r.output),
-        harness.lim(arc_state.archive_size - 1),
+        harness.resourceLimitParam(arc_state.archive_size - 1),
     }, .{ .ctx = true }, abi.Status.resource_limit, r.output);
 }
 
@@ -246,26 +258,32 @@ const rar_fixture_unknown = [_]u8{
 
 const rar_expected = "hello rar5 stored";
 
+fn rarCheckOutput(r: *Runner, committed: ?usize) !void {
+    if (r.response.byte_length != rar_expected.len) return error.RarOutputMismatch;
+    if (committed) |offset| {
+        if (offset != rar_expected.len) return error.RarOutputMismatch;
+    }
+    if (!std.mem.eql(u8, r.output[0..rar_expected.len], rar_expected)) return error.RarOutputMismatch;
+}
+
 fn setupRar(r: *Runner) void {
     harness.setup(r, harness.ids.rar, harness.mode_archive);
 }
 
 fn rarReadExpected(r: *Runner, data: []const u8) !void {
     _ = harness.call(r, harness.ids.read, &.{
-        harness.ord(0),
+        harness.archiveOrdinalParam(0),
         harness.sourceSpan(data),
         harness.sinkSpan(r.output),
     }, .{ .ctx = true });
     try harness.requireStatus(r, abi.Status.ok);
-    if (r.response.byte_length != rar_expected.len or !std.mem.eql(u8, r.output[0..rar_expected.len], rar_expected)) {
-        return error.RarContentMismatch;
-    }
+    try rarCheckOutput(r, null);
 }
 
 fn rarExpectUnsupported(r: *Runner, data: []const u8) !void {
     var output = [_]u8{0xa5} ** 64;
     try harness.reject(r, harness.ids.read, &.{
-        harness.ord(0),
+        harness.archiveOrdinalParam(0),
         harness.sourceSpan(data),
         harness.sinkSpan(&output),
     }, .{ .ctx = true }, abi.Status.unsupported, &output);
@@ -288,9 +306,9 @@ pub fn runRar(r: *Runner) anyerror!void {
     _ = harness.call(r, harness.ids.query, &.{
         harness.paramTargetCommand(harness.ids.read),
         harness.sourceSpan(&rar_fixture),
-        harness.cap(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay),
-        harness.pln(harness.plan_metadata_exact),
-        harness.dlv(harness.delivery_provisional),
+        harness.capabilityParam(arc_caps),
+        harness.sizingModeParam(harness.size_metadata_exact),
+        harness.commitModeParam(harness.commit_tentative),
     }, .{});
     try harness.requireStatus(r, abi.Status.ok);
     if (r.response.byte_length != 1) return error.RarEntryCountMismatch;
@@ -304,51 +322,47 @@ pub fn runRar(r: *Runner) anyerror!void {
     @memcpy(&corrupted, &rar_fixture);
     corrupted[8] ^= 0xff;
     try harness.reject(r, harness.ids.read, &.{
-        harness.ord(0),
+        harness.archiveOrdinalParam(0),
         harness.sourceSpan(&corrupted),
         harness.sinkSpan(r.output),
     }, .{ .ctx = true }, abi.Status.integrity_failure, r.output);
     @memcpy(&corrupted, &rar_fixture);
     corrupted[corrupted.len - 5] ^= 0xff;
     try harness.reject(r, harness.ids.read, &.{
-        harness.ord(0),
+        harness.archiveOrdinalParam(0),
         harness.sourceSpan(&corrupted),
         harness.sinkSpan(r.output),
     }, .{ .ctx = true }, abi.Status.integrity_failure, r.output);
     try harness.rejectAny(r, harness.ids.read, &.{
-        harness.ord(0),
+        harness.archiveOrdinalParam(0),
         harness.sourceSpan(rar_fixture[0 .. rar_fixture.len - 5]),
         harness.sinkSpan(r.output),
     }, .{ .ctx = true }, r.output);
     var source_ctx = harness.SourceCallbackContext{ .data = &rar_fixture };
     _ = harness.call(r, harness.ids.read, &.{
-        harness.ord(0),
+        harness.archiveOrdinalParam(0),
         harness.sourceCallbackNode(0, 0),
         harness.sinkSpan(r.output),
     }, .{ .ctx = true, .callback = harness.sourceCallback, .context = &source_ctx });
     try harness.requireStatus(r, abi.Status.ok);
-    if (r.response.byte_length != rar_expected.len or !std.mem.eql(u8, r.output[0..rar_expected.len], rar_expected)) {
-        return error.RarCallbackSourceMismatch;
-    }
+    try rarCheckOutput(r, null);
     var sink_ctx = harness.SinkBufferContext{ .buffer = r.output, .accept_limit = r.output.len };
     _ = harness.call(r, harness.ids.read, &.{
-        harness.ord(0),
+        harness.archiveOrdinalParam(0),
         harness.sourceSpan(&rar_fixture),
         harness.sinkCallbackNode(0, 0),
     }, .{ .ctx = true, .callback = harness.sinkBufferCallback, .context = &sink_ctx });
     try harness.requireStatus(r, abi.Status.ok);
-    if (r.response.byte_length != rar_expected.len or sink_ctx.offset != rar_expected.len or !std.mem.eql(u8, r.output[0..rar_expected.len], rar_expected)) {
-        return error.RarCallbackSinkMismatch;
-    }
+    try rarCheckOutput(r, sink_ctx.offset);
     var short_input = [_]u8{0} ** 4;
     try harness.rejectAny(r, harness.ids.read, &.{
-        harness.ord(0),
+        harness.archiveOrdinalParam(0),
         harness.sourceSpan(&short_input),
         harness.sinkSpan(r.output),
     }, .{ .ctx = true }, r.output);
     var overlap = [_]u8{0xa5} ** 128;
     try harness.reject(r, harness.ids.read, &.{
-        harness.ord(0),
+        harness.archiveOrdinalParam(0),
         harness.sourceSpan(overlap[0..rar_fixture.len]),
         harness.sinkSpan(&overlap),
     }, .{ .ctx = true }, abi.Status.invalid_call, &overlap);
@@ -361,23 +375,23 @@ pub fn runRar(r: *Runner) anyerror!void {
     try harness.expect(r, harness.ids.query, &.{
         harness.paramTargetCommand(harness.ids.read),
         harness.sourceSpan(&rar_fixture),
-        harness.cap(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay),
-        harness.pln(harness.plan_metadata_exact),
-        harness.dlv(harness.delivery_provisional),
-        harness.lim(rar_fixture.len - 1),
+        harness.capabilityParam(arc_caps),
+        harness.sizingModeParam(harness.size_metadata_exact),
+        harness.commitModeParam(harness.commit_tentative),
+        harness.resourceLimitParam(rar_fixture.len - 1),
     }, .{}, abi.Status.resource_limit);
     var small_output = [_]u8{0xa5} ** 1;
     try harness.reject(r, harness.ids.read, &.{
-        harness.ord(0),
+        harness.archiveOrdinalParam(0),
         harness.sourceSpan(&rar_fixture),
         harness.sinkSpan(&small_output),
     }, .{ .ctx = true }, abi.Status.insufficient_capacity, &small_output);
     var out = [_]u8{0xa5} ** 64;
     try harness.reject(r, harness.ids.read, &.{
-        harness.ord(0),
+        harness.archiveOrdinalParam(0),
         harness.sourceSpan(&rar_fixture),
         harness.sinkSpan(&out),
-        harness.lim(rar_expected.len - 1),
+        harness.resourceLimitParam(rar_expected.len - 1),
     }, .{ .ctx = true }, abi.Status.resource_limit, &out);
     try rarToolOracle(r);
 }

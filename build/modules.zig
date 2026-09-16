@@ -1,5 +1,7 @@
 const std = @import("std");
 
+const common = @import("platform/common.zig");
+
 pub const Import = struct {
     name: []const u8,
     module: []const u8,
@@ -14,7 +16,7 @@ pub const Module = struct {
 
 pub const checksum = Module{ .name = "checksum", .root = "src/common/primitive/checksum.zig", .crc_kernel = true };
 pub const crypto = Module{ .name = "crypto", .root = "src/common/primitive/crypto.zig" };
-pub const registry = Module{ .name = "registry", .root = "src/registry.zig" };
+
 pub const library = Module{ .name = "library", .root = "src/root.zig", .crc_kernel = true };
 pub const manifest = Module{ .name = "manifest", .root = "build/platform/manifest.zig" };
 pub const package = Module{
@@ -35,6 +37,15 @@ pub const oracles = Module{
         .{ .name = "crypto", .module = "crypto" },
     },
 };
+pub const nucleus = Module{ .name = "nucleus", .root = "src/nucleus/root.zig" };
+pub const trap = Module{
+    .name = "trap",
+    .root = "build/acceptance/oracles/trap.zig",
+    .imports = &.{
+        .{ .name = "nucleus", .module = "nucleus" },
+    },
+};
+pub const component = Module{ .name = "component", .root = "build/component.zig" };
 pub const benchmark = Module{
     .name = "benchmark",
     .root = "build/acceptance/benchmark/benchmark.zig",
@@ -44,7 +55,7 @@ pub const benchmark = Module{
     },
 };
 
-const importable = [_]Module{ checksum, crypto, registry, library, manifest, harness, run };
+const importable = [_]Module{ checksum, crypto, library, manifest, harness, run, nucleus, trap, component };
 
 fn byName(name: []const u8) Module {
     for (importable) |module| {
@@ -52,8 +63,6 @@ fn byName(name: []const u8) Module {
     }
     @compileError("unknown module: " ++ name);
 }
-
-const common = @import("platform/common.zig");
 
 pub fn create(b: *std.Build, comptime spec: Module, ctx: *const common.Context) *std.Build.Module {
     return createFor(b, spec, b.graph.host, .Debug, ctx);
@@ -67,7 +76,7 @@ pub fn createFor(
     ctx: *const common.Context,
 ) *std.Build.Module {
     var adjusted = target;
-    if (!ctx.force_fallback and spec.crc_kernel and adjusted.result.cpu.arch == .aarch64) {
+    if (!ctx.portable and spec.crc_kernel and adjusted.result.cpu.arch == .aarch64) {
         const crc_feature = @intFromEnum(std.Target.aarch64.Feature.crc);
         adjusted.query.cpu_features_add.addFeature(crc_feature);
         adjusted.result.cpu.features.addFeature(crc_feature);
@@ -80,7 +89,7 @@ pub fn createFor(
         .target = adjusted,
         .optimize = optimize,
     });
-    if (!ctx.force_fallback and spec.crc_kernel and target.result.cpu.arch == .aarch64) {
+    if (!ctx.portable and spec.crc_kernel and target.result.cpu.arch == .aarch64) {
         module.addAssemblyFile(b.path("src/common/primitive/checksum/aarch64.S"));
     }
     module.addImport("options", ctx.options);

@@ -11,8 +11,7 @@ const matrix = @import("matrix.zig");
 const metric = @import("metric.zig");
 const ours = @import("ours.zig");
 
-// Bound-sized verified staging (xz) peaks near 296 MiB at the largest corpus
-// file with the bt4 tuning; 384 MiB keeps every row configuration resident.
+// Bound-sized confirmed staging peaks near 296 MiB on the largest corpus file; 384 MiB keeps every row resident.
 const workspace_size = 384 * 1024 * 1024;
 
 fn corpusComplete(env: *env_mod.Env, dir: []const u8) bool {
@@ -26,7 +25,7 @@ fn ensureCorpus(env: *env_mod.Env) ![]const u8 {
     for (env_mod.paths.corpus_candidates) |dir| {
         if (corpusComplete(env, dir)) return dir;
     }
-    std.debug.print("Silesia corpus missing; downloading {s}\n", .{env_mod.silesia_url});
+    std.debug.print("The Silesia corpus is missing. Downloading \"{s}\".\n", .{env_mod.silesia_url});
     try std.Io.Dir.cwd().createDirPath(env.io, env_mod.paths.corpus_dir);
     const download = try run.output(env.init, &.{ "curl", "-fsSL", "-o", env_mod.paths.corpus_zip, env_mod.silesia_url });
     env.allocator.free(download);
@@ -58,11 +57,12 @@ fn produceArchive(env: *env_mod.Env, comptime row: matrix.Row, input_path: []con
 }
 
 fn availability(env: *env_mod.Env, comptime row: matrix.Row) [4]bool {
+    // Bypass rows print missing: references ran on the kernel-mediated row.
     return .{
         true,
-        if (row.cmd) |id| env.existsPath("{s}/{s}", .{ env_mod.paths.cmd, cmd.get(id).exe }) else false,
-        row.lib != null,
-        if (row.bin) |id| env.existsPath("{s}/{s}", .{ env_mod.paths.bins, cmd.get(id).exe }) else false,
+        !row.bypass and if (row.cmd) |id| env.existsPath("{s}/{s}", .{ env_mod.paths.cmd, cmd.get(id).exe }) else false,
+        !row.bypass and row.lib != null,
+        !row.bypass and if (row.bin) |id| env.existsPath("{s}/{s}", .{ env_mod.paths.bins, cmd.get(id).exe }) else false,
     };
 }
 
@@ -76,9 +76,10 @@ fn measureRow(env: *env_mod.Env, comptime row: matrix.Row, workspace: []u8) !met
         if (env.file) |filter| {
             if (!std.mem.eql(u8, name, filter)) continue;
         }
-        const input = try env.readFile(try env.makePath("{s}/{s}", .{ env.corpus, name }), 1 << 27);
-        defer env.allocator.free(input);
-        const encoded = if (env.bound and !row.archive and !row.decode_only)
+        const input_map = try env.mapFile(try env.makePath("{s}/{s}", .{ env.corpus, name }), 1 << 27);
+        defer input_map.release(env.allocator);
+        const input = input_map.bytes;
+        const encoded = if (env.bounded and !row.archive and !row.decode_only)
             try env.allocator.alloc(u8, try ours.encodedBound(row, input, workspace))
         else
             try env.allocator.alloc(u8, input.len + input.len / 2 + (1 << 20));
@@ -104,25 +105,28 @@ fn measureRow(env: *env_mod.Env, comptime row: matrix.Row, workspace: []u8) !met
             const ours_result = ours.transform(env, row, input, encoded, decoded, workspace);
             totals.add(.ours, ours_result);
             if (!ours_result.ok) {
-                std.debug.print("ours {s} failed on {s} (len {d})\n", .{ row.name, name, input.len });
+                std.debug.print("Benchmark \"{s}\" failed on \"{s}\" (input length {d}).\n", .{ row.name, name, input.len });
                 if (env.row != null) {
                     try env.writeFile(env_mod.paths.debug_ours, encoded[0..@min(ours_result.encoded, encoded.len)]);
                     try env.writeFile(env_mod.paths.debug_input, input);
                 }
             }
             var console_ns: u64 = 0;
-            if (row.cmd) |id| {
-                const m = cmd.measure(env, id, cmd_bin.?, input_path, output_path, row.ext, row.store, row.cmd_args, input);
-                totals.add(.cmd, m);
-                console_ns = m.encode_ns;
-            }
-            if (row.lib != null) {
-                var ref = lib.refOf(row);
-                if (row.lib.? == .lzma7z) ref.console = .{ .path = output_path, .encode_ns = console_ns };
-                totals.add(.lib, lib.measure(env, ref, input, encoded, decoded));
-            }
-            if (row.bin) |id| {
-                totals.add(.bin, cmd.measure(env, id, bin_bin.?, input_path, output_path, row.ext, row.store, row.cmd_args, input));
+            // Bypass skips references: they ran on the kernel-mediated row.
+            if (!row.bypass) {
+                if (row.cmd) |id| {
+                    const m = cmd.measure(env, id, cmd_bin.?, input_path, output_path, row.ext, row.store, row.cmd_args, input);
+                    totals.add(.cmd, m);
+                    console_ns = m.encode_ns;
+                }
+                if (row.lib != null) {
+                    var ref = lib.refOf(row);
+                    if (row.lib.? == .lzma7z) ref.console = .{ .path = output_path, .encode_ns = console_ns };
+                    totals.add(.lib, lib.measure(env, ref, input, encoded, decoded));
+                }
+                if (row.bin) |id| {
+                    totals.add(.bin, cmd.measure(env, id, bin_bin.?, input_path, output_path, row.ext, row.store, row.cmd_args, input));
+                }
             }
         }
         env.delete(input_path);
@@ -133,7 +137,7 @@ fn measureRow(env: *env_mod.Env, comptime row: matrix.Row, workspace: []u8) !met
 
 pub fn main(init: std.process.Init) !void {
     @setEvalBranchQuota(10000);
-    harness.io = init.io;
+    harness.oracle_io = init.io;
     var args = std.process.Args.Iterator.init(init.minimal.args);
     _ = args.next();
     const catalog_path = args.next() orelse return error.MissingCatalogArgument;
@@ -148,7 +152,7 @@ pub fn main(init: std.process.Init) !void {
         .corpus = env_mod.paths.corpus,
         .row = init.environ_map.get("STDK_BENCH_ROW"),
         .file = init.environ_map.get("STDK_BENCH_FILE"),
-        .bound = env_mod.parseDefaultOn(init.environ_map.get("STDK_BENCH_BOUND")),
+        .bounded = env_mod.parseDefaultOn(init.environ_map.get("STDK_BENCH_BOUND")),
     };
     defer env.arena.deinit();
     if (init.environ_map.get("STDK_BENCH_FILES")) |value| {
@@ -209,7 +213,7 @@ pub fn main(init: std.process.Init) !void {
             if (gate_cfg.enabled) try results.append(env.allocator, gate.classify(row, totals, available, gate_cfg));
         }
     }
-    // With the gate on, a row-filtered run must not overwrite the full-matrix baseline.
+    // Filtered runs must not overwrite the full-matrix baseline.
     const row_report: ?[]u8 = if (gate_cfg.enabled and env.row != null)
         try std.fmt.allocPrint(env.allocator, "zig-out/benchmark/report_{s}.txt", .{env.row.?})
     else

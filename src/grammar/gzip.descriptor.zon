@@ -1,0 +1,47 @@
+// Component descriptor (gzip, class grammar).
+// Identity and policy are frozen ABI: rename or re-id is a breaking
+// change, caught by the comptime assertions in kernel/catalog.zig.
+.{
+    .id = .{ .low = "0x6e6b82f08d910404", .high = "0xa7a351053d6d4004" },
+    .name = "gzip",
+    .class = "grammar",
+    .verbs = .{ "inspect", "decode_ordinal", "encode_ordinal", "encode_stream", "decoded_size" },
+    .parameters = .{
+        .{ .name = "modification_time", .family = 3, .ordinal = 1, .representation = "scalar_words" },
+        .{ .name = "extra_flags", .family = 3, .ordinal = 2, .representation = "scalar_words" },
+        .{ .name = "operating_system", .family = 3, .ordinal = 3, .representation = "scalar_words" },
+        .{ .name = "text", .family = 3, .ordinal = 4, .representation = "scalar_words" },
+        .{ .name = "header_crc", .family = 3, .ordinal = 5, .representation = "scalar_words" },
+        .{ .name = "extra", .family = 3, .ordinal = 6, .representation = "bytes" },
+        .{ .name = "name", .family = 3, .ordinal = 7, .representation = "bytes" },
+        .{ .name = "comment", .family = 3, .ordinal = 8, .representation = "bytes" },
+    },
+    .capabilities = .{ "read", "replay" },
+    .sizing = "measured",
+    .commit = "tentative",
+    .limits = .{ .window = 32768, .block = 0, .history = 0 },
+    .benchmark = .{
+        .row = "gzip",
+        .params = "gzip -6",
+        .kind = "gzip",
+        .ext = "gz",
+        .cmd = "gzip",
+        .lib = "sevenzip",
+        .fmt = 239,
+        .ref_params = "gzip -6",
+        .tunings = .{
+            .{},
+            .{
+                .name = "high",
+                .params = .{
+                    .{ .family = 8, .ordinal = 1, .value = 16 },
+                    .{ .family = 8, .ordinal = 2, .value = 258 },
+                    .{ .family = 8, .ordinal = 3, .value = 48 },
+                    .{ .family = 8, .ordinal = 4, .value = 32 },
+                    .{ .family = 8, .ordinal = 5, .value = 1 },
+                },
+                .ref_params = "gzip -6 high-compression",
+            },
+        },
+    },
+}

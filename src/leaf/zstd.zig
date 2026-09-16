@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+
 const build_options = @import("options");
 
 const binary = @import("../common/primitive/binary.zig");
@@ -11,7 +12,7 @@ const kernels = @import("kernels.zig");
 
 // NEON is baseline on aarch64, so the wide match-copy path needs no extra
 // target feature; other targets keep the portable word-at-a-time path.
-const vector_match_copy = !build_options.force_fallback and builtin.cpu.arch == .aarch64;
+const vector_match_copy = !build_options.portable and builtin.cpu.arch == .aarch64;
 
 pub const block_size_max = 1 << 17;
 pub const window_size_min = 1024;
@@ -57,6 +58,7 @@ const LimitedReader = struct {
     interface: std.Io.Reader,
 
     fn init(inner: *std.Io.Reader, limit: u64) LimitedReader {
+        // Filled by the vtable on every read path before any byte is consumed, so `undefined` is safe.
         return .{
             .inner = inner,
             .limit = limit,
@@ -120,6 +122,7 @@ fn decodeWithOutput(input: *std.Io.Reader, output: *std.Io.Writer, history: []u8
     if (history.len < needed_history) return error.Unsupported;
     var limited = LimitedReader.init(input, options.max_encoded_bytes);
     limited.interface.buffer = &limited.buffer;
+    // Per-block state below is filled at block scope before any use, so `undefined` is safe.
     var decoder: Decoder = .{
         .input = &limited.interface,
         .output = output,
@@ -321,7 +324,8 @@ fn encodeBlocks(output: *std.Io.Writer, content: []const u8, content_start: usiz
     const block_workspace = workspace[hash_size + chain.len ..];
     var offset: usize = 0;
     var repeat_offsets = [3]u32{ start_repeated_offset_1, start_repeated_offset_2, start_repeated_offset_3 };
-    var prev: PrevFseTables = .{};
+    // Written before use and gated by valid flags, so `undefined` is safe.
+    var prev: PrevFseTables = .{ .literal = undefined, .match = undefined, .offset = undefined };
     while (offset < frame_len) {
         const block_end = @min(offset + encoder_block_size_max, frame_len);
         const is_last = block_end == frame_len;
@@ -365,19 +369,13 @@ pub fn useRowMatch(options: Options) bool {
     return options.row_match;
 }
 
-// The dfast and row finders index fixed-size tables by hash, so a frame may
-// fill the history regardless of window; the chain matcher indexes its table
-// by absolute position and must cap the frame at the window.
+// Hash-indexed finders may fill history regardless of window; the position-indexed chain matcher must cap at window.
 fn useFixedTables(options: Options) bool {
     return useDfast(options) or useRowMatch(options);
 }
 
-// A block never exceeds its raw form (3-byte header + content): compressed
-// blocks ship only when strictly smaller and RLE blocks are 4 bytes. Frames
-// are capped at min(window, 2^26) by the adapter's history sizing, so the
-// frame count adds one magic+header+checksum (<= 18 bytes) per frame. The
-// plan's single-frame +64 constant ignored the multi-frame split at small
-// windows.
+// Blocks never exceed raw form; frames add <= 18 bytes each at min(window, 2^26) caps.
+// Accounts the multi-frame split at small windows.
 pub fn encodedSizeBound(input_len: usize, options: Options) usize {
     const frame_cap = @max(@min(@as(usize, options.window_size), encoder_frame_size_max), 1);
     const frames = input_len / frame_cap + 1;
@@ -442,6 +440,7 @@ fn encodeBlock(output: *std.Io.Writer, content: []const u8, block_start: usize, 
             insertPosition(content, insert_pos, block_end, head, chain, options);
             insert_pos += 1;
         }
+        // Assigned on every reaching path, so `undefined` is safe; the deferring lazy path continues instead.
         var match_len: usize = undefined;
         var match_offset: usize = undefined;
         if (has_pending) {
@@ -499,9 +498,8 @@ fn countLiteralFreqs(literals: []const u8, freq: *[256]u32) void {
 }
 
 fn appendSequence(seq_data: []SeqData, seq_count: *usize, literal_buf: []u8, literal_count: *usize, src: []const u8, lit_start: usize, lit_end: usize, match_len: usize, offset: u32, repeat_offsets: *[3]u32) void {
-    // Literal histogram is counted in one pass over the finished buffer.
     const run = src[lit_start..lit_end];
-    // Most runs are a few bytes; word-wise copies beat a memcpy call there.
+    // Short runs dominate; word-wise copies beat a memcpy call there.
     var k: usize = 0;
     while (k + 8 <= run.len) : (k += 8) {
         literal_buf[literal_count.* + k ..][0..8].* = run[k..][0..8].*;
@@ -510,7 +508,7 @@ fn appendSequence(seq_data: []SeqData, seq_count: *usize, literal_buf: []u8, lit
         literal_buf[literal_count.* + k] = run[k];
     }
     literal_count.* += run.len;
-    const literal_len = @as(u32, @intCast(lit_end - lit_start));
+    const literal_len: u32 = @intCast(lit_end - lit_start);
     const lit_code = literalLengthCode(literal_len);
     const mat_code = matchLengthCode(@intCast(match_len));
     const off_code = encodeOffset(offset, literal_len, repeat_offsets);
@@ -535,6 +533,7 @@ fn finishBlock(output: *std.Io.Writer, src: []const u8, literal_buf: []const u8,
     const literal_count = literal_buf.len;
     const seq_count = seq_data.len;
     const raw_size = 3 + src.len;
+    // Written by builders below and consumed only behind ok flags, so `undefined` is safe.
     var literal_section: []const u8 = undefined;
     var seq_section: []const u8 = undefined;
     const section_buf = std.mem.sliceAsBytes(block_workspace[encoder_block_seq_u32s + encoder_block_lit_u32s ..])[0 .. 3 * encoder_block_size_max];
@@ -542,9 +541,9 @@ fn finishBlock(output: *std.Io.Writer, src: []const u8, literal_buf: []const u8,
     const raw_literal_section_buf = section_buf[encoder_block_size_max .. 2 * encoder_block_size_max];
     const seq_section_buf = section_buf[2 * encoder_block_size_max .. 3 * encoder_block_size_max];
     const compressed_literal_ok = buildLiteralSection(literal_buf[0..literal_count], literal_freq, literal_section_buf, &literal_section);
+    // Consumed only behind raw_literal_ok, so `undefined` is safe.
     var raw_literal_section: []const u8 = undefined;
-    // A raw section costs at least literal_count + 1 bytes; only build it when
-    // it can still win against the compressed one.
+    // Raw costs at least literal_count + 1 bytes; build only when it can still win.
     var raw_literal_ok = false;
     if (!compressed_literal_ok or literal_section.len >= literal_count + 1) {
         raw_literal_ok = buildRawLiteralSection(literal_buf[0..literal_count], raw_literal_section_buf, &raw_literal_section);
@@ -602,8 +601,7 @@ fn encodeBlockDfast(output: *std.Io.Writer, content: []const u8, block_start: us
         const ilimit = src.len - 8;
         outer: while (true) {
             var step: usize = 1;
-            // Step escalation is relative to the search restart point: probe
-            // every position for step_incr bytes after each match, then skip.
+            // Escalation is restart-relative: probe every position for step_incr bytes after each match.
             var next_step: usize = ip + step_incr;
             const ip1_0 = ip + step;
             if (ip1_0 > ilimit) break;
@@ -618,6 +616,7 @@ fn encodeBlockDfast(output: *std.Io.Writer, content: []const u8, block_start: us
                 chain[hs0] = @intCast(pos_abs);
                 const curr: u32 = @intCast(pos_abs);
                 var stored = false;
+                // Assigned before any head read/write below, so `undefined` is safe.
                 var hl1: u32 = undefined;
                 var idxl1: u32 = undefined;
                 if (repeat_offsets[0] != 0 and pos_abs + 1 >= repeat_offsets[0] and pos_abs + 1 - repeat_offsets[0] >= min_abs and ip + 5 <= src.len and readU32At(content, pos_abs + 1 - repeat_offsets[0]) == readU32At(content, pos_abs + 1)) {
@@ -711,11 +710,8 @@ fn encodeBlockDfast(output: *std.Io.Writer, content: []const u8, block_start: us
     try finishBlock(output, src, literal_buf[0..literal_count], seq_data[0..seq_count], &literal_freq, literal_table, match_table, offset_table, is_last, block_workspace, prev);
 }
 
-// Row-based matchfinder (the zstd row_match selector): the position table is
-// split into rows of row_size slots selected by a 5-byte hash; a 16-bit tag
-// from the same hash prefilters the row, and the NEON scan compares a whole
-// row at once. The scalar path computes the identical mask, so fallback and
-// vector builds encode byte-identically.
+// Row finder: 5-byte hash selects a row, 16-bit tag prefilters; scalar computes the identical
+// mask so vector and fallback builds encode byte-identically.
 const row_log = 4;
 const row_size = 1 << row_log;
 
@@ -725,8 +721,8 @@ const RowProbe = struct {
 };
 
 fn rowProbeAt(content: []const u8, pos: usize, row_bits: u5) RowProbe {
-    const u = readU64At(content, pos);
-    const product = (u << 24) *% 889523592379;
+    const word = readU64At(content, pos);
+    const product = (word << 24) *% 889523592379;
     const shift: u6 = @intCast(64 - @as(u7, row_bits));
     const tag_shift: u6 = @intCast(64 - @as(u7, row_bits) - 16);
     return .{
@@ -747,20 +743,14 @@ fn rowTagMask(tag_table: []const u16, base: u32, tag: u16) u16 {
     return mask;
 }
 
-// Insertion evicts the slot the position's low bits name: consecutive inserts
-// cycle every slot, so eviction stays FIFO-like without a per-row cursor.
+// Eviction cycles slots FIFO-like without a per-row cursor.
 fn rowInsert(pos_table: []u32, tag_table: []u16, probe: RowProbe, pos_abs: usize) void {
     const slot = probe.base + @as(u32, @truncate(pos_abs & (row_size - 1)));
     tag_table[slot] = probe.tag;
     pos_table[slot] = @intCast(pos_abs);
 }
 
-// Longest tag-filtered candidate in the row, nearest offset on ties. Callers
-// scan before inserting the query position, so the row read is pre-insert
-// state and the evicted slot still competes. Depth counts only candidates
-// that pass the position guards, keeping the decision independent of
-// tag-table garbage in never-written slots (empty slots read back
-// encoder_no_position from the per-frame position memset).
+// Pre-insert scan with guard-counted depth keeps decisions independent of tag-table garbage.
 fn rowScan(content: []const u8, pos_table: []const u32, base: u32, mask: u16, pos_abs: usize, block_end: usize, min_abs: usize, options: Options) struct { len: usize, cand: usize } {
     const cur_word = readU32At(content, pos_abs);
     var best_len: usize = min_take_len - 1;
@@ -822,9 +812,7 @@ fn encodeBlockRow(output: *std.Io.Writer, content: []const u8, block_start: usiz
         const ilimit = src.len - 8;
         outer: while (true) {
             var step: usize = 1;
-            // Step escalation is relative to the search restart point, matching
-            // the dfast finder: probe every position for step_incr bytes after
-            // each match, then skip.
+            // Restart-relative escalation, matching dfast.
             var next_step: usize = ip + step_incr;
             const ip1_0 = ip + step;
             if (ip1_0 > ilimit) break;
@@ -834,6 +822,7 @@ fn encodeBlockRow(output: *std.Io.Writer, content: []const u8, block_start: usiz
                 const pos_abs = block_start + ip;
                 const curr: u32 = @intCast(pos_abs);
                 var stored = false;
+                // Built at the head of the one-ahead path before any read, so `undefined` is safe.
                 var probe1: RowProbe = undefined;
                 if (repeat_offsets[0] != 0 and pos_abs + 1 >= repeat_offsets[0] and pos_abs + 1 - repeat_offsets[0] >= min_abs and ip + 5 <= src.len and readU32At(content, pos_abs + 1 - repeat_offsets[0]) == readU32At(content, pos_abs + 1)) {
                     const mlen = 4 + countForward(content, pos_abs + 5 - repeat_offsets[0], pos_abs + 5, block_end);
@@ -853,8 +842,7 @@ fn encodeBlockRow(output: *std.Io.Writer, content: []const u8, block_start: usiz
                         var mip = ip;
                         var midx = best.cand;
                         const ip1_abs = block_start + ip1;
-                        // The one-ahead rescan mirrors the dfast short-hit
-                        // branch: only a weak match (< 8 bytes) justifies it.
+                        // One-ahead rescan pays only for weak matches (< 8 bytes).
                         if (best.len < 8) {
                             const next = rowScan(content, pos_table, probe1.base, rowTagMask(tag_table, probe1.base, probe1.tag), ip1_abs, block_end, min_abs, options);
                             if (next.len > mlen) {
@@ -919,15 +907,15 @@ fn readU64At(content: []const u8, pos: usize) u64 {
 }
 
 fn hash5At(content: []const u8, pos: usize, bits: u5) u32 {
-    const u = readU64At(content, pos);
+    const word = readU64At(content, pos);
     const shift: u6 = @intCast(64 - @as(u7, bits));
-    return @truncate(((u << 24) *% 889523592379) >> shift);
+    return @truncate(((word << 24) *% 889523592379) >> shift);
 }
 
 fn hash8At(content: []const u8, pos: usize, bits: u5) u32 {
-    const u = readU64At(content, pos);
+    const word = readU64At(content, pos);
     const shift: u6 = @intCast(64 - @as(u7, bits));
-    return @truncate((u *% 0xCF1BBCDCB7A56463) >> shift);
+    return @truncate((word *% 0xCF1BBCDCB7A56463) >> shift);
 }
 
 fn countForward(content: []const u8, a: usize, b: usize, end: usize) usize {
@@ -1095,9 +1083,7 @@ fn buildLiteralSection(literals: []const u8, freq: *[256]u32, out: []u8, section
         }
     }
     if (all_same) {
-        // One repeated byte is an RLE_Literals_Block: a raw header would
-        // declare `count` regenerated bytes but store one, which every
-        // decoder rejects or misreads.
+        // Raw header would declare `count` bytes but store one, which decoders reject; use RLE form.
         const header_len = rawLiteralHeaderSize(count);
         if (out.len < header_len + 1) return false;
         writeRleLiteralHeader(out[0..header_len], count);
@@ -1133,7 +1119,8 @@ fn buildLiteralSection(literals: []const u8, freq: *[256]u32, out: []u8, section
         if (weights[max_symbol] != derived_last) return false;
         weights[max_symbol] = derived_last;
     }
-    var tree: HuffmanTree = .{};
+    // Nodes filled before the tree is read back, so `undefined` is safe.
+    var tree: HuffmanTree = .{ .nodes = undefined };
     buildHuffmanTree(weights[0..symbol_count], symbol_count, &tree) catch return false;
     var codes: [256]HuffmanCode = undefined;
     for (0..tree.symbol_count) |i| {
@@ -1259,9 +1246,7 @@ fn buildFseTreeSection(weights: []const u4, out: []u8) ?[]const u8 {
     var stream_buf: [256]u8 = undefined;
     const stream = fseEncodeWeightStream(weights[0..stored], normalized[0..norm.count], norm.log, table_buf[0..table_size], &stream_buf) orelse return null;
     const compressed_size = ncount.len + stream.len;
-    // The FSE form is representable only below 128: header bytes >= 128 mean
-    // direct weights to every decoder, so a larger description must fall
-    // back (the caller then emits raw literals).
+    // Header bytes >= 128 mean direct weights, so larger FSE descriptions must fall back.
     if (compressed_size > 127 or out.len < 1 + compressed_size) return null;
     out[0] = @intCast(compressed_size);
     @memcpy(out[1..][0..ncount.len], ncount);
@@ -1279,6 +1264,7 @@ fn fseEncodeWeightStream(symbols: []const u4, normalized: []const i16, norm_log:
     var writer = ReverseBitWriter.init(out);
     const et = buildFseEncoderTable(normalized, table);
     var ip = symbols.len;
+    // Initialized in the prologue below before any encode step, so `undefined` is safe.
     var cstate1: u16 = undefined;
     var cstate2: u16 = undefined;
     if (ip % 2 == 1) {
@@ -1477,7 +1463,7 @@ fn buildSequenceSection(seqs: []const SeqData, literal_table: []const FseEntry, 
     prev.literal_valid = lit_plan.kind == .fse or lit_plan.kind == .predefined or lit_plan.kind == .repeat;
     prev.match_valid = match_plan.kind == .fse or match_plan.kind == .predefined or match_plan.kind == .repeat;
     prev.offset_valid = offset_plan.kind == .fse or offset_plan.kind == .predefined or offset_plan.kind == .repeat;
-    // A repeat plan's table already aliases prev.*; copying it onto itself trips @memcpy's no-alias check.
+    // Repeat table aliases prev.*, so copying would trip the no-alias check.
     if (prev.literal_valid and lit_plan.kind != .repeat) {
         @memcpy(prev.literal[0..lit_plan.table.len], lit_plan.table);
         prev.literal_log = lit_plan.accuracy_log;
@@ -1574,9 +1560,9 @@ fn writeSequenceHeader(out: []u8, n: usize, modes: u8) void {
 const ModeKind = enum(u2) { predefined, rle, fse, repeat };
 
 const PrevFseTables = struct {
-    literal: [512]FseEntry = undefined,
-    match: [512]FseEntry = undefined,
-    offset: [256]FseEntry = undefined,
+    literal: [512]FseEntry,
+    match: [512]FseEntry,
+    offset: [256]FseEntry,
     literal_log: u5 = 0,
     match_log: u5 = 0,
     offset_log: u5 = 0,
@@ -1621,7 +1607,7 @@ fn planMode(n: usize, symbols: []const u8, freq: *const [256]u32, symbol_count: 
         best = .{ .kind = .predefined, .accuracy_log = default_log, .table = default_table };
         best_bits = default_bits.?;
     }
-    // Match the reference's table-log choice: no finer than needed for n symbols.
+    // No finer table log than needed for n symbols, matching the reference.
     var start_log: u5 = 5;
     if (n > 2) {
         const hb = std.math.log2_int(usize, n - 1);
@@ -1634,7 +1620,7 @@ fn planMode(n: usize, symbols: []const u8, freq: *const [256]u32, symbol_count: 
             buildFseTable(normalized[0..norm.count], table_buf[0..table_size]) catch break :fse_candidate;
             if (estimateFseBits(table_buf[0..table_size], freq, symbol_count, norm.log)) |bits| {
                 if (writeNCounts(ncount_buf, normalized[0..norm.count], norm.log)) |ncount| {
-                    // The table description costs ncount.len bytes; compare total sizes in bits.
+                    // Description costs ncount bytes; compare totals in bits.
                     const total = bits + @as(u64, ncount.len) * 8;
                     if (total < best_bits) {
                         best = .{ .kind = .fse, .accuracy_log = norm.log, .table = table_buf[0..table_size], .ncount = ncount_buf[0..ncount.len] };
@@ -1645,6 +1631,7 @@ fn planMode(n: usize, symbols: []const u8, freq: *const [256]u32, symbol_count: 
         }
     }
     if (!best.valid) return best;
+    // `initial` is written before a true return, so `undefined` is safe.
     var initial: usize = undefined;
     var bits: u64 = 0;
     if (!evalFseTable(best.table, symbols, n, values, counts, &initial, &bits)) return .{ .kind = .predefined, .valid = false, .accuracy_log = default_log };
@@ -1662,7 +1649,7 @@ fn normalizeFseCounts(freq: *const [256]u32, symbol_count: usize, max_log: u5, s
         total += f;
     }
     if (present < 2 or total == 0) return null;
-    // Every present symbol needs a slot, and the ncount header encodes log-5.
+    // Present symbols need slots and the header encodes log-5.
     const fit_log: u5 = @intCast(std.math.log2_int(usize, present - 1) + 1);
     var table_log: u5 = @min(max_log, @max(5, @max(start_log, fit_log)));
     while (true) {
@@ -1679,8 +1666,7 @@ fn normalizeFseCounts(freq: *const [256]u32, symbol_count: usize, max_log: u5, s
         for (freq[0..symbol_count], 0..) |f, s| {
             if (f == 0) continue;
             if (f <= low_threshold) {
-                // Low-probability symbols are stored as -1: one slot at the
-                // high end of the table, cheaper ncount encoding.
+                // -1 takes one high-end slot with cheaper ncount encoding.
                 counts[s] = -1;
                 still_to_distribute -= 1;
             } else {
@@ -1711,8 +1697,7 @@ fn normalizeFseCounts(freq: *const [256]u32, symbol_count: usize, max_log: u5, s
         for (0..symbol_count) |s| {
             if (counts[s] != 0) last_present = s;
         }
-        // Absent symbols (count 0) occupy no table slot; only low-probability
-        // symbols stored as -1 still consume one.
+        // Absent symbols take no slot; only -1 symbols still consume one.
         var check: u64 = 0;
         for (0..last_present + 1) |s| {
             check += if (counts[s] < 0) 1 else @intCast(counts[s]);
@@ -1845,7 +1830,7 @@ fn writeNCounts(out: []u8, norm: []const i16, log: u5) ?[]const u8 {
 const FseTableIndex = struct {
     first: [256]u16 = @splat(0),
     count: [256]u16 = @splat(0),
-    states: [512]u16 = undefined,
+    states: [512]u16,
 };
 
 fn buildFseIndex(table: []const FseEntry, index: *FseTableIndex) void {
@@ -1899,8 +1884,6 @@ const FseEncodeStep = struct {
         }
     }
 
-    // Walk the symbol stream backwards, recording the transition value and bit
-    // count the decoder reads after each symbol, plus the flushed state.
     fn pass(step: *const FseEncodeStep, symbols: []const u8, n: usize, values: []u16, counts: []u8, initial: *usize, bits: *u64) bool {
         if (n == 0) return true;
         const table_size = @as(u32, 1) << step.table_log;
@@ -1930,15 +1913,16 @@ const FseEncodeStep = struct {
 };
 
 fn evalFseTable(table: []const FseEntry, symbols: []const u8, n: usize, values: []u16, counts: []u8, initial: *usize, bits: *u64) bool {
-    var index: FseTableIndex = .{};
+    // Index states filled below before use, so `undefined` is safe.
+    var index: FseTableIndex = .{ .states = undefined };
     buildFseIndex(table, &index);
+    // Built before pass reads any field, so `undefined` is safe.
     var step: FseEncodeStep = undefined;
     step.build(table, &index);
     return step.pass(symbols, n, values, counts, initial, bits);
 }
 
-// Average bits per occurrence of a symbol: its cells partition the state
-// range, so cost_s = sum(2^bits * bits) / table_size over the symbol's cells.
+// Cell-weighted bit estimate: cells partition the state range, so cost averages sum(2^bits*bits)/size.
 fn estimateFseBits(table: []const FseEntry, freq: *const [256]u32, symbol_count: usize, log: u5) ?u64 {
     var cost: [256]u32 = @splat(0);
     var cells: [256]u16 = @splat(0);
@@ -1963,8 +1947,7 @@ const BitWriter = struct {
     acc_bits: u5 = 0,
 
     fn init(buf: []u8) BitWriter {
-        // writeBitsFast assigns every byte it covers; finish() only reads
-        // those bytes, so the buffer needs no zeroing.
+        // Covered bytes are assigned before finish() reads them; no zeroing needed.
         return .{ .buf = buf, .pos = 0, .used = 0 };
     }
 
@@ -2007,8 +1990,7 @@ const BitWriter = struct {
             self.used = @intCast(self.acc_bits);
             self.acc_bits = 0;
         }
-        // The zstd FSE/Huffman bitstream stores the data bytes in reverse
-        // memory order, followed by the final-bit marker and zero padding.
+        // Bitstream order is reversed bytes plus final-bit marker and padding.
         const n = self.pos * 8 + self.used;
         if (n == 0) {
             if (self.buf.len == 0) return error.OutOfSpace;
@@ -2066,7 +2048,6 @@ const ReverseBitWriter = struct {
         if (count == 0) return;
         self.acc |= (value & ((@as(u64, 1) << @intCast(count)) - 1)) << @intCast(self.count);
         self.count += count;
-        // Flush whole bytes; the 8-byte store batch-flushes when space allows.
         if (self.count >= 8 and self.pos + 8 <= self.buf.len) {
             std.mem.writeInt(u64, self.buf[self.pos..][0..8], self.acc, .little);
             const full: u6 = self.count >> 3;
@@ -2085,7 +2066,6 @@ const ReverseBitWriter = struct {
     }
 
     fn finish(self: *ReverseBitWriter) error{OutOfSpace}![]u8 {
-        // Append the marker bit to the partial byte.
         if (self.count > 0) {
             if (self.pos >= self.buf.len) return error.OutOfSpace;
             self.buf[self.pos] = @intCast((self.acc & ((@as(u64, 1) << @intCast(self.count)) - 1)) | (@as(u64, 1) << @intCast(self.count)));
@@ -2132,7 +2112,6 @@ pub fn scanContentSize(input: *std.Io.Reader, max_window: u32) DecodeError!usize
         const header = try decodeFrameHeader(input, max_window);
         if (!header.has_content_size) return error.Unsupported;
         total = std.math.add(u64, total, header.content_size) catch return error.ResourceLimit;
-        // Skip blocks until last block.
         while (true) {
             const block_header = try readBlockHeader(input);
             if (block_header.size > block_size_max) return error.Unsupported;
@@ -2150,17 +2129,13 @@ pub fn scanContentSize(input: *std.Io.Reader, max_window: u32) DecodeError!usize
     return std.math.cast(usize, total) orelse error.ResourceLimit;
 }
 
-// Backward bit reader for the zstd literal and sequence streams: bits are
-// consumed most-significant-first from a 64-bit container loaded one
-// little-endian word at a time from the tail of the stream toward the head.
-// `pos` is the stream index the container was (conceptually) loaded at, so
-// the number of unread bits is always 8 * pos + valid().
+// Backward reader over the literal/sequence streams; unread bits are always 8 * pos + valid().
 const BackwardBitStream = struct {
     bytes: []const u8,
     pos: usize,
     container: u64,
     consumed: u8,
-    tail_pad: u8, // non-stream zero bits at the container bottom (short streams)
+    tail_pad: u8,
 
     fn init(bytes: []const u8) DecodeError!BackwardBitStream {
         var self: BackwardBitStream = .{ .bytes = bytes, .pos = 0, .container = 0, .consumed = 64, .tail_pad = 0 };
@@ -2168,7 +2143,6 @@ const BackwardBitStream = struct {
         const last = bytes[bytes.len - 1];
         if (last == 0) return error.InvalidData;
         const highbit = std.math.log2_int(u8, last);
-        // Skip the end-marker bit and the padding above it.
         if (bytes.len >= 8) {
             self.container = std.mem.readInt(u64, bytes[bytes.len - 8 ..][0..8], .little);
             self.pos = bytes.len - 8;
@@ -2200,8 +2174,7 @@ const BackwardBitStream = struct {
             self.consumed &= 7;
             self.container = std.mem.readInt(u64, self.bytes[self.pos..][0..8], .little);
         } else if (self.pos != 0) {
-            // Fewer than byte_shift whole bytes remain unread; reload at the
-            // stream head and keep the same bits consumed overall.
+            // Reload at the head keeping consumed bits identical.
             self.consumed -= @intCast(8 * self.pos);
             self.pos = 0;
             self.container = std.mem.readInt(u64, self.bytes[0..8], .little);
@@ -2336,7 +2309,8 @@ const Decoder = struct {
         if (dictionary_id == 0) return error.InvalidData;
         if (expected_id != 0 and dictionary_id != expected_id) return error.InvalidData;
         var cursor = binary.ReadCursor.init(dictionary[8..]);
-        d.huffman_tree = .{};
+        // Nodes filled below before use, so `undefined` is safe.
+        d.huffman_tree = .{ .nodes = undefined };
         try decodeHuffmanTree(&cursor, &d.huffman_tree.?);
         {
             const decoded = try decodeFseTable(cursor.remainingSlice(), 32, 8, &d.offset_state.entries);
@@ -2391,13 +2365,11 @@ const Decoder = struct {
         try streamExact(d.input, &target, block_size);
         var cursor = ReadCursor.init(d.block_buffer[0..block_size]);
         const literals = try decodeLiteralsSection(&cursor, d);
-        // Literal and sequence bit reader state lives in locals so the hot
-        // loops keep it in registers; the decoder fields take over only on
-        // the non-canonical stream-split fallback.
+        // Locals keep hot loops in registers; fields take over only on the stream-split fallback.
+        // Initialized only for compressed/treeless blocks and read only there, so `undefined` is safe.
         var lit_bits: BackwardBitStream = undefined;
         var lit_stream_index: usize = 0;
         var lit_legacy = false;
-        // Raw and RLE literals carry no bitstream; only compressed streams are bit-packed.
         if (literals.block_type == .compressed or literals.block_type == .treeless) {
             const first = switch (literals.streams) {
                 .one => |stream| stream,
@@ -2407,11 +2379,9 @@ const Decoder = struct {
             lit_bits = try BackwardBitStream.init(first);
         }
         const sequences = try decodeSequencesHeader(&cursor);
-        // Prepare FSE tables for sequences (forward read).
         try d.prepareFseTable(.literal, sequences.literal_mode, &cursor);
         try d.prepareFseTable(.offset, sequences.offset_mode, &cursor);
         try d.prepareFseTable(.match, sequences.match_mode, &cursor);
-        // The sequence bitstream occupies the remainder of the block.
         const sequences_data = d.block_buffer[cursor.pos..block_size];
         var seq_bits = try BackwardBitStream.init(sequences_data);
         var lit_state: u16 = 0;
@@ -2438,31 +2408,29 @@ const Decoder = struct {
         for (0..sequences.count) |seq_index| {
             const last_sequence = seq_index == sequences.count - 1;
 
-            // Decode the three sequence symbols from the current FSE states.
             const off_entry = off_table[off_state];
             const mat_entry = mat_table[mat_state];
             const lit_entry = lit_table[lit_state];
 
             const off_code = off_entry.symbol;
-            const off_extra = @as(u32, @intCast(try seq_bits.read(@intCast(off_code))));
+            const off_extra: u32 = @intCast(try seq_bits.read(@intCast(off_code)));
             const offset_value = (@as(u32, 1) << @intCast(off_code)) + off_extra;
 
             const mat_symbol = mat_entry.symbol;
             if (mat_symbol >= match_length_code_table.len) return error.InvalidData;
             const mat_len_code = match_length_code_table[mat_symbol];
-            const mat_extra = @as(u32, @intCast(try seq_bits.read(@intCast(mat_len_code[1]))));
+            const mat_extra: u32 = @intCast(try seq_bits.read(@intCast(mat_len_code[1])));
             const match_length = mat_len_code[0] + mat_extra;
 
             const lit_symbol = lit_entry.symbol;
             if (lit_symbol >= literals_length_code_table.len) return error.InvalidData;
             const lit_len_code = literals_length_code_table[lit_symbol];
-            const lit_extra = @as(u32, @intCast(try seq_bits.read(@intCast(lit_len_code[1]))));
+            const lit_extra: u32 = @intCast(try seq_bits.read(@intCast(lit_len_code[1])));
             const literal_length = lit_len_code[0] + lit_extra;
 
             const offset = computeOffsetValue(offset_value, literal_length, &reps);
             if (offset == 0) return error.InvalidData;
 
-            // Copy literals.
             if (literal_length > 0) {
                 if (literal_written + literal_length > literals.regenerated_size) return error.InvalidData;
                 if (decoded_count + literal_length > block_size_max) return error.InvalidData;
@@ -2470,23 +2438,21 @@ const Decoder = struct {
                 literal_written += literal_length;
                 decoded_count += literal_length;
             }
-            // Copy match.
             if (match_length > 0) {
                 if (decoded_count + match_length > block_size_max) return error.InvalidData;
                 try d.copyMatch(offset, match_length, decoded_count);
                 decoded_count += match_length;
             }
 
-            // Advance the three FSE states for the next sequence.
-            // Bitstream order is lit transition, then match, then offset.
+            // Bitstream order is lit, then match, then offset.
             if (!last_sequence) {
-                const lit_next = @as(u16, @intCast(try seq_bits.read(@intCast(lit_entry.bits))));
+                const lit_next: u16 = @intCast(try seq_bits.read(@intCast(lit_entry.bits)));
                 lit_state = lit_entry.baseline + lit_next;
 
-                const mat_next = @as(u16, @intCast(try seq_bits.read(@intCast(mat_entry.bits))));
+                const mat_next: u16 = @intCast(try seq_bits.read(@intCast(mat_entry.bits)));
                 mat_state = mat_entry.baseline + mat_next;
 
-                const off_next = @as(u16, @intCast(try seq_bits.read(@intCast(off_entry.bits))));
+                const off_next: u16 = @intCast(try seq_bits.read(@intCast(off_entry.bits)));
                 off_state = off_entry.baseline + off_next;
             }
         }
@@ -2494,14 +2460,13 @@ const Decoder = struct {
         d.match_state.state = mat_state;
         d.offset_state.state = off_state;
         d.repeat_offsets = reps;
-        // Remaining literals after last sequence.
         if (literal_written < literals.regenerated_size) {
             const remaining_literals = literals.regenerated_size - literal_written;
             if (decoded_count + remaining_literals > block_size_max) return error.InvalidData;
             try d.copyLiteralRun(&literals, &lit_bits, &lit_stream_index, &lit_legacy, d.history[d.history_end + decoded_count ..][0..remaining_literals], literal_written);
             decoded_count += remaining_literals;
         }
-        // Compressed/treeless literals must consume their bitstreams exactly.
+        // Bitstreams must be consumed exactly.
         switch (literals.block_type) {
             .compressed, .treeless => {
                 const empty = if (lit_legacy)
@@ -2564,9 +2529,7 @@ const Decoder = struct {
                 while (emitted < dest.len) {
                     if (bits.valid() < 11) {
                         bits.refill();
-                        // Advance to the next stream only once the current one
-                        // is consumed exactly; a handful of leftover bits is
-                        // the normal tail of a stream and still decodes.
+                        // Advance only on exact exhaustion; leftover tail bits still decode.
                         while (bits.pos == 0 and bits.valid() == 0) {
                             switch (literals.streams) {
                                 .one => break,
@@ -2588,9 +2551,7 @@ const Decoder = struct {
                     const len2: u8 = @intCast((entry >> 21) & 0x1F);
                     if (len1 == 0) return error.InvalidData;
                     if (len1 > avail) {
-                        // The next symbol does not fit in the current stream's
-                        // remaining bits: a split the merged-window decoder
-                        // handles; continue there for exact behavior.
+                        // Split streams continue in the merged-window decoder for exact behavior.
                         if (literals.streams == .four and stream_index.* + 1 < literals.streams.four.len) {
                             d.lit_window = bits.container << @as(u6, @intCast(bits.consumed));
                             d.lit_window_bits = @intCast(bits.valid());
@@ -3002,10 +2963,8 @@ const SequencesHeader = struct {
 const HuffmanTree = struct {
     max_bits: u4 = 0,
     symbol_count: u16 = 0,
-    nodes: [256]PrefixedSymbol = undefined,
+    nodes: [256]PrefixedSymbol,
     lookup: [2048]u16 = @splat(0xFFFF),
-    // Two-symbol decode table: [7:0] first symbol, [15:8] second symbol,
-    // [20:16] first code length, [26:21] second code length (0 = single).
     lookup2: [2048]u32 = @splat(0),
 };
 
@@ -3245,6 +3204,7 @@ fn decodeLiteralsSection(cursor: *ReadCursor, d: *Decoder) DecodeError!LiteralsS
             }
         },
     }
+    // Assigned in every branch before use, so `undefined` is safe.
     var streams: LiteralsStreams = undefined;
     switch (block_type) {
         .raw => {
@@ -3259,7 +3219,8 @@ fn decodeLiteralsSection(cursor: *ReadCursor, d: *Decoder) DecodeError!LiteralsS
             if (block_type == .treeless and d.huffman_tree == null) return error.InvalidData;
             const huffman_tree_size = if (block_type == .compressed) b: {
                 const before_huffman = cursor.pos;
-                if (d.huffman_tree == null) d.huffman_tree = .{};
+                // Nodes filled below before use, so `undefined` is safe.
+                if (d.huffman_tree == null) d.huffman_tree = .{ .nodes = undefined };
                 try decodeHuffmanTree(cursor, &d.huffman_tree.?);
                 break :b cursor.pos - before_huffman;
             } else 0;
@@ -3301,7 +3262,6 @@ fn decodeHuffmanTree(cursor: *ReadCursor, tree: *HuffmanTree) DecodeError!void {
     var weights: [256]u4 = undefined;
     var symbol_count: usize = 0;
     if (header < 128) {
-        // FSE-compressed weights.
         const compressed_size = header;
         const compressed = try cursor.readSlice(compressed_size);
         var entries: [1 << 6]FseEntry = undefined;
@@ -3310,7 +3270,6 @@ fn decodeHuffmanTree(cursor: *ReadCursor, tree: *HuffmanTree) DecodeError!void {
         const remaining = compressed[decoded.consumed..];
         symbol_count = assignHuffmanWeights(remaining, accuracy_log, &entries, &weights) catch return error.InvalidData;
     } else {
-        // Direct weights: each nibble is a weight.
         const weight_count = header - 127;
         symbol_count = weight_count + 1;
         const byte_count = (weight_count + 1) / 2;
@@ -3384,7 +3343,6 @@ fn buildHuffmanTree(weights: []const u4, symbol_count: usize, tree: *HuffmanTree
     for (0..symbol_count) |i| {
         nodes[i] = .{ .symbol = @intCast(i), .prefix = 0, .weight = local_weights[i] };
     }
-    // Stable sort by weight.
     for (1..symbol_count) |i| {
         const key = nodes[i];
         var j = i;
@@ -3540,6 +3498,7 @@ fn decodeFseTable(
         if (charnum >= expected_symbol_count) break;
         const max = (2 * threshold - 1) - remaining;
         const low = try window.peek(nb_bits - 1);
+        // Assigned in both branches before use, so `undefined` is safe.
         var count: i32 = undefined;
         if (low < max) {
             count = @intCast(low);
@@ -3577,7 +3536,7 @@ fn buildFseTable(values: []const i16, entries: []FseEntry) error{InvalidData}!vo
     const step = (entries.len >> 1) + (entries.len >> 3) + 3;
     var symbol_next: [256]u16 = undefined;
     var high_threshold = entries.len;
-    // Place low-probability (-1) symbols at the high end of the table.
+    // -1 symbols sit at the high end of the table.
     for (values, 0..) |value, symbol| {
         if (value == -1) {
             if (high_threshold == 0) return error.InvalidData;
@@ -3594,7 +3553,6 @@ fn buildFseTable(values: []const i16, entries: []FseEntry) error{InvalidData}!vo
             symbol_next[symbol] = @intCast(value);
         }
     }
-    // Spread the remaining symbols using the FSE modular step.
     var position: usize = 0;
     for (values, 0..) |value, symbol| {
         if (value <= 0) continue;
@@ -3608,14 +3566,13 @@ fn buildFseTable(values: []const i16, entries: []FseEntry) error{InvalidData}!vo
         }
     }
     if (position != 0) return error.InvalidData;
-    // Assign Number_of_Bits and Baseline following the reference decoder layout.
-    for (0..entries.len) |u| {
-        const symbol = entries[u].symbol;
+    for (0..entries.len) |index| {
+        const symbol = entries[index].symbol;
         const next_state = symbol_next[symbol];
         symbol_next[symbol] = next_state + 1;
         const bits = accuracy_log - std.math.log2_int(u16, next_state);
-        entries[u].bits = bits;
-        entries[u].baseline = (@as(u16, next_state) << bits) - total_probability;
+        entries[index].bits = bits;
+        entries[index].baseline = (@as(u16, next_state) << bits) - total_probability;
     }
 }
 

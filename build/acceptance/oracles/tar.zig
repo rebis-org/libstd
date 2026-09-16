@@ -74,10 +74,10 @@ const EntryNodes = struct {
 fn entryWithType(nodes: *EntryNodes, name: []const u8, data: []const u8, typeflag: u8, link_name: ?[]const u8, uid_value: ?u64) harness.Node {
     const entry = harness.archiveEntryNode(&nodes.name, &nodes.data, name, data);
     nodes.data.next = &nodes.type;
-    nodes.type = harness.tflag(typeflag);
+    nodes.type = harness.archiveTypeFlagParam(typeflag);
     if (link_name) |link| {
         nodes.type.next = &nodes.link;
-        nodes.link = harness.link(link);
+        nodes.link = harness.archiveLinkNameParam(link);
     }
     if (uid_value) |value| {
         if (link_name) |_| {
@@ -85,13 +85,75 @@ fn entryWithType(nodes: *EntryNodes, name: []const u8, data: []const u8, typefla
         } else {
             nodes.type.next = &nodes.uid;
         }
-        nodes.uid = harness.uid(value);
+        nodes.uid = harness.archiveUidParam(value);
     }
     return entry;
 }
 
+// Policy is fixed for the whole file, so node lists are built once here.
+const tar_caps: u64 = harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay;
+
+fn tarPolicy() [3]harness.Node {
+    return .{
+        harness.capabilityParam(tar_caps),
+        harness.sizingModeParam(harness.size_metadata_exact),
+        harness.commitModeParam(harness.commit_confirmed),
+    };
+}
+
+fn tarQuery(entry: harness.Node) [6]harness.Node {
+    return .{
+        harness.paramTargetCommand(harness.ids.write),
+        harness.scalarNode(harness.ids.source),
+    } ++ tarPolicy() ++ .{entry};
+}
+
+fn tarWrite(entry: harness.Node, sink: []u8) [6]harness.Node {
+    return .{
+        harness.scalarNode(harness.ids.source),
+        harness.sinkSpan(sink),
+    } ++ tarPolicy() ++ .{entry};
+}
+
 var tar_archive: [65536]u8 = undefined;
 var tar_output: [1024]u8 = undefined;
+
+// Archive writes carry policy as nodes, not through the context suffix.
+fn tarEncode(r: *Runner, entry: harness.Node) !usize {
+    _ = harness.call(r, harness.ids.query, &tarQuery(entry), .{});
+    try harness.requireStatus(r, abi.Status.ok);
+    if (r.response.byte_length == 0 or r.response.byte_length > tar_archive.len) return error.TarQueryCapacity;
+    const size: usize = @intCast(r.response.byte_length);
+    try harness.expect(r, harness.ids.write, &tarWrite(entry, tar_archive[0..size]), .{}, abi.Status.ok);
+    if (r.response.byte_length != size) return error.TarWriteMismatch;
+    return size;
+}
+
+fn pad512(buffer: []u8, pos: *usize) void {
+    while (pos.* % 512 != 0) : (pos.* += 1) buffer[pos.*] = 0;
+}
+
+fn finishArchive(buffer: []u8, pos: *usize) void {
+    pad512(buffer, pos);
+    @memset(buffer[pos.*..][0..1024], 0);
+    pos.* += 1024;
+}
+
+fn expectQuickBrown(r: *Runner, archive: []const u8, output: []u8) !void {
+    @memset(output, 0xa5);
+    tarSparseReadOrdinal(r, archive, 0, output);
+    try harness.requireStatus(r, abi.Status.ok);
+    if (r.response.byte_length != 100) return error.SparseLengthMismatch;
+    for (0..100) |i| {
+        const expected: u8 = if (i >= 10 and i < 15)
+            "quick"[i - 10]
+        else if (i >= 80 and i < 87)
+            "brown!!"[i - 80]
+        else
+            0;
+        if (output[i] != expected) return error.SparseContentMismatch;
+    }
+}
 
 fn tarEncEntryTypes(r: *Runner) !void {
     var tar_corpus_buffer: [445]u8 = undefined;
@@ -108,31 +170,11 @@ fn tarEncEntryTypes(r: *Runner) !void {
     entries[0].next = &entries[1];
     entries[1].next = &entries[2];
     entries[2].next = &entries[3];
-    _ = harness.call(r, harness.ids.query, &.{
-        harness.paramTargetCommand(harness.ids.write),
-        harness.scalarNode(harness.ids.source),
-        harness.cap(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay),
-        harness.pln(harness.plan_metadata_exact),
-        harness.dlv(harness.delivery_verified),
-        entries[0],
-    }, .{});
-    try harness.requireStatus(r, abi.Status.ok);
-    if (r.response.byte_length == 0 or r.response.byte_length > tar_archive.len) return error.EntryTypesQueryFailed;
-    const archive_size: usize = @intCast(r.response.byte_length);
-    _ = harness.call(r, harness.ids.write, &.{
-        harness.scalarNode(harness.ids.source),
-        harness.sinkSpan(tar_archive[0..archive_size]),
-        harness.cap(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay),
-        harness.pln(harness.plan_metadata_exact),
-        harness.dlv(harness.delivery_verified),
-        entries[0],
-    }, .{});
-    try harness.requireStatus(r, abi.Status.ok);
-    if (r.response.byte_length != archive_size) return error.EntryTypesWriteFailed;
+    const archive_size = try tarEncode(r, entries[0]);
     const expected_sizes = [_]usize{ tar_corpus_buffer.len, 0, 0, 0 };
     for (0..4) |i| {
         _ = harness.call(r, harness.ids.read, &.{
-            harness.ord(i),
+            harness.archiveOrdinalParam(i),
             harness.sourceSpan(tar_archive[0..archive_size]),
             harness.sinkSpan(&tar_output),
         }, .{ .ctx = true });
@@ -158,29 +200,9 @@ fn tarEncPaxName(r: *Runner) !void {
     corpus.select(r.corpus_index, &payload);
     var store: EntryNodes = undefined;
     const entry = entryWithType(&store, long_name, &payload, 0, null, null);
-    _ = harness.call(r, harness.ids.query, &.{
-        harness.paramTargetCommand(harness.ids.write),
-        harness.scalarNode(harness.ids.source),
-        harness.cap(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay),
-        harness.pln(harness.plan_metadata_exact),
-        harness.dlv(harness.delivery_verified),
-        entry,
-    }, .{});
-    try harness.requireStatus(r, abi.Status.ok);
-    if (r.response.byte_length == 0 or r.response.byte_length > tar_archive.len) return error.PaxNameQueryFailed;
-    const archive_size: usize = @intCast(r.response.byte_length);
-    _ = harness.call(r, harness.ids.write, &.{
-        harness.scalarNode(harness.ids.source),
-        harness.sinkSpan(tar_archive[0..archive_size]),
-        harness.cap(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay),
-        harness.pln(harness.plan_metadata_exact),
-        harness.dlv(harness.delivery_verified),
-        entry,
-    }, .{});
-    try harness.requireStatus(r, abi.Status.ok);
-    if (r.response.byte_length != archive_size) return error.PaxNameWriteFailed;
+    const archive_size = try tarEncode(r, entry);
     _ = harness.call(r, harness.ids.read, &.{
-        harness.ord(0),
+        harness.archiveOrdinalParam(0),
         harness.sourceSpan(tar_archive[0..archive_size]),
         harness.sinkSpan(&tar_output),
     }, .{ .ctx = true });
@@ -201,30 +223,10 @@ fn tarEncPaxUid(r: *Runner) !void {
     corpus.select(r.corpus_index, &tar_corpus_buffer);
     var store: EntryNodes = undefined;
     const entry = entryWithType(&store, "uidpax.txt", &tar_corpus_buffer, 0, null, @as(u64, 1) << 22);
-    _ = harness.call(r, harness.ids.query, &.{
-        harness.paramTargetCommand(harness.ids.write),
-        harness.scalarNode(harness.ids.source),
-        harness.cap(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay),
-        harness.pln(harness.plan_metadata_exact),
-        harness.dlv(harness.delivery_verified),
-        entry,
-    }, .{});
-    try harness.requireStatus(r, abi.Status.ok);
-    if (r.response.byte_length == 0 or r.response.byte_length > tar_archive.len) return error.PaxUidQueryFailed;
-    const archive_size: usize = @intCast(r.response.byte_length);
-    _ = harness.call(r, harness.ids.write, &.{
-        harness.scalarNode(harness.ids.source),
-        harness.sinkSpan(tar_archive[0..archive_size]),
-        harness.cap(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay),
-        harness.pln(harness.plan_metadata_exact),
-        harness.dlv(harness.delivery_verified),
-        entry,
-    }, .{});
-    try harness.requireStatus(r, abi.Status.ok);
-    if (r.response.byte_length != archive_size) return error.PaxUidWriteFailed;
+    const archive_size = try tarEncode(r, entry);
     if (!harness.containsBytes(tar_archive[0..archive_size], "uid=4194304")) return error.PaxUidRecordMissing;
     _ = harness.call(r, harness.ids.read, &.{
-        harness.ord(0),
+        harness.archiveOrdinalParam(0),
         harness.sourceSpan(tar_archive[0..archive_size]),
         harness.sinkSpan(&tar_output),
     }, .{ .ctx = true });
@@ -242,36 +244,15 @@ fn tarEncPaxUid(r: *Runner) !void {
 fn tarEncErrors(r: *Runner) !void {
     var store_bad_link: EntryNodes = undefined;
     const entry_bad_link = entryWithType(&store_bad_link, "badlink", &.{}, '2', "", null);
-    try harness.expect(r, harness.ids.write, &.{
-        harness.scalarNode(harness.ids.source),
-        harness.sinkSpan(tar_archive[0..tar_archive.len]),
-        harness.cap(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay),
-        harness.pln(harness.plan_metadata_exact),
-        harness.dlv(harness.delivery_verified),
-        entry_bad_link,
-    }, .{}, abi.Status.invalid_call);
+    try harness.expect(r, harness.ids.write, &tarWrite(entry_bad_link, &tar_archive), .{}, abi.Status.invalid_call);
     var tar_corpus_buffer: [445]u8 = undefined;
     corpus.select(r.corpus_index, &tar_corpus_buffer);
     var store_bad_dir: EntryNodes = undefined;
     const entry_bad_dir = entryWithType(&store_bad_dir, "baddir/", &tar_corpus_buffer, '5', null, null);
-    try harness.expect(r, harness.ids.write, &.{
-        harness.scalarNode(harness.ids.source),
-        harness.sinkSpan(tar_archive[0..tar_archive.len]),
-        harness.cap(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay),
-        harness.pln(harness.plan_metadata_exact),
-        harness.dlv(harness.delivery_verified),
-        entry_bad_dir,
-    }, .{}, abi.Status.invalid_call);
+    try harness.expect(r, harness.ids.write, &tarWrite(entry_bad_dir, &tar_archive), .{}, abi.Status.invalid_call);
     var store_bad_type: EntryNodes = undefined;
     const entry_bad_type = entryWithType(&store_bad_type, "badtype", &.{}, '9', null, null);
-    try harness.expect(r, harness.ids.write, &.{
-        harness.scalarNode(harness.ids.source),
-        harness.sinkSpan(tar_archive[0..tar_archive.len]),
-        harness.cap(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay),
-        harness.pln(harness.plan_metadata_exact),
-        harness.dlv(harness.delivery_verified),
-        entry_bad_type,
-    }, .{}, abi.Status.invalid_call);
+    try harness.expect(r, harness.ids.write, &tarWrite(entry_bad_type, &tar_archive), .{}, abi.Status.invalid_call);
 }
 
 pub fn runEncode(r: *Runner) anyerror!void {
@@ -284,7 +265,7 @@ pub fn runEncode(r: *Runner) anyerror!void {
 
 fn tarSparseReadOrdinal(r: *Runner, archive: []const u8, ordinal: u64, output: []u8) void {
     _ = harness.call(r, harness.ids.read, &.{
-        harness.ord(ordinal),
+        harness.archiveOrdinalParam(ordinal),
         harness.sourceSpan(archive),
         harness.sinkSpan(output),
     }, .{ .ctx = true });
@@ -297,7 +278,6 @@ fn sparseExpected(offset: usize, length: usize, output: []const u8, data: []cons
 
 fn tarSparseOld(r: *Runner) !void {
     var archive: [16384]u8 = undefined;
-    var output: [2048]u8 = undefined;
     var block: [512]u8 = undefined;
     @memset(&archive, 0);
     tarFillHeader(&block, "sparse.bin", 'S', 12, null);
@@ -318,29 +298,13 @@ fn tarSparseOld(r: *Runner) !void {
     pos += 5;
     @memcpy(archive[pos .. pos + 7], "brown!!");
     pos += 7;
-    while (pos % 512 != 0) {
-        archive[pos] = 0;
-        pos += 1;
-    }
-    @memset(archive[pos .. pos + 1024], 0);
-    pos += 1024;
-    @memset(&output, 0xa5);
-    tarSparseReadOrdinal(r, archive[0..pos], 0, &output);
-    try harness.requireStatus(r, abi.Status.ok);
-    if (r.response.byte_length != 100) return error.SparseOldLengthMismatch;
-    for (0..100) |i| {
-        const expected: u8 = if (i >= 10 and i < 15)
-            "quick"[i - 10]
-        else if (i >= 80 and i < 87)
-            "brown!!"[i - 80]
-        else
-            0;
-        if (output[i] != expected) return error.SparseOldContentMismatch;
-    }
+    finishArchive(&archive, &pos);
+    var output: [2048]u8 = undefined;
+    try expectQuickBrown(r, archive[0..pos], &output);
     var cb_output: [100]u8 = undefined;
     var cb = harness.SinkBufferContext{ .buffer = &cb_output, .accept_limit = cb_output.len };
     _ = harness.call(r, harness.ids.read, &.{
-        harness.ord(0),
+        harness.archiveOrdinalParam(0),
         harness.sourceSpan(archive[0..pos]),
         harness.sinkCallbackNode(0, 0),
     }, .{ .ctx = true, .callback = harness.sinkBufferCallback, .context = &cb });
@@ -385,12 +349,7 @@ fn tarSparseExtension(r: *Runner) !void {
         @memcpy(archive[pos .. pos + 3], &data[i]);
         pos += 3;
     }
-    while (pos % 512 != 0) {
-        archive[pos] = 0;
-        pos += 1;
-    }
-    @memset(archive[pos .. pos + 1024], 0);
-    pos += 1024;
+    finishArchive(&archive, &pos);
     @memset(&output, 0xa5);
     tarSparseReadOrdinal(r, archive[0..pos], 0, &output);
     try harness.requireStatus(r, abi.Status.ok);
@@ -414,12 +373,13 @@ fn tarSparseExtension(r: *Runner) !void {
     }
 }
 
-fn buildPaxSparse(r: *Runner, pax_records: []const []const u8, file_name: []const u8, map_data: []const u8, file_data: []const u8, include_map_block: bool) !usize {
-    var archive: [16384]u8 = undefined;
+var sparse_archive: [16384]u8 = undefined;
+
+fn buildPaxSparse(pax_records: []const []const u8, file_name: []const u8, map_data: []const u8, file_data: []const u8, include_map_block: bool) ![]const u8 {
     var block: [512]u8 = undefined;
     var pax_data: [512]u8 = undefined;
     var pax_len: usize = 0;
-    @memset(&archive, 0);
+    @memset(&sparse_archive, 0);
     @memset(&pax_data, 0);
     for (pax_records) |record| {
         const key = record[0..std.mem.indexOfScalar(u8, record, '=').?];
@@ -428,49 +388,24 @@ fn buildPaxSparse(r: *Runner, pax_records: []const []const u8, file_name: []cons
     }
     tarFillHeader(&block, "pax/", 'x', pax_len, null);
     var pos: usize = 0;
-    @memcpy(archive[pos .. pos + 512], &block);
+    @memcpy(sparse_archive[pos .. pos + 512], &block);
     pos += 512;
-    @memcpy(archive[pos .. pos + pax_len], pax_data[0..pax_len]);
+    @memcpy(sparse_archive[pos .. pos + pax_len], pax_data[0..pax_len]);
     pos += pax_len;
-    while (pos % 512 != 0) {
-        archive[pos] = 0;
-        pos += 1;
-    }
+    pad512(&sparse_archive, &pos);
     const file_size = if (include_map_block) map_data.len + 512 else file_data.len;
     tarFillHeader(&block, file_name, '0', file_size, null);
-    @memcpy(archive[pos .. pos + 512], &block);
+    @memcpy(sparse_archive[pos .. pos + 512], &block);
     pos += 512;
     if (include_map_block) {
-        @memcpy(archive[pos .. pos + map_data.len], map_data);
+        @memcpy(sparse_archive[pos .. pos + map_data.len], map_data);
         pos += map_data.len;
-        while (pos % 512 != 0) {
-            archive[pos] = 0;
-            pos += 1;
-        }
+        pad512(&sparse_archive, &pos);
     }
-    @memcpy(archive[pos .. pos + file_data.len], file_data);
+    @memcpy(sparse_archive[pos .. pos + file_data.len], file_data);
     pos += file_data.len;
-    while (pos % 512 != 0) {
-        archive[pos] = 0;
-        pos += 1;
-    }
-    @memset(archive[pos .. pos + 1024], 0);
-    pos += 1024;
-    var output: [2048]u8 = undefined;
-    @memset(&output, 0xa5);
-    tarSparseReadOrdinal(r, archive[0..pos], 0, &output);
-    try harness.requireStatus(r, abi.Status.ok);
-    if (r.response.byte_length != 100) return error.SparsePaxLengthMismatch;
-    for (0..100) |i| {
-        const expected: u8 = if (i >= 10 and i < 15)
-            "quick"[i - 10]
-        else if (i >= 80 and i < 87)
-            "brown!!"[i - 80]
-        else
-            0;
-        if (output[i] != expected) return error.SparsePaxContentMismatch;
-    }
-    return pos;
+    finishArchive(&sparse_archive, &pos);
+    return sparse_archive[0..pos];
 }
 
 fn tarSparsePax10(r: *Runner) !void {
@@ -480,7 +415,9 @@ fn tarSparsePax10(r: *Runner) !void {
         "GNU.sparse.name=spax.bin",
         "GNU.sparse.realsize=100",
     };
-    _ = try buildPaxSparse(r, &records, "0/GNUSparseFile.1/spax.bin", "2\n10\n5\n80\n7\n", "quickbrown!!", true);
+    var output: [2048]u8 = undefined;
+    const archive = try buildPaxSparse(&records, "0/GNUSparseFile.1/spax.bin", "2\n10\n5\n80\n7\n", "quickbrown!!", true);
+    try expectQuickBrown(r, archive, &output);
 }
 
 fn tarSparsePax01(r: *Runner) !void {
@@ -490,7 +427,9 @@ fn tarSparsePax01(r: *Runner) !void {
         "GNU.sparse.map=10,5,80,7",
         "GNU.sparse.name=pax01.bin",
     };
-    _ = try buildPaxSparse(r, &records, "0/GNUSparseFile.1/pax01.bin", "10,5,80,7", "quickbrown!!", false);
+    var output: [2048]u8 = undefined;
+    const archive = try buildPaxSparse(&records, "0/GNUSparseFile.1/pax01.bin", "10,5,80,7", "quickbrown!!", false);
+    try expectQuickBrown(r, archive, &output);
 }
 
 fn tarSparsePaxSize(r: *Runner) !void {
@@ -508,30 +447,19 @@ fn tarSparsePaxSize(r: *Runner) !void {
     pos += 512;
     @memcpy(archive[pos .. pos + pax_len], pax_data[0..pax_len]);
     pos += pax_len;
-    while (pos % 512 != 0) {
-        archive[pos] = 0;
-        pos += 1;
-    }
+    pad512(&archive, &pos);
     tarFillHeader(&block, "override.txt", '0', 3, null);
     @memcpy(archive[pos .. pos + 512], &block);
     pos += 512;
     @memcpy(archive[pos .. pos + 5], "quick");
     pos += 5;
-    while (pos % 512 != 0) {
-        archive[pos] = 0;
-        pos += 1;
-    }
+    pad512(&archive, &pos);
     tarFillHeader(&block, "after.txt", '0', 2, null);
     @memcpy(archive[pos .. pos + 512], &block);
     pos += 512;
     @memcpy(archive[pos .. pos + 2], "go");
     pos += 2;
-    while (pos % 512 != 0) {
-        archive[pos] = 0;
-        pos += 1;
-    }
-    @memset(archive[pos .. pos + 1024], 0);
-    pos += 1024;
+    finishArchive(&archive, &pos);
     @memset(&output, 0xa5);
     tarSparseReadOrdinal(r, archive[0..pos], 0, &output);
     try harness.requireStatus(r, abi.Status.ok);
@@ -558,12 +486,7 @@ fn tarSparseMalformed(r: *Runner) !void {
     pos += 512;
     @memcpy(archive[pos .. pos + 5], "quick");
     pos += 5;
-    while (pos % 512 != 0) {
-        archive[pos] = 0;
-        pos += 1;
-    }
-    @memset(archive[pos .. pos + 1024], 0);
-    pos += 1024;
+    finishArchive(&archive, &pos);
     @memset(&output, 0xa5);
     tarSparseReadOrdinal(r, archive[0..pos], 0, &output);
     if (r.status == abi.Status.ok) return error.MalformedSparseAccepted;
@@ -577,21 +500,13 @@ fn tarSparseMalformed(r: *Runner) !void {
     pos += 512;
     @memcpy(archive[pos .. pos + pax_len], pax_data[0..pax_len]);
     pos += pax_len;
-    while (pos % 512 != 0) {
-        archive[pos] = 0;
-        pos += 1;
-    }
+    pad512(&archive, &pos);
     tarFillHeader(&block, "huge.txt", '0', 3, null);
     @memcpy(archive[pos .. pos + 512], &block);
     pos += 512;
     @memcpy(archive[pos .. pos + 3], "abc");
     pos += 3;
-    while (pos % 512 != 0) {
-        archive[pos] = 0;
-        pos += 1;
-    }
-    @memset(archive[pos .. pos + 1024], 0);
-    pos += 1024;
+    finishArchive(&archive, &pos);
     @memset(&output, 0xa5);
     tarSparseReadOrdinal(r, archive[0..pos], 0, &output);
     if (r.status == abi.Status.ok) return error.OversizedPaxSizeAccepted;

@@ -2,14 +2,6 @@ const std = @import("std");
 const checksum = @import("checksum");
 const harness = @import("harness.zig");
 
-fn fillBuffer(buffer: []u8) void {
-    var seed: u64 = 0x9e3779b97f4a7c15;
-    for (buffer) |*byte| {
-        byte.* = @truncate(seed >> 56);
-        seed = seed *% 0x9e3779b97f4a7c15 +% 0x70d5e2f72d5a9c0b;
-    }
-}
-
 fn crc32Ref(input: []const u8) u32 {
     var crc: u32 = 0xffff_ffff;
     for (input) |byte| {
@@ -28,7 +20,7 @@ fn runSizes(r: *harness.Runner) !void {
     const gpa = std.heap.page_allocator;
     const page = try gpa.alloc(u8, 2 * 1024 * 1024 + 4096);
     defer gpa.free(page);
-    fillBuffer(page);
+    harness.xorshiftFill(page, 0x9e3779b97f4a7c15);
 
     const sizes = [_]usize{
         0,       1,   3,   7,   8,   15,  16,  31,   32,   33,   63,   64,   65,
@@ -43,7 +35,7 @@ fn runSizes(r: *harness.Runner) !void {
             const expected = crc32Ref(input);
             const got = checksum.crc32(input);
             if (got != expected) {
-                std.debug.print("checksum mismatch size={d} off={d}: got {x:0>8}, want {x:0>8}\n", .{ size, off, got, expected });
+                std.debug.print("Checksum mismatch: size {d}, offset {d}: got {x:0>8}, want {x:0>8}.\n", .{ size, off, got, expected });
                 return error.ChecksumMismatch;
             }
         }
@@ -55,7 +47,7 @@ fn runSplitUpdates(r: *harness.Runner, chunk_size: usize) !void {
     const gpa = std.heap.page_allocator;
     const data = try gpa.alloc(u8, 1048576);
     defer gpa.free(data);
-    fillBuffer(data);
+    harness.xorshiftFill(data, 0x9e3779b97f4a7c15);
 
     var split = checksum.Crc32.init();
     var offset: usize = 0;
@@ -71,7 +63,7 @@ fn runSplitUpdates(r: *harness.Runner, chunk_size: usize) !void {
     const whole_digest = whole.final();
 
     if (split_digest != whole_digest or split_digest != crc32Ref(data)) {
-        std.debug.print("split/whole mismatch chunk={d}: split={x:0>8} whole={x:0>8} ref={x:0>8}\n", .{ chunk_size, split_digest, whole_digest, crc32Ref(data) });
+        std.debug.print("Split/whole mismatch: chunk {d}: split {x:0>8}, whole {x:0>8}, reference {x:0>8}.\n", .{ chunk_size, split_digest, whole_digest, crc32Ref(data) });
         return error.SplitMismatch;
     }
 }

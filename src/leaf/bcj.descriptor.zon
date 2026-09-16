@@ -1,0 +1,14 @@
+// Component descriptor (bcj, class filter).
+// Identity and policy are frozen ABI: rename or re-id is a breaking
+// change, caught by the comptime assertions in kernel/catalog.zig.
+.{
+    .id = .{ .low = "0x6e6b82f08d910413", .high = "0xa7a351053d6d4013" },
+    .name = "bcj",
+    .class = "filter",
+    .verbs = .{ "encode", "decode" },
+    .parameters = .{},
+    .capabilities = .{},
+    .sizing = "unavailable",
+    .commit = "tentative",
+    .limits = .{ .window = 0, .block = 0, .history = 0 },
+}
