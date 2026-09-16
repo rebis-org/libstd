@@ -1,0 +1,12 @@
+// Protocol fixture: the read-only test profile for the oracle suite.
+.{
+    .id = .{ .low = "0x6e6b82f08d910402", .high = "0xa7a351053d6d4002" },
+    .name = "test_read",
+    .class = "slice",
+    .verbs = .{ "required_size", "decoded_size", "encoded_size_bound", "decode" },
+    .parameters = .{},
+    .capabilities = .{ "read", "write", "size", "replay", "seek", "range" },
+    .sizing = "metadata_exact",
+    .commit = "confirmed",
+    .limits = .{ .window = 0, .block = 0, .history = 0 },
+}

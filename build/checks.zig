@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const modules = @import("modules.zig");
 const common = @import("platform/common.zig");
@@ -29,11 +30,15 @@ pub fn expand(b: *std.Build, ctx: *common.Context) void {
 fn addAbi(b: *std.Build, ctx: *common.Context) void {
     const include = b.getInstallPath(.header, "");
     const include_flag = b.fmt("-I{s}", .{include});
-    const c_header = b.addSystemCommand(&.{ "cc", "-std=c23", "-fsyntax-only", include_flag });
+    const zig = b.graph.zig_exe;
+    // No -fsyntax-only mode: object to /dev/null proves C23/C++26 parse without linking.
+    const c_header = b.addSystemCommand(&.{ zig, "cc", "-std=c23", include_flag, "-c" });
     c_header.addFileArg(b.path("build/acceptance/header.c"));
+    c_header.addArgs(&.{ "-o", if (builtin.os.tag == .windows) "NUL" else "/dev/null" });
     c_header.step.dependOn(b.getInstallStep());
-    const cpp_header = b.addSystemCommand(&.{ "c++", "-std=c++2c", "-fsyntax-only", include_flag });
+    const cpp_header = b.addSystemCommand(&.{ zig, "c++", "-std=c++2c", include_flag, "-c" });
     cpp_header.addFileArg(b.path("build/acceptance/header.cpp"));
+    cpp_header.addArgs(&.{ "-o", if (builtin.os.tag == .windows) "NUL" else "/dev/null" });
     cpp_header.step.dependOn(b.getInstallStep());
     const abi = b.step("abi", "Verify the ABI contract of the generated header and library");
     abi.dependOn(&c_header.step);
@@ -62,7 +67,7 @@ fn addRender(b: *std.Build, ctx: *common.Context) void {
 }
 
 fn addPackage(b: *std.Build, ctx: *common.Context) void {
-    const archives = ctx.archives orelse @panic("dist units must expand before checks units");
+    const archives = ctx.archives orelse @panic("Dist units must expand before checks units.");
     const package_exe = b.addExecutable(.{ .name = "package", .root_module = modules.create(b, modules.package, ctx) });
     const package_run = b.addRunArtifact(package_exe);
     package_run.addFileArg(archives.host);

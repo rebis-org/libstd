@@ -37,14 +37,13 @@ SYM(stdk_crc32_le):
 3:
 	ret
 
-/* PMULL/PMULL2 4x128-bit folding CRC32. Called only for len >= threshold. */
+/* Called only for len >= threshold. */
 .align 2
 .globl SYM(stdk_crc32_le_pmull)
 HIDDEN(SYM(stdk_crc32_le_pmull))
 SYM(stdk_crc32_le_pmull):
 	mov	w9, w0
 
-	/* Align to 16 bytes with crc32b. */
 0:
 	ands	x3, x1, #0xf
 	b.eq	1f
@@ -55,7 +54,6 @@ SYM(stdk_crc32_le_pmull):
 	b	9f
 
 1:
-	/* Main 64-byte PMULL folding loop. */
 	cmp	x2, #64
 	b.lo	5f
 	ldp	q0, q1, [x1]
@@ -93,7 +91,6 @@ SYM(stdk_crc32_le_pmull):
 	b	2b
 
 3:
-	/* Reduce 4 accumulators to 1. */
 	ldr	q4, .Lcrc32_k1
 	pmull	v5.1q, v0.1d, v4.1d
 	eor	v5.16b, v5.16b, v1.16b
@@ -114,7 +111,6 @@ SYM(stdk_crc32_le_pmull):
 	crc32x	w9, w9, x10
 
 5:
-	/* 16..63 byte tail with a single vector accumulator. */
 	cmp	x2, #16
 	b.lo	6f
 	ldr	q0, [x1], #16
@@ -140,7 +136,6 @@ SYM(stdk_crc32_le_pmull):
 	crc32x	w9, w9, x10
 
 6:
-	/* Byte tail. */
 	cmp	x2, #8
 	b.lo	9f
 	ldr	x3, [x1], #8

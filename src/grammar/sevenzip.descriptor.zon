@@ -1,0 +1,31 @@
+// Component descriptor (sevenzip, class grammar).
+// Identity and policy are frozen ABI: rename or re-id is a breaking
+// change, caught by the comptime assertions in kernel/catalog.zig.
+.{
+    .id = .{ .low = "0x6e6b82f08d910408", .high = "0xa7a351053d6d4008" },
+    .name = "sevenzip",
+    .class = "grammar",
+    .verbs = .{ "inspect", "decode_ordinal", "encode_ordinal" },
+    .parameters = .{},
+    .capabilities = .{ "read", "write", "size", "replay" },
+    .sizing = "metadata_exact",
+    .commit = "tentative",
+    .limits = .{ .window = 0, .block = 0, .history = 0 },
+    .benchmark = .{
+        .row = "7z",
+        .params = "store",
+        .kind = "7z",
+        .ext = "7z",
+        .cmd = "sevenzz",
+        .lib = "sevenzip",
+        .bin = "sevenzz",
+        .fmt = 7,
+        .store = true,
+        .archive = true,
+        .method = true,
+        .ref_params = "store",
+        .tunings = .{
+            .{},
+        },
+    },
+}

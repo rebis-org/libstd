@@ -13,6 +13,7 @@ fn setup(r: *Runner) !void {
 
 fn discoveryCapacity(r: *Runner) !void {
     var small_buffer = [_]u8{0xa5} ** 4;
+    // Written by capacityDiagnostics below before any read.
     var required: harness.Node = undefined;
     var available: harness.Node = undefined;
     var diagnostic: harness.Node = undefined;
@@ -95,8 +96,8 @@ fn capabilityReject(r: *Runner) !void {
     try harness.reject(r, harness.ids.read, &.{
         harness.sourceCallbackNode(0, 0),
         harness.sinkSpan(&output),
-        harness.cap(harness.cap_read),
-        harness.pln(harness.plan_metadata_exact),
+        harness.capabilityParam(harness.cap_read),
+        harness.sizingModeParam(harness.size_metadata_exact),
     }, .{}, abi.Status.unsupported, &output);
 }
 
@@ -106,7 +107,7 @@ fn capacityReject(r: *Runner) !void {
     try harness.expectCapacity(r, harness.ids.read, &.{
         harness.sourceSpan(input),
         harness.sinkSpan(&output),
-    }, .{ .ctx = true }, harness.ids.diagnostic_required_capacity, harness.ids.diagnostic_available_capacity, input.len, output.len, &output);
+    }, .{ .ctx = true }, input.len, output.len, &output);
 }
 
 fn integrityReject(r: *Runner) !void {
@@ -115,9 +116,9 @@ fn integrityReject(r: *Runner) !void {
     try harness.reject(r, harness.ids.read, &.{
         harness.sourceSpan(&input),
         harness.sinkSpan(&output),
-        harness.cap(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay | harness.cap_seek | harness.cap_range),
-        harness.pln(harness.plan_metadata_exact),
-        harness.dlv(harness.delivery_verified),
+        harness.capabilityParam(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay | harness.cap_seek | harness.cap_range),
+        harness.sizingModeParam(harness.size_metadata_exact),
+        harness.commitModeParam(harness.commit_confirmed),
     }, .{}, abi.Status.integrity_failure, &output);
 }
 
@@ -127,7 +128,7 @@ fn limitReject(r: *Runner) !void {
     try harness.reject(r, harness.ids.read, &.{
         harness.sourceSpan(input),
         harness.sinkSpan(&output),
-        harness.lim(2),
+        harness.resourceLimitParam(2),
     }, .{ .ctx = true }, abi.Status.resource_limit, &output);
 }
 
@@ -150,12 +151,12 @@ fn readOnlyReject(r: *Runner) !void {
     const input = "read-only";
     var output = [_]u8{0xa5} ** 16;
     try harness.reject(r, harness.ids.write, &.{
-        harness.paramProfile(harness.ids.test_read_only),
+        harness.paramProfile(harness.ids.test_read),
         harness.sourceSpan(input),
         harness.sinkSpan(&output),
-        harness.cap(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay | harness.cap_seek | harness.cap_range),
-        harness.pln(harness.plan_metadata_exact),
-        harness.dlv(harness.delivery_provisional),
+        harness.capabilityParam(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay | harness.cap_seek | harness.cap_range),
+        harness.sizingModeParam(harness.size_metadata_exact),
+        harness.commitModeParam(harness.commit_tentative),
     }, .{ .profile = false }, abi.Status.unsupported, &output);
 }
 
@@ -163,7 +164,7 @@ fn missingSource(r: *Runner) !void {
     var output = [_]u8{0xa5} ** 16;
     try harness.reject(r, harness.ids.read, &.{
         harness.sinkSpan(&output),
-        harness.cap(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay | harness.cap_seek | harness.cap_range),
+        harness.capabilityParam(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay | harness.cap_seek | harness.cap_range),
     }, .{}, abi.Status.invalid_call, &output);
 }
 
@@ -171,7 +172,7 @@ fn missingSink(r: *Runner) !void {
     const input = "x";
     try harness.expect(r, harness.ids.read, &.{
         harness.sourceSpan(input),
-        harness.cap(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay | harness.cap_seek | harness.cap_range),
+        harness.capabilityParam(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay | harness.cap_seek | harness.cap_range),
     }, .{}, abi.Status.invalid_call);
 }
 
@@ -182,27 +183,27 @@ fn duplicateProfile(r: *Runner) !void {
     }, .{ .profile = false }, abi.Status.invalid_call);
 }
 
-fn badPlanning(r: *Runner) !void {
+fn badSizing(r: *Runner) !void {
     const input = "x";
     var output = [_]u8{0xa5} ** 16;
     try harness.reject(r, harness.ids.read, &.{
         harness.sourceSpan(input),
         harness.sinkSpan(&output),
-        harness.cap(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay | harness.cap_seek | harness.cap_range),
-        harness.pln(99),
-        harness.dlv(harness.delivery_provisional),
+        harness.capabilityParam(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay | harness.cap_seek | harness.cap_range),
+        harness.sizingModeParam(99),
+        harness.commitModeParam(harness.commit_tentative),
     }, .{}, abi.Status.invalid_call, &output);
 }
 
-fn badDelivery(r: *Runner) !void {
+fn badCommit(r: *Runner) !void {
     const input = "x";
     var output = [_]u8{0xa5} ** 16;
     try harness.reject(r, harness.ids.read, &.{
         harness.sourceSpan(input),
         harness.sinkSpan(&output),
-        harness.cap(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay | harness.cap_seek | harness.cap_range),
-        harness.pln(harness.plan_metadata_exact),
-        harness.dlv(99),
+        harness.capabilityParam(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay | harness.cap_seek | harness.cap_range),
+        harness.sizingModeParam(harness.size_metadata_exact),
+        harness.commitModeParam(99),
     }, .{}, abi.Status.invalid_call, &output);
 }
 
@@ -216,9 +217,9 @@ fn forgedSelector(r: *Runner) !void {
         harness.sourceSpan(input),
         harness.sinkSpan(&output),
         forged,
-        harness.cap(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay | harness.cap_seek | harness.cap_range),
-        harness.pln(harness.plan_metadata_exact),
-        harness.dlv(harness.delivery_provisional),
+        harness.capabilityParam(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay | harness.cap_seek | harness.cap_range),
+        harness.sizingModeParam(harness.size_metadata_exact),
+        harness.commitModeParam(harness.commit_tentative),
     }, .{ .profile = false }, abi.Status.unsupported, &output);
 }
 
@@ -229,9 +230,9 @@ fn cryptoDirect(r: *Runner) !void {
         harness.paramProfile(harness.ids.crypto),
         harness.sourceSpan(input),
         harness.sinkSpan(&output),
-        harness.cap(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay),
-        harness.pln(harness.plan_metadata_exact),
-        harness.dlv(harness.delivery_verified),
+        harness.capabilityParam(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay),
+        harness.sizingModeParam(harness.size_metadata_exact),
+        harness.commitModeParam(harness.commit_confirmed),
     }, .{ .profile = false }, abi.Status.unsupported, &output);
 }
 
@@ -242,9 +243,9 @@ fn modeMismatch(r: *Runner) !void {
         harness.paramProfile(harness.ids.deflate),
         harness.sourceSpan(input),
         harness.sinkSpan(&output),
-        harness.cap(harness.cap_read | harness.cap_size | harness.cap_replay),
-        harness.pln(harness.plan_metadata_exact),
-        harness.dlv(harness.delivery_provisional),
+        harness.capabilityParam(harness.cap_read | harness.cap_size | harness.cap_replay),
+        harness.sizingModeParam(harness.size_metadata_exact),
+        harness.commitModeParam(harness.commit_tentative),
     }, .{ .profile = false }, abi.Status.unsupported, &output);
 }
 
@@ -286,9 +287,9 @@ fn workspaceOverlap(r: *Runner) !void {
     try harness.expect(r, harness.ids.read, &.{
         harness.sourceSpan(buffer[0..4]),
         harness.sinkSpan(&output),
-        harness.cap(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay | harness.cap_seek | harness.cap_range),
-        harness.pln(harness.plan_metadata_exact),
-        harness.dlv(harness.delivery_provisional),
+        harness.capabilityParam(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay | harness.cap_seek | harness.cap_range),
+        harness.sizingModeParam(harness.size_metadata_exact),
+        harness.commitModeParam(harness.commit_tentative),
     }, .{ .profile = false, .workspace = &buffer }, abi.Status.invalid_call);
 }
 
@@ -297,9 +298,9 @@ fn sourceSinkOverlap(r: *Runner) !void {
     try harness.reject(r, harness.ids.read, &.{
         harness.sourceSpan(buffer[0..4]),
         harness.sinkSpan(buffer[2..10]),
-        harness.cap(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay | harness.cap_seek | harness.cap_range),
-        harness.pln(harness.plan_metadata_exact),
-        harness.dlv(harness.delivery_provisional),
+        harness.capabilityParam(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay | harness.cap_seek | harness.cap_range),
+        harness.sizingModeParam(harness.size_metadata_exact),
+        harness.commitModeParam(harness.commit_tentative),
     }, .{}, abi.Status.invalid_call, &buffer);
 }
 
@@ -312,9 +313,9 @@ fn nullSourceSpan(r: *Runner) !void {
         harness.paramProfile(harness.ids.test_echo),
         source,
         harness.sinkSpan(&output),
-        harness.cap(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay | harness.cap_seek | harness.cap_range),
-        harness.pln(harness.plan_metadata_exact),
-        harness.dlv(harness.delivery_provisional),
+        harness.capabilityParam(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay | harness.cap_seek | harness.cap_range),
+        harness.sizingModeParam(harness.size_metadata_exact),
+        harness.commitModeParam(harness.commit_tentative),
     }, .{ .profile = false }, abi.Status.invalid_call, &output);
 }
 
@@ -322,14 +323,14 @@ fn workspaceCapacity(r: *Runner) !void {
     const input = "workspace";
     var output = [_]u8{0xa5} ** 64;
     var small_workspace = [_]u8{0} ** 1;
-    try harness.expectCapacity(r, harness.ids.write, &.{
+    try harness.expectWorkspaceCapacity(r, harness.ids.write, &.{
         harness.paramProfile(harness.ids.deflate),
         harness.sourceSpan(input),
         harness.sinkSpan(&output),
-        harness.cap(harness.cap_read | harness.cap_size | harness.cap_replay),
-        harness.pln(harness.plan_replay_pass),
-        harness.dlv(harness.delivery_provisional),
-    }, .{ .profile = false, .workspace = &small_workspace }, harness.ids.workspace_required_capacity, harness.ids.workspace_available_capacity, null, 1, &output);
+        harness.capabilityParam(harness.cap_read | harness.cap_size | harness.cap_replay),
+        harness.sizingModeParam(harness.size_measured),
+        harness.commitModeParam(harness.commit_tentative),
+    }, .{ .profile = false, .workspace = &small_workspace }, null, 1, &output);
 }
 
 pub fn run(r: *Runner) anyerror!void {
@@ -349,8 +350,8 @@ pub fn run(r: *Runner) anyerror!void {
     try missingSource(r);
     try missingSink(r);
     try duplicateProfile(r);
-    try badPlanning(r);
-    try badDelivery(r);
+    try badSizing(r);
+    try badCommit(r);
     try forgedSelector(r);
     try cryptoDirect(r);
     try modeMismatch(r);

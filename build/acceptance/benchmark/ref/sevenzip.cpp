@@ -28,36 +28,36 @@ class CMemStream : public IInStream, public IOutStream, public CMyUnknownImp {
     Z7_COM_QI_END
     Z7_COM_ADDREF_RELEASE
     // NOLINTEND
-    const Byte* _data;
-    CByteDynBuffer _buf;
-    size_t _size;
-    UInt64 _pos;
-    bool _writable;
+    const Byte* data_;
+    CByteDynBuffer buffer_;
+    size_t size_;
+    UInt64 position_;
+    bool writable_;
 
   public:
     CMemStream(const Byte* data, size_t size, bool writable)
-        : _data(data),
-          _size(size),
-          _pos(0),
-          _writable(writable) {
+        : data_(data),
+          size_(size),
+          position_(0),
+          writable_(writable) {
     }
     size_t GetSize() const {
-        return _size;
+        return size_;
     }
     const Byte* GetBuffer() const {
-        return _writable ? (const Byte*) _buf : _data;
+        return writable_ ? (const Byte*) buffer_ : data_;
     }
     Z7_COM7F_IMF(Read(void* data, UInt32 size, UInt32* processedSize)) Z7_override {
         if (processedSize != NULL) {
             *processedSize = 0;
         }
-        if (size == 0 || _pos >= _size) {
+        if (size == 0 || position_ >= size_) {
             return S_OK;
         }
-        const UInt64 avail = _size - _pos;
+        const UInt64 avail = size_ - position_;
         const UInt32 n = (UInt32) (avail < size ? avail : size);
-        memcpy(data, GetBuffer() + _pos, n);
-        _pos += n;
+        memcpy(data, GetBuffer() + position_, n);
+        position_ += n;
         if (processedSize != NULL) {
             *processedSize = n;
         }
@@ -70,10 +70,10 @@ class CMemStream : public IInStream, public IOutStream, public CMyUnknownImp {
                 target = offset;
                 break;
             case STREAM_SEEK_CUR:
-                target = (Int64) _pos + offset;
+                target = (Int64) position_ + offset;
                 break;
             case STREAM_SEEK_END:
-                target = (Int64) _size + offset;
+                target = (Int64) size_ + offset;
                 break;
             default:
                 return E_INVALIDARG;
@@ -81,9 +81,9 @@ class CMemStream : public IInStream, public IOutStream, public CMyUnknownImp {
         if (target < 0) {
             return MY_E_ERROR_NEGATIVE_SEEK;
         }
-        _pos = (UInt64) target;
+        position_ = (UInt64) target;
         if (newPosition != NULL) {
-            *newPosition = _pos;
+            *newPosition = position_;
         }
         return S_OK;
     }
@@ -94,13 +94,13 @@ class CMemStream : public IInStream, public IOutStream, public CMyUnknownImp {
         if (size == 0) {
             return S_OK;
         }
-        if (!_writable || _pos > _size || !_buf.EnsureCapacity((size_t) _pos + size)) {
+        if (!writable_ || position_ > size_ || !buffer_.EnsureCapacity((size_t) position_ + size)) {
             return E_OUTOFMEMORY;
         }
-        memcpy((Byte*) _buf + _pos, data, size);
-        _pos += size;
-        if (_pos > _size) {
-            _size = (size_t) _pos;
+        memcpy((Byte*) buffer_ + position_, data, size);
+        position_ += size;
+        if (position_ > size_) {
+            size_ = (size_t) position_;
         }
         if (processedSize != NULL) {
             *processedSize = size;
@@ -108,13 +108,13 @@ class CMemStream : public IInStream, public IOutStream, public CMyUnknownImp {
         return S_OK;
     }
     Z7_COM7F_IMF(SetSize(UInt64 newSize)) Z7_override {
-        if (!_writable) {
+        if (!writable_) {
             return E_NOTIMPL;
         }
-        if (newSize > _size && !_buf.EnsureCapacity((size_t) newSize)) {
+        if (newSize > size_ && !buffer_.EnsureCapacity((size_t) newSize)) {
             return E_OUTOFMEMORY;
         }
-        _size = (size_t) newSize;
+        size_ = (size_t) newSize;
         return S_OK;
     }
 };
@@ -143,23 +143,23 @@ class CCallbackBase : public Interface, public CMyUnknownImp {
 };
 
 class CExtractCallback Z7_final : public CCallbackBase<IArchiveExtractCallback, IID_IArchiveExtractCallback> {
-    CMemStream* _spec;
-    CMyComPtr<ISequentialOutStream> _outStream;
-    UInt64 _written = 0;
-    bool _ok = false;
+    CMemStream* spec_;
+    CMyComPtr<ISequentialOutStream> out_stream_;
+    UInt64 written_ = 0;
+    bool ok_ = false;
 
   public:
     CExtractCallback()
-        : _spec(NULL) {
+        : spec_(NULL) {
     }
     UInt64 Written() const {
-        return _written;
+        return written_;
     }
     bool Ok() const {
-        return _ok;
+        return ok_;
     }
     const Byte* Buffer() const {
-        return _spec != NULL ? _spec->GetBuffer() : NULL;
+        return spec_ != NULL ? spec_->GetBuffer() : NULL;
     }
     Z7_COM7F_IMF(GetStream(UInt32, ISequentialOutStream** outStream, Int32 askExtractMode)) Z7_override {
         *outStream = NULL;
@@ -167,9 +167,9 @@ class CExtractCallback Z7_final : public CCallbackBase<IArchiveExtractCallback, 
             return S_OK;
         }
         // NOLINTNEXTLINE(bugprone-unhandled-exception-at-new)
-        _spec = new CMemStream(NULL, 0, true);
-        CMyComPtr<ISequentialOutStream> streamPtr(_spec);
-        _outStream = streamPtr;
+        spec_ = new CMemStream(NULL, 0, true);
+        CMyComPtr<ISequentialOutStream> streamPtr(spec_);
+        out_stream_ = streamPtr;
         *outStream = streamPtr.Detach();
         return S_OK;
     }
@@ -177,24 +177,24 @@ class CExtractCallback Z7_final : public CCallbackBase<IArchiveExtractCallback, 
         return S_OK;
     }
     Z7_COM7F_IMF(SetOperationResult(Int32 operationResult)) Z7_override {
-        _ok = (operationResult == NArchive::NExtract::NOperationResult::kOK);
-        if (_ok && _spec != NULL) {
-            _written = _spec->GetSize();
+        ok_ = (operationResult == NArchive::NExtract::NOperationResult::kOK);
+        if (ok_ && spec_ != NULL) {
+            written_ = spec_->GetSize();
         }
         return S_OK;
     }
 };
 
 class CUpdateCallback Z7_final : public CCallbackBase<IArchiveUpdateCallback, IID_IArchiveUpdateCallback> {
-    const Byte* _data;
-    UInt64 _size;
-    UString _name;
+    const Byte* data_;
+    UInt64 size_;
+    UString name_;
 
   public:
     CUpdateCallback(const Byte* data, UInt64 size, const char* name)
-        : _data(data),
-          _size(size),
-          _name(GetUnicodeString(name)) {
+        : data_(data),
+          size_(size),
+          name_(GetUnicodeString(name)) {
     }
     Z7_COM7F_IMF(GetUpdateItemInfo(UInt32, Int32* newData, Int32* newProps, UInt32* indexInArchive)) Z7_override {
         *newData = 1;
@@ -207,13 +207,13 @@ class CUpdateCallback Z7_final : public CCallbackBase<IArchiveUpdateCallback, II
         NWindows::NCOM::CPropVariant prop;
         switch (propID) {
             case kpidPath:
-                prop = _name;
+                prop = name_;
                 break;
             case kpidIsDir:
                 prop = false;
                 break;
             case kpidSize:
-                prop = _size;
+                prop = size_;
                 break;
             default:
                 break;
@@ -222,7 +222,7 @@ class CUpdateCallback Z7_final : public CCallbackBase<IArchiveUpdateCallback, II
     }
     Z7_COM7F_IMF(GetStream(UInt32, ISequentialInStream** inStream)) Z7_override {
         // NOLINTNEXTLINE(bugprone-unhandled-exception-at-new)
-        CMemStream* spec = new CMemStream(_data, (size_t) _size, false);
+        CMemStream* spec = new CMemStream(data_, (size_t) size_, false);
         CMyComPtr<ISequentialInStream> streamPtr(spec);
         *inStream = streamPtr.Detach();
         return S_OK;
@@ -233,9 +233,9 @@ class CUpdateCallback Z7_final : public CCallbackBase<IArchiveUpdateCallback, II
 };
 
 template <typename Interface>
-static HRESULT CreateHandler(Byte formatId, const GUID& iid, CMyComPtr<Interface>& out) {
+static HRESULT CreateHandler(Byte formatId, const GUID& iid, CMyComPtr<Interface>& output) {
     const GUID clsid = ARC_GUID(formatId);
-    if (FAILED(CreateObject(&clsid, &iid, (void**) &out)) || !out) {
+    if (FAILED(CreateObject(&clsid, &iid, (void**) &output)) || !output) {
         return E_FAIL;
     }
     return S_OK;
@@ -259,10 +259,10 @@ extern "C" int ref_archive_create(unsigned format_id,
                                   size_t size,
                                   const char* name,
                                   int store,
-                                  unsigned char* out,
-                                  size_t cap,
-                                  size_t* out_size) {
-    *out_size = 0;
+                                  unsigned char* output,
+                                  size_t capacity,
+                                  size_t* output_size) {
+    *output_size = 0;
     CMyComPtr<IOutArchive> archive;
     if (FAILED(CreateHandler((Byte) format_id, IID_IOutArchive, archive))) {
         return REF_FAIL;
@@ -276,16 +276,16 @@ extern "C" int ref_archive_create(unsigned format_id,
     if (FAILED(archive->UpdateItems(outStream, 1, callback))) {
         return REF_FAIL;
     }
-    return ref_emit(stream->GetBuffer(), stream->GetSize(), out, cap, out_size);
+    return ref_emit(stream->GetBuffer(), stream->GetSize(), output, capacity, output_size);
 }
 
 extern "C" int ref_archive_extract(unsigned format_id,
                                    const unsigned char* data,
                                    size_t size,
-                                   unsigned char* out,
-                                   size_t cap,
-                                   size_t* out_size) {
-    *out_size = 0;
+                                   unsigned char* output,
+                                   size_t capacity,
+                                   size_t* output_size) {
+    *output_size = 0;
     CMyComPtr<IInArchive> archive;
     if (FAILED(CreateHandler((Byte) format_id, IID_IInArchive, archive))) {
         return REF_FAIL;
@@ -303,5 +303,5 @@ extern "C" int ref_archive_extract(unsigned format_id,
     if (result != S_OK || !callback->Ok()) {
         return REF_FAIL;
     }
-    return ref_emit(callback->Buffer(), (size_t) callback->Written(), out, cap, out_size);
+    return ref_emit(callback->Buffer(), (size_t) callback->Written(), output, capacity, output_size);
 }

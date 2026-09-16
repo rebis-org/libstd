@@ -22,9 +22,9 @@ pub const Properties = struct {
     pub fn decode(byte: u8, dictionary_size: u32) Failure!Properties {
         if (byte >= 9 * 5 * 5) return error.InvalidData;
         const lc: u4 = @intCast(byte % 9);
-        const d = byte / 9;
-        const pb: u4 = @intCast(d / 5);
-        const lp: u4 = @intCast(d % 5);
+        const packed_pb_lp = byte / 9;
+        const pb: u4 = @intCast(packed_pb_lp / 5);
+        const lp: u4 = @intCast(packed_pb_lp % 5);
         return .{
             .lc = lc,
             .lp = lp,
@@ -61,17 +61,10 @@ const num_pos_bits_max = 4;
 const num_len_to_pos_states = 4;
 const match_min_len = 2;
 
-// Match finders (reference-style): a 4-byte hash table (head) whose buckets
-// drive either a position chain (hash_chain) or a content-ordered binary tree
-// over the cyclic slot pairs (bt4). Both walks are bounded by a fixed depth
-// cap so per-position work is O(depth) instead of O(dictionary_size), which
-// is what keeps encoding of large inputs near-linear rather than the earlier
-// brute-force O(n * dict) scan.
+// Bounded O(depth) walks keep large-input encoding near-linear, not O(n*dictionary).
 const match_finder_hash_min_bits: u5 = 12;
 const match_finder_hash_max_bits: u5 = 20;
-// Side tables for short matches: a 4-byte hash can never pair positions whose
-// fourth byte differs, so 2- and 3-byte matches need their own indices (the
-// reference bt4 carries the same hash2/hash3 side tables).
+// 4-byte hash cannot pair short matches, so separate hash2/hash3 indices.
 const match_finder_hash2_bits: u5 = 16;
 const match_finder_hash3_bits: u5 = 17;
 const end_pos_model_index = 14;
@@ -86,66 +79,47 @@ const low_coder_count = 1 << num_pos_bits_max;
 const mid_coder_count = 1 << num_pos_bits_max;
 const literal_probs_count = 0x300;
 
-// No copy fallback exists, so the bound rests on the probability model: the
-// >>prob_move_bits update keeps every probability inside [32, 2016] of 2048,
-// so a single bit decision never exceeds 6 bits and a converged context costs
-// ~1 bit; a literal byte costs the is-match decision plus 8 tree decisions.
-// 5/4 (= 10 bits per byte) covers the sustained converged cost (~9 bits per
-// literal byte) plus transient model wrongness; the constant absorbs the
-// range-coder cache byte, the 5-byte flush, and the end marker. Verified
-// against corpus and pathological inputs by the oracle suite; the strict
-// per-decision clamp bound would be ~7x and useless as a planning size.
+// No copy fallback: 10 bits/byte covers converged cost plus transient wrongness; strict clamp bound would be ~7x.
+// Constant absorbs cache byte, flush, and end marker.
 pub fn encodedSizeBound(input_len: usize) usize {
     return input_len +| (input_len / 4) +| 64;
 }
 
-// Fixed-point bit-price table used by the encoder's parser.  One bit costs
-// price_scale units; the table is indexed by probability >> 4 so it holds
-// 128 entries covering the full 11-bit probability range.
 const price_scale_shift = 10;
 const price_scale = 1 << price_scale_shift;
-const kBitPrice = blk: {
+const bit_price = blk: {
     @setEvalBranchQuota(10000);
     var table: [128]u16 = undefined;
     for (0..128) |i| {
-        var p = (i << 4) + 8;
-        if (p > 2047) p = 2047;
-        const f = @log2(2048.0 / @as(f64, p));
+        var probability = (i << 4) + 8;
+        if (probability > 2047) probability = 2047;
+        const f = @log2(2048.0 / @as(f64, probability));
         table[i] = @intFromFloat(@round(f * price_scale));
     }
     break :blk table;
 };
 
-// Optimal-parsing window: the encoder plans up to opt_window positions ahead
-// against the frozen probability model, then emits the cheapest decision
-// sequence. 8192 measured best on the corpus: smaller windows cut long-range
-// decisions at the boundary, larger windows let the frozen prices go stale on
-// evolving distributions before the next rebuild.
+// 8192 plans ahead on frozen prices; smaller cuts long decisions, larger goes stale.
 const max_match_len = 273;
 const opt_window = 8192;
 
-const back_literal: u32 = 0xFFFFFFFF;
-const back_short_rep: u32 = 0xFFFFFFFE;
-const back_rep_base: u32 = 0xF0000000; // | rep index; dist-1 never reaches 2^30.
+const distance_literal: u32 = 0xFFFFFFFF;
+const distance_short_rep: u32 = 0xFFFFFFFE;
+const distance_rep_base: u32 = 0xF0000000; // | rep index; distance-1 never reaches 2^30.
 
 const Opt = struct {
     price: u32,
-    pos_prev: u16,
-    back: u32,
+    previous_position: u16,
+    distance: u32,
     state: u8,
-    backs: [4]u32,
+    rep_distances: [4]u32,
 };
 
-const Decision = struct { back: u32, len: u32 };
+const Decision = struct { distance: u32, length: u32 };
 
-// One improving match candidate from the finder: strictly increasing lengths,
-// dist is 1-based (a stored dist of 1 means the previous byte).
-const MatchPair = struct { len: u16, dist: u32 };
+const MatchPair = struct { length: u16, distance: u32 };
 const match_list_max = 64;
 
-// Per-window bit prices derived from the frozen probability model. Indexed by
-// the same shapes the encoder tables use so the planner never touches Prob
-// state directly.
 const PriceTables = struct {
     is_match: [is_match_count][2]u32,
     is_rep: [num_states][2]u32,
@@ -153,15 +127,14 @@ const PriceTables = struct {
     is_rep_g1: [num_states][2]u32,
     is_rep_g2: [num_states][2]u32,
     is_rep0_long: [is_rep0_long_count][2]u32,
-    len: [low_coder_count][max_match_len + 1]u32,
-    rep_len: [low_coder_count][max_match_len + 1]u32,
+    length_prices: [low_coder_count][max_match_len + 1]u32,
+    repeat_length_prices: [low_coder_count][max_match_len + 1]u32,
     slot: [num_len_to_pos_states][64]u32,
-    dist: [num_len_to_pos_states][num_full_distances]u32,
+    distance_prices: [num_len_to_pos_states][num_full_distances]u32,
     align_prices: [align_size]u32,
 };
 
-// The probability tables are a single layout shared by sizing, both init
-// paths, and reset; the field order here is the workspace order.
+// Field order is the workspace order.
 const ProbTables = struct {
     literal_probs: []Prob,
     is_match: []Prob,
@@ -239,8 +212,7 @@ pub fn decodeWorkspaceSize(properties: Properties) usize {
     var plan = io.WorkspacePlan.init(null);
     plan.take(u8, properties.dictionary_size) catch return 0;
     planTables(&plan, properties) catch return 0;
-    // Account for worst-case alignment padding when the scratch slice is not
-    // ideally aligned for the u16 probability arrays taken by Decoder.init.
+    // Worst-case padding when scratch is misaligned for u16 tables.
     return std.mem.alignForward(usize, plan.required() + (@alignOf(u32) - 1) + (@alignOf(u16) - 1), @alignOf(u64));
 }
 
@@ -292,17 +264,10 @@ fn encodeWorkspaceSizeFor(properties: Properties, bt: bool) usize {
     plan.take(Decision, opt_window) catch return 0;
     plan.take(PriceTables, 1) catch return 0;
     plan.take(u32, properties.literalContextCount() << 8) catch return 0;
-    // The plan above is computed from an idealized aligned base. Callers may
-    // pass a slice whose base is only partially aligned (LZMA2's per-chunk
-    // estimate slice is offset into the main workspace), which adds a few bytes
-    // of alignment padding at the u32/u16 boundaries. Reserve the worst case so
-    // any caller-provided base alignment works.
+    // LZMA2 estimate slices offset into the workspace, so reserve worst-case padding for any base alignment.
     return std.mem.alignForward(usize, plan.required() + (@alignOf(u32) - 1) + (@alignOf(u16) - 1), @alignOf(u64));
 }
 
-// Stream-shaped range decoder: reads through a std.Io.Reader or a caller
-// slice; per-bit calls can fail mid-symbol. The buffer-to-buffer decode path
-// uses RangeDecoderFast instead.
 const RangeDecoder = struct {
     const E = Failure;
 
@@ -313,7 +278,7 @@ const RangeDecoder = struct {
 
     const Input = union(enum) {
         reader: *std.Io.Reader,
-        slice: struct { data: []const u8, pos: usize },
+        slice: struct { data: []const u8, position: usize },
     };
 
     fn init(reader: *std.Io.Reader) Failure!RangeDecoder {
@@ -334,7 +299,7 @@ const RangeDecoder = struct {
 
     fn initSlice(data: []const u8) Failure!RangeDecoder {
         var self = RangeDecoder{
-            .input = .{ .slice = .{ .data = data, .pos = 0 } },
+            .input = .{ .slice = .{ .data = data, .position = 0 } },
             .range = 0xFFFFFFFF,
             .code = 0,
             .corrupted = false,
@@ -351,13 +316,13 @@ const RangeDecoder = struct {
     fn readByte(self: *RangeDecoder) E!u8 {
         return switch (self.input) {
             .reader => |reader| io.readByte(reader),
-            .slice => |*s| blk: {
-                if (s.pos >= s.data.len) {
+            .slice => |*input_cursor| read_byte: {
+                if (input_cursor.position >= input_cursor.data.len) {
                     return error.InvalidData;
                 }
-                const byte = s.data[s.pos];
-                s.pos += 1;
-                break :blk byte;
+                const byte = input_cursor.data[input_cursor.position];
+                input_cursor.position += 1;
+                break :read_byte byte;
             },
         };
     }
@@ -370,17 +335,15 @@ const RangeDecoder = struct {
     }
 
     inline fn decodeBit(self: *RangeDecoder, prob: *Prob) E!u1 {
-        const p: u32 = prob.*;
-        const bound = (self.range >> prob_total_bits) * p;
-        // Branchless update: mask is all-ones when the decoded bit is 1.
-        // The range identity holds mod 2^32: bound + (range - 2*bound) ==
-        // range - bound, and the & 0 case leaves bound.
+        const probability: u32 = prob.*;
+        const bound = (self.range >> prob_total_bits) * probability;
+        // Branchless: identity holds mod 2^32, so mask selects the bit-1 case.
         const mask: u32 = 0 -% @as(u32, @intFromBool(self.code >= bound));
         self.code -%= bound & mask;
         self.range = bound +% ((self.range -% bound -% bound) & mask);
-        const up = (((@as(u32, 1) << prob_total_bits) - p) >> prob_move_bits) & ~mask;
-        const down = (p >> prob_move_bits) & mask;
-        prob.* = @intCast(p + up - down);
+        const increase = (((@as(u32, 1) << prob_total_bits) - probability) >> prob_move_bits) & ~mask;
+        const decrease = (probability >> prob_move_bits) & mask;
+        prob.* = @intCast(probability + increase - decrease);
         if (self.range < top_value) {
             self.range <<= 8;
             self.code = (self.code << 8) | try self.readByte();
@@ -396,9 +359,7 @@ const RangeDecoder = struct {
                 self.range <<= 8;
                 self.code = (self.code << 8) | try self.readByte();
             }
-            // Direct bits halve range each step. After normalizing,
-            // range >= top_value, so we can decode up to
-            // 7 - @clz(range) bits while keeping range >= top_value.
+            // Batch up to 7 - @clz(range) bits while keeping range >= top_value.
             const leading_zeros = @clz(self.range);
             const max_batch: u32 = @max(1, 7 - leading_zeros);
             const batch: u5 = @intCast(@min(@as(u32, remaining), max_batch));
@@ -406,15 +367,14 @@ const RangeDecoder = struct {
             while (i < batch) : (i += 1) {
                 self.range >>= 1;
                 self.code -%= self.range;
-                const t: u32 = 0 -% (self.code >> 31);
-                self.code +%= self.range & t;
+                const top_bit_mask: u32 = 0 -% (self.code >> 31);
+                self.code +%= self.range & top_bit_mask;
                 if (self.code == self.range) self.corrupted = true;
-                res = (res << 1) +% t +% 1;
+                res = (res << 1) +% top_bit_mask +% 1;
             }
             remaining -= batch;
         }
-        // Match the per-bit form's final normalization so callers see the
-        // same range/code state.
+        // Match per-bit final normalization so callers see the same state.
         if (self.range < top_value) {
             self.range <<= 8;
             self.code = (self.code << 8) | try self.readByte();
@@ -427,18 +387,16 @@ const RangeDecoder = struct {
     }
 };
 
-// Slice-only range decoder used by the buffer-to-buffer decode path. Removing
-// the per-bit error union lets the compiler keep the hot decode loop registers
-// in fast storage instead of shuffling error-payload state for every symbol.
+// Slice-only decoder drops the per-bit error union to keep the hot loop in registers.
 const RangeDecoderFast = struct {
-    input: struct { data: []const u8, pos: usize },
+    input: struct { data: []const u8, position: usize },
     range: u32,
     code: u32,
     corrupted: bool,
 
     fn initSlice(data: []const u8) Failure!RangeDecoderFast {
         var self = RangeDecoderFast{
-            .input = .{ .data = data, .pos = 0 },
+            .input = .{ .data = data, .position = 0 },
             .range = 0xFFFFFFFF,
             .code = 0,
             .corrupted = false,
@@ -453,13 +411,13 @@ const RangeDecoderFast = struct {
     }
 
     inline fn readByte(self: *RangeDecoderFast) u8 {
-        const s = &self.input;
-        if (s.pos >= s.data.len) {
+        const input_cursor = &self.input;
+        if (input_cursor.position >= input_cursor.data.len) {
             self.corrupted = true;
             return 0;
         }
-        const byte = s.data[s.pos];
-        s.pos += 1;
+        const byte = input_cursor.data[input_cursor.position];
+        input_cursor.position += 1;
         return byte;
     }
 
@@ -471,17 +429,15 @@ const RangeDecoderFast = struct {
     }
 
     inline fn decodeBit(self: *RangeDecoderFast, prob: *Prob) u1 {
-        const p: u32 = prob.*;
-        const bound = (self.range >> prob_total_bits) * p;
-        // Branchless update: mask is all-ones when the decoded bit is 1. The
-        // range identity holds mod 2^32: bound + (range - 2*bound) == range -
-        // bound, and the & 0 case leaves bound.
+        const probability: u32 = prob.*;
+        const bound = (self.range >> prob_total_bits) * probability;
+        // Branchless: identity holds mod 2^32, so mask selects the bit-1 case.
         const mask: u32 = 0 -% @as(u32, @intFromBool(self.code >= bound));
         self.code -%= bound & mask;
         self.range = bound +% ((self.range -% bound -% bound) & mask);
-        const up = (((@as(u32, 1) << prob_total_bits) - p) >> prob_move_bits) & ~mask;
-        const down = (p >> prob_move_bits) & mask;
-        prob.* = @intCast(p + up - down);
+        const increase = (((@as(u32, 1) << prob_total_bits) - probability) >> prob_move_bits) & ~mask;
+        const decrease = (probability >> prob_move_bits) & mask;
+        prob.* = @intCast(probability + increase - decrease);
         if (self.range < top_value) {
             self.range <<= 8;
             self.code = (self.code << 8) | self.readByte();
@@ -504,10 +460,10 @@ const RangeDecoderFast = struct {
             while (i < batch) : (i += 1) {
                 self.range >>= 1;
                 self.code -%= self.range;
-                const t: u32 = 0 -% (self.code >> 31);
-                self.code +%= self.range & t;
+                const top_bit_mask: u32 = 0 -% (self.code >> 31);
+                self.code +%= self.range & top_bit_mask;
                 if (self.code == self.range) self.corrupted = true;
-                res = (res << 1) +% t +% 1;
+                res = (res << 1) +% top_bit_mask +% 1;
             }
             remaining -= batch;
         }
@@ -567,8 +523,8 @@ pub const RangeEncoder = struct {
     }
 
     fn encodeBit(self: *RangeEncoder, prob: *Prob, symbol: u1) Failure!void {
-        const p: u32 = prob.*;
-        const bound = (self.range >> prob_total_bits) * p;
+        const probability: u32 = prob.*;
+        const bound = (self.range >> prob_total_bits) * probability;
         updateProb(prob, symbol);
         if (symbol == 0) {
             self.range = bound;
@@ -598,19 +554,15 @@ pub const RangeEncoder = struct {
     }
 };
 
-// The adaptive model update every encodeBit shares: RangeEncoder applies it
-// while emitting bits, PriceCounter while pricing a parse.
 inline fn updateProb(prob: *Prob, symbol: u1) void {
-    const p: u32 = prob.*;
+    const probability: u32 = prob.*;
     if (symbol == 0) {
-        prob.* = @intCast(p + (((@as(u32, 1) << prob_total_bits) - p) >> prob_move_bits));
+        prob.* = @intCast(probability + (((@as(u32, 1) << prob_total_bits) - probability) >> prob_move_bits));
     } else {
-        prob.* = @intCast(p - (p >> prob_move_bits));
+        prob.* = @intCast(probability - (probability >> prob_move_bits));
     }
 }
 
-// RangeEncoder-shaped price accumulator: charges the fixed-point bit price of
-// every coded decision against the live model without emitting a bitstream.
 const PriceCounter = struct {
     price: u64 = 0,
 
@@ -625,65 +577,65 @@ const PriceCounter = struct {
     }
 };
 
-inline fn bitTreeDecode(rc: anytype, probs: []Prob, comptime num_bits: u5) Failure!u32 {
-    var m: u32 = 1;
+inline fn bitTreeDecode(range_coder: anytype, probs: []Prob, comptime num_bits: u5) Failure!u32 {
+    var node: u32 = 1;
     inline for (0..num_bits) |_| {
-        const bit = try rc.decodeBit(&probs[m]);
-        m = (m << 1) + bit;
+        const bit = try range_coder.decodeBit(&probs[node]);
+        node = (node << 1) + bit;
     }
-    return m - (@as(u32, 1) << num_bits);
+    return node - (@as(u32, 1) << num_bits);
 }
 
-inline fn bitTreeReverseDecode(rc: anytype, probs: []Prob, num_bits: u5) Failure!u32 {
-    var m: u32 = 1;
+inline fn bitTreeReverseDecode(range_coder: anytype, probs: []Prob, num_bits: u5) Failure!u32 {
+    var node: u32 = 1;
     var symbol: u32 = 0;
     var i: u32 = 0;
     while (i < num_bits) : (i += 1) {
-        const bit = try rc.decodeBit(&probs[m]);
-        m = (m << 1) + bit;
+        const bit = try range_coder.decodeBit(&probs[node]);
+        node = (node << 1) + bit;
         symbol |= @as(u32, bit) << @intCast(i);
     }
     return symbol;
 }
 
-inline fn bitTreeDecodeFast(rc: *RangeDecoderFast, probs: []Prob, comptime num_bits: u5) u32 {
-    var m: u32 = 1;
+inline fn bitTreeDecodeFast(range_coder: *RangeDecoderFast, probs: []Prob, comptime num_bits: u5) u32 {
+    var node: u32 = 1;
     inline for (0..num_bits) |_| {
-        const bit = rc.decodeBit(&probs[m]);
-        m = (m << 1) + bit;
+        const bit = range_coder.decodeBit(&probs[node]);
+        node = (node << 1) + bit;
     }
-    return m - (@as(u32, 1) << num_bits);
+    return node - (@as(u32, 1) << num_bits);
 }
 
-inline fn bitTreeReverseDecodeFast(rc: *RangeDecoderFast, probs: []Prob, num_bits: u5) u32 {
-    var m: u32 = 1;
+inline fn bitTreeReverseDecodeFast(range_coder: *RangeDecoderFast, probs: []Prob, num_bits: u5) u32 {
+    var node: u32 = 1;
     var symbol: u32 = 0;
     var i: u32 = 0;
     while (i < num_bits) : (i += 1) {
-        const bit = rc.decodeBit(&probs[m]);
-        m = (m << 1) + bit;
+        const bit = range_coder.decodeBit(&probs[node]);
+        node = (node << 1) + bit;
         symbol |= @as(u32, bit) << @intCast(i);
     }
     return symbol;
 }
 
-fn bitTreeEncode(rc: anytype, probs: []Prob, num_bits: u5, symbol: u32) Failure!void {
-    var m: u32 = 1;
+fn bitTreeEncode(range_coder: anytype, probs: []Prob, num_bits: u5, symbol: u32) Failure!void {
+    var node: u32 = 1;
     var i = num_bits;
     while (i > 0) : (i -= 1) {
         const bit: u1 = @intCast((symbol >> @intCast(i - 1)) & 1);
-        try rc.encodeBit(&probs[m], bit);
-        m = (m << 1) + bit;
+        try range_coder.encodeBit(&probs[node], bit);
+        node = (node << 1) + bit;
     }
 }
 
-fn bitTreeReverseEncode(rc: anytype, probs: []Prob, num_bits: u5, symbol: u32) Failure!void {
-    var m: u32 = 1;
+fn bitTreeReverseEncode(range_coder: anytype, probs: []Prob, num_bits: u5, symbol: u32) Failure!void {
+    var node: u32 = 1;
     var i: u32 = 0;
     while (i < num_bits) : (i += 1) {
         const bit: u1 = @intCast((symbol >> @intCast(i)) & 1);
-        try rc.encodeBit(&probs[m], bit);
-        m = (m << 1) + bit;
+        try range_coder.encodeBit(&probs[node], bit);
+        node = (node << 1) + bit;
     }
 }
 
@@ -694,15 +646,12 @@ pub fn DecoderOf(comptime slice_input: bool) type {
 
         properties: Properties,
         dictionary: []u8,
-        dict_pos: u32,
-        dict_full: bool,
-        // In-place decode only: the dictionary position of the most recent
-        // format-level dictionary reset. The output buffer is the dictionary,
-        // so a reset cannot rewind the write position; it is a logical floor
-        // that distance validation enforces instead.
-        dict_floor: u32,
+        dictionary_pos: u32,
+        dictionary_full: bool,
+        // Reset cannot rewind in-place output, so it acts as a distance-validation floor.
+        dictionary_floor: u32,
         total_pos: u32,
-        rc: RC,
+        range_coder: RC,
         is_match: []Prob,
         is_rep: []Prob,
         is_rep_g0: []Prob,
@@ -729,8 +678,8 @@ pub fn DecoderOf(comptime slice_input: bool) type {
         output_buffer: ?[]u8,
         output_pos: usize,
         output_writer: ?*std.Io.Writer,
-        out_buf: [4096]u8,
-        out_len: usize,
+        staging_buffer: [4096]u8,
+        staging_length: usize,
         clear_dictionary: bool,
 
         pub fn setWriter(self: *Self, writer: *std.Io.Writer) void {
@@ -744,14 +693,15 @@ pub fn DecoderOf(comptime slice_input: bool) type {
         pub fn initProperties(properties: Properties, scratch: []u8) Failure!Self {
             var workspace = try io.Workspace.init(scratch.ptr, scratch.len);
             const dictionary = try workspace.take(u8, properties.dictionary_size);
+            // Tables assigned and filled before the decoder runs, so `undefined` is safe.
             var self = Self{
                 .properties = properties,
                 .dictionary = dictionary,
-                .dict_pos = 0,
-                .dict_full = false,
-                .dict_floor = 0,
+                .dictionary_pos = 0,
+                .dictionary_full = false,
+                .dictionary_floor = 0,
                 .total_pos = 0,
-                .rc = undefined,
+                .range_coder = undefined,
                 .is_match = undefined,
                 .is_rep = undefined,
                 .is_rep_g0 = undefined,
@@ -778,8 +728,8 @@ pub fn DecoderOf(comptime slice_input: bool) type {
                 .output_buffer = null,
                 .output_pos = 0,
                 .output_writer = null,
-                .out_buf = undefined,
-                .out_len = 0,
+                .staging_buffer = undefined,
+                .staging_length = 0,
                 .clear_dictionary = true,
             };
             try takeTables(&self, &workspace, properties);
@@ -791,14 +741,15 @@ pub fn DecoderOf(comptime slice_input: bool) type {
 
         pub fn initPropertiesInPlace(properties: Properties, output: []u8, scratch: []u8) Failure!Self {
             var workspace = try io.Workspace.init(scratch.ptr, scratch.len);
+            // Tables assigned and filled before the decoder runs, so `undefined` is safe.
             var self = Self{
                 .properties = properties,
                 .dictionary = output,
-                .dict_pos = 0,
-                .dict_full = false,
-                .dict_floor = 0,
+                .dictionary_pos = 0,
+                .dictionary_full = false,
+                .dictionary_floor = 0,
                 .total_pos = 0,
-                .rc = undefined,
+                .range_coder = undefined,
                 .is_match = undefined,
                 .is_rep = undefined,
                 .is_rep_g0 = undefined,
@@ -825,8 +776,8 @@ pub fn DecoderOf(comptime slice_input: bool) type {
                 .output_buffer = null,
                 .output_pos = 0,
                 .output_writer = null,
-                .out_buf = undefined,
-                .out_len = 0,
+                .staging_buffer = undefined,
+                .staging_length = 0,
                 .clear_dictionary = false,
             };
             try takeTables(&self, &workspace, properties);
@@ -846,11 +797,11 @@ pub fn DecoderOf(comptime slice_input: bool) type {
             if (comptime slice_input) {
                 return error.Unsupported;
             }
-            self.rc = try RC.init(_reader);
+            self.range_coder = try RC.init(_reader);
         }
 
         pub fn resetReaderSlice(self: *Self, data: []const u8) Failure!void {
-            self.rc = try RC.initSlice(data);
+            self.range_coder = try RC.initSlice(data);
         }
 
         pub fn resetState(self: *Self) void {
@@ -864,13 +815,11 @@ pub fn DecoderOf(comptime slice_input: bool) type {
         pub fn resetDictionary(self: *Self) void {
             if (self.clear_dictionary) {
                 @memset(self.dictionary, 0);
-                self.dict_pos = 0;
-                self.dict_full = false;
+                self.dictionary_pos = 0;
+                self.dictionary_full = false;
             } else {
-                // In-place decode: the output buffer is the dictionary, so a
-                // format-level reset cannot rewind the write position without
-                // corrupting already-produced output. Record it as a floor.
-                self.dict_floor = self.dict_pos;
+                // Output is the dictionary, so record reset as a floor instead of rewinding.
+                self.dictionary_floor = self.dictionary_pos;
             }
         }
 
@@ -879,13 +828,13 @@ pub fn DecoderOf(comptime slice_input: bool) type {
         }
 
         pub fn feedByte(self: *Self, byte: u8) void {
-            self.dictionary[self.dict_pos] = byte;
-            self.dict_pos += 1;
+            self.dictionary[self.dictionary_pos] = byte;
+            self.dictionary_pos += 1;
             self.total_pos +%= 1;
-            if (self.dict_pos == self.dictionary.len) {
+            if (self.dictionary_pos == self.dictionary.len) {
                 if (self.clear_dictionary) {
-                    self.dict_pos = 0;
-                    self.dict_full = true;
+                    self.dictionary_pos = 0;
+                    self.dictionary_full = true;
                 }
             }
         }
@@ -895,18 +844,16 @@ pub fn DecoderOf(comptime slice_input: bool) type {
             self.output_pos = 0;
             var remaining: ?u64 = unpack_size;
             if (comptime slice_input) {
-                // Local range-coder state: keeping range/code/input position out
-                // of the shared struct lets the compiler hold them in registers
-                // across the hot loop instead of round-tripping memory per bit.
-                var rc = self.rc;
-                defer self.rc = rc;
-                var prev_byte: u32 = if (self.dict_pos == 0 and !self.dict_full) 0 else self.getByte(1);
+                // Locals keep per-bit work in registers, not round-tripping memory.
+                var range_coder = self.range_coder;
+                defer self.range_coder = range_coder;
+                var prev_byte: u32 = if (self.dictionary_pos == 0 and !self.dictionary_full) 0 else self.getByte(1);
                 while (true) {
-                    if (rc.corrupted) return error.InvalidData;
-                    if (remaining) |*r| {
-                        if (r.* == 0) {
+                    if (range_coder.corrupted) return error.InvalidData;
+                    if (remaining) |*remaining_count| {
+                        if (remaining_count.* == 0) {
                             if (!marker_required) {
-                                if (rc.isFinishedOk()) {
+                                if (range_coder.isFinishedOk()) {
                                     try self.finishOutput();
                                     return;
                                 }
@@ -915,88 +862,84 @@ pub fn DecoderOf(comptime slice_input: bool) type {
                             }
                         }
                     }
-                    const pos_state = self.total_pos & ((@as(u32, 1) << @intCast(self.properties.pb)) - 1);
-                    const state2 = (self.state << num_pos_bits_max) + pos_state;
-                    if (rc.decodeBit(&self.is_match[state2]) == 0) {
-                        // Literal
-                        prev_byte = try self.decodeLiteral(&rc, prev_byte);
+                    const position_state = self.total_pos & ((@as(u32, 1) << @intCast(self.properties.pb)) - 1);
+                    const state2 = (self.state << num_pos_bits_max) + position_state;
+                    if (range_coder.decodeBit(&self.is_match[state2]) == 0) {
+                        prev_byte = try self.decodeLiteral(&range_coder, prev_byte);
                         self.state = updateStateLiteral(self.state);
-                        if (remaining) |*r| r.* -= 1;
+                        if (remaining) |*remaining_count| remaining_count.* -= 1;
                         continue;
                     }
-                    var len: u32 = undefined;
-                    if (rc.decodeBit(&self.is_rep[self.state]) == 0) {
-                        // Simple match
+                    // Assigned on both match branches, so `undefined` is safe.
+                    var length: u32 = undefined;
+                    if (range_coder.decodeBit(&self.is_rep[self.state]) == 0) {
                         self.rep3 = self.rep2;
                         self.rep2 = self.rep1;
                         self.rep1 = self.rep0;
                         self.state = updateStateMatch(self.state);
-                        len = try self.decodeLength(&rc, pos_state, false);
-                        self.rep0 = try self.decodeDistance(&rc, len);
+                        length = try self.decodeLength(&range_coder, position_state, false);
+                        self.rep0 = try self.decodeDistance(&range_coder, length);
                         if (self.rep0 == 0xFFFFFFFF) {
-                            if (!rc.isFinishedOk()) return error.InvalidData;
+                            if (!range_coder.isFinishedOk()) return error.InvalidData;
                             if (marker_required and remaining != null and remaining.? != 0) return error.InvalidData;
                             try self.finishOutput();
                             return;
                         }
                         if (self.rep0 >= self.properties.dictionary_size or !self.checkDistance(self.rep0)) return error.InvalidData;
                     } else {
-                        // Rep match
-                        if (self.dict_pos == 0 and !self.dict_full) return error.InvalidData;
-                        if (rc.decodeBit(&self.is_rep_g0[self.state]) == 0) {
-                            if (rc.decodeBit(&self.is_rep0_long[state2]) == 0) {
-                                // Short rep
+                        if (self.dictionary_pos == 0 and !self.dictionary_full) return error.InvalidData;
+                        if (range_coder.decodeBit(&self.is_rep_g0[self.state]) == 0) {
+                            if (range_coder.decodeBit(&self.is_rep0_long[state2]) == 0) {
                                 self.state = updateStateShortRep(self.state);
                                 const byte = self.getByte(self.rep0 + 1);
                                 try self.putByte(byte);
                                 prev_byte = byte;
-                                if (remaining) |*r| r.* -= 1;
+                                if (remaining) |*remaining_count| remaining_count.* -= 1;
                                 continue;
                             }
-                            // Rep match 0: no distance history change.
                         } else {
-                            if (rc.decodeBit(&self.is_rep_g1[self.state]) == 0) {
-                                const dist = self.rep1;
+                            if (range_coder.decodeBit(&self.is_rep_g1[self.state]) == 0) {
+                                const distance = self.rep1;
                                 self.rep1 = self.rep0;
-                                self.rep0 = dist;
+                                self.rep0 = distance;
                             } else {
-                                if (rc.decodeBit(&self.is_rep_g2[self.state]) == 0) {
-                                    const dist = self.rep2;
+                                if (range_coder.decodeBit(&self.is_rep_g2[self.state]) == 0) {
+                                    const distance = self.rep2;
                                     self.rep2 = self.rep1;
                                     self.rep1 = self.rep0;
-                                    self.rep0 = dist;
+                                    self.rep0 = distance;
                                 } else {
-                                    const dist = self.rep3;
+                                    const distance = self.rep3;
                                     self.rep3 = self.rep2;
                                     self.rep2 = self.rep1;
                                     self.rep1 = self.rep0;
-                                    self.rep0 = dist;
+                                    self.rep0 = distance;
                                 }
                             }
                         }
-                        len = try self.decodeLength(&rc, pos_state, true);
+                        length = try self.decodeLength(&range_coder, position_state, true);
                         self.state = updateStateRep(self.state);
                     }
-                    len += match_min_len;
+                    length += match_min_len;
                     var is_error = false;
-                    if (remaining) |*r| {
-                        if (r.* < len) {
-                            len = @intCast(r.*);
+                    if (remaining) |*remaining_count| {
+                        if (remaining_count.* < length) {
+                            length = @intCast(remaining_count.*);
                             is_error = true;
                         }
-                        r.* -= len;
+                        remaining_count.* -= length;
                     }
-                    try self.copyMatch(self.rep0 + 1, len);
+                    try self.copyMatch(self.rep0 + 1, length);
                     if (is_error) return error.InvalidData;
                     prev_byte = self.getByte(1);
                 }
             } else {
-                var prev_byte: u32 = if (self.dict_pos == 0 and !self.dict_full) 0 else self.getByte(1);
+                var prev_byte: u32 = if (self.dictionary_pos == 0 and !self.dictionary_full) 0 else self.getByte(1);
                 while (true) {
-                    if (remaining) |*r| {
-                        if (r.* == 0) {
+                    if (remaining) |*remaining_count| {
+                        if (remaining_count.* == 0) {
                             if (!marker_required) {
-                                if (self.rc.isFinishedOk()) {
+                                if (self.range_coder.isFinishedOk()) {
                                     try self.finishOutput();
                                     return;
                                 }
@@ -1005,85 +948,81 @@ pub fn DecoderOf(comptime slice_input: bool) type {
                             }
                         }
                     }
-                    const pos_state = self.total_pos & ((@as(u32, 1) << @intCast(self.properties.pb)) - 1);
-                    const state2 = (self.state << num_pos_bits_max) + pos_state;
-                    if (try self.rc.decodeBit(&self.is_match[state2]) == 0) {
-                        // Literal
-                        prev_byte = try self.decodeLiteral(&self.rc, prev_byte);
+                    const position_state = self.total_pos & ((@as(u32, 1) << @intCast(self.properties.pb)) - 1);
+                    const state2 = (self.state << num_pos_bits_max) + position_state;
+                    if (try self.range_coder.decodeBit(&self.is_match[state2]) == 0) {
+                        prev_byte = try self.decodeLiteral(&self.range_coder, prev_byte);
                         self.state = updateStateLiteral(self.state);
-                        if (remaining) |*r| r.* -= 1;
+                        if (remaining) |*remaining_count| remaining_count.* -= 1;
                         continue;
                     }
-                    var len: u32 = undefined;
-                    if (try self.rc.decodeBit(&self.is_rep[self.state]) == 0) {
-                        // Simple match
+                    // Assigned on both match branches, so `undefined` is safe.
+                    var length: u32 = undefined;
+                    if (try self.range_coder.decodeBit(&self.is_rep[self.state]) == 0) {
                         self.rep3 = self.rep2;
                         self.rep2 = self.rep1;
                         self.rep1 = self.rep0;
                         self.state = updateStateMatch(self.state);
-                        len = try self.decodeLength(&self.rc, pos_state, false);
-                        self.rep0 = try self.decodeDistance(&self.rc, len);
+                        length = try self.decodeLength(&self.range_coder, position_state, false);
+                        self.rep0 = try self.decodeDistance(&self.range_coder, length);
                         if (self.rep0 == 0xFFFFFFFF) {
-                            if (!self.rc.isFinishedOk()) return error.InvalidData;
+                            if (!self.range_coder.isFinishedOk()) return error.InvalidData;
                             if (marker_required and remaining != null and remaining.? != 0) return error.InvalidData;
                             try self.finishOutput();
                             return;
                         }
                         if (self.rep0 >= self.properties.dictionary_size or !self.checkDistance(self.rep0)) return error.InvalidData;
                     } else {
-                        // Rep match
-                        if (self.dict_pos == 0 and !self.dict_full) return error.InvalidData;
-                        if (try self.rc.decodeBit(&self.is_rep_g0[self.state]) == 0) {
-                            if (try self.rc.decodeBit(&self.is_rep0_long[state2]) == 0) {
-                                // Short rep
+                        if (self.dictionary_pos == 0 and !self.dictionary_full) return error.InvalidData;
+                        if (try self.range_coder.decodeBit(&self.is_rep_g0[self.state]) == 0) {
+                            if (try self.range_coder.decodeBit(&self.is_rep0_long[state2]) == 0) {
                                 self.state = updateStateShortRep(self.state);
                                 const byte = self.getByte(self.rep0 + 1);
                                 try self.putByte(byte);
                                 prev_byte = byte;
-                                if (remaining) |*r| r.* -= 1;
+                                if (remaining) |*remaining_count| remaining_count.* -= 1;
                                 continue;
                             }
-                            // Rep match 0: no distance history change.
                         } else {
-                            if (try self.rc.decodeBit(&self.is_rep_g1[self.state]) == 0) {
-                                const dist = self.rep1;
+                            if (try self.range_coder.decodeBit(&self.is_rep_g1[self.state]) == 0) {
+                                const distance = self.rep1;
                                 self.rep1 = self.rep0;
-                                self.rep0 = dist;
+                                self.rep0 = distance;
                             } else {
-                                if (try self.rc.decodeBit(&self.is_rep_g2[self.state]) == 0) {
-                                    const dist = self.rep2;
+                                if (try self.range_coder.decodeBit(&self.is_rep_g2[self.state]) == 0) {
+                                    const distance = self.rep2;
                                     self.rep2 = self.rep1;
                                     self.rep1 = self.rep0;
-                                    self.rep0 = dist;
+                                    self.rep0 = distance;
                                 } else {
-                                    const dist = self.rep3;
+                                    const distance = self.rep3;
                                     self.rep3 = self.rep2;
                                     self.rep2 = self.rep1;
                                     self.rep1 = self.rep0;
-                                    self.rep0 = dist;
+                                    self.rep0 = distance;
                                 }
                             }
                         }
-                        len = try self.decodeLength(&self.rc, pos_state, true);
+                        length = try self.decodeLength(&self.range_coder, position_state, true);
                         self.state = updateStateRep(self.state);
                     }
-                    len += match_min_len;
+                    length += match_min_len;
                     var is_error = false;
-                    if (remaining) |*r| {
-                        if (r.* < len) {
-                            len = @intCast(r.*);
+                    if (remaining) |*remaining_count| {
+                        if (remaining_count.* < length) {
+                            length = @intCast(remaining_count.*);
                             is_error = true;
                         }
-                        r.* -= len;
+                        remaining_count.* -= length;
                     }
-                    try self.copyMatch(self.rep0 + 1, len);
+                    try self.copyMatch(self.rep0 + 1, length);
                     if (is_error) return error.InvalidData;
                     prev_byte = self.getByte(1);
                 }
             }
         }
 
-        fn decodeLiteral(self: *Self, rc: *RC, prev_byte: u32) Failure!u8 {
+        fn decodeLiteral(self: *Self, range_coder: *RC, prev_byte: u32) Failure!u8 {
             const lit_state = ((self.total_pos & ((@as(u32, 1) << @intCast(self.properties.lp)) - 1)) << @intCast(self.properties.lc)) +
                 (prev_byte >> @intCast(8 - self.properties.lc));
             const probs = self.literal_probs[lit_state * literal_probs_count ..][0..literal_probs_count];
@@ -1092,27 +1031,26 @@ pub fn DecoderOf(comptime slice_input: bool) type {
                 if (self.state >= 7) {
                     var match = self.getByte(self.rep0 + 1);
                     var use_match = true;
-                    // The tree walk always runs exactly 8 bits: symbol stays
-                    // below 0x100 before the last shift.
+                    // Exactly 8 steps: symbol stays below 0x100 until the last shift.
                     inline for (0..8) |_| {
                         if (use_match) {
                             const match_bit: u32 = (match >> 7) & 1;
                             match <<= 1;
-                            const bit = rc.decodeBit(&probs[((1 + match_bit) << 8) + symbol]);
+                            const bit = range_coder.decodeBit(&probs[((1 + match_bit) << 8) + symbol]);
                             symbol = (symbol << 1) | bit;
                             if (match_bit != bit) use_match = false;
                         } else {
-                            const bit = rc.decodeBit(&probs[symbol]);
+                            const bit = range_coder.decodeBit(&probs[symbol]);
                             symbol = (symbol << 1) | bit;
                         }
                     }
                 } else {
                     inline for (0..8) |_| {
-                        const bit = rc.decodeBit(&probs[symbol]);
+                        const bit = range_coder.decodeBit(&probs[symbol]);
                         symbol = (symbol << 1) | bit;
                     }
                 }
-                if (rc.corrupted) return error.InvalidData;
+                if (range_coder.corrupted) return error.InvalidData;
                 const byte: u8 = @intCast(symbol - 0x100);
                 try self.putByte(byte);
                 return byte;
@@ -1124,17 +1062,17 @@ pub fn DecoderOf(comptime slice_input: bool) type {
                         if (use_match) {
                             const match_bit: u32 = (match >> 7) & 1;
                             match <<= 1;
-                            const bit = try rc.decodeBit(&probs[((1 + match_bit) << 8) + symbol]);
+                            const bit = try range_coder.decodeBit(&probs[((1 + match_bit) << 8) + symbol]);
                             symbol = (symbol << 1) | bit;
                             if (match_bit != bit) use_match = false;
                         } else {
-                            const bit = try rc.decodeBit(&probs[symbol]);
+                            const bit = try range_coder.decodeBit(&probs[symbol]);
                             symbol = (symbol << 1) | bit;
                         }
                     }
                 } else {
                     inline for (0..8) |_| {
-                        const bit = try rc.decodeBit(&probs[symbol]);
+                        const bit = try range_coder.decodeBit(&probs[symbol]);
                         symbol = (symbol << 1) | bit;
                     }
                 }
@@ -1144,171 +1082,166 @@ pub fn DecoderOf(comptime slice_input: bool) type {
             }
         }
 
-        fn decodeLength(self: *Self, rc: *RC, pos_state: u32, comptime is_rep: bool) Failure!u32 {
+        fn decodeLength(self: *Self, range_coder: *RC, position_state: u32, comptime is_rep: bool) Failure!u32 {
             const choice = if (is_rep) &self.rep_len_choice[0] else &self.len_choice[0];
             const choice2 = if (is_rep) &self.rep_len_choice[1] else &self.len_choice[1];
             const low = if (is_rep) self.rep_len_low else self.len_low;
             const mid = if (is_rep) self.rep_len_mid else self.len_mid;
             const high = if (is_rep) self.rep_len_high else self.len_high;
             if (comptime slice_input) {
-                if (rc.decodeBit(choice) == 0) {
-                    const res = bitTreeDecodeFast(rc, low[pos_state * (1 << 3) ..][0..(1 << 3)], 3);
-                    if (rc.corrupted) return error.InvalidData;
+                if (range_coder.decodeBit(choice) == 0) {
+                    const res = bitTreeDecodeFast(range_coder, low[position_state * (1 << 3) ..][0..(1 << 3)], 3);
+                    if (range_coder.corrupted) return error.InvalidData;
                     return res;
                 }
-                if (rc.decodeBit(choice2) == 0) {
-                    const res = 8 + bitTreeDecodeFast(rc, mid[pos_state * (1 << 3) ..][0..(1 << 3)], 3);
-                    if (rc.corrupted) return error.InvalidData;
+                if (range_coder.decodeBit(choice2) == 0) {
+                    const res = 8 + bitTreeDecodeFast(range_coder, mid[position_state * (1 << 3) ..][0..(1 << 3)], 3);
+                    if (range_coder.corrupted) return error.InvalidData;
                     return res;
                 }
-                const res = 16 + bitTreeDecodeFast(rc, high, 8);
-                if (rc.corrupted) return error.InvalidData;
+                const res = 16 + bitTreeDecodeFast(range_coder, high, 8);
+                if (range_coder.corrupted) return error.InvalidData;
                 return res;
             }
-            if (try rc.decodeBit(choice) == 0) {
-                return try bitTreeDecode(rc, low[pos_state * (1 << 3) ..][0..(1 << 3)], 3);
+            if (try range_coder.decodeBit(choice) == 0) {
+                return try bitTreeDecode(range_coder, low[position_state * (1 << 3) ..][0..(1 << 3)], 3);
             }
-            if (try rc.decodeBit(choice2) == 0) {
-                return 8 + try bitTreeDecode(rc, mid[pos_state * (1 << 3) ..][0..(1 << 3)], 3);
+            if (try range_coder.decodeBit(choice2) == 0) {
+                return 8 + try bitTreeDecode(range_coder, mid[position_state * (1 << 3) ..][0..(1 << 3)], 3);
             }
-            return 16 + try bitTreeDecode(rc, high, 8);
+            return 16 + try bitTreeDecode(range_coder, high, 8);
         }
 
-        fn decodeDistance(self: *Self, rc: *RC, len: u32) Failure!u32 {
-            var len_state = len;
-            if (len_state > num_len_to_pos_states - 1) len_state = num_len_to_pos_states - 1;
+        fn decodeDistance(self: *Self, range_coder: *RC, length: u32) Failure!u32 {
+            var length_state = length;
+            if (length_state > num_len_to_pos_states - 1) length_state = num_len_to_pos_states - 1;
             if (comptime slice_input) {
-                const pos_slot = bitTreeDecodeFast(rc, self.pos_slot_decoders[len_state * (1 << 6) ..][0..(1 << 6)], 6);
-                if (rc.corrupted) return error.InvalidData;
+                const pos_slot = bitTreeDecodeFast(range_coder, self.pos_slot_decoders[length_state * (1 << 6) ..][0..(1 << 6)], 6);
+                if (range_coder.corrupted) return error.InvalidData;
                 if (pos_slot < 4) return pos_slot;
                 const num_direct_bits = (pos_slot >> 1) - 1;
-                var dist: u32 = (@as(u32, 2) | (pos_slot & 1)) << @intCast(num_direct_bits);
+                var distance: u32 = (@as(u32, 2) | (pos_slot & 1)) << @intCast(num_direct_bits);
                 if (pos_slot < end_pos_model_index) {
-                    dist += bitTreeReverseDecodeFast(rc, self.pos_decoders[dist - pos_slot ..], @intCast(num_direct_bits));
+                    distance += bitTreeReverseDecodeFast(range_coder, self.pos_decoders[distance - pos_slot ..], @intCast(num_direct_bits));
                 } else {
-                    dist += (rc.decodeDirectBits(@intCast(num_direct_bits - num_align_bits))) << num_align_bits;
-                    dist += bitTreeReverseDecodeFast(rc, self.align_decoder, num_align_bits);
+                    distance += (range_coder.decodeDirectBits(@intCast(num_direct_bits - num_align_bits))) << num_align_bits;
+                    distance += bitTreeReverseDecodeFast(range_coder, self.align_decoder, num_align_bits);
                 }
-                if (rc.corrupted) return error.InvalidData;
-                return dist;
+                if (range_coder.corrupted) return error.InvalidData;
+                return distance;
             }
-            const pos_slot = try bitTreeDecode(rc, self.pos_slot_decoders[len_state * (1 << 6) ..][0..(1 << 6)], 6);
+            const pos_slot = try bitTreeDecode(range_coder, self.pos_slot_decoders[length_state * (1 << 6) ..][0..(1 << 6)], 6);
             if (pos_slot < 4) return pos_slot;
             const num_direct_bits = (pos_slot >> 1) - 1;
-            var dist: u32 = (@as(u32, 2) | (pos_slot & 1)) << @intCast(num_direct_bits);
+            var distance: u32 = (@as(u32, 2) | (pos_slot & 1)) << @intCast(num_direct_bits);
             if (pos_slot < end_pos_model_index) {
-                dist += try bitTreeReverseDecode(rc, self.pos_decoders[dist - pos_slot ..], @intCast(num_direct_bits));
+                distance += try bitTreeReverseDecode(range_coder, self.pos_decoders[distance - pos_slot ..], @intCast(num_direct_bits));
             } else {
-                dist += (try rc.decodeDirectBits(@intCast(num_direct_bits - num_align_bits))) << num_align_bits;
-                dist += try bitTreeReverseDecode(rc, self.align_decoder, num_align_bits);
+                distance += (try range_coder.decodeDirectBits(@intCast(num_direct_bits - num_align_bits))) << num_align_bits;
+                distance += try bitTreeReverseDecode(range_coder, self.align_decoder, num_align_bits);
             }
-            return dist;
+            return distance;
         }
 
         fn putByte(self: *Self, byte: u8) Failure!void {
-            if (!self.clear_dictionary and self.dict_pos >= self.dictionary.len) return error.InsufficientCapacity;
-            self.dictionary[self.dict_pos] = byte;
-            self.dict_pos += 1;
+            if (!self.clear_dictionary and self.dictionary_pos >= self.dictionary.len) return error.InsufficientCapacity;
+            self.dictionary[self.dictionary_pos] = byte;
+            self.dictionary_pos += 1;
             self.total_pos +%= 1;
-            if (self.dict_pos == self.dictionary.len) {
-                self.dict_pos = 0;
-                self.dict_full = true;
+            if (self.dictionary_pos == self.dictionary.len) {
+                self.dictionary_pos = 0;
+                self.dictionary_full = true;
             }
             if (self.output_buffer) |output| {
                 if (self.output_pos >= output.len) return error.InsufficientCapacity;
                 output[self.output_pos] = byte;
                 self.output_pos += 1;
             } else if (self.output_writer) |writer| {
-                self.out_buf[self.out_len] = byte;
-                self.out_len += 1;
+                self.staging_buffer[self.staging_length] = byte;
+                self.staging_length += 1;
                 self.output_pos += 1;
-                if (self.out_len == self.out_buf.len) try self.flushOutput(writer);
+                if (self.staging_length == self.staging_buffer.len) try self.flushOutput(writer);
             } else {
                 self.output_pos += 1;
             }
         }
 
         fn flushOutput(self: *Self, writer: *std.Io.Writer) Failure!void {
-            try io.writeBytes(writer, self.out_buf[0..self.out_len]);
-            self.out_len = 0;
+            try io.writeBytes(writer, self.staging_buffer[0..self.staging_length]);
+            self.staging_length = 0;
         }
 
         fn finishOutput(self: *Self) Failure!void {
             if (self.output_writer) |writer| {
-                if (self.out_len > 0) try self.flushOutput(writer);
+                if (self.staging_length > 0) try self.flushOutput(writer);
             }
         }
 
-        fn getByte(self: Self, dist: u32) u8 {
-            const pos = if (dist <= self.dict_pos) self.dict_pos - dist else @as(u32, @intCast(self.dictionary.len)) - dist + self.dict_pos;
-            return self.dictionary[pos];
+        fn getByte(self: Self, distance: u32) u8 {
+            const position = if (distance <= self.dictionary_pos) self.dictionary_pos - distance else @as(u32, @intCast(self.dictionary.len)) - distance + self.dictionary_pos;
+            return self.dictionary[position];
         }
 
-        fn checkDistance(self: Self, dist: u32) bool {
-            // dist is 0-based: it reaches dist + 1 bytes back, so a full
-            // dictionary of dict_pos bytes only covers dist < dict_pos.
-            // In-place decode enforces the reset floor instead: matches may
-            // not reach before the most recent dictionary reset.
-            if (!self.clear_dictionary) return dist < self.dict_pos - self.dict_floor;
-            return dist < self.dict_pos or self.dict_full;
+        fn checkDistance(self: Self, distance: u32) bool {
+            // 0-based distance reaches distance+1 distance; in-place matches may not cross the reset floor.
+            if (!self.clear_dictionary) return distance < self.dictionary_pos - self.dictionary_floor;
+            return distance < self.dictionary_pos or self.dictionary_full;
         }
 
-        fn copyMatch(self: *Self, dist: u32, len: u32) Failure!void {
-            // decodeInPlace uses the output buffer as a linear dictionary. A
-            // single forward copy covers the match because the source window is
-            // contiguous and the destination is past the source.
+        fn copyMatch(self: *Self, distance: u32, length: u32) Failure!void {
+            // Linear dictionary: source is contiguous and before dest, so one forward copy covers it.
             if (!self.clear_dictionary) {
-                if (self.dict_pos + len > self.dictionary.len) return error.InsufficientCapacity;
-                kernels.copyMatch(self.dictionary, self.dict_pos, dist, len);
-                self.dict_pos += len;
-                self.total_pos +%= len;
+                if (self.dictionary_pos + length > self.dictionary.len) return error.InsufficientCapacity;
+                kernels.copyMatch(self.dictionary, self.dictionary_pos, distance, length);
+                self.dictionary_pos += length;
+                self.total_pos +%= length;
                 return;
             }
-            var remaining = len;
+            var remaining = length;
             while (remaining > 0) {
-                if (self.dict_pos >= self.dictionary.len) return error.InsufficientCapacity;
-                const src = if (dist <= self.dict_pos)
-                    self.dict_pos - dist
+                if (self.dictionary_pos >= self.dictionary.len) return error.InsufficientCapacity;
+                const source = if (distance <= self.dictionary_pos)
+                    self.dictionary_pos - distance
                 else
-                    self.dictionary.len - dist + self.dict_pos;
-                var chunk = @min(@as(usize, remaining), self.dictionary.len - self.dict_pos);
-                if (src > self.dict_pos) chunk = @min(chunk, self.dictionary.len - src);
+                    self.dictionary.len - distance + self.dictionary_pos;
+                var chunk = @min(@as(usize, remaining), self.dictionary.len - self.dictionary_pos);
+                if (source > self.dictionary_pos) chunk = @min(chunk, self.dictionary.len - source);
                 if (self.output_buffer) |output| {
                     chunk = @min(chunk, output.len - self.output_pos);
                     if (chunk == 0) return error.InsufficientCapacity;
                 }
-                if (src < self.dict_pos) {
-                    var covered: usize = dist;
+                if (source < self.dictionary_pos) {
+                    var covered: usize = distance;
                     var done: usize = 0;
                     while (done < chunk) {
                         const take = @min(covered, chunk - done);
-                        @memcpy(self.dictionary[self.dict_pos + done ..][0..take], self.dictionary[self.dict_pos + done - covered ..][0..take]);
+                        @memcpy(self.dictionary[self.dictionary_pos + done ..][0..take], self.dictionary[self.dictionary_pos + done - covered ..][0..take]);
                         done += take;
                         covered += take;
                     }
                 } else {
-                    @memmove(self.dictionary[self.dict_pos..][0..chunk], self.dictionary[src..][0..chunk]);
+                    @memmove(self.dictionary[self.dictionary_pos..][0..chunk], self.dictionary[source..][0..chunk]);
                 }
                 if (self.output_buffer) |output| {
-                    @memcpy(output[self.output_pos..][0..chunk], self.dictionary[self.dict_pos..][0..chunk]);
+                    @memcpy(output[self.output_pos..][0..chunk], self.dictionary[self.dictionary_pos..][0..chunk]);
                     self.output_pos += chunk;
                 } else if (self.output_writer) |writer| {
                     var offset: usize = 0;
                     while (offset < chunk) {
-                        const take = @min(chunk - offset, self.out_buf.len - self.out_len);
-                        @memcpy(self.out_buf[self.out_len..][0..take], self.dictionary[self.dict_pos + offset ..][0..take]);
-                        self.out_len += take;
+                        const take = @min(chunk - offset, self.staging_buffer.len - self.staging_length);
+                        @memcpy(self.staging_buffer[self.staging_length..][0..take], self.dictionary[self.dictionary_pos + offset ..][0..take]);
+                        self.staging_length += take;
                         offset += take;
-                        if (self.out_len == self.out_buf.len) try self.flushOutput(writer);
+                        if (self.staging_length == self.staging_buffer.len) try self.flushOutput(writer);
                     }
                     self.output_pos += chunk;
                 } else {
                     self.output_pos += chunk;
                 }
-                self.dict_pos += @intCast(chunk);
-                if (self.dict_pos == self.dictionary.len) {
-                    self.dict_pos = 0;
-                    self.dict_full = true;
+                self.dictionary_pos += @intCast(chunk);
+                if (self.dictionary_pos == self.dictionary.len) {
+                    self.dictionary_pos = 0;
+                    self.dictionary_full = true;
                 }
                 self.total_pos +%= @intCast(chunk);
                 remaining -= @intCast(chunk);
@@ -1339,16 +1272,14 @@ fn updateStateShortRep(state: u32) u32 {
 
 fn initProbs(probs: []Prob) void {
     @memset(std.mem.sliceAsBytes(probs), 0);
-    for (probs) |*p| p.* = prob_init;
+    for (probs) |*prob_entry| prob_entry.* = prob_init;
 }
 
 pub fn decode(input: []const u8, output: []u8, scratch: []u8, options: Options) Failure!usize {
     const needed = decodeWorkspaceSize(options.properties);
     if (scratch.len < needed) return error.InsufficientCapacity;
     if (input.len + output.len > options.max_work) return error.ResourceLimit;
-    // Use the in-place dictionary path: the output buffer is large enough to
-    // hold the decoded stream, so it can serve as the dictionary window and
-    // avoid a per-byte copy to a separate output buffer.
+    // Output doubles as dictionary window, avoiding a separate copy.
     var decoder = try DecoderOf(true).initPropertiesInPlace(options.properties, output, scratch);
     try decoder.resetReaderSlice(input);
     try decoder.decodeToOutput(null, options.unpack_size, options.marker_required);
@@ -1394,14 +1325,8 @@ pub fn requiredSize(input: []const u8, scratch: []u8, options: Options) Failure!
     return std.math.cast(usize, counter.written()) orelse error.ResourceLimit;
 }
 
-// Sizing estimate for the LZMA2 chunk probe: one greedy forward pass with the
-// live model (no DP window, no range coder) priced through kBitPrice. The
-// dictionary clamps to the next power of two >= the chunk length (floored at
-// dictionary_min) — every match distance is bounded by the chunk anyway — so
-// the per-probe finder-table clears scale with the chunk, not the profile
-// dictionary. The estimate errs high by construction
-// (price-aware greedy acceptance, insert-only finder advance); the measured
-// divergence and margin calibration are documented at the probe in lzma2.zig.
+// Greedy live-model pass for the LZMA2 probe; dictionary clamps to chunk size so clears scale with chunk.
+// Calibration documented at the lzma2 probe.
 pub fn estimatedSize(input: []const u8, scratch: []u8, options: Options) Failure!usize {
     var props = options.properties;
     if (input.len < props.dictionary_size) {
@@ -1416,9 +1341,8 @@ pub fn estimatedSize(input: []const u8, scratch: []u8, options: Options) Failure
     var drain = std.Io.Writer.fixed(&.{});
     var encoder = try Encoder.init(props, &drain, scratch, probe_options);
     const price = try encoder.estimateInput(input);
-    // price_scale units per bit, 8 bits per byte: >> (price_scale_shift + 3).
     const payload = std.math.cast(usize, (price + (1 << 13) - 1) >> 13) orelse return error.ResourceLimit;
-    // 5 range-coder flush bytes plus the cache byte.
+    // 5 flush bytes plus the cache byte.
     return payload + 6;
 }
 
@@ -1437,13 +1361,9 @@ pub fn encodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, 
 pub const Encoder = struct {
     properties: Properties,
     dictionary: []u8,
-    dict_pos: u32,
-    dict_full: bool,
+    dictionary_pos: u32,
+    dictionary_full: bool,
     total_pos: u32,
-    // Hash-chain match finder state. head[bucket] stores the most recent
-    // position (offset by one so zero means empty) for each 4-byte hash;
-    // chain[slot] stores the previous same-hash position, one slot per window
-    // position. chain_window is dictionary_size + 1.
     head: []u32,
     chain: []u32,
     left: []u32,
@@ -1451,9 +1371,9 @@ pub const Encoder = struct {
     hash2: []u32,
     hash3: []u32,
     hash_mask: u32,
-    dict_mask: u32,
+    dictionary_mask: u32,
     chain_window: usize,
-    rc: RangeEncoder,
+    range_coder: RangeEncoder,
     is_match: []Prob,
     is_rep: []Prob,
     is_rep_g0: []Prob,
@@ -1482,8 +1402,6 @@ pub const Encoder = struct {
     state: u32,
     input: []const u8,
     input_base: usize,
-    // Optimal-parsing scratch (workspace-owned): the per-window optimum nodes,
-    // the extraction stack, and the derived price tables.
     opt: []Opt,
     decisions: []Decision,
     prices: *PriceTables,
@@ -1502,11 +1420,12 @@ pub const Encoder = struct {
         const decisions = try workspace.take(Decision, opt_window);
         const prices = &(try workspace.take(PriceTables, 1))[0];
         const literal_prices = try workspace.take(u32, properties.literalContextCount() << 8);
+        // Tables assigned and filled before the encoder runs, so `undefined` is safe.
         var self = Encoder{
             .properties = properties,
             .dictionary = dictionary,
-            .dict_pos = 0,
-            .dict_full = false,
+            .dictionary_pos = 0,
+            .dictionary_full = false,
             .total_pos = 0,
             .head = head,
             .chain = chain,
@@ -1515,9 +1434,9 @@ pub const Encoder = struct {
             .hash2 = hash2,
             .hash3 = hash3,
             .hash_mask = @intCast(matchFinderHashSize(properties.dictionary_size) - 1),
-            .dict_mask = if (properties.dictionary_size & (properties.dictionary_size - 1) == 0) properties.dictionary_size - 1 else 0,
+            .dictionary_mask = if (properties.dictionary_size & (properties.dictionary_size - 1) == 0) properties.dictionary_size - 1 else 0,
             .chain_window = matchFinderChainSize(properties.dictionary_size),
-            .rc = RangeEncoder.init(writer),
+            .range_coder = RangeEncoder.init(writer),
             .is_match = undefined,
             .is_rep = undefined,
             .is_rep_g0 = undefined,
@@ -1561,48 +1480,45 @@ pub const Encoder = struct {
 
     inline fn priceBit(prob: Prob, bit: u1) u32 {
         const idx = prob >> 4;
-        if (bit == 0) return kBitPrice[idx];
-        const q = 2048 - @as(u32, prob);
-        const idx1 = if (q > 2047) 127 else q >> 4;
-        return kBitPrice[idx1];
+        if (bit == 0) return bit_price[idx];
+        const complement = 2048 - @as(u32, prob);
+        const idx1 = if (complement > 2047) 127 else complement >> 4;
+        return bit_price[idx1];
     }
 
     inline fn bitTreePrice(comptime num_bits: u5, probs: []const Prob, symbol: u32) u32 {
         var price: u32 = 0;
-        var m: u32 = 1;
+        var node: u32 = 1;
         inline for (0..num_bits) |i| {
             const bit = (symbol >> @intCast(num_bits - 1 - i)) & 1;
-            price += priceBit(probs[m], @intCast(bit));
-            m = (m << 1) | bit;
+            price += priceBit(probs[node], @intCast(bit));
+            node = (node << 1) | bit;
         }
         return price;
     }
 
     inline fn bitTreeReversePrice(num_bits: u5, probs: []const Prob, symbol: u32) u32 {
         var price: u32 = 0;
-        var m: u32 = 1;
+        var node: u32 = 1;
         var i: u5 = 0;
         while (i < num_bits) : (i += 1) {
             const bit = (symbol >> i) & 1;
-            price += priceBit(probs[m], @intCast(bit));
-            m = (m << 1) | bit;
+            price += priceBit(probs[node], @intCast(bit));
+            node = (node << 1) | bit;
         }
         return price;
     }
 
-    // Matched-literal price: walks the actual byte against the match byte,
-    // mirroring encodeLiteral's tree indexing (match-context rows until the
-    // first differing bit, then the plain tree).
     inline fn matchedLiteralPrice(probs: []const Prob, literal: u8, match_byte: u8) u32 {
         var price: u32 = 0;
         var symbol: u32 = 1;
         var lit: u32 = literal;
-        var mb: u32 = match_byte;
+        var match_bits: u32 = match_byte;
         var use_match = true;
         inline for (0..8) |_| {
             if (symbol >= 0x100) break;
-            const match_bit = (mb >> 7) & 1;
-            mb <<= 1;
+            const match_bit = (match_bits >> 7) & 1;
+            match_bits <<= 1;
             const bit = (lit >> 7) & 1;
             lit <<= 1;
             const idx = if (use_match) ((1 + match_bit) << 8) + symbol else symbol;
@@ -1613,40 +1529,38 @@ pub const Encoder = struct {
         return price;
     }
 
-    // Refresh every price table from the live probability model. Runs once per
-    // optimum window; the model stays frozen while the window is planned.
     fn buildPrices(self: *Encoder) void {
         const prices = self.prices;
-        for (self.is_match, 0..) |p, i| {
-            prices.is_match[i][0] = priceBit(p, 0);
-            prices.is_match[i][1] = priceBit(p, 1);
+        for (self.is_match, 0..) |probability, i| {
+            prices.is_match[i][0] = priceBit(probability, 0);
+            prices.is_match[i][1] = priceBit(probability, 1);
         }
-        for (self.is_rep, 0..) |p, i| {
-            prices.is_rep[i][0] = priceBit(p, 0);
-            prices.is_rep[i][1] = priceBit(p, 1);
+        for (self.is_rep, 0..) |probability, i| {
+            prices.is_rep[i][0] = priceBit(probability, 0);
+            prices.is_rep[i][1] = priceBit(probability, 1);
         }
-        for (self.is_rep_g0, 0..) |p, i| {
-            prices.is_rep_g0[i][0] = priceBit(p, 0);
-            prices.is_rep_g0[i][1] = priceBit(p, 1);
+        for (self.is_rep_g0, 0..) |probability, i| {
+            prices.is_rep_g0[i][0] = priceBit(probability, 0);
+            prices.is_rep_g0[i][1] = priceBit(probability, 1);
         }
-        for (self.is_rep_g1, 0..) |p, i| {
-            prices.is_rep_g1[i][0] = priceBit(p, 0);
-            prices.is_rep_g1[i][1] = priceBit(p, 1);
+        for (self.is_rep_g1, 0..) |probability, i| {
+            prices.is_rep_g1[i][0] = priceBit(probability, 0);
+            prices.is_rep_g1[i][1] = priceBit(probability, 1);
         }
-        for (self.is_rep_g2, 0..) |p, i| {
-            prices.is_rep_g2[i][0] = priceBit(p, 0);
-            prices.is_rep_g2[i][1] = priceBit(p, 1);
+        for (self.is_rep_g2, 0..) |probability, i| {
+            prices.is_rep_g2[i][0] = priceBit(probability, 0);
+            prices.is_rep_g2[i][1] = priceBit(probability, 1);
         }
-        for (self.is_rep0_long, 0..) |p, i| {
-            prices.is_rep0_long[i][0] = priceBit(p, 0);
-            prices.is_rep0_long[i][1] = priceBit(p, 1);
+        for (self.is_rep0_long, 0..) |probability, i| {
+            prices.is_rep0_long[i][0] = priceBit(probability, 0);
+            prices.is_rep0_long[i][1] = priceBit(probability, 1);
         }
         const pos_states: usize = @as(usize, 1) << @intCast(self.properties.pb);
-        for (0..pos_states) |ps| {
-            const low = self.len_low[ps * (1 << 3) ..][0..(1 << 3)];
-            const mid = self.len_mid[ps * (1 << 3) ..][0..(1 << 3)];
-            const low_rep = self.rep_len_low[ps * (1 << 3) ..][0..(1 << 3)];
-            const mid_rep = self.rep_len_mid[ps * (1 << 3) ..][0..(1 << 3)];
+        for (0..pos_states) |position_state| {
+            const low = self.len_low[position_state * (1 << 3) ..][0..(1 << 3)];
+            const mid = self.len_mid[position_state * (1 << 3) ..][0..(1 << 3)];
+            const low_rep = self.rep_len_low[position_state * (1 << 3) ..][0..(1 << 3)];
+            const mid_rep = self.rep_len_mid[position_state * (1 << 3) ..][0..(1 << 3)];
             const c0 = priceBit(self.len_choice[0], 0);
             const c10 = priceBit(self.len_choice[0], 1) + priceBit(self.len_choice[1], 0);
             const c11 = priceBit(self.len_choice[0], 1) + priceBit(self.len_choice[1], 1);
@@ -1655,41 +1569,41 @@ pub const Encoder = struct {
             const r11 = priceBit(self.rep_len_choice[0], 1) + priceBit(self.rep_len_choice[1], 1);
             var raw: u32 = 0;
             while (raw <= max_match_len - match_min_len) : (raw += 1) {
-                const len = raw + match_min_len;
+                const length = raw + match_min_len;
                 if (raw < 8) {
-                    prices.len[ps][len] = c0 + bitTreePrice(3, low, raw);
-                    prices.rep_len[ps][len] = r0 + bitTreePrice(3, low_rep, raw);
+                    prices.length_prices[position_state][length] = c0 + bitTreePrice(3, low, raw);
+                    prices.repeat_length_prices[position_state][length] = r0 + bitTreePrice(3, low_rep, raw);
                 } else if (raw < 16) {
-                    prices.len[ps][len] = c10 + bitTreePrice(3, mid, raw - 8);
-                    prices.rep_len[ps][len] = r10 + bitTreePrice(3, mid_rep, raw - 8);
+                    prices.length_prices[position_state][length] = c10 + bitTreePrice(3, mid, raw - 8);
+                    prices.repeat_length_prices[position_state][length] = r10 + bitTreePrice(3, mid_rep, raw - 8);
                 } else {
-                    prices.len[ps][len] = c11 + bitTreePrice(8, self.len_high, raw - 16);
-                    prices.rep_len[ps][len] = r11 + bitTreePrice(8, self.rep_len_high, raw - 16);
+                    prices.length_prices[position_state][length] = c11 + bitTreePrice(8, self.len_high, raw - 16);
+                    prices.repeat_length_prices[position_state][length] = r11 + bitTreePrice(8, self.rep_len_high, raw - 16);
                 }
             }
         }
-        for (0..num_len_to_pos_states) |len_state| {
-            const slot_probs = self.pos_slot_decoders[len_state * (1 << 6) ..][0..(1 << 6)];
+        for (0..num_len_to_pos_states) |length_state| {
+            const slot_probs = self.pos_slot_decoders[length_state * (1 << 6) ..][0..(1 << 6)];
             var slot: u32 = 0;
             while (slot < 64) : (slot += 1) {
-                prices.slot[len_state][slot] = bitTreePrice(6, slot_probs, slot);
+                prices.slot[length_state][slot] = bitTreePrice(6, slot_probs, slot);
             }
-            var d: u32 = 0;
-            while (d < num_full_distances) : (d += 1) {
-                if (d < 4) {
-                    prices.dist[len_state][d] = prices.slot[len_state][d];
+            var distance: u32 = 0;
+            while (distance < num_full_distances) : (distance += 1) {
+                if (distance < 4) {
+                    prices.distance_prices[length_state][distance] = prices.slot[length_state][distance];
                     continue;
                 }
-                const s = encodePosSlot(d);
-                const nd: u5 = @intCast((s >> 1) - 1);
-                const base_dist = (@as(u32, 2) | (s & 1)) << nd;
-                prices.dist[len_state][d] = prices.slot[len_state][s] +
-                    bitTreeReversePrice(nd, self.pos_decoders[base_dist - s ..], d - base_dist);
+                const pos_slot = encodePosSlot(distance);
+                const direct_count: u5 = @intCast((pos_slot >> 1) - 1);
+                const base_dist = (@as(u32, 2) | (pos_slot & 1)) << direct_count;
+                prices.distance_prices[length_state][distance] = prices.slot[length_state][pos_slot] +
+                    bitTreeReversePrice(direct_count, self.pos_decoders[base_dist - pos_slot ..], distance - base_dist);
             }
         }
-        var a: u32 = 0;
-        while (a < align_size) : (a += 1) {
-            prices.align_prices[a] = bitTreeReversePrice(num_align_bits, self.align_decoder, a);
+        var align_index: u32 = 0;
+        while (align_index < align_size) : (align_index += 1) {
+            prices.align_prices[align_index] = bitTreeReversePrice(num_align_bits, self.align_decoder, align_index);
         }
         const contexts = self.properties.literalContextCount();
         for (0..contexts) |ctx| {
@@ -1697,59 +1611,56 @@ pub const Encoder = struct {
             var sym: u32 = 0;
             while (sym < 256) : (sym += 1) {
                 var price: u32 = 0;
-                var m: u32 = 1;
+                var node: u32 = 1;
                 inline for (0..8) |i| {
                     const bit = (sym >> @intCast(7 - i)) & 1;
-                    price += priceBit(probs[m], @intCast(bit));
-                    m = (m << 1) | bit;
+                    price += priceBit(probs[node], @intCast(bit));
+                    node = (node << 1) | bit;
                 }
                 self.literal_prices[ctx * 256 + sym] = price;
             }
         }
     }
 
-    inline fn distPrice(self: *const Encoder, len_state: u32, dist0: u32) u32 {
-        if (dist0 < num_full_distances) return self.prices.dist[len_state][dist0];
-        const slot = encodePosSlot(dist0);
-        const nd = (slot >> 1) - 1;
-        return self.prices.slot[len_state][slot] +
-            (nd - num_align_bits) * price_scale +
-            self.prices.align_prices[dist0 & (align_size - 1)];
+    inline fn distancePrice(self: *const Encoder, length_state: u32, distance: u32) u32 {
+        if (distance < num_full_distances) return self.prices.distance_prices[length_state][distance];
+        const slot = encodePosSlot(distance);
+        const direct_count = (slot >> 1) - 1;
+        return self.prices.slot[length_state][slot] +
+            (direct_count - num_align_bits) * price_scale +
+            self.prices.align_prices[distance & (align_size - 1)];
     }
 
     pub fn encodeInput(self: *Encoder, input: []const u8, marker_required: bool) Failure!void {
         self.input = input;
         self.input_base = self.total_pos;
-        var pos: usize = 0;
-        while (pos < input.len) {
-            const w_len = @min(opt_window, input.len - pos);
+        var position: usize = 0;
+        while (position < input.len) {
+            const window_length = @min(opt_window, input.len - position);
             self.buildPrices();
-            const count = self.planWindow(pos, w_len);
-            try self.encodeWindow(pos, count);
-            pos += w_len;
+            const count = self.planWindow(position, window_length);
+            try self.encodeWindow(position, count);
+            position += window_length;
         }
         if (marker_required) {
-            const pos_state = self.total_pos & ((@as(u32, 1) << @intCast(self.properties.pb)) - 1);
-            const state2 = (self.state << num_pos_bits_max) + pos_state;
-            try self.rc.encodeBit(&self.is_match[state2], 1);
-            try self.rc.encodeBit(&self.is_rep[self.state], 0);
+            const position_state = self.total_pos & ((@as(u32, 1) << @intCast(self.properties.pb)) - 1);
+            const state2 = (self.state << num_pos_bits_max) + position_state;
+            try self.range_coder.encodeBit(&self.is_match[state2], 1);
+            try self.range_coder.encodeBit(&self.is_rep[self.state], 0);
             self.rep3 = self.rep2;
             self.rep2 = self.rep1;
             self.rep1 = self.rep0;
             self.state = updateStateMatch(self.state);
-            try self.encodeLength(&self.rc, pos_state, 0);
-            try self.encodeEndMarker(&self.rc);
+            try self.encodeLength(&self.range_coder, position_state, 0);
+            try self.encodeEndMarker(&self.range_coder);
         }
-        try self.rc.finish();
+        try self.range_coder.finish();
         self.input = &.{};
     }
 
-    // Live-model prices for the estimator's greedy acceptance test: a match
-    // is taken only when its coded price beats the literal run it replaces,
-    // so sparse far matches on binary data cannot inflate the estimate past
-    // the LZMA2 pack-field boundary.
+    // Price-aware acceptance stops sparse far matches inflating past the pack boundary.
     fn literalLivePrice(self: *const Encoder, byte: u8) u32 {
-        const prev_byte: u32 = if (self.dict_pos == 0 and !self.dict_full) 0 else self.getByte(1);
+        const prev_byte: u32 = if (self.dictionary_pos == 0 and !self.dictionary_full) 0 else self.getByte(1);
         const lit_state = ((self.total_pos & ((@as(u32, 1) << @intCast(self.properties.lp)) - 1)) << @intCast(self.properties.lc)) +
             (prev_byte >> @intCast(8 - self.properties.lc));
         const probs = self.literal_probs[lit_state * literal_probs_count ..][0..literal_probs_count];
@@ -1766,20 +1677,20 @@ pub const Encoder = struct {
         return price;
     }
 
-    fn lenLivePrice(choice: []const Prob, low: []const Prob, mid: []const Prob, high: []const Prob, pos_state: u32, raw_len: u32) u32 {
-        if (raw_len < 8) return priceBit(choice[0], 0) + bitTreePrice(3, low[pos_state * (1 << 3) ..][0..(1 << 3)], raw_len);
-        if (raw_len < 16) return priceBit(choice[0], 1) + priceBit(choice[1], 0) + bitTreePrice(3, mid[pos_state * (1 << 3) ..][0..(1 << 3)], raw_len - 8);
-        return priceBit(choice[0], 1) + priceBit(choice[1], 1) + bitTreePrice(8, high, raw_len - 16);
+    fn lengthLivePrice(choice: []const Prob, low: []const Prob, mid: []const Prob, high: []const Prob, position_state: u32, raw_length: u32) u32 {
+        if (raw_length < 8) return priceBit(choice[0], 0) + bitTreePrice(3, low[position_state * (1 << 3) ..][0..(1 << 3)], raw_length);
+        if (raw_length < 16) return priceBit(choice[0], 1) + priceBit(choice[1], 0) + bitTreePrice(3, mid[position_state * (1 << 3) ..][0..(1 << 3)], raw_length - 8);
+        return priceBit(choice[0], 1) + priceBit(choice[1], 1) + bitTreePrice(8, high, raw_length - 16);
     }
 
-    fn distLivePrice(self: *const Encoder, raw_len: u32, dist0: u32) u32 {
-        const pos_slot = encodePosSlot(dist0);
-        const len_state: u32 = @min(raw_len, num_len_to_pos_states - 1);
-        const price = bitTreePrice(6, self.pos_slot_decoders[len_state * (1 << 6) ..][0..(1 << 6)], pos_slot);
+    fn distanceLivePrice(self: *const Encoder, raw_length: u32, distance: u32) u32 {
+        const pos_slot = encodePosSlot(distance);
+        const length_state: u32 = @min(raw_length, num_len_to_pos_states - 1);
+        const price = bitTreePrice(6, self.pos_slot_decoders[length_state * (1 << 6) ..][0..(1 << 6)], pos_slot);
         if (pos_slot < 4) return price;
         const num_direct_bits: u5 = @intCast((pos_slot >> 1) - 1);
         const base_dist = (@as(u32, 2) | (pos_slot & 1)) << num_direct_bits;
-        const offset = dist0 - base_dist;
+        const offset = distance - base_dist;
         if (pos_slot < end_pos_model_index) {
             return price + bitTreeReversePrice(num_direct_bits, self.pos_decoders[base_dist - pos_slot ..], offset);
         }
@@ -1787,186 +1698,172 @@ pub const Encoder = struct {
             bitTreeReversePrice(num_align_bits, self.align_decoder, offset & (align_size - 1));
     }
 
-    fn matchLivePrice(self: *const Encoder, state2: u32, pos_state: u32, dist: u32, len: usize) u32 {
-        const raw_len: u32 = @intCast(len - match_min_len);
+    fn matchLivePrice(self: *const Encoder, state2: u32, position_state: u32, distance: u32, length: usize) u32 {
+        const raw_length: u32 = @intCast(length - match_min_len);
         return priceBit(self.is_match[state2], 1) + priceBit(self.is_rep[self.state], 0) +
-            lenLivePrice(self.len_choice, self.len_low, self.len_mid, self.len_high, pos_state, raw_len) +
-            self.distLivePrice(raw_len, dist - 1);
+            lengthLivePrice(self.len_choice, self.len_low, self.len_mid, self.len_high, position_state, raw_length) +
+            self.distanceLivePrice(raw_length, distance - 1);
     }
 
-    fn repLivePrice(self: *const Encoder, state2: u32, pos_state: u32, rep: usize, len: usize) u32 {
+    fn repLivePrice(self: *const Encoder, state2: u32, position_state: u32, rep_index: usize, length: usize) u32 {
         var price = priceBit(self.is_match[state2], 1) + priceBit(self.is_rep[self.state], 1);
-        price += switch (rep) {
+        price += switch (rep_index) {
             0 => priceBit(self.is_rep_g0[self.state], 0) + priceBit(self.is_rep0_long[state2], 1),
             1 => priceBit(self.is_rep_g0[self.state], 1) + priceBit(self.is_rep_g1[self.state], 0),
             2 => priceBit(self.is_rep_g0[self.state], 1) + priceBit(self.is_rep_g1[self.state], 1) + priceBit(self.is_rep_g2[self.state], 0),
             else => priceBit(self.is_rep_g0[self.state], 1) + priceBit(self.is_rep_g1[self.state], 1) + priceBit(self.is_rep_g2[self.state], 1),
         };
-        const raw_len: u32 = @intCast(len - match_min_len);
-        return price + lenLivePrice(self.rep_len_choice, self.rep_len_low, self.rep_len_mid, self.rep_len_high, pos_state, raw_len);
+        const raw_length: u32 = @intCast(length - match_min_len);
+        return price + lengthLivePrice(self.rep_len_choice, self.rep_len_low, self.rep_len_mid, self.rep_len_high, position_state, raw_length);
     }
 
-    // Insert-only advance for the estimator: positions covered by a taken
-    // match still feed the hash-chain finder tables so later positions see
-    // the same match offers the DP probe would; only the chain walk is
-    // skipped. Hash-chain only — the bt4 tree ordering cannot be maintained
-    // without the walk, so a bt4 probe just sees fewer offers (looser but
-    // still safe).
-    fn insertSkipped(self: *Encoder, pos: usize, len: usize) void {
+    // Insert-only: covered positions feed tables without the chain walk; bt4 sees fewer offers but stays safe.
+    fn insertSkipped(self: *Encoder, position: usize, length: usize) void {
         if (self.match_finder != .hash_chain) return;
-        var p = pos + 1;
-        const end = pos + len;
-        while (p < end) : (p += 1) {
-            if (p + 4 > self.input.len) return;
-            const abs_pos = self.input_base + p;
+        var cursor = position + 1;
+        const span_end = position + length;
+        while (cursor < span_end) : (cursor += 1) {
+            if (cursor + 4 > self.input.len) return;
+            const abs_pos = self.input_base + cursor;
             if (abs_pos >= std.math.maxInt(u32)) return;
-            const hash = self.hash4(p);
+            const hash = self.hash4(cursor);
             const slot = abs_pos % self.chain_window;
             self.chain[slot] = self.head[hash];
             self.head[hash] = @intCast(abs_pos + 1);
-            const b = self.input[p..];
-            const h2 = @as(u32, b[0]) | (@as(u32, b[1]) << 8);
+            const remaining_input = self.input[cursor..];
+            const h2 = @as(u32, remaining_input[0]) | (@as(u32, remaining_input[1]) << 8);
             self.hash2[h2] = @intCast(abs_pos + 1);
-            const w3 = h2 | (@as(u32, b[2]) << 16);
+            const w3 = h2 | (@as(u32, remaining_input[2]) << 16);
             const h3 = (w3 *% 0x9E3779B1) >> @as(u5, @intCast(32 - @as(u6, match_finder_hash3_bits)));
             self.hash3[h3] = @intCast(abs_pos + 1);
         }
     }
 
-    // One greedy forward pass charging fixed-point prices against the live
-    // model instead of emitting a bitstream: the LZMA2 sizing probe shape (no
-    // DP window, no range coder). Match-covered positions still enter the
-    // finder (insert-only, no chain walk) so the estimate stays tight on
-    // sparse-match data.
     fn estimateInput(self: *Encoder, input: []const u8) Failure!u64 {
         self.input = input;
         self.input_base = self.total_pos;
-        var pc = PriceCounter{};
+        var price_counter = PriceCounter{};
         const pb_mask = (@as(u32, 1) << @intCast(self.properties.pb)) - 1;
         var matches: [match_list_max]MatchPair = undefined;
-        var pos: usize = 0;
-        while (pos < input.len) {
-            const abs = self.input_base + pos;
-            const pos_state = @as(u32, @truncate(abs)) & pb_mask;
-            const state2 = (self.state << num_pos_bits_max) + pos_state;
-            const max_len = @min(max_match_len, input.len - pos);
-            var rep_len: [4]usize = .{ 0, 0, 0, 0 };
-            var best_rep: usize = 0;
-            var best_rep_len: usize = 0;
+        var position: usize = 0;
+        while (position < input.len) {
+            const abs = self.input_base + position;
+            const position_state = @as(u32, @truncate(abs)) & pb_mask;
+            const state2 = (self.state << num_pos_bits_max) + position_state;
+            const max_length = @min(max_match_len, input.len - position);
+            var rep_lengths: [4]usize = .{ 0, 0, 0, 0 };
+            var best_rep_index: usize = 0;
+            var best_rep_length: usize = 0;
             if (abs > 0) {
-                const backs = [4]u32{ self.rep0, self.rep1, self.rep2, self.rep3 };
-                for (0..4) |r| {
-                    const dist = @as(usize, backs[r]) + 1;
-                    if (dist > abs) continue;
-                    const l = self.matchLen(abs - dist, abs, max_len);
-                    rep_len[r] = l;
-                    if (l > best_rep_len) {
-                        best_rep_len = l;
-                        best_rep = r;
+                const rep_distances = [4]u32{ self.rep0, self.rep1, self.rep2, self.rep3 };
+                for (0..4) |rep_index| {
+                    const distance = @as(usize, rep_distances[rep_index]) + 1;
+                    if (distance > abs) continue;
+                    const match_length = self.matchLen(abs - distance, abs, max_length);
+                    rep_lengths[rep_index] = match_length;
+                    if (match_length > best_rep_length) {
+                        best_rep_length = match_length;
+                        best_rep_index = rep_index;
                     }
                 }
             }
-            const count = self.findMatches(pos, &matches);
-            const found_len: usize = if (count > 0) matches[count - 1].len else 0;
-            const lit_price = priceBit(self.is_match[state2], 0) + self.literalLivePrice(input[pos]);
-            const rep_ok = best_rep_len >= match_min_len and
-                self.repLivePrice(state2, pos_state, best_rep, best_rep_len) < best_rep_len * lit_price;
-            const match_ok = found_len >= match_min_len and
-                self.matchLivePrice(state2, pos_state, matches[count - 1].dist, found_len) < found_len * lit_price;
-            if ((rep_ok and best_rep_len >= found_len) or (rep_ok and !match_ok)) {
-                try pc.encodeBit(&self.is_match[state2], 1);
-                try pc.encodeBit(&self.is_rep[self.state], 1);
-                switch (best_rep) {
+            const count = self.findMatches(position, &matches);
+            const found_length: usize = if (count > 0) matches[count - 1].length else 0;
+            const lit_price = priceBit(self.is_match[state2], 0) + self.literalLivePrice(input[position]);
+            const rep_ok = best_rep_length >= match_min_len and
+                self.repLivePrice(state2, position_state, best_rep_index, best_rep_length) < best_rep_length * lit_price;
+            const match_ok = found_length >= match_min_len and
+                self.matchLivePrice(state2, position_state, matches[count - 1].distance, found_length) < found_length * lit_price;
+            if ((rep_ok and best_rep_length >= found_length) or (rep_ok and !match_ok)) {
+                try price_counter.encodeBit(&self.is_match[state2], 1);
+                try price_counter.encodeBit(&self.is_rep[self.state], 1);
+                switch (best_rep_index) {
                     0 => {
-                        try pc.encodeBit(&self.is_rep_g0[self.state], 0);
-                        try pc.encodeBit(&self.is_rep0_long[state2], 1);
+                        try price_counter.encodeBit(&self.is_rep_g0[self.state], 0);
+                        try price_counter.encodeBit(&self.is_rep0_long[state2], 1);
                     },
                     1 => {
-                        try pc.encodeBit(&self.is_rep_g0[self.state], 1);
-                        try pc.encodeBit(&self.is_rep_g1[self.state], 0);
-                        const dist = self.rep1;
+                        try price_counter.encodeBit(&self.is_rep_g0[self.state], 1);
+                        try price_counter.encodeBit(&self.is_rep_g1[self.state], 0);
+                        const distance = self.rep1;
                         self.rep1 = self.rep0;
-                        self.rep0 = dist;
+                        self.rep0 = distance;
                     },
                     2 => {
-                        try pc.encodeBit(&self.is_rep_g0[self.state], 1);
-                        try pc.encodeBit(&self.is_rep_g1[self.state], 1);
-                        try pc.encodeBit(&self.is_rep_g2[self.state], 0);
-                        const dist = self.rep2;
+                        try price_counter.encodeBit(&self.is_rep_g0[self.state], 1);
+                        try price_counter.encodeBit(&self.is_rep_g1[self.state], 1);
+                        try price_counter.encodeBit(&self.is_rep_g2[self.state], 0);
+                        const distance = self.rep2;
                         self.rep2 = self.rep1;
                         self.rep1 = self.rep0;
-                        self.rep0 = dist;
+                        self.rep0 = distance;
                     },
                     else => {
-                        try pc.encodeBit(&self.is_rep_g0[self.state], 1);
-                        try pc.encodeBit(&self.is_rep_g1[self.state], 1);
-                        try pc.encodeBit(&self.is_rep_g2[self.state], 1);
-                        const dist = self.rep3;
+                        try price_counter.encodeBit(&self.is_rep_g0[self.state], 1);
+                        try price_counter.encodeBit(&self.is_rep_g1[self.state], 1);
+                        try price_counter.encodeBit(&self.is_rep_g2[self.state], 1);
+                        const distance = self.rep3;
                         self.rep3 = self.rep2;
                         self.rep2 = self.rep1;
                         self.rep1 = self.rep0;
-                        self.rep0 = dist;
+                        self.rep0 = distance;
                     },
                 }
-                try self.encodeRepLength(&pc, pos_state, @intCast(best_rep_len - match_min_len));
+                try self.encodeRepLength(&price_counter, position_state, @intCast(best_rep_length - match_min_len));
                 self.state = updateStateRep(self.state);
-                self.copyBytes(pos, @intCast(best_rep_len));
-                self.insertSkipped(pos, best_rep_len);
-                pos += best_rep_len;
+                self.copyBytes(position, @intCast(best_rep_length));
+                self.insertSkipped(position, best_rep_length);
+                position += best_rep_length;
             } else if (match_ok) {
-                const dist = matches[count - 1].dist;
-                try pc.encodeBit(&self.is_match[state2], 1);
-                try pc.encodeBit(&self.is_rep[self.state], 0);
+                const distance = matches[count - 1].distance;
+                try price_counter.encodeBit(&self.is_match[state2], 1);
+                try price_counter.encodeBit(&self.is_rep[self.state], 0);
                 self.rep3 = self.rep2;
                 self.rep2 = self.rep1;
                 self.rep1 = self.rep0;
-                self.rep0 = dist - 1;
+                self.rep0 = distance - 1;
                 self.state = updateStateMatch(self.state);
-                const raw_len: u32 = @intCast(found_len - match_min_len);
-                try self.encodeLength(&pc, pos_state, raw_len);
-                try self.encodeDistance(&pc, raw_len, dist - 1);
-                self.copyBytes(pos, @intCast(found_len));
-                self.insertSkipped(pos, found_len);
-                pos += found_len;
-            } else if (rep_len[0] >= 1 and
+                const raw_length: u32 = @intCast(found_length - match_min_len);
+                try self.encodeLength(&price_counter, position_state, raw_length);
+                try self.encodeDistance(&price_counter, raw_length, distance - 1);
+                self.copyBytes(position, @intCast(found_length));
+                self.insertSkipped(position, found_length);
+                position += found_length;
+            } else if (rep_lengths[0] >= 1 and
                 priceBit(self.is_match[state2], 1) + priceBit(self.is_rep[self.state], 1) +
                     priceBit(self.is_rep_g0[self.state], 0) + priceBit(self.is_rep0_long[state2], 0) < lit_price)
             {
-                try pc.encodeBit(&self.is_match[state2], 1);
-                try pc.encodeBit(&self.is_rep[self.state], 1);
-                try pc.encodeBit(&self.is_rep_g0[self.state], 0);
-                try pc.encodeBit(&self.is_rep0_long[state2], 0);
+                try price_counter.encodeBit(&self.is_match[state2], 1);
+                try price_counter.encodeBit(&self.is_rep[self.state], 1);
+                try price_counter.encodeBit(&self.is_rep_g0[self.state], 0);
+                try price_counter.encodeBit(&self.is_rep0_long[state2], 0);
                 self.state = updateStateShortRep(self.state);
                 self.putByte(self.getByte(self.rep0 + 1));
-                pos += 1;
+                position += 1;
             } else {
-                try pc.encodeBit(&self.is_match[state2], 0);
-                try self.encodeLiteral(&pc, input[pos]);
+                try price_counter.encodeBit(&self.is_match[state2], 0);
+                try self.encodeLiteral(&price_counter, input[position]);
                 self.state = updateStateLiteral(self.state);
-                self.putByte(input[pos]);
-                pos += 1;
+                self.putByte(input[position]);
+                position += 1;
             }
         }
         self.input = &.{};
-        return pc.price;
+        return price_counter.price;
     }
 
-    inline fn relax(self: *Encoder, j: usize, price: u32, prev: u16, back: u32, state: u32, backs: *const [4]u32) void {
-        const o = &self.opt[j];
-        if (price < o.price) {
-            o.price = price;
-            o.pos_prev = prev;
-            o.back = back;
-            o.state = @intCast(state);
-            o.backs = backs.*;
+    inline fn relax(self: *Encoder, node_index: usize, price: u32, previous_position: u16, distance: u32, state: u32, rep_distances: *const [4]u32) void {
+        const node = &self.opt[node_index];
+        if (price < node.price) {
+            node.price = price;
+            node.previous_position = previous_position;
+            node.distance = distance;
+            node.state = @intCast(state);
+            node.rep_distances = rep_distances.*;
         }
     }
 
-    // Dynamic-programming pass over one window: every position is inserted into
-    // the match finder and relaxed against literal, short-rep, rep, and finder
-    // matches using the frozen per-window prices. Fills self.decisions in
-    // reverse order and returns the decision count.
-    fn planWindow(self: *Encoder, w_start: usize, w_len: usize) usize {
+    fn planWindow(self: *Encoder, w_start: usize, window_length: usize) usize {
         const opt = self.opt;
         const prices = self.prices;
         const pb_mask = (@as(u32, 1) << @intCast(self.properties.pb)) - 1;
@@ -1974,23 +1871,22 @@ pub const Encoder = struct {
         const lc_shift: u5 = @intCast(8 - self.properties.lc);
         opt[0] = .{
             .price = 0,
-            .pos_prev = 0,
-            .back = back_literal,
+            .previous_position = 0,
+            .distance = distance_literal,
             .state = @intCast(self.state),
-            .backs = .{ self.rep0, self.rep1, self.rep2, self.rep3 },
+            .rep_distances = .{ self.rep0, self.rep1, self.rep2, self.rep3 },
         };
-        for (opt[1 .. w_len + 1]) |*o| o.price = std.math.maxInt(u32);
+        for (opt[1 .. window_length + 1]) |*opt_entry| opt_entry.price = std.math.maxInt(u32);
         var matches: [match_list_max]MatchPair = undefined;
         var i: usize = 0;
-        while (i < w_len) : (i += 1) {
+        while (i < window_length) : (i += 1) {
             const node = opt[i];
             const base = node.price;
             const abs = self.input_base + w_start + i;
             const abs32: u32 = @truncate(abs);
-            const pos_state = abs32 & pb_mask;
+            const position_state = abs32 & pb_mask;
             const state = node.state;
-            const state2 = (@as(u32, state) << num_pos_bits_max) + pos_state;
-            // Literal: exact tree price from the frozen model.
+            const state2 = (@as(u32, state) << num_pos_bits_max) + position_state;
             const prev_byte: u32 = if (abs == 0) 0 else self.byteAt(abs - 1);
             const lit_state = ((abs32 & lp_mask) << @intCast(self.properties.lc)) + (prev_byte >> lc_shift);
             const lit_row = self.literal_probs[lit_state * literal_probs_count ..][0..literal_probs_count];
@@ -1998,167 +1894,163 @@ pub const Encoder = struct {
             if (state < 7) {
                 lit_price += self.literal_prices[lit_state * 256 + self.input[w_start + i]];
             } else {
-                lit_price += matchedLiteralPrice(lit_row, self.input[w_start + i], self.byteAt(abs - node.backs[0] - 1));
+                lit_price += matchedLiteralPrice(lit_row, self.input[w_start + i], self.byteAt(abs - node.rep_distances[0] - 1));
             }
-            self.relax(i + 1, base + lit_price, @intCast(i), back_literal, updateStateLiteral(state), &node.backs);
+            self.relax(i + 1, base + lit_price, @intCast(i), distance_literal, updateStateLiteral(state), &node.rep_distances);
             if (abs > 0) {
-                const dist0 = node.backs[0];
-                if (dist0 < abs) {
-                    // Short rep: one byte copied from rep0.
-                    if (self.byteAt(abs) == self.byteAt(abs - dist0 - 1)) {
+                const rep_distance = node.rep_distances[0];
+                if (rep_distance < abs) {
+                    if (self.byteAt(abs) == self.byteAt(abs - rep_distance - 1)) {
                         const price = base + prices.is_match[state2][1] + prices.is_rep[state][1] +
                             prices.is_rep_g0[state][0] + prices.is_rep0_long[state2][0];
-                        self.relax(i + 1, price, @intCast(i), back_short_rep, updateStateShortRep(state), &node.backs);
+                        self.relax(i + 1, price, @intCast(i), distance_short_rep, updateStateShortRep(state), &node.rep_distances);
                     }
-                    // Rep matches: every length of every live rep distance.
                     const rep_base = base + prices.is_match[state2][1] + prices.is_rep[state][1];
-                    const max_len = @min(max_match_len, w_len - i);
-                    for (0..4) |r| {
-                        const dist = node.backs[r] +% 1;
-                        // Equal rep distances price identically except for the
-                        // index bits, so only the lowest duplicate index matters.
-                        if (r > 0 and node.backs[r] == node.backs[r - 1]) continue;
-                        if (dist <= abs) {
-                            const len_r = self.matchLen(abs - dist, abs, max_len);
-                            if (len_r >= match_min_len) {
-                                const rb = rep_base + switch (r) {
+                    const max_length = @min(max_match_len, window_length - i);
+                    for (0..4) |rep_index| {
+                        const distance = node.rep_distances[rep_index] +% 1;
+                        // Duplicate rep distances price identically but for index bits; keep the lowest.
+                        if (rep_index > 0 and node.rep_distances[rep_index] == node.rep_distances[rep_index - 1]) continue;
+                        if (distance <= abs) {
+                            const rep_length = self.matchLen(abs - distance, abs, max_length);
+                            if (rep_length >= match_min_len) {
+                                const rep_price = rep_base + switch (rep_index) {
                                     0 => prices.is_rep_g0[state][0] + prices.is_rep0_long[state2][1],
                                     1 => prices.is_rep_g0[state][1] + prices.is_rep_g1[state][0],
                                     2 => prices.is_rep_g0[state][1] + prices.is_rep_g1[state][1] + prices.is_rep_g2[state][0],
                                     else => prices.is_rep_g0[state][1] + prices.is_rep_g1[state][1] + prices.is_rep_g2[state][1],
                                 };
-                                var nb: [4]u32 = undefined;
-                                nb[0] = node.backs[r];
-                                var k: usize = 1;
-                                for (0..4) |j| {
-                                    if (j != r) {
-                                        nb[k] = node.backs[j];
-                                        k += 1;
+                                var next_distances: [4]u32 = undefined;
+                                next_distances[0] = node.rep_distances[rep_index];
+                                var write_index: usize = 1;
+                                for (0..4) |read_index| {
+                                    if (read_index != rep_index) {
+                                        next_distances[write_index] = node.rep_distances[read_index];
+                                        write_index += 1;
                                     }
                                 }
                                 const rep_state = updateStateRep(state);
-                                var l: usize = match_min_len;
-                                while (l <= len_r) : (l += 1) {
-                                    self.relax(i + l, rb + prices.rep_len[pos_state][l], @intCast(i), back_rep_base | @as(u32, @intCast(r)), rep_state, &nb);
+                                var candidate_length: usize = match_min_len;
+                                while (candidate_length <= rep_length) : (candidate_length += 1) {
+                                    self.relax(i + candidate_length, rep_price + prices.repeat_length_prices[position_state][candidate_length], @intCast(i), distance_rep_base | @as(u32, @intCast(rep_index)), rep_state, &next_distances);
                                 }
                             }
                         }
                     }
                 }
             }
-            // Normal matches from the finder (also inserts the position).
             const count = self.findMatches(w_start + i, &matches);
             if (count > 0) {
-                const mb = base + prices.is_match[state2][1] + prices.is_rep[state][0];
+                const match_base = base + prices.is_match[state2][1] + prices.is_rep[state][0];
                 const match_state = updateStateMatch(state);
-                var prev_len: u32 = match_min_len - 1;
-                for (matches[0..count]) |mp| {
-                    const clip = @min(@as(usize, mp.len), w_len - i);
-                    if (clip <= prev_len) break;
-                    var nb: [4]u32 = .{ mp.dist - 1, node.backs[0], node.backs[1], node.backs[2] };
-                    var l: usize = prev_len + 1;
-                    while (l <= clip) : (l += 1) {
-                        const len_state = @min(@as(u32, @intCast(l - match_min_len)), num_len_to_pos_states - 1);
-                        self.relax(i + l, mb + prices.len[pos_state][l] + self.distPrice(len_state, mp.dist - 1), @intCast(i), mp.dist - 1, match_state, &nb);
+                var previous_length: u32 = match_min_len - 1;
+                for (matches[0..count]) |match_pair| {
+                    const clipped_length = @min(@as(usize, match_pair.length), window_length - i);
+                    if (clipped_length <= previous_length) break;
+                    var next_distances: [4]u32 = .{ match_pair.distance - 1, node.rep_distances[0], node.rep_distances[1], node.rep_distances[2] };
+                    var candidate_length: usize = previous_length + 1;
+                    while (candidate_length <= clipped_length) : (candidate_length += 1) {
+                        const length_state = @min(@as(u32, @intCast(candidate_length - match_min_len)), num_len_to_pos_states - 1);
+                        self.relax(i + candidate_length, match_base + prices.length_prices[position_state][candidate_length] + self.distancePrice(length_state, match_pair.distance - 1), @intCast(i), match_pair.distance - 1, match_state, &next_distances);
                     }
-                    prev_len = @intCast(clip);
+                    previous_length = @intCast(clipped_length);
                 }
             }
         }
-        var e: usize = w_len;
-        var n: usize = 0;
-        while (e > 0) {
-            const o = opt[e];
-            self.decisions[n] = .{ .back = o.back, .len = @intCast(e - o.pos_prev) };
-            e = o.pos_prev;
-            n += 1;
+        var end_position: usize = window_length;
+        var decision_count: usize = 0;
+        while (end_position > 0) {
+            const node = opt[end_position];
+            self.decisions[decision_count] = .{ .distance = node.distance, .length = @intCast(end_position - node.previous_position) };
+            end_position = node.previous_position;
+            decision_count += 1;
         }
-        return n;
+        return decision_count;
     }
 
     fn encodeWindow(self: *Encoder, w_start: usize, count: usize) Failure!void {
         const pb_mask = (@as(u32, 1) << @intCast(self.properties.pb)) - 1;
-        var d = count;
-        var pos = w_start;
-        while (d > 0) {
-            d -= 1;
-            const dec = self.decisions[d];
-            const pos_state = self.total_pos & pb_mask;
-            const state2 = (self.state << num_pos_bits_max) + pos_state;
-            if (dec.back == back_literal) {
-                try self.rc.encodeBit(&self.is_match[state2], 0);
-                try self.encodeLiteral(&self.rc, self.input[pos]);
+        var pending_decisions = count;
+        var position = w_start;
+        while (pending_decisions > 0) {
+            pending_decisions -= 1;
+            const dec = self.decisions[pending_decisions];
+            const position_state = self.total_pos & pb_mask;
+            const state2 = (self.state << num_pos_bits_max) + position_state;
+            if (dec.distance == distance_literal) {
+                try self.range_coder.encodeBit(&self.is_match[state2], 0);
+                try self.encodeLiteral(&self.range_coder, self.input[position]);
                 self.state = updateStateLiteral(self.state);
-                self.putByte(self.input[pos]);
-                pos += 1;
-            } else if (dec.back == back_short_rep) {
-                try self.rc.encodeBit(&self.is_match[state2], 1);
-                try self.rc.encodeBit(&self.is_rep[self.state], 1);
-                try self.rc.encodeBit(&self.is_rep_g0[self.state], 0);
-                try self.rc.encodeBit(&self.is_rep0_long[state2], 0);
+                self.putByte(self.input[position]);
+                position += 1;
+            } else if (dec.distance == distance_short_rep) {
+                try self.range_coder.encodeBit(&self.is_match[state2], 1);
+                try self.range_coder.encodeBit(&self.is_rep[self.state], 1);
+                try self.range_coder.encodeBit(&self.is_rep_g0[self.state], 0);
+                try self.range_coder.encodeBit(&self.is_rep0_long[state2], 0);
                 self.state = updateStateShortRep(self.state);
                 self.putByte(self.getByte(self.rep0 + 1));
-                pos += 1;
-            } else if (dec.back >= back_rep_base) {
-                const index: u4 = @intCast(dec.back - back_rep_base);
-                try self.rc.encodeBit(&self.is_match[state2], 1);
-                try self.rc.encodeBit(&self.is_rep[self.state], 1);
+                position += 1;
+            } else if (dec.distance >= distance_rep_base) {
+                const index: u4 = @intCast(dec.distance - distance_rep_base);
+                try self.range_coder.encodeBit(&self.is_match[state2], 1);
+                try self.range_coder.encodeBit(&self.is_rep[self.state], 1);
                 switch (index) {
                     0 => {
-                        try self.rc.encodeBit(&self.is_rep_g0[self.state], 0);
-                        try self.rc.encodeBit(&self.is_rep0_long[state2], 1);
+                        try self.range_coder.encodeBit(&self.is_rep_g0[self.state], 0);
+                        try self.range_coder.encodeBit(&self.is_rep0_long[state2], 1);
                     },
                     1 => {
-                        try self.rc.encodeBit(&self.is_rep_g0[self.state], 1);
-                        try self.rc.encodeBit(&self.is_rep_g1[self.state], 0);
-                        const dist = self.rep1;
+                        try self.range_coder.encodeBit(&self.is_rep_g0[self.state], 1);
+                        try self.range_coder.encodeBit(&self.is_rep_g1[self.state], 0);
+                        const distance = self.rep1;
                         self.rep1 = self.rep0;
-                        self.rep0 = dist;
+                        self.rep0 = distance;
                     },
                     2 => {
-                        try self.rc.encodeBit(&self.is_rep_g0[self.state], 1);
-                        try self.rc.encodeBit(&self.is_rep_g1[self.state], 1);
-                        try self.rc.encodeBit(&self.is_rep_g2[self.state], 0);
-                        const dist = self.rep2;
+                        try self.range_coder.encodeBit(&self.is_rep_g0[self.state], 1);
+                        try self.range_coder.encodeBit(&self.is_rep_g1[self.state], 1);
+                        try self.range_coder.encodeBit(&self.is_rep_g2[self.state], 0);
+                        const distance = self.rep2;
                         self.rep2 = self.rep1;
                         self.rep1 = self.rep0;
-                        self.rep0 = dist;
+                        self.rep0 = distance;
                     },
                     else => {
-                        try self.rc.encodeBit(&self.is_rep_g0[self.state], 1);
-                        try self.rc.encodeBit(&self.is_rep_g1[self.state], 1);
-                        try self.rc.encodeBit(&self.is_rep_g2[self.state], 1);
-                        const dist = self.rep3;
+                        try self.range_coder.encodeBit(&self.is_rep_g0[self.state], 1);
+                        try self.range_coder.encodeBit(&self.is_rep_g1[self.state], 1);
+                        try self.range_coder.encodeBit(&self.is_rep_g2[self.state], 1);
+                        const distance = self.rep3;
                         self.rep3 = self.rep2;
                         self.rep2 = self.rep1;
                         self.rep1 = self.rep0;
-                        self.rep0 = dist;
+                        self.rep0 = distance;
                     },
                 }
-                try self.encodeRepLength(&self.rc, pos_state, dec.len - match_min_len);
+                try self.encodeRepLength(&self.range_coder, position_state, dec.length - match_min_len);
                 self.state = updateStateRep(self.state);
-                self.copyBytes(pos, dec.len);
-                pos += dec.len;
+                self.copyBytes(position, dec.length);
+                position += dec.length;
             } else {
-                const dist = dec.back + 1;
-                try self.rc.encodeBit(&self.is_match[state2], 1);
-                try self.rc.encodeBit(&self.is_rep[self.state], 0);
+                const distance = dec.distance + 1;
+                try self.range_coder.encodeBit(&self.is_match[state2], 1);
+                try self.range_coder.encodeBit(&self.is_rep[self.state], 0);
                 self.rep3 = self.rep2;
                 self.rep2 = self.rep1;
                 self.rep1 = self.rep0;
-                self.rep0 = dist - 1;
+                self.rep0 = distance - 1;
                 self.state = updateStateMatch(self.state);
-                const raw_len = dec.len - match_min_len;
-                try self.encodeLength(&self.rc, pos_state, raw_len);
-                try self.encodeDistance(&self.rc, raw_len, dist - 1);
-                self.copyBytes(pos, dec.len);
-                pos += dec.len;
+                const raw_length = dec.length - match_min_len;
+                try self.encodeLength(&self.range_coder, position_state, raw_length);
+                try self.encodeDistance(&self.range_coder, raw_length, distance - 1);
+                self.copyBytes(position, dec.length);
+                position += dec.length;
             }
         }
     }
 
-    fn encodeLiteral(self: *Encoder, rc: anytype, byte: u8) Failure!void {
-        const prev_byte: u32 = if (self.dict_pos == 0 and !self.dict_full) 0 else self.getByte(1);
+    fn encodeLiteral(self: *Encoder, range_coder: anytype, byte: u8) Failure!void {
+        const prev_byte: u32 = if (self.dictionary_pos == 0 and !self.dictionary_full) 0 else self.getByte(1);
         const lit_state = ((self.total_pos & ((@as(u32, 1) << @intCast(self.properties.lp)) - 1)) << @intCast(self.properties.lc)) +
             (prev_byte >> @intCast(8 - self.properties.lc));
         const probs = self.literal_probs[lit_state * literal_probs_count ..][0..literal_probs_count];
@@ -2171,7 +2063,7 @@ pub const Encoder = struct {
                 match_byte <<= 1;
                 const bit: u1 = @intCast((literal >> 7) & 1);
                 literal <<= 1;
-                try rc.encodeBit(&probs[((@as(u32, 1) + match_bit) << 8) + symbol], bit);
+                try range_coder.encodeBit(&probs[((@as(u32, 1) + match_bit) << 8) + symbol], bit);
                 symbol = (symbol << 1) | bit;
                 if (match_bit != bit) break;
             }
@@ -2179,142 +2071,135 @@ pub const Encoder = struct {
         while (symbol < 0x100) {
             const bit: u1 = @intCast((literal >> 7) & 1);
             literal <<= 1;
-            try rc.encodeBit(&probs[symbol], bit);
+            try range_coder.encodeBit(&probs[symbol], bit);
             symbol = (symbol << 1) | bit;
         }
     }
 
-    fn encodeLength(self: *Encoder, rc: anytype, pos_state: u32, len: u32) Failure!void {
-        if (len < 8) {
-            try rc.encodeBit(&self.len_choice[0], 0);
-            try bitTreeEncode(rc, self.len_low[pos_state * (1 << 3) ..][0..(1 << 3)], 3, len);
-        } else if (len < 16) {
-            try rc.encodeBit(&self.len_choice[0], 1);
-            try rc.encodeBit(&self.len_choice[1], 0);
-            try bitTreeEncode(rc, self.len_mid[pos_state * (1 << 3) ..][0..(1 << 3)], 3, len - 8);
+    fn encodeLength(self: *Encoder, range_coder: anytype, position_state: u32, length: u32) Failure!void {
+        if (length < 8) {
+            try range_coder.encodeBit(&self.len_choice[0], 0);
+            try bitTreeEncode(range_coder, self.len_low[position_state * (1 << 3) ..][0..(1 << 3)], 3, length);
+        } else if (length < 16) {
+            try range_coder.encodeBit(&self.len_choice[0], 1);
+            try range_coder.encodeBit(&self.len_choice[1], 0);
+            try bitTreeEncode(range_coder, self.len_mid[position_state * (1 << 3) ..][0..(1 << 3)], 3, length - 8);
         } else {
-            try rc.encodeBit(&self.len_choice[0], 1);
-            try rc.encodeBit(&self.len_choice[1], 1);
-            try bitTreeEncode(rc, self.len_high, 8, len - 16);
+            try range_coder.encodeBit(&self.len_choice[0], 1);
+            try range_coder.encodeBit(&self.len_choice[1], 1);
+            try bitTreeEncode(range_coder, self.len_high, 8, length - 16);
         }
     }
 
-    fn encodeRepLength(self: *Encoder, rc: anytype, pos_state: u32, len: u32) Failure!void {
-        if (len < 8) {
-            try rc.encodeBit(&self.rep_len_choice[0], 0);
-            try bitTreeEncode(rc, self.rep_len_low[pos_state * (1 << 3) ..][0..(1 << 3)], 3, len);
-        } else if (len < 16) {
-            try rc.encodeBit(&self.rep_len_choice[0], 1);
-            try rc.encodeBit(&self.rep_len_choice[1], 0);
-            try bitTreeEncode(rc, self.rep_len_mid[pos_state * (1 << 3) ..][0..(1 << 3)], 3, len - 8);
+    fn encodeRepLength(self: *Encoder, range_coder: anytype, position_state: u32, length: u32) Failure!void {
+        if (length < 8) {
+            try range_coder.encodeBit(&self.rep_len_choice[0], 0);
+            try bitTreeEncode(range_coder, self.rep_len_low[position_state * (1 << 3) ..][0..(1 << 3)], 3, length);
+        } else if (length < 16) {
+            try range_coder.encodeBit(&self.rep_len_choice[0], 1);
+            try range_coder.encodeBit(&self.rep_len_choice[1], 0);
+            try bitTreeEncode(range_coder, self.rep_len_mid[position_state * (1 << 3) ..][0..(1 << 3)], 3, length - 8);
         } else {
-            try rc.encodeBit(&self.rep_len_choice[0], 1);
-            try rc.encodeBit(&self.rep_len_choice[1], 1);
-            try bitTreeEncode(rc, self.rep_len_high, 8, len - 16);
+            try range_coder.encodeBit(&self.rep_len_choice[0], 1);
+            try range_coder.encodeBit(&self.rep_len_choice[1], 1);
+            try bitTreeEncode(range_coder, self.rep_len_high, 8, length - 16);
         }
     }
 
-    fn encodeDistance(self: *Encoder, rc: anytype, raw_len: u32, dist: u32) Failure!void {
-        const pos_slot = encodePosSlot(dist);
-        var len_state = raw_len;
-        if (len_state > num_len_to_pos_states - 1) len_state = num_len_to_pos_states - 1;
-        try bitTreeEncode(rc, self.pos_slot_decoders[len_state * (1 << 6) ..][0..(1 << 6)], 6, pos_slot);
+    fn encodeDistance(self: *Encoder, range_coder: anytype, raw_length: u32, distance: u32) Failure!void {
+        const pos_slot = encodePosSlot(distance);
+        var length_state = raw_length;
+        if (length_state > num_len_to_pos_states - 1) length_state = num_len_to_pos_states - 1;
+        try bitTreeEncode(range_coder, self.pos_slot_decoders[length_state * (1 << 6) ..][0..(1 << 6)], 6, pos_slot);
         if (pos_slot < 4) return;
         const num_direct_bits = (pos_slot >> 1) - 1;
         const base_dist = (@as(u32, 2) | (pos_slot & 1)) << @intCast(num_direct_bits);
-        const offset = dist - base_dist;
+        const offset = distance - base_dist;
         if (pos_slot < end_pos_model_index) {
-            try bitTreeReverseEncode(rc, self.pos_decoders[base_dist - pos_slot ..], @intCast(num_direct_bits), offset);
+            try bitTreeReverseEncode(range_coder, self.pos_decoders[base_dist - pos_slot ..], @intCast(num_direct_bits), offset);
         } else {
-            try rc.encodeDirectBits(offset >> num_align_bits, @intCast(num_direct_bits - num_align_bits));
-            try bitTreeReverseEncode(rc, self.align_decoder, num_align_bits, offset & ((@as(u32, 1) << num_align_bits) - 1));
+            try range_coder.encodeDirectBits(offset >> num_align_bits, @intCast(num_direct_bits - num_align_bits));
+            try bitTreeReverseEncode(range_coder, self.align_decoder, num_align_bits, offset & ((@as(u32, 1) << num_align_bits) - 1));
         }
     }
 
-    fn encodeEndMarker(self: *Encoder, rc: anytype) Failure!void {
+    fn encodeEndMarker(self: *Encoder, range_coder: anytype) Failure!void {
         const pos_slot: u32 = 63;
-        const len_state: u32 = 0;
-        try bitTreeEncode(rc, self.pos_slot_decoders[len_state * (1 << 6) ..][0..(1 << 6)], 6, pos_slot);
-        const num_direct_bits = (pos_slot >> 1) - 1; // 30
-        const base_dist: u32 = (@as(u32, 2) | (pos_slot & 1)) << @intCast(num_direct_bits); // 0xC0000000
-        const offset: u32 = 0xFFFFFFFF - base_dist; // 0x3FFFFFFF
-        try rc.encodeDirectBits(offset >> num_align_bits, @intCast(num_direct_bits - num_align_bits)); // 0x03FFFFFF, 26 bits
-        try bitTreeReverseEncode(rc, self.align_decoder, num_align_bits, offset & ((@as(u32, 1) << num_align_bits) - 1)); // 15
+        const length_state: u32 = 0;
+        try bitTreeEncode(range_coder, self.pos_slot_decoders[length_state * (1 << 6) ..][0..(1 << 6)], 6, pos_slot);
+        const num_direct_bits = (pos_slot >> 1) - 1;
+        const base_dist: u32 = (@as(u32, 2) | (pos_slot & 1)) << @intCast(num_direct_bits);
+        const offset: u32 = 0xFFFFFFFF - base_dist;
+        try range_coder.encodeDirectBits(offset >> num_align_bits, @intCast(num_direct_bits - num_align_bits));
+        try bitTreeReverseEncode(range_coder, self.align_decoder, num_align_bits, offset & ((@as(u32, 1) << num_align_bits) - 1));
     }
 
     inline fn byteAt(self: *const Encoder, abs_pos: usize) u8 {
         if (abs_pos >= self.input_base) return self.input[abs_pos - self.input_base];
-        return self.dictionary[if (self.dict_mask != 0) abs_pos & self.dict_mask else abs_pos % self.dictionary.len];
+        return self.dictionary[if (self.dictionary_mask != 0) abs_pos & self.dictionary_mask else abs_pos % self.dictionary.len];
     }
 
-    inline fn matchLen(self: *const Encoder, a: usize, b: usize, max_len: usize) usize {
-        if (a >= self.input_base) {
-            return kernels.matchLen8(self.input, a - self.input_base, b - self.input_base, max_len);
+    inline fn matchLen(self: *const Encoder, first: usize, second: usize, max_length: usize) usize {
+        if (first >= self.input_base) {
+            return kernels.matchLen8(self.input, first - self.input_base, second - self.input_base, max_length);
         }
-        var len: usize = 0;
-        const da = if (self.dict_mask != 0) a & self.dict_mask else a % self.dictionary.len;
-        const first_span = @min(@min(self.input_base - a, max_len), self.dictionary.len - da);
+        var length: usize = 0;
+        const dictionary_index = if (self.dictionary_mask != 0) first & self.dictionary_mask else first % self.dictionary.len;
+        const first_span = @min(@min(self.input_base - first, max_length), self.dictionary.len - dictionary_index);
         if (first_span > 0) {
-            const input_offset = b - self.input_base;
-            var l: usize = 0;
-            while (l + 8 <= first_span and std.mem.readInt(u64, self.dictionary[da + l ..][0..8], .little) == std.mem.readInt(u64, self.input[input_offset + l ..][0..8], .little)) l += 8;
-            while (l < first_span and self.dictionary[da + l] == self.input[input_offset + l]) l += 1;
-            len += l;
-            if (l < first_span) return len;
+            const input_offset = second - self.input_base;
+            var offset: usize = 0;
+            while (offset + 8 <= first_span and std.mem.readInt(u64, self.dictionary[dictionary_index + offset ..][0..8], .little) == std.mem.readInt(u64, self.input[input_offset + offset ..][0..8], .little)) offset += 8;
+            while (offset < first_span and self.dictionary[dictionary_index + offset] == self.input[input_offset + offset]) offset += 1;
+            length += offset;
+            if (offset < first_span) return length;
         }
-        if (len < max_len) {
-            const p = a + len;
-            if (p >= self.input_base) {
-                return len + kernels.matchLen8(self.input, p - self.input_base, b - self.input_base + len, max_len - len);
+        if (length < max_length) {
+            const position = first + length;
+            if (position >= self.input_base) {
+                return length + kernels.matchLen8(self.input, position - self.input_base, second - self.input_base + length, max_length - length);
             }
-            while (len < max_len and self.byteAt(a + len) == self.byteAt(b + len)) len += 1;
+            while (length < max_length and self.byteAt(first + length) == self.byteAt(second + length)) length += 1;
         }
-        return len;
+        return length;
     }
 
-    // Fill `matches` with the improving (len, dist) candidates at pos and
-    // insert the position into the finder. Returns the entry count.
-    fn findMatches(self: *Encoder, pos: usize, matches: []MatchPair) usize {
-        if (self.match_finder == .bt4) return self.btFindMatches(pos, matches);
-        return self.hcFindMatches(pos, matches);
+    fn findMatches(self: *Encoder, position: usize, matches: []MatchPair) usize {
+        if (self.match_finder == .bt4) return self.btFindMatches(position, matches);
+        return self.hcFindMatches(position, matches);
     }
 
-    // The bt4 walk records only lengths whose bytes were compared during the
-    // descent (the min(len0, len1) prefix is the tree invariant and each step
-    // beyond it is byte-checked), so list entries need no re-verification.
-    // hash2/hash3 side tables: most recent position for each 2-byte value and
-    // each mixed 3-byte key. Covers matches shorter than 4 bytes, which the
-    // 4-byte main index structurally cannot pair. Returns entries appended to
-    // matches (strictly increasing lengths).
-    fn shortMatches(self: *Encoder, pos: usize, matches: []MatchPair) usize {
-        const abs_pos = self.input_base + pos;
+    // Walk records only byte-compared lengths, so entries need no re-verification.
+    // Side tables cover sub-4-byte matches the main index cannot pair.
+    fn shortMatches(self: *Encoder, position: usize, matches: []MatchPair) usize {
+        const abs_pos = self.input_base + position;
         if (abs_pos >= std.math.maxInt(u32)) return 0;
-        const b = self.input[pos..];
+        const key_bytes = self.input[position..];
         var count: usize = 0;
-        const h2 = @as(u32, b[0]) | (@as(u32, b[1]) << 8);
+        const h2 = @as(u32, key_bytes[0]) | (@as(u32, key_bytes[1]) << 8);
         const cand2 = self.hash2[h2];
         self.hash2[h2] = @intCast(abs_pos + 1);
         if (cand2 != 0) {
-            const delta = abs_pos - (cand2 - 1);
-            // The 2-byte value is the index itself, so equality is free.
-            if (delta < self.chain_window) {
-                matches[count] = .{ .len = 2, .dist = @intCast(delta) };
+            const distance = abs_pos - (cand2 - 1);
+            // Index is the 2-byte value itself, so equality is free.
+            if (distance < self.chain_window) {
+                matches[count] = .{ .length = 2, .distance = @intCast(distance) };
                 count += 1;
             }
         }
-        const w3 = h2 | (@as(u32, b[2]) << 16);
+        const w3 = h2 | (@as(u32, key_bytes[2]) << 16);
         const h3 = (w3 *% 0x9E3779B1) >> @as(u5, @intCast(32 - @as(u6, match_finder_hash3_bits)));
         const cand3 = self.hash3[h3];
         self.hash3[h3] = @intCast(abs_pos + 1);
         if (cand3 != 0) {
-            const prev = cand3 - 1;
-            const delta = abs_pos - prev;
-            if (delta < self.chain_window) {
-                // Mixed hash: a collision can share only a prefix, so verify.
-                var l: u32 = 0;
-                while (l < 3 and self.byteAt(prev + l) == self.byteAt(abs_pos + l)) l += 1;
-                if (l >= match_min_len and (count == 0 or l > matches[0].len)) {
-                    matches[count] = .{ .len = @intCast(l), .dist = @intCast(delta) };
+            const previous_position = cand3 - 1;
+            const distance = abs_pos - previous_position;
+            if (distance < self.chain_window) {
+                // Mixed hash may collide on a prefix only, so verify.
+                var verify_length: u32 = 0;
+                while (verify_length < 3 and self.byteAt(previous_position + verify_length) == self.byteAt(abs_pos + verify_length)) verify_length += 1;
+                if (verify_length >= match_min_len and (count == 0 or verify_length > matches[0].length)) {
+                    matches[count] = .{ .length = @intCast(verify_length), .distance = @intCast(distance) };
                     count += 1;
                 }
             }
@@ -2322,22 +2207,14 @@ pub const Encoder = struct {
         return count;
     }
 
-    fn btFindMatches(self: *Encoder, pos: usize, matches: []MatchPair) usize {
-        const abs_pos = self.input_base + pos;
-        // Stored positions are u32; past that boundary there is no window to
-        // match against within profile limits, so fall back to the bounded
-        // tail scan rather than wrapping the position arithmetic (the same
-        // guard the hash-chain and short-match paths carry).
-        if (abs_pos >= std.math.maxInt(u32)) return self.tailMatches(pos, matches);
-        // Positions without a full max_match_len lookahead never enter the
-        // tree: the len == len_limit splice grafts a node on a verified prefix
-        // of len_limit bytes, which is only order-safe when len_limit is the
-        // format maximum; a chunk tail would splice on a weak prefix and
-        // corrupt the ordering every later insert relies on. It also keeps
-        // every probe inside the chunk slice.
-        if (pos + max_match_len >= self.input.len) return self.tailMatches(pos, matches);
-        const len_limit: usize = @min(self.input.len - pos, max_match_len);
-        const hash = self.hash4(pos);
+    fn btFindMatches(self: *Encoder, position: usize, matches: []MatchPair) usize {
+        const abs_pos = self.input_base + position;
+        // u32 positions cannot wrap; fall distance to the bounded tail scan past the boundary.
+        if (abs_pos >= std.math.maxInt(u32)) return self.tailMatches(position, matches);
+        // Splice is order-safe only at the format maximum; chunk tails stay out of the tree.
+        if (position + max_match_len >= self.input.len) return self.tailMatches(position, matches);
+        const length_limit: usize = @min(self.input.len - position, max_match_len);
+        const hash = self.hash4(position);
         const cyc = abs_pos % self.chain_window;
         var ptr0: *u32 = &self.right[cyc];
         var ptr1: *u32 = &self.left[cyc];
@@ -2345,86 +2222,86 @@ pub const Encoder = struct {
         ptr1.* = 0;
         var cur = self.head[hash];
         self.head[hash] = @intCast(abs_pos);
-        var len0: usize = 0;
-        var len1: usize = 0;
-        var count: usize = self.shortMatches(pos, matches);
-        var best_len: usize = if (count > 0) matches[count - 1].len else 0;
+        var length0: usize = 0;
+        var length1: usize = 0;
+        var count: usize = self.shortMatches(position, matches);
+        var best_length: usize = if (count > 0) matches[count - 1].length else 0;
         const cm_check = if (abs_pos < self.chain_window) 0 else abs_pos - self.chain_window;
         var depth: u32 = self.match_finder_depth;
         const input = self.input;
         const input_base = self.input_base;
         while (cur != 0 and depth != 0 and cm_check < cur) : (depth -= 1) {
             if (cur == abs_pos) break;
-            const delta = abs_pos - cur;
-            const pair_slot = if (cyc >= delta) cyc - delta else self.chain_window + cyc - delta;
+            const distance = abs_pos - cur;
+            const pair_slot = if (cyc >= distance) cyc - distance else self.chain_window + cyc - distance;
             const pb = cur;
-            var len = @min(len0, len1);
+            var length = @min(length0, length1);
             if (pb >= input_base) {
                 const pb_off = @as(usize, pb) - input_base;
-                if (input[pb_off + len] == input[pos + len]) {
-                    len += 1;
-                    if (len != len_limit and input[pb_off + len] == input[pos + len]) {
-                        len = self.matchLen(pb, abs_pos, len_limit);
+                if (input[pb_off + length] == input[position + length]) {
+                    length += 1;
+                    if (length != length_limit and input[pb_off + length] == input[position + length]) {
+                        length = self.matchLen(pb, abs_pos, length_limit);
                     }
-                    if (best_len < len) {
-                        best_len = len;
+                    if (best_length < length) {
+                        best_length = length;
                         if (count < matches.len) {
-                            matches[count] = .{ .len = @intCast(len), .dist = @intCast(delta) };
+                            matches[count] = .{ .length = @intCast(length), .distance = @intCast(distance) };
                             count += 1;
                         }
-                        if (len == len_limit) {
+                        if (length == length_limit) {
                             ptr1.* = self.left[pair_slot];
                             ptr0.* = self.right[pair_slot];
                             return count;
                         }
                     }
                 }
-                if (input[pb_off + len] < input[pos + len]) {
+                if (input[pb_off + length] < input[position + length]) {
                     ptr1.* = cur;
                     cur = self.right[pair_slot];
                     ptr1 = &self.right[pair_slot];
-                    len1 = len;
+                    length1 = length;
                 } else {
                     ptr0.* = cur;
                     cur = self.left[pair_slot];
                     ptr0 = &self.left[pair_slot];
-                    len0 = len;
+                    length0 = length;
                 }
                 continue;
             }
-            const abs_b0 = input[pos + len];
-            if (self.byteAt(pb + len) == abs_b0) {
-                len += 1;
-                if (len != len_limit) {
-                    const abs_b1 = input[pos + len];
-                    if (self.byteAt(pb + len) == abs_b1) {
-                        len = self.matchLen(pb, abs_pos, len_limit);
+            const input_byte0 = input[position + length];
+            if (self.byteAt(pb + length) == input_byte0) {
+                length += 1;
+                if (length != length_limit) {
+                    const input_byte1 = input[position + length];
+                    if (self.byteAt(pb + length) == input_byte1) {
+                        length = self.matchLen(pb, abs_pos, length_limit);
                     }
                 }
-                if (best_len < len) {
-                    best_len = len;
+                if (best_length < length) {
+                    best_length = length;
                     if (count < matches.len) {
-                        matches[count] = .{ .len = @intCast(len), .dist = @intCast(delta) };
+                        matches[count] = .{ .length = @intCast(length), .distance = @intCast(distance) };
                         count += 1;
                     }
-                    if (len == len_limit) {
+                    if (length == length_limit) {
                         ptr1.* = self.left[pair_slot];
                         ptr0.* = self.right[pair_slot];
                         return count;
                     }
                 }
             }
-            const abs_b = input[pos + len];
-            if (self.byteAt(pb + len) < abs_b) {
+            const input_byte = input[position + length];
+            if (self.byteAt(pb + length) < input_byte) {
                 ptr1.* = cur;
                 cur = self.right[pair_slot];
                 ptr1 = &self.right[pair_slot];
-                len1 = len;
+                length1 = length;
             } else {
                 ptr0.* = cur;
                 cur = self.left[pair_slot];
                 ptr0 = &self.left[pair_slot];
-                len0 = len;
+                length0 = length;
             }
         }
         ptr0.* = 0;
@@ -2432,111 +2309,104 @@ pub const Encoder = struct {
         return count;
     }
 
-    fn hcFindMatches(self: *Encoder, pos: usize, matches: []MatchPair) usize {
-        // The 4-byte hash key needs four bytes ahead; the last few positions
-        // fall back to a bounded scan (at most a couple of positions, so the
-        // direct dictionary walk stays cheap).
-        if (pos + 4 > self.input.len) return self.tailMatches(pos, matches);
-        const abs_pos = self.input_base + pos;
-        // Stored positions are u32; beyond that boundary there is no window to
-        // match against within profile limits, so emit no match rather than
-        // letting the position offset wrap.
+    fn hcFindMatches(self: *Encoder, position: usize, matches: []MatchPair) usize {
+        // Last positions lack a full key; bounded scan stays cheap there.
+        if (position + 4 > self.input.len) return self.tailMatches(position, matches);
+        const abs_pos = self.input_base + position;
+        // u32 positions cannot wrap; emit no match past the boundary.
         if (abs_pos >= std.math.maxInt(u32)) return 0;
-        const max_len: usize = @min(self.input.len - pos, max_match_len);
-        const hash = self.hash4(pos);
+        const max_length: usize = @min(self.input.len - position, max_match_len);
+        const hash = self.hash4(position);
         const window = self.chain_window;
         const slot = abs_pos % window;
         var prev_stored = self.head[hash];
         self.head[hash] = @intCast(abs_pos + 1);
         self.chain[slot] = prev_stored;
-        var count: usize = self.shortMatches(pos, matches);
-        var best_len: usize = if (count > 0) matches[count - 1].len else 0;
+        var count: usize = self.shortMatches(position, matches);
+        var best_length: usize = if (count > 0) matches[count - 1].length else 0;
         var depth: u32 = self.match_finder_depth;
         while (prev_stored != 0 and depth != 0) : (depth -= 1) {
-            const prev = @as(usize, prev_stored - 1);
-            const delta = abs_pos - prev;
-            if (delta >= window) break;
-            const len = self.matchLen(prev, abs_pos, max_len);
-            if (len > best_len) {
-                best_len = len;
+            const previous_position: usize = prev_stored - 1;
+            const distance = abs_pos - previous_position;
+            if (distance >= window) break;
+            const length = self.matchLen(previous_position, abs_pos, max_length);
+            if (length > best_length) {
+                best_length = length;
                 if (count < matches.len) {
-                    matches[count] = .{ .len = @intCast(len), .dist = @intCast(delta) };
+                    matches[count] = .{ .length = @intCast(length), .distance = @intCast(distance) };
                     count += 1;
                 }
-                if (len == max_len or len >= self.nice_len) break;
+                if (length == max_length or length >= self.nice_len) break;
             }
-            const prev_slot = if (slot >= delta) slot - delta else window + slot - delta;
+            const prev_slot = if (slot >= distance) slot - distance else window + slot - distance;
             prev_stored = self.chain[prev_slot];
         }
         return count;
     }
 
-    fn tailMatches(self: *const Encoder, pos: usize, matches: []MatchPair) usize {
-        if (pos + 2 > self.input.len) return 0;
-        const abs_pos = self.input_base + pos;
-        // Tail positions only carry a couple of bytes; cap the direct scan so
-        // per-chunk tail work stays bounded regardless of dictionary size.
-        const max_dist = @min(@min(@as(usize, abs_pos), @as(usize, self.properties.dictionary_size)), 1 << 12);
-        const max_len: usize = @min(self.input.len - pos, max_match_len);
-        var best_len: usize = 0;
+    fn tailMatches(self: *const Encoder, position: usize, matches: []MatchPair) usize {
+        if (position + 2 > self.input.len) return 0;
+        const abs_pos = self.input_base + position;
+        // Cap the scan so tail work stays bounded regardless of dictionary size.
+        const max_distance = @min(@min(@as(usize, abs_pos), @as(usize, self.properties.dictionary_size)), 1 << 12);
+        const max_length: usize = @min(self.input.len - position, max_match_len);
+        var best_length: usize = 0;
         var count: usize = 0;
-        var dist: usize = 1;
-        while (dist <= max_dist) : (dist += 1) {
-            const prev = abs_pos - dist;
-            if (self.byteAt(abs_pos) != self.byteAt(prev)) continue;
-            const len = self.matchLen(prev, abs_pos, max_len);
-            if (len > best_len) {
-                best_len = len;
-                matches[count] = .{ .len = @intCast(len), .dist = @intCast(dist) };
+        var distance: usize = 1;
+        while (distance <= max_distance) : (distance += 1) {
+            const previous_position = abs_pos - distance;
+            if (self.byteAt(abs_pos) != self.byteAt(previous_position)) continue;
+            const length = self.matchLen(previous_position, abs_pos, max_length);
+            if (length > best_length) {
+                best_length = length;
+                matches[count] = .{ .length = @intCast(length), .distance = @intCast(distance) };
                 count += 1;
-                if (len >= max_len or count == matches.len) break;
+                if (length >= max_length or count == matches.len) break;
             }
         }
         return count;
     }
 
-    fn hash4(self: *const Encoder, pos: usize) u32 {
-        const b = self.input[pos..][0..4];
-        const word = @as(u32, b[0]) | (@as(u32, b[1]) << 8) | (@as(u32, b[2]) << 16) | (@as(u32, b[3]) << 24);
-        var h = word *% 0x9E3779B1;
-        h ^= h >> 16;
-        return h & self.hash_mask;
+    fn hash4(self: *const Encoder, position: usize) u32 {
+        const key_bytes = self.input[position..][0..4];
+        const word = @as(u32, key_bytes[0]) | (@as(u32, key_bytes[1]) << 8) | (@as(u32, key_bytes[2]) << 16) | (@as(u32, key_bytes[3]) << 24);
+        var hash = word *% 0x9E3779B1;
+        hash ^= hash >> 16;
+        return hash & self.hash_mask;
     }
 
-    fn copyBytes(self: *Encoder, pos: usize, len: u32) void {
-        var p: usize = pos;
-        var remaining: usize = len;
+    fn copyBytes(self: *Encoder, position: usize, length: u32) void {
+        var cursor: usize = position;
+        var remaining: usize = length;
         while (remaining > 0) {
-            const n = @min(remaining, self.dictionary.len - self.dict_pos);
-            @memcpy(self.dictionary[self.dict_pos..][0..n], self.input[p..][0..n]);
-            self.dict_pos += @intCast(n);
-            self.total_pos +%= @intCast(n);
-            if (self.dict_pos == self.dictionary.len) {
-                self.dict_pos = 0;
-                self.dict_full = true;
+            const chunk = @min(remaining, self.dictionary.len - self.dictionary_pos);
+            @memcpy(self.dictionary[self.dictionary_pos..][0..chunk], self.input[cursor..][0..chunk]);
+            self.dictionary_pos += @intCast(chunk);
+            self.total_pos +%= @intCast(chunk);
+            if (self.dictionary_pos == self.dictionary.len) {
+                self.dictionary_pos = 0;
+                self.dictionary_full = true;
             }
-            p += n;
-            remaining -= n;
+            cursor += chunk;
+            remaining -= chunk;
         }
     }
 
     pub fn putByte(self: *Encoder, byte: u8) void {
-        self.dictionary[self.dict_pos] = byte;
-        self.dict_pos += 1;
+        self.dictionary[self.dictionary_pos] = byte;
+        self.dictionary_pos += 1;
         self.total_pos +%= 1;
-        if (self.dict_pos == self.dictionary.len) {
-            self.dict_pos = 0;
-            self.dict_full = true;
+        if (self.dictionary_pos == self.dictionary.len) {
+            self.dictionary_pos = 0;
+            self.dictionary_full = true;
         }
     }
 
-    pub fn setRangeEncoder(self: *Encoder, rc: RangeEncoder) void {
-        self.rc = rc;
+    pub fn setRangeEncoder(self: *Encoder, range_coder: RangeEncoder) void {
+        self.range_coder = range_coder;
     }
 
-    // LZMA2 state reset without a dictionary reset (control 0xC0): the model,
-    // state, and rep distances return to initial values while the dictionary,
-    // finder tables, and position counters continue across the chunk boundary.
+    // Control 0xC0 resets model/state/reps while dictionary and finder continue.
     pub fn resetModelKeepDictionary(self: *Encoder) void {
         resetTables(self);
         self.state = 0;
@@ -2555,18 +2425,18 @@ pub const Encoder = struct {
         }
     }
 
-    pub fn restoreModel(self: *Encoder, src: []const Prob) void {
+    pub fn restoreModel(self: *Encoder, probabilities: []const Prob) void {
         var offset: usize = 0;
         inline for (std.meta.fields(ProbTables)) |field| {
             const slice = @field(self, field.name);
-            @memcpy(slice, src[offset..][0..slice.len]);
+            @memcpy(slice, probabilities[offset..][0..slice.len]);
             offset += slice.len;
         }
     }
 
-    fn getByte(self: *const Encoder, dist: u32) u8 {
-        const pos = if (dist <= self.dict_pos) self.dict_pos - dist else @as(u32, @intCast(self.dictionary.len)) - dist + self.dict_pos;
-        return self.dictionary[pos];
+    fn getByte(self: *const Encoder, distance: u32) u8 {
+        const position = if (distance <= self.dictionary_pos) self.dictionary_pos - distance else @as(u32, @intCast(self.dictionary.len)) - distance + self.dictionary_pos;
+        return self.dictionary[position];
     }
 };
 
@@ -2577,10 +2447,10 @@ fn encodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options
     try encoder.encodeInput(input, options.marker_required);
 }
 
-fn encodePosSlot(dist: u32) u32 {
-    const d: u64 = dist;
-    if (d < 4) return dist;
-    const k = 63 - @clz(d);
-    const slot_offset = (d - (@as(u64, 1) << @intCast(k))) >> @intCast(k - 1);
-    return 2 * @as(u32, @intCast(k)) + @as(u32, @intCast(slot_offset));
+fn encodePosSlot(distance: u32) u32 {
+    const wide_distance: u64 = distance;
+    if (wide_distance < 4) return distance;
+    const bit_index = 63 - @clz(wide_distance);
+    const slot_offset = (wide_distance - (@as(u64, 1) << @intCast(bit_index))) >> @intCast(bit_index - 1);
+    return 2 * @as(u32, @intCast(bit_index)) + @as(u32, @intCast(slot_offset));
 }

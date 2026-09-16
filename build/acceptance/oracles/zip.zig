@@ -9,6 +9,37 @@ const EntryNodes = harness.ArchiveEntryNodes;
 const entryWithMethod = harness.archiveEntryMethod;
 const lib = @import("lib.zig");
 
+const zip_caps: u64 = harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay;
+
+// Output is poisoned first so a short write cannot match by luck.
+fn zipReadOrdinal0(r: *Runner, archive: []const u8, output: []u8, expected: []const u8) !void {
+    @memset(output, 0xa5);
+    try harness.spanProduce(r, harness.ids.read, &.{
+        harness.archiveOrdinalParam(0),
+        harness.sourceSpan(archive),
+        harness.sinkSpan(output),
+    });
+    if (r.response.byte_length != expected.len or !std.mem.eql(u8, output[0..expected.len], expected)) {
+        return error.ZipReadMismatch;
+    }
+}
+
+fn expectCryptoRejection(r: *Runner, sink: []u8, password: []const u8, extra: harness.Node, entries: harness.Node, status: u32, diag: *harness.CryptoDiag, checked: *harness.Node) !void {
+    try harness.expect(r, harness.ids.write, &.{
+        harness.paramProfile(r.profile_id),
+        harness.scalarNode(harness.ids.source),
+        harness.sinkSpan(sink),
+        harness.capabilityParam(zip_caps),
+        harness.sizingModeParam(harness.size_metadata_exact),
+        harness.commitModeParam(harness.commit_confirmed),
+        harness.cryptoProfile(),
+        harness.cryptoPasswordParam(password),
+        extra,
+        entries,
+    }, .{ .profile = false, .diagnostic = &diag.diagnostic }, status);
+    if (checked.value_low != status) return error.CryptoDiagnosticMismatch;
+}
+
 fn setupZip(r: *Runner) void {
     harness.setup(r, harness.ids.zip, harness.mode_archive);
 }
@@ -105,19 +136,19 @@ fn cryptoNodes(password: []const u8, algo: ?u64, kdf_limit: ?u64, lifetime: ?u64
     if (password.len != 0) {
         out[count] = harness.cryptoProfile();
         count += 1;
-        out[count] = harness.pw(password);
+        out[count] = harness.cryptoPasswordParam(password);
         count += 1;
     }
     if (algo) |value| {
-        out[count] = harness.algo(value);
+        out[count] = harness.cryptoAlgorithmParam(value);
         count += 1;
     }
     if (kdf_limit) |value| {
-        out[count] = harness.kdf(value);
+        out[count] = harness.cryptoKdfLimitParam(value);
         count += 1;
     }
     if (lifetime) |value| {
-        out[count] = harness.plt(value);
+        out[count] = harness.cryptoPasswordLifetimeParam(value);
         count += 1;
     }
     return count;
@@ -132,11 +163,11 @@ fn zipWriteWithCrypto(r: *Runner, entries: harness.Node, archive: []u8, password
     count += 1;
     nodes[count] = harness.scalarNode(harness.ids.source);
     count += 1;
-    nodes[count] = harness.cap(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay);
+    nodes[count] = harness.capabilityParam(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay);
     count += 1;
-    nodes[count] = harness.pln(harness.plan_metadata_exact);
+    nodes[count] = harness.sizingModeParam(harness.size_metadata_exact);
     count += 1;
-    nodes[count] = harness.dlv(harness.delivery_verified);
+    nodes[count] = harness.commitModeParam(harness.commit_confirmed);
     count += 1;
     @memcpy(nodes[count..][0..crypto_count], crypto[0..crypto_count]);
     count += crypto_count;
@@ -151,11 +182,11 @@ fn zipWriteWithCrypto(r: *Runner, entries: harness.Node, archive: []u8, password
     count += 1;
     nodes[count] = harness.sinkSpan(archive[0..size]);
     count += 1;
-    nodes[count] = harness.cap(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay);
+    nodes[count] = harness.capabilityParam(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay);
     count += 1;
-    nodes[count] = harness.pln(harness.plan_metadata_exact);
+    nodes[count] = harness.sizingModeParam(harness.size_metadata_exact);
     count += 1;
-    nodes[count] = harness.dlv(harness.delivery_verified);
+    nodes[count] = harness.commitModeParam(harness.commit_confirmed);
     count += 1;
     @memcpy(nodes[count..][0..crypto_count], crypto[0..crypto_count]);
     count += crypto_count;
@@ -172,7 +203,7 @@ fn zipReadWithPassword(r: *Runner, archive: []const u8, ordinal: u64, output: []
     const crypto_count = cryptoNodes(password, null, null, null, &crypto);
     var nodes: [7]harness.Node = undefined;
     var count: usize = 0;
-    nodes[count] = harness.ord(ordinal);
+    nodes[count] = harness.archiveOrdinalParam(ordinal);
     count += 1;
     nodes[count] = harness.sourceSpan(archive);
     count += 1;
@@ -227,45 +258,42 @@ fn runEncrypted(r: *Runner) anyerror!void {
     }
     var source_ctx = harness.SourceCallbackContext{ .data = zip_enc_archive[0..zip_enc_archive_size] };
     _ = harness.call(r, harness.ids.read, &.{
-        harness.ord(0),
+        harness.archiveOrdinalParam(0),
         harness.sourceCallbackNode(0, 0),
         harness.sinkSpan(&output),
         harness.cryptoProfile(),
-        harness.pw(password),
+        harness.cryptoPasswordParam(password),
     }, .{ .ctx = true, .callback = harness.sourceCallback, .context = &source_ctx });
     try harness.requireStatus(r, abi.Status.ok);
     if (r.response.byte_length != zip_small.len or !std.mem.eql(u8, output[0..zip_small.len], &zip_small)) {
         return error.EncryptedCallbackReadMismatch;
     }
     try harness.reject(r, harness.ids.read, &.{
-        harness.ord(0),
+        harness.archiveOrdinalParam(0),
         harness.sourceSpan(zip_enc_archive[0..zip_enc_archive_size]),
         harness.sinkSpan(&output),
     }, .{ .ctx = true }, abi.Status.unsupported, &output);
-    var wrong_password: harness.Node = undefined;
-    var kdf_limit: harness.Node = undefined;
-    var password_lifetime: harness.Node = undefined;
-    var unsupported_algorithm: harness.Node = undefined;
-    var diagnostic = harness.cryptoDiagnostic(&wrong_password, &kdf_limit, &password_lifetime, &unsupported_algorithm);
+    var diag: harness.CryptoDiag = undefined;
+    harness.cryptoDiag(&diag);
     @memset(&output, 0xa5);
     _ = harness.call(r, harness.ids.read, &.{
-        harness.ord(0),
+        harness.archiveOrdinalParam(0),
         harness.sourceSpan(zip_enc_archive[0..zip_enc_archive_size]),
         harness.sinkSpan(&output),
         harness.cryptoProfile(),
-        harness.pw("wrong"),
-    }, .{ .ctx = true, .diagnostic = &diagnostic });
+        harness.cryptoPasswordParam("wrong"),
+    }, .{ .ctx = true, .diagnostic = &diag.diagnostic });
     try harness.requireStatus(r, abi.Status.invalid_data);
-    if (wrong_password.value_low != abi.Status.invalid_data or !harness.allBytesEqual(&output, 0xa5)) {
+    if (diag.wrong_password.value_low != abi.Status.invalid_data or !harness.allBytesEqual(&output, 0xa5)) {
         return error.WrongPasswordDiagnosticMismatch;
     }
     zip_enc_archive[64] ^= 0xff;
     const corrupted_nodes = &.{
-        harness.ord(0),
+        harness.archiveOrdinalParam(0),
         harness.sourceSpan(zip_enc_archive[0..zip_enc_archive_size]),
         harness.sinkSpan(&output),
         harness.cryptoProfile(),
-        harness.pw(password),
+        harness.cryptoPasswordParam(password),
     };
     @memset(&output, 0xa5);
     _ = harness.call(r, harness.ids.read, corrupted_nodes, .{ .ctx = true });
@@ -273,73 +301,37 @@ fn runEncrypted(r: *Runner) anyerror!void {
     try harness.requireStatus(r, abi.Status.integrity_failure);
     if (!harness.allBytesEqual(&output, 0xa5)) return error.EncryptedCorruptionChangedOutput;
     try harness.rejectAny(r, harness.ids.read, &.{
-        harness.ord(0),
+        harness.archiveOrdinalParam(0),
         harness.sourceSpan(zip_enc_archive[0 .. zip_enc_archive_size / 2]),
         harness.sinkSpan(&output),
         harness.cryptoProfile(),
-        harness.pw(password),
+        harness.cryptoPasswordParam(password),
     }, .{ .ctx = true }, &output);
     var sink_buffer: [512]u8 = undefined;
-    var diag2 = harness.cryptoDiagnostic(&wrong_password, &kdf_limit, &password_lifetime, &unsupported_algorithm);
-    var limit_nodes = [_]harness.Node{
-        harness.paramProfile(r.profile_id),
-        harness.scalarNode(harness.ids.source),
-        harness.sinkSpan(&sink_buffer),
-        harness.cap(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay),
-        harness.pln(harness.plan_metadata_exact),
-        harness.dlv(harness.delivery_verified),
-        harness.cryptoProfile(),
-        harness.pw(password),
-        harness.kdf(500),
-        entries[0],
-    };
-    try harness.expect(r, harness.ids.write, &limit_nodes, .{ .profile = false, .diagnostic = &diag2 }, abi.Status.resource_limit);
-    if (kdf_limit.value_low != abi.Status.resource_limit) return error.KdfLimitDiagnosticMismatch;
-    var diag3 = harness.cryptoDiagnostic(&wrong_password, &kdf_limit, &password_lifetime, &unsupported_algorithm);
-    var lifetime_nodes = [_]harness.Node{
-        harness.paramProfile(r.profile_id),
-        harness.scalarNode(harness.ids.source),
-        harness.sinkSpan(&sink_buffer),
-        harness.cap(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay),
-        harness.pln(harness.plan_metadata_exact),
-        harness.dlv(harness.delivery_verified),
-        harness.cryptoProfile(),
-        harness.pw(password),
-        harness.plt(1),
-        entries[0],
-    };
-    try harness.expect(r, harness.ids.write, &lifetime_nodes, .{ .profile = false, .diagnostic = &diag3 }, abi.Status.resource_limit);
-    if (password_lifetime.value_low != abi.Status.resource_limit) return error.PasswordLifetimeDiagnosticMismatch;
-    var diag4 = harness.cryptoDiagnostic(&wrong_password, &kdf_limit, &password_lifetime, &unsupported_algorithm);
-    var algo_nodes = [_]harness.Node{
-        harness.paramProfile(r.profile_id),
-        harness.scalarNode(harness.ids.source),
-        harness.sinkSpan(&sink_buffer),
-        harness.cap(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay),
-        harness.pln(harness.plan_metadata_exact),
-        harness.dlv(harness.delivery_verified),
-        harness.cryptoProfile(),
-        harness.pw(password),
-        harness.algo(1),
-        entries[0],
-    };
-    try harness.expect(r, harness.ids.write, &algo_nodes, .{ .profile = false, .diagnostic = &diag4 }, abi.Status.unsupported);
-    if (unsupported_algorithm.value_low != abi.Status.unsupported) return error.UnsupportedAlgorithmDiagnosticMismatch;
+    var diag2: harness.CryptoDiag = undefined;
+    harness.cryptoDiag(&diag2);
+    try expectCryptoRejection(r, &sink_buffer, password, harness.cryptoKdfLimitParam(500), entries[0], abi.Status.resource_limit, &diag2, &diag2.kdf_limit);
+    var diag3: harness.CryptoDiag = undefined;
+    harness.cryptoDiag(&diag3);
+    try expectCryptoRejection(r, &sink_buffer, password, harness.cryptoPasswordLifetimeParam(1), entries[0], abi.Status.resource_limit, &diag3, &diag3.password_lifetime);
+    var diag4: harness.CryptoDiag = undefined;
+    harness.cryptoDiag(&diag4);
+    try expectCryptoRejection(r, &sink_buffer, password, harness.cryptoAlgorithmParam(1), entries[0], abi.Status.unsupported, &diag4, &diag4.unsupported_algorithm);
     try harness.expect(r, harness.ids.write, &.{
         harness.scalarNode(harness.ids.source),
         harness.sinkSpan(&sink_buffer),
-        harness.cap(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay),
-        harness.pln(harness.plan_metadata_exact),
-        harness.dlv(harness.delivery_verified),
-        harness.pw(password),
+        harness.capabilityParam(zip_caps),
+        harness.sizingModeParam(harness.size_metadata_exact),
+        harness.commitModeParam(harness.commit_confirmed),
+        harness.cryptoPasswordParam(password),
         entries[0],
     }, .{}, abi.Status.invalid_call);
     try harness.expect(r, harness.ids.write, &.{
         harness.scalarNode(harness.ids.source),
         harness.sinkSpan(&sink_buffer),
-        harness.cap(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay),
-        harness.pln(harness.plan_metadata_exact),
-        harness.dlv(harness.delivery_verified),
+        harness.capabilityParam(zip_caps),
+        harness.sizingModeParam(harness.size_metadata_exact),
+        harness.commitModeParam(harness.commit_confirmed),
         harness.cryptoProfile(),
         entries[0],
     }, .{}, abi.Status.invalid_call);
@@ -349,18 +341,18 @@ fn runEncrypted(r: *Runner) anyerror!void {
     };
     const oracle = lib.archiveReadMatches(zip_enc_archive[0..zip_enc_archive_size], &expected);
     if (oracle == .mismatch) return error.EncryptedOracleRejected;
-    if (oracle == .unsupported) std.debug.print("zip encrypted oracle: unsupported (libarchive cannot read AES zip)\n", .{});
+    if (oracle == .unsupported) std.debug.print("zip encrypted oracle: unsupported (libarchive cannot read AES zip).\n", .{});
     const fixture_data = [_][]const u8{ &fixtures.zip_aes128_fixture, &fixtures.zip_aes192_fixture, &fixtures.zip_aes256_fixture };
     const fixture_expected = "encrypted\n";
     for (fixture_data) |fixture_bytes| {
         var fixture_output: [1024]u8 = undefined;
         @memset(&fixture_output, 0xa5);
         _ = harness.call(r, harness.ids.read, &.{
-            harness.ord(1),
+            harness.archiveOrdinalParam(1),
             harness.sourceSpan(fixture_bytes),
             harness.sinkSpan(&fixture_output),
             harness.cryptoProfile(),
-            harness.pw("foofoofoo"),
+            harness.cryptoPasswordParam("foofoofoo"),
         }, .{ .ctx = true });
         try harness.requireStatus(r, abi.Status.ok);
         if (r.response.byte_length != fixture_expected.len or !std.mem.eql(u8, fixture_output[0..fixture_expected.len], fixture_expected)) {
@@ -378,7 +370,7 @@ fn runEncrypted(r: *Runner) anyerror!void {
     }
     zip_enc_archive[central_offset + 8] |= 0x20;
     const bit5_nodes = &.{
-        harness.ord(0),
+        harness.archiveOrdinalParam(0),
         harness.sourceSpan(zip_enc_archive[0..zip_enc_archive_size]),
         harness.sinkSpan(&output),
     };
@@ -416,21 +408,18 @@ fn runTraditional(r: *Runner) anyerror!void {
     if (r.response.byte_length != zip_big.len or !std.mem.eql(u8, output[0..zip_big.len], &zip_big)) {
         return error.TraditionalCallbackReadMismatch;
     }
-    var wrong_password: harness.Node = undefined;
-    var kdf_limit: harness.Node = undefined;
-    var password_lifetime: harness.Node = undefined;
-    var unsupported_algorithm: harness.Node = undefined;
-    var diagnostic = harness.cryptoDiagnostic(&wrong_password, &kdf_limit, &password_lifetime, &unsupported_algorithm);
+    var diag: harness.CryptoDiag = undefined;
+    harness.cryptoDiag(&diag);
     @memset(&output, 0xa5);
     _ = harness.call(r, harness.ids.read, &.{
-        harness.ord(0),
+        harness.archiveOrdinalParam(0),
         harness.sourceSpan(zip_trad_archive[0..zip_trad_archive_size]),
         harness.sinkSpan(&output),
         harness.cryptoProfile(),
-        harness.pw("wrong"),
-    }, .{ .ctx = true, .diagnostic = &diagnostic });
+        harness.cryptoPasswordParam("wrong"),
+    }, .{ .ctx = true, .diagnostic = &diag.diagnostic });
     try harness.requireStatus(r, abi.Status.invalid_data);
-    if (wrong_password.value_low != abi.Status.invalid_data) return error.TraditionalWrongPasswordDiagnosticMissing;
+    if (diag.wrong_password.value_low != abi.Status.invalid_data) return error.TraditionalWrongPasswordDiagnosticMissing;
     try makeTraditionalZip(r, 8);
     _ = try zipReadWithPassword(r, zip_trad_archive[0..zip_trad_archive_size], 0, &output, "s3cret");
     try harness.requireStatus(r, abi.Status.ok);
@@ -461,31 +450,22 @@ fn runMethods(r: *Runner) anyerror!void {
             harness.paramProfile(harness.ids.bzip2),
             harness.sourceSpan(zip_methods_bz_saved[0..bz_size]),
             harness.sinkSpan(&direct_output),
-            harness.cap(harness.cap_read | harness.cap_size | harness.cap_replay),
-            harness.pln(harness.plan_replay_pass),
-            harness.dlv(harness.delivery_provisional),
+            harness.capabilityParam(harness.cap_read | harness.cap_size | harness.cap_replay),
+            harness.sizingModeParam(harness.size_measured),
+            harness.commitModeParam(harness.commit_tentative),
         }, .{ .profile = false });
         const archive_size = zipWrapOne(&zip_methods_archive, "in.txt", 12, 0, zip_methods_bz_saved[0..bz_size], crc, @intCast(zip_large.len));
-        @memset(&output, 0xa5);
-        _ = harness.call(r, harness.ids.read, &.{
-            harness.ord(0),
-            harness.sourceSpan(zip_methods_archive[0..archive_size]),
-            harness.sinkSpan(&output),
-        }, .{ .ctx = true });
-        try harness.requireStatus(r, abi.Status.ok);
-        if (r.response.byte_length != zip_large.len or !std.mem.eql(u8, output[0..zip_large.len], &zip_large)) {
-            return error.MethodsBzip2ReadMismatch;
-        }
+        try zipReadOrdinal0(r, zip_methods_archive[0..archive_size], &output, &zip_large);
     }
     var lzma_payload: [8192]u8 = undefined;
     _ = harness.call(r, harness.ids.write, &.{
         harness.paramProfile(harness.ids.lzma),
-        harness.lzd(1 << 20),
+        harness.lzmaDictionaryParam(1 << 20),
         harness.sourceSpan(&zip_large),
         harness.sinkSpan(&lzma_payload),
-        harness.cap(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay),
-        harness.pln(harness.plan_replay_pass),
-        harness.dlv(harness.delivery_provisional),
+        harness.capabilityParam(zip_caps),
+        harness.sizingModeParam(harness.size_measured),
+        harness.commitModeParam(harness.commit_tentative),
     }, .{ .profile = false });
     if (r.status == abi.Status.ok) {
         const stream_size: usize = @intCast(r.response.byte_length);
@@ -500,16 +480,7 @@ fn runMethods(r: *Runner) anyerror!void {
     }
     if (zip_methods_saved_sizes[0] != 0) {
         const archive_size = zipWrapOne(&zip_methods_archive, "in.txt", 14, 0, zip_methods_saved[0][0..zip_methods_saved_sizes[0]], crc, @intCast(zip_large.len));
-        @memset(&output, 0xa5);
-        _ = harness.call(r, harness.ids.read, &.{
-            harness.ord(0),
-            harness.sourceSpan(zip_methods_archive[0..archive_size]),
-            harness.sinkSpan(&output),
-        }, .{ .ctx = true });
-        try harness.requireStatus(r, abi.Status.ok);
-        if (r.response.byte_length != zip_large.len or !std.mem.eql(u8, output[0..zip_large.len], &zip_large)) {
-            return error.MethodsLzmaReadMismatch;
-        }
+        try zipReadOrdinal0(r, zip_methods_archive[0..archive_size], &output, &zip_large);
     }
     var damaged: [2048]u8 = undefined;
     if (zip_methods_bz_saved_size >= 8) {
@@ -523,7 +494,7 @@ fn runMethods(r: *Runner) anyerror!void {
             const bad_size = zipWrapOne(&zip_methods_archive, "bad.txt", methods[t], 0, damaged[0..damaged_size], crc, @intCast(zip_large.len));
             @memset(&output, 0xa5);
             _ = harness.call(r, harness.ids.read, &.{
-                harness.ord(0),
+                harness.archiveOrdinalParam(0),
                 harness.sourceSpan(zip_methods_archive[0..bad_size]),
                 harness.sinkSpan(&output),
             }, .{ .ctx = true });
@@ -533,31 +504,22 @@ fn runMethods(r: *Runner) anyerror!void {
     var xz_payload: [4096]u8 = undefined;
     _ = harness.call(r, harness.ids.write, &.{
         harness.paramProfile(harness.ids.xz),
-        harness.lzd(1 << 20),
+        harness.lzmaDictionaryParam(1 << 20),
         harness.sourceSpan(&zip_large),
         harness.sinkSpan(&xz_payload),
-        harness.cap(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay),
-        harness.pln(harness.plan_replay_pass),
-        harness.dlv(harness.delivery_verified),
+        harness.capabilityParam(zip_caps),
+        harness.sizingModeParam(harness.size_measured),
+        harness.commitModeParam(harness.commit_confirmed),
     }, .{ .profile = false });
     try harness.requireStatus(r, abi.Status.ok);
     const xz_size: usize = @intCast(r.response.byte_length);
     if (xz_size == 0 or xz_size >= xz_payload.len) return error.XzEncodeFailed;
     const archive_size = zipWrapOne(&zip_methods_archive, "in.txt", 95, 0, xz_payload[0..xz_size], crc, @intCast(zip_large.len));
-    @memset(&output, 0xa5);
-    _ = harness.call(r, harness.ids.read, &.{
-        harness.ord(0),
-        harness.sourceSpan(zip_methods_archive[0..archive_size]),
-        harness.sinkSpan(&output),
-    }, .{ .ctx = true });
-    try harness.requireStatus(r, abi.Status.ok);
-    if (r.response.byte_length != zip_large.len or !std.mem.eql(u8, output[0..zip_large.len], &zip_large)) {
-        return error.MethodsXzReadMismatch;
-    }
+    try zipReadOrdinal0(r, zip_methods_archive[0..archive_size], &output, &zip_large);
     const bad_size = zipWrapOne(&zip_methods_archive, "bad.txt", 95, 0, xz_payload[0 .. xz_size - 4], crc, @intCast(zip_large.len));
     @memset(&output, 0xa5);
     _ = harness.call(r, harness.ids.read, &.{
-        harness.ord(0),
+        harness.archiveOrdinalParam(0),
         harness.sourceSpan(zip_methods_archive[0..bad_size]),
         harness.sinkSpan(&output),
     }, .{ .ctx = true });
@@ -567,7 +529,7 @@ fn runMethods(r: *Runner) anyerror!void {
     const bad2_size = zipWrapOne(&zip_methods_archive, "bad.txt", 95, 0, damaged[0..xz_size], crc, @intCast(zip_large.len));
     @memset(&output, 0xa5);
     _ = harness.call(r, harness.ids.read, &.{
-        harness.ord(0),
+        harness.archiveOrdinalParam(0),
         harness.sourceSpan(zip_methods_archive[0..bad2_size]),
         harness.sinkSpan(&output),
     }, .{ .ctx = true });
@@ -584,23 +546,14 @@ fn runEncodeMethods(r: *Runner) anyerror!void {
         var store: EntryNodes = undefined;
         const entry = entryWithMethod(&store, "enc.txt", &zip_encmethods_payload, method);
         const size = try zipWriteWithCrypto(r, entry, &archive, "", null, null, null);
-        @memset(&output, 0xa5);
-        _ = harness.call(r, harness.ids.read, &.{
-            harness.ord(0),
-            harness.sourceSpan(archive[0..size]),
-            harness.sinkSpan(&output),
-        }, .{ .ctx = true });
-        try harness.requireStatus(r, abi.Status.ok);
-        if (r.response.byte_length != zip_encmethods_payload.len or !std.mem.eql(u8, output[0..zip_encmethods_payload.len], &zip_encmethods_payload)) {
-            return error.EncmethodsReadMismatch;
-        }
+        try zipReadOrdinal0(r, archive[0..size], &output, &zip_encmethods_payload);
         if (method != 95) {
             const expected = [_]lib.ExpectedEntry{
                 .{ .name = "enc.txt", .data = &zip_encmethods_payload },
             };
             const oracle = lib.archiveReadMatches(archive[0..size], &expected);
             if (oracle == .mismatch) return error.EncmethodsOracleRejected;
-            if (oracle == .unsupported) std.debug.print("zip method {d} oracle: unsupported (libarchive cannot read)\n", .{method});
+            if (oracle == .unsupported) std.debug.print("zip method {d} oracle: unsupported (libarchive cannot read).\n", .{method});
         }
     }
     const empty_methods = [_]u16{ 14, 98 };
@@ -608,14 +561,7 @@ fn runEncodeMethods(r: *Runner) anyerror!void {
         var store: EntryNodes = undefined;
         const entry = entryWithMethod(&store, "empty.txt", &.{}, method);
         const size = try zipWriteWithCrypto(r, entry, &archive, "", null, null, null);
-        @memset(&output, 0xa5);
-        _ = harness.call(r, harness.ids.read, &.{
-            harness.ord(0),
-            harness.sourceSpan(archive[0..size]),
-            harness.sinkSpan(&output),
-        }, .{ .ctx = true });
-        try harness.requireStatus(r, abi.Status.ok);
-        if (r.response.byte_length != 0) return error.EncmethodsEmptyReadMismatch;
+        try zipReadOrdinal0(r, archive[0..size], &output, "");
     }
     const password = "zipcrypto-secret";
     var store: EntryNodes = undefined;
@@ -671,9 +617,9 @@ fn runRobust(r: *Runner) anyerror!void {
     try harness.expect(r, harness.ids.write, &.{
         harness.scalarNode(harness.ids.source),
         harness.sinkSpan(&zip_enc_archive),
-        harness.cap(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay),
-        harness.pln(harness.plan_metadata_exact),
-        harness.dlv(r.delivery_write),
+        harness.capabilityParam(zip_caps),
+        harness.sizingModeParam(harness.size_metadata_exact),
+        harness.commitModeParam(r.commit_write),
         entry3,
     }, .{}, abi.Status.unsupported);
     const foreign_data = "system unzip check";

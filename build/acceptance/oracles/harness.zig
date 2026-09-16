@@ -16,11 +16,11 @@ pub const cap_replay: u32 = 1 << 3;
 pub const cap_seek: u32 = 1 << 4;
 pub const cap_range: u32 = 1 << 5;
 pub const plan_unavailable: u64 = 0;
-pub const plan_metadata_exact: u64 = 1;
-pub const plan_replay_pass: u64 = 2;
-pub const plan_bounded_materialization: u64 = 3;
-pub const delivery_provisional: u64 = 0;
-pub const delivery_verified: u64 = 1;
+pub const size_metadata_exact: u64 = 1;
+pub const size_measured: u64 = 2;
+pub const plan_materialization: u64 = 3;
+pub const commit_tentative: u64 = 0;
+pub const commit_confirmed: u64 = 1;
 pub const cmd_query: u32 = 1 << 0;
 pub const cmd_read: u32 = 1 << 1;
 pub const cmd_write: u32 = 1 << 2;
@@ -38,8 +38,8 @@ pub const param_family_xz: u16 = 7;
 pub const protocol_workspace_hint: u32 = 1;
 pub const protocol_resource_limit: u32 = 2;
 pub const protocol_resource_capabilities: u32 = 3;
-pub const protocol_planning_mode: u32 = 4;
-pub const protocol_delivery_mode: u32 = 5;
+pub const protocol_sizing_mode: u32 = 4;
+pub const protocol_commit_mode: u32 = 5;
 pub const crypto_password: u32 = 1;
 pub const crypto_algorithm: u32 = 2;
 pub const crypto_kdf_rounds_limit: u32 = 3;
@@ -89,10 +89,10 @@ pub const xz_check: u32 = 1;
 pub const xz_filters: u32 = 2;
 pub var ids: catalog.Ids = undefined;
 pub var catalog_descriptors: []catalog.DescriptorJson = &.{};
-pub var io: std.Io = undefined;
+pub var oracle_io: std.Io = undefined;
 
 pub fn loadCatalog(path: []const u8) !catalog.Catalog {
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, std.heap.page_allocator, .limited(1 << 20));
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(oracle_io, path, std.heap.page_allocator, .limited(1 << 20));
     const parsed = try catalog.parse(std.heap.page_allocator, bytes);
     ids = try catalog.loadIds(&parsed);
     catalog_descriptors = parsed.descriptors;
@@ -160,50 +160,50 @@ pub fn scenarios(comptime suite: []const u8, comptime specs: []const Spec, compt
 }
 
 pub const Mode = struct {
-    planning: u64,
-    delivery_write: u64,
-    delivery_read: u64,
+    sizing: u64,
+    commit_write: u64,
+    commit_read: u64,
     caps_query: u64,
     caps_io: u64,
 };
 
 pub const mode_stream = Mode{
-    .planning = plan_replay_pass,
-    .delivery_write = delivery_provisional,
-    .delivery_read = delivery_provisional,
+    .sizing = size_measured,
+    .commit_write = commit_tentative,
+    .commit_read = commit_tentative,
     .caps_query = cap_read | cap_size | cap_replay,
     .caps_io = cap_read | cap_write | cap_size | cap_replay,
 };
 
 pub const mode_archive = Mode{
-    .planning = plan_metadata_exact,
-    .delivery_write = delivery_verified,
-    .delivery_read = delivery_provisional,
+    .sizing = size_metadata_exact,
+    .commit_write = commit_confirmed,
+    .commit_read = commit_tentative,
     .caps_query = cap_read | cap_write | cap_size | cap_replay,
     .caps_io = cap_read | cap_write | cap_size | cap_replay,
 };
 
 pub const mode_xz = Mode{
-    .planning = plan_replay_pass,
-    .delivery_write = delivery_verified,
-    .delivery_read = delivery_verified,
+    .sizing = size_measured,
+    .commit_write = commit_confirmed,
+    .commit_read = commit_confirmed,
     .caps_query = cap_read | cap_size | cap_replay,
     .caps_io = cap_read | cap_write | cap_size | cap_replay,
 };
 
 pub const mode_protocol = Mode{
-    .planning = plan_metadata_exact,
-    .delivery_write = delivery_provisional,
-    .delivery_read = delivery_provisional,
+    .sizing = size_metadata_exact,
+    .commit_write = commit_tentative,
+    .commit_read = commit_tentative,
     .caps_query = cap_read | cap_write | cap_size | cap_replay | cap_seek | cap_range,
     .caps_io = cap_read | cap_write | cap_size | cap_replay | cap_seek | cap_range,
 };
 
 pub fn setup(r: *Runner, profile_id: Id, mode: Mode) void {
     r.profile_id = profile_id;
-    r.planning = mode.planning;
-    r.delivery_write = mode.delivery_write;
-    r.delivery_read = mode.delivery_read;
+    r.sizing = mode.sizing;
+    r.commit_write = mode.commit_write;
+    r.commit_read = mode.commit_read;
     r.caps_query = mode.caps_query;
     r.caps_io = mode.caps_io;
 }
@@ -212,7 +212,7 @@ pub const Runner = struct {
     gpa: std.mem.Allocator,
     scenario_name: []const u8,
     corpus_index: usize = 0,
-    corpus_buffer: [32]u8 = undefined,
+    corpus_buffer: [32]u8,
     workspace: []u8 = &.{},
     output: []u8 = &.{},
     encoded: []u8 = &.{},
@@ -221,15 +221,15 @@ pub const Runner = struct {
     required: usize = 0,
     encoded_len: usize = 0,
     profile_id: Id = .{ .low = 0, .high = 0 },
-    extra: u64 = 0,
-    extra2: ?u64 = null,
+    lzma_dictionary: u64 = 0,
+    lzma_match_finder: ?u64 = null,
     sink_accept: u64 = 0,
     input: []const u8 = &.{},
     caps_query: u64 = 0,
     caps_io: u64 = 0,
-    planning: u64 = 0,
-    delivery_write: u64 = 0,
-    delivery_read: u64 = 0,
+    sizing: u64 = 0,
+    commit_write: u64 = 0,
+    commit_read: u64 = 0,
     invalid: []const u8 = &.{},
     invalid_status: u32 = 0,
     corrupt_status: u32 = 0,
@@ -255,9 +255,9 @@ pub fn scalarNode(id: Id) Node {
     return result;
 }
 
-pub fn scalarValue(id: Id, v: u64) Node {
+pub fn scalarValue(id: Id, value: u64) Node {
     var result = scalarNode(id);
-    result.value_low = v;
+    result.value_low = value;
     return result;
 }
 
@@ -275,12 +275,12 @@ pub fn paramTargetCommand(id: Id) Node {
     return result;
 }
 
-pub fn paramPlanningBound() Node {
-    return scalarNode(ids.planning_bound);
+pub fn paramSizingBound() Node {
+    return scalarNode(ids.size_bound);
 }
 
-pub fn paramSelector(family: u16, ordinal: u32, attrs: u8, command_mask: u32) u64 {
-    return (@as(u64, family) << 48) | (@as(u64, ordinal) << 16) | (@as(u64, attrs) << 8) | @as(u64, command_mask & 0x07);
+pub fn paramSelector(family: u16, ordinal: u32, attributes: u8, command_mask: u32) u64 {
+    return (@as(u64, family) << 48) | (@as(u64, ordinal) << 16) | (@as(u64, attributes) << 8) | @as(u64, command_mask & 0x07);
 }
 
 pub fn paramScalar(family: u16, ordinal: u32, commands: u32, value: u64) Node {
@@ -294,113 +294,113 @@ pub fn paramBytes(family: u16, ordinal: u32, commands: u32, bytes: []const u8) N
     return paramBytesFull(family, ordinal, 0x12, commands, bytes);
 }
 
-pub fn paramBytesFull(family: u16, ordinal: u32, attrs: u8, commands: u32, bytes: []const u8) Node {
+pub fn paramBytesFull(family: u16, ordinal: u32, attributes: u8, commands: u32, bytes: []const u8) Node {
     var result = scalarNode(ids.parameter);
-    result.value_high = paramSelector(family, ordinal, attrs, commands);
+    result.value_high = paramSelector(family, ordinal, attributes, commands);
     result.bytes = @ptrCast(@constCast(bytes.ptr));
     result.byte_capacity = bytes.len;
     result.byte_length = bytes.len;
     return result;
 }
 
-pub fn cap(v: u64) Node {
-    return paramScalar(param_family_protocol, protocol_resource_capabilities, cmd_all, v);
+pub fn capabilityParam(value: u64) Node {
+    return paramScalar(param_family_protocol, protocol_resource_capabilities, cmd_all, value);
 }
 
-pub fn pln(v: u64) Node {
-    return paramScalar(param_family_protocol, protocol_planning_mode, cmd_all, v);
+pub fn sizingModeParam(value: u64) Node {
+    return paramScalar(param_family_protocol, protocol_sizing_mode, cmd_all, value);
 }
 
-pub fn dlv(v: u64) Node {
-    return paramScalar(param_family_protocol, protocol_delivery_mode, cmd_all, v);
+pub fn commitModeParam(value: u64) Node {
+    return paramScalar(param_family_protocol, protocol_commit_mode, cmd_all, value);
 }
 
-pub fn lim(v: u64) Node {
-    return paramScalar(param_family_protocol, protocol_resource_limit, cmd_all, v);
+pub fn resourceLimitParam(value: u64) Node {
+    return paramScalar(param_family_protocol, protocol_resource_limit, cmd_all, value);
 }
 
-pub fn blck(v: u64) Node {
-    return paramScalar(param_family_bzip2, bzip2_block_size, cmd_query_write, v);
+pub fn bzip2BlockParam(value: u64) Node {
+    return paramScalar(param_family_bzip2, bzip2_block_size, cmd_query_write, value);
 }
 
-pub fn lzd(v: u64) Node {
-    return paramScalar(param_family_lzma, lzma_dictionary, cmd_all, v);
+pub fn lzmaDictionaryParam(value: u64) Node {
+    return paramScalar(param_family_lzma, lzma_dictionary, cmd_all, value);
 }
 
-pub fn xck(v: u64) Node {
-    return paramScalar(param_family_xz, xz_check, cmd_query_write, v);
+pub fn xzCheckParam(value: u64) Node {
+    return paramScalar(param_family_xz, xz_check, cmd_query_write, value);
 }
 
-pub fn xflt(v: u64) Node {
-    return paramScalar(param_family_xz, xz_filters, cmd_query_write, v);
+pub fn xzFiltersParam(value: u64) Node {
+    return paramScalar(param_family_xz, xz_filters, cmd_query_write, value);
 }
 
-pub fn pw(bytes: []const u8) Node {
+pub fn cryptoPasswordParam(bytes: []const u8) Node {
     return paramBytes(param_family_crypto, crypto_password, cmd_all, bytes);
 }
 
-pub fn algo(v: u64) Node {
-    return paramScalar(param_family_crypto, crypto_algorithm, cmd_all, v);
+pub fn cryptoAlgorithmParam(value: u64) Node {
+    return paramScalar(param_family_crypto, crypto_algorithm, cmd_all, value);
 }
 
-pub fn kdf(v: u64) Node {
-    return paramScalar(param_family_crypto, crypto_kdf_rounds_limit, cmd_all, v);
+pub fn cryptoKdfLimitParam(value: u64) Node {
+    return paramScalar(param_family_crypto, crypto_kdf_rounds_limit, cmd_all, value);
 }
 
-pub fn plt(v: u64) Node {
-    return paramScalar(param_family_crypto, crypto_password_lifetime, cmd_all, v);
+pub fn cryptoPasswordLifetimeParam(value: u64) Node {
+    return paramScalar(param_family_crypto, crypto_password_lifetime, cmd_all, value);
 }
 
-pub fn mtime(v: u64) Node {
-    return paramScalar(param_family_gzip, gzip_modification_time, cmd_query_write, v);
+pub fn gzipMtimeParam(value: u64) Node {
+    return paramScalar(param_family_gzip, gzip_modification_time, cmd_query_write, value);
 }
 
-pub fn xflags(v: u64) Node {
-    return paramScalar(param_family_gzip, gzip_extra_flags, cmd_query_write, v);
+pub fn gzipExtraFlagsParam(value: u64) Node {
+    return paramScalar(param_family_gzip, gzip_extra_flags, cmd_query_write, value);
 }
 
-pub fn os(v: u64) Node {
-    return paramScalar(param_family_gzip, gzip_operating_system, cmd_query_write, v);
+pub fn gzipOsParam(value: u64) Node {
+    return paramScalar(param_family_gzip, gzip_operating_system, cmd_query_write, value);
 }
 
-pub fn text(v: u64) Node {
-    return paramScalar(param_family_gzip, gzip_text, cmd_query_write, v);
+pub fn gzipTextParam(value: u64) Node {
+    return paramScalar(param_family_gzip, gzip_text, cmd_query_write, value);
 }
 
-pub fn hcrc(v: u64) Node {
-    return paramScalar(param_family_gzip, gzip_header_crc, cmd_query_write, v);
+pub fn gzipHeaderCrcParam(value: u64) Node {
+    return paramScalar(param_family_gzip, gzip_header_crc, cmd_query_write, value);
 }
 
-pub fn gname(bytes: []const u8) Node {
+pub fn gzipNameParam(bytes: []const u8) Node {
     return paramBytes(param_family_gzip, gzip_name, cmd_query_write, bytes);
 }
 
-pub fn gcomment(bytes: []const u8) Node {
+pub fn gzipCommentParam(bytes: []const u8) Node {
     return paramBytes(param_family_gzip, gzip_comment, cmd_query_write, bytes);
 }
 
-pub fn gextra(bytes: []const u8) Node {
+pub fn gzipExtraParam(bytes: []const u8) Node {
     return paramBytes(param_family_gzip, gzip_extra, cmd_query_write, bytes);
 }
 
-pub fn tflag(v: u64) Node {
-    return paramScalar(param_family_archive, archive_entry_typeflag, cmd_query_write, v);
+pub fn archiveTypeFlagParam(value: u64) Node {
+    return paramScalar(param_family_archive, archive_entry_typeflag, cmd_query_write, value);
 }
 
-pub fn link(bytes: []const u8) Node {
+pub fn archiveLinkNameParam(bytes: []const u8) Node {
     return paramBytes(param_family_archive, archive_entry_link_name, cmd_query_write, bytes);
 }
 
-pub fn uid(v: u64) Node {
-    return paramScalar(param_family_archive, archive_entry_uid, cmd_query_write, v);
+pub fn archiveUidParam(value: u64) Node {
+    return paramScalar(param_family_archive, archive_entry_uid, cmd_query_write, value);
 }
 
-pub fn mt(v: u64) Node {
-    return paramScalar(param_family_archive, archive_entry_mtime, cmd_query_write, v);
+pub fn archiveMtimeParam(value: u64) Node {
+    return paramScalar(param_family_archive, archive_entry_mtime, cmd_query_write, value);
 }
 
-pub fn ord(v: u64) Node {
-    return paramScalar(param_family_archive, archive_ordinal, cmd_read, v);
+pub fn archiveOrdinalParam(value: u64) Node {
+    return paramScalar(param_family_archive, archive_ordinal, cmd_read, value);
 }
 
 pub fn callbackNode(token_low: u64, token_high: u64) Node {
@@ -555,7 +555,8 @@ pub const CallOpts = struct {
 };
 
 pub fn call(r: *Runner, operation: Id, nodes: []const Node, opts: CallOpts) u32 {
-    var list: [16]Node = undefined;
+    // Zeroed, not undefined: validation reads every node field, and an uninitialized tail once caused intermittent invalid_call.
+    var list: [16]Node = @splat(Node.init());
     const prefix: usize = if (opts.profile) 1 else 0;
     const suffix: usize = if (opts.ctx) 3 else 0;
     std.debug.assert(nodes.len + prefix + suffix <= list.len);
@@ -567,11 +568,11 @@ pub fn call(r: *Runner, operation: Id, nodes: []const Node, opts: CallOpts) u32 
     @memcpy(list[count .. count + nodes.len], nodes);
     count += nodes.len;
     if (opts.ctx) {
-        list[count] = cap(ctxCap(r, operation));
+        list[count] = capabilityParam(ctxCap(r, operation));
         count += 1;
-        list[count] = pln(r.planning);
+        list[count] = sizingModeParam(r.sizing);
         count += 1;
-        list[count] = dlv(ctxDelivery(r, operation));
+        list[count] = commitModeParam(ctxCommit(r, operation));
         count += 1;
     }
     const workspace = if (opts.workspace.len != 0) opts.workspace else r.workspace;
@@ -583,13 +584,13 @@ fn ctxCap(r: *Runner, operation: Id) u64 {
     return if (abi.idEqual(operation, ids.query)) r.caps_query else r.caps_io;
 }
 
-fn ctxDelivery(r: *Runner, operation: Id) u64 {
-    return if (abi.idEqual(operation, ids.read)) r.delivery_read else r.delivery_write;
+fn ctxCommit(r: *Runner, operation: Id) u64 {
+    return if (abi.idEqual(operation, ids.read)) r.commit_read else r.commit_write;
 }
 
 pub fn requireStatus(r: *Runner, expected: u32) !void {
     if (r.status != expected) {
-        std.debug.print("scenario {s}: unexpected status {d}, expected {d}\n", .{ r.scenario_name, r.status, expected });
+        std.debug.print("Scenario \"{s}\" failed: unexpected status {d}, expected {d}.\n", .{ r.scenario_name, r.status, expected });
         return error.UnexpectedStatus;
     }
 }
@@ -612,22 +613,79 @@ pub fn rejectAny(r: *Runner, operation: Id, nodes: []const Node, opts: CallOpts,
     if (r.status == Status.ok or !allBytesEqual(unchanged, 0xa5)) return error.UnexpectedAcceptance;
 }
 
-pub fn expectCapacity(
+pub fn spanCall(r: *Runner, operation: Id, source: []const u8, sink: []u8) !void {
+    return spanProduce(r, operation, &.{ sourceSpan(source), sinkSpan(sink) });
+}
+
+// Only writes record frame length: a read's byte count is decoded size and must not clobber it.
+pub fn spanProduce(r: *Runner, operation: Id, nodes: []const Node) !void {
+    try expect(r, operation, nodes, .{ .ctx = true }, Status.ok);
+    if (abi.idEqual(operation, ids.write)) r.encoded_len = @intCast(r.response.byte_length);
+}
+
+pub fn capacityDiagnostic(required_id: Id, available_id: Id, required: *Node, available: *Node) Node {
+    required.* = scalarNode(required_id);
+    available.* = scalarNode(available_id);
+    var diagnostic = node(null, 0);
+    diagnostic.child = required;
+    required.next = available;
+    return diagnostic;
+}
+
+pub const CryptoDiag = struct {
+    wrong_password: Node,
+    kdf_limit: Node,
+    password_lifetime: Node,
+    unsupported_algorithm: Node,
+    diagnostic: Node,
+};
+
+pub fn cryptoDiag(d: *CryptoDiag) void {
+    d.diagnostic = cryptoDiagnostic(&d.wrong_password, &d.kdf_limit, &d.password_lifetime, &d.unsupported_algorithm);
+}
+
+pub fn chain(nodes: anytype) void {
+    for (0..nodes.len - 1) |index| {
+        nodes[index].next = &nodes[index + 1];
+    }
+}
+
+pub fn xorshiftFill(buffer: []u8, seed_base: u64) void {
+    var seed = seed_base;
+    for (buffer) |*byte| {
+        byte.* = @truncate(seed >> 56);
+        seed = seed *% 0x9e3779b97f4a7c15 +% 0x70d5e2f72d5a9c0b;
+    }
+}
+
+pub fn oracleFixture(
+    r: *Runner,
+    comptime reference: fn ([]const u8, []u8) ?usize,
+    input: []const u8,
+    compressed: []u8,
+    output: []u8,
+) !void {
+    const size = reference(input, compressed) orelse return error.OracleRejectedInput;
+    if (size == 0 or size >= compressed.len) return error.OracleOutputSize;
+    try spanCall(r, ids.read, compressed[0..size], output);
+    if (r.response.byte_length != input.len) return error.OracleDecodeLengthMismatch;
+    if (!std.mem.eql(u8, output[0..input.len], input)) return error.OracleContentMismatch;
+}
+
+fn expectCapacityIds(
+    required_id: Id,
+    available_id: Id,
     r: *Runner,
     operation: Id,
     nodes: []const Node,
     opts: CallOpts,
-    required_id: Id,
-    available_id: Id,
     expected_required: ?u64,
     expected_available: u64,
     unchanged: []u8,
 ) !void {
-    var required = scalarNode(required_id);
-    var available = scalarNode(available_id);
-    var diagnostic = node(null, 0);
-    diagnostic.child = &required;
-    required.next = &available;
+    var required: Node = undefined;
+    var available: Node = undefined;
+    var diagnostic = capacityDiagnostic(required_id, available_id, &required, &available);
     @memset(unchanged, 0xa5);
     _ = call(r, operation, nodes, .{ .profile = opts.profile, .ctx = opts.ctx, .workspace = opts.workspace, .diagnostic = &diagnostic });
     try requireStatus(r, Status.insufficient_capacity);
@@ -638,6 +696,14 @@ pub fn expectCapacity(
     }
     if (available.value_low != expected_available) return error.CapacityAvailableMismatch;
     if (!allBytesEqual(unchanged, 0xa5)) return error.CapacityChangedOutput;
+}
+
+pub fn expectCapacity(r: *Runner, operation: Id, nodes: []const Node, opts: CallOpts, expected_required: ?u64, expected_available: u64, unchanged: []u8) !void {
+    return expectCapacityIds(ids.diagnostic_required_capacity, ids.diagnostic_available_capacity, r, operation, nodes, opts, expected_required, expected_available, unchanged);
+}
+
+pub fn expectWorkspaceCapacity(r: *Runner, operation: Id, nodes: []const Node, opts: CallOpts, expected_required: ?u64, expected_available: u64, unchanged: []u8) !void {
+    return expectCapacityIds(ids.workspace_required_capacity, ids.workspace_available_capacity, r, operation, nodes, opts, expected_required, expected_available, unchanged);
 }
 
 pub const SourceCallbackContext = struct {

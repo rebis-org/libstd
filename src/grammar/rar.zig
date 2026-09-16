@@ -5,7 +5,6 @@ const bounds = @import("../common/primitive/bounds.zig");
 const checksum = @import("../common/primitive/checksum.zig");
 const failure_prim = @import("../common/primitive/failure.zig");
 const Failure = failure_prim.Failure;
-const io = @import("../common/primitive/io.zig");
 
 const signature = [8]u8{ 0x52, 0x61, 0x72, 0x21, 0x1a, 0x07, 0x01, 0x00 };
 const sfx_scan_limit: usize = 1024 * 1024;
@@ -176,7 +175,7 @@ fn parseBlock(archive: []const u8, cursor: *usize) Failure!ParsedHeader {
             const archive_flags = try sub.readULEB128();
             result.archive_flags = archive_flags;
             if (archive_flags & archive_flag_volume_number != 0) {
-                _ = try sub.readULEB128(); // volume number
+                _ = try sub.readULEB128();
             }
         },
         header_type_file, header_type_service => {

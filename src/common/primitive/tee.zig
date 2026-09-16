@@ -32,25 +32,25 @@ pub fn CountingTee(comptime has_crc32: bool, comptime has_crc64: bool) type {
             return self.crc64.final();
         }
 
-        fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
-            const self: *@This() = @fieldParentPtr("writer", w);
+        fn drain(writer: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+            const self: *@This() = @fieldParentPtr("writer", writer);
             if (data.len == 0) return 0;
             var total: usize = 0;
-            for (data[0 .. data.len - 1]) |buf| total += buf.len;
+            for (data[0 .. data.len - 1]) |chunk| total += chunk.len;
             total += data[data.len - 1].len * splat;
             if (total == 0) return 0;
             if (self.downstream) |out| {
-                for (data[0 .. data.len - 1]) |buf| out.writeAll(buf) catch return error.WriteFailed;
+                for (data[0 .. data.len - 1]) |chunk| out.writeAll(chunk) catch return error.WriteFailed;
                 const last = data[data.len - 1];
                 for (0..splat) |_| out.writeAll(last) catch return error.WriteFailed;
             }
             if (comptime has_crc32) {
-                for (data[0 .. data.len - 1]) |buf| self.crc32.update(buf);
+                for (data[0 .. data.len - 1]) |chunk| self.crc32.update(chunk);
                 const last = data[data.len - 1];
                 for (0..splat) |_| self.crc32.update(last);
             }
             if (comptime has_crc64) {
-                for (data[0 .. data.len - 1]) |buf| self.crc64.update(buf);
+                for (data[0 .. data.len - 1]) |chunk| self.crc64.update(chunk);
                 const last = data[data.len - 1];
                 for (0..splat) |_| self.crc64.update(last);
             }
