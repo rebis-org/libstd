@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const silesia_url = "https://sun.aei.polsl.pl/~sdeor/corpus/silesia.zip";
 pub const silesia_files = [_][]const u8{ "dickens", "mozilla", "mr", "nci", "ooffice", "osdb", "reymont", "samba", "sao", "webster", "xml", "x-ray" };
@@ -27,7 +28,7 @@ pub const Env = struct {
     row: ?[]const u8 = null,
     file: ?[]const u8 = null,
     limit: usize = silesia_files.len,
-    bound: bool = true,
+    bounded: bool = true,
 
     pub fn now(self: *const Env) u64 {
         return @intCast(std.Io.Clock.Timestamp.now(self.io, .awake).raw.nanoseconds);
@@ -58,6 +59,40 @@ pub const Env = struct {
 
     pub fn readFile(self: *Env, path: []const u8, max: u64) ![]u8 {
         return std.Io.Dir.cwd().readFileAlloc(self.io, path, self.allocator, .limited(max));
+    }
+
+    pub const Mapped = struct {
+        bytes: []const u8,
+        alloc: ?[]u8 = null,
+        map: if (builtin.os.tag == .windows) @TypeOf(null) else ?[]align(std.heap.page_size_min) const u8 = null,
+
+        pub fn release(self: Mapped, allocator: std.mem.Allocator) void {
+            if (self.alloc) |buf| {
+                allocator.free(buf);
+            } else if (self.map) |mapped| {
+                std.posix.munmap(mapped);
+            }
+        }
+    };
+
+    // Mmap keeps pages resident across repeated passes; heap fallback off POSIX.
+    pub fn mapFile(self: *Env, path: []const u8, max: u64) !Mapped {
+        if (builtin.os.tag == .windows) {
+            const buf = try self.readFile(path, max);
+            return .{ .bytes = buf, .alloc = buf };
+        }
+        const file = try std.Io.Dir.cwd().openFile(self.io, path, .{});
+        defer file.close(self.io);
+        const file_size: usize = @intCast((try file.stat(self.io)).size);
+        if (file_size > max) return error.FileTooBig;
+        if (file_size == 0) return .{ .bytes = &.{} };
+        // Darwin uses the packed-struct PROT form; other POSIX targets use the enum.
+        const read_prot: std.posix.PROT = switch (builtin.os.tag) {
+            .macos, .ios, .tvos, .watchos, .visionos, .maccatalyst, .driverkit => .{ .READ = true },
+            else => .READ,
+        };
+        const mapped = try std.posix.mmap(null, file_size, read_prot, .{ .TYPE = .PRIVATE }, file.handle, 0);
+        return .{ .bytes = mapped, .map = mapped };
     }
 
     pub fn writeFile(self: *Env, path: []const u8, data: []const u8) !void {

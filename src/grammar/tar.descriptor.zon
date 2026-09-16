@@ -1,0 +1,39 @@
+// Component descriptor (tar, class grammar).
+// Identity and policy are frozen ABI: rename or re-id is a breaking
+// change, caught by the comptime assertions in kernel/catalog.zig.
+.{
+    .id = .{ .low = "0x6e6b82f08d910405", .high = "0xa7a351053d6d4005" },
+    .name = "tar",
+    .class = "grammar",
+    .verbs = .{ "inspect", "decode_ordinal", "encode_ordinal" },
+    .parameters = .{
+        .{ .name = "ordinal", .family = 2, .ordinal = 1, .representation = "scalar_words" },
+        .{ .name = "entry_count", .family = 2, .ordinal = 2, .representation = "scalar_words" },
+        .{ .name = "entry_name", .family = 2, .ordinal = 3, .representation = "bytes" },
+        .{ .name = "entry_size", .family = 2, .ordinal = 4, .representation = "scalar_words" },
+        .{ .name = "entry", .family = 2, .ordinal = 5, .representation = "node_chain" },
+        .{ .name = "entry_data", .family = 2, .ordinal = 6, .representation = "bytes" },
+        .{ .name = "entry_method", .family = 2, .ordinal = 7, .representation = "scalar_words" },
+        .{ .name = "comment", .family = 2, .ordinal = 8, .representation = "bytes" },
+        .{ .name = "entry_typeflag", .family = 2, .ordinal = 9, .representation = "scalar_words" },
+        .{ .name = "entry_link_name", .family = 2, .ordinal = 10, .representation = "bytes" },
+        .{ .name = "entry_uid", .family = 2, .ordinal = 11, .representation = "scalar_words" },
+        .{ .name = "entry_mtime", .family = 2, .ordinal = 12, .representation = "scalar_words" },
+    },
+    .capabilities = .{ "read", "write", "size", "replay" },
+    .sizing = "metadata_exact",
+    .commit = "tentative",
+    .limits = .{ .window = 0, .block = 0, .history = 0 },
+    .benchmark = .{
+        .row = "tar",
+        .params = "store",
+        .kind = "tar",
+        .ext = "tar",
+        .cmd = "tar",
+        .archive = true,
+        .ref_params = "store",
+        .tunings = .{
+            .{},
+        },
+    },
+}

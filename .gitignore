@@ -265,3 +265,4 @@ docgen_tmp/
 
 !build/templates/module.modulemap.in
 .zig-cache/
+!src/testing/

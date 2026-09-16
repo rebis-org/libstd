@@ -2,7 +2,6 @@ const std = @import("std");
 
 const failure_prim = @import("../../common/primitive/failure.zig");
 const Failure = failure_prim.Failure;
-const io = @import("../../common/primitive/io.zig");
 const measurement = @import("../../common/primitive/measurement.zig");
 
 pub const order_min = 2;
@@ -258,21 +257,21 @@ fn hiBitsFlag4(sym: u8) u8 {
 }
 
 const Tables = struct {
-    units2_indx: [128]u8 = undefined,
-    indx2_units: [num_indexes]u8 = undefined,
-    ns2_bs_indx: [256]u8 = undefined,
-    ns2_indx: [260]u8 = undefined,
-    exp_escape: [16]u8 = undefined,
-    free_list: [num_indexes]u32 = undefined,
-    stamps: [num_indexes]u32 = undefined,
-    dummy_see: See = undefined,
-    see: [24][32]See = undefined,
-    bin_summ: [25][64]u16 = undefined,
+    units2_indx: [128]u8,
+    indx2_units: [num_indexes]u8,
+    ns2_bs_indx: [256]u8,
+    ns2_indx: [260]u8,
+    exp_escape: [16]u8,
+    free_list: [num_indexes]u32,
+    stamps: [num_indexes]u32,
+    dummy_see: See,
+    see: [24][32]See,
+    bin_summ: [25][64]u16,
 };
 
 const Model = struct {
-    tables: Tables = .{},
-    base: [*]u8 = undefined,
+    tables: Tables,
+    base: [*]u8,
     size: u32 = 0,
     text: u32 = 0,
     lo_unit: u32 = 0,
@@ -415,6 +414,7 @@ const Model = struct {
         @memset(&self.tables.stamps, 0);
         if (self.lo_unit != self.hi_unit) self.node(self.lo_unit).stamp = 0;
         var head: u32 = 0;
+        // Assigned at loop top before use, so `undefined` is safe.
         var next: u32 = undefined;
         var prev: *u32 = &head;
         var i: usize = 0;
@@ -497,8 +497,8 @@ const Model = struct {
     }
 
     fn copyUnits(self: *Model, dest: u32, source: u32, num: u32) void {
-        const d = @as([*]u32, @ptrFromInt(@intFromPtr(self.base) + dest));
-        const z = @as([*]const u32, @ptrFromInt(@intFromPtr(self.base) + source));
+        const d: [*]u32 = @ptrFromInt(@intFromPtr(self.base) + dest);
+        const z: [*]const u32 = @ptrFromInt(@intFromPtr(self.base) + source);
         var i: u32 = 0;
         while (i < num) : (i += 1) {
             d[i * 3] = z[i * 3];
@@ -640,7 +640,7 @@ const Model = struct {
 
     fn makeEscFreq(self: *Model, num_masked: u32) struct { see: *See, esc_freq: u32 } {
         const min_ctx = self.ctx(self.min_context);
-        const num_stats = @as(u32, min_ctx.num_stats);
+        const num_stats: u32 = min_ctx.num_stats;
         if (num_stats != 0xFF) {
             const row = self.tables.ns2_indx[@as(usize, num_stats) + 2] - 3;
             const col = @as(u32, @intFromBool(min_ctx.summ_freq > 11 * (num_stats + 1))) +
@@ -665,6 +665,7 @@ const Model = struct {
         var cc = c;
         var s1_mut = s1;
         while (cc.suffix != 0) {
+            // Assigned in every branch before use, so `undefined` is safe.
             var s: *State = undefined;
             cc = self.suffixOf(cc);
             if (s1_mut) |s1v| {
@@ -695,6 +696,7 @@ const Model = struct {
         const new_sym = self.ptr(up_branch)[0];
         const up_branch_next = up_branch + 1;
         const flags: u8 = hiBitsFlag4(self.state(self.found_state).symbol) + hiBitsFlag3(new_sym);
+        // Assigned in both branches before use, so `undefined` is safe.
         var new_freq: u8 = undefined;
         if (cc.num_stats == 0) {
             new_freq = Model.oneState(cc).freq;
@@ -709,6 +711,7 @@ const Model = struct {
                 (cf + 2 * s0 - 3) / s0);
         }
         while (num_ps != 0) {
+            // Assigned in every branch before use, so `undefined` is safe.
             var c1_off: u32 = undefined;
             if (self.hi_unit != self.lo_unit) {
                 self.hi_unit -= unit_size;
@@ -947,7 +950,7 @@ const Model = struct {
 
     fn updateModel(self: *Model) void {
         const f_symbol = self.state(self.found_state).symbol;
-        const f_freq = @as(u32, self.state(self.found_state).freq);
+        const f_freq: u32 = self.state(self.found_state).freq;
         var min_successor = Model.successor(self.state(self.found_state));
         var s: ?*State = null;
         if (f_freq < max_freq / 4 and self.ctx(self.min_context).suffix != 0) {
@@ -1018,6 +1021,7 @@ const Model = struct {
         var c = c0;
         while (self.ref(c) != self.min_context) {
             const ns1: u32 = c.num_stats;
+            // Assigned in both branches before use, so `undefined` is safe.
             var sum: u32 = undefined;
             if (ns1 != 0) {
                 if ((ns1 & 1) != 0) {
@@ -1125,7 +1129,7 @@ const Model = struct {
                 if (s[0].freq != 0) break;
             }
             esc_freq += removed;
-            const num_stats = @as(u32, min_ctx.num_stats);
+            const num_stats: u32 = min_ctx.num_stats;
             const num_stats_new = num_stats - removed;
             min_ctx.num_stats = @intCast(num_stats_new);
             const n0 = (num_stats + 2) >> 1;
@@ -1167,7 +1171,7 @@ const Model = struct {
     fn update1_0(self: *Model) void {
         const s = self.state(self.found_state);
         const min_ctx = self.ctx(self.min_context);
-        const freq = @as(u32, s.freq);
+        const freq: u32 = s.freq;
         self.prev_success = @intFromBool(2 * freq >= min_ctx.summ_freq);
         self.run_length += @intCast(self.prev_success);
         min_ctx.summ_freq +%= 4;
@@ -1249,7 +1253,7 @@ const Model = struct {
                 rc.range = size0;
                 try rc.normalize();
                 const c_off = Model.successor(s);
-                const freq = @as(u32, s.freq);
+                const freq: u32 = s.freq;
                 self.found_state = self.ref(s);
                 self.prev_success = 1;
                 self.run_length += 1;
@@ -1368,7 +1372,7 @@ const Model = struct {
                 rc.range = bound;
                 try rc.normalize();
                 const c_off = Model.successor(s);
-                const freq = @as(u32, s.freq);
+                const freq: u32 = s.freq;
                 self.found_state = self.ref(s);
                 self.prev_success = 1;
                 self.run_length += 1;

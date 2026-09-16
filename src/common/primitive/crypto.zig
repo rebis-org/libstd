@@ -22,17 +22,18 @@ pub const FailureCause = enum {
 
 pub const Sha256 = struct {
     state: [8]u32,
-    buffer: [64]u8 = undefined,
+    buffer: [64]u8,
     buffered: usize = 0,
     total: u64 = 0,
 
     pub const Options = struct {};
 
     pub fn init(_: Options) Sha256 {
+        // Undefined until update fills it before any read.
         return .{ .state = .{
             0x6a09_e667, 0xbb67_ae85, 0x3c6e_f372, 0xa54f_f53a,
             0x510e_527f, 0x9b05_688c, 0x1f83_d9ab, 0x5be0_cd19,
-        } };
+        }, .buffer = undefined };
     }
 
     fn rotr(value: u32, amount: u32) u32 {
@@ -141,14 +142,15 @@ pub const Sha256 = struct {
 
 pub const Sha1 = struct {
     state: [5]u32,
-    buffer: [64]u8 = undefined,
+    buffer: [64]u8,
     buffered: usize = 0,
     total: u64 = 0,
 
     pub const Options = struct {};
 
     pub fn init(_: Options) Sha1 {
-        return .{ .state = .{ 0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476, 0xc3d2_e1f0 } };
+        // Undefined until update fills it before any read.
+        return .{ .state = .{ 0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476, 0xc3d2_e1f0 }, .buffer = undefined };
     }
 
     fn compress(self: *Sha1, block: *const [64]u8) void {
@@ -449,16 +451,16 @@ pub fn aesDecryptBlock(key: []const u8, block: [block_length]u8) Failure![block_
     return aesDecryptWithSchedule(&schedule, &block);
 }
 
-pub fn winzipCtr(key: []const u8, dst: []u8, src: []const u8) Failure!void {
-    if (dst.len < src.len) return error.InvalidCall;
+pub fn winzipCtr(key: []const u8, destination: []u8, source: []const u8) Failure!void {
+    if (destination.len < source.len) return error.InvalidCall;
     const schedule = try aesKeySchedule(key);
     var counter: [block_length]u8 = .{0} ** block_length;
     counter[0] = 1;
     var offset: usize = 0;
-    while (offset < src.len) : (offset += block_length) {
+    while (offset < source.len) : (offset += block_length) {
         const keystream = aesEncryptWithSchedule(&schedule, &counter);
-        const count = @min(block_length, src.len - offset);
-        for (0..count) |index| dst[offset + index] = src[offset + index] ^ keystream[index];
+        const count = @min(block_length, source.len - offset);
+        for (0..count) |index| destination[offset + index] = source[offset + index] ^ keystream[index];
         var byte_index: usize = 0;
         while (byte_index < 8) : (byte_index += 1) {
             counter[byte_index] +%= 1;
@@ -468,31 +470,31 @@ pub fn winzipCtr(key: []const u8, dst: []u8, src: []const u8) Failure!void {
     return;
 }
 
-// AES-256-CBC operates on whole 16-byte blocks; zero padding is the caller's job.
-pub fn aesCbcEncrypt(key: []const u8, iv: [block_length]u8, dst: []u8, src: []const u8) Failure!void {
-    if (key.len != 32 or src.len % block_length != 0 or dst.len < src.len) return error.InvalidCall;
+// Whole blocks only; padding is the caller's job.
+pub fn aesCbcEncrypt(key: []const u8, iv: [block_length]u8, destination: []u8, source: []const u8) Failure!void {
+    if (key.len != 32 or source.len % block_length != 0 or destination.len < source.len) return error.InvalidCall;
     const schedule = try aesKeySchedule(key);
     var previous = iv;
     var offset: usize = 0;
-    while (offset < src.len) : (offset += block_length) {
+    while (offset < source.len) : (offset += block_length) {
         var block: [block_length]u8 = undefined;
-        for (0..block_length) |index| block[index] = src[offset + index] ^ previous[index];
+        for (0..block_length) |index| block[index] = source[offset + index] ^ previous[index];
         const encrypted = aesEncryptWithSchedule(&schedule, &block);
-        @memcpy(dst[offset..][0..block_length], &encrypted);
+        @memcpy(destination[offset..][0..block_length], &encrypted);
         previous = encrypted;
     }
     return;
 }
 
-pub fn aesCbcDecrypt(key: []const u8, iv: [block_length]u8, dst: []u8, src: []const u8) Failure!void {
-    if (key.len != 32 or src.len % block_length != 0 or dst.len < src.len) return error.InvalidCall;
+pub fn aesCbcDecrypt(key: []const u8, iv: [block_length]u8, destination: []u8, source: []const u8) Failure!void {
+    if (key.len != 32 or source.len % block_length != 0 or destination.len < source.len) return error.InvalidCall;
     const schedule = try aesKeySchedule(key);
     var previous = iv;
     var offset: usize = 0;
-    while (offset < src.len) : (offset += block_length) {
-        const decrypted = aesDecryptWithSchedule(&schedule, src[offset..][0..block_length]);
-        for (0..block_length) |index| dst[offset + index] = decrypted[index] ^ previous[index];
-        @memcpy(&previous, src[offset..][0..block_length]);
+    while (offset < source.len) : (offset += block_length) {
+        const decrypted = aesDecryptWithSchedule(&schedule, source[offset..][0..block_length]);
+        for (0..block_length) |index| destination[offset + index] = decrypted[index] ^ previous[index];
+        @memcpy(&previous, source[offset..][0..block_length]);
     }
     return;
 }
@@ -504,8 +506,6 @@ pub fn winzipDeriveKey(password: []const u8, salt: []const u8, key_length: usize
     return;
 }
 
-// The 7z AES key derivation hashes salt, UTF-16LE password, and an incrementing
-// little-endian u32 counter followed by four zero bytes for 2^num_cycles_power rounds.
 pub fn sevenZipKdf(password_utf16: []const u8, salt: []const u8, num_cycles_power: u8, out_key: *[seven_zip_key_length]u8) void {
     var sha = Sha256.init(.{});
     const rounds: u64 = @as(u64, 1) << @intCast(num_cycles_power);
@@ -558,9 +558,7 @@ pub fn constantTimeEqual(left: []const u8, right: []const u8) bool {
     return accumulator == 0;
 }
 
-// Entropy comes from the platform through the standard library; every shipped
-// target exposes one of these sources. The deterministic derivation is only a
-// compile-time fallback so unsupported targets still produce per-entry-unique salts.
+// Compile-time fallback only, so unsupported targets still get per-entry-unique salts.
 pub fn fillRandom(bytes: []u8) bool {
     if (comptime @hasDecl(std.posix.system, "arc4random_buf")) {
         std.posix.system.arc4random_buf(bytes.ptr, bytes.len);
@@ -630,19 +628,19 @@ pub const ZipCryptoKeys = struct {
         return self.decryptByte();
     }
 
-    pub fn encrypt(self: *ZipCryptoKeys, dst: []u8, src: []const u8) void {
-        for (src, 0..) |plain, index| {
+    pub fn encrypt(self: *ZipCryptoKeys, destination: []u8, source: []const u8) void {
+        for (source, 0..) |plain, index| {
             const cipher = self.encryptByte() ^ plain;
             self.update(plain);
-            dst[index] = cipher;
+            destination[index] = cipher;
         }
     }
 
-    pub fn decrypt(self: *ZipCryptoKeys, dst: []u8, src: []const u8) void {
-        for (src, 0..) |cipher, index| {
+    pub fn decrypt(self: *ZipCryptoKeys, destination: []u8, source: []const u8) void {
+        for (source, 0..) |cipher, index| {
             const plain = self.decryptByte() ^ cipher;
             self.update(plain);
-            dst[index] = plain;
+            destination[index] = plain;
         }
     }
 };

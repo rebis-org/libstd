@@ -5,8 +5,8 @@ const Failure = @import("failure.zig").Failure;
 pub fn readByte(reader: *std.Io.Reader) Failure!u8 {
     var buffer: [1]u8 = undefined;
     var iovecs = [_][]u8{buffer[0..]};
-    const n = reader.readVec(&iovecs) catch return error.IoFailure;
-    if (n == 0) return error.IoFailure;
+    const bytes_read = reader.readVec(&iovecs) catch return error.IoFailure;
+    if (bytes_read == 0) return error.IoFailure;
     return buffer[0];
 }
 

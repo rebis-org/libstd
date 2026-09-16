@@ -1,0 +1,13 @@
+// Protocol fixture: the echo test profile, used by the oracle suite to pin
+// envelope behavior without a real codec. A component like everything else.
+.{
+    .id = .{ .low = "0x6e6b82f08d910401", .high = "0xa7a351053d6d4001" },
+    .name = "test_echo",
+    .class = "slice",
+    .verbs = .{ "required_size", "decoded_size", "encoded_size_bound", "encode", "decode" },
+    .parameters = .{},
+    .capabilities = .{ "read", "write", "size", "replay", "seek", "range" },
+    .sizing = "metadata_exact",
+    .commit = "confirmed",
+    .limits = .{ .window = 0, .block = 0, .history = 0 },
+}

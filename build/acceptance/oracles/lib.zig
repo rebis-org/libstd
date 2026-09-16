@@ -4,10 +4,10 @@ const c = @import("c");
 
 const harness = @import("harness.zig");
 
-extern fn ZSTD_compress(dst: [*]u8, dstCapacity: usize, src: [*]const u8, srcSize: usize, level: c_int) usize;
-extern fn ZSTD_decompress(dst: [*]u8, dstCapacity: usize, src: [*]const u8, compressedSize: usize) usize;
+extern fn ZSTD_compress(destination: [*]u8, destination_capacity: usize, source: [*]const u8, source_size: usize, level: c_int) usize;
+extern fn ZSTD_decompress(destination: [*]u8, destination_capacity: usize, source: [*]const u8, compressed_size: usize) usize;
 extern fn ZSTD_isError(code: usize) c_uint;
-extern fn ZSTD_compressBound(srcSize: usize) usize;
+extern fn ZSTD_compressBound(source_size: usize) usize;
 
 pub const SystemLibraryStatus = struct {
     name: []const u8,
@@ -23,13 +23,13 @@ pub fn requiredStatuses() []const SystemLibraryStatus {
     };
 }
 
-fn runStream(stream: anytype, comptime code: anytype, comptime finish: anytype, comptime end: anytype, input: []const u8, output: []u8) ?usize {
+fn runStream(stream: anytype, comptime step_fn: anytype, comptime finish_flag: anytype, comptime expected_status: anytype, input: []const u8, output: []u8) ?usize {
     stream.next_in = @ptrCast(@constCast(input.ptr));
     stream.avail_in = @intCast(input.len);
     stream.next_out = output.ptr;
     stream.avail_out = @intCast(output.len);
-    const ret = code(stream, finish);
-    if (ret != end) return null;
+    const ret = step_fn(stream, finish_flag);
+    if (ret != expected_status) return null;
     return output.len - @as(usize, @intCast(stream.avail_out));
 }
 
@@ -52,6 +52,13 @@ pub fn gzipCompress(input: []const u8, output: []u8) ?usize {
     return runStream(&stream, c.deflate, c.Z_FINISH, c.Z_STREAM_END, input, output);
 }
 
+pub fn gzipDecompress(compressed: []const u8, output: []u8) ?usize {
+    var stream: c.z_stream = std.mem.zeroes(c.z_stream);
+    if (c.inflateInit2_(&stream, 15 + 32, c.ZLIB_VERSION, @sizeOf(c.z_stream)) != c.Z_OK) return null;
+    defer _ = c.inflateEnd(&stream);
+    return runStream(&stream, c.inflate, c.Z_FINISH, c.Z_STREAM_END, compressed, output);
+}
+
 pub fn bzip2Valid(compressed: []const u8) bool {
     var output: [65536]u8 = undefined;
     var dest_len: c_uint = @intCast(output.len);
@@ -64,6 +71,20 @@ pub fn bzip2Valid(compressed: []const u8) bool {
         0,
     );
     return ret == c.BZ_OK and dest_len > 0;
+}
+
+pub fn bzip2Decompress(compressed: []const u8, output: []u8) ?usize {
+    var dest_len: c_uint = @intCast(output.len);
+    const ret = c.BZ2_bzBuffToBuffDecompress(
+        @ptrCast(output.ptr),
+        &dest_len,
+        @ptrCast(@constCast(compressed.ptr)),
+        @intCast(compressed.len),
+        0,
+        0,
+    );
+    if (ret != c.BZ_OK) return null;
+    return dest_len;
 }
 
 pub fn zstdValid(compressed: []const u8) bool {
@@ -159,31 +180,31 @@ pub fn xzEncode(input: []const u8, output: []u8, check: u64, delta_dist: ?u32, b
     return runStream(&stream, c.lzma_code, c.LZMA_FINISH, c.LZMA_STREAM_END, input, output);
 }
 
-var temp_counter: usize = 0;
+var temp_file_sequence: usize = 0;
 
-pub fn writeTemp(bytes: []const u8, extension: []const u8) ![:0]u8 {
-    const io = harness.io;
+pub fn writeTempFile(bytes: []const u8, extension: []const u8) ![:0]u8 {
+    const oracle_io = harness.oracle_io;
     const dir = "zig-out/oracles";
-    try std.Io.Dir.cwd().createDirPath(io, dir);
-    var index = @atomicRmw(usize, &temp_counter, .Add, 1, .monotonic);
+    try std.Io.Dir.cwd().createDirPath(oracle_io, dir);
+    var index = @atomicRmw(usize, &temp_file_sequence, .Add, 1, .monotonic);
     while (true) : (index += 1) {
         const formatted = try std.fmt.allocPrint(std.heap.page_allocator, "{s}/oracle-{d}.{s}", .{ dir, index, extension });
         defer std.heap.page_allocator.free(formatted);
         const path = try std.heap.page_allocator.dupeZ(u8, formatted);
-        const file = std.Io.Dir.cwd().createFile(io, path, .{ .exclusive = true, .truncate = true }) catch |err| {
-            if (err == error.PathAlreadyExists) {
+        const file = std.Io.Dir.cwd().createFile(oracle_io, path, .{ .exclusive = true, .truncate = true }) catch |failure| {
+            if (failure == error.PathAlreadyExists) {
                 std.heap.page_allocator.free(path);
                 continue;
             }
             std.heap.page_allocator.free(path);
-            return err;
+            return failure;
         };
         errdefer {
-            file.close(io);
-            _ = std.Io.Dir.cwd().deleteFile(io, path) catch {};
+            file.close(oracle_io);
+            _ = std.Io.Dir.cwd().deleteFile(oracle_io, path) catch {};
         }
-        try file.writeStreamingAll(io, bytes);
-        file.close(io);
+        try file.writeStreamingAll(oracle_io, bytes);
+        file.close(oracle_io);
         return path;
     }
 }
@@ -211,10 +232,10 @@ pub const ExpectedEntry = struct {
 pub const ArchiveReadResult = enum { ok, unsupported, mismatch };
 
 pub fn archiveReadMatches(bytes: []const u8, expected: []const ExpectedEntry) ArchiveReadResult {
-    const io = harness.io;
-    const path = writeTemp(bytes, "bin") catch return .unsupported;
+    const oracle_io = harness.oracle_io;
+    const path = writeTempFile(bytes, "bin") catch return .unsupported;
     defer {
-        _ = std.Io.Dir.cwd().deleteFile(io, path) catch {};
+        _ = std.Io.Dir.cwd().deleteFile(oracle_io, path) catch {};
         std.heap.page_allocator.free(path);
     }
     const reader = c.archive_read_new() orelse return .unsupported;
@@ -230,12 +251,12 @@ pub fn archiveReadMatches(bytes: []const u8, expected: []const ExpectedEntry) Ar
         const e = entry orelse return .mismatch;
         const name_ptr = c.archive_entry_pathname(e) orelse return .mismatch;
         if (!std.mem.eql(u8, std.mem.span(name_ptr), exp.name)) {
-            std.debug.print("archive entry {d}: expected name {s}, got {s}\n", .{ expected_index, exp.name, std.mem.span(name_ptr) });
+            std.debug.print("Archive entry {d}: expected name {s}, got {s}.\n", .{ expected_index, exp.name, std.mem.span(name_ptr) });
             return .mismatch;
         }
         if (exp.filetype) |filetype| {
             if (c.archive_entry_filetype(e) != filetype) {
-                std.debug.print("archive entry {s}: expected filetype 0o{x}, got 0o{x}\n", .{ exp.name, filetype, c.archive_entry_filetype(e) });
+                std.debug.print("Archive entry {s}: expected filetype 0o{x}, got 0o{x}.\n", .{ exp.name, filetype, c.archive_entry_filetype(e) });
                 return .mismatch;
             }
         }
@@ -245,14 +266,14 @@ pub fn archiveReadMatches(bytes: []const u8, expected: []const ExpectedEntry) Ar
         if (exp.symlink) |expected_link| {
             const link_ptr = c.archive_entry_symlink(e) orelse return .mismatch;
             if (!std.mem.eql(u8, std.mem.span(link_ptr), expected_link)) {
-                std.debug.print("archive entry {s}: expected symlink {s}, got {s}\n", .{ exp.name, expected_link, std.mem.span(link_ptr) });
+                std.debug.print("Archive entry {s}: expected symlink {s}, got {s}.\n", .{ exp.name, expected_link, std.mem.span(link_ptr) });
                 return .mismatch;
             }
         }
         if (exp.hardlink) |expected_link| {
             const link_ptr = c.archive_entry_hardlink(e) orelse return .mismatch;
             if (!std.mem.eql(u8, std.mem.span(link_ptr), expected_link)) {
-                std.debug.print("archive entry {s}: expected hardlink {s}, got {s}\n", .{ exp.name, expected_link, std.mem.span(link_ptr) });
+                std.debug.print("Archive entry {s}: expected hardlink {s}, got {s}.\n", .{ exp.name, expected_link, std.mem.span(link_ptr) });
                 return .mismatch;
             }
         }
@@ -266,7 +287,7 @@ pub fn archiveReadMatches(bytes: []const u8, expected: []const ExpectedEntry) Ar
                 if (n == 0) break;
                 const chunk: usize = @intCast(n);
                 if (!std.mem.eql(u8, buffer[0..chunk], data[got .. got + chunk])) {
-                    std.debug.print("archive entry {s}: data mismatch at {d}\n", .{ exp.name, got });
+                    std.debug.print("Archive entry {s}: data mismatch at {d}.\n", .{ exp.name, got });
                     return .mismatch;
                 }
                 got += chunk;
@@ -281,15 +302,15 @@ pub fn archiveReadMatches(bytes: []const u8, expected: []const ExpectedEntry) Ar
 }
 
 pub fn archiveWrite(format: ArchiveFormat, entries: []const WriteEntry) ?[]u8 {
-    const io = harness.io;
+    const oracle_io = harness.oracle_io;
     const extension = switch (format) {
         .tar => "tar",
         .zip => "zip",
         .seven_zip => "7z",
     };
-    const path = writeTemp("", extension) catch return null;
+    const path = writeTempFile("", extension) catch return null;
     defer {
-        _ = std.Io.Dir.cwd().deleteFile(io, path) catch {};
+        _ = std.Io.Dir.cwd().deleteFile(oracle_io, path) catch {};
         std.heap.page_allocator.free(path);
     }
     const writer = c.archive_write_new() orelse return null;
@@ -328,6 +349,6 @@ pub fn archiveWrite(format: ArchiveFormat, entries: []const WriteEntry) ?[]u8 {
         if (c.archive_write_finish_entry(writer) != c.ARCHIVE_OK) return null;
     }
     if (c.archive_write_close(writer) != c.ARCHIVE_OK) return null;
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, std.heap.page_allocator, .limited(1 << 24)) catch return null;
+    const bytes = std.Io.Dir.cwd().readFileAlloc(oracle_io, path, std.heap.page_allocator, .limited(1 << 24)) catch return null;
     return bytes;
 }

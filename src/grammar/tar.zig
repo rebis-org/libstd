@@ -13,7 +13,6 @@ const tar_type_gnu_long_link: u8 = 'K';
 const tar_type_gnu_sparse: u8 = 'S';
 const tar_type_pax: u8 = 'x';
 const tar_type_global_pax: u8 = 'g';
-const tar_type_gnu_sparse_extension: u8 = 'X';
 const max_sparse_segments = 1024;
 
 pub const SparseSegment = struct {
@@ -24,7 +23,7 @@ pub const SparseSegment = struct {
 pub const SparseInfo = struct {
     realsize: u64,
     segment_count: usize,
-    segments: [max_sparse_segments]SparseSegment = undefined,
+    segments: [max_sparse_segments]SparseSegment,
 };
 
 pub const TarEntry = struct {
@@ -473,7 +472,7 @@ const TarReader = struct {
     }
 
     fn parseOldGnuSparse(self: *TarReader, entry: *TarEntryInfo) Failure!SparseInfo {
-        var info = SparseInfo{ .realsize = 0, .segment_count = 0 };
+        var info = SparseInfo{ .realsize = 0, .segment_count = 0, .segments = undefined };
         const header = try bounds.slice(self.archive, entry.header_offset, tar_block_size);
         info.realsize = try tarNumber(header[483..495]);
         var chunk_sum: u64 = 0;
@@ -503,6 +502,7 @@ const TarReader = struct {
 
     fn sparseFromPax(self: *TarReader, entry: *TarEntryInfo, pax: TarPax) Failure!?SparseInfo {
         if (pax.sparse_major == null and pax.sparse_size == null and pax.sparse_realsize == null and pax.sparse_map == null and pax.sparse_pax == null) return null;
+        // Every branch assigns info wholesale before any field is read, so undefined init is safe.
         var info: SparseInfo = undefined;
         const realsize = pax.sparse_realsize orelse pax.sparse_size orelse return error.InvalidData;
         if (pax.sparse_map) |map| {
@@ -510,7 +510,7 @@ const TarReader = struct {
         } else if (pax.sparse_pax) |pax_data| {
             info = try parseSparsePaxPairs(pax_data, realsize);
         } else {
-            info = .{ .realsize = realsize, .segment_count = 0 };
+            info = .{ .realsize = realsize, .segment_count = 0, .segments = undefined };
         }
         if (pax.sparse_major) |major| {
             if (major != 1) return error.Unsupported;
@@ -654,7 +654,7 @@ fn validateSparseInfo(info: SparseInfo) Failure!void {
 }
 
 fn parseSparseMapString(map: []const u8, realsize: u64) Failure!SparseInfo {
-    var info = SparseInfo{ .realsize = realsize, .segment_count = 0 };
+    var info = SparseInfo{ .realsize = realsize, .segment_count = 0, .segments = undefined };
     var chunk_sum: u64 = 0;
     var pending_offset: ?u64 = null;
     var tokens = std.mem.splitScalar(u8, map, ',');
@@ -672,7 +672,7 @@ fn parseSparseMapString(map: []const u8, realsize: u64) Failure!SparseInfo {
 }
 
 fn parseSparsePaxPairs(data: []const u8, realsize: u64) Failure!SparseInfo {
-    var info = SparseInfo{ .realsize = realsize, .segment_count = 0 };
+    var info = SparseInfo{ .realsize = realsize, .segment_count = 0, .segments = undefined };
     var chunk_sum: u64 = 0;
     var offset: usize = 0;
     var pending_offset: ?u64 = null;

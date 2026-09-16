@@ -1,0 +1,34 @@
+// Component descriptor (zip, class grammar).
+// Identity and policy are frozen ABI: rename or re-id is a breaking
+// change, caught by the comptime assertions in kernel/catalog.zig.
+.{
+    .id = .{ .low = "0x6e6b82f08d910406", .high = "0xa7a351053d6d4006" },
+    .name = "zip",
+    .class = "grammar",
+    .verbs = .{ "inspect", "decode_ordinal", "encode_ordinal" },
+    .parameters = .{
+        .{ .name = "password", .family = 1, .ordinal = 1, .representation = "bytes" },
+        .{ .name = "algorithm", .family = 1, .ordinal = 2, .representation = "scalar_words" },
+        .{ .name = "kdf_rounds_limit", .family = 1, .ordinal = 3, .representation = "scalar_words" },
+        .{ .name = "password_lifetime", .family = 1, .ordinal = 4, .representation = "scalar_words" },
+    },
+    .capabilities = .{ "read", "write", "size", "replay" },
+    .sizing = "metadata_exact",
+    .commit = "tentative",
+    .limits = .{ .window = 0, .block = 0, .history = 0 },
+    .benchmark = .{
+        .row = "zip",
+        .params = "store",
+        .kind = "zip",
+        .ext = "zip",
+        .cmd = "ziptool",
+        .lib = "libzip",
+        .store = true,
+        .archive = true,
+        .method = true,
+        .ref_params = "store",
+        .tunings = .{
+            .{},
+        },
+    },
+}

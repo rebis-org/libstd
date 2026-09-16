@@ -119,9 +119,14 @@ const max_args = blk: {
 };
 
 const Argv = struct {
-    items: [max_args][]const u8 = undefined,
+    items: [max_args][]const u8,
     len: usize = 0,
 };
+
+fn put(result: *Argv, n: *usize, item: []const u8) void {
+    result.items[n.*] = item;
+    n.* += 1;
+}
 
 fn argv(
     env: *env_mod.Env,
@@ -137,52 +142,27 @@ fn argv(
     store_on: bool,
 ) !Argv {
     _ = env.arena.reset(.retain_capacity);
-    var result = Argv{};
+    var result = Argv{ .items = undefined };
     var n: usize = 0;
     for (spec) |arg| switch (arg) {
         .lit => |s| {
-            result.items[n] = if (std.mem.indexOfScalar(u8, s, '%')) |i| try env.print("{s}{s}{s}", .{ s[0..i], ext, s[i + 1 ..] }) else s;
-            n += 1;
+            put(&result, &n, if (std.mem.indexOfScalar(u8, s, '%')) |i| try env.print("{s}{s}{s}", .{ s[0..i], ext, s[i + 1 ..] }) else s);
         },
-        .bin => {
-            result.items[n] = bin;
-            n += 1;
-        },
-        .input => {
-            result.items[n] = input;
-            n += 1;
-        },
-        .output => {
-            result.items[n] = output;
-            n += 1;
-        },
-        .archive => {
-            result.items[n] = archive;
-            n += 1;
-        },
-        .work => {
-            result.items[n] = env_mod.paths.work;
-            n += 1;
-        },
-        .outfile => {
-            result.items[n] = env_mod.paths.out_bin;
-            n += 1;
-        },
-        .size => {
-            result.items[n] = try env.print("{d}", .{try env.size(input)});
-            n += 1;
-        },
+        .bin => put(&result, &n, bin),
+        .input => put(&result, &n, input),
+        .output => put(&result, &n, output),
+        .archive => put(&result, &n, archive),
+        .work => put(&result, &n, env_mod.paths.work),
+        .outfile => put(&result, &n, env_mod.paths.out_bin),
+        .size => put(&result, &n, try env.print("{d}", .{try env.size(input)})),
         .store => if (store_on) inline for (store) |s| {
-            result.items[n] = s.lit;
-            n += 1;
+            put(&result, &n, s.lit);
         },
         .lzma => if (std.mem.eql(u8, ext, "lzma")) inline for (lzma) |s| {
-            result.items[n] = s.lit;
-            n += 1;
+            put(&result, &n, s.lit);
         },
         .extra => for (extra) |s| {
-            result.items[n] = s;
-            n += 1;
+            put(&result, &n, s);
         },
     };
     result.len = n;
@@ -209,6 +189,16 @@ pub fn decode(env: *env_mod.Env, comptime cmd: Cmd, bin: []const u8, archive: []
     return data;
 }
 
+fn timedDecode(env: *env_mod.Env, comptime cmd: Cmd, started: u64, bin: []const u8, archive: []const u8, input: []const u8, m: *metric.Metric) void {
+    const bytes = decode(env, cmd, bin, archive) catch {
+        m.decode_ns = env.now() - started;
+        return;
+    };
+    defer env.allocator.free(bytes);
+    m.decode_ns = env.now() - started;
+    m.ok = bytes.len == input.len and std.mem.eql(u8, bytes[0..input.len], input);
+}
+
 pub fn measure(env: *env_mod.Env, comptime id: matrix.Cmd, bin: []const u8, input_path: []const u8, output_path: []const u8, ext: []const u8, store: bool, extra: []const []const u8, input: []const u8) metric.Metric {
     var m = metric.Metric{};
     const cmd = comptime get(id);
@@ -219,27 +209,13 @@ pub fn measure(env: *env_mod.Env, comptime id: matrix.Cmd, bin: []const u8, inpu
     };
     m.encode_ns = env.now() - t0;
     m.encoded = encoded;
-    const t1 = env.now();
-    const bytes = decode(env, cmd, bin, output_path) catch {
-        m.decode_ns = env.now() - t1;
-        return m;
-    };
-    defer env.allocator.free(bytes);
-    m.decode_ns = env.now() - t1;
-    m.ok = bytes.len == input.len and std.mem.eql(u8, bytes[0..input.len], input);
+    timedDecode(env, cmd, env.now(), bin, output_path, input, &m);
     return m;
 }
 
 pub fn decodeMeasure(env: *env_mod.Env, comptime id: matrix.Cmd, bin: []const u8, archive_path: []const u8, input: []const u8) metric.Metric {
     var m = metric.Metric{};
     const cmd = comptime get(id);
-    const t1 = env.now();
-    const bytes = decode(env, cmd, bin, archive_path) catch {
-        m.decode_ns = env.now() - t1;
-        return m;
-    };
-    defer env.allocator.free(bytes);
-    m.decode_ns = env.now() - t1;
-    m.ok = bytes.len == input.len and std.mem.eql(u8, bytes[0..input.len], input);
+    timedDecode(env, cmd, env.now(), bin, archive_path, input, &m);
     return m;
 }
