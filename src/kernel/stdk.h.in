@@ -47,6 +47,18 @@ struct stdk_call_envelope {
 #endif
 @STDK_ASSERT@
 @STDK_CALL@
+
+/* Substrate session boundary: caller-owned storage, opaque handles, no
+ * allocator. stdk_session_storage sizes the storage for a component/verb
+ * pair (0 when the pair names no session). stdk_session_step is the pump:
+ * one call consumes input and/or fills the output span once; counts_out[0]
+ * receives the consumed length, counts_out[1] the produced length, and
+ * state_out 0 while open, 1 when finished, -1 on failure. Destroy is
+ * idempotent; stepping a destroyed session returns STDK_STATUS_INVALID_CALL. */
+uint64_t stdk_session_storage(const char* component, const char* verb);
+uint32_t stdk_session_create(const char* component, const char* verb, void* storage, uint64_t storage_len);
+uint32_t stdk_session_step(void* session, const uint8_t* input, uint64_t input_len, uint8_t* output, uint64_t output_len, int end_of_input, uint64_t counts_out[2], int* state_out);
+uint32_t stdk_session_destroy(void* session);
 #ifdef __cplusplus
 }
 #endif

@@ -47,9 +47,7 @@ pub fn limitedLengths(freqs: []const u32, lengths: []u8, limit: u8) void {
     var overflow: u32 = 0;
     for (0..2 * count - 1) |node_index| overflow += @intFromBool(depth[node_index] > limit);
     for (0..count) |i| bl_count[@min(depth[i], limit)] += 1;
-    // Every clamped node (leaf or internal) counts, so overflow is even and
-    // the Kraft excess in 2^-limit units is exactly overflow/2; each pull-up
-    // repairs two units and always finds a leaf below the limit.
+    // Overflow counts in 2^-limit units, so each pull-up repairs two units.
     while (overflow > 0) {
         var bits: usize = limit - 1;
         while (bl_count[bits] == 0) bits -= 1;

@@ -46,10 +46,10 @@ fn medianValue(comptime T: type, allocator: std.mem.Allocator, values: []const T
     std.mem.sort(T, sorted, {}, comptime std.sort.asc(T));
     const med0 = medianOfSorted(T, sorted);
     if (med0 == 0) return med0;
-    const fmed = @as(f64, @floatFromInt(med0));
+    const fmed: f64 = @floatFromInt(med0);
     var keep: usize = 0;
     for (sorted) |v| {
-        const fv = @as(f64, @floatFromInt(v));
+        const fv: f64 = @floatFromInt(v);
         const delta = if (fv > fmed) fv - fmed else fmed - fv;
         if (delta / fmed <= 0.05) {
             sorted[keep] = v;

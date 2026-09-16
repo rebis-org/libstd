@@ -91,8 +91,8 @@ fn profileId(kind: Kind) harness.Id {
 }
 
 fn setupCase(r: *Runner, case: Case) void {
-    const verified = case.kind == .zstd or case.kind == .xz;
-    harness.setup(r, profileId(case.kind), if (verified) harness.mode_xz else harness.mode_stream);
+    const confirmed = case.kind == .zstd or case.kind == .xz;
+    harness.setup(r, profileId(case.kind), if (confirmed) harness.mode_xz else harness.mode_stream);
 }
 
 fn addParams(nodes: []harness.Node, count: *usize, case: Case) void {
@@ -110,7 +110,7 @@ fn queryWriteSize(r: *Runner, case: Case, input: []const u8, bound: bool) !usize
     var nodes: [12]harness.Node = undefined;
     var count: usize = 0;
     if (bound) {
-        nodes[count] = harness.paramPlanningBound();
+        nodes[count] = harness.paramSizingBound();
         count += 1;
     }
     nodes[count] = harness.paramTargetCommand(harness.ids.write);
@@ -118,11 +118,11 @@ fn queryWriteSize(r: *Runner, case: Case, input: []const u8, bound: bool) !usize
     nodes[count] = harness.sourceSpan(input);
     count += 1;
     addParams(&nodes, &count, case);
-    nodes[count] = harness.cap(r.caps_query);
+    nodes[count] = harness.capabilityParam(r.caps_query);
     count += 1;
-    nodes[count] = harness.pln(r.planning);
+    nodes[count] = harness.sizingModeParam(r.sizing);
     count += 1;
-    nodes[count] = harness.dlv(r.delivery_write);
+    nodes[count] = harness.commitModeParam(r.commit_write);
     count += 1;
     _ = harness.call(r, harness.ids.query, nodes[0..count], .{});
     try harness.requireStatus(r, abi.Status.ok);
@@ -133,7 +133,7 @@ fn writeSpan(r: *Runner, case: Case, input: []const u8, sink: []u8, bound: bool)
     var nodes: [9]harness.Node = undefined;
     var count: usize = 0;
     if (bound) {
-        nodes[count] = harness.paramPlanningBound();
+        nodes[count] = harness.paramSizingBound();
         count += 1;
     }
     nodes[count] = harness.sourceSpan(input);
@@ -188,14 +188,14 @@ fn runCapacity(r: *Runner) anyerror!void {
         if (bound > r.encoded.len) return error.BoundRange;
         var nodes: [9]harness.Node = undefined;
         var count: usize = 0;
-        nodes[count] = harness.paramPlanningBound();
+        nodes[count] = harness.paramSizingBound();
         count += 1;
         nodes[count] = harness.sourceSpan(input);
         count += 1;
         nodes[count] = harness.sinkSpan(r.encoded[0 .. bound - 1]);
         count += 1;
         addParams(&nodes, &count, case);
-        try harness.expectCapacity(r, harness.ids.write, nodes[0..count], .{ .ctx = true }, harness.ids.diagnostic_required_capacity, harness.ids.diagnostic_available_capacity, bound, bound - 1, r.encoded[0 .. bound - 1]);
+        try harness.expectCapacity(r, harness.ids.write, nodes[0..count], .{ .ctx = true }, bound, bound - 1, r.encoded[0 .. bound - 1]);
         const produced = try writeSpan(r, case, input, r.encoded[0..bound], true);
         if (produced > bound) return error.BoundViolated;
     }
@@ -205,11 +205,7 @@ var path_random: [1 << 20]u8 = undefined;
 var path_same: [1 << 20]u8 = undefined;
 var path_period: [1 << 20]u8 = undefined;
 var path_mixed: [8 << 20]u8 = undefined;
-// The lzma2 sizing probe's greedy estimate is fast, but the real encode that
-// follows is the full DP parser, so truly incompressible megabytes still cost
-// ~1000x in a Debug oracle build. The lzma family takes the uniform inputs at
-// 64 KiB and the mixed input at mixed_small; corpus-scale incompressible
-// coverage for those profiles runs in ReleaseFast through the benchmark rows.
+// Debug oracles pay ~1000x on incompressible megabytes (greedy probe plus full DP encode), so the lzma family stays at 64 KiB here.
 var path_mixed_small: [(1 << 20) + 3 * 64 * 1024]u8 = undefined;
 var zstd_dict: [64 * 1024]u8 = undefined;
 var dict_text: [1 << 20]u8 = undefined;
@@ -297,7 +293,7 @@ fn runCallback(r: *Runner) anyerror!void {
         var source_ctx = harness.SourceCallbackContext{ .data = input };
         var source_nodes: [9]harness.Node = undefined;
         var source_count: usize = 0;
-        source_nodes[source_count] = harness.paramPlanningBound();
+        source_nodes[source_count] = harness.paramSizingBound();
         source_count += 1;
         source_nodes[source_count] = harness.sourceCallbackNode(0, 0);
         source_count += 1;
@@ -311,7 +307,7 @@ fn runCallback(r: *Runner) anyerror!void {
         var sink_ctx = harness.SinkBufferContext{ .buffer = &callback_sink_buffer, .accept_limit = std.math.maxInt(usize) };
         var sink_nodes: [9]harness.Node = undefined;
         var sink_count: usize = 0;
-        sink_nodes[sink_count] = harness.paramPlanningBound();
+        sink_nodes[sink_count] = harness.paramSizingBound();
         sink_count += 1;
         sink_nodes[sink_count] = harness.sourceSpan(input);
         sink_count += 1;
@@ -334,39 +330,39 @@ fn runCallback(r: *Runner) anyerror!void {
 }
 
 fn runMisuse(r: *Runner) !void {
-    const input = "planning bound misuse";
+    const input = "sizing bound misuse";
     var sink: [256]u8 = undefined;
     harness.setup(r, harness.ids.gzip, harness.mode_stream);
     try harness.expect(r, harness.ids.read, &.{
-        harness.paramPlanningBound(),
+        harness.paramSizingBound(),
         harness.sourceSpan(input),
         harness.sinkSpan(&sink),
     }, .{ .ctx = true }, abi.Status.unsupported);
     try harness.expect(r, harness.ids.query, &.{
-        harness.paramPlanningBound(),
+        harness.paramSizingBound(),
         harness.paramTargetCommand(harness.ids.read),
         harness.sourceSpan(input),
-        harness.cap(r.caps_query),
-        harness.pln(r.planning),
-        harness.dlv(r.delivery_read),
+        harness.capabilityParam(r.caps_query),
+        harness.sizingModeParam(r.sizing),
+        harness.commitModeParam(r.commit_read),
     }, .{}, abi.Status.unsupported);
     try harness.expect(r, harness.ids.write, &.{
         harness.paramProfile(harness.ids.tar),
-        harness.paramPlanningBound(),
+        harness.paramSizingBound(),
         harness.sourceSpan(input),
         harness.sinkSpan(&sink),
-        harness.cap(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay),
-        harness.pln(harness.plan_metadata_exact),
-        harness.dlv(harness.delivery_verified),
+        harness.capabilityParam(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay),
+        harness.sizingModeParam(harness.size_metadata_exact),
+        harness.commitModeParam(harness.commit_confirmed),
     }, .{ .profile = false }, abi.Status.unsupported);
     try harness.expect(r, harness.ids.write, &.{
         harness.paramProfile(harness.ids.test_echo),
-        harness.paramPlanningBound(),
+        harness.paramSizingBound(),
         harness.sourceSpan(input),
         harness.sinkSpan(&sink),
-        harness.cap(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay),
-        harness.pln(harness.plan_metadata_exact),
-        harness.dlv(harness.delivery_provisional),
+        harness.capabilityParam(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay),
+        harness.sizingModeParam(harness.size_metadata_exact),
+        harness.commitModeParam(harness.commit_tentative),
     }, .{ .profile = false }, abi.Status.unsupported);
 }
 
@@ -378,18 +374,18 @@ fn runGzipHeaders(r: *Runner) anyerror!void {
     const comment = "stdk gzip comment";
     const extra = [_]u8{ 0x01, 0x02, 0x03, 0x04 };
     const header_nodes = [_]harness.Node{
-        harness.mtime(0x12345678),
-        harness.xflags(2),
-        harness.os(3),
-        harness.text(1),
-        harness.hcrc(1),
-        harness.gname(name),
-        harness.gcomment(comment),
-        harness.gextra(&extra),
+        harness.gzipMtimeParam(0x12345678),
+        harness.gzipExtraFlagsParam(2),
+        harness.gzipOsParam(3),
+        harness.gzipTextParam(1),
+        harness.gzipHeaderCrcParam(1),
+        harness.gzipNameParam(name),
+        harness.gzipCommentParam(comment),
+        harness.gzipExtraParam(&extra),
     };
     var nodes: [14]harness.Node = undefined;
     var count: usize = 0;
-    nodes[count] = harness.paramPlanningBound();
+    nodes[count] = harness.paramSizingBound();
     count += 1;
     nodes[count] = harness.paramTargetCommand(harness.ids.write);
     count += 1;
@@ -399,11 +395,11 @@ fn runGzipHeaders(r: *Runner) anyerror!void {
         nodes[count] = node;
         count += 1;
     }
-    nodes[count] = harness.cap(r.caps_query);
+    nodes[count] = harness.capabilityParam(r.caps_query);
     count += 1;
-    nodes[count] = harness.pln(r.planning);
+    nodes[count] = harness.sizingModeParam(r.sizing);
     count += 1;
-    nodes[count] = harness.dlv(r.delivery_write);
+    nodes[count] = harness.commitModeParam(r.commit_write);
     count += 1;
     _ = harness.call(r, harness.ids.query, nodes[0..count], .{});
     try harness.requireStatus(r, abi.Status.ok);
@@ -427,7 +423,7 @@ fn runGzipHeaders(r: *Runner) anyerror!void {
 
     write_nodes[1] = harness.sinkSpan(bound_sink[0..bound]);
     var bound_nodes: [14]harness.Node = undefined;
-    bound_nodes[0] = harness.paramPlanningBound();
+    bound_nodes[0] = harness.paramSizingBound();
     @memcpy(bound_nodes[1 .. write_count + 1], write_nodes[0..write_count]);
     _ = harness.call(r, harness.ids.write, bound_nodes[0 .. write_count + 1], .{ .ctx = true });
     try harness.requireStatus(r, abi.Status.ok);

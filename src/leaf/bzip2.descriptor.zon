@@ -1,0 +1,28 @@
+// Component descriptor (bzip2, class slice).
+// Identity and policy are frozen ABI: rename or re-id is a breaking
+// change, caught by the comptime assertions in kernel/catalog.zig.
+.{
+    .id = .{ .low = "0x6e6b82f08d910409", .high = "0xa7a351053d6d4009" },
+    .name = "bzip2",
+    .class = "slice",
+    .verbs = .{ "required_size", "decoded_size", "encoded_size_bound", "encode", "decode" },
+    .parameters = .{
+        .{ .name = "block_size", .family = 5, .ordinal = 1, .representation = "scalar_words" },
+    },
+    .capabilities = .{ "read", "replay" },
+    .sizing = "measured",
+    .commit = "tentative",
+    .limits = .{ .window = 0, .block = 900000, .history = 0 },
+    .benchmark = .{
+        .row = "bzip2",
+        .params = "bzip2 default (block 900k)",
+        .kind = "bzip2",
+        .ext = "bz2",
+        .cmd = "bzip2",
+        .lib = "bzip2",
+        .ref_params = "bzip2 default (block 900k)",
+        .tunings = .{
+            .{},
+        },
+    },
+}

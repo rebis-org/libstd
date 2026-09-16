@@ -329,7 +329,7 @@ pub fn zipCompressedSize(entry: ZipEntry, history: []u8, measurement_buffer: []u
         8 => {
             if (history.len < deflate_history_size or measurement_buffer.len < deflate_measurement_buffer_size) return error.InsufficientCapacity;
             var counter = measurement.Counter.init(null);
-            var compressor = deflate.Compress.init(&counter.writer, history[0..deflate_history_size], zip_deflate_options) catch |err| return err;
+            var compressor = try deflate.Compress.init(&counter.writer, history[0..deflate_history_size], zip_deflate_options);
             compressor.writer.writeAll(entry.data) catch return error.InternalFailure;
             compressor.finish() catch return error.InternalFailure;
             return std.math.cast(usize, counter.written()) orelse error.ResourceLimit;
@@ -337,7 +337,7 @@ pub fn zipCompressedSize(entry: ZipEntry, history: []u8, measurement_buffer: []u
         9 => {
             if (history.len < deflate64_history_size or measurement_buffer.len < deflate_measurement_buffer_size) return error.InsufficientCapacity;
             var counter = measurement.Counter.init(null);
-            var compressor = deflate.Compress64.init(&counter.writer, history[0..deflate64_history_size], zip_deflate_options) catch |err| return err;
+            var compressor = try deflate.Compress64.init(&counter.writer, history[0..deflate64_history_size], zip_deflate_options);
             compressor.writer.writeAll(entry.data) catch return error.InternalFailure;
             compressor.finish() catch return error.InternalFailure;
             return std.math.cast(usize, counter.written()) orelse error.ResourceLimit;
@@ -442,7 +442,7 @@ fn zipCompressEntry(entry: ZipEntry, history: []u8, output: []u8, scratch: []u8)
         8 => {
             if (history.len < deflate_history_size or output.len < deflate_measurement_buffer_size) return error.InsufficientCapacity;
             var writer = std.Io.Writer.fixed(output);
-            var compressor = deflate.Compress.init(&writer, history[0..deflate_history_size], zip_deflate_options) catch |err| return err;
+            var compressor = try deflate.Compress.init(&writer, history[0..deflate_history_size], zip_deflate_options);
             compressor.writer.writeAll(entry.data) catch return error.InternalFailure;
             compressor.finish() catch return error.InternalFailure;
             return output[0..writer.end];
@@ -450,7 +450,7 @@ fn zipCompressEntry(entry: ZipEntry, history: []u8, output: []u8, scratch: []u8)
         9 => {
             if (history.len < deflate64_history_size or output.len < deflate_measurement_buffer_size) return error.InsufficientCapacity;
             var writer = std.Io.Writer.fixed(output);
-            var compressor = deflate.Compress64.init(&writer, history[0..deflate64_history_size], zip_deflate_options) catch |err| return err;
+            var compressor = try deflate.Compress64.init(&writer, history[0..deflate64_history_size], zip_deflate_options);
             compressor.writer.writeAll(entry.data) catch return error.InternalFailure;
             compressor.finish() catch return error.InternalFailure;
             return output[0..writer.end];

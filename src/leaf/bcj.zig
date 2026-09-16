@@ -85,6 +85,7 @@ fn x86Code(data: []u8, start_offset: u32, comptime is_encoder: bool) void {
                 (@as(u32, data[buffer_pos + 3]) << 16) |
                 (@as(u32, data[buffer_pos + 2]) << 8) |
                 @as(u32, data[buffer_pos + 1]);
+            // Assigned on every loop path before any read, so `undefined` is safe.
             var dest: u32 = undefined;
             while (true) {
                 if (is_encoder) {

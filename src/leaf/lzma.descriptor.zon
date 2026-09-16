@@ -1,0 +1,57 @@
+// Component descriptor (lzma, class slice).
+// Identity and policy are frozen ABI: rename or re-id is a breaking
+// change, caught by the comptime assertions in kernel/catalog.zig.
+.{
+    .id = .{ .low = "0x6e6b82f08d91040a", .high = "0xa7a351053d6d400a" },
+    .name = "lzma",
+    .class = "slice",
+    .verbs = .{ "required_size", "decoded_size", "encoded_size_bound", "encode", "decode" },
+    .parameters = .{
+        .{ .name = "dictionary", .family = 6, .ordinal = 1, .representation = "scalar_words" },
+        .{ .name = "match_finder_depth", .family = 6, .ordinal = 2, .representation = "scalar_words" },
+        .{ .name = "lazy", .family = 6, .ordinal = 3, .representation = "scalar_words" },
+        .{ .name = "nice_len", .family = 6, .ordinal = 4, .representation = "scalar_words" },
+        .{ .name = "match_finder", .family = 6, .ordinal = 5, .representation = "scalar_words" },
+    },
+    .capabilities = .{ "read", "replay" },
+    .sizing = "measured",
+    .commit = "tentative",
+    .limits = .{ .window = 8388608, .block = 0, .history = 0 },
+    .benchmark = .{
+        .row = "lzma",
+        .params = "",
+        .kind = "lzma",
+        .ext = "lzma",
+        .cmd = "lzma",
+        .lib = "lzma7z",
+        .fmt = 10,
+        .tunings = .{
+            .{
+                .params = .{
+                    .{ .family = 6, .ordinal = 1, .value = 8388608 },
+                    .{ .family = 6, .ordinal = 2, .value = 48 },
+                },
+                .ref_params = "lzma preset 6, dict 8 MiB, depth 48",
+            },
+            .{
+                .name = "bt",
+                .params = .{
+                    .{ .family = 6, .ordinal = 1, .value = 8388608 },
+                    .{ .family = 6, .ordinal = 5, .value = 1 },
+                    .{ .family = 6, .ordinal = 2, .value = 48 },
+                },
+                .ref_params = "lzma preset 6, bt4, depth 48",
+            },
+            .{
+                .name = "bt-lazy",
+                .params = .{
+                    .{ .family = 6, .ordinal = 1, .value = 8388608 },
+                    .{ .family = 6, .ordinal = 5, .value = 1 },
+                    .{ .family = 6, .ordinal = 3, .value = 1 },
+                    .{ .family = 6, .ordinal = 2, .value = 48 },
+                },
+                .ref_params = "lzma preset 6, bt4 lazy, depth 48",
+            },
+        },
+    },
+}

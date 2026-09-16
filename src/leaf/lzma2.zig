@@ -47,8 +47,7 @@ pub fn decodeInPlaceWorkspaceSize(dictionary_size: u32) usize {
 
 pub fn encodeWorkspaceSize(dictionary_size: u32) usize {
     const props = properties(dictionary_size);
-    // The streaming encoder holds one encoder state for the persistent encoder
-    // and a second, equal-sized state for the per-chunk size estimate.
+    // Two encoder states: persistent plus per-chunk estimate.
     return 2 * lzma.encodeWorkspaceSize(props) + lzma.modelSize(props) + 4 * max_pack_size + 2 * @alignOf(u16);
 }
 
@@ -67,12 +66,8 @@ pub const Options = struct {
     match_finder: lzma.MatchFinder = .bt4,
 };
 
-// Per chunk the output is either a copy chunk (3-byte header per 64 KiB
-// batch) or a compressed chunk (lzma.encodedSizeBound payload plus a 6-byte
-// header). The sizing probe halves incompressible chunks down to the
-// chunk_min_unpacked/2 floor before they go out as copies, so the chunk count
-// is bounded by input_len / 2048 + 1, not input_len / chunk_max_unpacked:
-// the plan's 6-bytes-per-2-MiB form ignored the halving floor.
+// Chunks halve to the 2 KiB floor before going out as copies, so chunk count
+// bounds by input_len/2048 + 1 with copy/compressed headers covered.
 pub fn encodedSizeBound(input_len: usize) usize {
     const chunks = input_len / (chunk_min_unpacked / 2) + 1;
     return input_len +| (input_len / 4) +| 72 *| chunks +| 8;
@@ -281,19 +276,8 @@ pub fn encodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, 
     try encodeStreamInner(input, writer, scratch, options);
 }
 
-// KTD5 calibration: the greedy estimate was diffed against the real
-// per-chunk encode (persistent model, DP parse, bt4) across the benchmark
-// corpus plus generated all-random, all-same-byte, period-4, and adversarial
-// alternating-statistics blocks. The estimate errs high by construction:
-// corpus median overestimate 2.1 KB, worst underestimate 222 bytes (p99.9 =
-// 124), and underestimates only occur on compressible chunks with several
-// KiB of boundary slack — never near 64 KiB, where chunks are
-// literal-dominated and the estimate is accurate to ~0.1% (still over). A
-// positive pack-test margin was measured to flip the censored est ~= 64 KiB
-// pile-up into copy-chunk cascades (mozilla +6.5% at a 256-byte margin), so
-// the calibrated margin is zero: the pack test stays `estimate <=
-// max_pack_size`. Underestimates beyond it (flip blocks, up to ~4 KB) land
-// on the snapshot/restore net below, which the oracle suite exercises.
+// Estimate errs high by construction; zero pack margin avoids copy cascades,
+// snapshot/restore covers the residual underestimates.
 fn probeChunk(chunk: []const u8, est_scratch: []u8, props: lzma.Properties, options: Options) bool {
     const estimate = lzma.estimatedSize(chunk, est_scratch, .{
         .properties = props,
@@ -332,9 +316,7 @@ fn encodeStreamInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, o
     var props_sent: bool = false;
     var last_fit: usize = chunk_max_unpacked;
     while (offset < input.len) {
-        // The LZMA2 pack-size field caps each compressed chunk at 64 KiB, so
-        // shrink the chunk until its estimate fits instead of falling back to
-        // an uncompressed chunk for whole blocks of compressible data.
+        // Pack field caps chunks at 64 KiB, so shrink until the estimate fits.
         var chunk_len = @min(last_fit, input.len - offset);
         var compressible = probeChunk(input[offset..][0..chunk_len], estimate_scratch, props, options);
         while (!compressible and chunk_len >= chunk_min_unpacked) {
@@ -352,11 +334,8 @@ fn encodeStreamInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, o
             const snap_rep3 = encoder.rep3;
             encoder.snapshotModel(model_snapshot);
             encoder.setRangeEncoder(lzma.RangeEncoder.init(&pack_writer));
-            // A first chunk that went down the copy path never carried
-            // properties, so the first compressed chunk after it must send
-            // them with a state reset (0xC0); the model reset happens before
-            // the encode, and the snapshot above keeps the PRE-reset model,
-            // which is what the oversize restore must put back.
+            // First compressed chunk after copies must send props with reset (0xC0);
+            // snapshot keeps the pre-reset model for the oversize restore.
             const send_props = !props_sent;
             if (send_props and !first) encoder.resetModelKeepDictionary();
             try encoder.encodeInput(chunk, false);
@@ -376,10 +355,7 @@ fn encodeStreamInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, o
                 try io.writeBytes(writer, pack_buffer[0..packed_len]);
                 props_sent = true;
             } else {
-                // The persistent model can exceed the fresh-encoder estimate.
-                // Discard the encoded symbols and emit a copy chunk instead;
-                // the aborted encode already fed the dictionary, so only the
-                // model state must return to the pre-chunk snapshot.
+                // Aborted encode already fed the dictionary, so restore model state only.
                 encoder.restoreModel(model_snapshot);
                 encoder.state = snap_state;
                 encoder.rep0 = snap_rep0;

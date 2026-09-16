@@ -49,9 +49,7 @@ pub const Options = struct {
     match_finder: lzma.MatchFinder = .bt4,
 };
 
-// One stream, one block: 12-byte stream header, block header with padding,
-// the check (<= 32 bytes for sha256), the index, and the 12-byte footer all
-// fit in the constant; filters are 1:1 transforms and add no bytes.
+// Single stream/block overhead fits the constant; 1:1 filters add no bytes.
 pub fn encodedSizeBound(input_len: usize) usize {
     return lzma2.encodedSizeBound(input_len) +| 128;
 }
@@ -85,7 +83,8 @@ fn scanStreamSize(input: []const u8) Failure!?usize {
     var total: u64 = 0;
     while (cursor.remaining() > 0) {
         const check = try decodeStreamHeader(&cursor);
-        var records: IndexRecordList = .{};
+        // records backing is written during parse and read only below len, so undefined init is safe.
+        var records: IndexRecordList = .{ .records = undefined };
         while (cursor.remaining() > 0 and cursor.buffer[cursor.pos] != 0x00) {
             const info = try decodeBlockHeader(&cursor);
             const uncompressed_size = info.uncompressed_size orelse return null;
@@ -171,7 +170,8 @@ fn decodeInternalImpl(input: []const u8, sink: *Sink, scratch: []u8, in_place: b
     var cursor = binary.ReadCursor.init(input);
     while (cursor.remaining() > 0) {
         const check = try decodeStreamHeader(&cursor);
-        var records: IndexRecordList = .{};
+        // records backing is written during parse and read only below len, so undefined init is safe.
+        var records: IndexRecordList = .{ .records = undefined };
         while (true) {
             if (cursor.remaining() == 0 or cursor.buffer[cursor.pos] == 0x00) break;
             const record = try decodeBlock(&cursor, sink, scratch, check, in_place);
@@ -220,7 +220,7 @@ const IndexRecord = struct {
 const max_index_records = 1024;
 
 const IndexRecordList = struct {
-    records: [max_index_records]IndexRecord = undefined,
+    records: [max_index_records]IndexRecord,
     len: usize = 0,
 
     fn append(self: *IndexRecordList, record: IndexRecord) Failure!void {
@@ -263,6 +263,7 @@ fn decodeBlock(cursor: *binary.ReadCursor, sink: *Sink, scratch: []u8, check: Ch
         .properties = lzma2.properties(dictionary_size),
         .max_work = std.math.maxInt(u64),
     };
+    // Both sizes are assigned during block iteration before the index/footer reads them.
     var compressed_size: usize = undefined;
     var uncompressed_size: usize = undefined;
     var decode_tee: ?tee.Tee = null;
@@ -467,7 +468,7 @@ fn decodeStreamFooter(cursor: *binary.ReadCursor, check: CheckType, index_size: 
     const footer = try cursor.readSlice(stream_footer_size);
     const footer_crc = std.mem.readInt(u32, footer[0..4], .little);
     try verifyCrc32(footer[4..10], footer_crc);
-    const backward_size = @as(usize, std.mem.readInt(u32, footer[4..8], .little));
+    const backward_size: usize = std.mem.readInt(u32, footer[4..8], .little);
     if (index_size < 4 or index_size % 4 != 0) return error.IntegrityFailure;
     if (@as(u64, backward_size) + 1 != index_size / 4) return error.IntegrityFailure;
     if (footer[8] != 0x00) return error.InvalidData;
@@ -522,8 +523,7 @@ pub fn encode(input: []const u8, output: []u8, scratch: []u8, options: Options) 
 }
 
 fn encodeInternal(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options: Options) Failure!void {
-    // One stream keeps a single LZMA2 encoder, so the configured dictionary
-    // stays continuous across the whole input instead of resetting every chunk.
+    // Single LZMA2 encoder keeps the dictionary continuous instead of resetting per chunk.
     try encodeStream(writer, input, scratch, options);
 }
 

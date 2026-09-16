@@ -210,7 +210,7 @@ pub fn add(b: *std.Build, ctx: *const common.Context) Refs {
     });
     const bzip2_cmd = installOut(b, &bzip2.build.step, "zig-out/benchmark/build/bzip2/bzip2", "bzip2");
     const bzip2_lib = copyOut(b, &bzip2.build.step, "zig-out/benchmark/build/bzip2/libbz2_static.a", "libbz2.a");
-    // The bzip2 dlltest vendor suite links the static lib from this path.
+    // Vendor dlltest suite links the static lib from this path.
     const bzip2_lib_install = b.addInstallFileWithDir(bzip2_lib, .{ .custom = "benchmark/bin" }, "libbz2.a");
 
     const mkdir_dummy = b.addSystemCommand(&.{ "mkdir", "-p", "zig-out/benchmark/build/dummy" });

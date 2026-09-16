@@ -31,24 +31,24 @@ fn requireUnique(descriptors: []const harness.catalog.DescriptorJson) !void {
 
 const Expectation = struct {
     name: []const u8,
-    planning: ?[]const u8 = null,
-    delivery: ?[]const u8 = null,
+    sizing: ?[]const u8 = null,
+    commit: ?[]const u8 = null,
     command_mask: ?u32 = null,
     kind: ?[]const u8 = null,
 };
 
 fn requireExpectations() !void {
     const expectations = [_]Expectation{
-        .{ .name = "deflate", .planning = "replay_pass", .delivery = "provisional", .command_mask = 7 },
-        .{ .name = "tar", .planning = "metadata_exact", .command_mask = 7 },
-        .{ .name = "zstd", .delivery = "verified" },
-        .{ .name = "xz", .delivery = "verified" },
+        .{ .name = "deflate", .sizing = "measured", .commit = "tentative", .command_mask = 7 },
+        .{ .name = "tar", .sizing = "metadata_exact", .command_mask = 7 },
+        .{ .name = "zstd", .commit = "confirmed" },
+        .{ .name = "xz", .commit = "confirmed" },
         .{ .name = "crypto", .kind = "profile" },
     };
     for (expectations) |expected| {
         const descriptor = try requireDescriptor(expected.name);
-        if (expected.planning) |value| try require(std.mem.eql(u8, descriptor.planning, value));
-        if (expected.delivery) |value| try require(std.mem.eql(u8, descriptor.delivery, value));
+        if (expected.sizing) |value| try require(std.mem.eql(u8, descriptor.sizing, value));
+        if (expected.commit) |value| try require(std.mem.eql(u8, descriptor.commit, value));
         if (expected.command_mask) |value| try require(descriptor.command_mask == value);
         if (expected.kind) |value| try require(std.mem.eql(u8, descriptor.kind, value));
     }

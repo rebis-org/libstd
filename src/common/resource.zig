@@ -1,14 +1,14 @@
 const std = @import("std");
 
-const abi = @import("../abi/contract.zig");
-const registry = @import("../catalog/registry.zig");
-pub const Failure = registry.Failure;
-pub const capability_bit_read = registry.resource_capability_bit_read;
-pub const capability_bit_write = registry.resource_capability_bit_write;
-pub const capability_bit_size = registry.resource_capability_bit_size;
-pub const capability_bit_replay = registry.resource_capability_bit_replay;
-pub const capability_bit_seek = registry.resource_capability_bit_seek;
-pub const capability_bit_range = registry.resource_capability_bit_range;
+const abi = @import("../kernel/envelope.zig");
+const vocabulary = @import("../kernel/vocabulary.zig");
+pub const Failure = vocabulary.Failure;
+pub const capability_bit_read = vocabulary.resource_capability_bit_read;
+pub const capability_bit_write = vocabulary.resource_capability_bit_write;
+pub const capability_bit_size = vocabulary.resource_capability_bit_size;
+pub const capability_bit_replay = vocabulary.resource_capability_bit_replay;
+pub const capability_bit_seek = vocabulary.resource_capability_bit_seek;
+pub const capability_bit_range = vocabulary.resource_capability_bit_range;
 const io = @import("primitive/io.zig");
 pub const checkedConstBytes = io.checkedConstBytes;
 pub const checkedMutBytes = io.checkedMutBytes;
@@ -34,6 +34,7 @@ pub const Resource = struct {
     };
 
     pub fn directRead(bytes: []const u8, capabilities: u32) Resource {
+        // Bound at open, before any dispatch through it.
         return .{
             .call = undefined,
             .token_low = 0,
@@ -44,6 +45,7 @@ pub const Resource = struct {
     }
 
     pub fn directWrite(bytes: []u8, capabilities: u32) Resource {
+        // Bound at open, before any dispatch through it.
         return .{
             .call = undefined,
             .token_low = 0,
@@ -101,7 +103,7 @@ pub const Resource = struct {
         switch (self.kind) {
             .direct_read => |bytes| return bytes.len,
             .callback_read => {
-                const result = try self.invoke(registry.ids.callback_size, null, null);
+                const result = try self.invoke(vocabulary.ids.callback_size, null, null);
                 if (result.value_high != 0) return error.ResourceLimit;
                 return std.math.cast(usize, result.value_low) orelse error.ResourceLimit;
             },
@@ -113,7 +115,7 @@ pub const Resource = struct {
         switch (self.kind) {
             .direct_read => self.offset = 0,
             .direct_write => self.offset = 0,
-            .callback_read => _ = try self.invoke(registry.ids.callback_rewind, null, null),
+            .callback_read => _ = try self.invoke(vocabulary.ids.callback_rewind, null, null),
             .callback_write => {},
         }
     }
@@ -122,7 +124,7 @@ pub const Resource = struct {
         switch (self.kind) {
             .direct_read => self.offset = @min(position, self.kind.direct_read.len),
             .direct_write => self.offset = @min(position, self.kind.direct_write.len),
-            .callback_read => _ = try self.invokeWithValue(registry.ids.callback_seek, null, null, position),
+            .callback_read => _ = try self.invokeWithValue(vocabulary.ids.callback_seek, null, null, position),
             .callback_write => return error.Unsupported,
         }
     }
@@ -132,17 +134,17 @@ pub const Resource = struct {
         switch (self.kind) {
             .direct_read => |bytes| {
                 const remaining = bytes.len - self.offset;
-                const n = @min(buffer.len, remaining);
-                if (n == 0) return 0;
-                @memcpy(buffer[0..n], bytes[self.offset..][0..n]);
-                self.offset += n;
-                return n;
+                const byte_count = @min(buffer.len, remaining);
+                if (byte_count == 0) return 0;
+                @memcpy(buffer[0..byte_count], bytes[self.offset..][0..byte_count]);
+                self.offset += byte_count;
+                return byte_count;
             },
             .callback_read => {
-                const result = try self.invoke(registry.ids.callback_read, null, buffer);
-                const n = std.math.cast(usize, result.bytes) orelse return error.IoFailure;
-                if (n > buffer.len) return error.IoFailure;
-                return n;
+                const result = try self.invoke(vocabulary.ids.callback_read, null, buffer);
+                const bytes_read = std.math.cast(usize, result.bytes) orelse return error.IoFailure;
+                if (bytes_read > buffer.len) return error.IoFailure;
+                return bytes_read;
             },
             else => return error.Unsupported,
         }
@@ -151,19 +153,19 @@ pub const Resource = struct {
     pub fn write(self: *Resource, bytes: []const u8) Failure!usize {
         if (bytes.len == 0) return 0;
         switch (self.kind) {
-            .direct_write => |buf| {
-                if (self.offset + bytes.len > buf.len) return error.InsufficientCapacity;
-                @memcpy(buf[self.offset..][0..bytes.len], bytes);
+            .direct_write => |destination| {
+                if (self.offset + bytes.len > destination.len) return error.InsufficientCapacity;
+                @memcpy(destination[self.offset..][0..bytes.len], bytes);
                 self.offset += bytes.len;
                 return bytes.len;
             },
             .callback_write => {
                 const initial = self.committed;
-                const result = self.invoke(registry.ids.callback_write, bytes, null) catch |err| return err;
-                const n = std.math.cast(usize, result.bytes) orelse return error.IoFailure;
-                if (n > bytes.len) return error.IoFailure;
-                self.committed = std.math.add(u64, initial, n) catch return error.ResourceLimit;
-                return n;
+                const result = try self.invoke(vocabulary.ids.callback_write, bytes, null);
+                const bytes_written = std.math.cast(usize, result.bytes) orelse return error.IoFailure;
+                if (bytes_written > bytes.len) return error.IoFailure;
+                self.committed = std.math.add(u64, initial, bytes_written) catch return error.ResourceLimit;
+                return bytes_written;
             },
             else => return error.Unsupported,
         }
@@ -172,23 +174,23 @@ pub const Resource = struct {
     pub fn writeAll(self: *Resource, bytes: []const u8) Failure!void {
         var offset: usize = 0;
         while (offset < bytes.len) {
-            const n = try self.write(bytes[offset..]);
-            if (n == 0) return error.IoFailure;
-            offset += n;
+            const bytes_written = try self.write(bytes[offset..]);
+            if (bytes_written == 0) return error.IoFailure;
+            offset += bytes_written;
         }
     }
 
     pub fn materialize(self: *Resource, buffer: []u8) Failure![]const u8 {
         var offset: usize = 0;
         while (offset < buffer.len) {
-            const n = try self.read(buffer[offset..]);
-            if (n == 0) break;
-            offset += n;
+            const bytes_read = try self.read(buffer[offset..]);
+            if (bytes_read == 0) break;
+            offset += bytes_read;
         }
         if (offset == buffer.len) {
             var extra: [1]u8 = undefined;
-            const n = try self.read(&extra);
-            if (n != 0) return error.ResourceLimit;
+            const tail_read = try self.read(&extra);
+            if (tail_read != 0) return error.ResourceLimit;
         }
         return buffer[0..offset];
     }
@@ -231,15 +233,16 @@ pub const BoundedReader = struct {
     resource: *Resource,
     limit: u64,
     reader: std.Io.Reader,
-    temp: [4096]u8 = undefined,
+    temp: [4096]u8,
 
     pub fn init(self: *BoundedReader, resource: *Resource, limit: u64) void {
-        self.* = .{
+        const initial: BoundedReader = .{
             .resource = resource,
             .limit = limit,
             .reader = undefined,
             .temp = undefined,
         };
+        self.* = initial;
         self.reader = .{
             .vtable = &reader_vtable,
             .buffer = &self.temp,
@@ -251,18 +254,18 @@ pub const BoundedReader = struct {
 
 const reader_vtable = std.Io.Reader.VTable{ .stream = boundedReaderStream };
 
-fn boundedReaderStream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
-    const self = @as(*BoundedReader, @fieldParentPtr("reader", r));
+fn boundedReaderStream(reader: *std.Io.Reader, writer: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+    const self: *BoundedReader = @fieldParentPtr("reader", reader);
     if (self.limit == 0) return error.EndOfStream;
     const max_request = std.math.cast(usize, self.limit) orelse std.math.maxInt(usize);
     const requested = @min(@intFromEnum(limit), max_request);
     if (requested == 0) return 0;
     var buffer: [4096]u8 = undefined;
     const chunk = @min(buffer.len, requested);
-    const n = self.resource.read(buffer[0..chunk]) catch |err| return mapResourceErrorToReadFailed(err);
-    if (n == 0) return error.EndOfStream;
-    const written = w.write(buffer[0..n]) catch return error.WriteFailed;
-    if (written > n) return error.WriteFailed;
+    const bytes_read = self.resource.read(buffer[0..chunk]) catch |failure| return mapResourceErrorToReadFailed(failure);
+    if (bytes_read == 0) return error.EndOfStream;
+    const written = writer.write(buffer[0..bytes_read]) catch return error.WriteFailed;
+    if (written > bytes_read) return error.WriteFailed;
     self.limit -= written;
     return written;
 }
@@ -287,24 +290,24 @@ pub const BoundedWriter = struct {
 
 const writer_vtable = std.Io.Writer.VTable{ .drain = boundedWriterDrain };
 
-fn boundedWriterDrain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
-    const self = @as(*BoundedWriter, @fieldParentPtr("writer", w));
+fn boundedWriterDrain(writer: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+    const self: *BoundedWriter = @fieldParentPtr("writer", writer);
     var total: usize = 0;
-    for (data[0 .. data.len - 1]) |buf| total += buf.len;
+    for (data[0 .. data.len - 1]) |chunk| total += chunk.len;
     total += data[data.len - 1].len * splat;
     if (total == 0) return 0;
     if (total > self.limit) return error.WriteFailed;
     var offset: usize = 0;
-    for (data[0 .. data.len - 1]) |buf| {
-        const n = writeToResource(self.resource, buf) catch return error.WriteFailed;
-        offset += n;
-        if (n < buf.len) return offset;
+    for (data[0 .. data.len - 1]) |chunk| {
+        const bytes_written = writeToResource(self.resource, chunk) catch return error.WriteFailed;
+        offset += bytes_written;
+        if (bytes_written < chunk.len) return offset;
     }
     const last = data[data.len - 1];
     for (0..splat) |_| {
-        const n = writeToResource(self.resource, last) catch return error.WriteFailed;
-        offset += n;
-        if (n < last.len) return offset;
+        const bytes_written = writeToResource(self.resource, last) catch return error.WriteFailed;
+        offset += bytes_written;
+        if (bytes_written < last.len) return offset;
     }
     self.limit -= offset;
     return offset;
@@ -314,8 +317,8 @@ fn writeToResource(resource: *Resource, bytes: []const u8) Failure!usize {
     return resource.write(bytes);
 }
 
-fn mapResourceErrorToReadFailed(err: Failure) std.Io.Reader.StreamError {
-    return switch (err) {
+fn mapResourceErrorToReadFailed(failure: Failure) std.Io.Reader.StreamError {
+    return switch (failure) {
         error.InsufficientCapacity => error.ReadFailed,
         error.InvalidData => error.ReadFailed,
         error.IntegrityFailure => error.ReadFailed,

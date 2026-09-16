@@ -25,9 +25,7 @@ pub fn addArchive(b: *std.Build, ctx: *const common.Context) std.Build.LazyPath 
 
 fn buildSlice(b: *std.Build, ctx: *const common.Context, slice: slices.AppleSlice) std.Build.LazyPath {
     const base = slice.library[0 .. slice.library.len - ".dylib".len];
-    // The install name must be the final leaf name inside the XCFramework,
-    // not a per-arch build path: every arch of a slice shares one LC_ID_DYLIB
-    // so the lipo output and any consumer's LC_LOAD_DYLIB resolve via @rpath.
+    // Final leaf name, not a per-arch path: every arch shares one LC_ID_DYLIB for @rpath resolution.
     const install_name = b.fmt("@rpath/{s}", .{slice.library});
     if (slice.arches.len == 1) return buildArch(b, ctx, base, install_name, slice.arches[0]);
     var libraries: [4]std.Build.LazyPath = undefined;

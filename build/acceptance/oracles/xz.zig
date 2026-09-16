@@ -8,7 +8,7 @@ const lib = @import("lib.zig");
 
 fn setupXz(r: *Runner) void {
     harness.setup(r, harness.ids.xz, harness.mode_xz);
-    r.extra = 4096;
+    r.lzma_dictionary = 4096;
 }
 
 var xz_corpus: [100]u8 = undefined;
@@ -28,12 +28,12 @@ fn xzMakeReference(data: []const u8, check: u64, delta_dist: ?u32, bcj: ?u32, ou
     return lib.xzEncode(data, out, check, delta_dist, bcj, 4096);
 }
 
-fn xzRead(r: *Runner, archive: []const u8, output: []u8) !void {
-    _ = harness.call(r, harness.ids.read, &.{
-        harness.lzd(r.extra),
-        harness.sourceSpan(archive),
-        harness.sinkSpan(output),
-    }, .{ .ctx = true });
+fn dict(r: *Runner) harness.Node {
+    return harness.lzmaDictionaryParam(r.lzma_dictionary);
+}
+
+fn readOk(r: *Runner, source: []const u8, output: []u8) !void {
+    try harness.spanProduce(r, harness.ids.read, &.{ dict(r), harness.sourceSpan(source), harness.sinkSpan(output) });
 }
 
 fn runChecks(r: *Runner) !void {
@@ -42,43 +42,37 @@ fn runChecks(r: *Runner) !void {
     const checks = [_]u64{ 0, 1, 4 };
     for (checks) |check| {
         _ = harness.call(r, harness.ids.query, &.{
-            harness.lzd(r.extra),
-            harness.xck(check),
+            harness.lzmaDictionaryParam(r.lzma_dictionary),
+            harness.xzCheckParam(check),
             harness.paramTargetCommand(harness.ids.write),
             harness.sourceSpan(xz_corpus[0..32]),
-            harness.cap(r.caps_query),
-            harness.pln(r.planning),
-            harness.dlv(r.delivery_write),
+            harness.capabilityParam(r.caps_query),
+            harness.sizingModeParam(r.sizing),
+            harness.commitModeParam(r.commit_write),
         }, .{});
         try harness.requireStatus(r, abi.Status.ok);
         if (r.response.byte_length == 0 or r.response.byte_length > stream1.len) return error.CheckQueryCapacity;
         r.required = @intCast(r.response.byte_length);
-        _ = harness.call(r, harness.ids.write, &.{
-            harness.lzd(r.extra),
-            harness.xck(check),
+        try harness.spanProduce(r, harness.ids.write, &.{
+            dict(r),
+            harness.xzCheckParam(check),
             harness.sourceSpan(xz_corpus[0..32]),
             harness.sinkSpan(&stream1),
-        }, .{ .ctx = true });
-        try harness.requireStatus(r, abi.Status.ok);
+        });
         const compressed_size: usize = @intCast(r.response.byte_length);
         if (compressed_size != r.required) return error.CheckWriteLengthMismatch;
         _ = harness.call(r, harness.ids.query, &.{
-            harness.lzd(r.extra),
+            harness.lzmaDictionaryParam(r.lzma_dictionary),
             harness.paramTargetCommand(harness.ids.read),
             harness.sourceSpan(stream1[0..compressed_size]),
-            harness.cap(r.caps_query),
-            harness.pln(r.planning),
-            harness.dlv(r.delivery_read),
+            harness.capabilityParam(r.caps_query),
+            harness.sizingModeParam(r.sizing),
+            harness.commitModeParam(r.commit_read),
         }, .{});
         try harness.requireStatus(r, abi.Status.ok);
         if (r.response.byte_length != 32) return error.CheckReadCapacity;
         @memset(&output, 0xa5);
-        _ = harness.call(r, harness.ids.read, &.{
-            harness.lzd(r.extra),
-            harness.sourceSpan(stream1[0..compressed_size]),
-            harness.sinkSpan(output[0..@intCast(r.response.byte_length)]),
-        }, .{ .ctx = true });
-        try harness.requireStatus(r, abi.Status.ok);
+        try readOk(r, stream1[0..compressed_size], output[0..@intCast(r.response.byte_length)]);
         if (r.response.byte_length != 32 or !std.mem.eql(u8, output[0..32], xz_corpus[0..32])) {
             return error.CheckRoundtripContentMismatch;
         }
@@ -93,7 +87,7 @@ fn runCallback(r: *Runner) !void {
     var output: [256]u8 = undefined;
     var source_ctx = harness.SourceCallbackContext{ .data = xz_corpus[0..32] };
     _ = harness.call(r, harness.ids.write, &.{
-        harness.lzd(r.extra),
+        harness.lzmaDictionaryParam(r.lzma_dictionary),
         harness.sourceCallbackNode(0, 0),
         harness.sinkSpan(&stream1),
     }, .{ .ctx = true, .callback = harness.sourceCallback, .context = &source_ctx });
@@ -102,12 +96,7 @@ fn runCallback(r: *Runner) !void {
     r.encoded = &xz_encoded;
     @memcpy(xz_encoded[0..r.encoded_len], stream1[0..r.encoded_len]);
     @memset(&output, 0xa5);
-    _ = harness.call(r, harness.ids.read, &.{
-        harness.lzd(r.extra),
-        harness.sourceSpan(stream1[0..r.encoded_len]),
-        harness.sinkSpan(&output),
-    }, .{ .ctx = true });
-    try harness.requireStatus(r, abi.Status.ok);
+    try readOk(r, stream1[0..r.encoded_len], &output);
     if (r.response.byte_length != 32 or !std.mem.eql(u8, output[0..32], xz_corpus[0..32])) {
         return error.CallbackRoundtripMismatch;
     }
@@ -118,46 +107,41 @@ fn runCombined(r: *Runner) !void {
     var stream2: [4096]u8 = undefined;
     var combined: [8192]u8 = undefined;
     var output: [4096]u8 = undefined;
+    // Capture before this write replaces r.encoded_len.
+    const stream1_size = r.encoded_len;
+    @memcpy(stream1[0..stream1_size], r.encoded[0..stream1_size]);
     _ = harness.call(r, harness.ids.query, &.{
-        harness.lzd(r.extra),
-        harness.xck(4),
+        dict(r),
+        harness.xzCheckParam(4),
         harness.paramTargetCommand(harness.ids.write),
         harness.sourceSpan(&xz_payload_a),
-        harness.cap(r.caps_query),
-        harness.pln(r.planning),
-        harness.dlv(r.delivery_write),
+        harness.capabilityParam(r.caps_query),
+        harness.sizingModeParam(r.sizing),
+        harness.commitModeParam(r.commit_write),
     }, .{});
     try harness.requireStatus(r, abi.Status.ok);
-    _ = harness.call(r, harness.ids.write, &.{
-        harness.lzd(r.extra),
-        harness.xck(4),
+    try harness.spanProduce(r, harness.ids.write, &.{
+        dict(r),
+        harness.xzCheckParam(4),
         harness.sourceSpan(&xz_payload_a),
         harness.sinkSpan(&stream2),
-    }, .{ .ctx = true });
-    try harness.requireStatus(r, abi.Status.ok);
+    });
     const stream2_size: usize = @intCast(r.response.byte_length);
-    @memcpy(stream1[0..r.encoded_len], r.encoded[0..r.encoded_len]);
-    const stream1_size = r.encoded_len;
     @memcpy(combined[0..stream1_size], stream1[0..stream1_size]);
     @memcpy(combined[stream1_size .. stream1_size + stream2_size], stream2[0..stream2_size]);
     const combined_size = stream1_size + stream2_size;
     _ = harness.call(r, harness.ids.query, &.{
-        harness.lzd(r.extra),
+        harness.lzmaDictionaryParam(r.lzma_dictionary),
         harness.paramTargetCommand(harness.ids.read),
         harness.sourceSpan(combined[0..combined_size]),
-        harness.cap(r.caps_query),
-        harness.pln(r.planning),
-        harness.dlv(r.delivery_read),
+        harness.capabilityParam(r.caps_query),
+        harness.sizingModeParam(r.sizing),
+        harness.commitModeParam(r.commit_read),
     }, .{});
     try harness.requireStatus(r, abi.Status.ok);
     if (r.response.byte_length != 32 + xz_payload_a.len) return error.CombinedQueryLength;
     @memset(&output, 0xa5);
-    _ = harness.call(r, harness.ids.read, &.{
-        harness.lzd(r.extra),
-        harness.sourceSpan(combined[0..combined_size]),
-        harness.sinkSpan(&output),
-    }, .{ .ctx = true });
-    try harness.requireStatus(r, abi.Status.ok);
+    try readOk(r, combined[0..combined_size], &output);
     if (r.response.byte_length != 32 + xz_payload_a.len) return error.CombinedReadLength;
     if (!std.mem.eql(u8, output[0..32], xz_corpus[0..32])) return error.CombinedFirstContent;
     if (!std.mem.eql(u8, output[32 .. 32 + xz_payload_a.len], &xz_payload_a)) return error.CombinedSecondContent;
@@ -176,12 +160,7 @@ fn runReferenceDecode(r: *Runner) !void {
     for (checks) |check| {
         const ref_size = xzMakeReference(xz_corpus[0..32], check, null, null, &stream1) orelse return error.XzReferenceFailed;
         @memset(&output, 0xa5);
-        _ = harness.call(r, harness.ids.read, &.{
-            harness.lzd(r.extra),
-            harness.sourceSpan(stream1[0..ref_size]),
-            harness.sinkSpan(&output),
-        }, .{ .ctx = true });
-        try harness.requireStatus(r, abi.Status.ok);
+        try readOk(r, stream1[0..ref_size], &output);
         if (r.response.byte_length != 32 or !std.mem.eql(u8, output[0..32], xz_corpus[0..32])) {
             return error.ReferenceDecodeMismatch;
         }
@@ -197,35 +176,35 @@ fn runEdgeCases(r: *Runner) !void {
     const invalid_magic = [_]u8{ 0x00, 0x37, 0x7a, 0x58, 0x5a, 0x00 };
     @memcpy(stream1[0..r.encoded_len], r.encoded[0..r.encoded_len]);
     try harness.rejectAny(r, harness.ids.read, &.{
-        harness.lzd(r.extra),
+        harness.lzmaDictionaryParam(r.lzma_dictionary),
         harness.sourceSpan(stream1[0 .. r.encoded_len - 1]),
         harness.sinkSpan(&output),
     }, .{ .ctx = true }, &output);
     @memcpy(corrupted[0..r.encoded_len], stream1[0..r.encoded_len]);
     corrupted[r.encoded_len - 3] ^= 0xff;
     try harness.rejectAny(r, harness.ids.read, &.{
-        harness.lzd(r.extra),
+        harness.lzmaDictionaryParam(r.lzma_dictionary),
         harness.sourceSpan(corrupted[0..r.encoded_len]),
         harness.sinkSpan(&output),
     }, .{ .ctx = true }, &output);
     try harness.rejectAny(r, harness.ids.read, &.{
-        harness.lzd(r.extra),
+        harness.lzmaDictionaryParam(r.lzma_dictionary),
         harness.sourceSpan(&invalid_magic),
         harness.sinkSpan(&output),
     }, .{ .ctx = true }, &output);
     try harness.expect(r, harness.ids.query, &.{
-        harness.lzd(r.extra),
-        harness.xck(2),
+        harness.lzmaDictionaryParam(r.lzma_dictionary),
+        harness.xzCheckParam(2),
         harness.paramTargetCommand(harness.ids.write),
         harness.sourceSpan(xz_corpus[0..32]),
-        harness.cap(r.caps_query),
-        harness.pln(r.planning),
-        harness.dlv(r.delivery_write),
+        harness.capabilityParam(r.caps_query),
+        harness.sizingModeParam(r.sizing),
+        harness.commitModeParam(r.commit_write),
     }, .{}, abi.Status.unsupported);
     @memcpy(reserved_flags[0..r.encoded_len], stream1[0..r.encoded_len]);
     reserved_flags[13] |= 0x04;
     try harness.reject(r, harness.ids.read, &.{
-        harness.lzd(r.extra),
+        harness.lzmaDictionaryParam(r.lzma_dictionary),
         harness.sourceSpan(reserved_flags[0..r.encoded_len]),
         harness.sinkSpan(&output),
     }, .{ .ctx = true }, abi.Status.invalid_data, &output);
@@ -244,7 +223,7 @@ fn runEdgeCases(r: *Runner) !void {
     std.mem.writeInt(u32, two_filters[24..28], header_crc, .little);
     @memcpy(two_filters[28 .. 28 + (r.encoded_len - 24)], stream1[24..r.encoded_len]);
     try harness.reject(r, harness.ids.read, &.{
-        harness.lzd(r.extra),
+        harness.lzmaDictionaryParam(r.lzma_dictionary),
         harness.sourceSpan(two_filters[0 .. r.encoded_len + 4]),
         harness.sinkSpan(&output),
     }, .{ .ctx = true }, abi.Status.unsupported, &output);
@@ -286,16 +265,11 @@ fn runFilterCases(r: *Runner) !void {
     };
     for (cases) |item| {
         const ref_size = xzMakeReference(item.data[0..item.len], 4, item.delta, item.bcj, &filter_xz) orelse {
-            std.debug.print("xz filter case unsupported (system liblzma does not support filter 0x{x})\n", .{item.bcj orelse 0});
+            std.debug.print("xz filter case unsupported (system liblzma does not support filter 0x{x}).\n", .{item.bcj orelse 0});
             continue;
         };
         @memset(&output, 0xa5);
-        _ = harness.call(r, harness.ids.read, &.{
-            harness.lzd(r.extra),
-            harness.sourceSpan(filter_xz[0..ref_size]),
-            harness.sinkSpan(&output),
-        }, .{ .ctx = true });
-        try harness.requireStatus(r, abi.Status.ok);
+        try readOk(r, filter_xz[0..ref_size], &output);
         if (r.response.byte_length != item.len or !std.mem.eql(u8, output[0..item.len], item.data[0..item.len])) {
             return error.FilterDecodeMismatch;
         }
@@ -317,7 +291,7 @@ fn runFilterCases(r: *Runner) !void {
     std.mem.writeInt(u32, bad[12 + header_size - 4 ..][0..4], header_crc, .little);
     @memset(&output, 0xa5);
     _ = harness.call(r, harness.ids.read, &.{
-        harness.lzd(r.extra),
+        harness.lzmaDictionaryParam(r.lzma_dictionary),
         harness.sourceSpan(bad[0..ref_size]),
         harness.sinkSpan(&output),
     }, .{ .ctx = true });
@@ -341,18 +315,13 @@ fn runOptionalBody(r: *Runner) !void {
     const stream_a_size = xzMakeReference(&xz_payload_a, 10, null, null, &stream_a) orelse return error.StreamAReferenceFailed;
     const stream_b_size = xzMakeReference(&xz_payload_b, 10, null, null, &stream_b) orelse return error.StreamBReferenceFailed;
     @memset(&output, 0xa5);
-    _ = harness.call(r, harness.ids.read, &.{
-        harness.lzd(r.extra),
-        harness.sourceSpan(stream_a[0..stream_a_size]),
-        harness.sinkSpan(&output),
-    }, .{ .ctx = true });
-    try harness.requireStatus(r, abi.Status.ok);
+    try readOk(r, stream_a[0..stream_a_size], &output);
     if (r.response.byte_length != xz_payload_a.len or !std.mem.eql(u8, output[0..xz_payload_a.len], &xz_payload_a)) {
         return error.Sha256StreamMismatch;
     }
     stream_a[stream_a_size - 4] ^= 0xff;
     try harness.reject(r, harness.ids.read, &.{
-        harness.lzd(r.extra),
+        harness.lzmaDictionaryParam(r.lzma_dictionary),
         harness.sourceSpan(stream_a[0..stream_a_size]),
         harness.sinkSpan(&output),
     }, .{ .ctx = true }, abi.Status.integrity_failure, &output);
@@ -363,12 +332,7 @@ fn runOptionalBody(r: *Runner) !void {
     @memset(combined_payload[stream_a_size2 + 4 + stream_b_size .. stream_a_size2 + 4 + stream_b_size + 4], 0);
     const combined_size = stream_a_size2 + 4 + stream_b_size + 4;
     @memset(&output, 0xa5);
-    _ = harness.call(r, harness.ids.read, &.{
-        harness.lzd(r.extra),
-        harness.sourceSpan(combined_payload[0..combined_size]),
-        harness.sinkSpan(&output),
-    }, .{ .ctx = true });
-    try harness.requireStatus(r, abi.Status.ok);
+    try readOk(r, combined_payload[0..combined_size], &output);
     if (r.response.byte_length != xz_payload_a.len + xz_payload_b.len) return error.PaddedCombinedMismatch;
     if (!std.mem.eql(u8, output[0..xz_payload_a.len], &xz_payload_a) or !std.mem.eql(u8, output[xz_payload_a.len .. xz_payload_a.len + xz_payload_b.len], &xz_payload_b)) {
         return error.PaddedCombinedContentMismatch;
@@ -379,7 +343,7 @@ fn runOptionalBody(r: *Runner) !void {
         @memset(&combined, 0);
         @memcpy(combined[0..stream_a3], stream_a[0..stream_a3]);
         try harness.reject(r, harness.ids.read, &.{
-            harness.lzd(r.extra),
+            harness.lzmaDictionaryParam(r.lzma_dictionary),
             harness.sourceSpan(combined[0 .. stream_a3 + pad_len]),
             harness.sinkSpan(&output),
         }, .{ .ctx = true }, abi.Status.invalid_data, &output);
@@ -394,7 +358,7 @@ fn runOptionalBody(r: *Runner) !void {
     const old_index_end = stream_a_size - 12;
     const new_unpadded = old_header_size + @as(usize, compressed_size) + 32 - 4;
     if (old_header_size != 16 or old_index_start > old_index_end or stream_a[16] != 0x21 or new_unpadded > 127 or uncompressed_size > 127) {
-        std.debug.print("xz optional sizes: skipped (liblzma stream shape differs from xz CLI reference)\n", .{});
+        std.debug.print("xz optional sizes: skipped (liblzma stream shape differs from xz CLI reference).\n", .{});
         return;
     }
     var new_header: [12]u8 = undefined;
@@ -423,12 +387,7 @@ fn runOptionalBody(r: *Runner) !void {
     @memcpy(mutated[pos .. pos + (stream_a_size - old_index_end)], stream_a[old_index_end..stream_a_size]);
     const new_size = pos + (stream_a_size - old_index_end);
     @memset(&output, 0xa5);
-    _ = harness.call(r, harness.ids.read, &.{
-        harness.lzd(r.extra),
-        harness.sourceSpan(mutated[0..new_size]),
-        harness.sinkSpan(&output),
-    }, .{ .ctx = true });
-    try harness.requireStatus(r, abi.Status.ok);
+    try readOk(r, mutated[0..new_size], &output);
     if (r.response.byte_length != xz_payload_a.len or !std.mem.eql(u8, output[0..xz_payload_a.len], &xz_payload_a)) {
         return error.NoSizeBlockMismatch;
     }
@@ -449,12 +408,7 @@ fn runOptionalBody(r: *Runner) !void {
     @memcpy(mutated[pos .. pos + (stream_a_size - old_index_end)], stream_a[old_index_end..stream_a_size]);
     const new_size2 = pos + (stream_a_size - old_index_end);
     @memset(&output, 0xa5);
-    _ = harness.call(r, harness.ids.read, &.{
-        harness.lzd(r.extra),
-        harness.sourceSpan(mutated[0..new_size2]),
-        harness.sinkSpan(&output),
-    }, .{ .ctx = true });
-    try harness.requireStatus(r, abi.Status.ok);
+    try readOk(r, mutated[0..new_size2], &output);
     if (r.response.byte_length != xz_payload_a.len or !std.mem.eql(u8, output[0..xz_payload_a.len], &xz_payload_a)) {
         return error.UncompressedSizeOnlyBlockMismatch;
     }
@@ -472,23 +426,17 @@ fn runEncodeFilters(r: *Runner) !void {
     var output: [1024]u8 = undefined;
     const filters = [_]u64{ 1, 2 };
     for (filters) |filter| {
-        _ = harness.call(r, harness.ids.write, &.{
-            harness.lzd(r.extra),
-            harness.xflt(filter),
+        try harness.spanProduce(r, harness.ids.write, &.{
+            dict(r),
+            harness.xzFiltersParam(filter),
             harness.sourceSpan(xz_corpus[0..100]),
             harness.sinkSpan(&encoded),
-        }, .{ .ctx = true });
-        try harness.requireStatus(r, abi.Status.ok);
+        });
         if (r.response.byte_length == 0 or r.response.byte_length > encoded.len) return error.FilteredEncodeSize;
         r.encoded = &encoded;
         r.encoded_len = @intCast(r.response.byte_length);
         @memset(&output, 0xa5);
-        _ = harness.call(r, harness.ids.read, &.{
-            harness.lzd(r.extra),
-            harness.sourceSpan(encoded[0..r.encoded_len]),
-            harness.sinkSpan(&output),
-        }, .{ .ctx = true });
-        try harness.requireStatus(r, abi.Status.ok);
+        try readOk(r, encoded[0..r.encoded_len], &output);
         if (r.response.byte_length != 100 or !std.mem.eql(u8, output[0..100], &xz_corpus)) {
             return error.FilteredEncodeRoundtrip;
         }
@@ -502,22 +450,16 @@ fn runEncodeFilters(r: *Runner) !void {
 fn runEncodeSha256(r: *Runner) !void {
     var encoded: [16384]u8 = undefined;
     var output: [1024]u8 = undefined;
-    _ = harness.call(r, harness.ids.write, &.{
-        harness.lzd(r.extra),
-        harness.xck(0x0A),
+    try harness.spanProduce(r, harness.ids.write, &.{
+        dict(r),
+        harness.xzCheckParam(0x0A),
         harness.sourceSpan(xz_corpus[0..100]),
         harness.sinkSpan(&encoded),
-    }, .{ .ctx = true });
-    try harness.requireStatus(r, abi.Status.ok);
+    });
     r.encoded = &encoded;
     r.encoded_len = @intCast(r.response.byte_length);
     @memset(&output, 0xa5);
-    _ = harness.call(r, harness.ids.read, &.{
-        harness.lzd(r.extra),
-        harness.sourceSpan(encoded[0..r.encoded_len]),
-        harness.sinkSpan(&output),
-    }, .{ .ctx = true });
-    try harness.requireStatus(r, abi.Status.ok);
+    try readOk(r, encoded[0..r.encoded_len], &output);
     if (r.response.byte_length != 100 or !std.mem.eql(u8, output[0..100], &xz_corpus)) {
         return error.Sha256EncodeRoundtrip;
     }
@@ -529,8 +471,8 @@ fn runEncodeSha256(r: *Runner) !void {
 fn runEncodeInvalidFilter(r: *Runner) !void {
     var encoded: [16384]u8 = undefined;
     try harness.expect(r, harness.ids.write, &.{
-        harness.lzd(r.extra),
-        harness.xflt(99),
+        harness.lzmaDictionaryParam(r.lzma_dictionary),
+        harness.xzFiltersParam(99),
         harness.sourceSpan(xz_corpus[0..100]),
         harness.sinkSpan(&encoded),
     }, .{ .ctx = true }, abi.Status.invalid_call);
@@ -546,21 +488,15 @@ fn runEncodeMultistream(r: *Runner) !void {
     defer allocator.free(big_output);
     const pattern = "multi stream xz payload %d\n";
     for (big_payload, 0..) |*byte, i| byte.* = pattern[i % pattern.len];
-    _ = harness.call(r, harness.ids.write, &.{
-        harness.lzd(r.extra),
+    try harness.spanProduce(r, harness.ids.write, &.{
+        dict(r),
         harness.sourceSpan(big_payload),
         harness.sinkSpan(big_encoded),
-    }, .{ .ctx = true });
-    try harness.requireStatus(r, abi.Status.ok);
+    });
     r.encoded = big_encoded;
     r.encoded_len = @intCast(r.response.byte_length);
     @memset(big_output, 0xa5);
-    _ = harness.call(r, harness.ids.read, &.{
-        harness.lzd(r.extra),
-        harness.sourceSpan(big_encoded[0..r.encoded_len]),
-        harness.sinkSpan(big_output),
-    }, .{ .ctx = true });
-    try harness.requireStatus(r, abi.Status.ok);
+    try readOk(r, big_encoded[0..r.encoded_len], big_output);
     if (r.response.byte_length != big_payload.len or !std.mem.eql(u8, big_output, big_payload)) {
         return error.MultistreamRoundtrip;
     }

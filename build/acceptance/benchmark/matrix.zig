@@ -1,7 +1,8 @@
 const std = @import("std");
 
-const harness = @import("harness");
-
+// Three intentional stems: Kind uses the released profile stem (seven_zip),
+// Cmd mirrors the reference binary name (7zz), Lib mirrors the bridge module
+// name (sevenzip). Do not unify the spellings.
 pub const Kind = enum { gzip, bzip2, lzma, lzma2, lzma_file, xz, zstd, tar, zip, seven_zip, rar };
 pub const Cmd = enum { sevenzz, zstd, xz, bzip2, gzip, tar, ziptool, unrar, lzma };
 pub const Lib = enum { sevenzip, zstd, bzip2, xz, lzma7z, libzip, unrar, fast_lzma2 };
@@ -13,40 +14,7 @@ pub const Tuning = struct {
     ref_params: []const u8 = "",
     cmd_args: []const []const u8 = &.{},
     lib_level: ?i32 = null,
-};
-
-const p = struct {
-    fn scalar(family: u16, ordinal: u32, value: u64) Param {
-        return .{ .family = family, .ordinal = ordinal, .value = value };
-    }
-    fn lzma(ordinal: u32, value: u64) Param {
-        return scalar(harness.param_family_lzma, ordinal, value);
-    }
-    fn zstd(ordinal: u32, value: u64) Param {
-        return scalar(harness.param_family_zstd, ordinal, value);
-    }
-    fn deflate(ordinal: u32, value: u64) Param {
-        return scalar(harness.param_family_deflate, ordinal, value);
-    }
-};
-
-pub const tuning = struct {
-    pub const none = Tuning{ .name = "", .params = &.{} };
-    pub const lzma_dict = Tuning{ .name = "", .params = &.{ p.lzma(harness.lzma_dictionary, 1 << 23), p.lzma(harness.lzma_match_finder_depth, 48) }, .ref_params = "lzma preset 6, dict 8 MiB, depth 48" };
-    pub const lzma_bt = Tuning{ .name = "bt", .params = &.{ p.lzma(harness.lzma_dictionary, 1 << 23), p.lzma(harness.lzma_match_finder, 1), p.lzma(harness.lzma_match_finder_depth, 48) }, .ref_params = "lzma preset 6, bt4, depth 48" };
-    pub const lzma_bt_lazy = Tuning{ .name = "bt-lazy", .params = &.{ p.lzma(harness.lzma_dictionary, 1 << 23), p.lzma(harness.lzma_match_finder, 1), p.lzma(harness.lzma_lazy, 1), p.lzma(harness.lzma_match_finder_depth, 48) }, .ref_params = "lzma preset 6, bt4 lazy, depth 48" };
-    pub const lzma2_dict = Tuning{ .name = "", .params = &.{ p.lzma(harness.lzma_dictionary, 1 << 23), p.lzma(harness.lzma_match_finder_depth, 48) }, .ref_params = "fast-lzma2 level 9" };
-    pub const zstd_window = Tuning{ .name = "", .params = &.{ p.zstd(harness.zstd_window, 1 << 22), p.zstd(harness.zstd_hash_bits, 17), p.zstd(harness.zstd_double_hash, 1) }, .ref_params = "zstd level 3, window 4 MiB, dfast", .cmd_args = &.{"--long=22"} };
-    pub const zstd_lazy = Tuning{ .name = "lazy", .params = &.{ p.zstd(harness.zstd_window, 1 << 20), p.zstd(harness.zstd_row_match, 1) }, .ref_params = "zstd --lazy, row matchfinder", .cmd_args = &.{"--long=20"} };
-    pub const zstd_fast = Tuning{ .name = "fast", .params = &.{ p.zstd(harness.zstd_window, 1 << 20), p.zstd(harness.zstd_skip_interior_insert, 1) }, .ref_params = "zstd --fast=1", .cmd_args = &.{"--fast=1"}, .lib_level = -1 };
-    pub const zstd_dfast = Tuning{ .name = "dfast", .params = &.{ p.zstd(harness.zstd_window, 1 << 21), p.zstd(harness.zstd_double_hash, 1) }, .ref_params = "zstd dfast", .cmd_args = &.{"--long=21"} };
-    pub const deflate_high = Tuning{ .name = "high", .params = &.{
-        p.deflate(harness.deflate_good, 16),
-        p.deflate(harness.deflate_nice, 258),
-        p.deflate(harness.deflate_lazy, 48),
-        p.deflate(harness.deflate_chain, 32),
-        p.deflate(harness.deflate_optimal, 1),
-    }, .ref_params = "gzip -6 high-compression" };
+    bypass: bool = false,
 };
 
 pub const Base = struct {
@@ -65,19 +33,46 @@ pub const Base = struct {
     ref_params: []const u8 = "",
 };
 
-pub const bases = [_]Base{
-    .{ .name = "gzip", .kind = .gzip, .ext = "gz", .cmd = .gzip, .lib = .sevenzip, .fmt = 0xef, .tunings = &.{ tuning.none, tuning.deflate_high }, .ref_params = "gzip -6" },
-    .{ .name = "bzip2", .kind = .bzip2, .ext = "bz2", .cmd = .bzip2, .lib = .bzip2, .tunings = &.{tuning.none}, .ref_params = "bzip2 default (block 900k)" },
-    .{ .name = "xz", .kind = .xz, .ext = "xz", .cmd = .xz, .lib = .xz, .tunings = &.{ tuning.lzma_dict, tuning.lzma_bt } },
-    .{ .name = "lzma", .kind = .lzma, .ext = "lzma", .cmd = .lzma, .lib = .lzma7z, .fmt = 0x0a, .tunings = &.{ tuning.lzma_dict, tuning.lzma_bt, tuning.lzma_bt_lazy } },
-    .{ .name = "lzma2", .kind = .lzma2, .ext = "lzma2", .cmd = null, .lib = .fast_lzma2, .tunings = &.{tuning.lzma2_dict} },
-    .{ .name = "lzma_file", .kind = .lzma_file, .ext = "lzma", .cmd = .lzma, .bin = .sevenzz, .lib = .lzma7z, .fmt = 0x0a, .decode_only = true, .tunings = &.{tuning.none}, .ref_params = "decode-only" },
-    .{ .name = "zstd", .kind = .zstd, .ext = "zst", .cmd = .zstd, .lib = .zstd, .tunings = &.{ tuning.zstd_window, tuning.zstd_lazy, tuning.zstd_fast, tuning.zstd_dfast } },
-    .{ .name = "tar", .kind = .tar, .ext = "tar", .cmd = .tar, .archive = true, .tunings = &.{tuning.none}, .ref_params = "store" },
-    .{ .name = "zip", .kind = .zip, .ext = "zip", .cmd = .ziptool, .lib = .libzip, .store = true, .archive = true, .method = true, .tunings = &.{tuning.none}, .ref_params = "store" },
-    .{ .name = "7z", .kind = .seven_zip, .ext = "7z", .cmd = .sevenzz, .bin = .sevenzz, .lib = .sevenzip, .fmt = 7, .store = true, .archive = true, .method = true, .tunings = &.{tuning.none}, .ref_params = "store" },
-    .{ .name = "rar", .kind = .rar, .ext = "rar", .cmd = .unrar, .bin = .unrar, .lib = .unrar, .archive = true, .decode_only = true, .tunings = &.{tuning.none}, .ref_params = "decode-only" },
+// Rows derive from descriptors, so removing one removes its rows with no central edits.
+const generated = @import("components");
+
+fn kindFor(comptime name: []const u8) Kind {
+    if (std.mem.eql(u8, name, "7z")) return .seven_zip;
+    return std.meta.stringToEnum(Kind, name) orelse @compileError("unknown benchmark kind: " ++ name);
+}
+
+fn cmdFor(comptime name: []const u8) Cmd {
+    return std.meta.stringToEnum(Cmd, name) orelse @compileError("unknown benchmark cmd: " ++ name);
+}
+
+fn libFor(comptime name: []const u8) Lib {
+    return std.meta.stringToEnum(Lib, name) orelse @compileError("unknown benchmark lib: " ++ name);
+}
+
+const derived_bases = blk: {
+    @setEvalBranchQuota(100_000);
+    var list: []const Base = &.{};
+    for (generated.benchmarks) |benchmark| {
+        const tuning_list: []const Tuning = blk2: {
+            var inner: []const Tuning = &.{};
+            for (benchmark.tunings) |raw_tuning| {
+                const params: []const Param = blk3: {
+                    var plist: []const Param = &.{};
+                    for (raw_tuning.params) |param| {
+                        plist = plist ++ &[_]Param{.{ .family = param.family, .ordinal = param.ordinal, .value = param.value }};
+                    }
+                    break :blk3 plist;
+                };
+                inner = inner ++ &[_]Tuning{.{ .name = raw_tuning.name, .params = params, .ref_params = raw_tuning.ref_params, .cmd_args = raw_tuning.cmd_args, .lib_level = raw_tuning.lib_level, .bypass = raw_tuning.bypass }};
+            }
+            break :blk2 inner;
+        };
+        list = list ++ &[_]Base{.{ .name = benchmark.row, .kind = kindFor(benchmark.kind), .ext = benchmark.ext, .cmd = if (benchmark.cmd) |value| cmdFor(value) else null, .lib = if (benchmark.lib) |value| libFor(value) else null, .bin = if (benchmark.bin) |value| cmdFor(value) else null, .fmt = benchmark.fmt, .store = benchmark.store, .archive = benchmark.archive, .method = benchmark.method, .decode_only = benchmark.decode_only, .ref_params = benchmark.ref_params, .tunings = tuning_list }};
+    }
+    break :blk list;
 };
+
+pub const bases = derived_bases;
 
 pub const Row = struct {
     name: []const u8,
@@ -96,6 +91,7 @@ pub const Row = struct {
     row_type: []const u8,
     cmd_args: []const []const u8,
     lib_level: ?i32,
+    bypass: bool = false,
 };
 
 const row_count = blk: {
@@ -105,6 +101,7 @@ const row_count = blk: {
 };
 
 const row_array = blk: {
+    @setEvalBranchQuota(100_000);
     var list: [row_count]Row = undefined;
     var i: usize = 0;
     for (bases) |base| {
@@ -134,6 +131,7 @@ const row_array = blk: {
                 .row_type = row_type,
                 .cmd_args = t.cmd_args,
                 .lib_level = t.lib_level,
+                .bypass = t.bypass,
             };
             i += 1;
         }

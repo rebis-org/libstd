@@ -1,5 +1,3 @@
-const std = @import("std");
-
 pub const Id = extern struct {
     low: u64,
     high: u64,

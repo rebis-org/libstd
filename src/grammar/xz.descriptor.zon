@@ -1,0 +1,43 @@
+// Component descriptor (xz, class grammar).
+// Identity and policy are frozen ABI: rename or re-id is a breaking
+// change, caught by the comptime assertions in kernel/catalog.zig.
+.{
+    .id = .{ .low = "0x6e6b82f08d91040d", .high = "0xa7a351053d6d400d" },
+    .name = "xz",
+    .class = "grammar",
+    .verbs = .{ "inspect", "decode_ordinal", "encode_ordinal", "encode_stream", "decoded_size" },
+    .parameters = .{
+        .{ .name = "check", .family = 7, .ordinal = 1, .representation = "scalar_words" },
+        .{ .name = "filters", .family = 7, .ordinal = 2, .representation = "node_chain" },
+    },
+    .capabilities = .{ "read", "replay" },
+    .sizing = "measured",
+    .commit = "confirmed",
+    .limits = .{ .window = 8388608, .block = 0, .history = 0 },
+    .benchmark = .{
+        .row = "xz",
+        .params = "",
+        .kind = "xz",
+        .ext = "xz",
+        .cmd = "xz",
+        .lib = "xz",
+        .tunings = .{
+            .{
+                .params = .{
+                    .{ .family = 6, .ordinal = 1, .value = 8388608 },
+                    .{ .family = 6, .ordinal = 2, .value = 48 },
+                },
+                .ref_params = "lzma preset 6, dict 8 MiB, depth 48",
+            },
+            .{
+                .name = "bt",
+                .params = .{
+                    .{ .family = 6, .ordinal = 1, .value = 8388608 },
+                    .{ .family = 6, .ordinal = 5, .value = 1 },
+                    .{ .family = 6, .ordinal = 2, .value = 48 },
+                },
+                .ref_params = "lzma preset 6, bt4, depth 48",
+            },
+        },
+    },
+}

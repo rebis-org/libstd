@@ -67,7 +67,7 @@ typedef uint32_t (*stdk_call_signature)(stdk_call_envelope*);
     CHECK(OFFSET, stdk_call_envelope, callback, 64);                                                                   \
     CHECK(OFFSET, stdk_call_envelope, callback_context, 72);                                                           \
     CHECK(OFFSET, stdk_call_envelope, reserved, 80);                                                                   \
-    CHECK(VALUE, STDK_ABI_EPOCH, 3);                                                                                   \
+    CHECK(VALUE, STDK_ABI_EPOCH, 7);                                                                                   \
     CHECK(VALUE, STDK_STATUS_OK, 0);                                                                                   \
     CHECK(VALUE, STDK_STATUS_INVALID_CALL, 1);                                                                         \
     CHECK(VALUE, STDK_STATUS_UNSUPPORTED, 2);                                                                          \

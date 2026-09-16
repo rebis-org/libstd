@@ -9,12 +9,12 @@ pub const MaxExtra = 4;
 pub const Params = *const fn (r: *Runner, out: *[MaxExtra]harness.Node) usize;
 
 pub const Nodes = struct {
-    items: [16]harness.Node = undefined,
+    items: [16]harness.Node = @splat(harness.Node.init()),
     len: usize = 0,
 };
 
 pub fn build(comptime extra: Params, r: *Runner, base: []const harness.Node) Nodes {
-    var buf: [MaxExtra]harness.Node = undefined;
+    var buf: [MaxExtra]harness.Node = @splat(harness.Node.init());
     const extra_count = extra(r, &buf);
     var result = Nodes{};
     @memcpy(result.items[0..extra_count], buf[0..extra_count]);
@@ -24,18 +24,22 @@ pub fn build(comptime extra: Params, r: *Runner, base: []const harness.Node) Nod
     return result;
 }
 
-pub fn queryWrite(comptime extra: Params, r: *Runner) !void {
-    const nodes = build(extra, r, &.{
-        harness.paramTargetCommand(harness.ids.write),
-        harness.sourceSpan(r.input),
-        harness.cap(r.caps_query),
-        harness.pln(r.planning),
-        harness.dlv(r.delivery_write),
-    });
+pub fn plan(comptime extra: Params, r: *Runner, base: []const harness.Node) !void {
+    const nodes = build(extra, r, base);
     _ = harness.call(r, harness.ids.query, nodes.items[0..nodes.len], .{});
     try harness.requireStatus(r, abi.Status.ok);
     if (r.response.byte_length == 0 or r.response.byte_length > r.encoded.len) return error.QueryCapacity;
     r.required = @intCast(r.response.byte_length);
+}
+
+pub fn queryWrite(comptime extra: Params, r: *Runner) !void {
+    try plan(extra, r, &.{
+        harness.paramTargetCommand(harness.ids.write),
+        harness.sourceSpan(r.input),
+        harness.capabilityParam(r.caps_query),
+        harness.sizingModeParam(r.sizing),
+        harness.commitModeParam(r.commit_write),
+    });
 }
 
 pub fn writeSpan(comptime extra: Params, r: *Runner) !void {
@@ -51,9 +55,9 @@ pub fn queryRead(comptime extra: Params, r: *Runner) !void {
     const nodes = build(extra, r, &.{
         harness.paramTargetCommand(harness.ids.read),
         harness.sourceSpan(r.encoded[0..r.encoded_len]),
-        harness.cap(r.caps_query),
-        harness.pln(r.planning),
-        harness.dlv(r.delivery_read),
+        harness.capabilityParam(r.caps_query),
+        harness.sizingModeParam(r.sizing),
+        harness.commitModeParam(r.commit_read),
     });
     _ = harness.call(r, harness.ids.query, nodes.items[0..nodes.len], .{});
     try harness.requireStatus(r, abi.Status.ok);
@@ -98,11 +102,11 @@ pub fn invalidReject(comptime extra: Params, r: *Runner) !void {
 
 pub fn capacitySmallSink(comptime extra: Params, r: *Runner) !void {
     const nodes = build(extra, r, &.{ harness.sourceSpan(r.input), harness.sinkSpan(r.output[0..1]) });
-    try harness.expectCapacity(r, harness.ids.write, nodes.items[0..nodes.len], .{ .ctx = true }, harness.ids.diagnostic_required_capacity, harness.ids.diagnostic_available_capacity, r.encoded_len, 1, r.output[0..1]);
+    try harness.expectCapacity(r, harness.ids.write, nodes.items[0..nodes.len], .{ .ctx = true }, r.encoded_len, 1, r.output[0..1]);
 }
 
 pub fn limitReject(comptime extra: Params, r: *Runner) !void {
-    const nodes = build(extra, r, &.{ harness.sourceSpan(r.encoded[0..r.encoded_len]), harness.sinkSpan(r.output), harness.lim(r.input.len - 1) });
+    const nodes = build(extra, r, &.{ harness.sourceSpan(r.encoded[0..r.encoded_len]), harness.sinkSpan(r.output), harness.resourceLimitParam(r.input.len - 1) });
     try harness.reject(r, harness.ids.read, nodes.items[0..nodes.len], .{ .ctx = true }, abi.Status.resource_limit, r.output);
 }
 

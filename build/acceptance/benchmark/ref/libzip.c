@@ -7,19 +7,19 @@ int ref_zip_create(const unsigned char* data,
                    size_t size,
                    const char* name,
                    int store,
-                   const char* tmp_path,
-                   unsigned char* out,
-                   size_t cap,
-                   size_t* out_size) {
-    *out_size = 0;
-    int error = 0;
-    zip_t* za = zip_open(tmp_path, (int) ((unsigned int) ZIP_CREATE | (unsigned int) ZIP_TRUNCATE), &error);
+                   const char* temp_path,
+                   unsigned char* output,
+                   size_t capacity,
+                   size_t* output_size) {
+    *output_size = 0;
+    int open_error = 0;
+    zip_t* za = zip_open(temp_path, (int) ((unsigned int) ZIP_CREATE | (unsigned int) ZIP_TRUNCATE), &open_error);
     if (za == NULL) {
         return REF_FAIL;
     }
-    zip_error_t zerr;
-    zip_error_init(&zerr);
-    zip_source_t* file = zip_source_buffer_create(data, size, 0, &zerr);
+    zip_error_t source_error;
+    zip_error_init(&source_error);
+    zip_source_t* file = zip_source_buffer_create(data, size, 0, &source_error);
     if (file == NULL) {
         zip_close(za);
         return REF_FAIL;
@@ -37,20 +37,24 @@ int ref_zip_create(const unsigned char* data,
     if (zip_close(za) != 0) {
         return REF_FAIL;
     }
-    const int status = ref_file_read(tmp_path, out, cap, out_size);
-    remove(tmp_path);
+    const int status = ref_file_read(temp_path, output, capacity, output_size);
+    remove(temp_path);
     return status;
 }
 
-int ref_zip_extract(const unsigned char* data, size_t size, unsigned char* out, size_t cap, size_t* out_size) {
-    *out_size = 0;
-    zip_error_t error;
-    zip_error_init(&error);
-    zip_source_t* source = zip_source_buffer_create(data, size, 0, &error);
+int ref_zip_extract(const unsigned char* data,
+                    size_t size,
+                    unsigned char* output,
+                    size_t capacity,
+                    size_t* output_size) {
+    *output_size = 0;
+    zip_error_t archive_error;
+    zip_error_init(&archive_error);
+    zip_source_t* source = zip_source_buffer_create(data, size, 0, &archive_error);
     if (source == NULL) {
         return REF_FAIL;
     }
-    zip_t* za = zip_open_from_source(source, 0, &error);
+    zip_t* za = zip_open_from_source(source, 0, &archive_error);
     if (za == NULL) {
         zip_source_free(source);
         return REF_FAIL;
@@ -78,9 +82,9 @@ int ref_zip_extract(const unsigned char* data, size_t size, unsigned char* out, 
         zip_close(za);
         return REF_FAIL;
     }
-    if (st.size > cap) {
+    if (st.size > capacity) {
         zip_close(za);
-        *out_size = (size_t) st.size;
+        *output_size = (size_t) st.size;
         return REF_OVERFLOW;
     }
     zip_file_t* zf = zip_fopen_index(za, index, 0);
@@ -90,7 +94,7 @@ int ref_zip_extract(const unsigned char* data, size_t size, unsigned char* out, 
     }
     size_t done = 0;
     while (done < (size_t) st.size) {
-        const zip_int64_t n = zip_fread(zf, out + done, (zip_uint64_t) ((size_t) st.size - done));
+        const zip_int64_t n = zip_fread(zf, output + done, (zip_uint64_t) ((size_t) st.size - done));
         if (n <= 0) {
             break;
         }
@@ -101,6 +105,6 @@ int ref_zip_extract(const unsigned char* data, size_t size, unsigned char* out, 
     if (done != (size_t) st.size) {
         return REF_FAIL;
     }
-    *out_size = done;
+    *output_size = done;
     return REF_OK;
 }

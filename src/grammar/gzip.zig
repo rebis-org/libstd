@@ -33,8 +33,7 @@ const flag_name = 0x08;
 const flag_comment = 0x10;
 const reserved_flags = 0xe0;
 
-// The wrapper is the 10-byte header, the option-driven optional fields, and
-// the 8-byte trailer; the deflate payload carries its own structural bound.
+// Bound is the deflate structural bound plus the option-driven wrapper.
 pub fn encodedSizeBound(input_len: usize, options: Options) usize {
     var wrapper: usize = 18;
     if (options.extra.len != 0) wrapper +|= 2 +| options.extra.len;
@@ -56,15 +55,7 @@ pub const SinglePass = union(enum) {
     fallback: void,
 };
 
-// KD3 fast path: one inflate straight into the caller's span for a
-// single-member stream. The tail ISIZE is trusted only far enough to start;
-// the result commits only when the decoded count equals ISIZE exactly (the
-// truncated comparison in decode would accept a wrapped size), the CRC32
-// matches, and the member trailer ends exactly at the input end. Every
-// anomaly — multi-member evidence, an input of 4 GiB or more (ISIZE wraps at
-// 2^32), a count or CRC mismatch, a mid-stream capacity excess — defers to
-// the two-pass route, which recomputes the exact size and answers capacity
-// before any further write.
+// Fast path: ISIZE only seeds the attempt; commit needs exact count == ISIZE, CRC match, and trailer at input end. Every anomaly defers to the two-pass route.
 pub fn decodeSinglePass(input: []const u8, output: []u8, history: []u8) Failure!SinglePass {
     if (history.len < deflate_history_size) return error.InsufficientCapacity;
     if (input.len >= std.math.maxInt(u32)) return .fallback;
@@ -136,9 +127,8 @@ pub fn decode(input: []const u8, output: *std.Io.Writer, history: []u8) Failure!
 pub fn encodeStream(source: *std.Io.Reader, output: *std.Io.Writer, history: []u8, options: Options) Failure!void {
     if (history.len < deflate_history_size) return error.InsufficientCapacity;
     try writeHeader(output, options);
-    // The full slice goes to the compressor: optimal mode carves its scratch
-    // past deflate_history_size.
-    var compressor = deflate.Compress.init(output, history, options.deflate) catch |err| return err;
+    // Pass the full slice: optimal mode carves scratch past deflate_history_size.
+    var compressor = try deflate.Compress.init(output, history, options.deflate);
     var crc = checksum.Crc32.init();
     var total: u64 = 0;
     var buffer: [4096]u8 = undefined;

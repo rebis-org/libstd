@@ -1,0 +1,20 @@
+// Component descriptor (deflate, class streaming).
+// Identity and policy are frozen ABI: rename or re-id is a breaking
+// change, caught by the comptime assertions in kernel/catalog.zig.
+.{
+    .id = .{ .low = "0x6e6b82f08d910403", .high = "0xa7a351053d6d4003" },
+    .name = "deflate",
+    .class = "streaming",
+    .verbs = .{ "encode_stream", "decode_stream", "decoded_size", "encoded_size_bound" },
+    .parameters = .{
+        .{ .name = "good", .family = 8, .ordinal = 1, .representation = "scalar_words" },
+        .{ .name = "nice", .family = 8, .ordinal = 2, .representation = "scalar_words" },
+        .{ .name = "lazy", .family = 8, .ordinal = 3, .representation = "scalar_words" },
+        .{ .name = "chain", .family = 8, .ordinal = 4, .representation = "scalar_words" },
+        .{ .name = "optimal", .family = 8, .ordinal = 5, .representation = "scalar_words" },
+    },
+    .capabilities = .{ "read", "replay" },
+    .sizing = "measured",
+    .commit = "tentative",
+    .limits = .{ .window = 32768, .block = 0, .history = 0 },
+}

@@ -19,28 +19,28 @@ static int CALLBACK unrar_callback(UINT msg, LPARAM user, LPARAM p1, LPARAM p2) 
 
 int ref_unrar_extract(const unsigned char* data,
                       size_t size,
-                      const char* tmp_path,
-                      const char* dest_dir,
-                      unsigned char* out,
-                      size_t cap,
-                      size_t* out_size) {
-    *out_size = 0;
-    if (ref_file_write(tmp_path, data, size) != REF_OK) {
+                      const char* temp_path,
+                      const char* destination_dir,
+                      unsigned char* output,
+                      size_t capacity,
+                      size_t* output_size) {
+    *output_size = 0;
+    if (ref_file_write(temp_path, data, size) != REF_OK) {
         return REF_FAIL;
     }
     struct RAROpenArchiveDataEx arc;
     memset(&arc, 0, sizeof(arc));
-    arc.ArcName = (char*) tmp_path;
+    arc.ArcName = (char*) temp_path;
     arc.OpenMode = RAR_OM_EXTRACT;
     HANDLE handle = RAROpenArchiveEx(&arc);
     if (handle == NULL || arc.OpenResult != ERAR_SUCCESS) {
         if (handle != NULL) {
             RARCloseArchive(handle);
         }
-        remove(tmp_path);
+        remove(temp_path);
         return REF_FAIL;
     }
-    ref_sink sink = {out, cap, 0, 0};
+    ref_sink sink = {output, capacity, 0, 0};
     RARSetCallback(handle, unrar_callback, (LPARAM) &sink);
 
     int result = ERAR_SUCCESS;
@@ -58,16 +58,16 @@ int ref_unrar_extract(const unsigned char* data,
             break;
         }
         const int operation = (header.Flags & (unsigned int) RHDF_DIRECTORY) ? RAR_OM_LIST : RAR_OM_EXTRACT;
-        result = RARProcessFile(handle, operation, (char*) dest_dir, NULL);
+        result = RARProcessFile(handle, operation, (char*) destination_dir, NULL);
         if (result != ERAR_SUCCESS) {
             break;
         }
         if (operation == RAR_OM_EXTRACT && extracted[0] == '\0') {
-            snprintf(extracted, sizeof(extracted), "%s/%s", dest_dir, header.FileName);
+            snprintf(extracted, sizeof(extracted), "%s/%s", destination_dir, header.FileName);
         }
     }
     RARCloseArchive(handle);
-    remove(tmp_path);
+    remove(temp_path);
     if (extracted[0] != '\0') {
         remove(extracted);
     }
@@ -75,9 +75,9 @@ int ref_unrar_extract(const unsigned char* data,
         return REF_FAIL;
     }
     if (sink.overflow) {
-        *out_size = sink.len;
+        *output_size = sink.length;
         return REF_OVERFLOW;
     }
-    *out_size = sink.len;
+    *output_size = sink.length;
     return REF_OK;
 }

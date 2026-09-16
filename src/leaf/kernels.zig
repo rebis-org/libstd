@@ -4,7 +4,7 @@ const build_options = @import("options");
 
 // NEON is baseline on aarch64, so the wide match-copy path needs no extra
 // target feature; other targets keep the portable word-at-a-time path.
-const vector_match_copy = !build_options.force_fallback and builtin.cpu.arch == .aarch64;
+const vector_match_copy = !build_options.portable and builtin.cpu.arch == .aarch64;
 
 pub fn matchLen8(buf: []const u8, a: usize, b: usize, max: usize) usize {
     var len: usize = 0;
@@ -18,15 +18,12 @@ pub fn matchLen8(buf: []const u8, a: usize, b: usize, max: usize) usize {
 }
 
 pub const CopyMatchCfg = struct {
-    Ret: type, // void or usize; usize returns dst + len
+    Ret: type,
     short_one: enum { byte_widen, memset } = .byte_widen,
 };
 
-// LZ77 match copy ending at `dst` (exclusive): replicates buf[dst-dist..]
-// forward, so overlapping ranges with dist < len repeat with period dist.
-// Short copies dominate the decoders; the gated path uses exact inline
-// ladders so no platform memcpy/memset call overhead lands in the loop.
-// Wrappers gate the fast path by length and supply their own fallback semantics.
+// Short copies dominate, so inline ladders avoid per-call memcpy/memset overhead.
+// Wrappers gate length and supply their own fallback.
 pub inline fn copyMatchCore(comptime cfg: CopyMatchCfg, buf: []u8, dst: usize, dist: u32, len: usize) cfg.Ret {
     const src = dst - dist;
     if (dist >= len) {
@@ -59,8 +56,7 @@ pub inline fn copyMatchCore(comptime cfg: CopyMatchCfg, buf: []u8, dst: usize, d
         } else {
             switch (cfg.short_one) {
                 .byte_widen => {
-                    // Short runs widen the byte into a word; a platform
-                    // memset call costs more than the copy at this size.
+                    // Word widening beats a memset call at this size.
                     const w: u64 = @as(u64, buf[src]) * 0x0101_0101_0101_0101;
                     if (len >= 8) {
                         std.mem.writeInt(u64, buf[dst..][0..8], w, .little);
@@ -84,8 +80,6 @@ pub inline fn copyMatchCore(comptime cfg: CopyMatchCfg, buf: []u8, dst: usize, d
     if (cfg.Ret == usize) return dst + len;
 }
 
-// Default wrapper used by lzma (cap 273, scalar fallback for non-aarch64 or
-// long matches). The fast path is the same core the other callers use.
 pub inline fn copyMatch(buf: []u8, dst: usize, dist: u32, len: u32) void {
     if (comptime vector_match_copy) {
         if (len <= 273) {

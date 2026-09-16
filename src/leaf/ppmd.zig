@@ -78,11 +78,11 @@ fn encodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options
     try validateOptions(options, unpack);
     const model = try Model.prepare(scratch, options.mem_size);
     model.restart(options.order);
-    var rc = RangeEncoder.init(writer);
+    var range_coder = RangeEncoder.init(writer);
     for (input) |byte| {
-        try model.encodeSymbol(&rc, byte);
+        try model.encodeSymbol(&range_coder, byte);
     }
-    try rc.flush();
+    try range_coder.flush();
 }
 
 pub fn decodedSize(input: []const u8, scratch: []u8, options: Options) Failure!usize {
@@ -98,15 +98,15 @@ pub fn decode(input: []const u8, output: []u8, scratch: []u8, options: Options) 
     try validateOptions(options, unpack);
     const model = try Model.prepare(scratch, options.mem_size);
     model.restart(options.order);
-    var rc = RangeDecoder.init(input);
-    try rc.initStream();
+    var range_coder = RangeDecoder.init(input);
+    try range_coder.initStream();
     var dest = std.Io.Writer.fixed(output);
     var count: usize = 0;
     while (count < unpack) : (count += 1) {
-        const symbol = model.decodeSymbol(&rc) catch return error.InvalidData;
+        const symbol = model.decodeSymbol(&range_coder) catch return error.InvalidData;
         try io.writeByte(&dest, @intCast(symbol));
     }
-    if (rc.code != 0) return error.InvalidData;
+    if (range_coder.code != 0) return error.InvalidData;
     return count;
 }
 
@@ -116,14 +116,14 @@ pub fn decodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, 
     try validateOptions(options, unpack);
     const model = try Model.prepare(scratch, options.mem_size);
     model.restart(options.order);
-    var rc = RangeDecoder.init(input);
-    try rc.initStream();
+    var range_coder = RangeDecoder.init(input);
+    try range_coder.initStream();
     var count: usize = 0;
     while (count < unpack) : (count += 1) {
-        const symbol = model.decodeSymbol(&rc) catch return error.InvalidData;
+        const symbol = model.decodeSymbol(&range_coder) catch return error.InvalidData;
         try io.writeByte(writer, @intCast(symbol));
     }
-    if (rc.code != 0) return error.InvalidData;
+    if (range_coder.code != 0) return error.InvalidData;
 }
 
 fn validateOptions(options: Options, unpack: usize) Failure!void {
@@ -248,20 +248,20 @@ const RangeEncoder = struct {
 };
 
 const Tables = struct {
-    indx2_units: [num_indexes]u8 = undefined,
-    units2_indx: [128]u8 = undefined,
-    ns2_indx: [256]u8 = undefined,
-    ns2_bs_indx: [256]u8 = undefined,
-    hb2_flag: [256]u8 = undefined,
-    free_list: [num_indexes]u32 = undefined,
-    dummy_see: See = undefined,
-    see: [25][16]See = undefined,
-    bin_summ: [128][64]u16 = undefined,
+    indx2_units: [num_indexes]u8,
+    units2_indx: [128]u8,
+    ns2_indx: [256]u8,
+    ns2_bs_indx: [256]u8,
+    hb2_flag: [256]u8,
+    free_list: [num_indexes]u32,
+    dummy_see: See,
+    see: [25][16]See,
+    bin_summ: [128][64]u16,
 };
 
 const Model = struct {
-    tables: Tables = .{},
-    base: [*]u8 = undefined,
+    tables: Tables,
+    base: [*]u8,
     size: u32 = 0,
     text: u32 = 0,
     lo_unit: u32 = 0,
@@ -576,6 +576,7 @@ const Model = struct {
     }
 
     fn createSuccessors(self: *Model, skip: bool) ?u32 {
+        // All fields assigned after the suffix walk, so `undefined` is safe.
         var up_state: State = undefined;
         var c_off = self.min_context;
         var c = self.ctx(c_off);
@@ -588,6 +589,7 @@ const Model = struct {
         }
         const found_symbol = self.state(self.found_state).symbol;
         while (c.suffix != 0) {
+            // Assigned in both branches before use, so `undefined` is safe.
             var s: *State = undefined;
             c_off = c.suffix;
             c = self.ctx(c_off);
@@ -615,7 +617,7 @@ const Model = struct {
         } else {
             var scan = self.statsOf(c);
             while (scan[0].symbol != up_state.symbol) scan += 1;
-            const cf = @as(u32, scan[0].freq - 1);
+            const cf: u32 = scan[0].freq - 1;
             const s0 = @as(u32, c.summ_freq) - c.num_stats - cf;
             up_state.freq = @intCast(1 + if (2 * cf <= s0)
                 @intFromBool(5 * cf > s0)
@@ -623,6 +625,7 @@ const Model = struct {
                 (2 * cf + 3 * s0 - 1) / (2 * s0));
         }
         while (num_ps != 0) {
+            // Assigned in every branch before use, so `undefined` is safe.
             var c1_off: u32 = undefined;
             if (self.hi_unit != self.lo_unit) {
                 self.hi_unit -= unit_size;
@@ -705,12 +708,12 @@ const Model = struct {
             f_successor = self.min_context;
         }
         const min_ctx = self.ctx(self.min_context);
-        const ns = @as(u32, min_ctx.num_stats);
-        const s0 = @as(u32, min_ctx.summ_freq) - ns - (@as(u32, found.freq) - 1);
+        const ns: u32 = min_ctx.num_stats;
+        const s0: u32 = min_ctx.summ_freq - ns - (@as(u32, found.freq) - 1);
         var c_off = self.max_context;
         while (c_off != self.min_context) {
             const c = self.ctx(c_off);
-            const ns1 = @as(u32, c.num_stats);
+            const ns1: u32 = c.num_stats;
             if (ns1 != 1) {
                 if ((ns1 & 1) == 0) {
                     const old_nu = ns1 >> 1;
@@ -743,7 +746,7 @@ const Model = struct {
                 }
                 c.summ_freq = @intCast(@as(u32, s.freq) + self.init_esc + @as(u32, @intFromBool(ns > 3)));
             }
-            const found_freq = @as(u32, self.state(self.found_state).freq);
+            const found_freq: u32 = self.state(self.found_state).freq;
             var cf = 2 * found_freq * (@as(u32, c.summ_freq) + 6);
             const sf = s0 + @as(u32, c.summ_freq);
             if (cf < 6 * sf) {
@@ -914,16 +917,16 @@ const Model = struct {
         }
     }
 
-    fn decodeSymbol(self: *Model, rc: *RangeDecoder) Failure!u32 {
+    fn decodeSymbol(self: *Model, range_coder: *RangeDecoder) Failure!u32 {
         var mask: [256]u8 = undefined;
         var min_ctx = self.ctx(self.min_context);
         if (min_ctx.num_stats != 1) {
             var s = self.statsOf(min_ctx);
-            const count = try rc.getThreshold(min_ctx.summ_freq);
+            const count = try range_coder.getThreshold(min_ctx.summ_freq);
             var hi_cnt: u32 = s[0].freq;
             if (count < hi_cnt) {
                 const symbol = s[0].symbol;
-                try rc.decodeRange(0, s[0].freq);
+                try range_coder.decodeRange(0, s[0].freq);
                 self.found_state = self.ref(s);
                 self.update1_0();
                 return symbol;
@@ -935,7 +938,7 @@ const Model = struct {
                 hi_cnt += s[0].freq;
                 if (hi_cnt > count) {
                     const symbol = s[0].symbol;
-                    try rc.decodeRange(hi_cnt - s[0].freq, s[0].freq);
+                    try range_coder.decodeRange(hi_cnt - s[0].freq, s[0].freq);
                     self.found_state = self.ref(s);
                     self.update1();
                     return symbol;
@@ -945,7 +948,7 @@ const Model = struct {
             }
             if (count >= min_ctx.summ_freq) return error.InvalidData;
             self.hi_bits_flag = self.tables.hb2_flag[self.state(self.found_state).symbol];
-            try rc.decodeRange(hi_cnt, @as(u32, min_ctx.summ_freq) - hi_cnt);
+            try range_coder.decodeRange(hi_cnt, @as(u32, min_ctx.summ_freq) - hi_cnt);
             @memset(&mask, 0xFF);
             mask[s[0].symbol] = 0;
             i = min_ctx.num_stats - 1;
@@ -957,7 +960,7 @@ const Model = struct {
             }
         } else {
             const prob = self.binSumm();
-            if (try rc.decodeBit(prob.*) == 0) {
+            if (try range_coder.decodeBit(prob.*) == 0) {
                 const symbol = Model.oneState(min_ctx).symbol;
                 prob.* = updateProb0(prob.*);
                 self.found_state = self.ref(Model.oneState(min_ctx));
@@ -972,7 +975,7 @@ const Model = struct {
         }
         while (true) {
             var ps: [256]u32 = undefined;
-            const num_masked = @as(u32, min_ctx.num_stats);
+            const num_masked: u32 = min_ctx.num_stats;
             while (true) {
                 self.order_fall += 1;
                 if (min_ctx.suffix == 0) return error.InvalidData;
@@ -995,7 +998,7 @@ const Model = struct {
             }
             const esc = self.makeEscFreq(num_masked);
             const freq_sum = esc.esc_freq + hi_cnt;
-            const count = try rc.getThreshold(freq_sum);
+            const count = try range_coder.getThreshold(freq_sum);
             if (count < hi_cnt) {
                 var pps: usize = 0;
                 hi_cnt = 0;
@@ -1006,7 +1009,7 @@ const Model = struct {
                 }
                 const s_off = ps[pps];
                 const found = self.state(s_off);
-                try rc.decodeRange(hi_cnt - found.freq, found.freq);
+                try range_coder.decodeRange(hi_cnt - found.freq, found.freq);
                 Model.seeUpdate(esc.see);
                 self.found_state = s_off;
                 const symbol = found.symbol;
@@ -1014,7 +1017,7 @@ const Model = struct {
                 return symbol;
             }
             if (count >= freq_sum) return error.InvalidData;
-            try rc.decodeRange(hi_cnt, freq_sum - hi_cnt);
+            try range_coder.decodeRange(hi_cnt, freq_sum - hi_cnt);
             esc.see.summ = @intCast(esc.see.summ + freq_sum);
             while (i != 0) {
                 i -= 1;
@@ -1023,14 +1026,14 @@ const Model = struct {
         }
     }
 
-    fn encodeSymbol(self: *Model, rc: *RangeEncoder, symbol: i32) Failure!void {
+    fn encodeSymbol(self: *Model, range_coder: *RangeEncoder, symbol: i32) Failure!void {
         var mask: [256]u8 = undefined;
         const min_ctx = self.ctx(self.min_context);
         if (min_ctx.num_stats != 1) {
             var s = self.statsOf(min_ctx);
-            rc.range /= min_ctx.summ_freq;
+            range_coder.range /= min_ctx.summ_freq;
             if (s[0].symbol == symbol) {
-                try rc.encodeFinal(0, s[0].freq);
+                try range_coder.encodeFinal(0, s[0].freq);
                 self.found_state = self.ref(s);
                 self.update1_0();
                 return;
@@ -1041,7 +1044,7 @@ const Model = struct {
             while (true) {
                 s += 1;
                 if (s[0].symbol == symbol) {
-                    try rc.encodeFinal(sum, s[0].freq);
+                    try range_coder.encodeFinal(sum, s[0].freq);
                     self.found_state = self.ref(s);
                     self.update1();
                     return;
@@ -1050,7 +1053,7 @@ const Model = struct {
                 i -= 1;
                 if (i == 0) break;
             }
-            rc.encode(sum, min_ctx.summ_freq - sum);
+            range_coder.encode(sum, min_ctx.summ_freq - sum);
             self.hi_bits_flag = self.tables.hb2_flag[self.state(self.found_state).symbol];
             @memset(&mask, 0xFF);
             var scan = self.statsOf(min_ctx);
@@ -1064,17 +1067,17 @@ const Model = struct {
             const s = Model.oneState(min_ctx);
             const prob = self.binSumm();
             var pr: u32 = prob.*;
-            const bound = (rc.range >> bit_shift) * pr;
+            const bound = (range_coder.range >> bit_shift) * pr;
             pr = updateProb1(@intCast(pr));
             if (s.symbol == symbol) {
                 prob.* = @intCast(pr + (1 << int_bits));
-                rc.range = bound;
-                if (rc.range < top_value) {
-                    rc.range <<= 8;
-                    try rc.shiftLow();
+                range_coder.range = bound;
+                if (range_coder.range < top_value) {
+                    range_coder.range <<= 8;
+                    try range_coder.shiftLow();
                 }
                 const c_off = Model.successor(s);
-                const freq = @as(u32, s.freq);
+                const freq: u32 = s.freq;
                 self.found_state = self.ref(s);
                 self.prev_success = 1;
                 self.run_length += 1;
@@ -1089,16 +1092,17 @@ const Model = struct {
             }
             prob.* = @intCast(pr);
             self.init_esc = exp_escape[pr >> 10];
-            rc.low += @as(u64, bound);
-            rc.range -= bound;
+            range_coder.low += @as(u64, bound);
+            range_coder.range -= bound;
             @memset(&mask, 0xFF);
             mask[Model.oneState(min_ctx).symbol] = 0;
             self.prev_success = 0;
         }
         while (true) {
-            try rc.normalize();
+            try range_coder.normalize();
             var mc = self.ctx(self.min_context);
             const num_masked: u32 = mc.num_stats;
+            // Assigned at loop top before the break check, so `undefined` is safe.
             var i: u32 = undefined;
             while (true) {
                 self.order_fall += 1;
@@ -1126,8 +1130,8 @@ const Model = struct {
                         if (mask[scan[0].symbol] != 0) total += scan[0].freq;
                         scan += 1;
                     }
-                    rc.range /= total;
-                    try rc.encodeFinal(low, freq);
+                    range_coder.range /= total;
+                    try range_coder.encodeFinal(low, freq);
                     self.update2();
                     return;
                 }
@@ -1138,8 +1142,8 @@ const Model = struct {
             }
             const total = sum + esc.esc_freq;
             esc.see.summ = @intCast(esc.see.summ + total);
-            rc.range /= total;
-            rc.encode(sum, esc.esc_freq);
+            range_coder.range /= total;
+            range_coder.encode(sum, esc.esc_freq);
             var scan = self.statsOf(mc);
             var n: usize = 0;
             while (n < mc.num_stats) : (n += 1) {

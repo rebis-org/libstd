@@ -1,0 +1,13 @@
+// The crypto selector: named by the crypto_profile parameter of the archive
+// writers. It is not a callable profile; invoking it returns unsupported.
+.{
+    .id = .{ .low = "0x6e6b82f08d910410", .high = "0xa7a351053d6d4010" },
+    .name = "crypto",
+    .class = "grammar",
+    .verbs = .{ "inspect", "decode_ordinal", "encode_ordinal" },
+    .parameters = .{},
+    .capabilities = .{ "read", "write", "size", "replay" },
+    .sizing = "metadata_exact",
+    .commit = "confirmed",
+    .limits = .{ .window = 0, .block = 0, .history = 0 },
+}

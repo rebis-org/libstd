@@ -67,8 +67,7 @@ pub fn runGzipOptimal(r: *Runner) anyerror!void {
     try steps.writeSpan(&optimalParams, r);
     try steps.readSpan(&noParams, r);
     try steps.foreignTool(r);
-    // The optimal parser must engage: its stream differs from the default
-    // lazy parser's on this input, and the default stream still roundtrips.
+    // Parser must engage: optimal stream differs from the default lazy stream here.
     const optimal_len = r.encoded_len;
     @memcpy(optimal_reference[0..optimal_len], r.encoded[0..optimal_len]);
     try steps.writeSpan(&noParams, r);
@@ -102,41 +101,24 @@ fn bzOracleFixture(r: *Runner) !void {
     var compressed: [131072]u8 = undefined;
     var decoded: [65536]u8 = undefined;
     corpus.select(r.corpus_index, &fixture_input);
-    const ref_size = lib.bzip2Compress(&fixture_input, &compressed) orelse return error.Bzip2OracleRejectedInput;
-    if (ref_size == 0 or ref_size >= compressed.len) return error.Bzip2OracleOutputSize;
-    _ = harness.call(r, harness.ids.read, &.{
-        harness.sourceSpan(compressed[0..ref_size]),
-        harness.sinkSpan(&decoded),
-    }, .{ .ctx = true });
-    try harness.requireStatus(r, abi.Status.ok);
-    if (r.response.byte_length != fixture_input.len) return error.Bzip2OracleDecodeLengthMismatch;
-    if (!std.mem.eql(u8, &decoded, &fixture_input)) return error.Bzip2OracleContentMismatch;
+    try harness.oracleFixture(r, lib.bzip2Compress, &fixture_input, &compressed, &decoded);
 }
 
 fn bzBlockSizeRoundtrip(r: *Runner) !void {
-    _ = harness.call(r, harness.ids.query, &.{
-        harness.blck(900000),
+    try steps.plan(&noParams, r, &.{
+        harness.bzip2BlockParam(900000),
         harness.paramTargetCommand(harness.ids.write),
         harness.sourceSpan(r.input),
-        harness.cap(r.caps_query),
-        harness.pln(r.planning),
-        harness.dlv(r.delivery_write),
-    }, .{});
-    try harness.requireStatus(r, abi.Status.ok);
-    if (r.response.byte_length == 0 or r.response.byte_length > r.encoded.len) return error.BlockSizeQueryCapacity;
-    r.required = @intCast(r.response.byte_length);
-    _ = harness.call(r, harness.ids.write, &.{
-        harness.blck(900000),
+        harness.capabilityParam(r.caps_query),
+        harness.sizingModeParam(r.sizing),
+        harness.commitModeParam(r.commit_write),
+    });
+    try harness.spanProduce(r, harness.ids.write, &.{
+        harness.bzip2BlockParam(900000),
         harness.sourceSpan(r.input),
         harness.sinkSpan(r.encoded),
-    }, .{ .ctx = true });
-    try harness.requireStatus(r, abi.Status.ok);
-    r.encoded_len = @intCast(r.response.byte_length);
-    _ = harness.call(r, harness.ids.read, &.{
-        harness.sourceSpan(r.encoded[0..r.encoded_len]),
-        harness.sinkSpan(r.output),
-    }, .{ .ctx = true });
-    try harness.requireStatus(r, abi.Status.ok);
+    });
+    try harness.spanCall(r, harness.ids.read, r.encoded[0..r.encoded_len], r.output);
     if (r.response.byte_length != r.input.len) return error.BlockSizeRoundtripLengthMismatch;
     if (!std.mem.eql(u8, r.output[0..r.input.len], r.input)) return error.BlockSizeRoundtripContentMismatch;
 }
@@ -173,39 +155,26 @@ fn gzOptionalHeaders(r: *Runner) !void {
     const name = "payload.txt";
     const comment = "stdk gzip comment";
     const extra = [_]u8{ 0x01, 0x02, 0x03, 0x04 };
-    _ = harness.call(r, harness.ids.query, &.{
+    const header_params = [_]harness.Node{
+        harness.gzipMtimeParam(0x12345678),
+        harness.gzipExtraFlagsParam(2),
+        harness.gzipOsParam(3),
+        harness.gzipTextParam(1),
+        harness.gzipHeaderCrcParam(1),
+        harness.gzipNameParam(name),
+        harness.gzipCommentParam(comment),
+        harness.gzipExtraParam(&extra),
+    };
+    try steps.plan(&noParams, r, &[_]harness.Node{
         harness.paramTargetCommand(harness.ids.write),
         harness.sourceSpan(r.input),
-        harness.mtime(0x12345678),
-        harness.xflags(2),
-        harness.os(3),
-        harness.text(1),
-        harness.hcrc(1),
-        harness.gname(name),
-        harness.gcomment(comment),
-        harness.gextra(&extra),
-        harness.cap(r.caps_query),
-        harness.pln(r.planning),
-        harness.dlv(r.delivery_write),
-    }, .{});
-    try harness.requireStatus(r, abi.Status.ok);
-    if (r.response.byte_length == 0 or r.response.byte_length > r.encoded.len) return error.OptionalHeaderQueryCapacity;
-    r.required = @intCast(r.response.byte_length);
-    _ = harness.call(r, harness.ids.write, &.{
-        harness.sourceSpan(r.input),
-        harness.mtime(0x12345678),
-        harness.xflags(2),
-        harness.os(3),
-        harness.text(1),
-        harness.hcrc(1),
-        harness.gname(name),
-        harness.gcomment(comment),
-        harness.gextra(&extra),
-        harness.sinkSpan(r.encoded),
-    }, .{ .ctx = true });
-    try harness.requireStatus(r, abi.Status.ok);
-    if (r.response.byte_length != r.required) return error.OptionalHeaderWriteLengthMismatch;
-    r.encoded_len = @intCast(r.response.byte_length);
+    } ++ header_params ++ [_]harness.Node{
+        harness.capabilityParam(r.caps_query),
+        harness.sizingModeParam(r.sizing),
+        harness.commitModeParam(r.commit_write),
+    });
+    try harness.spanProduce(r, harness.ids.write, &[_]harness.Node{harness.sourceSpan(r.input)} ++ header_params ++ [_]harness.Node{harness.sinkSpan(r.encoded)});
+    if (r.encoded_len != r.required) return error.OptionalHeaderWriteLengthMismatch;
     if (r.encoded_len < 10 or r.encoded[0] != 0x1f or r.encoded[1] != 0x8b or r.encoded[2] != 0x08) return error.GzipMagicMismatch;
     if (r.encoded[3] != 0x1f) return error.GzipFlagsMismatch;
     const stored_mtime = @as(u32, r.encoded[4]) | (@as(u32, r.encoded[5]) << 8) | (@as(u32, r.encoded[6]) << 16) | (@as(u32, r.encoded[7]) << 24);
@@ -214,36 +183,25 @@ fn gzOptionalHeaders(r: *Runner) !void {
     if (!harness.containsBytes(r.encoded[0..r.encoded_len], name)) return error.GzipNameMissing;
     if (!harness.containsBytes(r.encoded[0..r.encoded_len], comment)) return error.GzipCommentMissing;
     if (!harness.containsBytes(r.encoded[0..r.encoded_len], &extra)) return error.GzipExtraMissing;
-    _ = harness.call(r, harness.ids.query, &.{
+    try steps.plan(&noParams, r, &.{
         harness.paramTargetCommand(harness.ids.read),
         harness.sourceSpan(r.encoded[0..r.encoded_len]),
-        harness.cap(r.caps_query),
-        harness.pln(r.planning),
-        harness.dlv(r.delivery_read),
-    }, .{});
-    try harness.requireStatus(r, abi.Status.ok);
-    if (r.response.byte_length != r.input.len) return error.OptionalHeaderReadCapacityMismatch;
-    _ = harness.call(r, harness.ids.read, &.{
-        harness.sourceSpan(r.encoded[0..r.encoded_len]),
-        harness.sinkSpan(r.output),
-    }, .{ .ctx = true });
-    try harness.requireStatus(r, abi.Status.ok);
+        harness.capabilityParam(r.caps_query),
+        harness.sizingModeParam(r.sizing),
+        harness.commitModeParam(r.commit_read),
+    });
+    if (r.required != r.input.len) return error.OptionalHeaderReadCapacityMismatch;
+    try harness.spanCall(r, harness.ids.read, r.encoded[0..r.encoded_len], r.output);
     if (r.response.byte_length != r.input.len or !std.mem.eql(u8, r.output[0..r.input.len], r.input)) return error.OptionalHeaderRoundtripMismatch;
 }
 
 fn gzHeaderCrc(r: *Runner) !void {
-    _ = harness.call(r, harness.ids.write, &.{
+    try harness.spanProduce(r, harness.ids.write, &.{
         harness.sourceSpan(r.input),
-        harness.hcrc(1),
+        harness.gzipHeaderCrcParam(1),
         harness.sinkSpan(r.encoded),
-    }, .{ .ctx = true });
-    try harness.requireStatus(r, abi.Status.ok);
-    r.encoded_len = @intCast(r.response.byte_length);
-    _ = harness.call(r, harness.ids.read, &.{
-        harness.sourceSpan(r.encoded[0..r.encoded_len]),
-        harness.sinkSpan(r.output),
-    }, .{ .ctx = true });
-    try harness.requireStatus(r, abi.Status.ok);
+    });
+    try harness.spanCall(r, harness.ids.read, r.encoded[0..r.encoded_len], r.output);
     if (!std.mem.eql(u8, r.output[0..r.input.len], r.input)) return error.HeaderCrcReadMismatch;
     if (r.encoded_len <= 11) return error.HeaderCrcFrameTooShort;
     r.encoded[10] ^= 0xff;
@@ -257,45 +215,26 @@ fn gzHeaderCrc(r: *Runner) !void {
 fn gzConcat(r: *Runner) !void {
     const part1_len: usize = 11;
     const part2_len: usize = 11;
-    _ = harness.call(r, harness.ids.write, &.{
-        harness.sourceSpan(r.input[0..part1_len]),
-        harness.sinkSpan(r.encoded),
-    }, .{ .ctx = true });
-    try harness.requireStatus(r, abi.Status.ok);
-    const member1_size: usize = @intCast(r.response.byte_length);
-    _ = harness.call(r, harness.ids.write, &.{
-        harness.sourceSpan(r.input[part1_len .. part1_len + part2_len]),
-        harness.sinkSpan(r.encoded[member1_size..]),
-    }, .{ .ctx = true });
-    try harness.requireStatus(r, abi.Status.ok);
-    const member2_size: usize = @intCast(r.response.byte_length);
-    r.encoded_len = member1_size + member2_size;
+    try harness.spanCall(r, harness.ids.write, r.input[0..part1_len], r.encoded);
+    const member1_size: usize = r.encoded_len;
+    try harness.spanCall(r, harness.ids.write, r.input[part1_len .. part1_len + part2_len], r.encoded[member1_size..]);
+    r.encoded_len += member1_size;
     if (r.encoded_len > r.encoded.len) return error.ConcatenatedGzipOverflow;
-    _ = harness.call(r, harness.ids.query, &.{
+    try steps.plan(&noParams, r, &.{
         harness.paramTargetCommand(harness.ids.read),
         harness.sourceSpan(r.encoded[0..r.encoded_len]),
-        harness.cap(r.caps_query),
-        harness.pln(r.planning),
-        harness.dlv(r.delivery_read),
-    }, .{});
-    try harness.requireStatus(r, abi.Status.ok);
-    if (r.response.byte_length != part1_len + part2_len) return error.ConcatenatedQueryLengthMismatch;
-    _ = harness.call(r, harness.ids.read, &.{
-        harness.sourceSpan(r.encoded[0..r.encoded_len]),
-        harness.sinkSpan(r.output),
-    }, .{ .ctx = true });
-    try harness.requireStatus(r, abi.Status.ok);
+        harness.capabilityParam(r.caps_query),
+        harness.sizingModeParam(r.sizing),
+        harness.commitModeParam(r.commit_read),
+    });
+    if (r.required != part1_len + part2_len) return error.ConcatenatedQueryLengthMismatch;
+    try harness.spanCall(r, harness.ids.read, r.encoded[0..r.encoded_len], r.output);
     if (r.response.byte_length != 22 or !std.mem.eql(u8, r.output[0..22], r.input[0..22])) return error.ConcatenatedReadMismatch;
-    // The tail ISIZE belongs to the second member, so the fast path starts,
-    // hits the member boundary, and falls back; the two-pass route answers
-    // capacity before any further write. No unchanged-output assertion: the
-    // aborted attempt may leave a provisional prefix (KD2 carve-out).
+    // Tail ISIZE belongs to the second member, so the fast path aborts and falls back; the prefix may be tentative.
     const short: usize = part1_len + part2_len - 6;
-    var required = harness.scalarNode(harness.ids.diagnostic_required_capacity);
-    var available = harness.scalarNode(harness.ids.diagnostic_available_capacity);
-    var diagnostic = harness.node(null, 0);
-    diagnostic.child = &required;
-    required.next = &available;
+    var required: harness.Node = undefined;
+    var available: harness.Node = undefined;
+    var diagnostic = harness.capacityDiagnostic(harness.ids.diagnostic_required_capacity, harness.ids.diagnostic_available_capacity, &required, &available);
     _ = harness.call(r, harness.ids.read, &.{
         harness.sourceSpan(r.encoded[0..r.encoded_len]),
         harness.sinkSpan(r.output[0..short]),
@@ -307,12 +246,7 @@ fn gzConcat(r: *Runner) !void {
 
 fn gzCorruption(r: *Runner) !void {
     var bad_copy: [256]u8 = undefined;
-    _ = harness.call(r, harness.ids.write, &.{
-        harness.sourceSpan(r.input),
-        harness.sinkSpan(r.encoded),
-    }, .{ .ctx = true });
-    try harness.requireStatus(r, abi.Status.ok);
-    r.encoded_len = @intCast(r.response.byte_length);
+    try harness.spanCall(r, harness.ids.write, r.input, r.encoded);
     @memcpy(bad_copy[0..r.encoded_len], r.encoded[0..r.encoded_len]);
     bad_copy[0] = 0x00;
     try harness.reject(r, harness.ids.read, &.{
@@ -329,11 +263,7 @@ fn gzCorruption(r: *Runner) !void {
         harness.sourceSpan(bad_copy[0..r.encoded_len]),
         harness.sinkSpan(r.output),
     }, .{ .ctx = true }, abi.Status.integrity_failure, r.output);
-    // The low ISIZE byte keeps the claim within sink capacity, so the fast
-    // path decodes fully, detects the count mismatch, and falls back; the
-    // two-pass route then fails in planning, matching the old behavior. The
-    // aborted attempt may leave a provisional prefix (KD2 carve-out), so only
-    // the status is asserted.
+    // Low ISIZE byte fits the sink, so the fast path decodes fully before falling back; only status is asserted.
     @memcpy(bad_copy[0..r.encoded_len], r.encoded[0..r.encoded_len]);
     bad_copy[r.encoded_len - 4] ^= 0xff;
     _ = harness.call(r, harness.ids.read, &.{
@@ -344,29 +274,17 @@ fn gzCorruption(r: *Runner) !void {
 }
 
 fn gzSmallSinkRead(r: *Runner) !void {
-    _ = harness.call(r, harness.ids.write, &.{
-        harness.sourceSpan(r.input),
-        harness.sinkSpan(r.encoded),
-    }, .{ .ctx = true });
-    try harness.requireStatus(r, abi.Status.ok);
-    r.encoded_len = @intCast(r.response.byte_length);
-    // One byte short of the trailer ISIZE: the fast path declines before any
-    // write and the two-pass route answers capacity up front.
+    try harness.spanCall(r, harness.ids.write, r.input, r.encoded);
+    // One byte short of ISIZE: the fast path declines before any write.
     try harness.expectCapacity(r, harness.ids.read, &.{
         harness.sourceSpan(r.encoded[0..r.encoded_len]),
         harness.sinkSpan(r.output[0 .. r.input.len - 1]),
-    }, .{ .ctx = true }, harness.ids.diagnostic_required_capacity, harness.ids.diagnostic_available_capacity, r.input.len, r.input.len - 1, r.output[0 .. r.input.len - 1]);
+    }, .{ .ctx = true }, r.input.len, r.input.len - 1, r.output[0 .. r.input.len - 1]);
 }
 
 fn gzCallbackSinkFailure(r: *Runner) !void {
-    _ = harness.call(r, harness.ids.write, &.{
-        harness.sourceSpan(r.input),
-        harness.sinkSpan(r.encoded),
-    }, .{ .ctx = true });
-    try harness.requireStatus(r, abi.Status.ok);
-    r.encoded_len = @intCast(r.response.byte_length);
-    // Callback sinks never take the fast path: the staged route keeps
-    // committed-prefix progress and downstream status reporting.
+    try harness.spanCall(r, harness.ids.write, r.input, r.encoded);
+    // Callback sinks keep the staged route with committed-prefix progress reporting.
     var fail_ctx = harness.SinkCallbackContext{ .fail_after = 5 };
     var downstream = harness.scalarNode(harness.ids.diagnostic_downstream_status);
     var diagnostic = harness.node(null, 0);
@@ -406,15 +324,7 @@ fn runGzipOracleFixture(r: *Runner) anyerror!void {
     setupProfile(r, harness.ids.gzip);
     corpus.select(r.corpus_index, gzip_large_input[0..]);
     var compressed: [64 * 1024 + 4096]u8 = undefined;
-    const ref_size = lib.gzipCompress(gzip_large_input[0..], &compressed) orelse return error.GzipOracleRejectedInput;
-    if (ref_size == 0 or ref_size >= compressed.len) return error.GzipOracleOutputSize;
-    _ = harness.call(r, harness.ids.read, &.{
-        harness.sourceSpan(compressed[0..ref_size]),
-        harness.sinkSpan(r.output),
-    }, .{ .ctx = true });
-    try harness.requireStatus(r, abi.Status.ok);
-    if (r.response.byte_length != gzip_large_input.len) return error.GzipOracleDecodeLengthMismatch;
-    if (!std.mem.eql(u8, r.output[0..gzip_large_input.len], gzip_large_input[0..])) return error.GzipOracleContentMismatch;
+    try harness.oracleFixture(r, lib.gzipCompress, gzip_large_input[0..], &compressed, r.output);
 }
 
 var gzip_staged_output: [64 * 1024]u8 = undefined;
@@ -425,16 +335,9 @@ fn runGzipSinglePass(r: *Runner) anyerror!void {
     corpus.select(r.corpus_index, gzip_large_input[0..]);
     r.input = gzip_large_input[0..];
     try steps.writeSpan(&noParams, r);
-    // Direct span with capacity == trailer ISIZE: the KD3 fast path decodes
-    // in one inflate pass.
-    _ = harness.call(r, harness.ids.read, &.{
-        harness.sourceSpan(r.encoded[0..r.encoded_len]),
-        harness.sinkSpan(r.output),
-    }, .{ .ctx = true });
-    try harness.requireStatus(r, abi.Status.ok);
+    // Capacity == ISIZE engages the single-pass path.
+    try harness.spanCall(r, harness.ids.read, r.encoded[0..r.encoded_len], r.output);
     if (r.response.byte_length != r.input.len or !std.mem.eql(u8, r.output[0..r.input.len], r.input)) return error.SinglePassReadMismatch;
-    // A callback sink keeps the staged two-pass route; both outputs must
-    // agree byte-for-byte.
     var sink_ctx = harness.SinkBufferContext{ .buffer = &gzip_staged_output, .accept_limit = std.math.maxInt(usize) };
     _ = harness.call(r, harness.ids.read, &.{
         harness.sourceSpan(r.encoded[0..r.encoded_len]),

@@ -30,7 +30,7 @@ pub fn addReference(
         .flags = &flags,
     });
     module.addCSourceFile(.{
-        .file = b.path("build/acceptance/benchmark/ref/benchmark.cpp"),
+        .file = b.path("build/acceptance/benchmark/ref/sevenzip.cpp"),
         .flags = &flags,
     });
     module.addIncludePath(b.path("vendor/7zip/CPP"));

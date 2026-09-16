@@ -15,23 +15,22 @@ pub const Ids = struct {
     sink: Id,
     profile: Id,
     target_command: Id,
-    planning_bound: Id,
+    size_bound: Id,
     parameter: Id,
     crypto_profile: Id,
     test_echo: Id,
-    test_read_only: Id,
+    test_read: Id,
     deflate: Id,
     gzip: Id,
     zstd: Id,
     tar: Id,
     zip: Id,
-    seven_zip_decoded: Id,
     bzip2: Id,
     lzma: Id,
     lzma_file: Id,
     lzma2: Id,
     xz: Id,
-    seven_zip_coded: Id,
+    sevenzip: Id,
     rar: Id,
     crypto: Id,
     invalid_call: Id,
@@ -71,8 +70,8 @@ pub const DescriptorJson = struct {
     command_mask: u32,
     capability: []const u8,
     capability_mask: u32,
-    planning: []const u8,
-    delivery: []const u8,
+    sizing: []const u8,
+    commit: []const u8,
 };
 
 const CatalogJson = struct {
@@ -104,9 +103,18 @@ pub fn loadIds(catalog: *const Catalog) !Ids {
     return result;
 }
 
+// Field names use underscores where component names use hyphens.
+fn hyphenatedEql(component_name: []const u8, field_name: []const u8) bool {
+    if (component_name.len != field_name.len) return false;
+    for (component_name, field_name) |a, b| {
+        if (a != b and !(a == '-' and b == '_')) return false;
+    }
+    return true;
+}
+
 fn findId(catalog: *const Catalog, name: []const u8) !Id {
     for (catalog.descriptors) |descriptor| {
-        if (std.mem.eql(u8, descriptor.name, name)) {
+        if (std.mem.eql(u8, descriptor.name, name) or hyphenatedEql(descriptor.name, name)) {
             return .{
                 .low = try parseHexWord(descriptor.id.low),
                 .high = try parseHexWord(descriptor.id.high),

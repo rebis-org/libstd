@@ -1,11 +1,12 @@
 const std = @import("std");
 const builtin = @import("builtin");
+
 const options = @import("options");
 
 extern fn stdk_crc32_le(crc: u32, data: [*]const u8, len: usize) u32;
 extern fn stdk_crc32_le_pmull(crc: u32, data: [*]const u8, len: usize) u32;
 
-const crc32_pmull_threshold = 256; // bytes; derived from synthetic sweep (see u2_verdict.txt)
+const crc32_pmull_threshold = 256; // Fold above this length; threshold from synthetic sweep.
 
 pub const Crc32 = TableCrc(u32, 0xedb8_8320, true);
 
@@ -16,42 +17,44 @@ pub fn crc32(input: []const u8) u32 {
 }
 
 pub const XxHash64 = struct {
-    acc1: u64,
-    acc2: u64,
-    acc3: u64,
-    acc4: u64,
-    buffer: [32]u8 = undefined,
+    accumulator_1: u64,
+    accumulator_2: u64,
+    accumulator_3: u64,
+    accumulator_4: u64,
+    buffer: [32]u8,
     buffered: usize = 0,
     total: u64 = 0,
 
-    const p1: u64 = 0x9e37_79b1_85eb_ca87;
-    const p2: u64 = 0xc2b2_ae3d_27d4_eb4f;
-    const p3: u64 = 0x1656_67b1_9e37_79f9;
-    const p4: u64 = 0x85eb_ca77_c2b2_ae63;
-    const p5: u64 = 0x27d4_eb2f_1656_67c5;
+    const prime_1: u64 = 0x9e37_79b1_85eb_ca87;
+    const prime_2: u64 = 0xc2b2_ae3d_27d4_eb4f;
+    const prime_3: u64 = 0x1656_67b1_9e37_79f9;
+    const prime_4: u64 = 0x85eb_ca77_c2b2_ae63;
+    const prime_5: u64 = 0x27d4_eb2f_1656_67c5;
 
     pub fn init(seed: u64) XxHash64 {
+        // Undefined until update fills it before any read.
         return .{
-            .acc1 = seed +% p1 +% p2,
-            .acc2 = seed +% p2,
-            .acc3 = seed,
-            .acc4 = seed -% p1,
+            .accumulator_1 = seed +% prime_1 +% prime_2,
+            .accumulator_2 = seed +% prime_2,
+            .accumulator_3 = seed,
+            .accumulator_4 = seed -% prime_1,
+            .buffer = undefined,
         };
     }
 
-    fn round(acc: u64, input: u64) u64 {
-        return std.math.rotl(u64, acc +% (input *% p2), 31) *% p1;
+    fn round(accumulator: u64, input: u64) u64 {
+        return std.math.rotl(u64, accumulator +% (input *% prime_2), 31) *% prime_1;
     }
 
-    fn mergeAcc(acc: u64, input: u64) u64 {
-        return (acc ^ round(0, input)) *% p1 +% p4;
+    fn mergeAccumulator(accumulator: u64, input: u64) u64 {
+        return (accumulator ^ round(0, input)) *% prime_1 +% prime_4;
     }
 
     fn consumeStripe(self: *XxHash64, bytes: *const [32]u8) void {
-        self.acc1 = round(self.acc1, std.mem.readInt(u64, bytes[0..8], .little));
-        self.acc2 = round(self.acc2, std.mem.readInt(u64, bytes[8..16], .little));
-        self.acc3 = round(self.acc3, std.mem.readInt(u64, bytes[16..24], .little));
-        self.acc4 = round(self.acc4, std.mem.readInt(u64, bytes[24..32], .little));
+        self.accumulator_1 = round(self.accumulator_1, std.mem.readInt(u64, bytes[0..8], .little));
+        self.accumulator_2 = round(self.accumulator_2, std.mem.readInt(u64, bytes[8..16], .little));
+        self.accumulator_3 = round(self.accumulator_3, std.mem.readInt(u64, bytes[16..24], .little));
+        self.accumulator_4 = round(self.accumulator_4, std.mem.readInt(u64, bytes[24..32], .little));
     }
 
     pub fn update(self: *XxHash64, input: []const u8) void {
@@ -79,39 +82,39 @@ pub const XxHash64 = struct {
 
     pub fn final(self: *const XxHash64) u64 {
         var hash: u64 = if (self.total >= 32)
-            std.math.rotl(u64, self.acc1, 1) +%
-                std.math.rotl(u64, self.acc2, 7) +%
-                std.math.rotl(u64, self.acc3, 12) +%
-                std.math.rotl(u64, self.acc4, 18)
+            std.math.rotl(u64, self.accumulator_1, 1) +%
+                std.math.rotl(u64, self.accumulator_2, 7) +%
+                std.math.rotl(u64, self.accumulator_3, 12) +%
+                std.math.rotl(u64, self.accumulator_4, 18)
         else
-            self.acc3 +% p5;
+            self.accumulator_3 +% prime_5;
         if (self.total >= 32) {
-            hash = mergeAcc(hash, self.acc1);
-            hash = mergeAcc(hash, self.acc2);
-            hash = mergeAcc(hash, self.acc3);
-            hash = mergeAcc(hash, self.acc4);
+            hash = mergeAccumulator(hash, self.accumulator_1);
+            hash = mergeAccumulator(hash, self.accumulator_2);
+            hash = mergeAccumulator(hash, self.accumulator_3);
+            hash = mergeAccumulator(hash, self.accumulator_4);
         }
         hash +%= self.total;
         var tail = self.buffer[0..self.buffered];
         while (tail.len >= 8) {
             hash ^= round(0, std.mem.readInt(u64, tail[0..8], .little));
-            hash = std.math.rotl(u64, hash, 27) *% p1 +% p4;
+            hash = std.math.rotl(u64, hash, 27) *% prime_1 +% prime_4;
             tail = tail[8..];
         }
         if (tail.len >= 4) {
-            hash ^= @as(u64, std.mem.readInt(u32, tail[0..4], .little)) *% p1;
-            hash = std.math.rotl(u64, hash, 23) *% p2 +% p3;
+            hash ^= @as(u64, std.mem.readInt(u32, tail[0..4], .little)) *% prime_1;
+            hash = std.math.rotl(u64, hash, 23) *% prime_2 +% prime_3;
             tail = tail[4..];
         }
         while (tail.len != 0) {
-            hash ^= @as(u64, tail[0]) *% p5;
-            hash = std.math.rotl(u64, hash, 11) *% p1;
+            hash ^= @as(u64, tail[0]) *% prime_5;
+            hash = std.math.rotl(u64, hash, 11) *% prime_1;
             tail = tail[1..];
         }
         hash ^= hash >> 33;
-        hash *%= p2;
+        hash *%= prime_2;
         hash ^= hash >> 29;
-        hash *%= p3;
+        hash *%= prime_3;
         hash ^= hash >> 32;
         return hash;
     }
@@ -134,7 +137,7 @@ fn TableCrc(comptime T: type, comptime poly: T, comptime reflected: bool) type {
 
         pub fn update(self: *@This(), input: []const u8) void {
             if (comptime T == u32 and reflected) {
-                if (comptime !options.force_fallback and builtin.cpu.arch == .aarch64) {
+                if (comptime !options.portable and builtin.cpu.arch == .aarch64) {
                     if (input.len >= crc32_pmull_threshold) {
                         self.state = stdk_crc32_le_pmull(self.state, input.ptr, input.len);
                     } else {
@@ -204,3 +207,21 @@ fn TableCrc(comptime T: type, comptime poly: T, comptime reflected: bool) type {
 
 pub const Bzip2Crc32 = TableCrc(u32, 0x04c11db7, false);
 pub const XZCrc64 = TableCrc(u64, 0xc96c5795d7870f42, true);
+
+test "crc32 known vectors" {
+    try std.testing.expectEqual(@as(u32, 0x00000000), crc32(""));
+    try std.testing.expectEqual(@as(u32, 0xCBF43926), crc32("123456789"));
+    var hash = Crc32.init();
+    hash.update("1234");
+    hash.update("56789");
+    try std.testing.expectEqual(crc32("123456789"), hash.final());
+}
+
+test "xxh64 known vectors" {
+    try std.testing.expectEqual(@as(u64, 0xEF46DB3751D8E999), xxh64(""));
+    try std.testing.expectEqual(@as(u64, 0xD24EC4F1A98C6E5B), xxh64("a"));
+    var hasher = XxHash64.init(0);
+    hasher.update("hello ");
+    hasher.update("world");
+    try std.testing.expectEqual(xxh64("hello world"), hasher.final());
+}

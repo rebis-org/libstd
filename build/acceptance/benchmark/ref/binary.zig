@@ -124,12 +124,12 @@ pub fn main(init: std.process.Init) !void {
 
     var expected: [32]u8 = undefined;
     try parseHex(sha256_hex, &expected);
-    var verified = false;
+    var confirmed = false;
     if (std.Io.Dir.cwd().access(init.io, archive_path, .{})) |_| {
         const digest = try sha256File(archive_path);
-        verified = std.mem.eql(u8, &digest, &expected);
+        confirmed = std.mem.eql(u8, &digest, &expected);
     } else |_| {}
-    if (!verified) {
+    if (!confirmed) {
         std.debug.print("downloading {s}\n", .{url});
         try download(url, archive_path);
         const digest = try sha256File(archive_path);

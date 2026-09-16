@@ -1,19 +1,21 @@
 const std = @import("std");
 
+const ab_variant = @import("ab_variant");
+
 const abi = @import("abi.zig");
+const catalog = @import("catalog.zig");
 const corpus = @import("corpus.zig");
 const harness = @import("harness.zig");
 const Runner = harness.Runner;
 const lib = @import("lib.zig");
 const steps = @import("steps.zig");
-const catalog = @import("catalog.zig");
 
 var lzma_file_input: [48]u8 = undefined;
 
 fn lzmaParams(r: *Runner, out: *[steps.MaxExtra]harness.Node) usize {
-    out[0] = harness.lzd(r.extra);
+    out[0] = harness.lzmaDictionaryParam(r.lzma_dictionary);
     var count: usize = 1;
-    if (r.extra2) |value| {
+    if (r.lzma_match_finder) |value| {
         out[count] = harness.paramScalar(harness.param_family_lzma, harness.lzma_match_finder, harness.cmd_all, value);
         count += 1;
     }
@@ -22,7 +24,7 @@ fn lzmaParams(r: *Runner, out: *[steps.MaxExtra]harness.Node) usize {
 
 fn setupLzma(r: *Runner, profile_id: harness.Id, dictionary: u64) void {
     harness.setup(r, profile_id, harness.mode_stream);
-    r.extra = dictionary;
+    r.lzma_dictionary = dictionary;
     r.sink_accept = 3;
 }
 
@@ -54,9 +56,9 @@ fn longRoundtrip(r: *Runner) !void {
     nodes = steps.build(&lzmaParams, r, &.{
         harness.paramTargetCommand(harness.ids.read),
         harness.sourceSpan(long_compressed[0..long_compressed_size]),
-        harness.cap(r.caps_query),
-        harness.pln(r.planning),
-        harness.dlv(r.delivery_read),
+        harness.capabilityParam(r.caps_query),
+        harness.sizingModeParam(r.sizing),
+        harness.commitModeParam(r.commit_read),
     });
     _ = harness.call(r, harness.ids.query, nodes.items[0..nodes.len], .{});
     try harness.requireStatus(r, abi.Status.ok);
@@ -79,7 +81,7 @@ fn missingDictionary(r: *Runner) !void {
 
 fn smallDictionary(r: *Runner) !void {
     try harness.expect(r, harness.ids.write, &.{
-        harness.lzd(1024),
+        harness.lzmaDictionaryParam(1024),
         harness.sourceSpan(r.input),
         harness.sinkSpan(r.encoded),
     }, .{ .ctx = true }, abi.Status.invalid_call);
@@ -89,10 +91,10 @@ fn limitQueryWrite(r: *Runner) !void {
     const nodes = steps.build(&lzmaParams, r, &.{
         harness.paramTargetCommand(harness.ids.write),
         harness.sourceSpan(r.input),
-        harness.cap(r.caps_query),
-        harness.pln(r.planning),
-        harness.dlv(r.delivery_write),
-        harness.lim(r.input.len + r.encoded_len - 1),
+        harness.capabilityParam(r.caps_query),
+        harness.sizingModeParam(r.sizing),
+        harness.commitModeParam(r.commit_write),
+        harness.resourceLimitParam(r.input.len + r.encoded_len - 1),
     });
     try harness.expect(r, harness.ids.query, nodes.items[0..nodes.len], .{}, abi.Status.resource_limit);
 }
@@ -101,10 +103,10 @@ fn limitQueryRead(r: *Runner) !void {
     const nodes = steps.build(&lzmaParams, r, &.{
         harness.paramTargetCommand(harness.ids.read),
         harness.sourceSpan(r.encoded[0..r.encoded_len]),
-        harness.cap(r.caps_query),
-        harness.pln(r.planning),
-        harness.dlv(r.delivery_read),
-        harness.lim(r.encoded_len + r.input.len - 1),
+        harness.capabilityParam(r.caps_query),
+        harness.sizingModeParam(r.sizing),
+        harness.commitModeParam(r.commit_read),
+        harness.resourceLimitParam(r.encoded_len + r.input.len - 1),
     });
     try harness.expect(r, harness.ids.query, nodes.items[0..nodes.len], .{}, abi.Status.resource_limit);
 }
@@ -160,12 +162,12 @@ fn lzmaFileWrite(r: *Runner) !void {
     r.input = &lzma_file_input;
     _ = harness.call(r, harness.ids.write, &.{
         harness.paramProfile(harness.ids.lzma),
-        harness.lzd(r.extra),
+        harness.lzmaDictionaryParam(r.lzma_dictionary),
         harness.sourceSpan(&lzma_file_input),
         harness.sinkSpan(r.encoded[13..]),
-        harness.cap(r.caps_io),
-        harness.pln(r.planning),
-        harness.dlv(r.delivery_write),
+        harness.capabilityParam(r.caps_io),
+        harness.sizingModeParam(r.sizing),
+        harness.commitModeParam(r.commit_write),
     }, .{ .profile = false });
     try harness.requireStatus(r, abi.Status.ok);
     r.encoded[0] = 0x5d;
@@ -182,9 +184,9 @@ fn lzmaFileRead(r: *Runner) !void {
     _ = harness.call(r, harness.ids.query, &.{
         harness.paramTargetCommand(harness.ids.read),
         harness.sourceSpan(r.encoded[0..r.encoded_len]),
-        harness.cap(r.caps_query),
-        harness.pln(r.planning),
-        harness.dlv(r.delivery_read),
+        harness.capabilityParam(r.caps_query),
+        harness.sizingModeParam(r.sizing),
+        harness.commitModeParam(r.commit_read),
     }, .{});
     try harness.requireStatus(r, abi.Status.ok);
     if (r.response.byte_length != r.input.len) return error.LzmaFileQueryLength;
@@ -247,7 +249,7 @@ pub fn runLzmaLarge(r: *Runner) anyerror!void {
     var input: [1 << 20]u8 = undefined;
     corpus.select(r.corpus_index, &input);
     setupLzma(r, harness.ids.lzma, 128 << 20);
-    r.extra2 = 0;
+    r.lzma_match_finder = 0;
     r.input = &input;
     r.write_exact = true;
     try steps.queryWrite(&lzmaParams, r);
@@ -291,48 +293,41 @@ fn dictionaryCap(r: *Runner) !void {
     const input = "dictionary cap";
     for (candidates, 0..) |candidate, index| {
         _ = harness.call(r, harness.ids.query, &.{
-            harness.lzd(candidate),
+            harness.lzmaDictionaryParam(candidate),
             harness.paramTargetCommand(harness.ids.write),
             harness.sourceSpan(input),
-            harness.cap(r.caps_query),
-            harness.pln(r.planning),
-            harness.dlv(r.delivery_write),
+            harness.capabilityParam(r.caps_query),
+            harness.sizingModeParam(r.sizing),
+            harness.commitModeParam(r.commit_write),
         }, .{});
         try harness.requireStatus(r, expected[index]);
     }
 }
 
-fn setupCap(r: *Runner, profile_id: harness.Id, delivery_write: u64) void {
+fn setupCap(r: *Runner, profile_id: harness.Id, commit_write: u64) void {
     r.profile_id = profile_id;
     r.caps_query = harness.cap_read | harness.cap_size | harness.cap_replay;
-    r.planning = harness.plan_replay_pass;
-    r.delivery_write = delivery_write;
+    r.sizing = harness.size_measured;
+    r.commit_write = commit_write;
 }
 
 pub fn runLzmaCap(r: *Runner) anyerror!void {
-    setupCap(r, harness.ids.lzma, harness.delivery_provisional);
+    setupCap(r, harness.ids.lzma, harness.commit_tentative);
     try dictionaryCap(r);
 }
 
 pub fn runLzma2Cap(r: *Runner) anyerror!void {
-    setupCap(r, harness.ids.lzma2, harness.delivery_provisional);
+    setupCap(r, harness.ids.lzma2, harness.commit_tentative);
     try dictionaryCap(r);
 }
 
 pub fn runXzCap(r: *Runner) anyerror!void {
-    setupCap(r, harness.ids.xz, harness.delivery_verified);
+    setupCap(r, harness.ids.xz, harness.commit_confirmed);
     try dictionaryCap(r);
 }
 
 pub fn runOversizeRestore(r: *Runner) anyerror!void {
-    // An incompressible prefix floor-copies first, so the alternating
-    // 2-symbol/random 2 KiB blocks that follow start at a chunk boundary;
-    // their statistics flip inside the encoder's frozen-price windows, the
-    // greedy sizing estimate dips under the real encode, and the accepted
-    // chunk oversizes the 64 KiB pack field. The oversize-restore path must
-    // discard it and emit a valid copy chunk instead. Parameters measured by
-    // the U3 calibration driver (several neighboring lengths restore, so the
-    // case is not a knife-edge).
+    // Alternating blocks start at a chunk boundary so the greedy estimate dips under the real encode.
     var input: [65536 + 77312]u8 = undefined;
     var state: u64 = 0x12345678;
     for (0..65536) |i| {
@@ -354,12 +349,7 @@ pub fn runOversizeRestore(r: *Runner) anyerror!void {
     try steps.writeSpan(&lzmaParams, r);
     try steps.queryRead(&lzmaParams, r);
     try steps.readSpan(&lzmaParams, r);
-    // A mid-stream copy chunk above the 2 KiB halving floor is the restore
-    // signature: the probe accepted the chunk, so only the oversize fallback
-    // could emit it as a copy. Also assert dictionary resets appear at most
-    // at the stream head: the in-place read path shares the output buffer
-    // with the dictionary, and a mid-stream reset would clobber produced
-    // output.
+    // Mid-stream reset is a validation floor, not a rewind: the in-place path shares the output buffer with the dictionary.
     var pos: usize = 0;
     var restored = false;
     while (true) {
@@ -380,9 +370,7 @@ pub fn runOversizeRestore(r: *Runner) anyerror!void {
 }
 
 pub fn runCopyFloor(r: *Runner) anyerror!void {
-    // Pure noise never probes compressible, so every chunk reaches the
-    // halving floor and goes out as a copy: the stream is all 0x01/0x02
-    // controls and must roundtrip unchanged.
+    // Pure noise reaches the halving floor on every chunk, so the stream is all copy controls.
     var input: [48 << 10]u8 = undefined;
     var prng = std.Random.DefaultPrng.init(0xc09f10);
     prng.fill(&input);
@@ -407,12 +395,7 @@ pub fn runCopyFloor(r: *Runner) anyerror!void {
     if (chunks == 0) return error.UnexpectedChunkControl;
 }
 
-// A hand-assembled lzma2 stream with dictionary resets mid-stream: two
-// copy-with-reset chunks, then an 0xE0 compressed chunk (props + state reset
-// + dictionary reset) whose payload self-references. In-place decode must
-// keep the write position advancing across the resets — the dictionary
-// reset is a validation floor, not a rewind. The compressed payload is the
-// lzma leaf encoding of the 100-byte `(i * 7) % 23` pattern.
+// Dictionary reset is a validation floor, not a rewind: the write position keeps advancing across resets.
 const midstream_reset_pack = [_]u8{ 0x00, 0x00, 0x02, 0x0f, 0x57, 0x00, 0xc2, 0x48, 0xf8, 0xb2, 0xf1, 0x19, 0x52, 0xc8, 0x9a, 0xd6, 0x54, 0xb6, 0xa1, 0xd4, 0xe6, 0x05, 0x40, 0x9c, 0xd4, 0x50, 0xfa, 0x32, 0x00, 0x00 };
 
 pub fn runMidstreamReset(r: *Runner) anyerror!void {
@@ -456,9 +439,7 @@ pub fn runMidstreamReset(r: *Runner) anyerror!void {
 }
 
 pub fn runMixedChunks(r: *Runner) anyerror!void {
-    // Incompressible prefix (probes down to a copy chunk first) followed by
-    // compressible content spanning several 1 MiB lzma2 chunks: covers the
-    // copy-before-first-compressed props ordering and cross-chunk bt4 state.
+    // Incompressible prefix plus multi-chunk compressible tail covers copy-before-compressed ordering and cross-chunk state.
     var input: [(64 << 10) + (2 << 20)]u8 = undefined;
     var prng = std.Random.DefaultPrng.init(0x5eed);
     prng.fill(input[0..(64 << 10)]);
@@ -470,8 +451,6 @@ pub fn runMixedChunks(r: *Runner) anyerror!void {
     try steps.writeSpan(&lzmaParams, r);
     try steps.queryRead(&lzmaParams, r);
     try steps.readSpan(&lzmaParams, r);
-    // Walk the chunk headers: the first chunk must be a copy with dictionary
-    // reset, and the first compressed chunk must carry properties.
     var pos: usize = 0;
     var first_compressed: ?u8 = null;
     while (true) {
@@ -498,16 +477,16 @@ const lzma_alone_header_size = 13;
 fn lzmaAloneEncode(r: *Runner, input: []const u8, declared_size: ?usize, out: []u8) !usize {
     const dict: u64 = @max(input.len, 4096);
     const saved_profile = r.profile_id;
-    const saved_extra = r.extra;
-    const saved_extra2 = r.extra2;
+    const saved_dictionary = r.lzma_dictionary;
+    const saved_match_finder = r.lzma_match_finder;
     defer {
         r.profile_id = saved_profile;
-        r.extra = saved_extra;
-        r.extra2 = saved_extra2;
+        r.lzma_dictionary = saved_dictionary;
+        r.lzma_match_finder = saved_match_finder;
     }
     r.profile_id = harness.ids.lzma;
-    r.extra = dict;
-    r.extra2 = null;
+    r.lzma_dictionary = dict;
+    r.lzma_match_finder = null;
     const payload_buf = out[lzma_alone_header_size..];
     const nodes = steps.build(&lzmaParams, r, &.{
         harness.sourceSpan(input),
@@ -523,65 +502,53 @@ fn lzmaAloneEncode(r: *Runner, input: []const u8, declared_size: ?usize, out: []
     return lzma_alone_header_size + payload_len;
 }
 
+fn lzmaDeclaredRead(r: *Runner, input: []const u8, declared: usize, output: []u8, encoded: *[512]u8) !usize {
+    setupLzma(r, harness.ids.lzma_file, 4096);
+    const encoded_len = try lzmaAloneEncode(r, input, declared, encoded);
+    @memset(output, 0xa5);
+    try harness.spanCall(r, harness.ids.read, encoded[0..encoded_len], output);
+    if (r.response.byte_length != declared) return error.DeclaredByteLengthMismatch;
+    return encoded_len;
+}
+
 fn runLzmaFileDeclaredEqual(r: *Runner) !void {
-    const input = "AE1 equal-size declared-size lzma-alone path";
+    const input = "equal-size declared-size lzma-alone path";
     var encoded: [512]u8 = undefined;
+    var output: [input.len]u8 = undefined;
     setupLzma(r, harness.ids.lzma_file, 4096);
     const encoded_len = try lzmaAloneEncode(r, input, input.len, &encoded);
     _ = harness.call(r, harness.ids.query, &.{
         harness.paramTargetCommand(harness.ids.read),
         harness.sourceSpan(encoded[0..encoded_len]),
-        harness.cap(r.caps_query),
-        harness.pln(r.planning),
-        harness.dlv(r.delivery_read),
+        harness.capabilityParam(r.caps_query),
+        harness.sizingModeParam(r.sizing),
+        harness.commitModeParam(r.commit_read),
     }, .{});
     try harness.requireStatus(r, abi.Status.ok);
     if (r.response.byte_length != input.len) return error.EqualQueryLength;
-    var output: [input.len]u8 = undefined;
-    _ = harness.call(r, harness.ids.read, &.{
-        harness.sourceSpan(encoded[0..encoded_len]),
-        harness.sinkSpan(&output),
-    }, .{ .ctx = true });
-    try harness.requireStatus(r, abi.Status.ok);
+    try harness.spanCall(r, harness.ids.read, encoded[0..encoded_len], &output);
     if (r.response.byte_length != input.len or !std.mem.eql(u8, &output, input)) {
         return error.EqualReadMismatch;
     }
 }
 
 fn runLzmaFileDeclaredGreater(r: *Runner) !void {
-    const input = "AE1 declared greater than actual decoded count pattern";
+    const input = "declared greater than actual decoded count pattern";
     const actual = input.len;
     const declared = actual + 100;
     var encoded: [512]u8 = undefined;
-    setupLzma(r, harness.ids.lzma_file, 4096);
-    const encoded_len = try lzmaAloneEncode(r, input, declared, &encoded);
     var output: [declared]u8 = undefined;
-    @memset(&output, 0xa5);
-    _ = harness.call(r, harness.ids.read, &.{
-        harness.sourceSpan(encoded[0..encoded_len]),
-        harness.sinkSpan(&output),
-    }, .{ .ctx = true });
-    try harness.requireStatus(r, abi.Status.ok);
-    if (r.response.byte_length != declared) return error.GreaterByteLength;
+    _ = try lzmaDeclaredRead(r, input, declared, &output, &encoded);
     if (!std.mem.eql(u8, output[0..actual], input)) return error.GreaterPrefixMismatch;
     if (!harness.allBytesEqual(output[actual..declared], 0xa5)) return error.GreaterTailChanged;
 }
 
 fn runLzmaFileDeclaredLess(r: *Runner) !void {
-    const input = "AE1 declared less than actual decoded count pattern";
-    const actual = input.len;
-    const declared = actual - 1;
+    const input = "declared less than actual decoded count pattern";
+    const declared = input.len - 1;
     var encoded: [512]u8 = undefined;
-    setupLzma(r, harness.ids.lzma_file, 4096);
-    const encoded_len = try lzmaAloneEncode(r, input, declared, &encoded);
     var output: [declared]u8 = undefined;
-    @memset(&output, 0xa5);
-    _ = harness.call(r, harness.ids.read, &.{
-        harness.sourceSpan(encoded[0..encoded_len]),
-        harness.sinkSpan(&output),
-    }, .{ .ctx = true });
-    try harness.requireStatus(r, abi.Status.ok);
-    if (r.response.byte_length != declared) return error.LessByteLength;
+    _ = try lzmaDeclaredRead(r, input, declared, &output, &encoded);
     if (!std.mem.eql(u8, &output, input[0..declared])) return error.LessPrefixMismatch;
 }
 
@@ -623,7 +590,7 @@ fn countingSourceCallback(c: *harness.Call) callconv(.c) u32 {
 }
 
 fn runLzmaFileSourceOnce(r: *Runner) !void {
-    const input = "AE1 callback source consumed exactly once";
+    const input = "callback source consumed exactly once";
     var encoded: [512]u8 = undefined;
     setupLzma(r, harness.ids.lzma_file, 4096);
     const encoded_len = try lzmaAloneEncode(r, input, input.len, &encoded);
@@ -643,16 +610,16 @@ fn runLzmaFileSourceOnce(r: *Runner) !void {
 }
 
 fn runLzmaFileMarkerMode(r: *Runner) !void {
-    const input = "AE2 marker-mode lzma-alone two-pass route";
+    const input = "marker-mode lzma-alone two-pass route";
     var encoded: [512]u8 = undefined;
     setupLzma(r, harness.ids.lzma_file, 4096);
     const encoded_len = try lzmaAloneEncode(r, input, null, &encoded);
     _ = harness.call(r, harness.ids.query, &.{
         harness.paramTargetCommand(harness.ids.read),
         harness.sourceSpan(encoded[0..encoded_len]),
-        harness.cap(r.caps_query),
-        harness.pln(r.planning),
-        harness.dlv(r.delivery_read),
+        harness.capabilityParam(r.caps_query),
+        harness.sizingModeParam(r.sizing),
+        harness.commitModeParam(r.commit_read),
     }, .{});
     try harness.requireStatus(r, abi.Status.ok);
     if (r.response.byte_length != input.len) return error.MarkerQueryLength;
@@ -829,6 +796,7 @@ extern "c" fn clock_gettime(clk_id: c_int, tp: *Timespec) c_int;
 const CLOCK_REALTIME = 0;
 
 fn nowNs() u64 {
+    // Failure path returns before any field is read, so undefined init is safe.
     var ts: Timespec = undefined;
     if (clock_gettime(CLOCK_REALTIME, &ts) != 0) return 0;
     return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
@@ -917,7 +885,7 @@ pub fn runScanTiming(r: *Runner) !void {
     const scan_start = nowNs();
     for (0..iterations) |_| _ = try scanSize(stream[0..stream_len]);
     const scan_end = nowNs();
-    const scan_total_ns = @as(u64, @intCast(scan_end - scan_start));
+    const scan_total_ns: u64 = @intCast(scan_end - scan_start);
     const scan_ns = scan_total_ns / iterations;
     const decode_start = nowNs();
     const read_nodes = steps.build(&lzmaParams, r, &.{
@@ -927,14 +895,14 @@ pub fn runScanTiming(r: *Runner) !void {
     _ = harness.call(r, harness.ids.read, read_nodes.items[0..read_nodes.len], .{ .ctx = true });
     const decode_end = nowNs();
     try harness.requireStatus(r, abi.Status.ok);
-    const decode_ns = @as(u64, @intCast(decode_end - decode_start));
+    const decode_ns: u64 = @intCast(decode_end - decode_start);
     if (r.response.byte_length != input_len) return error.ScanDecodeLength;
     for (0..input_len) |i| {
         if (r.output[i] != @as(u8, @truncate(i & 0xff))) return error.ScanDecodeMismatch;
     }
     const scan_ms = @as(f64, @floatFromInt(scan_ns)) / 1.0e6;
     const decode_ms = @as(f64, @floatFromInt(decode_ns)) / 1.0e6;
-    std.debug.print("U4 scanSize timing: input_len={d} iterations={d} scan_per_call_ns={d} ({d:.3} ms) decode_ns={d} ({d:.3} ms) fraction={d:.4}%\n", .{
+    std.debug.print("scanSize timing: input_len={d} iterations={d} scan_per_call_ns={d} ({d:.3} ms) decode_ns={d} ({d:.3} ms) fraction={d:.4}%\n", .{
         input_len,
         iterations,
         scan_ns,
@@ -945,20 +913,18 @@ pub fn runScanTiming(r: *Runner) !void {
     });
 }
 
-const ab_variant = @import("ab_variant");
-
 fn abEncodeAndWrite(r: *Runner, profile_id: harness.Id, dictionary: u64, finder: ?u64, input: []const u8, label: []const u8) !void {
     const mode = if (abi.idEqual(profile_id, harness.ids.xz)) harness.mode_xz else harness.mode_stream;
     harness.setup(r, profile_id, mode);
-    r.extra = dictionary;
+    r.lzma_dictionary = dictionary;
     r.input = input;
-    r.extra2 = finder;
+    r.lzma_match_finder = finder;
     steps.queryWrite(&lzmaParams, r) catch |err| {
-        std.debug.print("abEncodeAndWrite query failed {s} status={d}\n", .{ label, r.status });
+        std.debug.print("abEncodeAndWrite query failed: {s}, status {d}.\n", .{ label, r.status });
         return err;
     };
     steps.writeSpan(&lzmaParams, r) catch |err| {
-        std.debug.print("abEncodeAndWrite write failed {s} status={d}\n", .{ label, r.status });
+        std.debug.print("abEncodeAndWrite write failed: {s}, status {d}.\n", .{ label, r.status });
         return err;
     };
     const encoded_len: usize = r.encoded_len;
@@ -970,9 +936,9 @@ fn abEncodeAndWrite(r: *Runner, profile_id: harness.Id, dictionary: u64, finder:
     const path = try std.fs.path.join(r.gpa, &.{ dir, label });
     defer r.gpa.free(path);
     if (std.fs.path.dirname(path)) |parent| {
-        try std.Io.Dir.cwd().createDirPath(harness.io, parent);
+        try std.Io.Dir.cwd().createDirPath(harness.oracle_io, parent);
     }
-    try std.Io.Dir.cwd().writeFile(harness.io, .{
+    try std.Io.Dir.cwd().writeFile(harness.oracle_io, .{
         .sub_path = path,
         .data = r.encoded[0..encoded_len],
     });
@@ -1119,9 +1085,9 @@ pub const scenarios = harness.scenarios(
         .{ .name = "lzma2 mixed chunks", .run = runMixedChunks, .workspace_size = 48 * 1024 * 1024, .output_size = (64 << 10) + (2 << 20), .encoded_size = (1 << 20) + 4096 },
         .{ .name = "lzma2 copy floor", .run = runCopyFloor, .workspace_size = 3 * 1024 * 1024, .output_size = 48 << 10, .encoded_size = (48 << 10) + 2048 },
         .{ .name = "lzma2 oversize restore", .run = runOversizeRestore, .workspace_size = 240 * 1024 * 1024, .output_size = 142848 + 16, .encoded_size = 142848 + 4096 },
-        .{ .name = "lzma dictionary cap provisional", .run = runLzmaCap, .workspace_size = 1310720, .output_size = 16, .encoded_size = 256 },
-        .{ .name = "lzma2 dictionary cap provisional", .run = runLzma2Cap, .workspace_size = 3670016, .output_size = 16, .encoded_size = 256 },
-        .{ .name = "xz dictionary cap verified", .run = runXzCap, .workspace_size = 8 * 1024 * 1024, .output_size = 16, .encoded_size = 256 },
+        .{ .name = "lzma dictionary cap tentative", .run = runLzmaCap, .workspace_size = 1310720, .output_size = 16, .encoded_size = 256 },
+        .{ .name = "lzma2 dictionary cap tentative", .run = runLzma2Cap, .workspace_size = 3670016, .output_size = 16, .encoded_size = 256 },
+        .{ .name = "xz dictionary cap confirmed", .run = runXzCap, .workspace_size = 8 * 1024 * 1024, .output_size = 16, .encoded_size = 256 },
         .{ .name = "lzma2 scan timing", .run = runScanTiming, .workspace_size = 4 * 1024 * 1024, .output_size = 4 << 20, .encoded_size = 64 },
         .{ .name = "lzma ab corpus", .run = runLzmaAbCorpus, .workspace_size = 680 * 1024 * 1024, .output_size = 16, .encoded_size = 1 << 20, .suite = "lzma_ab" },
         .{ .name = "lzma ab zeros", .run = runLzmaAbZeros, .workspace_size = 680 * 1024 * 1024, .output_size = 16, .encoded_size = 1 << 20, .suite = "lzma_ab" },

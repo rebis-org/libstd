@@ -1,0 +1,29 @@
+// Component descriptor (rar, class grammar).
+// Identity and policy are frozen ABI: rename or re-id is a breaking
+// change, caught by the comptime assertions in kernel/catalog.zig.
+.{
+    .id = .{ .low = "0x6e6b82f08d91040f", .high = "0xa7a351053d6d400f" },
+    .name = "rar",
+    .class = "grammar",
+    .verbs = .{ "inspect", "decode_ordinal" },
+    .parameters = .{},
+    .capabilities = .{ "read", "write", "size", "replay" },
+    .sizing = "metadata_exact",
+    .commit = "tentative",
+    .limits = .{ .window = 0, .block = 0, .history = 0 },
+    .benchmark = .{
+        .row = "rar",
+        .params = "decode-only",
+        .kind = "rar",
+        .ext = "rar",
+        .cmd = "unrar",
+        .lib = "unrar",
+        .bin = "unrar",
+        .archive = true,
+        .decode_only = true,
+        .ref_params = "decode-only",
+        .tunings = .{
+            .{},
+        },
+    },
+}

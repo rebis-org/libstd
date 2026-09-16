@@ -1,7 +1,7 @@
 const std = @import("std");
 
-const failure_prim = @import("failure.zig");
-const Failure = failure_prim.Failure;
+const failure = @import("failure.zig");
+const Failure = failure.Failure;
 
 pub fn add(left: usize, right: usize) Failure!usize {
     return std.math.add(usize, left, right) catch error.ResourceLimit;
