@@ -66,7 +66,7 @@ fn requireAppleSlice(init: std.process.Init, archive: []const u8, slice: slices.
     const temporary_path = try print("zig-out/.package-{s}.dylib", .{slice.id});
     defer std.heap.page_allocator.free(temporary_path);
     defer std.Io.Dir.cwd().deleteFile(init.io, temporary_path) catch {};
-    const entry = try print("StdK.xcframework/{s}/{s}", .{ slice.id, slice.library });
+    const entry = try print("StdK.xcframework/{s}/{s}", .{ slice.id, slices.libraryEntry(slice) });
     defer std.heap.page_allocator.free(entry);
     const bytes = try extract(init, archive, entry);
     defer std.heap.page_allocator.free(bytes);
@@ -78,4 +78,14 @@ fn requireAppleSlice(init: std.process.Init, archive: []const u8, slice: slices.
     const minimum_text = try print("minos {s}", .{slice.minimum});
     defer std.heap.page_allocator.free(minimum_text);
     if (std.mem.indexOf(u8, stdout, platform_text) == null or std.mem.indexOf(u8, stdout, minimum_text) == null) return error.InvalidAppleLibrary;
+    // App Store validation rejects embedded frameworks whose Info.plist
+    // lacks MinimumOSVersion (90530/90360).
+    const plist_entry = if (slices.isMacos(slice))
+        try print("StdK.xcframework/{s}/{s}/Versions/A/Resources/Info.plist", .{ slice.id, slices.framework_bundle })
+    else
+        try print("StdK.xcframework/{s}/{s}/Info.plist", .{ slice.id, slices.framework_bundle });
+    defer std.heap.page_allocator.free(plist_entry);
+    const plist = try extract(init, archive, plist_entry);
+    defer std.heap.page_allocator.free(plist);
+    if (std.mem.indexOf(u8, plist, "<key>MinimumOSVersion</key>") == null) return error.MissingMinimumOSVersion;
 }
