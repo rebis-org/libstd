@@ -264,5 +264,6 @@ docgen_tmp/
 # Others
 
 !build/templates/module.modulemap.in
+!build/templates/module.framework.modulemap.in
 .zig-cache/
 !src/testing/

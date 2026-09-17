@@ -45,6 +45,7 @@ pub const Generated = struct {
     header: std.Build.LazyPath,
     catalog: std.Build.LazyPath,
     module_map: std.Build.LazyPath,
+    framework_module_map: std.Build.LazyPath,
 };
 
 pub const HostLibraries = struct {
@@ -138,6 +139,7 @@ pub fn addGenerated(b: *std.Build) Generated {
         .header = files.add("stdk.h", render.header),
         .catalog = gen_run.addOutputFileArg("stdk.catalog.json"),
         .module_map = files.add("module.modulemap", render.module_map),
+        .framework_module_map = files.add("module.framework.modulemap", render.framework_module_map),
     };
 }
 
