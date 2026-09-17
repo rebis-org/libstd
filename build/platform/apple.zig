@@ -7,26 +7,42 @@ const slices = @import("slices.zig");
 pub fn addArchive(b: *std.Build, ctx: *const common.Context) std.Build.LazyPath {
     const headers = b.addWriteFiles();
     _ = headers.addCopyFile(ctx.generated.header, "stdk.h");
-    _ = headers.addCopyFile(ctx.generated.module_map, "module.modulemap");
+    _ = headers.addCopyFile(ctx.generated.framework_module_map, "module.modulemap");
+    const plist = b.addWriteFiles();
     const create = b.addSystemCommand(&.{ "xcodebuild", "-create-xcframework" });
     for (slices.apple_slices) |slice| {
-        create.addArg("-library");
-        create.addFileArg(buildSlice(b, ctx, slice));
-        create.addArg("-headers");
-        create.addDirectoryArg(headers.getDirectory());
+        // App Store validation requires MinimumOSVersion on every embedded
+        // framework; it follows the slice's own deployment floor.
+        const plist_file = plist.add(b.fmt("Info-{s}.plist", .{slice.id}), b.fmt(framework_plist, .{ slices.framework_binary, slice.minimum }));
+        create.addArg("-framework");
+        create.addDirectoryArg(wrapFramework(b, buildSlice(b, ctx, slice), headers.getDirectory(), plist_file, slices.isMacos(slice)));
     }
     create.addArg("-output");
     const framework = create.addOutputDirectoryArg("StdK.xcframework");
-    const stage = b.addWriteFiles();
-    _ = stage.addCopyDirectory(framework, "StdK.xcframework", .{});
-    _ = stage.addCopyFile(ctx.generated.catalog, "StdK.xcframework/stdk.catalog.json");
-    return common.addZipArchive(b, manifest.apple, stage);
+    // WriteFile staging resolves symlinks away; the versioned macOS framework
+    // keeps its bundle root as symlinks, so stage and zip in one shell step.
+    const archive = b.addSystemCommand(&.{
+        "sh", "-c",
+        \\set -eu
+        \\mkdir -p "$1"
+        \\cp -R "$2" "$1/StdK.xcframework"
+        \\cp "$3" "$1/StdK.xcframework/stdk.catalog.json"
+        \\cd "$1"
+        \\zip -qry "$4" StdK.xcframework
+        ,
+        "sh",
+    });
+    _ = archive.addOutputDirectoryArg("stage");
+    archive.addDirectoryArg(framework);
+    archive.addFileArg(ctx.generated.catalog);
+    return archive.addOutputFileArg(manifest.apple.archive);
 }
 
 fn buildSlice(b: *std.Build, ctx: *const common.Context, slice: slices.AppleSlice) std.Build.LazyPath {
     const base = slice.library[0 .. slice.library.len - ".dylib".len];
-    // Final leaf name, not a per-arch path: every arch shares one LC_ID_DYLIB for @rpath resolution.
-    const install_name = b.fmt("@rpath/{s}", .{slice.library});
+    // Final leaf name, not a per-arch path: every slice shares one
+    // bundle-relative LC_ID_DYLIB for @rpath resolution.
+    const install_name = slices.framework_install_name;
     if (slice.arches.len == 1) return buildArch(b, ctx, base, install_name, slice.arches[0]);
     var libraries: [4]std.Build.LazyPath = undefined;
     for (slice.arches, 0..) |arch, index| libraries[index] = buildArch(b, ctx, b.fmt("{s}_{s}", .{ base, archName(arch.arch) }), install_name, arch);
@@ -71,3 +87,78 @@ fn archName(arch: std.Target.Cpu.Arch) []const u8 {
         else => @tagName(arch),
     };
 }
+
+// codesign seals the tree it signs, so the bundle is assembled and signed in
+// one step: Zig steps cannot declare an input that a command mutates in place.
+fn wrapFramework(b: *std.Build, library: std.Build.LazyPath, headers: std.Build.LazyPath, plist: std.Build.LazyPath, versioned: bool) std.Build.LazyPath {
+    const command = b.addSystemCommand(&.{
+        "sh", "-c",
+        b.fmt(
+            \\set -eu
+            \\rm -rf "$1"
+            \\if [ "$5" = versioned ]; then
+            \\    mkdir -p "$1/Versions/A/Headers" "$1/Versions/A/Modules" "$1/Versions/A/Resources"
+            \\    cp "$2" "$1/Versions/A/{s}"
+            \\    codesign --remove-signature "$1/Versions/A/{s}" 2>/dev/null || true
+            \\    cp "$3/stdk.h" "$1/Versions/A/Headers/stdk.h"
+            \\    cp "$3/module.modulemap" "$1/Versions/A/Headers/module.modulemap"
+            \\    cp "$3/module.modulemap" "$1/Versions/A/Modules/module.modulemap"
+            \\    cp "$4" "$1/Versions/A/Resources/Info.plist"
+            \\    ln -s A "$1/Versions/Current"
+            \\    ln -s Versions/Current/{s} "$1/{s}"
+            \\    ln -s Versions/Current/Headers "$1/Headers"
+            \\    ln -s Versions/Current/Modules "$1/Modules"
+            \\    ln -s Versions/Current/Resources "$1/Resources"
+            \\else
+            \\    mkdir -p "$1/Headers" "$1/Modules"
+            \\    cp "$2" "$1/{s}"
+            \\    codesign --remove-signature "$1/{s}" 2>/dev/null || true
+            \\    cp "$3/stdk.h" "$1/Headers/stdk.h"
+            \\    cp "$3/module.modulemap" "$1/Headers/module.modulemap"
+            \\    cp "$3/module.modulemap" "$1/Modules/module.modulemap"
+            \\    cp "$4" "$1/Info.plist"
+            \\fi
+            \\codesign --force --sign - "$1"
+        , .{
+            slices.framework_binary,
+            slices.framework_binary,
+            slices.framework_binary,
+            slices.framework_binary,
+            slices.framework_binary,
+            slices.framework_binary,
+        }),
+        "sh",
+    });
+    const wrapped = command.addOutputDirectoryArg(slices.framework_bundle);
+    command.addFileArg(library);
+    command.addDirectoryArg(headers);
+    command.addFileArg(plist);
+    command.addArg(if (versioned) "versioned" else "flat");
+    return wrapped;
+}
+
+const framework_plist =
+    \\<?xml version="1.0" encoding="UTF-8"?>
+    \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    \\<plist version="1.0">
+    \\<dict>
+    \\    <key>CFBundleDevelopmentRegion</key>
+    \\    <string>en</string>
+    \\    <key>CFBundleExecutable</key>
+    \\    <string>{s}</string>
+    \\    <key>CFBundleIdentifier</key>
+    \\    <string>org.rebis.stdk</string>
+    \\    <key>CFBundleInfoDictionaryVersion</key>
+    \\    <string>6.0</string>
+    \\    <key>CFBundlePackageType</key>
+    \\    <string>FMWK</string>
+    \\    <key>CFBundleShortVersionString</key>
+    \\    <string>1.0</string>
+    \\    <key>CFBundleVersion</key>
+    \\    <string>1</string>
+    \\    <key>MinimumOSVersion</key>
+    \\    <string>{s}</string>
+    \\</dict>
+    \\</plist>
+    \\
+;
