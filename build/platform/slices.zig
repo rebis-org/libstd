@@ -43,6 +43,24 @@ pub const apple_slices = [_]AppleSlice{
     } },
 };
 
+pub const framework_bundle = "StdK.framework";
+pub const framework_binary = "StdK";
+pub const framework_install_name = "@rpath/StdK.framework/StdK";
+
+// Every Apple slice ships as a framework bundle: App Store validation rejects
+// loose dylibs inside an iOS/tvOS/Catalyst app bundle, and create-xcframework
+// refuses an XCFramework that mixes frameworks with bare libraries.
+pub fn isMacos(slice: AppleSlice) bool {
+    return std.mem.eql(u8, slice.platform, "MACOS");
+}
+
+pub fn libraryEntry(slice: AppleSlice) []const u8 {
+    // macOS frameworks are versioned bundles: the binary lives under
+    // Versions/A and the bundle root holds symlinks only.
+    if (isMacos(slice)) return framework_bundle ++ "/Versions/A/" ++ framework_binary;
+    return framework_bundle ++ "/" ++ framework_binary;
+}
+
 pub const AndroidAbi = struct {
     library: []const u8,
     arch: std.Target.Cpu.Arch,
