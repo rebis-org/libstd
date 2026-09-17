@@ -32,7 +32,7 @@ pub const android: Distribution = .{
 pub const apple: Distribution = .{
     .id = "apple",
     .archive = "StdK.XCFramework.zip",
-    .header = std.fmt.comptimePrint("StdK.xcframework/{s}/Headers/stdk.h", .{slices.apple_slices[0].id}),
+    .header = std.fmt.comptimePrint("StdK.xcframework/{s}/{s}/Headers/stdk.h", .{ slices.apple_slices[0].id, slices.framework_bundle }),
     .catalog = "StdK.xcframework/stdk.catalog.json",
     .entries = appleEntries(),
     .apple = &slices.apple_slices,
@@ -67,16 +67,26 @@ fn androidEntries() []const []const u8 {
 }
 
 fn appleEntries() []const []const u8 {
-    const count = 2 + 3 * slices.apple_slices.len;
+    const count = 2 + 5 * slices.apple_slices.len;
     const entries: [count][]const u8 = blk: {
         var tmp: [count][]const u8 = undefined;
         tmp[0] = "StdK.xcframework/Info.plist";
         tmp[1] = "StdK.xcframework/stdk.catalog.json";
         inline for (slices.apple_slices, 0..) |slice, index| {
-            tmp[2 + 3 * index] = std.fmt.comptimePrint("StdK.xcframework/{s}/Headers/stdk.h", .{slice.id});
-            tmp[2 + 3 * index + 1] =
-                std.fmt.comptimePrint("StdK.xcframework/{s}/Headers/module.modulemap", .{slice.id});
-            tmp[2 + 3 * index + 2] = std.fmt.comptimePrint("StdK.xcframework/{s}/{s}", .{ slice.id, slice.library });
+            const root = std.fmt.comptimePrint("StdK.xcframework/{s}/{s}", .{ slice.id, slices.framework_bundle });
+            if (slices.isMacos(slice)) {
+                tmp[2 + 5 * index] = root ++ "/Versions/A/" ++ slices.framework_binary;
+                tmp[2 + 5 * index + 1] = root ++ "/Versions/A/Headers/stdk.h";
+                tmp[2 + 5 * index + 2] = root ++ "/Versions/A/Headers/module.modulemap";
+                tmp[2 + 5 * index + 3] = root ++ "/Versions/A/Modules/module.modulemap";
+                tmp[2 + 5 * index + 4] = root ++ "/Versions/A/Resources/Info.plist";
+            } else {
+                tmp[2 + 5 * index] = root ++ "/" ++ slices.framework_binary;
+                tmp[2 + 5 * index + 1] = root ++ "/Headers/stdk.h";
+                tmp[2 + 5 * index + 2] = root ++ "/Headers/module.modulemap";
+                tmp[2 + 5 * index + 3] = root ++ "/Modules/module.modulemap";
+                tmp[2 + 5 * index + 4] = root ++ "/Info.plist";
+            }
         }
         break :blk tmp;
     };
