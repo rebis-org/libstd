@@ -93,9 +93,11 @@ fn wrapFramework(b: *std.Build, library: std.Build.LazyPath, headers: std.Build.
         "sh", "-c",
         b.fmt(
             \\set -eu
+            \\rm -rf "$1"
             \\if [ "$5" = versioned ]; then
             \\    mkdir -p "$1/Versions/A/Headers" "$1/Versions/A/Modules" "$1/Versions/A/Resources"
             \\    cp "$2" "$1/Versions/A/{s}"
+            \\    codesign --remove-signature "$1/Versions/A/{s}" 2>/dev/null || true
             \\    cp "$3/stdk.h" "$1/Versions/A/Headers/stdk.h"
             \\    cp "$3/module.modulemap" "$1/Versions/A/Headers/module.modulemap"
             \\    cp "$3/module.modulemap" "$1/Versions/A/Modules/module.modulemap"
@@ -108,13 +110,21 @@ fn wrapFramework(b: *std.Build, library: std.Build.LazyPath, headers: std.Build.
             \\else
             \\    mkdir -p "$1/Headers" "$1/Modules"
             \\    cp "$2" "$1/{s}"
+            \\    codesign --remove-signature "$1/{s}" 2>/dev/null || true
             \\    cp "$3/stdk.h" "$1/Headers/stdk.h"
             \\    cp "$3/module.modulemap" "$1/Headers/module.modulemap"
             \\    cp "$3/module.modulemap" "$1/Modules/module.modulemap"
             \\    cp "$4" "$1/Info.plist"
             \\fi
             \\codesign --force --sign - "$1"
-        , .{ slices.framework_binary, slices.framework_binary, slices.framework_binary, slices.framework_binary }),
+        , .{
+            slices.framework_binary,
+            slices.framework_binary,
+            slices.framework_binary,
+            slices.framework_binary,
+            slices.framework_binary,
+            slices.framework_binary,
+        }),
         "sh",
     });
     const wrapped = command.addOutputDirectoryArg(slices.framework_bundle);
