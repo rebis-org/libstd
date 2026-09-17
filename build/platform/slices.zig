@@ -43,6 +43,17 @@ pub const apple_slices = [_]AppleSlice{
     } },
 };
 
+pub const framework_bundle = "StdK.framework";
+pub const framework_binary = "StdK";
+pub const framework_install_name = "@rpath/StdK.framework/StdK";
+
+// Every Apple slice ships as a framework bundle: App Store validation rejects
+// loose dylibs inside an iOS/tvOS/Catalyst app bundle, and create-xcframework
+// refuses an XCFramework that mixes frameworks with bare libraries.
+pub fn libraryEntry() []const u8 {
+    return framework_bundle ++ "/" ++ framework_binary;
+}
+
 pub const AndroidAbi = struct {
     library: []const u8,
     arch: std.Target.Cpu.Arch,

@@ -66,7 +66,7 @@ fn requireAppleSlice(init: std.process.Init, archive: []const u8, slice: slices.
     const temporary_path = try print("zig-out/.package-{s}.dylib", .{slice.id});
     defer std.heap.page_allocator.free(temporary_path);
     defer std.Io.Dir.cwd().deleteFile(init.io, temporary_path) catch {};
-    const entry = try print("StdK.xcframework/{s}/{s}", .{ slice.id, slice.library });
+    const entry = try print("StdK.xcframework/{s}/{s}", .{ slice.id, slices.libraryEntry() });
     defer std.heap.page_allocator.free(entry);
     const bytes = try extract(init, archive, entry);
     defer std.heap.page_allocator.free(bytes);
