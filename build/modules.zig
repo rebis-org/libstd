@@ -38,6 +38,7 @@ pub const oracles = Module{
     },
 };
 pub const nucleus = Module{ .name = "nucleus", .root = "src/nucleus/root.zig" };
+pub const grammar = Module{ .name = "grammar", .root = "src/grammar.zig", .crc_kernel = true };
 pub const trap = Module{
     .name = "trap",
     .root = "build/acceptance/oracles/trap.zig",
@@ -55,7 +56,7 @@ pub const benchmark = Module{
     },
 };
 
-const importable = [_]Module{ checksum, crypto, library, manifest, harness, run, nucleus, trap, component };
+const importable = [_]Module{ checksum, crypto, library, manifest, harness, run, nucleus, grammar, trap, component };
 
 fn byName(name: []const u8) Module {
     for (importable) |module| {

@@ -58,8 +58,13 @@ fn archivePolicy(command: u32, target: u32) ?CommandPolicy {
 }
 
 fn rarPolicy(command: u32, target: u32) ?CommandPolicy {
-    if (command == command_mask_query and target == command_mask_read) return .{ .command = command_mask_query, .target = target, .capabilities = archive_capabilities, .sizing = .metadata_exact, .commit = .tentative };
+    if (command == command_mask_query) {
+        if (target == command_mask_read) return .{ .command = command_mask_query, .target = target, .capabilities = archive_capabilities, .sizing = .metadata_exact, .commit = .tentative };
+        if (target == command_mask_write) return .{ .command = command_mask_query, .target = target, .capabilities = archive_capabilities, .sizing = .metadata_exact, .commit = .confirmed };
+        return null;
+    }
     if (command == command_mask_read) return .{ .command = command_mask_read, .capabilities = archive_capabilities, .sizing = .metadata_exact, .commit = .tentative };
+    if (command == command_mask_write) return .{ .command = command_mask_write, .capabilities = archive_capabilities, .sizing = .metadata_exact, .commit = .confirmed };
     return null;
 }
 
