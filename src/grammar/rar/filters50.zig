@@ -17,8 +17,8 @@ pub const FilterType = enum(u3) {
 
 pub const Filter = struct {
     filter_type: FilterType,
-    block_start: usize, // window-stream position of the region start
-    block_length: usize,
+    start: usize, // window-stream position of the region start
+    length: usize,
     channels: u8, // delta filter only (1-32)
 };
 
@@ -42,8 +42,8 @@ pub const max_filter_block: usize = 0x400000;
 const e8_wrap: u32 = 0x1000000;
 
 pub fn applyFilter(data: []u8, filter: Filter, file_offset: u64, scratch: []u8) Failure!void {
-    if (filter.block_length > data.len) return error.InvalidData;
-    const region = data[0..filter.block_length];
+    if (filter.length > data.len) return error.InvalidData;
+    const region = data[0..filter.length];
     switch (filter.filter_type) {
         .delta => try applyDelta(region, filter.channels, scratch),
         .e8 => applyE8E9(region, file_offset, false),

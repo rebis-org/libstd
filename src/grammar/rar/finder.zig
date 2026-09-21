@@ -378,7 +378,7 @@ test "match finder replays through the window byte-exactly" {
         }
     }
     var out: [1024]u8 = undefined;
-    var bs = @import("sink.zig").BufferSink.init(&out);
+    var bs = @import("../../common/sink.zig").BufferSink.init(&out);
     try std.testing.expect(win.emitTo(bs.sink(), win.write_pos, data.len));
     try std.testing.expectEqualSlices(u8, data, out[0..data.len]);
 }

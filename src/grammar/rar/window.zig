@@ -1,5 +1,5 @@
 const std = @import("std");
-const sink = @import("sink.zig");
+const sink = @import("../../common/sink.zig");
 const Sink = sink.Sink;
 const kernels = @import("../../leaf/kernels.zig");
 
