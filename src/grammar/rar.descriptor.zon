@@ -5,7 +5,7 @@
     .id = .{ .low = "0x6e6b82f08d91040f", .high = "0xa7a351053d6d400f" },
     .name = "rar",
     .class = "grammar",
-    .verbs = .{ "inspect", "decode_ordinal" },
+    .verbs = .{ "inspect", "decode_ordinal", "encode_ordinal" },
     .parameters = .{},
     .capabilities = .{ "read", "write", "size", "replay" },
     .sizing = "metadata_exact",

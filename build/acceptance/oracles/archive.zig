@@ -5,6 +5,7 @@ const corpus = @import("corpus.zig");
 const harness = @import("harness.zig");
 const Runner = harness.Runner;
 const lib = @import("lib.zig");
+const fixtures = @import("fixtures.zig");
 
 const arc_caps: u64 = harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay;
 
@@ -367,11 +368,43 @@ pub fn runRar(r: *Runner) anyerror!void {
         harness.sinkSpan(&overlap),
     }, .{ .ctx = true }, abi.Status.invalid_call, &overlap);
     try rarExpectUnsupported(r, &rar_fixture_encryption);
-    try rarExpectUnsupported(r, &rar_fixture_compressed);
-    try rarExpectUnsupported(r, &rar_fixture_solid);
-    try rarExpectUnsupported(r, &rar_fixture_service);
     try rarExpectUnsupported(r, &rar_fixture_multi_volume);
-    try rarExpectUnsupported(r, &rar_fixture_unknown);
+    // Service blocks (QuickOpen) carry no payload we expose; the walk skips
+    // their data and ends cleanly at EOF, so the archive lists zero entries
+    // and any ordinal read is invalid_data — the same observable shape the
+    // reference gives this archive ("0 files").
+    _ = harness.call(r, harness.ids.query, &.{
+        harness.paramTargetCommand(harness.ids.read),
+        harness.sourceSpan(&rar_fixture_service),
+        harness.capabilityParam(arc_caps),
+        harness.sizingModeParam(harness.size_metadata_exact),
+        harness.commitModeParam(harness.commit_tentative),
+    }, .{});
+    try harness.requireStatus(r, abi.Status.ok);
+    if (r.response.byte_length != 0) return error.RarServiceEntryCountMismatch;
+    try harness.reject(r, harness.ids.read, &.{
+        harness.archiveOrdinalParam(0),
+        harness.sourceSpan(&rar_fixture_service),
+        harness.sinkSpan(r.output),
+    }, .{ .ctx = true }, abi.Status.invalid_data, r.output);
+    // Unknown block types are skipped by size regardless of the skip flag
+    // (the reference parses the flag but never enforces it): the walk ends
+    // cleanly at EOF with zero entries listed, and any ordinal read is
+    // invalid_data.
+    _ = harness.call(r, harness.ids.query, &.{
+        harness.paramTargetCommand(harness.ids.read),
+        harness.sourceSpan(&rar_fixture_unknown),
+        harness.capabilityParam(arc_caps),
+        harness.sizingModeParam(harness.size_metadata_exact),
+        harness.commitModeParam(harness.commit_tentative),
+    }, .{});
+    try harness.requireStatus(r, abi.Status.ok);
+    if (r.response.byte_length != 0) return error.RarUnknownEntryCountMismatch;
+    try harness.reject(r, harness.ids.read, &.{
+        harness.archiveOrdinalParam(0),
+        harness.sourceSpan(&rar_fixture_unknown),
+        harness.sinkSpan(r.output),
+    }, .{ .ctx = true }, abi.Status.invalid_data, r.output);
     try harness.expect(r, harness.ids.query, &.{
         harness.paramTargetCommand(harness.ids.read),
         harness.sourceSpan(&rar_fixture),
@@ -396,9 +429,83 @@ pub fn runRar(r: *Runner) anyerror!void {
     try rarToolOracle(r);
 }
 
+fn runRarArchive(r: *Runner) anyerror!void {
+    try runArchive(r, harness.ids.rar);
+}
+
+// Every official-fixture decode runs the envelope's CRC check (and BLAKE2sp
+// where the archive carries it), so a clean status at the expected length is
+// already a byte-exactness proof against the producer.
+const RarOfficial = struct {
+    data: []const u8,
+    sizes: []const usize,
+};
+
+const rar_official = [_]RarOfficial{
+    .{ .data = &fixtures.rar5_store_fixture, .sizes = &.{17} },
+    .{ .data = &fixtures.rar5_comp_fixture, .sizes = &.{ 17, 900 } },
+    .{ .data = &fixtures.rar5_solid_fixture, .sizes = &.{ 900, 17 } },
+    .{ .data = &fixtures.rar5_blake_fixture, .sizes = &.{17} },
+    .{ .data = &fixtures.rar4_store_fixture, .sizes = &.{17} },
+    .{ .data = &fixtures.rar4_comp_fixture, .sizes = &.{ 17, 900 } },
+    .{ .data = &fixtures.rar4_solid_fixture, .sizes = &.{ 900, 17 } },
+    .{ .data = &fixtures.rar5_x86_filter_fixture, .sizes = &.{44056} },
+    .{ .data = &fixtures.rar4_x86_filter_fixture, .sizes = &.{44056} },
+    .{ .data = &fixtures.rar2_v20_m3_fixture, .sizes = &.{ 8192, 4096, 15, 33, 7212, 7212, 7212 } },
+};
+
+pub fn runRarOfficial(r: *Runner) anyerror!void {
+    harness.setup(r, harness.ids.rar, harness.mode_archive);
+    for (rar_official) |fix| {
+        _ = harness.call(r, harness.ids.query, &.{
+            harness.paramTargetCommand(harness.ids.read),
+            harness.sourceSpan(fix.data),
+            harness.capabilityParam(arc_caps),
+            harness.sizingModeParam(harness.size_metadata_exact),
+            harness.commitModeParam(harness.commit_tentative),
+        }, .{});
+        try harness.requireStatus(r, abi.Status.ok);
+        if (r.response.byte_length != fix.sizes.len) return error.RarOfficialEntryCountMismatch;
+        for (fix.sizes, 0..) |expected_size, ordinal| {
+            _ = harness.call(r, harness.ids.read, &.{
+                harness.archiveOrdinalParam(ordinal),
+                harness.sourceSpan(fix.data),
+                harness.sinkSpan(r.output),
+            }, .{ .ctx = true });
+            try harness.requireStatus(r, abi.Status.ok);
+            if (r.response.byte_length != expected_size) return error.RarOfficialSizeMismatch;
+        }
+    }
+}
+
 pub const scenarios = harness.scenarios("archive", &.{
     .{ .label = "archive tar", .run = runTar, .workspace_size = 65536, .output_size = 512, .encoded_size = 4096 },
     .{ .label = "archive zip", .run = runZip, .workspace_size = 65536 + 4096, .output_size = 512, .encoded_size = 4096 },
+    .{ .label = "archive rar", .run = runRarArchive, .workspace_size = 12 * 1024 * 1024, .output_size = 512, .encoded_size = 4096 },
 }, &.{
     .{ .name = "rar", .suite = "rar", .run = runRar, .workspace_size = 65536, .output_size = 64, .encoded_size = 4096 },
+    .{ .name = "rar official", .suite = "rar", .run = runRarOfficial, .workspace_size = 12 * 1024 * 1024, .output_size = 48 * 1024, .encoded_size = 1024 },
+    // PPMd at -m5 asks the decoder for ~139 MiB of model heap — the format's
+    // own size, not a workaround: the encoder built its contexts that large.
+    .{ .name = "rar ppm", .suite = "rar", .run = runRarPpm, .workspace_size = 176 * 1024 * 1024, .output_size = 2048, .encoded_size = 2048 },
 });
+
+pub fn runRarPpm(r: *Runner) anyerror!void {
+    harness.setup(r, harness.ids.rar, harness.mode_archive);
+    _ = harness.call(r, harness.ids.query, &.{
+        harness.paramTargetCommand(harness.ids.read),
+        harness.sourceSpan(&fixtures.rar4_ppm_fixture),
+        harness.capabilityParam(arc_caps),
+        harness.sizingModeParam(harness.size_metadata_exact),
+        harness.commitModeParam(harness.commit_tentative),
+    }, .{});
+    try harness.requireStatus(r, abi.Status.ok);
+    if (r.response.byte_length != 1) return error.RarPpmEntryCountMismatch;
+    _ = harness.call(r, harness.ids.read, &.{
+        harness.archiveOrdinalParam(0),
+        harness.sourceSpan(&fixtures.rar4_ppm_fixture),
+        harness.sinkSpan(r.output),
+    }, .{ .ctx = true });
+    try harness.requireStatus(r, abi.Status.ok);
+    if (r.response.byte_length != 1590) return error.RarPpmSizeMismatch;
+}
