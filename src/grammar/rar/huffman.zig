@@ -28,6 +28,38 @@ pub const DecodeTable = struct {
     valid: bool = false,
 };
 
+// Reads a code-length-alphabet table: `count` 4-bit lengths, then the decode
+// table built from them. With `escapes` (v29), a 15 is an ESCAPE — the next
+// 4 bits are a zero-run count, 0 meaning the length really is 15 — and a run
+// that overruns `count` is truncated, as in the reference. v20 has no escape
+// and reads its lengths verbatim.
+pub fn readCodeLengthTable(br: *BitReader, count: usize, comptime escapes: bool, storage: []u16) Failure!DecodeTable {
+    var lengths = [_]u8{0} ** 64;
+    var i: usize = 0;
+    while (i < count) {
+        const length: u8 = @intCast(try br.readBits(4));
+        if (escapes and length == 15) {
+            const zero_count: u8 = @intCast(try br.readBits(4));
+            if (zero_count == 0) {
+                lengths[i] = 15;
+            } else {
+                // ZeroCount+2 zeros; the loop increment lands past the run
+                // (the reference does I-- after its inner while).
+                var remaining: u32 = @as(u32, zero_count) + 2;
+                while (remaining > 0 and i < count) : (remaining -= 1) {
+                    lengths[i] = 0;
+                    i += 1;
+                }
+                i -|= 1;
+            }
+        } else {
+            lengths[i] = length;
+        }
+        i += 1;
+    }
+    return makeDecodeTables(lengths[0..count], storage);
+}
+
 // storage.len bounds the table: every present symbol must fit.
 pub fn makeDecodeTables(code_lengths: []const u8, storage: []u16) Failure!DecodeTable {
     var table = DecodeTable{};

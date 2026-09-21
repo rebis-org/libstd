@@ -8,7 +8,8 @@ const DecodeTable = huffman.DecodeTable;
 const window_mod = @import("window.zig");
 const Window = window_mod.Window;
 const filters = @import("filters50.zig");
-const sink = @import("sink.zig");
+const sink = @import("../../common/sink.zig");
+const emit = @import("emit.zig");
 const Sink = sink.Sink;
 
 // Buffer plan (all caller-provided): the window is dict-sized; decode tables
@@ -250,11 +251,11 @@ fn readTables(st: *State) Failure!void {
     st.tables_loaded = true;
 }
 
-// Filter descriptor wire format (reference unpack50 ReadFilter):
-// block_start delta (ReadFilterData), block_length (ReadFilterData), 3-bit
-// filter type, and for DELTA a 5-bit channel count minus one. block_start is
-// a FORWARD delta from the current write position, so every filter is known
-// before any byte of its region is decoded.
+// Filter descriptor wire format (reference unpack50 ReadFilter): start delta
+// (ReadFilterData), length (ReadFilterData), 3-bit filter type, and for DELTA
+// a 5-bit channel count minus one. The start is a FORWARD delta from the
+// current write position, so every filter is known before any byte of its
+// region is decoded.
 fn parseFilterDescriptor(st: *State) Failure!void {
     const br = &st.br;
 
@@ -275,8 +276,8 @@ fn parseFilterDescriptor(st: *State) Failure!void {
     if (st.pending_count >= st.pending.len) return error.Unsupported;
     st.pending[st.pending_count] = .{
         .filter_type = filter_type,
-        .block_start = block_start,
-        .block_length = block_length,
+        .start = block_start,
+        .length = block_length,
         .channels = channels,
     };
     st.pending_count += 1;
@@ -295,10 +296,10 @@ fn flushDecoded(st: *State, limit: u64) Failure!void {
     // filter that would be split by it. The filter is applied whole on a
     // later flush, once its region has fully decoded.
     for (st.pending[0..st.pending_count]) |f| {
-        if (f.block_length == 0) continue;
-        const fstart = f.block_start - st.entry_start;
+        if (f.length == 0) continue;
+        const fstart = f.start - st.entry_start;
         if (fstart >= st.flushed and fstart < emit_upto and
-            fstart + f.block_length > emit_upto)
+            fstart + f.length > emit_upto)
         {
             emit_upto = fstart;
         }
@@ -321,51 +322,28 @@ fn flushDecoded(st: *State, limit: u64) Failure!void {
     // A filter starting BEFORE the flushed mark lost part of its region to an
     // earlier emit. Unreachable while the cap above holds; kept because the
     // failure direction of a stale assumption here is silent wrong output.
-    var needs_staging = false;
     for (st.pending[0..st.pending_count]) |f| {
-        if (f.block_length == 0) continue;
-        const fstart = f.block_start - st.entry_start;
-        if (fstart < st.flushed and fstart + f.block_length > st.flushed) {
+        if (f.length == 0) continue;
+        const fstart = f.start - st.entry_start;
+        if (fstart < st.flushed and fstart + f.length > st.flushed) {
             return error.InvalidData;
         }
-        if (fstart >= st.flushed and fstart + f.block_length <= emit_upto) {
-            needs_staging = true;
-        }
     }
 
-    if (!needs_staging) {
-        if (!st.window.emitTo(out, back, count)) return error.InvalidData;
-        st.flushed += count;
-        return;
-    }
-
-    // Filters rewrite their region in place, so the span must be materialised
-    // contiguously before it can be transformed and emitted. The staging
-    // buffer is carved out of the unfiltered prefix of the caller's scratch:
-    // it only needs `count` bytes, and count <= produced - flushed <= window.
-    const staged = st.filter_scratch[0..count];
-    var staged_sink = sink.BufferSink.init(staged);
-    if (!st.window.emitTo(staged_sink.sink(), back, count)) {
-        return error.InvalidData;
-    }
-
-    for (st.pending[0..st.pending_count]) |*f| {
-        if (f.block_length == 0) continue;
-        const fstart = f.block_start - st.entry_start;
-        if (fstart < st.flushed or fstart + f.block_length > emit_upto) continue;
-        const rel = fstart - st.flushed;
-        // Same offset the non-streaming path passes: the region's position
-        // within the FILE (see the E8 relocation note there).
-        try filters.applyFilter(
-            staged[rel .. rel + f.block_length],
-            f.*,
-            @intCast(fstart),
-            st.filter_scratch[count..],
-        );
-        f.block_length = 0; // consumed
-    }
-
-    out.write(staged);
+    // The staged copy sits above a max_filter_block transform scratch; the
+    // buffer is window + max_filter_block, so both always fit.
+    try emit.emitSpan(
+        &st.window,
+        out,
+        back,
+        st.flushed,
+        count,
+        st.pending[0..st.pending_count],
+        st.filter_scratch[filters.max_filter_block..],
+        st.filter_scratch[0..filters.max_filter_block],
+        st.entry_start,
+        applyFilter50,
+    );
     st.flushed += count;
 }
 
@@ -546,45 +524,31 @@ pub const Session = struct {
         // the cursor actually moved rather than assuming it moved out_size.
         const consumed = st.window.write_pos - start_pos;
 
-        var has_filters = false;
-        for (st.pending[0..st.pending_count]) |f| {
-            if (f.block_length > 0) has_filters = true;
-        }
-
-        if (!has_filters) {
-            if (!st.window.emitTo(out, consumed, out_size)) return error.InvalidData;
-            return;
-        }
-
         // Filters MUST be staged, never applied in the window: later solid
         // entries match back into earlier entries' window regions, so
         // in-place filtering corrupts them. Staging also linearises wrapped
         // regions in FILE coordinates.
-        const staged = st.filter_scratch[0..out_size];
-        var staged_sink = sink.BufferSink.init(staged);
-        if (!st.window.emitTo(staged_sink.sink(), consumed, out_size)) {
-            return error.InvalidData;
-        }
-        for (st.pending[0..st.pending_count]) |filter| {
-            if (filter.block_length == 0) continue;
-            // E8/E8E9 relocate branch targets using the block's offset WITHIN
-            // THE FILE. block_start is a window-stream position; in a solid
-            // stream the two differ by everything decoded before this entry.
-            const file_offset = filter.block_start - start_pos;
-            // A filter region outside the entry's decoded range means our
-            // block geometry disagrees with the stream. Refuse rather than
-            // transform the wrong bytes.
-            if (file_offset + filter.block_length > out_size) return error.InvalidData;
-            try filters.applyFilter(
-                staged[file_offset .. file_offset + filter.block_length],
-                filter,
-                @intCast(file_offset),
-                st.filter_scratch[out_size..],
-            );
-        }
-        out.write(staged);
+        try emit.emitSpan(
+            &st.window,
+            out,
+            consumed,
+            0,
+            out_size,
+            st.pending[0..st.pending_count],
+            st.filter_scratch[filters.max_filter_block..],
+            st.filter_scratch[0..filters.max_filter_block],
+            start_pos,
+            applyFilter50,
+        );
     }
 };
+
+// E8/E8E9 relocate branch targets using the block's offset WITHIN THE FILE:
+// `start` is a window-stream position, so the entry start (ctx) converts it;
+// in a solid stream the two differ by everything decoded before this entry.
+fn applyFilter50(entry_start: usize, f: *filters.Filter, region: []u8, scratch: []u8) Failure!void {
+    try filters.applyFilter(region, f.*, @intCast(f.start - entry_start), scratch);
+}
 
 test "length table slots match the rar5 mapping" {
     for (0..8) |i| {
