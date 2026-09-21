@@ -451,22 +451,125 @@ pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
         const size = std.math.cast(usize, info.size) orelse return error.ResourceLimit;
         if (size > limits.decoded_bytes) return error.ResourceLimit;
         try common.requireSinkCapacity(sink_resource, call, size);
+
+        // The walk resolved the entry's declared needs into RarInfo; store
+        // entries carve nothing. The PPMd heap is whatever workspace remains:
+        // the stream names its model size at decode time and is refused
+        // cleanly if the pool cannot hold it.
+        const window_len = std.math.cast(usize, info.window_bytes) orelse return error.ResourceLimit;
+        var bufs: rar.DecodeBuffers = .{
+            .state = &.{},
+            .window = &.{},
+            .table_pool = &.{},
+            .pending50 = &.{},
+            .pending29 = &.{},
+            .filter_scratch = &.{},
+            .ppm_heap = &.{},
+        };
+        if (info.method != 0) {
+            const state_words = try workspace.take(u64, (rar.max_state_bytes + 7) / 8);
+            const window_buf = try workspace.take(u8, window_len);
+            const table_pool = try workspace.take(u16, rar.table_pool_words);
+            const pending50 = try workspace.take(rar.PendingFilter50, rar.max_pending50);
+            const pending29 = try workspace.take(rar.PendingFilter29, rar.max_pending29);
+            const filter_scratch = try workspace.take(u8, window_len + rar.filter_scratch_extra);
+            const ppm_heap = try workspace.take(u8, workspace.remaining());
+            bufs = .{
+                .state = std.mem.sliceAsBytes(state_words),
+                .window = window_buf,
+                .table_pool = table_pool,
+                .pending50 = pending50,
+                .pending29 = pending29,
+                .filter_scratch = filter_scratch,
+                .ppm_heap = ppm_heap,
+            };
+        }
+
         if (sink_resource.kind == .direct_write) {
             const output = try common.sinkDirectBuffer(sink_resource, size);
-            _ = try rar.rarDecodeOrdinal(archive, ordinal, output, limits.entries);
+            _ = try rar.rarDecodeOrdinal(archive, ordinal, output, &bufs);
         } else {
-            const staging = workspace.take(u8, size) catch |err| {
-                const available = workspace.bytes.len - workspace.cursor;
-                common.writeCapacityDiagnostic(call, std.math.cast(u64, size) orelse std.math.maxInt(u64), std.math.cast(u64, available) orelse std.math.maxInt(u64));
-                return err;
-            };
-            _ = try rar.rarDecodeOrdinal(archive, ordinal, staging, limits.entries);
+            const staging = try workspace.take(u8, size);
+            _ = try rar.rarDecodeOrdinal(archive, ordinal, staging, &bufs);
             try common.commitBytesToSink(sink_resource, call, staging);
         }
         response.byte_length = size;
+    } else if (command_mask == vocabulary.command_mask_write) {
+        try requireVerified(commit);
+        const entries = try parseRarEntries(call.request, &workspace);
+        var max_input: usize = 0;
+        var packed_total: usize = 0;
+        for (entries) |entry| {
+            max_input = @max(max_input, entry.data.len);
+            packed_total = try bounds.add(packed_total, rar.packedBound(entry));
+        }
+        const sizes = rar.pack50Sizes(max_input);
+        const hash = try workspace.take(u32, sizes.hash_words);
+        const hash2 = try workspace.take(u32, sizes.hash2_words);
+        const hash3 = try workspace.take(u32, sizes.hash3_words);
+        const bt_left = try workspace.take(u32, sizes.bt_words);
+        const bt_right = try workspace.take(u32, sizes.bt_words);
+        const tokens = try workspace.take(rar.LzToken, sizes.token_count);
+        const staging = try workspace.take(u8, sizes.staging_bytes);
+        const packed_buf = try workspace.take(u8, packed_total);
+        const packed_sizes = try workspace.take(usize, entries.len);
+        var ws: rar.WriteBuffers = .{
+            .hash = hash,
+            .hash2 = hash2,
+            .hash3 = hash3,
+            .bt_left = bt_left,
+            .bt_right = bt_right,
+            .tokens = tokens,
+            .staging = staging,
+            .packed_buf = packed_buf,
+            .packed_sizes = packed_sizes,
+        };
+        const required = try rar.rarWriteSize(entries, &ws);
+        if (sink == null) {
+            response.byte_length = required;
+            return;
+        }
+        const sink_resource = sink.?;
+        try common.checkWorkspaceOverlap(call, source_resource, sink_resource);
+        try common.requireSinkCapacity(sink_resource, call, required);
+        if (sink_resource.kind == .direct_write) {
+            const output = try common.sinkDirectBuffer(sink_resource, required);
+            const written = try rar.rarEncode(entries, output, &ws);
+            response.byte_length = written;
+        } else {
+            const staging_out = try workspace.take(u8, required);
+            const written = try rar.rarEncode(entries, staging_out, &ws);
+            try common.commitBytesToSink(sink_resource, call, staging_out[0..written]);
+            response.byte_length = written;
+        }
     } else {
         return error.Unsupported;
     }
+}
+
+fn parseRarEntries(request: ?*Node, workspace: *resource.Workspace) Failure![]const rar.RarEntry {
+    const entries = try workspace.take(rar.RarEntry, entryCount(request));
+    var index: usize = 0;
+    var cursor = request;
+    while (cursor) |node| : (cursor = node.next) {
+        if (!isArchiveEntry(node)) continue;
+        const name_node = node_graph.findSelector(node.child, comptime discovery.parameter("tar", "entry_name").family, comptime discovery.parameter("tar", "entry_name").ordinal);
+        const data_node = node_graph.findSelector(node.child, comptime discovery.parameter("tar", "entry_data").family, comptime discovery.parameter("tar", "entry_data").ordinal);
+        const method_node = node_graph.findSelector(node.child, comptime discovery.parameter("tar", "entry_method").family, comptime discovery.parameter("tar", "entry_method").ordinal);
+        const mtime_node = node_graph.findSelector(node.child, comptime discovery.parameter("tar", "entry_mtime").family, comptime discovery.parameter("tar", "entry_mtime").ordinal);
+        const name = if (name_node) |n| try resource.checkedConstBytes(n.bytes, n.byte_length) else &.{};
+        const data = if (data_node) |n| try resource.checkedConstBytes(n.bytes, n.byte_length) else &.{};
+        const method: u8 = if (method_node) |n| @truncate(n.value_low) else 0;
+        const mtime: u64 = if (mtime_node) |n| node_graph.parseU64(n) else 0;
+        entries[index] = .{
+            .name = name,
+            .data = data,
+            .mtime = @truncate(mtime),
+            .method = method,
+        };
+        index += 1;
+    }
+    return entries;
 }
 
 fn archiveComment(request: ?*Node) Failure![]const u8 {
