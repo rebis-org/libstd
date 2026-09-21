@@ -480,7 +480,7 @@ test "compress block round-trips through the decoder" {
     var session = try unpack50.Session.init(&st, &window_buf, &pool, &pending, &filter_scratch, false);
 
     var out: [4096]u8 = undefined;
-    var bs = @import("sink.zig").BufferSink.init(&out);
+    var bs = @import("../../common/sink.zig").BufferSink.init(&out);
     try session.decodeFile(compressed[0..written], data.len, false, bs.sink());
     try std.testing.expect(!bs.overflowed);
     try std.testing.expectEqualSlices(u8, data, out[0..data.len]);

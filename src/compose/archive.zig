@@ -16,6 +16,7 @@ const resource = @import("../common/resource.zig");
 const Resource = resource.Resource;
 const Limits = resource.Limits;
 const rar = @import("../grammar/rar.zig");
+const rar_writer = @import("../grammar/rar/writer.zig");
 const seven_zip = @import("../grammar/sevenzip.zig");
 const tar = @import("../grammar/tar.zig");
 const zip = @import("../grammar/zip.zig");
@@ -501,19 +502,19 @@ pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
         var packed_total: usize = 0;
         for (entries) |entry| {
             max_input = @max(max_input, entry.data.len);
-            packed_total = try bounds.add(packed_total, rar.packedBound(entry));
+            packed_total = try bounds.add(packed_total, rar_writer.packedBound(entry));
         }
-        const sizes = rar.pack50Sizes(max_input);
+        const sizes = rar_writer.pack50Sizes(max_input);
         const hash = try workspace.take(u32, sizes.hash_words);
         const hash2 = try workspace.take(u32, sizes.hash2_words);
         const hash3 = try workspace.take(u32, sizes.hash3_words);
         const bt_left = try workspace.take(u32, sizes.bt_words);
         const bt_right = try workspace.take(u32, sizes.bt_words);
-        const tokens = try workspace.take(rar.LzToken, sizes.token_count);
+        const tokens = try workspace.take(rar_writer.LzToken, sizes.token_count);
         const staging = try workspace.take(u8, sizes.staging_bytes);
         const packed_buf = try workspace.take(u8, packed_total);
         const packed_sizes = try workspace.take(usize, entries.len);
-        var ws: rar.WriteBuffers = .{
+        var ws: rar_writer.WriteBuffers = .{
             .hash = hash,
             .hash2 = hash2,
             .hash3 = hash3,
@@ -524,7 +525,7 @@ pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
             .packed_buf = packed_buf,
             .packed_sizes = packed_sizes,
         };
-        const required = try rar.rarWriteSize(entries, &ws);
+        const required = try rar_writer.rarWriteSize(entries, &ws);
         if (sink == null) {
             response.byte_length = required;
             return;
@@ -534,11 +535,11 @@ pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
         try common.requireSinkCapacity(sink_resource, call, required);
         if (sink_resource.kind == .direct_write) {
             const output = try common.sinkDirectBuffer(sink_resource, required);
-            const written = try rar.rarEncode(entries, output, &ws);
+            const written = try rar_writer.rarEncode(entries, output, &ws);
             response.byte_length = written;
         } else {
             const staging_out = try workspace.take(u8, required);
-            const written = try rar.rarEncode(entries, staging_out, &ws);
+            const written = try rar_writer.rarEncode(entries, staging_out, &ws);
             try common.commitBytesToSink(sink_resource, call, staging_out[0..written]);
             response.byte_length = written;
         }
@@ -547,8 +548,8 @@ pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
     }
 }
 
-fn parseRarEntries(request: ?*Node, workspace: *resource.Workspace) Failure![]const rar.RarEntry {
-    const entries = try workspace.take(rar.RarEntry, entryCount(request));
+fn parseRarEntries(request: ?*Node, workspace: *resource.Workspace) Failure![]const rar_writer.RarEntry {
+    const entries = try workspace.take(rar_writer.RarEntry, entryCount(request));
     var index: usize = 0;
     var cursor = request;
     while (cursor) |node| : (cursor = node.next) {

@@ -10,7 +10,8 @@ const Window = window_mod.Window;
 const ppm_mod = @import("ppm.zig");
 const PpmModel = ppm_mod.PpmModel;
 const rarvm = @import("rarvm.zig");
-const sink = @import("sink.zig");
+const sink = @import("../../common/sink.zig");
+const emit = @import("emit.zig");
 const Sink = sink.Sink;
 
 // RAR3/4 (v29/v36) decoder. The stateful legacy engine: in a solid archive
@@ -269,36 +270,9 @@ pub const State = struct {
         }
         st.br.skipBits(2);
 
-        // Step 3: the 20 code-length-alphabet lengths, 4 bits each. A 15 is
-        // an ESCAPE, not a literal length: the next 4 bits are a zero-run
-        // count (0 means the length really is 15).
-        var bc_lengths: [bc]u8 = [_]u8{0} ** bc;
-        {
-            var i: usize = 0;
-            while (i < bc) : (i += 1) {
-                const length: u8 = @intCast(try st.br.readBits(4));
-                if (length == 15) {
-                    const zero_count: u8 = @intCast(try st.br.readBits(4));
-                    if (zero_count == 0) {
-                        bc_lengths[i] = 15;
-                    } else {
-                        // ZeroCount+2 entries of zero, then the outer loop's
-                        // increment accounts for the last one (reference does
-                        // I-- after the inner while).
-                        var remaining: u32 = @as(u32, zero_count) + 2;
-                        while (remaining > 0 and i < bc) : (remaining -= 1) {
-                            bc_lengths[i] = 0;
-                            i += 1;
-                        }
-                        i -= 1;
-                    }
-                } else {
-                    bc_lengths[i] = length;
-                }
-            }
-        }
-
-        var bc_table = try huffman.makeDecodeTables(&bc_lengths, pool[0 * table_pool_words ..][0..table_pool_words]);
+        // Step 3: the 20 code-length-alphabet lengths, 4 bits each; a 15 is
+        // an ESCAPE, not a literal length (see readCodeLengthTable).
+        var bc_table = try huffman.readCodeLengthTable(&st.br, bc, true, pool[0 * table_pool_words ..][0..table_pool_words]);
         if (!bc_table.valid) return error.InvalidData;
 
         // Symbol lengths via the CL table: 0..15 are DELTAs against the old
@@ -729,51 +703,20 @@ pub const State = struct {
         const back = produced - st.flushed;
         if (back > st.window.buffer.len) return error.InvalidData;
 
-        // Does any un-applied filter touch the span about to leave?
-        var first_touch: ?usize = null;
-        for (st.pending[0..st.pending_count], 0..) |pf, idx| {
-            if (pf.length == 0) continue;
-            const s: usize = @intCast(pf.start);
-            if (s < st.flushed + count and s + pf.length > st.flushed) {
-                first_touch = idx;
-                break;
-            }
-        }
-
-        if (first_touch == null) {
-            if (!st.window.emitTo(out, back, count)) return error.InvalidData;
-            st.flushed += count;
-            return;
-        }
-
-        // Materialise the span so the transform can rewrite it in place.
-        const staged = st.filter_scratch[0..count];
-        var staged_sink = sink.BufferSink.init(staged);
-        if (!st.window.emitTo(staged_sink.sink(), back, count)) {
-            return error.InvalidData;
-        }
-
-        const vm_scratch = st.filter_scratch[count .. count + max_filter_block];
-        for (st.pending[0..st.pending_count]) |*pf| {
-            if (pf.length == 0) continue;
-            const s: usize = @intCast(pf.start);
-            if (s + pf.length <= st.flushed or s >= st.flushed + count) continue;
-            // A filter straddling the flush boundary would need bytes already
-            // gone. Refuse; do not transform a partial range.
-            if (s < st.flushed or s + pf.length > st.flushed + count) {
-                return error.Unsupported;
-            }
-            if (pf.length > vm_scratch.len) return error.Unsupported;
-            var init_r = pf.init_r;
-            init_r[6] = @truncate(pf.start); // see applyPendingFilters
-            const rel = s - st.flushed;
-            if (!rarvm.applyFilter(pf.filter, staged[rel .. rel + pf.length], vm_scratch, init_r)) {
-                return error.Unsupported;
-            }
-            pf.length = 0; // consumed
-        }
-
-        out.write(staged);
+        // The staged copy sits above a max_filter_block transform scratch;
+        // the buffer is window + the shared filter slack, so both always fit.
+        try emit.emitSpan(
+            &st.window,
+            out,
+            back,
+            st.flushed,
+            count,
+            st.pending[0..st.pending_count],
+            st.filter_scratch[max_filter_block..],
+            st.filter_scratch[0..max_filter_block],
+            {},
+            applyFilter29,
+        );
         st.flushed += count;
     }
 
@@ -818,40 +761,6 @@ pub const State = struct {
         }
     }
 };
-
-// Each recorded filter is a transform OF the LZ output, so skipping any
-// silently corrupts that range.
-fn applyPendingFilters(st: *State, output: []u8) Failure!void {
-    // The staged bytes sit ABOVE this scratch (see decodeFile): the scratch
-    // holds the transform's working copy, the staged region the entry.
-    const vm_scratch = st.filter_scratch[0..max_filter_block];
-
-    for (st.pending[0..st.pending_count]) |pf| {
-        if (pf.length == 0) continue;
-        const start: usize = @intCast(pf.start);
-        const len: usize = pf.length;
-        // A range escaping the output means our block geometry is wrong.
-        // Refuse rather than filter the wrong bytes.
-        if (start >= output.len or start + len > output.len) {
-            return error.Unsupported;
-        }
-        if (len > vm_scratch.len) return error.Unsupported;
-
-        // R[6] is overwritten at execution time (InitR[6] = WrittenFileSize):
-        // the block's byte offset within the FILE, which is the E8/E8E9
-        // relocation base. The record's own value (normally 0) mis-relocates
-        // every branch it edits.
-        var init_r = pf.init_r;
-        init_r[6] = @truncate(pf.start);
-
-        // Chaining is handled implicitly: consecutive filters sharing a range
-        // operate on this same slice, so a second one sees the first's
-        // output, which is what the reference's PrgStack loop does.
-        if (!rarvm.applyFilter(pf.filter, output[start .. start + len], vm_scratch, init_r)) {
-            return error.Unsupported;
-        }
-    }
-}
 
 pub const Session = struct {
     state: *State,
@@ -957,30 +866,32 @@ pub const Session = struct {
         const out_size: usize = @intCast(@min(st.written_size, unpacked_size));
         const consumed = st.window.write_pos - start_pos;
 
-        if (st.pending_count == 0) {
-            // No filters: stream straight out of the window, no staging.
-            if (!st.window.emitTo(out, consumed, out_size)) {
-                return error.InvalidData;
-            }
-            return;
-        }
-
-        // Filters rewrite output in place, so their ranges are materialised
-        // in a staged copy above the transform scratch (applyPendingFilters
-        // owns the first max_filter_block bytes) — the window keeps raw LZ
-        // bytes because later solid entries match back into it. Unfiltered
-        // entries stream straight out of the window below.
-        if (out_size + max_filter_block > st.filter_scratch.len) return error.InternalFailure;
-        const staged = st.filter_scratch[max_filter_block .. max_filter_block + out_size];
-        var staged_sink = sink.BufferSink.init(staged);
-        if (!st.window.emitTo(staged_sink.sink(), consumed, out_size)) {
-            return error.InvalidData;
-        }
-
-        try applyPendingFilters(st, staged);
-        out.write(staged);
+        // Filters MUST be staged, never applied in the window: later solid
+        // entries match back into earlier entries' window regions (see
+        // emit.zig). The staged copy sits above the transform scratch.
+        try emit.emitSpan(
+            &st.window,
+            out,
+            consumed,
+            0,
+            out_size,
+            st.pending[0..st.pending_count],
+            st.filter_scratch[max_filter_block..],
+            st.filter_scratch[0..max_filter_block],
+            {},
+            applyFilter29,
+        );
     }
 };
+
+// R[6] carries the region's byte offset WITHIN THE FILE; `start` is already
+// file-absolute here.
+fn applyFilter29(_: void, pf: *PendingFilter, region: []u8, scratch: []u8) Failure!void {
+    if (region.len > scratch.len) return error.Unsupported;
+    var init_r = pf.init_r;
+    init_r[6] = @truncate(pf.start);
+    if (!rarvm.applyFilter(pf.filter, region, scratch, init_r)) return error.Unsupported;
+}
 
 test "length tables are the verbatim reference tables" {
     const reference_ldecode = [rc]u32{

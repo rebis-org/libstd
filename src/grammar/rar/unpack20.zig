@@ -7,7 +7,7 @@ const huffman = @import("huffman.zig");
 const DecodeTable = huffman.DecodeTable;
 const window_mod = @import("window.zig");
 const Window = window_mod.Window;
-const sink = @import("sink.zig");
+const sink = @import("../../common/sink.zig");
 const Sink = sink.Sink;
 
 // RAR 2.x (v20/v26) decoder. Unlike v29: no byte alignment before table
@@ -313,13 +313,8 @@ fn readTables(st: *Unpack20State) Failure!void {
     }
 
     // The 19 code-length-alphabet lengths, 4 bits each. Unlike v29, v20 has
-    // NO length-15 escape here.
-    var bc_lengths: [bc20]u8 = undefined;
-    for (0..bc20) |i| {
-        bc_lengths[i] = @intCast(try br.readBits(4));
-    }
-
-    var bc_table = try huffman.makeDecodeTables(&bc_lengths, ldPool(st, 0, bc20));
+    // NO length-15 escape here (readCodeLengthTable with escapes=false).
+    var bc_table = try huffman.readCodeLengthTable(br, bc20, false, ldPool(st, 0, bc20));
 
     // 4-bit DELTAs against the previous block's table (why old_table must
     // persist). v20's escape mapping is its own — do not copy v29's: 16
