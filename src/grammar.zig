@@ -3,4 +3,8 @@
 // inside the module path.
 test {
     _ = @import("grammar/rar.zig");
+    // The writer's test block covers create→inspect→decode round trips,
+    // including zero-length entries; without this reference the aggregate
+    // root compiles the facade only and the block never runs.
+    _ = @import("grammar/rar/writer.zig");
 }
