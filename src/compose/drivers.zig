@@ -55,7 +55,7 @@ pub const GzipDecodeState = struct {
     }
 
     // leftover snapshots pre-append length so consumed reporting covers only this step's bytes.
-    fn restage(self: *GzipDecodeState, input: []const u8) Failure!void {
+    fn restage(self: *GzipDecodeState, input: []const u8, result: *StepResult) Failure!void {
         const consumed = self.inflater.input.slice.pos;
         const floor = if (self.phase == .deflate) consumed else self.frame_pos;
         if (floor > self.pending_len) return error.InternalFailure;
@@ -71,7 +71,10 @@ pub const GzipDecodeState = struct {
             self.inflater.input.slice.pos = 0;
         }
         self.leftover = self.pending_len;
-        if (input.len > self.pending.len - self.pending_len) return error.InsufficientCapacity;
+        if (input.len > self.pending.len - self.pending_len) {
+            result.failure_value = input.len - (self.pending.len - self.pending_len);
+            return error.InsufficientCapacity;
+        }
         @memcpy(self.pending[self.pending_len..][0..input.len], input);
         self.pending_len += input.len;
         self.inflater.input.slice.data = self.pending[0..self.pending_len];
@@ -157,7 +160,7 @@ fn selectPostHeaderPhase(state: *GzipDecodeState) void {
 
 pub fn gzipDecodeStep(state: *GzipDecodeState, input: []const u8, output: []u8, end_of_input: bool) StepResult {
     var result = StepResult{};
-    state.restage(input) catch |failure| {
+    state.restage(input, &result) catch |failure| {
         return framingFailed(&result, 0, failure);
     };
 
@@ -378,253 +381,4 @@ pub fn gzipEncode(output: []u8, input: []const u8, history: []u8, options: gzip.
             return sink.end;
         },
     }
-}
-
-// Trailer zero blocks finalize only at end of input; cancel is caller-owned with produced bytes left for the caller to discard.
-pub const TarWritePhase = enum { name_len, name, size, header, data, padding, trailer, done };
-
-pub const TarWriteState = struct {
-    pending: [pending_cap]u8,
-    pending_len: usize = 0,
-    leftover: usize = 0,
-    frame_pos: usize = 0,
-    phase: TarWritePhase = .name_len,
-    header: [512]u8,
-    header_pos: usize = 0,
-    name_buf: [100]u8,
-    name_len: u8 = 0,
-    size_bytes: [8]u8,
-    size: u64 = 0,
-    data_remaining: u64 = 0,
-    pad_remaining: usize = 0,
-    trailer_remaining: usize = 0,
-    budgets: sessions.Budgets,
-
-    fn restage(self: *TarWriteState, input: []const u8) Failure!void {
-        if (self.frame_pos > 0) {
-            @memmove(self.pending[0 .. self.pending_len - self.frame_pos], self.pending[self.frame_pos..self.pending_len]);
-            self.pending_len -= self.frame_pos;
-            self.frame_pos = 0;
-        }
-        self.leftover = self.pending_len;
-        if (input.len > self.pending.len - self.pending_len) return error.InsufficientCapacity;
-        @memcpy(self.pending[self.pending_len..][0..input.len], input);
-        self.pending_len += input.len;
-    }
-
-    fn available(self: *const TarWriteState) []const u8 {
-        return self.pending[self.frame_pos..self.pending_len];
-    }
-
-    fn buildHeader(self: *TarWriteState) void {
-        const block = &self.header;
-        @memset(block, 0);
-        tarWriteField(block[0..100], self.name_buf[0..self.name_len]);
-        tarWriteNumber(block[100..108], 0o644);
-        tarWriteNumber(block[108..116], 0);
-        tarWriteNumber(block[116..124], 0);
-        tarWriteNumber(block[124..136], self.size);
-        tarWriteNumber(block[136..148], 0);
-        block[156] = '0';
-        tarWriteField(block[257..263], "ustar");
-        tarWriteField(block[263..265], "00");
-        var header_sum = tarChecksumBlock(block);
-        var index: usize = 154;
-        while (index > 148) {
-            index -= 1;
-            block[index] = '0' + @as(u8, @truncate(header_sum & 7));
-            header_sum >>= 3;
-        }
-        block[154] = 0;
-        block[155] = ' ';
-    }
-};
-
-fn tarWriteField(field: []u8, value: []const u8) void {
-    @memset(field, 0);
-    @memcpy(field[0..value.len], value);
-}
-
-fn tarWriteNumber(field: []u8, value: u64) void {
-    @memset(field, 0);
-    const octal_bits = (field.len - 1) * 3;
-    if (octal_bits < 64 and value < (@as(u64, 1) << @intCast(octal_bits))) {
-        var remaining = value;
-        var index = field.len - 1;
-        while (index > 0) {
-            index -= 1;
-            field[index] = '0' + @as(u8, @truncate(remaining & 7));
-            remaining >>= 3;
-        }
-        return;
-    }
-    var remaining = value;
-    var index = field.len;
-    while (index > 1) {
-        index -= 1;
-        field[index] = @truncate(remaining);
-        remaining >>= 8;
-    }
-    field[0] = 0x80;
-}
-
-fn tarChecksumBlock(block: *const [512]u8) u64 {
-    var sum: u64 = 0;
-    for (block, 0..) |byte, index| sum += if (index >= 148 and index < 156) ' ' else byte;
-    return sum;
-}
-
-const zero_block = [_]u8{0} ** 512;
-
-pub fn tarWriteStorage() usize {
-    return std.mem.alignForward(usize, @sizeOf(TarWriteState), 16);
-}
-
-pub fn tarWriteStateInit(storage: []u8, budgets: sessions.Budgets) error{InsufficientCapacity}!*TarWriteState {
-    const state_size = std.mem.alignForward(usize, @sizeOf(TarWriteState), 16);
-    if (storage.len < state_size) return error.InsufficientCapacity;
-    const state: *TarWriteState = @ptrCast(@alignCast(storage.ptr));
-    // pending/header/name_buf/size_bytes are written before any read, so undefined init is safe.
-    state.* = .{ .pending = undefined, .header = undefined, .name_buf = undefined, .size_bytes = undefined, .budgets = budgets };
-    return state;
-}
-
-const tar_write_ops = sessions.Ops{
-    .step = struct {
-        fn call(state: *anyopaque, input: []const u8, output: []u8, end_of_input: bool) sessions.StepResult {
-            return tarWriteStep(@ptrCast(@alignCast(state)), input, output, end_of_input);
-        }
-    }.call,
-    .destroy = struct {
-        fn call(state: *anyopaque) void {
-            _ = state;
-        }
-    }.call,
-};
-
-pub fn tarWriteSession(storage: []u8, budgets: sessions.Budgets) error{InsufficientCapacity}!sessions.Session {
-    const state = try tarWriteStateInit(storage, budgets);
-    return .{ .state = state, .ops = &tar_write_ops };
-}
-
-fn tarWriteFailed(result: *sessions.StepResult, consumed: usize, failure: Failure) sessions.StepResult {
-    result.consumed = consumed;
-    result.status = .failed;
-    result.failure = failure;
-    return result.*;
-}
-
-pub fn tarWriteStep(state: *TarWriteState, input: []const u8, output: []u8, end_of_input: bool) sessions.StepResult {
-    var result = sessions.StepResult{};
-    state.restage(input) catch |failure| {
-        return tarWriteFailed(&result, 0, failure);
-    };
-
-    while (true) {
-        // Emissions drain first since they are bounded by the output span.
-        if (state.phase == .header) {
-            const count = @min(512 - state.header_pos, output.len - result.produced);
-            @memcpy(output[result.produced..][0..count], state.header[state.header_pos..][0..count]);
-            state.header_pos += count;
-            result.produced += count;
-            if (state.header_pos == 512) {
-                if (state.size == 0) {
-                    state.phase = .name_len;
-                } else {
-                    state.phase = .data;
-                    state.data_remaining = state.size;
-                }
-            }
-            if (result.produced == output.len) break;
-            continue;
-        }
-        if (state.phase == .data and state.data_remaining > 0) {
-            const available = state.available();
-            const count = @min(@min(available.len, state.data_remaining), output.len - result.produced);
-            if (count == 0) break;
-            @memcpy(output[result.produced..][0..count], available[0..count]);
-            state.frame_pos += count;
-            state.data_remaining -= count;
-            result.produced += count;
-            if (state.data_remaining == 0) {
-                state.pad_remaining = @intCast((512 - state.size % 512) % 512);
-                state.phase = if (state.pad_remaining > 0) .padding else .name_len;
-            }
-            if (result.produced == output.len) break;
-            continue;
-        }
-        if (state.phase == .padding and state.pad_remaining > 0) {
-            const count = @min(state.pad_remaining, output.len - result.produced);
-            @memcpy(output[result.produced..][0..count], zero_block[0..count]);
-            state.pad_remaining -= count;
-            result.produced += count;
-            if (state.pad_remaining == 0) state.phase = .name_len;
-            if (result.produced == output.len) break;
-            continue;
-        }
-        if (state.phase == .trailer and state.trailer_remaining > 0) {
-            const count = @min(state.trailer_remaining, output.len - result.produced);
-            const first = @min(count, 512);
-            @memcpy(output[result.produced..][0..first], zero_block[0..first]);
-            if (count > 512) @memcpy(output[result.produced + 512 ..][0 .. count - 512], zero_block[0 .. count - 512]);
-            state.trailer_remaining -= count;
-            result.produced += count;
-            if (state.trailer_remaining == 0) state.phase = .done;
-            if (result.produced == output.len) break;
-            continue;
-        }
-        if (state.phase == .done) {
-            result.status = .done;
-            break;
-        }
-
-        switch (state.phase) {
-            .name_len => {
-                const available = state.available();
-                if (available.len == 0) {
-                    if (end_of_input) {
-                        state.phase = .trailer;
-                        state.trailer_remaining = 1024;
-                        continue;
-                    }
-                    break;
-                }
-                state.name_len = available[0];
-                state.frame_pos += 1;
-                if (state.name_len == 0 or state.name_len > 100) return tarWriteFailed(&result, input.len, error.InvalidCall);
-                state.phase = .name;
-            },
-            .name => {
-                const available = state.available();
-                if (available.len < state.name_len) {
-                    if (end_of_input) return tarWriteFailed(&result, input.len, error.InvalidData);
-                    break;
-                }
-                @memcpy(state.name_buf[0..state.name_len], available[0..state.name_len]);
-                state.frame_pos += state.name_len;
-                state.phase = .size;
-            },
-            .size => {
-                const available = state.available();
-                if (available.len < 8) {
-                    if (end_of_input) return tarWriteFailed(&result, input.len, error.InvalidData);
-                    break;
-                }
-                for (0..8) |i| state.size_bytes[i] = available[i];
-                state.frame_pos += 8;
-                state.size = std.mem.readInt(u64, &state.size_bytes, .little);
-                state.buildHeader();
-                state.header_pos = 0;
-                state.phase = .header;
-            },
-            else => break,
-        }
-    }
-
-    state.budgets.addEncoded(result.produced) catch |failure| {
-        return tarWriteFailed(&result, input.len, failure);
-    };
-    result.consumed = input.len;
-    if (result.status != .done and state.phase == .done) result.status = .done;
-    return result;
 }

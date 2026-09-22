@@ -7,7 +7,10 @@ pub const exports = [_][]const u8{
     "_stdk_call",
     "_stdk_session_storage",
     "_stdk_session_create",
+    "_stdk_session_bounded",
     "_stdk_session_step",
+    "_stdk_session_failure",
+    "_stdk_session_catalog",
     "_stdk_session_destroy",
 };
 

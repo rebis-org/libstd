@@ -2,7 +2,6 @@ const std = @import("std");
 const drivers = @import("compose/drivers.zig");
 const sessions = @import("compose/sessions.zig");
 const gzip = @import("grammar/gzip.zig");
-const tar = @import("grammar/tar.zig");
 
 // Both paths run the same leaf code, so outputs and step counts must match; input is
 // non-periodic xorshift because repeating corpora hide composition bugs.
@@ -173,92 +172,6 @@ pub fn main(init: std.process.Init) !void {
     check(undersized == error.InsufficientCapacity, "bounded mode capacity enforced a priori");
     const roundtrip = try decodeKernel(allocator, one_out[0..one_size], .{}, false);
     check(roundtrip != null and std.mem.eql(u8, roundtrip.?.bytes, corpus), "bounded-mode output decodes through the session");
-
-    var framed: std.ArrayList(u8) = .empty;
-    const tar_entries = [_]tar.TarEntry{
-        .{ .name = "a.txt", .data = corpus[0..100] },
-        .{ .name = "b.bin", .data = corpus[100..800] },
-        .{ .name = "empty", .data = &.{} },
-    };
-    for (&tar_entries) |*entry| {
-        try framed.append(allocator, @intCast(entry.name.len));
-        try framed.appendSlice(allocator, entry.name);
-        var size_bytes: [8]u8 = undefined;
-        std.mem.writeInt(u64, &size_bytes, entry.data.len, .little);
-        try framed.appendSlice(allocator, &size_bytes);
-        try framed.appendSlice(allocator, entry.data);
-    }
-    {
-        const tar_storage = try allocator.alignedAlloc(u8, .@"8", drivers.tarWriteStorage() + 8);
-        const base = @intFromPtr(tar_storage.ptr);
-        const aligned = std.mem.alignForward(usize, base, @alignOf(drivers.TarWriteState));
-        var tar_session = try drivers.tarWriteSession(tar_storage[aligned - base ..][0..drivers.tarWriteStorage()], .{});
-        var produced: std.ArrayList(u8) = .empty;
-        var pos: usize = 0;
-        var guard: usize = 0;
-        while (guard < 100000) {
-            guard += 1;
-            const take = @min(5000, framed.items.len - pos);
-            var scratch: [4096]u8 = undefined;
-            const result = tar_session.step(framed.items[pos..][0..take], &scratch, pos + take == framed.items.len);
-            try produced.appendSlice(allocator, scratch[0..result.produced]);
-            if (result.status == .failed) return error.UnexpectedFailure;
-            if (result.status == .done) break;
-            if (result.consumed == 0 and result.produced == 0 and pos + take == framed.items.len) return error.NoProgress;
-            pos += result.consumed;
-        }
-        const reference = try allocator.alloc(u8, tar.tarArchiveSize(&tar_entries) catch return error.UnexpectedFailure);
-        var scratch: [tar.tar_scratch_size]u8 = undefined;
-        const reference_size = tar.tarEncode(&tar_entries, reference, &scratch) catch return error.UnexpectedFailure;
-        check(produced.items.len == reference_size, "tar write session matches grammar encode size");
-        check(std.mem.eql(u8, produced.items, reference[0..reference_size]), "tar write session byte-identical to grammar encode");
-        const count = tar.tarInspectCount(produced.items) catch return error.UnexpectedFailure;
-        check(count == 3, "tar session output inspects as three entries");
-        for (&tar_entries, 0..) |*entry, ordinal| {
-            const info = tar.tarInspectOrdinal(produced.items, ordinal) catch return error.UnexpectedFailure;
-            check(std.mem.eql(u8, info.name, entry.name), "tar entry name round-trips");
-            const data = try allocator.alloc(u8, info.size);
-            const decoded = tar.tarDecodeOrdinal(produced.items, ordinal, data) catch return error.UnexpectedFailure;
-            check(decoded == entry.data.len and std.mem.eql(u8, data, entry.data), "tar entry data round-trips");
-        }
-    }
-    {
-        const tar_storage = try allocator.alignedAlloc(u8, .@"8", drivers.tarWriteStorage() + 8);
-        const base = @intFromPtr(tar_storage.ptr);
-        const aligned = std.mem.alignForward(usize, base, @alignOf(drivers.TarWriteState));
-        var tar_session = try drivers.tarWriteSession(tar_storage[aligned - base ..][0..drivers.tarWriteStorage()], .{ .max_encoded = 100 });
-        var scratch: [4096]u8 = undefined;
-        var tripped = false;
-        var pos: usize = 0;
-        while (pos < framed.items.len) {
-            const take = @min(5000, framed.items.len - pos);
-            const result = tar_session.step(framed.items[pos..][0..take], &scratch, false);
-            if (result.status == .failed) {
-                if (result.failure) |failure| tripped = failure == error.ResourceLimit;
-                break;
-            }
-            pos += result.consumed;
-        }
-        check(tripped, "encoded budget trips mid-entry");
-    }
-    {
-        // Partial output carries no trailer, so it must not inspect as complete.
-        const tar_storage = try allocator.alignedAlloc(u8, .@"8", drivers.tarWriteStorage() + 8);
-        const base = @intFromPtr(tar_storage.ptr);
-        const aligned = std.mem.alignForward(usize, base, @alignOf(drivers.TarWriteState));
-        var tar_session = try drivers.tarWriteSession(tar_storage[aligned - base ..][0..drivers.tarWriteStorage()], .{});
-        var scratch: [4096]u8 = undefined;
-        const partial_take = @min(9000, framed.items.len);
-        _ = tar_session.step(framed.items[0..partial_take], &scratch, false);
-        tar_session.destroy();
-        var incomplete = true;
-        if (tar.tarInspectCount(scratch[0..@min(4096, partial_take)])) |count| {
-            incomplete = count != 3;
-        } else |_| {
-            incomplete = true;
-        }
-        check(incomplete, "cancelled partial archive is not a complete tar");
-    }
 
     {
         const pipe_storage = try allocStateStorage(allocator);

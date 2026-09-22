@@ -323,6 +323,7 @@ fn mapResourceErrorToReadFailed(failure: Failure) std.Io.Reader.StreamError {
         error.InvalidData => error.ReadFailed,
         error.IntegrityFailure => error.ReadFailed,
         error.IoFailure => error.ReadFailed,
+        error.Starved => error.ReadFailed,
         error.ResourceLimit => error.ReadFailed,
         error.InvalidCall => error.ReadFailed,
         error.Unsupported => error.ReadFailed,
