@@ -158,6 +158,7 @@ fn addOracles(b: *std.Build, ctx: *common.Context) void {
     compose_ab_module.addImport("options", ctx.options);
     if (!ctx.portable and ctx.target.result.cpu.arch == .aarch64) {
         compose_ab_module.addAssemblyFile(b.path("src/common/primitive/checksum/aarch64.S"));
+        compose_ab_module.addAssemblyFile(b.path("src/common/primitive/checksum/x86_64.S"));
     }
     const compose_ab_exe = b.addExecutable(.{ .name = "compose_ab", .root_module = compose_ab_module });
     const compose_ab_run = b.addRunArtifact(compose_ab_exe);
@@ -184,6 +185,7 @@ fn addBenchmark(b: *std.Build, ctx: *common.Context, refs: cmd.Refs) void {
     bypass_module.addImport("nucleus", bench_nucleus);
     if (!ctx.portable and ref_target.result.cpu.arch == .aarch64) {
         bypass_module.addAssemblyFile(b.path("src/common/primitive/checksum/aarch64.S"));
+        bypass_module.addAssemblyFile(b.path("src/common/primitive/checksum/x86_64.S"));
     }
     const app = addAcceptanceApp(b, ctx, "benchmark", modules.benchmark, ref_target, ctx.optimize, &.{
         .{ .name = "components", .module = bench_components_module },

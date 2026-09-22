@@ -5,6 +5,8 @@ const options = @import("options");
 
 extern fn stdk_crc32_le(crc: u32, data: [*]const u8, len: usize) u32;
 extern fn stdk_crc32_le_pmull(crc: u32, data: [*]const u8, len: usize) u32;
+extern fn stdk_crc32_x86_le(crc: u32, data: [*]const u8, len: usize) u32;
+extern fn stdk_crc32_x86_le_pmull(crc: u32, data: [*]const u8, len: usize) u32;
 
 const crc32_pmull_threshold = 256; // Fold above this length; threshold from synthetic sweep.
 
@@ -142,6 +144,14 @@ fn TableCrc(comptime T: type, comptime poly: T, comptime reflected: bool) type {
                         self.state = stdk_crc32_le_pmull(self.state, input.ptr, input.len);
                     } else {
                         self.state = stdk_crc32_le(self.state, input.ptr, input.len);
+                    }
+                    return;
+                }
+                if (comptime !options.portable and builtin.cpu.arch == .x86_64) {
+                    if (input.len >= crc32_pmull_threshold) {
+                        self.state = stdk_crc32_x86_le_pmull(self.state, input.ptr, input.len);
+                    } else {
+                        self.state = stdk_crc32_x86_le(self.state, input.ptr, input.len);
                     }
                     return;
                 }

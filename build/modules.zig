@@ -93,6 +93,9 @@ pub fn createFor(
     if (!ctx.portable and spec.crc_kernel and target.result.cpu.arch == .aarch64) {
         module.addAssemblyFile(b.path("src/common/primitive/checksum/aarch64.S"));
     }
+    if (!ctx.portable and spec.crc_kernel and target.result.cpu.arch == .x86_64) {
+        module.addAssemblyFile(b.path("src/common/primitive/checksum/x86_64.S"));
+    }
     module.addImport("options", ctx.options);
     inline for (spec.imports) |import| {
         module.addImport(import.name, createFor(b, byName(import.module), target, optimize, ctx));
