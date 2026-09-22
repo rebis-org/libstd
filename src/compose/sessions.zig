@@ -12,6 +12,10 @@ pub const StepResult = struct {
     committed: usize = 0,
     downstream: u32 = 0,
     failure: ?Failure = null,
+    /// Driver-defined detail for the failure: the required capacity for
+    /// insufficient_capacity, 0 where the failure carries no scalar. The C
+    /// boundary copies it into the session record on failure.
+    failure_value: u64 = 0,
 };
 
 pub const Budgets = struct {
@@ -52,6 +56,11 @@ pub const Session = struct {
     state: *anyopaque,
     ops: *const Ops,
     alive: bool = true,
+    /// The last step's failure in envelope status vocabulary, plus the
+    /// driver detail. Written by the boundary on failure; hosts read them
+    /// through `stdk_session_failure` while the storage is alive.
+    failure_status: u32 = 0,
+    failure_detail: u64 = 0,
 
     pub fn step(self: *Session, input: []const u8, output: []u8, end_of_input: bool) StepResult {
         if (!self.alive) return .{ .status = .failed, .failure = error.InvalidCall };

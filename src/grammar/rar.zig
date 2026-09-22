@@ -34,6 +34,11 @@ pub const RarInfo = struct {
     method: u8 = 0,
     unpack_version: u8 = 0,
     window_bytes: u64 = 0,
+    // Modification time as Unix seconds; 0 when the producer recorded none
+    // or a non-Unix time base (RAR4 DOS-time entries). Solid marks a RAR
+    // entry whose decode replays from its group start.
+    mtime: u64 = 0,
+    solid: bool = false,
 };
 
 pub const Entry = struct {
@@ -170,6 +175,7 @@ const Rar5Block = struct {
     blake2: ?[32]u8 = null,
     is_directory: bool = false,
     archive_flags: u64 = 0,
+    mtime: u64 = 0,
 };
 
 fn parseRar5Block(archive: []const u8, cursor: *usize) Failure!Rar5Block {
@@ -214,7 +220,8 @@ fn parseRar5Block(archive: []const u8, cursor: *usize) Failure!Rar5Block {
             result.unpacked_size = try sub.readULEB128();
             _ = try sub.readULEB128(); // attributes
             if (result.file_flags & rar5_file_mtime != 0) {
-                _ = try sub.readU32le();
+                // RAR5 stores Unix time directly.
+                result.mtime = try sub.readU32le();
             }
             if (result.file_flags & rar5_file_crc32 != 0) {
                 result.data_crc32 = try sub.readU32le();
@@ -312,6 +319,7 @@ fn walkRar5(archive: []const u8, offset: usize, ctx: anytype, comptime visit: fn
                         .crc = header.data_crc32,
                         .has_crc = header.file_flags & rar5_file_crc32 != 0,
                         .ordinal = ordinal,
+                        .mtime = header.mtime,
                     },
                     .family = .rar5,
                     .is_directory = header.is_directory,
@@ -356,6 +364,7 @@ fn walkRar5(archive: []const u8, offset: usize, ctx: anytype, comptime visit: fn
                 entry.info.method = entry.method;
                 entry.info.unpack_version = entry.unpack_version;
                 entry.info.window_bytes = if (entry.method == 0) 0 else @as(u64, 1) << entry.dict_bits;
+                entry.info.solid = entry.solid;
                 // Ordinals count the entries a caller can actually read:
                 // directories are listed in the walk but never exposed, and
                 // must not shift the file ordinals (the v20 fixture's two
@@ -407,6 +416,7 @@ const rar4_lhd_split_before: u16 = 0x0001;
 const rar4_lhd_split_after: u16 = 0x0002;
 const rar4_lhd_password: u16 = 0x0004;
 const rar4_lhd_solid: u16 = 0x0010;
+const rar4_host_unix: u8 = 3;
 const rar4_mhd_volume: u16 = 0x0001;
 const rar4_mhd_password: u16 = 0x0080;
 const rar4_mhd_protect: u16 = 0x0040;
@@ -459,6 +469,10 @@ const Rar4File = struct {
     method: u8,
     name: []const u8,
     is_directory: bool,
+    // RAR4 mtime is Unix time only for Unix producers; other host systems
+    // write DOS date/time, which has no timezone-free Unix conversion.
+    host_os: u8,
+    mtime: u32,
 };
 
 fn parseRar4File(archive: []const u8, header: Rar4Header) Failure!Rar4File {
@@ -470,9 +484,9 @@ fn parseRar4File(archive: []const u8, header: Rar4Header) Failure!Rar4File {
     const fields_offset = try bounds.add(header.header_offset, 7 + @as(usize, if (header.flags & rar4_long_block != 0) 4 else 0));
     var sub = binary.ReadCursor.init(archive[fields_offset..]);
     const unpacked_size_low = try sub.readU32le();
-    _ = try sub.readU8(); // host_os
+    const host_os = try sub.readU8();
     const file_crc = try sub.readU32le();
-    _ = try sub.readU32le(); // mtime
+    const mtime = try sub.readU32le();
     const unpack_version = try sub.readU8();
     const method_raw = try sub.readU8();
     const name_size = std.mem.readInt(u16, &(try sub.readBytes(2)), .little);
@@ -499,6 +513,8 @@ fn parseRar4File(archive: []const u8, header: Rar4Header) Failure!Rar4File {
         .method = method_raw -% 0x30,
         .name = name,
         .is_directory = is_directory,
+        .host_os = host_os,
+        .mtime = mtime,
     };
 }
 
@@ -532,6 +548,7 @@ fn walkRar4(archive: []const u8, ctx: anytype, comptime visit: fn (@TypeOf(ctx),
                         .packed_size = file.packed_size,
                         .crc = file.file_crc,
                         .ordinal = ordinal,
+                        .mtime = if (file.host_os == rar4_host_unix) file.mtime else 0,
                     },
                     .family = .rar4,
                     .is_directory = file.is_directory,
@@ -554,6 +571,7 @@ fn walkRar4(archive: []const u8, ctx: anytype, comptime visit: fn (@TypeOf(ctx),
                 entry.info.method = entry.method;
                 entry.info.unpack_version = entry.unpack_version;
                 entry.info.window_bytes = if (entry.method == 0) 0 else @as(u64, 1) << dictBitsRar4(entry.file_flags);
+                entry.info.solid = entry.solid;
                 // See the RAR5 walk: directories are never exposed and do not
                 // consume ordinals.
                 if (!entry.is_directory) {
