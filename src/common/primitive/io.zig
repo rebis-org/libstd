@@ -3,10 +3,23 @@ const std = @import("std");
 const Failure = @import("failure.zig").Failure;
 
 pub fn readByte(reader: *std.Io.Reader) Failure!u8 {
+    return readByteResuming(reader) catch |failure| switch (failure) {
+        error.Starved => error.IoFailure,
+        else => |other| other,
+    };
+}
+
+// Starvation-preserving variant for stepped (session) drivers: a reader that
+// has no bytes ready raises Starved so the driver can suspend and re-enter,
+// while genuine read errors stay IoFailure.
+pub fn readByteResuming(reader: *std.Io.Reader) Failure!u8 {
     var buffer: [1]u8 = undefined;
     var iovecs = [_][]u8{buffer[0..]};
-    const bytes_read = reader.readVec(&iovecs) catch return error.IoFailure;
-    if (bytes_read == 0) return error.IoFailure;
+    const bytes_read = reader.readVec(&iovecs) catch |failure| switch (failure) {
+        error.EndOfStream => return error.Starved,
+        else => return error.IoFailure,
+    };
+    if (bytes_read == 0) return error.Starved;
     return buffer[0];
 }
 
