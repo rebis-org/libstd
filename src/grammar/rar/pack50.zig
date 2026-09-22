@@ -471,13 +471,19 @@ test "compress block round-trips through the decoder" {
     };
     const written = try compressBlock(data, 3, true, ws, &compressed);
 
-    // Decode through the real engine.
+    // Decode through the real engine. The scratch must mirror the compose
+    // layout: window bytes first, then filter_scratch_extra of working
+    // space; the decoder slices the latter at max_filter_block.
     var window_buf: [4096]u8 = undefined;
     var pool: [unpack50.table_pool_words * 4]u16 = undefined;
     var pending: [unpack50.max_pending_filters]@import("filters50.zig").Filter = undefined;
-    var filter_scratch: [8192]u8 = undefined;
+    const filter_scratch = try std.heap.page_allocator.alloc(
+        u8,
+        window_buf.len + @import("../rar.zig").filter_scratch_extra,
+    );
+    defer std.heap.page_allocator.free(filter_scratch);
     var st: unpack50.State = undefined;
-    var session = try unpack50.Session.init(&st, &window_buf, &pool, &pending, &filter_scratch, false);
+    var session = try unpack50.Session.init(&st, &window_buf, &pool, &pending, filter_scratch, false);
 
     var out: [4096]u8 = undefined;
     var bs = @import("../../common/sink.zig").BufferSink.init(&out);

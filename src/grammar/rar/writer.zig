@@ -144,8 +144,11 @@ const block_writer = struct {
 
         var contents: usize = 0;
         contents += vintSize(rar.rar5_type_file);
-        contents += vintSize(if (packed_len > 0) rar.rar5_flag_data else 0);
-        if (packed_len > 0) contents += vintSize(packed_len);
+        // The walk requires HFL_DATA on file blocks; winrar sets it even for
+        // zero-length payloads (data_size 0), and omitting it for empty files
+        // broke our own write→read round trips.
+        contents += vintSize(if (entry.is_directory) 0 else rar.rar5_flag_data);
+        if (!entry.is_directory) contents += vintSize(packed_len);
         contents += body;
 
         return 4 + vintSize(contents) + contents + packed_len;
@@ -187,8 +190,8 @@ const block_writer = struct {
         var contents: [4400]u8 = undefined;
         var c: usize = 0;
         c += writeVint(rar.rar5_type_file, contents[c..]);
-        c += writeVint(if (data_size > 0) rar.rar5_flag_data else 0, contents[c..]);
-        if (data_size > 0) c += writeVint(data_size, contents[c..]);
+        c += writeVint(if (entry.is_directory) 0 else rar.rar5_flag_data, contents[c..]);
+        if (!entry.is_directory) c += writeVint(data_size, contents[c..]);
         @memcpy(contents[c..][0..b], body[0..b]);
         c += b;
 
@@ -315,6 +318,9 @@ test "created archive round-trips through the facade reader (store and lz)" {
         const entries = [_]RarEntry{
             .{ .name = "m1.txt", .data = data1, .method = method },
             .{ .name = "m2.txt", .data = data2, .method = method },
+            // Empty files must round trip: the block carries HFL_DATA with
+            // data_size 0, matching what the official rar binary writes.
+            .{ .name = "empty.txt", .data = "", .method = method },
         };
         const sizes = pack50.workspacesFor(@max(data1.len, data2.len));
         const hash = try allocator.alloc(u32, sizes.hash_words);
@@ -354,7 +360,7 @@ test "created archive round-trips through the facade reader (store and lz)" {
         const written = try rarEncode(&entries, archive, &ws);
         try testing.expectEqual(required, written);
 
-        try testing.expectEqual(@as(usize, 2), try rar.rarInspectCount(archive, 128));
+        try testing.expectEqual(@as(usize, 3), try rar.rarInspectCount(archive, 128));
         const out1 = try allocator.alloc(u8, data1.len);
         defer allocator.free(out1);
         const out2 = try allocator.alloc(u8, data2.len);
@@ -372,5 +378,6 @@ test "created archive round-trips through the facade reader (store and lz)" {
         try testing.expectEqualSlices(u8, data1, out1);
         try testing.expectEqual(@as(usize, data2.len), try rar.rarDecodeOrdinal(archive, 1, out2, @constCast(&bufs)));
         try testing.expectEqualSlices(u8, data2, out2);
+        try testing.expectEqual(@as(usize, 0), try rar.rarDecodeOrdinal(archive, 2, &.{}, @constCast(&bufs)));
     }
 }
