@@ -6,9 +6,9 @@ const Node = abi.Node;
 const Call = abi.Call;
 const vocabulary = @import("../kernel/vocabulary.zig");
 const Failure = vocabulary.Failure;
-const node_graph = @import("../common/node.zig");
+const node_graph = @import("../kernel/node.zig");
 const measurement = @import("../common/primitive/measurement.zig");
-const resource = @import("../common/resource.zig");
+const resource = @import("../kernel/resource.zig");
 const Resource = resource.Resource;
 const Limits = resource.Limits;
 

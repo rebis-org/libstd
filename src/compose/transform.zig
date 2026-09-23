@@ -1,8 +1,8 @@
 const std = @import("std");
 
-const node_graph = @import("../common/node.zig");
+const node_graph = @import("../kernel/node.zig");
 const measurement = @import("../common/primitive/measurement.zig");
-const resource = @import("../common/resource.zig");
+const resource = @import("../kernel/resource.zig");
 const Resource = resource.Resource;
 const Limits = resource.Limits;
 const gzip = @import("../grammar/gzip.zig");

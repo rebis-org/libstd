@@ -1,7 +1,7 @@
-const abi = @import("../kernel/envelope.zig");
-const vocabulary = @import("../kernel/vocabulary.zig");
-const catalog = @import("../kernel/catalog.zig");
-const discovery = @import("../kernel/discovery.zig");
+const abi = @import("./envelope.zig");
+const vocabulary = @import("./vocabulary.zig");
+const catalog = @import("./catalog.zig");
+const discovery = @import("./discovery.zig");
 const Failure = vocabulary.Failure;
 
 const max_depth = 32;
