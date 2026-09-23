@@ -1,4 +1,4 @@
-const resource = @import("../common/resource.zig");
+const resource = @import("../kernel/resource.zig");
 const Resource = resource.Resource;
 const Limits = resource.Limits;
 const abi = @import("../kernel/envelope.zig");
