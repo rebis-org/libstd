@@ -1,7 +1,7 @@
 const std = @import("std");
 
-const node_graph = @import("../common/node.zig");
-const resource = @import("../common/resource.zig");
+const node_graph = @import("../kernel/node.zig");
+const resource = @import("../kernel/resource.zig");
 const Resource = resource.Resource;
 const Limits = resource.Limits;
 const kernel_catalog = @import("../kernel/catalog.zig");
