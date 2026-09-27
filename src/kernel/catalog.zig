@@ -128,33 +128,31 @@ pub const catalog_json = blk: {
 };
 
 comptime {
-    // Renaming or re-iding a released profile is an ABI break.
-    const expected = [_]struct { component: []const u8, profile: []const u8 }{
-        .{ .component = "bzip2", .profile = "bzip2" },
-        .{ .component = "crypto", .profile = "crypto" },
-        .{ .component = "deflate", .profile = "deflate" },
-        .{ .component = "gzip", .profile = "gzip" },
-        .{ .component = "lzma", .profile = "lzma" },
-        .{ .component = "lzma-file", .profile = "lzma_file" },
-        .{ .component = "lzma2", .profile = "lzma2" },
-        .{ .component = "rar", .profile = "rar" },
-        .{ .component = "sevenzip", .profile = "sevenzip" },
-        .{ .component = "tar", .profile = "tar" },
-        .{ .component = "test_echo", .profile = "test_echo" },
-        .{ .component = "test_read", .profile = "test_read" },
-        .{ .component = "xz", .profile = "xz" },
-        .{ .component = "zip", .profile = "zip" },
-        .{ .component = "zstd", .profile = "zstd" },
-        .{ .component = "zlib", .profile = "zlib" },
-        .{ .component = "lz4", .profile = "lz4" },
-        .{ .component = "zstd-seekable", .profile = "zstd_seekable" },
-        .{ .component = "zdict", .profile = "zdict" },
+    // Renaming or re-iding a released profile is an ABI break. Every projection
+    // derives from this frozen identity table, and new components join it at
+    // release time.
+    const frozen_identities = [_]struct { name: []const u8, low: u64, high: u64 }{
+        .{ .name = "bzip2", .low = 0x6e6b_82f0_8d91_0409, .high = 0xa7a3_5105_3d6d_4009 },
+        .{ .name = "deflate", .low = 0x6e6b_82f0_8d91_0403, .high = 0xa7a3_5105_3d6d_4003 },
+        .{ .name = "gzip", .low = 0x6e6b_82f0_8d91_0404, .high = 0xa7a3_5105_3d6d_4004 },
+        .{ .name = "lzma", .low = 0x6e6b_82f0_8d91_040a, .high = 0xa7a3_5105_3d6d_400a },
+        .{ .name = "lzma-file", .low = 0x6e6b_82f0_8d91_040b, .high = 0xa7a3_5105_3d6d_400b },
+        .{ .name = "lzma2", .low = 0x6e6b_82f0_8d91_040c, .high = 0xa7a3_5105_3d6d_400c },
+        .{ .name = "lz4", .low = 0x6e6b_82f0_8d91_0415, .high = 0xa7a3_5105_3d6d_4015 },
+        .{ .name = "rar", .low = 0x6e6b_82f0_8d91_040f, .high = 0xa7a3_5105_3d6d_400f },
+        .{ .name = "sevenzip", .low = 0x6e6b_82f0_8d91_0408, .high = 0xa7a3_5105_3d6d_4008 },
+        .{ .name = "tar", .low = 0x6e6b_82f0_8d91_0405, .high = 0xa7a3_5105_3d6d_4005 },
+        .{ .name = "xz", .low = 0x6e6b_82f0_8d91_040d, .high = 0xa7a3_5105_3d6d_400d },
+        .{ .name = "zip", .low = 0x6e6b_82f0_8d91_0406, .high = 0xa7a3_5105_3d6d_4006 },
+        .{ .name = "zlib", .low = 0x6e6b_82f0_8d91_0414, .high = 0xa7a3_5105_3d6d_4014 },
+        .{ .name = "zdict", .low = 0x6e6b_82f0_8d91_0417, .high = 0xa7a3_5105_3d6d_4017 },
+        .{ .name = "zstd", .low = 0x6e6b_82f0_8d91_0407, .high = 0xa7a3_5105_3d6d_4007 },
+        .{ .name = "zstd-seekable", .low = 0x6e6b_82f0_8d91_0416, .high = 0xa7a3_5105_3d6d_4016 },
     };
-    for (expected) |pair| {
-        const component = discovery.findByName(pair.component) orelse
-            @compileError("expected component descriptor missing: " ++ pair.component);
-        const profile_id = @field(vocabulary.ids, pair.profile);
-        if (!idEqual(.{ .low = component.id.low, .high = component.id.high }, profile_id))
-            @compileError("component id drifted from the frozen profile id: " ++ pair.component);
+    for (frozen_identities) |frozen| {
+        const component = discovery.findByName(frozen.name) orelse
+            @compileError("released component descriptor missing: " ++ frozen.name);
+        if (component.id.low != frozen.low or component.id.high != frozen.high)
+            @compileError("released component id drifted: " ++ frozen.name);
     }
 }

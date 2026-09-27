@@ -199,27 +199,6 @@ pub const protocol_rows = [_]Descriptor{
     .{ .id = ids.workspace_available_capacity, .name = "workspace_available_capacity", .kind = .diagnostic, .representation = .node_chain },
 };
 
-pub const ProfileTag = enum {
-    test_echo,
-    test_read,
-    deflate,
-    gzip,
-    zstd,
-    bzip2,
-    lzma,
-    lzma2,
-    lzma_file,
-    xz,
-    tar,
-    zip,
-    sevenzip,
-    rar,
-    zlib,
-    lz4,
-    zstd_seekable,
-    zdict,
-};
-
 pub const CommandPolicy = struct {
     command: u32,
     target: u32 = 0,
@@ -252,23 +231,7 @@ pub const ids = struct {
     pub const resource_range = Id{ .low = 0x6e6b_82f0_8d91_0306, .high = 0xa7a3_5105_3d6d_3006 };
     pub const test_echo = Id{ .low = 0x6e6b_82f0_8d91_0401, .high = 0xa7a3_5105_3d6d_4001 };
     pub const test_read = Id{ .low = 0x6e6b_82f0_8d91_0402, .high = 0xa7a3_5105_3d6d_4002 };
-    pub const deflate = Id{ .low = 0x6e6b_82f0_8d91_0403, .high = 0xa7a3_5105_3d6d_4003 };
-    pub const gzip = Id{ .low = 0x6e6b_82f0_8d91_0404, .high = 0xa7a3_5105_3d6d_4004 };
-    pub const tar = Id{ .low = 0x6e6b_82f0_8d91_0405, .high = 0xa7a3_5105_3d6d_4005 };
-    pub const zip = Id{ .low = 0x6e6b_82f0_8d91_0406, .high = 0xa7a3_5105_3d6d_4006 };
-    pub const zstd = Id{ .low = 0x6e6b_82f0_8d91_0407, .high = 0xa7a3_5105_3d6d_4007 };
-    pub const sevenzip = Id{ .low = 0x6e6b_82f0_8d91_0408, .high = 0xa7a3_5105_3d6d_4008 };
-    pub const bzip2 = Id{ .low = 0x6e6b_82f0_8d91_0409, .high = 0xa7a3_5105_3d6d_4009 };
-    pub const lzma = Id{ .low = 0x6e6b_82f0_8d91_040a, .high = 0xa7a3_5105_3d6d_400a };
-    pub const lzma_file = Id{ .low = 0x6e6b_82f0_8d91_040b, .high = 0xa7a3_5105_3d6d_400b };
-    pub const lzma2 = Id{ .low = 0x6e6b_82f0_8d91_040c, .high = 0xa7a3_5105_3d6d_400c };
-    pub const xz = Id{ .low = 0x6e6b_82f0_8d91_040d, .high = 0xa7a3_5105_3d6d_400d };
-    pub const rar = Id{ .low = 0x6e6b_82f0_8d91_040f, .high = 0xa7a3_5105_3d6d_400f };
     pub const crypto = Id{ .low = 0x6e6b_82f0_8d91_0410, .high = 0xa7a3_5105_3d6d_4010 };
-    pub const zlib = Id{ .low = 0x6e6b_82f0_8d91_0414, .high = 0xa7a3_5105_3d6d_4014 };
-    pub const lz4 = Id{ .low = 0x6e6b_82f0_8d91_0415, .high = 0xa7a3_5105_3d6d_4015 };
-    pub const zstd_seekable = Id{ .low = 0x6e6b_82f0_8d91_0416, .high = 0xa7a3_5105_3d6d_4016 };
-    pub const zdict = Id{ .low = 0x6e6b_82f0_8d91_0417, .high = 0xa7a3_5105_3d6d_4017 };
     pub const callback_size = Id{ .low = 0x6e6b_82f0_8d91_0a01, .high = 0xa7a3_5105_3d6d_a001 };
     pub const callback_read = Id{ .low = 0x6e6b_82f0_8d91_0a02, .high = 0xa7a3_5105_3d6d_a002 };
     pub const callback_write = Id{ .low = 0x6e6b_82f0_8d91_0a03, .high = 0xa7a3_5105_3d6d_a003 };

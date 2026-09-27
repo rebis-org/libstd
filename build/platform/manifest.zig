@@ -62,13 +62,14 @@ fn hostEntries() []const []const u8 {
 }
 
 fn androidEntries() []const []const u8 {
-    const count = 3 + slices.android_abis.len;
+    const count = 4 + slices.android_abis.len;
     const entries: [count][]const u8 = blk: {
         var tmp: [count][]const u8 = undefined;
         tmp[0] = "AndroidManifest.xml";
         tmp[1] = "include/stdk.h";
         tmp[2] = "assets/stdk.catalog.json";
-        inline for (slices.android_abis, 0..) |abi, index| tmp[3 + index] = abi.library;
+        tmp[3] = "classes.jar";
+        inline for (slices.android_abis, 0..) |abi, index| tmp[4 + index] = abi.library;
         break :blk tmp;
     };
     return &entries;
@@ -102,16 +103,17 @@ fn appleEntries() []const []const u8 {
 }
 
 fn cjpmEntries() []const []const u8 {
-    const count = 4 + 2 * slices.ohos_abis.len;
+    const count = 5 + 2 * slices.ohos_abis.len;
     const entries: [count][]const u8 = blk: {
         var tmp: [count][]const u8 = undefined;
         tmp[0] = "stdk/cjpm.toml";
         tmp[1] = "stdk/src/stdk.cj";
-        tmp[2] = "stdk/libs/include/stdk.h";
-        tmp[3] = "stdk/stdk.catalog.json";
+        tmp[2] = "stdk/src/session.cj";
+        tmp[3] = "stdk/libs/include/stdk.h";
+        tmp[4] = "stdk/stdk.catalog.json";
         inline for (slices.ohos_abis, 0..) |abi, index| {
-            tmp[4 + 2 * index] = std.fmt.comptimePrint("stdk/libs/{s}/libstd.a", .{abi.triple});
-            tmp[4 + 2 * index + 1] = std.fmt.comptimePrint("stdk/libs/{s}/libstd.so", .{abi.triple});
+            tmp[5 + 2 * index] = std.fmt.comptimePrint("stdk/libs/{s}/libstd.a", .{abi.triple});
+            tmp[5 + 2 * index + 1] = std.fmt.comptimePrint("stdk/libs/{s}/libstd.so", .{abi.triple});
         }
         break :blk tmp;
     };

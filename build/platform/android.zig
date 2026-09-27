@@ -6,6 +6,47 @@ const slices = @import("slices.zig");
 
 const android_api_level: u32 = 33;
 
+// Java bindings are compiled into classes.jar at the AAR root so Java and
+// Kotlin consumers get the session wrapper without hand-written JNI. The
+// toolchain javac is a hard dist dependency, matching the llvm requirement.
+// The JNI bridge C builds into the Android libraries only, never the host
+// library, so the C ABI export surface stays the enumerated set. The Kotlin
+// facade compiles into the same jar; kotlinc is a hard dependency of the dist
+// step, matching javac.
+fn addClassesJar(b: *std.Build) std.Build.LazyPath {
+    const compile = b.addSystemCommand(&.{
+        "sh", "-c",
+        \\case "$4" in *.jar) ;; *) echo "classes.jar output argument is $4" && exit 1 ;; esac
+        \\case "$4" in *.jar) ;; *) echo "classes.jar output argument is $4" && exit 1 ;; esac
+        \\out_dir=$(dirname "$4")
+        \\mkdir -p "$out_dir/classes"
+        \\javac -Xlint:all -Werror -encoding UTF-8 -d "$out_dir/classes" "$2"
+        \\jar cf "$4" -C "$out_dir/classes" .
+        \\mkdir -p "$out_dir/kotlin"
+        \\kotlinc -jvm-target 17 -cp "$4" -d "$out_dir/kotlin" "$3"
+        \\jar uf "$4" -C "$out_dir/kotlin" .
+        ,
+        "_",  "unused",
+    });
+    compile.addFileArg(b.path("build/templates/android/dev/stdk/StdK.java"));
+    compile.addFileArg(b.path("build/templates/android/dev/stdk/StdK.kt"));
+    return compile.addOutputFileArg("classes.jar");
+}
+
+fn addJniBridge(b: *std.Build, library: *std.Build.Step.Compile) void {
+    const java_home = b.graph.environ_map.get("JAVA_HOME") orelse
+        @panic("android archive needs JAVA_HOME for jni.h");
+    const shim = b.path("build/templates/android/jni/shim").getPath(b);
+    library.root_module.addCSourceFile(.{
+        .file = b.path("build/templates/android/jni/stdk.c"),
+        .flags = &.{
+            b.fmt("-I{s}", .{shim}),
+            b.fmt("-I{s}", .{b.pathJoin(&.{ java_home, "include" })}),
+            b.fmt("-I{s}", .{b.pathJoin(&.{ java_home, "include", "darwin" })}),
+        },
+    });
+}
+
 pub fn addArchive(
     b: *std.Build,
     ctx: *const common.Context,
@@ -17,6 +58,7 @@ pub fn addArchive(
     ));
     _ = stage.addCopyFile(ctx.generated.header, "include/stdk.h");
     _ = stage.addCopyFile(ctx.generated.catalog, "assets/stdk.catalog.json");
+    _ = stage.addCopyFile(addClassesJar(b), "classes.jar");
     for (slices.android_abis) |abi| {
         const library = common.addLibrary(b, b.resolveTargetQuery(.{
             .cpu_arch = abi.arch,
@@ -24,6 +66,7 @@ pub fn addArchive(
             .abi = .android,
             .android_api_level = android_api_level,
         }), ctx.optimize, .dynamic, ctx);
+        addJniBridge(b, library);
         _ = stage.addCopyFile(library.getEmittedBin(), abi.library);
     }
     return common.addZipArchive(b, manifest.android, stage);

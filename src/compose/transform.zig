@@ -365,7 +365,7 @@ fn parseLz4Options(request: ?*Node, command_mask: u32) Failure!lz4.Options {
     return options;
 }
 
-pub fn zstdSeekableHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
+pub fn zstd_seekableHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
     const source_resource = source orelse return error.InvalidCall;
     try requireReplay(source_resource, sizing, commit, false);
     var options = zstd_seekable.Options{};
@@ -838,7 +838,7 @@ fn codecDecodeDirectInPlace(comptime Codec: type, input: []const u8, output: []u
     return if (Codec == lzma2) result.produced else result;
 }
 
-pub fn lzmaFileHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
+pub fn lzma_fileHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
     const source_resource = source orelse return error.InvalidCall;
     try requireReplay(source_resource, sizing, commit, false);
     if (sink == null) try common.checkSourceWorkspaceOverlap(call, source_resource);

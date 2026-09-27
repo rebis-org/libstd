@@ -147,7 +147,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     var output: std.ArrayList(u8) = .empty;
-    try output.appendSlice(allocator, "const contract = @import(\"nucleus\").contract;\n\npub const descriptors = [_]contract.Descriptor{\n");
+    try output.appendSlice(allocator, "const std = @import(\"std\");\nconst contract = @import(\"nucleus\").contract;\n\npub const descriptors = [_]contract.Descriptor{\n");
     for (descriptors.items) |descriptor| {
         try output.print(allocator, "    .{{ .id = .{{ .low = {s}, .high = {s} }}, .name = \"{s}\", .class = .{s}, .verbs = &.{{ ", .{ descriptor.id.low, descriptor.id.high, descriptor.name, descriptor.class });
         for (descriptor.verbs, 0..) |verb, verb_index| {
@@ -216,6 +216,30 @@ pub fn main(init: std.process.Init) !void {
         try output.appendSlice(allocator, "} },\n");
     }
     try output.appendSlice(allocator, "};\n");
+    try emitTagTable(allocator, &output, descriptors.items);
 
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = resolved_output_path, .data = output.items });
+}
+
+// Identity beyond the descriptor is generated, so a new component is a
+// descriptor file plus one convention-named hook. Hyphens become underscores
+// for the tag, and tagForName maps back for dispatch.
+fn underscore(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+    const tagged = try allocator.dupe(u8, name);
+    for (tagged) |*character| {
+        if (character.* == '-') character.* = '_';
+    }
+    return tagged;
+}
+
+fn emitTagTable(allocator: std.mem.Allocator, output: *std.ArrayList(u8), descriptors: []const RawDescriptor) !void {
+    try output.appendSlice(allocator, "\npub const ProfileTag = enum {\n");
+    for (descriptors) |descriptor| {
+        try output.print(allocator, "    {s},\n", .{try underscore(allocator, descriptor.name)});
+    }
+    try output.appendSlice(allocator, "};\n\npub fn tagForName(name: []const u8) ?ProfileTag {\n");
+    for (descriptors) |descriptor| {
+        try output.print(allocator, "    if (std.mem.eql(u8, name, \"{s}\")) return .{s};\n", .{ descriptor.name, try underscore(allocator, descriptor.name) });
+    }
+    try output.appendSlice(allocator, "    return null;\n}\n");
 }

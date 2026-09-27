@@ -276,7 +276,7 @@ pub fn zipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
     }
 }
 
-pub fn sevenZipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
+pub fn sevenzipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
     // Single sevenzip profile unions decoded/coded sides: reads accept every method, writes pack. Queries follow their target.
     return sevenZipGeneric(true, plan, source, sink, call, response, sizing, commit, limits, command_mask);
 }

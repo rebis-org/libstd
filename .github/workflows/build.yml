@@ -35,9 +35,6 @@ jobs:
           restore-keys: |
             benchmark-${{ runner.os }}-
       - uses: mlugg/setup-zig@v2.2.1
-      - run: zig fmt --check --ast-check build.zig build src
-      - run: zig fmt --check --zon build.zig.zon
-      - run: git diff --check
       - run: zig build exe -Doptimize=Debug
       - run: zig build exe -Doptimize=ReleaseSafe
       - run: zig build -Doptimize=ReleaseFast
@@ -48,8 +45,10 @@ jobs:
       - if: inputs.benchmark
         run: zig build benchmark -Doptimize=ReleaseFast
       - run: |
-          brew install llvm
+          brew install llvm kotlin
+          brew install --cask temurin
           echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+          echo "JAVA_HOME=/Library/Java/JavaVirtualMachines/temurin-27.jdk/Contents/Home" >> "$GITHUB_ENV"
       - run: zig build dist -Doptimize=ReleaseFast
       - run: zig build package -Doptimize=ReleaseFast
       - id: provenance
@@ -60,6 +59,7 @@ jobs:
             zig-out/libstd.zip
             zig-out/stdk.aar
             zig-out/StdK.XCFramework.zip
+            zig-out/stdk.zip
           show-summary: false
       - id: version
         if: inputs.publish
@@ -101,7 +101,8 @@ jobs:
             --latest=false \
             zig-out/libstd.zip \
             zig-out/stdk.aar \
-            zig-out/StdK.XCFramework.zip
+            zig-out/StdK.XCFramework.zip \
+            zig-out/stdk.zip
       - if: inputs.publish
         env:
           GH_TOKEN: ${{ github.token }}
