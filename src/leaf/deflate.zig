@@ -7,7 +7,7 @@ const huffman = @import("../common/primitive/huffman.zig");
 const kernels = @import("kernels.zig");
 
 // NEON is baseline on aarch64, so the wide match-copy path needs no extra
-// target feature; other targets keep the portable word-at-a-time path.
+// target feature. Other targets keep the portable word-at-a-time path.
 const vector_match_copy = !build_options.portable and builtin.cpu.arch == .aarch64;
 
 pub const history_size = 2 * window_size;
@@ -38,12 +38,12 @@ const too_far = 4096;
 const no_position = std.math.maxInt(u32);
 const token_literal: u64 = 1 << 63;
 
-// Optimal parse: one forward pass plus frozen-price backward DP; no second price
+// Optimal parse: one forward pass plus frozen-price backward DP. No second price
 // iteration (costs ~30% speed for ~0.3% ratio). Span cap preserves the reread invariant.
 const optimal_span = window_size - min_lookahead;
 const optimal_stride = 4;
 const optimal_price_shift = 6;
-// 4-byte chain cannot surface exactly-3 matches; side table recovers those for short distances.
+// 4-byte chain cannot surface exactly-3 matches. Side table recovers those for short distances.
 const hash3_bits = 15;
 const hash3_size = 1 << hash3_bits;
 
@@ -235,7 +235,7 @@ fn buildTree(lengths: []const u8, tree: anytype, comptime max_root_bits: u5, all
     if (sub_len > tree.sub.len) return error.InvalidData;
     tree.sub_len = sub_len;
 
-    // Only the live span needs clearing; complete trees tile every slot.
+    // Only the live span needs clearing. Complete trees tile every slot.
     @memset(tree.root[0..root_size], 0);
     @memset(tree.sub[0..sub_len], 0);
 
@@ -350,7 +350,7 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
                 .head = @splat(no_position),
                 .prev = undefined,
                 .tokens = undefined,
-                // Filled only for optimal mode; the lazy path never reads it.
+                // Filled only for optimal mode. The lazy path never reads it.
                 .head3 = if (options.optimal) @splat(no_position) else undefined,
                 .failed = false,
                 .finished = false,
@@ -442,7 +442,7 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
         fn slide(c: *@This(), keep_from: usize) void {
             if (keep_from == 0) return;
             if ((c.tokens_len != 0 or c.opt_pending_len != 0) and c.block_start < keep_from) {
-                // Span cap keeps this unreachable; retaining block start is defensive only.
+                // Span cap keeps this unreachable. Retaining block start is defensive only.
                 c.slide(c.block_start);
                 return;
             }
@@ -460,14 +460,14 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
             while (c.cursor < c.end) {
                 if (!finishing and c.end - c.cursor < config.min_lookahead) break;
                 try c.step();
-                // Deflate64 matches can exceed the window; subtracting lookahead would stall the slide forever.
+                // Deflate64 matches can exceed the window. Subtracting lookahead would stall the slide forever.
                 const span_cap = if (config.window_size > config.min_lookahead) config.window_size - config.min_lookahead else config.window_size;
                 if (c.tokens_len == block_tokens or c.finalized - c.block_start >= span_cap) try c.emitBlock(false, c.tokens[0..c.tokens_len]);
             }
         }
 
         fn tokenizeOptimal(c: *@This(), finishing: bool) std.Io.Writer.Error!void {
-            // Pending block pins its span; emit non-final to keep block_start == cursor.
+            // Pending block pins its span. Emit non-final to keep block_start == cursor.
             if (c.opt_pending_len != 0) {
                 try c.emitBlock(false, c.optimal.?.tokens[0..c.opt_pending_len]);
                 c.opt_pending_len = 0;
@@ -475,7 +475,7 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
             while (c.cursor < c.end) {
                 if (!finishing and c.end - c.cursor < config.min_lookahead) break;
                 const limit = if (finishing) c.end - c.cursor else c.end - c.cursor - config.min_lookahead + 1;
-                // Non-final sliver waits for more input; buffer-full path leaves room for a full span.
+                // Non-final sliver waits for more input. Buffer-full path leaves room for a full span.
                 if (!finishing and limit < 4096) break;
                 const span = @min(optimal_span, limit);
                 try c.encodeBlockOptimal(c.cursor + span, finishing);
@@ -575,7 +575,7 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
             c.cursor = span_end;
             c.finalized = span_end;
             if (finishing and span_end == c.end) {
-                // Final flag belongs to finish(); block waits tallied.
+                // Final flag belongs to finish(). Block waits tallied.
                 c.opt_pending_len = token_count;
                 return;
             }
@@ -643,7 +643,7 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
             return .{ .count = count, .length = @min(best, clip), .distance = best_dist };
         }
 
-        // Backward DP on frozen prices; suffix minima give each length its cheapest covering distance.
+        // Backward DP on frozen prices. Suffix minima give each length its cheapest covering distance.
         fn optimalParse(c: *@This(), span: usize, lit_price: []const u32, lit_lengths: []const u8, dist_lengths: []const u8, overhead: u32) usize {
             const scratch = c.optimal.?;
             const history = c.history[c.block_start..][0..span];
@@ -719,7 +719,7 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
                 const found = c.search(s, head_candidate);
                 current_length = found.length;
                 current_distance = found.distance;
-                // Too-far minimum match costs more than literals; demote before lazy.
+                // Too-far minimum match costs more than literals. Demote before lazy.
                 if (current_length == min_match and current_distance > too_far) {
                     current_length = min_match - 1;
                     current_distance = 0;
@@ -748,7 +748,7 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
 
         fn insert(c: *@This(), s: usize) u32 {
             const position: u32 = @truncate(c.base + s);
-            // Sentinel collides once per 4 GiB; that position forfeits its slot.
+            // Sentinel collides once per 4 GiB. That position forfeits its slot.
             if (position == no_position) return no_position;
             const h = hash4(c.history[s..]);
             const candidate = c.head[h];
@@ -931,7 +931,7 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
             c.bit_count += @intCast(count);
             if (c.bit_count < 8) return;
             if (c.staging_len + 8 > staging_size) try c.flushStaging();
-            // Wide store covers pending bytes; tail bytes are overwritten next call.
+            // Wide store covers pending bytes. Tail bytes are overwritten next call.
             std.mem.writeInt(u64, c.staging[c.staging_len..][0..8], c.bits, .little);
             const written: u7 = c.bit_count >> 3;
             c.staging_len += written;
@@ -968,7 +968,7 @@ fn hash3(bytes: []const u8) u32 {
     return h & (hash3_size - 1);
 }
 
-// Keep ascending order with nearer distance on ties; over capacity keep ends for cheap shorts and coverage.
+// Keep ascending order with nearer distance on ties. Over capacity keep ends for cheap shorts and coverage.
 fn mergeCandidates(output: []u32, chain: []const u32, side_length: usize, side_distance: u32) u8 {
     if (side_length < min_match) {
         @memcpy(output[0..chain.len], chain);
@@ -998,7 +998,7 @@ fn mergeCandidates(output: []u32, chain: []const u32, side_length: usize, side_d
         count += 1;
     }
     if (count > optimal_stride) {
-        @memcpy(output, buffer[0 .. optimal_stride - 1]);
+        @memcpy(output[0 .. optimal_stride - 1], buffer[0 .. optimal_stride - 1]);
         output[optimal_stride - 1] = buffer[count - 1];
         return optimal_stride;
     }
@@ -1056,7 +1056,7 @@ const SliceBits = struct {
 
     inline fn decode(b: *SliceBits, tree: anytype, root_bits: u7) InflateError!u16 {
         b.refill(max_code_bits);
-        // Zero-padded tail is exact via tiled tables; fail only past real buffered bits.
+        // Zero-padded tail is exact via tiled tables. Fail only past real buffered bits.
         const entry = tree.root[@intCast(b.bits & ((@as(u64, 1) << @intCast(root_bits)) - 1))];
         if (entry == 0) return error.InvalidData;
         const len: u7 = @intCast(entry & 0xFF);
@@ -1285,7 +1285,7 @@ pub fn DecompressOf(comptime variant: enum { deflate, deflate64 }) type {
         }
 
         pub fn inputBitsConsumed(self: *const @This()) usize {
-            // Whole-byte pulls leave unconsumed bits; subtract for the logical position.
+            // Whole-byte pulls leave unconsumed bits. Subtract for the logical position.
             return switch (self.input) {
                 .reader => |r| r.seek * 8 - self.bit_count,
                 .slice => |s| s.pos * 8 - self.bit_count,
@@ -1375,7 +1375,7 @@ pub fn DecompressOf(comptime variant: enum { deflate, deflate64 }) type {
                     d.state = .stored_copy;
                 },
                 1 => {
-                    // Point at comptime tables; dynamic trees stay for the next dynamic block.
+                    // Point at comptime tables. Dynamic trees stay for the next dynamic block.
                     d.fixed = true;
                     d.state = .data;
                 },
@@ -1452,7 +1452,7 @@ pub fn DecompressOf(comptime variant: enum { deflate, deflate64 }) type {
             }
         }
 
-        // Locals keep per-symbol work in registers; state writes back on exit.
+        // Locals keep per-symbol work in registers. State writes back on exit.
         fn decodeDataSlice(d: *@This(), lit: anytype, distance_tree: anytype) InflateError!void {
             const r = &d.reader;
             if (lit.empty) return error.InvalidData;
@@ -1550,7 +1550,7 @@ pub fn DecompressOf(comptime variant: enum { deflate, deflate64 }) type {
                     rd.seek += want_bytes;
                 },
                 .slice => |*s| {
-                    // Mask the wide load to consumed bytes so upper bits stay zero; drain tail byte-wise.
+                    // Mask the wide load to consumed bytes so upper bits stay zero. Drain tail byte-wise.
                     if (s.pos + 8 <= s.data.len) {
                         const word = std.mem.readInt(u64, s.data[s.pos..][0..8], .little);
                         const advance: u7 = @min((64 - d.bit_count) >> 3, 8);
@@ -1584,7 +1584,7 @@ pub fn DecompressOf(comptime variant: enum { deflate, deflate64 }) type {
             // One refill covers the longest code in the common case.
             try d.refill(max_code_bits);
             const root_bits = tree.root_bits;
-            // Zero-padded tail is exact via tiled tables; fail only past real buffered bits.
+            // Zero-padded tail is exact via tiled tables. Fail only past real buffered bits.
             const entry = tree.root[@intCast(d.bits & ((@as(u64, 1) << @intCast(root_bits)) - 1))];
             if (entry == 0) return error.InvalidData;
             const len: u7 = @intCast(entry & 0xFF);

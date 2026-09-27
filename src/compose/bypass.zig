@@ -16,7 +16,7 @@ pub fn zstdEncodeBound(input_len: usize, options: Options) usize {
 }
 
 // History sizing mirrors the kernel path: frame boundaries reset matchfinder history, so differing sizes change encoded bytes.
-// Only resource limits propagate; all other leaf failures map to invalid input.
+// Only resource limits propagate. all other leaf failures map to invalid input.
 fn mapFailure(err: anyerror) Failure {
     return switch (err) {
         error.ResourceLimit => error.ResourceLimit,
@@ -34,7 +34,7 @@ pub fn zstdEncode(input: nucleus.span.ConstSpan, output: nucleus.span.Span, hist
     return zstd.encodeStream(&source, &sink, history.bytes(), aligned, options) catch |err| mapFailure(err);
 }
 
-// Caller supplies exactly-sized history/output spans; no padded staging unlike the kernel path.
+// Caller supplies exactly-sized history/output spans. No padded staging unlike the kernel path.
 pub fn zstdDecodeStream(input: nucleus.span.ConstSpan, output: nucleus.span.Span, history: nucleus.span.Span, options: Options) Failure!usize {
     var source = std.Io.Reader.fixed(input.bytes());
     var sink = std.Io.Writer.fixed(output.bytes());

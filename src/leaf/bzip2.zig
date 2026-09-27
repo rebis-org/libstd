@@ -88,7 +88,7 @@ pub fn encode(input: []const u8, output: []u8, scratch: []u8, options: Options) 
 }
 
 // No stored fallback: RLE1 expands at most 5/4 and symbols cost at most 20 bits.
-// 13/4 covers symbols plus per-block tables; loose by design.
+// 13/4 covers symbols plus per-block tables. Loose by design.
 pub fn encodedSizeBound(input_len: usize) usize {
     return (input_len *| 13) / 4 +| 16384;
 }
@@ -258,7 +258,7 @@ fn decodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8) Failure
                 occ[b] += 1;
             }
         }
-        // Packed successor gives one load per output byte; RLE rides the traversal.
+        // Packed successor gives one load per output byte. RLE rides the traversal.
         var block_crc = Bzip2Crc32.init();
         var out_buf: [4096]u8 = undefined;
         var out_len: usize = 0;
@@ -407,7 +407,7 @@ fn appendRun(buffer: []u8, len: *usize, byte: u8, count: usize) Failure!void {
 const sais_empty = std.math.maxInt(u32);
 const sais_type_s: u8 = 1;
 
-// SA-IS sort requires the unique smallest trailing symbol; levels share workspace
+// SA-IS sort requires the unique smallest trailing symbol. Levels share workspace
 // via disjoint `types` regions while pname/hist/bptr are dead in the parent.
 fn saisIsLms(types: []const u8, i: usize) bool {
     return i > 0 and types[i] == sais_type_s and types[i - 1] != sais_type_s;
@@ -587,7 +587,7 @@ fn encodeBlock(block: []const u8, block_crc: u32, bit_writer: *BitWriter, worksp
     if (n_in_use == 0) return error.InternalFailure;
     const alpha_size = n_in_use + 2;
     const eob = alpha_size - 1;
-    // Doubled block plus sentinel makes sub-nblock suffixes exactly the rotations; L is tie-order independent.
+    // Doubled block plus sentinel makes sub-nblock suffixes exactly the rotations. L is tie-order independent.
     const doubled: usize = 2 * nblock + 1;
     const t16 = try workspace.take(u16, doubled);
     const sa = try workspace.take(u32, doubled);
@@ -739,7 +739,7 @@ fn buildHuffmanGroups(mtfv: []const u16, n_mtf: usize, alpha_size: u32, group_le
         }
         for (0..n_selectors) |s| {
             const chunk = mtfv[s * group_size .. @min((s + 1) * group_size, n_mtf)];
-            // One pass with independent accumulators; separate passes serialize on one register.
+            // One pass with independent accumulators. Separate passes serialize on one register.
             var costs: [max_groups]u32 = @splat(0);
             for (chunk) |sym| {
                 var g: usize = 0;

@@ -11,10 +11,11 @@ pub fn main(init: std.process.Init) !void {
     const host = try args.next(error.MissingArchive);
     const android = try args.next(error.MissingArchive);
     const apple = try args.next(error.MissingArchive);
+    const cjpm = try args.next(error.MissingArchive);
     const dynamic_library = try args.next(error.MissingArchive);
     try args.done(error.UnexpectedArgument);
-    const archive_paths = [_][]const u8{ host, android, apple };
-    const distributions = [_]*const manifest.Distribution{ &manifest.host, &manifest.android, &manifest.apple };
+    const archive_paths = [_][]const u8{ host, android, apple, cjpm };
+    const distributions = [_]*const manifest.Distribution{ &manifest.host, &manifest.android, &manifest.apple, &manifest.cjpm };
     var headers: [archive_paths.len]?[]u8 = .{null} ** archive_paths.len;
     var catalogs: [archive_paths.len]?[]u8 = .{null} ** archive_paths.len;
     defer {
@@ -32,8 +33,19 @@ pub fn main(init: std.process.Init) !void {
     for (headers[1..]) |header| if (!std.mem.eql(u8, headers[0].?, header.?)) return error.HeaderMismatch;
     for (catalogs[1..]) |catalog| if (!std.mem.eql(u8, catalogs[0].?, catalog.?)) return error.CatalogMismatch;
     for (manifest.android.android.?) |abi| try requireAndroidArchitecture(init, android, abi.library, abi.elf_machine);
+    for (slices.ohos_abis) |abi| try requireOhosArchitecture(init, cjpm, abi);
     for (manifest.apple.apple.?) |slice| try requireAppleSlice(init, apple, slice);
     try symbols.assertSingleExport(init, dynamic_library);
+}
+
+fn requireOhosArchitecture(init: std.process.Init, archive: []const u8, abi: slices.OhosAbi) !void {
+    const entry = try print("stdk/libs/{s}/libstd.so", .{abi.triple});
+    defer std.heap.page_allocator.free(entry);
+    const library = try extract(init, archive, entry);
+    defer std.heap.page_allocator.free(library);
+    if (library.len < 20 or !std.mem.eql(u8, library[0..4], "\x7fELF")) return error.InvalidOhosLibrary;
+    const machine = std.mem.readInt(u16, library[18..20], .little);
+    if (machine != abi.elf_machine) return error.InvalidOhosLibrary;
 }
 
 fn print(comptime format: []const u8, args: anytype) ![]u8 {

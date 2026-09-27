@@ -47,7 +47,7 @@ fn run(r: *harness.Runner) anyerror!void {
     r.input = r.corpus_buffer[0..];
     try steps.writeSpan(&noParams, r);
 
-    // Control: the envelope's own readback must accept the same frame; if
+    // Control: the envelope's own readback must accept the same frame. If
     // this fails the frame (not the session boundary) is at fault.
     try steps.queryRead(&noParams, r);
     try steps.readSpan(&noParams, r);
@@ -85,7 +85,7 @@ fn run(r: *harness.Runner) anyerror!void {
     var state: c_int = 0;
     if (stdk_session_step(storage, null, 0, null, 0, 1, &counts, &state) != abi.Status.invalid_call) return error.StepAfterDestroy;
 
-    // Discovery: the versioned catalog names the session-able pairs; the
+    // Discovery: the versioned catalog names the session-able pairs. The
     // removed tar/write pair stays out (retirement is part of the contract).
     const catalog = std.mem.span(stdk_session_catalog());
     if (!std.mem.startsWith(u8, catalog, "v1:")) return error.CatalogVersion;
@@ -145,6 +145,35 @@ fn run(r: *harness.Runner) anyerror!void {
     if (stdk_session_failure(storage, &detail_status, &detail) != abi.Status.ok) return error.FailureReadback;
     if (detail_status != abi.Status.resource_limit) return error.BudgetDetail;
     if (stdk_session_destroy(storage) != abi.Status.ok) return error.DestroyFailed;
+
+    // Raw DEFLATE session: a stream produced by the deflate profile decodes
+    // chunked through the same boundary, and the pair is discoverable.
+    harness.setup(r, harness.ids.deflate, harness.mode_stream);
+    r.input = r.corpus_buffer[0..];
+    try steps.writeSpan(&noParams, r);
+    const deflate_storage_len = stdk_session_storage("deflate", "decode");
+    if (deflate_storage_len == 0 or deflate_storage_len > r.workspace.len) return error.DeflateStorageSize;
+    const deflate_storage = r.workspace.ptr;
+    if (stdk_session_create("deflate", "decode", deflate_storage, deflate_storage_len) != abi.Status.ok) return error.DeflateCreateFailed;
+    @memset(&decoded, 0);
+    pos = 0;
+    out_pos = 0;
+    guard = 0;
+    while (guard < 64) : (guard += 1) {
+        const take = @min(65536, r.encoded_len - pos);
+        const chunk = r.encoded[pos..][0..take];
+        const end = pos + take == r.encoded_len;
+        const status = stdk_session_step(deflate_storage, chunk.ptr, chunk.len, decoded[out_pos..].ptr, decoded.len - out_pos, @intFromBool(end), &counts, &state);
+        if (status != abi.Status.ok) return error.DeflateStepFailed;
+        pos += @intCast(counts[0]);
+        out_pos += @intCast(counts[1]);
+        if (state == 1) break;
+        if (state < 0) return error.DeflateStepCorrupt;
+    }
+    if (out_pos != r.input.len or !std.mem.eql(u8, decoded[0..out_pos], r.input)) return error.DeflateSessionMismatch;
+    if (stdk_session_destroy(deflate_storage) != abi.Status.ok) return error.DestroyFailed;
+    const catalog_check = std.mem.span(stdk_session_catalog());
+    if (std.mem.indexOf(u8, catalog_check, "deflate/decode") == null) return error.CatalogMissingDeflate;
 }
 
 pub const scenarios = harness.scenarios("api", &.{}, &.{.{

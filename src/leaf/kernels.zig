@@ -3,7 +3,7 @@ const builtin = @import("builtin");
 const build_options = @import("options");
 
 // NEON is baseline on aarch64, so the wide match-copy path needs no extra
-// target feature; other targets keep the portable word-at-a-time path.
+// target feature. Other targets keep the portable word-at-a-time path.
 const vector_match_copy = !build_options.portable and builtin.cpu.arch == .aarch64;
 
 pub fn matchLen8(buf: []const u8, a: usize, b: usize, max: usize) usize {
@@ -29,7 +29,7 @@ pub inline fn copyMatchCore(comptime cfg: CopyMatchCfg, buf: []u8, dst: usize, d
     if (dist >= len) {
         copyShort16(buf[dst..][0..len], buf[src..][0..len]);
     } else if (dist >= 16) {
-        // Chunks read only finalized bytes; the last chunk overlaps.
+        // Chunks read only finalized bytes. The last chunk overlaps.
         var i: usize = 0;
         while (i + 16 <= len) : (i += 16) {
             buf[dst + i ..][0..16].* = buf[src + i ..][0..16].*;

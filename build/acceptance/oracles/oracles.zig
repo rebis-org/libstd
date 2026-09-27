@@ -6,6 +6,7 @@ const api = @import("api.zig");
 const archive = @import("archive.zig");
 const bound = @import("bound.zig");
 const checksum = @import("checksum.zig");
+const containers = @import("containers.zig");
 const harness = @import("harness.zig");
 const inflate = @import("inflate.zig");
 const interop = @import("interop.zig");
@@ -22,7 +23,7 @@ const zip = @import("zip.zig");
 const zstd = @import("zstd.zig");
 
 // Suites derive from the component table: removing a descriptor removes its suite with no central edits.
-// Harness constants duplicate the table for build-side convenience; descriptors stay authoritative, drift fails the build.
+// Harness constants duplicate the table for build-side convenience. Descriptors stay authoritative, drift fails the build.
 comptime {
     const Pin = struct { component: []const u8, parameter: []const u8, family: u16, ordinal: u32 };
     const pins = [_]Pin{
@@ -54,12 +55,16 @@ comptime {
         .{ .component = "tar", .parameter = "entry", .family = 2, .ordinal = 5 },
         .{ .component = "tar", .parameter = "entry_data", .family = 2, .ordinal = 6 },
         .{ .component = "tar", .parameter = "entry_method", .family = 2, .ordinal = 7 },
+        .{ .component = "tar", .parameter = "entry_filter", .family = 2, .ordinal = 13 },
+        .{ .component = "zstd-seekable", .parameter = "frame_size", .family = 13, .ordinal = 1 },
+        .{ .component = "zdict", .parameter = "sample_size", .family = 13, .ordinal = 2 },
         .{ .component = "zip", .parameter = "password", .family = 1, .ordinal = 1 },
         .{ .component = "zip", .parameter = "algorithm", .family = 1, .ordinal = 2 },
         .{ .component = "zip", .parameter = "kdf_rounds_limit", .family = 1, .ordinal = 3 },
         .{ .component = "zip", .parameter = "password_lifetime", .family = 1, .ordinal = 4 },
     };
     for (pins) |pin| {
+        @setEvalBranchQuota(10_000);
         const component = for (components.descriptors) |descriptor| {
             if (std.mem.eql(u8, descriptor.name, pin.component)) break descriptor;
         } else @compileError("pin names unknown component: " ++ pin.component);
@@ -83,7 +88,7 @@ const format_groups = format_block: {
         components: []const []const u8,
         scenarios: []const harness.Scenario,
     };
-    // Component keys use frozen descriptor identity ("lzma-file", "sevenzip");
+    // Component keys use frozen descriptor identity ("lzma-file", "sevenzip").
     // profiles, benchmark rows, and suite labels use the released stems
     // ("lzma_file", "seven_zip"). Do not unify the spellings.
     const mapping = [_]Group{
@@ -96,6 +101,7 @@ const format_groups = format_block: {
         .{ .components = &.{"zip"}, .scenarios = &zip.scenarios },
         .{ .components = &.{"sevenzip"}, .scenarios = &seven_zip.scenarios },
         .{ .components = &.{"rar"}, .scenarios = &archive.scenarios },
+        .{ .components = &.{ "zlib", "lz4" }, .scenarios = &containers.scenarios },
     };
     var list: []const harness.Scenario = &.{};
     for (mapping) |group| {

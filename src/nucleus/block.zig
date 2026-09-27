@@ -4,7 +4,7 @@ const span = @import("span.zig");
 const Span = span.Span;
 const Failure = span.Failure;
 
-// Generation lives in a header prefix; free bumps it and every access re-reads
+// Generation lives in a header prefix. Free bumps it and every access re-reads
 // it, so a stale view traps instead of touching reclaimed storage.
 pub const Block = struct {
     storage: []u8,

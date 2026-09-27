@@ -4,7 +4,7 @@ const Span = span_module.Span;
 const ConstSpan = span_module.ConstSpan;
 const Failure = span_module.Failure;
 
-// Caller frees are unobservable, so memory is leased per session; the registry
+// Caller frees are unobservable, so memory is leased per session. The registry
 // lives in caller storage to keep sessions allocation-free and reentrant.
 pub const Lease = struct {
     token: u64,

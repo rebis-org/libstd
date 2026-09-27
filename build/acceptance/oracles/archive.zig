@@ -369,9 +369,9 @@ pub fn runRar(r: *Runner) anyerror!void {
     }, .{ .ctx = true }, abi.Status.invalid_call, &overlap);
     try rarExpectUnsupported(r, &rar_fixture_encryption);
     try rarExpectUnsupported(r, &rar_fixture_multi_volume);
-    // Service blocks (QuickOpen) carry no payload we expose; the walk skips
+    // Service blocks (QuickOpen) carry no payload we expose. The walk skips
     // their data and ends cleanly at EOF, so the archive lists zero entries
-    // and any ordinal read is invalid_data — the same observable shape the
+    // and any ordinal read is invalid_data, the same observable shape the
     // reference gives this archive ("0 files").
     _ = harness.call(r, harness.ids.query, &.{
         harness.paramTargetCommand(harness.ids.read),
@@ -485,7 +485,7 @@ pub const scenarios = harness.scenarios("archive", &.{
 }, &.{
     .{ .name = "rar", .suite = "rar", .run = runRar, .workspace_size = 65536, .output_size = 64, .encoded_size = 4096 },
     .{ .name = "rar official", .suite = "rar", .run = runRarOfficial, .workspace_size = 12 * 1024 * 1024, .output_size = 48 * 1024, .encoded_size = 1024 },
-    // PPMd at -m5 asks the decoder for ~139 MiB of model heap — the format's
+    // PPMd at -m5 asks the decoder for ~139 MiB of model heap, the format's
     // own size, not a workaround: the encoder built its contexts that large.
     .{ .name = "rar ppm", .suite = "rar", .run = runRarPpm, .workspace_size = 176 * 1024 * 1024, .output_size = 2048, .encoded_size = 2048 },
 });

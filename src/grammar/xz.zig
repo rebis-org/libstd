@@ -49,7 +49,7 @@ pub const Options = struct {
     match_finder: lzma.MatchFinder = .bt4,
 };
 
-// Single stream/block overhead fits the constant; 1:1 filters add no bytes.
+// Single stream/block overhead fits the constant. 1:1 filters add no bytes.
 pub fn encodedSizeBound(input_len: usize) usize {
     return lzma2.encodedSizeBound(input_len) +| 128;
 }

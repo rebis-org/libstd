@@ -470,7 +470,7 @@ pub fn winzipCtr(key: []const u8, destination: []u8, source: []const u8) Failure
     return;
 }
 
-// Whole blocks only; padding is the caller's job.
+// Whole blocks only. Padding is the caller's job.
 pub fn aesCbcEncrypt(key: []const u8, iv: [block_length]u8, destination: []u8, source: []const u8) Failure!void {
     if (key.len != 32 or source.len % block_length != 0 or destination.len < source.len) return error.InvalidCall;
     const schedule = try aesKeySchedule(key);

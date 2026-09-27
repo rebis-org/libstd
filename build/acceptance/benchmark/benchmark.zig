@@ -11,7 +11,7 @@ const matrix = @import("matrix.zig");
 const metric = @import("metric.zig");
 const ours = @import("ours.zig");
 
-// Bound-sized confirmed staging peaks near 296 MiB on the largest corpus file; 384 MiB keeps every row resident.
+// Bound-sized confirmed staging peaks near 296 MiB on the largest corpus file. 384 MiB keeps every row resident.
 const workspace_size = 384 * 1024 * 1024;
 
 fn corpusComplete(env: *env_mod.Env, dir: []const u8) bool {
