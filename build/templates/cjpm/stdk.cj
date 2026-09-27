@@ -59,15 +59,21 @@ public struct CallEnvelope {
     var reserved: VArray<UInt64, $4> = [0, 0, 0, 0]
 }
 
+// The parameter counts below are fixed by the C ABI, so the style rule that
+// caps parameter lists does not apply to this block.
+// cjlint-ignore -start !G.FUN.01
 foreign func stdk_call(call: CPointer<CallEnvelope>): UInt32
 
 foreign func stdk_session_storage(component: CString, verb: CString): UInt64
 
 foreign func stdk_session_create(component: CString, verb: CString, storage: CPointer<UInt8>, storage_len: UInt64): UInt32
 
-foreign func stdk_session_bounded(component: CString, verb: CString, storage: CPointer<UInt8>, storage_len: UInt64, max_encoded: UInt64, max_decoded: UInt64, max_work: UInt64, max_entries: UInt64): UInt32
+foreign func stdk_session_bounded(component: CString, verb: CString, storage: CPointer<UInt8>, storage_len: UInt64,
+    max_encoded: UInt64, max_decoded: UInt64, max_work: UInt64, max_entries: UInt64): UInt32
 
-foreign func stdk_session_step(session: CPointer<Unit>, input: CPointer<UInt8>, input_len: UInt64, output: CPointer<UInt8>, output_len: UInt64, end_of_input: Int32, counts_out: CPointer<UInt64>, state_out: CPointer<Int32>): UInt32
+foreign func stdk_session_step(session: CPointer<Unit>, input: CPointer<UInt8>, input_len: UInt64,
+    output: CPointer<UInt8>, output_len: UInt64, end_of_input: Int32, counts_out: CPointer<UInt64>,
+    state_out: CPointer<Int32>): UInt32
 
 foreign func stdk_session_failure(session: CPointer<Unit>, status_out: CPointer<UInt32>, detail_out: CPointer<UInt64>): UInt32
 
@@ -88,13 +94,16 @@ public func sessionCreate(component: CString, verb: CString, storage: CPointer<U
     unsafe { stdk_session_create(component, verb, storage, storageLen) }
 }
 
-public func sessionBounded(component: CString, verb: CString, storage: CPointer<UInt8>, storageLen: UInt64, maxEncoded: UInt64, maxDecoded: UInt64, maxWork: UInt64, maxEntries: UInt64): UInt32 {
+public func sessionBounded(component: CString, verb: CString, storage: CPointer<UInt8>, storageLen: UInt64,
+    maxEncoded: UInt64, maxDecoded: UInt64, maxWork: UInt64, maxEntries: UInt64): UInt32 {
     unsafe { stdk_session_bounded(component, verb, storage, storageLen, maxEncoded, maxDecoded, maxWork, maxEntries) }
 }
 
-public func sessionStep(session: CPointer<Unit>, input: CPointer<UInt8>, inputLen: UInt64, output: CPointer<UInt8>, outputLen: UInt64, endOfInput: Int32, countsOut: CPointer<UInt64>, stateOut: CPointer<Int32>): UInt32 {
+public func sessionStep(session: CPointer<Unit>, input: CPointer<UInt8>, inputLen: UInt64, output: CPointer<UInt8>,
+    outputLen: UInt64, endOfInput: Int32, countsOut: CPointer<UInt64>, stateOut: CPointer<Int32>): UInt32 {
     unsafe { stdk_session_step(session, input, inputLen, output, outputLen, endOfInput, countsOut, stateOut) }
 }
+// cjlint-ignore -end
 
 public func sessionFailure(session: CPointer<Unit>, statusOut: CPointer<UInt32>, detailOut: CPointer<UInt64>): UInt32 {
     unsafe { stdk_session_failure(session, statusOut, detailOut) }
