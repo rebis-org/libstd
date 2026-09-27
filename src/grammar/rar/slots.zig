@@ -1,7 +1,7 @@
 const std = @import("std");
 
 // Inverse of the unpack50 slot tables. The distance-dependent length bonus
-// must be subtracted before slotting; a match whose adjusted length drops
+// must be subtracted before slotting. a match whose adjusted length drops
 // below 2 is unencodable and becomes literals upstream.
 
 pub const LengthSlotResult = struct {
@@ -129,7 +129,7 @@ test "encodeDistanceSlot direct distances and split extras" {
     try std.testing.expectEqual(@as(u5, 1), r5.dd_extra_bits);
     try std.testing.expect(!r5.use_ldd);
     // A wide distance splits its extra bits across the stream and the LDD
-    // table. distance 65536: dist_base 65535 falls in slot 31 (base 49152,
+    // table. Distance 65536: dist_base 65535 falls in slot 31 (base 49152,
     // 14 extra bits), extra_value 16383 = 1023 high bits + low nibble 15.
     const wide = encodeDistanceSlot(65536);
     try std.testing.expectEqual(@as(u32, 31), wide.dd_slot);

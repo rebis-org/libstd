@@ -19,7 +19,7 @@ const Sink = sink.Sink;
 // across entries. Tables are verbatim from the reference (unpack30.cpp):
 // every arithmetic derivation tried upstream grouped extra-bit widths in
 // pairs where the real tables group in fours, and small payloads never reach
-// the diverging slots — green unit tests, undecodable real archives.
+// the diverging slots: green unit tests, undecodable real archives.
 
 const mc: usize = 299; // 256 literals + 43 control codes
 const dc: usize = 60;
@@ -30,10 +30,10 @@ const total_code_lengths: usize = mc + dc + ldc + rc;
 pub const table_pool_words: usize = total_code_lengths;
 
 // Upper bound on a RAR3 filter program (the largest standard filter is 216
-// bytes; the length field can encode more, which is rejected as corrupt).
+// bytes. The length field can encode more, which is rejected as corrupt).
 const max_vm_code_size: usize = 0x1000;
 
-// Distinct filter programs tracked per stream. The reference allows 8192;
+// Distinct filter programs tracked per stream. The reference allows 8192.
 // real archives use a handful, and the cap only needs to bound memory.
 pub const max_filters: u32 = 1024;
 
@@ -44,7 +44,7 @@ pub const max_pending_filters: usize = 8192;
 // and a filter's data must fit in half of it).
 pub const max_filter_block: usize = 0x20000;
 
-// Largest live table (the LD alphabet); one table's worth of decode_num words
+// Largest live table (the LD alphabet). One table's worth of decode_num words
 // per table, four tables.
 pub const PendingFilter = struct {
     filter: rarvm.StandardFilter,
@@ -64,7 +64,7 @@ const low_dist_rep_count: u32 = 16;
 // Reference DDecode/DBits (vendor/unrar/unpack30.cpp), built at comptime by
 // the same DBitLengthCounts loop the reference runs: the bit width keeps
 // growing through the last group, so the top slots carry 17-18 extra bits
-// and reach past 4 MB. Do not "saturate" this at 16 — that is the v20 table.
+// and reach past 4 MB. Do not "saturate" this at 16, that is the v20 table.
 const d_bit_length_counts = [_]u32{ 4, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 14, 0, 12 };
 
 const dist_tables = blk: {
@@ -88,7 +88,7 @@ const dist_tables = blk: {
 const dist_decode = dist_tables.decode;
 const dist_bits = dist_tables.bits;
 
-// Reference LDecode, RAW — no constant folded in. The same table is used with
+// Reference LDecode, RAW, no constant folded in. The same table is used with
 // two different bases: new match (symbol >= 271) adds +3, rep-distance match
 // (259..262) adds +2. Callers add their own constant.
 const length_bases = [rc]u32{
@@ -100,7 +100,7 @@ const length_bases = [rc]u32{
 const length_match_base: u32 = 3;
 const length_rep_base: u32 = 2;
 
-// Reference LBits — groups of FOUR after the first eight zero-width slots.
+// Reference LBits, groups of FOUR after the first eight zero-width slots.
 const length_extra_bits = [rc]u5{
     0, 0, 0, 0, 0, 0, 0, 0,
     1, 1, 1, 1, 2, 2, 2, 2,
@@ -127,13 +127,13 @@ pub const State = struct {
     written_size: u64,
     block_mode: BlockMode,
     tables_loaded: bool,
-    // Previous block's code lengths (the reference UnpOldTable). v29 encodes
+    // Previous block's code lengths (the reference UnpOldTable). V29 encodes
     // each block's lengths as a 4-bit DELTA against this, so it must persist
     // across readTables() calls. A block may also ask to keep it (BitField &
-    // 0x4000); when that bit is clear the table is zeroed.
+    // 0x4000). When that bit is clear the table is zeroed.
     old_table: [total_code_lengths]u8,
     // Set when a filter program was recognised as one of the six standard
-    // filters; applying it is the next step.
+    // filters. applying it is the next step.
     filter_seen: rarvm.StandardFilter,
     // Set when a filter program was NOT one of the six. The transform cannot
     // be reproduced at all, so the output must be reported unverifiable
@@ -144,7 +144,7 @@ pub const State = struct {
     prev_low_dist: u32,
     low_dist_rep_count: u32,
     // Identified type of each filter program, indexed by filter position. A
-    // program is transmitted only on a position's first use; later
+    // program is transmitted only on a position's first use. Later
     // invocations reference it, so the type must persist.
     filter_types: [max_filters]rarvm.StandardFilter,
     filter_count: u32,
@@ -153,15 +153,15 @@ pub const State = struct {
     pending: []PendingFilter,
     pending_count: usize,
     // Streaming-output state, used ONLY for entries larger than the window.
-    // The reference flushes decoded bytes continuously (UnpWriteBuf); holding
+    // The reference flushes decoded bytes continuously (UnpWriteBuf). Holding
     // an entry entirely in the window silently caps it at the dictionary size
     // and its opening bytes get overwritten by its own tail.
     stream_out: ?Sink,
     entry_start: usize,
     flushed: usize,
     flush_threshold: usize,
-    // PPM state. The model persists across blocks and (solid) files; only
-    // DecodeInit's reset bit rebuilds it. esc_char is the in-band escape
+    // PPM state. The model persists across blocks and (solid) files. Only
+    // DecodeInit's reset bit rebuilds it. Esc_char is the in-band escape
     // byte, reset to 2 per UnpInitData30.
     ppm_model: ?PpmModel,
     ppm_heap: []u8,
@@ -241,13 +241,13 @@ pub const State = struct {
         const bit_field = try st.br.peekBits(16);
         if (bit_field & 0x8000 != 0) {
             // PPM mode. Consume NOTHING: the reference peeks this flag and
-            // then DecodeInit's first GetChar reads the SAME byte — its bits
+            // then DecodeInit's first GetChar reads the SAME byte, its bits
             // 0-4 are the order, bit 5 the reset flag, bit 6 "escape char
             // follows". Consuming even one flag bit here desynchronises the
             // entire PPM stream from its first byte.
             st.block_mode = .ppm_mode;
             if (st.ppm_model == null) {
-                // The MODEL persists across blocks and (solid) files; only
+                // The MODEL persists across blocks and (solid) files. Only
                 // DecodeInit's reset bit rebuilds it.
                 st.ppm_model = PpmModel.init();
             }
@@ -270,13 +270,13 @@ pub const State = struct {
         }
         st.br.skipBits(2);
 
-        // Step 3: the 20 code-length-alphabet lengths, 4 bits each; a 15 is
+        // Step 3: the 20 code-length-alphabet lengths, 4 bits each. a 15 is
         // an ESCAPE, not a literal length (see readCodeLengthTable).
         var bc_table = try huffman.readCodeLengthTable(&st.br, bc, true, pool[0 * table_pool_words ..][0..table_pool_words]);
         if (!bc_table.valid) return error.InvalidData;
 
         // Symbol lengths via the CL table: 0..15 are DELTAs against the old
-        // table; 16 repeats 3+read(3), 17 repeats 11+read(7), 18 zeros
+        // table. 16 repeats 3+read(3), 17 repeats 11+read(7), 18 zeros
         // 3+read(3), 19 zeros 11+read(7).
         var code_lengths: [total_code_lengths]u8 = [_]u8{0} ** total_code_lengths;
         var i: usize = 0;
@@ -291,7 +291,7 @@ pub const State = struct {
                     3 + try st.br.readBits(3)
                 else
                     11 + try st.br.readBits(7);
-                // "Repeat previous" cannot appear first — there is nothing to
+                // "Repeat previous" cannot appear first, there is nothing to
                 // repeat, and reading code_lengths[i-1] would underflow.
                 if (i == 0) return error.InvalidData;
                 var remaining = n;
@@ -325,8 +325,8 @@ pub const State = struct {
     }
 
     // Read a filter program from the bitstream (reference ReadVMCode). Layout:
-    // one length byte whose low 3 bits give (len-1); the escape values 7 and 8
-    // introduce an 8-bit or 16-bit length. The program bytes follow; RAR
+    // one length byte whose low 3 bits give (len-1). The escape values 7 and 8
+    // introduce an 8-bit or 16-bit length. The program bytes follow. RAR
     // guarantees a filter program never crosses a Huffman block boundary.
     fn readVMCode(st: *State) Failure!void {
         const first_byte: u32 = try st.br.readBits(8);
@@ -352,8 +352,8 @@ pub const State = struct {
     // and the program itself only on a position's first use.
     fn addVMCode(st: *State, first_byte: u32, code: []const u8) Failure!void {
         // RarVM::ReadData peeks 16 bits and consumes as few as 6, so a 7-byte
-        // record overruns the buffer mid-read; the reference's over-allocated
-        // zero padding makes that harmless there — reproduce it.
+        // record overruns the buffer mid-read. The reference's over-allocated
+        // zero padding makes that harmless there, reproduce it.
         var padded: [max_vm_code_size + 8]u8 = undefined;
         @memcpy(padded[0..code.len], code);
         @memset(padded[code.len .. code.len + 8], 0);
@@ -388,7 +388,7 @@ pub const State = struct {
         }
         const block_length = st.old_filter_lengths[filt_pos];
 
-        // R[4] carries the block length; R[0] is the channel count for the
+        // R[4] carries the block length. R[0] is the channel count for the
         // delta/audio filters. Both come from the optional-parameter block.
         var init_r = [_]u32{0} ** 7;
         init_r[4] = block_length;
@@ -424,7 +424,7 @@ pub const State = struct {
         // Record where this filter applies. BlockStart is relative to the
         // current output position, so resolve it to an absolute offset now.
         if (st.pending_count >= st.pending.len) {
-            st.unsupported_filter_seen = true; // too many to track; do not guess
+            st.unsupported_filter_seen = true; // too many to track. Do not guess
             return;
         }
         st.pending[st.pending_count] = .{
@@ -437,7 +437,7 @@ pub const State = struct {
     }
 
     // Decode a length from the RC table (rep-distance path: LDecode[n] + 2 +
-    // extra; no distance-dependent bonus — the reference applies that only to
+    // extra, no distance-dependent bonus. The reference applies that only to
     // new matches).
     fn decodeLength(st: *State) Failure!u32 {
         const slot = try huffman.decodeNumber(&st.br, &st.rc_t);
@@ -458,7 +458,7 @@ pub const State = struct {
         if (table_bits > 0) {
             if (slot > 9) {
                 // Wide distance: the high part comes from the bitstream, and
-                // the low 4 bits come from the LDC table — with a repeat
+                // the low 4 bits come from the LDC table, with a repeat
                 // mechanism, because consecutive matches often share them.
                 if (table_bits > 4) {
                     const high = try st.br.readBits(table_bits - 4);
@@ -517,13 +517,13 @@ pub const State = struct {
                 return true; // same file continues with the new table
             }
             // New file. The second bit records TablesRead3 = !NewTable for
-            // the next entry; a solid entry consults it without re-reading
+            // the next entry. a solid entry consults it without re-reading
             // tables, so dropping it desynchronises the shared stream from its
             // first symbol.
             const new_table = (bit_field & 0x4000) != 0;
             st.br.skipBits(2);
             st.tables_loaded = !new_table;
-            return false; // new file — this one is done
+            return false; // new file, this one is done
         }
 
         if (symbol == 257) {
@@ -590,8 +590,8 @@ pub const State = struct {
             // Distance-dependent length bonus. The encoder cannot emit a
             // 2-byte match at a large distance, so those short lengths are
             // reused to mean longer matches and the decoder adds the bonus
-            // back (reference: if (Distance>=0x2000) { Length++; if
-            // (Distance>=0x40000) Length++; }, applied to NEW matches only).
+            // back (reference: if (Distance>=0x2000) { Length++. If
+            // (Distance>=0x40000) Length++. }, applied to NEW matches only).
             if (distance >= 0x2000) {
                 length += 1;
                 if (distance >= 0x40000) length += 1;
@@ -613,9 +613,9 @@ pub const State = struct {
     }
 
     // PPM in-band escape protocol (PPMEscChar): 0 = end of PPM encoding, an
-    // LZ block may follow in the same entry; 1 = the escape byte itself;
-    // 2 = end of file; 3 = VM filter code; 4 = LZ match (3 distance bytes +
-    // length, +32/+2); 5 = RLE (len+4, distance 1). True continues, false ends
+    // LZ block may follow in the same entry. 1 = the escape byte itself.
+    // 2 = end of file. 3 = VM filter code. 4 = LZ match (3 distance bytes +
+    // length, +32/+2). 5 = RLE (len+4, distance 1). True continues, false ends
     // the entry.
     fn processPpmSymbol(st: *State) Failure!bool {
         if (st.ppm_model == null) return error.Unsupported;
@@ -690,11 +690,11 @@ pub const State = struct {
     // bytes are deliberately held back so a filter recorded slightly after
     // its data was decoded can still reach the region it covers. A filter
     // that reaches further back than that is refused rather than applied to
-    // the wrong bytes — unverifiable, not damaged.
+    // the wrong bytes, unverifiable, not damaged.
     fn flushDecoded(st: *State, keep: usize, limit: u64) Failure!void {
         const out = st.stream_out orelse return;
         const produced = st.window.write_pos - st.entry_start;
-        // Never emit past the size the header declared; the tail of a final
+        // Never emit past the size the header declared. The tail of a final
         // match may overshoot it.
         const emit_upto = @min(produced -| keep, limit);
         if (emit_upto <= st.flushed) return;
@@ -703,7 +703,7 @@ pub const State = struct {
         const back = produced - st.flushed;
         if (back > st.window.buffer.len) return error.InvalidData;
 
-        // The staged copy sits above a max_filter_block transform scratch;
+        // The staged copy sits above a max_filter_block transform scratch.
         // the buffer is window + the shared filter slack, so both always fit.
         try emit.emitSpan(
             &st.window,
@@ -722,7 +722,7 @@ pub const State = struct {
 
     // Runs to the END-OF-BLOCK MARKER, not unpacked_size: the marker carries
     // the "next file starts with a new table" bit the next solid entry needs,
-    // and a trailing match may overshoot the declared size — those bytes stay
+    // and a trailing match may overshoot the declared size. Those bytes stay
     // in the window, where the next solid entry can match against them.
     pub fn decompressLoop(st: *State, unpacked_size: u64) Failure!void {
         if (!st.tables_loaded) {
@@ -730,7 +730,7 @@ pub const State = struct {
         }
 
         // Termination guard. The encoder emits the marker where the entry
-        // ends, so a legitimate overshoot is at most one match; a stream that
+        // ends, so a legitimate overshoot is at most one match. a stream that
         // keeps producing well past that is corrupt, and without a bound a
         // crafted archive could spin here indefinitely.
         const overshoot_limit = unpacked_size +| st.window.buffer.len;
@@ -789,7 +789,7 @@ pub const Session = struct {
         st.old_table = [_]u8{0} ** total_code_lengths;
         st.block_mode = .lz;
         // Reference UnpInitData30(!Solid) resets PPMEscChar and the block type
-        // but does NOT destroy the PPM model — it persists for the whole
+        // but does NOT destroy the PPM model. It persists for the whole
         // unpack session, and only DecodeInit's reset bit rebuilds it. A
         // non-solid file whose first PPM block has reset clear would
         // otherwise find no allocator and fail on an archive unrar accepts.
@@ -816,7 +816,7 @@ pub const Session = struct {
 
         if (!solid) self.resetForNewStream();
 
-        // Reset every entry, solid or not — filter INVOCATIONS never share
+        // Reset every entry, solid or not. Filter INVOCATIONS never share
         // solid files (InitFilters: "Filters never share several solid
         // files"), while filter PROGRAMS do (InitFilters30 clears the program
         // table only when !Solid).
@@ -825,7 +825,7 @@ pub const Session = struct {
         st.unsupported_filter_seen = false;
 
         // Padded, unlike the other decoders: the end-of-block marker peeks
-        // 16 bits but consumes 1-2, and at a hard bound the peek fails — so
+        // 16 bits but consumes 1-2, and at a hard bound the peek fails, so
         // the marker (and the table flag it carries) was never read and the
         // next solid entry desynchronised. The reference has the same slack
         // (ReadBorder = ReadTop - 30).
@@ -836,7 +836,7 @@ pub const Session = struct {
 
         const start_pos = st.window.write_pos;
 
-        // Entries larger than the window MUST stream out as they decode;
+        // Entries larger than the window MUST stream out as they decode.
         // below that size the single-emit path at the end is used unchanged.
         st.entry_start = start_pos;
         st.flushed = 0;
@@ -851,8 +851,8 @@ pub const Session = struct {
 
         try st.decompressLoop(unpacked_size);
 
-        // A filter program we could not identify — or one of the six whose
-        // transform is not implemented — means we cannot reproduce the data.
+        // A filter program we could not identify, or one of the six whose
+        // transform is not implemented, means we cannot reproduce the data.
         // The LZ output is real but incomplete, so returning it would be
         // silently wrong: the worst outcome for an integrity tool.
         if (st.unsupported_filter_seen) return error.Unsupported;
@@ -884,7 +884,7 @@ pub const Session = struct {
     }
 };
 
-// R[6] carries the region's byte offset WITHIN THE FILE; `start` is already
+// R[6] carries the region's byte offset WITHIN THE FILE. `start` is already
 // file-absolute here.
 fn applyFilter29(_: void, pf: *PendingFilter, region: []u8, scratch: []u8) Failure!void {
     if (region.len > scratch.len) return error.Unsupported;

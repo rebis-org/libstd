@@ -1,7 +1,7 @@
 const invoke = @import("compose/call.zig").invoke;
 const Call = @import("kernel/envelope.zig").Call;
 
-// Default wiring only; callers may assemble or bypass these pieces.
+// Default wiring only. Callers may assemble or bypass these pieces.
 comptime {
     _ = @import("compose/api.zig");
 }

@@ -10,7 +10,7 @@ const tee = @import("../common/primitive/tee.zig");
 const deflate = @import("../leaf/deflate.zig");
 pub const deflate_history_size = deflate.history_size;
 
-const GzipTee = tee.CountingTee(true, false);
+const GzipTee = tee.CountingTee(true, false, false);
 pub const Options = struct {
     modification_time: u32,
     extra_flags: u8,
@@ -55,7 +55,7 @@ pub const SinglePass = union(enum) {
     fallback: void,
 };
 
-// Fast path: ISIZE only seeds the attempt; commit needs exact count == ISIZE, CRC match, and trailer at input end. Every anomaly defers to the two-pass route.
+// Fast path: ISIZE only seeds the attempt. Commit needs exact count == ISIZE, CRC match, and trailer at input end. Every anomaly defers to the two-pass route.
 pub fn decodeSinglePass(input: []const u8, output: []u8, history: []u8) Failure!SinglePass {
     if (history.len < deflate_history_size) return error.InsufficientCapacity;
     if (input.len >= std.math.maxInt(u32)) return .fallback;

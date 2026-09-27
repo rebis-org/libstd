@@ -277,7 +277,7 @@ pub fn zipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
 }
 
 pub fn sevenZipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
-    // Single sevenzip profile unions decoded/coded sides: reads accept every method, writes pack; queries follow their target.
+    // Single sevenzip profile unions decoded/coded sides: reads accept every method, writes pack. Queries follow their target.
     return sevenZipGeneric(true, plan, source, sink, call, response, sizing, commit, limits, command_mask);
 }
 
@@ -388,10 +388,15 @@ fn parseSevenZipEntries(request: ?*Node, workspace: *resource.Workspace, default
             node_graph.findSelector(node.child, comptime discovery.parameter("tar", "entry_method").family, comptime discovery.parameter("tar", "entry_method").ordinal)
         else
             null;
+        const filter_node = if (allow_method)
+            node_graph.findSelector(node.child, comptime discovery.parameter("tar", "entry_filter").family, comptime discovery.parameter("tar", "entry_filter").ordinal)
+        else
+            null;
         const name = if (name_node) |n| try resource.checkedConstBytes(n.bytes, n.byte_length) else &.{};
         const data = if (data_node) |n| try resource.checkedConstBytes(n.bytes, n.byte_length) else &.{};
         const method = if (method_node) |n| try parseSevenZipMethod(n) else default_method;
         var entry: seven_zip.SevenZipEntry = .{ .name = name, .data = data, .method = method };
+        if (filter_node) |n| entry.filter = try parseSevenZipMethod(n);
         if (crypto_params) |params| {
             entry.encrypted = true;
             entry.password = params.password;
@@ -453,7 +458,7 @@ pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
         if (size > limits.decoded_bytes) return error.ResourceLimit;
         try common.requireSinkCapacity(sink_resource, call, size);
 
-        // The walk resolved the entry's declared needs into RarInfo; store
+        // The walk resolved the entry's declared needs into RarInfo. Store
         // entries carve nothing. The PPMd heap is whatever workspace remains:
         // the stream names its model size at decode time and is refused
         // cleanly if the pool cannot hold it.

@@ -45,6 +45,7 @@ pub const SevenZipEntry = struct {
     name: []const u8,
     data: []const u8,
     method: CoderMethod = .copy,
+    filter: ?CoderMethod = null,
     encrypted: bool = false,
     password: []const u8 = &.{},
     iv: [16]u8 = .{0} ** 16,
@@ -236,6 +237,27 @@ fn packEntry(entry: SevenZipEntry, workspace: *Workspace, limits: Limits, failur
             break :blk try packBuffer(ppmd, .ppmd, entry.data, unpacked_crc, workspace, limits, ppmd.encodeWorkspaceSize(default_ppmd_mem), options);
         },
         .delta, .x86, .ppc, .ia64, .arm, .armt, .sparc, .arm64, .riscv => blk: {
+            if (entry.filter) |explicit| {
+                // Explicit filter + caller-chosen coder: LZMA1 filters stay
+                // decodable by every 7z reader, LZMA2 is the modern default.
+                const filtered = try workspace.take(u8, entry.data.len);
+                @memcpy(filtered, entry.data);
+                try applyEncodeFilter(explicit, filtered);
+                var packed_entry = switch (entry.method) {
+                    .lzma => blk2: {
+                        const properties = lzma2.properties(default_dictionary);
+                        const options: lzma.Options = .{ .properties = properties, .unpack_size = filtered.len, .marker_required = false, .max_work = limits.codec_work };
+                        break :blk2 try packBuffer(lzma, .lzma, filtered, unpacked_crc, workspace, limits, lzma.encodeWorkspaceSizeBt(properties), options);
+                    },
+                    .lzma2 => blk2: {
+                        const options: lzma2.Options = .{ .dictionary_size = default_dictionary, .properties = lzma2.properties(default_dictionary), .max_work = limits.codec_work };
+                        break :blk2 try packBuffer(lzma2, .lzma2, filtered, unpacked_crc, workspace, limits, lzma2.encodeWorkspaceSizeBt(default_dictionary), options);
+                    },
+                    else => return error.InvalidCall,
+                };
+                packed_entry.filter = explicit;
+                break :blk packed_entry;
+            }
             const filtered = try workspace.take(u8, entry.data.len);
             @memcpy(filtered, entry.data);
             try applyEncodeFilter(entry.method, filtered);

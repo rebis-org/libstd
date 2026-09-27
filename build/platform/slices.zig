@@ -71,3 +71,16 @@ pub const android_abis = [_]AndroidAbi{
     .{ .library = "jni/arm64-v8a/libstd.so", .arch = .aarch64, .elf_machine = 183 },
     .{ .library = "jni/x86_64/libstd.so", .arch = .x86_64, .elf_machine = 62 },
 };
+
+// HarmonyOS (OHOS) targets for the cjpm package: cjc names these
+// aarch64-linux-ohos / x86_64-linux-ohos (see cjc cross-compilation docs).
+pub const OhosAbi = struct {
+    triple: []const u8,
+    arch: std.Target.Cpu.Arch,
+    elf_machine: u16,
+};
+
+pub const ohos_abis = [_]OhosAbi{
+    .{ .triple = "aarch64-linux-ohos", .arch = .aarch64, .elf_machine = 183 },
+    .{ .triple = "x86_64-linux-ohos", .arch = .x86_64, .elf_machine = 62 },
+};

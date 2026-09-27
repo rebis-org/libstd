@@ -30,6 +30,10 @@ fn hookForTag(comptime tag: vocabulary.ProfileTag) ProfileHook {
         .zip => archive.zipHook,
         .sevenzip => archive.sevenZipHook,
         .rar => archive.rarHook,
+        .zlib => transform.zlibHook,
+        .lz4 => transform.lz4Hook,
+        .zstd_seekable => transform.zstdSeekableHook,
+        .zdict => transform.zdictHook,
     };
 }
 

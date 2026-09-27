@@ -6,7 +6,7 @@ const options = @import("options");
 extern fn stdk_crc32_le(crc: u32, data: [*]const u8, len: usize) u32;
 extern fn stdk_crc32_le_pmull(crc: u32, data: [*]const u8, len: usize) u32;
 
-const crc32_pmull_threshold = 256; // Fold above this length; threshold from synthetic sweep.
+const crc32_pmull_threshold = 256; // Fold above this length. Threshold from synthetic sweep.
 
 pub const Crc32 = TableCrc(u32, 0xedb8_8320, true);
 
@@ -207,6 +207,152 @@ fn TableCrc(comptime T: type, comptime poly: T, comptime reflected: bool) type {
 
 pub const Bzip2Crc32 = TableCrc(u32, 0x04c11db7, false);
 pub const XZCrc64 = TableCrc(u64, 0xc96c5795d7870f42, true);
+
+pub const Adler32 = struct {
+    state: u32,
+
+    pub fn init() Adler32 {
+        return .{ .state = 1 };
+    }
+
+    pub fn update(self: *Adler32, input: []const u8) void {
+        var a: u32 = self.state & 0xffff;
+        var b: u32 = self.state >> 16;
+        var index: usize = 0;
+        while (index < input.len) {
+            const end = @min(index + 5552, input.len);
+            while (index < end) : (index += 1) {
+                a += input[index];
+                b += a;
+            }
+            a %= 65521;
+            b %= 65521;
+        }
+        self.state = (b << 16) | a;
+    }
+
+    pub fn final(self: *const Adler32) u32 {
+        return self.state;
+    }
+};
+
+pub fn adler32(input: []const u8) u32 {
+    var hasher = Adler32.init();
+    hasher.update(input);
+    return hasher.final();
+}
+
+const xxh32_prime1: u32 = 2654435761;
+const xxh32_prime2: u32 = 2246822519;
+const xxh32_prime3: u32 = 3266489917;
+const xxh32_prime4: u32 = 668265263;
+const xxh32_prime5: u32 = 374761393;
+
+fn xxh32Round(acc: u32, lane: u32) u32 {
+    return std.math.rotl(u32, acc +% lane *% xxh32_prime2, 13) *% xxh32_prime1;
+}
+
+pub const XxHash32 = struct {
+    seed: u32,
+    total: u64,
+    acc1: u32,
+    acc2: u32,
+    acc3: u32,
+    acc4: u32,
+    buffer: [16]u8,
+    buffer_len: usize,
+
+    pub fn init(seed: u32) XxHash32 {
+        return .{
+            .seed = seed,
+            .total = 0,
+            .acc1 = seed +% xxh32_prime1 +% xxh32_prime2,
+            .acc2 = seed +% xxh32_prime2,
+            .acc3 = seed,
+            .acc4 = seed -% xxh32_prime1,
+            .buffer = undefined,
+            .buffer_len = 0,
+        };
+    }
+
+    pub fn update(self: *XxHash32, input: []const u8) void {
+        self.total += input.len;
+        var data = input;
+        if (self.buffer_len != 0) {
+            const want = 16 - self.buffer_len;
+            const take = @min(want, data.len);
+            @memcpy(self.buffer[self.buffer_len..][0..take], data[0..take]);
+            self.buffer_len += take;
+            data = data[take..];
+            if (self.buffer_len == 16) {
+                self.consume(&self.buffer);
+                self.buffer_len = 0;
+            }
+        }
+        while (data.len >= 16) {
+            self.consume(data[0..16]);
+            data = data[16..];
+        }
+        if (data.len != 0) {
+            @memcpy(self.buffer[0..data.len], data);
+            self.buffer_len = data.len;
+        }
+    }
+
+    fn consume(self: *XxHash32, lanes: []const u8) void {
+        self.acc1 = xxh32Round(self.acc1, std.mem.readInt(u32, lanes[0..4], .little));
+        self.acc2 = xxh32Round(self.acc2, std.mem.readInt(u32, lanes[4..8], .little));
+        self.acc3 = xxh32Round(self.acc3, std.mem.readInt(u32, lanes[8..12], .little));
+        self.acc4 = xxh32Round(self.acc4, std.mem.readInt(u32, lanes[12..16], .little));
+    }
+
+    pub fn final(self: *const XxHash32) u32 {
+        var hash: u32 = undefined;
+        if (self.total >= 16) {
+            hash = std.math.rotl(u32, self.acc1, 1) +% std.math.rotl(u32, self.acc2, 7) +% std.math.rotl(u32, self.acc3, 12) +% std.math.rotl(u32, self.acc4, 18);
+        } else {
+            hash = self.seed +% xxh32_prime5;
+        }
+        hash +%= @truncate(self.total);
+        var rest: []const u8 = if (self.buffer_len != 0) self.buffer[0..self.buffer_len] else &.{};
+        var index: usize = 0;
+        while (index + 4 <= rest.len) : (index += 4) {
+            hash = std.math.rotl(u32, hash +% std.mem.readInt(u32, rest[index..][0..4], .little) *% xxh32_prime3, 17) *% xxh32_prime4;
+        }
+        while (index < rest.len) : (index += 1) {
+            hash = std.math.rotl(u32, hash +% @as(u32, rest[index]) *% xxh32_prime5, 11) *% xxh32_prime1;
+        }
+        hash ^= hash >> 15;
+        hash *%= xxh32_prime2;
+        hash ^= hash >> 13;
+        hash *%= xxh32_prime3;
+        hash ^= hash >> 16;
+        return hash;
+    }
+};
+
+pub fn xxh32(input: []const u8) u32 {
+    var hasher = XxHash32.init(0);
+    hasher.update(input);
+    return hasher.final();
+}
+
+test "xxh32 known vectors" {
+    try std.testing.expectEqual(@as(u32, 0x02CC5D05), xxh32(""));
+    try std.testing.expectEqual(@as(u32, 0x550D7456), xxh32("a"));
+    try std.testing.expectEqual(@as(u32, 0x32D153FF), xxh32("abc"));
+    try std.testing.expectEqual(@as(u32, 0xE2293B2F), xxh32("Nobody inspects the spammish repetition"));
+}
+
+test "adler32 known vectors" {
+    try std.testing.expectEqual(@as(u32, 0x00000001), adler32(""));
+    try std.testing.expectEqual(@as(u32, 0x091E01DE), adler32("123456789"));
+    try std.testing.expectEqual(@as(u32, 0x11E60398), adler32("Wikipedia"));
+    var hasher = Adler32.init();
+    hasher.update("1234");
+    hasher.update("56789");
+    try std.testing.expectEqual(@as(u32, 0x091E01DE), hasher.final());
+}
 
 test "crc32 known vectors" {
     try std.testing.expectEqual(@as(u32, 0x00000000), crc32(""));

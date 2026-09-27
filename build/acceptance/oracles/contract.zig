@@ -48,6 +48,10 @@ pub fn main(init: std.process.Init) !void {
         .{ .profile = "xz", .component = "xz" },
         .{ .profile = "sevenzip", .component = "sevenzip" },
         .{ .profile = "rar", .component = "rar" },
+        .{ .profile = "zlib", .component = "zlib" },
+        .{ .profile = "lz4", .component = "lz4" },
+        .{ .profile = "zstd_seekable", .component = "zstd-seekable" },
+        .{ .profile = "zdict", .component = "zdict" },
     };
 
     var catalog_profiles: usize = 0;
@@ -63,7 +67,7 @@ pub fn main(init: std.process.Init) !void {
     // One profile row per component plus descriptor-less protocol fixtures.
     const all = kernel.discovery.enumerate();
     check(catalog_profiles == all.len, "catalog profile count");
-    check(all.len == 18, "descriptor count");
+    check(all.len == 22, "descriptor count");
     for (all) |*descriptor| {
         check(kernel.discovery.findById(descriptor.id) == descriptor, "id lookup round trip");
     }

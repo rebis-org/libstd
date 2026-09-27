@@ -276,7 +276,7 @@ pub fn encodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, 
     try encodeStreamInner(input, writer, scratch, options);
 }
 
-// Estimate errs high by construction; zero pack margin avoids copy cascades,
+// Estimate errs high by construction. Zero pack margin avoids copy cascades,
 // snapshot/restore covers the residual underestimates.
 fn probeChunk(chunk: []const u8, est_scratch: []u8, props: lzma.Properties, options: Options) bool {
     const estimate = lzma.estimatedSize(chunk, est_scratch, .{
@@ -334,7 +334,7 @@ fn encodeStreamInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, o
             const snap_rep3 = encoder.rep3;
             encoder.snapshotModel(model_snapshot);
             encoder.setRangeEncoder(lzma.RangeEncoder.init(&pack_writer));
-            // First compressed chunk after copies must send props with reset (0xC0);
+            // First compressed chunk after copies must send props with reset (0xC0).
             // snapshot keeps the pre-reset model for the oversize restore.
             const send_props = !props_sent;
             if (send_props and !first) encoder.resetModelKeepDictionary();

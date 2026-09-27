@@ -1,4 +1,4 @@
-// Verbs name capability only; type-safe binding to codec code lives in the drivers.
+// Verbs name capability only. Type-safe binding to codec code lives in the drivers.
 pub const Id = struct {
     low: u64,
     high: u64,

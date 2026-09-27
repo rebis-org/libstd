@@ -34,7 +34,7 @@ pub const RarInfo = struct {
     method: u8 = 0,
     unpack_version: u8 = 0,
     window_bytes: u64 = 0,
-    // Modification time as Unix seconds; 0 when the producer recorded none
+    // Modification time as Unix seconds. 0 when the producer recorded none
     // or a non-Unix time base (RAR4 DOS-time entries). Solid marks a RAR
     // entry whose decode replays from its group start.
     mtime: u64 = 0,
@@ -46,7 +46,7 @@ pub const Entry = struct {
     family: enum { rar4, rar5 },
     is_directory: bool,
     // Normalized method: 0 = store, 1-5 = LZ level. RAR4 stores the raw
-    // 0x30-0x35 byte's low nibble; RAR5 the compression info's method field.
+    // 0x30-0x35 byte's low nibble. RAR5 the compression info's method field.
     method: u8,
     // RAR4: unpack version (15/20/26/29/36). RAR5: normalized algorithm
     // version (50 or 70).
@@ -67,7 +67,7 @@ const sfx_scan_limit: usize = 1024 * 1024;
 // ---------------------------------------------------------------------------
 
 // Decode-side buffers, carved by the caller (the compose hook) from the call
-// workspace. Only one engine state is live at a time; `state` holds whichever
+// workspace. Only one engine state is live at a time. `state` holds whichever
 // is in use. `ppm_heap` must be the LAST carve of the workspace so PPMd can
 // grow to whatever the stream requests within what remains.
 pub const DecodeBuffers = struct {
@@ -96,13 +96,13 @@ pub const DecodeBuffers = struct {
 };
 
 // Largest decode table pool across engines (unpack50 uses four tables of
-// 446 words each; unpack29 four of 404; unpack20 1402 total).
+// 446 words each. Unpack29 four of 404. Unpack20 1402 total).
 pub const table_pool_words = unpack50.table_pool_words * 4;
 
-// Window ceilings per family: RAR4 caps at 4 MB (dict code 6); RAR5 declares
+// Window ceilings per family: RAR4 caps at 4 MB (dict code 6). RAR5 declares
 // its own (base 0x20000 << dict_bits, 4-bit exponent for v50).
 pub const max_rar4_window: usize = 4 * 1024 * 1024;
-pub const max_rar5_window_bits: u6 = 31; // 0x20000 << 14 already is 2^31; refuse beyond
+pub const max_rar5_window_bits: u6 = 31; // 0x20000 << 14 already is 2^31. Refuse beyond
 pub const max_pending50 = unpack50.max_pending_filters;
 pub const max_pending29 = unpack29.max_pending_filters;
 pub const PendingFilter50 = filters50.Filter;
@@ -280,7 +280,7 @@ fn parseRar5Block(archive: []const u8, cursor: *usize) Failure!Rar5Block {
 }
 
 // Walk the archive, invoking `visit` for every file entry in archive order
-// (directories are walked but not visited; see the ordinal note below).
+// (directories are walked but not visited. See the ordinal note below).
 // Header CRCs are verified as blocks are crossed.
 fn walkRar5(archive: []const u8, offset: usize, ctx: anytype, comptime visit: fn (@TypeOf(ctx), Entry) Failure!void) Failure!void {
     var cursor = offset + rar5_signature.len;
@@ -305,7 +305,7 @@ fn walkRar5(archive: []const u8, offset: usize, ctx: anytype, comptime visit: fn
             rar5_type_service => {
                 if (!seen_main) return error.InvalidData;
                 // Service blocks (QuickOpen, etc.) carry no file payload we
-                // expose; skip their data.
+                // expose. Skip their data.
                 continue;
             },
             rar5_type_file => {
@@ -344,7 +344,7 @@ fn walkRar5(archive: []const u8, offset: usize, ctx: anytype, comptime visit: fn
                         if (method > 5) return error.Unsupported;
                         if (version != 50 and version != 70) return error.Unsupported;
                         const win_bits_field: u6 = @intCast((header.compression >> 10) & (if (version == 70) @as(u64, 0x1F) else 0x0F));
-                        // The window the entry was encoded against; decoding
+                        // The window the entry was encoded against. Decoding
                         // with less would silently truncate history, so a
                         // window we cannot fit is refused, never clamped.
                         const win: u64 = (@as(u64, 0x20000) << win_bits_field);
@@ -402,7 +402,7 @@ fn dictBitsRar4(file_flags: u16) u5 {
 // ---------------------------------------------------------------------------
 
 // Header CRC note (measured against production archives and the unrar
-// reference): RAR legacy HEAD_CRC is the low 16 bits of CRC-32 — NOT
+// reference): RAR legacy HEAD_CRC is the low 16 bits of CRC-32, not
 // CRC-16/ARC, despite the field's width. CRC-16/ARC of real header bytes
 // gives values no producer stores.
 
@@ -438,8 +438,8 @@ fn parseRar4Header(archive: []const u8, offset: usize) Failure!Rar4Header {
     const header_end = try bounds.add(offset, head_size);
     if (header_end > archive.len) return error.InvalidData;
     const flags = std.mem.readInt(u16, head[3..5], .little);
-    // CRC-32 low 16 bits over bytes [2..head_size] — except the marker block
-    // (0x72), whose first two bytes ARE the 'Ra' signature and carry no CRC;
+    // CRC-32 low 16 bits over bytes [2..head_size], except the marker block
+    // (0x72), whose first two bytes ARE the 'Ra' signature and carry no CRC.
     // the reference exempts HEAD3_SIGN the same way.
     if (head[2] != rar4_mark) {
         const stored_crc = std.mem.readInt(u16, head[0..2], .little);
@@ -469,16 +469,16 @@ const Rar4File = struct {
     method: u8,
     name: []const u8,
     is_directory: bool,
-    // RAR4 mtime is Unix time only for Unix producers; other host systems
+    // RAR4 mtime is Unix time only for Unix producers. Other host systems
     // write DOS date/time, which has no timezone-free Unix conversion.
     host_os: u8,
     mtime: u32,
 };
 
 fn parseRar4File(archive: []const u8, header: Rar4Header) Failure!Rar4File {
-    // For a RAR4 file block the base header's ADD_SIZE field IS PACK_SIZE;
+    // For a RAR4 file block the base header's ADD_SIZE field IS PACK_SIZE.
     // there is no second packed-size field. Reading one here would shift
-    // every subsequent field by 4 bytes (the reference got this wrong once;
+    // every subsequent field by 4 bytes (the reference got this wrong once.
     // every entry then showed empty names, ~2^32 sizes, and one shared CRC).
     var packed_size: u64 = header.data_size;
     const fields_offset = try bounds.add(header.header_offset, 7 + @as(usize, if (header.flags & rar4_long_block != 0) 4 else 0));
@@ -501,7 +501,7 @@ fn parseRar4File(archive: []const u8, header: Rar4Header) Failure!Rar4File {
     const name = try sub.readSlice(name_size);
 
     // The dictionary-size field with every bit set is the DIRECTORY marker
-    // (LHD_WINDOWMASK == LHD_DIRECTORY == 0x00e0); a directory has no data.
+    // (LHD_WINDOWMASK == LHD_DIRECTORY == 0x00e0). a directory has no data.
     const is_directory = (header.flags & rar4_window_mask) == rar4_window_directory;
 
     return .{
@@ -528,7 +528,7 @@ fn walkRar4(archive: []const u8, ctx: anytype, comptime visit: fn (@TypeOf(ctx),
         switch (header.header_type) {
             rar4_mark => {},
             rar4_main => {
-                // 0x0040 is MHD_PROTECT (recovery record) — NOT password;
+                // 0x0040 is MHD_PROTECT (recovery record), not password.
                 // conflating them reported every protected archive as
                 // encrypted. Only 0x0080 (MHD_PASSWORD) and the volume flag
                 // are unsupported here.
@@ -654,13 +654,13 @@ pub fn rarInspectOrdinal(archive: []const u8, ordinal: usize, max_entries: u64) 
 // Decode
 // ---------------------------------------------------------------------------
 
-// Largest of the three engine states; the caller carves one buffer this big
+// Largest of the three engine states. The caller carves one buffer this big
 // and the active engine is constructed in place.
 pub const max_state_bytes = @max(@sizeOf(unpack50.State), @max(@sizeOf(unpack29.State), @sizeOf(unpack20.State)));
 
 // Pass 1: locate the target entry and, for a solid target, the ordinal where
 // its compression group started (the most recent non-solid file entry before
-// it), plus the largest dictionary any group member declares — the shared
+// it), plus the largest dictionary any group member declares. The shared
 // session must be built for that window.
 const LocateCtx = struct {
     target: usize,
@@ -698,7 +698,7 @@ fn locateVisit(ctx: *LocateCtx, entry: Entry) Failure!void {
     ctx.ordinal = try bounds.add(ctx.ordinal, 1);
 }
 
-// Pass 2: replay the group's compressed entries through the session — a
+// Pass 2: replay the group's compressed entries through the session. A
 // discard sink for predecessors, the caller's buffer for the target. Store
 // entries never join a compressed stream and are skipped. Entries before the
 // group start cost a header walk only.
@@ -712,7 +712,7 @@ fn replayVisit(
     if (entry.is_directory) return;
     if (entry.info.ordinal > ctx.target) return;
     if (entry.info.ordinal < ctx.group_start) return;
-    if (entry.method == 0) return; // stores never join a compressed stream; the facade copies them
+    if (entry.method == 0) return; // stores never join a compressed stream. The facade copies them
     const payload = try bounds.slice(archive, entry.info.data_offset, entry.info.packed_size);
     if (entry.info.ordinal == ctx.target) {
         const size = std.math.cast(usize, entry.info.size) orelse return error.ResourceLimit;
@@ -748,7 +748,7 @@ pub fn rarDecodeOrdinal(
         try replayCompressed(archive, &locate, entry, output[0..size], bufs, window_len);
     }
 
-    // Integrity: CRC32 over the delivered bytes; RAR5 archives that carry a
+    // Integrity: CRC32 over the delivered bytes. RAR5 archives that carry a
     // BLAKE2sp hash extra record verify that too.
     if (entry.info.has_crc and checksum.crc32(output[0..size]) != entry.info.crc) return error.IntegrityFailure;
     if (entry.blake2) |expected| {

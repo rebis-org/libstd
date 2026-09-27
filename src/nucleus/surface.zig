@@ -29,7 +29,7 @@ fn statusFor(failure: Failure) u32 {
     };
 }
 
-// Source/destination aliasing traps as overlap (in-place is a different verb);
+// Source/destination aliasing traps as overlap (in-place is a different verb).
 // null with nonzero length returns a status, provenance violations trap.
 pub fn nucleusCopy(output: Surface, input: ConstSurface) callconv(.c) u32 {
     const destination = span.mutSpan(output.ptr, output.len) catch |failure| return statusFor(failure);

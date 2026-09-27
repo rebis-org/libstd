@@ -7,7 +7,7 @@ const BitReader = bits.BitReader;
 // PPMd variant H, the model RAR3 "text compression" blocks use. Pointers are
 // u32 offsets into a caller-provided heap slice, dereferenced through packed
 // extern views (same technique as the 7z PPMd leaf). Offset 0 is unreachable
-// — successor stubs are recorded after the pText increment — so it serves as
+// successor stubs are recorded after the pText increment, so it serves as
 // NULL and the reference's `ptr <= pText` guards work verbatim on offsets.
 
 const int_bits: u5 = 7;
@@ -36,7 +36,7 @@ const StateView = extern struct {
     succ_lo: u16,
     succ_hi: u16,
 
-    // The successor is one u32 in the wire layout; the view splits it into
+    // The successor is one u32 in the wire layout. The view splits it into
     // two u16 halves to keep the packed struct at the 6-byte PPMd stride.
     inline fn succ(self: *const StateView) u32 {
         return @as(u32, self.succ_hi) << 16 | self.succ_lo;
@@ -113,7 +113,7 @@ const RangeCoder = struct {
     }
 
     // (code-low)/(range /= scale). A zero divisor is corrupt-stream state the
-    // C original would crash on; report corruption instead.
+    // C original would crash on. Report corruption instead.
     fn currentCount(self: *RangeCoder) Failure!u32 {
         if (self.scale == 0) return error.InvalidData;
         self.range /= self.scale;
@@ -189,7 +189,7 @@ const SubAllocator = struct {
         self.sub_allocator_size = 0;
     }
 
-    // heap must be at least (sa_size_mb << 20) bytes; the caller sizes the
+    // heap must be at least (sa_size_mb << 20) bytes. The caller sizes the
     // slice before the stream's requested model size is known, so a stream
     // asking for more than the caller provisioned is refused here. The pool
     // is 4-byte aligned inside the slice so u32 fields load directly.
@@ -211,7 +211,7 @@ const SubAllocator = struct {
         self.ptext = 0;
 
         const t = self.sub_allocator_size;
-        // 7/8 of the pool for units, 1/8 for the text area; UNIT_SIZE ==
+        // 7/8 of the pool for units, 1/8 for the text area. UNIT_SIZE ==
         // FIXED_UNIT_SIZE collapses the reference's Real*/Fake* split except
         // for the +UNIT_SIZE remainder compensation, kept verbatim.
         const size2: u32 = unit_size * (t / 8 / unit_size * 7);
@@ -283,7 +283,7 @@ const SubAllocator = struct {
     }
 
     // GlueFreeBlocks. The reference threads a stack-local sentinel node (s0)
-    // into the doubly-linked list; the sentinel's links live in locals and
+    // into the doubly-linked list. The sentinel's links live in locals and
     // accesses route through S0 comparisons instead.
     const s0: u32 = 0xFFFFFFFF;
 
@@ -314,7 +314,7 @@ const SubAllocator = struct {
         while (p != s0) : (p = blkAt(h, p).next) {
             while (true) {
                 const p1 = p + u2b(blkAt(h, p).nu);
-                if (p1 + unit_size > h.len) break; // guard; unreachable for valid states
+                if (p1 + unit_size > h.len) break; // guard. Unreachable for valid states
                 const blk1 = blkAt(h, p1);
                 if (blk1.stamp != 0xFFFF) break;
                 const total: u32 = @as(u32, blkAt(h, p).nu) + blk1.nu;
@@ -507,7 +507,7 @@ pub const PpmModel = struct {
         return m;
     }
 
-    // heap: caller-provided pool; the stream names its model size in MiB and
+    // heap: caller-provided pool. The stream names its model size in MiB and
     // anything up to heap.len is accepted, larger is refused.
     pub fn startModel(self: *Self, heap: []u8, max_order: u32, heap_mb: u32) Failure!void {
         self.esc_count = 1;
@@ -540,7 +540,7 @@ pub const PpmModel = struct {
     }
 
     // ModelPPM::DecodeInit. The reference peeks the PPM-block flag without
-    // consuming, so this first byte read must stay bit-aligned with it;
+    // consuming, so this first byte read must stay bit-aligned with it.
     // consuming even one flag bit desynchronises the whole stream.
     pub fn decodeInit(self: *Self, br: *BitReader, heap: []u8, esc_char: *u8) Failure!bool {
         var max_order: u32 = RangeCoder.getByte(br);
@@ -675,7 +675,7 @@ pub const PpmModel = struct {
         const h = self.sub.heap;
         const cctx = ctxAt(h, c);
         const old_ns: u32 = cctx.num_stats;
-        if (old_ns == 0) return; // corrupt heap; guards will surface it
+        if (old_ns == 0) return; // corrupt heap. Guards will surface it
         var i: u32 = old_ns - 1;
         const stats = cctx.stats;
 
@@ -970,7 +970,7 @@ pub const PpmModel = struct {
         const cctx = ctxAt(h, c);
         const suffix_ns: usize = ctxAt(h, cctx.suffix).num_stats;
         // Saturating indexes: a corrupt heap can hold zero frequencies or a
-        // zero-stats suffix; the C original would index garbage, we take the
+        // zero-stats suffix. The C original would index garbage, we take the
         // escape path and let the guards/CRC surface it.
         const freq_idx: usize = @as(usize, rs_state.freq) -| 1;
         if (suffix_ns == 0) {
@@ -987,7 +987,7 @@ pub const PpmModel = struct {
         const bs = &self.bin_summ[freq_idx][bs_idx];
 
         const shifted = self.coder.currentShiftCount(tot_bits) catch {
-            // Range collapse: force the escape path; guards will surface it.
+            // Range collapse: force the escape path. Guards will surface it.
             self.found_state = null_off;
             self.coder.low_count = 0;
             self.coder.high_count = bin_scale;
@@ -1100,7 +1100,7 @@ pub const PpmModel = struct {
         const cctx = ctxAt(h, c);
         const num_stats: u32 = cctx.num_stats;
         if (diff == 0) {
-            // Nothing left unmasked; the reference would index ns2indx[-1].
+            // Nothing left unmasked. The reference would index ns2indx[-1].
             self.coder.scale = 1;
             return &self.dummy_see2;
         }

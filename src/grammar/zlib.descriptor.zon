@@ -1,0 +1,30 @@
+// Component descriptor (zlib, class grammar).
+// Identity and policy are frozen ABI: rename or re-id is a breaking
+// change, caught by the comptime assertions in kernel/catalog.zig.
+.{
+    .id = .{ .low = "0x6e6b82f08d910414", .high = "0xa7a351053d6d4014" },
+    .name = "zlib",
+    .class = "grammar",
+    .verbs = .{ "inspect", "decode_ordinal", "encode_ordinal", "encode_stream", "decoded_size" },
+    .parameters = .{},
+    .capabilities = .{ "read", "replay" },
+    .sizing = "measured",
+    .commit = "tentative",
+    .limits = .{ .window = 32768, .block = 0, .history = 0 },
+    .benchmark = .{
+        .row = "zlib",
+        .params = "zlib -6",
+        .kind = "zlib",
+        .ext = "zlib",
+        .cmd = null,
+        .lib = "zlib",
+        .bin = null,
+        .fmt = 0,
+        .ref_params = "zlib -6",
+        .tunings = .{
+            .{
+                .lib_level = 6,
+            },
+        },
+    },
+}

@@ -119,7 +119,7 @@ fn dispatch(envelope: *Call, response: *Node) Failure!void {
         if (sizing != policy.sizing) return error.Unsupported;
         if (commit != policy.commit) return error.Unsupported;
     }
-    // size_bound only opts measured writes into bounded sizing; other targets map to unsupported as parameter misuse.
+    // size_bound only opts measured writes into bounded sizing. Other targets map to unsupported as parameter misuse.
     var effective_sizing = sizing;
     if (node_graph.findParameter(envelope.request, ids.size_bound) != null) {
         if (policy.sizing != .measured or effective_command_mask != command_mask_write) return error.Unsupported;

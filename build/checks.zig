@@ -73,6 +73,7 @@ fn addPackage(b: *std.Build, ctx: *common.Context) void {
     package_run.addFileArg(archives.host);
     package_run.addFileArg(archives.android);
     package_run.addFileArg(archives.apple);
+    package_run.addFileArg(archives.cjpm);
     package_run.addFileArg(ctx.host.dynamic_library.getEmittedBin());
     b.step("package", "Validate distribution archives").dependOn(&package_run.step);
 }

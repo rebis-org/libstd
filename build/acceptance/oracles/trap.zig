@@ -171,7 +171,7 @@ const scenarios = [_]struct {
     .{ .name = "copy-round-trip", .expect = .{ .exit = 0 }, .run = scenarioCopyRoundTrip },
 };
 
-// Signals 4-11 cover SIGILL..SIGSEGV; SIGTRAP and debug panics land in the same band.
+// Signals 4-11 cover SIGILL..SIGSEGV. SIGTRAP and debug panics land in the same band.
 fn isTrapSignal(term: std.process.Child.Term) bool {
     return switch (term) {
         .signal => |sig| @intFromEnum(sig) >= 4 and @intFromEnum(sig) <= 11,

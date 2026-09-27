@@ -35,8 +35,8 @@ pub fn filterTypeFromRaw(raw: u3) ?FilterType {
 // Largest region one RAR5 filter may cover (reference MAX_FILTER_BLOCK_SIZE).
 pub const max_filter_block: usize = 0x400000;
 
-// The wrap constant the E8/E8E9 filter relocates against — a FIXED 16 MB.
-// (An earlier reading used the file size here; every filtered region past the
+// The wrap constant the E8/E8E9 filter relocates against, a FIXED 16 MB.
+// (An earlier reading used the file size here. Every filtered region past the
 // first then decoded to the wrong bytes. The constant and the file offset are
 // different quantities that appear two lines apart in the reference.)
 const e8_wrap: u32 = 0x1000000;
@@ -106,7 +106,7 @@ pub fn applyArm(data: []u8, file_offset: u64) void {
     while (i + 3 < data.len) : (i += 4) {
         if (data[i + 3] == 0xEB) {
             // ARM BL with the 'always' condition. Plain unsigned 24-bit
-            // arithmetic; only the low 24 bits are written back, so no sign
+            // arithmetic. Only the low 24 bits are written back, so no sign
             // extension is needed (or performed by the reference). Branches
             // count in instruction units, hence the /4.
             const b0: u32 = data[i];
@@ -124,7 +124,7 @@ pub fn applyArm(data: []u8, file_offset: u64) void {
 }
 
 // Wire format (reference ReadFilterData): a 2-bit prefix gives the byte count
-// (1-4); the value assembles little-endian, first byte read = low 8 bits.
+// (1-4). The value assembles little-endian, first byte read = low 8 bits.
 pub fn readFilterSize(br: *BitReader) Failure!usize {
     const byte_count: u3 = @intCast((try br.readBits(2)) + 1);
     var value: usize = 0;

@@ -1,6 +1,6 @@
 const std = @import("std");
 
-// Reader machinery only refills buffered readers, so chunks stage through a small buffer; handed bytes are permanently consumed, so accounting uses returned counts.
+// Reader machinery only refills buffered readers, so chunks stage through a small buffer. Handed bytes are permanently consumed, so accounting uses returned counts.
 pub const ChunkInput = struct {
     reader: std.Io.Reader,
     chunk: []const u8 = &.{},

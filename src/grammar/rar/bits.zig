@@ -3,7 +3,7 @@ const failure = @import("../../common/primitive/failure.zig");
 const Failure = failure.Failure;
 
 // RAR packs codes MSB-first within each byte, fixing every table's bit
-// order. The reader is hard-bounded by default; v29 opts into zero padding
+// order. The reader is hard-bounded by default. V29 opts into zero padding
 // because its end-of-block marker peeks 16 bits to reach 1-2 final bits (the
 // reference reads an over-allocated buffer the same way).
 
@@ -38,7 +38,7 @@ pub const BitReader = struct {
         return (self.data.len + self.pad_bytes) * 8;
     }
 
-    // A stream that ends mid-code can still exit cleanly; this records whether
+    // A stream that ends mid-code can still exit cleanly. This records whether
     // any padding byte was consumed, so callers can distinguish "finished"
     // from "ran out" instead of trusting the exit status.
     pub fn overran(self: *const BitReader) bool {
@@ -72,7 +72,7 @@ pub const BitReader = struct {
         const result: u32 = @intCast(self.buffer >> shift);
         self.buffer <<= @intCast(count);
         // Saturating: inside the padding region the buffer holds fewer real
-        // bits than served; the rest are implicit zeros.
+        // bits than served. The rest are implicit zeros.
         self.bits_in_buffer -= @min(count, self.bits_in_buffer);
         self.bit_pos += count;
         return result;
@@ -244,14 +244,14 @@ test "bit writer round-trips through the reader" {
     var br = BitReader.init(buf[0..n]);
     try std.testing.expectEqual(@as(u32, 0b101), try br.readBits(3));
     try std.testing.expectEqual(@as(u32, 0x1FF), try br.readBits(9));
-    // The flushed buffer is 16 bits; 4 bits of zero padding remain unread.
+    // The flushed buffer is 16 bits. 4 bits of zero padding remain unread.
     try std.testing.expectEqual(@as(usize, 4), br.remainingBits());
 }
 
 test "bit writer refuses a full buffer" {
     var buf: [1]u8 = undefined;
     var bw = BitWriter.init(&buf);
-    // The first byte flushes; the second trips the capacity check inside the
+    // The first byte flushes. The second trips the capacity check inside the
     // write itself.
     try std.testing.expectError(error.InsufficientCapacity, bw.writeBits(0xFFFF, 16));
 }

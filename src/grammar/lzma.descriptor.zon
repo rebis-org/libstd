@@ -5,8 +5,10 @@
     .id = .{ .low = "0x6e6b82f08d91040b", .high = "0xa7a351053d6d400b" },
     .name = "lzma-file",
     .class = "grammar",
-    .verbs = .{ "inspect", "decode_ordinal", "decoded_size" },
-    .parameters = .{},
+    .verbs = .{ "inspect", "decode_ordinal", "decoded_size", "encode_ordinal", "required_size", "encoded_size_bound" },
+    .parameters = .{
+        .{ .name = "dictionary", .family = 6, .ordinal = 1, .representation = "scalar_words" },
+    },
     .capabilities = .{ "read", "replay" },
     .sizing = "measured",
     .commit = "tentative",

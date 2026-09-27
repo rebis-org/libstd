@@ -3,7 +3,7 @@ const drivers = @import("compose/drivers.zig");
 const sessions = @import("compose/sessions.zig");
 const gzip = @import("grammar/gzip.zig");
 
-// Both paths run the same leaf code, so outputs and step counts must match; input is
+// Both paths run the same leaf code, so outputs and step counts must match. Input is
 // non-periodic xorshift because repeating corpora hide composition bugs.
 // Rooted at src/: module confinement requires it for mains reaching the whole tree.
 var failures: usize = 0;

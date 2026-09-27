@@ -8,7 +8,7 @@ const envelope = @import("envelope.zig");
 const Id = envelope.Id;
 const Status = envelope.Status;
 
-// Wire values are frozen ABI; per-profile policy lives in compose, per-component
+// Wire values are frozen ABI. Per-profile policy lives in compose, per-component
 // declaration in the descriptor files.
 
 pub const DescriptorKind = enum(u32) {
@@ -214,6 +214,10 @@ pub const ProfileTag = enum {
     zip,
     sevenzip,
     rar,
+    zlib,
+    lz4,
+    zstd_seekable,
+    zdict,
 };
 
 pub const CommandPolicy = struct {
@@ -261,6 +265,10 @@ pub const ids = struct {
     pub const xz = Id{ .low = 0x6e6b_82f0_8d91_040d, .high = 0xa7a3_5105_3d6d_400d };
     pub const rar = Id{ .low = 0x6e6b_82f0_8d91_040f, .high = 0xa7a3_5105_3d6d_400f };
     pub const crypto = Id{ .low = 0x6e6b_82f0_8d91_0410, .high = 0xa7a3_5105_3d6d_4010 };
+    pub const zlib = Id{ .low = 0x6e6b_82f0_8d91_0414, .high = 0xa7a3_5105_3d6d_4014 };
+    pub const lz4 = Id{ .low = 0x6e6b_82f0_8d91_0415, .high = 0xa7a3_5105_3d6d_4015 };
+    pub const zstd_seekable = Id{ .low = 0x6e6b_82f0_8d91_0416, .high = 0xa7a3_5105_3d6d_4016 };
+    pub const zdict = Id{ .low = 0x6e6b_82f0_8d91_0417, .high = 0xa7a3_5105_3d6d_4017 };
     pub const callback_size = Id{ .low = 0x6e6b_82f0_8d91_0a01, .high = 0xa7a3_5105_3d6d_a001 };
     pub const callback_read = Id{ .low = 0x6e6b_82f0_8d91_0a02, .high = 0xa7a3_5105_3d6d_a002 };
     pub const callback_write = Id{ .low = 0x6e6b_82f0_8d91_0a03, .high = 0xa7a3_5105_3d6d_a003 };

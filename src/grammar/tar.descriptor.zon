@@ -19,6 +19,7 @@
         .{ .name = "entry_link_name", .family = 2, .ordinal = 10, .representation = "bytes" },
         .{ .name = "entry_uid", .family = 2, .ordinal = 11, .representation = "scalar_words" },
         .{ .name = "entry_mtime", .family = 2, .ordinal = 12, .representation = "scalar_words" },
+        .{ .name = "entry_filter", .family = 2, .ordinal = 13, .representation = "scalar_words" },
     },
     .capabilities = .{ "read", "write", "size", "replay" },
     .sizing = "metadata_exact",

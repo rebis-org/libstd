@@ -80,6 +80,11 @@ const cmds = struct {
         .encode = .{ .out = .file, .args = &.{ .bin, .{ .lit = "e" }, .input, .output, .extra } },
         .decode = .{ .out = .file, .args = &.{ .bin, .{ .lit = "d" }, .archive, .outfile } },
     };
+    const lz4 = Cmd{
+        .exe = "lz4",
+        .encode = .{ .out = .stdout, .args = &.{ .bin, .{ .lit = "-q" }, .{ .lit = "-c" }, .extra, .input } },
+        .decode = .{ .out = .stdout, .args = &.{ .bin, .{ .lit = "-q" }, .{ .lit = "-dc" }, .archive } },
+    };
 };
 
 pub fn get(comptime id: matrix.Cmd) Cmd {
@@ -93,6 +98,7 @@ pub fn get(comptime id: matrix.Cmd) Cmd {
         .ziptool => cmds.ziptool,
         .unrar => cmds.unrar,
         .lzma => cmds.lzma,
+        .lz4 => cmds.lz4,
     };
 }
 

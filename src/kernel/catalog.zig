@@ -6,7 +6,7 @@ const EnvelopeId = envelope.Id;
 const vocabulary = @import("vocabulary.zig");
 pub const Descriptor = vocabulary.Descriptor;
 
-// Wire values live in vocabulary; per-component identity and limits live in descriptors.
+// Wire values live in vocabulary. Per-component identity and limits live in descriptors.
 
 const all_capabilities = vocabulary.resource_capability_bit_read | vocabulary.resource_capability_bit_write | vocabulary.resource_capability_bit_size | vocabulary.resource_capability_bit_replay | vocabulary.resource_capability_bit_seek | vocabulary.resource_capability_bit_range;
 const archive_capabilities = vocabulary.resource_capability_bit_read | vocabulary.resource_capability_bit_write | vocabulary.resource_capability_bit_size | vocabulary.resource_capability_bit_replay;
@@ -14,7 +14,7 @@ const commands_masks = vocabulary.command_mask_query | vocabulary.command_mask_r
 const read_write_mask = vocabulary.command_mask_read | vocabulary.command_mask_write;
 const query_read_mask = vocabulary.command_mask_query | vocabulary.command_mask_read;
 
-// Policy fields only; behavioral policy lives in compose catalog.
+// Policy fields only. Behavioral policy lives in compose catalog.
 pub const ProfileRow = struct {
     id: EnvelopeId,
     name: []const u8,
@@ -24,7 +24,7 @@ pub const ProfileRow = struct {
     commit: vocabulary.CommitMode,
 };
 
-// Policy is component data from descriptors; fixture rows below are reference-only legacy.
+// Policy is component data from descriptors. Fixture rows below are reference-only legacy.
 pub const fixture_rows = [_]ProfileRow{
     .{ .id = vocabulary.ids.test_echo, .name = "test_echo", .command_mask = read_write_mask, .capability_mask = all_capabilities, .sizing = .metadata_exact, .commit = .confirmed },
     .{ .id = vocabulary.ids.test_read, .name = "test_read", .command_mask = query_read_mask, .capability_mask = all_capabilities, .sizing = .metadata_exact, .commit = .confirmed },
@@ -145,6 +145,10 @@ comptime {
         .{ .component = "xz", .profile = "xz" },
         .{ .component = "zip", .profile = "zip" },
         .{ .component = "zstd", .profile = "zstd" },
+        .{ .component = "zlib", .profile = "zlib" },
+        .{ .component = "lz4", .profile = "lz4" },
+        .{ .component = "zstd-seekable", .profile = "zstd_seekable" },
+        .{ .component = "zdict", .profile = "zdict" },
     };
     for (expected) |pair| {
         const component = discovery.findByName(pair.component) orelse

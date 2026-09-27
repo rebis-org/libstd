@@ -1,6 +1,6 @@
 # libstd
 
-Library (for standard) in Zig as XCFramework and AAR
+Library (for standard) in Zig as XCFramework, cjpm and AAR
 
 > [!WARNING]
 > This project is an experimental implementation and should be treated as such in production environments.

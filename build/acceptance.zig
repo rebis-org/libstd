@@ -85,6 +85,7 @@ fn addOracles(b: *std.Build, ctx: *common.Context) void {
     app.exe.root_module.linkSystemLibrary("bz2", .{});
     app.exe.root_module.linkSystemLibrary("archive", .{});
     app.exe.root_module.addObjectFile(ctx.refs.?.zstd_lib);
+    app.exe.root_module.addObjectFile(ctx.refs.?.lz4_lib);
     app.run.addFileArg(ctx.generated.catalog);
 
     const skip_options = b.addOptions();
@@ -106,6 +107,7 @@ fn addOracles(b: *std.Build, ctx: *common.Context) void {
     skip_app.exe.root_module.linkSystemLibrary("bz2", .{});
     skip_app.exe.root_module.linkSystemLibrary("archive", .{});
     skip_app.exe.root_module.addObjectFile(ctx.refs.?.zstd_lib);
+    skip_app.exe.root_module.addObjectFile(ctx.refs.?.lz4_lib);
     skip_app.run.addFileArg(ctx.generated.catalog);
 
     const baseline_ab_run = b.addRunArtifact(app.exe);
@@ -193,7 +195,7 @@ fn addBenchmark(b: *std.Build, ctx: *common.Context, refs: cmd.Refs) void {
     refs.link(b, app.exe.root_module);
     app.exe.root_module.addCSourceFile(.{ .file = b.path("build/acceptance/benchmark/ref/libzip.c") });
     app.exe.root_module.addCSourceFile(.{ .file = b.path("build/acceptance/benchmark/ref/unrar.c") });
-    // SDK path exists only for Darwin targets; expansion runs for every -Dtarget.
+    // SDK path exists only for Darwin targets. Expansion runs for every -Dtarget.
     const macos_sdk_usr_lib: ?[]const u8 = if (ref_target.result.os.tag.isDarwin())
         macosSdkUsrLib(b, ctx) orelse
             @panic("benchmark build needs the macOS SDK: run `xcode-select` to point at an Xcode install")

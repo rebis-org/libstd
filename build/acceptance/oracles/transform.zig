@@ -230,7 +230,7 @@ fn gzConcat(r: *Runner) !void {
     if (r.required != part1_len + part2_len) return error.ConcatenatedQueryLengthMismatch;
     try harness.spanCall(r, harness.ids.read, r.encoded[0..r.encoded_len], r.output);
     if (r.response.byte_length != 22 or !std.mem.eql(u8, r.output[0..22], r.input[0..22])) return error.ConcatenatedReadMismatch;
-    // Tail ISIZE belongs to the second member, so the fast path aborts and falls back; the prefix may be tentative.
+    // Tail ISIZE belongs to the second member, so the fast path aborts and falls back. The prefix may be tentative.
     const short: usize = part1_len + part2_len - 6;
     var required: harness.Node = undefined;
     var available: harness.Node = undefined;
@@ -263,7 +263,7 @@ fn gzCorruption(r: *Runner) !void {
         harness.sourceSpan(bad_copy[0..r.encoded_len]),
         harness.sinkSpan(r.output),
     }, .{ .ctx = true }, abi.Status.integrity_failure, r.output);
-    // Low ISIZE byte fits the sink, so the fast path decodes fully before falling back; only status is asserted.
+    // Low ISIZE byte fits the sink, so the fast path decodes fully before falling back. Only status is asserted.
     @memcpy(bad_copy[0..r.encoded_len], r.encoded[0..r.encoded_len]);
     bad_copy[r.encoded_len - 4] ^= 0xff;
     _ = harness.call(r, harness.ids.read, &.{

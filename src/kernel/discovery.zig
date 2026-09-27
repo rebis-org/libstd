@@ -2,12 +2,13 @@ const std = @import("std");
 const contract = @import("nucleus").contract;
 pub const components = @import("components");
 
-// Table is comptime-small, so linear scan suffices; hot dispatch lives in the drivers.
+// Table is comptime-small, so linear scan suffices. Hot dispatch lives in the drivers.
 pub fn enumerate() []const contract.Descriptor {
     return &components.descriptors;
 }
 
 pub fn findByName(name: []const u8) ?*const contract.Descriptor {
+    @setEvalBranchQuota(10_000);
     for (&components.descriptors) |*descriptor| {
         if (std.mem.eql(u8, descriptor.name, name)) return descriptor;
     }
@@ -15,14 +16,16 @@ pub fn findByName(name: []const u8) ?*const contract.Descriptor {
 }
 
 pub fn findById(id: contract.Id) ?*const contract.Descriptor {
+    @setEvalBranchQuota(10_000);
     for (&components.descriptors) |*descriptor| {
         if (contract.eqlId(descriptor.id, id)) return descriptor;
     }
     return null;
 }
 
-// Ordinals are component data; one declaration per wire parameter.
+// Ordinals are component data. One declaration per wire parameter.
 pub fn parameter(comptime component_name: []const u8, comptime parameter_name: []const u8) contract.Parameter {
+    @setEvalBranchQuota(10_000);
     const component = findByName(component_name) orelse @compileError("Unknown component \"" ++ component_name ++ "\".");
     for (component.parameters) |parameter_entry| {
         if (std.mem.eql(u8, parameter_entry.name, parameter_name)) return parameter_entry;

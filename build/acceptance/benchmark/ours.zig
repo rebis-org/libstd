@@ -40,6 +40,8 @@ fn profileOf(kind: matrix.Kind) harness.Id {
         .zip => harness.ids.zip,
         .seven_zip => harness.ids.sevenzip,
         .rar => harness.ids.rar,
+        .zlib => harness.ids.zlib,
+        .lz4 => harness.ids.lz4,
     };
 }
 
@@ -110,7 +112,7 @@ pub fn transform(env: *env_mod.Env, row: matrix.Row, input: []const u8, encoded:
     return .{ .encode_ns = write_result.ns, .decode_ns = read_result.decode_ns, .encoded = write_result.len, .ok = read_result.ok };
 }
 
-// Bypass row caller-wires the zstd leaf with no kernel in the loop; the untimed kernel transform proves byte-identity.
+// Bypass row caller-wires the zstd leaf with no kernel in the loop. The untimed kernel transform proves byte-identity.
 fn bypassOptions(row: matrix.Row) bypass.Options {
     var options: bypass.Options = .{ .window_size = 1 << 21 };
     for (row.params) |param| {

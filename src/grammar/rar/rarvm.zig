@@ -6,7 +6,7 @@ const BitReader = bits.BitReader;
 const checksum = @import("../../common/primitive/checksum.zig");
 
 // RAR3 ships data filters as bytecode programs, but only six are ever
-// emitted and modern unrar dispatches them straight to native code — so do
+// emitted and modern unrar dispatches them straight to native code, so do
 // we, keyed by CRC32 and length. Anything else makes the entry unverifiable,
 // never silently unfiltered.
 
@@ -33,7 +33,7 @@ const std_filters = [_]StdFilterEntry{
 // Identify a filter program, or .none if it is not one of the six. Both
 // length and CRC must match: length alone is not distinguishing, and CRC
 // alone would accept a truncated program. Byte 0 is an XOR checksum over
-// bytes 1..n; a mismatch means corrupt code and yields .none (the reference
+// bytes 1..n. a mismatch means corrupt code and yields .none (the reference
 // bails out of Prepare()).
 pub fn identifyFilter(code: []const u8) StandardFilter {
     if (code.len == 0) return .none;
@@ -85,7 +85,7 @@ pub fn readData(br: *BitReader) Failure!u32 {
 }
 
 // False means out-of-range parameters: the caller must report the entry
-// unverifiable. The reference filters into a VM image at Mem + BlockSize;
+// unverifiable. The reference filters into a VM image at Mem + BlockSize.
 // reading from a copy of the input and writing back over `data` is the same
 // transform without the scratch copy.
 pub fn applyFilter(
@@ -206,7 +206,7 @@ pub fn applyFilter(
         },
         .e8, .e8e9 => {
             // x86 call/jump target conversion: the encoder rewrote relative
-            // targets as absolute to make them compress; undo that.
+            // targets as absolute to make them compress. Undo that.
             if (data_size < 4) return false;
             const file_offset: u32 = init_r[6];
             const cmp_byte2: u8 = if (filter == .e8e9) 0xe9 else 0xe8;
@@ -288,7 +288,7 @@ pub fn applyFilter(
         .itanium => {
             // IA-64 instruction bundles are 16 bytes holding three 41-bit
             // slots plus a 5-bit template. For slots whose opcode is a branch
-            // (op type 5), the 20-bit target was converted to absolute;
+            // (op type 5), the 20-bit target was converted to absolute.
             // convert it back.
             if (data_size < 21) return false;
             var file_offset: u32 = init_r[6] >> 4;
@@ -319,7 +319,7 @@ pub fn applyFilter(
     }
 }
 
-// x86 image size the E8 filter normalises against (reference FileSize) — a
+// x86 image size the E8 filter normalises against (reference FileSize), a
 // FIXED 16 MB, not the size of the file being decoded.
 const e8_file_size: u32 = 0x1000000;
 

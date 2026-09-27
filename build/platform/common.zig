@@ -57,6 +57,7 @@ pub const Archives = struct {
     host: std.Build.LazyPath,
     android: std.Build.LazyPath,
     apple: std.Build.LazyPath,
+    cjpm: std.Build.LazyPath,
 };
 
 pub const Context = struct {
@@ -108,7 +109,7 @@ fn addLibraryFromModule(b: *std.Build, module: *std.Build.Module, linkage: std.b
 pub fn addGenerated(b: *std.Build) Generated {
     const files = b.addWriteFiles();
     // Catalog derives from the same comptime source the discovery call serves.
-    // Scan path reads only options and portable; version/generated/host go unread.
+    // Scan path reads only options and portable. Version/generated/host go unread.
     var scan_ctx = Context{
         .target = b.graph.host,
         .optimize = .Debug,
@@ -160,7 +161,7 @@ pub fn addHostLibrariesWithOptions(
     portable: bool,
     options: *std.Build.Module,
 ) HostLibraries {
-    // Module construction reads only portable; version/generated/host go unread here.
+    // Module construction reads only portable. Version/generated/host go unread here.
     var ctx = Context{
         .target = target,
         .optimize = optimize,
