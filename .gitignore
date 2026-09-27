@@ -1,5 +1,5 @@
-# Created by https://www.toptal.com/developers/gitignore/api/c,c++,zig,cmake,linux,macos,swift,windows
-# Edit at https://www.toptal.com/developers/gitignore?templates=c,c++,zig,cmake,linux,macos,swift,windows
+# Created by https://www.toptal.com/developers/gitignore/api/c,c++,zig,java,kotlin,cmake,linux,macos,swift,windows
+# Edit at https://www.toptal.com/developers/gitignore?templates=c,c++,zig,java,kotlin,cmake,linux,macos,swift,windows
 
 ### C ###
 # Prerequisites
@@ -93,6 +93,45 @@ CMakeUserPresets.json
 # External projects
 *-prefix/
 
+### Java ###
+# Compiled class file
+*.class
+
+# Log file
+*.log
+
+# BlueJ files
+*.ctxt
+
+# Mobile Tools for Java (J2ME)
+.mtj.tmp/
+
+# Package Files #
+*.jar
+*.war
+*.nar
+*.ear
+*.zip
+*.tar.gz
+*.rar
+
+# virtual machine crash logs, see http://www.java.com/en/download/help/error_hotspot.xml
+hs_err_pid*
+replay_pid*
+
+### Kotlin ###
+# Compiled class file
+
+# Log file
+
+# BlueJ files
+
+# Mobile Tools for Java (J2ME)
+
+# Package Files #
+
+# virtual machine crash logs, see http://www.java.com/en/download/help/error_hotspot.xml
+
 ### Linux ###
 *~
 
@@ -150,21 +189,21 @@ Temporary Items
 xcuserdata/
 
 ## compatibility with Xcode 8 and earlier (ignoring not required starting Xcode 9)
-# *.xcscmblueprint
-# *.xccheckout
+*.xcscmblueprint
+*.xccheckout
 
 ## compatibility with Xcode 3 and earlier (ignoring not required starting Xcode 4)
-# build/
-# DerivedData/
-# *.moved-aside
-# *.pbxuser
-# !default.pbxuser
-# *.mode1v3
-# !default.mode1v3
-# *.mode2v3
-# !default.mode2v3
-# *.perspectivev3
-# !default.perspectivev3
+build/
+DerivedData/
+*.moved-aside
+*.pbxuser
+!default.pbxuser
+*.mode1v3
+!default.mode1v3
+*.mode2v3
+!default.mode2v3
+*.perspectivev3
+!default.perspectivev3
 
 ## Obj-C/Swift specific
 *.hmap
@@ -180,13 +219,13 @@ playground.xcworkspace
 
 # Swift Package Manager
 # Add this line if you want to avoid checking in source code from Swift Package Manager dependencies.
-Packages/
-Package.pins
-Package.resolved
-*.xcodeproj
+# Packages/
+# Package.pins
+# Package.resolved
+# *.xcodeproj
 # Xcode automatically generates this directory with a .xcworkspacedata file and xcuserdata
 # hence it is not needed unless you have added a package configuration file to your project
-.swiftpm
+# .swiftpm
 
 .build/
 
@@ -194,13 +233,13 @@ Package.resolved
 # We recommend against adding the Pods directory to your .gitignore. However
 # you should judge for yourself, the pros and cons are mentioned at:
 # https://guides.cocoapods.org/using/using-cocoapods.html#should-i-check-the-pods-directory-into-source-control
-Pods/
+# Pods/
 # Add this line if you want to avoid checking in source code from the Xcode workspace
-*.xcworkspace
+# *.xcworkspace
 
 # Carthage
 # Add this line if you want to avoid checking in source code from Carthage dependencies.
-Carthage/Checkouts
+# Carthage/Checkouts
 
 Carthage/Build/
 
@@ -259,11 +298,10 @@ zig-out/
 build-*/
 docgen_tmp/
 
-# End of https://www.toptal.com/developers/gitignore/api/c,c++,zig,cmake,linux,macos,swift,windows
+# End of https://www.toptal.com/developers/gitignore/api/c,c++,zig,java,kotlin,cmake,linux,macos,swift,windows
 
 # Others
 
-!build/templates/module.modulemap.in
-!build/templates/module.framework.modulemap.in
+!build/
 .zig-cache/
 !src/testing/
