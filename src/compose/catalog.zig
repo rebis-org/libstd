@@ -7,7 +7,7 @@ const command_mask_write = vocabulary.command_mask_write;
 const CommandPolicy = vocabulary.CommandPolicy;
 const CommitMode = vocabulary.CommitMode;
 
-// Behavioral dispatch policy only; structural descriptors live in kernel.catalog.
+// Behavioral dispatch policy only. Structural descriptors live in kernel.catalog.
 
 fn idEqual(left: EnvelopeId, right: EnvelopeId) bool {
     return left.low == right.low and left.high == right.high;
@@ -29,6 +29,10 @@ pub fn profileTagForId(id: EnvelopeId) ?vocabulary.ProfileTag {
     if (idEqual(id, ids.zip)) return .zip;
     if (idEqual(id, ids.sevenzip)) return .sevenzip;
     if (idEqual(id, ids.rar)) return .rar;
+    if (idEqual(id, ids.zlib)) return .zlib;
+    if (idEqual(id, ids.lz4)) return .lz4;
+    if (idEqual(id, ids.zstd_seekable)) return .zstd_seekable;
+    if (idEqual(id, ids.zdict)) return .zdict;
     return null;
 }
 
@@ -84,7 +88,7 @@ pub fn commandPolicyFor(id: EnvelopeId, command: u32, target: u32) ?CommandPolic
     return switch (tag) {
         .test_echo => testEchoPolicy(command),
         .test_read => testReadPolicy(command, target),
-        .deflate, .gzip, .bzip2, .lzma, .lzma2, .lzma_file => measuredPolicy(command, target, false),
+        .deflate, .gzip, .bzip2, .lzma, .lzma2, .lzma_file, .zlib, .lz4, .zstd_seekable, .zdict => measuredPolicy(command, target, false),
         .zstd, .xz => measuredPolicy(command, target, true),
         .tar, .zip, .sevenzip => archivePolicy(command, target),
         .rar => rarPolicy(command, target),

@@ -6,7 +6,7 @@ const BitReader = bits.BitReader;
 
 // Range-boundary decode tables in the reference form (unrar's
 // DecodeLen/DecodePos/DecodeNum), which accepts the slightly over-committed
-// tables real archives contain. decode_num lives in caller storage so the
+// tables real archives contain. Decode_num lives in caller storage so the
 // whole decode context carves out of one workspace.
 
 pub const max_code_length: u5 = 15;
@@ -29,9 +29,9 @@ pub const DecodeTable = struct {
 };
 
 // Reads a code-length-alphabet table: `count` 4-bit lengths, then the decode
-// table built from them. With `escapes` (v29), a 15 is an ESCAPE — the next
-// 4 bits are a zero-run count, 0 meaning the length really is 15 — and a run
-// that overruns `count` is truncated, as in the reference. v20 has no escape
+// table built from them. With `escapes` (v29), a 15 is an ESCAPE, the next
+// 4 bits are a zero-run count, 0 meaning the length really is 15, and a run
+// that overruns `count` is truncated, as in the reference. V20 has no escape
 // and reads its lengths verbatim.
 pub fn readCodeLengthTable(br: *BitReader, count: usize, comptime escapes: bool, storage: []u16) Failure!DecodeTable {
     var lengths = [_]u8{0} ** 64;
@@ -43,7 +43,7 @@ pub fn readCodeLengthTable(br: *BitReader, count: usize, comptime escapes: bool,
             if (zero_count == 0) {
                 lengths[i] = 15;
             } else {
-                // ZeroCount+2 zeros; the loop increment lands past the run
+                // ZeroCount+2 zeros. The loop increment lands past the run
                 // (the reference does I-- after its inner while).
                 var remaining: u32 = @as(u32, zero_count) + 2;
                 while (remaining > 0 and i < count) : (remaining -= 1) {
@@ -96,7 +96,7 @@ pub fn makeDecodeTables(code_lengths: []const u8, storage: []u16) Failure!Decode
     }
 
     // Large alphabets (v20/v29/v50 main tables) peek wider so short codes stay
-    // on the single-lookup path; small ones keep a compact table.
+    // on the single-lookup path. Small ones keep a compact table.
     const size = code_lengths.len;
     table.quick_bits = if (size == 306 or size == 298 or size == 299)
         max_quick_bits
@@ -189,7 +189,7 @@ test "decode table builds canonical ranges" {
 }
 
 test "decode number round-trips short codes" {
-    // Codes: A=0, B=10, C=11; stream A B C A = 0x58.
+    // Codes: A=0, B=10, C=11. Stream A B C A = 0x58.
     const code_lengths = [_]u8{ 1, 2, 2 };
     var storage: [3]u16 = undefined;
     const table = try makeDecodeTables(&code_lengths, &storage);

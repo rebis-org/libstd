@@ -1,0 +1,16 @@
+// Component descriptor (zdict, class slice).
+// Identity and policy are frozen ABI: rename or re-id is a breaking
+// change, caught by the comptime assertions in kernel/catalog.zig.
+.{
+    .id = .{ .low = "0x6e6b82f08d910417", .high = "0xa7a351053d6d4017" },
+    .name = "zdict",
+    .class = "slice",
+    .verbs = .{ "required_size", "decoded_size", "encoded_size_bound", "encode", "decode" },
+    .parameters = .{
+        .{ .name = "sample_size", .family = 13, .ordinal = 2, .representation = "scalar_words" },
+    },
+    .capabilities = .{ "read", "replay" },
+    .sizing = "measured",
+    .commit = "tentative",
+    .limits = .{ .window = 0, .block = 0, .history = 0 },
+}

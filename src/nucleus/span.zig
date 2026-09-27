@@ -7,7 +7,7 @@ pub const Violation = enum { out_of_bounds, use_after_free, lease_violation, ove
 var empty_storage: [1]u8 = .{0};
 
 // Contract violations trap: out-of-provenance access is a bug, never a
-// survivable runtime condition; data-dependent failures stay in Failure.
+// survivable runtime condition. Data-dependent failures stay in Failure.
 pub fn trap(violation: Violation, context: []const u8) noreturn {
     var buffer: [128]u8 = undefined;
     const message = std.fmt.bufPrint(&buffer, "Nucleus trap: {s}: {s}.\n", .{ @tagName(violation), context }) catch "Nucleus trap.\n";
@@ -80,7 +80,7 @@ pub fn constSpan(pointer: ?[*]const u8, length: u64) Failure!ConstSpan {
     return spanFrom([*]const u8, pointer, length);
 }
 
-// Independently handed spans must not alias; overlap is a caller contract violation.
+// Independently handed spans must not alias. Overlap is a caller contract violation.
 pub fn requireDisjoint(left: ConstSpan, right: ConstSpan, context: []const u8) void {
     const left_start = @intFromPtr(left.ptr);
     const right_start = @intFromPtr(right.ptr);

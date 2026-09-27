@@ -8,7 +8,7 @@
     .verbs = .{ "encode_stream", "decode_stream", "decoded_size", "encoded_size_bound" },
     .parameters = .{
         .{ .name = "window", .family = 4, .ordinal = 1, .representation = "scalar_words" },
-        .{ .name = "dictionary", .family = 4, .ordinal = 2, .representation = "scalar_words" },
+        .{ .name = "dictionary", .family = 4, .ordinal = 2, .representation = "bytes" },
         .{ .name = "hash_bits", .family = 4, .ordinal = 3, .representation = "scalar_words" },
         .{ .name = "max_chain", .family = 4, .ordinal = 4, .representation = "scalar_words" },
         .{ .name = "nice_len", .family = 4, .ordinal = 5, .representation = "scalar_words" },

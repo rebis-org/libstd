@@ -1,7 +1,7 @@
 const std = @import("std");
 
 // The circular window can split one logical run into two spans, so sinks
-// must tolerate arbitrary chunking; `write` cannot fail because destinations
+// must tolerate arbitrary chunking. `write` cannot fail because destinations
 // are pre-sized. BufferSink records overflow rather than truncating: a
 // partial file that still looks like success is the failure mode an
 // integrity layer must not have.

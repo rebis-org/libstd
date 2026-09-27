@@ -6,7 +6,7 @@ const kernels = @import("../../leaf/kernels.zig");
 // Circular LZ window over caller-provided storage. Distances are validated
 // against total_written, so bytes from a previous non-solid entry are never
 // reachable and reset() deliberately does not re-zero the buffer (the
-// reference leaves the same comment in its UnpInitData) — a window-sized
+// reference leaves the same comment in its UnpInitData), a window-sized
 // memset per entry would dwarf decoding on archives of many small files.
 
 pub const Window = struct {
@@ -33,9 +33,9 @@ pub const Window = struct {
     }
 
     // An impossible distance (0 or beyond everything written) zero-fills
-    // instead of reading stale slots — corrupt streams must not turn into
+    // instead of reading stale slots. Corrupt streams must not turn into
     // plausible bytes. Wrap-free segments run on the shared match-copy
-    // ladder (the hot path for the short matches that dominate LZ output);
+    // ladder (the hot path for the short matches that dominate LZ output).
     // the circular buffer only segments at the wrap points.
     pub fn copyMatch(self: *Window, distance: usize, length: usize) void {
         if (length == 0) return;
@@ -90,7 +90,7 @@ pub const Window = struct {
     }
 
     // A logically contiguous run can straddle the wrap point and leave as
-    // one or two spans. False means the bytes were overwritten since —
+    // one or two spans. False means the bytes were overwritten since,
     // returning whatever occupies those slots now would be a wrong answer in
     // a right answer's shape, so callers must refuse.
     pub fn emitTo(self: *const Window, out: Sink, start_offset: usize, count: usize) bool {

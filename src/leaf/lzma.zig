@@ -79,7 +79,7 @@ const low_coder_count = 1 << num_pos_bits_max;
 const mid_coder_count = 1 << num_pos_bits_max;
 const literal_probs_count = 0x300;
 
-// No copy fallback: 10 bits/byte covers converged cost plus transient wrongness; strict clamp bound would be ~7x.
+// No copy fallback: 10 bits/byte covers converged cost plus transient wrongness. Strict clamp bound would be ~7x.
 // Constant absorbs cache byte, flush, and end marker.
 pub fn encodedSizeBound(input_len: usize) usize {
     return input_len +| (input_len / 4) +| 64;
@@ -99,13 +99,13 @@ const bit_price = blk: {
     break :blk table;
 };
 
-// 8192 plans ahead on frozen prices; smaller cuts long decisions, larger goes stale.
+// 8192 plans ahead on frozen prices. Smaller cuts long decisions, larger goes stale.
 const max_match_len = 273;
 const opt_window = 8192;
 
 const distance_literal: u32 = 0xFFFFFFFF;
 const distance_short_rep: u32 = 0xFFFFFFFE;
-const distance_rep_base: u32 = 0xF0000000; // | rep index; distance-1 never reaches 2^30.
+const distance_rep_base: u32 = 0xF0000000; // | rep index. Distance-1 never reaches 2^30.
 
 const Opt = struct {
     price: u32,
@@ -1183,7 +1183,7 @@ pub fn DecoderOf(comptime slice_input: bool) type {
         }
 
         fn checkDistance(self: Self, distance: u32) bool {
-            // 0-based distance reaches distance+1 distance; in-place matches may not cross the reset floor.
+            // 0-based distance reaches distance+1 distance. In-place matches may not cross the reset floor.
             if (!self.clear_dictionary) return distance < self.dictionary_pos - self.dictionary_floor;
             return distance < self.dictionary_pos or self.dictionary_full;
         }
@@ -1325,7 +1325,7 @@ pub fn requiredSize(input: []const u8, scratch: []u8, options: Options) Failure!
     return std.math.cast(usize, counter.written()) orelse error.ResourceLimit;
 }
 
-// Greedy live-model pass for the LZMA2 probe; dictionary clamps to chunk size so clears scale with chunk.
+// Greedy live-model pass for the LZMA2 probe. Dictionary clamps to chunk size so clears scale with chunk.
 // Calibration documented at the lzma2 probe.
 pub fn estimatedSize(input: []const u8, scratch: []u8, options: Options) Failure!usize {
     var props = options.properties;
@@ -1717,7 +1717,7 @@ pub const Encoder = struct {
         return price + lengthLivePrice(self.rep_len_choice, self.rep_len_low, self.rep_len_mid, self.rep_len_high, position_state, raw_length);
     }
 
-    // Insert-only: covered positions feed tables without the chain walk; bt4 sees fewer offers but stays safe.
+    // Insert-only: covered positions feed tables without the chain walk. Bt4 sees fewer offers but stays safe.
     fn insertSkipped(self: *Encoder, position: usize, length: usize) void {
         if (self.match_finder != .hash_chain) return;
         var cursor = position + 1;
@@ -1909,7 +1909,7 @@ pub const Encoder = struct {
                     const max_length = @min(max_match_len, window_length - i);
                     for (0..4) |rep_index| {
                         const distance = node.rep_distances[rep_index] +% 1;
-                        // Duplicate rep distances price identically but for index bits; keep the lowest.
+                        // Duplicate rep distances price identically but for index bits. Keep the lowest.
                         if (rep_index > 0 and node.rep_distances[rep_index] == node.rep_distances[rep_index - 1]) continue;
                         if (distance <= abs) {
                             const rep_length = self.matchLen(abs - distance, abs, max_length);
@@ -2209,9 +2209,9 @@ pub const Encoder = struct {
 
     fn btFindMatches(self: *Encoder, position: usize, matches: []MatchPair) usize {
         const abs_pos = self.input_base + position;
-        // u32 positions cannot wrap; fall distance to the bounded tail scan past the boundary.
+        // u32 positions cannot wrap. Fall distance to the bounded tail scan past the boundary.
         if (abs_pos >= std.math.maxInt(u32)) return self.tailMatches(position, matches);
-        // Splice is order-safe only at the format maximum; chunk tails stay out of the tree.
+        // Splice is order-safe only at the format maximum. Chunk tails stay out of the tree.
         if (position + max_match_len >= self.input.len) return self.tailMatches(position, matches);
         const length_limit: usize = @min(self.input.len - position, max_match_len);
         const hash = self.hash4(position);
@@ -2310,10 +2310,10 @@ pub const Encoder = struct {
     }
 
     fn hcFindMatches(self: *Encoder, position: usize, matches: []MatchPair) usize {
-        // Last positions lack a full key; bounded scan stays cheap there.
+        // Last positions lack a full key. Bounded scan stays cheap there.
         if (position + 4 > self.input.len) return self.tailMatches(position, matches);
         const abs_pos = self.input_base + position;
-        // u32 positions cannot wrap; emit no match past the boundary.
+        // u32 positions cannot wrap. Emit no match past the boundary.
         if (abs_pos >= std.math.maxInt(u32)) return 0;
         const max_length: usize = @min(self.input.len - position, max_match_len);
         const hash = self.hash4(position);

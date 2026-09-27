@@ -14,6 +14,8 @@ pub const Refs = struct {
     bzip2_lib_install: *std.Build.Step.InstallFile,
     gzip_cmd: *std.Build.Step.InstallFile,
     lzma_cmd: *std.Build.Step.InstallFile,
+    lz4_cmd: *std.Build.Step.InstallFile,
+    lz4_lib: std.Build.LazyPath,
     tar_cmd: *std.Build.Step.InstallFile,
     ziptool_cmd: *std.Build.Step.InstallFile,
     libzip_lib: std.Build.LazyPath,
@@ -34,6 +36,7 @@ pub const Refs = struct {
         module.addObjectFile(self.libzip_lib);
         module.addObjectFile(self.libunrar_lib);
         module.addObjectFile(self.fast_lzma2_lib);
+        module.addObjectFile(self.lz4_lib);
         module.addIncludePath(b.path("vendor/libzip/lib"));
         module.addIncludePath(b.path(libzip_build_dir));
         module.addIncludePath(b.path("vendor/unrar"));
@@ -47,6 +50,7 @@ pub const Refs = struct {
         step.dependOn(&self.bzip2_lib_install.step);
         step.dependOn(&self.gzip_cmd.step);
         step.dependOn(&self.lzma_cmd.step);
+        step.dependOn(&self.lz4_cmd.step);
         step.dependOn(&self.tar_cmd.step);
         step.dependOn(&self.ziptool_cmd.step);
         step.dependOn(&self.unrar_cmd.step);
@@ -272,6 +276,11 @@ pub fn add(b: *std.Build, ctx: *const common.Context) Refs {
     const make_lzma = make(b, "vendor/7zip/CPP/7zip/Bundles/LzmaCon", &.{ "make", "-f", "makefile.gcc", "-j4" });
     const lzma_cmd = installOut(b, &make_lzma.step, "vendor/7zip/CPP/7zip/Bundles/LzmaCon/_o/lzma", "lzma");
 
+    const make_lz4_cmd = make(b, "vendor/lz4", &.{ "make", "lz4-release" });
+    const lz4_cmd = installOut(b, &make_lz4_cmd.step, "vendor/lz4/programs/lz4", "lz4");
+    const make_lz4_lib = make(b, "vendor/lz4", &.{ "make", "lib-release" });
+    const lz4_lib = copyOut(b, &make_lz4_lib.step, "vendor/lz4/lib/liblz4.a", "liblz4.a");
+
     const bin_refs = addBinaryRefs(b, ctx);
 
     return .{
@@ -285,6 +294,8 @@ pub fn add(b: *std.Build, ctx: *const common.Context) Refs {
         .bzip2_lib_install = bzip2_lib_install,
         .gzip_cmd = gzip_cmd,
         .lzma_cmd = lzma_cmd,
+        .lz4_cmd = lz4_cmd,
+        .lz4_lib = lz4_lib,
         .tar_cmd = tar_cmd,
         .ziptool_cmd = ziptool_cmd,
         .libzip_lib = libzip_lib,

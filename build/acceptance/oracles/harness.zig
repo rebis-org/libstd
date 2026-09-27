@@ -31,6 +31,7 @@ pub const param_family_crypto: u16 = 1;
 pub const param_family_archive: u16 = 2;
 pub const param_family_gzip: u16 = 3;
 pub const param_family_zstd: u16 = 4;
+pub const param_family_seekable: u16 = 13;
 pub const param_family_bzip2: u16 = 5;
 pub const param_family_lzma: u16 = 6;
 pub const param_family_deflate: u16 = 8;
@@ -56,6 +57,9 @@ pub const archive_entry_typeflag: u32 = 9;
 pub const archive_entry_link_name: u32 = 10;
 pub const archive_entry_uid: u32 = 11;
 pub const archive_entry_mtime: u32 = 12;
+pub const archive_entry_filter: u32 = 13;
+pub const zstd_seekable_frame_size: u32 = 1;
+pub const zdict_sample_size: u32 = 2;
 pub const gzip_modification_time: u32 = 1;
 pub const gzip_extra_flags: u32 = 2;
 pub const gzip_operating_system: u32 = 3;
@@ -468,6 +472,24 @@ pub const ArchiveEntryNodes = struct {
 
 pub fn archiveEntryMethod(nodes: *ArchiveEntryNodes, name: []const u8, data: []const u8, method: u64) Node {
     return archiveEntryWithMethod(&nodes.name, &nodes.data, &nodes.method, name, data, method);
+}
+
+pub fn archiveEntryWithMethodAndFilter(
+    name_node: *Node,
+    data_node: *Node,
+    filter_node: *Node,
+    method_node: *Node,
+    name: []const u8,
+    data: []const u8,
+    method: u64,
+    filter: u64,
+) Node {
+    const entry = archiveEntryNode(name_node, data_node, name, data);
+    method_node.* = paramScalar(param_family_archive, archive_entry_method, cmd_query_write, method);
+    filter_node.* = paramScalar(param_family_archive, archive_entry_filter, cmd_query_write, filter);
+    method_node.next = filter_node;
+    data_node.next = method_node;
+    return entry;
 }
 
 pub fn capacityDiagnostics(required: *Node, available: *Node, diagnostic: *Node) void {

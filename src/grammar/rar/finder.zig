@@ -4,7 +4,7 @@ const Failure = failure.Failure;
 const kernels = @import("../../leaf/kernels.zig");
 
 // BT4 match finder. Positions inside matches get skip() updates (hash2/3
-// only) — tree insertions there buy little. Nothing allocates: all tables are
+// only). Tree insertions there buy little. Nothing allocates: all tables are
 // caller-provided, and token-buffer exhaustion is a clean
 // InsufficientCapacity for the caller to size against.
 
@@ -322,9 +322,9 @@ pub const MatchFinder = struct {
                             continue;
                         }
                     }
-                    // Original match was better or equal — emit it. pos was
+                    // Original match was better or equal, emit it. Pos was
                     // already inserted by findBT4Match, pos+1 by the lazy
-                    // check above; insert the remaining positions.
+                    // check above. Insert the remaining positions.
                     if (count >= tokens.len) return error.InsufficientCapacity;
                     tokens[count] = .{ .match = .{ .length = m.length, .distance = m.distance } };
                     count += 1;

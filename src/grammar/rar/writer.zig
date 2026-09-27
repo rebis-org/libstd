@@ -7,7 +7,7 @@ const pack50 = @import("pack50.zig");
 const finder = @import("finder.zig");
 const rar = @import("../rar.zig");
 
-// RAR5 archive creation (store or LZ). The facade (../rar.zig) owns reading;
+// RAR5 archive creation (store or LZ). The facade (../rar.zig) owns reading.
 // this file owns writing: entry serialization, the packed region, and the
 // block compressor handoff.
 
@@ -73,7 +73,7 @@ fn compressionInfoVint(method: u3) u64 {
 
 const block_writer = struct {
     // Serialize `contents` (already starting with the type vint) as one
-    // header: CRC32 over [size_vint .. end], little-endian, then the bytes.
+    // header: CRC32 over [size_vint .. End], little-endian, then the bytes.
     fn emitHeader(out: []u8, pos: usize, contents: []const u8) Failure!usize {
         var size_buf: [10]u8 = undefined;
         const size_len = writeVint(contents.len, &size_buf);
@@ -93,8 +93,8 @@ const block_writer = struct {
     }
 
     fn mainBlockSize() usize {
-        // type(1) + flags(1) + archive_flags(1) = 3 contents bytes; one-byte
-        // size vint; 4 CRC bytes.
+        // type(1) + flags(1) + archive_flags(1) = 3 contents bytes. One-byte
+        // size vint. 4 CRC bytes.
         return 4 + 1 + 3;
     }
 
@@ -144,7 +144,7 @@ const block_writer = struct {
 
         var contents: usize = 0;
         contents += vintSize(rar.rar5_type_file);
-        // The walk requires HFL_DATA on file blocks; winrar sets it even for
+        // The walk requires HFL_DATA on file blocks. Winrar sets it even for
         // zero-length payloads (data_size 0), and omitting it for empty files
         // broke our own write→read round trips.
         contents += vintSize(if (entry.is_directory) 0 else rar.rar5_flag_data);
@@ -215,13 +215,13 @@ fn checkWriteEntries(entries: []const RarEntry) Failure!void {
 
 // Compress every LZ entry into its slot of the packed region, returning the
 // total archive size. Shared by the sizing query and the commit pass (each
-// runs it afresh — the two-pass shape the zip writer established).
+// runs it afresh (the two-pass shape the zip writer established).
 fn packEntries(entries: []const RarEntry, ws: *WriteBuffers) Failure!usize {
     var total: usize = rar.rar5_signature.len + block_writer.mainBlockSize() + block_writer.endBlockSize();
     var packed_cursor: usize = 0;
     for (entries, 0..) |entry, i| {
         const packed_len: usize = if (entry.is_directory or entry.data.len == 0 or entry.method == 0) blk: {
-            // Store entries' "packed" data is the raw bytes; lay them into
+            // Store entries' "packed" data is the raw bytes. Lay them into
             // the packed region so the writer reads everything from there.
             if (ws.packed_buf.len - packed_cursor < entry.data.len) return error.InternalFailure;
             @memcpy(ws.packed_buf[packed_cursor .. packed_cursor + entry.data.len], entry.data);

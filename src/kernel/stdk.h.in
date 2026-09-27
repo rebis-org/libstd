@@ -48,17 +48,16 @@ struct stdk_call_envelope {
 @STDK_ASSERT@
 @STDK_CALL@
 
-/* Substrate session boundary: caller-owned storage, opaque handles, no
- * allocator. stdk_session_storage sizes the storage for a component/verb
- * pair (0 when the pair names no session). stdk_session_step is the pump:
- * one call consumes input and/or fills the output span once; counts_out[0]
- * receives the consumed length, counts_out[1] the produced length, and
- * state_out 0 while open, 1 when finished, -1 on failure. Destroy is
- * idempotent; stepping a destroyed session returns STDK_STATUS_INVALID_CALL.
- * stdk_session_bounded additionally takes per-session ceilings on
- * encoded, decoded, work, and entry bytes. stdk_session_failure reads the
- * last failed step's status and detail back out. stdk_session_catalog
- * returns a comma-separated "component/verb" list of the session-able pairs.
+/* Session boundary over caller-owned storage with opaque handles and no
+ * allocator, so hosts keep control of every byte. Storage sizing lives in
+ * stdk_session_storage because driver state is fixed per pair. The step pump
+ * reports consumed and produced counts separately so callers can stream
+ * across arbitrary buffer boundaries. Destroy is idempotent so cleanup paths
+ * cannot step a dead session. stdk_session_bounded exists so zip-bomb limits
+ * are enforced engine-side rather than by host policing. stdk_session_failure
+ * reads back the failing status and detail. stdk_session_catalog carries the
+ * versioned pair list so hosts discover streamable codecs without hardcoding
+ * them.
  */
 uint64_t stdk_session_storage(const char* component, const char* verb);
 uint32_t stdk_session_create(const char* component, const char* verb, void* storage, uint64_t storage_len);

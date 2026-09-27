@@ -38,6 +38,14 @@ pub const apple: Distribution = .{
     .apple = &slices.apple_slices,
 };
 
+pub const cjpm: Distribution = .{
+    .id = "cjpm",
+    .archive = "stdk.zip",
+    .header = "stdk/libs/include/stdk.h",
+    .catalog = "stdk/stdk.catalog.json",
+    .entries = cjpmEntries(),
+};
+
 pub fn versionCode(version: std.SemanticVersion) u32 {
     return @intCast(version.major * 1_000_000 + version.minor * 1_000 + version.patch);
 }
@@ -87,6 +95,23 @@ fn appleEntries() []const []const u8 {
                 tmp[2 + 5 * index + 3] = root ++ "/Modules/module.modulemap";
                 tmp[2 + 5 * index + 4] = root ++ "/Info.plist";
             }
+        }
+        break :blk tmp;
+    };
+    return &entries;
+}
+
+fn cjpmEntries() []const []const u8 {
+    const count = 4 + 2 * slices.ohos_abis.len;
+    const entries: [count][]const u8 = blk: {
+        var tmp: [count][]const u8 = undefined;
+        tmp[0] = "stdk/cjpm.toml";
+        tmp[1] = "stdk/src/stdk.cj";
+        tmp[2] = "stdk/libs/include/stdk.h";
+        tmp[3] = "stdk/stdk.catalog.json";
+        inline for (slices.ohos_abis, 0..) |abi, index| {
+            tmp[4 + 2 * index] = std.fmt.comptimePrint("stdk/libs/{s}/libstd.a", .{abi.triple});
+            tmp[4 + 2 * index + 1] = std.fmt.comptimePrint("stdk/libs/{s}/libstd.so", .{abi.triple});
         }
         break :blk tmp;
     };

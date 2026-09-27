@@ -8,6 +8,12 @@ extern fn ZSTD_compress(destination: [*]u8, destination_capacity: usize, source:
 extern fn ZSTD_decompress(destination: [*]u8, destination_capacity: usize, source: [*]const u8, compressed_size: usize) usize;
 extern fn ZSTD_isError(code: usize) c_uint;
 extern fn ZSTD_compressBound(source_size: usize) usize;
+extern fn ZSTD_createCCtx() ?*anyopaque;
+extern fn ZSTD_freeCCtx(ctx: ?*anyopaque) usize;
+extern fn ZSTD_createDCtx() ?*anyopaque;
+extern fn ZSTD_freeDCtx(ctx: ?*anyopaque) usize;
+extern fn ZSTD_compress_usingDict(ctx: ?*anyopaque, dst: [*]u8, dst_capacity: usize, src: [*]const u8, src_size: usize, dict: [*]const u8, dict_size: usize, level: c_int) usize;
+extern fn ZSTD_decompress_usingDict(ctx: ?*anyopaque, dst: [*]u8, dst_capacity: usize, src: [*]const u8, src_size: usize, dict: [*]const u8, dict_size: usize) usize;
 
 pub const SystemLibraryStatus = struct {
     name: []const u8,
@@ -99,6 +105,22 @@ pub fn zstdCompress(input: []const u8, output: []u8) ?usize {
     return len;
 }
 
+pub fn zstdCompressUsingDict(input: []const u8, dictionary: []const u8, output: []u8) ?usize {
+    const ctx = ZSTD_createCCtx() orelse return null;
+    defer _ = ZSTD_freeCCtx(ctx);
+    const len = ZSTD_compress_usingDict(ctx, output.ptr, output.len, input.ptr, input.len, dictionary.ptr, dictionary.len, 3);
+    if (ZSTD_isError(len) != 0) return null;
+    return len;
+}
+
+pub fn zstdDecompressUsingDict(data: []const u8, dictionary: []const u8, output: []u8) ?usize {
+    const ctx = ZSTD_createDCtx() orelse return null;
+    defer _ = ZSTD_freeDCtx(ctx);
+    const len = ZSTD_decompress_usingDict(ctx, output.ptr, output.len, data.ptr, data.len, dictionary.ptr, dictionary.len);
+    if (ZSTD_isError(len) != 0) return null;
+    return len;
+}
+
 pub fn bzip2Compress(input: []const u8, output: []u8) ?usize {
     var dest_len: c_uint = @intCast(output.len);
     const ret = c.BZ2_bzBuffToBuffCompress(
@@ -152,6 +174,56 @@ pub fn lzmaAloneDecode(bytes: []const u8, output: []u8) ?usize {
     if (c.lzma_alone_decoder(&stream, 1 << 30) != c.LZMA_OK) return null;
     defer c.lzma_end(&stream);
     return runStream(&stream, c.lzma_code, c.LZMA_FINISH, c.LZMA_STREAM_END, bytes, output);
+}
+
+pub fn zlibValid(compressed: []const u8) bool {
+    var stream: c.z_stream = std.mem.zeroes(c.z_stream);
+    stream.next_in = @ptrCast(@constCast(compressed.ptr));
+    stream.avail_in = @intCast(compressed.len);
+    var output: [65536]u8 = undefined;
+    stream.next_out = &output;
+    stream.avail_out = output.len;
+    if (c.inflateInit2_(&stream, 15, c.ZLIB_VERSION, @sizeOf(c.z_stream)) != c.Z_OK) return false;
+    defer _ = c.inflateEnd(&stream);
+    return c.inflate(&stream, c.Z_FINISH) == c.Z_STREAM_END;
+}
+
+pub fn zlibCompress(input: []const u8, output: []u8) ?usize {
+    var stream: c.z_stream = std.mem.zeroes(c.z_stream);
+    if (c.deflateInit2_(&stream, 6, c.Z_DEFLATED, 15, 8, c.Z_DEFAULT_STRATEGY, c.ZLIB_VERSION, @sizeOf(c.z_stream)) != c.Z_OK) return null;
+    defer _ = c.deflateEnd(&stream);
+    return runStream(&stream, c.deflate, c.Z_FINISH, c.Z_STREAM_END, input, output);
+}
+
+extern fn LZ4F_compressFrameBound(src_size: usize, preferences: ?*const anyopaque) usize;
+extern fn LZ4F_compressFrame(destination: [*]u8, dst_capacity: usize, source: [*]const u8, src_size: usize, preferences: ?*const anyopaque) usize;
+extern fn LZ4F_isError(code: usize) c_uint;
+extern fn LZ4F_createDecompressionContext(ctx: *usize, version: c_uint) usize;
+extern fn LZ4F_freeDecompressionContext(ctx: usize) usize;
+extern fn LZ4F_decompress(ctx: usize, dst: [*]u8, dst_size: *usize, src: [*]const u8, src_size: *usize, options: ?*const anyopaque) usize;
+
+pub fn lz4Valid(compressed: []const u8) bool {
+    var output: [65536]u8 = undefined;
+    return lz4Decompress(compressed, &output) != null;
+}
+
+pub fn lz4Compress(input: []const u8, output: []u8) ?usize {
+    if (LZ4F_compressFrameBound(input.len, null) > output.len) return null;
+    const len = LZ4F_compressFrame(output.ptr, output.len, input.ptr, input.len, null);
+    if (LZ4F_isError(len) != 0) return null;
+    return len;
+}
+
+pub fn lz4Decompress(compressed: []const u8, output: []u8) ?usize {
+    var ctx: usize = 0;
+    if (LZ4F_isError(LZ4F_createDecompressionContext(&ctx, 100)) != 0) return null;
+    defer _ = LZ4F_freeDecompressionContext(ctx);
+    var src_len = compressed.len;
+    var dst_len = output.len;
+    const result = LZ4F_decompress(ctx, output.ptr, &dst_len, compressed.ptr, &src_len, null);
+    if (LZ4F_isError(result) != 0) return null;
+    if (result != 0 or src_len != compressed.len) return null;
+    return dst_len;
 }
 
 pub fn xzEncode(input: []const u8, output: []u8, check: u64, delta_dist: ?u32, bcj: ?u32, dict: u32) ?usize {

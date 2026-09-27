@@ -1,0 +1,40 @@
+// Component descriptor (lz4, class slice).
+// Identity and policy are frozen ABI: rename or re-id is a breaking
+// change, caught by the comptime assertions in kernel/catalog.zig.
+.{
+    .id = .{ .low = "0x6e6b82f08d910415", .high = "0xa7a351053d6d4015" },
+    .name = "lz4",
+    .class = "slice",
+    .verbs = .{ "required_size", "decoded_size", "encoded_size_bound", "encode", "decode" },
+    .parameters = .{
+        .{ .name = "block_size", .family = 12, .ordinal = 1, .representation = "scalar_words" },
+        .{ .name = "block_checksum", .family = 12, .ordinal = 2, .representation = "scalar_words" },
+        .{ .name = "content_checksum", .family = 12, .ordinal = 3, .representation = "scalar_words" },
+        .{ .name = "acceleration", .family = 12, .ordinal = 4, .representation = "scalar_words" },
+    },
+    .capabilities = .{ "read", "replay" },
+    .sizing = "measured",
+    .commit = "tentative",
+    .limits = .{ .window = 65535, .block = 4194304, .history = 0 },
+    .benchmark = .{
+        .row = "lz4",
+        .params = "lz4 -1",
+        .kind = "lz4",
+        .ext = "lz4",
+        .cmd = "lz4",
+        .lib = "lz4",
+        .bin = null,
+        .fmt = 0,
+        .ref_params = "lz4 -1",
+        .tunings = .{
+            .{},
+            .{
+                .name = "fast",
+                .params = .{
+                    .{ .family = 12, .ordinal = 4, .value = 8 },
+                },
+                .ref_params = "lz4 -8",
+            },
+        },
+    },
+}
