@@ -277,7 +277,7 @@ pub fn mapSinkError(failure: Failure, call: *Call, sink: *Resource) Failure {
     return failure;
 }
 
-// Bound plan must never truncate; overrun past it is an internal bug.
+// Bound plan must never truncate. Overrun past it is an internal bug.
 pub fn boundedProduced(bounded_sink: *resource.BoundedWriter, encoded_limit: u64, planned: usize) Failure!usize {
     const produced = encoded_limit - bounded_sink.limit;
     if (produced > planned) return error.InternalFailure;

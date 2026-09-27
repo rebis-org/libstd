@@ -2,12 +2,13 @@ const std = @import("std");
 
 const checksum = @import("checksum.zig");
 
-pub fn CountingTee(comptime has_crc32: bool, comptime has_crc64: bool) type {
+pub fn CountingTee(comptime has_crc32: bool, comptime has_crc64: bool, comptime has_adler32: bool) type {
     return struct {
         writer: std.Io.Writer,
         downstream: ?*std.Io.Writer,
         crc32: checksum.Crc32,
         crc64: checksum.XZCrc64,
+        adler32: checksum.Adler32,
         size: u64,
 
         pub fn init(downstream: ?*std.Io.Writer) @This() {
@@ -16,6 +17,7 @@ pub fn CountingTee(comptime has_crc32: bool, comptime has_crc64: bool) type {
                 .downstream = downstream,
                 .crc32 = checksum.Crc32.init(),
                 .crc64 = checksum.XZCrc64.init(),
+                .adler32 = checksum.Adler32.init(),
                 .size = 0,
             };
         }
@@ -26,6 +28,10 @@ pub fn CountingTee(comptime has_crc32: bool, comptime has_crc64: bool) type {
 
         pub fn crc32Value(self: *const @This()) u32 {
             return self.crc32.final();
+        }
+
+        pub fn adler32Value(self: *const @This()) u32 {
+            return self.adler32.final();
         }
 
         pub fn crc64Value(self: *const @This()) u64 {
@@ -54,6 +60,11 @@ pub fn CountingTee(comptime has_crc32: bool, comptime has_crc64: bool) type {
                 const last = data[data.len - 1];
                 for (0..splat) |_| self.crc64.update(last);
             }
+            if (comptime has_adler32) {
+                for (data[0 .. data.len - 1]) |chunk| self.adler32.update(chunk);
+                const last = data[data.len - 1];
+                for (0..splat) |_| self.adler32.update(last);
+            }
             self.size = std.math.add(u64, self.size, total) catch return error.WriteFailed;
             return total;
         }
@@ -66,4 +77,4 @@ pub fn CountingTee(comptime has_crc32: bool, comptime has_crc64: bool) type {
     };
 }
 
-pub const Tee = CountingTee(true, true);
+pub const Tee = CountingTee(true, true, false);

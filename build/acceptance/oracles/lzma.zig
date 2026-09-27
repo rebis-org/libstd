@@ -153,31 +153,28 @@ pub fn runLzma2(r: *Runner) anyerror!void {
 fn lzmaFileForeign(r: *Runner) !void {
     var output: [4096]u8 = undefined;
     const decoded = lib.lzmaAloneDecode(r.encoded[0..r.encoded_len], &output);
-    if (decoded == null) return error.ReferenceToolRejectedOutput;
+    if (decoded == null or decoded.? != r.input.len or !std.mem.eql(u8, output[0..r.input.len], r.input)) {
+        return error.ReferenceToolRejectedOutput;
+    }
 }
 
 fn lzmaFileWrite(r: *Runner) !void {
     corpus.select(r.corpus_index, &lzma_file_input);
     setupLzma(r, harness.ids.lzma_file, 4096);
     r.input = &lzma_file_input;
+    // The profile writes the 13-byte container itself: properties, dictionary,
+    // and the declared size, ahead of the markerless raw stream.
     _ = harness.call(r, harness.ids.write, &.{
-        harness.paramProfile(harness.ids.lzma),
         harness.lzmaDictionaryParam(r.lzma_dictionary),
         harness.sourceSpan(&lzma_file_input),
-        harness.sinkSpan(r.encoded[13..]),
+        harness.sinkSpan(r.encoded),
         harness.capabilityParam(r.caps_io),
         harness.sizingModeParam(r.sizing),
         harness.commitModeParam(r.commit_write),
-    }, .{ .profile = false });
+    }, .{});
     try harness.requireStatus(r, abi.Status.ok);
-    r.encoded[0] = 0x5d;
-    r.encoded[1] = 0x00;
-    r.encoded[2] = 0x10;
-    r.encoded[3] = 0x00;
-    r.encoded[4] = 0x00;
-    const size = lzma_file_input.len;
-    for (0..8) |i| r.encoded[5 + i] = @truncate(size >> @intCast(8 * i));
-    r.encoded_len = 13 + @as(usize, @intCast(r.response.byte_length));
+    r.encoded_len = @intCast(r.response.byte_length);
+    if (r.encoded_len <= 13 or r.encoded[0] != 0x5d) return error.LzmaFileHeaderShape;
 }
 
 fn lzmaFileRead(r: *Runner) !void {

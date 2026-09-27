@@ -20,6 +20,17 @@ const EntryNodes = struct {
     type: harness.Node,
 };
 
+const FilterNodes = struct {
+    name: harness.Node,
+    data: harness.Node,
+    method: harness.Node,
+    filter: harness.Node,
+};
+
+fn entryWithMethodAndFilter(nodes: *FilterNodes, name: []const u8, data: []const u8, method: u64, filter: u64) harness.Node {
+    return harness.archiveEntryWithMethodAndFilter(&nodes.name, &nodes.data, &nodes.method, &nodes.filter, name, data, method, filter);
+}
+
 const PlainNodes = struct {
     name: harness.Node,
     data: harness.Node,
@@ -61,6 +72,7 @@ var sz_coded_data3_buf: [16]u8 = undefined;
 var sz_coded_archive: [16384]u8 = undefined;
 var sz_coded_output: [512]u8 = undefined;
 var sz_coded_archive_size: usize = 0;
+var sz_filter_payload: [600]u8 = undefined;
 
 fn sevenZipWrite(r: *Runner, entries: harness.Node, archive: []u8, crypto_nodes: []const harness.Node) !usize {
     var nodes: [12]harness.Node = undefined;
@@ -335,6 +347,31 @@ fn runEncodeAdvanced(r: *Runner) anyerror!void {
 
 const sz_enc_password = "secret";
 
+fn runFilters(r: *Runner) anyerror!void {
+    setup7z(r, harness.ids.sevenzip);
+    corpus.select(r.corpus_index, &sz_filter_payload);
+    // Filter + LZMA1 folders (x86/delta under legacy LZMA) plus the modern
+    // LZMA2 pairing. Every archive round-trips through our reader and the
+    // libarchive oracle where it can express the folder chain.
+    const combos = [_]struct { filter: u64, method: u64 }{
+        .{ .filter = 6, .method = 3 },
+        .{ .filter = 5, .method = 3 },
+        .{ .filter = 6, .method = 4 },
+    };
+    for (combos) |combo| {
+        var store: FilterNodes = undefined;
+        const entry = entryWithMethodAndFilter(&store, "f.txt", &sz_filter_payload, combo.method, combo.filter);
+        sz_adv_archive_size = try sevenZipWrite(r, entry, &sz_adv_archive, &.{});
+        try sevenZipReadExpected(r, sz_adv_archive[0..sz_adv_archive_size], 0, &sz_adv_output, &sz_filter_payload, &.{});
+        const expected = [_]lib.ExpectedEntry{
+            .{ .name = "f.txt", .data = &sz_filter_payload },
+        };
+        const oracle = lib.archiveReadMatches(sz_adv_archive[0..sz_adv_archive_size], &expected);
+        if (oracle == .mismatch) return error.FilterOracleRejected;
+        if (oracle == .unsupported) std.debug.print("seven_zip filters oracle method {d}+{d}: unsupported (libarchive cannot read).\n", .{ combo.filter, combo.method });
+    }
+}
+
 fn runEncrypted(r: *Runner) anyerror!void {
     setup7z(r, harness.ids.sevenzip);
     corpus.select(r.corpus_index, &sz_enc_data);
@@ -449,7 +486,7 @@ pub const scenarios = harness.scenarios("seven_zip", &.{
     .{ .label = "seven_zip coded", .run = runCoded, .workspace_size = 64 * 1024 * 1024, .output_size = 1024, .encoded_size = 65536 },
     .{ .label = "seven_zip encode advanced", .run = runEncodeAdvanced, .workspace_size = 48 * 1024 * 1024, .output_size = 1024, .encoded_size = 65536 },
     .{ .label = "seven_zip encrypted", .run = runEncrypted, .workspace_size = 64 * 1024 * 1024, .output_size = 1024, .encoded_size = 65536 },
-    .{ .label = "seven_zip filters", .run = skipped("seven_zip filters"), .workspace_size = 8 * 1024 * 1024, .output_size = 1024, .encoded_size = 65536 },
+    .{ .label = "seven_zip filters", .run = runFilters, .workspace_size = 48 * 1024 * 1024, .output_size = 1024, .encoded_size = 65536 },
     .{ .label = "seven_zip solid", .run = skipped("seven_zip solid"), .workspace_size = 8 * 1024 * 1024, .output_size = 1024, .encoded_size = 65536 },
     .{ .label = "seven_zip ppmd", .run = skipped("seven_zip ppmd"), .workspace_size = 32 * 1024 * 1024, .output_size = 1024, .encoded_size = 65536 },
 }, &.{

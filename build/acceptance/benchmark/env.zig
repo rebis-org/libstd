@@ -75,7 +75,7 @@ pub const Env = struct {
         }
     };
 
-    // Mmap keeps pages resident across repeated passes; heap fallback off POSIX.
+    // Mmap keeps pages resident across repeated passes. Heap fallback off POSIX.
     pub fn mapFile(self: *Env, path: []const u8, max: u64) !Mapped {
         if (builtin.os.tag == .windows) {
             const buf = try self.readFile(path, max);
@@ -86,7 +86,7 @@ pub const Env = struct {
         const file_size: usize = @intCast((try file.stat(self.io)).size);
         if (file_size > max) return error.FileTooBig;
         if (file_size == 0) return .{ .bytes = &.{} };
-        // Darwin uses the packed-struct PROT form; other POSIX targets use the enum.
+        // Darwin uses the packed-struct PROT form. Other POSIX targets use the enum.
         const read_prot: std.posix.PROT = switch (builtin.os.tag) {
             .macos, .ios, .tvos, .watchos, .visionos, .maccatalyst, .driverkit => .{ .READ = true },
             else => .READ,

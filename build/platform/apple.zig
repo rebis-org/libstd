@@ -12,14 +12,14 @@ pub fn addArchive(b: *std.Build, ctx: *const common.Context) std.Build.LazyPath 
     const create = b.addSystemCommand(&.{ "xcodebuild", "-create-xcframework" });
     for (slices.apple_slices) |slice| {
         // App Store validation requires MinimumOSVersion on every embedded
-        // framework; it follows the slice's own deployment floor.
+        // framework. It follows the slice's own deployment floor.
         const plist_file = plist.add(b.fmt("Info-{s}.plist", .{slice.id}), b.fmt(framework_plist, .{ slices.framework_binary, slice.minimum }));
         create.addArg("-framework");
         create.addDirectoryArg(wrapFramework(b, buildSlice(b, ctx, slice), headers.getDirectory(), plist_file, slices.isMacos(slice)));
     }
     create.addArg("-output");
     const framework = create.addOutputDirectoryArg("StdK.xcframework");
-    // WriteFile staging resolves symlinks away; the versioned macOS framework
+    // WriteFile staging resolves symlinks away. The versioned macOS framework
     // keeps its bundle root as symlinks, so stage and zip in one shell step.
     const archive = b.addSystemCommand(&.{
         "sh", "-c",

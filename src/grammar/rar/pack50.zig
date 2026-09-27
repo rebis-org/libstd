@@ -11,7 +11,7 @@ const LzToken = finder_mod.LzToken;
 const unpack50 = @import("unpack50.zig");
 
 // Produces one complete RAR5 compressed block (header + tables + symbols)
-// for a file block's data area. Nothing allocates; the output staging cannot
+// for a file block's data area. Nothing allocates. The output staging cannot
 // exceed 2x the input plus slack (worst case is ~8 bits per symbol plus the
 // table, and matches only shrink it).
 
@@ -121,8 +121,8 @@ pub fn compressBlock(
             },
             .match => |m| {
                 if (findRepeatDistance(prev_distances, m.distance)) |idx| {
-                    // Repeat-distance symbol (258+idx); length goes to the RD
-                    // table RAW — the decoder does not add the distance bonus
+                    // Repeat-distance symbol (258+idx). Length goes to the RD
+                    // table RAW, the decoder does not add the distance bonus
                     // on the repeat path.
                     ld_freq[258 + idx] += 1;
                     rotatePrevDistances(&prev_distances, idx);
@@ -238,7 +238,7 @@ pub fn compressBlock(
             },
             .match => |m| {
                 if (findRepeatDistance(prev_distances, m.distance)) |idx| {
-                    // Repeat-distance symbol; RD carries the raw length.
+                    // Repeat-distance symbol. RD carries the raw length.
                     const sym: usize = 258 + idx;
                     try bw.writeBits(ld_codes[sym], @intCast(ld_lengths[sym]));
                     rotatePrevDistances(&prev_distances, idx);
@@ -473,7 +473,7 @@ test "compress block round-trips through the decoder" {
 
     // Decode through the real engine. The scratch must mirror the compose
     // layout: window bytes first, then filter_scratch_extra of working
-    // space; the decoder slices the latter at max_filter_block.
+    // space. The decoder slices the latter at max_filter_block.
     var window_buf: [4096]u8 = undefined;
     var pool: [unpack50.table_pool_words * 4]u16 = undefined;
     var pending: [unpack50.max_pending_filters]@import("filters50.zig").Filter = undefined;

@@ -12,9 +12,9 @@ const sink = @import("../../common/sink.zig");
 const emit = @import("emit.zig");
 const Sink = sink.Sink;
 
-// Buffer plan (all caller-provided): the window is dict-sized; decode tables
-// share a u16 pool; filter transforms use a scratch sized to the largest
-// filter region; the pending-filter list is capped — a real entry carries a
+// Buffer plan (all caller-provided): the window is dict-sized. Decode tables
+// share a u16 pool. Filter transforms use a scratch sized to the largest
+// filter region. The pending-filter list is capped, a real entry carries a
 // handful, and beyond the cap it is refused rather than guessed at.
 
 pub const nc: u16 = 306; // 256 literals + 6 control + 44 length slots
@@ -25,7 +25,7 @@ pub const rc: u16 = 44;
 
 const code_length_symbols: u16 = 20;
 const max_total_symbols: usize = nc + dc_rar7 + ldc + rc;
-pub const table_pool_words: usize = max_total_symbols; // one table's worth; the caller passes 4x
+pub const table_pool_words: usize = max_total_symbols; // one table's worth. The caller passes 4x
 pub const max_pending_filters: usize = 4096;
 
 const LengthEntry = struct { base: u32, extra: u5 };
@@ -188,7 +188,7 @@ fn readTables(st: *State) Failure!void {
     if (!cl_table.valid) return error.InvalidData;
 
     // Stage 2: code lengths for the full alphabet. RAR5 assigns lengths
-    // directly (no delta across blocks, unlike RAR3); symbols 16-19 are
+    // directly (no delta across blocks, unlike RAR3). Symbols 16-19 are
     // repeat/zero runs.
     const dc: u16 = if (st.is_rar7) dc_rar7 else dc_rar5;
     const total_symbols: usize = @as(usize, nc) + dc + ldc + rc;
@@ -286,7 +286,7 @@ fn parseFilterDescriptor(st: *State) Failure!void {
 // Emit decoded bytes before the circular window overwrites them. No look-back
 // reserve is needed: a filter's start is a forward delta from the position at
 // which its descriptor appears, so every filter is known before any byte of
-// its region is decoded; the cap below therefore covers all of them.
+// its region is decoded. The cap below therefore covers all of them.
 fn flushDecoded(st: *State, limit: u64) Failure!void {
     const out = st.stream_out orelse return;
     const produced = st.window.write_pos - st.entry_start;
@@ -307,7 +307,7 @@ fn flushDecoded(st: *State, limit: u64) Failure!void {
 
     if (emit_upto <= st.flushed) {
         // Nothing emittable while a filter's region is still decoding. Only
-        // fatal when the window is about to wrap over unemitted data — a
+        // fatal when the window is about to wrap over unemitted data. A
         // filter genuinely larger than the window. Unverifiable, not damaged.
         if (produced - st.flushed + max_lz_match >= st.window.buffer.len) {
             return error.Unsupported;
@@ -320,7 +320,7 @@ fn flushDecoded(st: *State, limit: u64) Failure!void {
     if (back > st.window.buffer.len) return error.InvalidData;
 
     // A filter starting BEFORE the flushed mark lost part of its region to an
-    // earlier emit. Unreachable while the cap above holds; kept because the
+    // earlier emit. Unreachable while the cap above holds. Kept because the
     // failure direction of a stale assumption here is silent wrong output.
     for (st.pending[0..st.pending_count]) |f| {
         if (f.length == 0) continue;
@@ -330,7 +330,7 @@ fn flushDecoded(st: *State, limit: u64) Failure!void {
         }
     }
 
-    // The staged copy sits above a max_filter_block transform scratch; the
+    // The staged copy sits above a max_filter_block transform scratch. The
     // buffer is window + max_filter_block, so both always fit.
     try emit.emitSpan(
         &st.window,
@@ -481,7 +481,7 @@ pub const Session = struct {
     // `solid` is the entry's own flag: a solid entry keeps the window and the
     // tables (the reference relies on TablesRead5 to decode the first solid
     // block even when its header lacks TablePresent). Filters are per entry
-    // even in a solid archive — InitFilters() runs outside the `if (!Solid)`
+    // even in a solid archive. InitFilters() runs outside the `if (!Solid)`
     // with the comment "Filters never share several solid files".
     pub fn decodeFile(
         self: *Session,
@@ -502,7 +502,7 @@ pub const Session = struct {
 
         const start_pos = st.window.write_pos;
 
-        // Entries larger than the window MUST stream out as they decode; held
+        // Entries larger than the window MUST stream out as they decode. Held
         // entirely in the window they lose their opening bytes.
         st.entry_start = start_pos;
         st.flushed = 0;
@@ -544,7 +544,7 @@ pub const Session = struct {
 };
 
 // E8/E8E9 relocate branch targets using the block's offset WITHIN THE FILE:
-// `start` is a window-stream position, so the entry start (ctx) converts it;
+// `start` is a window-stream position, so the entry start (ctx) converts it.
 // in a solid stream the two differ by everything decoded before this entry.
 fn applyFilter50(entry_start: usize, f: *filters.Filter, region: []u8, scratch: []u8) Failure!void {
     try filters.applyFilter(region, f.*, @intCast(f.start - entry_start), scratch);

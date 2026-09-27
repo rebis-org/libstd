@@ -19,7 +19,7 @@ const flag_name: u8 = 0x08;
 const flag_comment: u8 = 0x10;
 const reserved_flags: u8 = 0xe0;
 
-// Framing reads ahead of the inflater via shared pending with per-step compaction for bounded memory; step chunks must satisfy chunk_len <= pending_cap - 8.
+// Framing reads ahead of the inflater via shared pending with per-step compaction for bounded memory. Step chunks must satisfy chunk_len <= pending_cap - 8.
 pub const pending_cap: usize = 131072;
 
 pub const Phase = enum { idle, fixed, extra_len, extra_skip, extra_field, name, comment, hcrc, deflate, trailer, done };
@@ -63,7 +63,7 @@ pub const GzipDecodeState = struct {
             @memmove(self.pending[0 .. self.pending_len - floor], self.pending[floor..self.pending_len]);
             self.pending_len -= floor;
             if (self.phase == .deflate) {
-                // frame_pos is stale while the inflater owns the stream; re-established from slice.pos at member end.
+                // frame_pos is stale while the inflater owns the stream. Re-established from slice.pos at member end.
                 self.frame_pos = 0;
             } else {
                 self.frame_pos -= floor;
@@ -80,7 +80,7 @@ pub const GzipDecodeState = struct {
         self.inflater.input.slice.data = self.pending[0..self.pending_len];
     }
 
-    // Each step's whole chunk is accepted into pending; consumed is the accepted length and bytes are never re-sent.
+    // Each step's whole chunk is accepted into pending. Consumed is the accepted length and bytes are never re-sent.
     fn streamPosition(self: *const GzipDecodeState) usize {
         return if (self.phase == .deflate) self.inflater.input.slice.pos else self.frame_pos;
     }
@@ -210,7 +210,7 @@ pub fn gzipDecodeStep(state: *GzipDecodeState, input: []const u8, output: []u8, 
                             const byte = state.nextByte() orelse break :framing;
                             state.header_crc.update(&.{byte});
                         }
-                        // XLEN is consumed once; later fields chain from name.
+                        // XLEN is consumed once. Later fields chain from name.
                         if (state.fixed[3] & flag_name != 0) {
                             state.phase = .name;
                         } else if (state.fixed[3] & flag_comment != 0) {
@@ -290,7 +290,7 @@ pub fn gzipDecodeStep(state: *GzipDecodeState, input: []const u8, output: []u8, 
             var sink = std.Io.Writer.fixed(output[result.produced..]);
             const limit = composition.limitFor(output.len - result.produced);
             const emitted = state.inflater.reader.vtable.stream(&state.inflater.reader, &sink, limit) catch {
-                // Suspension vs corruption is distinguishable only by position (pending end vs early fail); flushed bytes are real output and count first.
+                // Suspension vs corruption is distinguishable only by position (pending end vs early fail). Flushed bytes are real output and count first.
                 const partial = sink.end;
                 if (partial > 0) {
                     result.produced += partial;
@@ -337,7 +337,7 @@ pub fn gzipDecodeStep(state: *GzipDecodeState, input: []const u8, output: []u8, 
     return result;
 }
 
-// Bounded checks capacity against the analytic bound and encodes once; measured sizes exactly first. Output bytes identical either way.
+// Bounded checks capacity against the analytic bound and encodes once. Measured sizes exactly first. Output bytes identical either way.
 pub const GzipEncodeSizing = enum { measured, bounded };
 
 pub const default_encode_options: gzip.Options = .{
@@ -381,4 +381,139 @@ pub fn gzipEncode(output: []u8, input: []const u8, history: []u8, options: gzip.
             return sink.end;
         },
     }
+}
+
+// Raw DEFLATE decode session: the gzip driver minus framing. One stream ends
+// at the final block, trailing bytes are an error.
+pub const DeflateDecodeState = struct {
+    inflater: deflate.Decompress,
+    history: []u8 = &.{},
+    pending: [pending_cap]u8,
+    pending_len: usize = 0,
+    leftover: usize = 0,
+    started: bool = false,
+    stream_end: usize = 0,
+    budgets: sessions.Budgets,
+
+    fn restage(self: *DeflateDecodeState, input: []const u8, result: *StepResult) Failure!void {
+        const consumed = self.inflater.input.slice.pos;
+        if (consumed > self.pending_len) return error.InternalFailure;
+        if (consumed > 0) {
+            @memmove(self.pending[0 .. self.pending_len - consumed], self.pending[consumed..self.pending_len]);
+            self.pending_len -= consumed;
+            self.inflater.input.slice.pos = 0;
+        }
+        self.leftover = self.pending_len;
+        if (input.len > self.pending.len - self.pending_len) {
+            result.failure_value = input.len - (self.pending.len - self.pending_len);
+            return error.InsufficientCapacity;
+        }
+        @memcpy(self.pending[self.pending_len..][0..input.len], input);
+        self.pending_len += input.len;
+        self.inflater.input.slice.data = self.pending[0..self.pending_len];
+    }
+};
+
+pub fn deflateDecodeStorage() usize {
+    return std.mem.alignForward(usize, @sizeOf(DeflateDecodeState), 16) + deflate.history_size;
+}
+
+pub fn deflateDecodeStateInit(storage: []u8, budgets: sessions.Budgets) error{InsufficientCapacity}!*DeflateDecodeState {
+    const state_size = std.mem.alignForward(usize, @sizeOf(DeflateDecodeState), 16);
+    if (storage.len < state_size + deflate.history_size) return error.InsufficientCapacity;
+    const state: *DeflateDecodeState = @ptrCast(@alignCast(storage.ptr));
+    const history = storage[state_size..][0..deflate.history_size];
+    state.* = .{
+        .inflater = deflate.Decompress.initSlice(&.{}, history),
+        .history = history,
+        .pending = undefined,
+        .budgets = budgets,
+    };
+    return state;
+}
+
+const deflate_decode_ops = sessions.Ops{
+    .step = struct {
+        fn call(state: *anyopaque, input: []const u8, output: []u8, end_of_input: bool) StepResult {
+            return deflateDecodeStep(@ptrCast(@alignCast(state)), input, output, end_of_input);
+        }
+    }.call,
+    .destroy = struct {
+        fn call(state: *anyopaque) void {
+            _ = state;
+        }
+    }.call,
+};
+
+pub fn deflateDecodeSession(storage: []u8, budgets: sessions.Budgets) error{InsufficientCapacity}!sessions.Session {
+    const state = try deflateDecodeStateInit(storage, budgets);
+    return .{ .state = state, .ops = &deflate_decode_ops };
+}
+
+fn deflateFramingFailed(result: *StepResult, consumed: usize, failure: Failure) StepResult {
+    result.consumed = consumed;
+    result.status = .failed;
+    result.failure = failure;
+    return result.*;
+}
+
+pub fn deflateDecodeStep(state: *DeflateDecodeState, input: []const u8, output: []u8, end_of_input: bool) StepResult {
+    var result = StepResult{};
+    state.restage(input, &result) catch |failure| {
+        return deflateFramingFailed(&result, 0, failure);
+    };
+    if (!state.started) {
+        state.inflater = deflate.Decompress.initSlice(state.pending[0..state.pending_len], state.history);
+        state.started = true;
+    }
+    if (output.len != 0 and result.produced < output.len) {
+        var sink = std.Io.Writer.fixed(output[result.produced..]);
+        const limit = composition.limitFor(output.len - result.produced);
+        const emitted = state.inflater.reader.vtable.stream(&state.inflater.reader, &sink, limit) catch {
+            const partial = sink.end;
+            if (partial > 0) {
+                result.produced += partial;
+                state.budgets.addDecoded(partial) catch |failure| {
+                    return deflateFramingFailed(&result, input.len, failure);
+                };
+            }
+            const starved = state.inflater.input.slice.pos == state.pending_len;
+            if (!end_of_input and starved) {
+                state.inflater.failed = false;
+                result.consumed = input.len;
+                result.status = .open;
+                return result;
+            }
+            return deflateFramingFailed(&result, input.len, error.InvalidData);
+        };
+        result.produced += emitted;
+        state.budgets.addDecoded(emitted) catch |failure| {
+            return deflateFramingFailed(&result, input.len, failure);
+        };
+    }
+    if (state.inflater.state == .end) {
+        if (state.inflater.reader.seek < state.inflater.reader.end) {
+            // Stream ended with decoded bytes still buffered in the reader.
+            result.consumed = input.len;
+            result.status = .open;
+            return result;
+        }
+        // The stream ends at consumed bits, not buffered bytes: word-granular
+        // refill over-reads up to seven bytes past the final block. Trailing
+        // bytes after the logical end are an error.
+        const consumed_bits = state.inflater.inputBitsConsumed();
+        state.stream_end = (consumed_bits + 7) / 8;
+        if (state.stream_end != state.pending_len) {
+            return deflateFramingFailed(&result, input.len, error.InvalidData);
+        }
+        result.consumed = input.len;
+        result.status = .done;
+        return result;
+    }
+    result.consumed = input.len;
+    if (end_of_input and state.inflater.input.slice.pos == state.pending_len) {
+        return deflateFramingFailed(&result, input.len, error.InvalidData);
+    }
+    result.status = .open;
+    return result;
 }

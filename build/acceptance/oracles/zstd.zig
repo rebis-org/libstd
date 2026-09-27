@@ -96,7 +96,7 @@ var row_reference: [64 * 1024 + 4096]u8 = undefined;
 fn runRowEngages(r: *Runner) anyerror!void {
     setupProfile(r);
     r.write_exact = false;
-    // Periodic input collapses finders onto rep-offset paths; xorshift avoids periodic reps.
+    // Periodic input collapses finders onto rep-offset paths. Xorshift avoids periodic reps.
     var state: u64 = 0x9E3779B97F4A7C15;
     for (&row_input) |*b| {
         state ^= state << 13;

@@ -19,6 +19,14 @@ extern fn lzma_stream_buffer_decode(memlimit: ?*u64, flags: u32, allocator: ?*an
 extern fn FL2_compress(destination: [*]u8, destination_capacity: usize, source: [*]const u8, source_size: usize, compressionLevel: c_int) usize;
 extern fn FL2_decompress(destination: [*]u8, destination_capacity: usize, source: [*]const u8, source_size: usize) usize;
 extern fn FL2_isError(code: usize) c_uint;
+extern fn compress2(destination: [*]u8, dest_len: *u32, source: [*]const u8, source_len: u32, level: c_int) c_int;
+extern fn uncompress(destination: [*]u8, dest_len: *u32, source: [*]const u8, source_len: u32) c_int;
+extern fn LZ4F_compressFrameBound(src_size: usize, preferences: ?*const anyopaque) usize;
+extern fn LZ4F_compressFrame(destination: [*]u8, dst_capacity: usize, source: [*]const u8, src_size: usize, preferences: ?*const anyopaque) usize;
+extern fn LZ4F_isError(code: usize) c_uint;
+extern fn LZ4F_createDecompressionContext(ctx: *usize, version: c_uint) usize;
+extern fn LZ4F_freeDecompressionContext(ctx: usize) usize;
+extern fn LZ4F_decompress(ctx: usize, dst: [*]u8, dst_size: *usize, src: [*]const u8, src_size: *usize, options: ?*const anyopaque) usize;
 
 pub const Console = struct { path: []const u8, encode_ns: u64 };
 
@@ -124,6 +132,39 @@ const fl2 = struct {
     }
 };
 
+const zlib = struct {
+    fn encode(_: *env_mod.Env, ref: Ref, input: []const u8, output: []u8) anyerror!Enc {
+        var len: u32 = @intCast(output.len);
+        if (compress2(output.ptr, &len, input.ptr, @intCast(input.len), @intCast(ref.level)) != 0) return error.EncodeFailed;
+        return .{ .len = len };
+    }
+    fn decode(_: *env_mod.Env, _: Ref, data: []const u8, output: []u8) anyerror!usize {
+        var len: u32 = @intCast(output.len);
+        if (uncompress(output.ptr, &len, data.ptr, @intCast(data.len)) != 0) return error.DecodeFailed;
+        return len;
+    }
+};
+
+const lz4 = struct {
+    fn encode(_: *env_mod.Env, _: Ref, input: []const u8, output: []u8) anyerror!Enc {
+        const bound = LZ4F_compressFrameBound(input.len, null);
+        if (bound > output.len) return error.OutTooSmall;
+        const len = LZ4F_compressFrame(output.ptr, output.len, input.ptr, input.len, null);
+        if (LZ4F_isError(len) != 0) return error.EncodeFailed;
+        return .{ .len = len };
+    }
+    fn decode(_: *env_mod.Env, _: Ref, data: []const u8, output: []u8) anyerror!usize {
+        var ctx: usize = 0;
+        if (LZ4F_isError(LZ4F_createDecompressionContext(&ctx, 100)) != 0) return error.DecodeFailed;
+        defer _ = LZ4F_freeDecompressionContext(ctx);
+        var src_len = data.len;
+        var dst_len = output.len;
+        const result = LZ4F_decompress(ctx, output.ptr, &dst_len, data.ptr, &src_len, null);
+        if (LZ4F_isError(result) != 0) return error.DecodeFailed;
+        return dst_len;
+    }
+};
+
 const libzip = struct {
     fn encode(env: *env_mod.Env, ref: Ref, input: []const u8, output: []u8) anyerror!Enc {
         const temp = try env.makePathZ("{s}/ref-libzip.zip", .{env_mod.paths.work});
@@ -161,6 +202,8 @@ fn get(kind: matrix.Lib) Spec {
         .libzip => .{ .encode = libzip.encode, .decode = libzip.decode },
         .unrar => .{ .decode = unrar.decode },
         .fast_lzma2 => .{ .encode = fl2.encode, .decode = fl2.decode },
+        .zlib => .{ .encode = zlib.encode, .decode = zlib.decode },
+        .lz4 => .{ .encode = lz4.encode, .decode = lz4.decode },
     };
 }
 

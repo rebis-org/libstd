@@ -1,0 +1,16 @@
+// Component descriptor (zstd-seekable, class grammar).
+// Identity and policy are frozen ABI: rename or re-id is a breaking
+// change, caught by the comptime assertions in kernel/catalog.zig.
+.{
+    .id = .{ .low = "0x6e6b82f08d910416", .high = "0xa7a351053d6d4016" },
+    .name = "zstd-seekable",
+    .class = "grammar",
+    .verbs = .{ "inspect", "decode_ordinal", "encode_ordinal", "decoded_size" },
+    .parameters = .{
+        .{ .name = "frame_size", .family = 13, .ordinal = 1, .representation = "scalar_words" },
+    },
+    .capabilities = .{ "read", "replay" },
+    .sizing = "measured",
+    .commit = "tentative",
+    .limits = .{ .window = 8388608, .block = 131072, .history = 0 },
+}

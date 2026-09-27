@@ -6,7 +6,7 @@ const sessions = @import("sessions.zig");
 const Failure = @import("../common/primitive/failure.zig").Failure;
 
 // Caller-owned storage: the handle IS the storage pointer, so no allocator, registry, or global state and sessions stay isolated.
-// Destroy nulls the ops word so post-destroy steps fail deterministically; no span constructor since it would be a no-op.
+// Destroy nulls the ops word so post-destroy steps fail deterministically. No span constructor since it would be a no-op.
 
 const Session = sessions.Session;
 
@@ -31,16 +31,21 @@ const session_pair = struct { component: [:0]const u8, verb: [:0]const u8 };
 // envelope path. A full-surface tar write session can re-enter as a v2 pair.
 const session_pairs = [_]session_pair{
     .{ .component = "gzip", .verb = "decode" },
+    .{ .component = "deflate", .verb = "decode" },
 };
 
-const SessionKind = enum { gzip_decode };
+const SessionKind = enum { gzip_decode, deflate_decode };
 
 fn matchSessionKind(component: [*:0]const u8, verb: [*:0]const u8) ?SessionKind {
     const component_name = std.mem.span(component);
     const verb_name = std.mem.span(verb);
-    for (session_pairs) |pair| {
+    for (session_pairs, 0..) |pair, index| {
         if (std.mem.eql(u8, component_name, pair.component) and std.mem.eql(u8, verb_name, pair.verb)) {
-            return .gzip_decode;
+            return switch (index) {
+                0 => .gzip_decode,
+                1 => .deflate_decode,
+                else => unreachable,
+            };
         }
     }
     return null;
@@ -49,6 +54,7 @@ fn matchSessionKind(component: [*:0]const u8, verb: [*:0]const u8) ?SessionKind 
 export fn stdk_session_storage(component: [*:0]const u8, verb: [*:0]const u8) callconv(.c) u64 {
     return switch (matchSessionKind(component, verb) orelse return 0) {
         .gzip_decode => driverStateOffset() + drivers.gzipDecodeStorage(),
+        .deflate_decode => driverStateOffset() + drivers.deflateDecodeStorage(),
     };
 }
 
@@ -66,6 +72,7 @@ fn createWithBudgets(
     const state_storage = bytes[driverStateOffset()..storage_len];
     const session = switch (kind) {
         .gzip_decode => drivers.gzipDecodeSession(state_storage, budgets) catch |failure| return failureStatus(failure),
+        .deflate_decode => drivers.deflateDecodeSession(state_storage, budgets) catch |failure| return failureStatus(failure),
     };
     std.mem.bytesAsValue(Session, bytes[0..@sizeOf(Session)]).* = session;
     return envelope.Status.ok;
@@ -83,7 +90,7 @@ export fn stdk_session_create(
 // Bounded variant of stdk_session_create: per-session ceilings on encoded,
 // decoded, work, and entry bytes. Hosts that run untrusted archives through
 // the stepped boundary pass their zip-bomb limits here instead of policing
-// produced bytes themselves; the unbounded create keeps the old behavior.
+// produced bytes themselves. The unbounded create keeps the old behavior.
 export fn stdk_session_bounded(
     component: [*:0]const u8,
     verb: [*:0]const u8,
@@ -172,7 +179,7 @@ const session_catalog_text: [:0]const u8 = blk: {
     break :blk text;
 };
 
-// Destroy is idempotent; stepping a destroyed session is invalid_call.
+// Destroy is idempotent. Stepping a destroyed session is invalid_call.
 export fn stdk_session_destroy(handle: ?*anyopaque) callconv(.c) u32 {
     const session: *Session = @ptrCast(@alignCast(handle orelse return envelope.Status.invalid_call));
     if (session.ops == &destroyed_ops) return envelope.Status.ok;
@@ -181,7 +188,7 @@ export fn stdk_session_destroy(handle: ?*anyopaque) callconv(.c) u32 {
     return envelope.Status.ok;
 }
 
-// Sentinel ops for destroyed sessions; function pointers are never called since callers check first.
+// Sentinel ops for destroyed sessions. Function pointers are never called since callers check first.
 const destroyed_ops = sessions.Ops{
     .step = struct {
         fn call(state: *anyopaque, input: []const u8, output: []u8, end_of_input: bool) sessions.StepResult {

@@ -2,7 +2,7 @@ const std = @import("std");
 
 const Failure = @import("../common/primitive/failure.zig").Failure;
 
-// Dynamic dispatch allowed here; leaf inner loops stay comptime-specialized. Caller-owned storage keeps zero library state, so reentrancy holds by construction.
+// Dynamic dispatch allowed here. Leaf inner loops stay comptime-specialized. Caller-owned storage keeps zero library state, so reentrancy holds by construction.
 pub const StepStatus = enum { open, done, failed };
 
 pub const StepResult = struct {
@@ -57,7 +57,7 @@ pub const Session = struct {
     ops: *const Ops,
     alive: bool = true,
     /// The last step's failure in envelope status vocabulary, plus the
-    /// driver detail. Written by the boundary on failure; hosts read them
+    /// driver detail. Written by the boundary on failure. Hosts read them
     /// through `stdk_session_failure` while the storage is alive.
     failure_status: u32 = 0,
     failure_detail: u64 = 0,
