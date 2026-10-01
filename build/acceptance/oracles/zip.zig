@@ -224,7 +224,7 @@ fn runEncrypted(r: *Runner) anyerror!void {
     const entry1 = entryWithMethod(&store1, "a.txt", &zip_small, 8);
     const entry2 = entryWithMethod(&store2, "b.txt", &zip_large, 0);
     var entries = [_]harness.Node{ entry1, entry2 };
-    entries[0].next = &entries[1];
+    harness.linkNodes(entries[0..]);
     const password = "s3cret";
     zip_enc_archive_size = try zipWriteWithCrypto(r, entries[0], &zip_enc_archive, password, null, null, null);
     const version: u16 = @as(u16, zip_enc_archive[4]) | (@as(u16, zip_enc_archive[5]) << 8);
@@ -387,7 +387,7 @@ fn makeTraditionalZip(r: *Runner, method: u64) !void {
     const entry1 = entryWithMethod(&store1, "a.txt", &zip_small, method);
     const entry2 = entryWithMethod(&store2, "b.txt", &zip_big, method);
     var entries = [_]harness.Node{ entry1, entry2 };
-    entries[0].next = &entries[1];
+    harness.linkNodes(entries[0..]);
     const password = "s3cret";
     zip_trad_archive_size = try zipWriteWithCrypto(r, entries[0], &zip_trad_archive, password, 0, null, null);
 }

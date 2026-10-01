@@ -167,7 +167,7 @@ fn runDecoded(r: *Runner) anyerror!void {
     const entry3 = entryWithMethod(&store3, "unicode/\xe4\xbd\xa0\xe5\xa5\xbd.txt", &sz_dec_data3_buf, 0);
     const entry_dir = dirEntry(&store_dir, "dir/");
     var entries = [_]harness.Node{ entry1, entry2, entry3, entry_dir };
-    harness.chain(&entries);
+    harness.linkNodes(entries[0..]);
     sz_dec_archive_size = try sevenZipWrite(r, entries[0], &sz_dec_archive, &.{});
     try sevenZipEntryCount(r, sz_dec_archive[0..sz_dec_archive_size], 4);
     const expected_data = [_][]const u8{ &sz_dec_data1_buf, &sz_dec_data2_buf, &sz_dec_data3_buf };
@@ -228,7 +228,7 @@ fn runCoded(r: *Runner) anyerror!void {
         const entry3 = entryWithMethod(&store3, "unicode/\xe4\xbd\xa0\xe5\xa5\xbd.txt", &sz_coded_data3_buf, method);
         const entry_dir = dirEntry(&store_dir, "dir/");
         var entries = [_]harness.Node{ entry1, entry2, entry3, entry_dir };
-        harness.chain(&entries);
+        harness.linkNodes(entries[0..]);
         sz_coded_archive_size = try sevenZipWrite(r, entries[0], &sz_coded_archive, &.{});
         try sevenZipEntryCount(r, sz_coded_archive[0..sz_coded_archive_size], 4);
         const datas = [_][]const u8{ &sz_small, &sz_coded_data2_buf, &sz_coded_data3_buf };
@@ -254,7 +254,7 @@ fn runCoded(r: *Runner) anyerror!void {
     const entry3 = entryWithMethod(&store3, "bzip2.txt", &sz_coded_data3_buf, 2);
     const entry_dir = dirEntry(&store_dir, "dir/");
     var mixed = [_]harness.Node{ entry1, entry2, entry3, entry_dir };
-    harness.chain(&mixed);
+    harness.linkNodes(mixed[0..]);
     sz_coded_archive_size = try sevenZipWrite(r, mixed[0], &sz_coded_archive, &.{});
     const datas = [_][]const u8{ &sz_small, &sz_coded_data2_buf, &sz_coded_data3_buf };
     for (0..3) |i| {
@@ -339,7 +339,7 @@ fn runEncodeAdvanced(r: *Runner) anyerror!void {
     const entry_full = entryWithMethod(&store_full, "full.txt", &sz_small, 4);
     const entry_empty = entryWithMethod(&store_empty, "empty.txt", &.{}, 4);
     var entries = [_]harness.Node{ entry_full, entry_empty };
-    harness.chain(&entries);
+    harness.linkNodes(entries[0..]);
     sz_adv_archive_size = try sevenZipWrite(r, entries[0], &sz_adv_archive, &.{});
     try sevenZipReadExpected(r, sz_adv_archive[0..sz_adv_archive_size], 0, &sz_adv_output, &sz_small, &.{});
     try sevenZipReadExpected(r, sz_adv_archive[0..sz_adv_archive_size], 1, &sz_adv_output, "", &.{});

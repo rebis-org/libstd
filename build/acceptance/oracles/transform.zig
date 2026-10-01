@@ -7,11 +7,6 @@ const lib = @import("lib.zig");
 const Runner = harness.Runner;
 const steps = @import("steps.zig");
 
-fn noParams(_: *Runner, out: *[steps.MaxExtra]harness.Node) usize {
-    _ = out;
-    return 0;
-}
-
 fn optimalParams(_: *Runner, out: *[steps.MaxExtra]harness.Node) usize {
     out[0] = harness.paramScalar(harness.param_family_deflate, harness.deflate_optimal, harness.cmd_all, 1);
     out[1] = harness.paramScalar(harness.param_family_deflate, harness.deflate_nice, harness.cmd_all, 258);
@@ -31,14 +26,7 @@ fn setupProfile(r: *Runner, profile_id: harness.Id) void {
 
 fn runRoundtrip(r: *Runner, profile_id: harness.Id) anyerror!void {
     setupProfile(r, profile_id);
-    try steps.queryWrite(&noParams, r);
-    try steps.writeSpan(&noParams, r);
-    try steps.queryRead(&noParams, r);
-    try steps.readSpan(&noParams, r);
-    try steps.writeCallbackSource(&noParams, r);
-    try steps.readCallbackSink(&noParams, r);
-    try steps.invalidReject(&noParams, r);
-    try steps.capacitySmallSink(&noParams, r);
+    try steps.roundtrip(&steps.noParams, r);
 }
 
 pub fn runDeflate(r: *Runner) anyerror!void {
@@ -49,10 +37,10 @@ pub fn runDeflateOptimal(r: *Runner) anyerror!void {
     setupProfile(r, harness.ids.deflate);
     try steps.queryWrite(&optimalParams, r);
     try steps.writeSpan(&optimalParams, r);
-    try steps.queryRead(&noParams, r);
-    try steps.readSpan(&noParams, r);
+    try steps.queryRead(&steps.noParams, r);
+    try steps.readSpan(&steps.noParams, r);
     try steps.writeCallbackSource(&optimalParams, r);
-    try steps.readCallbackSink(&noParams, r);
+    try steps.readCallbackSink(&steps.noParams, r);
     try steps.capacitySmallSink(&optimalParams, r);
 }
 
@@ -65,19 +53,19 @@ pub fn runGzipOptimal(r: *Runner) anyerror!void {
     corpus.select(r.corpus_index, optimal_input[0..]);
     r.input = optimal_input[0..];
     try steps.writeSpan(&optimalParams, r);
-    try steps.readSpan(&noParams, r);
+    try steps.readSpan(&steps.noParams, r);
     try steps.foreignTool(r);
     // Parser must engage: optimal stream differs from the default lazy stream here.
     const optimal_len = r.encoded_len;
     @memcpy(optimal_reference[0..optimal_len], r.encoded[0..optimal_len]);
-    try steps.writeSpan(&noParams, r);
+    try steps.writeSpan(&steps.noParams, r);
     if (r.encoded_len == optimal_len and std.mem.eql(u8, r.encoded[0..r.encoded_len], optimal_reference[0..optimal_len])) return error.OptimalParserNotEngaged;
-    try steps.readSpan(&noParams, r);
+    try steps.readSpan(&steps.noParams, r);
 }
 
 pub fn runGzip(r: *Runner) anyerror!void {
     try runRoundtrip(r, harness.ids.gzip);
-    try steps.truncateReject(&noParams, r);
+    try steps.truncateReject(&steps.noParams, r);
     try steps.foreignTool(r);
 }
 
@@ -88,8 +76,8 @@ pub fn runBzip2Roundtrip(r: *Runner) anyerror!void {
 pub fn runBzip2Extras(r: *Runner) anyerror!void {
     setupProfile(r, harness.ids.bzip2);
     r.write_exact = false;
-    try steps.writeSpan(&noParams, r);
-    try steps.readSpan(&noParams, r);
+    try steps.writeSpan(&steps.noParams, r);
+    try steps.readSpan(&steps.noParams, r);
     try steps.foreignTool(r);
     try bzOracleFixture(r);
     try bzBlockSizeRoundtrip(r);
@@ -105,7 +93,7 @@ fn bzOracleFixture(r: *Runner) !void {
 }
 
 fn bzBlockSizeRoundtrip(r: *Runner) !void {
-    try steps.plan(&noParams, r, &.{
+    try steps.plan(&steps.noParams, r, &.{
         harness.bzip2BlockParam(900000),
         harness.paramTargetCommand(harness.ids.write),
         harness.sourceSpan(r.input),
@@ -165,7 +153,7 @@ fn gzOptionalHeaders(r: *Runner) !void {
         harness.gzipCommentParam(comment),
         harness.gzipExtraParam(&extra),
     };
-    try steps.plan(&noParams, r, &[_]harness.Node{
+    try steps.plan(&steps.noParams, r, &[_]harness.Node{
         harness.paramTargetCommand(harness.ids.write),
         harness.sourceSpan(r.input),
     } ++ header_params ++ [_]harness.Node{
@@ -183,7 +171,7 @@ fn gzOptionalHeaders(r: *Runner) !void {
     if (!harness.containsBytes(r.encoded[0..r.encoded_len], name)) return error.GzipNameMissing;
     if (!harness.containsBytes(r.encoded[0..r.encoded_len], comment)) return error.GzipCommentMissing;
     if (!harness.containsBytes(r.encoded[0..r.encoded_len], &extra)) return error.GzipExtraMissing;
-    try steps.plan(&noParams, r, &.{
+    try steps.plan(&steps.noParams, r, &.{
         harness.paramTargetCommand(harness.ids.read),
         harness.sourceSpan(r.encoded[0..r.encoded_len]),
         harness.capabilityParam(r.caps_query),
@@ -220,7 +208,7 @@ fn gzConcat(r: *Runner) !void {
     try harness.spanCall(r, harness.ids.write, r.input[part1_len .. part1_len + part2_len], r.encoded[member1_size..]);
     r.encoded_len += member1_size;
     if (r.encoded_len > r.encoded.len) return error.ConcatenatedGzipOverflow;
-    try steps.plan(&noParams, r, &.{
+    try steps.plan(&steps.noParams, r, &.{
         harness.paramTargetCommand(harness.ids.read),
         harness.sourceSpan(r.encoded[0..r.encoded_len]),
         harness.capabilityParam(r.caps_query),
@@ -285,17 +273,15 @@ fn gzSmallSinkRead(r: *Runner) !void {
 fn gzCallbackSinkFailure(r: *Runner) !void {
     try harness.spanCall(r, harness.ids.write, r.input, r.encoded);
     // Callback sinks keep the staged route with committed-prefix progress reporting.
-    var fail_ctx = harness.SinkCallbackContext{ .fail_after = 5 };
-    var downstream = harness.scalarNode(harness.ids.diagnostic_downstream_status);
-    var diagnostic = harness.node(null, 0);
-    diagnostic.child = &downstream;
+    var fail_ctx: harness.SinkCallbackContext = undefined;
+    var downstream: harness.Node = undefined;
+    var diagnostic: harness.Node = undefined;
+    harness.sinkFailureInit(&fail_ctx, &downstream, &diagnostic);
     _ = harness.call(r, harness.ids.read, &.{
         harness.sourceSpan(r.encoded[0..r.encoded_len]),
         harness.sinkCallbackNode(0, 0),
     }, .{ .ctx = true, .callback = harness.sinkCallback, .context = &fail_ctx, .diagnostic = &diagnostic });
-    try harness.requireStatus(r, abi.Status.io_failure);
-    if (fail_ctx.accepted_total != 4) return error.CallbackAcceptedTotalMismatch;
-    if (downstream.value_low != abi.Status.insufficient_capacity) return error.DownstreamStatusMismatch;
+    try harness.expectSinkFailure(r, &fail_ctx, &downstream);
 }
 
 fn runGzipExtras(r: *Runner) anyerror!void {
@@ -315,8 +301,8 @@ fn runGzipLarge(r: *Runner) anyerror!void {
     r.write_exact = false;
     corpus.select(r.corpus_index, gzip_large_input[0..]);
     r.input = gzip_large_input[0..];
-    try steps.writeSpan(&noParams, r);
-    try steps.readSpan(&noParams, r);
+    try steps.writeSpan(&steps.noParams, r);
+    try steps.readSpan(&steps.noParams, r);
     try steps.foreignTool(r);
 }
 
@@ -334,7 +320,7 @@ fn runGzipSinglePass(r: *Runner) anyerror!void {
     r.write_exact = false;
     corpus.select(r.corpus_index, gzip_large_input[0..]);
     r.input = gzip_large_input[0..];
-    try steps.writeSpan(&noParams, r);
+    try steps.writeSpan(&steps.noParams, r);
     // Capacity == ISIZE engages the single-pass path.
     try harness.spanCall(r, harness.ids.read, r.encoded[0..r.encoded_len], r.output);
     if (r.response.byte_length != r.input.len or !std.mem.eql(u8, r.output[0..r.input.len], r.input)) return error.SinglePassReadMismatch;

@@ -39,15 +39,7 @@ fn roundtrip(comptime params: steps.Params) fn (*Runner) anyerror!void {
     return struct {
         fn run(r: *Runner) anyerror!void {
             setupProfile(r);
-            try steps.queryWrite(params, r);
-            try steps.writeSpan(params, r);
-            try steps.queryRead(params, r);
-            try steps.readSpan(params, r);
-            try steps.writeCallbackSource(params, r);
-            try steps.readCallbackSink(params, r);
-            try steps.invalidReject(params, r);
-            try steps.truncateReject(params, r);
-            try steps.capacitySmallSink(params, r);
+            try steps.roundtripTruncate(params, r);
         }
     }.run;
 }

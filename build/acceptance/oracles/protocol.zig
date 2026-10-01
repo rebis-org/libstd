@@ -13,11 +13,10 @@ fn setup(r: *Runner) !void {
 
 fn discoveryCapacity(r: *Runner) !void {
     var small_buffer = [_]u8{0xa5} ** 4;
-    // Written by capacityDiagnostics below before any read.
+    // Written by capacityDiagnostic below before any read.
     var required: harness.Node = undefined;
     var available: harness.Node = undefined;
-    var diagnostic: harness.Node = undefined;
-    harness.capacityDiagnostics(&required, &available, &diagnostic);
+    var diagnostic = harness.capacityDiagnostic(harness.ids.diagnostic_required_capacity, harness.ids.diagnostic_available_capacity, &required, &available);
     var discovery_response = harness.node(&small_buffer, small_buffer.len);
     r.status = harness.invoke(
         .{ .low = 0, .high = 0 },
@@ -134,17 +133,15 @@ fn limitReject(r: *Runner) !void {
 
 fn callbackDownstream(r: *Runner) !void {
     const input = "partial";
-    var callback_ctx = harness.SinkCallbackContext{ .fail_after = 5 };
-    var downstream = harness.scalarNode(harness.ids.diagnostic_downstream_status);
-    var diagnostic = harness.node(null, 0);
-    diagnostic.child = &downstream;
+    var callback_ctx: harness.SinkCallbackContext = undefined;
+    var downstream: harness.Node = undefined;
+    var diagnostic: harness.Node = undefined;
+    harness.sinkFailureInit(&callback_ctx, &downstream, &diagnostic);
     _ = harness.call(r, harness.ids.read, &.{
         harness.sourceSpan(input),
         harness.sinkCallbackNode(0, 0),
     }, .{ .ctx = true, .callback = harness.sinkCallback, .context = &callback_ctx, .diagnostic = &diagnostic });
-    try harness.requireStatus(r, abi.Status.io_failure);
-    if (callback_ctx.accepted_total != 4) return error.CallbackAcceptedTotalMismatch;
-    if (downstream.value_low != abi.Status.insufficient_capacity) return error.DownstreamStatusMismatch;
+    try harness.expectSinkFailure(r, &callback_ctx, &downstream);
 }
 
 fn readOnlyReject(r: *Runner) !void {

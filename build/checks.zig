@@ -27,19 +27,21 @@ pub fn expand(b: *std.Build, ctx: *common.Context) void {
     };
 }
 
+fn addHeaderProbe(b: *std.Build, zig: []const u8, driver: []const u8, std_flag: []const u8, include_flag: []const u8, source: std.Build.LazyPath) *std.Build.Step.Run {
+    const probe = b.addSystemCommand(&.{ zig, driver, std_flag, include_flag, "-c" });
+    probe.addFileArg(source);
+    probe.addArgs(&.{ "-o", if (builtin.os.tag == .windows) "NUL" else "/dev/null" });
+    probe.step.dependOn(b.getInstallStep());
+    return probe;
+}
+
 fn addAbi(b: *std.Build, ctx: *common.Context) void {
     const include = b.getInstallPath(.header, "");
     const include_flag = b.fmt("-I{s}", .{include});
     const zig = b.graph.zig_exe;
     // No -fsyntax-only mode: object to /dev/null proves C23/C++26 parse without linking.
-    const c_header = b.addSystemCommand(&.{ zig, "cc", "-std=c23", include_flag, "-c" });
-    c_header.addFileArg(b.path("build/acceptance/header.c"));
-    c_header.addArgs(&.{ "-o", if (builtin.os.tag == .windows) "NUL" else "/dev/null" });
-    c_header.step.dependOn(b.getInstallStep());
-    const cpp_header = b.addSystemCommand(&.{ zig, "c++", "-std=c++2c", include_flag, "-c" });
-    cpp_header.addFileArg(b.path("build/acceptance/header.cpp"));
-    cpp_header.addArgs(&.{ "-o", if (builtin.os.tag == .windows) "NUL" else "/dev/null" });
-    cpp_header.step.dependOn(b.getInstallStep());
+    const c_header = addHeaderProbe(b, zig, "cc", "-std=c23", include_flag, b.path("build/acceptance/header.c"));
+    const cpp_header = addHeaderProbe(b, zig, "c++", "-std=c++2c", include_flag, b.path("build/acceptance/header.cpp"));
     const abi = b.step("abi", "Verify the ABI contract of the generated header and library");
     abi.dependOn(&c_header.step);
     abi.dependOn(&cpp_header.step);

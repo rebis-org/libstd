@@ -46,10 +46,6 @@ pub const cjpm: Distribution = .{
     .entries = cjpmEntries(),
 };
 
-pub fn versionCode(version: std.SemanticVersion) u32 {
-    return @intCast(version.major * 1_000_000 + version.minor * 1_000 + version.patch);
-}
-
 fn hostEntries() []const []const u8 {
     const entries: [5][]const u8 = .{
         "libstd/include/stdk.h",

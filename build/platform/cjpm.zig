@@ -4,10 +4,7 @@ const common = @import("common.zig");
 const manifest = @import("manifest.zig");
 const slices = @import("slices.zig");
 
-// Cangjie package (cjpm) archive: a Cangjie module with FFI bindings, the
-// generated header and catalog, and prebuilt OHOS libraries per target triple.
-// cjpm is the official Cangjie package manager. [ffi.c] entries name the
-// native library each target links (libstd.a / libstd.so under libs/<triple>).
+// [ffi.c] entries name the native library each target links.
 pub fn addArchive(
     b: *std.Build,
     ctx: *const common.Context,
@@ -16,8 +13,8 @@ pub fn addArchive(
     _ = stage.add("stdk/cjpm.toml", tomlText(b, ctx));
     _ = stage.addCopyFile(b.path("build/templates/cjpm/stdk.cj"), "stdk/src/stdk.cj");
     _ = stage.addCopyFile(b.path("build/templates/cjpm/session.cj"), "stdk/src/session.cj");
-    _ = stage.addCopyFile(ctx.generated.header, "stdk/libs/include/stdk.h");
-    _ = stage.addCopyFile(ctx.generated.catalog, "stdk/stdk.catalog.json");
+    _ = stage.addCopyFile(ctx.generated.header, manifest.cjpm.header);
+    _ = stage.addCopyFile(ctx.generated.catalog, manifest.cjpm.catalog);
     for (slices.ohos_abis) |abi| {
         const resolved = b.resolveTargetQuery(.{
             .cpu_arch = abi.arch,
