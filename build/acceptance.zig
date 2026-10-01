@@ -20,9 +20,10 @@ pub const units = [_]Unit{
 pub fn expand(b: *std.Build, ctx: *common.Context) void {
     const refs = ctx.refs orelse @panic("Vendor units must expand before acceptance units.");
     inline for (units) |unit| switch (unit.kind) {
-        .oracles => addOracles(b, ctx),
+        .oracles => addOracles(b, ctx, refs),
         .benchmark => addBenchmark(b, ctx, refs),
     };
+    addOraclesUbsan(b, ctx, refs);
 }
 
 const AcceptanceApp = struct {
@@ -51,64 +52,101 @@ fn addAcceptanceApp(
     return .{ .exe = exe, .run = run };
 }
 
-fn addOracles(b: *std.Build, ctx: *common.Context) void {
-    const generated_components = common.descriptorScan(b, ctx);
-
-    const nucleus_module = modules.createFor(b, modules.nucleus, ctx.target, ctx.optimize, ctx);
-    const components_module = b.createModule(.{
-        .root_source_file = generated_components,
-        .target = ctx.target,
-        .optimize = ctx.optimize,
+fn translateCModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    const translate_c = b.addTranslateC(.{
+        .root_source_file = b.path("build/acceptance/oracles/c/c.h"),
+        .target = target,
+        .optimize = optimize,
     });
-    components_module.addImport("nucleus", nucleus_module);
+    return translate_c.createModule();
+}
 
-    const c_module = blk: {
-        const translate_c = b.addTranslateC(.{
-            .root_source_file = b.path("build/acceptance/oracles/c/c.h"),
-            .target = ctx.target,
-            .optimize = ctx.optimize,
-        });
-        break :blk translate_c.createModule();
-    };
+fn abVariantModule(b: *std.Build, name: []const u8) *std.Build.Module {
+    const variant = b.addOptions();
+    variant.addOption([]const u8, "name", name);
+    return variant.createModule();
+}
 
-    const ab_variant_baseline = b.addOptions();
-    ab_variant_baseline.addOption([]const u8, "name", "baseline");
-    const ab_variant_baseline_module = ab_variant_baseline.createModule();
+fn skipHostLibs(b: *std.Build, ctx: *const common.Context) common.HostLibraries {
+    const skip_options = b.addOptions();
+    skip_options.addOption(bool, "portable", ctx.portable);
+    return common.addHostLibrariesWithOptions(b, ctx.target, ctx.optimize, ctx.portable, skip_options.createModule(), ctx.sanitize_c);
+}
 
-    const app = addAcceptanceApp(b, ctx, "oracles", modules.oracles, ctx.target, ctx.optimize, &.{
-        .{ .name = "c", .module = c_module },
-        .{ .name = "ab_variant", .module = ab_variant_baseline_module },
-        .{ .name = "components", .module = components_module },
-    }, ctx.host, "oracles", "Run the oracle suite against the system libraries");
+fn linkOracleRefs(app: AcceptanceApp, refs: cmd.Refs, catalog: std.Build.LazyPath) void {
     app.exe.root_module.linkSystemLibrary("z", .{});
     app.exe.root_module.linkSystemLibrary("lzma", .{});
     app.exe.root_module.linkSystemLibrary("bz2", .{});
     app.exe.root_module.linkSystemLibrary("archive", .{});
-    app.exe.root_module.addObjectFile(ctx.refs.?.zstd_lib);
-    app.exe.root_module.addObjectFile(ctx.refs.?.lz4_lib);
-    app.run.addFileArg(ctx.generated.catalog);
+    app.exe.root_module.addObjectFile(refs.zstd_lib);
+    app.exe.root_module.addObjectFile(refs.lz4_lib);
+    app.run.addFileArg(catalog);
+}
 
-    const skip_options = b.addOptions();
-    skip_options.addOption(bool, "portable", ctx.portable);
-    const skip_options_module = skip_options.createModule();
-    const skip_host = common.addHostLibrariesWithOptions(b, ctx.target, ctx.optimize, ctx.portable, skip_options_module);
+fn addTrapRun(b: *std.Build, ctx: *const common.Context, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, exe_name: []const u8) *std.Build.Step.Run {
+    const trap_module = modules.createFor(b, modules.trap, target, optimize, ctx);
+    const trap_exe = b.addExecutable(.{ .name = exe_name, .root_module = trap_module });
+    return b.addRunArtifact(trap_exe);
+}
 
-    const ab_variant_skip = b.addOptions();
-    ab_variant_skip.addOption([]const u8, "name", "skip");
-    const ab_variant_skip_module = ab_variant_skip.createModule();
+fn addContractCheck(b: *std.Build, nucleus: *std.Build.Module, components: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, sanitize_c: ?std.zig.SanitizeC, exe_name: []const u8, catalog: std.Build.LazyPath) *std.Build.Step.Run {
+    const kernel_module = b.createModule(.{
+        .root_source_file = b.path("src/kernel/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    if (sanitize_c) |sc| kernel_module.sanitize_c = sc;
+    kernel_module.addImport("nucleus", nucleus);
+    kernel_module.addImport("components", components);
+    const contract_module = b.createModule(.{
+        .root_source_file = b.path("build/acceptance/oracles/contract.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    if (sanitize_c) |sc| contract_module.sanitize_c = sc;
+    contract_module.addImport("nucleus", nucleus);
+    contract_module.addImport("kernel", kernel_module);
+    const contract_exe = b.addExecutable(.{ .name = exe_name, .root_module = contract_module });
+    const contract_run = b.addRunArtifact(contract_exe);
+    contract_run.addFileArg(catalog);
+    return contract_run;
+}
+
+fn linkBenchmarkExe(b: *std.Build, exe: *std.Build.Step.Compile, run: *std.Build.Step.Run, refs: cmd.Refs, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, catalog: std.Build.LazyPath, sdk_usr_lib: ?[]const u8) void {
+    _ = sevenzip.addReference(b, target, optimize, exe);
+    refs.link(b, exe.root_module);
+    exe.root_module.addCSourceFile(.{ .file = b.path("build/acceptance/benchmark/ref/libzip.c") });
+    exe.root_module.addCSourceFile(.{ .file = b.path("build/acceptance/benchmark/ref/unrar.c") });
+    if (sdk_usr_lib) |lib| exe.root_module.addLibraryPath(.{ .cwd_relative = lib });
+    exe.root_module.linkSystemLibrary("c++", .{});
+    exe.root_module.linkSystemLibrary("z", .{});
+    exe.step.dependOn(&refs.libzip_build.step);
+    refs.dependOnTools(&run.step);
+    refs.dependOnBins(&run.step);
+    run.addFileArg(catalog);
+}
+
+fn addOracles(b: *std.Build, ctx: *common.Context, refs: cmd.Refs) void {
+    const pair = modules.componentsWithNucleus(b, ctx, ctx.target, ctx.target, ctx.optimize);
+    const c_module = translateCModule(b, ctx.target, ctx.optimize);
+    const ab_variant_baseline_module = abVariantModule(b, "baseline");
+
+    const app = addAcceptanceApp(b, ctx, "oracles", modules.oracles, ctx.target, ctx.optimize, &.{
+        .{ .name = "c", .module = c_module },
+        .{ .name = "ab_variant", .module = ab_variant_baseline_module },
+        .{ .name = "components", .module = pair.components },
+    }, ctx.host, "oracles", "Run the oracle suite against the system libraries");
+    linkOracleRefs(app, refs, ctx.generated.catalog);
+
+    const skip_host = skipHostLibs(b, ctx);
+    const ab_variant_skip_module = abVariantModule(b, "skip");
 
     const skip_app = addAcceptanceApp(b, ctx, "oracles_skip", modules.oracles, ctx.target, ctx.optimize, &.{
         .{ .name = "c", .module = c_module },
         .{ .name = "ab_variant", .module = ab_variant_skip_module },
-        .{ .name = "components", .module = components_module },
+        .{ .name = "components", .module = pair.components },
     }, skip_host, "oracles_skip", "Run the oracle suite against the encode A/B variant slot");
-    skip_app.exe.root_module.linkSystemLibrary("z", .{});
-    skip_app.exe.root_module.linkSystemLibrary("lzma", .{});
-    skip_app.exe.root_module.linkSystemLibrary("bz2", .{});
-    skip_app.exe.root_module.linkSystemLibrary("archive", .{});
-    skip_app.exe.root_module.addObjectFile(ctx.refs.?.zstd_lib);
-    skip_app.exe.root_module.addObjectFile(ctx.refs.?.lz4_lib);
-    skip_app.run.addFileArg(ctx.generated.catalog);
+    linkOracleRefs(skip_app, refs, ctx.generated.catalog);
 
     const baseline_ab_run = b.addRunArtifact(app.exe);
     baseline_ab_run.addFileArg(ctx.generated.catalog);
@@ -128,29 +166,8 @@ fn addOracles(b: *std.Build, ctx: *common.Context) void {
     b.step("oracles_ab", "Compare LZMA encode output between baseline and skip-on variants").dependOn(&diff.step);
 
     // Re-executes per scenario: contract violations trap the process, so driver and scenarios cannot share an address space.
-    const trap_module = modules.createFor(b, modules.trap, ctx.target, ctx.optimize, ctx);
-    const trap_exe = b.addExecutable(.{ .name = "oracles_trap", .root_module = trap_module });
-    const trap_run = b.addRunArtifact(trap_exe);
-    app.run.step.dependOn(&trap_run.step);
-
-    const kernel_module = b.createModule(.{
-        .root_source_file = b.path("src/kernel/root.zig"),
-        .target = ctx.target,
-        .optimize = ctx.optimize,
-    });
-    kernel_module.addImport("nucleus", nucleus_module);
-    kernel_module.addImport("components", components_module);
-    const contract_module = b.createModule(.{
-        .root_source_file = b.path("build/acceptance/oracles/contract.zig"),
-        .target = ctx.target,
-        .optimize = ctx.optimize,
-    });
-    contract_module.addImport("nucleus", nucleus_module);
-    contract_module.addImport("kernel", kernel_module);
-    const contract_exe = b.addExecutable(.{ .name = "contract_check", .root_module = contract_module });
-    const contract_run = b.addRunArtifact(contract_exe);
-    contract_run.addFileArg(ctx.generated.catalog);
-    app.run.step.dependOn(&contract_run.step);
+    app.run.step.dependOn(&addTrapRun(b, ctx, ctx.target, ctx.optimize, "oracles_trap").step);
+    app.run.step.dependOn(&addContractCheck(b, pair.nucleus, pair.components, ctx.target, ctx.optimize, ctx.sanitize_c, "contract_check", ctx.generated.catalog).step);
 
     const compose_ab_module = b.createModule(.{
         .root_source_file = b.path("src/compose_ab.zig"),
@@ -158,24 +175,41 @@ fn addOracles(b: *std.Build, ctx: *common.Context) void {
         .optimize = ctx.optimize,
     });
     compose_ab_module.addImport("options", ctx.options);
-    if (!ctx.portable and ctx.target.result.cpu.arch == .aarch64) {
-        compose_ab_module.addAssemblyFile(b.path("src/common/primitive/checksum/aarch64.S"));
-    }
+    modules.maybeAddCrcAsm(b, compose_ab_module, ctx.target, ctx.portable);
     const compose_ab_exe = b.addExecutable(.{ .name = "compose_ab", .root_module = compose_ab_module });
     const compose_ab_run = b.addRunArtifact(compose_ab_exe);
     app.run.step.dependOn(&compose_ab_run.step);
 }
 
+fn addOraclesUbsan(b: *std.Build, ctx: *common.Context, refs: cmd.Refs) void {
+    // Zig 0.16 ships no ASan runtime, so UBSan is the only implementable sanitizer step.
+    var ubsan_ctx = ctx.*;
+    ubsan_ctx.sanitize_c = .full;
+    ubsan_ctx.host = common.addHostLibrariesWithOptions(b, ctx.target, ctx.optimize, ctx.portable, ctx.options, .full);
+
+    const pair = modules.componentsWithNucleus(b, &ubsan_ctx, ctx.target, ctx.target, ctx.optimize);
+    const c_module = translateCModule(b, ctx.target, ctx.optimize);
+    const ab_variant_baseline_module = abVariantModule(b, "baseline");
+
+    const app = addAcceptanceApp(b, &ubsan_ctx, "oracles_ubsan", modules.oracles, ctx.target, ctx.optimize, &.{
+        .{ .name = "c", .module = c_module },
+        .{ .name = "ab_variant", .module = ab_variant_baseline_module },
+        .{ .name = "components", .module = pair.components },
+    }, ubsan_ctx.host, "oracles_ubsan", "Run the oracle suite with UBSan");
+    linkOracleRefs(app, refs, ctx.generated.catalog);
+    app.run.step.dependOn(&addTrapRun(b, &ubsan_ctx, ctx.target, ctx.optimize, "oracles_trap_ubsan").step);
+    app.run.step.dependOn(&addContractCheck(b, pair.nucleus, pair.components, ctx.target, ctx.optimize, .full, "contract_check_ubsan", ctx.generated.catalog).step);
+
+    // compose_ab is a throughput gate that flakes under contention; sanitizer slowdown would fault it, so it stays out.
+    b.step("oracles_san", "Run all sanitizer suites (ASan absent: Zig 0.16 ships no ASan runtime)").dependOn(&app.run.step);
+}
+
 fn addBenchmark(b: *std.Build, ctx: *common.Context, refs: cmd.Refs) void {
     const ref_target = common.refTarget(b, ctx.target);
-    const bench_generated = common.descriptorScan(b, ctx);
-    const bench_components_module = b.createModule(.{
-        .root_source_file = bench_generated,
-        .target = ctx.target,
-        .optimize = ctx.optimize,
-    });
-    const bench_nucleus = modules.createFor(b, modules.nucleus, ref_target, ctx.optimize, ctx);
-    bench_components_module.addImport("nucleus", bench_nucleus);
+    // Components target intentionally stays on ctx.target while nucleus uses refTarget (reference parity codegen).
+    const pair = modules.componentsWithNucleus(b, ctx, ctx.target, ref_target, ctx.optimize);
+    const bench_components_module = pair.components;
+    const bench_nucleus = pair.nucleus;
     // Links the zstd leaf directly: the bypass row wires substrate spans without kernel or dylib.
     const bypass_module = b.createModule(.{
         .root_source_file = b.path("src/bypass.zig"),
@@ -184,48 +218,23 @@ fn addBenchmark(b: *std.Build, ctx: *common.Context, refs: cmd.Refs) void {
     });
     bypass_module.addImport("options", ctx.options);
     bypass_module.addImport("nucleus", bench_nucleus);
-    if (!ctx.portable and ref_target.result.cpu.arch == .aarch64) {
-        bypass_module.addAssemblyFile(b.path("src/common/primitive/checksum/aarch64.S"));
-    }
+    modules.maybeAddCrcAsm(b, bypass_module, ref_target, ctx.portable);
     const app = addAcceptanceApp(b, ctx, "benchmark", modules.benchmark, ref_target, ctx.optimize, &.{
         .{ .name = "components", .module = bench_components_module },
         .{ .name = "bypass", .module = bypass_module },
     }, ctx.host, "benchmark", "Run the Silesia codec benchmark against reference implementations and write the report");
-    _ = sevenzip.addReference(b, ref_target, ctx.optimize, app.exe);
-    refs.link(b, app.exe.root_module);
-    app.exe.root_module.addCSourceFile(.{ .file = b.path("build/acceptance/benchmark/ref/libzip.c") });
-    app.exe.root_module.addCSourceFile(.{ .file = b.path("build/acceptance/benchmark/ref/unrar.c") });
     // SDK path exists only for Darwin targets. Expansion runs for every -Dtarget.
     const macos_sdk_usr_lib: ?[]const u8 = if (ref_target.result.os.tag.isDarwin())
         macosSdkUsrLib(b, ctx) orelse
             @panic("benchmark build needs the macOS SDK: run `xcode-select` to point at an Xcode install")
     else
         null;
-    if (macos_sdk_usr_lib) |sdk_usr_lib| app.exe.root_module.addLibraryPath(.{ .cwd_relative = sdk_usr_lib });
-    app.exe.root_module.linkSystemLibrary("c++", .{});
-    app.exe.root_module.linkSystemLibrary("z", .{});
-    app.exe.step.dependOn(&refs.libzip_build.step);
-    refs.dependOnTools(&app.run.step);
-    refs.dependOnBins(&app.run.step);
-    app.run.addFileArg(ctx.generated.catalog);
+    linkBenchmarkExe(b, app.exe, app.run, refs, ref_target, ctx.optimize, ctx.generated.catalog, macos_sdk_usr_lib);
 
-    const skip_options = b.addOptions();
-    skip_options.addOption(bool, "portable", ctx.portable);
-    const skip_options_module = skip_options.createModule();
-    const skip_host = common.addHostLibrariesWithOptions(b, ctx.target, ctx.optimize, ctx.portable, skip_options_module);
+    const skip_host = skipHostLibs(b, ctx);
 
     const skip_app = addAcceptanceApp(b, ctx, "benchmark_skip", modules.benchmark, ref_target, ctx.optimize, &.{}, skip_host, "benchmark_skip", "Run the Silesia codec benchmark against the encode A/B variant slot");
-    _ = sevenzip.addReference(b, ref_target, ctx.optimize, skip_app.exe);
-    refs.link(b, skip_app.exe.root_module);
-    skip_app.exe.root_module.addCSourceFile(.{ .file = b.path("build/acceptance/benchmark/ref/libzip.c") });
-    skip_app.exe.root_module.addCSourceFile(.{ .file = b.path("build/acceptance/benchmark/ref/unrar.c") });
-    if (macos_sdk_usr_lib) |sdk_usr_lib| skip_app.exe.root_module.addLibraryPath(.{ .cwd_relative = sdk_usr_lib });
-    skip_app.exe.root_module.linkSystemLibrary("c++", .{});
-    skip_app.exe.root_module.linkSystemLibrary("z", .{});
-    skip_app.exe.step.dependOn(&refs.libzip_build.step);
-    refs.dependOnTools(&skip_app.run.step);
-    refs.dependOnBins(&skip_app.run.step);
-    skip_app.run.addFileArg(ctx.generated.catalog);
+    linkBenchmarkExe(b, skip_app.exe, skip_app.run, refs, ref_target, ctx.optimize, ctx.generated.catalog, macos_sdk_usr_lib);
 }
 
 fn macosSdkUsrLib(b: *std.Build, ctx: *common.Context) ?[]const u8 {

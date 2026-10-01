@@ -90,6 +90,18 @@ fn safeText(text: []const u8) bool {
     return true;
 }
 
+fn safeTag(text: []const u8) bool {
+    if (text.len == 0) return false;
+    for (text, 0..) |character, index| {
+        const word = character == '_' or character == '-' or
+            (character >= 'a' and character <= 'z') or
+            (character >= 'A' and character <= 'Z') or
+            (index != 0 and character >= '0' and character <= '9');
+        if (!word) return false;
+    }
+    return true;
+}
+
 fn quoted(allocator: std.mem.Allocator, value: []const u8) ![]const u8 {
     return std.fmt.allocPrint(allocator, "\"{s}\"", .{value});
 }
@@ -130,13 +142,23 @@ pub fn main(init: std.process.Init) !void {
         for (descriptor.verbs) |verb| if (!contains(&known_verbs, verb)) return error.UnknownVerb;
         for (descriptor.parameters) |parameter| {
             if (!contains(&known_representations, parameter.representation)) return error.UnknownRepresentation;
+            if (!safeText(parameter.name)) return error.UnsafeText;
         }
         for (descriptor.capabilities) |capability| if (!contains(&known_capabilities, capability)) return error.UnknownCapability;
         if (!contains(&known_sizing, descriptor.sizing)) return error.UnknownSizing;
         if (!contains(&known_commit, descriptor.commit)) return error.UnknownCommit;
-        if (!safeText(descriptor.name)) return error.UnsafeText;
+        if (!safeText(descriptor.name) or !safeTag(descriptor.name)) return error.UnsafeText;
+        if (!safeText(descriptor.id.low) or !safeText(descriptor.id.high)) return error.UnsafeText;
         if (descriptor.benchmark) |benchmark| {
             if (!safeText(benchmark.row) or !safeText(benchmark.params)) return error.UnsafeText;
+            if (!safeText(benchmark.kind) or !safeText(benchmark.ext) or !safeText(benchmark.ref_params)) return error.UnsafeText;
+            if (benchmark.cmd) |text| if (!safeText(text)) return error.UnsafeText;
+            if (benchmark.lib) |text| if (!safeText(text)) return error.UnsafeText;
+            if (benchmark.bin) |text| if (!safeText(text)) return error.UnsafeText;
+            for (benchmark.tunings) |tuning| {
+                if (!safeText(tuning.name) or !safeText(tuning.ref_params)) return error.UnsafeText;
+                for (tuning.cmd_args) |arg| if (!safeText(arg)) return error.UnsafeText;
+            }
         }
     }
     for (descriptors.items, 0..) |descriptor, index| {

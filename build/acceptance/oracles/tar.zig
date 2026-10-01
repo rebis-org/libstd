@@ -167,9 +167,7 @@ fn tarEncEntryTypes(r: *Runner) !void {
     const entry_link = entryWithType(&store_link, "alink", &.{}, '2', "afile.txt", null);
     const entry_hard = entryWithType(&store_hard, "ahard", &.{}, '1', "afile.txt", null);
     var entries = [_]harness.Node{ entry_file, entry_dir, entry_link, entry_hard };
-    entries[0].next = &entries[1];
-    entries[1].next = &entries[2];
-    entries[2].next = &entries[3];
+    harness.linkNodes(entries[0..]);
     const archive_size = try tarEncode(r, entries[0]);
     const expected_sizes = [_]usize{ tar_corpus_buffer.len, 0, 0, 0 };
     for (0..4) |i| {
