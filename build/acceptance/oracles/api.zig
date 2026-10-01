@@ -37,20 +37,16 @@ extern fn stdk_session_failure(session: ?*anyopaque, status_out: ?*u32, detail_o
 extern fn stdk_session_catalog() [*:0]const u8;
 extern fn stdk_session_destroy(session: ?*anyopaque) u32;
 
-fn noParams(_: *harness.Runner, _: *[steps.MaxExtra]harness.Node) usize {
-    return 0;
-}
-
 fn run(r: *harness.Runner) anyerror!void {
     harness.setup(r, harness.ids.gzip, harness.mode_stream);
     corpus.select(r.corpus_index, r.corpus_buffer[0..]);
     r.input = r.corpus_buffer[0..];
-    try steps.writeSpan(&noParams, r);
+    try steps.writeSpan(&steps.noParams, r);
 
     // Control: the envelope's own readback must accept the same frame. If
     // this fails the frame (not the session boundary) is at fault.
-    try steps.queryRead(&noParams, r);
-    try steps.readSpan(&noParams, r);
+    try steps.queryRead(&steps.noParams, r);
+    try steps.readSpan(&steps.noParams, r);
 
     const storage_len = stdk_session_storage("gzip", "decode");
     if (storage_len == 0 or storage_len > r.workspace.len) return error.StorageSize;
@@ -150,7 +146,7 @@ fn run(r: *harness.Runner) anyerror!void {
     // chunked through the same boundary, and the pair is discoverable.
     harness.setup(r, harness.ids.deflate, harness.mode_stream);
     r.input = r.corpus_buffer[0..];
-    try steps.writeSpan(&noParams, r);
+    try steps.writeSpan(&steps.noParams, r);
     const deflate_storage_len = stdk_session_storage("deflate", "decode");
     if (deflate_storage_len == 0 or deflate_storage_len > r.workspace.len) return error.DeflateStorageSize;
     const deflate_storage = r.workspace.ptr;

@@ -70,6 +70,7 @@ pub const Context = struct {
     archives: ?Archives = null,
     portable: bool = false,
     options: *std.Build.Module,
+    sanitize_c: ?std.zig.SanitizeC = null,
 };
 
 pub fn addLibrary(
@@ -85,16 +86,9 @@ pub fn addLibrary(
 pub fn rootModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, ctx: *const Context) *std.Build.Module {
     const module = modules.createFor(b, modules.library, target, optimize, ctx);
     // Discovery expects the generated table plus the nucleus import.
-    const generated_components = descriptorScan(b, ctx);
-    const components_module = b.createModule(.{
-        .root_source_file = generated_components,
-        .target = target,
-        .optimize = optimize,
-    });
-    const nucleus_module = modules.createFor(b, modules.nucleus, target, optimize, ctx);
-    components_module.addImport("nucleus", nucleus_module);
-    module.addImport("components", components_module);
-    module.addImport("nucleus", nucleus_module);
+    const pair = modules.componentsWithNucleus(b, ctx, target, target, optimize);
+    module.addImport("components", pair.components);
+    module.addImport("nucleus", pair.nucleus);
     return module;
 }
 
@@ -118,14 +112,9 @@ pub fn addGenerated(b: *std.Build) Generated {
         .host = undefined,
         .options = b.addOptions().createModule(),
     };
-    const generated_components = descriptorScan(b, &scan_ctx);
-    const components_module = b.createModule(.{
-        .root_source_file = generated_components,
-        .target = b.graph.host,
-        .optimize = .Debug,
-    });
-    const nucleus_module = modules.createFor(b, modules.nucleus, b.graph.host, .Debug, &scan_ctx);
-    components_module.addImport("nucleus", nucleus_module);
+    const pair = modules.componentsWithNucleus(b, &scan_ctx, b.graph.host, b.graph.host, .Debug);
+    const components_module = pair.components;
+    const nucleus_module = pair.nucleus;
     const gen_module = b.createModule(.{
         .root_source_file = b.path("src/catalog_gen.zig"),
         .target = b.graph.host,
@@ -151,7 +140,7 @@ pub fn addHostLibraries(
     portable: bool,
     options: *std.Build.Module,
 ) HostLibraries {
-    return addHostLibrariesWithOptions(b, target, optimize, portable, options);
+    return addHostLibrariesWithOptions(b, target, optimize, portable, options, null);
 }
 
 pub fn addHostLibrariesWithOptions(
@@ -160,6 +149,7 @@ pub fn addHostLibrariesWithOptions(
     optimize: std.builtin.OptimizeMode,
     portable: bool,
     options: *std.Build.Module,
+    sanitize_c: ?std.zig.SanitizeC,
 ) HostLibraries {
     // Module construction reads only portable. Version/generated/host go unread here.
     var ctx = Context{
@@ -170,6 +160,7 @@ pub fn addHostLibrariesWithOptions(
         .host = undefined,
         .portable = portable,
         .options = options,
+        .sanitize_c = sanitize_c,
     };
     const module = rootModule(b, target, optimize, &ctx);
     const static_library = addLibraryFromModule(b, module, .static);

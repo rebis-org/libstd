@@ -131,6 +131,37 @@ pub fn truncateReject(comptime extra: Params, r: *Runner) !void {
     try harness.reject(r, harness.ids.read, nodes.items[0..nodes.len], .{ .ctx = true }, r.invalid_status, r.output);
 }
 
+pub fn noParams(_: *Runner, _: *[MaxExtra]harness.Node) usize {
+    return 0;
+}
+
+pub fn roundtripHead(comptime extra: Params, r: *Runner) !void {
+    try queryWrite(extra, r);
+    try writeSpan(extra, r);
+    try queryRead(extra, r);
+    try readSpan(extra, r);
+    try writeCallbackSource(extra, r);
+}
+
+pub fn roundtripTail(comptime extra: Params, r: *Runner) !void {
+    try readCallbackSink(extra, r);
+    try invalidReject(extra, r);
+    try capacitySmallSink(extra, r);
+}
+
+pub fn roundtrip(comptime extra: Params, r: *Runner) !void {
+    try roundtripHead(extra, r);
+    try roundtripTail(extra, r);
+}
+
+pub fn roundtripTruncate(comptime extra: Params, r: *Runner) !void {
+    try roundtripHead(extra, r);
+    try readCallbackSink(extra, r);
+    try invalidReject(extra, r);
+    try truncateReject(extra, r);
+    try capacitySmallSink(extra, r);
+}
+
 pub fn foreignTool(r: *Runner) !void {
     const valid = if (abi.idEqual(r.profile_id, harness.ids.gzip))
         lib.gzipValid(r.encoded[0..r.encoded_len])

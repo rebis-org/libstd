@@ -492,30 +492,16 @@ pub fn archiveEntryWithMethodAndFilter(
     return entry;
 }
 
-pub fn capacityDiagnostics(required: *Node, available: *Node, diagnostic: *Node) void {
-    required.* = scalarNode(ids.diagnostic_required_capacity);
-    available.* = scalarNode(ids.diagnostic_available_capacity);
-    diagnostic.* = node(null, 0);
-    diagnostic.child = required;
-    required.next = available;
-}
-
-pub fn cryptoDiagnostic(
-    wrong_password: *Node,
-    kdf_limit: *Node,
-    password_lifetime: *Node,
-    unsupported_algorithm: *Node,
-) Node {
-    wrong_password.* = scalarNode(ids.crypto_wrong_password);
-    kdf_limit.* = scalarNode(ids.crypto_kdf_limit);
-    password_lifetime.* = scalarNode(ids.crypto_password_lifetime);
-    unsupported_algorithm.* = scalarNode(ids.crypto_unsupported_algorithm);
-    var diagnostic = node(null, 0);
-    diagnostic.child = wrong_password;
-    wrong_password.next = kdf_limit;
-    kdf_limit.next = password_lifetime;
-    password_lifetime.next = unsupported_algorithm;
-    return diagnostic;
+pub fn cryptoDiag(d: *CryptoDiag) void {
+    d.wrong_password = scalarNode(ids.crypto_wrong_password);
+    d.kdf_limit = scalarNode(ids.crypto_kdf_limit);
+    d.password_lifetime = scalarNode(ids.crypto_password_lifetime);
+    d.unsupported_algorithm = scalarNode(ids.crypto_unsupported_algorithm);
+    d.diagnostic = node(null, 0);
+    d.diagnostic.child = &d.wrong_password;
+    d.wrong_password.next = &d.kdf_limit;
+    d.kdf_limit.next = &d.password_lifetime;
+    d.password_lifetime.next = &d.unsupported_algorithm;
 }
 
 pub fn cryptoProfile() Node {
@@ -662,16 +648,6 @@ pub const CryptoDiag = struct {
     diagnostic: Node,
 };
 
-pub fn cryptoDiag(d: *CryptoDiag) void {
-    d.diagnostic = cryptoDiagnostic(&d.wrong_password, &d.kdf_limit, &d.password_lifetime, &d.unsupported_algorithm);
-}
-
-pub fn chain(nodes: anytype) void {
-    for (0..nodes.len - 1) |index| {
-        nodes[index].next = &nodes[index + 1];
-    }
-}
-
 pub fn xorshiftFill(buffer: []u8, seed_base: u64) void {
     var seed = seed_base;
     for (buffer) |*byte| {
@@ -738,6 +714,19 @@ pub const SinkCallbackContext = struct {
     fail_after: usize,
     last_status: u32 = Status.ok,
 };
+
+pub fn sinkFailureInit(fail: *SinkCallbackContext, downstream: *Node, diagnostic: *Node) void {
+    fail.* = .{ .fail_after = 5 };
+    downstream.* = scalarNode(ids.diagnostic_downstream_status);
+    diagnostic.* = node(null, 0);
+    diagnostic.child = downstream;
+}
+
+pub fn expectSinkFailure(r: *Runner, fail: *const SinkCallbackContext, downstream: *const Node) !void {
+    try requireStatus(r, Status.io_failure);
+    if (fail.accepted_total != 4) return error.CallbackAcceptedTotalMismatch;
+    if (downstream.value_low != Status.insufficient_capacity) return error.DownstreamStatusMismatch;
+}
 
 pub const SinkBufferContext = struct {
     buffer: []u8,
