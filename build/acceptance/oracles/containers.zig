@@ -7,14 +7,6 @@ const lib = @import("lib.zig");
 const Runner = harness.Runner;
 const steps = @import("steps.zig");
 
-// Stream-container suites for the zlib and lz4 profiles: envelope round trips
-// plus reference-tool interop (system libz, vendored liblz4).
-
-fn noParams(_: *Runner, out: *[steps.MaxExtra]harness.Node) usize {
-    _ = out;
-    return 0;
-}
-
 fn setupContainer(r: *Runner, profile_id: harness.Id) void {
     harness.setup(r, profile_id, harness.mode_stream);
     r.input = r.corpus_buffer[0..32];
@@ -27,14 +19,7 @@ fn setupContainer(r: *Runner, profile_id: harness.Id) void {
 
 fn runZlib(r: *Runner) anyerror!void {
     setupContainer(r, harness.ids.zlib);
-    try steps.queryWrite(&noParams, r);
-    try steps.writeSpan(&noParams, r);
-    try steps.queryRead(&noParams, r);
-    try steps.readSpan(&noParams, r);
-    try steps.writeCallbackSource(&noParams, r);
-    try steps.readCallbackSink(&noParams, r);
-    try steps.invalidReject(&noParams, r);
-    try steps.capacitySmallSink(&noParams, r);
+    try steps.roundtrip(&steps.noParams, r);
     if (!lib.zlibValid(r.encoded[0..r.encoded_len])) return error.ReferenceToolRejectedOutput;
     // Reference encoder produces, our decoder reads.
     var fixture_input: [65536]u8 = undefined;
@@ -52,14 +37,7 @@ fn runZlib(r: *Runner) anyerror!void {
 
 fn runLz4(r: *Runner) anyerror!void {
     setupContainer(r, harness.ids.lz4);
-    try steps.queryWrite(&noParams, r);
-    try steps.writeSpan(&noParams, r);
-    try steps.queryRead(&noParams, r);
-    try steps.readSpan(&noParams, r);
-    try steps.writeCallbackSource(&noParams, r);
-    try steps.readCallbackSink(&noParams, r);
-    try steps.invalidReject(&noParams, r);
-    try steps.capacitySmallSink(&noParams, r);
+    try steps.roundtrip(&steps.noParams, r);
     if (!lib.lz4Valid(r.encoded[0..r.encoded_len])) return error.ReferenceToolRejectedOutput;
     var fixture_input: [65536]u8 = undefined;
     var compressed: [131072]u8 = undefined;
@@ -76,14 +54,7 @@ fn runLz4(r: *Runner) anyerror!void {
 
 fn runZstdSeekable(r: *Runner) anyerror!void {
     setupContainer(r, harness.ids.zstd_seekable);
-    try steps.queryWrite(&noParams, r);
-    try steps.writeSpan(&noParams, r);
-    try steps.queryRead(&noParams, r);
-    try steps.readSpan(&noParams, r);
-    try steps.writeCallbackSource(&noParams, r);
-    try steps.readCallbackSink(&noParams, r);
-    try steps.invalidReject(&noParams, r);
-    try steps.capacitySmallSink(&noParams, r);
+    try steps.roundtrip(&steps.noParams, r);
     // The payload is a plain multi-frame zstd stream (seek table skippable)
     // and must decode with the reference library.
     if (!lib.zstdValid(r.encoded[0..r.encoded_len])) return error.ReferenceToolRejectedOutput;

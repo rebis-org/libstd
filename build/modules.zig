@@ -69,6 +69,35 @@ pub fn create(b: *std.Build, comptime spec: Module, ctx: *const common.Context) 
     return createFor(b, spec, b.graph.host, .Debug, ctx);
 }
 
+pub const Components = struct {
+    nucleus: *std.Build.Module,
+    components: *std.Build.Module,
+};
+
+pub fn componentsWithNucleus(
+    b: *std.Build,
+    ctx: *const common.Context,
+    components_target: std.Build.ResolvedTarget,
+    nucleus_target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) Components {
+    const generated = common.descriptorScan(b, ctx);
+    const nucleus_module = createFor(b, nucleus, nucleus_target, optimize, ctx);
+    const components_module = b.createModule(.{
+        .root_source_file = generated,
+        .target = components_target,
+        .optimize = optimize,
+    });
+    if (ctx.sanitize_c) |sc| components_module.sanitize_c = sc;
+    components_module.addImport("nucleus", nucleus_module);
+    return .{ .nucleus = nucleus_module, .components = components_module };
+}
+
+pub fn maybeAddCrcAsm(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget, portable: bool) void {
+    if (!portable and target.result.cpu.arch == .aarch64)
+        module.addAssemblyFile(b.path("src/common/primitive/checksum/aarch64.S"));
+}
+
 pub fn createFor(
     b: *std.Build,
     comptime spec: Module,
@@ -90,9 +119,8 @@ pub fn createFor(
         .target = adjusted,
         .optimize = optimize,
     });
-    if (!ctx.portable and spec.crc_kernel and target.result.cpu.arch == .aarch64) {
-        module.addAssemblyFile(b.path("src/common/primitive/checksum/aarch64.S"));
-    }
+    if (ctx.sanitize_c) |sc| module.sanitize_c = sc;
+    if (spec.crc_kernel) maybeAddCrcAsm(b, module, target, ctx.portable);
     module.addImport("options", ctx.options);
     inline for (spec.imports) |import| {
         module.addImport(import.name, createFor(b, byName(import.module), target, optimize, ctx));

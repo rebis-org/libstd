@@ -118,11 +118,7 @@ fn runRoundtrip(r: *Runner, profile_id: harness.Id, invalid: []const u8, extra_s
     r.input = lzma_corpus_buffer[0..48];
     r.invalid = invalid;
     r.invalid_status = abi.Status.invalid_data;
-    try steps.queryWrite(&lzmaParams, r);
-    try steps.writeSpan(&lzmaParams, r);
-    try steps.queryRead(&lzmaParams, r);
-    try steps.readSpan(&lzmaParams, r);
-    try steps.writeCallbackSource(&lzmaParams, r);
+    try steps.roundtripHead(&lzmaParams, r);
     try sinkCallbackWriteParity(r);
     try steps.readCallbackSink(&lzmaParams, r);
     try steps.invalidReject(&lzmaParams, r);

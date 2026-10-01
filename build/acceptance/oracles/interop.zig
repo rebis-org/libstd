@@ -30,10 +30,6 @@ fn xzRefEncode(input: []const u8, output: []u8) ?usize {
     return lib.xzEncode(input, output, 1, null, null, 1 << 20); // 1 is LZMA_CHECK_CRC32.
 }
 
-fn noParams(_: *harness.Runner, _: *[steps.MaxExtra]harness.Node) usize {
-    return 0;
-}
-
 fn gzipRefEncode(input: []const u8, output: []u8) ?usize {
     return lib.gzipCompress(input, output);
 }
@@ -106,8 +102,8 @@ fn cross(
 
 fn run(r: *harness.Runner) anyerror!void {
     try cross(harness.ids.zstd, harness.mode_xz, &zstdParams, r, .{ .encode = &zstdRefEncode, .decode = &zstdRefDecode });
-    try cross(harness.ids.gzip, harness.mode_stream, &noParams, r, .{ .encode = &gzipRefEncode, .decode = &gzipRefDecode });
-    try cross(harness.ids.bzip2, harness.mode_stream, &noParams, r, .{ .encode = &bzip2RefEncode, .decode = &bzip2RefDecode });
+    try cross(harness.ids.gzip, harness.mode_stream, &steps.noParams, r, .{ .encode = &gzipRefEncode, .decode = &gzipRefDecode });
+    try cross(harness.ids.bzip2, harness.mode_stream, &steps.noParams, r, .{ .encode = &bzip2RefEncode, .decode = &bzip2RefDecode });
     r.lzma_dictionary = 1 << 20; // match xzRefEncode's dictionary
     try cross(harness.ids.xz, harness.mode_xz, &xzParams, r, .{ .encode = &xzRefEncode, .decode = &xzRefDecode });
 }

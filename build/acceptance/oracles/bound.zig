@@ -318,14 +318,12 @@ fn runCallback(r: *Runner) anyerror!void {
         try harness.requireStatus(r, abi.Status.ok);
         if (sink_ctx.offset != direct_len or !std.mem.eql(u8, callback_sink_buffer[0..direct_len], callback_direct[0..direct_len])) return error.CallbackSinkMismatch;
 
-        var fail_ctx = harness.SinkCallbackContext{ .fail_after = 5 };
-        var downstream = harness.scalarNode(harness.ids.diagnostic_downstream_status);
-        var diagnostic = harness.node(null, 0);
-        diagnostic.child = &downstream;
+        var fail_ctx: harness.SinkCallbackContext = undefined;
+        var downstream: harness.Node = undefined;
+        var diagnostic: harness.Node = undefined;
+        harness.sinkFailureInit(&fail_ctx, &downstream, &diagnostic);
         _ = harness.call(r, harness.ids.write, sink_nodes[0..sink_count], .{ .ctx = true, .callback = harness.sinkCallback, .context = &fail_ctx, .diagnostic = &diagnostic });
-        try harness.requireStatus(r, abi.Status.io_failure);
-        if (fail_ctx.accepted_total != 4) return error.CallbackAcceptedTotalMismatch;
-        if (downstream.value_low != abi.Status.insufficient_capacity) return error.DownstreamStatusMismatch;
+        try harness.expectSinkFailure(r, &fail_ctx, &downstream);
     }
 }
 
