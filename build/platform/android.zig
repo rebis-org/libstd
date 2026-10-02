@@ -15,19 +15,15 @@ fn versionCode(version: std.SemanticVersion) u32 {
 fn addClassesJar(b: *std.Build) std.Build.LazyPath {
     const compile = b.addSystemCommand(&.{
         "sh", "-c",
-        \\case "$4" in *.jar) ;; *) echo "classes.jar output argument is $4" && exit 1 ;; esac
-        \\out_dir=$(dirname "$4")
+        \\case "$3" in *.jar) ;; *) echo "classes.jar output argument is $3" && exit 1 ;; esac
+        \\out_dir=$(dirname "$3")
         \\mkdir -p "$out_dir/classes"
         \\javac -Xlint:all -Werror -encoding UTF-8 -d "$out_dir/classes" "$2"
-        \\jar cf "$4" -C "$out_dir/classes" .
-        \\mkdir -p "$out_dir/kotlin"
-        \\kotlinc -jvm-target 17 -cp "$4" -d "$out_dir/kotlin" "$3"
-        \\jar uf "$4" -C "$out_dir/kotlin" .
+        \\jar cf "$3" -C "$out_dir/classes" .
         ,
         "_",  "unused",
     });
     compile.addFileArg(b.path("build/templates/android/dev/stdk/StdK.java"));
-    compile.addFileArg(b.path("build/templates/android/dev/stdk/StdK.kt"));
     return compile.addOutputFileArg("classes.jar");
 }
 

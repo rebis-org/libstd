@@ -1,4 +1,3 @@
 [tools]
 java = "temurin-27.0.0+35"
-kotlin = { version = "2.4.20", asset_pattern = "kotlin-compiler-*.zip", bin_path = "kotlinc/bin" }
 zig = "0.16.0"

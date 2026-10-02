@@ -12,7 +12,6 @@ pub fn addArchive(
     const stage = b.addWriteFiles();
     _ = stage.add("stdk/cjpm.toml", tomlText(b, ctx));
     _ = stage.addCopyFile(b.path("build/templates/cjpm/stdk.cj"), "stdk/src/stdk.cj");
-    _ = stage.addCopyFile(b.path("build/templates/cjpm/session.cj"), "stdk/src/session.cj");
     _ = stage.addCopyFile(ctx.generated.header, manifest.cjpm.header);
     _ = stage.addCopyFile(ctx.generated.catalog, manifest.cjpm.catalog);
     for (slices.ohos_abis) |abi| {
