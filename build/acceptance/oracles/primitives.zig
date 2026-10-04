@@ -53,6 +53,18 @@ fn pbkdf2Sha1(password: []const u8, salt: []const u8, rounds: u32) [20]u8 {
     return output;
 }
 
+fn hmacSha256Hex(message: []const u8, key: []const u8) [64]u8 {
+    var digest: [32]u8 = undefined;
+    crypto.hmacSha256(&digest, message, key);
+    return hexEncode(digest);
+}
+
+fn pbkdf2Sha256(password: []const u8, salt: []const u8, rounds: u32) [32]u8 {
+    var output: [32]u8 = undefined;
+    crypto.pbkdf2HmacSha256(&output, password, salt, rounds);
+    return output;
+}
+
 fn sanityBuffer() [256]u8 {
     var buffer: [256]u8 = undefined;
     var generator: u64 = 0x9e37_79b1;
@@ -124,14 +136,19 @@ fn runSha256() !void {
 fn runHmac() !void {
     try require(std.mem.eql(u8, &sha1Hex("abc"), "a9993e364706816aba3e25717850c26c9cd0d89d"));
     try require(std.mem.eql(u8, &sha1Hex(""), "da39a3ee5e6b4b0d3255bfef95601890afd80709"));
-    const short_key = [_]u8{0x0b} ** 20;
+    const short_key: [20]u8 = @splat(0x0b);
     try require(std.mem.eql(u8, &hmacSha1Hex("Hi There", &short_key), "b617318655057264e28bc0b6fb378c8ef146be00"));
-    const long_key = [_]u8{0xaa} ** 80;
+    const long_key: [80]u8 = @splat(0xaa);
     try require(std.mem.eql(u8, &hmacSha1Hex("Test Using Larger Than Block-Size Key - Hash Key First", &long_key), "aa4ae5e15272d00e95705637ce8a3b55ed402112"));
     try require(std.mem.eql(u8, &hmacSha1Hex("Test Using Larger Than Block-Size Key and Larger Than One Block-Size Data", &long_key), "e8e99d0f45237d786d6bbaa7965c7808bbff1a91"));
     try require(std.mem.eql(u8, &pbkdf2Sha1("password", "salt", 1), &.{ 0x0c, 0x60, 0xc8, 0x0f, 0x96, 0x1f, 0x0e, 0x71, 0xf3, 0xa9, 0xb5, 0x24, 0xaf, 0x60, 0x12, 0x06, 0x2f, 0xe0, 0x37, 0xa6 }));
     try require(std.mem.eql(u8, &pbkdf2Sha1("password", "salt", 2), &.{ 0xea, 0x6c, 0x01, 0x4d, 0xc7, 0x2d, 0x6f, 0x8c, 0xcd, 0x1e, 0xd9, 0x2a, 0xce, 0x1d, 0x41, 0xf0, 0xd8, 0xde, 0x89, 0x57 }));
-    try require(std.mem.eql(u8, &pbkdf2Sha1("password", "salt", 4096), &.{ 0x4b, 0x00, 0x79, 0x01, 0xb7, 0x65, 0x48, 0x9a, 0xbe, 0xad, 0x49, 0xd9, 0x26, 0xf7, 0x21, 0xd0, 0x65, 0xa4, 0x29, 0xc1 }));
+    try require(std.mem.eql(u8, &hmacSha256Hex("Hi There", &short_key), "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"));
+    try require(std.mem.eql(u8, &hmacSha256Hex("what do ya want for nothing", "Jefe"), "a0f14ba018012b764b32dc157ce0a20e8322dae09da80cae035670ce0879e5d4"));
+    const longer_key: [131]u8 = @splat(0xaa);
+    try require(std.mem.eql(u8, &hmacSha256Hex("Test Using Larger Than Block-Size Key - Hash Key First", &longer_key), "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"));
+    try require(std.mem.eql(u8, &pbkdf2Sha256("password", "salt", 1), &.{ 0x12, 0x0f, 0xb6, 0xcf, 0xfc, 0xf8, 0xb3, 0x2c, 0x43, 0xe7, 0x22, 0x52, 0x56, 0xc4, 0xf8, 0x37, 0xa8, 0x65, 0x48, 0xc9, 0x2c, 0xcc, 0x35, 0x48, 0x08, 0x05, 0x98, 0x7c, 0xb7, 0x0b, 0xe1, 0x7b }));
+    try require(std.mem.eql(u8, &pbkdf2Sha256("password", "salt", 2), &.{ 0xae, 0x4d, 0x0c, 0x95, 0xaf, 0x6b, 0x46, 0xd3, 0x2d, 0x0a, 0xdf, 0xf9, 0x28, 0xf0, 0x6d, 0xd0, 0x2a, 0x30, 0x3f, 0x8e, 0xf3, 0xc2, 0x51, 0xdf, 0xd6, 0xe2, 0xd8, 0x5a, 0x95, 0x47, 0x4c, 0x43 }));
 }
 
 fn requireAesBlock(key: []const u8, plaintext: [16]u8, expected: []const u8) !void {
@@ -142,7 +159,7 @@ fn requireAesBlock(key: []const u8, plaintext: [16]u8, expected: []const u8) !vo
 }
 
 fn requireCtr(key: []const u8, block_1: []const u8, block_ff: []const u8, block_100: []const u8) !void {
-    var source: [16 * 257]u8 = .{0} ** (16 * 257);
+    var source: [16 * 257]u8 = @splat(0);
     var output: [16 * 257]u8 = undefined;
     try crypto.winzipCtr(key, &output, &source);
     try require(std.mem.eql(u8, output[0..16], block_1));
@@ -171,8 +188,8 @@ fn runAes() !void {
     try crypto.aesCbcDecrypt(&fips_256_key, cbc_iv, &cbc_back, &cbc_output);
     try require(std.mem.eql(u8, &cbc_back, &cbc_plaintext));
     try crypto.aesCbcEncrypt(&fips_256_key, cbc_iv, &cbc_output, &.{});
-    const invalid_key = [_]u8{0} ** 15;
-    const zeros_16 = [_]u8{0} ** 16;
+    const invalid_key: [15]u8 = @splat(0);
+    const zeros_16: [16]u8 = @splat(0);
     var invalid_out: [16]u8 = undefined;
     if (crypto.winzipCtr(&invalid_key, &invalid_out, &zeros_16)) |_| return error.ExpectedInvalidCall else |err| {
         try require(err == error.InvalidCall);

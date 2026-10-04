@@ -10,6 +10,7 @@ test {
     _ = @import("grammar/zlib.zig");
     _ = @import("grammar/lzma.zig");
     _ = @import("grammar/zstd_seekable.zig");
+    _ = @import("grammar/sevenzip.zig");
     _ = @import("leaf/lz4.zig");
     _ = @import("leaf/zstd.zig");
 }

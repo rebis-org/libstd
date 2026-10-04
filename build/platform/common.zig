@@ -21,7 +21,7 @@ pub fn descriptorPaths(b: *std.Build) [][]const u8 {
     while (walker.next(b.graph.io) catch @panic("component scan: walk src")) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.path, ".descriptor.zon")) continue;
-        const rel = std.fmt.allocPrint(b.allocator, "src/{s}", .{entry.path}) catch @panic("component scan: oom");
+        const rel = b.allocator.print("src/{s}", .{entry.path}) catch @panic("component scan: oom");
         list.append(b.allocator, rel) catch @panic("component scan: oom");
     }
     std.mem.sort([]const u8, list.items, {}, struct {
@@ -43,6 +43,7 @@ pub fn descriptorScan(b: *std.Build, ctx: *const Context) std.Build.LazyPath {
 pub const Generated = struct {
     step: *std.Build.Step,
     header: std.Build.LazyPath,
+    header_dir: std.Build.LazyPath,
     catalog: std.Build.LazyPath,
     module_map: std.Build.LazyPath,
     framework_module_map: std.Build.LazyPath,
@@ -62,7 +63,7 @@ pub const Archives = struct {
 
 pub const Context = struct {
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.builtin.Optimize,
     version: std.SemanticVersion,
     generated: Generated,
     host: HostLibraries,
@@ -76,14 +77,14 @@ pub const Context = struct {
 pub fn addLibrary(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.builtin.Optimize,
     linkage: std.builtin.LinkMode,
     ctx: *const Context,
 ) *std.Build.Step.Compile {
     return addLibraryFromModule(b, rootModule(b, target, optimize, ctx), linkage);
 }
 
-pub fn rootModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, ctx: *const Context) *std.Build.Module {
+pub fn rootModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.Optimize, ctx: *const Context) *std.Build.Module {
     const module = modules.createFor(b, modules.library, target, optimize, ctx);
     // Discovery expects the generated table plus the nucleus import.
     const pair = modules.componentsWithNucleus(b, ctx, target, target, optimize);
@@ -127,6 +128,7 @@ pub fn addGenerated(b: *std.Build) Generated {
     return .{
         .step = &files.step,
         .header = files.add("stdk.h", render.header),
+        .header_dir = files.getDirectory(),
         .catalog = gen_run.addOutputFileArg("stdk.catalog.json"),
         .module_map = files.add("module.modulemap", render.module_map),
         .framework_module_map = files.add("module.framework.modulemap", render.framework_module_map),
@@ -136,7 +138,7 @@ pub fn addGenerated(b: *std.Build) Generated {
 pub fn addHostLibraries(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.builtin.Optimize,
     portable: bool,
     options: *std.Build.Module,
 ) HostLibraries {
@@ -146,7 +148,7 @@ pub fn addHostLibraries(
 pub fn addHostLibrariesWithOptions(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.builtin.Optimize,
     portable: bool,
     options: *std.Build.Module,
     sanitize_c: ?std.zig.SanitizeC,

@@ -1164,3 +1164,22 @@ fn updateProb1(prob: u16) u16 {
     const mean = (prob + (1 << (period_bits - 2))) >> period_bits;
     return prob - mean;
 }
+
+test "ppmd leaf roundtrip period-97 repetitive 4500" {
+    const testing = std.testing;
+    const backing = try testing.allocator.alloc(u8, decodeWorkspaceSize(4 << 20));
+    defer testing.allocator.free(backing);
+    const input = try testing.allocator.alloc(u8, 4500);
+    defer testing.allocator.free(input);
+    for (input, 0..) |*byte, i| byte.* = @truncate(i / 97);
+    const scratch = backing;
+    const bound = try requiredSize(input, scratch, .{ .order = 8, .mem_size = 4 << 20, .unpack_size = input.len });
+    const encoded = try testing.allocator.alloc(u8, bound);
+    defer testing.allocator.free(encoded);
+    const encoded_len = try encode(input, encoded, scratch, .{ .order = 8, .mem_size = 4 << 20, .unpack_size = input.len });
+    const output = try testing.allocator.alloc(u8, input.len);
+    defer testing.allocator.free(output);
+    const produced = try decode(encoded[0..encoded_len], output, scratch, .{ .order = 8, .mem_size = 4 << 20, .unpack_size = input.len });
+    try testing.expectEqual(input.len, produced);
+    try testing.expectEqualSlices(u8, input, output);
+}

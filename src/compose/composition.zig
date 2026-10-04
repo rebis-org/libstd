@@ -29,7 +29,7 @@ pub const ChunkInput = struct {
             self.starved = true;
             return error.ReadFailed;
         }
-        const count = @min(@as(usize, @intFromEnum(limit)), available.len);
+        const count = @min(@as(usize, @backingInt(limit)), available.len);
         w.writeAll(available[0..count]) catch return error.WriteFailed;
         self.pos += count;
         return count;
@@ -54,5 +54,5 @@ pub const ChunkInput = struct {
 };
 
 pub fn limitFor(remaining: usize) std.Io.Limit {
-    return @enumFromInt(remaining);
+    return @fromBackingInt(@intCast(remaining));
 }

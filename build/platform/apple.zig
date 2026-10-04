@@ -24,11 +24,13 @@ pub fn addArchive(b: *std.Build, ctx: *const common.Context) std.Build.LazyPath 
     const archive = b.addSystemCommand(&.{
         "sh", "-c",
         \\set -eu
+        \\rm -rf "$1"
         \\mkdir -p "$1"
         \\cp -R "$2" "$1/StdK.xcframework"
         \\cp "$3" "$1/StdK.xcframework/stdk.catalog.json"
+        \\out="$(cd "$(dirname "$4")" && pwd)/$(basename "$4")"
         \\cd "$1"
-        \\zip -qry "$4" StdK.xcframework
+        \\zip -qry "$out" StdK.xcframework
         ,
         "sh",
     });

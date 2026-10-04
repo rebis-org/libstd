@@ -103,7 +103,7 @@ fn safeTag(text: []const u8) bool {
 }
 
 fn quoted(allocator: std.mem.Allocator, value: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "\"{s}\"", .{value});
+    return allocator.print("\"{s}\"", .{value});
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -121,9 +121,14 @@ pub fn main(init: std.process.Init) !void {
             break;
         }
         const text = try std.Io.Dir.cwd().readFileAlloc(init.io, arg, allocator, .limited(1 << 20));
-        const source = try allocator.dupeZ(u8, text);
-        var diagnostics: std.zon.parse.Diagnostics = .{};
-        const parsed = std.zon.parse.fromSliceAlloc(RawDescriptor, allocator, source, &diagnostics, .{}) catch |err| {
+        const source = try allocator.dupeSentinel(u8, text, 0);
+        var diagnostics: std.zon.parse.Diagnostics = undefined;
+        const parsed = std.zon.parse.fromSlice(RawDescriptor, .{
+            .gpa = std.heap.page_allocator,
+            .arena = allocator,
+            .source = source,
+            .diagnostics = &diagnostics,
+        }) catch |err| {
             std.debug.print("Failed to parse descriptor \"{s}\": {s}.\n", .{ arg, @errorName(err) });
             return err;
         };

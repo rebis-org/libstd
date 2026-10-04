@@ -124,7 +124,7 @@ pub fn applyFilter(
             while (cur_channel < channels) : (cur_channel += 1) {
                 var prev_byte: u32 = 0;
                 var prev_delta: i32 = 0;
-                var dif = [_]u32{0} ** 7;
+                var dif: [7]u32 = @splat(0);
                 var d1: i32 = 0;
                 var d2: i32 = 0;
                 var d3: i32 = 0;

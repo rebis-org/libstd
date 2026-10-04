@@ -258,7 +258,7 @@ fn boundedReaderStream(reader: *std.Io.Reader, writer: *std.Io.Writer, limit: st
     const self: *BoundedReader = @fieldParentPtr("reader", reader);
     if (self.limit == 0) return error.EndOfStream;
     const max_request = std.math.cast(usize, self.limit) orelse std.math.maxInt(usize);
-    const requested = @min(@intFromEnum(limit), max_request);
+    const requested = @min(@backingInt(limit), max_request);
     if (requested == 0) return 0;
     var buffer: [4096]u8 = undefined;
     const chunk = @min(buffer.len, requested);

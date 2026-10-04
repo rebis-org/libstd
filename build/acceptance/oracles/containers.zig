@@ -52,6 +52,17 @@ fn runLz4(r: *Runner) anyerror!void {
     }, .{ .ctx = true }, abi.Status.integrity_failure, r.output);
 }
 
+fn hcParams(_: *Runner, out: *[steps.MaxExtra]harness.Node) usize {
+    out[0] = harness.paramScalar(harness.param_family_lz4, harness.lz4_search_depth, harness.cmd_all, 256);
+    return 1;
+}
+
+fn runLz4Hc(r: *Runner) anyerror!void {
+    setupContainer(r, harness.ids.lz4);
+    try steps.roundtrip(&hcParams, r);
+    if (!lib.lz4Valid(r.encoded[0..r.encoded_len])) return error.ReferenceToolRejectedOutput;
+}
+
 fn runZstdSeekable(r: *Runner) anyerror!void {
     setupContainer(r, harness.ids.zstd_seekable);
     try steps.roundtrip(&steps.noParams, r);
@@ -101,8 +112,36 @@ fn runZdict(r: *Runner) anyerror!void {
         harness.sinkSpan(&content_out),
     }, .{ .ctx = true });
     try harness.requireStatus(r, abi.Status.ok);
-    if (r.response.byte_length != dictionary.len - dictionary_header_size or !std.mem.eql(u8, content_out[0..r.response.byte_length], zdict_sample_data[0..r.response.byte_length])) {
-        return error.DictionaryContentMismatch;
+    // Fastcover content: selected 50-byte windows of the samples, in a
+    // deterministic order. The content length must match the header math,
+    // every window must occur in the training data, and a second training
+    // run must produce byte-identical output.
+    const content = content_out[0..r.response.byte_length];
+    if (r.response.byte_length != dictionary.len - dictionary_header_size) return error.DictionaryShapeInvalid;
+    var offset: usize = 0;
+    while (offset + 50 <= content.len) : (offset += 50) {
+        var found = false;
+        var at: usize = 0;
+        while (at + 50 <= zdict_sample_data.len) : (at += 1) {
+            if (std.mem.eql(u8, content[offset..][0..50], zdict_sample_data[at..][0..50])) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return error.DictionaryContentMismatch;
+    }
+    var second_training: [16 * 1024]u8 = undefined;
+    _ = harness.call(r, harness.ids.write, &.{
+        harness.paramScalar(harness.param_family_seekable, harness.zdict_sample_size, harness.cmd_query_write, sample_size),
+        harness.sourceSpan(&zdict_sample_data),
+        harness.sinkSpan(&second_training),
+        harness.capabilityParam(r.caps_io),
+        harness.sizingModeParam(r.sizing),
+        harness.commitModeParam(r.commit_write),
+    }, .{});
+    try harness.requireStatus(r, abi.Status.ok);
+    if (r.response.byte_length != dictionary.len or !std.mem.eql(u8, second_training[0..r.response.byte_length], dictionary)) {
+        return error.DictionaryTrainingNotDeterministic;
     }
     const input = zdict_sample_data[0..sample_size];
 
@@ -149,6 +188,7 @@ fn runZdict(r: *Runner) anyerror!void {
 pub const scenarios = harness.scenarios("containers", &.{
     .{ .label = "zlib roundtrip", .run = runZlib, .workspace_size = 8 * 1024 * 1024, .output_size = 65536, .encoded_size = 65536 },
     .{ .label = "lz4 roundtrip", .run = runLz4, .workspace_size = 16 * 1024 * 1024, .output_size = 65536, .encoded_size = 65536 },
+    .{ .label = "lz4 hc roundtrip", .run = runLz4Hc, .workspace_size = 16 * 1024 * 1024, .output_size = 65536, .encoded_size = 65536 },
     .{ .label = "zstd seekable", .run = runZstdSeekable, .workspace_size = 16 * 1024 * 1024, .output_size = 65536, .encoded_size = 65536 },
     .{ .label = "zdict train", .run = runZdict, .workspace_size = 8 * 1024 * 1024, .output_size = 4096, .encoded_size = 24 * 1024 },
 }, &.{});

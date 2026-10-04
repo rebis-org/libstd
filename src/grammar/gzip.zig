@@ -10,7 +10,7 @@ const tee = @import("../common/primitive/tee.zig");
 const deflate = @import("../leaf/deflate.zig");
 pub const deflate_history_size = deflate.history_size;
 
-const GzipTee = tee.CountingTee(true, false, false);
+const GzipTee = tee.CountingTee(.{ .crc32 = true });
 pub const Options = struct {
     modification_time: u32,
     extra_flags: u8,

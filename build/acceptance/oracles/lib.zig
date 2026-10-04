@@ -260,9 +260,9 @@ pub fn writeTempFile(bytes: []const u8, extension: []const u8) ![:0]u8 {
     try std.Io.Dir.cwd().createDirPath(oracle_io, dir);
     var index = @atomicRmw(usize, &temp_file_sequence, .Add, 1, .monotonic);
     while (true) : (index += 1) {
-        const formatted = try std.fmt.allocPrint(std.heap.page_allocator, "{s}/oracle-{d}.{s}", .{ dir, index, extension });
+        const formatted = try std.heap.page_allocator.print("{s}/oracle-{d}.{s}", .{ dir, index, extension });
         defer std.heap.page_allocator.free(formatted);
-        const path = try std.heap.page_allocator.dupeZ(u8, formatted);
+        const path = try std.heap.page_allocator.dupeSentinel(u8, formatted, 0);
         const file = std.Io.Dir.cwd().createFile(oracle_io, path, .{ .exclusive = true, .truncate = true }) catch |failure| {
             if (failure == error.PathAlreadyExists) {
                 std.heap.page_allocator.free(path);
@@ -400,7 +400,7 @@ pub fn archiveWrite(format: ArchiveFormat, entries: []const WriteEntry) ?[]u8 {
     for (entries) |item| {
         const entry = c.archive_entry_new() orelse return null;
         defer c.archive_entry_free(entry);
-        const name_z = std.heap.page_allocator.dupeZ(u8, item.name) catch return null;
+        const name_z = std.heap.page_allocator.dupeSentinel(u8, item.name, 0) catch return null;
         defer std.heap.page_allocator.free(name_z);
         c.archive_entry_set_pathname(entry, name_z.ptr);
         c.archive_entry_set_filetype(entry, item.filetype);
@@ -408,7 +408,7 @@ pub fn archiveWrite(format: ArchiveFormat, entries: []const WriteEntry) ?[]u8 {
         if (item.uid) |value| c.archive_entry_set_uid(entry, value);
         if (item.mtime) |value| c.archive_entry_set_mtime(entry, value, 0);
         if (item.symlink) |link| {
-            const link_z = std.heap.page_allocator.dupeZ(u8, link) catch return null;
+            const link_z = std.heap.page_allocator.dupeSentinel(u8, link, 0) catch return null;
             defer std.heap.page_allocator.free(link_z);
             c.archive_entry_set_symlink(entry, link_z.ptr);
         }
