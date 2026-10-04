@@ -193,7 +193,7 @@ pub fn main(init: std.process.Init) !void {
                 try per_row[idx].append(env.allocator, totals);
             }
         }
-        const run_path = try std.fmt.allocPrint(env.allocator, "zig-out/benchmark/report_{d}.txt", .{run_index});
+        const run_path = try env.allocator.print("zig-out/benchmark/report_{d}.txt", .{run_index});
         defer env.allocator.free(run_path);
         try env.writeFile(run_path, run_report.items);
     }
@@ -215,7 +215,7 @@ pub fn main(init: std.process.Init) !void {
     }
     // Filtered runs must not overwrite the full-matrix baseline.
     const row_report: ?[]u8 = if (gate_cfg.enabled and env.row != null)
-        try std.fmt.allocPrint(env.allocator, "zig-out/benchmark/report_{s}.txt", .{env.row.?})
+        try env.allocator.print("zig-out/benchmark/report_{s}.txt", .{env.row.?})
     else
         null;
     defer if (row_report) |path| env.allocator.free(path);
@@ -228,7 +228,7 @@ pub fn main(init: std.process.Init) !void {
         try gate_report.appendSlice(env.allocator, gate.header);
         for (results.items) |result| try gate.row(&gate_report, env.allocator, result);
         const row_gate: ?[]u8 = if (env.row) |filter|
-            try std.fmt.allocPrint(env.allocator, "zig-out/benchmark/gate_{s}.txt", .{filter})
+            try env.allocator.print("zig-out/benchmark/gate_{s}.txt", .{filter})
         else
             null;
         defer if (row_gate) |path| env.allocator.free(path);

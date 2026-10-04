@@ -20,7 +20,7 @@ pub const Totals = struct {
     ok: [4]bool = .{ true, true, true, true },
 
     pub fn add(self: *Totals, side: Side, m: Metric) void {
-        const i = @intFromEnum(side);
+        const i = @backingInt(side);
         self.encoded[i] += m.encoded;
         self.encode_ns[i] += m.encode_ns;
         self.decode_ns[i] += m.decode_ns;
@@ -104,7 +104,7 @@ pub fn ratio(bytes: usize, encoded: usize) f64 {
 }
 
 fn cellRatio(buf: *[16]u8, totals: Totals, side: Side, show: bool) []const u8 {
-    return tsv.cell(buf, "{d:.3}", ratio(totals.input_bytes, totals.encoded[@intFromEnum(side)]), show);
+    return tsv.cell(buf, "{d:.3}", ratio(totals.input_bytes, totals.encoded[@backingInt(side)]), show);
 }
 
 fn cellMibps(buf: *[16]u8, bytes: usize, ns: u64, show: bool) []const u8 {
@@ -112,7 +112,7 @@ fn cellMibps(buf: *[16]u8, bytes: usize, ns: u64, show: bool) []const u8 {
 }
 
 fn coverage(allocator: std.mem.Allocator, totals: Totals, available: [4]bool) ![]const u8 {
-    if (!totals.ok[@intFromEnum(Side.ours)]) return "failed";
+    if (!totals.ok[@backingInt(Side.ours)]) return "failed";
     var parts: [3][]const u8 = undefined;
     var n: usize = 0;
     if (!available[1]) {

@@ -131,11 +131,23 @@ fn installOut(b: *std.Build, dep: *std.Build.Step, source: []const u8, name: []c
     return b.addInstallFileWithDir(copyOut(b, dep, source, name), .{ .custom = "benchmark/bin" }, name);
 }
 
-fn gnu(b: *std.Build, cwd: []const u8, argv: []const []const u8, makeinfo: []const u8, texi2pdf: []const u8) *std.Build.Step.Run {
-    const step = b.addSystemCommand(argv);
+fn gnu(b: *std.Build, cwd: []const u8, argv: []const []const u8, dummy_dir: std.Build.LazyPath) *std.Build.Step.Run {
+    // The vendor autotools builds only probe $MAKEINFO/$TEXI2PDF for --version;
+    // the generated scripts answer that and the real work stays disabled. The
+    // paths must be absolute single words: gnulib's get_version splits its
+    // argument unquoted, and recursive makes resolve MAKEINFO from subdirs.
+    const step = b.addSystemCommand(&.{
+        "sh", "-c",
+        \\dummy="$(cd "$1" && pwd)"
+        \\export MAKEINFO="$dummy/makeinfo" TEXI2PDF="$dummy/texi2pdf"
+        \\shift
+        \\exec "$@"
+        ,
+        "sh",
+    });
+    step.addDirectoryArg2(dummy_dir, .{});
+    step.addArgs(argv);
     step.setCwd(b.path(cwd));
-    step.setEnvironmentVariable("MAKEINFO", makeinfo);
-    step.setEnvironmentVariable("TEXI2PDF", texi2pdf);
     return step;
 }
 
@@ -163,7 +175,7 @@ fn addBinaryFetch(b: *std.Build, ctx: *const common.Context, ref: BinaryRef) *st
 }
 
 fn addBinaryRefs(b: *std.Build, ctx: *const common.Context) struct { sevenzz: *std.Build.Step.InstallFile, rar: *std.Build.Step.InstallFile, unrar: *std.Build.Step.InstallFile } {
-    var fetches: [binary_refs.len]?*std.Build.Step.Run = .{null} ** binary_refs.len;
+    var fetches: [binary_refs.len]?*std.Build.Step.Run = @splat(null);
     var installs: [3]?*std.Build.Step.InstallFile = .{ null, null, null };
     for (binary_refs, 0..) |ref, i| {
         const fetch = blk: {
@@ -175,7 +187,7 @@ fn addBinaryRefs(b: *std.Build, ctx: *const common.Context) struct { sevenzz: *s
             break :blk created;
         };
         for (ref.installs) |install| {
-            const slot = @intFromEnum(install.bin);
+            const slot = @backingInt(install.bin);
             if (installs[slot] != null) continue;
             const source = b.path(b.fmt("{s}/{s}.d/{s}", .{ bin_pkgs_dir, archiveFileName(ref.url), install.member }));
             const target = b.addInstallFileWithDir(source, .{ .custom = "benchmark/bin/bins" }, binName(install.bin));
@@ -187,7 +199,10 @@ fn addBinaryRefs(b: *std.Build, ctx: *const common.Context) struct { sevenzz: *s
 }
 
 pub fn add(b: *std.Build, ctx: *const common.Context) Refs {
-    const make_7zz = make(b, "vendor/7zip/CPP/7zip/Bundles/Alone2", &.{ "make", "-f", "../../cmpl_mac_arm64.mak", "DISABLE_RAR_COMPRESS=1" });
+    // 7-Zip 26.03 trips clang/LLVM 22's lifetime-safety-intra-TU suggestion on
+    // MyStpCpy under the makefile's -Weverything -Werror; the makefile composes
+    // flags from CFLAGS_WARN_WALL, so the warning is disabled there.
+    const make_7zz = make(b, "vendor/7zip/CPP/7zip/Bundles/Alone2", &.{ "make", "-f", "../../cmpl_mac_arm64.mak", "DISABLE_RAR_COMPRESS=1", "CFLAGS_WARN_WALL=-Werror -Wall -Wextra -Wno-lifetime-safety-intra-tu-suggestions" });
     const sevenzz = installOut(b, &make_7zz.step, "vendor/7zip/CPP/7zip/Bundles/Alone2/b/m_arm64/7zz", "7zz");
 
     const make_zstd_cmd = make(b, "vendor/zstd", &.{ "make", "zstd-release" });
@@ -217,27 +232,33 @@ pub fn add(b: *std.Build, ctx: *const common.Context) Refs {
     // Vendor dlltest suite links the static lib from this path.
     const bzip2_lib_install = b.addInstallFileWithDir(bzip2_lib, .{ .custom = "benchmark/bin" }, "libbz2.a");
 
-    const mkdir_dummy = b.addSystemCommand(&.{ "mkdir", "-p", "zig-out/benchmark/build/dummy" });
-    const write_dummy = b.addSystemCommand(&.{ "sh", "-c", "printf '%s\\n' '#!/bin/sh' 'if [ \"$1\" = \"--version\" ]; then echo \"makeinfo (GNU texinfo) 7.1\"; fi' 'exit 0' > zig-out/benchmark/build/dummy/makeinfo && chmod +x zig-out/benchmark/build/dummy/makeinfo && printf '%s\\n' '#!/bin/sh' 'if [ \"$1\" = \"--version\" ]; then echo \"texi2pdf (GNU texinfo) 7.1\"; fi' 'exit 0' > zig-out/benchmark/build/dummy/texi2pdf && chmod +x zig-out/benchmark/build/dummy/texi2pdf" });
-    write_dummy.step.dependOn(&mkdir_dummy.step);
-    const makeinfo = b.pathFromRoot("zig-out/benchmark/build/dummy/makeinfo");
-    const texi2pdf = b.pathFromRoot("zig-out/benchmark/build/dummy/texi2pdf");
+    // Texinfo doc tools are only version-probed by the vendor autotools builds;
+    // dummy scripts answer --version and the real doc work stays disabled.
+    const texinfo = b.addSystemCommand(&.{
+        "sh", "-c",
+        \\set -eu
+        \\mkdir -p "$1"
+        \\printf '%s\n' '#!/bin/sh' 'if [ "$1" = "--version" ]; then echo "makeinfo (GNU texinfo) 7.1"; fi' 'exit 0' > "$1/makeinfo"
+        \\printf '%s\n' '#!/bin/sh' 'if [ "$1" = "--version" ]; then echo "texi2pdf (GNU texinfo) 7.1"; fi' 'exit 0' > "$1/texi2pdf"
+        \\chmod +x "$1/makeinfo" "$1/texi2pdf"
+        ,
+        "sh",
+    });
+    const dummy_dir = texinfo.addOutputDirectoryArg("texinfo-dummy");
 
-    const bootstrap_gzip = gnu(b, "vendor/gzip", &.{ "./bootstrap", "--skip-po" }, makeinfo, texi2pdf);
-    bootstrap_gzip.step.dependOn(&write_dummy.step);
-    const configure_gzip = gnu(b, "vendor/gzip", &.{"./configure"}, makeinfo, texi2pdf);
+    const bootstrap_gzip = gnu(b, "vendor/gzip", &.{ "./bootstrap", "--skip-po" }, dummy_dir);
+    const configure_gzip = gnu(b, "vendor/gzip", &.{"./configure"}, dummy_dir);
     configure_gzip.step.dependOn(&bootstrap_gzip.step);
-    const make_gzip = gnu(b, "vendor/gzip", &.{ "make", "-j4" }, makeinfo, texi2pdf);
+    const make_gzip = gnu(b, "vendor/gzip", &.{ "make", "-j4" }, dummy_dir);
     make_gzip.step.dependOn(&configure_gzip.step);
     const gzip_cmd = installOut(b, &make_gzip.step, "vendor/gzip/gzip", "gzip");
 
     const tar_check_bison = b.addSystemCommand(&.{ "sh", "-c", "if [ ! -x /opt/homebrew/opt/bison/bin/bison ]; then echo 'GNU tar build requires bison >= 2.4 (for example Homebrew bison); install it and retry' >&2; exit 1; fi" });
-    const bootstrap_tar = gnu(b, "vendor/tar", &.{ "sh", "-c", "export PATH=\"/opt/homebrew/opt/bison/bin:$PATH\"; exec ./bootstrap --skip-po" }, makeinfo, texi2pdf);
-    bootstrap_tar.step.dependOn(&write_dummy.step);
+    const bootstrap_tar = gnu(b, "vendor/tar", &.{ "sh", "-c", "export PATH=\"/opt/homebrew/opt/bison/bin:$PATH\"; exec ./bootstrap --skip-po" }, dummy_dir);
     bootstrap_tar.step.dependOn(&tar_check_bison.step);
-    const configure_tar = gnu(b, "vendor/tar", &.{ "sh", "-c", "export PATH=\"/opt/homebrew/opt/bison/bin:$PATH\"; exec ./configure --disable-nls" }, makeinfo, texi2pdf);
+    const configure_tar = gnu(b, "vendor/tar", &.{ "sh", "-c", "export PATH=\"/opt/homebrew/opt/bison/bin:$PATH\"; exec ./configure --disable-nls" }, dummy_dir);
     configure_tar.step.dependOn(&bootstrap_tar.step);
-    const make_tar = gnu(b, "vendor/tar", &.{ "sh", "-c", "export PATH=\"/opt/homebrew/opt/bison/bin:$PATH\"; exec make -j4 LIBS=-liconv" }, makeinfo, texi2pdf);
+    const make_tar = gnu(b, "vendor/tar", &.{ "sh", "-c", "export PATH=\"/opt/homebrew/opt/bison/bin:$PATH\"; exec make -j4 LIBS=-liconv" }, dummy_dir);
     make_tar.step.dependOn(&configure_tar.step);
     const tar_cmd = installOut(b, &make_tar.step, "vendor/tar/src/tar", "tar");
 
@@ -268,10 +289,10 @@ pub fn add(b: *std.Build, ctx: *const common.Context) Refs {
     const archive_fl2 = b.addSystemCommand(&.{ "sh", "-c", "ar rcs \"$1\" vendor/fast-lzma2/*.o", "sh" });
     const fast_lzma2_lib = archive_fl2.addOutputFileArg("libfast-lzma2.a");
     archive_fl2.step.dependOn(&make_fl2.step);
-    const install_fl2_lib = b.addInstallFileWithDir(fast_lzma2_lib, .{ .custom = "benchmark/build/fast-lzma2" }, "libfast-lzma2.a");
-    const make_fl2_test = b.addSystemCommand(&.{ "make", "-j4", "CFLAGS=-Wall -O1 -pthread -I..", b.fmt("LIB={s}", .{b.pathFromRoot("zig-out/benchmark/build/fast-lzma2/libfast-lzma2.a")}) });
+    const make_fl2_test = b.addSystemCommand(&.{ "make", "-j4", "CFLAGS=-Wall -O1 -pthread -I.." });
+    make_fl2_test.addFileArg2(fast_lzma2_lib, .{ .prefix = "LIB=" });
     make_fl2_test.setCwd(b.path("vendor/fast-lzma2/test"));
-    make_fl2_test.step.dependOn(&install_fl2_lib.step);
+    make_fl2_test.step.dependOn(&archive_fl2.step);
 
     const make_lzma = make(b, "vendor/7zip/CPP/7zip/Bundles/LzmaCon", &.{ "make", "-f", "makefile.gcc", "-j4" });
     const lzma_cmd = installOut(b, &make_lzma.step, "vendor/7zip/CPP/7zip/Bundles/LzmaCon/_o/lzma", "lzma");

@@ -107,10 +107,10 @@ pub fn compressBlock(
     }
     const tokens = raw_tokens[0..count];
 
-    var ld_freq: [nc]u32 = [_]u32{0} ** nc;
-    var dd_freq: [dc]u32 = [_]u32{0} ** dc;
-    var ldd_freq: [ldc]u32 = [_]u32{0} ** ldc;
-    var rd_freq: [rc]u32 = [_]u32{0} ** rc;
+    var ld_freq: [nc]u32 = @splat(0);
+    var dd_freq: [dc]u32 = @splat(0);
+    var ldd_freq: [ldc]u32 = @splat(0);
+    var rd_freq: [rc]u32 = @splat(0);
 
     var prev_distances: [4]u32 = .{ 0, 0, 0, 0 };
 
@@ -181,7 +181,7 @@ pub fn compressBlock(
     var cl_count: usize = 0;
     encodeCLSymbols(&ld_lengths, &dd_lengths, &ldd_lengths, &rd_lengths, &cl_symbols, &cl_count);
 
-    var cl_freq: [code_length_symbols]u32 = [_]u32{0} ** code_length_symbols;
+    var cl_freq: [code_length_symbols]u32 = @splat(0);
     for (cl_symbols[0..cl_count]) |sym| {
         cl_freq[sym.symbol] += 1;
     }
@@ -282,7 +282,7 @@ pub fn compressBlock(
 }
 
 fn computeCanonicalCodes(lengths: []const u8, codes: []u32) void {
-    var len_count: [16]u32 = [_]u32{0} ** 16;
+    var len_count: [16]u32 = @splat(0);
     var max_len: u8 = 0;
     for (lengths) |cl| {
         if (cl > 0) {
@@ -291,7 +291,7 @@ fn computeCanonicalCodes(lengths: []const u8, codes: []u32) void {
         }
     }
 
-    var next_code: [16]u32 = [_]u32{0} ** 16;
+    var next_code: [16]u32 = @splat(0);
     var code: u32 = 0;
     for (1..@as(usize, max_len) + 1) |bit_count| {
         code = (code + len_count[bit_count - 1]) << 1;

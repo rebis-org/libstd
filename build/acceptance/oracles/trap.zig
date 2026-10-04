@@ -174,7 +174,7 @@ const scenarios = [_]struct {
 // Signals 4-11 cover SIGILL..SIGSEGV. SIGTRAP and debug panics land in the same band.
 fn isTrapSignal(term: std.process.Child.Term) bool {
     return switch (term) {
-        .signal => |sig| @intFromEnum(sig) >= 4 and @intFromEnum(sig) <= 11,
+        .signal => |sig| @backingInt(sig) >= 4 and @backingInt(sig) <= 11,
         else => false,
     };
 }

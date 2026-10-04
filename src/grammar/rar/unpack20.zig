@@ -102,7 +102,7 @@ const AudioChannel = struct {
     d3: i32 = 0,
     d4: i32 = 0,
     last_delta: i32 = 0,
-    dif: [11]u32 = [_]u32{0} ** 11,
+    dif: [11]u32 = @splat(0),
     byte_count: u32 = 0,
     last_char: i32 = 0,
 
@@ -241,7 +241,7 @@ const Unpack20State = struct {
             .ld = .{},
             .dd = .{},
             .rd = .{},
-            .md = [_]DecodeTable{.{}} ** max_audio_channels,
+            .md = @splat(.{}),
             .old_dist = [_]u32{ 0, 0, 0, 0 },
             .old_dist_ptr = 0,
             .last_distance = 0,
@@ -254,10 +254,10 @@ const Unpack20State = struct {
             .audio_block = false,
             .audio_channels = 0,
             .cur_channel = 0,
-            .old_table = [_]u8{0} ** old_table_size,
+            .old_table = @splat(0),
             .channel_delta = 0,
             .tables_loaded = false,
-            .audio_state = [_]AudioChannel{.{}} ** max_audio_channels,
+            .audio_state = @splat(.{}),
             .table_pool = table_pool,
         };
     }
@@ -266,7 +266,7 @@ const Unpack20State = struct {
         st.ld = .{};
         st.dd = .{};
         st.rd = .{};
-        st.md = [_]DecodeTable{.{}} ** max_audio_channels;
+        st.md = @splat(.{});
     }
 };
 
@@ -298,7 +298,7 @@ fn readTables(st: *Unpack20State) Failure!void {
     st.audio_block = (bit_field & 0x8000) != 0;
 
     if ((bit_field & 0x4000) == 0) {
-        st.old_table = [_]u8{0} ** old_table_size;
+        st.old_table = @splat(0);
     }
     br.skipBits(2);
 
@@ -319,7 +319,7 @@ fn readTables(st: *Unpack20State) Failure!void {
     // 4-bit DELTAs against the previous block's table (why old_table must
     // persist). V20's escape mapping is its own, do not copy v29's. 16
     // repeats 3+read(2), 17 zeros 3+read(3), 18/19 zeros 11+read(7).
-    var table: [old_table_size]u8 = [_]u8{0} ** old_table_size;
+    var table: [old_table_size]u8 = @splat(0);
     var i: u16 = 0;
     while (i < table_size) {
         const sym = try huffman.decodeNumber(br, &bc_table);
@@ -346,7 +346,7 @@ fn readTables(st: *Unpack20State) Failure!void {
     }
 
     if (st.audio_block) {
-        st.md = [_]DecodeTable{.{}} ** max_audio_channels;
+        st.md = @splat(.{});
         for (0..st.audio_channels) |ch| {
             const off = ch * mc20;
             st.md[ch] = try huffman.makeDecodeTables(table[off .. off + mc20], ldPool(st, 3 + ch, mc20));
@@ -576,8 +576,8 @@ pub const Session = struct {
         st.audio_channels = 1;
         st.cur_channel = 0;
         st.channel_delta = 0;
-        st.audio_state = [_]AudioChannel{.{}} ** max_audio_channels;
-        st.old_table = [_]u8{0} ** old_table_size;
+        st.audio_state = @splat(.{});
+        st.old_table = @splat(0);
     }
 
     // The reference gate is `if ((!Solid || !TablesRead2) && !ReadTables20())`

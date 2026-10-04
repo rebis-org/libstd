@@ -34,6 +34,10 @@ const distance_max: u32 = 65535;
 const hash_log = 12;
 const hash_size = 1 << hash_log;
 const hash_prime: u32 = 2654435761;
+// LZ4HC-class matcher: wider hash plus a chain slot per position.
+const hc_hash_log = 15;
+const hc_hash_size = 1 << hc_hash_log;
+const hc_mask = hc_hash_size - 1;
 const header_size_max = 4 + 2 + 8 + 4 + 1;
 
 pub const Options = struct {
@@ -41,6 +45,9 @@ pub const Options = struct {
     content_checksum: bool = true,
     block_checksum: bool = false,
     acceleration: u32 = 1,
+    // Hash-chain search attempt budget per position, LZ4HC searchNum semantics
+    // (0 keeps the default greedy parser).
+    search_depth: u32 = 0,
 };
 
 fn blockCode(block_size: u32) Failure!u8 {
@@ -54,7 +61,7 @@ fn blockCode(block_size: u32) Failure!u8 {
 }
 
 pub fn encodeWorkspaceSize() usize {
-    return hash_size * @sizeOf(u32) + blockBound(block_size_max);
+    return (hash_size + 2 * hc_hash_size) * @sizeOf(u32) + blockBound(block_size_max);
 }
 
 pub fn decodeWorkspaceSize() usize {
@@ -134,12 +141,16 @@ pub fn encodeToWriter(input: []const u8, output: *std.Io.Writer, scratch: []u8, 
     header_hasher.update(&size_bytes);
     output.writeByte(@truncate(header_hasher.final() >> 8)) catch return error.IoFailure;
     const table: []u32 = @alignCast(std.mem.bytesAsSlice(u32, scratch[0 .. hash_size * @sizeOf(u32)]));
-    const work = scratch[hash_size * @sizeOf(u32) ..];
+    const hc_tables: []u32 = @alignCast(std.mem.bytesAsSlice(u32, scratch[hash_size * @sizeOf(u32) .. (hash_size + 2 * hc_hash_size) * @sizeOf(u32)]));
+    const work = scratch[(hash_size + 2 * hc_hash_size) * @sizeOf(u32) ..];
     var offset: usize = 0;
     while (offset < input.len) {
         const chunk_len: usize = @min(input.len - offset, options.block_size);
         const chunk = input[offset .. offset + chunk_len];
-        const compressed_len = compressBlock(chunk, work, table, acceleration);
+        const compressed_len = if (options.search_depth == 0)
+            compressBlock(chunk, work, table, acceleration)
+        else
+            compressBlockHc(chunk, work, hc_tables[0..hc_hash_size], hc_tables[hc_hash_size..], options.search_depth);
         if (compressed_len >= chunk_len) {
             output.writeInt(u32, uncompressed_block | (std.math.cast(u32, chunk_len) orelse return error.ResourceLimit), .little) catch return error.IoFailure;
             output.writeAll(chunk) catch return error.IoFailure;
@@ -341,6 +352,109 @@ fn compressBlock(input: []const u8, output: []u8, table: []u32, acceleration: u3
     return emitLastLiterals(input[anchor..], output, op);
 }
 
+// LZ4HC-class parser: every position enters a per-bucket chain, a match search
+// walks the chain within the attempt budget, and a one-position lazy step keeps
+// the longer of the two candidate matches (LZ4HC_compress_hashChain semantics).
+fn compressBlockHc(input: []const u8, output: []u8, head: []u32, chain: []u32, search_depth: u32) usize {
+    @memset(head, 0);
+    const len = input.len;
+    if (len < min_length) return emitLastLiterals(input, output, 0);
+    var op: usize = 0;
+    var anchor: usize = 0;
+    var ip: usize = 0;
+    const mflimit = len - mf_limit;
+    const match_limit = len - last_literals;
+    var attempts = search_depth;
+
+    while (true) {
+        var best = hcSearch(input, head, chain, ip, &attempts, match_limit);
+        if (best.len == 0) {
+            ip += 1;
+            if (ip > mflimit) break;
+            attempts = search_depth;
+            continue;
+        }
+        if (best.len < match_limit - ip and ip + 1 <= mflimit) {
+            var probe_attempts = search_depth;
+            const probe = hcSearch(input, head, chain, ip + 1, &probe_attempts, match_limit);
+            if (probe.len > best.len) {
+                ip += 1;
+                best = probe;
+            }
+        }
+        op = emitSequence(input, output, op, anchor, ip, best.index, best.len);
+        ip += best.len;
+        anchor = ip;
+        if (ip > mflimit) break;
+        attempts = search_depth;
+    }
+    return emitLastLiterals(input[anchor..], output, op);
+}
+
+const HcMatch = struct { index: usize, len: usize };
+
+// Insert position ip into its bucket chain and search the chain that preceded
+// it (mirroring LZ4HC_InsertAndGetWiderMatch: inserting first guarantees the
+// walk never self-matches). The attempt budget decrements per candidate; the
+// chain strictly decreases so the window check also bounds the walk.
+fn hcSearch(input: []const u8, head: []u32, chain: []u32, ip: usize, attempts: *u32, match_limit: usize) HcMatch {
+    const h = hash4(std.mem.readInt(u32, input[ip..][0..4], .little));
+    var candidate = head[h];
+    chain[ip & hc_mask] = candidate;
+    head[h] = @intCast(ip + 1);
+    const needle = std.mem.readInt(u32, input[ip..][0..4], .little);
+    var best: HcMatch = .{ .index = 0, .len = 0 };
+    while (candidate != 0 and attempts.* > 0) : (attempts.* -= 1) {
+        const index = candidate - 1;
+        candidate = chain[index & hc_mask];
+        if (index + distance_max < ip) break;
+        if (std.mem.readInt(u32, input[index..][0..4], .little) != needle) continue;
+        const extra = kernels.matchLen8(input, index + min_match, ip + min_match, match_limit - ip);
+        if (min_match + extra > best.len) {
+            best = .{ .index = index, .len = min_match + extra };
+            if (ip + best.len >= match_limit) break;
+        }
+    }
+    return best;
+}
+
+fn emitSequence(input: []const u8, output: []u8, op_start: usize, anchor: usize, ip: usize, match_index: usize, match_len: usize) usize {
+    var op = op_start;
+    const token_pos = op;
+    op += 1;
+    const lit_len = ip - anchor;
+    if (lit_len >= run_mask) {
+        output[token_pos] = run_mask << 4;
+        var rest = lit_len - run_mask;
+        while (rest >= 255) : (rest -= 255) {
+            output[op] = 255;
+            op += 1;
+        }
+        output[op] = @intCast(rest);
+        op += 1;
+    } else {
+        output[token_pos] = @as(u8, @intCast(lit_len)) << 4;
+    }
+    @memcpy(output[op .. op + lit_len], input[anchor..ip]);
+    op += lit_len;
+    std.mem.writeInt(u16, output[op..][0..2], @intCast(ip - match_index), .little);
+    op += 2;
+    const stored = match_len - min_match;
+    if (stored >= ml_mask) {
+        output[token_pos] += ml_mask;
+        var rest = stored - ml_mask;
+        while (rest >= 255) : (rest -= 255) {
+            output[op] = 255;
+            op += 1;
+        }
+        output[op] = @intCast(rest);
+        op += 1;
+    } else {
+        output[token_pos] += @as(u8, @intCast(stored));
+    }
+    return op;
+}
+
 fn emitLastLiterals(literals: []const u8, output: []u8, op_start: usize) usize {
     var op = op_start;
     const lit_len = literals.len;
@@ -471,4 +585,66 @@ test "lz4 corrupt blocks rejected" {
     } else |err| {
         try std.testing.expect(err == error.InvalidData or err == error.IntegrityFailure);
     }
+}
+
+test "lz4 hc roundtrip beats greedy on repetitive data" {
+    var prng = std.Random.DefaultPrng.init(0x5a);
+    const random = prng.random();
+    const input = try std.testing.allocator.alloc(u8, 300000);
+    defer std.testing.allocator.free(input);
+    // Mixed periodic content separates hash-chain search from greedy skips.
+    for (input, 0..) |*byte, i| {
+        byte.* = if (i % 211 < 150) @as(u8, @truncate(i / 8192)) else random.int(u8);
+    }
+    const scratch = try std.testing.allocator.alloc(u8, @max(encodeWorkspaceSize(), decodeWorkspaceSize()));
+    defer std.testing.allocator.free(scratch);
+    const bound = encodedSizeBound(input.len);
+    const greedy = try std.testing.allocator.alloc(u8, bound);
+    defer std.testing.allocator.free(greedy);
+    const hc = try std.testing.allocator.alloc(u8, bound);
+    defer std.testing.allocator.free(hc);
+    const greedy_len = try encode(input, greedy, scratch, .{});
+    const hc_len = try encode(input, hc, scratch, .{ .search_depth = 256 });
+    try std.testing.expect(hc_len < greedy_len);
+    const decoded = try std.testing.allocator.alloc(u8, input.len);
+    defer std.testing.allocator.free(decoded);
+    const produced = try decode(hc[0..hc_len], decoded, scratch, .{});
+    try std.testing.expectEqual(input.len, produced);
+    try std.testing.expectEqualSlices(u8, input, decoded);
+}
+
+test "lz4 hc is deterministic" {
+    var prng = std.Random.DefaultPrng.init(0x77);
+    const random = prng.random();
+    const input = try std.testing.allocator.alloc(u8, 150000);
+    defer std.testing.allocator.free(input);
+    for (input) |*byte| byte.* = random.int(u8) & 0x3f;
+    const scratch = try std.testing.allocator.alloc(u8, @max(encodeWorkspaceSize(), decodeWorkspaceSize()));
+    defer std.testing.allocator.free(scratch);
+    const bound = encodedSizeBound(input.len);
+    const first = try std.testing.allocator.alloc(u8, bound);
+    defer std.testing.allocator.free(first);
+    const second = try std.testing.allocator.alloc(u8, bound);
+    defer std.testing.allocator.free(second);
+    const first_len = try encode(input, first, scratch, .{ .search_depth = 64 });
+    const second_len = try encode(input, second, scratch, .{ .search_depth = 64 });
+    try std.testing.expectEqual(first_len, second_len);
+    try std.testing.expectEqualSlices(u8, first[0..first_len], second[0..second_len]);
+}
+
+test "lz4 hc roundtrip incompressible" {
+    var prng = std.Random.DefaultPrng.init(0x9e37);
+    const random = prng.random();
+    const input = try std.testing.allocator.alloc(u8, 100000);
+    defer std.testing.allocator.free(input);
+    for (input) |*byte| byte.* = random.int(u8);
+    const scratch = try std.testing.allocator.alloc(u8, @max(encodeWorkspaceSize(), decodeWorkspaceSize()));
+    defer std.testing.allocator.free(scratch);
+    const encoded = try std.testing.allocator.alloc(u8, encodedSizeBound(input.len));
+    defer std.testing.allocator.free(encoded);
+    const encoded_len = try encode(input, encoded, scratch, .{ .search_depth = 256 });
+    const decoded = try std.testing.allocator.alloc(u8, input.len);
+    defer std.testing.allocator.free(decoded);
+    const produced = try decode(encoded[0..encoded_len], decoded, scratch, .{});
+    try std.testing.expectEqualSlices(u8, input, decoded[0..produced]);
 }

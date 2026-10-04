@@ -1,7 +1,7 @@
 pub const max_distance: u8 = 255;
 
 pub fn decode(data: []u8, distance: u8) void {
-    var history = [_]u8{0} ** 256;
+    var history: [256]u8 = @splat(0);
     var pos: u8 = 0;
     for (data, 0..) |byte, index| {
         const history_index = distance +% 1 +% pos;
@@ -13,7 +13,7 @@ pub fn decode(data: []u8, distance: u8) void {
 }
 
 pub fn encode(data: []u8, distance: u8) void {
-    var history = [_]u8{0} ** 256;
+    var history: [256]u8 = @splat(0);
     var pos: u8 = 0;
     for (data, 0..) |byte, index| {
         const history_index = distance +% 1 +% pos;

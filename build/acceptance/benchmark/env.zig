@@ -35,15 +35,15 @@ pub const Env = struct {
     }
 
     pub fn makePath(self: *Env, comptime fmt: []const u8, args: anytype) ![]u8 {
-        return std.fmt.allocPrint(self.allocator, fmt, args);
+        return self.allocator.print(fmt, args);
     }
 
     pub fn makePathZ(self: *Env, comptime fmt: []const u8, args: anytype) ![:0]u8 {
-        return std.fmt.allocPrintSentinel(self.allocator, fmt, args, 0);
+        return self.allocator.printSentinel(fmt, args, 0);
     }
 
     pub fn print(self: *Env, comptime fmt: []const u8, args: anytype) ![]u8 {
-        return std.fmt.allocPrint(self.arena.allocator(), fmt, args);
+        return self.arena.allocator().print(fmt, args);
     }
 
     pub fn exists(self: *const Env, path: []const u8) bool {

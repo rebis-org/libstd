@@ -137,7 +137,7 @@ fn TableCrc(comptime T: type, comptime poly: T, comptime reflected: bool) type {
 
         pub fn update(self: *@This(), input: []const u8) void {
             if (comptime T == u32 and reflected) {
-                if (comptime !options.portable and builtin.cpu.arch == .aarch64) {
+                if (comptime !options.portable and builtin.target.cpu.arch == .aarch64) {
                     if (input.len >= crc32_pmull_threshold) {
                         self.state = stdk_crc32_le_pmull(self.state, input.ptr, input.len);
                     } else {
