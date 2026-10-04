@@ -19,29 +19,27 @@ pub const AppleArch = struct {
 };
 
 pub const apple_slices = [_]AppleSlice{
-    .{ .id = "ios-arm64", .library = "ios.dylib", .platform = "IOS", .minimum = "15.0", .arches = &.{
-        .{ .arch = .aarch64, .os = .ios, .sdk = "iphoneos", .triple = "arm64-apple-ios15.0" },
+    .{ .id = "ios-arm64", .library = "ios.dylib", .platform = "IOS", .minimum = "16.0", .arches = &.{
+        .{ .arch = .aarch64, .os = .ios, .os_version_min = .{ .major = 16, .minor = 0, .patch = 0 }, .sdk = "iphoneos", .triple = "arm64-apple-ios16.0" },
     } },
-    .{ .id = "ios-arm64_x86_64-simulator", .library = "ios_sim.dylib", .platform = "IOSSIMULATOR", .minimum = "15.0", .arches = &.{
-        .{ .arch = .aarch64, .os = .ios, .abi = .simulator, .sdk = "iphonesimulator", .triple = "arm64-apple-ios15.0-simulator" },
-        .{ .arch = .x86_64, .os = .ios, .abi = .simulator, .sdk = "iphonesimulator", .triple = "x86_64-apple-ios15.0-simulator" },
+    .{ .id = "ios-arm64_x86_64-simulator", .library = "ios_sim.dylib", .platform = "IOSSIMULATOR", .minimum = "16.0", .arches = &.{
+        .{ .arch = .aarch64, .os = .ios, .abi = .simulator, .os_version_min = .{ .major = 16, .minor = 0, .patch = 0 }, .sdk = "iphonesimulator", .triple = "arm64-apple-ios16.0-simulator" },
+        .{ .arch = .x86_64, .os = .ios, .abi = .simulator, .os_version_min = .{ .major = 16, .minor = 0, .patch = 0 }, .sdk = "iphonesimulator", .triple = "x86_64-apple-ios16.0-simulator" },
     } },
-    .{ .id = "macos-arm64_x86_64", .library = "macos.dylib", .platform = "MACOS", .minimum = "12.0", .arches = &.{
-        .{ .arch = .aarch64, .os = .macos, .os_version_min = .{ .major = 12, .minor = 0, .patch = 0 }, .sdk = "macosx", .triple = "arm64-apple-macos12.0" },
-        .{ .arch = .x86_64, .os = .macos, .os_version_min = .{ .major = 12, .minor = 0, .patch = 0 }, .sdk = "macosx", .triple = "x86_64-apple-macos12.0" },
+    .{ .id = "macos-arm64_x86_64", .library = "macos.dylib", .platform = "MACOS", .minimum = "13.0", .arches = &.{
+        .{ .arch = .aarch64, .os = .macos, .os_version_min = .{ .major = 13, .minor = 0, .patch = 0 }, .sdk = "macosx", .triple = "arm64-apple-macos13.0" },
+        .{ .arch = .x86_64, .os = .macos, .os_version_min = .{ .major = 13, .minor = 0, .patch = 0 }, .sdk = "macosx", .triple = "x86_64-apple-macos13.0" },
     } },
-    .{ .id = "ios-arm64_x86_64-maccatalyst", .library = "catalyst.dylib", .platform = "MACCATALYST", .minimum = "15.0", .arches = &.{
-        .{ .arch = .aarch64, .os = .maccatalyst, .os_version_min = .{ .major = 15, .minor = 0, .patch = 0 }, .zig = true },
-        .{ .arch = .x86_64, .os = .maccatalyst, .os_version_min = .{ .major = 15, .minor = 0, .patch = 0 }, .zig = true },
-    } },
-    .{ .id = "tvos-arm64", .library = "tvos.dylib", .platform = "TVOS", .minimum = "15.0", .arches = &.{
-        .{ .arch = .aarch64, .os = .tvos, .sdk = "appletvos", .triple = "arm64-apple-tvos15.0" },
-    } },
-    .{ .id = "tvos-arm64_x86_64-simulator", .library = "tvos_sim.dylib", .platform = "TVOSSIMULATOR", .minimum = "15.0", .arches = &.{
-        .{ .arch = .aarch64, .os = .tvos, .abi = .simulator, .sdk = "appletvsimulator", .triple = "arm64-apple-tvos15.0-simulator" },
-        .{ .arch = .x86_64, .os = .tvos, .abi = .simulator, .sdk = "appletvsimulator", .triple = "x86_64-apple-tvos15.0-simulator" },
+    .{ .id = "ios-arm64_x86_64-maccatalyst", .library = "catalyst.dylib", .platform = "MACCATALYST", .minimum = "16.0", .arches = &.{
+        .{ .arch = .aarch64, .os = .maccatalyst, .os_version_min = .{ .major = 16, .minor = 0, .patch = 0 }, .zig = true },
+        .{ .arch = .x86_64, .os = .maccatalyst, .os_version_min = .{ .major = 16, .minor = 0, .patch = 0 }, .zig = true },
     } },
 };
+
+// Only iOS, iOS Simulator, macOS, and Mac Catalyst ship. tvOS and visionOS
+// are omitted for now. watchOS is blocked: its device slice needs arm64_32, which Zig
+// 0.17 has no backend for, and aarch64-watchos clamps any floor below 26.0
+// up to minos 26.0, so no v9 slice can pass the package gate.
 
 pub const framework_bundle = "StdK.framework";
 pub const framework_binary = "StdK";

@@ -160,7 +160,7 @@ fn readTables(st: *State) Failure!void {
     // Stage 1: 20 code-length code lengths, 4 bits each. A 15 followed by
     // another 4-bit value is an escape: 0 means the length really is 15,
     // nonzero means a zero run of (value + 2).
-    var cl_lengths: [code_length_symbols]u8 = [_]u8{0} ** code_length_symbols;
+    var cl_lengths: [code_length_symbols]u8 = @splat(0);
     {
         var ci: usize = 0;
         while (ci < code_length_symbols) {
@@ -192,7 +192,7 @@ fn readTables(st: *State) Failure!void {
     // repeat/zero runs.
     const dc: u16 = if (st.is_rar7) dc_rar7 else dc_rar5;
     const total_symbols: usize = @as(usize, nc) + dc + ldc + rc;
-    var code_lengths: [max_total_symbols]u8 = [_]u8{0} ** max_total_symbols;
+    var code_lengths: [max_total_symbols]u8 = @splat(0);
 
     var i: usize = 0;
     while (i < total_symbols) {
@@ -572,11 +572,11 @@ test "decodeLengthSlot: direct and extra-bit slots" {
 }
 
 test "decodeDistance: slot 0 returns 1" {
-    var dd_lengths: [dc_rar5]u8 = [_]u8{0} ** dc_rar5;
+    var dd_lengths: [dc_rar5]u8 = @splat(0);
     dd_lengths[0] = 1;
     var pool: [table_pool_words * 4]u16 = undefined;
     const dd = try huffman.makeDecodeTables(&dd_lengths, pool[0..dc_rar5]);
-    var ldd_lengths: [ldc]u8 = [_]u8{0} ** ldc;
+    var ldd_lengths: [ldc]u8 = @splat(0);
     ldd_lengths[0] = 1;
     const ldd = try huffman.makeDecodeTables(&ldd_lengths, pool[dc_rar5..][0..ldc]);
     var data = [_]u8{0x00};

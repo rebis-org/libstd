@@ -116,8 +116,9 @@ fn buildLen(comptime spec: []const Arg, comptime store: []const Arg, comptime lz
 const max_extra_args = 4;
 const max_args = blk: {
     var n: usize = 0;
-    for (std.meta.fields(matrix.Cmd)) |field| {
-        const cmd = get(@enumFromInt(field.value));
+    const cmd_info = @typeInfo(matrix.Cmd).@"enum";
+    for (cmd_info.field_names, cmd_info.field_values) |_, field_value| {
+        const cmd = get(@fromBackingInt(@intCast(field_value)));
         if (cmd.encode) |spec| n = @max(n, buildLen(spec.args, spec.store, spec.lzma, 0));
         if (cmd.decode) |spec| n = @max(n, buildLen(spec.args, spec.store, spec.lzma, 0));
     }

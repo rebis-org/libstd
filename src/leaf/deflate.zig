@@ -8,7 +8,7 @@ const kernels = @import("kernels.zig");
 
 // NEON is baseline on aarch64, so the wide match-copy path needs no extra
 // target feature. Other targets keep the portable word-at-a-time path.
-const vector_match_copy = !build_options.portable and builtin.cpu.arch == .aarch64;
+const vector_match_copy = !build_options.portable and builtin.target.cpu.arch == .aarch64;
 
 pub const history_size = 2 * window_size;
 pub const measurement_buffer_size = 64;
@@ -1295,7 +1295,7 @@ pub fn DecompressOf(comptime variant: enum { deflate, deflate64 }) type {
         fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
             const decompressor: *@This() = @alignCast(@fieldParentPtr("reader", r));
             if (decompressor.failed) return error.ReadFailed;
-            var remaining: usize = @intFromEnum(limit);
+            var remaining: usize = @backingInt(limit);
             var produced: usize = 0;
             while (remaining > 0) {
                 if (decompressor.state == .end) break;

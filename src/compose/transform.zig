@@ -362,6 +362,9 @@ fn parseLz4Options(request: ?*Node, command_mask: u32) Failure!lz4.Options {
     if (node_graph.findSelector(request, comptime discovery.parameter("lz4", "acceleration").family, comptime discovery.parameter("lz4", "acceleration").ordinal)) |node| {
         options.acceleration = std.math.cast(u32, node.value_low) orelse return error.InvalidCall;
     }
+    if (node_graph.findSelector(request, comptime discovery.parameter("lz4", "search_depth").family, comptime discovery.parameter("lz4", "search_depth").ordinal)) |node| {
+        options.search_depth = std.math.cast(u32, node.value_low) orelse return error.InvalidCall;
+    }
     return options;
 }
 
@@ -473,7 +476,8 @@ pub fn zdictHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resour
     }
     const capacity = input.len + zstd.dictionary_header_size;
     const staging = try workspace.take(u8, capacity);
-    const produced = try zstd.trainDictionary(samples, capacity, staging);
+    const train_scratch = try workspace.take(u8, zstd.trainWorkspaceSize());
+    const produced = try zstd.trainDictionary(samples, capacity, staging, train_scratch);
     if (produced > limits.encoded_bytes) return error.ResourceLimit;
     if (input.len + produced > limits.codec_work) return error.ResourceLimit;
     if (sink) |sink_resource| {

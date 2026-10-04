@@ -191,15 +191,15 @@ pub const State = struct {
             .written_size = 0,
             .block_mode = .lz,
             .tables_loaded = false,
-            .old_table = [_]u8{0} ** total_code_lengths,
+            .old_table = @splat(0),
             .filter_seen = .none,
             .unsupported_filter_seen = false,
             .prev_low_dist = 0,
             .low_dist_rep_count = 0,
-            .filter_types = [_]rarvm.StandardFilter{.none} ** max_filters,
+            .filter_types = @splat(.none),
             .filter_count = 0,
             .last_filter = 0,
-            .old_filter_lengths = [_]u32{0} ** max_filters,
+            .old_filter_lengths = @splat(0),
             .pending = pending,
             .pending_count = 0,
             .stream_out = null,
@@ -266,7 +266,7 @@ pub const State = struct {
         // 0x4000 clear means "start from a zeroed table" rather than
         // continuing the delta chain from the previous block.
         if (bit_field & 0x4000 == 0) {
-            st.old_table = [_]u8{0} ** total_code_lengths;
+            st.old_table = @splat(0);
         }
         st.br.skipBits(2);
 
@@ -278,7 +278,7 @@ pub const State = struct {
         // Symbol lengths via the CL table: 0..15 are DELTAs against the old
         // table. 16 repeats 3+read(3), 17 repeats 11+read(7), 18 zeros
         // 3+read(3), 19 zeros 11+read(7).
-        var code_lengths: [total_code_lengths]u8 = [_]u8{0} ** total_code_lengths;
+        var code_lengths: [total_code_lengths]u8 = @splat(0);
         var i: usize = 0;
         while (i < total_code_lengths) {
             const sym = try huffman.decodeNumber(&st.br, &bc_table);
@@ -390,7 +390,7 @@ pub const State = struct {
 
         // R[4] carries the block length. R[0] is the channel count for the
         // delta/audio filters. Both come from the optional-parameter block.
-        var init_r = [_]u32{0} ** 7;
+        var init_r: [7]u32 = @splat(0);
         init_r[4] = block_length;
         if (first_byte & 0x10 != 0) {
             const init_mask = try cr.readBits(7);
@@ -786,7 +786,7 @@ pub const Session = struct {
         st.last_distance = 0;
         st.last_length = 0;
         st.freeTables();
-        st.old_table = [_]u8{0} ** total_code_lengths;
+        st.old_table = @splat(0);
         st.block_mode = .lz;
         // Reference UnpInitData30(!Solid) resets PPMEscChar and the block type
         // but does NOT destroy the PPM model. It persists for the whole
@@ -795,10 +795,10 @@ pub const Session = struct {
         // otherwise find no allocator and fail on an archive unrar accepts.
         st.ppm_esc_char = 2;
         // InitFilters30(!Solid): the filter PROGRAM table.
-        st.filter_types = [_]rarvm.StandardFilter{.none} ** max_filters;
+        st.filter_types = @splat(.none);
         st.filter_count = 0;
         st.last_filter = 0;
-        st.old_filter_lengths = [_]u32{0} ** max_filters;
+        st.old_filter_lengths = @splat(0);
         st.prev_low_dist = 0;
         st.low_dist_rep_count = 0;
     }

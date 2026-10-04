@@ -87,7 +87,7 @@ pub fn selector(
     direction: Direction,
     command_mask: u32,
 ) u64 {
-    const attributes = @as(u8, @intCast(@intFromEnum(representation))) | (@as(u8, @intCast(@intFromEnum(cardinality))) << parameter_card_shift) | (@as(u8, @intCast(@intFromEnum(direction))) << parameter_dir_shift);
+    const attributes = @as(u8, @intCast(@backingInt(representation))) | (@as(u8, @intCast(@backingInt(cardinality))) << parameter_card_shift) | (@as(u8, @intCast(@backingInt(direction))) << parameter_dir_shift);
     return (@as(u64, family) << 48) | (@as(u64, ordinal) << 16) | (@as(u64, attributes) << 8) | @as(u64, command_mask & parameter_flag_command_mask);
 }
 
@@ -119,15 +119,15 @@ pub fn directionFieldOf(attributes: u8) u2 {
 }
 
 pub fn representationOf(selector_value: Selector) Representation {
-    return @enumFromInt(representationFieldOf(selector_value.attributes));
+    return @fromBackingInt(@intCast(representationFieldOf(selector_value.attributes)));
 }
 
 pub fn cardinalityOf(selector_value: Selector) Cardinality {
-    return @enumFromInt(cardinalityFieldOf(selector_value.attributes));
+    return @fromBackingInt(@intCast(cardinalityFieldOf(selector_value.attributes)));
 }
 
 pub fn directionOf(selector_value: Selector) Direction {
-    return @enumFromInt(directionFieldOf(selector_value.attributes));
+    return @fromBackingInt(@intCast(directionFieldOf(selector_value.attributes)));
 }
 
 pub fn commandMaskForId(id: Id) u32 {

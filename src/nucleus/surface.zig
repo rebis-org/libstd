@@ -23,9 +23,9 @@ pub const Status = enum(u32) {
 
 fn statusFor(failure: Failure) u32 {
     return switch (failure) {
-        error.InvalidCall => @intFromEnum(Status.invalid_call),
-        error.ResourceLimit => @intFromEnum(Status.resource_limit),
-        error.InsufficientCapacity, error.InvalidData => @intFromEnum(Status.invalid_call),
+        error.InvalidCall => @backingInt(Status.invalid_call),
+        error.ResourceLimit => @backingInt(Status.resource_limit),
+        error.InsufficientCapacity, error.InvalidData => @backingInt(Status.invalid_call),
     };
 }
 
@@ -37,5 +37,5 @@ pub fn nucleusCopy(output: Surface, input: ConstSurface) callconv(.c) u32 {
     span.requireDisjoint(.{ .ptr = destination.ptr, .len = destination.len }, source, "Surface copy regions overlap.");
     const limit = @min(destination.len, source.len);
     destination.write(0, source.read(0, limit));
-    return @intFromEnum(Status.ok);
+    return @backingInt(Status.ok);
 }

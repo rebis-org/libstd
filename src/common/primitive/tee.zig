@@ -2,7 +2,21 @@ const std = @import("std");
 
 const checksum = @import("checksum.zig");
 
-pub fn CountingTee(comptime has_crc32: bool, comptime has_crc64: bool, comptime has_adler32: bool) type {
+/// Checksum algorithms a CountingTee instance computes while passing bytes
+/// through. Selecting kinds is a comptime EnumSet-style packed struct so a
+/// new kind (e.g. CRC32C) adds one field here and one line in `per_kind`,
+/// not a new bool parameter at every call site.
+pub const Kinds = packed struct {
+    crc32: bool = false,
+    crc64: bool = false,
+    adler32: bool = false,
+};
+
+pub const Kind = enum { crc32, crc64, adler32 };
+
+const kind_fields = std.enums.values(Kind);
+
+pub fn CountingTee(comptime kinds: Kinds) type {
     return struct {
         writer: std.Io.Writer,
         downstream: ?*std.Io.Writer,
@@ -50,20 +64,13 @@ pub fn CountingTee(comptime has_crc32: bool, comptime has_crc64: bool, comptime 
                 const last = data[data.len - 1];
                 for (0..splat) |_| out.writeAll(last) catch return error.WriteFailed;
             }
-            if (comptime has_crc32) {
-                for (data[0 .. data.len - 1]) |chunk| self.crc32.update(chunk);
-                const last = data[data.len - 1];
-                for (0..splat) |_| self.crc32.update(last);
-            }
-            if (comptime has_crc64) {
-                for (data[0 .. data.len - 1]) |chunk| self.crc64.update(chunk);
-                const last = data[data.len - 1];
-                for (0..splat) |_| self.crc64.update(last);
-            }
-            if (comptime has_adler32) {
-                for (data[0 .. data.len - 1]) |chunk| self.adler32.update(chunk);
-                const last = data[data.len - 1];
-                for (0..splat) |_| self.adler32.update(last);
+            inline for (kind_fields) |kind| {
+                if (comptime @field(kinds, @tagName(kind))) {
+                    const hasher = &@field(self, @tagName(kind));
+                    for (data[0 .. data.len - 1]) |chunk| hasher.update(chunk);
+                    const last = data[data.len - 1];
+                    for (0..splat) |_| hasher.update(last);
+                }
             }
             self.size = std.math.add(u64, self.size, total) catch return error.WriteFailed;
             return total;
@@ -77,4 +84,4 @@ pub fn CountingTee(comptime has_crc32: bool, comptime has_crc64: bool, comptime 
     };
 }
 
-pub const Tee = CountingTee(true, true, false);
+pub const Tee = CountingTee(.{ .crc32 = true, .crc64 = true });

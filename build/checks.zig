@@ -27,8 +27,9 @@ pub fn expand(b: *std.Build, ctx: *common.Context) void {
     };
 }
 
-fn addHeaderProbe(b: *std.Build, zig: []const u8, driver: []const u8, std_flag: []const u8, include_flag: []const u8, source: std.Build.LazyPath) *std.Build.Step.Run {
-    const probe = b.addSystemCommand(&.{ zig, driver, std_flag, include_flag, "-c" });
+fn addHeaderProbe(b: *std.Build, zig: []const u8, driver: []const u8, std_flag: []const u8, source: std.Build.LazyPath, header_dir: std.Build.LazyPath) *std.Build.Step.Run {
+    const probe = b.addSystemCommand(&.{ zig, driver, std_flag });
+    probe.addDirectoryArg2(header_dir, .{ .prefix = "-I" });
     probe.addFileArg(source);
     probe.addArgs(&.{ "-o", if (builtin.os.tag == .windows) "NUL" else "/dev/null" });
     probe.step.dependOn(b.getInstallStep());
@@ -36,12 +37,10 @@ fn addHeaderProbe(b: *std.Build, zig: []const u8, driver: []const u8, std_flag: 
 }
 
 fn addAbi(b: *std.Build, ctx: *common.Context) void {
-    const include = b.getInstallPath(.header, "");
-    const include_flag = b.fmt("-I{s}", .{include});
     const zig = b.graph.zig_exe;
     // No -fsyntax-only mode: object to /dev/null proves C23/C++26 parse without linking.
-    const c_header = addHeaderProbe(b, zig, "cc", "-std=c23", include_flag, b.path("build/acceptance/header.c"));
-    const cpp_header = addHeaderProbe(b, zig, "c++", "-std=c++2c", include_flag, b.path("build/acceptance/header.cpp"));
+    const c_header = addHeaderProbe(b, zig, "cc", "-std=c23", b.path("build/acceptance/header.c"), ctx.generated.header_dir);
+    const cpp_header = addHeaderProbe(b, zig, "c++", "-std=c++2c", b.path("build/acceptance/header.cpp"), ctx.generated.header_dir);
     const abi = b.step("abi", "Verify the ABI contract of the generated header and library");
     abi.dependOn(&c_header.step);
     abi.dependOn(&cpp_header.step);

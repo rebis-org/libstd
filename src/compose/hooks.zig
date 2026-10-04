@@ -34,21 +34,21 @@ fn unsupportedHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Reso
 
 const handler_map = blk: {
     @setEvalBranchQuota(50_000);
-    const fields = @typeInfo(components.ProfileTag).@"enum".fields;
-    var entries: [fields.len]struct { []const u8, ProfileHook } = undefined;
-    for (fields, 0..) |field, index| {
+    const tag_info = @typeInfo(components.ProfileTag).@"enum";
+    var entries: [tag_info.field_names.len]struct { []const u8, ProfileHook } = undefined;
+    for (tag_info.field_names, 0..) |field_name, index| {
         // Both fixtures share the single echo hook, which predates the `<tag>Hook` naming convention.
-        if (std.mem.eql(u8, field.name, "test_echo") or std.mem.eql(u8, field.name, "test_read")) {
-            entries[index] = .{ field.name, transform.testHook };
+        if (std.mem.eql(u8, field_name, "test_echo") or std.mem.eql(u8, field_name, "test_read")) {
+            entries[index] = .{ field_name, transform.testHook };
             continue;
         }
-        const hook_name = field.name ++ "Hook";
+        const hook_name = field_name ++ "Hook";
         if (@hasDecl(transform, hook_name)) {
-            entries[index] = .{ field.name, @field(transform, hook_name) };
+            entries[index] = .{ field_name, @field(transform, hook_name) };
         } else if (@hasDecl(archive, hook_name)) {
-            entries[index] = .{ field.name, @field(archive, hook_name) };
+            entries[index] = .{ field_name, @field(archive, hook_name) };
         } else {
-            entries[index] = .{ field.name, unsupportedHook };
+            entries[index] = .{ field_name, unsupportedHook };
         }
     }
     break :blk std.StaticStringMap(ProfileHook).initComptime(entries);

@@ -89,17 +89,23 @@ test "lzma file container write read roundtrip" {
     options.unpack_size = 2000;
     const scratch = try std.testing.allocator.alloc(u8, @max(lzma.encodeWorkspaceSizeBt(options.properties), lzma.decodeWorkspaceSize(options.properties)));
     defer std.testing.allocator.free(scratch);
-    const input = ("the lzma alone container wraps a raw stream in a 13 byte header. " ** 40)[0..2000];
+    const input = comptime blk: {
+        @setEvalBranchQuota(4000);
+        const phrase = "the lzma alone container wraps a raw stream in a 13 byte header. ";
+        var buf: [2000]u8 = undefined;
+        for (&buf, 0..) |*byte, i| byte.* = phrase[i % phrase.len];
+        break :blk buf;
+    };
     options.unpack_size = input.len;
     const bound = encodedSizeBound(input.len);
     const encoded = try std.testing.allocator.alloc(u8, bound);
     defer std.testing.allocator.free(encoded);
-    const encoded_len = try encode(input, encoded, scratch, options);
+    const encoded_len = try encode(&input, encoded, scratch, options);
     const header = try decodeOptions(encoded[0..encoded_len]);
     try std.testing.expectEqual(@as(?u64, input.len), header.unpack_size);
     try std.testing.expect(!header.marker_required);
     const decoded = try std.testing.allocator.alloc(u8, input.len);
     defer std.testing.allocator.free(decoded);
     const produced = try decode(encoded[0..encoded_len], decoded, scratch);
-    try std.testing.expectEqualSlices(u8, input, decoded[0..produced]);
+    try std.testing.expectEqualSlices(u8, &input, decoded[0..produced]);
 }

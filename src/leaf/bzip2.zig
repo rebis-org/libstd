@@ -573,7 +573,7 @@ fn encodeBlock(block: []const u8, block_crc: u32, bit_writer: *BitWriter, worksp
     const log_n = std.math.log2_int_ceil(u32, @as(u32, @intCast(@max(2, nblock))));
     const estimate = @as(u64, nblock) * @as(u64, log_n) * 4;
     if (estimate > options.max_work) return error.ResourceLimit;
-    var in_use = [_]bool{false} ** 256;
+    var in_use: [256]bool = @splat(false);
     for (block) |b| in_use[b] = true;
     var unseq_to_seq: [256]u8 = undefined;
     var n_in_use: u32 = 0;
@@ -645,7 +645,7 @@ fn encodeBlock(block: []const u8, block_crc: u32, bit_writer: *BitWriter, worksp
     mtfv[wr] = @intCast(eob);
     wr += 1;
     const n_mtf = wr;
-    const n_selectors: u32 = @intCast((n_mtf + group_size - 1) / group_size);
+    const n_selectors: u32 = @intCast(@divCeil(n_mtf, group_size));
     var group_lens: [max_groups][max_alpha_size]u8 = undefined;
     var group_codes: [max_groups][max_alpha_size]u32 = undefined;
     var selectors: [max_selectors]u8 = undefined;
@@ -718,7 +718,7 @@ fn encodeBlock(block: []const u8, block_crc: u32, bit_writer: *BitWriter, worksp
 }
 
 fn buildHuffmanGroups(mtfv: []const u16, n_mtf: usize, alpha_size: u32, group_lens: *[max_groups][max_alpha_size]u8, group_codes: *[max_groups][max_alpha_size]u32, selectors: *[max_selectors]u8, n_groups_out: *u32) void {
-    const n_selectors: usize = (n_mtf + group_size - 1) / group_size;
+    const n_selectors: usize = @divCeil(n_mtf, group_size);
     const n_groups: u32 = if (n_mtf < 200) 2 else if (n_mtf < 600) 3 else if (n_mtf < 1200) 4 else if (n_mtf < 2400) 5 else 6;
     n_groups_out.* = n_groups;
     var group_freq: [max_groups][max_alpha_size]u32 = undefined;

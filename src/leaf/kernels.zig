@@ -4,7 +4,7 @@ const build_options = @import("options");
 
 // NEON is baseline on aarch64, so the wide match-copy path needs no extra
 // target feature. Other targets keep the portable word-at-a-time path.
-const vector_match_copy = !build_options.portable and builtin.cpu.arch == .aarch64;
+const vector_match_copy = !build_options.portable and builtin.target.cpu.arch == .aarch64;
 
 pub fn matchLen8(buf: []const u8, a: usize, b: usize, max: usize) usize {
     var len: usize = 0;

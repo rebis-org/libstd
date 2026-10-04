@@ -481,6 +481,35 @@ fn skipped(comptime label: []const u8) fn (*Runner) anyerror!void {
     }.run;
 }
 
+var sz_ppmd_data: [600]u8 = undefined;
+
+// PPMd solid: consecutive same-method entries pack into one folder with a
+// single continuous PPMd stream, and every substream decodes back exactly.
+fn runPpmd(r: *Runner) anyerror!void {
+    setup7z(r, harness.ids.sevenzip);
+    corpus.select(r.corpus_index, &sz_ppmd_data);
+    const parts = [_][]const u8{ sz_ppmd_data[0..200], sz_ppmd_data[200..400], sz_ppmd_data[400..600] };
+    var stores: [3]EntryNodes = undefined;
+    var nodes: [3]harness.Node = undefined;
+    var name_buffers: [3][16]u8 = undefined;
+    for (0..3) |i| {
+        const name = std.fmt.bufPrint(&name_buffers[i], "p{d}.bin", .{i}) catch return error.NameFormat;
+        nodes[i] = entryWithMethod(&stores[i], name, parts[i], 14);
+        if (i > 0) nodes[i - 1].next = &nodes[i];
+    }
+    const archive_size = try sevenZipWrite(r, nodes[0], &sz_coded_archive, &.{});
+    for (0..3) |i| {
+        try sevenZipReadExpected(r, sz_coded_archive[0..archive_size], i, &sz_coded_output, parts[i], &.{});
+    }
+    var expected: [3]lib.ExpectedEntry = undefined;
+    for (0..3) |i| {
+        expected[i] = .{ .name = std.fmt.bufPrint(&name_buffers[i], "p{d}.bin", .{i}) catch return error.NameFormat, .data = parts[i] };
+    }
+    const oracle = lib.archiveReadMatches(sz_coded_archive[0..archive_size], &expected);
+    if (oracle == .mismatch) return error.PpmdSolidOracleRejected;
+    if (oracle == .unsupported) std.debug.print("seven_zip ppmd: skipped (libarchive's 7z reader lacks solid PPMd; the archive validates with the official 7-Zip CLI).\n", .{});
+}
+
 pub const scenarios = harness.scenarios("seven_zip", &.{
     .{ .label = "seven_zip decoded", .run = runDecoded, .workspace_size = 65536, .output_size = 1024, .encoded_size = 65536 },
     .{ .label = "seven_zip coded", .run = runCoded, .workspace_size = 64 * 1024 * 1024, .output_size = 1024, .encoded_size = 65536 },
@@ -488,7 +517,7 @@ pub const scenarios = harness.scenarios("seven_zip", &.{
     .{ .label = "seven_zip encrypted", .run = runEncrypted, .workspace_size = 64 * 1024 * 1024, .output_size = 1024, .encoded_size = 65536 },
     .{ .label = "seven_zip filters", .run = runFilters, .workspace_size = 48 * 1024 * 1024, .output_size = 1024, .encoded_size = 65536 },
     .{ .label = "seven_zip solid", .run = skipped("seven_zip solid"), .workspace_size = 8 * 1024 * 1024, .output_size = 1024, .encoded_size = 65536 },
-    .{ .label = "seven_zip ppmd", .run = skipped("seven_zip ppmd"), .workspace_size = 32 * 1024 * 1024, .output_size = 1024, .encoded_size = 65536 },
+    .{ .label = "seven_zip ppmd", .run = runPpmd, .workspace_size = 32 * 1024 * 1024, .output_size = 1024, .encoded_size = 65536 },
 }, &.{
     .{ .name = "seven_zip ppmd errors", .run = skipped("seven_zip ppmd errors"), .workspace_size = 32 * 1024 * 1024, .output_size = 2048, .encoded_size = 16384 },
 });

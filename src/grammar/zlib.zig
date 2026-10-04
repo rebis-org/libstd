@@ -64,7 +64,7 @@ pub fn decode(input: []const u8, output: *std.Io.Writer, history: []u8) Failure!
     const info = try inspect(&.{ cmf, flg });
     if (info.has_dictionary) return error.Unsupported;
     if (info.window_size > window_size) return error.Unsupported;
-    var tee_writer = tee.CountingTee(false, false, true).init(output);
+    var tee_writer = tee.CountingTee(.{ .adler32 = true }).init(output);
     var inflater = deflate.Decompress.initSlice(input[header_size..], history);
     const produced = inflater.reader.streamRemaining(&tee_writer.writer) catch |err| {
         return switch (err) {

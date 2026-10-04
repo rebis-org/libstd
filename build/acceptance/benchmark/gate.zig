@@ -56,7 +56,7 @@ fn speedGap(ours: f64, target: ?f64) ?f64 {
 }
 
 pub fn classify(r: matrix.Row, totals: metric.Totals, available: [4]bool, cfg: env_mod.Gate) Result {
-    const ours = @intFromEnum(metric.Side.ours);
+    const ours = @backingInt(metric.Side.ours);
     var result = Result{ .name = r.name, .class = .pass };
     if (!totals.ok[ours]) {
         result.class = .fail;

@@ -8,7 +8,7 @@ const Status = enum { pass, fail, skip };
 
 fn writeRandom(init: std.process.Init, name: []const u8, size: usize, seed: u64) !void {
     try std.Io.Dir.cwd().createDirPath(init.io, work_dir);
-    const path = try std.fmt.allocPrint(std.heap.page_allocator, "{s}/{s}", .{ work_dir, name });
+    const path = try std.heap.page_allocator.print("{s}/{s}", .{ work_dir, name });
     defer std.heap.page_allocator.free(path);
     const data = try std.heap.page_allocator.alloc(u8, size);
     defer std.heap.page_allocator.free(data);
@@ -56,7 +56,7 @@ fn suiteXz(init: std.process.Init) !Status {
 
 fn suiteXzOssfuzz(init: std.process.Init) !Status {
     const xz_build = "zig-out/benchmark/build/xz";
-    const liblzma = try std.fmt.allocPrint(std.heap.page_allocator, "{s}/liblzma.a", .{xz_build});
+    const liblzma = try std.heap.page_allocator.print("{s}/liblzma.a", .{xz_build});
     defer std.heap.page_allocator.free(liblzma);
 
     std.Io.Dir.cwd().access(init.io, liblzma, .{}) catch {
@@ -72,17 +72,17 @@ fn suiteXzOssfuzz(init: std.process.Init) !Status {
     const fuzz_build = "zig-out/benchmark/test/xz-ossfuzz";
     try std.Io.Dir.cwd().createDirPath(init.io, fuzz_build);
 
-    const seed = try std.fmt.allocPrint(std.heap.page_allocator, "{s}/seed.bin", .{fuzz_build});
+    const seed = try std.heap.page_allocator.print("{s}/seed.bin", .{fuzz_build});
     defer std.heap.page_allocator.free(seed);
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = seed, .data = "xz fuzz seed payload\n" });
 
     const fuzzers = [_][]const u8{ "fuzz_decode_alone", "fuzz_decode_stream", "fuzz_decode_stream_mt", "fuzz_encode_stream" };
     for (fuzzers) |fuzzer| {
-        const src = try std.fmt.allocPrint(std.heap.page_allocator, "vendor/xz/tests/ossfuzz/{s}.c", .{fuzzer});
+        const src = try std.heap.page_allocator.print("vendor/xz/tests/ossfuzz/{s}.c", .{fuzzer});
         defer std.heap.page_allocator.free(src);
-        const obj = try std.fmt.allocPrint(std.heap.page_allocator, "{s}/{s}.o", .{ fuzz_build, fuzzer });
+        const obj = try std.heap.page_allocator.print("{s}/{s}.o", .{ fuzz_build, fuzzer });
         defer std.heap.page_allocator.free(obj);
-        const bin = try std.fmt.allocPrint(std.heap.page_allocator, "{s}/{s}", .{ fuzz_build, fuzzer });
+        const bin = try std.heap.page_allocator.print("{s}/{s}", .{ fuzz_build, fuzzer });
         defer std.heap.page_allocator.free(bin);
 
         if (run.exitCode(init, &.{
@@ -123,12 +123,12 @@ fn suiteLibzipOssfuzz(init: std.process.Init) !Status {
         "-DBUILD_SHARED_LIBS=OFF",
     }) != .pass) return .fail;
     try std.Io.Dir.cwd().createDirPath(init.io, work_dir);
-    const seed = try std.fmt.allocPrint(std.heap.page_allocator, "{s}/input.zip", .{work_dir});
+    const seed = try std.heap.page_allocator.print("{s}/input.zip", .{work_dir});
     defer std.heap.page_allocator.free(seed);
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = seed, .data = "zip fuzz seed payload\n" });
     const fuzzers = [_][]const u8{ "zip_read_file_fuzzer", "zip_read_fuzzer", "zip_write_encrypt_aes256_file_fuzzer", "zip_write_encrypt_pkware_file_fuzzer" };
     for (fuzzers) |fuzzer| {
-        const bin = try std.fmt.allocPrint(std.heap.page_allocator, "{s}/ossfuzz/{s}", .{ build_dir, fuzzer });
+        const bin = try std.heap.page_allocator.print("{s}/ossfuzz/{s}", .{ build_dir, fuzzer });
         defer std.heap.page_allocator.free(bin);
         if (run.exitCode(init, &.{ bin, seed }) != 0) return .fail;
     }
@@ -137,7 +137,7 @@ fn suiteLibzipOssfuzz(init: std.process.Init) !Status {
 
 fn suiteFastLzma2Test(init: std.process.Init) !Status {
     if (run.exitCode(init, &.{ "make", "-C", "vendor/fast-lzma2/test", "-j4", "CFLAGS=-Wall -O1 -pthread -I..", "LIB=../libfast-lzma2.a" }) != 0) return .fail;
-    const input = try std.fmt.allocPrint(std.heap.page_allocator, "{s}/fl2-input.bin", .{work_dir});
+    const input = try std.heap.page_allocator.print("{s}/fl2-input.bin", .{work_dir});
     defer std.heap.page_allocator.free(input);
     try writeRandom(init, "fl2-input.bin", 1024, 0x12345678);
     return if (run.exitCode(init, &.{ "vendor/fast-lzma2/test/file_test", "-6", input }) == 0) .pass else .fail;
@@ -162,14 +162,14 @@ fn suiteTar(init: std.process.Init) !Status {
 
 fn suiteBzip2Dlltest(init: std.process.Init) !Status {
     try std.Io.Dir.cwd().createDirPath(init.io, work_dir);
-    const exe = try std.fmt.allocPrint(std.heap.page_allocator, "{s}/dlltest", .{work_dir});
+    const exe = try std.heap.page_allocator.print("{s}/dlltest", .{work_dir});
     defer std.heap.page_allocator.free(exe);
     if (run.exitCode(init, &.{ "cc", "-o", exe, "vendor/bzip2/dlltest.c", "zig-out/benchmark/bin/libbz2.a" }) != 0) return .fail;
-    const input = try std.fmt.allocPrint(std.heap.page_allocator, "{s}/bz2-input.bin", .{work_dir});
+    const input = try std.heap.page_allocator.print("{s}/bz2-input.bin", .{work_dir});
     defer std.heap.page_allocator.free(input);
-    const compressed = try std.fmt.allocPrint(std.heap.page_allocator, "{s}/bz2-input.bz2", .{work_dir});
+    const compressed = try std.heap.page_allocator.print("{s}/bz2-input.bz2", .{work_dir});
     defer std.heap.page_allocator.free(compressed);
-    const restored = try std.fmt.allocPrint(std.heap.page_allocator, "{s}/bz2-restored.bin", .{work_dir});
+    const restored = try std.heap.page_allocator.print("{s}/bz2-restored.bin", .{work_dir});
     defer std.heap.page_allocator.free(restored);
     try writeRandom(init, "bz2-input.bin", 4096, 0x9e3779b97f4a7c15);
     if (run.exitCode(init, &.{ exe, "-9", input, compressed }) != 0) return .fail;

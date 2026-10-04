@@ -12,7 +12,7 @@ fn setup(r: *Runner) !void {
 }
 
 fn discoveryCapacity(r: *Runner) !void {
-    var small_buffer = [_]u8{0xa5} ** 4;
+    var small_buffer: [4]u8 = @splat(0xa5);
     // Written by capacityDiagnostic below before any read.
     var required: harness.Node = undefined;
     var available: harness.Node = undefined;
@@ -60,7 +60,7 @@ fn duplicateSource(r: *Runner) !void {
 }
 
 fn echoReadSpan(r: *Runner) !void {
-    var output = [_]u8{0xa5} ** 64;
+    var output: [64]u8 = @splat(0xa5);
     _ = harness.call(r, harness.ids.read, &.{
         harness.sourceSpan(r.input),
         harness.sinkSpan(&output),
@@ -70,7 +70,7 @@ fn echoReadSpan(r: *Runner) !void {
 }
 
 fn echoWriteSpan(r: *Runner) !void {
-    var output = [_]u8{0xa5} ** 64;
+    var output: [64]u8 = @splat(0xa5);
     _ = harness.call(r, harness.ids.write, &.{
         harness.sourceSpan(r.input),
         harness.sinkSpan(&output),
@@ -80,7 +80,7 @@ fn echoWriteSpan(r: *Runner) !void {
 }
 
 fn echoCallbackSource(r: *Runner) !void {
-    var output = [_]u8{0xa5} ** 64;
+    var output: [64]u8 = @splat(0xa5);
     var source_ctx = harness.SourceCallbackContext{ .data = r.input };
     _ = harness.call(r, harness.ids.read, &.{
         harness.sourceCallbackNode(0, 0),
@@ -91,7 +91,7 @@ fn echoCallbackSource(r: *Runner) !void {
 }
 
 fn capabilityReject(r: *Runner) !void {
-    var output = [_]u8{0xa5} ** 16;
+    var output: [16]u8 = @splat(0xa5);
     try harness.reject(r, harness.ids.read, &.{
         harness.sourceCallbackNode(0, 0),
         harness.sinkSpan(&output),
@@ -102,7 +102,7 @@ fn capabilityReject(r: *Runner) !void {
 
 fn capacityReject(r: *Runner) !void {
     const input = "too long";
-    var output = [_]u8{0xa5} ** 4;
+    var output: [4]u8 = @splat(0xa5);
     try harness.expectCapacity(r, harness.ids.read, &.{
         harness.sourceSpan(input),
         harness.sinkSpan(&output),
@@ -111,7 +111,7 @@ fn capacityReject(r: *Runner) !void {
 
 fn integrityReject(r: *Runner) !void {
     const input = [_]u8{ 'a', 'b', 'c', 0xff };
-    var output = [_]u8{0xa5} ** 16;
+    var output: [16]u8 = @splat(0xa5);
     try harness.reject(r, harness.ids.read, &.{
         harness.sourceSpan(&input),
         harness.sinkSpan(&output),
@@ -123,7 +123,7 @@ fn integrityReject(r: *Runner) !void {
 
 fn limitReject(r: *Runner) !void {
     const input = "limited";
-    var output = [_]u8{0xa5} ** 16;
+    var output: [16]u8 = @splat(0xa5);
     try harness.reject(r, harness.ids.read, &.{
         harness.sourceSpan(input),
         harness.sinkSpan(&output),
@@ -146,7 +146,7 @@ fn callbackDownstream(r: *Runner) !void {
 
 fn readOnlyReject(r: *Runner) !void {
     const input = "read-only";
-    var output = [_]u8{0xa5} ** 16;
+    var output: [16]u8 = @splat(0xa5);
     try harness.reject(r, harness.ids.write, &.{
         harness.paramProfile(harness.ids.test_read),
         harness.sourceSpan(input),
@@ -158,7 +158,7 @@ fn readOnlyReject(r: *Runner) !void {
 }
 
 fn missingSource(r: *Runner) !void {
-    var output = [_]u8{0xa5} ** 16;
+    var output: [16]u8 = @splat(0xa5);
     try harness.reject(r, harness.ids.read, &.{
         harness.sinkSpan(&output),
         harness.capabilityParam(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay | harness.cap_seek | harness.cap_range),
@@ -182,7 +182,7 @@ fn duplicateProfile(r: *Runner) !void {
 
 fn badSizing(r: *Runner) !void {
     const input = "x";
-    var output = [_]u8{0xa5} ** 16;
+    var output: [16]u8 = @splat(0xa5);
     try harness.reject(r, harness.ids.read, &.{
         harness.sourceSpan(input),
         harness.sinkSpan(&output),
@@ -194,7 +194,7 @@ fn badSizing(r: *Runner) !void {
 
 fn badCommit(r: *Runner) !void {
     const input = "x";
-    var output = [_]u8{0xa5} ** 16;
+    var output: [16]u8 = @splat(0xa5);
     try harness.reject(r, harness.ids.read, &.{
         harness.sourceSpan(input),
         harness.sinkSpan(&output),
@@ -206,7 +206,7 @@ fn badCommit(r: *Runner) !void {
 
 fn forgedSelector(r: *Runner) !void {
     const input = "x";
-    var output = [_]u8{0xa5} ** 16;
+    var output: [16]u8 = @splat(0xa5);
     var forged = harness.scalarNode(harness.ids.parameter);
     forged.value_high = harness.paramSelector(99, 1, 0x11, harness.cmd_all);
     try harness.reject(r, harness.ids.read, &.{
@@ -222,7 +222,7 @@ fn forgedSelector(r: *Runner) !void {
 
 fn cryptoDirect(r: *Runner) !void {
     const input = "x";
-    var output = [_]u8{0xa5} ** 16;
+    var output: [16]u8 = @splat(0xa5);
     try harness.reject(r, harness.ids.read, &.{
         harness.paramProfile(harness.ids.crypto),
         harness.sourceSpan(input),
@@ -235,7 +235,7 @@ fn cryptoDirect(r: *Runner) !void {
 
 fn modeMismatch(r: *Runner) !void {
     const input = "x";
-    var output = [_]u8{0xa5} ** 16;
+    var output: [16]u8 = @splat(0xa5);
     try harness.reject(r, harness.ids.read, &.{
         harness.paramProfile(harness.ids.deflate),
         harness.sourceSpan(input),
@@ -279,8 +279,8 @@ fn diagnosticCycle(r: *Runner) !void {
 }
 
 fn workspaceOverlap(r: *Runner) !void {
-    var buffer = [_]u8{0xa5} ** 16;
-    var output = [_]u8{0xa5} ** 16;
+    var buffer: [16]u8 = @splat(0xa5);
+    var output: [16]u8 = @splat(0xa5);
     try harness.expect(r, harness.ids.read, &.{
         harness.sourceSpan(buffer[0..4]),
         harness.sinkSpan(&output),
@@ -291,7 +291,7 @@ fn workspaceOverlap(r: *Runner) !void {
 }
 
 fn sourceSinkOverlap(r: *Runner) !void {
-    var buffer = [_]u8{0xa5} ** 16;
+    var buffer: [16]u8 = @splat(0xa5);
     try harness.reject(r, harness.ids.read, &.{
         harness.sourceSpan(buffer[0..4]),
         harness.sinkSpan(buffer[2..10]),
@@ -302,7 +302,7 @@ fn sourceSinkOverlap(r: *Runner) !void {
 }
 
 fn nullSourceSpan(r: *Runner) !void {
-    var output = [_]u8{0xa5} ** 16;
+    var output: [16]u8 = @splat(0xa5);
     var source = harness.node(null, 5);
     source.id = harness.ids.source;
     source.byte_length = 5;
@@ -318,8 +318,8 @@ fn nullSourceSpan(r: *Runner) !void {
 
 fn workspaceCapacity(r: *Runner) !void {
     const input = "workspace";
-    var output = [_]u8{0xa5} ** 64;
-    var small_workspace = [_]u8{0} ** 1;
+    var output: [64]u8 = @splat(0xa5);
+    var small_workspace: [1]u8 = @splat(0);
     try harness.expectWorkspaceCapacity(r, harness.ids.write, &.{
         harness.paramProfile(harness.ids.deflate),
         harness.sourceSpan(input),

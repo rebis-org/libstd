@@ -95,7 +95,7 @@ pub fn readCallbackSink(comptime extra: Params, r: *Runner) !void {
 }
 
 pub fn invalidReject(comptime extra: Params, r: *Runner) !void {
-    var output = [_]u8{0xa5} ** 16;
+    var output: [16]u8 = @splat(0xa5);
     const nodes = build(extra, r, &.{ harness.sourceSpan(r.invalid), harness.sinkSpan(&output) });
     try harness.reject(r, harness.ids.read, nodes.items[0..nodes.len], .{ .ctx = true }, r.invalid_status, &output);
 }

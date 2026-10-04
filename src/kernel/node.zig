@@ -19,7 +19,7 @@ const Context = struct {
     direction: vocabulary.Direction,
     command_mask: u32,
     count: usize = 0,
-    ancestors: [max_depth + 1]?*abi.Node = .{null} ** (max_depth + 1),
+    ancestors: [max_depth + 1]?*abi.Node = @splat(null),
 };
 
 fn validateNode(first: ?*abi.Node, context: *Context, depth: usize) Failure!void {

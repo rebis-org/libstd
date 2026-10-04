@@ -474,7 +474,7 @@ fn decodeStreamFooter(cursor: *binary.ReadCursor, check: CheckType, index_size: 
     if (footer[8] != 0x00) return error.InvalidData;
     const check_type: u8 = footer[9];
     if (check_type & 0xF0 != 0) return error.InvalidData;
-    if (@intFromEnum(check) != check_type) return error.IntegrityFailure;
+    if (@backingInt(check) != check_type) return error.IntegrityFailure;
     if (!std.mem.eql(u8, footer[10..12], &footer_magic)) return error.InvalidData;
 }
 
@@ -558,7 +558,7 @@ fn encodeStream(writer: *std.Io.Writer, input: []const u8, scratch: []u8, option
     const compressed_size = std.math.cast(usize, count_tee.size) orelse return error.ResourceLimit;
     const block_padding = blockPadding(compressed_size);
     if (block_padding > 0) {
-        const zeroes = [_]u8{0} ** 3;
+        const zeroes: [3]u8 = @splat(0);
         try io.writeBytes(writer, zeroes[0..block_padding]);
     }
     var tee_writer = tee.Tee.init(null);
@@ -601,7 +601,7 @@ fn bcjKindFromChoice(filter: FilterChoice) bcj.Kind {
 }
 
 fn writeStreamHeader(writer: *std.Io.Writer, check: CheckType) Failure!void {
-    const flags_bytes = [_]u8{ 0x00, @intFromEnum(check) };
+    const flags_bytes = [_]u8{ 0x00, @backingInt(check) };
     var crc = checksum.Crc32.init();
     crc.update(&flags_bytes);
     try io.writeBytes(writer, &header_magic);
@@ -690,14 +690,14 @@ fn writeIndex(writer: *std.Io.Writer, unpadded_size: usize, uncompressed_size: u
     var crc = checksum.Crc32.init();
     crc.update(content[0..content_size]);
     if (padding > 0) {
-        const zeroes = [_]u8{0} ** 3;
+        const zeroes: [3]u8 = @splat(0);
         crc.update(zeroes[0..padding]);
     }
     var crc_bytes: [4]u8 = undefined;
     std.mem.writeInt(u32, &crc_bytes, crc.final(), .little);
     try io.writeBytes(writer, content[0..content_size]);
     if (padding > 0) {
-        const zeroes = [_]u8{0} ** 3;
+        const zeroes: [3]u8 = @splat(0);
         try io.writeBytes(writer, zeroes[0..padding]);
     }
     try io.writeBytes(writer, &crc_bytes);
@@ -711,7 +711,7 @@ fn writeStreamFooter(writer: *std.Io.Writer, check: CheckType, index_size: usize
     var footer_tail: [8]u8 = undefined;
     std.mem.writeInt(u32, footer_tail[0..4], backward_size_u32, .little);
     footer_tail[4] = 0x00;
-    footer_tail[5] = @intFromEnum(check);
+    footer_tail[5] = @backingInt(check);
     footer_tail[6] = footer_magic[0];
     footer_tail[7] = footer_magic[1];
     var crc = checksum.Crc32.init();

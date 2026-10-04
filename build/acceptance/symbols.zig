@@ -17,7 +17,7 @@ pub const exports = [_][]const u8{
 pub fn assertExports(init: std.process.Init, library: []const u8) !void {
     const stdout = try run.output(init, &.{ "nm", "-gU", library });
     defer std.heap.page_allocator.free(stdout);
-    var found = [_]bool{false} ** exports.len;
+    var found: [exports.len]bool = @splat(false);
     var count: usize = 0;
     var lines = std.mem.splitScalar(u8, stdout, '\n');
     while (lines.next()) |line| {

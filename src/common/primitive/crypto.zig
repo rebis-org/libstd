@@ -234,42 +234,56 @@ pub const Sha1 = struct {
     }
 };
 
-const HmacSha1 = struct {
-    inner: Sha1,
-    outer: Sha1,
+fn Hmac(comptime H: type, comptime digest_length: usize) type {
+    return struct {
+        inner: H,
+        outer: H,
 
-    pub fn init(key: []const u8) HmacSha1 {
-        var key_block: [64]u8 = .{0} ** 64;
-        if (key.len > 64) {
-            const digest = sha1(key);
-            @memcpy(key_block[0..20], &digest);
-        } else {
-            @memcpy(key_block[0..key.len], key);
+        pub fn init(key: []const u8) @This() {
+            var key_block: [64]u8 = @splat(0);
+            if (key.len > 64) {
+                const digest = hash(key);
+                @memcpy(key_block[0..digest.len], &digest);
+            } else {
+                @memcpy(key_block[0..key.len], key);
+            }
+            var inner_pad: [64]u8 = undefined;
+            var outer_pad: [64]u8 = undefined;
+            for (key_block, 0..) |byte, index| {
+                inner_pad[index] = byte ^ 0x36;
+                outer_pad[index] = byte ^ 0x5c;
+            }
+            var inner = H.init(.{});
+            inner.update(&inner_pad);
+            var outer = H.init(.{});
+            outer.update(&outer_pad);
+            return .{ .inner = inner, .outer = outer };
         }
-        var inner_pad: [64]u8 = undefined;
-        var outer_pad: [64]u8 = undefined;
-        for (key_block, 0..) |byte, index| {
-            inner_pad[index] = byte ^ 0x36;
-            outer_pad[index] = byte ^ 0x5c;
+
+        pub fn update(self: *@This(), input: []const u8) void {
+            self.inner.update(input);
         }
-        var inner = Sha1.init(.{});
-        inner.update(&inner_pad);
-        var outer = Sha1.init(.{});
-        outer.update(&outer_pad);
-        return .{ .inner = inner, .outer = outer };
-    }
 
-    pub fn update(self: *HmacSha1, input: []const u8) void {
-        self.inner.update(input);
-    }
+        pub fn final(self: *@This(), out: []u8) void {
+            var digest: [digest_length]u8 = undefined;
+            self.inner.final(&digest);
+            self.outer.update(&digest);
+            self.outer.final(out);
+        }
 
-    pub fn final(self: *HmacSha1, out: []u8) void {
-        var digest: [20]u8 = undefined;
-        self.inner.final(&digest);
-        self.outer.update(&digest);
-        self.outer.final(out);
-    }
-};
+        fn hash(input: []const u8) [digest_length]u8 {
+            var hasher = H.init(.{});
+            hasher.update(input);
+            var digest: [digest_length]u8 = undefined;
+            hasher.final(&digest);
+            return digest;
+        }
+    };
+}
+
+pub const HmacSha1 = Hmac(Sha1, 20);
+pub const HmacSha256 = Hmac(Sha256, 32);
+pub const hmac_sha256_length = 32;
 
 fn sha1(input: []const u8) [20]u8 {
     var hasher = Sha1.init(.{});
@@ -454,7 +468,7 @@ pub fn aesDecryptBlock(key: []const u8, block: [block_length]u8) Failure![block_
 pub fn winzipCtr(key: []const u8, destination: []u8, source: []const u8) Failure!void {
     if (destination.len < source.len) return error.InvalidCall;
     const schedule = try aesKeySchedule(key);
-    var counter: [block_length]u8 = .{0} ** block_length;
+    var counter: [block_length]u8 = @splat(0);
     counter[0] = 1;
     var offset: usize = 0;
     while (offset < source.len) : (offset += block_length) {
@@ -472,7 +486,7 @@ pub fn winzipCtr(key: []const u8, destination: []u8, source: []const u8) Failure
 
 // Whole blocks only. Padding is the caller's job.
 pub fn aesCbcEncrypt(key: []const u8, iv: [block_length]u8, destination: []u8, source: []const u8) Failure!void {
-    if (key.len != 32 or source.len % block_length != 0 or destination.len < source.len) return error.InvalidCall;
+    if (source.len % block_length != 0 or destination.len < source.len) return error.InvalidCall;
     const schedule = try aesKeySchedule(key);
     var previous = iv;
     var offset: usize = 0;
@@ -487,7 +501,7 @@ pub fn aesCbcEncrypt(key: []const u8, iv: [block_length]u8, destination: []u8, s
 }
 
 pub fn aesCbcDecrypt(key: []const u8, iv: [block_length]u8, destination: []u8, source: []const u8) Failure!void {
-    if (key.len != 32 or source.len % block_length != 0 or destination.len < source.len) return error.InvalidCall;
+    if (source.len % block_length != 0 or destination.len < source.len) return error.InvalidCall;
     const schedule = try aesKeySchedule(key);
     var previous = iv;
     var offset: usize = 0;
@@ -509,7 +523,7 @@ pub fn winzipDeriveKey(password: []const u8, salt: []const u8, key_length: usize
 pub fn sevenZipKdf(password_utf16: []const u8, salt: []const u8, num_cycles_power: u8, out_key: *[seven_zip_key_length]u8) void {
     var sha = Sha256.init(.{});
     const rounds: u64 = @as(u64, 1) << @intCast(num_cycles_power);
-    var counter: [8]u8 = .{0} ** 8;
+    var counter: [8]u8 = @splat(0);
     var index: u64 = 0;
     while (index < rounds) : (index += 1) {
         sha.update(salt);
@@ -526,28 +540,42 @@ pub fn hmacSha1(out: *[hmac_sha1_length]u8, message: []const u8, key: []const u8
     hmac.final(out);
 }
 
+pub fn hmacSha256(out: *[hmac_sha256_length]u8, message: []const u8, key: []const u8) void {
+    var hmac = HmacSha256.init(key);
+    hmac.update(message);
+    hmac.final(out);
+}
+
 pub fn pbkdf2HmacSha1(out: []u8, password: []const u8, salt: []const u8, rounds: u32) void {
+    pbkdf2Hmac(20, HmacSha1, out, password, salt, rounds);
+}
+
+pub fn pbkdf2HmacSha256(out: []u8, password: []const u8, salt: []const u8, rounds: u32) void {
+    pbkdf2Hmac(32, HmacSha256, out, password, salt, rounds);
+}
+
+fn pbkdf2Hmac(comptime digest_length: usize, comptime H: type, out: []u8, password: []const u8, salt: []const u8, rounds: u32) void {
     var block_index: u32 = 1;
     var offset: usize = 0;
     while (offset < out.len) : (block_index +%= 1) {
-        var hmac = HmacSha1.init(password);
+        var hmac = H.init(password);
         hmac.update(salt);
         var counter_bytes: [4]u8 = undefined;
         std.mem.writeInt(u32, &counter_bytes, block_index, .big);
         hmac.update(&counter_bytes);
-        var u: [20]u8 = undefined;
+        var u: [digest_length]u8 = undefined;
         hmac.final(&u);
         var t = u;
         var round: u32 = 1;
         while (round < rounds) : (round += 1) {
-            var next = HmacSha1.init(password);
+            var next = H.init(password);
             next.update(&u);
             next.final(&u);
-            for (0..20) |index| t[index] ^= u[index];
+            for (&t, u) |*byte, other| byte.* ^= other;
         }
-        const count = @min(20, out.len - offset);
-        @memcpy(out[offset..][0..count], t[0..count]);
-        offset += count;
+        const take = @min(digest_length, out.len - offset);
+        @memcpy(out[offset..][0..take], t[0..take]);
+        offset += take;
     }
 }
 

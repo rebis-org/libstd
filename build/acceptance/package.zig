@@ -16,8 +16,8 @@ pub fn main(init: std.process.Init) !void {
     try args.done(error.UnexpectedArgument);
     const archive_paths = [_][]const u8{ host, android, apple, cjpm };
     const distributions = [_]*const manifest.Distribution{ &manifest.host, &manifest.android, &manifest.apple, &manifest.cjpm };
-    var headers: [archive_paths.len]?[]u8 = .{null} ** archive_paths.len;
-    var catalogs: [archive_paths.len]?[]u8 = .{null} ** archive_paths.len;
+    var headers: [archive_paths.len]?[]u8 = @splat(null);
+    var catalogs: [archive_paths.len]?[]u8 = @splat(null);
     defer {
         for (headers) |header| if (header) |bytes| std.heap.page_allocator.free(bytes);
         for (catalogs) |catalog| if (catalog) |bytes| std.heap.page_allocator.free(bytes);
@@ -49,7 +49,7 @@ fn requireOhosArchitecture(init: std.process.Init, archive: []const u8, abi: sli
 }
 
 fn print(comptime format: []const u8, args: anytype) ![]u8 {
-    return std.fmt.allocPrint(std.heap.page_allocator, format, args);
+    return std.heap.page_allocator.print(format, args);
 }
 
 fn extract(init: std.process.Init, archive: []const u8, entry: []const u8) ![]u8 {

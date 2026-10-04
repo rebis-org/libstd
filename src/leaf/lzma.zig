@@ -180,8 +180,8 @@ fn probCount(comptime name: []const u8, properties: Properties) usize {
 
 pub fn modelProbCount(properties: Properties) usize {
     var total: usize = 0;
-    inline for (std.meta.fields(ProbTables)) |field| {
-        total += probCount(field.name, properties);
+    inline for (@typeInfo(ProbTables).@"struct".field_names) |name| {
+        total += probCount(name, properties);
     }
     return total;
 }
@@ -191,20 +191,20 @@ pub fn modelSize(properties: Properties) usize {
 }
 
 fn takeTables(self: anytype, workspace: *io.Workspace, properties: Properties) Failure!void {
-    inline for (std.meta.fields(ProbTables)) |field| {
-        @field(self, field.name) = try workspace.take(Prob, probCount(field.name, properties));
+    inline for (@typeInfo(ProbTables).@"struct".field_names) |name| {
+        @field(self, name) = try workspace.take(Prob, probCount(name, properties));
     }
 }
 
 fn planTables(plan: *io.WorkspacePlan, properties: Properties) Failure!void {
-    inline for (std.meta.fields(ProbTables)) |field| {
-        try plan.take(Prob, probCount(field.name, properties));
+    inline for (@typeInfo(ProbTables).@"struct".field_names) |name| {
+        try plan.take(Prob, probCount(name, properties));
     }
 }
 
 fn resetTables(self: anytype) void {
-    inline for (std.meta.fields(ProbTables)) |field| {
-        initProbs(@field(self, field.name));
+    inline for (@typeInfo(ProbTables).@"struct".field_names) |name| {
+        initProbs(@field(self, name));
     }
 }
 
@@ -2418,8 +2418,8 @@ pub const Encoder = struct {
 
     pub fn snapshotModel(self: *const Encoder, dst: []Prob) void {
         var offset: usize = 0;
-        inline for (std.meta.fields(ProbTables)) |field| {
-            const slice = @field(self, field.name);
+        inline for (@typeInfo(ProbTables).@"struct".field_names) |name| {
+            const slice = @field(self, name);
             @memcpy(dst[offset..][0..slice.len], slice);
             offset += slice.len;
         }
@@ -2427,8 +2427,8 @@ pub const Encoder = struct {
 
     pub fn restoreModel(self: *Encoder, probabilities: []const Prob) void {
         var offset: usize = 0;
-        inline for (std.meta.fields(ProbTables)) |field| {
-            const slice = @field(self, field.name);
+        inline for (@typeInfo(ProbTables).@"struct".field_names) |name| {
+            const slice = @field(self, name);
             @memcpy(slice, probabilities[offset..][0..slice.len]);
             offset += slice.len;
         }

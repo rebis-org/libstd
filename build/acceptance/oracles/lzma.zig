@@ -941,20 +941,20 @@ fn runLzmaAbCorpus(r: *Runner) !void {
     var input: [48]u8 = undefined;
     for (0..4) |corpus_index| {
         corpus.select(corpus_index, &input);
-        const suffix = try std.fmt.allocPrint(r.gpa, "corpus_{d}", .{corpus_index});
+        const suffix = try r.gpa.print("corpus_{d}", .{corpus_index});
         defer r.gpa.free(suffix);
         const dict: u64 = @max(input.len, 4096);
-        const lzma_hc = try std.fmt.allocPrint(r.gpa, "{s}/lzma_hc.bin", .{suffix});
+        const lzma_hc = try r.gpa.print("{s}/lzma_hc.bin", .{suffix});
         defer r.gpa.free(lzma_hc);
-        const lzma_bt4 = try std.fmt.allocPrint(r.gpa, "{s}/lzma_bt4.bin", .{suffix});
+        const lzma_bt4 = try r.gpa.print("{s}/lzma_bt4.bin", .{suffix});
         defer r.gpa.free(lzma_bt4);
-        const lzma2_hc = try std.fmt.allocPrint(r.gpa, "{s}/lzma2_hc.bin", .{suffix});
+        const lzma2_hc = try r.gpa.print("{s}/lzma2_hc.bin", .{suffix});
         defer r.gpa.free(lzma2_hc);
-        const lzma2_bt4 = try std.fmt.allocPrint(r.gpa, "{s}/lzma2_bt4.bin", .{suffix});
+        const lzma2_bt4 = try r.gpa.print("{s}/lzma2_bt4.bin", .{suffix});
         defer r.gpa.free(lzma2_bt4);
-        const xz_hc = try std.fmt.allocPrint(r.gpa, "{s}/xz_hc.bin", .{suffix});
+        const xz_hc = try r.gpa.print("{s}/xz_hc.bin", .{suffix});
         defer r.gpa.free(xz_hc);
-        const xz_bt4 = try std.fmt.allocPrint(r.gpa, "{s}/xz_bt4.bin", .{suffix});
+        const xz_bt4 = try r.gpa.print("{s}/xz_bt4.bin", .{suffix});
         defer r.gpa.free(xz_bt4);
         try abEncodeAndWrite(r, harness.ids.lzma, dict, 0, &input, lzma_hc);
         try abEncodeAndWrite(r, harness.ids.lzma, dict, 1, &input, lzma_bt4);
@@ -966,13 +966,13 @@ fn runLzmaAbCorpus(r: *Runner) !void {
 }
 
 fn runLzmaAbZeros(r: *Runner) !void {
-    const input = [_]u8{0} ** 1024;
+    const input: [1024]u8 = @splat(0);
     try abEncodeAndWrite(r, harness.ids.lzma, 4096, 0, &input, "lzma_hc.bin");
     try abEncodeAndWrite(r, harness.ids.lzma, 4096, 1, &input, "lzma_bt4.bin");
 }
 
 fn runLzmaAbSameByte(r: *Runner) !void {
-    const input = [_]u8{0xa5} ** 1024;
+    const input: [1024]u8 = @splat(0xa5);
     try abEncodeAndWrite(r, harness.ids.lzma, 4096, 0, &input, "lzma_hc.bin");
     try abEncodeAndWrite(r, harness.ids.lzma, 4096, 1, &input, "lzma_bt4.bin");
     try abEncodeAndWrite(r, harness.ids.lzma2, 4096, 0, &input, "lzma2_hc.bin");
