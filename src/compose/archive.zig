@@ -430,15 +430,27 @@ fn parseSevenZipMethod(node: *Node) Failure!seven_zip.CoderMethod {
     };
 }
 
+// Largest decrypted-header staging either RAR family can need: RAR5 caps a
+// header at 2 MiB, RAR4 headers are u16-sized aligned to the 16-byte block.
+const rar_header_scratch_size = 2 * 1024 * 1024 + 16;
+
 pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
     const source_resource = source orelse return error.InvalidCall;
     if (sizing != .metadata_exact) return error.Unsupported;
     var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
     if (command_mask == vocabulary.command_mask_read) {
+        var failure_cause: crypto.FailureCause = .none;
+        const crypto_params = try parseCryptoParams(call.request, &failure_cause);
+        const decrypting = crypto_params != null;
         if (sink == null) {
             try common.checkSourceWorkspaceOverlap(call, source_resource);
             const archive = try materializeArchive(source_resource, &workspace, limits);
-            const count = try rar.rarInspectCount(archive, limits.entries);
+            // -hp walks need decrypted-header staging capped by the archive.
+            const header_scratch = if (decrypting) try workspace.take(u8, @min(@as(usize, rar_header_scratch_size), archive.len + 16)) else try workspace.take(u8, 0);
+            const count = try rar.rarInspectCountOpts(archive, limits.entries, .{
+                .password = if (crypto_params) |params| params.password else null,
+                .scratch = header_scratch,
+            });
             response.byte_length = count;
             return;
         }
@@ -453,7 +465,17 @@ pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
             comptime discovery.parameter("tar", "ordinal").ordinal,
         ));
         const archive = try materializeArchive(source_resource, &workspace, limits);
-        const info = try rar.rarInspectOrdinal(archive, ordinal, limits.entries);
+        // Decryption needs a mutable copy of the packed data and, for -hp
+        // archives, staging for the decrypted headers; both are capped by the
+        // archive size. Plaintext reads carve nothing, keeping workspace
+        // sizing byte-identical to before.
+        const packed_stage = if (decrypting) try workspace.take(u8, @min(limits.encoded_bytes, archive.len)) else try workspace.take(u8, 0);
+        const header_scratch = if (decrypting) try workspace.take(u8, @min(@as(usize, rar_header_scratch_size), archive.len + 16)) else try workspace.take(u8, 0);
+        const decode_opts: rar.DecodeOptions = .{
+            .password = if (crypto_params) |params| params.password else null,
+            .scratch = header_scratch,
+        };
+        const info = try rar.rarInspectOrdinalOpts(archive, ordinal, limits.entries, decode_opts);
         const size = std.math.cast(usize, info.size) orelse return error.ResourceLimit;
         if (size > limits.decoded_bytes) return error.ResourceLimit;
         try common.requireSinkCapacity(sink_resource, call, size);
@@ -471,6 +493,7 @@ pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
             .pending29 = &.{},
             .filter_scratch = &.{},
             .ppm_heap = &.{},
+            .packed_stage = packed_stage,
         };
         if (info.method != 0) {
             const state_words = try workspace.take(u64, (rar.max_state_bytes + 7) / 8);
@@ -488,15 +511,16 @@ pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
                 .pending29 = pending29,
                 .filter_scratch = filter_scratch,
                 .ppm_heap = ppm_heap,
+                .packed_stage = packed_stage,
             };
         }
 
         if (sink_resource.kind == .direct_write) {
             const output = try common.sinkDirectBuffer(sink_resource, size);
-            _ = try rar.rarDecodeOrdinal(archive, ordinal, output, &bufs);
+            _ = try rar.rarDecodeOrdinal(archive, ordinal, output, &bufs, decode_opts);
         } else {
             const staging = try workspace.take(u8, size);
-            _ = try rar.rarDecodeOrdinal(archive, ordinal, staging, &bufs);
+            _ = try rar.rarDecodeOrdinal(archive, ordinal, staging, &bufs, decode_opts);
             try common.commitBytesToSink(sink_resource, call, staging);
         }
         response.byte_length = size;

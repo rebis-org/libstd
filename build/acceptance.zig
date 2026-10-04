@@ -37,7 +37,7 @@ fn addAcceptanceApp(
     name: []const u8,
     comptime spec: modules.Module,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.builtin.Optimize,
     extra_imports: []const std.Build.Module.Import,
     host: common.HostLibraries,
     step_name: []const u8,
@@ -52,13 +52,18 @@ fn addAcceptanceApp(
     return .{ .exe = exe, .run = run };
 }
 
-fn translateCModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
-    const translate_c = b.addTranslateC(.{
-        .root_source_file = b.path("build/acceptance/oracles/c/c.h"),
+const Translator = @import("translate_c").Translator;
+
+fn translateCModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.Optimize) *std.Build.Module {
+    // C translation moved out of the toolchain in 0.17.0: the ZSF translate-c
+    // package is the same implementation with an independent release cadence.
+    const translate_c = b.dependency("translate_c", .{});
+    const translator: Translator = .init(translate_c, .{
+        .c_source_file = b.path("build/acceptance/oracles/c/c.h"),
         .target = target,
         .optimize = optimize,
     });
-    return translate_c.createModule();
+    return translator.mod;
 }
 
 fn abVariantModule(b: *std.Build, name: []const u8) *std.Build.Module {
@@ -83,13 +88,13 @@ fn linkOracleRefs(app: AcceptanceApp, refs: cmd.Refs, catalog: std.Build.LazyPat
     app.run.addFileArg(catalog);
 }
 
-fn addTrapRun(b: *std.Build, ctx: *const common.Context, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, exe_name: []const u8) *std.Build.Step.Run {
+fn addTrapRun(b: *std.Build, ctx: *const common.Context, target: std.Build.ResolvedTarget, optimize: std.builtin.Optimize, exe_name: []const u8) *std.Build.Step.Run {
     const trap_module = modules.createFor(b, modules.trap, target, optimize, ctx);
     const trap_exe = b.addExecutable(.{ .name = exe_name, .root_module = trap_module });
     return b.addRunArtifact(trap_exe);
 }
 
-fn addContractCheck(b: *std.Build, nucleus: *std.Build.Module, components: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, sanitize_c: ?std.zig.SanitizeC, exe_name: []const u8, catalog: std.Build.LazyPath) *std.Build.Step.Run {
+fn addContractCheck(b: *std.Build, nucleus: *std.Build.Module, components: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.Optimize, sanitize_c: ?std.zig.SanitizeC, exe_name: []const u8, catalog: std.Build.LazyPath) *std.Build.Step.Run {
     const kernel_module = b.createModule(.{
         .root_source_file = b.path("src/kernel/root.zig"),
         .target = target,
@@ -112,7 +117,7 @@ fn addContractCheck(b: *std.Build, nucleus: *std.Build.Module, components: *std.
     return contract_run;
 }
 
-fn linkBenchmarkExe(b: *std.Build, exe: *std.Build.Step.Compile, run: *std.Build.Step.Run, refs: cmd.Refs, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, catalog: std.Build.LazyPath, sdk_usr_lib: ?[]const u8) void {
+fn linkBenchmarkExe(b: *std.Build, exe: *std.Build.Step.Compile, run: *std.Build.Step.Run, refs: cmd.Refs, target: std.Build.ResolvedTarget, optimize: std.builtin.Optimize, catalog: std.Build.LazyPath, sdk_usr_lib: ?[]const u8) void {
     _ = sevenzip.addReference(b, target, optimize, exe);
     refs.link(b, exe.root_module);
     exe.root_module.addCSourceFile(.{ .file = b.path("build/acceptance/benchmark/ref/libzip.c") });

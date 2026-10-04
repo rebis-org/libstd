@@ -296,7 +296,12 @@ test "vint encoding matches the rar5 wire form" {
 test "created archive round-trips through the facade reader (store and lz)" {
     const testing = std.testing;
     const data1 = "hello rar5 stored";
-    const data2 = "The quick brown fox jumps over the lazy dog. " ** 8;
+    const data2 = comptime blk: {
+        const phrase = "The quick brown fox jumps over the lazy dog. ";
+        var buf: [phrase.len * 8]u8 = undefined;
+        for (&buf, 0..) |*byte, i| byte.* = phrase[i % phrase.len];
+        break :blk buf;
+    };
     const allocator = testing.allocator;
 
     const window = try allocator.alloc(u8, 1 << 20);
@@ -317,7 +322,7 @@ test "created archive round-trips through the facade reader (store and lz)" {
     for ([_]u8{ 0, 3 }) |method| {
         const entries = [_]RarEntry{
             .{ .name = "m1.txt", .data = data1, .method = method },
-            .{ .name = "m2.txt", .data = data2, .method = method },
+            .{ .name = "m2.txt", .data = &data2, .method = method },
             // Empty files must round trip: the block carries HFL_DATA with
             // data_size 0, matching what the official rar binary writes.
             .{ .name = "empty.txt", .data = "", .method = method },
@@ -374,10 +379,10 @@ test "created archive round-trips through the facade reader (store and lz)" {
             .filter_scratch = filter_scratch,
             .ppm_heap = ppm_heap,
         };
-        try testing.expectEqual(@as(usize, data1.len), try rar.rarDecodeOrdinal(archive, 0, out1, @constCast(&bufs)));
+        try testing.expectEqual(@as(usize, data1.len), try rar.rarDecodeOrdinal(archive, 0, out1, @constCast(&bufs), .{}));
         try testing.expectEqualSlices(u8, data1, out1);
-        try testing.expectEqual(@as(usize, data2.len), try rar.rarDecodeOrdinal(archive, 1, out2, @constCast(&bufs)));
-        try testing.expectEqualSlices(u8, data2, out2);
-        try testing.expectEqual(@as(usize, 0), try rar.rarDecodeOrdinal(archive, 2, &.{}, @constCast(&bufs)));
+        try testing.expectEqual(@as(usize, data2.len), try rar.rarDecodeOrdinal(archive, 1, out2, @constCast(&bufs), .{}));
+        try testing.expectEqualSlices(u8, &data2, out2);
+        try testing.expectEqual(@as(usize, 0), try rar.rarDecodeOrdinal(archive, 2, &.{}, @constCast(&bufs), .{}));
     }
 }

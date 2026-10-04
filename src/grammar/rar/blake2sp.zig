@@ -38,13 +38,13 @@ const State = struct {
         }
         state.t = 0;
         state.buf_len = 0;
-        state.buf = [_]u8{0} ** 64;
+        state.buf = @splat(0);
         state.last_node = false;
         return state;
     }
 
     fn makeParamBlock(digest_length: u8, fanout: u8, depth: u8, node_offset: u32, node_depth: u8, inner_length: u8) [32]u8 {
-        var p: [32]u8 = [_]u8{0} ** 32;
+        var p: [32]u8 = @splat(0);
         p[0] = digest_length;
         p[2] = fanout;
         p[3] = depth;
@@ -185,7 +185,7 @@ test "blake2sp known vectors" {
         0x9c, 0x14, 0x8a, 0x53, 0x52, 0x11, 0xb4, 0x8c,
         0x36, 0x60, 0x1a, 0x83, 0xe5, 0x05, 0x67, 0xbc,
     };
-    var block = [_]u8{0} ** 64;
+    var block: [64]u8 = @splat(0);
     blake2sp(&block, &out);
     try std.testing.expectEqualSlices(u8, &zero_block, &out);
 
@@ -195,7 +195,7 @@ test "blake2sp known vectors" {
         0xfe, 0x48, 0xc1, 0xf2, 0x0a, 0xcd, 0x22, 0xad,
         0xa6, 0x51, 0x57, 0x4d, 0xb8, 0xb5, 0x16, 0x79,
     };
-    var data: [1000]u8 = [_]u8{0xFF} ** 1000;
+    var data: [1000]u8 = @splat(0xFF);
     blake2sp(&data, &out);
     try std.testing.expectEqualSlices(u8, &ff_1000, &out);
 }

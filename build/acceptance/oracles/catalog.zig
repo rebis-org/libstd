@@ -101,8 +101,8 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) !Catalog {
 
 pub fn loadIds(catalog: *const Catalog) !Ids {
     var result: Ids = undefined;
-    inline for (std.meta.fields(Ids)) |field| {
-        @field(result, field.name) = try findId(catalog, field.name);
+    inline for (@typeInfo(Ids).@"struct".field_names) |name| {
+        @field(result, name) = try findId(catalog, name);
     }
     return result;
 }

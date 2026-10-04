@@ -79,7 +79,7 @@ pub fn componentsWithNucleus(
     ctx: *const common.Context,
     components_target: std.Build.ResolvedTarget,
     nucleus_target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.builtin.Optimize,
 ) Components {
     const generated = common.descriptorScan(b, ctx);
     const nucleus_module = createFor(b, nucleus, nucleus_target, optimize, ctx);
@@ -102,15 +102,15 @@ pub fn createFor(
     b: *std.Build,
     comptime spec: Module,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.builtin.Optimize,
     ctx: *const common.Context,
 ) *std.Build.Module {
     var adjusted = target;
     if (!ctx.portable and spec.crc_kernel and adjusted.result.cpu.arch == .aarch64) {
-        const crc_feature = @intFromEnum(std.Target.aarch64.Feature.crc);
+        const crc_feature = @backingInt(std.Target.aarch64.Feature.crc);
         adjusted.query.cpu_features_add.addFeature(crc_feature);
         adjusted.result.cpu.features.addFeature(crc_feature);
-        const crypto_feature = @intFromEnum(std.Target.aarch64.Feature.crypto);
+        const crypto_feature = @backingInt(std.Target.aarch64.Feature.crypto);
         adjusted.query.cpu_features_add.addFeature(crypto_feature);
         adjusted.result.cpu.features.addFeature(crypto_feature);
     }

@@ -12,7 +12,7 @@ const kernels = @import("kernels.zig");
 
 // NEON is baseline on aarch64, so the wide match-copy path needs no extra
 // target feature. Other targets keep the portable word-at-a-time path.
-const vector_match_copy = !build_options.portable and builtin.cpu.arch == .aarch64;
+const vector_match_copy = !build_options.portable and builtin.target.cpu.arch == .aarch64;
 
 pub const block_size_max = 1 << 17;
 pub const window_size_min = 1024;
@@ -189,7 +189,7 @@ pub fn frameContentSize(input: []const u8, max_window: u32) DecodeError!usize {
 
 pub fn decodedSize(input: []const u8, history: []u8, options: Options) DecodeError!usize {
     var source = std.Io.Reader.fixed(input);
-    var counter = tee.CountingTee(false, false, false).init(null);
+    var counter = tee.CountingTee(.{}).init(null);
     return try decodeStream(&source, &counter.writer, history, options);
 }
 
@@ -215,51 +215,137 @@ pub fn trainedDictionaryBound(total_sample_bytes: usize) usize {
     return total_sample_bytes +| dictionary_header_size;
 }
 
-pub fn trainDictionary(samples: []const []const u8, max_size: usize, output: []u8) TrainError!usize {
+// Fastcover-style segment selection (ZDICT_trainFromBuffer_fastCover
+// semantics, deterministic by construction): hash every d-byte prefix in the
+// training split into 2^f buckets, then greedily pick the k-byte window whose
+// distinct d-mers carry the most remaining training frequency, zeroing the
+// covered buckets after each pick.
+const train_d: usize = 8;
+const train_k: usize = 50;
+const train_f: usize = 17;
+const train_buckets = 1 << train_f;
+const train_dmers_in_k = train_k - train_d + 1;
+const train_split_numerator: usize = 3; // first 3/4 of the samples train
+const train_split_denominator: usize = 4;
+
+pub fn trainWorkspaceSize() usize {
+    return 2 * train_buckets * @sizeOf(u32);
+}
+
+fn trainHash(bytes: *const [train_d]u8) u32 {
+    var hasher = checksum.XxHash64.init(0);
+    hasher.update(bytes);
+    return @truncate(hasher.final() >> @as(u6, @intCast(64 - train_f)));
+}
+
+pub fn trainDictionary(samples: []const []const u8, max_size: usize, output: []u8, scratch: []u8) TrainError!usize {
     if (samples.len == 0) return error.InvalidCall;
     if (max_size < dictionary_header_size + 8) return error.InvalidCall;
     var total: usize = 0;
     for (samples) |sample| total = std.math.add(usize, total, sample.len) catch return error.ResourceLimit;
     if (total == 0) return error.InvalidCall;
     if (output.len < @min(total, max_size - dictionary_header_size) + dictionary_header_size) return error.InsufficientCapacity;
-    const content_len = @min(total, max_size - dictionary_header_size);
+    if (scratch.len < trainWorkspaceSize()) return error.InsufficientCapacity;
+    const content_cap = @min(total, max_size - dictionary_header_size);
+
+    const freqs: []u32 = @alignCast(std.mem.bytesAsSlice(u32, scratch[0 .. train_buckets * @sizeOf(u32)]));
+    const seg_freqs: []u32 = @alignCast(std.mem.bytesAsSlice(u32, scratch[train_buckets * @sizeOf(u32) ..][0 .. train_buckets * @sizeOf(u32)]));
+    @memset(freqs, 0);
+
+    const train_count = @max(1, samples.len * train_split_numerator / train_split_denominator);
+
+    // Frequency table over the training split.
+    for (samples[0..train_count]) |sample| {
+        if (sample.len < train_d) continue;
+        for (0..sample.len - train_d + 1) |pos| {
+            freqs[trainHash(sample[pos..][0..train_d])] += 1;
+        }
+    }
+
+    // Greedy selection over the test split; ties keep the earliest window.
+    @memset(seg_freqs, 0);
+    var chosen: [train_k]u8 = undefined;
+    var content_len: usize = 0;
+    while (content_len + train_k <= content_cap) {
+        var best_score: u64 = 0;
+        var best_sample: []const u8 = &.{};
+        var best_begin: usize = 0;
+        for (samples[train_count..]) |sample| {
+            if (sample.len < train_k) continue;
+            var begin: usize = 0;
+            var end: usize = 0;
+            var score: u64 = 0;
+            while (end < sample.len - train_d + 1) {
+                const idx = trainHash(sample[end..][0..train_d]);
+                end += 1;
+                if (seg_freqs[idx] == 0) score += freqs[idx];
+                seg_freqs[idx] += 1;
+                if (end - begin == train_dmers_in_k + 1) {
+                    const del = trainHash(sample[begin..][0..train_d]);
+                    begin += 1;
+                    seg_freqs[del] -= 1;
+                    if (seg_freqs[del] == 0) score -= freqs[del];
+                }
+                if (score > best_score) {
+                    best_score = score;
+                    best_sample = sample;
+                    best_begin = begin;
+                }
+            }
+            while (begin < end) : (begin += 1) {
+                const del = trainHash(sample[begin..][0..train_d]);
+                seg_freqs[del] -= 1;
+            }
+        }
+        if (best_score == 0) break;
+        @memcpy(&chosen, best_sample[best_begin..][0..train_k]);
+        for (best_begin..best_begin + train_dmers_in_k) |pos| {
+            freqs[trainHash(best_sample[pos..][0..train_d])] = 0;
+        }
+        @memcpy(output[dictionary_header_size + content_len ..][0..train_k], &chosen);
+        content_len += train_k;
+    }
+
+    // Small or degenerate corpora yield no segments: fall back to the
+    // deterministic concatenation so the dictionary stays valid.
+    if (content_len == 0) {
+        for (samples) |sample| {
+            if (content_len == content_cap) break;
+            const take = @min(sample.len, content_cap - content_len);
+            @memcpy(output[dictionary_header_size + content_len ..][0..take], sample[0..take]);
+            content_len += take;
+        }
+    }
+
     var hasher = checksum.XxHash64.init(0);
     for (samples) |sample| hasher.update(sample);
     const span: u64 = dictionary_id_max - dictionary_id_min;
     const dict_id: u32 = dictionary_id_min + @as(u32, @truncate(hasher.final() % span));
-    var pos: usize = 0;
-    std.mem.writeInt(u32, output[pos..][0..4], dictionary_magic, .little);
-    std.mem.writeInt(u32, output[pos + 4 ..][0..4], dict_id, .little);
-    pos += 8;
+    std.mem.writeInt(u32, output[0..4], dictionary_magic, .little);
+    std.mem.writeInt(u32, output[4..8], dict_id, .little);
     // Huffman tree description: direct weights, one stored weight-1 symbol
     // plus the implied weight-1 last symbol. This is the smallest tree
     // libzstd's HUF_readStats accepts: its construction check demands an even
     // count of weight-1 symbols, at least two.
-    output[pos] = 128;
-    output[pos + 1] = 0x10;
-    pos += 2;
+    var header_pos: usize = 8;
+    output[header_pos] = 128;
+    output[header_pos + 1] = 0x10;
+    header_pos += 2;
     // FSE tables (offsets, match lengths, literal lengths): accuracy log 5,
     // symbol 0 at 31, symbol 1 as low probability (-1). Bit-exact with the
     // reference ncount writer: (tableLog-5)<<0, then 62<<(4), flush 11 bits.
     const minimal_ncount = [2]u8{ 0xE0, 0x03 };
-    for (0..3) |_| {
-        output[pos] = minimal_ncount[0];
-        output[pos + 1] = minimal_ncount[1];
-        pos += 2;
+    for (0..3) |i| {
+        output[header_pos + 2 * i] = minimal_ncount[0];
+        output[header_pos + 1 + 2 * i] = minimal_ncount[1];
     }
+    header_pos += 6;
     const recent: [3]u32 = if (content_len >= 8) .{ 1, 4, 8 } else .{ 1, 1, 1 };
     for (recent) |offset| {
-        std.mem.writeInt(u32, output[pos..][0..4], offset, .little);
-        pos += 4;
+        std.mem.writeInt(u32, output[header_pos..][0..4], offset, .little);
+        header_pos += 4;
     }
-    var written: usize = 0;
-    for (samples) |sample| {
-        if (written == content_len) break;
-        const take = @min(sample.len, content_len - written);
-        @memcpy(output[pos + written ..][0..take], sample[0..take]);
-        written += take;
-    }
-    return pos + written;
+    return dictionary_header_size + content_len;
 }
 
 pub const EncodeError = error{
@@ -329,7 +415,7 @@ fn checkedAdd(a: u64, b: u64, limit: u64) EncodeError!u64 {
 }
 
 pub fn encodeFrame(output: *std.Io.Writer, content: []const u8, workspace: []u32, options: Options, content_start: usize) EncodeError!usize {
-    var counted = tee.CountingTee(false, false, false).init(output);
+    var counted = tee.CountingTee(.{}).init(output);
     try writeU32le(&counted.writer, frame_magic);
     const frame_len = content.len - content_start;
     try writeFrameHeader(&counted.writer, frame_len, options.window_size);
@@ -370,7 +456,7 @@ fn encodeWindowDescriptor(window_size: u32) u8 {
     const exponent: u5 = @intCast(31 - @clz(window_size) - 10);
     const base: u64 = @as(u64, 1) << @intCast(exponent + 10);
     const unit = base / 8;
-    const mantissa_u = (window_size - base + unit - 1) / unit;
+    const mantissa_u = @divCeil(window_size - base, unit);
     const mantissa: u8 = @intCast(@min(mantissa_u, 7));
     return (@as(u8, exponent) << 3) | mantissa;
 }
@@ -1110,7 +1196,7 @@ fn updateRepeatOffsets(offset: u32, reps: *[3]u32) void {
 
 fn writeBlockHeader(writer: *std.Io.Writer, block_type: BlockType, size: usize, is_last: bool) EncodeError!void {
     const last_bit: u24 = if (is_last) 1 else 0;
-    const type_bits: u24 = @intFromEnum(block_type);
+    const type_bits: u24 = @backingInt(block_type);
     const value: u24 = last_bit | (type_bits << 1) | (@as(u24, @intCast(size)) << 3);
     var bytes: [3]u8 = undefined;
     bytes[0] = @truncate(value);
@@ -1546,7 +1632,7 @@ fn buildSequenceSection(seqs: []const SeqData, literal_table: []const FseEntry, 
         prev.offset_log = offset_plan.accuracy_log;
     }
     const header_len = sequenceHeaderSize(n);
-    const modes_byte = (@as(u8, @intFromEnum(lit_plan.kind)) << 6) | (@as(u8, @intFromEnum(offset_plan.kind)) << 4) | (@as(u8, @intFromEnum(match_plan.kind)) << 2);
+    const modes_byte = (@as(u8, @backingInt(lit_plan.kind)) << 6) | (@as(u8, @backingInt(offset_plan.kind)) << 4) | (@as(u8, @backingInt(match_plan.kind)) << 2);
     writeSequenceHeader(out[0..header_len], n, modes_byte);
     var tables_len: usize = 0;
     switch (lit_plan.kind) {
@@ -3106,7 +3192,7 @@ const ReverseBitReader = struct {
     }
 
     fn readBitsAny(self: *ReverseBitReader, comptime T: type, num: u16) DecodeError!struct { value: T, count: u16 } {
-        const UT = std.meta.Int(.unsigned, @bitSizeOf(T));
+        const UT = @Int(.unsigned, @bitSizeOf(T));
         const U = if (@bitSizeOf(T) < 8) u8 else UT;
         if (num <= self.count) {
             return .{
@@ -3239,7 +3325,7 @@ fn readBlockHeader(input: *std.Io.Reader) DecodeError!BlockHeader {
     try streamExact(input, &target, 3);
     const value = @as(u24, bytes[0]) | (@as(u24, bytes[1]) << 8) | (@as(u24, bytes[2]) << 16);
     const last = (value & 1) != 0;
-    const block_type: BlockType = @enumFromInt((value >> 1) & 0b11);
+    const block_type: BlockType = @fromBackingInt(@intCast((value >> 1) & 0b11));
     const size = value >> 3;
     return .{ .last = last, .type = block_type, .size = size };
 }
@@ -3264,7 +3350,7 @@ fn readVarInt(input: *std.Io.Reader, bytes: u4) DecodeError!u64 {
 
 fn decodeLiteralsSection(cursor: *ReadCursor, d: *Decoder) DecodeError!LiteralsSection {
     const byte0 = try cursor.readU8();
-    const block_type: LiteralsBlockType = @enumFromInt(byte0 & 0b11);
+    const block_type: LiteralsBlockType = @fromBackingInt(@intCast(byte0 & 0b11));
     const size_format: u2 = @intCast((byte0 >> 2) & 0b11);
     var regenerated_size: usize = 0;
     var compressed_size: ?usize = null;
@@ -3530,9 +3616,9 @@ fn decodeSequencesHeader(cursor: *ReadCursor) DecodeError!SequencesHeader {
     }
     const modes = try cursor.readU8();
     if ((modes & 0b11) != 0) return error.InvalidData;
-    const match_mode: SequenceMode = @enumFromInt((modes >> 2) & 0b11);
-    const offset_mode: SequenceMode = @enumFromInt((modes >> 4) & 0b11);
-    const literal_mode: SequenceMode = @enumFromInt((modes >> 6) & 0b11);
+    const match_mode: SequenceMode = @fromBackingInt(@intCast((modes >> 2) & 0b11));
+    const offset_mode: SequenceMode = @fromBackingInt(@intCast((modes >> 4) & 0b11));
+    const literal_mode: SequenceMode = @fromBackingInt(@intCast((modes >> 6) & 0b11));
     return .{
         .count = count,
         .literal_mode = literal_mode,
@@ -3726,7 +3812,8 @@ const match_length_code_table = [53]struct { u32, u5 }{
     .{ 4099, 12 }, .{ 8195, 13 }, .{ 16387, 14 }, .{ 32771, 15 }, .{ 65539, 16 },
 };
 
-test "zstd dictionary content extraction at oracle scale" {
+test "zstd dictionary trainer selects deterministic segments" {
+    const allocator = std.testing.allocator;
     const phrases = [_][]const u8{
         "the quick brown fox jumps over the lazy dog and runs through the forest. ",
         "pack my box with five dozen liquor jugs then seal the box with tape. ",
@@ -3739,11 +3826,32 @@ test "zstd dictionary content extraction at oracle scale" {
     }
     var samples: [8][]const u8 = undefined;
     for (0..8) |i| samples[i] = sample_data[i * 2048 ..][0..2048];
-    var dict_buffer: [24 * 1024]u8 = undefined;
-    const dict_len = try trainDictionary(&samples, dict_buffer.len, &dict_buffer);
-    const content = try dictionaryContent(dict_buffer[0..dict_len]);
-    try std.testing.expectEqual(@as(usize, dict_len - dictionary_header_size), content.len);
-    try std.testing.expectEqualSlices(u8, &sample_data, content);
+    const scratch = try allocator.alloc(u8, trainWorkspaceSize());
+    defer allocator.free(scratch);
+    var first: [24 * 1024]u8 = undefined;
+    const first_len = try trainDictionary(&samples, first.len, &first, scratch);
+    var second: [24 * 1024]u8 = undefined;
+    const second_len = try trainDictionary(&samples, second.len, &second, scratch);
+    try std.testing.expectEqual(first_len, second_len);
+    if (!std.mem.eql(u8, first[0..first_len], second[0..first_len])) {
+        std.debug.print("first_len={d} mismatch at {d}: {x} vs {x}\n", .{ first_len, std.mem.indexOfDiff(u8, first[0..first_len], second[0..first_len]).?, first[std.mem.indexOfDiff(u8, first[0..first_len], second[0..first_len]).?], second[std.mem.indexOfDiff(u8, first[0..first_len], second[0..first_len]).?] });
+    }
+    try std.testing.expectEqualSlices(u8, first[0..first_len], second[0..first_len]);
+
+    const content = try dictionaryContent(first[0..first_len]);
+    try std.testing.expectEqual(first_len - dictionary_header_size, content.len);
+    // Every selected segment is a verbatim window of the training corpus.
+    var offset: usize = 0;
+    while (offset + train_k <= content.len) : (offset += train_k) {
+        var found = false;
+        for (samples) |sample| {
+            if (std.mem.indexOfPos(u8, sample, 0, content[offset..][0..train_k]) != null) {
+                found = true;
+                break;
+            }
+        }
+        try std.testing.expect(found);
+    }
 }
 
 test "zstd dictionary trainer produces a loadable dictionary" {
@@ -3756,8 +3864,10 @@ test "zstd dictionary trainer produces a loadable dictionary" {
     };
     var samples: [4][]const u8 = undefined;
     for (sample_texts, 0..) |text, i| samples[i] = text;
+    const scratch = try allocator.alloc(u8, trainWorkspaceSize());
+    defer allocator.free(scratch);
     var dict_buffer: [512]u8 = undefined;
-    const dict_len = try trainDictionary(&samples, dict_buffer.len, &dict_buffer);
+    const dict_len = try trainDictionary(&samples, dict_buffer.len, &dict_buffer, scratch);
     try std.testing.expect(dict_len > dictionary_header_size);
     try std.testing.expectEqual(@as(u32, 0xEC30A437), std.mem.readInt(u32, dict_buffer[0..4], .little));
     const dict_id = std.mem.readInt(u32, dict_buffer[4..8], .little);
@@ -3787,13 +3897,7 @@ test "zstd dictionary trainer produces a loadable dictionary" {
     var decoded_sink = std.Io.Writer.fixed(decoded);
     _ = try decodeStream(&encoded_source, &decoded_sink, history, decode_options);
     try std.testing.expectEqualSlices(u8, input, decoded);
-    // The content view must round-trip to the concatenated samples.
+    // The content view is the selected segments, capped by the request.
     const content = try dictionaryContent(dict_buffer[0..dict_len]);
-    var expected: [512]u8 = undefined;
-    var filled: usize = 0;
-    for (samples) |sample| {
-        @memcpy(expected[filled .. filled + sample.len], sample);
-        filled += sample.len;
-    }
-    try std.testing.expectEqualSlices(u8, expected[0..filled], content);
+    try std.testing.expect(content.len <= 512 - dictionary_header_size);
 }

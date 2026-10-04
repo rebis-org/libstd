@@ -11,6 +11,7 @@
         .{ .name = "block_checksum", .family = 12, .ordinal = 2, .representation = "scalar_words" },
         .{ .name = "content_checksum", .family = 12, .ordinal = 3, .representation = "scalar_words" },
         .{ .name = "acceleration", .family = 12, .ordinal = 4, .representation = "scalar_words" },
+        .{ .name = "search_depth", .family = 12, .ordinal = 5, .representation = "scalar_words" },
     },
     .capabilities = .{ "read", "replay" },
     .sizing = "measured",
@@ -34,6 +35,13 @@
                     .{ .family = 12, .ordinal = 4, .value = 8 },
                 },
                 .ref_params = "lz4 -8",
+            },
+            .{
+                .name = "hc",
+                .params = .{
+                    .{ .family = 12, .ordinal = 5, .value = 256 },
+                },
+                .ref_params = "lz4 -9",
             },
         },
     },

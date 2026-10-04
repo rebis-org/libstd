@@ -46,12 +46,12 @@ fn download(url: []const u8, path: []const u8) !void {
 }
 
 fn extractMember(iterator: *std.tar.Iterator, entry: std.tar.Iterator.File, stage_dir: []const u8, member: []const u8) !void {
-    const dest = try std.fmt.allocPrint(std.heap.page_allocator, "{s}/{s}", .{ stage_dir, member });
+    const dest = try std.heap.page_allocator.print("{s}/{s}", .{ stage_dir, member });
     defer std.heap.page_allocator.free(dest);
     if (std.mem.lastIndexOfScalar(u8, dest, '/')) |slash| {
         try std.Io.Dir.cwd().createDirPath(g_io, dest[0..slash]);
     }
-    var file = try std.Io.Dir.cwd().createFile(g_io, dest, .{ .truncate = true, .permissions = @enumFromInt(0o755) });
+    var file = try std.Io.Dir.cwd().createFile(g_io, dest, .{ .truncate = true, .permissions = @fromBackingInt(@intCast(0o755)) });
     defer file.close(g_io);
     var buffer: [64 * 1024]u8 = undefined;
     var writer = std.Io.File.writer(file, g_io, &buffer);
@@ -119,7 +119,7 @@ pub fn main(init: std.process.Init) !void {
 
     try std.Io.Dir.cwd().createDirPath(init.io, cache_dir);
     try std.Io.Dir.cwd().createDirPath(init.io, stage_dir);
-    const archive_path = try std.fmt.allocPrint(std.heap.page_allocator, "{s}/{s}", .{ cache_dir, archive_name });
+    const archive_path = try std.heap.page_allocator.print("{s}/{s}", .{ cache_dir, archive_name });
     defer std.heap.page_allocator.free(archive_path);
 
     var expected: [32]u8 = undefined;

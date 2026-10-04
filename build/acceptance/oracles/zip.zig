@@ -436,7 +436,7 @@ fn runTraditional(r: *Runner) anyerror!void {
 var zip_methods_bz_saved: [8192]u8 = undefined;
 var zip_methods_bz_saved_size: usize = 0;
 var zip_methods_saved: [4][8192]u8 = undefined;
-var zip_methods_saved_sizes: [4]usize = .{0} ** 4;
+var zip_methods_saved_sizes: [4]usize = @splat(0);
 
 fn runMethods(r: *Runner) anyerror!void {
     setupZip(r);

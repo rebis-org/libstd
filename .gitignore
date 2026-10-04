@@ -304,4 +304,5 @@ docgen_tmp/
 
 !build/
 .zig-cache/
+zig-pkg/
 !src/testing/

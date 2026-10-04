@@ -19,9 +19,9 @@ pub const QuickEntry = struct {
 };
 
 pub const DecodeTable = struct {
-    quick_table: [quick_table_size]QuickEntry = [_]QuickEntry{.{}} ** quick_table_size,
-    decode_len: [max_code_length + 2]u32 = [_]u32{0} ** (max_code_length + 2),
-    decode_pos: [max_code_length + 2]u32 = [_]u32{0} ** (max_code_length + 2),
+    quick_table: [quick_table_size]QuickEntry = @splat(.{}),
+    decode_len: [max_code_length + 2]u32 = @splat(0),
+    decode_pos: [max_code_length + 2]u32 = @splat(0),
     decode_num: []u16 = &.{},
     max_num: u16 = 0,
     quick_bits: u5 = max_quick_bits,
@@ -34,7 +34,7 @@ pub const DecodeTable = struct {
 // that overruns `count` is truncated, as in the reference. V20 has no escape
 // and reads its lengths verbatim.
 pub fn readCodeLengthTable(br: *BitReader, count: usize, comptime escapes: bool, storage: []u16) Failure!DecodeTable {
-    var lengths = [_]u8{0} ** 64;
+    var lengths: [64]u8 = @splat(0);
     var i: usize = 0;
     while (i < count) {
         const length: u8 = @intCast(try br.readBits(4));
@@ -65,7 +65,7 @@ pub fn makeDecodeTables(code_lengths: []const u8, storage: []u16) Failure!Decode
     var table = DecodeTable{};
     table.max_num = @intCast(code_lengths.len);
 
-    var len_count = [_]u32{0} ** (max_code_length + 2);
+    var len_count: [max_code_length + 2]u32 = @splat(0);
     for (code_lengths) |cl| {
         if (cl > 0 and cl <= max_code_length) len_count[cl] += 1;
     }
