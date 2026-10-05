@@ -34,7 +34,7 @@ jobs:
           key: benchmark-${{ runner.os }}-${{ hashFiles('build/acceptance/benchmark/command.zig', 'build/acceptance/benchmark/env.zig') }}
           restore-keys: |
             benchmark-${{ runner.os }}-
-      - uses: jdx/mise-action@v5.0.0
+      - uses: jdx/mise-action@v5.0.1
         with:
           install: true
       - run: zig build exe -Doptimize=Debug
