@@ -138,7 +138,7 @@ const block_writer = struct {
         body += 4; // mtime
         if (!entry.is_directory) body += 4; // crc32
         body += vintSize(if (entry.method == 0) 0 else compressionInfoVint(@intCast(entry.method)));
-        body += vintSize(3); // host_os unix
+        body += vintSize(1); // host_os unix (RAR5 table: 0=windows, 1=unix)
         body += vintSize(entry.name.len);
         body += entry.name.len;
 
@@ -181,7 +181,7 @@ const block_writer = struct {
             b += 4;
         }
         b += writeVint(if (entry.method == 0) 0 else compressionInfoVint(@intCast(entry.method)), body[b..]);
-        b += writeVint(3, body[b..]);
+        b += writeVint(1, body[b..]); // host_os unix (RAR5 table)
         b += writeVint(entry.name.len, body[b..]);
         @memcpy(body[b..][0..entry.name.len], entry.name);
         b += entry.name.len;

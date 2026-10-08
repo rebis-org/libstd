@@ -526,6 +526,7 @@ pub const ZipInfo = struct {
     aes_strength: u8 = 0,
     aes_version: u16 = 0,
     actual_method: u16 = 0,
+    extra: []const u8 = &.{},
 };
 
 pub const ZipDecodeOptions = struct {
@@ -882,7 +883,7 @@ fn zipNext(archive: []const u8, directory: ZipDirectory, cursor: *usize, ordinal
     } else {
         actual_method = method;
     }
-    return .{ .name = name, .method = method, .flags = flags, .dos_time = readU16(record, 12), .crc = readU32(record, 16), .compressed_size = std.math.cast(usize, compressed) orelse return error.ResourceLimit, .uncompressed_size = std.math.cast(usize, uncompressed) orelse return error.ResourceLimit, .local_offset = try bounds.addUsize(directory.base, std.math.cast(usize, local_relative) orelse return error.ResourceLimit), .ordinal = ordinal, .version_made_by = readU16(record, 4), .internal_attributes = readU16(record, 36), .external_attributes = readU32(record, 38), .encrypted = flags & 1 != 0, .aes_strength = aes_strength, .aes_version = aes_version, .actual_method = actual_method };
+    return .{ .name = name, .method = method, .flags = flags, .dos_time = readU16(record, 12), .crc = readU32(record, 16), .compressed_size = std.math.cast(usize, compressed) orelse return error.ResourceLimit, .uncompressed_size = std.math.cast(usize, uncompressed) orelse return error.ResourceLimit, .local_offset = try bounds.addUsize(directory.base, std.math.cast(usize, local_relative) orelse return error.ResourceLimit), .ordinal = ordinal, .version_made_by = readU16(record, 4), .internal_attributes = readU16(record, 36), .external_attributes = readU32(record, 38), .encrypted = flags & 1 != 0, .aes_strength = aes_strength, .aes_version = aes_version, .actual_method = actual_method, .extra = extra };
 }
 
 fn parseWinzipAesExtra(extra: []const u8, strength: *u8, version: *u16, actual_method: *u16) Failure!void {

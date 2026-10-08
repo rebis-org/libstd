@@ -35,6 +35,8 @@ pub const TarEntry = struct {
     gid: u32 = 0,
     modification_time: u64 = 0,
     typeflag: u8 = typeflag_regular,
+    devmajor: u32 = 0,
+    devminor: u32 = 0,
 };
 
 pub const TarEntryInfo = struct {
@@ -48,6 +50,8 @@ pub const TarEntryInfo = struct {
     sparse: ?SparseInfo = null,
     modification_time: u64,
     typeflag: u8,
+    devmajor: u32,
+    devminor: u32,
     ordinal: u64,
     header_offset: u64,
     data_offset: u64,
@@ -88,11 +92,11 @@ pub fn tarEncode(entries: []const TarEntry, output: []u8, scratch: []u8) Failure
         var pax_buffer: [512]u8 = undefined;
         const pax_len = try writePaxRecords(entry, data_size, parts.uses_long_name, &pax_buffer);
         if (pax_len > 0) {
-            try tarWriteHeader(&sink, scratch, "././@PaxHeader", &.{}, &.{}, 0o644, 0, 0, 0, typeflag_pax, pax_len);
+            try tarWriteHeader(&sink, scratch, "././@PaxHeader", &.{}, &.{}, 0o644, 0, 0, 0, typeflag_pax, pax_len, 0, 0);
             try sink.write(pax_buffer[0..pax_len]);
             try tarWritePadding(&sink, scratch, pax_len);
         }
-        try tarWriteHeader(&sink, scratch, parts.name, parts.prefix, if (entry.link_name.len > 100) &.{} else entry.link_name, entry.mode, entry.uid, entry.gid, entry.modification_time, entry.typeflag, data_size);
+        try tarWriteHeader(&sink, scratch, parts.name, parts.prefix, if (entry.link_name.len > 100) &.{} else entry.link_name, entry.mode, entry.uid, entry.gid, entry.modification_time, entry.typeflag, data_size, entry.devmajor, entry.devminor);
         try sink.write(entry.data);
         try tarWritePadding(&sink, scratch, data_size);
     }
@@ -373,7 +377,7 @@ fn tarExtensionSize(value: []const u8) Failure!u64 {
     return bounds.addU64(block_size, try tarAligned(try bounds.addU64(value.len, 1)));
 }
 
-fn tarWriteHeader(sink: *io.Sink, scratch: []u8, name: []const u8, prefix: []const u8, link_name: []const u8, mode: u32, uid: u32, gid: u32, modification_time: u64, typeflag: u8, size: u64) Failure!void {
+fn tarWriteHeader(sink: *io.Sink, scratch: []u8, name: []const u8, prefix: []const u8, link_name: []const u8, mode: u32, uid: u32, gid: u32, modification_time: u64, typeflag: u8, size: u64, devmajor: u32, devminor: u32) Failure!void {
     if (scratch.len < tar_scratch_size) return error.InsufficientCapacity;
     const block = scratch[0..tar_scratch_size];
     @memset(block, 0);
@@ -387,6 +391,10 @@ fn tarWriteHeader(sink: *io.Sink, scratch: []u8, name: []const u8, prefix: []con
     tarWriteField(block[157..257], link_name);
     tarWriteField(block[257..263], "ustar");
     tarWriteField(block[263..265], "00");
+    if (typeflag == '3' or typeflag == '4') {
+        tarWriteNumber(block[329..337], devmajor);
+        tarWriteNumber(block[337..345], devminor);
+    }
     tarWriteField(block[345..500], prefix);
     var checksum = tarChecksum(block);
     var index: usize = 154;
@@ -411,7 +419,7 @@ fn tarWritePadding(sink: *io.Sink, scratch: []u8, size: u64) Failure!void {
 
 fn tarWriteExtension(sink: *io.Sink, scratch: []u8, typeflag: u8, value: []const u8) Failure!void {
     const size = try bounds.addU64(value.len, 1);
-    try tarWriteHeader(sink, scratch, "././@LongLink", &.{}, &.{}, 0, 0, 0, 0, typeflag, size);
+    try tarWriteHeader(sink, scratch, "././@LongLink", &.{}, &.{}, 0, 0, 0, 0, typeflag, size, 0, 0);
     try sink.write(value);
     try sink.write(&.{0});
     try tarWritePadding(sink, scratch, size);
@@ -460,6 +468,8 @@ const Reader = struct {
             .size = size,
             .modification_time = try tarNumber(header[136..148]),
             .typeflag = header[156],
+            .devmajor = std.math.cast(u32, try tarNumber(header[329..337])) orelse return error.InvalidData,
+            .devminor = std.math.cast(u32, try tarNumber(header[337..345])) orelse return error.InvalidData,
             .ordinal = 0,
             .header_offset = self.offset,
             .data_offset = data_offset,
@@ -855,4 +865,22 @@ fn tarApplyPax(entry: *TarEntryInfo, attributes: Pax) Failure!void {
     if (attributes.gid) |gid| entry.gid = gid;
     if (attributes.size) |size| entry.size = size;
     if (attributes.modification_time) |modification_time| entry.modification_time = modification_time;
+}
+
+test "tar device entries roundtrip devmajor and devminor" {
+    const testing = std.testing;
+    const entries = [_]TarEntry{
+        .{ .name = "dev/null", .data = &.{}, .typeflag = '3', .mode = 0o666, .devmajor = 1, .devminor = 3 },
+        .{ .name = "regular.txt", .data = "hello", .typeflag = '0' },
+    };
+    var archive: [2048]u8 = undefined;
+    var scratch: [4096]u8 = undefined;
+    const written = try tarEncode(&entries, &archive, &scratch);
+    const info = try tarInspectOrdinal(archive[0..written], 0);
+    try testing.expectEqual(@as(u8, '3'), info.typeflag);
+    try testing.expectEqual(@as(u32, 1), info.devmajor);
+    try testing.expectEqual(@as(u32, 3), info.devminor);
+    const plain = try tarInspectOrdinal(archive[0..written], 1);
+    try testing.expectEqual(@as(u32, 0), plain.devmajor);
+    try testing.expectEqual(@as(u32, 0), plain.devminor);
 }

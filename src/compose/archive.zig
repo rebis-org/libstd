@@ -544,6 +544,13 @@ pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
         response.byte_length = size;
     } else if (command_mask == vocabulary.command_mask_write) {
         try requireVerified(commit);
+        // The RAR writer has no encryption path; refuse crypto parameters
+        // outright instead of silently producing a plaintext archive.
+        var crypto_cause: crypto.FailureCause = .none;
+        if (try parseCryptoParams(call.request, &crypto_cause) != null) {
+            writeCryptoFailure(call, crypto_cause);
+            return error.Unsupported;
+        }
         const entries = try parseRarEntries(call.request, &workspace);
         var max_input: usize = 0;
         var packed_total: usize = 0;
@@ -606,6 +613,7 @@ fn parseRarEntries(request: ?*Node, workspace: *resource.Workspace) Failure![]co
         const method_node = node_graph.findSelector(node.child, comptime discovery.parameter("tar", "entry_method").family, comptime discovery.parameter("tar", "entry_method").ordinal);
         const mtime_node = node_graph.findSelector(node.child, comptime discovery.parameter("tar", "entry_mtime").family, comptime discovery.parameter("tar", "entry_mtime").ordinal);
         const name = if (name_node) |n| try resource.checkedConstBytes(n.bytes, n.byte_length) else &.{};
+        if (!std.unicode.utf8ValidateSlice(name)) return error.InvalidCall;
         const data = if (data_node) |n| try resource.checkedConstBytes(n.bytes, n.byte_length) else &.{};
         const method: u8 = if (method_node) |n| @truncate(n.value_low) else 0;
         const mtime: u64 = if (mtime_node) |n| node_graph.parseU64(n) else 0;
