@@ -4,7 +4,7 @@ const failure_prim = @import("../common/primitive/failure.zig");
 const Failure = failure_prim.Failure;
 const io = @import("../common/primitive/io.zig");
 const measurement = @import("../common/primitive/measurement.zig");
-const kernels = @import("kernels.zig");
+const kernels = @import("../common/kernels.zig");
 
 pub const dictionary_min = 1 << 12;
 pub const dictionary_max = 1 << 30; // 1 GiB for 64-bit workspace sizing.
@@ -1718,15 +1718,21 @@ pub const Encoder = struct {
         return price + lengthLivePrice(self.rep_len_choice, self.rep_len_low, self.rep_len_mid, self.rep_len_high, position_state, raw_length);
     }
 
-    // Insert-only: covered positions feed the tables without a chain walk. Bt4 sees fewer offers but stays safe.
+    // Insert-only: covered positions feed the tables without a chain walk, so
+    // later walks can still offer them. Mirrors the insert side of
+    // btFindMatches plus the hash2/hash3 upkeep in shortMatches.
     fn insertSkipped(self: *Encoder, position: usize, length: usize) void {
-        if (self.match_finder != .hash_chain) return;
         var cursor = position + 1;
         const span_end = position + length;
         while (cursor < span_end) : (cursor += 1) {
             if (cursor + 4 > self.input.len) return;
             const abs_pos = self.input_base + cursor;
             if (abs_pos >= std.math.maxInt(u32)) return;
+            if (self.match_finder == .bt4) {
+                self.btInsert(cursor);
+                continue;
+            }
+            if (self.match_finder != .hash_chain) continue;
             const hash = self.hash4(cursor);
             const slot = abs_pos % self.chain_window;
             self.chain[slot] = self.head[hash];
@@ -1738,6 +1744,81 @@ pub const Encoder = struct {
             const hash3_index = (word3 *% 0x9E3779B1) >> @as(u5, @intCast(32 - @as(u6, match_finder_hash3_bits)));
             self.hash3[hash3_index] = @intCast(abs_pos + 1);
         }
+    }
+
+    // Tree-only descent for a covered position: links it into left/right so
+    // future btFindMatches walks can descend through it. Depth-bounded like
+    // the search; a cut just leaf-splices the subtree, which only forfeits
+    // some future candidates, never correctness.
+    fn btInsert(self: *Encoder, position: usize) void {
+        const abs_pos = self.input_base + position;
+        if (abs_pos >= std.math.maxInt(u32)) return;
+        if (position + max_match_len >= self.input.len) return;
+        const length_limit: usize = @min(self.input.len - position, max_match_len);
+        const hash = self.hash4(position);
+        const slot = abs_pos % self.chain_window;
+        var ptr0: *u32 = &self.right[slot];
+        var ptr1: *u32 = &self.left[slot];
+        ptr0.* = 0;
+        ptr1.* = 0;
+        var cur = self.head[hash];
+        self.head[hash] = @intCast(abs_pos);
+        var length0: usize = 0;
+        var length1: usize = 0;
+        const oldest_position = if (abs_pos < self.chain_window) 0 else abs_pos - self.chain_window;
+        var depth: u32 = self.match_finder_depth *% 4;
+        const input = self.input;
+        const input_base = self.input_base;
+        while (cur != 0 and depth != 0 and oldest_position < cur) : (depth -= 1) {
+            if (cur == abs_pos) break;
+            const distance = abs_pos - cur;
+            const pair_slot = if (slot >= distance) slot - distance else self.chain_window + slot - distance;
+            var length = @min(length0, length1);
+            if (cur >= input_base) {
+                const candidate_offset = @as(usize, cur) - input_base;
+                if (input[candidate_offset + length] == input[position + length]) {
+                    length += 1;
+                    if (length != length_limit and input[candidate_offset + length] == input[position + length]) {
+                        length = self.matchLen(cur, abs_pos, length_limit);
+                    }
+                }
+                if (input[candidate_offset + length] < input[position + length]) {
+                    ptr1.* = cur;
+                    cur = self.right[pair_slot];
+                    ptr1 = &self.right[pair_slot];
+                    length1 = length;
+                } else {
+                    ptr0.* = cur;
+                    cur = self.left[pair_slot];
+                    ptr0 = &self.left[pair_slot];
+                    length0 = length;
+                }
+                continue;
+            }
+            const input_byte = input[position + length];
+            if (self.byteAt(cur + length) == input_byte) {
+                length += 1;
+                if (length != length_limit) {
+                    const next_input_byte = input[position + length];
+                    if (self.byteAt(cur + length) == next_input_byte) {
+                        length = self.matchLen(cur, abs_pos, length_limit);
+                    }
+                }
+            }
+            if (self.byteAt(cur + length) < input[position + length]) {
+                ptr1.* = cur;
+                cur = self.right[pair_slot];
+                ptr1 = &self.right[pair_slot];
+                length1 = length;
+            } else {
+                ptr0.* = cur;
+                cur = self.left[pair_slot];
+                ptr0 = &self.left[pair_slot];
+                length0 = length;
+            }
+        }
+        ptr0.* = 0;
+        ptr1.* = 0;
     }
 
     fn estimateInput(self: *Encoder, input: []const u8) Failure!u64 {
@@ -2250,7 +2331,7 @@ pub const Encoder = struct {
                             matches[count] = .{ .length = @intCast(length), .distance = @intCast(distance) };
                             count += 1;
                         }
-                        if (length == length_limit) {
+                        if (length == length_limit or length >= self.nice_len) {
                             ptr1.* = self.left[pair_slot];
                             ptr0.* = self.right[pair_slot];
                             return count;
@@ -2285,7 +2366,7 @@ pub const Encoder = struct {
                         matches[count] = .{ .length = @intCast(length), .distance = @intCast(distance) };
                         count += 1;
                     }
-                    if (length == length_limit) {
+                    if (length == length_limit or length >= self.nice_len) {
                         ptr1.* = self.left[pair_slot];
                         ptr0.* = self.right[pair_slot];
                         return count;
@@ -2455,4 +2536,26 @@ fn encodePosSlot(distance: u32) u32 {
     const bit_index = 63 - @clz(wide_distance);
     const slot_offset = (wide_distance - (@as(u64, 1) << @intCast(bit_index))) >> @intCast(bit_index - 1);
     return 2 * @as(u32, @intCast(bit_index)) + @as(u32, @intCast(slot_offset));
+}
+
+test "lzma bt4 honors nice_len and still roundtrips" {
+    const allocator = std.testing.allocator;
+    var input: [8192]u8 = undefined;
+    for (&input, 0..) |*byte, i| byte.* = @truncate(i / 13 + (i >> 7));
+    const properties = Properties{ .lc = 3, .lp = 0, .pb = 2, .dictionary_size = 1 << 20 };
+    const scratch = try allocator.alloc(u8, encodeWorkspaceSizeBt(properties));
+    defer allocator.free(scratch);
+    const bound = encodedSizeBound(input.len);
+    const encoded = try allocator.alloc(u8, bound);
+    defer allocator.free(encoded);
+    // A tiny nice_len forces the new bt4 early-exit splice on every long match.
+    const options: Options = .{ .properties = properties, .unpack_size = input.len, .marker_required = false, .nice_len = 8, .max_work = 64 << 20 };
+    const encoded_len = try encode(&input, encoded, scratch, options);
+
+    const decode_scratch = try allocator.alloc(u8, decodeWorkspaceSize(properties));
+    defer allocator.free(decode_scratch);
+    const output = try allocator.alloc(u8, input.len);
+    defer allocator.free(output);
+    const decoded = try decode(encoded[0..encoded_len], output, decode_scratch, .{ .properties = properties, .unpack_size = input.len, .marker_required = false, .max_work = 64 << 20 });
+    try std.testing.expectEqualSlices(u8, &input, output[0..decoded]);
 }

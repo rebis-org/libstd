@@ -1,7 +1,7 @@
 const std = @import("std");
 const failure = @import("../../common/primitive/failure.zig");
 const Failure = failure.Failure;
-const kernels = @import("../../leaf/kernels.zig");
+const kernels = @import("../../common/kernels.zig");
 
 // BT4 match finder. Positions inside matches get skip() updates (hash2/3
 // only). Tree insertions there buy little. Nothing allocates: all tables are

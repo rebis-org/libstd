@@ -94,229 +94,240 @@ pub fn encodedSizeBound(input_len: usize) usize {
 }
 
 fn decodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8) Failure!void {
-    if (input.len < 4) return error.InvalidData;
-    if (input[0] != 'B' or input[1] != 'Z' or input[2] != 'h') return error.InvalidData;
-    const block_digit = input[3];
-    if (block_digit < '1' or block_digit > '9') return error.InvalidData;
-    const max_block = @as(u32, block_digit - '0') * 100_000;
-    var br = BitReader.init(input[4..]);
-    var combined_crc: u32 = 0;
+    var cursor: []const u8 = input;
+    // Concatenated streams (cat a.bz2 b.bz2) decode back to back; each outer
+    // pass consumes exactly one BZh stream through its EOS magic.
     while (true) {
-        const marker = try br.readBits(48);
-        if (marker == 0x177245385090) {
-            const stored_combined = try br.readU32be();
-            if (combined_crc != stored_combined) return error.IntegrityFailure;
-            break;
-        }
-        if (marker != 0x314159265359) return error.InvalidData;
-        const stored_crc = try br.readU32be();
-        const randomised = try br.readBit();
-        if (randomised != 0) return error.Unsupported;
-        const orig_ptr_u = try br.readBits(24);
-        const orig_ptr = std.math.cast(u32, orig_ptr_u) orelse return error.InvalidData;
-        const in_use16: u16 = @intCast(try br.readBits(16));
-        var seq_to_unseq: [256]u8 = undefined;
-        var n_in_use: u32 = 0;
-        var group: u32 = 0;
-        while (group < 16) : (group += 1) {
-            if ((in_use16 >> @intCast(15 - group)) & 1 == 0) continue;
-            const bits: u16 = @intCast(try br.readBits(16));
-            var bit: u32 = 0;
-            while (bit < 16) : (bit += 1) {
-                if ((bits >> @intCast(15 - bit)) & 1 != 0) {
-                    const value: u8 = @intCast(group * 16 + bit);
-                    seq_to_unseq[n_in_use] = value;
-                    n_in_use += 1;
+        if (cursor.len < 4) return error.InvalidData;
+        if (cursor[0] != 'B' or cursor[1] != 'Z' or cursor[2] != 'h') return error.InvalidData;
+        const block_digit = cursor[3];
+        if (block_digit < '1' or block_digit > '9') return error.InvalidData;
+        const max_block = @as(u32, block_digit - '0') * 100_000;
+        var br = BitReader.init(cursor[4..]);
+        var combined_crc: u32 = 0;
+        while (true) {
+            const marker = try br.readBits(48);
+            if (marker == 0x177245385090) {
+                const stored_combined = try br.readU32be();
+                if (combined_crc != stored_combined) return error.IntegrityFailure;
+                break;
+            }
+            if (marker != 0x314159265359) return error.InvalidData;
+            const stored_crc = try br.readU32be();
+            const randomised = try br.readBit();
+            if (randomised != 0) return error.Unsupported;
+            const orig_ptr_u = try br.readBits(24);
+            const orig_ptr = std.math.cast(u32, orig_ptr_u) orelse return error.InvalidData;
+            const in_use16: u16 = @intCast(try br.readBits(16));
+            var seq_to_unseq: [256]u8 = undefined;
+            var n_in_use: u32 = 0;
+            var group: u32 = 0;
+            while (group < 16) : (group += 1) {
+                if ((in_use16 >> @intCast(15 - group)) & 1 == 0) continue;
+                const bits: u16 = @intCast(try br.readBits(16));
+                var bit: u32 = 0;
+                while (bit < 16) : (bit += 1) {
+                    if ((bits >> @intCast(15 - bit)) & 1 != 0) {
+                        const value: u8 = @intCast(group * 16 + bit);
+                        seq_to_unseq[n_in_use] = value;
+                        n_in_use += 1;
+                    }
                 }
             }
-        }
-        if (n_in_use == 0) return error.InvalidData;
-        const alpha_size = n_in_use + 2;
-        const eob = alpha_size - 1;
-        const n_groups_u = try br.readBits(3);
-        const n_groups = std.math.cast(u32, n_groups_u) orelse return error.InvalidData;
-        if (n_groups < 2 or n_groups > max_groups) return error.InvalidData;
-        const n_selectors_u = try br.readBits(15);
-        const n_selectors = std.math.cast(u32, n_selectors_u) orelse return error.InvalidData;
-        if (n_selectors == 0) return error.InvalidData;
-        var selectors: [max_selectors]u8 = undefined;
-        {
-            var pos: [max_groups]u8 = undefined;
-            var i: u32 = 0;
-            while (i < n_groups) : (i += 1) pos[i] = @intCast(i);
-            i = 0;
-            while (i < n_selectors) : (i += 1) {
-                var v: u32 = 0;
-                while (true) {
-                    const bit = try br.readBit();
-                    if (bit == 0) break;
-                    v += 1;
-                    if (v >= n_groups) return error.InvalidData;
-                }
-                const selected = pos[v];
-                var j = v;
-                while (j > 0) : (j -= 1) pos[j] = pos[j - 1];
-                pos[0] = selected;
-                if (i < max_selectors) selectors[i] = selected;
-            }
-        }
-        if (n_selectors > max_selectors) return error.InvalidData;
-        var lens: [max_groups][max_alpha_size]u8 = undefined;
-        var tables: [max_groups]HuffTable = undefined;
-        {
-            var t: u32 = 0;
-            while (t < n_groups) : (t += 1) {
-                const curr_u = try br.readBits(5);
-                var curr = std.math.cast(u32, curr_u) orelse return error.InvalidData;
-                if (curr < 1 or curr > max_code_len) return error.InvalidData;
-                var sym: u32 = 0;
-                while (sym < alpha_size) : (sym += 1) {
+            if (n_in_use == 0) return error.InvalidData;
+            const alpha_size = n_in_use + 2;
+            const eob = alpha_size - 1;
+            const n_groups_u = try br.readBits(3);
+            const n_groups = std.math.cast(u32, n_groups_u) orelse return error.InvalidData;
+            if (n_groups < 2 or n_groups > max_groups) return error.InvalidData;
+            const n_selectors_u = try br.readBits(15);
+            const n_selectors = std.math.cast(u32, n_selectors_u) orelse return error.InvalidData;
+            if (n_selectors == 0) return error.InvalidData;
+            var selectors: [max_selectors]u8 = undefined;
+            {
+                var pos: [max_groups]u8 = undefined;
+                var i: u32 = 0;
+                while (i < n_groups) : (i += 1) pos[i] = @intCast(i);
+                i = 0;
+                while (i < n_selectors) : (i += 1) {
+                    var v: u32 = 0;
                     while (true) {
                         const bit = try br.readBit();
                         if (bit == 0) break;
-                        const sign = try br.readBit();
-                        if (sign == 0) {
-                            curr += 1;
-                        } else {
-                            curr -%= 1;
-                        }
-                        if (curr < 1 or curr > max_code_len) return error.InvalidData;
+                        v += 1;
+                        if (v >= n_groups) return error.InvalidData;
                     }
-                    lens[t][sym] = @intCast(curr);
+                    const selected = pos[v];
+                    var j = v;
+                    while (j > 0) : (j -= 1) pos[j] = pos[j - 1];
+                    pos[0] = selected;
+                    if (i < max_selectors) selectors[i] = selected;
                 }
-                tables[t] = try buildHuffTable(&lens[t], alpha_size);
             }
-        }
-        var workspace = try io.Workspace.init(scratch.ptr, scratch.len);
-        const bwt_buffer = try workspace.take(u8, max_block + max_block / 4 + 8);
-        var nblock: u32 = 0;
-        var mtf: [256]u8 = undefined;
-        {
+            if (n_selectors > max_selectors) return error.InvalidData;
+            var lens: [max_groups][max_alpha_size]u8 = undefined;
+            var tables: [max_groups]HuffTable = undefined;
+            {
+                var t: u32 = 0;
+                while (t < n_groups) : (t += 1) {
+                    const curr_u = try br.readBits(5);
+                    var curr = std.math.cast(u32, curr_u) orelse return error.InvalidData;
+                    if (curr < 1 or curr > max_code_len) return error.InvalidData;
+                    var sym: u32 = 0;
+                    while (sym < alpha_size) : (sym += 1) {
+                        while (true) {
+                            const bit = try br.readBit();
+                            if (bit == 0) break;
+                            const sign = try br.readBit();
+                            if (sign == 0) {
+                                curr += 1;
+                            } else {
+                                curr -%= 1;
+                            }
+                            if (curr < 1 or curr > max_code_len) return error.InvalidData;
+                        }
+                        lens[t][sym] = @intCast(curr);
+                    }
+                    tables[t] = try buildHuffTable(&lens[t], alpha_size);
+                }
+            }
+            var workspace = try io.Workspace.init(scratch.ptr, scratch.len);
+            const bwt_buffer = try workspace.take(u8, max_block + max_block / 4 + 8);
+            var nblock: u32 = 0;
+            var mtf: [256]u8 = undefined;
+            {
+                var i: u32 = 0;
+                while (i < n_in_use) : (i += 1) mtf[i] = @intCast(i);
+            }
+            var group_no: i32 = -1;
+            var group_pos: u32 = 0;
+            var run_accum: i64 = -1;
+            var run_weight: i64 = 1;
+            while (true) {
+                if (group_pos == 0) {
+                    group_no += 1;
+                    if (group_no >= n_selectors) return error.InvalidData;
+                    group_pos = group_size;
+                }
+                group_pos -= 1;
+                const sel = selectors[@intCast(group_no)];
+                const table = &tables[sel];
+                const sym = try decodeHuffman(&br, table);
+                if (sym == 0 or sym == 1) {
+                    if (run_weight >= 2 * 1024 * 1024) return error.InvalidData;
+                    run_accum += (sym + 1) * run_weight;
+                    run_weight *= 2;
+                    continue;
+                }
+                if (run_accum != -1) {
+                    const copies = std.math.cast(u32, run_accum + 1) orelse return error.InvalidData;
+                    const byte = seq_to_unseq[mtf[0]];
+                    var k: u32 = 0;
+                    while (k < copies) : (k += 1) {
+                        if (nblock >= bwt_buffer.len) return error.InvalidData;
+                        bwt_buffer[nblock] = byte;
+                        nblock += 1;
+                    }
+                    run_accum = -1;
+                    run_weight = 1;
+                }
+                if (sym == eob) break;
+                const idx = sym - 1;
+                const uc = mtfMove(&mtf, idx);
+                if (nblock >= bwt_buffer.len) return error.InvalidData;
+                bwt_buffer[nblock] = seq_to_unseq[uc];
+                nblock += 1;
+            }
+            if (nblock == 0 or orig_ptr >= nblock) return error.InvalidData;
+            var cftab: [256]u32 = undefined;
+            @memset(&cftab, 0);
             var i: u32 = 0;
-            while (i < n_in_use) : (i += 1) mtf[i] = @intCast(i);
-        }
-        var group_no: i32 = -1;
-        var group_pos: u32 = 0;
-        var run_accum: i64 = -1;
-        var run_weight: i64 = 1;
-        while (true) {
-            if (group_pos == 0) {
-                group_no += 1;
-                if (group_no >= n_selectors) return error.InvalidData;
-                group_pos = group_size;
-            }
-            group_pos -= 1;
-            const sel = selectors[@intCast(group_no)];
-            const table = &tables[sel];
-            const sym = try decodeHuffman(&br, table);
-            if (sym == 0 or sym == 1) {
-                if (run_weight >= 2 * 1024 * 1024) return error.InvalidData;
-                run_accum += (sym + 1) * run_weight;
-                run_weight *= 2;
-                continue;
-            }
-            if (run_accum != -1) {
-                const copies = std.math.cast(u32, run_accum + 1) orelse return error.InvalidData;
-                const byte = seq_to_unseq[mtf[0]];
-                var k: u32 = 0;
-                while (k < copies) : (k += 1) {
-                    if (nblock >= bwt_buffer.len) return error.InvalidData;
-                    bwt_buffer[nblock] = byte;
-                    nblock += 1;
-                }
-                run_accum = -1;
-                run_weight = 1;
-            }
-            if (sym == eob) break;
-            const idx = sym - 1;
-            const uc = mtfMove(&mtf, idx);
-            if (nblock >= bwt_buffer.len) return error.InvalidData;
-            bwt_buffer[nblock] = seq_to_unseq[uc];
-            nblock += 1;
-        }
-        if (nblock == 0 or orig_ptr >= nblock) return error.InvalidData;
-        var cftab: [256]u32 = undefined;
-        @memset(&cftab, 0);
-        var i: u32 = 0;
-        while (i < nblock) : (i += 1) {
-            cftab[bwt_buffer[i]] += 1;
-        }
-        var sum: u32 = 0;
-        i = 0;
-        while (i < 256) : (i += 1) {
-            const count = cftab[i];
-            cftab[i] = sum;
-            sum += count;
-        }
-        const fwd = try workspace.take(u32, nblock);
-        {
-            var occ: [256]u32 = @splat(0);
-            i = 0;
             while (i < nblock) : (i += 1) {
-                const b = bwt_buffer[i];
-                fwd[cftab[b] + occ[b]] = (i << 8) | b;
-                occ[b] += 1;
+                cftab[bwt_buffer[i]] += 1;
             }
-        }
-        // Packed successor gives one load per output byte. RLE rides the traversal.
-        var block_crc = Bzip2Crc32.init();
-        var out_buf: [4096]u8 = undefined;
-        var out_len: usize = 0;
-        var cur: u32 = orig_ptr;
-        var last: u8 = 0;
-        var run: u32 = 0;
-        var emitted: u32 = 0;
-        while (emitted < nblock) {
-            const entry = fwd[cur];
-            const b: u8 = @truncate(entry);
-            cur = entry >> 8;
-            emitted += 1;
-            var copies: u32 = 1;
-            var out_byte = b;
-            if (run == 4) {
-                copies = b;
-                out_byte = last;
-                run = 0;
-            } else {
-                if (b == last) {
-                    run += 1;
+            var sum: u32 = 0;
+            i = 0;
+            while (i < 256) : (i += 1) {
+                const count = cftab[i];
+                cftab[i] = sum;
+                sum += count;
+            }
+            const fwd = try workspace.take(u32, nblock);
+            {
+                var occ: [256]u32 = @splat(0);
+                i = 0;
+                while (i < nblock) : (i += 1) {
+                    const b = bwt_buffer[i];
+                    fwd[cftab[b] + occ[b]] = (i << 8) | b;
+                    occ[b] += 1;
+                }
+            }
+            // Packed successor gives one load per output byte. RLE rides the traversal.
+            var block_crc = Bzip2Crc32.init();
+            var out_buf: [4096]u8 = undefined;
+            var out_len: usize = 0;
+            var cur: u32 = orig_ptr;
+            var last: u8 = 0;
+            var run: u32 = 0;
+            var emitted: u32 = 0;
+            while (emitted < nblock) {
+                const entry = fwd[cur];
+                const b: u8 = @truncate(entry);
+                cur = entry >> 8;
+                emitted += 1;
+                var copies: u32 = 1;
+                var out_byte = b;
+                if (run == 4) {
+                    copies = b;
+                    out_byte = last;
+                    run = 0;
                 } else {
-                    last = b;
-                    run = 1;
+                    if (b == last) {
+                        run += 1;
+                    } else {
+                        last = b;
+                        run = 1;
+                    }
+                }
+                if (copies == 1) {
+                    out_buf[out_len] = out_byte;
+                    out_len += 1;
+                    if (out_len == out_buf.len) {
+                        try io.writeBytes(writer, &out_buf);
+                        block_crc.update(&out_buf);
+                        out_len = 0;
+                    }
+                    continue;
+                }
+                var remaining = copies;
+                while (remaining > 0) {
+                    const take = @min(remaining, out_buf.len - out_len);
+                    @memset(out_buf[out_len..][0..take], out_byte);
+                    out_len += take;
+                    remaining -= take;
+                    if (out_len == out_buf.len) {
+                        try io.writeBytes(writer, &out_buf);
+                        block_crc.update(&out_buf);
+                        out_len = 0;
+                    }
                 }
             }
-            if (copies == 1) {
-                out_buf[out_len] = out_byte;
-                out_len += 1;
-                if (out_len == out_buf.len) {
-                    try io.writeBytes(writer, &out_buf);
-                    block_crc.update(&out_buf);
-                    out_len = 0;
-                }
-                continue;
+            if (out_len > 0) {
+                try io.writeBytes(writer, out_buf[0..out_len]);
+                block_crc.update(out_buf[0..out_len]);
             }
-            var remaining = copies;
-            while (remaining > 0) {
-                const take = @min(remaining, out_buf.len - out_len);
-                @memset(out_buf[out_len..][0..take], out_byte);
-                out_len += take;
-                remaining -= take;
-                if (out_len == out_buf.len) {
-                    try io.writeBytes(writer, &out_buf);
-                    block_crc.update(&out_buf);
-                    out_len = 0;
-                }
+            if (block_crc.final() != stored_crc) {
+                return error.IntegrityFailure;
             }
+            combined_crc = (combined_crc << 1) | (combined_crc >> 31);
+            combined_crc ^= stored_crc;
         }
-        if (out_len > 0) {
-            try io.writeBytes(writer, out_buf[0..out_len]);
-            block_crc.update(out_buf[0..out_len]);
-        }
-        if (block_crc.final() != stored_crc) {
-            return error.IntegrityFailure;
-        }
-        combined_crc = (combined_crc << 1) | (combined_crc >> 31);
-        combined_crc ^= stored_crc;
+        // The bit stream ends with zero padding to the next byte boundary;
+        // anything nonzero there is corruption.
+        if (br.bits != 0) return error.InvalidData;
+        const remaining = br.bytes[br.byte_pos..];
+        if (remaining.len == 0) return;
+        cursor = remaining;
     }
 }
 
@@ -1160,4 +1171,45 @@ fn decodeHuffman(br: *BitReader, table: *const HuffTable) Failure!u32 {
     const idx = zvec - table.base[zn];
     if (idx >= max_alpha_size) return error.InvalidData;
     return table.perm[idx];
+}
+
+test "bzip2 concatenated streams decode in sequence" {
+    const allocator = std.testing.allocator;
+    const input_a = "first stream payload, first stream payload, first!";
+    const input_b = "second stream: completely different content 0123456789";
+    const scratch = try allocator.alloc(u8, encodeWorkspaceSize(100_000));
+    defer allocator.free(scratch);
+    const bound_a = encodedSizeBound(input_a.len);
+    const bound_b = encodedSizeBound(input_b.len);
+    const part_a = try allocator.alloc(u8, bound_a);
+    defer allocator.free(part_a);
+    const part_b = try allocator.alloc(u8, bound_b);
+    defer allocator.free(part_b);
+    const len_a = try encode(input_a, part_a, scratch, .{ .block_size = 100_000 });
+    const len_b = try encode(input_b, part_b, scratch, .{ .block_size = 100_000 });
+
+    const joined = try allocator.alloc(u8, len_a + len_b);
+    defer allocator.free(joined);
+    @memcpy(joined[0..len_a], part_a[0..len_a]);
+    @memcpy(joined[len_a..][0..len_b], part_b[0..len_b]);
+
+    const decode_scratch = try allocator.alloc(u8, try decodeWorkspaceSizeFor(joined));
+    defer allocator.free(decode_scratch);
+    const output = try allocator.alloc(u8, input_a.len + input_b.len);
+    defer allocator.free(output);
+    const decoded = try decode(joined, output, decode_scratch);
+    try std.testing.expectEqual(input_a.len + input_b.len, decoded);
+    try std.testing.expectEqualSlices(u8, input_a, output[0..input_a.len]);
+    try std.testing.expectEqualSlices(u8, input_b, output[input_a.len..][0..input_b.len]);
+
+    // Trailing garbage after a valid stream is still refused.
+    const garbage = try allocator.alloc(u8, len_a + 3);
+    defer allocator.free(garbage);
+    @memcpy(garbage[0..len_a], part_a[0..len_a]);
+    garbage[len_a] = 'X';
+    garbage[len_a + 1] = 'Y';
+    garbage[len_a + 2] = 'Z';
+    const garbage_scratch = try allocator.alloc(u8, try decodeWorkspaceSizeFor(garbage));
+    defer allocator.free(garbage_scratch);
+    try std.testing.expectError(error.InvalidData, decode(garbage, output, garbage_scratch));
 }
