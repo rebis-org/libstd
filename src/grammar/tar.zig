@@ -873,7 +873,7 @@ test "tar device entries roundtrip devmajor and devminor" {
         .{ .name = "dev/null", .data = &.{}, .typeflag = '3', .mode = 0o666, .devmajor = 1, .devminor = 3 },
         .{ .name = "regular.txt", .data = "hello", .typeflag = '0' },
     };
-    var archive: [2048]u8 = undefined;
+    var archive: [4096]u8 = undefined;
     var scratch: [4096]u8 = undefined;
     const written = try tarEncode(&entries, &archive, &scratch);
     const info = try tarInspectOrdinal(archive[0..written], 0);

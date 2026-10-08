@@ -1015,3 +1015,23 @@ test "zip kdf_rounds_limit gates winzip aes" {
     try testing.expectError(error.ResourceLimit, zipRequiredSize(&entries, "", &.{}, &.{}, &.{}, &cause));
     try testing.expectEqual(crypto.FailureCause.kdf_limit, cause);
 }
+
+test "zip aes128 single entry fits a 512-byte buffer" {
+    const testing = std.testing;
+    const data = "0123456789abcdef0123456789abcdef";
+    const entries = [_]ZipEntry{
+        .{ .name = "a.txt", .data = data, .method = 8, .encrypted = true, .password = "pw", .aes_strength = 1 },
+    };
+    var cause: crypto.FailureCause = .none;
+    var history: [deflate_history_size]u8 = undefined;
+    var measure_buf: [deflate_measurement_buffer_size]u8 = undefined;
+    var small: [512]u8 = undefined;
+    var staging: [deflate_measurement_buffer_size]u8 = undefined;
+    const required = try zipRequiredSize(&entries, "", &history, &measure_buf, &.{}, &cause);
+    try testing.expect(required < 512);
+    const written = try zipEncode(&entries, "", &small, &history, &measure_buf, &staging, &.{}, &cause);
+    var decode_history: [deflate_history_size]u8 = undefined;
+    var output: [64]u8 = undefined;
+    const decoded = try zipDecodeOrdinal(small[0..written], 0, &output, .{ .password = "pw", .failure_cause = &cause, .staging = &staging, .history = &decode_history });
+    try testing.expectEqualSlices(u8, data, output[0..decoded]);
+}
