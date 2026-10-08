@@ -50,6 +50,11 @@ pub const SevenZipEntry = struct {
     password: []const u8 = &.{},
     iv: [16]u8 = @splat(0),
     iv_set: bool = false,
+    // KDF cost knob: 0 selects the default 2^19 rounds, otherwise the power
+    // is written verbatim (1..24). 0x3F direct-key mode is decode-only here.
+    num_cycles_power: u8 = 0,
+    salt: [16]u8 = @splat(0),
+    salt_length: u8 = 0,
     kdf_rounds_limit: u64 = 0,
     password_lifetime: u64 = 0,
 };
@@ -174,6 +179,9 @@ const PackedEntry = struct {
     encrypted: bool = false,
     filter: ?CoderMethod = null,
     iv: [16]u8 = @splat(0),
+    salt: [16]u8 = @splat(0),
+    salt_length: u8 = 0,
+    num_cycles_power: u8 = 0,
     pack_size: usize = 0,
     unpack_size: usize = 0,
 };
@@ -191,7 +199,11 @@ fn packBuffer(comptime codec: type, method: CoderMethod, input: []const u8, unpa
 fn packEntry(entry: SevenZipEntry, workspace: *Workspace, limits: Limits, failure_cause: *crypto.FailureCause) Failure!PackedEntry {
     if (entry.encrypted) {
         if (entry.password.len == 0) return error.InvalidCall;
-        if (entry.kdf_rounds_limit != 0 and entry.kdf_rounds_limit < crypto.seven_zip_default_rounds) {
+        if (entry.num_cycles_power > crypto.seven_zip_cycles_max) return error.InvalidCall;
+        if (entry.salt_length > 16) return error.InvalidCall;
+        const cycles = if (entry.num_cycles_power == 0) crypto.seven_zip_default_cycles else entry.num_cycles_power;
+        const rounds: u64 = @as(u64, 1) << @intCast(cycles);
+        if (entry.kdf_rounds_limit != 0 and entry.kdf_rounds_limit < rounds) {
             failure_cause.* = .kdf_limit;
             return error.ResourceLimit;
         }
@@ -269,8 +281,9 @@ fn packEntry(entry: SevenZipEntry, workspace: *Workspace, limits: Limits, failur
     };
     if (!entry.encrypted) return compressed_entry;
     const password_utf16 = try passwordToUtf16(entry.password, workspace);
+    const cycles = if (entry.num_cycles_power == 0) crypto.seven_zip_default_cycles else entry.num_cycles_power;
     var key: [crypto.seven_zip_key_length]u8 = undefined;
-    crypto.sevenZipKdf(password_utf16, &.{}, crypto.seven_zip_default_cycles, &key);
+    crypto.sevenZipKdf(password_utf16, entry.salt[0..entry.salt_length], cycles, &key);
     const padded_size = std.mem.alignForward(usize, compressed_entry.data.len, crypto.block_length);
     if (entry.password_lifetime != 0 and padded_size > entry.password_lifetime) {
         failure_cause.* = .password_lifetime;
@@ -281,10 +294,10 @@ fn packEntry(entry: SevenZipEntry, workspace: *Workspace, limits: Limits, failur
     @memcpy(encrypted_data[0..compressed_entry.data.len], compressed_entry.data);
     var iv: [16]u8 = entry.iv;
     if (!entry.iv_set) {
-        if (!crypto.fillRandom(&iv)) try crypto.deriveDeterministicSalt(entry.password, entry.name, entry.data, &iv);
+        try crypto.fillRandom(&iv);
     }
     try crypto.aesCbcEncrypt(&key, iv, encrypted_data, encrypted_data);
-    return .{ .method = compressed_entry.method, .data = encrypted_data, .crc = compressed_entry.crc, .encrypted = true, .filter = compressed_entry.filter, .iv = iv, .pack_size = compressed_entry.pack_size, .unpack_size = compressed_entry.unpack_size };
+    return .{ .method = compressed_entry.method, .data = encrypted_data, .crc = compressed_entry.crc, .encrypted = true, .filter = compressed_entry.filter, .iv = iv, .salt = entry.salt, .salt_length = entry.salt_length, .num_cycles_power = cycles, .pack_size = compressed_entry.pack_size, .unpack_size = compressed_entry.unpack_size };
 }
 
 fn applyEncodeFilter(method: CoderMethod, data: []u8) Failure!void {
@@ -1268,12 +1281,19 @@ fn writeStreamsInfo(writer: *std.Io.Writer, entries: []const SevenZipEntry, pack
             const aes_flags: u8 = @as(u8, @intCast(method_7z_aes_id.len)) | 0x20;
             try io.writeBytes(writer, &.{aes_flags});
             try io.writeBytes(writer, &method_7z_aes_id);
-            try writeUint64(writer, 18);
-            var props: [18]u8 = undefined;
-            props[0] = crypto.seven_zip_default_cycles | 0x40;
-            props[1] = 0x0F;
-            @memcpy(props[2..18], &p.iv);
-            try io.writeBytes(writer, &props);
+            const salt_size: usize = p.salt_length;
+            const iv_size: usize = 16;
+            // Sizes encode as a 1-bit high half plus a 4-bit low half that
+            // SUM to the size, so 16 is high=1 low=15 (see parseAesProps).
+            const salt_high: u8 = @intCast(salt_size >> 4);
+            const iv_high: u8 = @intCast(iv_size >> 4);
+            var props: [2 + 16 + 16]u8 = undefined;
+            props[0] = p.num_cycles_power | (salt_high << 7) | (iv_high << 6);
+            props[1] = @as(u8, @intCast((salt_size - salt_high) << 4)) | @as(u8, @intCast(iv_size - iv_high));
+            @memcpy(props[2 .. 2 + salt_size], p.salt[0..salt_size]);
+            @memcpy(props[2 + salt_size ..][0..iv_size], &p.iv);
+            try writeUint64(writer, 2 + salt_size + iv_size);
+            try io.writeBytes(writer, props[0 .. 2 + salt_size + iv_size]);
         }
         const method = p.method;
         try writeFolderCoder(writer, method, p.crc);
@@ -1790,4 +1810,44 @@ test "sevenzip ppmd solid grouping roundtrip" {
         try testing.expectEqual(data.len, produced);
         try testing.expectEqualSlices(u8, data, out);
     }
+}
+
+test "sevenzip encrypted roundtrip with salt and custom cycles" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const backing = try allocator.alloc(u8, 64 * 1024 * 1024);
+    defer allocator.free(backing);
+    const data = "seven zip secret seven zip secret seven zip secret";
+    var salt: [16]u8 = undefined;
+    for (&salt, 0..) |*byte, i| byte.* = @intCast(i + 1);
+    const entries = [_]SevenZipEntry{
+        .{ .name = "enc.bin", .data = data, .method = .copy, .encrypted = true, .password = "pw", .num_cycles_power = 10, .salt = salt, .salt_length = 16 },
+    };
+    var workspace = try Workspace.init(backing.ptr, backing.len);
+    var cause: crypto.FailureCause = .none;
+    const packed_entries = try sevenZipPack(&entries, &workspace, .{}, &cause);
+    const total = try sevenZipPackedSize(&entries, packed_entries, &workspace);
+    const archive = try allocator.alloc(u8, total);
+    defer allocator.free(archive);
+    const written = try sevenZipWritePacked(&entries, packed_entries, archive, &workspace);
+    try testing.expectEqual(total, written);
+
+    var decode_ws = try Workspace.init(backing.ptr, backing.len);
+    const out = try allocator.alloc(u8, data.len);
+    defer allocator.free(out);
+    const produced = try sevenZipDecodeOrdinal(archive, &decode_ws, .{}, 0, out, .{ .password = "pw", .failure_cause = &cause });
+    try testing.expectEqual(data.len, produced);
+    try testing.expectEqualSlices(u8, data, out);
+
+    // A decode budget below the encoded 2^10 rounds is refused with kdf_limit.
+    var refuse_ws = try Workspace.init(backing.ptr, backing.len);
+    cause = .none;
+    const refuse_out = try allocator.alloc(u8, data.len);
+    defer allocator.free(refuse_out);
+    try testing.expectError(error.ResourceLimit, sevenZipDecodeOrdinal(archive, &refuse_ws, .{}, 0, refuse_out, .{
+        .password = "pw",
+        .kdf_rounds_limit = (1 << 10) - 1,
+        .failure_cause = &cause,
+    }));
+    try testing.expectEqual(crypto.FailureCause.kdf_limit, cause);
 }

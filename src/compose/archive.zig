@@ -222,7 +222,7 @@ pub fn zipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
     } else if (command_mask == vocabulary.command_mask_write) {
         try requireVerified(commit);
         if (crypto_params) |params| {
-            if (params.algorithm != 0 and params.algorithm != 3) {
+            if (params.algorithm > 3) {
                 writeCryptoFailure(call, .unsupported_algorithm);
                 return error.Unsupported;
             }
@@ -447,10 +447,16 @@ pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
             const archive = try materializeArchive(source_resource, &workspace, limits);
             // Archives with encrypted headers (-hp) need decrypted-header staging, capped by the archive size.
             const header_scratch = if (decrypting) try workspace.take(u8, @min(@as(usize, rar_header_scratch_size), archive.len + 16)) else try workspace.take(u8, 0);
-            const count = try rar.rarInspectCountOpts(archive, limits.entries, .{
+            const count = rar.rarInspectCountOpts(archive, limits.entries, .{
                 .password = if (crypto_params) |params| params.password else null,
                 .scratch = header_scratch,
-            });
+                .kdf_rounds_limit = if (crypto_params) |params| params.kdf_rounds_limit else 0,
+                .password_lifetime = if (crypto_params) |params| params.password_lifetime else 0,
+                .failure_cause = &failure_cause,
+            }) catch |err| {
+                writeCryptoFailure(call, failure_cause);
+                return err;
+            };
             response.byte_length = count;
             return;
         }
@@ -474,8 +480,14 @@ pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
         const decode_opts: rar.DecodeOptions = .{
             .password = if (crypto_params) |params| params.password else null,
             .scratch = header_scratch,
+            .kdf_rounds_limit = if (crypto_params) |params| params.kdf_rounds_limit else 0,
+            .password_lifetime = if (crypto_params) |params| params.password_lifetime else 0,
+            .failure_cause = &failure_cause,
         };
-        const entry = try rar.rarInspectOrdinalOpts(archive, ordinal, limits.entries, decode_opts);
+        const entry = rar.rarInspectOrdinalOpts(archive, ordinal, limits.entries, decode_opts) catch |err| {
+            writeCryptoFailure(call, failure_cause);
+            return err;
+        };
         const size = std.math.cast(usize, entry.size) orelse return error.ResourceLimit;
         if (size > limits.decoded_bytes) return error.ResourceLimit;
         try common.requireSinkCapacity(sink_resource, call, size);
@@ -517,10 +529,16 @@ pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
 
         if (sink_resource.kind == .direct_write) {
             const output = try common.sinkDirectBuffer(sink_resource, size);
-            _ = try rar.rarDecodeOrdinal(archive, ordinal, output, &bufs, decode_opts);
+            _ = rar.rarDecodeOrdinal(archive, ordinal, output, &bufs, decode_opts) catch |err| {
+                writeCryptoFailure(call, failure_cause);
+                return err;
+            };
         } else {
             const staging = try workspace.take(u8, size);
-            _ = try rar.rarDecodeOrdinal(archive, ordinal, staging, &bufs, decode_opts);
+            _ = rar.rarDecodeOrdinal(archive, ordinal, staging, &bufs, decode_opts) catch |err| {
+                writeCryptoFailure(call, failure_cause);
+                return err;
+            };
             try common.commitBytesToSink(sink_resource, call, staging);
         }
         response.byte_length = size;

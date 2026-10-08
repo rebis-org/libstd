@@ -198,7 +198,7 @@ fn validateZipEntry(entry: ZipEntry) Failure!void {
         if (entry.zipcrypto) {
             if (entry.salt_length != 0) return error.InvalidCall;
         } else {
-            if (entry.aes_strength != 3) return error.Unsupported;
+            if (entry.aes_strength < 1 or entry.aes_strength > 3) return error.Unsupported;
             if (entry.salt_length > 16) return error.InvalidCall;
         }
     }
@@ -248,15 +248,13 @@ fn zipWriteAesExtra(sink: *io.Sink, entry: ZipEntry) Failure!void {
     try zipU16(sink, entry.method);
 }
 
-fn entrySalt(entry: ZipEntry) Failure![16]u8 {
+fn entrySalt(entry: ZipEntry, salt_length: usize) Failure![16]u8 {
     if (entry.salt_length != 0) {
-        if (entry.salt_length != 16) return error.InvalidCall;
+        if (entry.salt_length != salt_length) return error.InvalidCall;
         return entry.salt;
     }
     var salt: [16]u8 = undefined;
-    if (!crypto.fillRandom(&salt)) {
-        try crypto.deriveDeterministicSalt(entry.password, entry.name, entry.data, &salt);
-    }
+    try crypto.fillRandom(salt[0..salt_length]);
     return salt;
 }
 
@@ -393,11 +391,7 @@ fn zipWriteData(sink: *io.Sink, entry: ZipEntry, history: []u8, staging: []u8, s
     if (entry.zipcrypto) {
         var keys = crypto.ZipCryptoKeys.init(entry.password);
         var header: [12]u8 = undefined;
-        if (!crypto.fillRandom(header[0..11])) {
-            var seed_bytes: [16]u8 = undefined;
-            try crypto.deriveDeterministicSalt(entry.password, entry.name, entry.data, &seed_bytes);
-            @memcpy(header[0..11], seed_bytes[0..11]);
-        }
+        try crypto.fillRandom(header[0..11]);
         header[11] = @truncate(checksum.crc32(entry.data) >> 24);
         keys.encrypt(&header, &header);
         try sink.write(&header);
@@ -415,25 +409,27 @@ fn zipWriteData(sink: *io.Sink, entry: ZipEntry, history: []u8, staging: []u8, s
         sink.offset = try bounds.addUsize(sink.offset, compressed.len);
         return;
     }
-    const salt = try entrySalt(entry);
+    const salt_length = try crypto.winzipSaltLength(entry.aes_strength);
+    const key_length = try crypto.winzipKeyLength(entry.aes_strength);
+    const salt = try entrySalt(entry, salt_length);
     var derived: [66]u8 = undefined;
-    try crypto.winzipDeriveKey(entry.password, salt[0..16], 32, &derived);
+    try crypto.winzipDeriveKey(entry.password, salt[0..salt_length], key_length, derived[0 .. 2 * key_length + winzip_aes_verify_length]);
     const data_offset = sink.offset;
-    try sink.write(salt[0..16]);
-    try sink.write(derived[64..66]);
+    try sink.write(salt[0..salt_length]);
+    try sink.write(derived[2 * key_length ..][0..winzip_aes_verify_length]);
     if (entry.method == 0) {
         if (entry.password_lifetime != 0 and entry.data.len > entry.password_lifetime) return error.ResourceLimit;
-        try crypto.winzipCtr(derived[0..32], sink.bytes[sink.offset..][0..entry.data.len], entry.data);
+        try crypto.winzipCtr(derived[0..key_length], sink.bytes[sink.offset..][0..entry.data.len], entry.data);
         sink.offset = try bounds.addUsize(sink.offset, entry.data.len);
     } else {
         const compressed = try zipCompressEntry(entry, history, staging, scratch);
         if (entry.password_lifetime != 0 and compressed.len > entry.password_lifetime) return error.ResourceLimit;
-        try crypto.winzipCtr(derived[0..32], sink.bytes[sink.offset..][0..compressed.len], compressed);
+        try crypto.winzipCtr(derived[0..key_length], sink.bytes[sink.offset..][0..compressed.len], compressed);
         sink.offset = try bounds.addUsize(sink.offset, compressed.len);
     }
-    const ciphertext = sink.bytes[data_offset + 16 + winzip_aes_verify_length .. sink.offset];
+    const ciphertext = sink.bytes[data_offset + salt_length + winzip_aes_verify_length .. sink.offset];
     var mac: [crypto.hmac_sha1_length]u8 = undefined;
-    crypto.hmacSha1(&mac, ciphertext, derived[32..64]);
+    crypto.hmacSha1(&mac, ciphertext, derived[key_length .. 2 * key_length]);
     try sink.write(mac[0..winzip_aes_hmac_length]);
 }
 
@@ -957,4 +953,64 @@ fn readU32(data: []const u8, offset: usize) u32 {
 
 fn readU64(data: []const u8, offset: usize) u64 {
     return std.mem.readInt(u64, data[offset..][0..8], .little);
+}
+
+test "zip encryption roundtrips zipcrypto and winzip aes strengths" {
+    const testing = std.testing;
+    const data = "the quick brown fox jumps over the lazy dog. the quick brown fox!";
+    const password = "correct horse battery staple";
+    const entries = [_]ZipEntry{
+        .{ .name = "plain.txt", .data = data, .method = 0 },
+        .{ .name = "zipcrypto.txt", .data = data, .method = 0, .encrypted = true, .zipcrypto = true, .password = password },
+        .{ .name = "aes128.bin", .data = data, .method = 0, .encrypted = true, .password = password, .aes_strength = 1 },
+        .{ .name = "aes192.bin", .data = data, .method = 0, .encrypted = true, .password = password, .aes_strength = 2 },
+        .{ .name = "aes256.bin", .data = data, .method = 0, .encrypted = true, .password = password, .aes_strength = 3 },
+    };
+    var cause: crypto.FailureCause = .none;
+    var archive: [8192]u8 = undefined;
+    const written = try zipEncode(&entries, "", &archive, &.{}, &.{}, &.{}, &.{}, &cause);
+    var staging: [4096]u8 = undefined;
+    for (entries, 0..) |entry, ordinal| {
+        var output: [128]u8 = undefined;
+        const decoded = try zipDecodeOrdinal(archive[0..written], ordinal, &output, .{
+            .password = if (entry.encrypted) password else null,
+            .failure_cause = &cause,
+            .staging = &staging,
+        });
+        try testing.expectEqual(data.len, decoded);
+        try testing.expectEqualSlices(u8, data, output[0..decoded]);
+    }
+}
+
+test "zip wrong password reports wrong_password cause" {
+    const testing = std.testing;
+    const data = "secret payload bytes, secret payload bytes, secret!";
+    const entries = [_]ZipEntry{
+        .{ .name = "aes256.bin", .data = data, .method = 0, .encrypted = true, .password = "right", .aes_strength = 3 },
+        .{ .name = "zipcrypto.txt", .data = data, .method = 0, .encrypted = true, .zipcrypto = true, .password = "right" },
+    };
+    var cause: crypto.FailureCause = .none;
+    var archive: [4096]u8 = undefined;
+    const written = try zipEncode(&entries, "", &archive, &.{}, &.{}, &.{}, &.{}, &cause);
+    var staging: [4096]u8 = undefined;
+    var output: [128]u8 = undefined;
+    for (0..entries.len) |ordinal| {
+        cause = .none;
+        try testing.expectError(error.InvalidData, zipDecodeOrdinal(archive[0..written], ordinal, &output, .{
+            .password = "wrong",
+            .failure_cause = &cause,
+            .staging = &staging,
+        }));
+        try testing.expectEqual(crypto.FailureCause.wrong_password, cause);
+    }
+}
+
+test "zip kdf_rounds_limit gates winzip aes" {
+    const testing = std.testing;
+    const entries = [_]ZipEntry{
+        .{ .name = "a.bin", .data = "secret", .method = 0, .encrypted = true, .password = "pw", .kdf_rounds_limit = crypto.winzip_pbkdf2_rounds - 1 },
+    };
+    var cause: crypto.FailureCause = .none;
+    try testing.expectError(error.ResourceLimit, zipRequiredSize(&entries, "", &.{}, &.{}, &.{}, &cause));
+    try testing.expectEqual(crypto.FailureCause.kdf_limit, cause);
 }
