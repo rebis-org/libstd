@@ -1,7 +1,7 @@
 const std = @import("std");
 const sink = @import("../../common/sink.zig");
 const Sink = sink.Sink;
-const kernels = @import("../../leaf/kernels.zig");
+const kernels = @import("../../common/kernels.zig");
 
 // Circular LZ window over caller-provided storage. Distances are validated
 // against total_written, so bytes from a previous non-solid entry are never

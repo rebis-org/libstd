@@ -4,7 +4,7 @@ const bounds = @import("../common/primitive/bounds.zig");
 const checksum = @import("../common/primitive/checksum.zig");
 const failure_prim = @import("../common/primitive/failure.zig");
 const Failure = failure_prim.Failure;
-const kernels = @import("kernels.zig");
+const kernels = @import("../common/kernels.zig");
 const measurement = @import("../common/primitive/measurement.zig");
 
 // Frame layout follows the "LZ4 Frame Format Description" spec; the block codec
@@ -189,12 +189,17 @@ fn decodeBlocks(input: []const u8, output: *std.Io.Writer, scratch: []u8) Failur
     if (block_code < 4 or block_code > 7) return error.InvalidData;
     const max_block: usize = @as(usize, 65536) << @intCast(2 * (@as(usize, block_code) - 4));
     var offset: usize = 6;
+    var content_size: ?u64 = null;
     if (flags & flag_content_size != 0) {
         if (input.len < offset + 8) return error.InvalidData;
+        content_size = std.mem.readInt(u64, input[offset..][0..8], .little);
         offset += 8;
     }
     if (flags & flag_dict_id != 0) offset += 4;
     if (input.len <= offset) return error.InvalidData;
+    // Header_Checksum: the high byte of xxh32 over FLG..end-of-header.
+    const stored_header_sum = input[offset];
+    if (stored_header_sum != @as(u8, @truncate(checksum.xxh32(input[4..offset]) >> 8))) return error.IntegrityFailure;
     offset += 1;
     var content_hasher = checksum.XxHash32.init(0);
     var total: usize = 0;
@@ -233,6 +238,9 @@ fn decodeBlocks(input: []const u8, output: *std.Io.Writer, scratch: []u8) Failur
         offset += 4;
     }
     if (offset != input.len) return error.InvalidData;
+    if (content_size) |expected| {
+        if (expected != total) return error.IntegrityFailure;
+    }
     return total;
 }
 
@@ -646,4 +654,34 @@ test "lz4 hc roundtrip incompressible" {
     defer std.testing.allocator.free(decoded);
     const produced = try decode(encoded[0..encoded_len], decoded, scratch, .{});
     try std.testing.expectEqualSlices(u8, input, decoded[0..produced]);
+}
+
+test "lz4 frame verifies content size and header checksum" {
+    const allocator = std.testing.allocator;
+    const input = "lz4 frame with content size and header checksum, repeated: abcabcabcabc";
+    const scratch = try allocator.alloc(u8, encodeWorkspaceSize());
+    defer allocator.free(scratch);
+    const bound = encodedSizeBound(input.len);
+    const encoded = try allocator.alloc(u8, bound);
+    defer allocator.free(encoded);
+    const encoded_len = try encode(input, encoded, scratch, .{});
+    const decode_scratch = try allocator.alloc(u8, decodeWorkspaceSize());
+    defer allocator.free(decode_scratch);
+    const output = try allocator.alloc(u8, input.len);
+    defer allocator.free(output);
+    const decoded = try decode(encoded[0..encoded_len], output, decode_scratch, .{});
+    try std.testing.expectEqualSlices(u8, input, output[0..decoded]);
+
+    // The encoder always writes Content_Size; corrupting it must fail.
+    // Header layout: magic(4) FLG(1) BD(1) Content_Size(8) Header_Checksum(1).
+    var bad_size = try allocator.dupe(u8, encoded[0..encoded_len]);
+    defer allocator.free(bad_size);
+    bad_size[6] ^= 0x01;
+    try std.testing.expectError(error.IntegrityFailure, decode(bad_size, output, decode_scratch, .{}));
+
+    // Corrupting the Header_Checksum byte itself must fail too.
+    var bad_sum = try allocator.dupe(u8, encoded[0..encoded_len]);
+    defer allocator.free(bad_sum);
+    bad_sum[14] ^= 0xFF;
+    try std.testing.expectError(error.IntegrityFailure, decode(bad_sum, output, decode_scratch, .{}));
 }

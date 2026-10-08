@@ -130,7 +130,9 @@ fn decodeStreamImpl(reader: *std.Io.Reader, writer: ?*std.Io.Writer, output: []u
             if (control >= control_lzma_new_props) {
                 const properties_byte = try io.readByte(reader);
                 const parsed = try lzma.Properties.decode(properties_byte, options.dictionary_size);
-                if (parsed.lc != props.lc or parsed.lp != props.lp or parsed.pb != props.pb) return error.Unsupported;
+                // LZMA2 permits any valid lc/lp/pb combination per chunk; only
+                // the lc+lp<=4 shape constraint applies (SDK behavior).
+                if (parsed.lc + parsed.lp > 4) return error.Unsupported;
                 decoder.setProperties(parsed);
                 need_properties = false;
                 decoder.resetState();
