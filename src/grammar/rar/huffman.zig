@@ -4,9 +4,9 @@ const Failure = failure.Failure;
 const bits = @import("bits.zig");
 const BitReader = bits.BitReader;
 
-// Range-boundary decode tables in the reference form (unrar's
-// DecodeLen/DecodePos/DecodeNum), which accepts the slightly over-committed
-// tables real archives contain. Decode_num lives in caller storage so the
+// Range-boundary decode tables in the reference form (the DecodeLen, DecodePos,
+// and DecodeNum arrays of unrar), which accepts the slightly over-committed
+// tables that real archives contain. decode_num lives in caller storage, so the
 // whole decode context carves out of one workspace.
 
 pub const max_code_length: u5 = 15;
@@ -15,7 +15,7 @@ pub const quick_table_size: usize = 1 << max_quick_bits;
 
 pub const QuickEntry = struct {
     symbol: u16 = 0,
-    length: u5 = 0, // 0 means the full decode path must run
+    length: u5 = 0, // A zero length forces the full decode path.
 };
 
 pub const DecodeTable = struct {

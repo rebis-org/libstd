@@ -14,9 +14,9 @@ const Sink = sink.Sink;
 // reads, no length-15 escape, and its own rep-match bonus a tier lower. The
 // old-distance ring is a true circular buffer. Every match pushes its
 // distance at the cursor, so v29-style rotation desynchronises it. Tables
-// are verbatim from the reference (unpack20.cpp): derived versions agreed
-// with the bugs they caused (DBits saturates at 16. No formula reproduces
-// it).
+// are verbatim from the reference (unpack20.cpp): a derived table agreed
+// with the reference only where it inherited the reference's bugs, and no
+// formula reproduces DBits saturating at 16.
 
 const nc20: u16 = 298;
 const mc20: u16 = 257; // audio alphabet: 256 deltas + the table-refresh code
@@ -76,7 +76,7 @@ const dist_bits = [dc20]u5{
     16, 16, 16, 16, 16, 16, 16, 16,
 };
 
-fn distanceDecode(slot: u32, br: *BitReader) Failure!u32 {
+fn decodeDistance(slot: u32, br: *BitReader) Failure!u32 {
     if (slot >= dc20) return error.InvalidData;
     var distance: u32 = dist_decode[slot] + 1;
     const table_bits = dist_bits[slot];
@@ -87,10 +87,10 @@ fn distanceDecode(slot: u32, br: *BitReader) Failure!u32 {
 }
 
 // RAR 2.0 audio-mode channel state, reference-exact (DecodeAudio /
-// AudioVariables). The predictor adapts every 32 SAMPLES by scanning an
-// 11-bucket accumulator of absolute prediction differences and nudging
-// exactly ONE coefficient toward the winning hypothesis, with asymmetric
-// clamps ([-17, 16]: the guard is `>= -16` BEFORE decrementing).
+// AudioVariables). The predictor adapts every 32 samples by scanning an
+// 11-bucket accumulator of absolute prediction differences and nudges
+// exactly one coefficient toward the winning bucket, with asymmetric clamps
+// ([-17, 16]: the guard is `>= -16` BEFORE the decrement).
 const AudioChannel = struct {
     k1: i32 = 0,
     k2: i32 = 0,
@@ -106,55 +106,55 @@ const AudioChannel = struct {
     byte_count: u32 = 0,
     last_char: i32 = 0,
 
-    // delta_raw is the Huffman-decoded symbol (0..255). Channel_delta is the
-    // SHARED cross-channel delta (reference UnpChannelDelta).
-    fn decode(self: *AudioChannel, channel_delta: *i32, delta_raw: u32) u8 {
+    // `delta_symbol` is the Huffman-decoded symbol (0..255). The channel
+    // delta is SHARED across channels (reference UnpChannelDelta).
+    fn decode(self: *AudioChannel, channel_delta: *i32, delta_symbol: u32) u8 {
         self.byte_count +%= 1;
         self.d4 = self.d3;
         self.d3 = self.d2;
         self.d2 = self.last_delta -% self.d1;
         self.d1 = self.last_delta;
-        var pch: i32 = 8 *% self.last_char +%
+        var predicted_sample: i32 = 8 *% self.last_char +%
             self.k1 *% self.d1 +% self.k2 *% self.d2 +%
             self.k3 *% self.d3 +% self.k4 *% self.d4 +%
             self.k5 *% channel_delta.*;
-        pch = (pch >> 3) & 0xFF;
+        predicted_sample = (predicted_sample >> 3) & 0xFF;
 
-        const ch: u32 = @as(u32, @bitCast(pch)) -% delta_raw;
+        const sample: u32 = @as(u32, @bitCast(predicted_sample)) -% delta_symbol;
 
-        // D = ((signed char)Delta) << 3, via unsigned per the reference.
-        const d_signed: i32 = @as(i8, @bitCast(@as(u8, @truncate(delta_raw))));
-        const d: i32 = @bitCast(@as(u32, @bitCast(d_signed)) << 3);
+        // The reference's D = ((signed char)Delta) << 3, computed unsigned.
+        const signed_delta: i32 = @as(i8, @bitCast(@as(u8, @truncate(delta_symbol))));
+        const scaled_delta: i32 = @bitCast(@as(u32, @bitCast(signed_delta)) << 3);
 
-        self.dif[0] +%= @abs(d);
-        self.dif[1] +%= @abs(d -% self.d1);
-        self.dif[2] +%= @abs(d +% self.d1);
-        self.dif[3] +%= @abs(d -% self.d2);
-        self.dif[4] +%= @abs(d +% self.d2);
-        self.dif[5] +%= @abs(d -% self.d3);
-        self.dif[6] +%= @abs(d +% self.d3);
-        self.dif[7] +%= @abs(d -% self.d4);
-        self.dif[8] +%= @abs(d +% self.d4);
-        self.dif[9] +%= @abs(d -% channel_delta.*);
-        self.dif[10] +%= @abs(d +% channel_delta.*);
+        self.dif[0] +%= @abs(scaled_delta);
+        self.dif[1] +%= @abs(scaled_delta -% self.d1);
+        self.dif[2] +%= @abs(scaled_delta +% self.d1);
+        self.dif[3] +%= @abs(scaled_delta -% self.d2);
+        self.dif[4] +%= @abs(scaled_delta +% self.d2);
+        self.dif[5] +%= @abs(scaled_delta -% self.d3);
+        self.dif[6] +%= @abs(scaled_delta +% self.d3);
+        self.dif[7] +%= @abs(scaled_delta -% self.d4);
+        self.dif[8] +%= @abs(scaled_delta +% self.d4);
+        self.dif[9] +%= @abs(scaled_delta -% channel_delta.*);
+        self.dif[10] +%= @abs(scaled_delta +% channel_delta.*);
 
-        const new_delta: i32 = @as(i8, @bitCast(@as(u8, @truncate(ch -% @as(u32, @bitCast(self.last_char))))));
+        const new_delta: i32 = @as(i8, @bitCast(@as(u8, @truncate(sample -% @as(u32, @bitCast(self.last_char))))));
         channel_delta.* = new_delta;
         self.last_delta = new_delta;
-        self.last_char = @bitCast(ch);
+        self.last_char = @bitCast(sample);
 
         if ((self.byte_count & 0x1F) == 0) {
             var min_dif: u32 = self.dif[0];
-            var num_min: usize = 0;
+            var min_bucket: usize = 0;
             self.dif[0] = 0;
             for (1..11) |i| {
                 if (self.dif[i] < min_dif) {
                     min_dif = self.dif[i];
-                    num_min = i;
+                    min_bucket = i;
                 }
                 self.dif[i] = 0;
             }
-            switch (num_min) {
+            switch (min_bucket) {
                 1 => if (self.k1 >= -16) {
                     self.k1 -= 1;
                 },
@@ -188,7 +188,7 @@ const AudioChannel = struct {
                 else => {},
             }
         }
-        return @truncate(ch);
+        return @truncate(sample);
     }
 
     fn reset(self: *AudioChannel) void {
@@ -196,16 +196,16 @@ const AudioChannel = struct {
     }
 };
 
-const Unpack20State = struct {
+const Decoder = struct {
     // By value, not by pointer: a solid Session outlives any single file, and
     // the reference restarts bit input per entry (Inp.InitBitInput in
     // UnpInitData, called for solid entries too).
     br: BitReader,
     window: Window,
-    ld: DecodeTable,
-    dd: DecodeTable,
-    rd: DecodeTable,
-    md: [max_audio_channels]DecodeTable,
+    literal_table: DecodeTable,
+    distance_table: DecodeTable,
+    length_table: DecodeTable,
+    audio_tables: [max_audio_channels]DecodeTable,
     // Reference OldDist, a CIRCULAR buffer of the last four match distances,
     // with old_dist_ptr as the write cursor.
     old_dist: [4]u32,
@@ -230,7 +230,7 @@ const Unpack20State = struct {
     table_pool: []u16,
 
     fn init(
-        st: *Unpack20State,
+        st: *Decoder,
         window_buffer: []u8,
         table_pool: []u16,
     ) Failure!void {
@@ -238,10 +238,10 @@ const Unpack20State = struct {
         st.* = .{
             .br = undefined,
             .window = Window.init(window_buffer),
-            .ld = .{},
-            .dd = .{},
-            .rd = .{},
-            .md = @splat(.{}),
+            .literal_table = .{},
+            .distance_table = .{},
+            .length_table = .{},
+            .audio_tables = @splat(.{}),
             .old_dist = [_]u32{ 0, 0, 0, 0 },
             .old_dist_ptr = 0,
             .last_distance = 0,
@@ -262,15 +262,15 @@ const Unpack20State = struct {
         };
     }
 
-    fn freeTables(st: *Unpack20State) void {
-        st.ld = .{};
-        st.dd = .{};
-        st.rd = .{};
-        st.md = @splat(.{});
+    fn freeTables(st: *Decoder) void {
+        st.literal_table = .{};
+        st.distance_table = .{};
+        st.length_table = .{};
+        st.audio_tables = @splat(.{});
     }
 };
 
-fn ldPool(st: *Unpack20State, index: usize, comptime size: usize) []u16 {
+fn tablePoolSlice(st: *Decoder, index: usize, comptime size: usize) []u16 {
     var offset: usize = 0;
     var i: usize = 0;
     while (i < index) : (i += 1) {
@@ -284,7 +284,7 @@ fn ldPool(st: *Unpack20State, index: usize, comptime size: usize) []u16 {
     return st.table_pool[offset..][0..size];
 }
 
-fn readTables(st: *Unpack20State) Failure!void {
+fn readTables(st: *Decoder) Failure!void {
     const br = &st.br;
 
     // NO byte alignment here. V20's ReadTables20 goes straight to getbits(),
@@ -314,56 +314,56 @@ fn readTables(st: *Unpack20State) Failure!void {
 
     // The 19 code-length-alphabet lengths, 4 bits each. Unlike v29, v20 has
     // NO length-15 escape here (readCodeLengthTable with escapes=false).
-    var bc_table = try huffman.readCodeLengthTable(br, bc20, false, ldPool(st, 0, bc20));
+    var code_length_table = try huffman.readCodeLengthTable(br, bc20, false, tablePoolSlice(st, 0, bc20));
 
-    // 4-bit DELTAs against the previous block's table (why old_table must
+    // 4-bit DELTAs against the previous block's lengths (why old_table must
     // persist). V20's escape mapping is its own, do not copy v29's. 16
     // repeats 3+read(2), 17 zeros 3+read(3), 18/19 zeros 11+read(7).
-    var table: [old_table_size]u8 = @splat(0);
+    var code_lengths: [old_table_size]u8 = @splat(0);
     var i: u16 = 0;
     while (i < table_size) {
-        const sym = try huffman.decodeNumber(br, &bc_table);
-        if (sym < 16) {
-            table[i] = @intCast((sym + st.old_table[i]) & 0x0f);
+        const symbol = try huffman.decodeNumber(br, &code_length_table);
+        if (symbol < 16) {
+            code_lengths[i] = @intCast((symbol + st.old_table[i]) & 0x0f);
             i += 1;
-        } else if (sym == 16) {
+        } else if (symbol == 16) {
             if (i == 0) return error.InvalidData; // nothing to repeat
-            var n: u32 = 3 + try br.readBits(2);
-            while (n > 0 and i < table_size) : (n -= 1) {
-                table[i] = table[i - 1];
+            var repeat_count: u32 = 3 + try br.readBits(2);
+            while (repeat_count > 0 and i < table_size) : (repeat_count -= 1) {
+                code_lengths[i] = code_lengths[i - 1];
                 i += 1;
             }
         } else {
-            var n: u32 = if (sym == 17)
+            var repeat_count: u32 = if (symbol == 17)
                 3 + try br.readBits(3)
             else
                 11 + try br.readBits(7);
-            while (n > 0 and i < table_size) : (n -= 1) {
-                table[i] = 0;
+            while (repeat_count > 0 and i < table_size) : (repeat_count -= 1) {
+                code_lengths[i] = 0;
                 i += 1;
             }
         }
     }
 
     if (st.audio_block) {
-        st.md = @splat(.{});
-        for (0..st.audio_channels) |ch| {
-            const off = ch * mc20;
-            st.md[ch] = try huffman.makeDecodeTables(table[off .. off + mc20], ldPool(st, 3 + ch, mc20));
+        st.audio_tables = @splat(.{});
+        for (0..st.audio_channels) |channel| {
+            const offset = channel * mc20;
+            st.audio_tables[channel] = try huffman.makeDecodeTables(code_lengths[offset .. offset + mc20], tablePoolSlice(st, 3 + channel, mc20));
         }
     } else {
-        st.ld = try huffman.makeDecodeTables(table[0..nc20], ldPool(st, 0, nc20));
-        st.dd = try huffman.makeDecodeTables(table[nc20 .. nc20 + dc20], ldPool(st, 1, dc20));
-        st.rd = try huffman.makeDecodeTables(table[nc20 + dc20 .. nc20 + dc20 + rc20], ldPool(st, 2, rc20));
+        st.literal_table = try huffman.makeDecodeTables(code_lengths[0..nc20], tablePoolSlice(st, 0, nc20));
+        st.distance_table = try huffman.makeDecodeTables(code_lengths[nc20 .. nc20 + dc20], tablePoolSlice(st, 1, dc20));
+        st.length_table = try huffman.makeDecodeTables(code_lengths[nc20 + dc20 .. nc20 + dc20 + rc20], tablePoolSlice(st, 2, rc20));
     }
 
-    @memcpy(st.old_table[0..table_size], table[0..table_size]);
+    @memcpy(st.old_table[0..table_size], code_lengths[0..table_size]);
 
     st.tables_loaded = true;
 }
 
-fn decodeLength(br: *BitReader, rd: *const DecodeTable) Failure!u32 {
-    const slot = try huffman.decodeNumber(br, rd);
+fn decodeLength(br: *BitReader, length_table: *const DecodeTable) Failure!u32 {
+    const slot = try huffman.decodeNumber(br, length_table);
     if (slot >= rc20) return error.InvalidData;
 
     const base = length_bases[slot] + length_rep_base;
@@ -378,7 +378,7 @@ fn decodeLength(br: *BitReader, rd: *const DecodeTable) Failure!u32 {
 // VM filters. Its multimedia mode is an inline decode path, not a
 // post-transform over a finished region, so unlike unpack29 there is nothing
 // that needs to reach backwards, and no reserve is held back.
-fn flushDecoded(st: *Unpack20State, keep: usize) Failure!void {
+fn flushDecoded(st: *Decoder, keep: usize) Failure!void {
     const out = st.stream_out orelse return;
     const produced = st.window.write_pos - st.entry_start;
     const emit_upto = @min(produced -| keep, st.unpacked_size);
@@ -393,11 +393,11 @@ fn flushDecoded(st: *Unpack20State, keep: usize) Failure!void {
 
 // How much may accumulate unflushed before the window wraps over it. Half the
 // window keeps the emit cheap while leaving ample slack for a long match.
-fn flushThreshold(st: *const Unpack20State) usize {
+fn flushThreshold(st: *const Decoder) usize {
     return st.window.buffer.len / 2;
 }
 
-fn unpackLoop(st: *Unpack20State) Failure!void {
+fn unpackLoop(st: *Decoder) Failure!void {
     while (st.written_size < st.unpacked_size) {
         if (!st.tables_loaded) {
             try readTables(st);
@@ -411,7 +411,7 @@ fn unpackLoop(st: *Unpack20State) Failure!void {
     }
 }
 
-fn unpackAudioBlock(st: *Unpack20State) Failure!void {
+fn unpackAudioBlock(st: *Decoder) Failure!void {
     const br = &st.br;
 
     while (st.written_size < st.unpacked_size) {
@@ -422,15 +422,15 @@ fn unpackAudioBlock(st: *Unpack20State) Failure!void {
         }
         if (br.remainingBits() < 1) return error.InvalidData;
 
-        const ch = st.cur_channel;
-        const sym = try huffman.decodeNumber(br, &st.md[ch]);
+        const channel = st.cur_channel;
+        const symbol = try huffman.decodeNumber(br, &st.audio_tables[channel]);
 
-        if (sym == 256) {
+        if (symbol == 256) {
             st.tables_loaded = false;
             return;
         }
 
-        const decoded_byte = st.audio_state[ch].decode(&st.channel_delta, sym & 0xFF);
+        const decoded_byte = st.audio_state[channel].decode(&st.channel_delta, symbol & 0xFF);
         st.window.putByte(decoded_byte);
         st.written_size += 1;
 
@@ -438,7 +438,7 @@ fn unpackAudioBlock(st: *Unpack20State) Failure!void {
     }
 }
 
-fn unpackLzBlock(st: *Unpack20State) Failure!void {
+fn unpackLzBlock(st: *Decoder) Failure!void {
     const br = &st.br;
 
     while (st.written_size < st.unpacked_size) {
@@ -449,12 +449,12 @@ fn unpackLzBlock(st: *Unpack20State) Failure!void {
         }
         if (br.remainingBits() < 1) return error.InvalidData;
 
-        const sym = try huffman.decodeNumber(br, &st.ld);
+        const symbol = try huffman.decodeNumber(br, &st.literal_table);
 
-        if (sym < 256) {
-            st.window.putByte(@intCast(sym));
+        if (symbol < 256) {
+            st.window.putByte(@intCast(symbol));
             st.written_size += 1;
-        } else if (sym == 256) {
+        } else if (symbol == 256) {
             if (st.last_distance == 0 or st.last_length == 0) {
                 continue; // no previous match to repeat
             }
@@ -466,14 +466,14 @@ fn unpackLzBlock(st: *Unpack20State) Failure!void {
             st.old_dist_ptr = (st.old_dist_ptr +% 1) & 3;
             st.window.copyMatch(st.last_distance, st.last_length);
             st.written_size += st.last_length;
-        } else if (sym >= 257 and sym <= 260) {
-            const dist_idx: u32 = sym - 257;
+        } else if (symbol >= 257 and symbol <= 260) {
+            const dist_idx: u32 = symbol - 257;
 
             // Count back from the write cursor: OldDist[(ptr - (dist_idx+1))
             // & 3]. V20 never rotates. The next match push advances the cursor.
             const dist = st.old_dist[(st.old_dist_ptr -% (dist_idx + 1)) & 3];
 
-            var length = try decodeLength(br, &st.rd);
+            var length = try decodeLength(br, &st.length_table);
 
             // v20's rep bonus starts a tier lower than v29's: +1 past 0x101,
             // then +1 past 0x2000, +1 past 0x40000.
@@ -493,8 +493,8 @@ fn unpackLzBlock(st: *Unpack20State) Failure!void {
             st.last_length = length;
             st.window.copyMatch(dist, length);
             st.written_size += length;
-        } else if (sym >= 261 and sym <= 268) {
-            const short_idx: u32 = sym - 261;
+        } else if (symbol >= 261 and symbol <= 268) {
+            const short_idx: u32 = symbol - 261;
             var dist = short_distances[short_idx] + 1;
             const sd_bits = short_distance_bits[short_idx];
             if (sd_bits > 0) dist += try br.readBits(sd_bits);
@@ -506,11 +506,11 @@ fn unpackLzBlock(st: *Unpack20State) Failure!void {
             st.last_length = 2;
             st.window.copyMatch(dist, 2);
             st.written_size += 2;
-        } else if (sym == 269) {
+        } else if (symbol == 269) {
             st.tables_loaded = false;
             return; // main loop re-reads tables
-        } else if (sym >= 270) {
-            const length_slot: u32 = sym - 270;
+        } else if (symbol >= 270) {
+            const length_slot: u32 = symbol - 270;
             if (length_slot >= rc20) return error.InvalidData;
 
             var length: u32 = blk: {
@@ -522,8 +522,8 @@ fn unpackLzBlock(st: *Unpack20State) Failure!void {
                 break :blk base;
             };
 
-            const dist_sym = try huffman.decodeNumber(br, &st.dd);
-            const dist = try distanceDecode(dist_sym, br);
+            const dist_sym = try huffman.decodeNumber(br, &st.distance_table);
+            const dist = try decodeDistance(dist_sym, br);
 
             // Distance-dependent length bonus, reference: if (Distance>=0x2000)
             // { Length++. If (Distance>=0x40000) Length++. }.
@@ -545,17 +545,17 @@ fn unpackLzBlock(st: *Unpack20State) Failure!void {
     }
 }
 
-pub const State = Unpack20State;
+pub const State = Decoder;
 
 pub const Session = struct {
-    state: *Unpack20State,
+    state: *Decoder,
 
     pub fn init(
-        st: *Unpack20State,
+        st: *Decoder,
         window_buffer: []u8,
         table_pool: []u16,
     ) Failure!Session {
-        try Unpack20State.init(st, window_buffer, table_pool);
+        try Decoder.init(st, window_buffer, table_pool);
         return .{ .state = st };
     }
 
@@ -653,10 +653,10 @@ test "v20 tables match the reference verbatim" {
 test "v20 distance decode for small slots" {
     const dummy = [_]u8{0xFF};
     var br = BitReader.init(&dummy);
-    try std.testing.expectEqual(@as(u32, 1), try distanceDecode(0, &br));
-    try std.testing.expectEqual(@as(u32, 2), try distanceDecode(1, &br));
-    try std.testing.expectEqual(@as(u32, 3), try distanceDecode(2, &br));
-    try std.testing.expectEqual(@as(u32, 4), try distanceDecode(3, &br));
+    try std.testing.expectEqual(@as(u32, 1), try decodeDistance(0, &br));
+    try std.testing.expectEqual(@as(u32, 2), try decodeDistance(1, &br));
+    try std.testing.expectEqual(@as(u32, 3), try decodeDistance(2, &br));
+    try std.testing.expectEqual(@as(u32, 4), try decodeDistance(3, &br));
 }
 
 test "audio decode traces the reference for the first samples" {
@@ -685,7 +685,7 @@ test "audio adaptation fires every 32 samples and clamps at [-17, 16]" {
 }
 
 test "old-distance ring: rep matches count back and every match pushes" {
-    var st: Unpack20State = undefined;
+    var st: Decoder = undefined;
     var window_buf: [64]u8 = undefined;
     var pool: [table_pool_words]u16 = undefined;
     var session = try Session.init(&st, &window_buf, &pool);
@@ -695,7 +695,6 @@ test "old-distance ring: rep matches count back and every match pushes" {
     // Symbol 257 (rep idx 0) reads OldDist[(ptr - 1) & 3] = OldDist[3].
     const dist = st.old_dist[(st.old_dist_ptr -% (0 + 1)) & 3];
     try std.testing.expectEqual(@as(u32, 40), dist);
-    // Then pushes the used distance at the cursor.
     st.old_dist[st.old_dist_ptr] = dist;
     st.old_dist_ptr = (st.old_dist_ptr +% 1) & 3;
     try std.testing.expectEqual(@as(u32, 40), st.old_dist[0]);

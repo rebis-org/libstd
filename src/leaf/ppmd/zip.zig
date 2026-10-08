@@ -1168,7 +1168,7 @@ const Model = struct {
         self.nextContext();
     }
 
-    fn update1_0(self: *Model) void {
+    fn update1To0(self: *Model) void {
         const s = self.state(self.found_state);
         const min_ctx = self.ctx(self.min_context);
         const freq: u32 = s.freq;
@@ -1214,7 +1214,7 @@ const Model = struct {
                 const symbol = s[0].symbol;
                 try rc.decodeFinal(0, s[0].freq);
                 self.found_state = self.ref(s);
-                self.update1_0();
+                self.update1To0();
                 return symbol;
             }
             self.prev_success = 0;
@@ -1335,7 +1335,7 @@ const Model = struct {
             if (s[0].symbol == symbol) {
                 try rc.encodeFinal(0, s[0].freq, summ_freq);
                 self.found_state = self.ref(s);
-                self.update1_0();
+                self.update1To0();
                 return;
             }
             self.prev_success = 0;

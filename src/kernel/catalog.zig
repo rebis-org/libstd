@@ -10,7 +10,7 @@ pub const Descriptor = vocabulary.Descriptor;
 
 const all_capabilities = vocabulary.resource_capability_bit_read | vocabulary.resource_capability_bit_write | vocabulary.resource_capability_bit_size | vocabulary.resource_capability_bit_replay | vocabulary.resource_capability_bit_seek | vocabulary.resource_capability_bit_range;
 const archive_capabilities = vocabulary.resource_capability_bit_read | vocabulary.resource_capability_bit_write | vocabulary.resource_capability_bit_size | vocabulary.resource_capability_bit_replay;
-const commands_masks = vocabulary.command_mask_query | vocabulary.command_mask_read | vocabulary.command_mask_write;
+const all_commands_mask = vocabulary.command_mask_query | vocabulary.command_mask_read | vocabulary.command_mask_write;
 const read_write_mask = vocabulary.command_mask_read | vocabulary.command_mask_write;
 const query_read_mask = vocabulary.command_mask_query | vocabulary.command_mask_read;
 
@@ -28,25 +28,22 @@ pub const ProfileRow = struct {
 pub const fixture_rows = [_]ProfileRow{
     .{ .id = vocabulary.ids.test_echo, .name = "test_echo", .command_mask = read_write_mask, .capability_mask = all_capabilities, .sizing = .metadata_exact, .commit = .confirmed },
     .{ .id = vocabulary.ids.test_read, .name = "test_read", .command_mask = query_read_mask, .capability_mask = all_capabilities, .sizing = .metadata_exact, .commit = .confirmed },
-    .{ .id = vocabulary.ids.crypto, .name = "crypto", .command_mask = commands_masks, .capability_mask = archive_capabilities, .sizing = .metadata_exact, .commit = .confirmed },
+    .{ .id = vocabulary.ids.crypto, .name = "crypto", .command_mask = all_commands_mask, .capability_mask = archive_capabilities, .sizing = .metadata_exact, .commit = .confirmed },
 };
-
-fn idEqual(left: EnvelopeId, right: EnvelopeId) bool {
-    return left.low == right.low and left.high == right.high;
-}
 
 pub fn descriptorFor(id: EnvelopeId) ?*const Descriptor {
     inline for (&vocabulary.protocol_rows) |*row| {
-        if (idEqual(id, row.id)) return row;
+        if (vocabulary.idEqual(id, row.id)) return row;
     }
     inline for (&profile_descriptors) |*descriptor| {
-        if (idEqual(id, descriptor.id)) return descriptor;
+        if (vocabulary.idEqual(id, descriptor.id)) return descriptor;
     }
     return null;
 }
 
-pub fn knownId(id: EnvelopeId) bool {
-    if (id.low == 0 and id.high == 0) return true;
+// An all-zero id means "no component requested", so it passes as known.
+pub fn isKnownId(id: EnvelopeId) bool {
+    if (vocabulary.idIsZero(id)) return true;
     return descriptorFor(id) != null;
 }
 
@@ -151,8 +148,8 @@ comptime {
     };
     for (frozen_identities) |frozen| {
         const component = discovery.findByName(frozen.name) orelse
-            @compileError("released component descriptor missing: " ++ frozen.name);
+            @compileError("Released component has no descriptor: " ++ frozen.name ++ ".");
         if (component.id.low != frozen.low or component.id.high != frozen.high)
-            @compileError("released component id drifted: " ++ frozen.name);
+            @compileError("Released component id drifted: " ++ frozen.name ++ ".");
     }
 }

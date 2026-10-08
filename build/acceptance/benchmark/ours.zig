@@ -147,7 +147,7 @@ fn bypassTransform(env: *env_mod.Env, row: matrix.Row, input: []const u8, encode
     kernel_row.bypass = false;
     const kernel = transform(env, kernel_row, input, kernel_encoded, kernel_decoded, workspace);
     if (!kernel.ok) {
-        std.debug.print("bypass {s}: kernel reference failed\n", .{row.name});
+        std.debug.print("bypass {s}: the kernel reference failed\n", .{row.name});
         return .{ .ok = false };
     }
 
@@ -170,7 +170,7 @@ fn bypassTransform(env: *env_mod.Env, row: matrix.Row, input: []const u8, encode
         std.mem.eql(u8, encoded[0..encoded_size], kernel_encoded[0..kernel.encoded]) and
         decoded_size == input.len and
         std.mem.eql(u8, decoded[0..decoded_size], kernel_decoded[0..input.len]);
-    if (!identical) std.debug.print("bypass {s}: kernel/bypass bytes differ (enc {d}/{d} dec {d}/{d})\n", .{ row.name, encoded_size, kernel.encoded, decoded_size, input.len });
+    if (!identical) std.debug.print("bypass {s}: kernel and bypass bytes differ (encoded {d}/{d}, decoded {d}/{d})\n", .{ row.name, encoded_size, kernel.encoded, decoded_size, input.len });
     return .{ .encode_ns = t1 - t0, .decode_ns = t2 - t1, .encoded = encoded_size, .ok = identical };
 }
 

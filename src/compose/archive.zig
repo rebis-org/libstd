@@ -123,20 +123,20 @@ pub fn tarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
             comptime discovery.parameter("tar", "ordinal").ordinal,
         ));
         const archive = try materializeArchive(source_resource, &workspace, limits);
-        const info = try tar.tarInspectOrdinal(archive, ordinal);
-        const size = std.math.cast(usize, info.size) orelse return error.ResourceLimit;
+        const entry = try tar.tarInspectOrdinal(archive, ordinal);
+        const size = std.math.cast(usize, entry.size) orelse return error.ResourceLimit;
         if (size > limits.decoded_bytes) return error.ResourceLimit;
         try common.requireSinkCapacity(sink_resource, call, size);
         if (sink_resource.kind == .direct_write) {
             const output = try common.sinkDirectBuffer(sink_resource, size);
             _ = try tar.tarDecodeOrdinal(archive, ordinal, output);
         } else {
-            if (info.sparse != null) {
+            if (entry.sparse != null) {
                 const staged = try workspace.take(u8, size);
                 _ = try tar.tarDecodeOrdinal(archive, ordinal, staged);
                 try common.commitBytesToSink(sink_resource, call, staged);
             } else {
-                const data = try bounds.slice(archive, info.data_offset, info.size);
+                const data = try bounds.slice(archive, entry.data_offset, entry.size);
                 try common.commitBytesToSink(sink_resource, call, data);
             }
         }
@@ -188,12 +188,12 @@ pub fn zipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
             comptime discovery.parameter("tar", "ordinal").ordinal,
         ));
         const archive = try materializeArchive(source_resource, &workspace, limits);
-        const info = try zip.zipInspectOrdinal(archive, ordinal);
-        const history = try workspace.take(u8, if (info.actual_method == 9) zip.deflate64_decode_history_size else zip.deflate_history_size);
-        const size = info.uncompressed_size;
+        const entry = try zip.zipInspectOrdinal(archive, ordinal);
+        const history = try workspace.take(u8, if (entry.actual_method == 9) zip.deflate64_decode_history_size else zip.deflate_history_size);
+        const size = entry.uncompressed_size;
         if (size > limits.decoded_bytes) return error.ResourceLimit;
         try common.requireSinkCapacity(sink_resource, call, size);
-        const decrypt_staging = if (info.encrypted) try workspace.take(u8, info.compressed_size) else @as([]u8, &.{});
+        const decrypt_staging = if (entry.encrypted) try workspace.take(u8, entry.compressed_size) else @as([]u8, &.{});
         const callback_staging = if (sink_resource.kind == .callback_write) try workspace.take(u8, size) else @as([]u8, &.{});
         const scratch = try workspace.take(u8, workspace.remaining());
         const decode_options: zip.ZipDecodeOptions = .{
@@ -304,9 +304,9 @@ fn sevenZipGeneric(comptime coded: bool, plan: *common.ExecutionPlan, source: ?*
             comptime discovery.parameter("tar", "ordinal").ordinal,
         ));
         const archive = try common.materializeSource(.replay, source_resource, &workspace, limits.encoded_bytes);
-        const info = try seven_zip.sevenZipInspectOrdinal(archive, &workspace, limits, ordinal);
-        if (!coded and info.method != .copy) return error.Unsupported;
-        const size = std.math.cast(usize, info.size) orelse return error.ResourceLimit;
+        const entry = try seven_zip.sevenZipInspectOrdinal(archive, &workspace, limits, ordinal);
+        if (!coded and entry.method != .copy) return error.Unsupported;
+        const size = std.math.cast(usize, entry.size) orelse return error.ResourceLimit;
         if (size > limits.decoded_bytes) return error.ResourceLimit;
         try common.requireSinkCapacity(sink_resource, call, size);
         const decode_options: seven_zip.SevenZipDecodeOptions = .{
@@ -445,7 +445,7 @@ pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
         if (sink == null) {
             try common.checkSourceWorkspaceOverlap(call, source_resource);
             const archive = try materializeArchive(source_resource, &workspace, limits);
-            // -hp walks need decrypted-header staging capped by the archive.
+            // Archives with encrypted headers (-hp) need decrypted-header staging, capped by the archive size.
             const header_scratch = if (decrypting) try workspace.take(u8, @min(@as(usize, rar_header_scratch_size), archive.len + 16)) else try workspace.take(u8, 0);
             const count = try rar.rarInspectCountOpts(archive, limits.entries, .{
                 .password = if (crypto_params) |params| params.password else null,
@@ -475,8 +475,8 @@ pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
             .password = if (crypto_params) |params| params.password else null,
             .scratch = header_scratch,
         };
-        const info = try rar.rarInspectOrdinalOpts(archive, ordinal, limits.entries, decode_opts);
-        const size = std.math.cast(usize, info.size) orelse return error.ResourceLimit;
+        const entry = try rar.rarInspectOrdinalOpts(archive, ordinal, limits.entries, decode_opts);
+        const size = std.math.cast(usize, entry.size) orelse return error.ResourceLimit;
         if (size > limits.decoded_bytes) return error.ResourceLimit;
         try common.requireSinkCapacity(sink_resource, call, size);
 
@@ -484,7 +484,7 @@ pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
         // entries carve nothing. The PPMd heap is whatever workspace remains:
         // the stream names its model size at decode time and is refused
         // cleanly if the pool cannot hold it.
-        const window_len = std.math.cast(usize, info.window_bytes) orelse return error.ResourceLimit;
+        const window_len = std.math.cast(usize, entry.window_bytes) orelse return error.ResourceLimit;
         var bufs: rar.DecodeBuffers = .{
             .state = &.{},
             .window = &.{},
@@ -495,7 +495,7 @@ pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
             .ppm_heap = &.{},
             .packed_stage = packed_stage,
         };
-        if (info.method != 0) {
+        if (entry.method != 0) {
             const state_words = try workspace.take(u64, (rar.max_state_bytes + 7) / 8);
             const window_buf = try workspace.take(u8, window_len);
             const table_pool = try workspace.take(u16, rar.table_pool_words);
@@ -531,7 +531,7 @@ pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
         var packed_total: usize = 0;
         for (entries) |entry| {
             max_input = @max(max_input, entry.data.len);
-            packed_total = try bounds.add(packed_total, rar_writer.packedBound(entry));
+            packed_total = try bounds.addUsize(packed_total, rar_writer.packedBound(entry));
         }
         const sizes = rar_writer.pack50Sizes(max_input);
         const hash = try workspace.take(u32, sizes.hash_words);

@@ -44,20 +44,20 @@ fn medianValue(comptime T: type, allocator: std.mem.Allocator, values: []const T
     defer allocator.free(sorted);
     @memcpy(sorted, values);
     std.mem.sort(T, sorted, {}, comptime std.sort.asc(T));
-    const med0 = medianOfSorted(T, sorted);
-    if (med0 == 0) return med0;
-    const fmed: f64 = @floatFromInt(med0);
-    var keep: usize = 0;
-    for (sorted) |v| {
-        const fv: f64 = @floatFromInt(v);
-        const delta = if (fv > fmed) fv - fmed else fmed - fv;
-        if (delta / fmed <= 0.05) {
-            sorted[keep] = v;
-            keep += 1;
+    const full_median = medianOfSorted(T, sorted);
+    if (full_median == 0) return full_median;
+    const full_median_f64: f64 = @floatFromInt(full_median);
+    var kept: usize = 0;
+    for (sorted) |value| {
+        const value_f64: f64 = @floatFromInt(value);
+        const delta = if (value_f64 > full_median_f64) value_f64 - full_median_f64 else full_median_f64 - value_f64;
+        if (delta / full_median_f64 <= 0.05) {
+            sorted[kept] = value;
+            kept += 1;
         }
     }
-    if (keep == 0) return med0;
-    return medianOfSorted(T, sorted[0..keep]);
+    if (kept == 0) return full_median;
+    return medianOfSorted(T, sorted[0..kept]);
 }
 
 pub fn medianTotals(allocator: std.mem.Allocator, runs: []const Totals, skip: usize) !Totals {
@@ -74,13 +74,13 @@ pub fn medianTotals(allocator: std.mem.Allocator, runs: []const Totals, skip: us
         encode_ns_values.clearRetainingCapacity();
         decode_ns_values.clearRetainingCapacity();
         var all_ok = true;
-        var any = false;
-        for (runs[skip..]) |r| {
-            if (r.ok[side]) {
-                any = true;
-                try enc_values.append(allocator, r.encoded[side]);
-                try encode_ns_values.append(allocator, r.encode_ns[side]);
-                try decode_ns_values.append(allocator, r.decode_ns[side]);
+        var any_ok = false;
+        for (runs[skip..]) |run| {
+            if (run.ok[side]) {
+                any_ok = true;
+                try enc_values.append(allocator, run.encoded[side]);
+                try encode_ns_values.append(allocator, run.encode_ns[side]);
+                try decode_ns_values.append(allocator, run.decode_ns[side]);
             } else {
                 all_ok = false;
             }
@@ -88,7 +88,7 @@ pub fn medianTotals(allocator: std.mem.Allocator, runs: []const Totals, skip: us
         result.encoded[side] = if (enc_values.items.len > 0) try medianValue(usize, allocator, enc_values.items) else 0;
         result.encode_ns[side] = if (encode_ns_values.items.len > 0) try medianValue(u64, allocator, encode_ns_values.items) else 0;
         result.decode_ns[side] = if (decode_ns_values.items.len > 0) try medianValue(u64, allocator, decode_ns_values.items) else 0;
-        result.ok[side] = all_ok and any;
+        result.ok[side] = all_ok and any_ok;
     }
     return result;
 }

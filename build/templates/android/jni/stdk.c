@@ -29,12 +29,12 @@ extern uint32_t stdk_session_destroy(void* session);
 
 // The string materialization pairs collapse into one helper so the release
 // path cannot drift from the acquire path.
-static const char* utf8(JNIEnv* env, jstring value) {
+static const char* acquireUtf8(JNIEnv* env, jstring value) {
     // GetStringUTFChars returns NULL on JVM out-of-memory.
     return value == NULL ? NULL : (*env)->GetStringUTFChars(env, value, NULL);
 }
 
-static void utf8_done(JNIEnv* env, jstring value, const char* chars) {
+static void releaseUtf8(JNIEnv* env, jstring value, const char* chars) {
     if (chars != NULL) {
         (*env)->ReleaseStringUTFChars(env, value, chars);
     }
@@ -42,16 +42,16 @@ static void utf8_done(JNIEnv* env, jstring value, const char* chars) {
 
 JNIEXPORT jlong JNICALL Java_dev_stdk_StdK_sessionStorage(JNIEnv* env, jclass cls, jstring component, jstring verb) {
     (void) cls;
-    const char* component_chars = utf8(env, component);
-    const char* verb_chars = utf8(env, verb);
+    const char* component_chars = acquireUtf8(env, component);
+    const char* verb_chars = acquireUtf8(env, verb);
     if (component_chars == NULL || verb_chars == NULL) {
-        utf8_done(env, component, component_chars);
-        utf8_done(env, verb, verb_chars);
+        releaseUtf8(env, component, component_chars);
+        releaseUtf8(env, verb, verb_chars);
         return 0;
     }
     jlong storage = (jlong) stdk_session_storage(component_chars, verb_chars);
-    utf8_done(env, component, component_chars);
-    utf8_done(env, verb, verb_chars);
+    releaseUtf8(env, component, component_chars);
+    releaseUtf8(env, verb, verb_chars);
     return storage;
 }
 
@@ -64,23 +64,23 @@ JNIEXPORT jlong JNICALL Java_dev_stdk_StdK_sessionCreate(JNIEnv* env,
                                                          jlong max_work,
                                                          jlong max_entries) {
     (void) cls;
-    const char* component_chars = utf8(env, component);
-    const char* verb_chars = utf8(env, verb);
+    const char* component_chars = acquireUtf8(env, component);
+    const char* verb_chars = acquireUtf8(env, verb);
     if (component_chars == NULL || verb_chars == NULL) {
-        utf8_done(env, component, component_chars);
-        utf8_done(env, verb, verb_chars);
+        releaseUtf8(env, component, component_chars);
+        releaseUtf8(env, verb, verb_chars);
         return 0;
     }
     uint64_t storage_len = stdk_session_storage(component_chars, verb_chars);
     if (storage_len == 0) {
-        utf8_done(env, component, component_chars);
-        utf8_done(env, verb, verb_chars);
+        releaseUtf8(env, component, component_chars);
+        releaseUtf8(env, verb, verb_chars);
         return 0;
     }
     void* storage = malloc(storage_len);
     if (storage == NULL) {
-        utf8_done(env, component, component_chars);
-        utf8_done(env, verb, verb_chars);
+        releaseUtf8(env, component, component_chars);
+        releaseUtf8(env, verb, verb_chars);
         return 0;
     }
     uint32_t rc = stdk_session_bounded(component_chars,
@@ -91,8 +91,8 @@ JNIEXPORT jlong JNICALL Java_dev_stdk_StdK_sessionCreate(JNIEnv* env,
                                        (uint64_t) max_decoded,
                                        (uint64_t) max_work,
                                        (uint64_t) max_entries);
-    utf8_done(env, component, component_chars);
-    utf8_done(env, verb, verb_chars);
+    releaseUtf8(env, component, component_chars);
+    releaseUtf8(env, verb, verb_chars);
     if (rc != 0) {
         free(storage);
         return 0;

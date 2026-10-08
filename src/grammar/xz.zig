@@ -49,7 +49,7 @@ pub const Options = struct {
     match_finder: lzma.MatchFinder = .bt4,
 };
 
-// Single stream/block overhead fits the constant. 1:1 filters add no bytes.
+// One stream and one block fit the constant, and 1:1 filters add no bytes.
 pub fn encodedSizeBound(input_len: usize) usize {
     return lzma2.encodedSizeBound(input_len) +| 128;
 }
@@ -74,7 +74,7 @@ pub fn decodedSize(input: []const u8, scratch: []u8) Failure!usize {
     if (try scanStreamSize(input)) |size| return size;
     var counter = measurement.Counter.init(null);
     var sink = Sink{ .writer = &counter.writer, .buffer = null };
-    try decodeInternal(input, &sink, scratch);
+    try decodeOutOfPlace(input, &sink, scratch);
     return std.math.cast(usize, counter.written()) orelse error.ResourceLimit;
 }
 
@@ -83,12 +83,12 @@ fn scanStreamSize(input: []const u8) Failure!?usize {
     var total: u64 = 0;
     while (cursor.remaining() > 0) {
         const check = try decodeStreamHeader(&cursor);
-        // records backing is written during parse and read only below len, so undefined init is safe.
+        // Append writes every backing slot and reads only below len, so undefined init is safe.
         var records: IndexRecordList = .{ .records = undefined };
         while (cursor.remaining() > 0 and cursor.buffer[cursor.pos] != 0x00) {
-            const info = try decodeBlockHeader(&cursor);
-            const uncompressed_size = info.uncompressed_size orelse return null;
-            const compressed_size = if (info.compressed_size) |size|
+            const block_header = try decodeBlockHeader(&cursor);
+            const uncompressed_size = block_header.uncompressed_size orelse return null;
+            const compressed_size = if (block_header.compressed_size) |size|
                 size
             else blk: {
                 const data_start = cursor.pos;
@@ -113,7 +113,7 @@ fn scanStreamSize(input: []const u8) Failure!?usize {
             };
             try cursor.advance(blockPadding(compressed_size));
             try cursor.advance(checkSize(check));
-            const unpadded_size = try bounds.add(info.header_size, try bounds.add(compressed_size, checkSize(check)));
+            const unpadded_size = try bounds.addUsize(block_header.header_size, try bounds.addUsize(compressed_size, checkSize(check)));
             try records.append(.{
                 .unpadded_size = std.math.cast(u64, unpadded_size) orelse return error.ResourceLimit,
                 .uncompressed_size = @as(u64, uncompressed_size),
@@ -131,13 +131,13 @@ fn scanStreamSize(input: []const u8) Failure!?usize {
 
 pub fn decode(input: []const u8, output: []u8, scratch: []u8) Failure!usize {
     var sink = Sink{ .writer = null, .buffer = output };
-    try decodeInternal(input, &sink, scratch);
+    try decodeOutOfPlace(input, &sink, scratch);
     return sink.offset;
 }
 
 pub fn decodeInPlace(input: []const u8, output: []u8, scratch: []u8) Failure!usize {
     var sink = Sink{ .writer = null, .buffer = output };
-    try decodeInternalImpl(input, &sink, scratch, true);
+    try decodeStreams(input, &sink, scratch, true);
     return sink.offset;
 }
 
@@ -162,15 +162,15 @@ const Sink = struct {
     }
 };
 
-fn decodeInternal(input: []const u8, sink: *Sink, scratch: []u8) Failure!void {
-    try decodeInternalImpl(input, sink, scratch, false);
+fn decodeOutOfPlace(input: []const u8, sink: *Sink, scratch: []u8) Failure!void {
+    try decodeStreams(input, sink, scratch, false);
 }
 
-fn decodeInternalImpl(input: []const u8, sink: *Sink, scratch: []u8, in_place: bool) Failure!void {
+fn decodeStreams(input: []const u8, sink: *Sink, scratch: []u8, in_place: bool) Failure!void {
     var cursor = binary.ReadCursor.init(input);
     while (cursor.remaining() > 0) {
         const check = try decodeStreamHeader(&cursor);
-        // records backing is written during parse and read only below len, so undefined init is safe.
+        // Append writes every backing slot and reads only below len, so undefined init is safe.
         var records: IndexRecordList = .{ .records = undefined };
         while (true) {
             if (cursor.remaining() == 0 or cursor.buffer[cursor.pos] == 0x00) break;
@@ -188,8 +188,8 @@ fn decodeInternalImpl(input: []const u8, sink: *Sink, scratch: []u8, in_place: b
 fn decodeStreamHeader(cursor: *binary.ReadCursor) Failure!CheckType {
     const bytes = try cursor.readSlice(stream_header_size);
     if (!std.mem.eql(u8, bytes[0..6], &header_magic)) return error.InvalidData;
-    const check_value = std.mem.readInt(u32, bytes[8..12], .little);
-    try verifyCrc32(bytes[6..8], check_value);
+    const flags_crc = std.mem.readInt(u32, bytes[8..12], .little);
+    try verifyCrc32(bytes[6..8], flags_crc);
     if (bytes[6] != 0x00) return error.InvalidData;
     const check_type: u8 = bytes[7];
     if (check_type & 0xF0 != 0) return error.InvalidData;
@@ -206,9 +206,9 @@ fn checkTypeFromInt(value: u8) Failure!CheckType {
     };
 }
 
-fn verifyCrc32(data: []const u8, expected: u32) Failure!void {
+fn verifyCrc32(bytes: []const u8, expected: u32) Failure!void {
     var crc = checksum.Crc32.init();
-    crc.update(data);
+    crc.update(bytes);
     if (crc.final() != expected) return error.IntegrityFailure;
 }
 
@@ -249,26 +249,26 @@ const Filter = union(enum) {
 };
 
 fn decodeBlock(cursor: *binary.ReadCursor, sink: *Sink, scratch: []u8, check: CheckType, in_place: bool) Failure!IndexRecord {
-    const info = try decodeBlockHeader(cursor);
-    const compressed_data: ?[]const u8 = if (info.compressed_size) |size|
+    const block_header = try decodeBlockHeader(cursor);
+    const compressed_data: ?[]const u8 = if (block_header.compressed_size) |size|
         try cursor.readSlice(size)
     else
         null;
-    const dictionary_size = lzma2.dictionaryFromProp(info.filters[info.filter_count - 1].lzma2);
+    const dictionary_size = lzma2.dictionarySizeFromProperties(block_header.filters[block_header.filter_count - 1].lzma2);
     if (dictionary_size < lzma.dictionary_min or dictionary_size > lzma.dictionary_max) return error.Unsupported;
     const lzma_scratch_size = if (in_place) lzma2.decodeInPlaceWorkspaceSize(dictionary_size) else lzma2.decodeWorkspaceSize(dictionary_size);
     if (scratch.len < lzma_scratch_size) return error.InsufficientCapacity;
     const options = lzma2.Options{
         .dictionary_size = dictionary_size,
-        .properties = lzma2.properties(dictionary_size),
+        .properties = lzma2.defaultProperties(dictionary_size),
         .max_work = std.math.maxInt(u64),
     };
-    // Both sizes are assigned during block iteration before the index/footer reads them.
+    // Both sizes are assigned in every branch below before any read.
     var compressed_size: usize = undefined;
     var uncompressed_size: usize = undefined;
     var decode_tee: ?tee.Tee = null;
     if (sink.buffer != null) {
-        const block_output = if (info.uncompressed_size) |size|
+        const block_output = if (block_header.uncompressed_size) |size|
             try sink.blockBuffer(size)
         else
             sink.blockBufferRemaining();
@@ -277,39 +277,39 @@ fn decodeBlock(cursor: *binary.ReadCursor, sink: *Sink, scratch: []u8, check: Ch
             if (scratch.len < in_place_scratch_size) return error.InsufficientCapacity;
             const result = try lzma2.decodeInPlace(if (compressed_data) |data| data else cursor.remainingSlice(), block_output, scratch[0..in_place_scratch_size], options);
             uncompressed_size = result.produced;
-            compressed_size = info.compressed_size orelse result.consumed;
+            compressed_size = block_header.compressed_size orelse result.consumed;
         } else {
             var fixed_writer = std.Io.Writer.fixed(block_output);
             var chunk_reader = std.Io.Reader.fixed(if (compressed_data) |data| data else cursor.remainingSlice());
             try lzma2.decodeStream(&chunk_reader, &fixed_writer, scratch[0..lzma2.decodeWorkspaceSize(dictionary_size)], options);
-            compressed_size = info.compressed_size orelse chunk_reader.seek;
+            compressed_size = block_header.compressed_size orelse chunk_reader.seek;
             uncompressed_size = fixed_writer.end;
         }
-        if (info.uncompressed_size) |size| {
+        if (block_header.uncompressed_size) |size| {
             if (uncompressed_size != size) return error.IntegrityFailure;
         }
-        applyDecodeFilters(info.filters[0..info.filter_count], block_output[0..uncompressed_size]);
+        applyDecodeFilters(block_header.filters[0..block_header.filter_count], block_output[0..uncompressed_size]);
         sink.commitBlock(uncompressed_size);
     } else {
         decode_tee = tee.Tee.init(sink.writer);
         var chunk_reader = std.Io.Reader.fixed(if (compressed_data) |data| data else cursor.remainingSlice());
         try lzma2.decodeStream(&chunk_reader, &decode_tee.?.writer, scratch[0..lzma_scratch_size], options);
-        compressed_size = info.compressed_size orelse chunk_reader.seek;
+        compressed_size = block_header.compressed_size orelse chunk_reader.seek;
         uncompressed_size = std.math.cast(usize, decode_tee.?.size) orelse return error.ResourceLimit;
-        if (info.uncompressed_size) |size| {
+        if (block_header.uncompressed_size) |size| {
             if (uncompressed_size != size) return error.IntegrityFailure;
         }
     }
-    if (info.compressed_size == null) try cursor.advance(compressed_size);
+    if (block_header.compressed_size == null) try cursor.advance(compressed_size);
     try cursor.advance(blockPadding(compressed_size));
     const check_bytes = try cursor.readSlice(checkSize(check));
     if (sink.buffer != null) {
         const block_output = sink.buffer.?[sink.offset - uncompressed_size ..][0..uncompressed_size];
         try verifyFilteredCheck(check, block_output, check_bytes);
-    } else if (info.filter_count == 1 and check != .sha256) {
+    } else if (block_header.filter_count == 1 and check != .sha256) {
         try verifyCheck(check, decode_tee.?.crc32Value(), decode_tee.?.crc64Value(), check_bytes);
     }
-    const unpadded_size = try bounds.add(info.header_size, try bounds.add(compressed_size, checkSize(check)));
+    const unpadded_size = try bounds.addUsize(block_header.header_size, try bounds.addUsize(compressed_size, checkSize(check)));
     return .{
         .unpadded_size = std.math.cast(u64, unpadded_size) orelse return error.ResourceLimit,
         .uncompressed_size = @as(u64, uncompressed_size),
@@ -321,8 +321,8 @@ fn decodeBlockHeader(cursor: *binary.ReadCursor) Failure!BlockInfo {
     const size_byte = try cursor.readU8();
     const header_size = (@as(usize, size_byte & 0x3F) + 1) * 4;
     if (header_size < 8) return error.InvalidData;
-    // The size byte is the first byte of the header, which the CRC covers.
-    const header_end = try bounds.add(header_start, header_size);
+    // The CRC covers the size byte, so a rewritten header size fails verification.
+    const header_end = try bounds.addUsize(header_start, header_size);
     if (header_end > cursor.buffer.len) return error.InvalidData;
     const header_bytes = cursor.buffer[header_start..header_end];
     cursor.pos = header_end;
@@ -399,22 +399,22 @@ fn decodeBlockHeader(cursor: *binary.ReadCursor) Failure!BlockInfo {
     };
 }
 
-fn applyDecodeFilters(filters: []const Filter, data: []u8) void {
+fn applyDecodeFilters(filters: []const Filter, block: []u8) void {
     var index = filters.len;
     while (index > 1) {
         index -= 1;
         switch (filters[index - 1]) {
-            .delta => |distance| delta.decode(data, distance),
-            .bcj => |options| bcj.decode(options.kind, options.start_offset, data),
+            .delta => |distance| delta.decode(block, distance),
+            .bcj => |options| bcj.decode(options.kind, options.start_offset, block),
             .lzma2 => return,
         }
     }
 }
 
-fn verifyFilteredCheck(check: CheckType, data: []const u8, expected: []const u8) Failure!void {
+fn verifyFilteredCheck(check: CheckType, block: []const u8, expected: []const u8) Failure!void {
     if (check == .sha256) {
         var sha = crypto.Sha256.init(.{});
-        sha.update(data);
+        sha.update(block);
         var digest: [32]u8 = undefined;
         sha.final(&digest);
         if (!std.mem.eql(u8, &digest, expected)) return error.IntegrityFailure;
@@ -424,14 +424,14 @@ fn verifyFilteredCheck(check: CheckType, data: []const u8, expected: []const u8)
         .none => {},
         .crc32 => {
             var crc = checksum.Crc32.init();
-            crc.update(data);
+            crc.update(block);
             const actual: u32 = crc.final();
             const stored = std.mem.readInt(u32, expected[0..4], .little);
             if (actual != stored) return error.IntegrityFailure;
         },
         .crc64 => {
-            var crc = checksum.XZCrc64.init();
-            crc.update(data);
+            var crc = checksum.XzCrc64.init();
+            crc.update(block);
             const actual: u64 = crc.final();
             const stored = std.mem.readInt(u64, expected[0..8], .little);
             if (actual != stored) return error.IntegrityFailure;
@@ -457,7 +457,7 @@ fn decodeIndex(cursor: *binary.ReadCursor, records: IndexRecordList) Failure!voi
         if (cursor.pos >= cursor.buffer.len or cursor.buffer[cursor.pos] != 0x00) return error.InvalidData;
         cursor.pos += 1;
     }
-    const index_end = try bounds.add(cursor.pos, 4);
+    const index_end = try bounds.addUsize(cursor.pos, 4);
     if (index_end > cursor.buffer.len) return error.InvalidData;
     const index_crc = std.mem.readInt(u32, cursor.buffer[cursor.pos..][0..4], .little);
     try verifyCrc32(cursor.buffer[index_start..cursor.pos], index_crc);
@@ -523,20 +523,20 @@ pub fn encode(input: []const u8, output: []u8, scratch: []u8, options: Options) 
 }
 
 fn encodeInternal(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options: Options) Failure!void {
-    // Single LZMA2 encoder keeps the dictionary continuous instead of resetting per chunk.
+    // One LZMA2 encoder keeps the dictionary continuous instead of resetting it per chunk.
     try encodeStream(writer, input, scratch, options);
 }
 
 fn encodeStream(writer: *std.Io.Writer, input: []const u8, scratch: []u8, options: Options) Failure!void {
-    const dictionary_props = lzma2.propFromDictionary(options.dictionary_size);
-    const dictionary_size = lzma2.dictionaryFromProp(dictionary_props);
+    const dictionary_props = lzma2.propertiesFromDictionarySize(options.dictionary_size);
+    const dictionary_size = lzma2.dictionarySizeFromProperties(dictionary_props);
     const lzma_scratch_size = if (options.match_finder == .bt4) lzma2.encodeWorkspaceSizeBt(dictionary_size) else lzma2.encodeWorkspaceSize(dictionary_size);
     if (scratch.len < lzma_scratch_size) return error.InsufficientCapacity;
     const lzma_scratch = scratch[0..lzma_scratch_size];
     const remaining_scratch = scratch[lzma_scratch_size..];
     const lzma_options = lzma2.Options{
         .dictionary_size = dictionary_size,
-        .properties = lzma2.properties(dictionary_size),
+        .properties = lzma2.defaultProperties(dictionary_size),
         .max_work = std.math.maxInt(u64),
         .match_finder_depth = options.match_finder_depth,
         .lazy = options.lazy,
@@ -573,16 +573,16 @@ fn encodeStream(writer: *std.Io.Writer, input: []const u8, scratch: []u8, option
         try writeCheck(writer, options.check, tee_writer.crc32Value(), tee_writer.crc64Value());
     }
     const check_size = checkSize(options.check);
-    const unpadded_size = try bounds.add(block_header.slice().len, try bounds.add(compressed_size, check_size));
+    const unpadded_size = try bounds.addUsize(block_header.slice().len, try bounds.addUsize(compressed_size, check_size));
     const index_size = try writeIndex(writer, unpadded_size, input.len);
     try writeStreamFooter(writer, options.check, index_size);
 }
 
-fn applyEncodeFilter(filter: FilterChoice, data: []u8) Failure!void {
+fn applyEncodeFilter(filter: FilterChoice, buffer: []u8) Failure!void {
     switch (filter) {
         .none => {},
-        .delta => delta.encode(data, 1),
-        .x86, .ppc, .ia64, .arm, .armt, .sparc, .arm64, .riscv => bcj.encode(bcjKindFromChoice(filter), 0, data),
+        .delta => delta.encode(buffer, 1),
+        .x86, .ppc, .ia64, .arm, .armt, .sparc, .arm64, .riscv => bcj.encode(bcjKindFromChoice(filter), 0, buffer),
     }
 }
 

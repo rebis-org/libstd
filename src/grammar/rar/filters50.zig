@@ -4,9 +4,9 @@ const Failure = failure.Failure;
 const bits = @import("bits.zig");
 const BitReader = bits.BitReader;
 
-// file_offset is the region's offset WITHIN THE FILE: the E8/ARM transforms
-// relocate against true file positions, not positions inside whatever region
-// the filter happens to cover.
+// A filter region starts at `file_offset` inside the file, not inside the
+// region, because the E8 and Arm transforms relocate against true file
+// positions.
 
 pub const FilterType = enum(u3) {
     delta = 0,
@@ -22,8 +22,8 @@ pub const Filter = struct {
     channels: u8, // delta filter only (1-32)
 };
 
-pub fn filterTypeFromRaw(raw: u3) ?FilterType {
-    return switch (raw) {
+pub fn filterTypeFromRaw(filter_code: u3) ?FilterType {
+    return switch (filter_code) {
         0 => .delta,
         1 => .e8,
         2 => .e8e9,
@@ -35,10 +35,11 @@ pub fn filterTypeFromRaw(raw: u3) ?FilterType {
 // Largest region one RAR5 filter may cover (reference MAX_FILTER_BLOCK_SIZE).
 pub const max_filter_block: usize = 0x400000;
 
-// The wrap constant the E8/E8E9 filter relocates against, a FIXED 16 MB.
-// (An earlier reading used the file size here. Every filtered region past the
-// first then decoded to the wrong bytes. The constant and the file offset are
-// different quantities that appear two lines apart in the reference.)
+// The E8 and E8E9 filters relocate against a FIXED 16 MB wrap constant (the
+// reference E8_WRAP), not the file size. An earlier reading used the file size
+// here, and every filtered region after the first then decoded to the wrong
+// bytes. The wrap constant and the file offset are separate quantities, and
+// the reference holds them two lines apart.
 const e8_wrap: u32 = 0x1000000;
 
 pub fn applyFilter(data: []u8, filter: Filter, file_offset: u64, scratch: []u8) Failure!void {
@@ -52,20 +53,21 @@ pub fn applyFilter(data: []u8, filter: Filter, file_offset: u64, scratch: []u8) 
     }
 }
 
-// Channel-sequential delta: the inverse is a per-channel prefix sum, and
-// source and destination overlap, so the transform needs a scratch copy.
+// The inverse of a channel-sequential delta is a per-channel prefix sum.
+// Source and destination overlap, so the transform reads from `data` and
+// writes to the scratch copy, then copies back.
 fn applyDelta(data: []u8, channels: u8, scratch: []u8) Failure!void {
     if (channels == 0 or data.len == 0) return;
     if (scratch.len < data.len) return error.InsufficientCapacity;
-    const ch: usize = channels;
+    const channel_count: usize = channels;
     const dst = scratch[0..data.len];
 
     var src_pos: usize = 0;
     var cur_channel: usize = 0;
-    while (cur_channel < ch) : (cur_channel += 1) {
+    while (cur_channel < channel_count) : (cur_channel += 1) {
         var prev: u8 = 0;
         var dest_pos: usize = cur_channel;
-        while (dest_pos < data.len) : (dest_pos += ch) {
+        while (dest_pos < data.len) : (dest_pos += channel_count) {
             prev -%= data[src_pos];
             dst[dest_pos] = prev;
             src_pos += 1;
@@ -80,9 +82,9 @@ pub fn applyE8E9(data: []u8, file_offset: u64, e9: bool) void {
     var i: usize = 0;
     while (i + 4 < data.len) {
         if (data[i] == 0xE8 or (e9 and data[i] == 0xE9)) {
-            // Truncating to u32 before the modulo is safe and matches the
-            // reference's (uint)WrittenFileSize: E8_WRAP is a power of two
-            // that divides 2^32.
+            // Truncating to u32 before the modulo is safe because e8_wrap is a
+            // power of two that divides 2^32, which is what makes the
+            // reference's (uint)WrittenFileSize agree.
             const offset: u32 = @truncate((@as(u64, i) + 1 +% file_offset) % e8_wrap);
             const addr = std.mem.readInt(u32, data[i + 1 ..][0..4], .little);
 
@@ -105,14 +107,15 @@ pub fn applyArm(data: []u8, file_offset: u64) void {
     var i: usize = 0;
     while (i + 3 < data.len) : (i += 4) {
         if (data[i + 3] == 0xEB) {
-            // ARM BL with the 'always' condition. Plain unsigned 24-bit
-            // arithmetic. Only the low 24 bits are written back, so no sign
-            // extension is needed (or performed by the reference). Branches
-            // count in instruction units, hence the /4.
-            const b0: u32 = data[i];
-            const b1: u32 = data[i + 1];
-            const b2: u32 = data[i + 2];
-            var offset: u32 = (b2 << 16) | (b1 << 8) | b0;
+            // An Arm BL instruction with the always condition encodes an unsigned
+            // 24-bit offset in the low three bytes. Only those bytes are
+            // written back, so the reference performs no sign extension. The
+            // offset counts instruction units, which is why it is divided by
+            // 4.
+            const low_byte: u32 = data[i];
+            const mid_byte: u32 = data[i + 1];
+            const high_byte: u32 = data[i + 2];
+            var offset: u32 = (high_byte << 16) | (mid_byte << 8) | low_byte;
 
             offset -%= @truncate((file_offset +% @as(u64, i)) / 4);
 
@@ -123,34 +126,35 @@ pub fn applyArm(data: []u8, file_offset: u64) void {
     }
 }
 
-// Wire format (reference ReadFilterData): a 2-bit prefix gives the byte count
-// (1-4). The value assembles little-endian, first byte read = low 8 bits.
+// The wire size field (reference ReadFilterData): a 2-bit prefix gives the
+// byte count, from 1 to 4, and the value assembles little-endian, so the first
+// byte read holds the low 8 bits.
 pub fn readFilterSize(br: *BitReader) Failure!usize {
     const byte_count: u3 = @intCast((try br.readBits(2)) + 1);
-    var value: usize = 0;
+    var size: usize = 0;
     var i: u3 = 0;
     while (i < byte_count) : (i += 1) {
-        const b: usize = try br.readBits(8);
-        value += b << @intCast(@as(u6, i) * 8);
+        const byte: usize = try br.readBits(8);
+        size += byte << @intCast(@as(u6, i) * 8);
     }
-    return value;
+    return size;
 }
 
-test "delta filter channels=1 cumulative subtract" {
+test "delta filter subtracts cumulatively with one channel" {
     var data = [_]u8{ 0, 1, 1, 1, 1 };
     var scratch: [5]u8 = undefined;
     try applyDelta(&data, 1, &scratch);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 255, 254, 253, 252 }, &data);
 }
 
-test "delta filter channels=3 de-interleaves" {
+test "delta filter separates three interleaved channels" {
     var data = [_]u8{ 10, 20, 30, 5, 5, 5, 3, 3, 3 };
     var scratch: [9]u8 = undefined;
     try applyDelta(&data, 3, &scratch);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 246, 251, 253, 226, 246, 250, 196, 241, 247 }, &data);
 }
 
-test "e8 filter relocates against the fixed wrap and the file offset" {
+test "e8 filter relocates against the wrap constant and the file offset" {
     const at_zero = blk: {
         var d = [_]u8{ 0xE8, 0x00, 0x10, 0x00, 0x00, 0x90 };
         applyE8E9(&d, 0, false);

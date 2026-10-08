@@ -29,7 +29,7 @@ fn addClassesJar(b: *std.Build) std.Build.LazyPath {
 
 fn addJniBridge(b: *std.Build, library: *std.Build.Step.Compile) void {
     const java_home = b.graph.environ_map.get("JAVA_HOME") orelse
-        @panic("android archive needs JAVA_HOME for jni.h");
+        @panic("The Android archive needs JAVA_HOME to find jni.h.");
     library.root_module.addIncludePath(b.path("build/templates/android/jni/shim"));
     library.root_module.addCSourceFile(.{
         .file = b.path("build/templates/android/jni/stdk.c"),

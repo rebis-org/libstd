@@ -121,11 +121,11 @@ pub fn main(init: std.process.Init) !void {
     const kernel_mibps = @as(f64, @floatFromInt(corpus.len)) / @as(f64, @floatFromInt(kernel_end - kernel_start)) * 1e3;
     const bypass_mibps = @as(f64, @floatFromInt(corpus.len)) / @as(f64, @floatFromInt(bypass_end - bypass_start)) * 1e3;
     std.debug.print("Bypass row: kernel {d:.1} MiB/s, bypass {d:.1} MiB/s.\n", .{ kernel_mibps, bypass_mibps });
-    check(bypass_mibps >= kernel_mibps * 0.5, "bypass throughput within 2x of kernel");
-    check(kernel != null and bypass.steps == kernel.?.steps, "kernel and bypass step counts match");
-    check(std.mem.eql(u8, kernel.?.bytes, corpus), "kernel decode matches corpus");
-    check(std.mem.eql(u8, bypass.bytes, corpus), "bypass decode matches corpus");
-    check(std.mem.eql(u8, kernel.?.bytes, bypass.bytes), "kernel and bypass byte-identical");
+    check(bypass_mibps >= kernel_mibps * 0.5, "Bypass throughput stays within 2x of the kernel path");
+    check(kernel != null and bypass.steps == kernel.?.steps, "Kernel and bypass step counts match");
+    check(std.mem.eql(u8, kernel.?.bytes, corpus), "Kernel decode matches the corpus");
+    check(std.mem.eql(u8, bypass.bytes, corpus), "Bypass decode matches the corpus");
+    check(std.mem.eql(u8, kernel.?.bytes, bypass.bytes), "Kernel and bypass output is byte-identical");
 
     var multi: std.ArrayList(u8) = .empty;
     try multi.appendSlice(allocator, compressed);
@@ -134,10 +134,10 @@ pub fn main(init: std.process.Init) !void {
     try joined_corpus.appendSlice(allocator, corpus);
     try joined_corpus.appendSlice(allocator, corpus);
     const kernel_multi = try decodeKernel(allocator, multi.items, .{}, false);
-    check(kernel_multi != null and std.mem.eql(u8, kernel_multi.?.bytes, joined_corpus.items), "multi-member decode");
+    check(kernel_multi != null and std.mem.eql(u8, kernel_multi.?.bytes, joined_corpus.items), "Multi-member stream decodes to the joined corpus");
 
     const budget_limited = try decodeKernel(allocator, compressed, .{ .max_decoded = corpus.len - 1 }, true);
-    check(budget_limited == null, "decoded budget trips mid-stream");
+    check(budget_limited == null, "The decoded budget trips mid-stream");
 
     const storage = try allocStateStorage(allocator);
     var session = try drivers.gzipDecodeSession(storage, .{});
@@ -148,13 +148,13 @@ pub fn main(init: std.process.Init) !void {
     if (after_destroy.failure) |failure| {
         destroy_invalid_call = failure == error.InvalidCall;
     }
-    check(after_destroy.status == .failed and destroy_invalid_call, "step after destroy returns invalid_call");
+    check(after_destroy.status == .failed and destroy_invalid_call, "A step after destroy returns invalid_call");
 
     var truncated_failed = false;
     _ = decodeKernel(allocator, compressed[0 .. compressed.len - 5], .{}, false) catch |err| {
         truncated_failed = err == error.UnexpectedFailure;
     };
-    check(truncated_failed, "truncated stream fails");
+    check(truncated_failed, "A truncated stream fails");
 
     var encode_history: [gzip.deflate_history_size]u8 = undefined;
     const bound = drivers.gzipEncodedSizeBound(corpus.len);
@@ -162,16 +162,16 @@ pub fn main(init: std.process.Init) !void {
     const one_size = try drivers.gzipEncode(one_out, corpus, &encode_history, drivers.default_encode_options, .bounded);
     const two_out = try allocator.alloc(u8, one_size);
     const two_size = try drivers.gzipEncode(two_out, corpus, &encode_history, drivers.default_encode_options, .measured);
-    check(one_size == two_size, "sizing modes produce identical sizes");
-    check(std.mem.eql(u8, one_out[0..one_size], two_out[0..two_size]), "bounded encode byte-identical to measured");
-    check(one_size <= bound, "one-pass within analytic bound");
+    check(one_size == two_size, "Both sizing modes produce identical sizes");
+    check(std.mem.eql(u8, one_out[0..one_size], two_out[0..two_size]), "Bounded encode is byte-identical to measured encode");
+    check(one_size <= bound, "The bounded encode stays within the analytic bound");
     const tight_two = try allocator.alloc(u8, two_size);
     const tight_size = try drivers.gzipEncode(tight_two, corpus, &encode_history, drivers.default_encode_options, .measured);
-    check(tight_size == two_size, "measured mode accepts exact-size sink");
+    check(tight_size == two_size, "Measured mode accepts an exact-size sink");
     const undersized = drivers.gzipEncode(one_out[0 .. bound - 1], corpus, &encode_history, drivers.default_encode_options, .bounded);
-    check(undersized == error.InsufficientCapacity, "bounded mode capacity enforced a priori");
+    check(undersized == error.InsufficientCapacity, "Bounded mode enforces capacity before encoding");
     const roundtrip = try decodeKernel(allocator, one_out[0..one_size], .{}, false);
-    check(roundtrip != null and std.mem.eql(u8, roundtrip.?.bytes, corpus), "bounded-mode output decodes through the session");
+    check(roundtrip != null and std.mem.eql(u8, roundtrip.?.bytes, corpus), "Bounded-mode output decodes through the session");
 
     {
         const pipe_storage = try allocStateStorage(allocator);
@@ -193,7 +193,7 @@ pub fn main(init: std.process.Init) !void {
         for (corpus) |byte| {
             try expected_upper.append(allocator, if (byte >= 'a' and byte <= 'z') byte - 32 else byte);
         }
-        check(std.mem.eql(u8, upper.items, expected_upper.items), "caller-built filter pipeline matches transformed corpus");
+        check(std.mem.eql(u8, upper.items, expected_upper.items), "A caller-built filter pipeline matches the transformed corpus");
     }
     {
         const cancel_storage = try allocStateStorage(allocator);
@@ -211,9 +211,9 @@ pub fn main(init: std.process.Init) !void {
             pos += result.consumed;
         }
         cancel_session.destroy();
-        check(std.mem.eql(u8, prefix.items, corpus[0..prefix.items.len]), "mid-stream cancel prefix is exact corpus prefix");
+        check(std.mem.eql(u8, prefix.items, corpus[0..prefix.items.len]), "A mid-stream cancel yields an exact corpus prefix");
         const after = cancel_session.step(compressed, &.{}, false);
-        check(after.status == .failed, "cancelled session rejects further steps");
+        check(after.status == .failed, "A cancelled session rejects further steps");
     }
     // Sessions share no library state, so interleaved sessions must stay isolated.
     {
@@ -240,7 +240,7 @@ pub fn main(init: std.process.Init) !void {
             pos_b += rb.consumed;
             if (ra.status == .done and rb.status == .done) break;
         }
-        check(std.mem.eql(u8, out_a.items, corpus) and std.mem.eql(u8, out_b.items, corpus), "interleaved sessions stay isolated");
+        check(std.mem.eql(u8, out_a.items, corpus) and std.mem.eql(u8, out_b.items, corpus), "Interleaved sessions stay isolated");
     }
 
     if (failures != 0) std.process.exit(1);

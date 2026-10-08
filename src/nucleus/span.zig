@@ -8,9 +8,11 @@ var empty_storage: [1]u8 = .{0};
 
 // Contract violations trap: out-of-provenance access is a bug, never a
 // survivable runtime condition. Data-dependent failures stay in Failure.
+// Context strings are complete sentences, so the trap message never has to
+// guess where a sentence ends.
 pub fn trap(violation: Violation, context: []const u8) noreturn {
     var buffer: [128]u8 = undefined;
-    const message = std.fmt.bufPrint(&buffer, "Nucleus trap: {s}: {s}.\n", .{ @tagName(violation), context }) catch "Nucleus trap.\n";
+    const message = std.fmt.bufPrint(&buffer, "Nucleus trap: {s}: {s}\n", .{ @tagName(violation), context }) catch "Nucleus trap.\n";
     std.debug.print("{s}", .{message});
     std.posix.raise(std.posix.SIG.TRAP) catch {};
     unreachable;
@@ -25,7 +27,7 @@ pub const Span = struct {
     }
 
     pub fn sub(self: Span, offset: usize, length: usize) Span {
-        if (offset > self.len or length > self.len - offset) trap(.out_of_bounds, "Subspan out of bounds");
+        if (offset > self.len or length > self.len - offset) trap(.out_of_bounds, "Subspan is out of bounds.");
         return .{ .ptr = self.ptr + offset, .len = length };
     }
 
@@ -47,7 +49,7 @@ pub const ConstSpan = struct {
     }
 
     pub fn sub(self: ConstSpan, offset: usize, length: usize) ConstSpan {
-        if (offset > self.len or length > self.len - offset) trap(.out_of_bounds, "Subspan out of bounds");
+        if (offset > self.len or length > self.len - offset) trap(.out_of_bounds, "Subspan is out of bounds.");
         return .{ .ptr = self.ptr + offset, .len = length };
     }
 
@@ -90,7 +92,7 @@ pub fn requireDisjoint(left: ConstSpan, right: ConstSpan, context: []const u8) v
     if (left_start < right_end and right_start < left_end) trap(.overlap, context);
 }
 
-test "span algebra: read write sub round trip" {
+test "span algebra: read, write, and sub round trip" {
     var backing: [16]u8 = .{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
     const span: Span = .{ .ptr = &backing, .len = backing.len };
     try std.testing.expectEqual(@as(usize, 16), span.len);

@@ -13,16 +13,12 @@ const CommitMode = vocabulary.CommitMode;
 // Dispatch answers how a profile runs, not what it is. Descriptor data drives
 // every rule here so a new component needs no edit in this file.
 
-fn idEqual(left: EnvelopeId, right: EnvelopeId) bool {
-    return left.low == right.low and left.high == right.high;
-}
-
-pub fn toContract(id: EnvelopeId) contract.Id {
+pub fn toContractId(id: EnvelopeId) contract.Id {
     return .{ .low = id.low, .high = id.high };
 }
 
 pub fn profileTagForId(id: EnvelopeId) ?components.ProfileTag {
-    const descriptor = discovery.findById(toContract(id)) orelse return null;
+    const descriptor = discovery.findById(toContractId(id)) orelse return null;
     return components.tagForName(descriptor.name);
 }
 
@@ -64,9 +60,9 @@ fn testReadPolicy(command: u32, target: u32) ?CommandPolicy {
 
 pub fn commandPolicyFor(id: EnvelopeId, command: u32, target: u32) ?CommandPolicy {
     // Fixtures accept every capability and both sizing modes, which no descriptor-derived rule expresses.
-    if (idEqual(id, vocabulary.ids.test_echo)) return testEchoPolicy(command);
-    if (idEqual(id, vocabulary.ids.test_read)) return testReadPolicy(command, target);
-    if (discovery.findById(toContract(id))) |descriptor| {
+    if (vocabulary.idEqual(id, vocabulary.ids.test_echo)) return testEchoPolicy(command);
+    if (vocabulary.idEqual(id, vocabulary.ids.test_read)) return testReadPolicy(command, target);
+    if (discovery.findById(toContractId(id))) |descriptor| {
         return switch (descriptor.class) {
             // Filters are ingredients, not callable profiles.
             .filter => null,

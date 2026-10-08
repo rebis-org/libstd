@@ -29,7 +29,7 @@ pub const Sha256 = struct {
     pub const Options = struct {};
 
     pub fn init(_: Options) Sha256 {
-        // Undefined until update fills it before any read.
+        // The buffer stays undefined until update fills it before any read.
         return .{ .state = .{
             0x6a09_e667, 0xbb67_ae85, 0x3c6e_f372, 0xa54f_f53a,
             0x510e_527f, 0x9b05_688c, 0x1f83_d9ab, 0x5be0_cd19,
@@ -149,7 +149,7 @@ pub const Sha1 = struct {
     pub const Options = struct {};
 
     pub fn init(_: Options) Sha1 {
-        // Undefined until update fills it before any read.
+        // The buffer stays undefined until update fills it before any read.
         return .{ .state = .{ 0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476, 0xc3d2_e1f0 }, .buffer = undefined };
     }
 
@@ -484,7 +484,7 @@ pub fn winzipCtr(key: []const u8, destination: []u8, source: []const u8) Failure
     return;
 }
 
-// Whole blocks only. Padding is the caller's job.
+// Operates on whole blocks only; the caller supplies the padding.
 pub fn aesCbcEncrypt(key: []const u8, iv: [block_length]u8, destination: []u8, source: []const u8) Failure!void {
     if (source.len % block_length != 0 or destination.len < source.len) return error.InvalidCall;
     const schedule = try aesKeySchedule(key);

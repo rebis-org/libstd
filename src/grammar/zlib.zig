@@ -14,16 +14,15 @@ pub const Options = struct {
     deflate: deflate.Options,
 };
 
-const window_size = 32768;
+const window_size_max = 32768;
 const cinfo_max = 7;
 const cm_deflate = 8;
 const fcheck_bits = 5;
-const fdict = 0x20;
-const flevel_default = 2;
+const flag_dictionary = 0x20;
+const level_default = 2;
 const header_size = 2;
 const trailer_size = 4;
 
-// Bound is the deflate structural bound plus the fixed 6-byte wrapper.
 pub fn encodedSizeBound(input_len: usize, options: Options) usize {
     _ = options;
     return deflate.encodedSizeBound(input_len) +| (header_size + trailer_size);
@@ -44,7 +43,7 @@ pub fn inspect(input: []const u8) Failure!Header {
     return .{
         .window_size = @as(u32, 1) << @intCast((cmf >> 4) + 8),
         .level = flg >> 6,
-        .has_dictionary = (flg & fdict) != 0,
+        .has_dictionary = (flg & flag_dictionary) != 0,
     };
 }
 
@@ -55,15 +54,15 @@ pub fn decodedSize(input: []const u8, history: []u8) Failure!usize {
     return std.math.cast(usize, counter.written()) orelse error.ResourceLimit;
 }
 
-// One stream per call: the Adler trailer ends the stream and trailing bytes are an error.
+// One stream per call: the adler32 trailer ends the stream, so trailing bytes are an error.
 pub fn decode(input: []const u8, output: *std.Io.Writer, history: []u8) Failure!usize {
     if (history.len < deflate_history_size) return error.InsufficientCapacity;
     var source = std.Io.Reader.fixed(input);
     const cmf = source.takeByte() catch return error.InvalidData;
     const flg = source.takeByte() catch return error.InvalidData;
-    const info = try inspect(&.{ cmf, flg });
-    if (info.has_dictionary) return error.Unsupported;
-    if (info.window_size > window_size) return error.Unsupported;
+    const header = try inspect(&.{ cmf, flg });
+    if (header.has_dictionary) return error.Unsupported;
+    if (header.window_size > window_size_max) return error.Unsupported;
     var tee_writer = tee.CountingTee(.{ .adler32 = true }).init(output);
     var inflater = deflate.Decompress.initSlice(input[header_size..], history);
     const produced = inflater.reader.streamRemaining(&tee_writer.writer) catch |err| {
@@ -78,8 +77,8 @@ pub fn decode(input: []const u8, output: *std.Io.Writer, history: []u8) Failure!
     var trailer_sink = std.Io.Writer.fixed(&trailer);
     source.streamExact(&trailer_sink, trailer_size) catch return error.InvalidData;
     if (source.seek != input.len) return error.InvalidData;
-    const stored = std.mem.readInt(u32, &trailer, .big);
-    if (stored != tee_writer.adler32Value()) return error.IntegrityFailure;
+    const stored_adler32 = std.mem.readInt(u32, &trailer, .big);
+    if (stored_adler32 != tee_writer.adler32Value()) return error.IntegrityFailure;
     return produced;
 }
 
@@ -87,7 +86,7 @@ pub fn encodeStream(source: *std.Io.Reader, output: *std.Io.Writer, history: []u
     if (history.len < deflate_history_size) return error.InsufficientCapacity;
     try writeHeader(output);
     var compressor = try deflate.Compress.init(output, history, options.deflate);
-    var adler = checksum.Adler32.init();
+    var adler32 = checksum.Adler32.init();
     var buffer: [4096]u8 = undefined;
     while (true) {
         var sink = std.Io.Writer.fixed(&buffer);
@@ -97,22 +96,23 @@ pub fn encodeStream(source: *std.Io.Reader, output: *std.Io.Writer, history: []u
         };
         if (count == 0) break;
         const part = buffer[0..count];
-        adler.update(part);
+        adler32.update(part);
         compressor.writer.writeAll(part) catch return error.IoFailure;
     }
     compressor.finish() catch return error.IoFailure;
-    output.writeInt(u32, adler.final(), .big) catch return error.IoFailure;
+    output.writeInt(u32, adler32.final(), .big) catch return error.IoFailure;
 }
 
 fn writeHeader(writer: *std.Io.Writer) Failure!void {
+    // FLEVEL 2 marks the default algorithm. The FCHECK bits of FLG make the 16 bit header a multiple of 31.
     const cmf: u8 = (cinfo_max << 4) | cm_deflate;
-    var flg: u8 = flevel_default << 6;
-    const rem = (@as(u32, cmf) << 8 | flg) % 31;
-    if (rem != 0) flg += @intCast(31 - rem);
+    var flg: u8 = level_default << 6;
+    const remainder = (@as(u32, cmf) << 8 | flg) % 31;
+    if (remainder != 0) flg += @intCast(31 - remainder);
     try io.writeBytes(writer, &.{ cmf, flg });
 }
 
-test "zlib roundtrip" {
+test "zlib round trip restores the original input" {
     const history = try std.testing.allocator.alloc(u8, deflate_history_size);
     defer std.testing.allocator.free(history);
     const input = "the quick brown fox jumps over the lazy dog, again and again and again";
@@ -122,7 +122,7 @@ test "zlib roundtrip" {
     try encodeStream(&source, &sink, history, .{ .deflate = .{ .good = 8, .nice = 128, .lazy = 16, .chain = 8 } });
     const compressed = encoded[0..sink.end];
     const info = try inspect(compressed);
-    try std.testing.expectEqual(@as(u32, window_size), info.window_size);
+    try std.testing.expectEqual(@as(u32, window_size_max), info.window_size);
     var counter = measurement.Counter.init(null);
     const produced = try decode(compressed, &counter.writer, history);
     try std.testing.expectEqual(input.len, produced);
@@ -132,7 +132,7 @@ test "zlib roundtrip" {
     try std.testing.expectEqualStrings(input, source_out[0..out_sink.end]);
 }
 
-test "zlib rejects fdict and trailing bytes" {
+test "zlib rejects a preset dictionary and trailing bytes" {
     const history = try std.testing.allocator.alloc(u8, deflate_history_size);
     defer std.testing.allocator.free(history);
     var discard_buffer: [0]u8 = .{};

@@ -14,7 +14,8 @@ pub const Block = struct {
 
     pub fn init(storage: []u8) Failure!Block {
         if (storage.len <= header_len) return error.ResourceLimit;
-        // Continue from the stored generation so a poisoned block handed back never resurrects a stale one.
+        // Incrementing the stored generation keeps a recycled buffer from
+        // reissuing a value that a stale view still holds.
         const generation = std.mem.readInt(u64, storage[0..header_len], .little) +% 1;
         std.mem.writeInt(u64, storage[0..header_len], generation, .little);
         return .{ .storage = storage, .generation = generation };
@@ -41,7 +42,7 @@ pub const TrackedSpan = struct {
 
     fn check(self: TrackedSpan) void {
         const current = std.mem.readInt(u64, self.owner.storage[0..Block.header_len], .little);
-        if (current != self.generation) span.trap(.use_after_free, "Stale substrate span.");
+        if (current != self.generation) span.trap(.use_after_free, "Tracked span is stale: the block was freed or reused.");
     }
 
     pub fn read(self: TrackedSpan, offset: usize, length: usize) []u8 {

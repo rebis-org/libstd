@@ -12,20 +12,21 @@ pub const default_dictionary: u32 = 1 << 20;
 
 pub fn decodeOptions(input: []const u8) Failure!lzma.Options {
     const header = try bounds.slice(input, 0, header_size);
-    var dict_size = std.mem.readInt(u32, header[1..5], .little);
-    if (dict_size < lzma.dictionary_min) dict_size = lzma.dictionary_min;
-    if (dict_size > lzma.dictionary_max) return error.Unsupported;
+    var dictionary_size = std.mem.readInt(u32, header[1..5], .little);
+    if (dictionary_size < lzma.dictionary_min) dictionary_size = lzma.dictionary_min;
+    if (dictionary_size > lzma.dictionary_max) return error.Unsupported;
     const unpack_size = std.mem.readInt(u64, header[5..13], .little);
+    // The lzma alone format marks an unknown size with the maximum u64 value, which requires the end marker.
     const marker_required = unpack_size == std.math.maxInt(u64);
     return .{
-        .properties = try lzma.Properties.decode(header[0], dict_size),
+        .properties = try lzma.Properties.decode(header[0], dictionary_size),
         .unpack_size = if (marker_required) null else unpack_size,
         .marker_required = marker_required,
     };
 }
 
-// A declared size accompanies a markerless stream. Callers that size later
-// pass unpack_size = null and get the end marker.
+// A declared size accompanies a markerless stream. A caller that sizes later
+// passes unpack_size = null and gets the end marker.
 pub fn encodeOptions(dictionary: u32) Failure!lzma.Options {
     if (dictionary < lzma.dictionary_min or dictionary > lzma.dictionary_max) return error.InvalidCall;
     return .{
@@ -49,9 +50,9 @@ pub fn encodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, 
 }
 
 pub fn encode(input: []const u8, output: []u8, scratch: []u8, options: lzma.Options) Failure!usize {
-    var fixed = std.Io.Writer.fixed(output);
-    try encodeToWriter(input, &fixed, scratch, options);
-    return fixed.end;
+    var writer = std.Io.Writer.fixed(output);
+    try encodeToWriter(input, &writer, scratch, options);
+    return writer.end;
 }
 
 pub fn requiredSize(input: []const u8, scratch: []u8, options: lzma.Options) Failure!usize {
@@ -84,7 +85,7 @@ pub fn decodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8) 
     return lzma.decodeToWriter(input[header_size..], writer, scratch, options);
 }
 
-test "lzma file container write read roundtrip" {
+test "lzma file container round trip restores the original input" {
     var options = try encodeOptions(1 << 20);
     options.unpack_size = 2000;
     const scratch = try std.testing.allocator.alloc(u8, @max(lzma.encodeWorkspaceSizeBt(options.properties), lzma.decodeWorkspaceSize(options.properties)));
