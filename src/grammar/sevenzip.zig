@@ -182,6 +182,10 @@ const PackedEntry = struct {
     salt: [16]u8 = @splat(0),
     salt_length: u8 = 0,
     num_cycles_power: u8 = 0,
+    // True when this entry's bytes ride on the previous entry's packed stream
+    // (a solid run merged by packAllEntries). buildFolderPlan keys on this so
+    // the header's folder plan can never diverge from what was packed.
+    solid_continuation: bool = false,
     pack_size: usize = 0,
     unpack_size: usize = 0,
 };
@@ -211,6 +215,7 @@ fn packEntry(entry: SevenZipEntry, workspace: *Workspace, limits: Limits, failur
     const unpacked_crc = checksum.crc32(entry.data);
     const compressed_entry = switch (entry.method) {
         .copy => blk: {
+            if (entry.filter != null) return error.InvalidCall;
             if (entry.data.len > limits.encoded_bytes) return error.ResourceLimit;
             if (entry.data.len > limits.codec_work) return error.ResourceLimit;
             break :blk PackedEntry{ .method = .copy, .data = entry.data, .crc = unpacked_crc, .pack_size = entry.data.len, .unpack_size = entry.data.len };
@@ -304,7 +309,7 @@ fn applyEncodeFilter(method: CoderMethod, data: []u8) Failure!void {
     switch (method) {
         .delta => delta.encode(data, 0),
         .x86, .ppc, .ia64, .arm, .armt, .sparc, .arm64, .riscv => bcj.encode(bcjKindFromMethod(method), 0, data),
-        else => return error.InternalFailure,
+        else => return error.InvalidCall,
     }
 }
 
@@ -364,7 +369,7 @@ fn packAllEntries(entries: []const SevenZipEntry, workspace: *Workspace, limits:
                     else => unreachable,
                 }
                 for (entries[i..j], 0..) |entry, run_index| {
-                    packed_entries[index] = .{ .method = entries[i].method, .data = if (run_index == 0) packed_data else &.{}, .crc = checksum.crc32(entry.data), .pack_size = packed_size, .unpack_size = entry.data.len };
+                    packed_entries[index] = .{ .method = entries[i].method, .data = if (run_index == 0) packed_data else &.{}, .crc = checksum.crc32(entry.data), .solid_continuation = run_index != 0, .pack_size = packed_size, .unpack_size = entry.data.len };
                     index += 1;
                 }
                 i = j;
@@ -1081,7 +1086,10 @@ fn parseFilesInfo(cursor: *binary.ReadCursor, workspace: *Workspace) Failure!Fil
                     names[i] = try readUtf16Name(&sub, workspace);
                 }
             },
-            0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19 => {},
+            0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x19 => {},
+            // kStartPos shifts per-file data offsets; pack offsets here are
+            // computed sequentially, so accepting it would mis-locate data.
+            0x18 => return error.Unsupported,
             else => return error.Unsupported,
         }
         if (id >= 0x0E and id <= 0x11 and sub.remaining() != 0) return error.InvalidData;
@@ -1226,14 +1234,11 @@ fn buildFolderPlan(packed_entries: []const PackedEntry, workspace: *Workspace) F
     while (i < packed_entries.len) {
         const p = packed_entries[i];
         var j = i + 1;
-        // Both solid-capable methods group consecutive same-filter entries.
-        if (p.method == .lzma2 or p.method == .ppmd) {
-            while (j < packed_entries.len and packed_entries[j].method == p.method and
-                packed_entries[j].filter == p.filter and packed_entries[j].encrypted == p.encrypted)
-            {
-                j += 1;
-            }
-        }
+        // Solid membership was decided by packAllEntries and is recorded on
+        // the entry; grouping by any other rule desyncs the header from the
+        // packed bytes (directories and encrypted entries break runs there,
+        // so they must break folders here too).
+        while (j < packed_entries.len and packed_entries[j].solid_continuation) j += 1;
         plan[plan_count] = .{ .filter = p.filter, .method = p.method, .encrypted = p.encrypted, .first = i, .count = j - i };
         plan_count += 1;
         i = j;
@@ -1850,4 +1855,62 @@ test "sevenzip encrypted roundtrip with salt and custom cycles" {
         .failure_cause = &cause,
     }));
     try testing.expectEqual(crypto.FailureCause.kdf_limit, cause);
+}
+
+test "sevenzip folder plan stays consistent across directory and encryption breaks" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const backing = try allocator.alloc(u8, 96 * 1024 * 1024);
+    defer allocator.free(backing);
+    var repetitive: [2048]u8 = undefined;
+    for (&repetitive, 0..) |*byte, i| byte.* = @truncate(i / 31);
+    const first = repetitive[0..1000];
+    const second = repetitive[400..1400];
+
+    // Case 1: two lzma2 entries split by a directory entry. packAllEntries
+    // breaks the solid run at the directory, so the header must declare two
+    // folders / two pack streams — one folder here used to lose the second
+    // entry's bytes entirely.
+    const with_dir = [_]SevenZipEntry{
+        .{ .name = "a.bin", .data = first, .method = .lzma2 },
+        .{ .name = "sub/", .data = &.{}, .method = .copy },
+        .{ .name = "b.bin", .data = second, .method = .lzma2 },
+    };
+    var workspace = try Workspace.init(backing.ptr, backing.len);
+    var cause: crypto.FailureCause = .none;
+    const packed_dir = try sevenZipPack(&with_dir, &workspace, .{}, &cause);
+    const total_dir = try sevenZipPackedSize(&with_dir, packed_dir, &workspace);
+    const archive_dir = try allocator.alloc(u8, total_dir);
+    defer allocator.free(archive_dir);
+    const written_dir = try sevenZipWritePacked(&with_dir, packed_dir, archive_dir, &workspace);
+    try testing.expectEqual(total_dir, written_dir);
+    // Ordinals 0 and 2: ordinal 1 is the directory entry between them.
+    for ([_][]const u8{ first, second }, 0..) |data, i| {
+        var decode_ws = try Workspace.init(backing.ptr, backing.len);
+        const out = try allocator.alloc(u8, data.len);
+        defer allocator.free(out);
+        const produced = try sevenZipDecodeOrdinal(archive_dir, &decode_ws, .{}, if (i == 0) 0 else 2, out, .{ .failure_cause = &cause });
+        try testing.expectEqualSlices(u8, data, out[0..produced]);
+    }
+
+    // Case 2: two encrypted lzma2 entries. Encryption never joins solid runs,
+    // so each entry is its own folder with its own pack stream and IV.
+    const encrypted_pair = [_]SevenZipEntry{
+        .{ .name = "enc-a.bin", .data = first, .method = .lzma2, .encrypted = true, .password = "pw" },
+        .{ .name = "enc-b.bin", .data = second, .method = .lzma2, .encrypted = true, .password = "pw" },
+    };
+    var enc_workspace = try Workspace.init(backing.ptr, backing.len);
+    const packed_enc = try sevenZipPack(&encrypted_pair, &enc_workspace, .{}, &cause);
+    const total_enc = try sevenZipPackedSize(&encrypted_pair, packed_enc, &enc_workspace);
+    const archive_enc = try allocator.alloc(u8, total_enc);
+    defer allocator.free(archive_enc);
+    const written_enc = try sevenZipWritePacked(&encrypted_pair, packed_enc, archive_enc, &enc_workspace);
+    try testing.expectEqual(total_enc, written_enc);
+    for ([_][]const u8{ first, second }, 0..) |data, i| {
+        var decode_ws = try Workspace.init(backing.ptr, backing.len);
+        const out = try allocator.alloc(u8, data.len);
+        defer allocator.free(out);
+        const produced = try sevenZipDecodeOrdinal(archive_enc, &decode_ws, .{}, i, out, .{ .password = "pw", .failure_cause = &cause });
+        try testing.expectEqualSlices(u8, data, out[0..produced]);
+    }
 }
