@@ -172,7 +172,12 @@ pub fn zipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
     const source_resource = source orelse return error.InvalidCall;
     var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
     var crypto_cause: crypto.FailureCause = .none;
-    const crypto_params = try parseCryptoParams(call.request, &crypto_cause);
+    const crypto_params = parseCryptoParams(call.request, &crypto_cause) catch |err| {
+        // A rejection inside the parser (e.g. algorithm > 3) already recorded
+        // its cause; surface it before the error unwinds.
+        writeCryptoFailure(call, crypto_cause);
+        return err;
+    };
     if (command_mask == vocabulary.command_mask_read) {
         if (sink == null) {
             const archive = try materializeArchive(source_resource, &workspace, limits);
@@ -286,7 +291,12 @@ fn sevenZipGeneric(comptime coded: bool, plan: *common.ExecutionPlan, source: ?*
     const source_resource = source orelse return error.InvalidCall;
     var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
     var crypto_cause: crypto.FailureCause = .none;
-    const crypto_params = try parseCryptoParams(call.request, &crypto_cause);
+    const crypto_params = parseCryptoParams(call.request, &crypto_cause) catch |err| {
+        // A rejection inside the parser (e.g. algorithm > 3) already recorded
+        // its cause; surface it before the error unwinds.
+        writeCryptoFailure(call, crypto_cause);
+        return err;
+    };
     if (command_mask == vocabulary.command_mask_read) {
         if (sink == null) {
             try common.checkSourceWorkspaceOverlap(call, source_resource);
@@ -440,7 +450,10 @@ pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
     var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
     if (command_mask == vocabulary.command_mask_read) {
         var failure_cause: crypto.FailureCause = .none;
-        const crypto_params = try parseCryptoParams(call.request, &failure_cause);
+        const crypto_params = parseCryptoParams(call.request, &failure_cause) catch |err| {
+            writeCryptoFailure(call, failure_cause);
+            return err;
+        };
         const decrypting = crypto_params != null;
         if (sink == null) {
             try common.checkSourceWorkspaceOverlap(call, source_resource);
@@ -547,7 +560,10 @@ pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
         // The RAR writer has no encryption path; refuse crypto parameters
         // outright instead of silently producing a plaintext archive.
         var crypto_cause: crypto.FailureCause = .none;
-        if (try parseCryptoParams(call.request, &crypto_cause) != null) {
+        if (parseCryptoParams(call.request, &crypto_cause) catch |err| {
+            writeCryptoFailure(call, crypto_cause);
+            return err;
+        } != null) {
             writeCryptoFailure(call, crypto_cause);
             return error.Unsupported;
         }

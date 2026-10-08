@@ -314,9 +314,23 @@ fn runEncrypted(r: *Runner) anyerror!void {
     var diag3: harness.CryptoDiag = undefined;
     harness.cryptoDiag(&diag3);
     try expectCryptoRejection(r, &sink_buffer, password, harness.cryptoPasswordLifetimeParam(1), entries[0], abi.Status.resource_limit, &diag3, &diag3.password_lifetime);
+    // AES-128 write is a supported mode: the archive must carry strength 1 in
+    // the AE record and round-trip through the decoder.
+    var aes128_archive: [4096]u8 = undefined;
+    const aes128_size = try zipWriteWithCrypto(r, entries[0], &aes128_archive, password, 1, null, null);
+    const aes128_extra = aes128_archive[30 + 5 ..];
+    const aes128_id: u16 = @as(u16, aes128_extra[0]) | (@as(u16, aes128_extra[1]) << 8);
+    if (aes128_id != 0x9901 or aes128_extra[4] != 2 or aes128_extra[8] != 1) return error.Aes128ExtraMismatch;
+    var aes128_out: [1024]u8 = undefined;
+    _ = try zipReadWithPassword(r, aes128_archive[0..aes128_size], 0, &aes128_out, password);
+    try harness.requireStatus(r, abi.Status.ok);
+    if (r.response.byte_length != zip_small.len or !std.mem.eql(u8, aes128_out[0..zip_small.len], &zip_small)) {
+        return error.Aes128RoundtripMismatch;
+    }
+    // Strengths beyond 3 stay refused with the unsupported_algorithm cause.
     var diag4: harness.CryptoDiag = undefined;
     harness.cryptoDiag(&diag4);
-    try expectCryptoRejection(r, &sink_buffer, password, harness.cryptoAlgorithmParam(1), entries[0], abi.Status.unsupported, &diag4, &diag4.unsupported_algorithm);
+    try expectCryptoRejection(r, &sink_buffer, password, harness.cryptoAlgorithmParam(4), entries[0], abi.Status.unsupported, &diag4, &diag4.unsupported_algorithm);
     try harness.expect(r, harness.ids.write, &.{
         harness.scalarNode(harness.ids.source),
         harness.sinkSpan(&sink_buffer),

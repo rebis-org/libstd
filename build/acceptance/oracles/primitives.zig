@@ -49,7 +49,7 @@ fn hmacSha1Hex(message: []const u8, key: []const u8) [40]u8 {
 
 fn pbkdf2Sha1(password: []const u8, salt: []const u8, rounds: u32) [20]u8 {
     var output: [20]u8 = undefined;
-    crypto.pbkdf2HmacSha1(&output, password, salt, rounds);
+    crypto.pbkdf2HmacSha1(&output, password, salt, rounds) catch unreachable; // rounds >= 1 at every call site
     return output;
 }
 
@@ -61,7 +61,7 @@ fn hmacSha256Hex(message: []const u8, key: []const u8) [64]u8 {
 
 fn pbkdf2Sha256(password: []const u8, salt: []const u8, rounds: u32) [32]u8 {
     var output: [32]u8 = undefined;
-    crypto.pbkdf2HmacSha256(&output, password, salt, rounds);
+    crypto.pbkdf2HmacSha256(&output, password, salt, rounds) catch unreachable; // rounds >= 1 at every call site
     return output;
 }
 
