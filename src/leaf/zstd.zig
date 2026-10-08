@@ -112,8 +112,8 @@ pub fn decodeInPlace(input: *std.Io.Reader, output: []u8, options: Options) Deco
     if (options.window_size < window_size_min or options.window_size > window_size_max) return error.Unsupported;
     if (output.len < @as(usize, options.window_size) + block_size_max) return error.Unsupported;
     var discard_buffer: [0]u8 = .{};
-    var discard = std.Io.Writer.Discarding.init(&discard_buffer).writer;
-    return decodeWithOutput(input, &discard, output, options, true);
+    var discarding: std.Io.Writer.Discarding = .init(&discard_buffer);
+    return decodeWithOutput(input, &discarding.writer, output, options, true);
 }
 
 fn decodeWithOutput(input: *std.Io.Reader, output: *std.Io.Writer, history: []u8, options: Options, in_place: bool) DecodeError!usize {

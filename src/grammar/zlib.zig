@@ -136,9 +136,9 @@ test "zlib rejects a preset dictionary and trailing bytes" {
     const history = try std.testing.allocator.alloc(u8, deflate_history_size);
     defer std.testing.allocator.free(history);
     var discard_buffer: [0]u8 = .{};
-    var discard = std.Io.Writer.Discarding.init(&discard_buffer).writer;
+    var discarding: std.Io.Writer.Discarding = .init(&discard_buffer);
     // 0x78/0x20 passes FCHECK ((0x78 << 8 | 0x20) % 31 == 0) and sets FDICT.
-    try std.testing.expectError(error.Unsupported, decode(&.{ 0x78, 0x20, 0x03, 0x00, 0, 0, 0, 1 }, &discard, history));
+    try std.testing.expectError(error.Unsupported, decode(&.{ 0x78, 0x20, 0x03, 0x00, 0, 0, 0, 1 }, &discarding.writer, history));
     const input = "payload";
     var source = std.Io.Reader.fixed(input);
     var encoded: [64]u8 = undefined;
@@ -147,5 +147,5 @@ test "zlib rejects a preset dictionary and trailing bytes" {
     var with_garbage: [65]u8 = undefined;
     @memcpy(with_garbage[0..sink.end], encoded[0..sink.end]);
     with_garbage[sink.end] = 0;
-    try std.testing.expectError(error.InvalidData, decode(with_garbage[0 .. sink.end + 1], &discard, history));
+    try std.testing.expectError(error.InvalidData, decode(with_garbage[0 .. sink.end + 1], &discarding.writer, history));
 }
