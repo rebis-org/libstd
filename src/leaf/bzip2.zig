@@ -325,7 +325,11 @@ fn decodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8) Failure
         // The bit stream ends with zero padding to the next byte boundary;
         // anything nonzero there is corruption.
         if (br.bits != 0) return error.InvalidData;
-        const remaining = br.bytes[br.byte_pos..];
+        // Trailing zero bytes are padding (7z pads encrypted pack streams to
+        // the 16-byte boundary with zeros); only nonzero tail bytes must form
+        // another complete BZh stream.
+        var remaining = br.bytes[br.byte_pos..];
+        while (remaining.len > 0 and remaining[0] == 0) remaining = remaining[1..];
         if (remaining.len == 0) return;
         cursor = remaining;
     }

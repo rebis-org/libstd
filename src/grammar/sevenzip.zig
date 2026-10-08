@@ -1914,3 +1914,52 @@ test "sevenzip folder plan stays consistent across directory and encryption brea
         try testing.expectEqualSlices(u8, data, out[0..produced]);
     }
 }
+
+test "sevenzip encrypted lzma2 entry roundtrips" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const backing = try allocator.alloc(u8, 96 * 1024 * 1024);
+    defer allocator.free(backing);
+    var repetitive: [97]u8 = undefined;
+    const corpus_01 = "Squdgy fez, blank jimp crwth vox!";
+    for (&repetitive, 0..) |*byte, i| byte.* = corpus_01[i % corpus_01.len];
+    const data = repetitive[0..97];
+    const entries = [_]SevenZipEntry{
+        .{ .name = "l2.txt", .data = data, .method = .lzma2, .encrypted = true, .password = "pw" },
+    };
+    var workspace = try Workspace.init(backing.ptr, backing.len);
+    var cause: crypto.FailureCause = .none;
+    const packed_entries = try sevenZipPack(&entries, &workspace, .{}, &cause);
+    const total = try sevenZipPackedSize(&entries, packed_entries, &workspace);
+    const archive = try allocator.alloc(u8, total);
+    defer allocator.free(archive);
+    const written = try sevenZipWritePacked(&entries, packed_entries, archive, &workspace);
+    try testing.expectEqual(total, written);
+    var decode_ws = try Workspace.init(backing.ptr, backing.len);
+    const out = try allocator.alloc(u8, data.len);
+    defer allocator.free(out);
+    const produced = try sevenZipDecodeOrdinal(archive, &decode_ws, .{}, 0, out, .{ .password = "pw", .failure_cause = &cause });
+    try testing.expectEqualSlices(u8, data, out[0..produced]);
+}
+
+test "sevenzip decode captured failing encrypted archive" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const hex = "377abcaf271c0004b264b2a5300000000000000061000000000000008558bbbb2b72c63fac9cfd34eaca9f16e66742cea052cbb171699629473766c1fb2c5dbf512f7ea0868dbd6dbb3fc9357fc34c640104060001093000070b0100022406f1070112530fb5ab02e1850647c55791b562eef5860f2121011001000c306100080a011ccdcb5000000501110f006c0032002e007400780074000000140a0100000000000000000015060100200000000000";
+    var archive: [177]u8 = undefined;
+    for (&archive, 0..) |*byte, i| {
+        byte.* = std.fmt.parseInt(u8, hex[2 * i ..][0..2], 16) catch unreachable;
+    }
+    const backing = try allocator.alloc(u8, 96 * 1024 * 1024);
+    defer allocator.free(backing);
+    @memset(backing, 0xAA);
+    var workspace = try Workspace.init(backing.ptr, backing.len);
+    var cause: crypto.FailureCause = .none;
+    var corpus_data: [97]u8 = undefined;
+    const corpus_01 = "Squdgy fez, blank jimp crwth vox!";
+    for (&corpus_data, 0..) |*byte, i| byte.* = corpus_01[i % corpus_01.len];
+    const out = try allocator.alloc(u8, corpus_data.len);
+    defer allocator.free(out);
+    const produced = try sevenZipDecodeOrdinal(&archive, &workspace, .{}, 0, out, .{ .password = "secret", .failure_cause = &cause });
+    try testing.expectEqualSlices(u8, &corpus_data, out[0..produced]);
+}
