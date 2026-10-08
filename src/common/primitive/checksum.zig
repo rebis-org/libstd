@@ -6,7 +6,8 @@ const options = @import("options");
 extern fn stdk_crc32_le(crc: u32, data: [*]const u8, len: usize) u32;
 extern fn stdk_crc32_le_pmull(crc: u32, data: [*]const u8, len: usize) u32;
 
-const crc32_pmull_threshold = 256; // Fold above this length. Threshold from synthetic sweep.
+// Folding pays off above this length; the threshold comes from a synthetic sweep.
+const crc32_pmull_threshold = 256;
 
 pub const Crc32 = TableCrc(u32, 0xedb8_8320, true);
 
@@ -32,7 +33,7 @@ pub const XxHash64 = struct {
     const prime_5: u64 = 0x27d4_eb2f_1656_67c5;
 
     pub fn init(seed: u64) XxHash64 {
-        // Undefined until update fills it before any read.
+        // The stripe buffer stays undefined until update fills it before any read.
         return .{
             .accumulator_1 = seed +% prime_1 +% prime_2,
             .accumulator_2 = seed +% prime_2,
@@ -206,7 +207,7 @@ fn TableCrc(comptime T: type, comptime poly: T, comptime reflected: bool) type {
 }
 
 pub const Bzip2Crc32 = TableCrc(u32, 0x04c11db7, false);
-pub const XZCrc64 = TableCrc(u64, 0xc96c5795d7870f42, true);
+pub const XzCrc64 = TableCrc(u64, 0xc96c5795d7870f42, true);
 
 pub const Adler32 = struct {
     state: u32,
@@ -216,19 +217,19 @@ pub const Adler32 = struct {
     }
 
     pub fn update(self: *Adler32, input: []const u8) void {
-        var a: u32 = self.state & 0xffff;
-        var b: u32 = self.state >> 16;
+        var low: u32 = self.state & 0xffff;
+        var high: u32 = self.state >> 16;
         var index: usize = 0;
         while (index < input.len) {
             const end = @min(index + 5552, input.len);
             while (index < end) : (index += 1) {
-                a += input[index];
-                b += a;
+                low += input[index];
+                high += low;
             }
-            a %= 65521;
-            b %= 65521;
+            low %= 65521;
+            high %= 65521;
         }
-        self.state = (b << 16) | a;
+        self.state = (high << 16) | low;
     }
 
     pub fn final(self: *const Adler32) u32 {
@@ -337,14 +338,14 @@ pub fn xxh32(input: []const u8) u32 {
     return hasher.final();
 }
 
-test "xxh32 known vectors" {
+test "xxh32 matches the published vectors" {
     try std.testing.expectEqual(@as(u32, 0x02CC5D05), xxh32(""));
     try std.testing.expectEqual(@as(u32, 0x550D7456), xxh32("a"));
     try std.testing.expectEqual(@as(u32, 0x32D153FF), xxh32("abc"));
     try std.testing.expectEqual(@as(u32, 0xE2293B2F), xxh32("Nobody inspects the spammish repetition"));
 }
 
-test "adler32 known vectors" {
+test "adler32 matches the published vectors" {
     try std.testing.expectEqual(@as(u32, 0x00000001), adler32(""));
     try std.testing.expectEqual(@as(u32, 0x091E01DE), adler32("123456789"));
     try std.testing.expectEqual(@as(u32, 0x11E60398), adler32("Wikipedia"));
@@ -354,7 +355,7 @@ test "adler32 known vectors" {
     try std.testing.expectEqual(@as(u32, 0x091E01DE), hasher.final());
 }
 
-test "crc32 known vectors" {
+test "crc32 matches the published vectors" {
     try std.testing.expectEqual(@as(u32, 0x00000000), crc32(""));
     try std.testing.expectEqual(@as(u32, 0xCBF43926), crc32("123456789"));
     var hash = Crc32.init();
@@ -363,7 +364,7 @@ test "crc32 known vectors" {
     try std.testing.expectEqual(crc32("123456789"), hash.final());
 }
 
-test "xxh64 known vectors" {
+test "xxh64 matches the published vectors" {
     try std.testing.expectEqual(@as(u64, 0xEF46DB3751D8E999), xxh64(""));
     try std.testing.expectEqual(@as(u64, 0xD24EC4F1A98C6E5B), xxh64("a"));
     var hasher = XxHash64.init(0);

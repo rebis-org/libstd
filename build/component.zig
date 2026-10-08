@@ -1,6 +1,6 @@
 const std = @import("std");
 
-// Emits a comptime table so adding or removing a component touches only its own files.
+// Emits a comptime table, so a component change touches only its own files.
 const RawParameter = struct {
     name: []const u8,
     family: u16,
@@ -70,7 +70,8 @@ const known_capabilities = [_][]const u8{ "read", "write", "size", "replay", "se
 const known_sizing = [_][]const u8{ "unavailable", "metadata_exact", "measured" };
 const known_commit = [_][]const u8{ "tentative", "confirmed" };
 
-// Maps verbs to command bits: sizing answers query, decode serves read, encode serves write.
+// Verb groups map to command bits: a sizing verb answers a query, a decode verb
+// serves a read, and an encode verb serves a write.
 fn commandBitForVerb(verb: []const u8) ?u32 {
     if (std.mem.eql(u8, verb, "required_size") or std.mem.eql(u8, verb, "decoded_size") or std.mem.eql(u8, verb, "encoded_size_bound") or std.mem.eql(u8, verb, "inspect")) return 1;
     if (std.mem.eql(u8, verb, "decode") or std.mem.eql(u8, verb, "decode_stream") or std.mem.eql(u8, verb, "decode_ordinal")) return 2;
@@ -83,14 +84,14 @@ fn contains(haystack: []const []const u8, needle: []const u8) bool {
     return false;
 }
 
-fn safeText(text: []const u8) bool {
+fn isSafeText(text: []const u8) bool {
     for (text) |character| {
         if (character == '"' or character == '\\' or character < 0x20) return false;
     }
     return true;
 }
 
-fn safeTag(text: []const u8) bool {
+fn isSafeTag(text: []const u8) bool {
     if (text.len == 0) return false;
     for (text, 0..) |character, index| {
         const word = character == '_' or character == '-' or
@@ -102,7 +103,7 @@ fn safeTag(text: []const u8) bool {
     return true;
 }
 
-fn quoted(allocator: std.mem.Allocator, value: []const u8) ![]const u8 {
+fn quote(allocator: std.mem.Allocator, value: []const u8) ![]const u8 {
     return allocator.print("\"{s}\"", .{value});
 }
 
@@ -112,7 +113,7 @@ pub fn main(init: std.process.Init) !void {
 
     var args = std.process.Args.Iterator.init(init.minimal.args);
     _ = args.next();
-    // Explicit file args keep the scan's cache key honest in both directions.
+    // Each descriptor is a file argument, because a directory argument is unfingerprinted.
     var descriptors: std.ArrayList(RawDescriptor) = .empty;
     var output_path: ?[]const u8 = null;
     while (args.next()) |arg| {
@@ -129,7 +130,7 @@ pub fn main(init: std.process.Init) !void {
             .source = source,
             .diagnostics = &diagnostics,
         }) catch |err| {
-            std.debug.print("Failed to parse descriptor \"{s}\": {s}.\n", .{ arg, @errorName(err) });
+            std.debug.print("failed to parse descriptor \"{s}\": {s}.\n", .{ arg, @errorName(err) });
             return err;
         };
         try descriptors.append(allocator, parsed);
@@ -147,22 +148,22 @@ pub fn main(init: std.process.Init) !void {
         for (descriptor.verbs) |verb| if (!contains(&known_verbs, verb)) return error.UnknownVerb;
         for (descriptor.parameters) |parameter| {
             if (!contains(&known_representations, parameter.representation)) return error.UnknownRepresentation;
-            if (!safeText(parameter.name)) return error.UnsafeText;
+            if (!isSafeText(parameter.name)) return error.UnsafeText;
         }
         for (descriptor.capabilities) |capability| if (!contains(&known_capabilities, capability)) return error.UnknownCapability;
         if (!contains(&known_sizing, descriptor.sizing)) return error.UnknownSizing;
         if (!contains(&known_commit, descriptor.commit)) return error.UnknownCommit;
-        if (!safeText(descriptor.name) or !safeTag(descriptor.name)) return error.UnsafeText;
-        if (!safeText(descriptor.id.low) or !safeText(descriptor.id.high)) return error.UnsafeText;
+        if (!isSafeText(descriptor.name) or !isSafeTag(descriptor.name)) return error.UnsafeText;
+        if (!isSafeText(descriptor.id.low) or !isSafeText(descriptor.id.high)) return error.UnsafeText;
         if (descriptor.benchmark) |benchmark| {
-            if (!safeText(benchmark.row) or !safeText(benchmark.params)) return error.UnsafeText;
-            if (!safeText(benchmark.kind) or !safeText(benchmark.ext) or !safeText(benchmark.ref_params)) return error.UnsafeText;
-            if (benchmark.cmd) |text| if (!safeText(text)) return error.UnsafeText;
-            if (benchmark.lib) |text| if (!safeText(text)) return error.UnsafeText;
-            if (benchmark.bin) |text| if (!safeText(text)) return error.UnsafeText;
+            if (!isSafeText(benchmark.row) or !isSafeText(benchmark.params)) return error.UnsafeText;
+            if (!isSafeText(benchmark.kind) or !isSafeText(benchmark.ext) or !isSafeText(benchmark.ref_params)) return error.UnsafeText;
+            if (benchmark.cmd) |text| if (!isSafeText(text)) return error.UnsafeText;
+            if (benchmark.lib) |text| if (!isSafeText(text)) return error.UnsafeText;
+            if (benchmark.bin) |text| if (!isSafeText(text)) return error.UnsafeText;
             for (benchmark.tunings) |tuning| {
-                if (!safeText(tuning.name) or !safeText(tuning.ref_params)) return error.UnsafeText;
-                for (tuning.cmd_args) |arg| if (!safeText(arg)) return error.UnsafeText;
+                if (!isSafeText(tuning.name) or !isSafeText(tuning.ref_params)) return error.UnsafeText;
+                for (tuning.cmd_args) |arg| if (!isSafeText(arg)) return error.UnsafeText;
             }
         }
     }
@@ -217,9 +218,9 @@ pub fn main(init: std.process.Init) !void {
             benchmark.params,
             benchmark.kind,
             benchmark.ext,
-            if (benchmark.cmd) |value| try quoted(allocator, value) else "null",
-            if (benchmark.lib) |value| try quoted(allocator, value) else "null",
-            if (benchmark.bin) |value| try quoted(allocator, value) else "null",
+            if (benchmark.cmd) |value| try quote(allocator, value) else "null",
+            if (benchmark.lib) |value| try quote(allocator, value) else "null",
+            if (benchmark.bin) |value| try quote(allocator, value) else "null",
             benchmark.fmt,
             benchmark.store,
             benchmark.archive,
@@ -229,8 +230,8 @@ pub fn main(init: std.process.Init) !void {
         });
         for (benchmark.tunings) |tuning| {
             try output.print(allocator, ".{{ .name = \"{s}\", .params = &.{{ ", .{tuning.name});
-            for (tuning.params) |param| {
-                try output.print(allocator, ".{{ .family = {d}, .ordinal = {d}, .value = {d} }}, ", .{ param.family, param.ordinal, param.value });
+            for (tuning.params) |parameter| {
+                try output.print(allocator, ".{{ .family = {d}, .ordinal = {d}, .value = {d} }}, ", .{ parameter.family, parameter.ordinal, parameter.value });
             }
             try output.appendSlice(allocator, "}, .ref_params = \"");
             try output.appendSlice(allocator, tuning.ref_params);
@@ -248,9 +249,9 @@ pub fn main(init: std.process.Init) !void {
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = resolved_output_path, .data = output.items });
 }
 
-// Identity beyond the descriptor is generated, so a new component is a
-// descriptor file plus one convention-named hook. Hyphens become underscores
-// for the tag, and tagForName maps back for dispatch.
+// The table derives every other identity from the descriptor, so a component is one
+// descriptor file plus one convention-named hook. A hyphen becomes an underscore in
+// the tag, and tagForName maps a profile name back to its tag.
 fn underscore(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
     const tagged = try allocator.dupe(u8, name);
     for (tagged) |*character| {

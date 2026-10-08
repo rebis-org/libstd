@@ -38,15 +38,15 @@ const generated = @import("components");
 
 fn kindFor(comptime name: []const u8) Kind {
     if (std.mem.eql(u8, name, "7z")) return .seven_zip;
-    return std.meta.stringToEnum(Kind, name) orelse @compileError("unknown benchmark kind: " ++ name);
+    return std.meta.stringToEnum(Kind, name) orelse @compileError("Unknown benchmark kind: " ++ name ++ ".");
 }
 
 fn cmdFor(comptime name: []const u8) Cmd {
-    return std.meta.stringToEnum(Cmd, name) orelse @compileError("unknown benchmark cmd: " ++ name);
+    return std.meta.stringToEnum(Cmd, name) orelse @compileError("Unknown benchmark cmd: " ++ name ++ ".");
 }
 
 fn libFor(comptime name: []const u8) Lib {
-    return std.meta.stringToEnum(Lib, name) orelse @compileError("unknown benchmark lib: " ++ name);
+    return std.meta.stringToEnum(Lib, name) orelse @compileError("Unknown benchmark lib: " ++ name ++ ".");
 }
 
 const derived_bases = blk: {
@@ -54,18 +54,18 @@ const derived_bases = blk: {
     var list: []const Base = &.{};
     for (generated.benchmarks) |benchmark| {
         const tuning_list: []const Tuning = blk2: {
-            var inner: []const Tuning = &.{};
+            var tunings: []const Tuning = &.{};
             for (benchmark.tunings) |raw_tuning| {
-                const params: []const Param = blk3: {
-                    var plist: []const Param = &.{};
+                const param_list: []const Param = blk3: {
+                    var params: []const Param = &.{};
                     for (raw_tuning.params) |param| {
-                        plist = plist ++ &[_]Param{.{ .family = param.family, .ordinal = param.ordinal, .value = param.value }};
+                        params = params ++ &[_]Param{.{ .family = param.family, .ordinal = param.ordinal, .value = param.value }};
                     }
-                    break :blk3 plist;
+                    break :blk3 params;
                 };
-                inner = inner ++ &[_]Tuning{.{ .name = raw_tuning.name, .params = params, .ref_params = raw_tuning.ref_params, .cmd_args = raw_tuning.cmd_args, .lib_level = raw_tuning.lib_level, .bypass = raw_tuning.bypass }};
+                tunings = tunings ++ &[_]Tuning{.{ .name = raw_tuning.name, .params = param_list, .ref_params = raw_tuning.ref_params, .cmd_args = raw_tuning.cmd_args, .lib_level = raw_tuning.lib_level, .bypass = raw_tuning.bypass }};
             }
-            break :blk2 inner;
+            break :blk2 tunings;
         };
         list = list ++ &[_]Base{.{ .name = benchmark.row, .kind = kindFor(benchmark.kind), .ext = benchmark.ext, .cmd = if (benchmark.cmd) |value| cmdFor(value) else null, .lib = if (benchmark.lib) |value| libFor(value) else null, .bin = if (benchmark.bin) |value| cmdFor(value) else null, .fmt = benchmark.fmt, .store = benchmark.store, .archive = benchmark.archive, .method = benchmark.method, .decode_only = benchmark.decode_only, .ref_params = benchmark.ref_params, .tunings = tuning_list }};
     }
@@ -95,17 +95,17 @@ pub const Row = struct {
 };
 
 const row_count = blk: {
-    var n: usize = 0;
-    for (bases) |base| n += base.tunings.len;
-    break :blk n;
+    var count: usize = 0;
+    for (bases) |base| count += base.tunings.len;
+    break :blk count;
 };
 
 const row_array = blk: {
     @setEvalBranchQuota(100_000);
     var list: [row_count]Row = undefined;
-    var i: usize = 0;
+    var index: usize = 0;
     for (bases) |base| {
-        for (base.tunings) |t| {
+        for (base.tunings) |tuning| {
             const row_type: []const u8 = if (base.decode_only)
                 "decode-only"
             else if (base.archive and base.method)
@@ -114,8 +114,8 @@ const row_array = blk: {
                 "archive-store"
             else
                 "stream";
-            list[i] = .{
-                .name = if (t.name.len == 0) base.name else base.name ++ "-" ++ t.name,
+            list[index] = .{
+                .name = if (tuning.name.len == 0) base.name else base.name ++ "-" ++ tuning.name,
                 .kind = base.kind,
                 .ext = base.ext,
                 .cmd = base.cmd,
@@ -126,14 +126,14 @@ const row_array = blk: {
                 .archive = base.archive,
                 .method = base.method,
                 .decode_only = base.decode_only,
-                .params = t.params,
-                .ref_params = if (t.ref_params.len != 0) t.ref_params else base.ref_params,
+                .params = tuning.params,
+                .ref_params = if (tuning.ref_params.len != 0) tuning.ref_params else base.ref_params,
                 .row_type = row_type,
-                .cmd_args = t.cmd_args,
-                .lib_level = t.lib_level,
-                .bypass = t.bypass,
+                .cmd_args = tuning.cmd_args,
+                .lib_level = tuning.lib_level,
+                .bypass = tuning.bypass,
             };
-            i += 1;
+            index += 1;
         }
     }
     break :blk list;

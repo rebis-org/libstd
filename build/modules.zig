@@ -62,7 +62,7 @@ fn byName(name: []const u8) Module {
     for (importable) |module| {
         if (std.mem.eql(u8, module.name, name)) return module;
     }
-    @compileError("unknown module: " ++ name);
+    @compileError("unknown module: " ++ name ++ ".");
 }
 
 pub fn create(b: *std.Build, comptime spec: Module, ctx: *const common.Context) *std.Build.Module {

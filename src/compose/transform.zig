@@ -707,7 +707,7 @@ fn parseLzmaMatchParams(request: ?*Node, command_mask: u32) Failure!LzmaMatchPar
 
 pub fn lzmaHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
     const dictionary_size = try parseLzmaDictionary(call.request);
-    const properties = lzma2.properties(dictionary_size);
+    const properties = lzma2.defaultProperties(dictionary_size);
     const params = try parseLzmaMatchParams(call.request, command_mask);
     const encode_workspace = if (params.match_finder == .bt4) lzma.encodeWorkspaceSizeBt(properties) else lzma.encodeWorkspaceSize(properties);
     return bufferCodecHook(lzma, plan, source, sink, call, response, sizing, commit, limits, command_mask, lzma.decodeWorkspaceSize(properties), encode_workspace, .{
@@ -724,7 +724,7 @@ pub fn lzmaHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resourc
 
 pub fn lzma2Hook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
     const dictionary_size = try parseLzmaDictionary(call.request);
-    const properties = lzma2.properties(dictionary_size);
+    const properties = lzma2.defaultProperties(dictionary_size);
     const params = try parseLzmaMatchParams(call.request, command_mask);
     const encode_workspace = if (params.match_finder == .bt4) lzma2.encodeWorkspaceSizeBt(dictionary_size) else lzma2.encodeWorkspaceSize(dictionary_size);
     return bufferCodecHook(lzma2, plan, source, sink, call, response, sizing, commit, limits, command_mask, lzma2.decodeWorkspaceSize(dictionary_size), encode_workspace, .{
@@ -750,7 +750,7 @@ fn bufferCodecHook(comptime Codec: type, plan: *common.ExecutionPlan, source: ?*
             try common.checkWorkspaceOverlap(call, source_resource, sink_resource);
             if (!sink_resource.hasCapability(resource.capability_bit_write)) return error.Unsupported;
             if (sink_resource.kind == .direct_write and try codecKnownOutputSize(Codec, options) == null and (Codec == lzma or Codec == bzip2)) {
-                // No size preflight: produced length comes back from the codec. Lzma2 excluded since chunk headers give cheap size and in-place is faster.
+                // No size preflight: the produced length comes back from the codec. lzma2 is excluded because chunk headers give a cheap size and in-place is faster.
                 const output = try common.sinkDirectBuffer(sink_resource, common.sinkCapacity(sink_resource));
                 if (input.len + output.len > limits.codec_work) return error.ResourceLimit;
                 const produced = try codecDecodeDirect(Codec, input, output, scratch, options);

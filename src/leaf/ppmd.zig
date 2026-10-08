@@ -16,7 +16,7 @@ const period_bits = 7;
 const bin_scale = 1 << (int_bits + period_bits);
 const top_value = 1 << 24;
 const max_freq = 124;
-const bit_shift = 14;
+const bin_shift = 14;
 const init_bin_esc = [_]u16{ 0x3CDD, 0x1F3F, 0x59BF, 0x48F3, 0x64A1, 0x5ABC, 0x6632, 0x6051 };
 const exp_escape = [_]u8{ 25, 14, 9, 7, 5, 5, 4, 4, 4, 3, 3, 3, 2, 2, 2, 2 };
 
@@ -62,20 +62,20 @@ pub const encodeWorkspaceSize = decodeWorkspaceSize;
 
 pub fn requiredSize(input: []const u8, scratch: []u8, options: Options) Failure!usize {
     var counter = measurement.Counter.init(null);
-    try encodeInner(input, &counter.writer, scratch, options);
+    try encodeToWriter(input, &counter.writer, scratch, options);
     return std.math.cast(usize, counter.written()) orelse error.ResourceLimit;
 }
 
 pub fn encode(input: []const u8, output: []u8, scratch: []u8, options: Options) Failure!usize {
     var writer = std.Io.Writer.fixed(output);
-    try encodeInner(input, &writer, scratch, options);
+    try encodeToWriter(input, &writer, scratch, options);
     return writer.end;
 }
 
-fn encodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options: Options) Failure!void {
-    const unpack = std.math.cast(usize, options.unpack_size) orelse return error.ResourceLimit;
-    if (input.len != unpack) return error.InvalidCall;
-    try validateOptions(options, unpack);
+fn encodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options: Options) Failure!void {
+    const unpack_size = std.math.cast(usize, options.unpack_size) orelse return error.ResourceLimit;
+    if (input.len != unpack_size) return error.InvalidCall;
+    try validateOptions(options, unpack_size);
     const model = try Model.prepare(scratch, options.mem_size);
     model.restart(options.order);
     var range_coder = RangeEncoder.init(writer);
@@ -93,16 +93,16 @@ pub fn decodedSize(input: []const u8, scratch: []u8, options: Options) Failure!u
 }
 
 pub fn decode(input: []const u8, output: []u8, scratch: []u8, options: Options) Failure!usize {
-    const unpack = std.math.cast(usize, options.unpack_size) orelse return error.ResourceLimit;
-    if (output.len < unpack) return error.InsufficientCapacity;
-    try validateOptions(options, unpack);
+    const unpack_size = std.math.cast(usize, options.unpack_size) orelse return error.ResourceLimit;
+    if (output.len < unpack_size) return error.InsufficientCapacity;
+    try validateOptions(options, unpack_size);
     const model = try Model.prepare(scratch, options.mem_size);
     model.restart(options.order);
     var range_coder = RangeDecoder.init(input);
     try range_coder.initStream();
     var dest = std.Io.Writer.fixed(output);
     var count: usize = 0;
-    while (count < unpack) : (count += 1) {
+    while (count < unpack_size) : (count += 1) {
         const symbol = model.decodeSymbol(&range_coder) catch return error.InvalidData;
         try io.writeByte(&dest, @intCast(symbol));
     }
@@ -112,25 +112,25 @@ pub fn decode(input: []const u8, output: []u8, scratch: []u8, options: Options) 
 
 pub fn decodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options: Options) Failure!void {
     if (options.unpack_size > std.math.maxInt(usize)) return error.ResourceLimit;
-    const unpack = std.math.cast(usize, options.unpack_size) orelse return error.ResourceLimit;
-    try validateOptions(options, unpack);
+    const unpack_size = std.math.cast(usize, options.unpack_size) orelse return error.ResourceLimit;
+    try validateOptions(options, unpack_size);
     const model = try Model.prepare(scratch, options.mem_size);
     model.restart(options.order);
     var range_coder = RangeDecoder.init(input);
     try range_coder.initStream();
     var count: usize = 0;
-    while (count < unpack) : (count += 1) {
+    while (count < unpack_size) : (count += 1) {
         const symbol = model.decodeSymbol(&range_coder) catch return error.InvalidData;
         try io.writeByte(writer, @intCast(symbol));
     }
     if (range_coder.code != 0) return error.InvalidData;
 }
 
-fn validateOptions(options: Options, unpack: usize) Failure!void {
+fn validateOptions(options: Options, unpack_size: usize) Failure!void {
     if (options.order < order_min or options.order > order_max) return error.Unsupported;
     if (options.mem_size < mem_min or options.mem_size > mem_max) return error.Unsupported;
     if (options.mem_size & 3 != 0) return error.Unsupported;
-    if (options.max_work < unpack) return error.ResourceLimit;
+    if (options.max_work < unpack_size) return error.ResourceLimit;
 }
 
 const RangeDecoder = struct {
@@ -181,7 +181,7 @@ const RangeDecoder = struct {
     }
 
     fn decodeBit(self: *RangeDecoder, size0: u32) Failure!u32 {
-        const new_bound = (self.range >> bit_shift) * size0;
+        const new_bound = (self.range >> bin_shift) * size0;
         if (self.code < new_bound) {
             self.range = new_bound;
             try self.normalize();
@@ -327,9 +327,9 @@ const Model = struct {
         return @as(u32, s.successor_low) | (@as(u32, s.successor_high) << 16);
     }
 
-    inline fn setSuccessor(s: *State, value: u32) void {
-        s.successor_low = @truncate(value);
-        s.successor_high = @truncate(value >> 16);
+    inline fn setSuccessor(s: *State, succ_off: u32) void {
+        s.successor_low = @truncate(succ_off);
+        s.successor_high = @truncate(succ_off >> 16);
     }
 
     fn construct(self: *Model) void {
@@ -661,9 +661,9 @@ const Model = struct {
                 if (s[0].symbol != found.symbol) {
                     while (s[0].symbol != found.symbol) s += 1;
                     if (s[0].freq >= (s - 1)[0].freq) {
-                        const tmp = s[0];
+                        const swap = s[0];
                         s[0] = (s - 1)[0];
-                        (s - 1)[0] = tmp;
+                        (s - 1)[0] = swap;
                         s -= 1;
                     }
                 }
@@ -773,12 +773,12 @@ const Model = struct {
         const stats = self.statsOf(min_ctx);
         var s: [*]State = @ptrCast(self.state(self.found_state));
         {
-            const tmp = s[0];
+            const moved = s[0];
             while (s != stats) {
                 s[0] = (s - 1)[0];
                 s -= 1;
             }
-            s[0] = tmp;
+            s[0] = moved;
         }
         var esc_freq: u32 = @as(u32, min_ctx.summ_freq) - s[0].freq;
         s[0].freq += 4;
@@ -792,14 +792,14 @@ const Model = struct {
             s[0].freq = @intCast((@as(u32, s[0].freq) + adder) >> 1);
             sum_freq += s[0].freq;
             if (s[0].freq > (s - 1)[0].freq) {
-                var s1 = s;
-                const tmp = s1[0];
-                while (s1 != stats) {
-                    if (tmp.freq <= (s1 - 1)[0].freq) break;
-                    s1[0] = (s1 - 1)[0];
-                    s1 -= 1;
+                var cursor = s;
+                const displaced = cursor[0];
+                while (cursor != stats) {
+                    if (displaced.freq <= (cursor - 1)[0].freq) break;
+                    cursor[0] = (cursor - 1)[0];
+                    cursor -= 1;
                 }
-                s1[0] = tmp;
+                cursor[0] = displaced;
             }
             if (i == 1) break;
             i -= 1;
@@ -815,15 +815,15 @@ const Model = struct {
             esc_freq += removed;
             min_ctx.num_stats = @intCast(min_ctx.num_stats - removed);
             if (min_ctx.num_stats == 1) {
-                var tmp = stats[0];
+                var kept = stats[0];
                 while (true) {
-                    tmp.freq = @intCast(@as(u32, tmp.freq) - (tmp.freq >> 1));
+                    kept.freq = @intCast(@as(u32, kept.freq) - (kept.freq >> 1));
                     esc_freq >>= 1;
                     if (esc_freq <= 1) break;
                 }
                 self.insertNode(self.ref(stats), self.u2i((num_stats + 1) >> 1));
                 const one = Model.oneState(min_ctx);
-                one.* = tmp;
+                one.* = kept;
                 self.found_state = self.ref(one);
                 return;
             }
@@ -880,7 +880,7 @@ const Model = struct {
         self.nextContext();
     }
 
-    fn update1_0(self: *Model) void {
+    fn update1To0(self: *Model) void {
         self.prev_success = @intFromBool(2 * @as(u32, self.state(self.found_state).freq) > self.ctx(self.min_context).summ_freq);
         self.run_length += @as(i32, @intCast(self.prev_success));
         self.ctx(self.min_context).summ_freq += 4;
@@ -928,7 +928,7 @@ const Model = struct {
                 const symbol = s[0].symbol;
                 try range_coder.decodeRange(0, s[0].freq);
                 self.found_state = self.ref(s);
-                self.update1_0();
+                self.update1To0();
                 return symbol;
             }
             self.prev_success = 0;
@@ -1035,7 +1035,7 @@ const Model = struct {
             if (s[0].symbol == symbol) {
                 try range_coder.encodeFinal(0, s[0].freq);
                 self.found_state = self.ref(s);
-                self.update1_0();
+                self.update1To0();
                 return;
             }
             self.prev_success = 0;
@@ -1067,7 +1067,7 @@ const Model = struct {
             const s = Model.oneState(min_ctx);
             const prob = self.binSumm();
             var pr: u32 = prob.*;
-            const bound = (range_coder.range >> bit_shift) * pr;
+            const bound = (range_coder.range >> bin_shift) * pr;
             pr = updateProb1(@intCast(pr));
             if (s.symbol == symbol) {
                 prob.* = @intCast(pr + (1 << int_bits));

@@ -8,7 +8,8 @@ const zstd = @import("../leaf/zstd.zig");
 
 // Zstandard seekable format (contrib/seekable_format spec 0.1.0): independent
 // zstd frames followed by a skippable frame carrying the seek table, whose
-// footer magic must be the last bytes of the file.
+// footer magic must be the last bytes of the file. A skippable frame header is
+// 8 bytes: the magic and the size of the frame payload.
 
 const frame_magic: u32 = 0xFD2FB528;
 const skippable_magic: u32 = 0x184D2A5E;
@@ -22,7 +23,7 @@ pub const frame_size_default: u32 = 1 << 20;
 
 pub const Options = struct {
     frame_size: u32 = frame_size_default,
-    window: u32 = 1 << 20,
+    window_size: u32 = 1 << 20,
     hash_bits: u32 = 17,
     max_chain: u32 = 32,
     nice_len: u32 = 64,
@@ -30,9 +31,9 @@ pub const Options = struct {
 };
 
 pub fn frameOptions(options: Options) zstd.Options {
-    const window: u32 = @max(options.window, zstd.window_size_min);
+    const window_size: u32 = @max(options.window_size, zstd.window_size_min);
     return .{
-        .window_size = window,
+        .window_size = window_size,
         .hash_bits = @intCast(options.hash_bits),
         .max_chain = options.max_chain,
         .nice_len = options.nice_len,
@@ -45,8 +46,8 @@ fn tableSize(frame_count: usize) usize {
 }
 
 pub fn encodedSizeBound(input_len: usize, options: Options) usize {
-    const frames = input_len / options.frame_size + 1;
-    return zstd.encodedSizeBound(input_len, frameOptions(options)) + tableSize(frames);
+    const frame_count = input_len / options.frame_size + 1;
+    return zstd.encodedSizeBound(input_len, frameOptions(options)) + tableSize(frame_count);
 }
 
 pub const FrameInfo = struct {
@@ -54,8 +55,8 @@ pub const FrameInfo = struct {
     has_checksums: bool,
 };
 
-// The table footer magic must be the file's last bytes. Table entries are
-// validated against the frame magics at their compressed offsets.
+// The footer magic must be at the end of the input. Each table entry is checked
+// against the frame magic at its compressed offset.
 pub fn inspect(input: []const u8) Failure!FrameInfo {
     if (input.len < 8 + footer_size) return error.InvalidData;
     if (std.mem.readInt(u32, input[input.len - 4 ..][0..4], .little) != seekable_magic) return error.InvalidData;
@@ -90,7 +91,7 @@ pub fn decodedSize(input: []const u8, history: []u8, options: Options) Failure!u
     return std.math.cast(usize, counter.written()) orelse error.ResourceLimit;
 }
 
-pub const FrameEntry = struct { compressed: u32, decompressed: u32 };
+pub const FrameEntry = struct { compressed_size: u32, decompressed_size: u32 };
 
 pub fn frameCountFor(input_len: usize, options: Options) usize {
     return input_len / options.frame_size + 1;
@@ -113,20 +114,20 @@ pub fn encodeToWriter(input: []const u8, output: *std.Io.Writer, history: []u8, 
             error.ResourceLimit, error.IoFailure => |e| return e,
         };
         entries[frame_count] = .{
-            .compressed = std.math.cast(u32, written) orelse return error.ResourceLimit,
-            .decompressed = std.math.cast(u32, chunk_len) orelse return error.ResourceLimit,
+            .compressed_size = std.math.cast(u32, written) orelse return error.ResourceLimit,
+            .decompressed_size = std.math.cast(u32, chunk_len) orelse return error.ResourceLimit,
         };
         frame_count += 1;
         offset += chunk_len;
         if (input.len == 0) break;
     }
-    // Seek table in a skippable frame. No per-entry checksums (descriptor 0).
+    // The seek table is a skippable frame. Descriptor 0 stores no per-entry checksums.
     const table_len = tableSize(frame_count);
     output.writeInt(u32, skippable_magic, .little) catch return error.IoFailure;
     output.writeInt(u32, std.math.cast(u32, table_len - 8) orelse return error.ResourceLimit, .little) catch return error.IoFailure;
     for (entries[0..frame_count]) |entry| {
-        output.writeInt(u32, entry.compressed, .little) catch return error.IoFailure;
-        output.writeInt(u32, entry.decompressed, .little) catch return error.IoFailure;
+        output.writeInt(u32, entry.compressed_size, .little) catch return error.IoFailure;
+        output.writeInt(u32, entry.decompressed_size, .little) catch return error.IoFailure;
     }
     output.writeInt(u32, std.math.cast(u32, frame_count) orelse return error.ResourceLimit, .little) catch return error.IoFailure;
     output.writeByte(0) catch return error.IoFailure;
@@ -134,9 +135,9 @@ pub fn encodeToWriter(input: []const u8, output: *std.Io.Writer, history: []u8, 
 }
 
 pub fn encode(input: []const u8, output: []u8, history: []u8, workspace: []u32, entries: []FrameEntry, options: Options) Failure!usize {
-    var fixed = std.Io.Writer.fixed(output);
-    try encodeToWriter(input, &fixed, history, workspace, entries, options);
-    return fixed.end;
+    var writer = std.Io.Writer.fixed(output);
+    try encodeToWriter(input, &writer, history, workspace, entries, options);
+    return writer.end;
 }
 
 pub fn decode(input: []const u8, output: *std.Io.Writer, history: []u8, options: Options) Failure!void {
@@ -146,7 +147,7 @@ pub fn decode(input: []const u8, output: *std.Io.Writer, history: []u8, options:
     _ = zstd.decodeStream(&source, output, history, frame_options) catch |err| return err;
 }
 
-test "zstd seekable roundtrip" {
+test "zstd seekable round trip restores the original input" {
     const options: Options = .{};
     var prng = std.Random.DefaultPrng.init(0xbeef);
     const random = prng.random();

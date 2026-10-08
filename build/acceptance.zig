@@ -18,7 +18,7 @@ pub const units = [_]Unit{
 };
 
 pub fn expand(b: *std.Build, ctx: *common.Context) void {
-    const refs = ctx.refs orelse @panic("Vendor units must expand before acceptance units.");
+    const refs = ctx.refs orelse @panic("The vendor units must expand before the acceptance units.");
     inline for (units) |unit| switch (unit.kind) {
         .oracles => addOracles(b, ctx, refs),
         .benchmark => addBenchmark(b, ctx, refs),
@@ -72,7 +72,7 @@ fn abVariantModule(b: *std.Build, name: []const u8) *std.Build.Module {
     return variant.createModule();
 }
 
-fn skipHostLibs(b: *std.Build, ctx: *const common.Context) common.HostLibraries {
+fn skipVariantHostLibraries(b: *std.Build, ctx: *const common.Context) common.HostLibraries {
     const skip_options = b.addOptions();
     skip_options.addOption(bool, "portable", ctx.portable);
     return common.addHostLibrariesWithOptions(b, ctx.target, ctx.optimize, ctx.portable, skip_options.createModule(), ctx.sanitize_c);
@@ -132,24 +132,24 @@ fn linkBenchmarkExe(b: *std.Build, exe: *std.Build.Step.Compile, run: *std.Build
 }
 
 fn addOracles(b: *std.Build, ctx: *common.Context, refs: cmd.Refs) void {
-    const pair = modules.componentsWithNucleus(b, ctx, ctx.target, ctx.target, ctx.optimize);
+    const modules_pair = modules.componentsWithNucleus(b, ctx, ctx.target, ctx.target, ctx.optimize);
     const c_module = translateCModule(b, ctx.target, ctx.optimize);
     const ab_variant_baseline_module = abVariantModule(b, "baseline");
 
     const app = addAcceptanceApp(b, ctx, "oracles", modules.oracles, ctx.target, ctx.optimize, &.{
         .{ .name = "c", .module = c_module },
         .{ .name = "ab_variant", .module = ab_variant_baseline_module },
-        .{ .name = "components", .module = pair.components },
+        .{ .name = "components", .module = modules_pair.components },
     }, ctx.host, "oracles", "Run the oracle suite against the system libraries");
     linkOracleRefs(app, refs, ctx.generated.catalog);
 
-    const skip_host = skipHostLibs(b, ctx);
+    const skip_host = skipVariantHostLibraries(b, ctx);
     const ab_variant_skip_module = abVariantModule(b, "skip");
 
     const skip_app = addAcceptanceApp(b, ctx, "oracles_skip", modules.oracles, ctx.target, ctx.optimize, &.{
         .{ .name = "c", .module = c_module },
         .{ .name = "ab_variant", .module = ab_variant_skip_module },
-        .{ .name = "components", .module = pair.components },
+        .{ .name = "components", .module = modules_pair.components },
     }, skip_host, "oracles_skip", "Run the oracle suite against the encode A/B variant slot");
     linkOracleRefs(skip_app, refs, ctx.generated.catalog);
 
@@ -168,11 +168,12 @@ fn addOracles(b: *std.Build, ctx: *common.Context, refs: cmd.Refs) void {
     const diff = b.addSystemCommand(&.{ "diff", "-rq", "zig-out/oracles/ab/baseline", "zig-out/oracles/ab/skip" });
     diff.step.dependOn(&baseline_ab_run.step);
     diff.step.dependOn(&skip_ab_run.step);
-    b.step("oracles_ab", "Compare LZMA encode output between baseline and skip-on variants").dependOn(&diff.step);
+    b.step("oracles_ab", "Compare LZMA encode output between the baseline and skip variants").dependOn(&diff.step);
 
-    // Re-executes per scenario: contract violations trap the process, so driver and scenarios cannot share an address space.
+    // Each scenario runs in its own process: a contract violation traps, so the
+    // driver and the scenarios cannot share one address space.
     app.run.step.dependOn(&addTrapRun(b, ctx, ctx.target, ctx.optimize, "oracles_trap").step);
-    app.run.step.dependOn(&addContractCheck(b, pair.nucleus, pair.components, ctx.target, ctx.optimize, ctx.sanitize_c, "contract_check", ctx.generated.catalog).step);
+    app.run.step.dependOn(&addContractCheck(b, modules_pair.nucleus, modules_pair.components, ctx.target, ctx.optimize, ctx.sanitize_c, "contract_check", ctx.generated.catalog).step);
 
     const compose_ab_module = b.createModule(.{
         .root_source_file = b.path("src/compose_ab.zig"),
@@ -192,30 +193,33 @@ fn addOraclesUbsan(b: *std.Build, ctx: *common.Context, refs: cmd.Refs) void {
     ubsan_ctx.sanitize_c = .full;
     ubsan_ctx.host = common.addHostLibrariesWithOptions(b, ctx.target, ctx.optimize, ctx.portable, ctx.options, .full);
 
-    const pair = modules.componentsWithNucleus(b, &ubsan_ctx, ctx.target, ctx.target, ctx.optimize);
+    const modules_pair = modules.componentsWithNucleus(b, &ubsan_ctx, ctx.target, ctx.target, ctx.optimize);
     const c_module = translateCModule(b, ctx.target, ctx.optimize);
     const ab_variant_baseline_module = abVariantModule(b, "baseline");
 
     const app = addAcceptanceApp(b, &ubsan_ctx, "oracles_ubsan", modules.oracles, ctx.target, ctx.optimize, &.{
         .{ .name = "c", .module = c_module },
         .{ .name = "ab_variant", .module = ab_variant_baseline_module },
-        .{ .name = "components", .module = pair.components },
+        .{ .name = "components", .module = modules_pair.components },
     }, ubsan_ctx.host, "oracles_ubsan", "Run the oracle suite with UBSan");
     linkOracleRefs(app, refs, ctx.generated.catalog);
     app.run.step.dependOn(&addTrapRun(b, &ubsan_ctx, ctx.target, ctx.optimize, "oracles_trap_ubsan").step);
-    app.run.step.dependOn(&addContractCheck(b, pair.nucleus, pair.components, ctx.target, ctx.optimize, .full, "contract_check_ubsan", ctx.generated.catalog).step);
+    app.run.step.dependOn(&addContractCheck(b, modules_pair.nucleus, modules_pair.components, ctx.target, ctx.optimize, .full, "contract_check_ubsan", ctx.generated.catalog).step);
 
-    // compose_ab is a throughput gate that flakes under contention; sanitizer slowdown would fault it, so it stays out.
-    b.step("oracles_san", "Run all sanitizer suites (ASan absent: Zig 0.16 ships no ASan runtime)").dependOn(&app.run.step);
+    // compose_ab is a throughput gate that flakes under contention, and the
+    // sanitizer slowdown would fault it, so this step leaves it out.
+    b.step("oracles_san", "Run all sanitizer suites (ASan is absent: Zig ships no ASan runtime)").dependOn(&app.run.step);
 }
 
 fn addBenchmark(b: *std.Build, ctx: *common.Context, refs: cmd.Refs) void {
     const ref_target = common.refTarget(b, ctx.target);
-    // Components target intentionally stays on ctx.target while nucleus uses refTarget (reference parity codegen).
-    const pair = modules.componentsWithNucleus(b, ctx, ctx.target, ref_target, ctx.optimize);
-    const bench_components_module = pair.components;
-    const bench_nucleus = pair.nucleus;
-    // Links the zstd leaf directly: the bypass row wires substrate spans without kernel or dylib.
+    // The components target stays on ctx.target while the nucleus uses ref_target,
+    // because the reference binaries need the parity code generation.
+    const modules_pair = modules.componentsWithNucleus(b, ctx, ctx.target, ref_target, ctx.optimize);
+    const bench_components_module = modules_pair.components;
+    const bench_nucleus = modules_pair.nucleus;
+    // The zstd leaf links directly: the bypass row wires substrate spans with no
+    // kernel and no dylib.
     const bypass_module = b.createModule(.{
         .root_source_file = b.path("src/bypass.zig"),
         .target = ref_target,
@@ -228,15 +232,15 @@ fn addBenchmark(b: *std.Build, ctx: *common.Context, refs: cmd.Refs) void {
         .{ .name = "components", .module = bench_components_module },
         .{ .name = "bypass", .module = bypass_module },
     }, ctx.host, "benchmark", "Run the Silesia codec benchmark against reference implementations and write the report");
-    // SDK path exists only for Darwin targets. Expansion runs for every -Dtarget.
+    // The SDK path exists only for a Darwin target, and the expansion runs for every -Dtarget.
     const macos_sdk_usr_lib: ?[]const u8 = if (ref_target.result.os.tag.isDarwin())
         macosSdkUsrLib(b, ctx) orelse
-            @panic("benchmark build needs the macOS SDK: run `xcode-select` to point at an Xcode install")
+            @panic("The benchmark build needs the macOS SDK. Run xcode-select to select an Xcode install.")
     else
         null;
     linkBenchmarkExe(b, app.exe, app.run, refs, ref_target, ctx.optimize, ctx.generated.catalog, macos_sdk_usr_lib);
 
-    const skip_host = skipHostLibs(b, ctx);
+    const skip_host = skipVariantHostLibraries(b, ctx);
 
     const skip_app = addAcceptanceApp(b, ctx, "benchmark_skip", modules.benchmark, ref_target, ctx.optimize, &.{}, skip_host, "benchmark_skip", "Run the Silesia codec benchmark against the encode A/B variant slot");
     linkBenchmarkExe(b, skip_app.exe, skip_app.run, refs, ref_target, ctx.optimize, ctx.generated.catalog, macos_sdk_usr_lib);

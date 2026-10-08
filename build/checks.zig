@@ -38,10 +38,11 @@ fn addHeaderProbe(b: *std.Build, zig: []const u8, driver: []const u8, std_flag: 
 
 fn addAbi(b: *std.Build, ctx: *common.Context) void {
     const zig = b.graph.zig_exe;
-    // No -fsyntax-only mode: object to /dev/null proves C23/C++26 parse without linking.
+    // There is no -fsyntax-only mode: objecting to /dev/null proves that the header
+    // parses as C23 and C++26 without linking.
     const c_header = addHeaderProbe(b, zig, "cc", "-std=c23", b.path("build/acceptance/header.c"), ctx.generated.header_dir);
     const cpp_header = addHeaderProbe(b, zig, "c++", "-std=c++2c", b.path("build/acceptance/header.cpp"), ctx.generated.header_dir);
-    const abi = b.step("abi", "Verify the ABI contract of the generated header and library");
+    const abi = b.step("abi", "Check the ABI contract of the generated header and library");
     abi.dependOn(&c_header.step);
     abi.dependOn(&cpp_header.step);
     abi.dependOn(&ctx.host.dynamic_library.step);
@@ -68,7 +69,7 @@ fn addRender(b: *std.Build, ctx: *common.Context) void {
 }
 
 fn addPackage(b: *std.Build, ctx: *common.Context) void {
-    const archives = ctx.archives orelse @panic("Dist units must expand before checks units.");
+    const archives = ctx.archives orelse @panic("The distribution units must expand before the checks units.");
     const package_exe = b.addExecutable(.{ .name = "package", .root_module = modules.create(b, modules.package, ctx) });
     const package_run = b.addRunArtifact(package_exe);
     package_run.addFileArg(archives.host);
@@ -76,5 +77,5 @@ fn addPackage(b: *std.Build, ctx: *common.Context) void {
     package_run.addFileArg(archives.apple);
     package_run.addFileArg(archives.cjpm);
     package_run.addFileArg(ctx.host.dynamic_library.getEmittedBin());
-    b.step("package", "Validate distribution archives").dependOn(&package_run.step);
+    b.step("package", "Check the distribution archives").dependOn(&package_run.step);
 }

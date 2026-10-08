@@ -226,8 +226,8 @@ pub const State = struct {
         st.tables_loaded = false;
     }
 
-    // Read Huffman tables from the bitstream (RAR3 format). Returns true if
-    // tables were loaded (LZ mode), false if switching to PPM.
+    // Returns true when the tables are loaded (LZ mode) and false when the
+    // stream switches to PPM.
     pub fn readTables(st: *State) Failure!bool {
         const pool = st.table_pool;
 

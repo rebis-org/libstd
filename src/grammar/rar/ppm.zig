@@ -13,10 +13,10 @@ const BitReader = bits.BitReader;
 const int_bits: u5 = 7;
 const period_bits: u5 = 7;
 const tot_bits: u5 = int_bits + period_bits;
-const interval: u32 = 1 << int_bits;
+const top_value: u32 = 1 << int_bits;
 const bin_scale: u32 = 1 << tot_bits;
 const max_freq: u32 = 124;
-const max_o: usize = 64;
+const max_parents: usize = 64;
 
 const unit_size: u32 = 12;
 const state_size: u32 = 6;
@@ -47,27 +47,29 @@ const StateView = extern struct {
     }
 };
 
-const MemBlk = extern struct {
+const FreeBlock = extern struct {
     stamp: u16,
-    nu: u16,
+    units: u16,
     next: u32,
     prev: u32,
 };
 
-inline fn ctxAt(h: []u8, off: u32) *Ctx {
-    return @ptrCast(@alignCast(h[off..][0..@sizeOf(Ctx)]));
+inline fn ctxAt(heap: []u8, off: u32) *Ctx {
+    return @ptrCast(@alignCast(heap[off..][0..@sizeOf(Ctx)]));
 }
 
-inline fn stAt(h: []u8, off: u32) *StateView {
-    return @ptrCast(@alignCast(h[off..][0..@sizeOf(StateView)]));
+inline fn stAt(heap: []u8, off: u32) *StateView {
+    return @ptrCast(@alignCast(heap[off..][0..@sizeOf(StateView)]));
 }
 
-inline fn blkAt(h: []u8, off: u32) *MemBlk {
-    return @ptrCast(@alignCast(h[off..][0..@sizeOf(MemBlk)]));
+inline fn freeBlockAt(heap: []u8, off: u32) *FreeBlock {
+    return @ptrCast(@alignCast(heap[off..][0..@sizeOf(FreeBlock)]));
 }
 
-inline fn ctxOneState(c: u32) u32 {
-    return c + 2;
+// A binary context stores its single state behind the context header, so the
+// state offset is the context offset plus the header size.
+inline fn ctxOneState(ctx_off: u32) u32 {
+    return ctx_off + 2;
 }
 
 // Held outside the heap like the reference's stack-local UpState.
@@ -76,12 +78,12 @@ const LocalState = struct {
     freq: u8,
     succ: u32,
 
-    fn load(h: []const u8, s: u32) LocalState {
-        const v = stAt(@constCast(h), s);
+    fn load(heap: []const u8, s: u32) LocalState {
+        const v = stAt(@constCast(heap), s);
         return .{ .sym = v.sym, .freq = v.freq, .succ = @as(u32, v.succ_hi) << 16 | v.succ_lo };
     }
-    fn store(self: LocalState, h: []u8, s: u32) void {
-        const v = stAt(h, s);
+    fn store(self: LocalState, heap: []u8, s: u32) void {
+        const v = stAt(heap, s);
         v.sym = self.sym;
         v.freq = self.freq;
         v.succ_lo = @truncate(self.succ);
@@ -155,7 +157,7 @@ const n_indexes = n1 + n2 + n3 + n4;
 
 const SubAllocator = struct {
     heap: []u8,
-    sub_allocator_size: u32, // the ORIGINAL byte size requested
+    pool_bytes: u32, // the ORIGINAL byte size requested
     glue_count: u8,
     indx2units: [n_indexes]u8,
     units2indx: [128]u8,
@@ -170,7 +172,7 @@ const SubAllocator = struct {
     fn initEmpty() SubAllocator {
         return .{
             .heap = &.{},
-            .sub_allocator_size = 0,
+            .pool_bytes = 0,
             .glue_count = 0,
             .indx2units = undefined,
             .units2indx = undefined,
@@ -186,7 +188,7 @@ const SubAllocator = struct {
 
     fn stop(self: *SubAllocator) void {
         self.heap = &.{};
-        self.sub_allocator_size = 0;
+        self.pool_bytes = 0;
     }
 
     // heap must be at least (sa_size_mb << 20) bytes. The caller sizes the
@@ -194,28 +196,28 @@ const SubAllocator = struct {
     // asking for more than the caller provisioned is refused here. The pool
     // is 4-byte aligned inside the slice so u32 fields load directly.
     fn start(self: *SubAllocator, heap: []u8, sa_size_mb: u32) bool {
-        const t: u32 = sa_size_mb << 20;
-        if (self.sub_allocator_size == t) return true;
-        const alloc_size: usize = @as(usize, t) / unit_size * unit_size + 2 * unit_size;
+        const pool_bytes: u32 = sa_size_mb << 20;
+        if (self.pool_bytes == pool_bytes) return true;
+        const alloc_size: usize = @as(usize, pool_bytes) / unit_size * unit_size + 2 * unit_size;
         if (heap.len < alloc_size + 8) return false;
         const base = std.mem.alignForward(usize, @intFromPtr(heap.ptr), 4) - @intFromPtr(heap.ptr);
         if (heap.len - base < alloc_size) return false;
         self.heap = heap[base .. base + alloc_size];
         self.heap_end = @intCast(alloc_size - unit_size);
-        self.sub_allocator_size = t;
+        self.pool_bytes = pool_bytes;
         return true;
     }
 
-    fn initSubAllocator(self: *SubAllocator) void {
+    fn initPool(self: *SubAllocator) void {
         @memset(&self.free_list, null_off);
         self.ptext = 0;
 
-        const t = self.sub_allocator_size;
+        const pool_bytes = self.pool_bytes;
         // 7/8 of the pool for units, 1/8 for the text area. UNIT_SIZE ==
         // FIXED_UNIT_SIZE collapses the reference's Real*/Fake* split except
         // for the +UNIT_SIZE remainder compensation, kept verbatim.
-        const size2: u32 = unit_size * (t / 8 / unit_size * 7);
-        const size1: u32 = t - size2;
+        const size2: u32 = unit_size * (pool_bytes / 8 / unit_size * 7);
+        const size1: u32 = pool_bytes - size2;
         const real_size1: u32 = size1 / unit_size * unit_size + unit_size;
 
         self.units_start = real_size1;
@@ -253,8 +255,8 @@ const SubAllocator = struct {
         }
     }
 
-    inline fn u2b(nu: u32) u32 {
-        return unit_size * nu;
+    inline fn unitsToBytes(units: u32) u32 {
+        return unit_size * units;
     }
 
     inline fn insertNode(self: *SubAllocator, p: u32, indx: usize) void {
@@ -270,81 +272,81 @@ const SubAllocator = struct {
 
     fn splitBlock(self: *SubAllocator, pv: u32, old_indx: usize, new_indx: usize) void {
         var udiff: u32 = @as(u32, self.indx2units[old_indx]) - self.indx2units[new_indx];
-        var p: u32 = pv + u2b(self.indx2units[new_indx]);
+        var p: u32 = pv + unitsToBytes(self.indx2units[new_indx]);
         var i: usize = self.units2indx[udiff - 1];
         if (self.indx2units[i] != udiff) {
             i -= 1;
             self.insertNode(p, i);
             const iu: u32 = self.indx2units[i];
-            p += u2b(iu);
+            p += unitsToBytes(iu);
             udiff -= iu;
         }
         self.insertNode(p, self.units2indx[udiff - 1]);
     }
 
-    // GlueFreeBlocks. The reference threads a stack-local sentinel node (s0)
+    // GlueFreeBlocks. The reference threads a stack-local sentinel node (sentinel)
     // into the doubly-linked list. The sentinel's links live in locals and
     // accesses route through S0 comparisons instead.
-    const s0: u32 = 0xFFFFFFFF;
+    const sentinel: u32 = 0xFFFFFFFF;
 
     fn glueFreeBlocks(self: *SubAllocator) void {
-        var s0_next: u32 = s0;
-        var s0_prev: u32 = s0;
-        const h = self.heap;
+        var sentinel_next: u32 = sentinel;
+        var sentinel_prev: u32 = sentinel;
+        const heap = self.heap;
 
-        if (self.lo_unit != self.hi_unit) h[self.lo_unit] = 0;
+        if (self.lo_unit != self.hi_unit) heap[self.lo_unit] = 0;
 
         // Phase 1: drain the free lists into one stamped, doubly-linked list.
         for (0..n_indexes) |i| {
             while (self.free_list[i] != null_off) {
                 const p = self.removeNode(i);
-                const blk = blkAt(h, p);
-                const next = s0_next;
-                blk.prev = s0;
-                blk.next = next;
-                if (next == s0) s0_prev = p else blkAt(h, next).prev = p;
-                s0_next = p;
-                blk.stamp = 0xFFFF;
-                blk.nu = self.indx2units[i];
+                const block = freeBlockAt(heap, p);
+                const next = sentinel_next;
+                block.prev = sentinel;
+                block.next = next;
+                if (next == sentinel) sentinel_prev = p else freeBlockAt(heap, next).prev = p;
+                sentinel_next = p;
+                block.stamp = 0xFFFF;
+                block.units = self.indx2units[i];
             }
         }
 
         // Phase 2: merge physically adjacent stamped blocks.
-        var p = s0_next;
-        while (p != s0) : (p = blkAt(h, p).next) {
+        var p = sentinel_next;
+        while (p != sentinel) : (p = freeBlockAt(heap, p).next) {
             while (true) {
-                const p1 = p + u2b(blkAt(h, p).nu);
-                if (p1 + unit_size > h.len) break; // guard. Unreachable for valid states
-                const blk1 = blkAt(h, p1);
-                if (blk1.stamp != 0xFFFF) break;
-                const total: u32 = @as(u32, blkAt(h, p).nu) + blk1.nu;
+                const p1 = p + unitsToBytes(freeBlockAt(heap, p).units);
+                if (p1 + unit_size > heap.len) break; // guard. Unreachable for valid states
+                const next_block = freeBlockAt(heap, p1);
+                if (next_block.stamp != 0xFFFF) break;
+                const total: u32 = @as(u32, freeBlockAt(heap, p).units) + next_block.units;
                 if (total >= 0x10000) break;
-                const pr = blk1.prev;
-                const nx = blk1.next;
-                if (pr == s0) s0_next = nx else blkAt(h, pr).next = nx;
-                if (nx == s0) s0_prev = pr else blkAt(h, nx).prev = pr;
-                blkAt(h, p).nu = @intCast(total);
+                const prev_off = next_block.prev;
+                const next_off = next_block.next;
+                if (prev_off == sentinel) sentinel_next = next_off else freeBlockAt(heap, prev_off).next = next_off;
+                if (next_off == sentinel) sentinel_prev = prev_off else freeBlockAt(heap, next_off).prev = prev_off;
+                freeBlockAt(heap, p).units = @intCast(total);
             }
         }
 
         // Phase 3: re-insert, chopping >128-unit runs.
-        while (s0_next != s0) {
-            p = s0_next;
+        while (sentinel_next != sentinel) {
+            p = sentinel_next;
             {
-                const nx = blkAt(h, p).next;
-                if (nx == s0) s0_prev = s0 else blkAt(h, nx).prev = s0;
-                s0_next = nx;
+                const next_off = freeBlockAt(heap, p).next;
+                if (next_off == sentinel) sentinel_prev = sentinel else freeBlockAt(heap, next_off).prev = sentinel;
+                sentinel_next = next_off;
             }
-            var sz: u32 = blkAt(h, p).nu;
-            while (sz > 128) : (sz -= 128) {
+            var remaining_units: u32 = freeBlockAt(heap, p).units;
+            while (remaining_units > 128) : (remaining_units -= 128) {
                 self.insertNode(p, n_indexes - 1);
-                p += u2b(128);
+                p += unitsToBytes(128);
             }
-            var i: usize = self.units2indx[sz - 1];
-            if (self.indx2units[i] != sz) {
+            var i: usize = self.units2indx[remaining_units - 1];
+            if (self.indx2units[i] != remaining_units) {
                 i -= 1;
-                const k: u32 = sz - self.indx2units[i];
-                self.insertNode(p + u2b(sz - k), @intCast(k - 1));
+                const k: u32 = remaining_units - self.indx2units[i];
+                self.insertNode(p + unitsToBytes(remaining_units - k), @intCast(k - 1));
             }
             self.insertNode(p, i);
         }
@@ -361,7 +363,7 @@ const SubAllocator = struct {
             i += 1;
             if (i == n_indexes) {
                 self.glue_count -%= 1;
-                const bytes: u32 = u2b(self.indx2units[indx]);
+                const bytes: u32 = unitsToBytes(self.indx2units[indx]);
                 // FIXED_UNIT_SIZE == UNIT_SIZE, so the reference's separate
                 // fake-units bookkeeping moves in lockstep with the real one.
                 if (self.fake_units_start > self.ptext and
@@ -380,13 +382,13 @@ const SubAllocator = struct {
         return ret;
     }
 
-    fn allocUnits(self: *SubAllocator, nu: u32) u32 {
-        const indx: usize = self.units2indx[nu - 1];
+    fn allocUnits(self: *SubAllocator, units: u32) u32 {
+        const indx: usize = self.units2indx[units - 1];
         if (self.free_list[indx] != null_off) return self.removeNode(indx);
         const ret = self.lo_unit;
-        self.lo_unit += u2b(self.indx2units[indx]);
+        self.lo_unit += unitsToBytes(self.indx2units[indx]);
         if (self.lo_unit <= self.hi_unit) return ret;
-        self.lo_unit -= u2b(self.indx2units[indx]);
+        self.lo_unit -= unitsToBytes(self.indx2units[indx]);
         return self.allocUnitsRare(indx);
     }
 
@@ -399,25 +401,25 @@ const SubAllocator = struct {
         return self.allocUnitsRare(0);
     }
 
-    fn expandUnits(self: *SubAllocator, old_ptr: u32, old_nu: u32) u32 {
-        const idx_old: usize = self.units2indx[old_nu - 1];
-        const idx_new: usize = self.units2indx[old_nu];
+    fn expandUnits(self: *SubAllocator, old_ptr: u32, old_units: u32) u32 {
+        const idx_old: usize = self.units2indx[old_units - 1];
+        const idx_new: usize = self.units2indx[old_units];
         if (idx_old == idx_new) return old_ptr;
-        const ptr = self.allocUnits(old_nu + 1);
+        const ptr = self.allocUnits(old_units + 1);
         if (ptr != null_off) {
-            std.mem.copyForwards(u8, self.heap[ptr..][0..u2b(old_nu)], self.heap[old_ptr..][0..u2b(old_nu)]);
+            std.mem.copyForwards(u8, self.heap[ptr..][0..unitsToBytes(old_units)], self.heap[old_ptr..][0..unitsToBytes(old_units)]);
             self.insertNode(old_ptr, idx_old);
         }
         return ptr;
     }
 
-    fn shrinkUnits(self: *SubAllocator, old_ptr: u32, old_nu: u32, new_nu: u32) u32 {
-        const idx_old: usize = self.units2indx[old_nu - 1];
-        const idx_new: usize = self.units2indx[new_nu - 1];
+    fn shrinkUnits(self: *SubAllocator, old_ptr: u32, old_units: u32, new_units: u32) u32 {
+        const idx_old: usize = self.units2indx[old_units - 1];
+        const idx_new: usize = self.units2indx[new_units - 1];
         if (idx_old == idx_new) return old_ptr;
         if (self.free_list[idx_new] != null_off) {
             const ptr = self.removeNode(idx_new);
-            std.mem.copyForwards(u8, self.heap[ptr..][0..u2b(new_nu)], self.heap[old_ptr..][0..u2b(new_nu)]);
+            std.mem.copyForwards(u8, self.heap[ptr..][0..unitsToBytes(new_units)], self.heap[old_ptr..][0..unitsToBytes(new_units)]);
             self.insertNode(old_ptr, idx_old);
             return ptr;
         }
@@ -425,8 +427,8 @@ const SubAllocator = struct {
         return old_ptr;
     }
 
-    fn freeUnits(self: *SubAllocator, ptr: u32, old_nu: u32) void {
-        self.insertNode(ptr, self.units2indx[old_nu - 1]);
+    fn freeUnits(self: *SubAllocator, ptr: u32, old_units: u32) void {
+        self.insertNode(ptr, self.units2indx[old_units - 1]);
     }
 };
 
@@ -435,10 +437,10 @@ const See2 = struct {
     shift: u8,
     count: u8,
 
-    fn init(init_val: u32) See2 {
+    fn init(initial_mean: u32) See2 {
         const shift: u8 = period_bits - 4;
         return .{
-            .summ = @truncate(init_val << @intCast(shift)),
+            .summ = @truncate(initial_mean << @intCast(shift)),
             .shift = shift,
             .count = 4,
         };
@@ -465,7 +467,7 @@ const See2 = struct {
 };
 
 // GET_MEAN(SUMM,SHIFT,ROUND) from the reference.
-inline fn getMeanSpread(summ: u32, comptime shift: u5, comptime round: u5) u32 {
+inline fn getRoundedMean(summ: u32, comptime shift: u5, comptime round: u5) u32 {
     return (summ + (@as(u32, 1) << (shift - round))) >> shift;
 }
 
@@ -549,7 +551,7 @@ pub const PpmModel = struct {
         if (reset) {
             max_mb = RangeCoder.getByte(br);
         } else {
-            if (self.sub.sub_allocator_size == 0) return false;
+            if (self.sub.pool_bytes == 0) return false;
         }
         if (max_order & 0x40 != 0) esc_char.* = @intCast(RangeCoder.getByte(br));
         self.coder.initDecoder(br);
@@ -568,10 +570,10 @@ pub const PpmModel = struct {
     // ModelPPM::DecodeChar. Returns the decoded byte, or InvalidData on
     // corrupt data (the reference's -1).
     pub fn decodeChar(self: *Self, br: *BitReader) Failure!u32 {
-        const h = self.sub.heap;
+        const heap = self.sub.heap;
         if (self.min_context <= self.sub.ptext or self.min_context > self.sub.heap_end)
             return error.InvalidData;
-        const min_ctx = ctxAt(h, self.min_context);
+        const min_ctx = ctxAt(heap, self.min_context);
         if (min_ctx.num_stats != 1) {
             const stats = min_ctx.stats;
             if (stats <= self.sub.ptext or stats > self.sub.heap_end)
@@ -586,19 +588,19 @@ pub const PpmModel = struct {
             self.coder.normalize(br);
             while (true) {
                 self.order_fall += 1;
-                self.min_context = ctxAt(h, self.min_context).suffix;
+                self.min_context = ctxAt(heap, self.min_context).suffix;
                 if (self.min_context <= self.sub.ptext or
                     self.min_context > self.sub.heap_end)
                     return error.InvalidData;
-                if (ctxAt(h, self.min_context).num_stats != self.num_masked) break;
+                if (ctxAt(heap, self.min_context).num_stats != self.num_masked) break;
             }
             if (!try self.decodeSymbol2(self.min_context))
                 return error.InvalidData;
             self.coder.decodeUpdate();
         }
-        const symbol: u32 = stAt(h, self.found_state).sym;
-        if (self.order_fall == 0 and stAt(h, self.found_state).succ() > self.sub.ptext) {
-            const succ_off = stAt(h, self.found_state).succ();
+        const symbol: u32 = stAt(heap, self.found_state).sym;
+        if (self.order_fall == 0 and stAt(heap, self.found_state).succ() > self.sub.ptext) {
+            const succ_off = stAt(heap, self.found_state).succ();
             self.min_context = succ_off;
             self.max_context = succ_off;
         } else {
@@ -611,14 +613,14 @@ pub const PpmModel = struct {
 
     fn restartModelRare(self: *Self) Failure!void {
         @memset(&self.char_mask, 0);
-        self.sub.initSubAllocator();
+        self.sub.initPool();
         self.init_rl = -@as(i32, @intCast(@min(self.max_order, 12))) - 1;
         const mc = self.sub.allocContext();
         if (mc == null_off) return error.InvalidData;
         self.min_context = mc;
         self.max_context = mc;
-        const h = self.sub.heap;
-        const root = ctxAt(h, mc);
+        const heap = self.sub.heap;
+        const root = ctxAt(heap, mc);
         root.suffix = null_off;
         self.order_fall = @intCast(self.max_order);
         root.num_stats = 256;
@@ -630,7 +632,7 @@ pub const PpmModel = struct {
         self.run_length = self.init_rl;
         self.prev_success = 0;
         for (0..256) |i| {
-            const s = stAt(h, stats + @as(u32, @intCast(i)) * state_size);
+            const s = stAt(heap, stats + @as(u32, @intCast(i)) * state_size);
             s.sym = @intCast(i);
             s.freq = 1;
             s.setSucc(null_off);
@@ -658,37 +660,37 @@ pub const PpmModel = struct {
         self.startModel(heap, 2, 1) catch {};
     }
 
-    fn createChild(self: *Self, c: u32, p_state: u32, first: LocalState) u32 {
-        const pc = self.sub.allocContext();
-        if (pc != null_off) {
-            const h = self.sub.heap;
-            const child = ctxAt(h, pc);
+    fn createChild(self: *Self, ctx_off: u32, parent_state_off: u32, initial_state: LocalState) u32 {
+        const child_off = self.sub.allocContext();
+        if (child_off != null_off) {
+            const heap = self.sub.heap;
+            const child = ctxAt(heap, child_off);
             child.num_stats = 1;
-            first.store(h, ctxOneState(pc));
-            child.suffix = c;
-            stAt(h, p_state).setSucc(pc);
+            initial_state.store(heap, ctxOneState(child_off));
+            child.suffix = ctx_off;
+            stAt(heap, parent_state_off).setSucc(child_off);
         }
-        return pc;
+        return child_off;
     }
 
-    fn rescale(self: *Self, c: u32) void {
-        const h = self.sub.heap;
-        const cctx = ctxAt(h, c);
-        const old_ns: u32 = cctx.num_stats;
-        if (old_ns == 0) return; // corrupt heap. Guards will surface it
+    fn rescale(self: *Self, ctx_off: u32) void {
+        const heap = self.sub.heap;
+        const ctx = ctxAt(heap, ctx_off);
+        const old_ns: u32 = ctx.num_stats;
+        if (old_ns == 0) return; // A corrupt heap; the callers' guards surface it.
         var i: u32 = old_ns - 1;
-        const stats = cctx.stats;
+        const stats = ctx.stats;
 
         {
             var p = self.found_state;
             while (p != stats) : (p -= state_size) {
-                swapStates(h, p, p - state_size);
+                swapStates(heap, p, p - state_size);
             }
         }
-        const head = stAt(h, stats);
+        const head = stAt(heap, stats);
         head.freq = head.freq +| 4;
-        cctx.summ_freq = cctx.summ_freq +% 4;
-        var esc_freq: u32 = @as(u32, cctx.summ_freq) -% head.freq;
+        ctx.summ_freq = ctx.summ_freq +% 4;
+        var esc_freq: u32 = @as(u32, ctx.summ_freq) -% head.freq;
         const adder: u32 = @intFromBool(self.order_fall != 0);
         head.freq = @intCast((@as(u32, head.freq) + adder) >> 1);
         var summ_freq: u32 = head.freq;
@@ -696,130 +698,130 @@ pub const PpmModel = struct {
         var p = stats;
         while (i != 0) : (i -= 1) {
             p += state_size;
-            const sp = stAt(h, p);
+            const sp = stAt(heap, p);
             esc_freq -%= sp.freq;
             sp.freq = @intCast((@as(u32, sp.freq) + adder) >> 1);
             summ_freq += sp.freq;
-            if (sp.freq > stAt(h, p - state_size).freq) {
+            if (sp.freq > stAt(heap, p - state_size).freq) {
                 var p1 = p;
-                var tmp: [state_size]u8 = undefined;
-                @memcpy(&tmp, h[p1..][0..state_size]);
-                const tmp_freq = tmp[1];
-                while (p1 != stats and tmp_freq > stAt(h, p1 - state_size).freq) : (p1 -= state_size) {
-                    copyState(h, p1, p1 - state_size);
+                var moved_state: [state_size]u8 = undefined;
+                @memcpy(&moved_state, heap[p1..][0..state_size]);
+                const moved_freq = moved_state[1];
+                while (p1 != stats and moved_freq > stAt(heap, p1 - state_size).freq) : (p1 -= state_size) {
+                    copyState(heap, p1, p1 - state_size);
                 }
-                @memcpy(h[p1..][0..state_size], &tmp);
+                @memcpy(heap[p1..][0..state_size], &moved_state);
             }
         }
 
-        if (stAt(h, p).freq == 0) {
+        if (stAt(heap, p).freq == 0) {
             var zeros: u32 = 0;
-            while (stAt(h, p).freq == 0) {
+            while (stAt(heap, p).freq == 0) {
                 zeros += 1;
                 p -= state_size;
             }
             esc_freq +%= zeros;
             const new_ns = old_ns - zeros;
-            cctx.num_stats = @intCast(new_ns);
+            ctx.num_stats = @intCast(new_ns);
             if (new_ns == 1) {
-                var tmp = LocalState.load(h, stats);
-                var ef = esc_freq;
+                var only_state = LocalState.load(heap, stats);
+                var esc_freq_scaled = esc_freq;
                 while (true) {
-                    tmp.freq -= tmp.freq >> 1;
-                    ef >>= 1;
-                    if (ef <= 1) break;
+                    only_state.freq -= only_state.freq >> 1;
+                    esc_freq_scaled >>= 1;
+                    if (esc_freq_scaled <= 1) break;
                 }
                 self.sub.freeUnits(stats, (old_ns + 1) >> 1);
-                tmp.store(h, ctxOneState(c));
-                self.found_state = ctxOneState(c);
+                only_state.store(heap, ctxOneState(ctx_off));
+                self.found_state = ctxOneState(ctx_off);
                 return;
             }
         }
-        const ns: u32 = cctx.num_stats;
+        const ns: u32 = ctx.num_stats;
         esc_freq -%= esc_freq >> 1;
-        cctx.summ_freq = @truncate(summ_freq + esc_freq);
+        ctx.summ_freq = @truncate(summ_freq + esc_freq);
         const half0 = (old_ns + 1) >> 1;
         const half1 = (ns + 1) >> 1;
         if (half0 != half1) {
             const moved = self.sub.shrinkUnits(stats, half0, half1);
-            cctx.stats = moved;
+            ctx.stats = moved;
         }
-        self.found_state = cctx.stats;
+        self.found_state = ctx.stats;
     }
 
     fn createSuccessors(self: *Self, skip: bool, p1: u32) u32 {
-        const h = self.sub.heap;
+        const heap = self.sub.heap;
         var pc = self.min_context;
-        const up_branch = stAt(h, self.found_state).succ();
-        var ps: [max_o]u32 = undefined;
+        const up_branch = stAt(heap, self.found_state).succ();
+        var ps: [max_parents]u32 = undefined;
         var nps: usize = 0;
         var p: u32 = null_off;
 
-        var goto_no_loop = false;
-        var goto_loop_entry = false;
+        var walk_finished = false;
+        var at_walk_entry = false;
         if (!skip) {
             ps[nps] = self.found_state;
             nps += 1;
-            if (ctxAt(h, pc).suffix == null_off) goto_no_loop = true;
+            if (ctxAt(heap, pc).suffix == null_off) walk_finished = true;
         }
-        if (!goto_no_loop and p1 != null_off) {
+        if (!walk_finished and p1 != null_off) {
             p = p1;
-            pc = ctxAt(h, pc).suffix;
-            goto_loop_entry = true;
+            pc = ctxAt(heap, pc).suffix;
+            at_walk_entry = true;
         }
-        if (!goto_no_loop) {
+        if (!walk_finished) {
             while (true) {
-                if (!goto_loop_entry) {
-                    pc = ctxAt(h, pc).suffix;
-                    if (ctxAt(h, pc).num_stats != 1) {
-                        p = ctxAt(h, pc).stats;
-                        if (stAt(h, p).sym != stAt(h, self.found_state).sym) {
+                if (!at_walk_entry) {
+                    pc = ctxAt(heap, pc).suffix;
+                    if (ctxAt(heap, pc).num_stats != 1) {
+                        p = ctxAt(heap, pc).stats;
+                        if (stAt(heap, p).sym != stAt(heap, self.found_state).sym) {
                             while (true) {
                                 p += state_size;
-                                if (p + state_size > h.len) return null_off; // guard
-                                if (stAt(h, p).sym == stAt(h, self.found_state).sym) break;
+                                if (p + state_size > heap.len) return null_off; // guard
+                                if (stAt(heap, p).sym == stAt(heap, self.found_state).sym) break;
                             }
                         }
                     } else {
                         p = ctxOneState(pc);
                     }
                 }
-                goto_loop_entry = false;
-                if (stAt(h, p).succ() != up_branch) {
-                    pc = stAt(h, p).succ();
+                at_walk_entry = false;
+                if (stAt(heap, p).succ() != up_branch) {
+                    pc = stAt(heap, p).succ();
                     break;
                 }
-                if (nps >= max_o) return null_off; // reference guard
+                if (nps >= max_parents) return null_off; // reference guard
                 ps[nps] = p;
                 nps += 1;
-                if (ctxAt(h, pc).suffix == null_off) break;
+                if (ctxAt(heap, pc).suffix == null_off) break;
             }
         }
         if (nps == 0) return pc;
 
         var up: LocalState = .{
-            .sym = h[up_branch],
+            .sym = heap[up_branch],
             .freq = 0,
             .succ = up_branch + 1,
         };
-        if (ctxAt(h, pc).num_stats != 1) {
+        if (ctxAt(heap, pc).num_stats != 1) {
             if (pc <= self.sub.ptext) return null_off;
-            var pp = ctxAt(h, pc).stats;
-            if (stAt(h, pp).sym != up.sym) {
+            var pp = ctxAt(heap, pc).stats;
+            if (stAt(heap, pp).sym != up.sym) {
                 while (true) {
                     pp += state_size;
-                    if (pp + state_size > h.len) return null_off; // guard
-                    if (stAt(h, pp).sym == up.sym) break;
+                    if (pp + state_size > heap.len) return null_off; // guard
+                    if (stAt(heap, pp).sym == up.sym) break;
                 }
             }
-            const cf: u32 = @as(u32, stAt(h, pp).freq) - 1;
-            const s0: u32 = @as(u32, ctxAt(h, pc).summ_freq) -% ctxAt(h, pc).num_stats -% cf;
-            up.freq = @intCast(1 + (if (2 * cf <= s0)
-                @intFromBool(5 * cf > s0)
+            const cf: u32 = @as(u32, stAt(heap, pp).freq) - 1;
+            const escape_sum: u32 = @as(u32, ctxAt(heap, pc).summ_freq) -% ctxAt(heap, pc).num_stats -% cf;
+            up.freq = @intCast(1 + (if (2 * cf <= escape_sum)
+                @intFromBool(5 * cf > escape_sum)
             else
-                (2 * cf + 3 * s0 - 1) / (2 * s0)));
+                (2 * cf + 3 * escape_sum - 1) / (2 * escape_sum)));
         } else {
-            up.freq = stAt(h, ctxOneState(pc)).freq;
+            up.freq = stAt(heap, ctxOneState(pc)).freq;
         }
 
         while (true) {
@@ -832,35 +834,35 @@ pub const PpmModel = struct {
     }
 
     fn updateModel(self: *Self) Failure!void {
-        const h = self.sub.heap;
-        const fs = LocalState.load(h, self.found_state);
-        var fs_succ = fs.succ;
+        const heap = self.sub.heap;
+        const found_snapshot = LocalState.load(heap, self.found_state);
+        var found_succ = found_snapshot.succ;
         var p: u32 = null_off;
 
-        const min_ctx = ctxAt(h, self.min_context);
-        if (fs.freq < max_freq / 4 and min_ctx.suffix != null_off) {
+        const min_ctx = ctxAt(heap, self.min_context);
+        if (found_snapshot.freq < max_freq / 4 and min_ctx.suffix != null_off) {
             const pc_off = min_ctx.suffix;
-            const pc = ctxAt(h, pc_off);
+            const pc = ctxAt(heap, pc_off);
             if (pc.num_stats != 1) {
                 p = pc.stats;
-                if (stAt(h, p).sym != fs.sym) {
+                if (stAt(heap, p).sym != found_snapshot.sym) {
                     while (true) {
                         p += state_size;
-                        if (p + state_size > h.len) return error.InvalidData;
-                        if (stAt(h, p).sym == fs.sym) break;
+                        if (p + state_size > heap.len) return error.InvalidData;
+                        if (stAt(heap, p).sym == found_snapshot.sym) break;
                     }
-                    if (stAt(h, p).freq >= stAt(h, p - state_size).freq) {
-                        swapStates(h, p, p - state_size);
+                    if (stAt(heap, p).freq >= stAt(heap, p - state_size).freq) {
+                        swapStates(heap, p, p - state_size);
                         p -= state_size;
                     }
                 }
-                if (stAt(h, p).freq < max_freq - 9) {
-                    stAt(h, p).freq += 2;
+                if (stAt(heap, p).freq < max_freq - 9) {
+                    stAt(heap, p).freq += 2;
                     pc.summ_freq = pc.summ_freq +% 2;
                 }
             } else {
                 p = ctxOneState(pc_off);
-                if (stAt(h, p).freq < 32) stAt(h, p).freq += 1;
+                if (stAt(heap, p).freq < 32) stAt(heap, p).freq += 1;
             }
         }
 
@@ -871,13 +873,13 @@ pub const PpmModel = struct {
                 self.esc_count = 0;
                 return;
             }
-            stAt(h, self.found_state).setSucc(new_succ);
+            stAt(heap, self.found_state).setSucc(new_succ);
             self.min_context = new_succ;
             self.max_context = new_succ;
             return;
         }
 
-        h[self.sub.ptext] = fs.sym;
+        heap[self.sub.ptext] = found_snapshot.sym;
         self.sub.ptext += 1;
         var successor: u32 = self.sub.ptext;
         if (self.sub.ptext >= self.sub.fake_units_start) {
@@ -886,10 +888,10 @@ pub const PpmModel = struct {
             return;
         }
 
-        if (fs_succ != null_off) {
-            if (fs_succ <= self.sub.ptext) {
-                fs_succ = self.createSuccessors(false, p);
-                if (fs_succ == null_off) {
+        if (found_succ != null_off) {
+            if (found_succ <= self.sub.ptext) {
+                found_succ = self.createSuccessors(false, p);
+                if (found_succ == null_off) {
                     try self.restartModelRare();
                     self.esc_count = 0;
                     return;
@@ -897,19 +899,19 @@ pub const PpmModel = struct {
             }
             self.order_fall -= 1;
             if (self.order_fall == 0) {
-                successor = fs_succ;
+                successor = found_succ;
                 if (self.max_context != self.min_context) self.sub.ptext -= 1;
             }
         } else {
-            stAt(h, self.found_state).setSucc(successor);
-            fs_succ = self.min_context;
+            stAt(heap, self.found_state).setSucc(successor);
+            found_succ = self.min_context;
         }
 
         const ns: u32 = min_ctx.num_stats;
-        const s0: u32 = @as(u32, min_ctx.summ_freq) -% ns -% (@as(u32, fs.freq) - 1);
+        const escape_sum: u32 = @as(u32, min_ctx.summ_freq) -% ns -% (@as(u32, found_snapshot.freq) - 1);
         var pc_off = self.max_context;
-        while (pc_off != self.min_context) : (pc_off = ctxAt(h, pc_off).suffix) {
-            const pc = ctxAt(h, pc_off);
+        while (pc_off != self.min_context) : (pc_off = ctxAt(heap, pc_off).suffix) {
+            const pc = ctxAt(heap, pc_off);
             const ns1: u32 = pc.num_stats;
             if (ns1 != 1) {
                 if ((ns1 & 1) == 0) {
@@ -932,16 +934,16 @@ pub const PpmModel = struct {
                     self.esc_count = 0;
                     return;
                 }
-                copyState(h, np, ctxOneState(pc_off));
+                copyState(heap, np, ctxOneState(pc_off));
                 pc.stats = np;
-                var f: u32 = stAt(h, np).freq;
-                if (f < max_freq / 4 - 1) f += f else f = max_freq - 4;
-                stAt(h, np).freq = @intCast(f);
-                pc.summ_freq = @truncate(f + self.init_esc +
+                var freq: u32 = stAt(heap, np).freq;
+                if (freq < max_freq / 4 - 1) freq += freq else freq = max_freq - 4;
+                stAt(heap, np).freq = @intCast(freq);
+                pc.summ_freq = @truncate(freq + self.init_esc +
                     @intFromBool(ns > 3));
             }
-            var cf: u32 = 2 * @as(u32, fs.freq) * (@as(u32, pc.summ_freq) + 6);
-            const sf: u32 = s0 +% pc.summ_freq;
+            var cf: u32 = 2 * @as(u32, found_snapshot.freq) * (@as(u32, pc.summ_freq) + 6);
+            const sf: u32 = escape_sum +% pc.summ_freq;
             if (cf < 6 * sf) {
                 cf = 1 + @as(u32, @intFromBool(cf > sf)) + @intFromBool(cf >= 4 * sf);
                 pc.summ_freq = pc.summ_freq +% 3;
@@ -951,24 +953,24 @@ pub const PpmModel = struct {
                 pc.summ_freq = pc.summ_freq +% @as(u16, @truncate(cf));
             }
             const np2 = pc.stats + ns1 * state_size;
-            if (np2 + state_size > h.len) return error.InvalidData;
-            const nstate = stAt(h, np2);
+            if (np2 + state_size > heap.len) return error.InvalidData;
+            const nstate = stAt(heap, np2);
             nstate.setSucc(successor);
-            nstate.sym = fs.sym;
+            nstate.sym = found_snapshot.sym;
             nstate.freq = @truncate(cf);
             pc.num_stats = @intCast(ns1 + 1);
         }
-        self.min_context = fs_succ;
-        self.max_context = fs_succ;
+        self.min_context = found_succ;
+        self.max_context = found_succ;
     }
 
     fn decodeBinSymbol(self: *Self, c: u32) void {
-        const h = self.sub.heap;
-        const rs = ctxOneState(c);
-        const rs_state = stAt(h, rs);
-        self.hi_bits_flag = self.hb2flag[stAt(h, self.found_state).sym];
-        const cctx = ctxAt(h, c);
-        const suffix_ns: usize = ctxAt(h, cctx.suffix).num_stats;
+        const heap = self.sub.heap;
+        const one_state_off = ctxOneState(c);
+        const rs_state = stAt(heap, one_state_off);
+        self.hi_bits_flag = self.hb2flag[stAt(heap, self.found_state).sym];
+        const cctx = ctxAt(heap, c);
+        const suffix_ns: usize = ctxAt(heap, cctx.suffix).num_stats;
         // Saturating indexes: a corrupt heap can hold zero frequencies or a
         // zero-stats suffix. The C original would index garbage, we take the
         // escape path and let the guards/CRC surface it.
@@ -994,16 +996,16 @@ pub const PpmModel = struct {
             return;
         };
         if (shifted < bs.*) {
-            self.found_state = rs;
+            self.found_state = one_state_off;
             if (rs_state.freq < 128) rs_state.freq += 1;
             self.coder.low_count = 0;
             self.coder.high_count = bs.*;
-            bs.* = @truncate(@as(u32, bs.*) + interval - getMeanSpread(bs.*, period_bits, 2));
+            bs.* = @truncate(@as(u32, bs.*) + top_value - getRoundedMean(bs.*, period_bits, 2));
             self.prev_success = 1;
             self.run_length += 1;
         } else {
             self.coder.low_count = bs.*;
-            bs.* = @truncate(@as(u32, bs.*) - getMeanSpread(bs.*, period_bits, 2));
+            bs.* = @truncate(@as(u32, bs.*) - getRoundedMean(bs.*, period_bits, 2));
             self.coder.high_count = bin_scale;
             self.init_esc = exp_escape[bs.* >> 10];
             self.num_masked = 1;
@@ -1014,38 +1016,38 @@ pub const PpmModel = struct {
     }
 
     fn update1(self: *Self, c: u32, p_in: u32) void {
-        const h = self.sub.heap;
+        const heap = self.sub.heap;
         var p = p_in;
-        const cctx = ctxAt(h, c);
+        const cctx = ctxAt(heap, c);
         self.found_state = p;
-        var sp = stAt(h, p);
+        var sp = stAt(heap, p);
         sp.freq += 4;
         cctx.summ_freq = cctx.summ_freq +% 4;
-        if (sp.freq > stAt(h, p - state_size).freq) {
-            swapStates(h, p, p - state_size);
+        if (sp.freq > stAt(heap, p - state_size).freq) {
+            swapStates(heap, p, p - state_size);
             p -= state_size;
-            sp = stAt(h, p);
+            sp = stAt(heap, p);
             self.found_state = p;
             if (sp.freq > max_freq) self.rescale(c);
         }
     }
 
     fn decodeSymbol1(self: *Self, c: u32) Failure!bool {
-        const h = self.sub.heap;
-        const cctx = ctxAt(h, c);
+        const heap = self.sub.heap;
+        const cctx = ctxAt(heap, c);
         if (cctx.num_stats == 0) return error.InvalidData;
         self.coder.scale = cctx.summ_freq;
         var p = cctx.stats;
         const count = try self.coder.currentCount();
         if (count >= self.coder.scale) return false;
-        var hi_cnt: u32 = stAt(h, p).freq;
+        var hi_cnt: u32 = stAt(heap, p).freq;
         if (count < hi_cnt) {
             self.coder.high_count = hi_cnt;
             self.prev_success = @intFromBool(2 * hi_cnt > self.coder.scale);
             self.run_length += self.prev_success;
             hi_cnt += 4;
             self.found_state = p;
-            stAt(h, p).freq = @intCast(hi_cnt);
+            stAt(heap, p).freq = @intCast(hi_cnt);
             cctx.summ_freq = cctx.summ_freq +% 4;
             if (hi_cnt > max_freq) self.rescale(c);
             self.coder.low_count = 0;
@@ -1057,14 +1059,14 @@ pub const PpmModel = struct {
         var i: u32 = cctx.num_stats - 1;
         while (true) {
             p += state_size;
-            if (p + state_size > h.len) return error.InvalidData;
-            hi_cnt += stAt(h, p).freq;
+            if (p + state_size > heap.len) return error.InvalidData;
+            hi_cnt += stAt(heap, p).freq;
             if (hi_cnt > count) break;
             i -= 1;
             if (i == 0) {
-                self.hi_bits_flag = self.hb2flag[stAt(h, self.found_state).sym];
+                self.hi_bits_flag = self.hb2flag[stAt(heap, self.found_state).sym];
                 self.coder.low_count = hi_cnt;
-                const p_state = stAt(h, p);
+                const p_state = stAt(heap, p);
                 self.char_mask[p_state.sym] = self.esc_count;
                 self.num_masked = cctx.num_stats;
                 self.found_state = null_off;
@@ -1072,46 +1074,46 @@ pub const PpmModel = struct {
                 var pp = p;
                 while (j != 0) : (j -= 1) {
                     pp -= state_size;
-                    self.char_mask[stAt(h, pp).sym] = self.esc_count;
+                    self.char_mask[stAt(heap, pp).sym] = self.esc_count;
                 }
                 self.coder.high_count = self.coder.scale;
                 return true;
             }
         }
         self.coder.high_count = hi_cnt;
-        self.coder.low_count = hi_cnt - stAt(h, p).freq;
+        self.coder.low_count = hi_cnt - stAt(heap, p).freq;
         self.update1(c, p);
         return true;
     }
 
     fn update2(self: *Self, c: u32, p: u32) void {
-        const h = self.sub.heap;
+        const heap = self.sub.heap;
         self.found_state = p;
-        const sp = stAt(h, p);
+        const sp = stAt(heap, p);
         sp.freq += 4;
-        ctxAt(h, c).summ_freq = ctxAt(h, c).summ_freq +% 4;
+        ctxAt(heap, c).summ_freq = ctxAt(heap, c).summ_freq +% 4;
         if (sp.freq > max_freq) self.rescale(c);
         self.esc_count +%= 1;
         self.run_length = self.init_rl;
     }
 
-    fn makeEscFreq2(self: *Self, c: u32, diff: u32) *See2 {
-        const h = self.sub.heap;
-        const cctx = ctxAt(h, c);
+    fn makeEscFreq2(self: *Self, c: u32, unmasked_count: u32) *See2 {
+        const heap = self.sub.heap;
+        const cctx = ctxAt(heap, c);
         const num_stats: u32 = cctx.num_stats;
-        if (diff == 0) {
+        if (unmasked_count == 0) {
             // Nothing left unmasked. The reference would index ns2indx[-1].
             self.coder.scale = 1;
             return &self.dummy_see2;
         }
         if (num_stats != 256) {
-            const suffix_ns: u32 = ctxAt(h, cctx.suffix).num_stats;
-            const idx1: usize = self.ns2indx[diff - 1];
-            const idx2: usize = @as(usize, @intFromBool(diff < suffix_ns - num_stats)) +
+            const suffix_ns: u32 = ctxAt(heap, cctx.suffix).num_stats;
+            const ns_idx: usize = self.ns2indx[unmasked_count - 1];
+            const cond_idx: usize = @as(usize, @intFromBool(unmasked_count < suffix_ns - num_stats)) +
                 2 * @as(usize, @intFromBool(cctx.summ_freq < 11 * num_stats)) +
-                4 * @as(usize, @intFromBool(self.num_masked > diff)) +
+                4 * @as(usize, @intFromBool(self.num_masked > unmasked_count)) +
                 self.hi_bits_flag;
-            const psee = &self.see2[idx1][idx2];
+            const psee = &self.see2[ns_idx][cond_idx];
             self.coder.scale = psee.getMean();
             return psee;
         }
@@ -1120,8 +1122,8 @@ pub const PpmModel = struct {
     }
 
     fn decodeSymbol2(self: *Self, c: u32) Failure!bool {
-        const h = self.sub.heap;
-        const cctx = ctxAt(h, c);
+        const heap = self.sub.heap;
+        const cctx = ctxAt(heap, c);
         if (self.num_masked >= cctx.num_stats) return error.InvalidData;
         var i: u32 = cctx.num_stats - self.num_masked;
         const psee = self.makeEscFreq2(c, i);
@@ -1132,10 +1134,10 @@ pub const PpmModel = struct {
         while (true) {
             while (true) {
                 p +%= state_size;
-                if (p + state_size > h.len) return error.InvalidData;
-                if (self.char_mask[stAt(h, p).sym] != self.esc_count) break;
+                if (p + state_size > heap.len) return error.InvalidData;
+                if (self.char_mask[stAt(heap, p).sym] != self.esc_count) break;
             }
-            hi_cnt += stAt(h, p).freq;
+            hi_cnt += stAt(heap, p).freq;
             if (nps >= 256) return error.InvalidData;
             ps[nps] = p;
             nps += 1;
@@ -1151,21 +1153,21 @@ pub const PpmModel = struct {
         if (count < hi_cnt) {
             var acc: u32 = 0;
             while (true) {
-                acc += stAt(h, p).freq;
+                acc += stAt(heap, p).freq;
                 if (acc > count) break;
                 pi += 1;
                 if (pi >= nps) return error.InvalidData;
                 p = ps[pi];
             }
             self.coder.high_count = acc;
-            self.coder.low_count = acc - stAt(h, p).freq;
+            self.coder.low_count = acc - stAt(heap, p).freq;
             psee.update();
             self.update2(c, p);
         } else {
             self.coder.low_count = hi_cnt;
             self.coder.high_count = self.coder.scale;
             for (ps[0..nps]) |sp| {
-                self.char_mask[stAt(h, sp).sym] = self.esc_count;
+                self.char_mask[stAt(heap, sp).sym] = self.esc_count;
             }
             psee.summ +%= @truncate(self.coder.scale);
             self.num_masked = cctx.num_stats;
@@ -1179,15 +1181,15 @@ pub const PpmModel = struct {
     }
 };
 
-inline fn copyState(h: []u8, dst: u32, src: u32) void {
-    @memcpy(h[dst..][0..state_size], h[src..][0..state_size]);
+inline fn copyState(heap: []u8, dst: u32, src: u32) void {
+    @memcpy(heap[dst..][0..state_size], heap[src..][0..state_size]);
 }
 
-inline fn swapStates(h: []u8, a: u32, b: u32) void {
-    var tmp: [state_size]u8 = undefined;
-    @memcpy(&tmp, h[a..][0..state_size]);
-    @memcpy(h[a..][0..state_size], h[b..][0..state_size]);
-    @memcpy(h[b..][0..state_size], &tmp);
+inline fn swapStates(heap: []u8, a: u32, b: u32) void {
+    var scratch_state: [state_size]u8 = undefined;
+    @memcpy(&scratch_state, heap[a..][0..state_size]);
+    @memcpy(heap[a..][0..state_size], heap[b..][0..state_size]);
+    @memcpy(heap[b..][0..state_size], &scratch_state);
 }
 
 test "suballocator unit tables match the reference construction" {
@@ -1269,7 +1271,7 @@ test "startModel refuses a heap smaller than the requested model size" {
 test "extern views preserve the packed six-byte state stride" {
     try std.testing.expectEqual(@as(usize, 6), @sizeOf(StateView));
     try std.testing.expectEqual(@as(usize, 12), @sizeOf(Ctx));
-    try std.testing.expectEqual(@as(usize, 12), @sizeOf(MemBlk));
+    try std.testing.expectEqual(@as(usize, 12), @sizeOf(FreeBlock));
     var heap: [4 * 1024 * 1024]u8 = undefined;
     var m = PpmModel.init();
     try m.startModel(&heap, 4, 1);

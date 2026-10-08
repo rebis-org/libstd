@@ -261,7 +261,7 @@ pub fn scalarNode(id: Id) Node {
     return result;
 }
 
-pub fn scalarValue(id: Id, value: u64) Node {
+pub fn scalarValueNode(id: Id, value: u64) Node {
     var result = scalarNode(id);
     result.value_low = value;
     return result;
@@ -297,10 +297,10 @@ pub fn paramScalar(family: u16, ordinal: u32, commands: u32, value: u64) Node {
 }
 
 pub fn paramBytes(family: u16, ordinal: u32, commands: u32, bytes: []const u8) Node {
-    return paramBytesFull(family, ordinal, 0x12, commands, bytes);
+    return paramBytesWithAttributes(family, ordinal, 0x12, commands, bytes);
 }
 
-pub fn paramBytesFull(family: u16, ordinal: u32, attributes: u8, commands: u32, bytes: []const u8) Node {
+pub fn paramBytesWithAttributes(family: u16, ordinal: u32, attributes: u8, commands: u32, bytes: []const u8) Node {
     var result = scalarNode(ids.parameter);
     result.value_high = paramSelector(family, ordinal, attributes, commands);
     result.bytes = @ptrCast(@constCast(bytes.ptr));
@@ -445,7 +445,7 @@ pub fn archiveEntryNode(name_node: *Node, data_node: *Node, name: []const u8, da
     var entry = node(null, 0);
     entry.id = ids.parameter;
     entry.value_high = paramSelector(param_family_archive, archive_entry, 0x17, cmd_query_write);
-    name_node.* = paramBytesFull(param_family_archive, archive_entry_name, 0x32, cmd_all, name);
+    name_node.* = paramBytesWithAttributes(param_family_archive, archive_entry_name, 0x32, cmd_all, name);
     data_node.* = paramBytes(param_family_archive, archive_entry_data, cmd_all, data);
     entry.child = name_node;
     name_node.next = data_node;
@@ -494,16 +494,16 @@ pub fn archiveEntryWithMethodAndFilter(
     return entry;
 }
 
-pub fn cryptoDiag(d: *CryptoDiag) void {
-    d.wrong_password = scalarNode(ids.crypto_wrong_password);
-    d.kdf_limit = scalarNode(ids.crypto_kdf_limit);
-    d.password_lifetime = scalarNode(ids.crypto_password_lifetime);
-    d.unsupported_algorithm = scalarNode(ids.crypto_unsupported_algorithm);
-    d.diagnostic = node(null, 0);
-    d.diagnostic.child = &d.wrong_password;
-    d.wrong_password.next = &d.kdf_limit;
-    d.kdf_limit.next = &d.password_lifetime;
-    d.password_lifetime.next = &d.unsupported_algorithm;
+pub fn cryptoDiag(diag: *CryptoDiag) void {
+    diag.wrong_password = scalarNode(ids.crypto_wrong_password);
+    diag.kdf_limit = scalarNode(ids.crypto_kdf_limit);
+    diag.password_lifetime = scalarNode(ids.crypto_password_lifetime);
+    diag.unsupported_algorithm = scalarNode(ids.crypto_unsupported_algorithm);
+    diag.diagnostic = node(null, 0);
+    diag.diagnostic.child = &diag.wrong_password;
+    diag.wrong_password.next = &diag.kdf_limit;
+    diag.kdf_limit.next = &diag.password_lifetime;
+    diag.password_lifetime.next = &diag.unsupported_algorithm;
 }
 
 pub fn cryptoProfile() Node {
@@ -565,7 +565,7 @@ pub const CallOpts = struct {
 };
 
 pub fn call(r: *Runner, operation: Id, nodes: []const Node, opts: CallOpts) u32 {
-    // Zeroed, not undefined: validation reads every node field, and an uninitialized tail once caused intermittent invalid_call.
+    // Zeroed, not undefined: validation reads every node field, and an uninitialized tail once caused an intermittent invalid_call.
     var list: [16]Node = @splat(Node.init());
     const prefix: usize = if (opts.profile) 1 else 0;
     const suffix: usize = if (opts.ctx) 3 else 0;
@@ -578,11 +578,11 @@ pub fn call(r: *Runner, operation: Id, nodes: []const Node, opts: CallOpts) u32 
     @memcpy(list[count .. count + nodes.len], nodes);
     count += nodes.len;
     if (opts.ctx) {
-        list[count] = capabilityParam(ctxCap(r, operation));
+        list[count] = capabilityParam(capabilitiesForOperation(r, operation));
         count += 1;
         list[count] = sizingModeParam(r.sizing);
         count += 1;
-        list[count] = commitModeParam(ctxCommit(r, operation));
+        list[count] = commitModeParam(commitModeForOperation(r, operation));
         count += 1;
     }
     const workspace = if (opts.workspace.len != 0) opts.workspace else r.workspace;
@@ -590,11 +590,11 @@ pub fn call(r: *Runner, operation: Id, nodes: []const Node, opts: CallOpts) u32 
     return r.status;
 }
 
-fn ctxCap(r: *Runner, operation: Id) u64 {
+fn capabilitiesForOperation(r: *Runner, operation: Id) u64 {
     return if (abi.idEqual(operation, ids.query)) r.caps_query else r.caps_io;
 }
 
-fn ctxCommit(r: *Runner, operation: Id) u64 {
+fn commitModeForOperation(r: *Runner, operation: Id) u64 {
     return if (abi.idEqual(operation, ids.read)) r.commit_read else r.commit_write;
 }
 
@@ -627,7 +627,7 @@ pub fn spanCall(r: *Runner, operation: Id, source: []const u8, sink: []u8) !void
     return spanProduce(r, operation, &.{ sourceSpan(source), sinkSpan(sink) });
 }
 
-// Only writes record frame length: a read's byte count is decoded size and must not clobber it.
+// Only a write records the frame length: a read reports the decoded size, which must not overwrite it.
 pub fn spanProduce(r: *Runner, operation: Id, nodes: []const Node) !void {
     try expect(r, operation, nodes, .{ .ctx = true }, Status.ok);
     if (abi.idEqual(operation, ids.write)) r.encoded_len = @intCast(r.response.byte_length);
@@ -660,14 +660,14 @@ pub fn xorshiftFill(buffer: []u8, seed_base: u64) void {
 
 pub fn oracleFixture(
     r: *Runner,
-    comptime reference: fn ([]const u8, []u8) ?usize,
+    comptime reference_encoder: fn ([]const u8, []u8) ?usize,
     input: []const u8,
     compressed: []u8,
     output: []u8,
 ) !void {
-    const size = reference(input, compressed) orelse return error.OracleRejectedInput;
-    if (size == 0 or size >= compressed.len) return error.OracleOutputSize;
-    try spanCall(r, ids.read, compressed[0..size], output);
+    const encoded_len = reference_encoder(input, compressed) orelse return error.OracleRejectedInput;
+    if (encoded_len == 0 or encoded_len >= compressed.len) return error.OracleOutputSize;
+    try spanCall(r, ids.read, compressed[0..encoded_len], output);
     if (r.response.byte_length != input.len) return error.OracleDecodeLengthMismatch;
     if (!std.mem.eql(u8, output[0..input.len], input)) return error.OracleContentMismatch;
 }
@@ -717,16 +717,16 @@ pub const SinkCallbackContext = struct {
     last_status: u32 = Status.ok,
 };
 
-pub fn sinkFailureInit(fail: *SinkCallbackContext, downstream: *Node, diagnostic: *Node) void {
-    fail.* = .{ .fail_after = 5 };
+pub fn sinkFailureInit(sink_context: *SinkCallbackContext, downstream: *Node, diagnostic: *Node) void {
+    sink_context.* = .{ .fail_after = 5 };
     downstream.* = scalarNode(ids.diagnostic_downstream_status);
     diagnostic.* = node(null, 0);
     diagnostic.child = downstream;
 }
 
-pub fn expectSinkFailure(r: *Runner, fail: *const SinkCallbackContext, downstream: *const Node) !void {
+pub fn expectSinkFailure(r: *Runner, sink_context: *const SinkCallbackContext, downstream: *const Node) !void {
     try requireStatus(r, Status.io_failure);
-    if (fail.accepted_total != 4) return error.CallbackAcceptedTotalMismatch;
+    if (sink_context.accepted_total != 4) return error.CallbackAcceptedTotalMismatch;
     if (downstream.value_low != Status.insufficient_capacity) return error.DownstreamStatusMismatch;
 }
 
@@ -736,74 +736,74 @@ pub const SinkBufferContext = struct {
     accept_limit: usize,
 };
 
-pub fn sourceCallback(c: *Call) callconv(.c) u32 {
-    const ctx: *SourceCallbackContext = @ptrCast(@alignCast(c.callback_context orelse return Status.unsupported));
-    const response = c.response orelse return Status.unsupported;
-    if (abi.idEqual(c.operation, catalog.callback_size)) {
-        response.value_low = ctx.data.len;
+pub fn sourceCallback(envelope: *Call) callconv(.c) u32 {
+    const source_context: *SourceCallbackContext = @ptrCast(@alignCast(envelope.callback_context orelse return Status.unsupported));
+    const response = envelope.response orelse return Status.unsupported;
+    if (abi.idEqual(envelope.operation, catalog.callback_size)) {
+        response.value_low = source_context.data.len;
         return Status.ok;
     }
-    if (abi.idEqual(c.operation, catalog.callback_rewind)) {
-        ctx.offset = 0;
+    if (abi.idEqual(envelope.operation, catalog.callback_rewind)) {
+        source_context.offset = 0;
         return Status.ok;
     }
-    if (abi.idEqual(c.operation, catalog.callback_seek)) {
-        ctx.offset = @intCast(c.request.?.value_low);
+    if (abi.idEqual(envelope.operation, catalog.callback_seek)) {
+        source_context.offset = @intCast(envelope.request.?.value_low);
         return Status.ok;
     }
-    if (abi.idEqual(c.operation, catalog.callback_read)) {
-        const remaining = ctx.data.len - ctx.offset;
+    if (abi.idEqual(envelope.operation, catalog.callback_read)) {
+        const remaining = source_context.data.len - source_context.offset;
         const capacity: usize = @intCast(response.byte_capacity);
         const n = @min(capacity, remaining);
         if (n > 0) {
             const dst = response.bytes orelse return Status.unsupported;
-            @memcpy(dst[0..n], ctx.data[ctx.offset .. ctx.offset + n]);
+            @memcpy(dst[0..n], source_context.data[source_context.offset .. source_context.offset + n]);
         }
-        ctx.offset += n;
+        source_context.offset += n;
         response.byte_length = n;
         return Status.ok;
     }
     return Status.unsupported;
 }
 
-pub fn sinkCallback(c: *Call) callconv(.c) u32 {
-    const ctx: *SinkCallbackContext = @ptrCast(@alignCast(c.callback_context orelse return Status.unsupported));
-    const response = c.response orelse return Status.unsupported;
-    if (abi.idEqual(c.operation, catalog.callback_write)) {
-        var n: usize = @intCast(c.request.?.byte_length);
+pub fn sinkCallback(envelope: *Call) callconv(.c) u32 {
+    const sink_context: *SinkCallbackContext = @ptrCast(@alignCast(envelope.callback_context orelse return Status.unsupported));
+    const response = envelope.response orelse return Status.unsupported;
+    if (abi.idEqual(envelope.operation, catalog.callback_write)) {
+        var n: usize = @intCast(envelope.request.?.byte_length);
         if (n > 2) n = 2;
-        const new_total = ctx.accepted_total + n;
-        if (new_total >= ctx.fail_after) {
-            ctx.last_status = Status.insufficient_capacity;
-            return ctx.last_status;
+        const new_total = sink_context.accepted_total + n;
+        if (new_total >= sink_context.fail_after) {
+            sink_context.last_status = Status.insufficient_capacity;
+            return sink_context.last_status;
         }
-        ctx.accepted_total = new_total;
+        sink_context.accepted_total = new_total;
         response.byte_length = n;
         return Status.ok;
     }
     return Status.unsupported;
 }
 
-pub fn sinkBufferCallback(c: *Call) callconv(.c) u32 {
-    const ctx: *SinkBufferContext = @ptrCast(@alignCast(c.callback_context orelse return Status.unsupported));
-    const response = c.response orelse return Status.unsupported;
-    if (abi.idEqual(c.operation, catalog.callback_write)) {
-        var n: usize = @intCast(c.request.?.byte_length);
-        if (n > ctx.accept_limit) n = ctx.accept_limit;
-        if (ctx.offset + n > ctx.buffer.len) n = ctx.buffer.len - ctx.offset;
+pub fn sinkBufferCallback(envelope: *Call) callconv(.c) u32 {
+    const sink_context: *SinkBufferContext = @ptrCast(@alignCast(envelope.callback_context orelse return Status.unsupported));
+    const response = envelope.response orelse return Status.unsupported;
+    if (abi.idEqual(envelope.operation, catalog.callback_write)) {
+        var n: usize = @intCast(envelope.request.?.byte_length);
+        if (n > sink_context.accept_limit) n = sink_context.accept_limit;
+        if (sink_context.offset + n > sink_context.buffer.len) n = sink_context.buffer.len - sink_context.offset;
         if (n > 0) {
-            @memcpy(ctx.buffer[ctx.offset .. ctx.offset + n], c.request.?.bytes.?[0..n]);
+            @memcpy(sink_context.buffer[sink_context.offset .. sink_context.offset + n], envelope.request.?.bytes.?[0..n]);
         }
-        ctx.offset += n;
+        sink_context.offset += n;
         response.byte_length = n;
         return Status.ok;
     }
     return Status.unsupported;
 }
 
-pub fn allBytesEqual(bytes: []const u8, value: u8) bool {
+pub fn allBytesEqual(bytes: []const u8, expected: u8) bool {
     for (bytes) |byte| {
-        if (byte != value) return false;
+        if (byte != expected) return false;
     }
     return true;
 }
@@ -820,11 +820,11 @@ pub fn containsBytes(haystack: []const u8, needle: []const u8) bool {
 pub fn crc32Ieee(bytes: []const u8) u32 {
     var crc: u32 = 0xffff_ffff;
     for (bytes) |byte| {
-        var value = crc ^ byte;
+        var shifted = crc ^ byte;
         var bit: u5 = 0;
         while (bit < 8) : (bit += 1) {
-            crc = if ((value & 1) != 0) (value >> 1) ^ 0xedb8_8320 else value >> 1;
-            value = crc;
+            crc = if ((shifted & 1) != 0) (shifted >> 1) ^ 0xedb8_8320 else shifted >> 1;
+            shifted = crc;
         }
     }
     return ~crc;

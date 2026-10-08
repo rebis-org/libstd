@@ -1,5 +1,5 @@
-// Protocol fixture: the echo test profile, used by the oracle suite to pin
-// envelope behavior without a real codec. A component like everything else.
+// Protocol fixture: the echo test profile, which the oracle suite uses to pin
+// envelope behavior without a real codec.
 .{
     .id = .{ .low = "0x6e6b82f08d910401", .high = "0xa7a351053d6d4001" },
     .name = "test_echo",

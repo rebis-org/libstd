@@ -5,7 +5,7 @@ const resource = @import("../kernel/resource.zig");
 const Resource = resource.Resource;
 const Limits = resource.Limits;
 const kernel_catalog = @import("../kernel/catalog.zig");
-const knownId = kernel_catalog.knownId;
+const isKnownId = kernel_catalog.isKnownId;
 const descriptorFor = kernel_catalog.descriptorFor;
 const catalog_json = @import("../kernel/catalog.zig").catalog_json;
 const abi = @import("../kernel/envelope.zig");
@@ -51,7 +51,7 @@ pub fn invoke(call: ?*Call) u32 {
     const command_mask = commandMaskForId(envelope.operation);
     node_graph.validateGraph(envelope.request, .in, command_mask) catch |failure| {
         const mapped = mapFailure(failure);
-        if (failure == error.Unsupported) if (unknownRequired(envelope.request)) |id| common.writeDiagnosticId(envelope, ids.diagnostic_subject, id);
+        if (failure == error.Unsupported) if (unknownRequiredId(envelope.request)) |id| common.writeDiagnosticId(envelope, ids.diagnostic_subject, id);
         common.writeDiagnostic(envelope, mapped.status, mapped.id);
         return mapped.status;
     };
@@ -63,7 +63,7 @@ pub fn invoke(call: ?*Call) u32 {
     if (idIsZero(envelope.operation)) return writeCatalog(envelope, response);
     dispatch(envelope, response) catch |failure| {
         const mapped = mapFailure(failure);
-        if (failure == error.Unsupported) if (unknownRequired(envelope.request)) |id| common.writeDiagnosticId(envelope, ids.diagnostic_subject, id);
+        if (failure == error.Unsupported) if (unknownRequiredId(envelope.request)) |id| common.writeDiagnosticId(envelope, ids.diagnostic_subject, id);
         common.writeDiagnostic(envelope, mapped.status, mapped.id);
         return mapped.status;
     };
@@ -166,19 +166,19 @@ fn dispatch(envelope: *Call, response: *Node) Failure!void {
     try hooks.dispatchToProfileHook(profile.id, &plan, &source, if (sink) |*sink_resource| sink_resource else null, envelope, response, effective_sizing, commit, limits, effective_command_mask);
 }
 
-fn unknownRequired(first: ?*Node) ?Id {
+fn unknownRequiredId(first: ?*Node) ?Id {
     var remaining: usize = 1024;
-    return unknownRequiredInGraph(first, 0, &remaining);
+    return unknownRequiredIdInGraph(first, 0, &remaining);
 }
 
-fn unknownRequiredInGraph(first: ?*Node, depth: u16, remaining: *usize) ?Id {
+fn unknownRequiredIdInGraph(first: ?*Node, depth: u16, remaining: *usize) ?Id {
     if (depth == 128) return null;
     var cursor = first;
     while (cursor) |node| : (cursor = node.next) {
         if (remaining.* == 0) return null;
         remaining.* -= 1;
-        if (!knownId(node.id) and (node.flags & abi.node_flag_optional) == 0) return node.id;
-        if (unknownRequiredInGraph(node.child, depth + 1, remaining)) |id| return id;
+        if (!isKnownId(node.id) and (node.flags & abi.node_flag_optional) == 0) return node.id;
+        if (unknownRequiredIdInGraph(node.child, depth + 1, remaining)) |id| return id;
     }
     return null;
 }

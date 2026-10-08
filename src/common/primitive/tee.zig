@@ -2,10 +2,9 @@ const std = @import("std");
 
 const checksum = @import("checksum.zig");
 
-/// Checksum algorithms a CountingTee instance computes while passing bytes
-/// through. Selecting kinds is a comptime EnumSet-style packed struct so a
-/// new kind (e.g. CRC32C) adds one field here and one line in `per_kind`,
-/// not a new bool parameter at every call site.
+// Selecting kinds through a comptime packed struct means a new checksum adds
+// one field here and one line in `per_kind`, not a new bool parameter at every
+// call site.
 pub const Kinds = packed struct {
     crc32: bool = false,
     crc64: bool = false,
@@ -21,7 +20,7 @@ pub fn CountingTee(comptime kinds: Kinds) type {
         writer: std.Io.Writer,
         downstream: ?*std.Io.Writer,
         crc32: checksum.Crc32,
-        crc64: checksum.XZCrc64,
+        crc64: checksum.XzCrc64,
         adler32: checksum.Adler32,
         size: u64,
 
@@ -30,7 +29,7 @@ pub fn CountingTee(comptime kinds: Kinds) type {
                 .writer = .{ .vtable = &vtable, .buffer = &.{}, .end = 0 },
                 .downstream = downstream,
                 .crc32 = checksum.Crc32.init(),
-                .crc64 = checksum.XZCrc64.init(),
+                .crc64 = checksum.XzCrc64.init(),
                 .adler32 = checksum.Adler32.init(),
                 .size = 0,
             };

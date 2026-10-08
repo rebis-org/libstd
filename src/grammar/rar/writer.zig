@@ -221,8 +221,8 @@ fn packEntries(entries: []const RarEntry, ws: *WriteBuffers) Failure!usize {
     var packed_cursor: usize = 0;
     for (entries, 0..) |entry, i| {
         const packed_len: usize = if (entry.is_directory or entry.data.len == 0 or entry.method == 0) blk: {
-            // Store entries' "packed" data is the raw bytes. Lay them into
-            // the packed region so the writer reads everything from there.
+            // The writer reads every entry back from the packed region, so a stored entry
+            // must lay its raw bytes there.
             if (ws.packed_buf.len - packed_cursor < entry.data.len) return error.InternalFailure;
             @memcpy(ws.packed_buf[packed_cursor .. packed_cursor + entry.data.len], entry.data);
             break :blk entry.data.len;
@@ -248,8 +248,8 @@ fn packEntries(entries: []const RarEntry, ws: *WriteBuffers) Failure!usize {
         };
         if (ws.packed_sizes.len < entries.len) return error.InternalFailure;
         ws.packed_sizes[i] = packed_len;
-        packed_cursor = try bounds.add(packed_cursor, packed_len);
-        total = try bounds.add(total, block_writer.fileBlockSize(entry, packed_len));
+        packed_cursor = try bounds.addUsize(packed_cursor, packed_len);
+        total = try bounds.addUsize(total, block_writer.fileBlockSize(entry, packed_len));
     }
     return total;
 }
@@ -275,7 +275,7 @@ pub fn rarEncode(entries: []const RarEntry, output: []u8, ws: *WriteBuffers) Fai
         const packed_len = ws.packed_sizes[i];
         const packed_slice = ws.packed_buf[cursor .. cursor + packed_len];
         pos = try block_writer.writeFileBlock(output, pos, entry, packed_slice);
-        cursor = try bounds.add(cursor, packed_len);
+        cursor = try bounds.addUsize(cursor, packed_len);
     }
 
     pos = try block_writer.writeEndBlock(output, pos);

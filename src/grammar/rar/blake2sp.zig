@@ -166,7 +166,7 @@ pub fn blake2sp(data: []const u8, out: *[32]u8) void {
     root.final(out);
 }
 
-test "blake2sp known vectors" {
+test "blake2sp matches the published vectors" {
     // Vectors from the interop-verified rarz implementation (validated
     // against official rar -htb archives end to end).
     const empty = [32]u8{

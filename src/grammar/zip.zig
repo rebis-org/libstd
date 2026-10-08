@@ -82,11 +82,11 @@ pub fn zipRequiredSize(entries: []const ZipEntry, archive_comment: []const u8, h
             return error.ResourceLimit;
         }
         const local_offset = local_total;
-        central_total = try bounds.add(central_total, 46 + entry.name.len + entry.extra.len + zipCentralZip64Length(try bounds.add(compressed, overhead), entry.data.len, local_offset) + (if (entry.encrypted and !entry.zipcrypto) winzip_aes_extra_record_length else 0) + entry.comment.len);
-        local_total = try bounds.add(local_total, try bounds.add(30 + entry.name.len + entry.extra.len + zipLocalZip64Length(try bounds.add(compressed, overhead), entry.data.len) + (if (entry.encrypted and !entry.zipcrypto) winzip_aes_extra_record_length else 0), try bounds.add(compressed, overhead)));
+        central_total = try bounds.addUsize(central_total, 46 + entry.name.len + entry.extra.len + zipCentralZip64Length(try bounds.addUsize(compressed, overhead), entry.data.len, local_offset) + (if (entry.encrypted and !entry.zipcrypto) winzip_aes_extra_record_length else 0) + entry.comment.len);
+        local_total = try bounds.addUsize(local_total, try bounds.addUsize(30 + entry.name.len + entry.extra.len + zipLocalZip64Length(try bounds.addUsize(compressed, overhead), entry.data.len) + (if (entry.encrypted and !entry.zipcrypto) winzip_aes_extra_record_length else 0), try bounds.addUsize(compressed, overhead)));
     }
     const needs_zip64 = entries.len >= std.math.maxInt(u16) or central_total >= std.math.maxInt(u32) or local_total >= std.math.maxInt(u32);
-    return try bounds.add(try bounds.add(local_total, central_total), try bounds.add(22 + archive_comment.len, if (needs_zip64) 76 else 0));
+    return try bounds.addUsize(try bounds.addUsize(local_total, central_total), try bounds.addUsize(22 + archive_comment.len, if (needs_zip64) 76 else 0));
 }
 
 pub fn zipEncode(entries: []const ZipEntry, archive_comment: []const u8, output: []u8, history: []u8, measurement_buffer: []u8, staging: []u8, scratch: []u8, failure_cause: *crypto.FailureCause) Failure!usize {
@@ -97,9 +97,9 @@ pub fn zipEncode(entries: []const ZipEntry, archive_comment: []const u8, output:
     for (entries) |entry| {
         const compressed = try zipCompressedSize(entry, history, measurement_buffer, scratch);
         const overhead = try zipAesOverhead(entry);
-        const stored_size = try bounds.add(compressed, overhead);
+        const stored_size = try bounds.addUsize(compressed, overhead);
         const zip64 = stored_size >= std.math.maxInt(u32) or entry.data.len >= std.math.maxInt(u32);
-        const extra_length = try bounds.add(try bounds.add(entry.extra.len, if (entry.encrypted and !entry.zipcrypto) winzip_aes_extra_record_length else 0), zipLocalZip64Length(stored_size, entry.data.len));
+        const extra_length = try bounds.addUsize(try bounds.addUsize(entry.extra.len, if (entry.encrypted and !entry.zipcrypto) winzip_aes_extra_record_length else 0), zipLocalZip64Length(stored_size, entry.data.len));
         try zipU32(&sink, zip_local_signature);
         try zipU16(&sink, if (entry.encrypted and !entry.zipcrypto) winzip_aes_version_needed else if (zip64) 45 else zipVersionNeeded(entry.method));
         try zipU16(&sink, if (entry.encrypted and !entry.zipcrypto) entry.flags | 1 else effectiveFlags(entry));
@@ -116,18 +116,18 @@ pub fn zipEncode(entries: []const ZipEntry, archive_comment: []const u8, output:
         try sink.write(entry.extra);
         if (entry.encrypted and !entry.zipcrypto) try zipWriteAesExtra(&sink, entry);
         try zipWriteData(&sink, entry, history, staging, scratch);
-        offsets = try bounds.add(offsets, 30 + entry.name.len + extra_length + stored_size);
+        offsets = try bounds.addUsize(offsets, 30 + entry.name.len + extra_length + stored_size);
     }
     const central_offset = offsets;
     var local_offset: usize = 0;
     for (entries) |entry| {
         const compressed = try zipCompressedSize(entry, history, measurement_buffer, scratch);
         const overhead = try zipAesOverhead(entry);
-        const stored_size = try bounds.add(compressed, overhead);
+        const stored_size = try bounds.addUsize(compressed, overhead);
         const zip64 = stored_size >= std.math.maxInt(u32) or entry.data.len >= std.math.maxInt(u32) or local_offset >= std.math.maxInt(u32);
         const local_extra = zipLocalZip64Length(stored_size, entry.data.len);
         const central_extra = zipCentralZip64Length(stored_size, entry.data.len, local_offset);
-        const extra_length = try bounds.add(try bounds.add(entry.extra.len, if (entry.encrypted and !entry.zipcrypto) winzip_aes_extra_record_length else 0), central_extra);
+        const extra_length = try bounds.addUsize(try bounds.addUsize(entry.extra.len, if (entry.encrypted and !entry.zipcrypto) winzip_aes_extra_record_length else 0), central_extra);
         try zipU32(&sink, zip_central_signature);
         try zipU16(&sink, entry.version_made_by);
         try zipU16(&sink, if (entry.encrypted and !entry.zipcrypto) winzip_aes_version_needed else if (zip64) 45 else zipVersionNeeded(entry.method));
@@ -150,7 +150,7 @@ pub fn zipEncode(entries: []const ZipEntry, archive_comment: []const u8, output:
         try sink.write(entry.extra);
         if (entry.encrypted and !entry.zipcrypto) try zipWriteAesExtra(&sink, entry);
         try sink.write(entry.comment);
-        local_offset = try bounds.add(local_offset, 30 + entry.name.len + entry.extra.len + (if (entry.encrypted and !entry.zipcrypto) winzip_aes_extra_record_length else 0) + local_extra + stored_size);
+        local_offset = try bounds.addUsize(local_offset, 30 + entry.name.len + entry.extra.len + (if (entry.encrypted and !entry.zipcrypto) winzip_aes_extra_record_length else 0) + local_extra + stored_size);
     }
     const central_size = sink.offset - central_offset;
     const needs_zip64 = entries.len >= std.math.maxInt(u16) or central_size >= std.math.maxInt(u32) or central_offset >= std.math.maxInt(u32);
@@ -236,7 +236,7 @@ fn zipAesOverhead(entry: ZipEntry) Failure!usize {
     if (!entry.encrypted) return 0;
     if (entry.zipcrypto) return 12;
     const salt_length = try crypto.winzipSaltLength(entry.aes_strength);
-    return try bounds.add(try bounds.add(salt_length, winzip_aes_verify_length), winzip_aes_hmac_length);
+    return try bounds.addUsize(try bounds.addUsize(salt_length, winzip_aes_verify_length), winzip_aes_hmac_length);
 }
 
 fn zipWriteAesExtra(sink: *io.Sink, entry: ZipEntry) Failure!void {
@@ -266,9 +266,9 @@ fn zipValidateExtra(extra: []const u8) Failure!void {
         if (extra.len - offset < 4) return error.InvalidCall;
         const id = readU16(extra, offset);
         const length = readU16(extra, offset + 2);
-        offset = try bounds.add(offset, 4);
+        offset = try bounds.addUsize(offset, 4);
         if (length > extra.len - offset or id == zip64_extra_id) return error.InvalidCall;
-        offset = try bounds.add(offset, length);
+        offset = try bounds.addUsize(offset, length);
     }
 }
 
@@ -351,7 +351,7 @@ pub fn zipCompressedSize(entry: ZipEntry, history: []u8, measurement_buffer: []u
             const required = lzma.encodeWorkspaceSizeBt(zip_lzma_props_default);
             if (scratch.len < required) return error.InsufficientCapacity;
             const stream = try lzma.requiredSize(entry.data, scratch[0..required], .{ .properties = zip_lzma_props_default, .marker_required = true });
-            return try bounds.add(stream, 9);
+            return try bounds.addUsize(stream, 9);
         },
         93 => {
             const needed = try zipZstdEncodeSize(entry.data, scratch);
@@ -366,7 +366,7 @@ pub fn zipCompressedSize(entry: ZipEntry, history: []u8, measurement_buffer: []u
             const required = ppmd_zip.encodeWorkspaceSize(zip_ppmd_mem_default);
             if (scratch.len < required) return error.InsufficientCapacity;
             const stream = try ppmd_zip.requiredSize(entry.data, scratch[0..required], .{ .order = zip_ppmd_order_default, .mem_size = zip_ppmd_mem_default, .restore_method = zip_ppmd_restore_default });
-            return try bounds.add(stream, 2);
+            return try bounds.addUsize(stream, 2);
         },
         else => return error.Unsupported,
     }
@@ -387,7 +387,7 @@ fn zipWriteData(sink: *io.Sink, entry: ZipEntry, history: []u8, staging: []u8, s
     if (!entry.encrypted) {
         if (entry.method == 0) return sink.write(entry.data);
         const compressed = try zipCompressEntry(entry, history, sink.bytes[sink.offset..], scratch);
-        sink.offset = try bounds.add(sink.offset, compressed.len);
+        sink.offset = try bounds.addUsize(sink.offset, compressed.len);
         return;
     }
     if (entry.zipcrypto) {
@@ -405,14 +405,14 @@ fn zipWriteData(sink: *io.Sink, entry: ZipEntry, history: []u8, staging: []u8, s
         if (entry.method == 0) {
             if (sink.bytes.len - sink.offset < entry.data.len) return error.InsufficientCapacity;
             keys.encrypt(sink.bytes[sink.offset..][0..entry.data.len], entry.data);
-            sink.offset = try bounds.add(sink.offset, entry.data.len);
+            sink.offset = try bounds.addUsize(sink.offset, entry.data.len);
             return;
         }
         const compressed = try zipCompressEntry(entry, history, staging, scratch);
         if (entry.password_lifetime != 0 and compressed.len > entry.password_lifetime) return error.ResourceLimit;
         if (sink.bytes.len - sink.offset < compressed.len) return error.InsufficientCapacity;
         keys.encrypt(sink.bytes[sink.offset..][0..compressed.len], compressed);
-        sink.offset = try bounds.add(sink.offset, compressed.len);
+        sink.offset = try bounds.addUsize(sink.offset, compressed.len);
         return;
     }
     const salt = try entrySalt(entry);
@@ -424,12 +424,12 @@ fn zipWriteData(sink: *io.Sink, entry: ZipEntry, history: []u8, staging: []u8, s
     if (entry.method == 0) {
         if (entry.password_lifetime != 0 and entry.data.len > entry.password_lifetime) return error.ResourceLimit;
         try crypto.winzipCtr(derived[0..32], sink.bytes[sink.offset..][0..entry.data.len], entry.data);
-        sink.offset = try bounds.add(sink.offset, entry.data.len);
+        sink.offset = try bounds.addUsize(sink.offset, entry.data.len);
     } else {
         const compressed = try zipCompressEntry(entry, history, staging, scratch);
         if (entry.password_lifetime != 0 and compressed.len > entry.password_lifetime) return error.ResourceLimit;
         try crypto.winzipCtr(derived[0..32], sink.bytes[sink.offset..][0..compressed.len], compressed);
-        sink.offset = try bounds.add(sink.offset, compressed.len);
+        sink.offset = try bounds.addUsize(sink.offset, compressed.len);
     }
     const ciphertext = sink.bytes[data_offset + 16 + winzip_aes_verify_length .. sink.offset];
     var mac: [crypto.hmac_sha1_length]u8 = undefined;
@@ -547,7 +547,7 @@ pub fn zipInspectCount(archive: []const u8) Failure!usize {
     var cursor = directory.offset;
     var index: usize = 0;
     while (index < directory.count) : (index += 1) _ = try zipNext(archive, directory, &cursor, index);
-    if (cursor != try bounds.add(directory.offset, directory.size)) return error.InvalidData;
+    if (cursor != try bounds.addUsize(directory.offset, directory.size)) return error.InvalidData;
     return directory.count;
 }
 
@@ -587,7 +587,7 @@ pub fn zipDecodeOrdinal(archive: []const u8, ordinal: usize, output: []u8, optio
     if (entry.flags & 8 == 0) {
         if (local_crc != entry.crc or (local_compressed != std.math.maxInt(u32) and local_compressed != entry.compressed_size) or (local_uncompressed != std.math.maxInt(u32) and local_uncompressed != entry.uncompressed_size)) return error.InvalidData;
     }
-    const data_offset = try bounds.add(entry.local_offset, 30 + name_length + extra_length);
+    const data_offset = try bounds.addUsize(entry.local_offset, 30 + name_length + extra_length);
     const compressed = try bounds.slice(archive, data_offset, entry.compressed_size);
     if (entry.flags & 8 != 0) try zipValidateDataDescriptor(archive, data_offset, entry);
     if (encrypted) {
@@ -595,7 +595,7 @@ pub fn zipDecodeOrdinal(archive: []const u8, ordinal: usize, output: []u8, optio
         if (entry.method == winzip_aes_method) {
             const key_length = try crypto.winzipKeyLength(entry.aes_strength);
             const salt_length = try crypto.winzipSaltLength(entry.aes_strength);
-            const header_length = try bounds.add(try bounds.add(salt_length, winzip_aes_verify_length), winzip_aes_hmac_length);
+            const header_length = try bounds.addUsize(try bounds.addUsize(salt_length, winzip_aes_verify_length), winzip_aes_hmac_length);
             if (entry.compressed_size < header_length) return error.InvalidData;
             const ciphertext_size = entry.compressed_size - header_length;
             if (options.kdf_rounds_limit != 0 and options.kdf_rounds_limit < crypto.winzip_pbkdf2_rounds) {
@@ -606,7 +606,7 @@ pub fn zipDecodeOrdinal(archive: []const u8, ordinal: usize, output: []u8, optio
                 options.failure_cause.* = .password_lifetime;
                 return error.ResourceLimit;
             }
-            const derived_length = try bounds.add(2 * key_length, winzip_aes_verify_length);
+            const derived_length = try bounds.addUsize(2 * key_length, winzip_aes_verify_length);
             var derived: [66]u8 = undefined;
             try crypto.winzipDeriveKey(password, compressed[0..salt_length], key_length, derived[0..derived_length]);
             const stored_verify = compressed[salt_length..][0..winzip_aes_verify_length];
@@ -712,7 +712,7 @@ fn zipDecompress(entry: ZipInfo, compressed: []const u8, output: []u8, options: 
         },
         93 => {
             const window = try zipZstdWindow(compressed);
-            const needed = try bounds.add(window, zstd.block_size_max);
+            const needed = try bounds.addUsize(window, zstd.block_size_max);
             if (needed > options.scratch.len) return error.InsufficientCapacity;
             var source = std.Io.Reader.fixed(compressed);
             var writer = std.Io.Writer.fixed(output[0..entry.uncompressed_size]);
@@ -782,9 +782,9 @@ fn zipZstdWindow(compressed: []const u8) Failure!u32 {
 }
 
 fn zipValidateDataDescriptor(archive: []const u8, data_offset: usize, entry: ZipInfo) Failure!void {
-    var offset = try bounds.add(data_offset, entry.compressed_size);
+    var offset = try bounds.addUsize(data_offset, entry.compressed_size);
     const marker = try bounds.slice(archive, offset, 4);
-    if (readU32(marker, 0) == 0x0807_4b50) offset = try bounds.add(offset, 4);
+    if (readU32(marker, 0) == 0x0807_4b50) offset = try bounds.addUsize(offset, 4);
     const zip64 = entry.compressed_size >= std.math.maxInt(u32) or entry.uncompressed_size >= std.math.maxInt(u32);
     const descriptor = try bounds.slice(archive, offset, if (zip64) 20 else 12);
     if (readU32(descriptor, 0) != entry.crc) return error.InvalidData;
@@ -848,7 +848,7 @@ fn zip64Directory(archive: []const u8, locator: usize, record_relative: u64) Fai
                 const offset = std.math.cast(usize, readU64(record, 48)) orelse return error.ResourceLimit;
                 if (candidate < relative) return error.InvalidData;
                 const base = candidate - relative;
-                const central = try bounds.add(base, offset);
+                const central = try bounds.addUsize(base, offset);
                 if (central > candidate or size != candidate - central) return error.InvalidData;
                 return .{ .offset = central, .size = size, .count = std.math.cast(usize, count) orelse return error.ResourceLimit, .base = base };
             }
@@ -860,7 +860,7 @@ fn zip64Directory(archive: []const u8, locator: usize, record_relative: u64) Fai
 }
 
 fn zipNext(archive: []const u8, directory: ZipDirectory, cursor: *usize, ordinal: usize) Failure!ZipInfo {
-    const end = try bounds.add(directory.offset, directory.size);
+    const end = try bounds.addUsize(directory.offset, directory.size);
     const record = try bounds.slice(archive, cursor.*, 46);
     if (cursor.* >= end or readU32(record, 0) != zip_central_signature) return error.InvalidData;
     const method = readU16(record, 10);
@@ -868,7 +868,7 @@ fn zipNext(archive: []const u8, directory: ZipDirectory, cursor: *usize, ordinal
     const name_length = readU16(record, 28);
     const extra_length = readU16(record, 30);
     const comment_length = readU16(record, 32);
-    const record_length = try bounds.add(46 + name_length, extra_length + comment_length);
+    const record_length = try bounds.addUsize(46 + name_length, extra_length + comment_length);
     if (record_length > end - cursor.*) return error.InvalidData;
     const name = try bounds.slice(archive, cursor.* + 46, name_length);
     try validateZipPath(name, readU16(record, 8));
@@ -877,7 +877,7 @@ fn zipNext(archive: []const u8, directory: ZipDirectory, cursor: *usize, ordinal
     var uncompressed: u64 = readU32(record, 24);
     var local_relative: u64 = readU32(record, 42);
     try zip64Extents(extra, &compressed, &uncompressed, &local_relative);
-    cursor.* = try bounds.add(cursor.*, record_length);
+    cursor.* = try bounds.addUsize(cursor.*, record_length);
     var aes_strength: u8 = 0;
     var aes_version: u16 = 0;
     var actual_method: u16 = 0;
@@ -886,7 +886,7 @@ fn zipNext(archive: []const u8, directory: ZipDirectory, cursor: *usize, ordinal
     } else {
         actual_method = method;
     }
-    return .{ .name = name, .method = method, .flags = flags, .dos_time = readU16(record, 12), .crc = readU32(record, 16), .compressed_size = std.math.cast(usize, compressed) orelse return error.ResourceLimit, .uncompressed_size = std.math.cast(usize, uncompressed) orelse return error.ResourceLimit, .local_offset = try bounds.add(directory.base, std.math.cast(usize, local_relative) orelse return error.ResourceLimit), .ordinal = ordinal, .version_made_by = readU16(record, 4), .internal_attributes = readU16(record, 36), .external_attributes = readU32(record, 38), .encrypted = flags & 1 != 0, .aes_strength = aes_strength, .aes_version = aes_version, .actual_method = actual_method };
+    return .{ .name = name, .method = method, .flags = flags, .dos_time = readU16(record, 12), .crc = readU32(record, 16), .compressed_size = std.math.cast(usize, compressed) orelse return error.ResourceLimit, .uncompressed_size = std.math.cast(usize, uncompressed) orelse return error.ResourceLimit, .local_offset = try bounds.addUsize(directory.base, std.math.cast(usize, local_relative) orelse return error.ResourceLimit), .ordinal = ordinal, .version_made_by = readU16(record, 4), .internal_attributes = readU16(record, 36), .external_attributes = readU32(record, 38), .encrypted = flags & 1 != 0, .aes_strength = aes_strength, .aes_version = aes_version, .actual_method = actual_method };
 }
 
 fn parseWinzipAesExtra(extra: []const u8, strength: *u8, version: *u16, actual_method: *u16) Failure!void {
@@ -895,7 +895,7 @@ fn parseWinzipAesExtra(extra: []const u8, strength: *u8, version: *u16, actual_m
         if (extra.len - offset < 4) return error.InvalidData;
         const id = readU16(extra, offset);
         const length = readU16(extra, offset + 2);
-        offset = try bounds.add(offset, 4);
+        offset = try bounds.addUsize(offset, 4);
         if (length > extra.len - offset) return error.InvalidData;
         if (id == winzip_aes_extra_id) {
             if (length != winzip_aes_extra_data_length) return error.InvalidData;
@@ -911,7 +911,7 @@ fn parseWinzipAesExtra(extra: []const u8, strength: *u8, version: *u16, actual_m
             actual_method.* = parsed_method;
             return;
         }
-        offset = try bounds.add(offset, length);
+        offset = try bounds.addUsize(offset, length);
     }
     return error.InvalidData;
 }
@@ -922,7 +922,7 @@ fn zip64Extents(extra: []const u8, compressed: *u64, uncompressed: *u64, local_o
         if (extra.len - offset < 4) return error.InvalidData;
         const id = readU16(extra, offset);
         const length = readU16(extra, offset + 2);
-        offset = try bounds.add(offset, 4);
+        offset = try bounds.addUsize(offset, 4);
         if (length > extra.len - offset) return error.InvalidData;
         if (id == zip64_extra_id) {
             var value_offset: usize = 0;
@@ -942,7 +942,7 @@ fn zip64Extents(extra: []const u8, compressed: *u64, uncompressed: *u64, local_o
             }
             return;
         }
-        offset = try bounds.add(offset, length);
+        offset = try bounds.addUsize(offset, length);
     }
     if (compressed.* == std.math.maxInt(u32) or uncompressed.* == std.math.maxInt(u32) or local_offset.* == std.math.maxInt(u32)) return error.InvalidData;
 }

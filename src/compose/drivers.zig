@@ -54,7 +54,7 @@ pub const GzipDecodeState = struct {
         return self.pending[self.frame_pos..self.pending_len];
     }
 
-    // leftover snapshots pre-append length so consumed reporting covers only this step's bytes.
+    // The leftover snapshot records its length before this step appends, so consumed reporting covers only this step's bytes.
     fn restage(self: *GzipDecodeState, input: []const u8, result: *StepResult) Failure!void {
         const consumed = self.inflater.input.slice.pos;
         const floor = if (self.phase == .deflate) consumed else self.frame_pos;

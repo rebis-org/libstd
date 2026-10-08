@@ -5,14 +5,14 @@ const failure_prim = @import("../common/primitive/failure.zig");
 const Failure = failure_prim.Failure;
 const io = @import("../common/primitive/io.zig");
 
-const tar_block_size: u64 = 512;
-pub const tar_scratch_size: usize = @intCast(tar_block_size);
-const tar_type_regular: u8 = '0';
-const tar_type_gnu_long_name: u8 = 'L';
-const tar_type_gnu_long_link: u8 = 'K';
-const tar_type_gnu_sparse: u8 = 'S';
-const tar_type_pax: u8 = 'x';
-const tar_type_global_pax: u8 = 'g';
+const block_size: u64 = 512;
+pub const tar_scratch_size: usize = @intCast(block_size);
+const typeflag_regular: u8 = '0';
+const typeflag_gnu_long_name: u8 = 'L';
+const typeflag_gnu_long_link: u8 = 'K';
+const typeflag_gnu_sparse: u8 = 'S';
+const typeflag_pax: u8 = 'x';
+const typeflag_global_pax: u8 = 'g';
 const max_sparse_segments = 1024;
 
 pub const SparseSegment = struct {
@@ -34,7 +34,7 @@ pub const TarEntry = struct {
     uid: u32 = 0,
     gid: u32 = 0,
     modification_time: u64 = 0,
-    typeflag: u8 = tar_type_regular,
+    typeflag: u8 = typeflag_regular,
 };
 
 pub const TarEntryInfo = struct {
@@ -53,7 +53,7 @@ pub const TarEntryInfo = struct {
     data_offset: u64,
 };
 
-const TarNameParts = struct {
+const NameParts = struct {
     name: []const u8,
     prefix: []const u8,
     uses_long_name: bool,
@@ -67,10 +67,10 @@ pub fn tarArchiveSize(entries: []const TarEntry) Failure!u64 {
         if ((entry.typeflag == '1' or entry.typeflag == '2') and entry.link_name.len == 0) return error.InvalidCall;
         const data_size = try tarDataSize(entry.typeflag, entry.data);
         var pax_buffer: [512]u8 = undefined;
-        const pax_len = try tarPaxRecords(entry, data_size, parts.uses_long_name, &pax_buffer);
-        if (pax_len > 0) total = try bounds.add64(total, try bounds.add64(tar_block_size, try tarAligned(pax_len)));
-        total = try bounds.add64(total, tar_block_size);
-        total = try bounds.add64(total, try tarAligned(data_size));
+        const pax_len = try writePaxRecords(entry, data_size, parts.uses_long_name, &pax_buffer);
+        if (pax_len > 0) total = try bounds.addU64(total, try bounds.addU64(block_size, try tarAligned(pax_len)));
+        total = try bounds.addU64(total, block_size);
+        total = try bounds.addU64(total, try tarAligned(data_size));
     }
     return total;
 }
@@ -86,9 +86,9 @@ pub fn tarEncode(entries: []const TarEntry, output: []u8, scratch: []u8) Failure
         if ((entry.typeflag == '1' or entry.typeflag == '2') and entry.link_name.len == 0) return error.InvalidCall;
         const data_size = try tarDataSize(entry.typeflag, entry.data);
         var pax_buffer: [512]u8 = undefined;
-        const pax_len = try tarPaxRecords(entry, data_size, parts.uses_long_name, &pax_buffer);
+        const pax_len = try writePaxRecords(entry, data_size, parts.uses_long_name, &pax_buffer);
         if (pax_len > 0) {
-            try tarWriteHeader(&sink, scratch, "././@PaxHeader", &.{}, &.{}, 0o644, 0, 0, 0, tar_type_pax, pax_len);
+            try tarWriteHeader(&sink, scratch, "././@PaxHeader", &.{}, &.{}, 0o644, 0, 0, 0, typeflag_pax, pax_len);
             try sink.write(pax_buffer[0..pax_len]);
             try tarWritePadding(&sink, scratch, pax_len);
         }
@@ -102,7 +102,7 @@ pub fn tarEncode(entries: []const TarEntry, output: []u8, scratch: []u8) Failure
     return sink.offset;
 }
 
-fn tarPaxRecords(entry: TarEntry, data_size: u64, uses_long_name: bool, buffer: []u8) Failure!usize {
+fn writePaxRecords(entry: TarEntry, data_size: u64, uses_long_name: bool, buffer: []u8) Failure!usize {
     var written: usize = 0;
     if (uses_long_name) written = try paxStringRecord(buffer, "path", entry.name);
     if (entry.link_name.len > 100) {
@@ -225,14 +225,14 @@ fn paxNumberRecord(buffer: []u8, key: []const u8, value: u64, base: u8) Failure!
 }
 
 pub fn tarInspectCount(archive: []const u8) Failure!u64 {
-    var reader = TarReader{ .archive = archive };
+    var reader = Reader{ .archive = archive };
     var count: u64 = 0;
-    while (try reader.next()) |_| count = try bounds.add64(count, 1);
+    while (try reader.next()) |_| count = try bounds.addU64(count, 1);
     return count;
 }
 
 pub fn tarInspectOrdinal(archive: []const u8, ordinal: u64) Failure!TarEntryInfo {
-    var reader = TarReader{ .archive = archive };
+    var reader = Reader{ .archive = archive };
     while (try reader.next()) |entry| {
         if (entry.ordinal == ordinal) return entry;
     }
@@ -251,9 +251,9 @@ pub fn tarDecodeOrdinal(archive: []const u8, ordinal: u64, output: []u8) Failure
             const start = std.math.cast(usize, segment.offset) orelse return error.InvalidData;
             const count = std.math.cast(usize, segment.num_bytes) orelse return error.InvalidData;
             if (start > size or count > size - start) return error.InvalidData;
-            const chunk = try bounds.slice(archive, try bounds.add64(entry.data_offset, stream_offset), count);
+            const chunk = try bounds.slice(archive, try bounds.addU64(entry.data_offset, stream_offset), count);
             @memcpy(output[start..][0..count], chunk);
-            stream_offset = try bounds.add64(stream_offset, segment.num_bytes);
+            stream_offset = try bounds.addU64(stream_offset, segment.num_bytes);
         }
         return size;
     }
@@ -262,13 +262,13 @@ pub fn tarDecodeOrdinal(archive: []const u8, ordinal: u64, output: []u8) Failure
     return size;
 }
 
-fn tarIsZeroBlock(block: []const u8) bool {
+fn isZeroBlock(block: []const u8) bool {
     return std.mem.allEqual(u8, block, 0);
 }
 
 fn tarAligned(size: u64) Failure!u64 {
-    const remainder = size % tar_block_size;
-    return if (remainder == 0) size else bounds.add64(size, tar_block_size - remainder);
+    const remainder = size % block_size;
+    return if (remainder == 0) size else bounds.addU64(size, block_size - remainder);
 }
 
 fn tarField(field: []const u8) []const u8 {
@@ -347,7 +347,7 @@ fn tarValidName(name: []const u8) Failure!void {
     }
 }
 
-fn tarNameParts(name: []const u8) Failure!TarNameParts {
+fn tarNameParts(name: []const u8) Failure!NameParts {
     try tarValidName(name);
     if (name.len <= 100) return .{ .name = name, .prefix = &.{}, .uses_long_name = false };
     var index = name.len;
@@ -363,14 +363,14 @@ fn tarNameParts(name: []const u8) Failure!TarNameParts {
 
 fn tarDataSize(typeflag: u8, data: []const u8) Failure!u64 {
     return switch (typeflag) {
-        0, tar_type_regular, '7' => data.len,
+        0, typeflag_regular, '7' => data.len,
         '1', '2', '3', '4', '5', '6' => if (data.len == 0) 0 else error.InvalidCall,
         else => error.InvalidCall,
     };
 }
 
 fn tarExtensionSize(value: []const u8) Failure!u64 {
-    return bounds.add64(tar_block_size, try tarAligned(try bounds.add64(value.len, 1)));
+    return bounds.addU64(block_size, try tarAligned(try bounds.addU64(value.len, 1)));
 }
 
 fn tarWriteHeader(sink: *io.Sink, scratch: []u8, name: []const u8, prefix: []const u8, link_name: []const u8, mode: u32, uid: u32, gid: u32, modification_time: u64, typeflag: u8, size: u64) Failure!void {
@@ -401,7 +401,7 @@ fn tarWriteHeader(sink: *io.Sink, scratch: []u8, name: []const u8, prefix: []con
 }
 
 fn tarWritePadding(sink: *io.Sink, scratch: []u8, size: u64) Failure!void {
-    const padding = (tar_block_size - size % tar_block_size) % tar_block_size;
+    const padding = (block_size - size % block_size) % block_size;
     if (padding != 0) {
         if (scratch.len < tar_scratch_size) return error.InsufficientCapacity;
         @memset(scratch[0..tar_scratch_size], 0);
@@ -410,14 +410,14 @@ fn tarWritePadding(sink: *io.Sink, scratch: []u8, size: u64) Failure!void {
 }
 
 fn tarWriteExtension(sink: *io.Sink, scratch: []u8, typeflag: u8, value: []const u8) Failure!void {
-    const size = try bounds.add64(value.len, 1);
+    const size = try bounds.addU64(value.len, 1);
     try tarWriteHeader(sink, scratch, "././@LongLink", &.{}, &.{}, 0, 0, 0, 0, typeflag, size);
     try sink.write(value);
     try sink.write(&.{0});
     try tarWritePadding(sink, scratch, size);
 }
 
-const TarPax = struct {
+const Pax = struct {
     path: ?[]const u8 = null,
     link_name: ?[]const u8 = null,
     mode: ?u32 = null,
@@ -435,21 +435,21 @@ const TarPax = struct {
     sparse_pax: ?[]const u8 = null,
 };
 
-const TarReader = struct {
+const Reader = struct {
     archive: []const u8,
     offset: u64 = 0,
     ordinal: u64 = 0,
     long_name: ?[]const u8 = null,
     long_link: ?[]const u8 = null,
-    global_pax: TarPax = .{},
-    local_pax: TarPax = .{},
+    global_pax: Pax = .{},
+    local_pax: Pax = .{},
 
-    fn readHeader(self: *TarReader) Failure!TarEntryInfo {
-        const header = try bounds.slice(self.archive, self.offset, tar_block_size);
+    fn readHeader(self: *Reader) Failure!TarEntryInfo {
+        const header = try bounds.slice(self.archive, self.offset, block_size);
         const recorded_checksum = try tarNumber(header[148..156]);
         if (recorded_checksum != tarChecksum(header)) return error.IntegrityFailure;
         const size = try tarNumber(header[124..136]);
-        const data_offset = try bounds.add64(self.offset, tar_block_size);
+        const data_offset = try bounds.addU64(self.offset, block_size);
         return .{
             .name = tarField(header[0..100]),
             .prefix = tarField(header[345..500]),
@@ -466,41 +466,41 @@ const TarReader = struct {
         };
     }
 
-    fn advance(self: *TarReader, size: u64) Failure!void {
-        self.offset = try bounds.add64(try bounds.add64(self.offset, tar_block_size), try tarAligned(size));
+    fn advance(self: *Reader, size: u64) Failure!void {
+        self.offset = try bounds.addU64(try bounds.addU64(self.offset, block_size), try tarAligned(size));
         if (self.offset > self.archive.len) return error.InvalidData;
     }
 
-    fn parseOldGnuSparse(self: *TarReader, entry: *TarEntryInfo) Failure!SparseInfo {
+    fn parseOldGnuSparse(self: *Reader, entry: *TarEntryInfo) Failure!SparseInfo {
         var info = SparseInfo{ .realsize = 0, .segment_count = 0, .segments = undefined };
-        const header = try bounds.slice(self.archive, entry.header_offset, tar_block_size);
+        const header = try bounds.slice(self.archive, entry.header_offset, block_size);
         info.realsize = try tarNumber(header[483..495]);
         var chunk_sum: u64 = 0;
         try parseSparseEntries(&info, &chunk_sum, header[386..482], 4);
         var is_extended = header[482];
         var extension_blocks: u64 = 0;
-        var extension_offset = try bounds.add64(entry.header_offset, tar_block_size);
+        var extension_offset = try bounds.addU64(entry.header_offset, block_size);
         while (is_extended != 0) {
-            const extension = try bounds.slice(self.archive, extension_offset, tar_block_size);
+            const extension = try bounds.slice(self.archive, extension_offset, block_size);
             try parseSparseEntries(&info, &chunk_sum, extension[0..504], 21);
             is_extended = extension[504];
             extension_blocks += 1;
-            extension_offset = try bounds.add64(extension_offset, tar_block_size);
+            extension_offset = try bounds.addU64(extension_offset, block_size);
         }
         if (chunk_sum != entry.size) return error.InvalidData;
         if (info.realsize == 0) {
             for (info.segments[0..info.segment_count]) |segment| {
-                info.realsize = @max(info.realsize, try bounds.add64(segment.offset, segment.num_bytes));
+                info.realsize = @max(info.realsize, try bounds.addU64(segment.offset, segment.num_bytes));
             }
         }
         try validateSparseInfo(info);
-        entry.data_offset = try bounds.add64(entry.header_offset, (extension_blocks + 1) * tar_block_size);
-        self.offset = try bounds.add64(entry.data_offset, try tarAligned(entry.size));
+        entry.data_offset = try bounds.addU64(entry.header_offset, (extension_blocks + 1) * block_size);
+        self.offset = try bounds.addU64(entry.data_offset, try tarAligned(entry.size));
         if (self.offset > self.archive.len) return error.InvalidData;
         return info;
     }
 
-    fn sparseFromPax(self: *TarReader, entry: *TarEntryInfo, pax: TarPax) Failure!?SparseInfo {
+    fn sparseFromPax(self: *Reader, entry: *TarEntryInfo, pax: Pax) Failure!?SparseInfo {
         if (pax.sparse_major == null and pax.sparse_size == null and pax.sparse_realsize == null and pax.sparse_map == null and pax.sparse_pax == null) return null;
         // Every branch assigns info wholesale before any field is read, so undefined init is safe.
         var info: SparseInfo = undefined;
@@ -519,7 +519,7 @@ const TarReader = struct {
             const map_start = entry.data_offset;
             const map_bytes = try readSparseMapData(self.archive, map_start, &info);
             const map_padded = try tarAligned(map_bytes);
-            entry.data_offset = try bounds.add64(entry.data_offset, map_padded);
+            entry.data_offset = try bounds.addU64(entry.data_offset, map_padded);
             if (entry.size < map_padded) return error.InvalidData;
             entry.size -= map_padded;
         }
@@ -535,38 +535,38 @@ const TarReader = struct {
         return info;
     }
 
-    fn next(self: *TarReader) Failure!?TarEntryInfo {
+    fn next(self: *Reader) Failure!?TarEntryInfo {
         while (self.offset < self.archive.len) {
-            const block = try bounds.slice(self.archive, self.offset, tar_block_size);
-            if (tarIsZeroBlock(block)) {
+            const block = try bounds.slice(self.archive, self.offset, block_size);
+            if (isZeroBlock(block)) {
                 const remaining = try bounds.slice(self.archive, self.offset, self.archive.len - @as(usize, @intCast(self.offset)));
-                if (remaining.len < 1024 or !tarIsZeroBlock(remaining)) return error.InvalidData;
+                if (remaining.len < 1024 or !isZeroBlock(remaining)) return error.InvalidData;
                 return null;
             }
             var entry = try self.readHeader();
             const physical_size = entry.size;
             const data = try bounds.slice(self.archive, entry.data_offset, physical_size);
             switch (entry.typeflag) {
-                tar_type_gnu_long_name => {
+                typeflag_gnu_long_name => {
                     if (self.long_name != null) return error.InvalidData;
                     self.long_name = tarField(data);
                     try self.advance(physical_size);
                 },
-                tar_type_gnu_long_link => {
+                typeflag_gnu_long_link => {
                     if (self.long_link != null) return error.InvalidData;
                     self.long_link = tarField(data);
                     try self.advance(physical_size);
                 },
-                tar_type_pax => {
+                typeflag_pax => {
                     if (!tarPaxEmpty(self.local_pax)) return error.InvalidData;
                     self.local_pax = try tarParsePax(data);
                     try self.advance(physical_size);
                 },
-                tar_type_global_pax => {
+                typeflag_global_pax => {
                     tarMergePax(&self.global_pax, try tarParsePax(data));
                     try self.advance(physical_size);
                 },
-                tar_type_gnu_sparse => {
+                typeflag_gnu_sparse => {
                     try tarValidateSparseHeader(entry);
                     const sparse = try self.parseOldGnuSparse(&entry);
                     entry.size = sparse.realsize;
@@ -577,7 +577,7 @@ const TarReader = struct {
                     }
                     if (self.long_link) |link_name| entry.link_name = link_name;
                     entry.ordinal = self.ordinal;
-                    self.ordinal = try bounds.add64(self.ordinal, 1);
+                    self.ordinal = try bounds.addU64(self.ordinal, 1);
                     self.long_name = null;
                     self.long_link = null;
                     self.local_pax = .{};
@@ -607,7 +607,7 @@ const TarReader = struct {
                     }
                     if (self.long_link) |link_name| entry.link_name = link_name;
                     entry.ordinal = self.ordinal;
-                    self.ordinal = try bounds.add64(self.ordinal, 1);
+                    self.ordinal = try bounds.addU64(self.ordinal, 1);
                     try self.advance(advance_size);
                     self.long_name = null;
                     self.long_link = null;
@@ -640,14 +640,14 @@ fn addSparseSegment(info: *SparseInfo, chunk_sum: *u64, offset: u64, num_bytes: 
     if (info.segment_count >= max_sparse_segments) return error.Unsupported;
     info.segments[info.segment_count] = .{ .offset = offset, .num_bytes = num_bytes };
     info.segment_count += 1;
-    chunk_sum.* = try bounds.add64(chunk_sum.*, num_bytes);
+    chunk_sum.* = try bounds.addU64(chunk_sum.*, num_bytes);
 }
 
 fn validateSparseInfo(info: SparseInfo) Failure!void {
     var previous_end: u64 = 0;
     for (info.segments[0..info.segment_count]) |segment| {
         if (segment.num_bytes == 0 or segment.offset < previous_end) return error.InvalidData;
-        const end = try bounds.add64(segment.offset, segment.num_bytes);
+        const end = try bounds.addU64(segment.offset, segment.num_bytes);
         if (end > info.realsize) return error.InvalidData;
         previous_end = end;
     }
@@ -738,16 +738,16 @@ fn readSparseLine(archive: []const u8, offset: *u64) Failure!u64 {
 
 fn tarValidateType(typeflag: u8) Failure!void {
     switch (typeflag) {
-        0, tar_type_regular, '1', '2', '3', '4', '5', '6', '7' => {},
+        0, typeflag_regular, '1', '2', '3', '4', '5', '6', '7' => {},
         else => return error.Unsupported,
     }
 }
 
-fn tarPaxEmpty(attributes: TarPax) bool {
+fn tarPaxEmpty(attributes: Pax) bool {
     return attributes.path == null and attributes.link_name == null and attributes.mode == null and attributes.uid == null and attributes.gid == null and attributes.size == null and attributes.modification_time == null and attributes.sparse_major == null and attributes.sparse_minor == null and attributes.sparse_name == null and attributes.sparse_size == null and attributes.sparse_realsize == null and attributes.sparse_numblocks == null and attributes.sparse_map == null and attributes.sparse_pax == null;
 }
 
-fn tarMergePax(target: *TarPax, updates: TarPax) void {
+fn tarMergePax(target: *Pax, updates: Pax) void {
     if (updates.path) |value| target.path = value;
     if (updates.link_name) |value| target.link_name = value;
     if (updates.mode) |value| target.mode = value;
@@ -776,8 +776,8 @@ fn tarDecimal(value: []const u8) Failure!u64 {
     return result;
 }
 
-fn tarParsePax(data: []const u8) Failure!TarPax {
-    var attributes: TarPax = .{};
+fn tarParsePax(data: []const u8) Failure!Pax {
+    var attributes: Pax = .{};
     var offset: usize = 0;
     while (offset < data.len) {
         const length_start = offset;
@@ -843,7 +843,7 @@ fn tarParsePax(data: []const u8) Failure!TarPax {
     return attributes;
 }
 
-fn tarApplyPax(entry: *TarEntryInfo, attributes: TarPax) Failure!void {
+fn tarApplyPax(entry: *TarEntryInfo, attributes: Pax) Failure!void {
     if (attributes.path) |path| {
         if (path.len == 0 or std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidData;
         entry.name = path;

@@ -51,20 +51,20 @@ fn validateNode(first: ?*abi.Node, context: *Context, depth: usize) Failure!void
             }
             return error.Unsupported;
         }
-        const info = descriptor.?;
-        switch (info.kind) {
+        const entry = descriptor.?;
+        switch (entry.kind) {
             .parameter => {
-                if (!directionAccepts(info.direction, context.direction)) return error.Unsupported;
-                if (context.direction == .in and (info.command_mask & context.command_mask) == 0) return error.Unsupported;
+                if (!directionAccepts(entry.direction, context.direction)) return error.Unsupported;
+                if (context.direction == .in and (entry.command_mask & context.command_mask) == 0) return error.Unsupported;
             },
             .diagnostic => {
                 if (context.direction != .out) return error.Unsupported;
             },
             else => return error.Unsupported,
         }
-        try validateRepresentation(node, info);
-        if (info.cardinality == .singleton and hasDuplicateSibling(first, node)) return error.InvalidCall;
-        if (info.representation == .node_chain) {
+        try validateRepresentation(node, entry);
+        if (entry.cardinality == .singleton and hasDuplicateSibling(first, node)) return error.InvalidCall;
+        if (entry.representation == .node_chain) {
             context.ancestors[depth] = node;
             try validateNode(node.child, context, depth + 1);
             context.ancestors[depth] = null;
@@ -73,10 +73,10 @@ fn validateNode(first: ?*abi.Node, context: *Context, depth: usize) Failure!void
     }
 }
 
-fn directionAccepts(descriptor_direction: vocabulary.Direction, usage: vocabulary.Direction) bool {
-    return switch (usage) {
-        .in => descriptor_direction == .in or descriptor_direction == .in_out,
-        .out => descriptor_direction == .out or descriptor_direction == .in_out,
+fn directionAccepts(declared: vocabulary.Direction, used: vocabulary.Direction) bool {
+    return switch (used) {
+        .in => declared == .in or declared == .in_out,
+        .out => declared == .out or declared == .in_out,
         else => false,
     };
 }
@@ -114,8 +114,8 @@ fn siblingKey(node: *abi.Node) SiblingKey {
 }
 
 fn validateParameter(node: *abi.Node, first: ?*abi.Node, context: *Context, selector: vocabulary.Selector) Failure!void {
-    if (!vocabulary.selectorValid(selector)) return error.InvalidCall;
-    if (!discovery.selectorKnown(selector.family, selector.ordinal)) return error.Unsupported;
+    if (!vocabulary.isSelectorValid(selector)) return error.InvalidCall;
+    if (!discovery.isSelectorKnown(selector.family, selector.ordinal)) return error.Unsupported;
     if (!directionAccepts(vocabulary.directionOf(selector), context.direction)) return error.Unsupported;
     if (context.direction == .in and (selector.flags & context.command_mask) == 0) return error.Unsupported;
     const representation = vocabulary.representationOf(selector);

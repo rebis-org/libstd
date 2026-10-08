@@ -24,11 +24,11 @@ const registry_fields = @typeInfo(@TypeOf(registry)).@"struct";
 
 comptime {
     for (registry_fields.field_names) |name| {
-        if (!@hasField(Category, name)) @compileError("registry field is not a category: " ++ name);
+        if (!@hasField(Category, name)) @compileError("registry field is not a category: " ++ name ++ ".");
         const layer = @field(registry, name);
         for (layer.units, 0..) |unit, index| {
             for (layer.units[0..index]) |other| {
-                if (std.mem.eql(u8, unit.name, other.name)) @compileError("duplicate unit name: " ++ unit.name);
+                if (std.mem.eql(u8, unit.name, other.name)) @compileError("duplicate unit name: " ++ unit.name ++ ".");
             }
         }
     }
@@ -84,7 +84,7 @@ pub fn addListingStep(b: *std.Build) *std.Build.Step {
         }),
     });
     const run = b.addRunArtifact(exe);
-    const step = b.step("units", "List registered build units");
+    const step = b.step("units", "List the registered build units");
     step.dependOn(&run.step);
     return step;
 }

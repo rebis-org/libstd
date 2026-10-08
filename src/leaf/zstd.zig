@@ -152,11 +152,11 @@ fn decodeWithOutput(input: *std.Io.Reader, output: *std.Io.Writer, history: []u8
             start_repeated_offset_3,
         },
         .huffman_tree = null,
-        .lit_window = 0,
-        .lit_window_bits = 0,
-        .lit_stream_bytes = &.{},
-        .lit_stream_remaining = 0,
-        .lit_stream_count = 0,
+        .literal_window = 0,
+        .literal_window_bits = 0,
+        .literal_stream_bytes = &.{},
+        .literal_stream_remaining = 0,
+        .literal_stream_count = 0,
         .literal_stream_index = 0,
     };
     while (true) {
@@ -281,10 +281,10 @@ pub fn trainDictionary(samples: []const []const u8, max_size: usize, output: []u
                 if (seg_freqs[idx] == 0) score += freqs[idx];
                 seg_freqs[idx] += 1;
                 if (end - begin == train_dmers_in_k + 1) {
-                    const del = trainHash(sample[begin..][0..train_d]);
+                    const leaving = trainHash(sample[begin..][0..train_d]);
                     begin += 1;
-                    seg_freqs[del] -= 1;
-                    if (seg_freqs[del] == 0) score -= freqs[del];
+                    seg_freqs[leaving] -= 1;
+                    if (seg_freqs[leaving] == 0) score -= freqs[leaving];
                 }
                 if (score > best_score) {
                     best_score = score;
@@ -293,8 +293,8 @@ pub fn trainDictionary(samples: []const []const u8, max_size: usize, output: []u
                 }
             }
             while (begin < end) : (begin += 1) {
-                const del = trainHash(sample[begin..][0..train_d]);
-                seg_freqs[del] -= 1;
+                const leaving = trainHash(sample[begin..][0..train_d]);
+                seg_freqs[leaving] -= 1;
             }
         }
         if (best_score == 0) break;
@@ -370,18 +370,18 @@ pub fn encodeStream(input: *std.Io.Reader, output: *std.Io.Writer, history: []u8
     if (workspace.len < encoderWorkspaceU32Count(dictionary.len, frame_cap, options)) return error.InvalidData;
     var total_encoded: u64 = 0;
     var total_input: u64 = 0;
-    var empty = true;
+    var is_empty = true;
     @memcpy(history[0..dictionary.len], dictionary);
     while (true) {
         const frame_len = try readFrameInput(input, history[dictionary.len..], frame_cap, options.max_decoded_bytes, &total_input);
         if (frame_len == 0) {
-            if (empty) {
+            if (is_empty) {
                 const written = try encodeFrame(output, history[dictionary.len..][0..0], workspace, options, 0);
                 total_encoded = try checkedAdd(total_encoded, written, options.max_encoded_bytes);
             }
             break;
         }
-        empty = false;
+        is_empty = false;
         const written = try encodeFrame(output, history[0 .. dictionary.len + frame_len], workspace, options, dictionary.len);
         total_encoded = try checkedAdd(total_encoded, written, options.max_encoded_bytes);
     }
@@ -426,28 +426,28 @@ pub fn encodeFrame(output: *std.Io.Writer, content: []const u8, workspace: []u32
 }
 
 fn writeFrameHeader(writer: *std.Io.Writer, content_size: usize, window_size: u32) EncodeError!void {
-    var cs_flag: u2 = 0;
+    var content_size_flag: u2 = 0;
     var field_size: u4 = 1;
-    var fcs: u64 = content_size;
+    var encoded_content_size: u64 = content_size;
     if (content_size > 0xFFFFFFFF) {
-        cs_flag = 3;
+        content_size_flag = 3;
         field_size = 8;
     } else if (content_size > 65791) {
-        cs_flag = 2;
+        content_size_flag = 2;
         field_size = 4;
     } else if (content_size > 255) {
-        cs_flag = 1;
+        content_size_flag = 1;
         field_size = 2;
-        fcs -%= 256;
+        encoded_content_size -%= 256;
     }
     const single_segment = content_size <= 0xFFFF and content_size <= window_size;
-    const descriptor: u8 = (@as(u8, cs_flag) << 6) | 0x04 | (if (single_segment) @as(u8, 0x20) else @as(u8, 0));
+    const descriptor: u8 = (@as(u8, content_size_flag) << 6) | 0x04 | (if (single_segment) @as(u8, 0x20) else @as(u8, 0));
     try writeByte(writer, descriptor);
     if (!single_segment) {
         try writeByte(writer, encodeWindowDescriptor(window_size));
     }
     for (0..field_size) |i| {
-        try writeByte(writer, @truncate(fcs >> @intCast(i * 8)));
+        try writeByte(writer, @truncate(encoded_content_size >> @intCast(i * 8)));
     }
 }
 
@@ -455,9 +455,9 @@ fn encodeWindowDescriptor(window_size: u32) u8 {
     if (window_size < 1024) return 0;
     const exponent: u5 = @intCast(31 - @clz(window_size) - 10);
     const base: u64 = @as(u64, 1) << @intCast(exponent + 10);
-    const unit = base / 8;
-    const mantissa_u = @divCeil(window_size - base, unit);
-    const mantissa: u8 = @intCast(@min(mantissa_u, 7));
+    const add_unit = base / 8;
+    const mantissa_raw = @divCeil(window_size - base, add_unit);
+    const mantissa: u8 = @intCast(@min(mantissa_raw, 7));
     return (@as(u8, exponent) << 3) | mantissa;
 }
 
@@ -567,14 +567,14 @@ fn encodeBlock(output: *std.Io.Writer, content: []const u8, block_start: usize, 
         return;
     }
     const first_byte = src[0];
-    var all_same = true;
+    var is_all_same = true;
     for (src) |b| {
         if (b != first_byte) {
-            all_same = false;
+            is_all_same = false;
             break;
         }
     }
-    if (all_same) {
+    if (is_all_same) {
         try writeBlockHeader(output, .rle, src.len, is_last);
         try writeByte(output, first_byte);
         return;
@@ -584,7 +584,7 @@ fn encodeBlock(output: *std.Io.Writer, content: []const u8, block_start: usize, 
     var literal_freq: [256]u32 = undefined;
     var literal_count: usize = 0;
     var seq_count: usize = 0;
-    var lit_start: usize = 0;
+    var anchor: usize = 0;
     var pos: usize = 0;
     var insert_pos: usize = block_start;
     var pending_len: usize = 0;
@@ -620,10 +620,10 @@ fn encodeBlock(output: *std.Io.Writer, content: []const u8, block_start: usize, 
             match_offset = match.offset;
         }
         if (match_len >= min_take_len) {
-            appendSequence(seq_data, &seq_count, literal_buf, &literal_count, src, lit_start, pos, match_len, @intCast(match_offset), repeat_offsets);
+            appendSequence(seq_data, &seq_count, literal_buf, &literal_count, src, anchor, pos, match_len, @intCast(match_offset), repeat_offsets);
             pos += match_len;
             if (options.skip_interior_insert) insert_pos = block_start + pos;
-            lit_start = pos;
+            anchor = pos;
         } else {
             pos += 1;
         }
@@ -632,7 +632,7 @@ fn encodeBlock(output: *std.Io.Writer, content: []const u8, block_start: usize, 
         insertPosition(content, insert_pos, block_end, head, chain, options);
         insert_pos += 1;
     }
-    const tail = src[lit_start..];
+    const tail = src[anchor..];
     @memcpy(literal_buf[literal_count..][0..tail.len], tail);
     literal_count += tail.len;
     countLiteralFreqs(literal_buf[0..literal_count], &literal_freq);
@@ -652,34 +652,34 @@ fn countLiteralFreqs(literals: []const u8, freq: *[256]u32) void {
     for (0..256) |s| freq[s] = lanes[0][s] + lanes[1][s] + lanes[2][s] + lanes[3][s];
 }
 
-fn appendSequence(seq_data: []SeqData, seq_count: *usize, literal_buf: []u8, literal_count: *usize, src: []const u8, lit_start: usize, lit_end: usize, match_len: usize, offset: u32, repeat_offsets: *[3]u32) void {
-    const run = src[lit_start..lit_end];
-    // Short runs dominate. Word-wise copies beat a memcpy call there.
-    var k: usize = 0;
-    while (k + 8 <= run.len) : (k += 8) {
-        literal_buf[literal_count.* + k ..][0..8].* = run[k..][0..8].*;
+fn appendSequence(seq_data: []SeqData, seq_count: *usize, literal_buf: []u8, literal_count: *usize, src: []const u8, literal_start: usize, literal_end: usize, match_len: usize, offset: u32, repeat_offsets: *[3]u32) void {
+    const literal_run = src[literal_start..literal_end];
+    // Short literal runs dominate. Word-wise copies beat a memcpy call there.
+    var copied: usize = 0;
+    while (copied + 8 <= literal_run.len) : (copied += 8) {
+        literal_buf[literal_count.* + copied ..][0..8].* = literal_run[copied..][0..8].*;
     }
-    while (k < run.len) : (k += 1) {
-        literal_buf[literal_count.* + k] = run[k];
+    while (copied < literal_run.len) : (copied += 1) {
+        literal_buf[literal_count.* + copied] = literal_run[copied];
     }
-    literal_count.* += run.len;
-    const literal_len: u32 = @intCast(lit_end - lit_start);
-    const lit_code = literalLengthCode(literal_len);
-    const mat_code = matchLengthCode(@intCast(match_len));
-    const off_code = encodeOffset(offset, literal_len, repeat_offsets);
+    literal_count.* += literal_run.len;
+    const literal_len: u32 = @intCast(literal_end - literal_start);
+    const literal_code = literalLengthCode(literal_len);
+    const match_code = matchLengthCode(@intCast(match_len));
+    const offset_code = offsetCode(offset, literal_len, repeat_offsets);
     seq_data[seq_count.*] = .{
         .literal_length = literal_len,
-        .literal_code = lit_code.code,
-        .literal_extra = lit_code.extra,
-        .literal_extra_bits = lit_code.bits,
+        .literal_code = literal_code.code,
+        .literal_extra = literal_code.extra,
+        .literal_extra_bits = literal_code.bits,
         .match_length = @intCast(match_len),
-        .match_code = mat_code.code,
-        .match_extra = mat_code.extra,
-        .match_extra_bits = mat_code.bits,
+        .match_code = match_code.code,
+        .match_extra = match_code.extra,
+        .match_extra_bits = match_code.bits,
         .offset = offset,
-        .offset_code = off_code.code,
-        .offset_extra = off_code.extra,
-        .offset_extra_bits = off_code.bits,
+        .offset_code = offset_code.code,
+        .offset_extra = offset_code.extra,
+        .offset_extra_bits = offset_code.bits,
     };
     seq_count.* += 1;
 }
@@ -710,9 +710,9 @@ fn finishBlock(output: *std.Io.Writer, src: []const u8, literal_buf: []const u8,
     const prev_saved = prev.*;
     const seq_ok = buildSequenceSection(seq_data[0..seq_count], literal_table, match_table, offset_table, prev, seq_section_buf, &seq_section);
     const compressed_size = if (literal_ok and seq_ok) 3 + literal_section.len + seq_section.len else raw_size;
-    const use_compressed = literal_ok and seq_ok and compressed_size < raw_size;
-    if (!use_compressed) prev.* = prev_saved;
-    if (use_compressed) {
+    const compressed_wins = literal_ok and seq_ok and compressed_size < raw_size;
+    if (!compressed_wins) prev.* = prev_saved;
+    if (compressed_wins) {
         try writeBlockHeader(output, .compressed, literal_section.len + seq_section.len, is_last);
         output.writeAll(literal_section) catch return error.IoFailure;
         output.writeAll(seq_section) catch return error.IoFailure;
@@ -729,14 +729,14 @@ fn encodeBlockDfast(output: *std.Io.Writer, content: []const u8, block_start: us
         return;
     }
     const first_byte = src[0];
-    var all_same = true;
+    var is_all_same = true;
     for (src) |b| {
         if (b != first_byte) {
-            all_same = false;
+            is_all_same = false;
             break;
         }
     }
-    if (all_same) {
+    if (is_all_same) {
         try writeBlockHeader(output, .rle, src.len, is_last);
         try writeByte(output, first_byte);
         return;
@@ -775,7 +775,7 @@ fn encodeBlockDfast(output: *std.Io.Writer, content: []const u8, block_start: us
                 var hl1: u32 = undefined;
                 var idxl1: u32 = undefined;
                 if (repeat_offsets[0] != 0 and pos_abs + 1 >= repeat_offsets[0] and pos_abs + 1 - repeat_offsets[0] >= min_abs and ip + 5 <= src.len and readU32At(content, pos_abs + 1 - repeat_offsets[0]) == readU32At(content, pos_abs + 1)) {
-                    const mlen = 4 + countForward(content, pos_abs + 5 - repeat_offsets[0], pos_abs + 5, block_end);
+                    const mlen = 4 + countMatchLen(content, pos_abs + 5 - repeat_offsets[0], pos_abs + 5, block_end);
                     const match_start = ip + 1;
                     appendSequence(seq_data, &seq_count, literal_buf, &literal_count, src, anchor, match_start, mlen, repeat_offsets[0], repeat_offsets);
                     ip = match_start + mlen;
@@ -785,7 +785,7 @@ fn encodeBlockDfast(output: *std.Io.Writer, content: []const u8, block_start: us
                 if (!stored) {
                     hl1 = hash8At(content, block_start + ip1, long_bits);
                     if (idxl0 != encoder_no_position and idxl0 >= min_abs and idxl0 < pos_abs and readU64At(content, idxl0) == readU64At(content, pos_abs)) {
-                        var mlen = 8 + countForward(content, idxl0 + 8, pos_abs + 8, block_end);
+                        var mlen = 8 + countMatchLen(content, idxl0 + 8, pos_abs + 8, block_end);
                         var mip = ip;
                         var midx = idxl0;
                         while (mip > anchor and midx > min_abs and content[block_start + mip - 1] == content[midx - 1]) {
@@ -801,12 +801,12 @@ fn encodeBlockDfast(output: *std.Io.Writer, content: []const u8, block_start: us
                     } else {
                         idxl1 = head[hl1];
                         if (idxs0 != encoder_no_position and idxs0 >= min_abs and idxs0 < pos_abs and readU32At(content, idxs0) == readU32At(content, pos_abs)) {
-                            var mlen = 4 + countForward(content, idxs0 + 4, pos_abs + 4, block_end);
+                            var mlen = 4 + countMatchLen(content, idxs0 + 4, pos_abs + 4, block_end);
                             var mip = ip;
                             var midx = idxs0;
                             const ip1_abs = block_start + ip1;
                             if (idxl1 != encoder_no_position and idxl1 >= min_abs and idxl1 < ip1_abs and readU64At(content, idxl1) == readU64At(content, ip1_abs)) {
-                                const l1len = 8 + countForward(content, idxl1 + 8, ip1_abs + 8, block_end);
+                                const l1len = 8 + countMatchLen(content, idxl1 + 8, ip1_abs + 8, block_end);
                                 if (l1len > mlen) {
                                     mip = ip1;
                                     mlen = l1len;
@@ -835,7 +835,7 @@ fn encodeBlockDfast(output: *std.Io.Writer, content: []const u8, block_start: us
                         chain[hash5At(content, @intCast(insert_abs), short_bits)] = insert_abs;
                         chain[hash5At(content, after_abs - 1, short_bits)] = @intCast(after_abs - 1);
                         while (ip <= ilimit and repeat_offsets[1] != 0 and after_abs >= repeat_offsets[1] and after_abs - repeat_offsets[1] >= min_abs and readU32At(content, after_abs - repeat_offsets[1]) == readU32At(content, after_abs)) {
-                            const rlen = 4 + countForward(content, after_abs + 4 - repeat_offsets[1], after_abs + 4, block_end);
+                            const rlen = 4 + countMatchLen(content, after_abs + 4 - repeat_offsets[1], after_abs + 4, block_end);
                             head[hash8At(content, after_abs, long_bits)] = @intCast(after_abs);
                             chain[hash5At(content, after_abs, short_bits)] = @intCast(after_abs);
                             appendSequence(seq_data, &seq_count, literal_buf, &literal_count, src, anchor, anchor, rlen, repeat_offsets[1], repeat_offsets);
@@ -906,7 +906,7 @@ fn rowInsert(pos_table: []u32, tag_table: []u16, probe: RowProbe, pos_abs: usize
 }
 
 // Pre-insert scan with guard-counted depth keeps decisions independent of tag-table garbage.
-fn rowScan(content: []const u8, pos_table: []const u32, base: u32, mask: u16, pos_abs: usize, block_end: usize, min_abs: usize, options: Options) struct { len: usize, cand: usize } {
+fn rowScan(content: []const u8, pos_table: []const u32, base: u32, mask: u16, pos_abs: usize, block_end: usize, min_abs: usize, options: Options) struct { len: usize, candidate: usize } {
     const cur_word = readU32At(content, pos_abs);
     var best_len: usize = min_take_len - 1;
     var best_cand: usize = 0;
@@ -916,20 +916,20 @@ fn rowScan(content: []const u8, pos_table: []const u32, base: u32, mask: u16, po
     while (rest != 0 and depth < options.max_chain) {
         const k: u4 = @intCast(@ctz(rest));
         rest &= rest - 1;
-        const cand: usize = pos_table[base + k];
-        if (cand == encoder_no_position or cand < min_abs or cand >= pos_abs) continue;
+        const candidate: usize = pos_table[base + k];
+        if (candidate == encoder_no_position or candidate < min_abs or candidate >= pos_abs) continue;
         depth += 1;
-        if (readU32At(content, cand) != cur_word) continue;
-        const mlen = 4 + countForward(content, cand + 4, pos_abs + 4, block_end);
-        const offset = pos_abs - cand;
+        if (readU32At(content, candidate) != cur_word) continue;
+        const mlen = 4 + countMatchLen(content, candidate + 4, pos_abs + 4, block_end);
+        const offset = pos_abs - candidate;
         if (mlen > best_len or (mlen == best_len and offset < best_offset)) {
             best_len = mlen;
-            best_cand = cand;
+            best_cand = candidate;
             best_offset = offset;
             if (best_len >= options.nice_len) break;
         }
     }
-    return .{ .len = best_len, .cand = best_cand };
+    return .{ .len = best_len, .candidate = best_cand };
 }
 
 fn encodeBlockRow(output: *std.Io.Writer, content: []const u8, block_start: usize, block_end: usize, head: []u32, chain: []u32, literal_table: []const FseEntry, match_table: []const FseEntry, offset_table: []const FseEntry, is_last: bool, options: Options, block_workspace: []u32, repeat_offsets: *[3]u32, prev: *PrevFseTables) EncodeError!void {
@@ -939,14 +939,14 @@ fn encodeBlockRow(output: *std.Io.Writer, content: []const u8, block_start: usiz
         return;
     }
     const first_byte = src[0];
-    var all_same = true;
+    var is_all_same = true;
     for (src) |b| {
         if (b != first_byte) {
-            all_same = false;
+            is_all_same = false;
             break;
         }
     }
-    if (all_same) {
+    if (is_all_same) {
         try writeBlockHeader(output, .rle, src.len, is_last);
         try writeByte(output, first_byte);
         return;
@@ -980,7 +980,7 @@ fn encodeBlockRow(output: *std.Io.Writer, content: []const u8, block_start: usiz
                 // Built at the head of the one-ahead path before any read, so `undefined` is safe.
                 var probe1: RowProbe = undefined;
                 if (repeat_offsets[0] != 0 and pos_abs + 1 >= repeat_offsets[0] and pos_abs + 1 - repeat_offsets[0] >= min_abs and ip + 5 <= src.len and readU32At(content, pos_abs + 1 - repeat_offsets[0]) == readU32At(content, pos_abs + 1)) {
-                    const mlen = 4 + countForward(content, pos_abs + 5 - repeat_offsets[0], pos_abs + 5, block_end);
+                    const mlen = 4 + countMatchLen(content, pos_abs + 5 - repeat_offsets[0], pos_abs + 5, block_end);
                     const match_start = ip + 1;
                     appendSequence(seq_data, &seq_count, literal_buf, &literal_count, src, anchor, match_start, mlen, repeat_offsets[0], repeat_offsets);
                     ip = match_start + mlen;
@@ -995,7 +995,7 @@ fn encodeBlockRow(output: *std.Io.Writer, content: []const u8, block_start: usiz
                     if (best.len >= min_take_len) {
                         var mlen = best.len;
                         var mip = ip;
-                        var midx = best.cand;
+                        var midx = best.candidate;
                         const ip1_abs = block_start + ip1;
                         // One-ahead rescan pays only for weak matches (< 8 bytes).
                         if (best.len < 8) {
@@ -1003,7 +1003,7 @@ fn encodeBlockRow(output: *std.Io.Writer, content: []const u8, block_start: usiz
                             if (next.len > mlen) {
                                 mip = ip1;
                                 mlen = next.len;
-                                midx = next.cand;
+                                midx = next.candidate;
                             }
                         }
                         if (step < 4) rowInsert(pos_table, tag_table, probe1, ip1_abs);
@@ -1025,7 +1025,7 @@ fn encodeBlockRow(output: *std.Io.Writer, content: []const u8, block_start: usiz
                         rowInsert(pos_table, tag_table, rowProbeAt(content, after_abs - 2, row_bits), after_abs - 2);
                         rowInsert(pos_table, tag_table, rowProbeAt(content, after_abs - 1, row_bits), after_abs - 1);
                         while (ip <= ilimit and repeat_offsets[1] != 0 and after_abs >= repeat_offsets[1] and after_abs - repeat_offsets[1] >= min_abs and readU32At(content, after_abs - repeat_offsets[1]) == readU32At(content, after_abs)) {
-                            const rlen = 4 + countForward(content, after_abs + 4 - repeat_offsets[1], after_abs + 4, block_end);
+                            const rlen = 4 + countMatchLen(content, after_abs + 4 - repeat_offsets[1], after_abs + 4, block_end);
                             rowInsert(pos_table, tag_table, rowProbeAt(content, after_abs, row_bits), after_abs);
                             appendSequence(seq_data, &seq_count, literal_buf, &literal_count, src, anchor, anchor, rlen, repeat_offsets[1], repeat_offsets);
                             ip += rlen;
@@ -1073,9 +1073,9 @@ fn hash8At(content: []const u8, pos: usize, bits: u5) u32 {
     return @truncate((word *% 0xCF1BBCDCB7A56463) >> shift);
 }
 
-fn countForward(content: []const u8, a: usize, b: usize, end: usize) usize {
-    const max_len = end - @max(a, b);
-    return kernels.matchLen8(content, a, b, max_len);
+fn countMatchLen(content: []const u8, match_pos: usize, scan_pos: usize, end: usize) usize {
+    const max_len = end - @max(match_pos, scan_pos);
+    return kernels.matchLen8(content, match_pos, scan_pos, max_len);
 }
 
 fn hash4(content: []const u8, pos: usize, mask: u32) u32 {
@@ -1160,21 +1160,21 @@ fn matchLengthCode(length: u32) LengthCode {
     return .{ .code = @intCast(lo), .extra = length - base, .bits = bits };
 }
 
-fn encodeOffset(offset: u32, literal_length: u32, reps: *[3]u32) LengthCode {
-    const ll0 = literal_length == 0;
-    const offset_value: u32 = if (!ll0 and offset == reps[0]) 1 else if (offset == reps[1]) @as(u32, 2) - @intFromBool(ll0) else if (offset == reps[2]) @as(u32, 3) - @intFromBool(ll0) else if (ll0 and offset == reps[0] - 1) 3 else offset + 3;
+fn offsetCode(offset: u32, literal_length: u32, reps: *[3]u32) LengthCode {
+    const no_literals = literal_length == 0;
+    const offset_value: u32 = if (!no_literals and offset == reps[0]) 1 else if (offset == reps[1]) @as(u32, 2) - @intFromBool(no_literals) else if (offset == reps[2]) @as(u32, 3) - @intFromBool(no_literals) else if (no_literals and offset == reps[0] - 1) 3 else offset + 3;
     switch (offset_value) {
         1 => {
-            if (ll0) std.mem.swap(u32, &reps[0], &reps[1]);
+            if (no_literals) std.mem.swap(u32, &reps[0], &reps[1]);
         },
         2 => {
-            if (ll0) {
+            if (no_literals) {
                 std.mem.swap(u32, &reps[0], &reps[2]);
                 std.mem.swap(u32, &reps[1], &reps[2]);
             } else std.mem.swap(u32, &reps[0], &reps[1]);
         },
         3 => {
-            if (ll0) {
+            if (no_literals) {
                 updateRepeatOffsets(offset, reps);
             } else {
                 std.mem.swap(u32, &reps[0], &reps[2]);
@@ -1230,14 +1230,14 @@ fn buildLiteralSection(literals: []const u8, freq: *[256]u32, out: []u8, section
         return true;
     }
     const first = literals[0];
-    var all_same = true;
+    var is_all_same = true;
     for (literals) |b| {
         if (b != first) {
-            all_same = false;
+            is_all_same = false;
             break;
         }
     }
-    if (all_same) {
+    if (is_all_same) {
         // Raw header would declare `count` bytes but store one, which decoders reject. Use RLE form.
         const header_len = rawLiteralHeaderSize(count);
         if (out.len < header_len + 1) return false;
@@ -1348,22 +1348,22 @@ fn buildLiteralSection(literals: []const u8, freq: *[256]u32, out: []u8, section
 }
 
 fn buildTreeSection(weights: []const u4, symbol_count: usize, out: []u8) ?[]const u8 {
-    const stored = symbol_count - 1;
+    const stored_count = symbol_count - 1;
     var fse_scratch: [256]u8 = undefined;
-    const fse = buildFseTreeSection(weights[0..stored], &fse_scratch);
-    if (stored <= 128) {
-        const direct_size = 1 + (stored + 1) / 2;
+    const fse = buildFseTreeSection(weights[0..stored_count], &fse_scratch);
+    if (stored_count <= 128) {
+        const direct_size = 1 + (stored_count + 1) / 2;
         const direct_fits = out.len >= direct_size;
         if (fse) |section| {
             if (direct_fits and direct_size <= section.len) {
-                return writeDirectTree(out, weights, stored, direct_size);
+                return writeDirectTree(out, weights, stored_count, direct_size);
             }
             if (out.len < section.len) return null;
             @memcpy(out[0..section.len], section);
             return out[0..section.len];
         }
         if (!direct_fits) return null;
-        return writeDirectTree(out, weights, stored, direct_size);
+        return writeDirectTree(out, weights, stored_count, direct_size);
     }
     if (fse) |section| {
         if (out.len < section.len) return null;
@@ -1373,33 +1373,33 @@ fn buildTreeSection(weights: []const u4, symbol_count: usize, out: []u8) ?[]cons
     return null;
 }
 
-fn writeDirectTree(out: []u8, weights: []const u4, stored: usize, size: usize) ?[]const u8 {
-    out[0] = @intCast(127 + stored);
-    for (0..stored / 2) |i| {
+fn writeDirectTree(out: []u8, weights: []const u4, stored_count: usize, byte_len: usize) ?[]const u8 {
+    out[0] = @intCast(127 + stored_count);
+    for (0..stored_count / 2) |i| {
         const high: u8 = weights[2 * i];
         const low: u8 = weights[2 * i + 1];
         out[1 + i] = (high << 4) | low;
     }
-    if (stored % 2 == 1) {
-        const last: u8 = weights[stored - 1];
-        out[1 + stored / 2] = last << 4;
+    if (stored_count % 2 == 1) {
+        const last: u8 = weights[stored_count - 1];
+        out[1 + stored_count / 2] = last << 4;
     }
-    return out[0..size];
+    return out[0..byte_len];
 }
 
 fn buildFseTreeSection(weights: []const u4, out: []u8) ?[]const u8 {
-    const stored = weights.len;
-    var wfreq: [256]u32 = @splat(0);
-    for (weights[0..stored]) |w| wfreq[w] += 1;
+    const stored_count = weights.len;
+    var weight_freq: [256]u32 = @splat(0);
+    for (weights[0..stored_count]) |w| weight_freq[w] += 1;
     var normalized: [256]i16 = undefined;
-    const norm = normalizeFseCounts(&wfreq, 12, 6, 6, &normalized) orelse return null;
+    const norm = normalizeFseCounts(&weight_freq, 12, 6, 6, &normalized) orelse return null;
     const table_size: usize = @as(usize, 1) << norm.log;
     var table_buf: [64]FseEntry = undefined;
     buildFseTable(normalized[0..norm.count], table_buf[0..table_size]) catch return null;
     var ncount_buf: [128]u8 = undefined;
     const ncount = writeNCounts(&ncount_buf, normalized[0..norm.count], norm.log) orelse return null;
     var stream_buf: [256]u8 = undefined;
-    const stream = fseEncodeWeightStream(weights[0..stored], normalized[0..norm.count], norm.log, table_buf[0..table_size], &stream_buf) orelse return null;
+    const stream = fseEncodeWeightStream(weights[0..stored_count], normalized[0..norm.count], norm.log, table_buf[0..table_size], &stream_buf) orelse return null;
     const compressed_size = ncount.len + stream.len;
     // Header bytes >= 128 mean direct weights, so larger FSE descriptions must fall back.
     if (compressed_size > 127 or out.len < 1 + compressed_size) return null;
@@ -1418,38 +1418,38 @@ const FseEncoderTable = struct {
 fn fseEncodeWeightStream(symbols: []const u4, normalized: []const i16, norm_log: u5, table: []const FseEntry, out: []u8) ?[]const u8 {
     var writer = ReverseBitWriter.init(out);
     const et = buildFseEncoderTable(normalized, table);
-    var ip = symbols.len;
+    var index = symbols.len;
     // Initialized in the prologue below before any encode step, so `undefined` is safe.
     var cstate1: u16 = undefined;
     var cstate2: u16 = undefined;
-    if (ip % 2 == 1) {
-        ip -= 1;
-        cstate1 = fseInitCState(&et, @intCast(symbols[ip]));
-        ip -= 1;
-        cstate2 = fseInitCState(&et, @intCast(symbols[ip]));
-        ip -= 1;
-        if (!fseEncodeSymbol(&writer, &cstate1, @intCast(symbols[ip]), &et)) return null;
+    if (index % 2 == 1) {
+        index -= 1;
+        cstate1 = fseInitCState(&et, @intCast(symbols[index]));
+        index -= 1;
+        cstate2 = fseInitCState(&et, @intCast(symbols[index]));
+        index -= 1;
+        if (!fseEncodeSymbol(&writer, &cstate1, @intCast(symbols[index]), &et)) return null;
     } else {
-        ip -= 1;
-        cstate2 = fseInitCState(&et, @intCast(symbols[ip]));
-        ip -= 1;
-        cstate1 = fseInitCState(&et, @intCast(symbols[ip]));
+        index -= 1;
+        cstate2 = fseInitCState(&et, @intCast(symbols[index]));
+        index -= 1;
+        cstate1 = fseInitCState(&et, @intCast(symbols[index]));
     }
     if ((symbols.len - 2) & 2 != 0) {
-        ip -= 1;
-        if (!fseEncodeSymbol(&writer, &cstate2, @intCast(symbols[ip]), &et)) return null;
-        ip -= 1;
-        if (!fseEncodeSymbol(&writer, &cstate1, @intCast(symbols[ip]), &et)) return null;
+        index -= 1;
+        if (!fseEncodeSymbol(&writer, &cstate2, @intCast(symbols[index]), &et)) return null;
+        index -= 1;
+        if (!fseEncodeSymbol(&writer, &cstate1, @intCast(symbols[index]), &et)) return null;
     }
-    while (ip > 0) {
-        ip -= 1;
-        if (!fseEncodeSymbol(&writer, &cstate2, @intCast(symbols[ip]), &et)) return null;
-        ip -= 1;
-        if (!fseEncodeSymbol(&writer, &cstate1, @intCast(symbols[ip]), &et)) return null;
-        ip -= 1;
-        if (!fseEncodeSymbol(&writer, &cstate2, symbols[ip], &et)) return null;
-        ip -= 1;
-        if (!fseEncodeSymbol(&writer, &cstate1, symbols[ip], &et)) return null;
+    while (index > 0) {
+        index -= 1;
+        if (!fseEncodeSymbol(&writer, &cstate2, @intCast(symbols[index]), &et)) return null;
+        index -= 1;
+        if (!fseEncodeSymbol(&writer, &cstate1, @intCast(symbols[index]), &et)) return null;
+        index -= 1;
+        if (!fseEncodeSymbol(&writer, &cstate2, symbols[index], &et)) return null;
+        index -= 1;
+        if (!fseEncodeSymbol(&writer, &cstate1, symbols[index], &et)) return null;
     }
     writer.writeBits(cstate2, norm_log) catch return null;
     writer.writeBits(cstate1, norm_log) catch return null;
@@ -1765,8 +1765,8 @@ fn planMode(n: usize, symbols: []const u8, freq: *const [256]u32, symbol_count: 
     // No finer table log than needed for n symbols, matching the reference.
     var start_log: u5 = 5;
     if (n > 2) {
-        const hb = std.math.log2_int(usize, n - 1);
-        start_log = @intCast(@min(@as(usize, max_log), @max(5, hb -| 2)));
+        const high_bit = std.math.log2_int(usize, n - 1);
+        start_log = @intCast(@min(@as(usize, max_log), @max(5, high_bit -| 2)));
     }
     var normalized: [256]i16 = undefined;
     if (normalizeFseCounts(freq, symbol_count, max_log, start_log, &normalized)) |norm| {
@@ -1813,10 +1813,10 @@ fn normalizeFseCounts(freq: *const [256]u32, symbol_count: usize, max_log: u5, s
         const scale: u6 = @as(u6, 62) - table_log;
         const step = (@as(u64, 1) << 62) / total;
         const v_step = @as(u64, 1) << @intCast(scale - 20);
-        const rtb = [8]u64{ 0, 473195, 504333, 520860, 550000, 700000, 750000, 830000 };
+        const rest_to_beat_table = [8]u64{ 0, 473195, 504333, 520860, 550000, 700000, 750000, 830000 };
         var still_to_distribute: i64 = @intCast(table_size);
         var largest: usize = 0;
-        var largest_p: i64 = 0;
+        var largest_probability: i64 = 0;
         const low_threshold: u32 = @intCast(total >> table_log);
         for (freq[0..symbol_count], 0..) |f, s| {
             if (f == 0) continue;
@@ -1825,18 +1825,18 @@ fn normalizeFseCounts(freq: *const [256]u32, symbol_count: usize, max_log: u5, s
                 counts[s] = -1;
                 still_to_distribute -= 1;
             } else {
-                var proba: i64 = @intCast((@as(u64, f) * step) >> @intCast(scale));
-                if (proba < 8) {
-                    const rest_to_beat = v_step * rtb[@intCast(proba)];
-                    const is_bigger = (@as(u64, f) * step) - (@as(u64, @intCast(proba)) << @intCast(scale)) > rest_to_beat;
-                    proba += @intFromBool(is_bigger);
+                var probability: i64 = @intCast((@as(u64, f) * step) >> @intCast(scale));
+                if (probability < 8) {
+                    const rest_to_beat = v_step * rest_to_beat_table[@intCast(probability)];
+                    const is_bigger = (@as(u64, f) * step) - (@as(u64, @intCast(probability)) << @intCast(scale)) > rest_to_beat;
+                    probability += @intFromBool(is_bigger);
                 }
-                if (proba > largest_p) {
-                    largest_p = proba;
+                if (probability > largest_probability) {
+                    largest_probability = probability;
                     largest = s;
                 }
-                counts[s] = @intCast(proba);
-                still_to_distribute -= proba;
+                counts[s] = @intCast(probability);
+                still_to_distribute -= probability;
             }
         }
         if (-still_to_distribute >= @as(i64, counts[largest]) >> 1) {
@@ -1902,22 +1902,22 @@ fn normalizeFseM2(freq: *const [256]u32, symbol_count: usize, table_log: u5, cou
             to_distribute = table_size - distributed;
         }
         if (distributed == symbol_count) {
-            var max_v: usize = 0;
-            var max_c: u64 = 0;
+            var largest_symbol: usize = 0;
+            var largest_freq: u64 = 0;
             for (freq[0..symbol_count], 0..) |f, s| {
-                if (f > max_c) {
-                    max_v = s;
-                    max_c = f;
+                if (f > largest_freq) {
+                    largest_symbol = s;
+                    largest_freq = f;
                 }
             }
-            counts[max_v] += @intCast(to_distribute);
+            counts[largest_symbol] += @intCast(to_distribute);
         } else if (remaining_total == 0) {
-            var rem = to_distribute;
+            var left = to_distribute;
             var s: usize = 0;
-            while (rem > 0) {
+            while (left > 0) {
                 if (counts[s] > 0) {
                     counts[s] += 1;
-                    rem -= 1;
+                    left -= 1;
                 }
                 s = (s + 1) % symbol_count;
             }
@@ -2039,17 +2039,17 @@ const FseEncodeStep = struct {
         }
     }
 
-    fn pass(step: *const FseEncodeStep, symbols: []const u8, n: usize, values: []u16, counts: []u8, initial: *usize, bits: *u64) bool {
-        if (n == 0) return true;
+    fn encode(step: *const FseEncodeStep, symbols: []const u8, count: usize, values: []u16, counts: []u8, initial: *usize, bits: *u64) bool {
+        if (count == 0) return true;
         const table_size = @as(u32, 1) << step.table_log;
-        var s: usize = symbols[n - 1];
+        var s: usize = symbols[count - 1];
         if (step.cell_count[s] == 0) return false;
         var total: u64 = step.table_log;
         const nb0: u32 = (step.delta_nb_bits[s] + (1 << 15)) >> 16;
         const v0: u32 = (nb0 << 16) -% step.delta_nb_bits[s];
         var idx: i32 = @as(i32, @intCast(v0 >> @as(u5, @intCast(nb0)))) + step.delta_find_state[s];
         var v: u32 = step.state_values[@intCast(idx)];
-        var j = n - 1;
+        var j = count - 1;
         while (j > 0) {
             j -= 1;
             s = symbols[j];
@@ -2067,14 +2067,14 @@ const FseEncodeStep = struct {
     }
 };
 
-fn evalFseTable(table: []const FseEntry, symbols: []const u8, n: usize, values: []u16, counts: []u8, initial: *usize, bits: *u64) bool {
+fn evalFseTable(table: []const FseEntry, symbols: []const u8, count: usize, values: []u16, counts: []u8, initial: *usize, bits: *u64) bool {
     // Index states filled below before use, so `undefined` is safe.
     var index: FseTableIndex = .{ .states = undefined };
     buildFseIndex(table, &index);
-    // Built before pass reads any field, so `undefined` is safe.
+    // Built before encode reads any field, so `undefined` is safe.
     var step: FseEncodeStep = undefined;
     step.build(table, &index);
-    return step.pass(symbols, n, values, counts, initial, bits);
+    return step.encode(symbols, count, values, counts, initial, bits);
 }
 
 // Cell-weighted bit estimate: cells partition the state range, so cost averages sum(2^bits*bits)/size.
@@ -2411,11 +2411,11 @@ const Decoder = struct {
     prev_tables_valid: bool,
     repeat_offsets: [3]u32,
     huffman_tree: ?HuffmanTree,
-    lit_window: u64,
-    lit_window_bits: u6,
-    lit_stream_bytes: []const u8,
-    lit_stream_remaining: usize,
-    lit_stream_count: usize,
+    literal_window: u64,
+    literal_window_bits: u6,
+    literal_stream_bytes: []const u8,
+    literal_stream_remaining: usize,
+    literal_stream_count: usize,
     literal_stream_index: usize,
     dictionary: ?[]const u8,
 
@@ -2554,16 +2554,16 @@ const Decoder = struct {
         const literals = try decodeLiteralsSection(&cursor, d);
         // Locals keep hot loops in registers. Fields take over only on the stream-split fallback.
         // Initialized only for compressed/treeless blocks and read only there, so `undefined` is safe.
-        var lit_bits: BackwardBitStream = undefined;
-        var lit_stream_index: usize = 0;
-        var lit_legacy = false;
+        var literal_bits: BackwardBitStream = undefined;
+        var literal_stream_index: usize = 0;
+        var literal_legacy = false;
         if (literals.block_type == .compressed or literals.block_type == .treeless) {
             const first = switch (literals.streams) {
                 .one => |stream| stream,
                 .four => |streams| streams[0],
             };
             if (first.len == 0) return error.InvalidData;
-            lit_bits = try BackwardBitStream.init(first);
+            literal_bits = try BackwardBitStream.init(first);
         }
         const sequences = try decodeSequencesHeader(&cursor);
         try d.prepareFseTable(.literal, sequences.literal_mode, &cursor);
@@ -2571,21 +2571,21 @@ const Decoder = struct {
         try d.prepareFseTable(.match, sequences.match_mode, &cursor);
         const sequences_data = d.block_buffer[cursor.pos..block_size];
         var seq_bits = try BackwardBitStream.init(sequences_data);
-        var lit_state: u16 = 0;
-        var mat_state: u16 = 0;
-        var off_state: u16 = 0;
+        var literal_state: u16 = 0;
+        var match_state: u16 = 0;
+        var offset_state: u16 = 0;
         if (sequences.count > 0) {
-            lit_state = @intCast(try seq_bits.read(d.literal_state.accuracy_log));
-            off_state = @intCast(try seq_bits.read(d.offset_state.accuracy_log));
-            mat_state = @intCast(try seq_bits.read(d.match_state.accuracy_log));
+            literal_state = @intCast(try seq_bits.read(d.literal_state.accuracy_log));
+            offset_state = @intCast(try seq_bits.read(d.offset_state.accuracy_log));
+            match_state = @intCast(try seq_bits.read(d.match_state.accuracy_log));
         }
 
-        var lit_rle: [1]FseEntry = undefined;
-        var mat_rle: [1]FseEntry = undefined;
-        var off_rle: [1]FseEntry = undefined;
-        const lit_table = fseTableOrRle(&d.literal_state, &lit_rle);
-        const mat_table = fseTableOrRle(&d.match_state, &mat_rle);
-        const off_table = fseTableOrRle(&d.offset_state, &off_rle);
+        var literal_rle: [1]FseEntry = undefined;
+        var match_rle: [1]FseEntry = undefined;
+        var offset_rle: [1]FseEntry = undefined;
+        const literal_table = fseTableOrRle(&d.literal_state, &literal_rle);
+        const match_table = fseTableOrRle(&d.match_state, &match_rle);
+        const offset_table = fseTableOrRle(&d.offset_state, &offset_rle);
 
         var reps = d.repeat_offsets;
         var literal_written: usize = 0;
@@ -2595,25 +2595,25 @@ const Decoder = struct {
         for (0..sequences.count) |seq_index| {
             const last_sequence = seq_index == sequences.count - 1;
 
-            const off_entry = off_table[off_state];
-            const mat_entry = mat_table[mat_state];
-            const lit_entry = lit_table[lit_state];
+            const offset_entry = offset_table[offset_state];
+            const match_entry = match_table[match_state];
+            const literal_entry = literal_table[literal_state];
 
-            const off_code = off_entry.symbol;
-            const off_extra: u32 = @intCast(try seq_bits.read(@intCast(off_code)));
-            const offset_value = (@as(u32, 1) << @intCast(off_code)) + off_extra;
+            const offset_code = offset_entry.symbol;
+            const offset_extra: u32 = @intCast(try seq_bits.read(@intCast(offset_code)));
+            const offset_value = (@as(u32, 1) << @intCast(offset_code)) + offset_extra;
 
-            const mat_symbol = mat_entry.symbol;
-            if (mat_symbol >= match_length_code_table.len) return error.InvalidData;
-            const mat_len_code = match_length_code_table[mat_symbol];
-            const mat_extra: u32 = @intCast(try seq_bits.read(@intCast(mat_len_code[1])));
-            const match_length = mat_len_code[0] + mat_extra;
+            const match_symbol = match_entry.symbol;
+            if (match_symbol >= match_length_code_table.len) return error.InvalidData;
+            const match_len_code = match_length_code_table[match_symbol];
+            const match_extra: u32 = @intCast(try seq_bits.read(@intCast(match_len_code[1])));
+            const match_length = match_len_code[0] + match_extra;
 
-            const lit_symbol = lit_entry.symbol;
-            if (lit_symbol >= literals_length_code_table.len) return error.InvalidData;
-            const lit_len_code = literals_length_code_table[lit_symbol];
-            const lit_extra: u32 = @intCast(try seq_bits.read(@intCast(lit_len_code[1])));
-            const literal_length = lit_len_code[0] + lit_extra;
+            const literal_symbol = literal_entry.symbol;
+            if (literal_symbol >= literals_length_code_table.len) return error.InvalidData;
+            const literal_len_code = literals_length_code_table[literal_symbol];
+            const literal_extra: u32 = @intCast(try seq_bits.read(@intCast(literal_len_code[1])));
+            const literal_length = literal_len_code[0] + literal_extra;
 
             const offset = computeOffsetValue(offset_value, literal_length, &reps);
             if (offset == 0) return error.InvalidData;
@@ -2621,7 +2621,7 @@ const Decoder = struct {
             if (literal_length > 0) {
                 if (literal_written + literal_length > literals.regenerated_size) return error.InvalidData;
                 if (decoded_count + literal_length > block_size_max) return error.InvalidData;
-                try d.copyLiteralRun(&literals, &lit_bits, &lit_stream_index, &lit_legacy, d.history[d.history_end + decoded_count ..][0..literal_length], literal_written);
+                try d.copyLiteralRun(&literals, &literal_bits, &literal_stream_index, &literal_legacy, d.history[d.history_end + decoded_count ..][0..literal_length], literal_written);
                 literal_written += literal_length;
                 decoded_count += literal_length;
             }
@@ -2633,34 +2633,34 @@ const Decoder = struct {
 
             // Bitstream order is lit, then match, then offset.
             if (!last_sequence) {
-                const lit_next: u16 = @intCast(try seq_bits.read(@intCast(lit_entry.bits)));
-                lit_state = lit_entry.baseline + lit_next;
+                const literal_next: u16 = @intCast(try seq_bits.read(@intCast(literal_entry.bits)));
+                literal_state = literal_entry.baseline + literal_next;
 
-                const mat_next: u16 = @intCast(try seq_bits.read(@intCast(mat_entry.bits)));
-                mat_state = mat_entry.baseline + mat_next;
+                const match_next: u16 = @intCast(try seq_bits.read(@intCast(match_entry.bits)));
+                match_state = match_entry.baseline + match_next;
 
-                const off_next: u16 = @intCast(try seq_bits.read(@intCast(off_entry.bits)));
-                off_state = off_entry.baseline + off_next;
+                const offset_next: u16 = @intCast(try seq_bits.read(@intCast(offset_entry.bits)));
+                offset_state = offset_entry.baseline + offset_next;
             }
         }
-        d.literal_state.state = lit_state;
-        d.match_state.state = mat_state;
-        d.offset_state.state = off_state;
+        d.literal_state.state = literal_state;
+        d.match_state.state = match_state;
+        d.offset_state.state = offset_state;
         d.repeat_offsets = reps;
         if (literal_written < literals.regenerated_size) {
             const remaining_literals = literals.regenerated_size - literal_written;
             if (decoded_count + remaining_literals > block_size_max) return error.InvalidData;
-            try d.copyLiteralRun(&literals, &lit_bits, &lit_stream_index, &lit_legacy, d.history[d.history_end + decoded_count ..][0..remaining_literals], literal_written);
+            try d.copyLiteralRun(&literals, &literal_bits, &literal_stream_index, &literal_legacy, d.history[d.history_end + decoded_count ..][0..remaining_literals], literal_written);
             decoded_count += remaining_literals;
         }
         // Bitstreams must be consumed exactly.
         switch (literals.block_type) {
             .compressed, .treeless => {
-                const empty = if (lit_legacy)
+                const is_empty = if (literal_legacy)
                     d.isLiteralStreamEmpty(&literals)
                 else
-                    lit_bits.remaining() == 0 and lit_stream_index + 1 >= litStreamCount(&literals);
-                if (!empty) return error.InvalidData;
+                    literal_bits.remaining() == 0 and literal_stream_index + 1 >= literalStreamCount(&literals);
+                if (!is_empty) return error.InvalidData;
             },
             .raw, .rle => {},
         }
@@ -2733,19 +2733,19 @@ const Decoder = struct {
                     const avail: u4 = @intCast(@min(bits.valid(), max_bits));
                     if (avail == 0) return error.InvalidData;
                     const index: u16 = @intCast(bits.peek(avail));
-                    const entry = tree.lookup2[index << @intCast(max_bits - avail)];
+                    const entry = tree.lookup_two[index << @intCast(max_bits - avail)];
                     const len1: u8 = @intCast((entry >> 16) & 0x1F);
                     const len2: u8 = @intCast((entry >> 21) & 0x1F);
                     if (len1 == 0) return error.InvalidData;
                     if (len1 > avail) {
                         // Split streams continue in the merged-window decoder for exact behavior.
                         if (literals.streams == .four and stream_index.* + 1 < literals.streams.four.len) {
-                            d.lit_window = bits.container << @as(u6, @intCast(bits.consumed));
-                            d.lit_window_bits = @intCast(bits.valid());
-                            d.lit_stream_bytes = literals.streams.four[stream_index.*];
-                            d.lit_stream_remaining = 0;
+                            d.literal_window = bits.container << @as(u6, @intCast(bits.consumed));
+                            d.literal_window_bits = @intCast(bits.valid());
+                            d.literal_stream_bytes = literals.streams.four[stream_index.*];
+                            d.literal_stream_remaining = 0;
                             d.literal_stream_index = stream_index.*;
-                            d.lit_stream_count = literals.streams.four.len;
+                            d.literal_stream_count = literals.streams.four.len;
                             legacy.* = true;
                             try d.decodeLiterals(literals, dest[emitted..], dest.len - emitted, 0);
                             return;
@@ -2767,9 +2767,9 @@ const Decoder = struct {
         }
     }
 
-    inline fn copyMatch(d: *Decoder, offset: u32, length: usize, decoded_already: usize) DecodeError!void {
+    inline fn copyMatch(d: *Decoder, offset: u32, length: usize, decoded_count: usize) DecodeError!void {
         if (offset == 0) return error.InvalidData;
-        const write_base = d.history_end + decoded_already;
+        const write_base = d.history_end + decoded_count;
         if (offset > write_base) return error.InvalidData;
         const src = write_base - offset;
         const history = d.history;
@@ -2898,16 +2898,16 @@ const Decoder = struct {
                 const tree = &d.huffman_tree.?;
                 var emitted: usize = 0;
                 while (emitted < length) {
-                    try d.litRefill(literals);
+                    try d.literalRefill(literals);
                     const max_bits = tree.max_bits;
-                    const available: u4 = @intCast(@min(d.lit_window_bits, max_bits));
+                    const available: u4 = @intCast(@min(d.literal_window_bits, max_bits));
                     if (available == 0) return error.InvalidData;
-                    const index: u16 = @intCast(d.lit_window >> @intCast(@as(u7, 64) - available));
+                    const index: u16 = @intCast(d.literal_window >> @intCast(@as(u7, 64) - available));
                     const index_aligned = index << @intCast(max_bits - available);
                     const entry = tree.lookup[index_aligned];
                     const bits: u4 = @intCast(entry >> 8);
-                    if (bits == 0 or bits > d.lit_window_bits) return error.InvalidData;
-                    d.litConsume(bits);
+                    if (bits == 0 or bits > d.literal_window_bits) return error.InvalidData;
+                    d.literalConsume(bits);
                     dest[emitted] = @intCast(entry & 0xFF);
                     emitted += 1;
                 }
@@ -2915,43 +2915,43 @@ const Decoder = struct {
         }
     }
 
-    fn litInitStream(d: *Decoder, stream: []const u8) DecodeError!void {
+    fn literalInitStream(d: *Decoder, stream: []const u8) DecodeError!void {
         if (stream.len == 0) return error.InvalidData;
         const last = stream[stream.len - 1];
         if (last == 0) return error.InvalidData;
         const highbit = std.math.log2_int(u8, last);
         const k: u6 = @intCast(highbit);
         const new_bits: u64 = last & ((@as(u64, 1) << k) - 1);
-        if (k != 0) d.lit_window |= new_bits << @intCast(@as(u7, 64) - d.lit_window_bits - k);
-        d.lit_window_bits += k;
-        d.lit_stream_bytes = stream;
-        d.lit_stream_remaining = stream.len - 1;
+        if (k != 0) d.literal_window |= new_bits << @intCast(@as(u7, 64) - d.literal_window_bits - k);
+        d.literal_window_bits += k;
+        d.literal_stream_bytes = stream;
+        d.literal_stream_remaining = stream.len - 1;
     }
 
-    inline fn litRefill(d: *Decoder, literals: *const LiteralsSection) DecodeError!void {
-        while (d.lit_window_bits < 11) {
-            if (d.lit_stream_remaining > 0) {
-                d.lit_stream_remaining -= 1;
-                const byte = d.lit_stream_bytes[d.lit_stream_remaining];
-                d.lit_window |= @as(u64, byte) << @intCast(@as(u7, 64) - d.lit_window_bits - 8);
-                d.lit_window_bits += 8;
-            } else if (literals.streams == .four and d.literal_stream_index + 1 < d.lit_stream_count) {
+    inline fn literalRefill(d: *Decoder, literals: *const LiteralsSection) DecodeError!void {
+        while (d.literal_window_bits < 11) {
+            if (d.literal_stream_remaining > 0) {
+                d.literal_stream_remaining -= 1;
+                const byte = d.literal_stream_bytes[d.literal_stream_remaining];
+                d.literal_window |= @as(u64, byte) << @intCast(@as(u7, 64) - d.literal_window_bits - 8);
+                d.literal_window_bits += 8;
+            } else if (literals.streams == .four and d.literal_stream_index + 1 < d.literal_stream_count) {
                 d.literal_stream_index += 1;
-                try d.litInitStream(literals.streams.four[d.literal_stream_index]);
+                try d.literalInitStream(literals.streams.four[d.literal_stream_index]);
             } else {
                 return;
             }
         }
     }
 
-    inline fn litConsume(d: *Decoder, count: u4) void {
-        d.lit_window <<= count;
-        d.lit_window_bits -= count;
+    inline fn literalConsume(d: *Decoder, count: u4) void {
+        d.literal_window <<= count;
+        d.literal_window_bits -= count;
     }
 
     fn isLiteralStreamEmpty(d: *Decoder, literals: *const LiteralsSection) bool {
-        const last_stream = literals.streams == .one or d.literal_stream_index + 1 >= d.lit_stream_count;
-        return d.lit_window_bits == 0 and d.lit_stream_remaining == 0 and last_stream;
+        const last_stream = literals.streams == .one or d.literal_stream_index + 1 >= d.literal_stream_count;
+        return d.literal_window_bits == 0 and d.literal_stream_remaining == 0 and last_stream;
     }
 
     fn slideHistory(d: *Decoder) DecodeError!void {
@@ -3019,12 +3019,12 @@ fn computeOffsetValue(offset_value: u32, literal_length: u32, reps: *[3]u32) u32
             reps[0] = offset;
             return offset;
         }
-        return useRepeatOffsetValue(offset_value, reps);
+        return resolveRepeatOffset(offset_value, reps);
     }
-    return useRepeatOffsetValue(offset_value - 1, reps);
+    return resolveRepeatOffset(offset_value - 1, reps);
 }
 
-fn useRepeatOffsetValue(index: usize, reps: *[3]u32) u32 {
+fn resolveRepeatOffset(index: usize, reps: *[3]u32) u32 {
     if (index == 1) std.mem.swap(u32, &reps[0], &reps[1]);
     if (index == 2) {
         std.mem.swap(u32, &reps[0], &reps[2]);
@@ -3057,7 +3057,7 @@ fn copyMatchOverlap(history: []u8, src: usize, dst: usize, offset: usize, length
     }
 }
 
-fn litStreamCount(literals: *const LiteralsSection) usize {
+fn literalStreamCount(literals: *const LiteralsSection) usize {
     return switch (literals.streams) {
         .one => 1,
         .four => 4,
@@ -3152,7 +3152,7 @@ const HuffmanTree = struct {
     symbol_count: u16 = 0,
     nodes: [256]PrefixedSymbol,
     lookup: [2048]u16 = @splat(0xFFFF),
-    lookup2: [2048]u32 = @splat(0),
+    lookup_two: [2048]u32 = @splat(0),
 };
 
 const PrefixedSymbol = struct {
@@ -3185,38 +3185,38 @@ const ReverseBitReader = struct {
         return error.InvalidData;
     }
 
-    fn readBitsNoEof(self: *ReverseBitReader, comptime T: type, num: u16) DecodeError!T {
-        const result = try self.readBitsAny(T, num);
-        if (result.count < num) return error.InvalidData;
+    fn readBitsNoEof(self: *ReverseBitReader, comptime T: type, count: u16) DecodeError!T {
+        const result = try self.readBitsAny(T, count);
+        if (result.count < count) return error.InvalidData;
         return result.value;
     }
 
-    fn readBitsAny(self: *ReverseBitReader, comptime T: type, num: u16) DecodeError!struct { value: T, count: u16 } {
-        const UT = @Int(.unsigned, @bitSizeOf(T));
-        const U = if (@bitSizeOf(T) < 8) u8 else UT;
-        if (num <= self.count) {
+    fn readBitsAny(self: *ReverseBitReader, comptime T: type, count: u16) DecodeError!struct { value: T, count: u16 } {
+        const unsigned_type = @Int(.unsigned, @bitSizeOf(T));
+        const acc_type = if (@bitSizeOf(T) < 8) u8 else unsigned_type;
+        if (count <= self.count) {
             return .{
-                .value = @intCast(self.removeBits(@intCast(num))),
-                .count = num,
+                .value = @intCast(self.removeBits(@intCast(count))),
+                .count = count,
             };
         }
         var out_count: u16 = self.count;
-        var out: U = self.removeBits(self.count);
-        const full_bytes = (num - out_count) / 8;
+        var out: acc_type = self.removeBits(self.count);
+        const full_bytes = (count - out_count) / 8;
         for (0..full_bytes) |_| {
             const byte = takeByte(self) catch return .{ .value = @intCast(out), .count = out_count };
-            if (U != u8) out <<= 8;
+            if (acc_type != u8) out <<= 8;
             out |= byte;
             out_count += 8;
         }
-        const bits_left: u16 = num - out_count;
-        if (bits_left == 0) return .{ .value = @intCast(out), .count = num };
+        const bits_left: u16 = count - out_count;
+        if (bits_left == 0) return .{ .value = @intCast(out), .count = count };
         const final_byte = takeByte(self) catch return .{ .value = @intCast(out), .count = out_count };
         const keep: u4 = @intCast(8 - bits_left);
         out = (out << @intCast(bits_left)) | (final_byte >> @intCast(keep));
         self.bits = final_byte & lowBitMask(keep);
         self.count = keep;
-        return .{ .value = @intCast(out), .count = num };
+        return .{ .value = @intCast(out), .count = count };
     }
 
     fn takeByte(self: *ReverseBitReader) DecodeError!u8 {
@@ -3225,12 +3225,12 @@ const ReverseBitReader = struct {
         return self.bytes[self.remaining];
     }
 
-    fn removeBits(self: *ReverseBitReader, num: u4) u8 {
-        if (num == 8) {
+    fn removeBits(self: *ReverseBitReader, count: u4) u8 {
+        if (count == 8) {
             self.count = 0;
             return self.bits;
         }
-        const keep = self.count - num;
+        const keep = self.count - count;
         const bits = self.bits >> @intCast(keep);
         self.bits &= lowBitMask(keep);
         self.count = keep;
@@ -3484,12 +3484,12 @@ fn assignHuffmanWeights(
     var odd_state = try reader.readBitsNoEof(u32, @intCast(accuracy_log));
     while (i < 254) {
         const even_data = entries[even_state];
-        var read_bits: u16 = 0;
+        var read_count: u16 = 0;
         const even_bits = reader.readBitsAny(u32, even_data.bits) catch return error.InvalidData;
-        read_bits = even_bits.count;
+        read_count = even_bits.count;
         weights[i] = std.math.cast(u4, even_data.symbol) orelse return error.InvalidData;
         i += 1;
-        if (read_bits < even_data.bits) {
+        if (read_count < even_data.bits) {
             weights[i] = std.math.cast(u4, entries[odd_state].symbol) orelse return error.InvalidData;
             i += 1;
             break;
@@ -3497,10 +3497,10 @@ fn assignHuffmanWeights(
         even_state = even_data.baseline + even_bits.value;
         const odd_data = entries[odd_state];
         const odd_bits = reader.readBitsAny(u32, odd_data.bits) catch return error.InvalidData;
-        read_bits = odd_bits.count;
+        read_count = odd_bits.count;
         weights[i] = std.math.cast(u4, odd_data.symbol) orelse return error.InvalidData;
         i += 1;
-        if (read_bits < odd_data.bits) {
+        if (read_count < odd_data.bits) {
             if (i == 255) return error.InvalidData;
             weights[i] = std.math.cast(u4, entries[even_state].symbol) orelse return error.InvalidData;
             i += 1;
@@ -3587,7 +3587,7 @@ fn buildHuffmanTree(weights: []const u4, symbol_count: usize, tree: *HuffmanTree
                 }
             }
         }
-        tree.lookup2[i] = entry2;
+        tree.lookup_two[i] = entry2;
     }
     tree.max_bits = max_bits;
     tree.symbol_count = @intCast(assigned);
@@ -3631,26 +3631,26 @@ const NCountWindow = struct {
     bytes: []const u8,
     pos: usize = 0,
     window: u32 = 0,
-    wbits: u6 = 0,
+    bit_count: u6 = 0,
     total: usize = 0,
 
     fn refill(self: *NCountWindow) void {
-        while (self.wbits <= 24 and self.pos < self.bytes.len) {
-            self.window |= @as(u32, self.bytes[self.pos]) << @as(u5, @intCast(self.wbits));
-            self.wbits += 8;
+        while (self.bit_count <= 24 and self.pos < self.bytes.len) {
+            self.window |= @as(u32, self.bytes[self.pos]) << @as(u5, @intCast(self.bit_count));
+            self.bit_count += 8;
             self.pos += 1;
         }
     }
 
     fn peek(self: *NCountWindow, n: u5) DecodeError!u32 {
         self.refill();
-        if (self.wbits < n) return error.InvalidData;
+        if (self.bit_count < n) return error.InvalidData;
         return self.window & ((@as(u32, 1) << n) - 1);
     }
 
     fn consume(self: *NCountWindow, n: u5) void {
         self.window >>= n;
-        self.wbits -= n;
+        self.bit_count -= n;
         self.total += n;
     }
 };
@@ -3717,8 +3717,8 @@ fn decodeFseTable(
 }
 
 fn buildFseTable(values: []const i16, entries: []FseEntry) error{InvalidData}!void {
-    const total_probability: u16 = @intCast(entries.len);
-    const accuracy_log = std.math.log2_int(u16, total_probability);
+    const table_size: u16 = @intCast(entries.len);
+    const accuracy_log = std.math.log2_int(u16, table_size);
     const table_mask = entries.len - 1;
     const step = (entries.len >> 1) + (entries.len >> 3) + 3;
     var symbol_next: [256]u16 = undefined;
@@ -3759,7 +3759,7 @@ fn buildFseTable(values: []const i16, entries: []FseEntry) error{InvalidData}!vo
         symbol_next[symbol] = next_state + 1;
         const bits = accuracy_log - std.math.log2_int(u16, next_state);
         entries[index].bits = bits;
-        entries[index].baseline = (@as(u16, next_state) << bits) - total_probability;
+        entries[index].baseline = (@as(u16, next_state) << bits) - table_size;
     }
 }
 
@@ -3834,7 +3834,7 @@ test "zstd dictionary trainer selects deterministic segments" {
     const second_len = try trainDictionary(&samples, second.len, &second, scratch);
     try std.testing.expectEqual(first_len, second_len);
     if (!std.mem.eql(u8, first[0..first_len], second[0..first_len])) {
-        std.debug.print("first_len={d} mismatch at {d}: {x} vs {x}\n", .{ first_len, std.mem.indexOfDiff(u8, first[0..first_len], second[0..first_len]).?, first[std.mem.indexOfDiff(u8, first[0..first_len], second[0..first_len]).?], second[std.mem.indexOfDiff(u8, first[0..first_len], second[0..first_len]).?] });
+        std.debug.print("first length {d} differs at offset {d}: {x} vs {x}\n", .{ first_len, std.mem.indexOfDiff(u8, first[0..first_len], second[0..first_len]).?, first[std.mem.indexOfDiff(u8, first[0..first_len], second[0..first_len]).?], second[std.mem.indexOfDiff(u8, first[0..first_len], second[0..first_len]).?] });
     }
     try std.testing.expectEqualSlices(u8, first[0..first_len], second[0..first_len]);
 

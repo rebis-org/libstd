@@ -87,9 +87,9 @@ pub fn idEqual(left: Id, right: Id) bool {
 }
 
 comptime {
-    if (@sizeOf(Id) != 16) @compileError("stdk_id layout changed");
-    if (@sizeOf(Node) != 96) @compileError("stdk_node layout changed");
-    if (@sizeOf(Call) != 112) @compileError("stdk_call layout changed");
-    if (@offsetOf(Call, "operation") != 8) @compileError("stdk_call operation offset changed");
-    if (@offsetOf(Node, "id") != 8) @compileError("stdk_node ID offset changed");
+    if (@sizeOf(Id) != 16) @compileError("stdk_id layout drifted: the ABI fixes 16 bytes.");
+    if (@sizeOf(Node) != 96) @compileError("stdk_node layout drifted: the ABI fixes 96 bytes.");
+    if (@sizeOf(Call) != 112) @compileError("stdk_call layout drifted: the ABI fixes 112 bytes.");
+    if (@offsetOf(Call, "operation") != 8) @compileError("stdk_call operation offset drifted: the ABI fixes offset 8.");
+    if (@offsetOf(Node, "id") != 8) @compileError("stdk_node id offset drifted: the ABI fixes offset 8.");
 }

@@ -16,7 +16,7 @@ pub fn zstdEncodeBound(input_len: usize, options: Options) usize {
 }
 
 // History sizing mirrors the kernel path: frame boundaries reset matchfinder history, so differing sizes change encoded bytes.
-// Only resource limits propagate. all other leaf failures map to invalid input.
+// Only resource limits propagate. All other leaf failures map to invalid input.
 fn mapFailure(err: anyerror) Failure {
     return switch (err) {
         error.ResourceLimit => error.ResourceLimit,
