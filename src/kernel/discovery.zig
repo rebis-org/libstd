@@ -18,7 +18,7 @@ pub fn findByName(name: []const u8) ?*const contract.Descriptor {
 pub fn findById(id: contract.Id) ?*const contract.Descriptor {
     @setEvalBranchQuota(10_000);
     for (&components.descriptors) |*descriptor| {
-        if (contract.eqlId(descriptor.id, id)) return descriptor;
+        if (contract.idEqual(descriptor.id, id)) return descriptor;
     }
     return null;
 }
@@ -26,7 +26,7 @@ pub fn findById(id: contract.Id) ?*const contract.Descriptor {
 // Ordinals are component data. One declaration per wire parameter.
 pub fn parameter(comptime component_name: []const u8, comptime parameter_name: []const u8) contract.Parameter {
     @setEvalBranchQuota(10_000);
-    const component = findByName(component_name) orelse @compileError("Unknown component \"" ++ component_name ++ "\".");
+    const component = findByName(component_name) orelse @compileError("Unknown component \"" ++ component_name ++ "\": no descriptor declares this name.");
     for (component.parameters) |parameter_entry| {
         if (std.mem.eql(u8, parameter_entry.name, parameter_name)) return parameter_entry;
     }
@@ -43,7 +43,7 @@ pub fn maxOrdinalFor(family: u16) u32 {
     return max;
 }
 
-pub fn selectorKnown(family: u16, ordinal: u32) bool {
+pub fn isSelectorKnown(family: u16, ordinal: u32) bool {
     if (family == 0) return ordinal >= 1 and ordinal <= 5;
     if (ordinal == 0) return false;
     return ordinal <= maxOrdinalFor(family);

@@ -68,7 +68,7 @@ fn scenarioDoublePoison() void {
 fn scenarioCopyAlias() void {
     var storage: [16]u8 = undefined;
     const lying = surface.Surface{ .ptr = &storage, .len = storage.len + 64 };
-    _ = surface.nucleusCopy(lying, .{ .ptr = &storage, .len = storage.len });
+    _ = surface.copy(lying, .{ .ptr = &storage, .len = storage.len });
 }
 
 fn scenarioCleanSessions() void {
@@ -89,7 +89,7 @@ fn scenarioCleanSessions() void {
 }
 
 fn scenarioCopyNull() void {
-    std.process.exit(@intCast(surface.nucleusCopy(.{ .ptr = null, .len = 8 }, .{ .ptr = null, .len = 0 })));
+    std.process.exit(@intCast(surface.copy(.{ .ptr = null, .len = 8 }, .{ .ptr = null, .len = 0 })));
 }
 
 fn scenarioCleanAccess() void {
@@ -133,7 +133,7 @@ fn scenarioCopyRoundTrip() void {
     var source: [16]u8 = undefined;
     var destination: [16]u8 = undefined;
     @memcpy(&source, "0123456789abcdef");
-    const result = surface.nucleusCopy(
+    const result = surface.copy(
         .{ .ptr = &destination, .len = destination.len },
         .{ .ptr = &source, .len = source.len },
     );

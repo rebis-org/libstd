@@ -85,6 +85,6 @@ pub const Descriptor = struct {
     benchmark: ?Benchmark = null,
 };
 
-pub fn eqlId(left: Id, right: Id) bool {
+pub fn idEqual(left: Id, right: Id) bool {
     return left.low == right.low and left.high == right.high;
 }

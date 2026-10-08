@@ -12,10 +12,10 @@ const sink = @import("../../common/sink.zig");
 const emit = @import("emit.zig");
 const Sink = sink.Sink;
 
-// Buffer plan (all caller-provided): the window is dict-sized. Decode tables
-// share a u16 pool. Filter transforms use a scratch sized to the largest
-// filter region. The pending-filter list is capped, a real entry carries a
-// handful, and beyond the cap it is refused rather than guessed at.
+// Every buffer is caller-provided: the window is dictionary-sized, the decode
+// tables share a u16 pool, and the filter scratch covers the largest filter
+// region. A real entry carries only a handful of filters, so a full pending
+// list means the stream is undecodable and is refused, not guessed at.
 
 pub const nc: u16 = 306; // 256 literals + 6 control + 44 length slots
 pub const dc_rar5: u16 = 64;
@@ -25,13 +25,13 @@ pub const rc: u16 = 44;
 
 const code_length_symbols: u16 = 20;
 const max_total_symbols: usize = nc + dc_rar7 + ldc + rc;
-pub const table_pool_words: usize = max_total_symbols; // one table's worth. The caller passes 4x
+pub const table_pool_words: usize = max_total_symbols; // One table's worth. The caller passes four.
 pub const max_pending_filters: usize = 4096;
 
 const LengthEntry = struct { base: u32, extra: u5 };
 
-// RAR5 slot-to-length mapping: slots 0-7 are direct (2..9), slots 8+ group in
-// fours with LBits = slot/4 - 1.
+// RAR5 slot-to-length mapping. Slots 0-7 map directly to lengths 2 to 9. Slot
+// 8 and above group in fours with LBits = slot / 4 - 1.
 const length_table: [rc]LengthEntry = blk: {
     var table: [rc]LengthEntry = undefined;
     for (0..8) |i| {
@@ -45,9 +45,9 @@ const length_table: [rc]LengthEntry = blk: {
     break :blk table;
 };
 
-// Longest single LZ match (reference MAX_INC_LZ_MATCH). One symbol can grow
-// the unflushed span by at most this, which sets how close to a full window
-// the streaming path may run.
+// The longest single LZ match (reference MAX_INC_LZ_MATCH). One symbol can grow
+// the unflushed span by at most this, so it sets how close to a full window the
+// streaming path may run.
 const max_lz_match: usize = 0x1001 + 3;
 
 pub const State = struct {
@@ -121,15 +121,15 @@ pub fn decodeLengthSlot(br: *BitReader, slot: u32) Failure!u32 {
     return entry.base + try br.readBits(entry.extra);
 }
 
-// Wide bit reads for RAR7 distances (extra bits reach 38). Sequential
-// composition keeps the reference bit order: earlier-read bits are the more
+// Wide bit reads for RAR7 distances, where the extra bits reach 38. Sequential
+// composition keeps the reference bit order: the earlier-read bits are the more
 // significant ones.
-fn readWideBits(br: *BitReader, n: u6) Failure!u64 {
-    if (n == 0) return 0;
-    if (n <= 31) return try br.readBits(@intCast(n));
-    const hi: u64 = try br.readBits(@intCast(n - 20));
-    const lo: u64 = try br.readBits(20);
-    return (hi << 20) | lo;
+fn readWideBits(br: *BitReader, bit_count: u6) Failure!u64 {
+    if (bit_count == 0) return 0;
+    if (bit_count <= 31) return try br.readBits(@intCast(bit_count));
+    const high: u64 = try br.readBits(@intCast(bit_count - 20));
+    const low: u64 = try br.readBits(20);
+    return (high << 20) | low;
 }
 
 pub fn decodeDistance(br: *BitReader, dd: *const DecodeTable, ldd: *const DecodeTable) Failure!u64 {
@@ -142,7 +142,8 @@ pub fn decodeDistance(br: *BitReader, dd: *const DecodeTable, ldd: *const Decode
     if (extra_bits < 4) {
         distance += try br.readBits(@intCast(extra_bits));
     } else {
-        // High part first, then the low 4 bits from the LDD table.
+        // The high bits come first, then the low 4 bits come from the LDD
+        // table.
         const high_extra: u6 = extra_bits - 4;
         if (high_extra > 0) {
             distance += (try readWideBits(br, high_extra)) << 4;
@@ -157,29 +158,29 @@ fn readTables(st: *State) Failure!void {
     const br = &st.br;
     const pool = st.tablePool();
 
-    // Stage 1: 20 code-length code lengths, 4 bits each. A 15 followed by
-    // another 4-bit value is an escape: 0 means the length really is 15,
-    // nonzero means a zero run of (value + 2).
+    // Stage 1: the 20 CL lengths, 4 bits each. A 15 is an escape: a following
+    // 0 means a real length of 15, and any other value is a zero run of
+    // (value + 2).
     var cl_lengths: [code_length_symbols]u8 = @splat(0);
     {
-        var ci: usize = 0;
-        while (ci < code_length_symbols) {
+        var cl_index: usize = 0;
+        while (cl_index < code_length_symbols) {
             const length: u8 = @intCast(try br.readBits(4));
             if (length == 15) {
                 const zero_count_raw: u8 = @intCast(try br.readBits(4));
                 if (zero_count_raw == 0) {
-                    cl_lengths[ci] = 15;
-                    ci += 1;
+                    cl_lengths[cl_index] = 15;
+                    cl_index += 1;
                 } else {
-                    var zc: usize = @as(usize, zero_count_raw) + 2;
-                    while (zc > 0 and ci < code_length_symbols) : (zc -= 1) {
-                        cl_lengths[ci] = 0;
-                        ci += 1;
+                    var zeros_left: usize = @as(usize, zero_count_raw) + 2;
+                    while (zeros_left > 0 and cl_index < code_length_symbols) : (zeros_left -= 1) {
+                        cl_lengths[cl_index] = 0;
+                        cl_index += 1;
                     }
                 }
             } else {
-                cl_lengths[ci] = length;
-                ci += 1;
+                cl_lengths[cl_index] = length;
+                cl_index += 1;
             }
         }
     }
@@ -187,21 +188,21 @@ fn readTables(st: *State) Failure!void {
     var cl_table = try huffman.makeDecodeTables(&cl_lengths, pool[0 * table_pool_words ..][0..table_pool_words]);
     if (!cl_table.valid) return error.InvalidData;
 
-    // Stage 2: code lengths for the full alphabet. RAR5 assigns lengths
-    // directly (no delta across blocks, unlike RAR3). Symbols 16-19 are
-    // repeat/zero runs.
+    // Stage 2: code lengths for the full alphabet. RAR5 assigns the lengths
+    // directly, with no delta across blocks, unlike RAR3. Symbols 16-19 are
+    // repeat and zero runs.
     const dc: u16 = if (st.is_rar7) dc_rar7 else dc_rar5;
     const total_symbols: usize = @as(usize, nc) + dc + ldc + rc;
     var code_lengths: [max_total_symbols]u8 = @splat(0);
 
     var i: usize = 0;
     while (i < total_symbols) {
-        const sym = try huffman.decodeNumber(br, &cl_table);
+        const cl_symbol = try huffman.decodeNumber(br, &cl_table);
 
-        if (sym < 16) {
-            code_lengths[i] = @intCast(sym);
+        if (cl_symbol < 16) {
+            code_lengths[i] = @intCast(cl_symbol);
             i += 1;
-        } else if (sym == 16) {
+        } else if (cl_symbol == 16) {
             const repeat_count = 3 + try br.readBits(3);
             if (i == 0) return error.InvalidData;
             const prev_len = code_lengths[i - 1];
@@ -210,7 +211,7 @@ fn readTables(st: *State) Failure!void {
                 code_lengths[i] = prev_len;
                 i += 1;
             }
-        } else if (sym == 17) {
+        } else if (cl_symbol == 17) {
             const repeat_count = 11 + try br.readBits(7);
             if (i == 0) return error.InvalidData;
             const prev_len = code_lengths[i - 1];
@@ -219,14 +220,14 @@ fn readTables(st: *State) Failure!void {
                 code_lengths[i] = prev_len;
                 i += 1;
             }
-        } else if (sym == 18) {
+        } else if (cl_symbol == 18) {
             const zero_count = 3 + try br.readBits(3);
             var j: u32 = 0;
             while (j < zero_count and i < total_symbols) : (j += 1) {
                 code_lengths[i] = 0;
                 i += 1;
             }
-        } else if (sym == 19) {
+        } else if (cl_symbol == 19) {
             const zero_count = 11 + try br.readBits(7);
             var j: u32 = 0;
             while (j < zero_count and i < total_symbols) : (j += 1) {
@@ -238,7 +239,6 @@ fn readTables(st: *State) Failure!void {
         }
     }
 
-    // Stage 3: split into the four tables and rebuild them.
     var offset: usize = 0;
     st.ld = try huffman.makeDecodeTables(code_lengths[offset .. offset + nc], pool[0 * table_pool_words ..][0..table_pool_words]);
     offset += nc;
@@ -265,8 +265,8 @@ fn parseFilterDescriptor(st: *State) Failure!void {
     const block_length = try filters.readFilterSize(br);
     if (block_length == 0) return error.InvalidData;
 
-    const ftype_raw: u3 = @intCast(try br.readBits(3));
-    const filter_type = filters.filterTypeFromRaw(ftype_raw) orelse return error.Unsupported;
+    const raw_filter_type: u3 = @intCast(try br.readBits(3));
+    const filter_type = filters.filterTypeFromRaw(raw_filter_type) orelse return error.Unsupported;
 
     var channels: u8 = 1;
     if (filter_type == .delta) {
@@ -283,25 +283,24 @@ fn parseFilterDescriptor(st: *State) Failure!void {
     st.pending_count += 1;
 }
 
-// Emit decoded bytes before the circular window overwrites them. No look-back
-// reserve is needed: a filter's start is a forward delta from the position at
-// which its descriptor appears, so every filter is known before any byte of
-// its region is decoded. The cap below therefore covers all of them.
+// No look-back reserve is needed: a filter start is a forward delta from the
+// position where its descriptor appears, so every filter is known before any
+// byte of its region decodes. The cap below therefore covers all of them.
 fn flushDecoded(st: *State, limit: u64) Failure!void {
     const out = st.stream_out orelse return;
     const produced = st.window.write_pos - st.entry_start;
     var emit_upto: usize = @intCast(@min(@as(u64, produced), limit));
 
     // Never emit INTO an unapplied filter's region: cap the span at the first
-    // filter that would be split by it. The filter is applied whole on a
-    // later flush, once its region has fully decoded.
-    for (st.pending[0..st.pending_count]) |f| {
-        if (f.length == 0) continue;
-        const fstart = f.start - st.entry_start;
-        if (fstart >= st.flushed and fstart < emit_upto and
-            fstart + f.length > emit_upto)
+    // filter that it would split. The filter is applied whole on a later
+    // flush, once its region has fully decoded.
+    for (st.pending[0..st.pending_count]) |filter| {
+        if (filter.length == 0) continue;
+        const filter_start = filter.start - st.entry_start;
+        if (filter_start >= st.flushed and filter_start < emit_upto and
+            filter_start + filter.length > emit_upto)
         {
-            emit_upto = fstart;
+            emit_upto = filter_start;
         }
     }
 
@@ -320,12 +319,12 @@ fn flushDecoded(st: *State, limit: u64) Failure!void {
     if (back > st.window.buffer.len) return error.InvalidData;
 
     // A filter starting BEFORE the flushed mark lost part of its region to an
-    // earlier emit. Unreachable while the cap above holds. Kept because the
-    // failure direction of a stale assumption here is silent wrong output.
-    for (st.pending[0..st.pending_count]) |f| {
-        if (f.length == 0) continue;
-        const fstart = f.start - st.entry_start;
-        if (fstart < st.flushed and fstart + f.length > st.flushed) {
+    // earlier emit. Unreachable while the cap above holds. Kept because a
+    // stale assumption here fails as silent wrong output.
+    for (st.pending[0..st.pending_count]) |filter| {
+        if (filter.length == 0) continue;
+        const filter_start = filter.start - st.entry_start;
+        if (filter_start < st.flushed and filter_start + filter.length > st.flushed) {
             return error.InvalidData;
         }
     }
@@ -354,7 +353,8 @@ fn decodeBlock(st: *State, unpacked_size: u64) Failure!bool {
 
     const flags: u8 = @intCast(try br.readBits(8));
     const block_bit_size: u4 = @intCast((flags & 7) + 1);
-    const byte_count: u8 = @intCast(((flags >> 3) & 3) + 1); // u8: value can be 4 and trip the guard
+    // The u8 annotation lets the value reach 4, which the next check rejects.
+    const byte_count: u8 = @intCast(((flags >> 3) & 3) + 1);
     if (byte_count == 4) return error.InvalidData;
     const is_last_block = (flags & 0x40) != 0;
     const table_present = (flags & 0x80) != 0;
@@ -378,8 +378,8 @@ fn decodeBlock(st: *State, unpacked_size: u64) Failure!bool {
     const block_end_byte = block_start_byte + block_size;
 
     while (st.written_size < unpacked_size) {
-        // Only true for entries larger than the window (stream_out is null
-        // otherwise), so the common path pays one null check per symbol.
+        // Only entries larger than the window set stream_out, so the common
+        // path pays one null check per symbol.
         if (st.stream_out != null) {
             const produced = st.window.write_pos - st.entry_start;
             if (produced - st.flushed > st.window.buffer.len / 2) {
@@ -420,9 +420,9 @@ fn decodeBlock(st: *State, unpacked_size: u64) Failure!bool {
             st.window.copyMatch(@intCast(distance), @intCast(length));
             st.written_size += @as(u64, length);
         } else {
-            // New match: symbol >= 262. The decoder adds a distance-dependent
-            // bonus to the length (+1 past 0x100, +2 past 0x2000, +3 past
-            // 0x40000) that the encoder subtracted before encoding.
+            // A new match (symbol 262 and above). The decoder adds back the
+            // distance-dependent bonus that the encoder subtracted: +1 past
+            // 0x100, +2 past 0x2000, +3 past 0x40000.
             const length_slot: u32 = symbol - 262;
             var length = try decodeLengthSlot(br, length_slot);
             const distance = try decodeDistance(br, &st.dd, &st.ldd);
@@ -453,8 +453,8 @@ fn decodeBlock(st: *State, unpacked_size: u64) Failure!bool {
 pub const Session = struct {
     state: *State,
 
-    // In-place: the caller carves the State out of its own storage (the
-    // struct is ~9 KB of decode tables) so nothing here allocates.
+    // In place: the caller carves the State out of its own storage, because
+    // the struct holds about 9 KB of decode tables, so nothing here allocates.
     pub fn init(
         st: *State,
         window_buffer: []u8,
@@ -467,7 +467,7 @@ pub const Session = struct {
         return .{ .state = st };
     }
 
-    // Reference UnpInitData(false) + UnpInitData50(false). Note how little
+    // Reference UnpInitData(false) plus UnpInitData50(false). Note how little
     // v50 resets compared to v29: UnpInitData50 is just TablesRead5=false.
     fn resetForNewStream(self: *Session) void {
         const st = self.state;

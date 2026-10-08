@@ -59,14 +59,14 @@ pub const Registry = struct {
     pub fn span(self: *Registry, handle: Lease, offset: usize, length: usize) Span {
         for (self.slots[0..self.used]) |slot| {
             if (slot.token != handle.token) continue;
-            if (!slot.live) span_module.trap(.lease_violation, "Use of revoked lease.");
-            if (offset > slot.len or length > slot.len - offset) span_module.trap(.out_of_bounds, "Lease subspan out of bounds.");
+            if (!slot.live) span_module.trap(.lease_violation, "Lease was revoked.");
+            if (offset > slot.len or length > slot.len - offset) span_module.trap(.out_of_bounds, "Lease subspan is out of bounds.");
             return .{ .ptr = @ptrFromInt(slot.base + offset), .len = length };
         }
-        span_module.trap(.lease_violation, "Unknown lease token.");
+        span_module.trap(.lease_violation, "Lease token is unknown.");
     }
 
-    pub fn constSpanFor(self: *Registry, handle: Lease, offset: usize, length: usize) ConstSpan {
+    pub fn constSpan(self: *Registry, handle: Lease, offset: usize, length: usize) ConstSpan {
         const mutable = self.span(handle, offset, length);
         return .{ .ptr = mutable.ptr, .len = mutable.len };
     }

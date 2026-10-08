@@ -169,8 +169,8 @@ pub fn main(init: std.process.Init) !void {
     const file_filtered = env.file != null or env.limit != env_mod.silesia_files.len;
     const gate_fatal = gate_cfg.fatal and runs >= 3 and env.row == null and !file_filtered;
     if (gate_cfg.enabled) {
-        if (runs < 3) std.debug.print("gate: warning: fewer than 3 runs ({d}); fatal mode disabled\n", .{runs});
-        if (env.row != null or file_filtered) std.debug.print("gate: warning: row or file filter active; fatal mode disabled\n", .{});
+        if (runs < 3) std.debug.print("gate: warning: fewer than 3 runs ({d}); fatal mode stays disabled\n", .{runs});
+        if (env.row != null or file_filtered) std.debug.print("gate: warning: a row or file filter is active; fatal mode stays disabled\n", .{});
     }
 
     var per_row: [matrix.rows.len]std.ArrayList(metric.Totals) = undefined;
@@ -240,7 +240,7 @@ pub fn main(init: std.process.Init) !void {
             if (results.items[0].worst_gap) |worst| std.debug.print("gate: worst gap {d:.1}% ({s})\n", .{ worst * 100.0, results.items[0].name });
         }
         if (gate_fatal and summary.fatalRows() > 0) {
-            std.debug.print("gate: fatal: {d} row(s) miss parity\n", .{summary.fatalRows()});
+            std.debug.print("gate: fatal: rows missing parity: {d}\n", .{summary.fatalRows()});
             std.process.exit(1);
         }
     }

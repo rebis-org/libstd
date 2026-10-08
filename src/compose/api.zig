@@ -6,7 +6,7 @@ const sessions = @import("sessions.zig");
 const Failure = @import("../common/primitive/failure.zig").Failure;
 
 // Caller-owned storage: the handle IS the storage pointer, so no allocator, registry, or global state and sessions stay isolated.
-// Destroy nulls the ops word so post-destroy steps fail deterministically. No span constructor since it would be a no-op.
+// Destroy nulls the ops word so post-destroy steps fail deterministically. No span constructor because it would be a no-op.
 
 const Session = sessions.Session;
 
@@ -24,12 +24,12 @@ fn failureStatus(failure: Failure) u32 {
 
 // The session-able surface, single-sourced for matchSessionKind, sizing, and
 // the catalog projection. Ordering is ABI once released: append only.
-const session_pair = struct { component: [:0]const u8, verb: [:0]const u8 };
+const SessionPair = struct { component: [:0]const u8, verb: [:0]const u8 };
 // The write-side pair (tar/write) was removed from the public boundary: its
 // store-only, fixed-mode framing could not express the tar profile's
 // typeflags, links, modes, or pax long names, and misled hosts away from the
 // envelope path. A full-surface tar write session can re-enter as a v2 pair.
-const session_pairs = [_]session_pair{
+const session_pairs = [_]SessionPair{
     .{ .component = "gzip", .verb = "decode" },
     .{ .component = "deflate", .verb = "decode" },
 };

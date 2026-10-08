@@ -100,7 +100,8 @@ pub const Call = extern struct {
 };
 
 comptime {
-    if (@sizeOf(Id) != 16 or @alignOf(Id) != 8) @compileError("stdk_id layout changed");
-    if (@offsetOf(Call, "operation") != 8) @compileError("stdk_call operation offset changed");
-    if (@offsetOf(Node, "id") != 8) @compileError("stdk_node ID offset changed");
+    // The C ABI fixes these offsets; a drift here is a silent host miscompile.
+    if (@sizeOf(Id) != 16 or @alignOf(Id) != 8) @compileError("stdk_id layout drifted: the ABI fixes 16 bytes at 8-byte alignment.");
+    if (@offsetOf(Call, "operation") != 8) @compileError("stdk_call layout drifted: the ABI fixes the operation id at offset 8.");
+    if (@offsetOf(Node, "id") != 8) @compileError("stdk_node layout drifted: the ABI fixes the id at offset 8.");
 }
