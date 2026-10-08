@@ -603,7 +603,10 @@ pub fn fillRandom(bytes: []u8) Failure!void {
         var filled: usize = 0;
         while (filled < bytes.len) {
             const count = std.os.linux.getrandom(bytes.ptr + filled, bytes.len - filled, 0);
-            if (std.os.linux.E.init(count) != .SUCCESS) return error.InternalFailure;
+            // getrandom returns the byte count, or -errno on failure. Sign-check
+            // the raw word instead of std.os.linux.E.init, which some linux
+            // targets (android, ohos) do not provide.
+            if (@as(isize, @bitCast(count)) < 0) return error.InternalFailure;
             if (count == 0) return error.InternalFailure;
             filled += count;
         }
