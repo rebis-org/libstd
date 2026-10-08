@@ -10,7 +10,6 @@ pub const seven_zip_key_length = 32;
 pub const winzip_pbkdf2_rounds = 1000;
 pub const seven_zip_cycles_max = 24;
 pub const seven_zip_default_cycles = 19;
-pub const seven_zip_default_rounds: u64 = @as(u64, 1) << seven_zip_default_cycles;
 
 pub const FailureCause = enum {
     none,
@@ -480,6 +479,7 @@ pub fn winzipCtr(key: []const u8, destination: []u8, source: []const u8) Failure
             counter[byte_index] +%= 1;
             if (counter[byte_index] != 0) break;
         }
+        if (byte_index == 8) return error.ResourceLimit; // 64-bit counter exhausted
     }
     return;
 }
@@ -516,7 +516,7 @@ pub fn aesCbcDecrypt(key: []const u8, iv: [block_length]u8, destination: []u8, s
 pub fn winzipDeriveKey(password: []const u8, salt: []const u8, key_length: usize, out: []u8) Failure!void {
     const derived_length = std.math.add(usize, 2 * key_length, winzip_verify_length) catch return error.ResourceLimit;
     if (out.len < derived_length) return error.InvalidCall;
-    pbkdf2HmacSha1(out[0..derived_length], password, salt, @intCast(winzip_pbkdf2_rounds));
+    try pbkdf2HmacSha1(out[0..derived_length], password, salt, @intCast(winzip_pbkdf2_rounds));
     return;
 }
 
@@ -546,15 +546,16 @@ pub fn hmacSha256(out: *[hmac_sha256_length]u8, message: []const u8, key: []cons
     hmac.final(out);
 }
 
-pub fn pbkdf2HmacSha1(out: []u8, password: []const u8, salt: []const u8, rounds: u32) void {
-    pbkdf2Hmac(20, HmacSha1, out, password, salt, rounds);
+pub fn pbkdf2HmacSha1(out: []u8, password: []const u8, salt: []const u8, rounds: u32) Failure!void {
+    return pbkdf2Hmac(20, HmacSha1, out, password, salt, rounds);
 }
 
-pub fn pbkdf2HmacSha256(out: []u8, password: []const u8, salt: []const u8, rounds: u32) void {
-    pbkdf2Hmac(32, HmacSha256, out, password, salt, rounds);
+pub fn pbkdf2HmacSha256(out: []u8, password: []const u8, salt: []const u8, rounds: u32) Failure!void {
+    return pbkdf2Hmac(32, HmacSha256, out, password, salt, rounds);
 }
 
-fn pbkdf2Hmac(comptime digest_length: usize, comptime H: type, out: []u8, password: []const u8, salt: []const u8, rounds: u32) void {
+fn pbkdf2Hmac(comptime digest_length: usize, comptime H: type, out: []u8, password: []const u8, salt: []const u8, rounds: u32) Failure!void {
+    if (rounds == 0) return error.InvalidCall;
     var block_index: u32 = 1;
     var offset: usize = 0;
     while (offset < out.len) : (block_index +%= 1) {
@@ -580,35 +581,35 @@ fn pbkdf2Hmac(comptime digest_length: usize, comptime H: type, out: []u8, passwo
 }
 
 pub fn constantTimeEqual(left: []const u8, right: []const u8) bool {
-    if (left.len != right.len) return false;
-    var accumulator: u8 = 0;
-    for (left, right) |l, r| accumulator |= l ^ r;
+    // No early return on length mismatch: timing depends only on the public
+    // lengths, never on where the contents first differ.
+    var accumulator: u8 = @truncate(left.len ^ right.len);
+    const common = @min(left.len, right.len);
+    for (left[0..common], right[0..common]) |l, r| accumulator |= l ^ r;
+    for (left[common..]) |l| accumulator |= l;
+    for (right[common..]) |r| accumulator |= r;
     return accumulator == 0;
 }
 
-// Compile-time fallback only, so unsupported targets still get per-entry-unique salts.
-pub fn fillRandom(bytes: []u8) bool {
+// Fails loudly instead of degrading to predictable material: a caller that
+// cannot obtain randomness must not produce salts or IVs derived from the
+// password and entry contents.
+pub fn fillRandom(bytes: []u8) Failure!void {
     if (comptime @hasDecl(std.posix.system, "arc4random_buf")) {
         std.posix.system.arc4random_buf(bytes.ptr, bytes.len);
-        return true;
+        return;
     }
     if (comptime @hasDecl(std.os.linux, "getrandom")) {
-        const count = std.os.linux.getrandom(bytes.ptr, bytes.len, 0);
-        return count == bytes.len;
+        var filled: usize = 0;
+        while (filled < bytes.len) {
+            const count = std.os.linux.getrandom(bytes.ptr + filled, bytes.len - filled, 0);
+            if (std.os.linux.E.init(count) != .SUCCESS) return error.InternalFailure;
+            if (count == 0) return error.InternalFailure;
+            filled += count;
+        }
+        return;
     }
-    return false;
-}
-
-pub fn deriveDeterministicSalt(password: []const u8, name: []const u8, data: []const u8, out: []u8) Failure!void {
-    if (out.len > 32) return error.InvalidCall;
-    var sha = Sha256.init(.{});
-    sha.update(password);
-    sha.update(name);
-    sha.update(data);
-    var digest: [32]u8 = undefined;
-    sha.final(&digest);
-    @memcpy(out, digest[0..out.len]);
-    return;
+    return error.Unsupported;
 }
 
 const zip_crc_table: [256]u32 = blk: {
