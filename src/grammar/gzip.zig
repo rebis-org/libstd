@@ -10,7 +10,7 @@ const tee = @import("../common/primitive/tee.zig");
 const deflate = @import("../leaf/deflate.zig");
 pub const deflate_history_size = deflate.history_size;
 
-const GzipTee = tee.CountingTee(.{ .crc32 = true });
+const Crc32Tee = tee.CountingTee(.{ .crc32 = true });
 pub const Options = struct {
     modification_time: u32,
     extra_flags: u8,
@@ -23,9 +23,9 @@ pub const Options = struct {
     deflate: deflate.Options,
 };
 
-const id1 = 0x1f;
-const id2 = 0x8b;
-const compression_method = 8;
+const magic_1 = 0x1f;
+const magic_2 = 0x8b;
+const cm_deflate = 8;
 const flag_text = 0x01;
 const flag_header_crc = 0x02;
 const flag_extra = 0x04;
@@ -33,14 +33,13 @@ const flag_name = 0x08;
 const flag_comment = 0x10;
 const reserved_flags = 0xe0;
 
-// Bound is the deflate structural bound plus the option-driven wrapper.
 pub fn encodedSizeBound(input_len: usize, options: Options) usize {
-    var wrapper: usize = 18;
-    if (options.extra.len != 0) wrapper +|= 2 +| options.extra.len;
-    if (options.name.len != 0) wrapper +|= options.name.len +| 1;
-    if (options.comment.len != 0) wrapper +|= options.comment.len +| 1;
-    if (options.header_crc) wrapper +|= 2;
-    return deflate.encodedSizeBound(input_len) +| wrapper;
+    var wrapper_size: usize = 18;
+    if (options.extra.len != 0) wrapper_size +|= 2 +| options.extra.len;
+    if (options.name.len != 0) wrapper_size +|= options.name.len +| 1;
+    if (options.comment.len != 0) wrapper_size +|= options.comment.len +| 1;
+    if (options.header_crc) wrapper_size +|= 2;
+    return deflate.encodedSizeBound(input_len) +| wrapper_size;
 }
 
 pub fn decodedSize(input: []const u8, history: []u8) Failure!usize {
@@ -55,24 +54,27 @@ pub const SinglePass = union(enum) {
     fallback: void,
 };
 
-// Fast path: ISIZE only seeds the attempt. Commit needs exact count == ISIZE, CRC match, and trailer at input end. Every anomaly defers to the two-pass route.
+// ISIZE only seeds the attempt. Commit needs the exact ISIZE count, a matching
+// CRC32, and the trailer at the end of the input. A mismatch defers to the
+// two-pass route.
 pub fn decodeSinglePass(input: []const u8, output: []u8, history: []u8) Failure!SinglePass {
     if (history.len < deflate_history_size) return error.InsufficientCapacity;
     if (input.len >= std.math.maxInt(u32)) return .fallback;
+    // The 10 byte header and the 8 byte trailer need 18 bytes before any deflate data is read.
     if (input.len < 18) return .fallback;
     const claimed_size = std.mem.readInt(u32, input[input.len - 4 ..][0..4], .little);
     if (output.len < claimed_size) return .fallback;
     var source = std.Io.Reader.fixed(input);
-    var fixed: [10]u8 = undefined;
+    var fixed_header: [10]u8 = undefined;
     var index: usize = 0;
-    while (index < fixed.len) {
-        fixed[index] = source.takeByte() catch return .fallback;
+    while (index < fixed_header.len) {
+        fixed_header[index] = source.takeByte() catch return .fallback;
         index += 1;
     }
-    skipHeader(&source, &fixed) catch return .fallback;
+    skipHeader(&source, &fixed_header) catch return .fallback;
     const data_start = source.seek;
     var sink_writer = std.Io.Writer.fixed(output);
-    var tee_writer = GzipTee.init(&sink_writer);
+    var tee_writer = Crc32Tee.init(&sink_writer);
     var inflater = deflate.Decompress.initSlice(input[data_start..], history);
     _ = inflater.reader.streamRemaining(&tee_writer.writer) catch return .fallback;
     source.seek = data_start + (inflater.inputBitsConsumed() + 7) / 8;
@@ -91,19 +93,19 @@ pub fn decode(input: []const u8, output: *std.Io.Writer, history: []u8) Failure!
     var source = std.Io.Reader.fixed(input);
     var total: usize = 0;
     while (true) {
-        var fixed: [10]u8 = undefined;
+        var fixed_header: [10]u8 = undefined;
         var index: usize = 0;
-        while (index < fixed.len) {
+        while (index < fixed_header.len) {
             const byte = source.takeByte() catch {
                 if (index == 0) break;
                 return error.InvalidData;
             };
-            fixed[index] = byte;
+            fixed_header[index] = byte;
             index += 1;
         }
         if (index == 0) break;
-        try skipHeader(&source, &fixed);
-        var tee_writer = GzipTee.init(output);
+        try skipHeader(&source, &fixed_header);
+        var tee_writer = Crc32Tee.init(output);
         const data_start = source.seek;
         var inflater = deflate.Decompress.initSlice(input[data_start..], history);
         const produced = inflater.reader.streamRemaining(&tee_writer.writer) catch |err| {
@@ -112,7 +114,7 @@ pub fn decode(input: []const u8, output: *std.Io.Writer, history: []u8) Failure!
                 else => error.InvalidData,
             };
         };
-        total = try bounds.add(total, produced);
+        total = try bounds.addUsize(total, produced);
         source.seek = data_start + (inflater.inputBitsConsumed() + 7) / 8;
         var trailer: [8]u8 = undefined;
         var trailer_sink = std.Io.Writer.fixed(&trailer);
@@ -127,9 +129,9 @@ pub fn decode(input: []const u8, output: *std.Io.Writer, history: []u8) Failure!
 pub fn encodeStream(source: *std.Io.Reader, output: *std.Io.Writer, history: []u8, options: Options) Failure!void {
     if (history.len < deflate_history_size) return error.InsufficientCapacity;
     try writeHeader(output, options);
-    // Pass the full slice: optimal mode carves scratch past deflate_history_size.
+    // Optimal mode carves scratch past deflate_history_size, so the full slice is required.
     var compressor = try deflate.Compress.init(output, history, options.deflate);
-    var crc = checksum.Crc32.init();
+    var crc32 = checksum.Crc32.init();
     var total: u64 = 0;
     var buffer: [4096]u8 = undefined;
     while (true) {
@@ -140,44 +142,44 @@ pub fn encodeStream(source: *std.Io.Reader, output: *std.Io.Writer, history: []u
         };
         if (count == 0) break;
         const part = buffer[0..count];
-        crc.update(part);
-        total = try bounds.add64(total, @intCast(count));
+        crc32.update(part);
+        total = try bounds.addU64(total, @intCast(count));
         compressor.writer.writeAll(part) catch return error.IoFailure;
     }
     compressor.finish() catch return error.IoFailure;
-    try writeTrailer(output, crc.final(), total);
+    try writeTrailer(output, crc32.final(), total);
 }
 
-fn skipHeader(input: *std.Io.Reader, fixed: *[10]u8) Failure!void {
-    if (fixed[0] != id1 or fixed[1] != id2) return error.InvalidData;
-    if (fixed[2] != compression_method) return error.Unsupported;
-    const flags = fixed[3];
+fn skipHeader(source: *std.Io.Reader, fixed_header: *[10]u8) Failure!void {
+    if (fixed_header[0] != magic_1 or fixed_header[1] != magic_2) return error.InvalidData;
+    if (fixed_header[2] != cm_deflate) return error.Unsupported;
+    const flags = fixed_header[3];
     if (flags & reserved_flags != 0) return error.InvalidData;
     var hasher = checksum.Crc32.init();
-    hasher.update(fixed);
+    hasher.update(fixed_header);
     if (flags & flag_extra != 0) {
-        const low = input.takeByte() catch return error.InvalidData;
-        const high = input.takeByte() catch return error.InvalidData;
+        const low = source.takeByte() catch return error.InvalidData;
+        const high = source.takeByte() catch return error.InvalidData;
         hasher.update(&.{ low, high });
         var remaining: u16 = (@as(u16, high) << 8) | low;
         while (remaining != 0) : (remaining -= 1) {
-            const byte = input.takeByte() catch return error.InvalidData;
+            const byte = source.takeByte() catch return error.InvalidData;
             hasher.update(&.{byte});
         }
     }
-    if (flags & flag_name != 0) try skipCString(input, &hasher);
-    if (flags & flag_comment != 0) try skipCString(input, &hasher);
+    if (flags & flag_name != 0) try skipCString(source, &hasher);
+    if (flags & flag_comment != 0) try skipCString(source, &hasher);
     if (flags & flag_header_crc != 0) {
-        const low = input.takeByte() catch return error.InvalidData;
-        const high = input.takeByte() catch return error.InvalidData;
-        const stored = (@as(u16, high) << 8) | low;
-        if (stored != @as(u16, @truncate(hasher.final()))) return error.IntegrityFailure;
+        const low = source.takeByte() catch return error.InvalidData;
+        const high = source.takeByte() catch return error.InvalidData;
+        const stored_crc = (@as(u16, high) << 8) | low;
+        if (stored_crc != @as(u16, @truncate(hasher.final()))) return error.IntegrityFailure;
     }
 }
 
-fn skipCString(input: *std.Io.Reader, hasher: *checksum.Crc32) Failure!void {
+fn skipCString(source: *std.Io.Reader, hasher: *checksum.Crc32) Failure!void {
     while (true) {
-        const byte = input.takeByte() catch return error.InvalidData;
+        const byte = source.takeByte() catch return error.InvalidData;
         hasher.update(&.{byte});
         if (byte == 0) return;
     }
@@ -193,16 +195,16 @@ fn writeHeader(writer: *std.Io.Writer, options: Options) Failure!void {
     if (options.name.len != 0) flags |= flag_name;
     if (options.comment.len != 0) flags |= flag_comment;
     var hasher = checksum.Crc32.init();
-    var fixed: [10]u8 = undefined;
-    fixed[0] = id1;
-    fixed[1] = id2;
-    fixed[2] = compression_method;
-    fixed[3] = flags;
-    std.mem.writeInt(u32, fixed[4..8], options.modification_time, .little);
-    fixed[8] = options.extra_flags;
-    fixed[9] = options.operating_system;
-    hasher.update(&fixed);
-    try io.writeBytes(writer, &fixed);
+    var fixed_header: [10]u8 = undefined;
+    fixed_header[0] = magic_1;
+    fixed_header[1] = magic_2;
+    fixed_header[2] = cm_deflate;
+    fixed_header[3] = flags;
+    std.mem.writeInt(u32, fixed_header[4..8], options.modification_time, .little);
+    fixed_header[8] = options.extra_flags;
+    fixed_header[9] = options.operating_system;
+    hasher.update(&fixed_header);
+    try io.writeBytes(writer, &fixed_header);
     if (options.extra.len != 0) {
         var xlen: [2]u8 = undefined;
         std.mem.writeInt(u16, &xlen, @intCast(options.extra.len), .little);
@@ -211,10 +213,10 @@ fn writeHeader(writer: *std.Io.Writer, options: Options) Failure!void {
         try io.writeBytes(writer, &xlen);
         try io.writeBytes(writer, options.extra);
     }
-    for ([_][]const u8{ options.name, options.comment }) |value| {
-        if (value.len == 0) continue;
-        hasher.update(value);
-        try io.writeBytes(writer, value);
+    for ([_][]const u8{ options.name, options.comment }) |field| {
+        if (field.len == 0) continue;
+        hasher.update(field);
+        try io.writeBytes(writer, field);
         const zero = [_]u8{0};
         hasher.update(&zero);
         try io.writeBytes(writer, &zero);
@@ -226,7 +228,7 @@ fn writeHeader(writer: *std.Io.Writer, options: Options) Failure!void {
     }
 }
 
-fn writeTrailer(writer: *std.Io.Writer, crc: u32, length: u64) Failure!void {
-    writer.writeInt(u32, crc, .little) catch return error.IoFailure;
-    writer.writeInt(u32, @truncate(length), .little) catch return error.IoFailure;
+fn writeTrailer(writer: *std.Io.Writer, crc32: u32, uncompressed_size: u64) Failure!void {
+    writer.writeInt(u32, crc32, .little) catch return error.IoFailure;
+    writer.writeInt(u32, @truncate(uncompressed_size), .little) catch return error.IoFailure;
 }

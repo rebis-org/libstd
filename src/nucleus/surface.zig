@@ -31,7 +31,7 @@ fn statusFor(failure: Failure) u32 {
 
 // Source/destination aliasing traps as overlap (in-place is a different verb).
 // null with nonzero length returns a status, provenance violations trap.
-pub fn nucleusCopy(output: Surface, input: ConstSurface) callconv(.c) u32 {
+pub fn copy(output: Surface, input: ConstSurface) callconv(.c) u32 {
     const destination = span.mutSpan(output.ptr, output.len) catch |failure| return statusFor(failure);
     const source = span.constSpan(input.ptr, input.len) catch |failure| return statusFor(failure);
     span.requireDisjoint(.{ .ptr = destination.ptr, .len = destination.len }, source, "Surface copy regions overlap.");

@@ -1,3 +1,5 @@
+/* Mach-O prefixes C symbols with an underscore and hides them behind
+   private_extern; ELF uses the plain name with .hidden visibility. */
 #ifdef __APPLE__
 #define SYM(x) _##x
 #define HIDDEN(x) .private_extern x
@@ -37,7 +39,7 @@ SYM(stdk_crc32_le):
 3:
 	ret
 
-/* Called only for len >= threshold. */
+/* The caller reaches this only at or above crc32_pmull_threshold. */
 .align 2
 .globl SYM(stdk_crc32_le_pmull)
 HIDDEN(SYM(stdk_crc32_le_pmull))

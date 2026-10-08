@@ -3,11 +3,11 @@ const std = @import("std");
 const failure = @import("failure.zig");
 const Failure = failure.Failure;
 
-pub fn add(left: usize, right: usize) Failure!usize {
+pub fn addUsize(left: usize, right: usize) Failure!usize {
     return std.math.add(usize, left, right) catch error.ResourceLimit;
 }
 
-pub fn add64(left: u64, right: u64) Failure!u64 {
+pub fn addU64(left: u64, right: u64) Failure!u64 {
     return std.math.add(u64, left, right) catch error.ResourceLimit;
 }
 

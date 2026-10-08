@@ -1,3 +1,5 @@
+const std = @import("std");
+
 const resource = @import("../kernel/resource.zig");
 const Resource = resource.Resource;
 const Limits = resource.Limits;
@@ -54,10 +56,8 @@ const handler_map = blk: {
     break :blk std.StaticStringMap(ProfileHook).initComptime(entries);
 };
 
-const std = @import("std");
-
 pub fn dispatchToProfileHook(profile_id: Id, plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
-    if (discovery.findById(catalog.toContract(profile_id))) |descriptor| {
+    if (discovery.findById(catalog.toContractId(profile_id))) |descriptor| {
         const tag = components.tagForName(descriptor.name) orelse return error.Unsupported;
         const hook = handler_map.get(@tagName(tag)) orelse return error.Unsupported;
         return hook(plan, source, sink, call, response, sizing, commit, limits, command_mask);

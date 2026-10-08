@@ -79,7 +79,7 @@ pub const Selector = struct {
     flags: u8,
 };
 
-pub fn selector(
+pub fn packSelector(
     family: u16,
     ordinal: u32,
     representation: Representation,
@@ -100,7 +100,7 @@ pub fn selectorOf(value_high: u64) Selector {
     };
 }
 
-pub fn selectorValid(selector_value: Selector) bool {
+pub fn isSelectorValid(selector_value: Selector) bool {
     if (selector_value.attributes & parameter_attr_reserved_mask != 0) return false;
     if (selector_value.flags & parameter_flag_reserved_mask != 0) return false;
     return cardinalityFieldOf(selector_value.attributes) <= 1;
@@ -158,25 +158,25 @@ pub const Descriptor = struct {
     commit: CommitMode = .tentative,
 };
 
-const commands_masks = command_mask_query | command_mask_read | command_mask_write;
+const all_commands_mask = command_mask_query | command_mask_read | command_mask_write;
 const read_write_mask = command_mask_read | command_mask_write;
 const query_write_mask = command_mask_query | command_mask_write;
 
 pub const protocol_rows = [_]Descriptor{
-    .{ .id = ids.query, .name = "query", .kind = .command, .representation = .node_chain, .command_mask = commands_masks },
-    .{ .id = ids.read, .name = "read", .kind = .command, .representation = .node_chain, .command_mask = commands_masks },
-    .{ .id = ids.write, .name = "write", .kind = .command, .representation = .node_chain, .command_mask = commands_masks },
+    .{ .id = ids.query, .name = "query", .kind = .command, .representation = .node_chain, .command_mask = all_commands_mask },
+    .{ .id = ids.read, .name = "read", .kind = .command, .representation = .node_chain, .command_mask = all_commands_mask },
+    .{ .id = ids.write, .name = "write", .kind = .command, .representation = .node_chain, .command_mask = all_commands_mask },
     .{ .id = ids.diagnostic_required_capacity, .name = "diagnostic_required_capacity", .kind = .parameter, .representation = .scalar_words, .direction = .out },
     .{ .id = ids.diagnostic_available_capacity, .name = "diagnostic_available_capacity", .kind = .parameter, .representation = .scalar_words, .direction = .out },
     .{ .id = ids.diagnostic_downstream_status, .name = "diagnostic_downstream_status", .kind = .parameter, .representation = .scalar_words, .direction = .out },
     .{ .id = ids.diagnostic_subject, .name = "diagnostic_subject", .kind = .parameter, .representation = .scalar_words, .direction = .out },
-    .{ .id = ids.source, .name = "source", .kind = .parameter, .representation = .bytes, .direction = .in, .command_mask = commands_masks },
+    .{ .id = ids.source, .name = "source", .kind = .parameter, .representation = .bytes, .direction = .in, .command_mask = all_commands_mask },
     .{ .id = ids.sink, .name = "sink", .kind = .parameter, .representation = .bytes, .direction = .in, .command_mask = read_write_mask },
-    .{ .id = ids.profile, .name = "profile", .kind = .parameter, .representation = .scalar_words, .direction = .in, .command_mask = commands_masks },
+    .{ .id = ids.profile, .name = "profile", .kind = .parameter, .representation = .scalar_words, .direction = .in, .command_mask = all_commands_mask },
     .{ .id = ids.target_command, .name = "target_command", .kind = .parameter, .representation = .scalar_words, .direction = .in, .command_mask = command_mask_query },
     .{ .id = ids.size_bound, .name = "size_bound", .kind = .parameter, .representation = .scalar_words, .direction = .in, .command_mask = query_write_mask },
-    .{ .id = ids.parameter, .name = "parameter", .kind = .parameter, .cardinality = .repeated, .direction = .in_out, .command_mask = commands_masks },
-    .{ .id = ids.crypto_profile, .name = "crypto_profile", .kind = .parameter, .representation = .scalar_words, .direction = .in, .command_mask = commands_masks },
+    .{ .id = ids.parameter, .name = "parameter", .kind = .parameter, .cardinality = .repeated, .direction = .in_out, .command_mask = all_commands_mask },
+    .{ .id = ids.crypto_profile, .name = "crypto_profile", .kind = .parameter, .representation = .scalar_words, .direction = .in, .command_mask = all_commands_mask },
     .{ .id = ids.resource_read, .name = "resource_read", .kind = .resource, .representation = .scalar_words, .capability = .read },
     .{ .id = ids.resource_write, .name = "resource_write", .kind = .resource, .representation = .scalar_words, .capability = .write },
     .{ .id = ids.resource_size, .name = "resource_size", .kind = .resource, .representation = .scalar_words, .capability = .size },

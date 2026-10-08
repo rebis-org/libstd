@@ -8,7 +8,7 @@ const kernels = @import("kernels.zig");
 
 // NEON is baseline on aarch64, so the wide match-copy path needs no extra
 // target feature. Other targets keep the portable word-at-a-time path.
-const vector_match_copy = !build_options.portable and builtin.target.cpu.arch == .aarch64;
+const use_vector_match_copy = !build_options.portable and builtin.target.cpu.arch == .aarch64;
 
 pub const history_size = 2 * window_size;
 pub const measurement_buffer_size = 64;
@@ -78,12 +78,12 @@ pub const deflate64_history_size = 2 * deflate64_window_size + deflate64_max_mat
 pub const deflate64_decode_history_size = deflate64_window_size + deflate64_max_match + 1;
 
 // Packed base|extra in one u32: one load per match code in the hot loop.
-const length_info = infoTable(&length_base, &length_extra);
-const dist_info = infoTable(&dist_base, &dist_extra);
-const deflate64_length_info = infoTable(&deflate64_length_base, &deflate64_length_extra);
-const deflate64_dist_info = infoTable(&deflate64_dist_base, &deflate64_dist_extra);
+const length_packed = packBaseExtra(&length_base, &length_extra);
+const dist_packed = packBaseExtra(&dist_base, &dist_extra);
+const deflate64_length_packed = packBaseExtra(&deflate64_length_base, &deflate64_length_extra);
+const deflate64_dist_packed = packBaseExtra(&deflate64_dist_base, &deflate64_dist_extra);
 
-fn infoTable(comptime bases: []const u16, comptime extras: []const u5) [bases.len]u32 {
+fn packBaseExtra(comptime bases: []const u16, comptime extras: []const u5) [bases.len]u32 {
     var out: [bases.len]u32 = undefined;
     for (bases, extras, 0..) |base, extra, i| out[i] = @as(u32, base) | @as(u32, extra) << 16;
     return out;
@@ -121,11 +121,11 @@ fn reverseBits(value: u16, bits: u8) u16 {
 
 fn completeTree(freqs: []const u32, lengths: []u8) void {
     var used_count: usize = 0;
-    var only: usize = 0;
+    var only_symbol: usize = 0;
     for (freqs, 0..) |freq, symbol| {
         if (freq != 0) {
             used_count += 1;
-            only = symbol;
+            only_symbol = symbol;
         }
     }
     // Strict decoders reject incomplete trees, so a zero-frequency sibling keeps trees complete.
@@ -133,8 +133,8 @@ fn completeTree(freqs: []const u32, lengths: []u8) void {
         lengths[0] = 1;
         lengths[1] = 1;
     } else if (used_count == 1) {
-        lengths[only] = 1;
-        lengths[if (only == 0) 1 else 0] = 1;
+        lengths[only_symbol] = 1;
+        lengths[if (only_symbol == 0) 1 else 0] = 1;
     }
 }
 
@@ -496,37 +496,37 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
             var stats_pending_dist: u32 = 0;
             var stats_deferred = false;
             var prev_best: usize = 0;
-            var p = start;
-            while (p < span_end) : (p += 1) {
+            var pos = start;
+            while (pos < span_end) : (pos += 1) {
                 var best_length: usize = min_match - 1;
                 var best_distance: u32 = 0;
                 var count: u8 = 0;
-                const candidates = scratch.candidates[(p - start) * optimal_stride ..][0..optimal_stride];
-                if (c.end - p >= min_match + 1) {
-                    const head = c.insert(p);
+                const candidates = scratch.candidates[(pos - start) * optimal_stride ..][0..optimal_stride];
+                if (c.end - pos >= min_match + 1) {
+                    const head = c.insert(pos);
                     var chain_list: [optimal_stride]u32 = undefined;
                     var chain_count: u8 = 0;
                     // Deep walk runs only where the previous position found nothing long.
                     if (head != no_position and prev_best < 32) {
-                        const found = c.searchImproving(p, head, span_end, &chain_list);
+                        const found = c.searchImproving(pos, head, span_end, &chain_list);
                         chain_count = found.count;
                         best_length = found.length;
                         best_distance = found.distance;
                     }
                     // Nearest 3-byte hit recovers what the 4-byte chain cannot surface.
-                    const position: u32 = @truncate(c.base + p);
+                    const position: u32 = @truncate(c.base + pos);
                     var side_length: usize = 0;
                     var side_distance: u32 = 0;
                     if (position != no_position) {
-                        const h3 = hash3(c.history[p..]);
+                        const h3 = hash3(c.history[pos..]);
                         const cand3 = c.head3[h3];
                         c.head3[h3] = position;
                         if (cand3 != no_position) {
                             const distance = position -% cand3;
                             if (distance != 0 and distance <= config.window_size) {
-                                const l = matchLength(c.history, p - distance, p, @min(@min(config.max_match, c.end - p), span_end - p));
-                                if (l >= min_match) {
-                                    side_length = l;
+                                const matched = matchLength(c.history, pos - distance, pos, @min(@min(config.max_match, c.end - pos), span_end - pos));
+                                if (matched >= min_match) {
+                                    side_length = matched;
                                     side_distance = distance;
                                 }
                             }
@@ -539,8 +539,8 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
                     }
                 }
                 prev_best = best_length;
-                scratch.candidate_count[p - start] = count;
-                if (p != stats_at) continue;
+                scratch.candidate_count[pos - start] = count;
+                if (pos != stats_at) continue;
                 var current_length = best_length;
                 const current_distance = best_distance;
                 if (stats_pending_len >= c.options.lazy and stats_pending_len >= min_match) current_length = min_match - 1;
@@ -549,18 +549,18 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
                     lit_freq[257 + @as(usize, lengthIndexFor(stats_pending_len))] += 1;
                     dist_freq[distIndexFor(stats_pending_dist)] += 1;
                     stats_tokens += 1;
-                    stats_at = p + stats_pending_len - 1;
+                    stats_at = pos + stats_pending_len - 1;
                     stats_pending_len = min_match - 1;
                     stats_deferred = false;
                 } else {
                     if (stats_deferred) {
-                        lit_freq[c.history[p - 1]] += 1;
+                        lit_freq[c.history[pos - 1]] += 1;
                         stats_tokens += 1;
                     }
                     stats_deferred = true;
                     stats_pending_len = current_length;
                     stats_pending_dist = current_distance;
-                    stats_at = p + 1;
+                    stats_at = pos + 1;
                 }
             }
             if (stats_pending_len >= min_match) {
@@ -601,15 +601,15 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
 
         // Ascending improving pairs let the DP price against the cheapest covering distance.
         // Budget collapses past good length: the chain tail dominates encode cost.
-        fn searchImproving(c: *@This(), s: usize, head_candidate: u32, span_end: usize, output: []u32) Improving {
-            const position: u32 = @truncate(c.base + s);
-            const available = @min(config.max_match, c.end - s);
-            const clip = @min(available, span_end - s);
+        fn searchImproving(c: *@This(), pos: usize, head_candidate: u32, span_end: usize, output: []u32) Improving {
+            const position: u32 = @truncate(c.base + pos);
+            const available = @min(config.max_match, c.end - pos);
+            const clip = @min(available, span_end - pos);
             const nice = @min(c.options.nice, available);
             var budget: u32 = c.options.chain;
             const good_budget: u32 = @max(1, c.options.chain / 4);
-            var best: usize = min_match - 1;
-            var best_dist: u32 = 0;
+            var best_length: usize = min_match - 1;
+            var best_distance: u32 = 0;
             var count: u8 = 0;
             var candidate = head_candidate;
             const history = c.history;
@@ -618,16 +618,16 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
             while (candidate != no_position and budget > 0) : (budget -= 1) {
                 const distance = position -% candidate;
                 if (distance == 0 or distance > config.window_size) break;
-                const at = s - distance;
-                if (best < available and history[at + best] == history[s + best] and history[at + best - 1] == history[s + best - 1]) {
-                    const len = matchLength(history, at, s, available);
-                    if (len > best) {
-                        best = len;
-                        best_dist = distance;
-                        if (best >= good and budget > good_budget) budget = good_budget;
-                        const l = @min(len, clip);
-                        if (l >= min_match) {
-                            const entry = (@as(u32, @intCast(l - 1)) << 16) | (distance - 1);
+                const cand = pos - distance;
+                if (best_length < available and history[cand + best_length] == history[pos + best_length] and history[cand + best_length - 1] == history[pos + best_length - 1]) {
+                    const len = matchLength(history, cand, pos, available);
+                    if (len > best_length) {
+                        best_length = len;
+                        best_distance = distance;
+                        if (best_length >= good and budget > good_budget) budget = good_budget;
+                        const clipped = @min(len, clip);
+                        if (clipped >= min_match) {
+                            const entry = (@as(u32, @intCast(clipped - 1)) << 16) | (distance - 1);
                             if (count < optimal_stride) {
                                 output[count] = entry;
                                 count += 1;
@@ -635,12 +635,12 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
                                 output[optimal_stride - 1] = entry;
                             }
                         }
-                        if (best >= nice) break;
+                        if (best_length >= nice) break;
                     }
                 }
-                candidate = prev[at & (config.window_size - 1)];
+                candidate = prev[cand & (config.window_size - 1)];
             }
-            return .{ .count = count, .length = @min(best, clip), .distance = best_dist };
+            return .{ .count = count, .length = @min(best_length, clip), .distance = best_distance };
         }
 
         // Backward DP on frozen prices. Suffix minima give each length its cheapest covering distance.
@@ -651,7 +651,7 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
             var i = span;
             while (i > 0) {
                 i -= 1;
-                var best = lit_price[history[i]] + overhead + scratch.cost[i + 1];
+                var best_price = lit_price[history[i]] + overhead + scratch.cost[i + 1];
                 var choice: u32 = 0;
                 const count = scratch.candidate_count[i];
                 if (count != 0) {
@@ -659,37 +659,37 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
                     var sfx_price: [optimal_stride]u32 = undefined;
                     var sfx_dist: [optimal_stride]u32 = undefined;
                     var j: usize = count;
-                    var sp: u32 = std.math.maxInt(u32);
-                    var sd: u32 = 0;
+                    var suffix_price: u32 = std.math.maxInt(u32);
+                    var suffix_distance: u32 = 0;
                     while (j > 0) {
                         j -= 1;
-                        const edist: u32 = (entries[j] & 0xFFFF) + 1;
-                        const di = distIndexFor(edist);
-                        const dp = (@as(u32, dist_lengths[di]) + config.dist_extra[di]) << optimal_price_shift;
-                        if (dp < sp) {
-                            sp = dp;
-                            sd = edist;
+                        const dist: u32 = (entries[j] & 0xFFFF) + 1;
+                        const di = distIndexFor(dist);
+                        const dist_price = (@as(u32, dist_lengths[di]) + config.dist_extra[di]) << optimal_price_shift;
+                        if (dist_price < suffix_price) {
+                            suffix_price = dist_price;
+                            suffix_distance = dist;
                         }
-                        sfx_price[j] = sp;
-                        sfx_dist[j] = sd;
+                        sfx_price[j] = suffix_price;
+                        sfx_dist[j] = suffix_distance;
                     }
                     // Prices are slot-constant, so only slot-first lengths plus the longest need trying.
                     const lmax: usize = @as(usize, entries[count - 1] >> 16) + 1;
                     var seg: usize = 0;
-                    var l: usize = min_match;
+                    var len: usize = min_match;
                     while (true) {
-                        while (@as(usize, entries[seg] >> 16) + 1 < l) seg += 1;
-                        const li = lengthIndexFor(l);
-                        const price = ((@as(u32, lit_lengths[257 + @as(usize, li)]) + config.length_extra[li]) << optimal_price_shift) + sfx_price[seg] + overhead + scratch.cost[i + l];
-                        if (price < best) {
-                            best = price;
-                            choice = (@as(u32, @intCast(l - 1)) << 16) | (sfx_dist[seg] - 1);
+                        while (@as(usize, entries[seg] >> 16) + 1 < len) seg += 1;
+                        const li = lengthIndexFor(len);
+                        const price = ((@as(u32, lit_lengths[257 + @as(usize, li)]) + config.length_extra[li]) << optimal_price_shift) + sfx_price[seg] + overhead + scratch.cost[i + len];
+                        if (price < best_price) {
+                            best_price = price;
+                            choice = (@as(u32, @intCast(len - 1)) << 16) | (sfx_dist[seg] - 1);
                         }
-                        if (l >= lmax) break;
-                        l = @min(config.length_base[li] + (@as(usize, 1) << config.length_extra[li]), lmax);
+                        if (len >= lmax) break;
+                        len = @min(config.length_base[li] + (@as(usize, 1) << config.length_extra[li]), lmax);
                     }
                 }
-                scratch.cost[i] = best;
+                scratch.cost[i] = best_price;
                 scratch.choice[i] = choice;
             }
             var token_count: usize = 0;
@@ -710,13 +710,13 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
         }
 
         fn step(c: *@This()) std.Io.Writer.Error!void {
-            const s = c.cursor;
+            const pos = c.cursor;
             var head_candidate: u32 = no_position;
-            if (c.end - s >= min_match + 1) head_candidate = c.insert(s);
+            if (c.end - pos >= min_match + 1) head_candidate = c.insert(pos);
             var current_length: usize = min_match - 1;
             var current_distance: u32 = 0;
             if (head_candidate != no_position and (c.pending_len < c.options.lazy or c.pending_len < min_match)) {
-                const found = c.search(s, head_candidate);
+                const found = c.search(pos, head_candidate);
                 current_length = found.length;
                 current_distance = found.distance;
                 // Too-far minimum match costs more than literals. Demote before lazy.
@@ -727,8 +727,8 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
             }
             if (c.pending_len >= min_match and current_length <= c.pending_len) {
                 c.tallyMatch(c.pending_len, c.pending_dist);
-                var p = s + 1;
-                const last = s + c.pending_len - 1;
+                var p = pos + 1;
+                const last = pos + c.pending_len - 1;
                 while (p < last) : (p += 1) {
                     if (c.end - p >= min_match + 1) _ = c.insert(p);
                 }
@@ -737,29 +737,29 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
                 c.pending_len = min_match - 1;
                 c.deferred = false;
             } else {
-                if (c.deferred) c.tallyLiteral(c.history[s - 1]);
+                if (c.deferred) c.tallyLiteral(c.history[pos - 1]);
                 c.deferred = true;
                 c.pending_len = current_length;
                 c.pending_dist = current_distance;
-                c.finalized = s;
-                c.cursor = s + 1;
+                c.finalized = pos;
+                c.cursor = pos + 1;
             }
         }
 
-        fn insert(c: *@This(), s: usize) u32 {
-            const position: u32 = @truncate(c.base + s);
+        fn insert(c: *@This(), pos: usize) u32 {
+            const position: u32 = @truncate(c.base + pos);
             // Sentinel collides once per 4 GiB. That position forfeits its slot.
             if (position == no_position) return no_position;
-            const h = hash4(c.history[s..]);
+            const h = hash4(c.history[pos..]);
             const candidate = c.head[h];
-            c.prev[s & (config.window_size - 1)] = candidate;
+            c.prev[pos & (config.window_size - 1)] = candidate;
             c.head[h] = position;
             return candidate;
         }
 
-        fn search(c: *@This(), s: usize, head_candidate: u32) Match {
-            const position: u32 = @truncate(c.base + s);
-            const available = @min(config.max_match, c.end - s);
+        fn search(c: *@This(), pos: usize, head_candidate: u32) Match {
+            const position: u32 = @truncate(c.base + pos);
+            const available = @min(config.max_match, c.end - pos);
             const nice = @min(c.options.nice, available);
             var budget: u32 = c.options.chain;
             if (c.pending_len >= c.options.good) budget >>= 2;
@@ -771,16 +771,16 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
             while (candidate != no_position and budget > 0) : (budget -= 1) {
                 const distance = position -% candidate;
                 if (distance == 0 or distance > config.window_size) break;
-                const at = s - distance;
-                if (best_length < available and history[at + best_length] == history[s + best_length] and history[at + best_length - 1] == history[s + best_length - 1]) {
-                    const match_length = matchLength(history, at, s, available);
+                const cand = pos - distance;
+                if (best_length < available and history[cand + best_length] == history[pos + best_length] and history[cand + best_length - 1] == history[pos + best_length - 1]) {
+                    const match_length = matchLength(history, cand, pos, available);
                     if (match_length > best_length) {
                         best_length = match_length;
                         best_distance = distance;
                         if (best_length >= nice) break;
                     }
                 }
-                candidate = prev[at & (config.window_size - 1)];
+                candidate = prev[cand & (config.window_size - 1)];
             }
             return .{ .length = best_length, .distance = best_distance };
         }
@@ -974,7 +974,7 @@ fn mergeCandidates(output: []u32, chain: []const u32, side_length: usize, side_d
         @memcpy(output[0..chain.len], chain);
         return @intCast(chain.len);
     }
-    var buffer: [optimal_stride + 1]u32 = undefined;
+    var merged: [optimal_stride + 1]u32 = undefined;
     var count: usize = 0;
     var side_taken = false;
     for (chain) |entry| {
@@ -983,62 +983,62 @@ fn mergeCandidates(output: []u32, chain: []const u32, side_length: usize, side_d
             side_taken = true;
             if (side_length == entry_length) {
                 const entry_distance = (entry & 0xFFFF) + 1;
-                buffer[count] = (@as(u32, @intCast(entry_length - 1)) << 16) | (@min(side_distance, entry_distance) - 1);
+                merged[count] = (@as(u32, @intCast(entry_length - 1)) << 16) | (@min(side_distance, entry_distance) - 1);
                 count += 1;
                 continue;
             }
-            buffer[count] = (@as(u32, @intCast(side_length - 1)) << 16) | (side_distance - 1);
+            merged[count] = (@as(u32, @intCast(side_length - 1)) << 16) | (side_distance - 1);
             count += 1;
         }
-        buffer[count] = entry;
+        merged[count] = entry;
         count += 1;
     }
     if (!side_taken) {
-        buffer[count] = (@as(u32, @intCast(side_length - 1)) << 16) | (side_distance - 1);
+        merged[count] = (@as(u32, @intCast(side_length - 1)) << 16) | (side_distance - 1);
         count += 1;
     }
     if (count > optimal_stride) {
-        @memcpy(output[0 .. optimal_stride - 1], buffer[0 .. optimal_stride - 1]);
-        output[optimal_stride - 1] = buffer[count - 1];
+        @memcpy(output[0 .. optimal_stride - 1], merged[0 .. optimal_stride - 1]);
+        output[optimal_stride - 1] = merged[count - 1];
         return optimal_stride;
     }
-    @memcpy(output[0..count], buffer[0..count]);
+    @memcpy(output[0..count], merged[0..count]);
     return @intCast(count);
 }
 
-inline fn matchLength(history: []const u8, at: usize, s: usize, available: usize) usize {
+inline fn matchLength(history: []const u8, cand: usize, pos: usize, available: usize) usize {
     var length: usize = 0;
     if (builtin.target.cpu.arch.endian() == .little) {
         while (length + 8 <= available) {
-            const back = std.mem.readInt(u64, history[at + length ..][0..8], .little);
-            const front = std.mem.readInt(u64, history[s + length ..][0..8], .little);
+            const back = std.mem.readInt(u64, history[cand + length ..][0..8], .little);
+            const front = std.mem.readInt(u64, history[pos + length ..][0..8], .little);
             if (back != front) return length + (@ctz(back ^ front) >> 3);
             length += 8;
         }
     }
-    while (length < available and history[at + length] == history[s + length]) length += 1;
+    while (length < available and history[cand + length] == history[pos + length]) length += 1;
     return length;
 }
 
 // Local bit buffer keeps the hot loop in registers.
 const SliceBits = struct {
-    data: []const u8,
+    bytes: []const u8,
     pos: usize,
     bits: u64,
-    count: u7,
+    bit_count: u7,
 
     inline fn refill(b: *SliceBits, need: u7) void {
-        while (b.count < need) {
-            if (b.pos + 8 <= b.data.len) {
-                const word = std.mem.readInt(u64, b.data[b.pos..][0..8], .little);
-                const advance: u7 = @min((64 - b.count) >> 3, 8);
+        while (b.bit_count < need) {
+            if (b.pos + 8 <= b.bytes.len) {
+                const word = std.mem.readInt(u64, b.bytes[b.pos..][0..8], .little);
+                const advance: u7 = @min((64 - b.bit_count) >> 3, 8);
                 const mask = ~@as(u64, 0) >> @intCast(64 - @as(u8, advance) * 8);
-                b.bits |= (word & mask) << @intCast(b.count);
+                b.bits |= (word & mask) << @intCast(b.bit_count);
                 b.pos += advance;
-                b.count += advance * 8;
-            } else if (b.pos < b.data.len and b.count <= 56) {
-                b.bits |= @as(u64, b.data[b.pos]) << @intCast(b.count);
-                b.count += 8;
+                b.bit_count += advance * 8;
+            } else if (b.pos < b.bytes.len and b.bit_count <= 56) {
+                b.bits |= @as(u64, b.bytes[b.pos]) << @intCast(b.bit_count);
+                b.bit_count += 8;
                 b.pos += 1;
             } else return;
         }
@@ -1047,10 +1047,10 @@ const SliceBits = struct {
     inline fn take(b: *SliceBits, n: u7) InflateError!u32 {
         if (n == 0) return 0;
         b.refill(n);
-        if (b.count < n) return error.Truncated;
+        if (b.bit_count < n) return error.Truncated;
         const value: u32 = @truncate(b.bits & ((@as(u64, 1) << @intCast(n)) - 1));
         b.bits >>= @intCast(n);
-        b.count -= n;
+        b.bit_count -= n;
         return value;
     }
 
@@ -1061,18 +1061,18 @@ const SliceBits = struct {
         if (entry == 0) return error.InvalidData;
         const len: u7 = @intCast(entry & 0xFF);
         if (len != 0) {
-            if (len > b.count) return error.Truncated;
+            if (len > b.bit_count) return error.Truncated;
             b.bits >>= @intCast(len);
-            b.count -= len;
+            b.bit_count -= len;
             return @intCast(entry >> 16);
         }
         const sub_bits: u7 = @intCast((entry >> 8) & 0xFF);
         const sub_entry = tree.sub[@intCast((entry >> 16) + ((b.bits >> @intCast(root_bits)) & ((@as(u64, 1) << @intCast(sub_bits)) - 1)))];
         const sub_len: u7 = @intCast(sub_entry & 0xFF);
         const consumed = @as(u7, root_bits) + sub_len;
-        if (consumed > b.count) return error.Truncated;
+        if (consumed > b.bit_count) return error.Truncated;
         b.bits >>= @intCast(consumed);
-        b.count -= consumed;
+        b.bit_count -= consumed;
         return @intCast(sub_entry >> 16);
     }
 };
@@ -1080,7 +1080,7 @@ const SliceBits = struct {
 // Short copies dominate, so inline ladders avoid per-call memcpy overhead.
 inline fn copyMatchBuf(buf: []u8, end: usize, distance: u32, length: u32) usize {
     const len: usize = length;
-    if (comptime vector_match_copy) {
+    if (comptime use_vector_match_copy) {
         if (len <= 512) {
             return kernels.copyMatchCore(.{
                 .Ret = usize,
@@ -1156,11 +1156,11 @@ fn runLengthEncode(lengths: []const u8, symbols: []u8, values: []u8, cl_freq: *[
     var count: usize = 0;
     var i: usize = 0;
     while (i < lengths.len) {
-        const value = lengths[i];
+        const code_len = lengths[i];
         var run: usize = 1;
-        while (i + run < lengths.len and lengths[i + run] == value) run += 1;
+        while (i + run < lengths.len and lengths[i + run] == code_len) run += 1;
         i += run;
-        if (value == 0) {
+        if (code_len == 0) {
             while (run >= 11) {
                 const n = @min(run, 138);
                 symbols[count] = 18;
@@ -1184,8 +1184,8 @@ fn runLengthEncode(lengths: []const u8, symbols: []u8, values: []u8, cl_freq: *[
                 count += 1;
             }
         } else {
-            symbols[count] = value;
-            cl_freq[value] += 1;
+            symbols[count] = code_len;
+            cl_freq[code_len] += 1;
             count += 1;
             run -= 1;
             while (run >= 3) {
@@ -1198,8 +1198,8 @@ fn runLengthEncode(lengths: []const u8, symbols: []u8, values: []u8, cl_freq: *[
                 run -= n;
             }
             for (0..run) |_| {
-                symbols[count] = value;
-                cl_freq[value] += 1;
+                symbols[count] = code_len;
+                cl_freq[code_len] += 1;
                 count += 1;
             }
         }
@@ -1220,13 +1220,13 @@ pub fn DecompressOf(comptime variant: enum { deflate, deflate64 }) type {
             length_extra: []const u5,
             dist_base: []const u16,
             dist_extra: []const u5,
-            length_info: []const u32,
-            dist_info: []const u32,
+            length_packed: []const u32,
+            dist_packed: []const u32,
         };
 
         const config: InflateConfig = switch (variant) {
-            .deflate => .{ .window_size = 32768, .max_match = 258, .dist_max = 29, .hdist_max = 30, .length_base = &length_base, .length_extra = &length_extra, .dist_base = &dist_base, .dist_extra = &dist_extra, .length_info = &length_info, .dist_info = &dist_info },
-            .deflate64 => .{ .window_size = deflate64_window_size, .max_match = deflate64_max_match, .dist_max = 31, .hdist_max = 32, .length_base = &deflate64_length_base, .length_extra = &deflate64_length_extra, .dist_base = &deflate64_dist_base, .dist_extra = &deflate64_dist_extra, .length_info = &deflate64_length_info, .dist_info = &deflate64_dist_info },
+            .deflate => .{ .window_size = 32768, .max_match = 258, .dist_max = 29, .hdist_max = 30, .length_base = &length_base, .length_extra = &length_extra, .dist_base = &dist_base, .dist_extra = &dist_extra, .length_packed = &length_packed, .dist_packed = &dist_packed },
+            .deflate64 => .{ .window_size = deflate64_window_size, .max_match = deflate64_max_match, .dist_max = 31, .hdist_max = 32, .length_base = &deflate64_length_base, .length_extra = &deflate64_length_extra, .dist_base = &deflate64_dist_base, .dist_extra = &deflate64_dist_extra, .length_packed = &deflate64_length_packed, .dist_packed = &deflate64_dist_packed },
         };
 
         reader: std.Io.Reader,
@@ -1456,19 +1456,19 @@ pub fn DecompressOf(comptime variant: enum { deflate, deflate64 }) type {
         fn decodeDataSlice(d: *@This(), lit: anytype, distance_tree: anytype) InflateError!void {
             const r = &d.reader;
             if (lit.empty) return error.InvalidData;
-            var b: SliceBits = .{ .data = d.input.slice.data, .pos = d.input.slice.pos, .bits = d.bits, .count = d.bit_count };
+            var slice_bits: SliceBits = .{ .bytes = d.input.slice.data, .pos = d.input.slice.pos, .bits = d.bits, .bit_count = d.bit_count };
             var end = r.end;
             const buf = r.buffer;
             const lit_root_bits = lit.root_bits;
             const distance_root_bits = distance_tree.root_bits;
             defer {
-                d.input.slice.pos = b.pos;
-                d.bits = b.bits;
-                d.bit_count = b.count;
+                d.input.slice.pos = slice_bits.pos;
+                d.bits = slice_bits.bits;
+                d.bit_count = slice_bits.bit_count;
                 r.end = end;
             }
             while (end + config.max_match <= buf.len) {
-                const symbol = try b.decode(lit, lit_root_bits);
+                const symbol = try slice_bits.decode(lit, lit_root_bits);
                 if (symbol < 256) {
                     buf[end] = @intCast(symbol);
                     end += 1;
@@ -1479,13 +1479,13 @@ pub fn DecompressOf(comptime variant: enum { deflate, deflate64 }) type {
                     return;
                 }
                 if (symbol > 285) return error.InvalidData;
-                const linfo = config.length_info[symbol - 257];
-                const length = (linfo & 0xFFFF) + try b.take(@intCast(linfo >> 16));
+                const length_entry = config.length_packed[symbol - 257];
+                const length = (length_entry & 0xFFFF) + try slice_bits.take(@intCast(length_entry >> 16));
                 if (distance_tree.empty) return error.InvalidData;
-                const dsym = try b.decode(distance_tree, distance_root_bits);
+                const dsym = try slice_bits.decode(distance_tree, distance_root_bits);
                 if (dsym > config.dist_max) return error.InvalidData;
-                const dinfo = config.dist_info[dsym];
-                const distance = (dinfo & 0xFFFF) + try b.take(@intCast(dinfo >> 16));
+                const distance_entry = config.dist_packed[dsym];
+                const distance = (distance_entry & 0xFFFF) + try slice_bits.take(@intCast(distance_entry >> 16));
                 if (distance > end) return error.InvalidData;
                 end = copyMatchBuf(buf, end, distance, length);
             }
@@ -1608,8 +1608,8 @@ pub fn DecompressOf(comptime variant: enum { deflate, deflate64 }) type {
 
 pub const Decompress = DecompressOf(.deflate);
 pub const Decompress64 = DecompressOf(.deflate64);
-const fixed_lit_tree = buildTreeValue(10, 9216, &fixed_lit_lengths, false, false) catch @compileError("The fixed literal table failed to build.");
-const fixed_dist_tree = buildTreeValue(8, 4096, &fixed_dist_lengths, false, false) catch @compileError("The fixed distance table failed to build.");
+const fixed_lit_tree = buildTreeValue(10, 9216, &fixed_lit_lengths, false, false) catch @compileError("The fixed Huffman literal table failed to build.");
+const fixed_dist_tree = buildTreeValue(8, 4096, &fixed_dist_lengths, false, false) catch @compileError("The fixed Huffman distance table failed to build.");
 
 fn buildTreeValue(comptime max_root_bits: u5, comptime max_sub: usize, lengths: []const u8, allow_single: bool, allow_empty: bool) error{InvalidData}!Tree(max_root_bits, max_sub) {
     @setEvalBranchQuota(1_000_000);

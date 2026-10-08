@@ -48,7 +48,7 @@ fn suiteZstd(init: std.process.Init) !Status {
 fn suiteXz(init: std.process.Init) !Status {
     const build_dir = "zig-out/benchmark/build/xz";
     std.Io.Dir.cwd().access(init.io, build_dir, .{}) catch {
-        std.debug.print("xz tests: build dir missing; run the benchmark step first\n", .{});
+        std.debug.print("xz tests: the build directory is missing; run the benchmark step first\n", .{});
         return .skip;
     };
     return ctest(init, build_dir);
@@ -60,7 +60,7 @@ fn suiteXzOssfuzz(init: std.process.Init) !Status {
     defer std.heap.page_allocator.free(liblzma);
 
     std.Io.Dir.cwd().access(init.io, liblzma, .{}) catch {
-        std.debug.print("xz ossfuzz: building xz cmake first\n", .{});
+        std.debug.print("xz ossfuzz: build xz with CMake first\n", .{});
         if (run.exitCode(init, &.{
             "cmake",                   "-S",              "vendor/xz",           "-B",                    xz_build,
             "-DBUILD_SHARED_LIBS=OFF", "-DXZ_TOOL_XZ=ON", "-DXZ_TOOL_XZDEC=OFF", "-DXZ_TOOL_LZMADEC=OFF", "-DXZ_TOOL_LZMAINFO=OFF",

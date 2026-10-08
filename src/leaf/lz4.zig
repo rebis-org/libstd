@@ -7,8 +7,8 @@ const Failure = failure_prim.Failure;
 const kernels = @import("kernels.zig");
 const measurement = @import("../common/primitive/measurement.zig");
 
-// LZ4 frame format (spec: "LZ4 Frame Format Description") with independent
-// blocks. The block codec mirrors the reference greedy parser in vendor/lz4.
+// Frame layout follows the "LZ4 Frame Format Description" spec; the block codec
+// mirrors the reference greedy parser in vendor/lz4.
 
 pub const block_size_min: u32 = 64 * 1024;
 pub const block_size_max: u32 = 4 * 1024 * 1024;
@@ -24,17 +24,18 @@ const flag_dict_id: u8 = 0x01;
 const uncompressed_block: u32 = 0x80000000;
 
 const min_match = 4;
-const mf_limit = 12;
+const match_finder_guard = 12;
 const last_literals = 5;
-const min_length = mf_limit + 1;
-const run_mask = 15;
-const ml_mask = 15;
+const min_length = match_finder_guard + 1;
+const lit_len_mask = 15;
+const match_len_mask = 15;
 const skip_trigger = 6;
 const distance_max: u32 = 65535;
 const hash_log = 12;
 const hash_size = 1 << hash_log;
 const hash_prime: u32 = 2654435761;
-// LZ4HC-class matcher: wider hash plus a chain slot per position.
+// The LZ4HC matcher needs a wider hash plus a chain slot per position, so its
+// tables cost more than the greedy tables.
 const hc_hash_log = 15;
 const hc_hash_size = 1 << hc_hash_log;
 const hc_mask = hc_hash_size - 1;
@@ -50,7 +51,7 @@ pub const Options = struct {
     search_depth: u32 = 0,
 };
 
-fn blockCode(block_size: u32) Failure!u8 {
+fn blockSizeCode(block_size: u32) Failure!u8 {
     return switch (block_size) {
         64 * 1024 => 4,
         256 * 1024 => 5,
@@ -61,15 +62,15 @@ fn blockCode(block_size: u32) Failure!u8 {
 }
 
 pub fn encodeWorkspaceSize() usize {
-    return (hash_size + 2 * hc_hash_size) * @sizeOf(u32) + blockBound(block_size_max);
+    return (hash_size + 2 * hc_hash_size) * @sizeOf(u32) + blockCompressBound(block_size_max);
 }
 
 pub fn decodeWorkspaceSize() usize {
     return block_size_max;
 }
 
-// Worst case: every block stores raw plus its size word. Compressed blocks
-// stay under compressBound (n + n/255 + 16) which the stored path dominates.
+// Worst case: every block stores raw plus its size word. Compressed blocks stay
+// under compressBound (n + n/255 + 16), so the stored path sets this bound.
 pub fn encodedSizeBound(input_len: usize) usize {
     const blocks = input_len / block_size_max + 1;
     return header_size_max + 4 + input_len + input_len / 255 + blocks * 20 + checksum_length;
@@ -77,15 +78,15 @@ pub fn encodedSizeBound(input_len: usize) usize {
 
 const checksum_length = 4;
 
-fn blockBound(block_len: usize) usize {
+fn blockCompressBound(block_len: usize) usize {
     return block_len + block_len / 255 + 16;
 }
 
 pub fn frameContentSize(input: []const u8) Failure!?u64 {
     if (input.len < 7) return error.InvalidData;
     if (std.mem.readInt(u32, input[0..4], .little) != magic) return error.InvalidData;
-    const flg = input[4];
-    if (flg & flag_content_size == 0) return null;
+    const flags = input[4];
+    if (flags & flag_content_size == 0) return null;
     if (input.len < 14) return error.InvalidData;
     return std.mem.readInt(u64, input[6..14], .little);
 }
@@ -121,46 +122,45 @@ pub fn decodeInPlace(input: []const u8, output: []u8, scratch: []u8, options: Op
 
 pub fn encodeToWriter(input: []const u8, output: *std.Io.Writer, scratch: []u8, options: Options) Failure!void {
     if (scratch.len < encodeWorkspaceSize()) return error.InsufficientCapacity;
-    _ = try blockCode(options.block_size);
+    const block_size_byte = try blockSizeCode(options.block_size) << 4;
     var acceleration = options.acceleration;
     if (acceleration < 1) acceleration = 1;
     output.writeInt(u32, magic, .little) catch return error.IoFailure;
-    var flg: u8 = version_bits | flag_block_independence;
-    if (options.block_checksum) flg |= flag_block_checksum;
-    flg |= flag_content_size;
-    if (options.content_checksum) flg |= flag_content_checksum;
-    const bd = try blockCode(options.block_size);
+    var flags: u8 = version_bits | flag_block_independence;
+    if (options.block_checksum) flags |= flag_block_checksum;
+    flags |= flag_content_size;
+    if (options.content_checksum) flags |= flag_content_checksum;
     var header_hasher = checksum.XxHash32.init(0);
-    output.writeByte(flg) catch return error.IoFailure;
-    header_hasher.update(&.{flg});
-    output.writeByte(bd << 4) catch return error.IoFailure;
-    header_hasher.update(&.{bd << 4});
+    output.writeByte(flags) catch return error.IoFailure;
+    header_hasher.update(&.{flags});
+    output.writeByte(block_size_byte) catch return error.IoFailure;
+    header_hasher.update(&.{block_size_byte});
     var size_bytes: [8]u8 = undefined;
     std.mem.writeInt(u64, &size_bytes, input.len, .little);
     output.writeAll(&size_bytes) catch return error.IoFailure;
     header_hasher.update(&size_bytes);
     output.writeByte(@truncate(header_hasher.final() >> 8)) catch return error.IoFailure;
-    const table: []u32 = @alignCast(std.mem.bytesAsSlice(u32, scratch[0 .. hash_size * @sizeOf(u32)]));
+    const hash_table: []u32 = @alignCast(std.mem.bytesAsSlice(u32, scratch[0 .. hash_size * @sizeOf(u32)]));
     const hc_tables: []u32 = @alignCast(std.mem.bytesAsSlice(u32, scratch[hash_size * @sizeOf(u32) .. (hash_size + 2 * hc_hash_size) * @sizeOf(u32)]));
-    const work = scratch[(hash_size + 2 * hc_hash_size) * @sizeOf(u32) ..];
+    const block_buffer = scratch[(hash_size + 2 * hc_hash_size) * @sizeOf(u32) ..];
     var offset: usize = 0;
     while (offset < input.len) {
-        const chunk_len: usize = @min(input.len - offset, options.block_size);
-        const chunk = input[offset .. offset + chunk_len];
+        const block_len: usize = @min(input.len - offset, options.block_size);
+        const block = input[offset .. offset + block_len];
         const compressed_len = if (options.search_depth == 0)
-            compressBlock(chunk, work, table, acceleration)
+            compressBlock(block, block_buffer, hash_table, acceleration)
         else
-            compressBlockHc(chunk, work, hc_tables[0..hc_hash_size], hc_tables[hc_hash_size..], options.search_depth);
-        if (compressed_len >= chunk_len) {
-            output.writeInt(u32, uncompressed_block | (std.math.cast(u32, chunk_len) orelse return error.ResourceLimit), .little) catch return error.IoFailure;
-            output.writeAll(chunk) catch return error.IoFailure;
-            if (options.block_checksum) output.writeInt(u32, checksum.xxh32(chunk), .little) catch return error.IoFailure;
+            compressBlockHc(block, block_buffer, hc_tables[0..hc_hash_size], hc_tables[hc_hash_size..], options.search_depth);
+        if (compressed_len >= block_len) {
+            output.writeInt(u32, uncompressed_block | (std.math.cast(u32, block_len) orelse return error.ResourceLimit), .little) catch return error.IoFailure;
+            output.writeAll(block) catch return error.IoFailure;
+            if (options.block_checksum) output.writeInt(u32, checksum.xxh32(block), .little) catch return error.IoFailure;
         } else {
             output.writeInt(u32, std.math.cast(u32, compressed_len) orelse return error.ResourceLimit, .little) catch return error.IoFailure;
-            output.writeAll(work[0..compressed_len]) catch return error.IoFailure;
-            if (options.block_checksum) output.writeInt(u32, checksum.xxh32(work[0..compressed_len]), .little) catch return error.IoFailure;
+            output.writeAll(block_buffer[0..compressed_len]) catch return error.IoFailure;
+            if (options.block_checksum) output.writeInt(u32, checksum.xxh32(block_buffer[0..compressed_len]), .little) catch return error.IoFailure;
         }
-        offset += chunk_len;
+        offset += block_len;
     }
     if (input.len == 0) {
         // One empty block (single zero token) keeps the block stream well-formed.
@@ -180,22 +180,22 @@ fn decodeBlocks(input: []const u8, output: *std.Io.Writer, scratch: []u8) Failur
     if (scratch.len < block_size_max) return error.InsufficientCapacity;
     if (input.len < 7) return error.InvalidData;
     if (std.mem.readInt(u32, input[0..4], .little) != magic) return error.InvalidData;
-    const flg = input[4];
-    if ((flg & 0xC0) != version_bits) return error.Unsupported;
-    if (flg & flag_block_independence == 0) return error.Unsupported;
-    if (flg & flag_dict_id != 0) return error.Unsupported;
-    const bd = input[5];
-    const block_code = (bd >> 4) & 0x07;
+    const flags = input[4];
+    if ((flags & 0xC0) != version_bits) return error.Unsupported;
+    if (flags & flag_block_independence == 0) return error.Unsupported;
+    if (flags & flag_dict_id != 0) return error.Unsupported;
+    const block_size_byte = input[5];
+    const block_code = (block_size_byte >> 4) & 0x07;
     if (block_code < 4 or block_code > 7) return error.InvalidData;
     const max_block: usize = @as(usize, 65536) << @intCast(2 * (@as(usize, block_code) - 4));
     var offset: usize = 6;
-    if (flg & flag_content_size != 0) {
+    if (flags & flag_content_size != 0) {
         if (input.len < offset + 8) return error.InvalidData;
         offset += 8;
     }
-    if (flg & flag_dict_id != 0) offset += 4;
+    if (flags & flag_dict_id != 0) offset += 4;
     if (input.len <= offset) return error.InvalidData;
-    offset += 1; // header checksum
+    offset += 1;
     var content_hasher = checksum.XxHash32.init(0);
     var total: usize = 0;
     while (true) {
@@ -203,30 +203,30 @@ fn decodeBlocks(input: []const u8, output: *std.Io.Writer, scratch: []u8) Failur
         const block_size_field = std.mem.readInt(u32, input[offset..][0..4], .little);
         offset += 4;
         if (block_size_field == 0) break;
-        const stored = (block_size_field & uncompressed_block) != 0;
-        const payload_len: usize = @intCast(block_size_field & ~uncompressed_block);
-        if (input.len < offset + payload_len) return error.InvalidData;
-        const payload = input[offset .. offset + payload_len];
-        offset += payload_len;
-        if (flg & flag_block_checksum != 0) {
+        const is_stored = (block_size_field & uncompressed_block) != 0;
+        const block_len: usize = @intCast(block_size_field & ~uncompressed_block);
+        if (input.len < offset + block_len) return error.InvalidData;
+        const block_data = input[offset .. offset + block_len];
+        offset += block_len;
+        if (flags & flag_block_checksum != 0) {
             if (input.len < offset + 4) return error.InvalidData;
             const stored_sum = std.mem.readInt(u32, input[offset..][0..4], .little);
-            if (stored_sum != checksum.xxh32(payload)) return error.IntegrityFailure;
+            if (stored_sum != checksum.xxh32(block_data)) return error.IntegrityFailure;
             offset += 4;
         }
-        if (stored) {
-            if (payload_len > max_block) return error.InvalidData;
-            output.writeAll(payload) catch return error.IoFailure;
-            content_hasher.update(payload);
-            total = try bounds.add(total, payload_len);
+        if (is_stored) {
+            if (block_len > max_block) return error.InvalidData;
+            output.writeAll(block_data) catch return error.IoFailure;
+            content_hasher.update(block_data);
+            total = try bounds.addUsize(total, block_len);
         } else {
-            const produced = decompressBlock(payload, scratch[0..max_block]) catch return error.InvalidData;
+            const produced = decompressBlock(block_data, scratch[0..max_block]) catch return error.InvalidData;
             output.writeAll(scratch[0..produced]) catch return error.IoFailure;
             content_hasher.update(scratch[0..produced]);
-            total = try bounds.add(total, produced);
+            total = try bounds.addUsize(total, produced);
         }
     }
-    if (flg & flag_content_checksum != 0) {
+    if (flags & flag_content_checksum != 0) {
         if (input.len < offset + 4) return error.InvalidData;
         const stored_sum = std.mem.readInt(u32, input[offset..][0..4], .little);
         if (stored_sum != content_hasher.final()) return error.IntegrityFailure;
@@ -240,30 +240,29 @@ fn hash4(value: u32) usize {
     return (value *% hash_prime) >> @intCast(32 - hash_log);
 }
 
-// Mirrors LZ4_compress_generic_validated for a single segment (no dict): skip
-// escalation on incompressible runs, catch-up, and the test-next-position step.
-// The carried forward_hash chain matches the reference: a search probe reads
-// and writes the same slot, and the first probe after a match uses the hash
-// carried from the search that found it, never the slot the test-next step
-// just wrote for the current position (that self-match would emit offset 0).
-fn compressBlock(input: []const u8, output: []u8, table: []u32, acceleration: u32) usize {
-    @memset(table, 0);
+// Mirrors LZ4_compress_generic_validated for one segment with no dictionary:
+// skip escalation, catch-up, and the test-next-position step. A probe reads and
+// writes the same slot, so the first probe after a match uses the carried hash,
+// never the slot the test-next step wrote for the current position; that
+// self-match would emit offset 0.
+fn compressBlock(input: []const u8, output: []u8, hash_table: []u32, acceleration: u32) usize {
+    @memset(hash_table, 0);
     var op: usize = 0;
-    const len = input.len;
-    if (len == 0) {
+    const input_len = input.len;
+    if (input_len == 0) {
         output[0] = 0;
         return 1;
     }
-    if (len < min_length) {
+    if (input_len < min_length) {
         op = emitLastLiterals(input, output, 0);
         return op;
     }
     var ip: usize = 1;
     var anchor: usize = 0;
-    const mflimit_plus_one = len - mf_limit + 1;
-    const match_limit = len - last_literals;
+    const search_stop = input_len - match_finder_guard + 1;
+    const match_limit = input_len - last_literals;
     var token_pos: usize = 0;
-    table[hash4(std.mem.readInt(u32, input[0..4], .little))] = 1;
+    hash_table[hash4(std.mem.readInt(u32, input[0..4], .little))] = 1;
     var forward_hash = hash4(std.mem.readInt(u32, input[1..][0..4], .little));
     outer: while (true) {
         var match: usize = 0;
@@ -273,15 +272,15 @@ fn compressBlock(input: []const u8, output: []u8, table: []u32, acceleration: u3
             var step: usize = 1;
             var search_match_nb = acceleration << skip_trigger;
             while (true) {
-                const h = forward_hash;
+                const hash_slot = forward_hash;
                 ip = forward_ip;
                 forward_ip += step;
                 step = search_match_nb >> skip_trigger;
                 search_match_nb += 1;
-                if (forward_ip > mflimit_plus_one) break :outer;
+                if (forward_ip > search_stop) break :outer;
                 forward_hash = hash4(std.mem.readInt(u32, input[forward_ip..][0..4], .little));
-                match_index = table[h];
-                table[h] = @intCast(ip + 1);
+                match_index = hash_table[hash_slot];
+                hash_table[hash_slot] = @intCast(ip + 1);
                 if (match_index == 0) continue;
                 match_index -= 1;
                 if (match_index >= ip) continue;
@@ -298,9 +297,9 @@ fn compressBlock(input: []const u8, output: []u8, table: []u32, acceleration: u3
         op += 1;
         {
             const lit_len = ip - anchor;
-            if (lit_len >= run_mask) {
-                output[token_pos] = run_mask << 4;
-                var rest = lit_len - run_mask;
+            if (lit_len >= lit_len_mask) {
+                output[token_pos] = lit_len_mask << 4;
+                var rest = lit_len - lit_len_mask;
                 while (rest >= 255) : (rest -= 255) {
                     output[op] = 255;
                     op += 1;
@@ -318,9 +317,9 @@ fn compressBlock(input: []const u8, output: []u8, table: []u32, acceleration: u3
             op += 2;
             const match_len = kernels.matchLen8(input, match + min_match, ip + min_match, match_limit - ip);
             ip += match_len + min_match;
-            if (match_len >= ml_mask) {
-                output[token_pos] += ml_mask;
-                var rest = match_len - ml_mask;
+            if (match_len >= match_len_mask) {
+                output[token_pos] += match_len_mask;
+                var rest = match_len - match_len_mask;
                 while (rest >= 255) : (rest -= 255) {
                     output[op] = 255;
                     op += 1;
@@ -331,11 +330,11 @@ fn compressBlock(input: []const u8, output: []u8, table: []u32, acceleration: u3
                 output[token_pos] += @as(u8, @intCast(match_len));
             }
             anchor = ip;
-            if (ip >= mflimit_plus_one) break :outer;
-            table[hash4(std.mem.readInt(u32, input[ip - 2 ..][0..4], .little))] = @intCast(ip - 1);
-            const h = hash4(std.mem.readInt(u32, input[ip..][0..4], .little));
-            match_index = table[h];
-            table[h] = @intCast(ip + 1);
+            if (ip >= search_stop) break :outer;
+            hash_table[hash4(std.mem.readInt(u32, input[ip - 2 ..][0..4], .little))] = @intCast(ip - 1);
+            const hash_slot = hash4(std.mem.readInt(u32, input[ip..][0..4], .little));
+            match_index = hash_table[hash_slot];
+            hash_table[hash_slot] = @intCast(ip + 1);
             if (match_index != 0) {
                 match_index -= 1;
                 if (match_index < ip and match_index + distance_max >= ip and std.mem.readInt(u32, input[match_index..][0..4], .little) == std.mem.readInt(u32, input[ip..][0..4], .little)) {
@@ -357,62 +356,62 @@ fn compressBlock(input: []const u8, output: []u8, table: []u32, acceleration: u3
 // the longer of the two candidate matches (LZ4HC_compress_hashChain semantics).
 fn compressBlockHc(input: []const u8, output: []u8, head: []u32, chain: []u32, search_depth: u32) usize {
     @memset(head, 0);
-    const len = input.len;
-    if (len < min_length) return emitLastLiterals(input, output, 0);
+    const input_len = input.len;
+    if (input_len < min_length) return emitLastLiterals(input, output, 0);
     var op: usize = 0;
     var anchor: usize = 0;
     var ip: usize = 0;
-    const mflimit = len - mf_limit;
-    const match_limit = len - last_literals;
+    const search_stop = input_len - match_finder_guard;
+    const match_limit = input_len - last_literals;
     var attempts = search_depth;
 
     while (true) {
         var best = hcSearch(input, head, chain, ip, &attempts, match_limit);
-        if (best.len == 0) {
+        if (best.match_len == 0) {
             ip += 1;
-            if (ip > mflimit) break;
+            if (ip > search_stop) break;
             attempts = search_depth;
             continue;
         }
-        if (best.len < match_limit - ip and ip + 1 <= mflimit) {
+        if (best.match_len < match_limit - ip and ip + 1 <= search_stop) {
             var probe_attempts = search_depth;
             const probe = hcSearch(input, head, chain, ip + 1, &probe_attempts, match_limit);
-            if (probe.len > best.len) {
+            if (probe.match_len > best.match_len) {
                 ip += 1;
                 best = probe;
             }
         }
-        op = emitSequence(input, output, op, anchor, ip, best.index, best.len);
-        ip += best.len;
+        op = emitSequence(input, output, op, anchor, ip, best.match_index, best.match_len);
+        ip += best.match_len;
         anchor = ip;
-        if (ip > mflimit) break;
+        if (ip > search_stop) break;
         attempts = search_depth;
     }
     return emitLastLiterals(input[anchor..], output, op);
 }
 
-const HcMatch = struct { index: usize, len: usize };
+const HcMatch = struct { match_index: usize, match_len: usize };
 
-// Insert position ip into its bucket chain and search the chain that preceded
-// it (mirroring LZ4HC_InsertAndGetWiderMatch: inserting first guarantees the
-// walk never self-matches). The attempt budget decrements per candidate; the
-// chain strictly decreases so the window check also bounds the walk.
+// Insert position ip into its bucket chain and search the chain that preceded it
+// (mirroring LZ4HC_InsertAndGetWiderMatch: inserting first keeps the walk from
+// self-matching). The attempt budget decrements per candidate, and the chain
+// strictly decreases, so the window check also bounds the walk.
 fn hcSearch(input: []const u8, head: []u32, chain: []u32, ip: usize, attempts: *u32, match_limit: usize) HcMatch {
-    const h = hash4(std.mem.readInt(u32, input[ip..][0..4], .little));
-    var candidate = head[h];
+    const hash_slot = hash4(std.mem.readInt(u32, input[ip..][0..4], .little));
+    var candidate = head[hash_slot];
     chain[ip & hc_mask] = candidate;
-    head[h] = @intCast(ip + 1);
+    head[hash_slot] = @intCast(ip + 1);
     const needle = std.mem.readInt(u32, input[ip..][0..4], .little);
-    var best: HcMatch = .{ .index = 0, .len = 0 };
+    var best: HcMatch = .{ .match_index = 0, .match_len = 0 };
     while (candidate != 0 and attempts.* > 0) : (attempts.* -= 1) {
         const index = candidate - 1;
         candidate = chain[index & hc_mask];
         if (index + distance_max < ip) break;
         if (std.mem.readInt(u32, input[index..][0..4], .little) != needle) continue;
         const extra = kernels.matchLen8(input, index + min_match, ip + min_match, match_limit - ip);
-        if (min_match + extra > best.len) {
-            best = .{ .index = index, .len = min_match + extra };
-            if (ip + best.len >= match_limit) break;
+        if (min_match + extra > best.match_len) {
+            best = .{ .match_index = index, .match_len = min_match + extra };
+            if (ip + best.match_len >= match_limit) break;
         }
     }
     return best;
@@ -423,9 +422,9 @@ fn emitSequence(input: []const u8, output: []u8, op_start: usize, anchor: usize,
     const token_pos = op;
     op += 1;
     const lit_len = ip - anchor;
-    if (lit_len >= run_mask) {
-        output[token_pos] = run_mask << 4;
-        var rest = lit_len - run_mask;
+    if (lit_len >= lit_len_mask) {
+        output[token_pos] = lit_len_mask << 4;
+        var rest = lit_len - lit_len_mask;
         while (rest >= 255) : (rest -= 255) {
             output[op] = 255;
             op += 1;
@@ -439,10 +438,10 @@ fn emitSequence(input: []const u8, output: []u8, op_start: usize, anchor: usize,
     op += lit_len;
     std.mem.writeInt(u16, output[op..][0..2], @intCast(ip - match_index), .little);
     op += 2;
-    const stored = match_len - min_match;
-    if (stored >= ml_mask) {
-        output[token_pos] += ml_mask;
-        var rest = stored - ml_mask;
+    const encoded_match_len = match_len - min_match;
+    if (encoded_match_len >= match_len_mask) {
+        output[token_pos] += match_len_mask;
+        var rest = encoded_match_len - match_len_mask;
         while (rest >= 255) : (rest -= 255) {
             output[op] = 255;
             op += 1;
@@ -450,7 +449,7 @@ fn emitSequence(input: []const u8, output: []u8, op_start: usize, anchor: usize,
         output[op] = @intCast(rest);
         op += 1;
     } else {
-        output[token_pos] += @as(u8, @intCast(stored));
+        output[token_pos] += @as(u8, @intCast(encoded_match_len));
     }
     return op;
 }
@@ -458,10 +457,10 @@ fn emitSequence(input: []const u8, output: []u8, op_start: usize, anchor: usize,
 fn emitLastLiterals(literals: []const u8, output: []u8, op_start: usize) usize {
     var op = op_start;
     const lit_len = literals.len;
-    if (lit_len >= run_mask) {
-        output[op] = run_mask << 4;
+    if (lit_len >= lit_len_mask) {
+        output[op] = lit_len_mask << 4;
         op += 1;
-        var rest = lit_len - run_mask;
+        var rest = lit_len - lit_len_mask;
         while (rest >= 255) : (rest -= 255) {
             output[op] = 255;
             op += 1;
@@ -484,7 +483,7 @@ fn decompressBlock(input: []const u8, output: []u8) error{InvalidData}!usize {
         const token = input[ip];
         ip += 1;
         var lit_len: usize = token >> 4;
-        if (lit_len == run_mask) {
+        if (lit_len == lit_len_mask) {
             while (true) {
                 if (ip >= input.len) return error.InvalidData;
                 const value = input[ip];
@@ -505,7 +504,7 @@ fn decompressBlock(input: []const u8, output: []u8) error{InvalidData}!usize {
         ip += 2;
         if (offset == 0 or offset > op) return error.InvalidData;
         var match_len: usize = (token & 0x0f) + min_match;
-        if ((token & 0x0f) == ml_mask) {
+        if ((token & 0x0f) == match_len_mask) {
             while (true) {
                 if (ip >= input.len) return error.InvalidData;
                 const value = input[ip];
