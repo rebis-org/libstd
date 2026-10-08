@@ -43,6 +43,7 @@ pub const Options = struct {
     dictionary_size: u32,
     check: CheckType,
     filters: FilterChoice = .none,
+    delta_distance: u8 = 1,
     match_finder_depth: u32 = 32,
     lazy: bool = false,
     nice_len: u32 = 273,
@@ -523,6 +524,7 @@ pub fn encode(input: []const u8, output: []u8, scratch: []u8, options: Options) 
 }
 
 fn encodeInternal(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options: Options) Failure!void {
+    if (options.filters == .delta and (options.delta_distance < 1 or options.delta_distance > 255)) return error.InvalidCall;
     // One LZMA2 encoder keeps the dictionary continuous instead of resetting it per chunk.
     try encodeStream(writer, input, scratch, options);
 }
@@ -547,11 +549,11 @@ fn encodeStream(writer: *std.Io.Writer, input: []const u8, scratch: []u8, option
         if (remaining_scratch.len < input.len) return error.InsufficientCapacity;
         const buffer = remaining_scratch[0..input.len];
         @memcpy(buffer, input);
-        try applyEncodeFilter(options.filters, buffer);
+        try applyEncodeFilter(options.filters, options.delta_distance, buffer);
         break :blk buffer;
     } else input;
     try writeStreamHeader(writer, options.check);
-    const block_header = try buildBlockHeader(input.len, dictionary_props, options.filters);
+    const block_header = try buildBlockHeader(input.len, dictionary_props, options.filters, options.delta_distance);
     try io.writeBytes(writer, block_header.slice());
     var count_tee = tee.Tee.init(writer);
     try lzma2.encodeToWriter(filtered, &count_tee.writer, lzma_scratch, lzma_options);
@@ -578,10 +580,10 @@ fn encodeStream(writer: *std.Io.Writer, input: []const u8, scratch: []u8, option
     try writeStreamFooter(writer, options.check, index_size);
 }
 
-fn applyEncodeFilter(filter: FilterChoice, buffer: []u8) Failure!void {
+fn applyEncodeFilter(filter: FilterChoice, delta_distance: u8, buffer: []u8) Failure!void {
     switch (filter) {
         .none => {},
-        .delta => delta.encode(buffer, 1),
+        .delta => delta.encode(buffer, delta_distance),
         .x86, .ppc, .ia64, .arm, .armt, .sparc, .arm64, .riscv => bcj.encode(bcjKindFromChoice(filter), 0, buffer),
     }
 }
@@ -620,14 +622,14 @@ const BlockHeader = struct {
     }
 };
 
-fn buildBlockHeader(uncompressed_size: usize, dictionary_props: u8, filters: FilterChoice) Failure!BlockHeader {
+fn buildBlockHeader(uncompressed_size: usize, dictionary_props: u8, filters: FilterChoice, delta_distance: u8) Failure!BlockHeader {
     var content: [60]u8 = undefined;
     var cursor = binary.WriteCursor.init(&content);
     cursor.writeULEB128(uncompressed_size) catch return error.InternalFailure;
     if (filters != .none) {
         cursor.writeULEB128(filterId(filters)) catch return error.InternalFailure;
         cursor.writeULEB128(filterPropsSize(filters)) catch return error.InternalFailure;
-        if (filters == .delta) cursor.writeU8(1) catch return error.InternalFailure;
+        if (filters == .delta) cursor.writeU8(delta_distance) catch return error.InternalFailure;
     }
     cursor.writeULEB128(0x21) catch return error.InternalFailure;
     cursor.writeULEB128(1) catch return error.InternalFailure;
@@ -729,4 +731,62 @@ fn checkSize(check: CheckType) usize {
         .crc64 => 8,
         .sha256 => 32,
     };
+}
+
+test "xz delta filter honors the requested distance" {
+    const allocator = std.testing.allocator;
+    var input: [512]u8 = undefined;
+    for (&input, 0..) |*byte, i| byte.* = @truncate(i *% 7 +% 3);
+    const dictionary_size: u32 = 1 << 20;
+    const scratch = try allocator.alloc(u8, encodeWorkspaceSizeBt(dictionary_size));
+    defer allocator.free(scratch);
+    const bound = encodedSizeBound(input.len);
+    const encoded = try allocator.alloc(u8, bound);
+    defer allocator.free(encoded);
+    const options: Options = .{
+        .dictionary_size = dictionary_size,
+        .check = .crc32,
+        .filters = .delta,
+        .delta_distance = 4,
+    };
+    const encoded_len = try encode(&input, encoded, scratch, options);
+
+    const decode_scratch = try allocator.alloc(u8, decodeWorkspaceSize(dictionary_size));
+    defer allocator.free(decode_scratch);
+    const output = try allocator.alloc(u8, input.len);
+    defer allocator.free(output);
+    const decoded = try decode(encoded[0..encoded_len], output, decode_scratch);
+    try std.testing.expectEqualSlices(u8, &input, output[0..decoded]);
+
+    // The delta distance is carried in the block header, not hardcoded to 1.
+    const header = findBlockHeader(encoded[0..encoded_len]) orelse return error.TestUnexpectedError;
+    try std.testing.expectEqual(@as(u8, 4), header);
+}
+
+test "xz delta filter rejects zero distance" {
+    var input: [16]u8 = @splat(1);
+    var output: [256]u8 = undefined;
+    var scratch: [4096]u8 = undefined;
+    const options: Options = .{
+        .dictionary_size = 1 << 20,
+        .check = .crc32,
+        .filters = .delta,
+        .delta_distance = 0,
+    };
+    try std.testing.expectError(error.InvalidCall, encode(&input, &output, &scratch, options));
+}
+
+// The delta filter props byte lives in the first block header, after the
+// ULEB128 uncompressed size and the filter id / props-size bytes.
+fn findBlockHeader(stream: []const u8) ?u8 {
+    if (stream.len < 16) return null;
+    const header_size = @as(usize, stream[12]) * 4;
+    const end = 12 + header_size;
+    if (stream.len < end) return null;
+    var i: usize = 13;
+    while (i < end and (stream[i] & 0x80) != 0) i += 1;
+    i += 1; // final ULEB size byte
+    if (i + 2 >= end) return null;
+    if (stream[i] != 0x03 or stream[i + 1] != 1) return null;
+    return stream[i + 2];
 }

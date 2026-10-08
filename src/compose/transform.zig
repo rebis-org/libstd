@@ -925,6 +925,19 @@ pub fn xzHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource,
         comptime discovery.parameter("xz", "filters").family,
         comptime discovery.parameter("xz", "filters").ordinal,
     ));
+    var delta_distance: u8 = 1;
+    if (filters == .delta) {
+        // The delta component's own selector carries the distance; the block
+        // header round-trips it so decoders apply the same transform.
+        if (node_graph.findSelector(
+            call.request,
+            comptime discovery.parameter("delta", "distance").family,
+            comptime discovery.parameter("delta", "distance").ordinal,
+        )) |node| {
+            if (node.value_low < 1 or node.value_low > 255) return error.InvalidCall;
+            delta_distance = @intCast(node.value_low);
+        }
+    }
     const params = try parseLzmaMatchParams(call.request, command_mask);
     if (command_mask == vocabulary.command_mask_read) {
         var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
@@ -952,6 +965,7 @@ pub fn xzHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource,
             .dictionary_size = dictionary_size,
             .check = check,
             .filters = filters,
+            .delta_distance = delta_distance,
             .match_finder_depth = params.match_finder_depth,
             .lazy = params.lazy,
             .nice_len = params.nice_len,

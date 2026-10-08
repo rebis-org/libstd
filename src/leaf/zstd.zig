@@ -8,7 +8,7 @@ const ReadCursor = binary.ReadCursor;
 const checksum = @import("../common/primitive/checksum.zig");
 const huffman = @import("../common/primitive/huffman.zig");
 const tee = @import("../common/primitive/tee.zig");
-const kernels = @import("kernels.zig");
+const kernels = @import("../common/kernels.zig");
 
 // NEON is baseline on aarch64, so the wide match-copy path needs no extra
 // target feature. Other targets keep the portable word-at-a-time path.
@@ -361,28 +361,34 @@ pub fn encodeStream(input: *std.Io.Reader, output: *std.Io.Writer, history: []u8
     if (options.nice_len < min_match_len) return error.InvalidData;
     if (options.search_window == 0) return error.InvalidData;
     const dictionary = options.dictionary orelse &.{};
-    const needed_history = @as(usize, options.window_size) + block_size_max + dictionary.len;
+    // Preload only the content view, like the decoder; formatted dictionaries
+    // carry magic/ID/entropy tables that are not match-finder material.
+    const dict_content: []const u8 = if (dictionary.len >= 8 and std.mem.readInt(u32, dictionary[0..4], .little) == dictionary_magic)
+        dictionaryContent(dictionary) catch return error.InvalidData
+    else
+        dictionary;
+    const needed_history = @as(usize, options.window_size) + block_size_max + dict_content.len;
     if (history.len < needed_history) return error.InvalidData;
     const frame_cap = if (useFixedTables(options))
-        @min(history.len - dictionary.len - block_size_max, encoder_frame_size_max)
+        @min(history.len - dict_content.len - block_size_max, encoder_frame_size_max)
     else
         @min(options.window_size, encoder_frame_size_max);
-    if (workspace.len < encoderWorkspaceU32Count(dictionary.len, frame_cap, options)) return error.InvalidData;
+    if (workspace.len < encoderWorkspaceU32Count(dict_content.len, frame_cap, options)) return error.InvalidData;
     var total_encoded: u64 = 0;
     var total_input: u64 = 0;
     var is_empty = true;
-    @memcpy(history[0..dictionary.len], dictionary);
+    @memcpy(history[0..dict_content.len], dict_content);
     while (true) {
-        const frame_len = try readFrameInput(input, history[dictionary.len..], frame_cap, options.max_decoded_bytes, &total_input);
+        const frame_len = try readFrameInput(input, history[dict_content.len..], frame_cap, options.max_decoded_bytes, &total_input);
         if (frame_len == 0) {
             if (is_empty) {
-                const written = try encodeFrame(output, history[dictionary.len..][0..0], workspace, options, 0);
+                const written = try encodeFrame(output, history[dict_content.len..][0..0], workspace, options, 0);
                 total_encoded = try checkedAdd(total_encoded, written, options.max_encoded_bytes);
             }
             break;
         }
         is_empty = false;
-        const written = try encodeFrame(output, history[0 .. dictionary.len + frame_len], workspace, options, dictionary.len);
+        const written = try encodeFrame(output, history[0 .. dict_content.len + frame_len], workspace, options, dict_content.len);
         total_encoded = try checkedAdd(total_encoded, written, options.max_encoded_bytes);
     }
     if (total_input > options.max_decoded_bytes) return error.ResourceLimit;
@@ -418,14 +424,19 @@ pub fn encodeFrame(output: *std.Io.Writer, content: []const u8, workspace: []u32
     var counted = tee.CountingTee(.{}).init(output);
     try writeU32le(&counted.writer, frame_magic);
     const frame_len = content.len - content_start;
-    try writeFrameHeader(&counted.writer, frame_len, options.window_size);
+    var dictionary_id: u32 = 0;
+    if (options.dictionary) |dict| {
+        if (dict.len >= 8 and std.mem.readInt(u32, dict[0..4], .little) == dictionary_magic)
+            dictionary_id = std.mem.readInt(u32, dict[4..8], .little);
+    }
+    try writeFrameHeader(&counted.writer, frame_len, options.window_size, dictionary_id);
     var hasher = checksum.XxHash64.init(0);
     try encodeBlocks(&counted.writer, content, content_start, workspace, options, &hasher);
     try writeU32le(&counted.writer, @truncate(hasher.final()));
     return std.math.cast(usize, counted.written()) orelse error.ResourceLimit;
 }
 
-fn writeFrameHeader(writer: *std.Io.Writer, content_size: usize, window_size: u32) EncodeError!void {
+fn writeFrameHeader(writer: *std.Io.Writer, content_size: usize, window_size: u32, dictionary_id: u32) EncodeError!void {
     var content_size_flag: u2 = 0;
     var field_size: u4 = 1;
     var encoded_content_size: u64 = content_size;
@@ -440,9 +451,26 @@ fn writeFrameHeader(writer: *std.Io.Writer, content_size: usize, window_size: u3
         field_size = 2;
         encoded_content_size -%= 256;
     }
+    var did_flag: u2 = 0;
+    var did_size: u4 = 0;
+    if (dictionary_id != 0) {
+        if (dictionary_id <= 0xFF) {
+            did_flag = 1;
+            did_size = 1;
+        } else if (dictionary_id <= 0xFFFF) {
+            did_flag = 2;
+            did_size = 2;
+        } else {
+            did_flag = 3;
+            did_size = 4;
+        }
+    }
     const single_segment = content_size <= 0xFFFF and content_size <= window_size;
-    const descriptor: u8 = (@as(u8, content_size_flag) << 6) | 0x04 | (if (single_segment) @as(u8, 0x20) else @as(u8, 0));
+    const descriptor: u8 = (@as(u8, content_size_flag) << 6) | 0x04 | (if (single_segment) @as(u8, 0x20) else @as(u8, 0)) | @as(u8, did_flag);
     try writeByte(writer, descriptor);
+    for (0..did_size) |i| {
+        try writeByte(writer, @truncate(dictionary_id >> @intCast(i * 8)));
+    }
     if (!single_segment) {
         try writeByte(writer, encodeWindowDescriptor(window_size));
     }
@@ -476,6 +504,25 @@ fn encodeBlocks(output: *std.Io.Writer, content: []const u8, content_start: usiz
     else
         workspace[hash_size .. hash_size + @max(content.len, dfastShortTableSize(options))];
     if (useDfast(options)) @memset(chain, encoder_no_position);
+    // Seed the finders with the dictionary region so emitted sequences can
+    // address it. The chain path links positions through chain[]; dfast uses
+    // single-candidate long/short tables with no walk, so a plain dual insert
+    // suffices. Row tables are tag-indexed and stay unseeded.
+    if (!useRowMatch(options) and content_start > 0) {
+        if (useDfast(options)) {
+            const long_bits = options.hash_bits;
+            const short_bits = long_bits - 1;
+            var seed: usize = 0;
+            while (seed + 8 <= content.len and seed < content_start) : (seed += 1) {
+                head[hash8At(content, seed, long_bits)] = @intCast(seed);
+                chain[hash5At(content, seed, short_bits)] = @intCast(seed);
+            }
+        } else {
+            var seed: usize = 0;
+            while (seed < content_start) : (seed += 1)
+                insertPosition(content, seed, content.len, head, chain, options);
+        }
+    }
     const block_workspace = workspace[hash_size + chain.len ..];
     var offset: usize = 0;
     var repeat_offsets = [3]u32{ start_repeated_offset_1, start_repeated_offset_2, start_repeated_offset_3 };
@@ -2361,8 +2408,8 @@ const BackwardBitStream = struct {
 pub fn dictionaryContent(dictionary: []const u8) DecodeError![]const u8 {
     if (dictionary.len < 8) return error.InvalidData;
     if (std.mem.readInt(u32, dictionary[0..4], .little) != dictionary_magic) return dictionary;
-    const dictionary_id = std.mem.readInt(u32, dictionary[4..8], .little);
-    if (dictionary_id == 0) return error.InvalidData;
+    // RFC 8878 permits a zero Dictionary_ID (it means "unspecified"); only
+    // the raw-content fast path (magic mismatch) bypasses parsing entirely.
     var cursor = binary.ReadCursor.init(dictionary[8..]);
     var tree: HuffmanTree = .{ .nodes = undefined };
     try decodeHuffmanTree(&cursor, &tree);
@@ -3900,4 +3947,79 @@ test "zstd dictionary trainer produces a loadable dictionary" {
     // The content view is the selected segments, capped by the request.
     const content = try dictionaryContent(dict_buffer[0..dict_len]);
     try std.testing.expect(content.len <= 512 - dictionary_header_size);
+}
+
+test "zstd encoder seeds dictionary matches and writes dictionary id" {
+    const allocator = std.testing.allocator;
+    const sample_texts = [_][]const u8{
+        "the quick brown fox jumps over the lazy dog and keeps running through the forest",
+        "pack my box with five dozen liquor jugs, then seal the box with heavy tape",
+        "how vexingly quick daft zebras jump over the lazy dogs in the meadow",
+        "the five boxing wizards jump quickly while the lazy dogs sleep all day",
+    };
+    var samples: [4][]const u8 = undefined;
+    for (sample_texts, 0..) |text, i| samples[i] = text;
+    const train_scratch = try allocator.alloc(u8, trainWorkspaceSize());
+    defer allocator.free(train_scratch);
+    var dict_buffer: [512]u8 = undefined;
+    const dict_len = try trainDictionary(&samples, dict_buffer.len, &dict_buffer, train_scratch);
+    const dictionary = dict_buffer[0..dict_len];
+
+    // Input taken from the dictionary content itself: the no-dict encode has
+    // nothing to match against, the seeded encode reaches back into the dict.
+    const dict_content = try dictionaryContent(dictionary);
+    const input = dict_content[0..@min(dict_content.len, 120)];
+    const window: u32 = 1 << 16;
+    const base_options: Options = .{ .window_size = window, .hash_bits = 12, .max_chain = 16, .nice_len = 32, .search_window = 4096 };
+
+    const with_dict = try allocator.alloc(u8, encodedSizeBound(input.len, .{ .window_size = window }) + 64);
+    defer allocator.free(with_dict);
+    const without_dict = try allocator.alloc(u8, encodedSizeBound(input.len, .{ .window_size = window }) + 64);
+    defer allocator.free(without_dict);
+
+    const history = try allocator.alloc(u8, @as(usize, window) + block_size_max + dictionary.len);
+    defer allocator.free(history);
+    const workspace = try allocator.alloc(u32, encoderWorkspaceU32Count(dictionary.len, window, base_options));
+    defer allocator.free(workspace);
+
+    var source = std.Io.Reader.fixed(input);
+    var with_sink = std.Io.Writer.fixed(with_dict);
+    const with_options: Options = .{ .window_size = window, .hash_bits = 12, .max_chain = 16, .nice_len = 32, .search_window = 4096, .dictionary = dictionary };
+    const with_len = try encodeStream(&source, &with_sink, history, workspace, with_options);
+
+    const plain_history = try allocator.alloc(u8, @as(usize, window) + block_size_max);
+    defer allocator.free(plain_history);
+    var plain_source = std.Io.Reader.fixed(input);
+    var without_sink = std.Io.Writer.fixed(without_dict);
+    const without_len = try encodeStream(&plain_source, &without_sink, plain_history, workspace, base_options);
+
+    try std.testing.expect(with_len < without_len);
+    // Frame header carries the Dictionary_ID (FHD low bits nonzero).
+    try std.testing.expect(with_dict[4] & 0x03 != 0);
+    const decoded = try allocator.alloc(u8, input.len);
+    defer allocator.free(decoded);
+    var encoded_source = std.Io.Reader.fixed(with_dict[0..with_len]);
+    var decoded_sink = std.Io.Writer.fixed(decoded);
+    _ = try decodeStream(&encoded_source, &decoded_sink, history, .{ .window_size = window, .dictionary = dictionary });
+    try std.testing.expectEqualSlices(u8, input, decoded);
+
+    // A frame declaring a Dictionary_ID refuses to decode without it.
+    var bare_source = std.Io.Reader.fixed(with_dict[0..with_len]);
+    var bare_sink = std.Io.Writer.fixed(decoded);
+    try std.testing.expectError(error.Unsupported, decodeStream(&bare_source, &bare_sink, plain_history, .{ .window_size = window }));
+}
+
+test "zstd dictionary content accepts zero dictionary id" {
+    const allocator = std.testing.allocator;
+    const sample_texts = [_][]const u8{ "alpha bravo charlie delta echo foxtrot golf hotel", "alpha bravo charlie delta echo foxtrot golf hotel" };
+    var samples: [2][]const u8 = undefined;
+    for (sample_texts, 0..) |text, i| samples[i] = text;
+    const train_scratch = try allocator.alloc(u8, trainWorkspaceSize());
+    defer allocator.free(train_scratch);
+    var dict_buffer: [512]u8 = undefined;
+    const dict_len = try trainDictionary(&samples, dict_buffer.len, &dict_buffer, train_scratch);
+    // RFC 8878: Dictionary_ID 0 means unspecified and must still load.
+    std.mem.writeInt(u32, dict_buffer[4..8], 0, .little);
+    const content = try dictionaryContent(dict_buffer[0..dict_len]);
+    try std.testing.expect(content.len > 0);
 }
