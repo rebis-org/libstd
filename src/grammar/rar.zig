@@ -81,6 +81,13 @@ pub const DecodeOptions = struct {
     // Header-decryption staging for -hp archives. Must cover the largest
     // header (RAR5 caps at 2 MiB, RAR4 at 64 KiB aligned).
     scratch: []u8 = &.{},
+    // Caller-side KDF budget in HMAC/SHA rounds: refuses work above the limit
+    // with .kdf_limit instead of running it. 0 means no limit.
+    kdf_rounds_limit: u64 = 0,
+    // Caller-side cap on encrypted payload bytes per entry. 0 means no limit.
+    password_lifetime: u64 = 0,
+    // Set on kdf_limit / password_lifetime refusal, like the ZIP/7z paths.
+    failure_cause: ?*crypto.FailureCause = null,
 };
 
 const rar5_kdf_lg2_count_max = 24;
@@ -198,18 +205,23 @@ const Rar5Keys = struct { key: [32]u8, hash_key: [32]u8, pswcheck: [32]u8 };
 // cipher key is the standard T1, but the hash key and password check value
 // continue the SAME U-chain for 16 more iterations each (unrar crypt5.cpp
 // pbkdf2 CurCount = {count-1, 16, 16}). Not standard PBKDF2 dkLen=96.
-fn rar5Kdf(password: []const u8, salt: *const [16]u8, lg2count: u8) Failure!Rar5Keys {
+fn rar5Kdf(password: []const u8, salt: *const [16]u8, lg2count: u8, opts: DecodeOptions) Failure!Rar5Keys {
     if (lg2count > rar5_kdf_lg2_count_max) return error.Unsupported;
+    const rounds: u64 = @as(u64, 1) << @intCast(lg2count);
+    if (opts.kdf_rounds_limit != 0 and rounds > opts.kdf_rounds_limit) {
+        if (opts.failure_cause) |cause| cause.* = .kdf_limit;
+        return error.ResourceLimit;
+    }
     var salt_block: [20]u8 = undefined;
     @memcpy(salt_block[0..16], salt);
     @memcpy(salt_block[16..20], &[_]u8{ 0, 0, 0, 1 });
     var u_value: [32]u8 = undefined;
     crypto.hmacSha256(&u_value, &salt_block, password);
     var accumulator: [32]u8 = u_value;
-    const rounds: u32 = @as(u32, 1) << @intCast(lg2count);
+    const rounds32: u32 = @intCast(rounds);
     var keys: Rar5Keys = undefined;
     var iteration: u32 = 1;
-    while (iteration < rounds) : (iteration += 1) {
+    while (iteration < rounds32) : (iteration += 1) {
         crypto.hmacSha256(&u_value, &u_value, password);
         for (&accumulator, u_value) |*byte, other| byte.* ^= other;
     }
@@ -259,9 +271,13 @@ const Rar4Keys = struct { key: [16]u8, iv: [16]u8 };
 // the forked digest's fifth word, the final digest is the AES-128 key
 // (unrar SetKey30). RawPsw is the password in UTF-16LE without terminator,
 // plus the salt when one is present.
-fn rar4Kdf(password_utf16le: []const u8, salt: ?[]const u8) Failure!Rar4Keys {
+fn rar4Kdf(password_utf16le: []const u8, salt: ?[]const u8, opts: DecodeOptions) Failure!Rar4Keys {
     var sha = crypto.Sha1.init(.{});
     const hash_rounds: u32 = 0x40000;
+    if (opts.kdf_rounds_limit != 0 and hash_rounds > opts.kdf_rounds_limit) {
+        if (opts.failure_cause) |cause| cause.* = .kdf_limit;
+        return error.ResourceLimit;
+    }
     var raw: [2 * 127 + 8]u8 = undefined;
     if (password_utf16le.len > raw.len - 8) return error.Unsupported;
     @memcpy(raw[0..password_utf16le.len], password_utf16le);
@@ -555,9 +571,9 @@ fn walkRar5(archive: []const u8, offset: usize, opts: DecodeOptions, ctx: anytyp
                 // archives, so no seen_main requirement here.
                 if (header.enc_lg2count > rar5_kdf_lg2_count_max) return error.Unsupported;
                 const password = opts.password orelse return error.Unsupported;
-                const keys = try rar5Kdf(password, &header.enc_salt, header.enc_lg2count);
+                const keys = try rar5Kdf(password, &header.enc_salt, header.enc_lg2count, opts);
                 if (header.enc_pswcheck) |expected| {
-                    if (!std.mem.eql(u8, &rar5PswCheck(&keys.pswcheck), &expected)) return error.IntegrityFailure;
+                    if (!crypto.constantTimeEqual(&rar5PswCheck(&keys.pswcheck), &expected)) return error.IntegrityFailure;
                 }
                 header_crypt = keys;
             },
@@ -880,7 +896,7 @@ fn walkRar4(archive: []const u8, opts: DecodeOptions, ctx: anytype, comptime vis
                     @memcpy(&salt_bytes, salt);
                     var utf16_buffer: [2 * 127]u8 = undefined;
                     const utf16 = try passwordToUtf16Le(password, &utf16_buffer);
-                    const keys = try rar4Kdf(utf16, &salt_bytes);
+                    const keys = try rar4Kdf(utf16, &salt_bytes, opts);
                     header_crypt = .{ .keys = keys, .iv = keys.iv };
                     cursor = try bounds.addUsize(cursor, header.head_size + 8);
                     seen_main = true;
@@ -1081,16 +1097,24 @@ fn entryPayload(entry: Entry, archive: []const u8, opts: DecodeOptions, bufs: *D
     if (bufs.packed_stage.len < payload.len) return error.InternalFailure;
     switch (crypt) {
         .rar5 => |c| {
-            const keys = try rar5Kdf(password, &c.salt, c.lg2count);
+            if (opts.password_lifetime != 0 and payload.len > opts.password_lifetime) {
+                if (opts.failure_cause) |cause| cause.* = .password_lifetime;
+                return error.ResourceLimit;
+            }
+            const keys = try rar5Kdf(password, &c.salt, c.lg2count, opts);
             if (c.pswcheck) |expected| {
-                if (!std.mem.eql(u8, &rar5PswCheck(&keys.pswcheck), &expected)) return error.InvalidData;
+                if (!crypto.constantTimeEqual(&rar5PswCheck(&keys.pswcheck), &expected)) return error.InvalidData;
             }
             crypto.aesCbcDecrypt(keys.key[0..], c.iv, bufs.packed_stage[0..payload.len], payload) catch return error.InvalidData;
         },
         .rar4 => |c| {
+            if (opts.password_lifetime != 0 and payload.len > opts.password_lifetime) {
+                if (opts.failure_cause) |cause| cause.* = .password_lifetime;
+                return error.ResourceLimit;
+            }
             var utf16_buffer: [2 * 127]u8 = undefined;
             const utf16 = try passwordToUtf16Le(password, &utf16_buffer);
-            const keys = try rar4Kdf(utf16, &c.salt);
+            const keys = try rar4Kdf(utf16, &c.salt, opts);
             crypto.aesCbcDecrypt(keys.key[0..], keys.iv, bufs.packed_stage[0..payload.len], payload) catch return error.InvalidData;
         },
     }
@@ -1158,7 +1182,7 @@ pub fn rarDecodeOrdinal(
         switch (c) {
             .rar5 => |r5| if (r5.hashmac) {
                 const password = opts.password orelse return error.Unsupported;
-                const keys = try rar5Kdf(password, &r5.salt, r5.lg2count);
+                const keys = try rar5Kdf(password, &r5.salt, r5.lg2count, opts);
                 hash_key = keys.hash_key;
             },
             .rar4 => {},
