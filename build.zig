@@ -11,9 +11,16 @@ const version = std.SemanticVersion.parse(package.version) catch @compileError("
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const portable = b.option(bool, "portable", "Disable arch-gated kernels and use portable fallbacks") orelse false;
+    const portable = b.option(bool, "portable", "Compatible implementation for primitive seam") orelse false;
+    const primitives_impl = b.option(enum { onprem, offprem }, "primitives_impl", "Default implementation for primitive seam") orelse .onprem;
     const options = b.addOptions();
     options.addOption(bool, "portable", portable);
+    const Implementation = @TypeOf(primitives_impl);
+    options.addOption(Implementation, "primitives_impl", primitives_impl);
+    inline for (.{ "sha256", "sha1", "hmac", "pbkdf2", "adler32", "xxh32", "xxh64", "aes" }) |capability| {
+        const selected = b.option(Implementation, capability ++ "_impl", "Implementation for the " ++ capability ++ " capability") orelse primitives_impl;
+        options.addOption(Implementation, capability ++ "_impl", selected);
+    }
     const options_module = options.createModule();
     const generated = common.addGenerated(b);
     const host = common.addHostLibraries(b, target, optimize, portable, options_module);

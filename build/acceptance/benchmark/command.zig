@@ -199,7 +199,7 @@ fn addBinaryRefs(b: *std.Build, ctx: *const common.Context) struct { sevenzz: *s
 }
 
 pub fn add(b: *std.Build, ctx: *const common.Context) Refs {
-    // 7-Zip 26.03 trips clang/LLVM 22's lifetime-safety-intra-TU suggestion on
+    // ip7z/7zip 26.03 trips clang/LLVM 22's lifetime-safety-intra-TU suggestion on
     // MyStpCpy under the makefile's -Weverything -Werror; the makefile composes
     // flags from CFLAGS_WARN_WALL, so the warning is disabled there.
     const make_7zz = make(b, "vendor/7zip/CPP/7zip/Bundles/Alone2", &.{ "make", "-f", "../../cmpl_mac_arm64.mak", "DISABLE_RAR_COMPRESS=1", "CFLAGS_WARN_WALL=-Werror -Wall -Wextra -Wno-lifetime-safety-intra-tu-suggestions" });

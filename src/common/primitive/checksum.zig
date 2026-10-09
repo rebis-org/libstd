@@ -3,11 +3,198 @@ const builtin = @import("builtin");
 
 const options = @import("options");
 
-extern fn stdk_crc32_le(crc: u32, data: [*]const u8, len: usize) u32;
-extern fn stdk_crc32_le_pmull(crc: u32, data: [*]const u8, len: usize) u32;
+// Zig inline asm cannot name the 32-bit register views, so the crc32 instructions bind
+// fixed X registers. The fold mirrors the vendor ip7z/7zip arm64 loop.
+const has_crc32 = builtin.cpu.arch == .aarch64 and !options.portable;
+const has_crc32_kernel = has_crc32 and builtin.cpu.has(.aarch64, .crc);
+// LLVM's aes feature implies pmull, which the fold kernel multiplies with.
+const has_pmull_kernel = has_crc32_kernel and builtin.cpu.has(.aarch64, .aes);
+
+const crc_lane = @Vector(2, u64);
+
+// Fold constants for the reflected CRC32 polynomial 0xEDB88320 (vendor 7zCrc arm64 literal pool).
+const crc_k0: crc_lane = .{ 0x000000008f352d95, 0x000000001d9513d7 };
+const crc_k1: crc_lane = .{ 0x00000000ae689191, 0x00000000ccaa009e };
+const crc_k2: crc_lane = .{ 0x00000000f1da05aa, 0x0000000081256527 };
+
+fn crc32x(crc: u32, data: u64) u32 {
+    return asm ("crc32x w8, w8, x9"
+        : [ret] "={x8}" (-> u32),
+        : [crc] "{x8}" (crc),
+          [data] "{x9}" (data),
+    );
+}
+
+fn crc32w(crc: u32, data: u32) u32 {
+    return asm ("crc32w w8, w8, w9"
+        : [ret] "={x8}" (-> u32),
+        : [crc] "{x8}" (crc),
+          [data] "{x9}" (data),
+    );
+}
+
+fn crc32b(crc: u32, data: u8) u32 {
+    return asm ("crc32b w8, w8, w9"
+        : [ret] "={x8}" (-> u32),
+        : [crc] "{x8}" (crc),
+          [data] "{x9}" (data),
+    );
+}
+
+fn pmull1(a: crc_lane, b: crc_lane) crc_lane {
+    return asm ("pmull %[ret].1q, %[a].1d, %[b].1d"
+        : [ret] "=x" (-> crc_lane),
+        : [a] "x" (a),
+          [b] "x" (b),
+    );
+}
+
+fn pmull2(a: crc_lane, b: crc_lane) crc_lane {
+    return asm ("pmull2 %[ret].1q, %[a].2d, %[b].2d"
+        : [ret] "=x" (-> crc_lane),
+        : [a] "x" (a),
+          [b] "x" (b),
+    );
+}
+
+fn foldLane(lane: crc_lane, data: crc_lane, k: crc_lane) crc_lane {
+    return pmull1(lane, k) ^ data ^ pmull2(lane, k);
+}
+
+fn crc32Aarch64Scalar(crc_in: u32, input: []const u8) u32 {
+    var crc = crc_in;
+    var data = input;
+    while (data.len >= 8) {
+        crc = crc32x(crc, std.mem.readInt(u64, data[0..8], .little));
+        data = data[8..];
+    }
+    if (data.len >= 4) {
+        crc = crc32w(crc, std.mem.readInt(u32, data[0..4], .little));
+        data = data[4..];
+    }
+    for (data) |byte| crc = crc32b(crc, byte);
+    return crc;
+}
+
+// CRC32 state via four-lane PMULL folding. The caller routes only inputs at or above
+// crc32_pmull_threshold, because folding costs a fixed setup that short inputs never repay.
+fn crc32Aarch64Fold(crc_in: u32, input: []const u8) u32 {
+    var crc = crc_in;
+    var data = input;
+    while (data.len != 0 and @intFromPtr(data.ptr) & 15 != 0) {
+        crc = crc32b(crc, data[0]);
+        data = data[1..];
+    }
+    if (data.len >= 64) {
+        var lanes: [4]crc_lane = undefined;
+        for (0..4) |i| {
+            lanes[i] = std.mem.bytesToValue(crc_lane, data[i * 16 ..][0..16]);
+        }
+        lanes[0][0] ^= crc;
+        data = data[64..];
+        while (data.len >= 64) {
+            for (0..4) |i| {
+                lanes[i] = foldLane(lanes[i], std.mem.bytesToValue(crc_lane, data[i * 16 ..][0..16]), crc_k0);
+            }
+            data = data[64..];
+        }
+        lanes[0] = foldLane(lanes[0], lanes[1], crc_k1);
+        lanes[2] = foldLane(lanes[2], lanes[3], crc_k1);
+        lanes[0] = foldLane(lanes[0], lanes[2], crc_k2);
+        crc = crc32x(0, lanes[0][0]);
+        crc = crc32x(crc, lanes[0][1]);
+    }
+    while (data.len >= 16) {
+        var lane = std.mem.bytesToValue(crc_lane, data[0..16]);
+        lane[0] ^= crc;
+        data = data[16..];
+        while (data.len >= 16) {
+            lane = foldLane(lane, std.mem.bytesToValue(crc_lane, data[0..16]), crc_k1);
+            data = data[16..];
+        }
+        crc = crc32x(0, lane[0]);
+        crc = crc32x(crc, lane[1]);
+    }
+    if (data.len >= 8) {
+        crc = crc32x(crc, std.mem.readInt(u64, data[0..8], .little));
+        data = data[8..];
+    }
+    for (data) |byte| crc = crc32b(crc, byte);
+    return crc;
+}
+
+// CRC-64/XZ (reflected ECMA polynomial) fold constants. A fold by shift s pairs x^s with
+// x^(s-64), and deriving them at comptime from the recurrence keeps them in step with the table.
+const crc64_poly: u64 = 0xC96C5795D7870F42;
+
+fn crc64Xpow(comptime n: u16) u64 {
+    // The same register recurrence as the byte table, from x^0 = 1.
+    var v: u64 = 1;
+    for (0..n) |_| {
+        v = (v >> 1) ^ (if (v & 1 != 0) crc64_poly else 0);
+    }
+    return v;
+}
+
+const crc64_k0: crc_lane = .{ crc64Xpow(512), crc64Xpow(448) };
+const crc64_k1: crc_lane = .{ crc64Xpow(128), crc64Xpow(64) };
+const crc64_k2: crc_lane = .{ crc64Xpow(256), crc64Xpow(192) };
+
+// CRC-64/XZ state via PMULL folding. No hardware crc64 instruction exists, so each folded
+// lane re-enters the register through 16 byte-table steps, amortized over the region.
+fn crc64Aarch64Fold(crc_in: u64, input: []const u8, comptime table: *const [256]u64) u64 {
+    var crc = crc_in;
+    var data = input;
+    while (data.len != 0 and @intFromPtr(data.ptr) & 15 != 0) {
+        crc = (crc >> 8) ^ table[(crc ^ data[0]) & 0xff];
+        data = data[1..];
+    }
+    if (data.len >= 64) {
+        var lanes: [4]crc_lane = undefined;
+        for (0..4) |i| {
+            lanes[i] = std.mem.bytesToValue(crc_lane, data[i * 16 ..][0..16]);
+        }
+        lanes[0][0] ^= crc;
+        data = data[64..];
+        while (data.len >= 64) {
+            for (0..4) |i| {
+                lanes[i] = foldLane(lanes[i], std.mem.bytesToValue(crc_lane, data[i * 16 ..][0..16]), crc64_k0);
+            }
+            data = data[64..];
+        }
+        lanes[0] = foldLane(lanes[0], lanes[1], crc64_k1);
+        lanes[2] = foldLane(lanes[2], lanes[3], crc64_k1);
+        lanes[0] = foldLane(lanes[0], lanes[2], crc64_k2);
+        crc = 0;
+        for (std.mem.toBytes(lanes[0])) |byte| {
+            crc = (crc >> 8) ^ table[(crc ^ byte) & 0xff];
+        }
+    }
+    while (data.len >= 16) {
+        var lane = std.mem.bytesToValue(crc_lane, data[0..16]);
+        lane[0] ^= crc;
+        data = data[16..];
+        while (data.len >= 16) {
+            lane = foldLane(lane, std.mem.bytesToValue(crc_lane, data[0..16]), crc64_k1);
+            data = data[16..];
+        }
+        crc = 0;
+        for (std.mem.toBytes(lane)) |byte| {
+            crc = (crc >> 8) ^ table[(crc ^ byte) & 0xff];
+        }
+    }
+    if (data.len >= 8) {
+        for (data[0..8]) |byte| {
+            crc = (crc >> 8) ^ table[(crc ^ byte) & 0xff];
+        }
+        data = data[8..];
+    }
+    for (data) |byte| crc = (crc >> 8) ^ table[(crc ^ byte) & 0xff];
+    return crc;
+}
 
 // Folding pays off above this length; the threshold comes from a synthetic sweep.
-const crc32_pmull_threshold = 256;
+const crc_pmull_threshold = 256;
 
 pub const Crc32 = TableCrc(u32, 0xedb8_8320, true);
 
@@ -17,115 +204,36 @@ pub fn crc32(input: []const u8) u32 {
     return hash.final();
 }
 
-pub const XxHash64 = struct {
-    accumulator_1: u64,
-    accumulator_2: u64,
-    accumulator_3: u64,
-    accumulator_4: u64,
-    buffer: [32]u8,
-    buffered: usize = 0,
-    total: u64 = 0,
+// xxHash and Adler32 route through their capability seams; each seam can
+// point at the on-prem port, std, or any compatible implementation.
+const xxh32_seam = @import("hash/xxh32/seam.zig");
+const xxh64_seam = @import("hash/xxh64/seam.zig");
+const adler32_seam = @import("hash/adler32/seam.zig");
 
-    const prime_1: u64 = 0x9e37_79b1_85eb_ca87;
-    const prime_2: u64 = 0xc2b2_ae3d_27d4_eb4f;
-    const prime_3: u64 = 0x1656_67b1_9e37_79f9;
-    const prime_4: u64 = 0x85eb_ca77_c2b2_ae63;
-    const prime_5: u64 = 0x27d4_eb2f_1656_67c5;
-
-    pub fn init(seed: u64) XxHash64 {
-        // The stripe buffer stays undefined until update fills it before any read.
-        return .{
-            .accumulator_1 = seed +% prime_1 +% prime_2,
-            .accumulator_2 = seed +% prime_2,
-            .accumulator_3 = seed,
-            .accumulator_4 = seed -% prime_1,
-            .buffer = undefined,
-        };
-    }
-
-    fn round(accumulator: u64, input: u64) u64 {
-        return std.math.rotl(u64, accumulator +% (input *% prime_2), 31) *% prime_1;
-    }
-
-    fn mergeAccumulator(accumulator: u64, input: u64) u64 {
-        return (accumulator ^ round(0, input)) *% prime_1 +% prime_4;
-    }
-
-    fn consumeStripe(self: *XxHash64, bytes: *const [32]u8) void {
-        self.accumulator_1 = round(self.accumulator_1, std.mem.readInt(u64, bytes[0..8], .little));
-        self.accumulator_2 = round(self.accumulator_2, std.mem.readInt(u64, bytes[8..16], .little));
-        self.accumulator_3 = round(self.accumulator_3, std.mem.readInt(u64, bytes[16..24], .little));
-        self.accumulator_4 = round(self.accumulator_4, std.mem.readInt(u64, bytes[24..32], .little));
-    }
-
-    pub fn update(self: *XxHash64, input: []const u8) void {
-        self.total +%= input.len;
-        var remaining = input;
-        if (self.buffered != 0) {
-            const take = @min(remaining.len, 32 - self.buffered);
-            @memcpy(self.buffer[self.buffered..][0..take], remaining[0..take]);
-            self.buffered += take;
-            remaining = remaining[take..];
-            if (self.buffered == 32) {
-                self.consumeStripe(&self.buffer);
-                self.buffered = 0;
-            }
-        }
-        while (remaining.len >= 32) {
-            self.consumeStripe(remaining[0..32]);
-            remaining = remaining[32..];
-        }
-        if (remaining.len != 0) {
-            @memcpy(self.buffer[0..remaining.len], remaining);
-            self.buffered = remaining.len;
-        }
-    }
-
-    pub fn final(self: *const XxHash64) u64 {
-        var hash: u64 = if (self.total >= 32)
-            std.math.rotl(u64, self.accumulator_1, 1) +%
-                std.math.rotl(u64, self.accumulator_2, 7) +%
-                std.math.rotl(u64, self.accumulator_3, 12) +%
-                std.math.rotl(u64, self.accumulator_4, 18)
-        else
-            self.accumulator_3 +% prime_5;
-        if (self.total >= 32) {
-            hash = mergeAccumulator(hash, self.accumulator_1);
-            hash = mergeAccumulator(hash, self.accumulator_2);
-            hash = mergeAccumulator(hash, self.accumulator_3);
-            hash = mergeAccumulator(hash, self.accumulator_4);
-        }
-        hash +%= self.total;
-        var tail = self.buffer[0..self.buffered];
-        while (tail.len >= 8) {
-            hash ^= round(0, std.mem.readInt(u64, tail[0..8], .little));
-            hash = std.math.rotl(u64, hash, 27) *% prime_1 +% prime_4;
-            tail = tail[8..];
-        }
-        if (tail.len >= 4) {
-            hash ^= @as(u64, std.mem.readInt(u32, tail[0..4], .little)) *% prime_1;
-            hash = std.math.rotl(u64, hash, 23) *% prime_2 +% prime_3;
-            tail = tail[4..];
-        }
-        while (tail.len != 0) {
-            hash ^= @as(u64, tail[0]) *% prime_5;
-            hash = std.math.rotl(u64, hash, 11) *% prime_1;
-            tail = tail[1..];
-        }
-        hash ^= hash >> 33;
-        hash *%= prime_2;
-        hash ^= hash >> 29;
-        hash *%= prime_3;
-        hash ^= hash >> 32;
-        return hash;
-    }
-};
+pub const XxHash64 = xxh64_seam.XxHash64;
+pub const XxHash32 = xxh32_seam.XxHash32;
 
 pub fn xxh64(input: []const u8) u64 {
     var hasher = XxHash64.init(0);
     hasher.update(input);
     return hasher.final();
 }
+
+pub const Adler32 = struct {
+    inner: adler32_seam.Inner = .{},
+
+    pub fn init() Adler32 {
+        return .{};
+    }
+
+    pub fn update(self: *Adler32, input: []const u8) void {
+        self.inner.update(input);
+    }
+
+    pub fn final(self: *const Adler32) u32 {
+        return self.inner.adler;
+    }
+};
 
 fn TableCrc(comptime T: type, comptime poly: T, comptime reflected: bool) type {
     const bits = @bitSizeOf(T);
@@ -138,11 +246,11 @@ fn TableCrc(comptime T: type, comptime poly: T, comptime reflected: bool) type {
 
         pub fn update(self: *@This(), input: []const u8) void {
             if (comptime T == u32 and reflected) {
-                if (comptime !options.portable and builtin.target.cpu.arch == .aarch64) {
-                    if (input.len >= crc32_pmull_threshold) {
-                        self.state = stdk_crc32_le_pmull(self.state, input.ptr, input.len);
+                if (comptime has_crc32_kernel) {
+                    if (input.len >= crc_pmull_threshold and comptime has_pmull_kernel) {
+                        self.state = crc32Aarch64Fold(self.state, input);
                     } else {
-                        self.state = stdk_crc32_le(self.state, input.ptr, input.len);
+                        self.state = crc32Aarch64Scalar(self.state, input);
                     }
                     return;
                 }
@@ -161,6 +269,12 @@ fn TableCrc(comptime T: type, comptime poly: T, comptime reflected: bool) type {
                 return;
             }
             if (comptime reflected) {
+                if (comptime T == u64 and has_pmull_kernel) {
+                    if (input.len >= crc_pmull_threshold) {
+                        self.state = crc64Aarch64Fold(self.state, input, &table);
+                        return;
+                    }
+                }
                 for (input) |b| self.state = (self.state >> 8) ^ table[(self.state ^ b) & 0xff];
             } else {
                 for (input) |b| self.state = (self.state << 8) ^ table[((self.state >> (bits - 8)) ^ b) & 0xff];
@@ -209,128 +323,11 @@ fn TableCrc(comptime T: type, comptime poly: T, comptime reflected: bool) type {
 pub const Bzip2Crc32 = TableCrc(u32, 0x04c11db7, false);
 pub const XzCrc64 = TableCrc(u64, 0xc96c5795d7870f42, true);
 
-pub const Adler32 = struct {
-    state: u32,
-
-    pub fn init() Adler32 {
-        return .{ .state = 1 };
-    }
-
-    pub fn update(self: *Adler32, input: []const u8) void {
-        var low: u32 = self.state & 0xffff;
-        var high: u32 = self.state >> 16;
-        var index: usize = 0;
-        while (index < input.len) {
-            const end = @min(index + 5552, input.len);
-            while (index < end) : (index += 1) {
-                low += input[index];
-                high += low;
-            }
-            low %= 65521;
-            high %= 65521;
-        }
-        self.state = (high << 16) | low;
-    }
-
-    pub fn final(self: *const Adler32) u32 {
-        return self.state;
-    }
-};
-
 pub fn adler32(input: []const u8) u32 {
     var hasher = Adler32.init();
     hasher.update(input);
     return hasher.final();
 }
-
-const xxh32_prime1: u32 = 2654435761;
-const xxh32_prime2: u32 = 2246822519;
-const xxh32_prime3: u32 = 3266489917;
-const xxh32_prime4: u32 = 668265263;
-const xxh32_prime5: u32 = 374761393;
-
-fn xxh32Round(acc: u32, lane: u32) u32 {
-    return std.math.rotl(u32, acc +% lane *% xxh32_prime2, 13) *% xxh32_prime1;
-}
-
-pub const XxHash32 = struct {
-    seed: u32,
-    total: u64,
-    acc1: u32,
-    acc2: u32,
-    acc3: u32,
-    acc4: u32,
-    buffer: [16]u8,
-    buffer_len: usize,
-
-    pub fn init(seed: u32) XxHash32 {
-        return .{
-            .seed = seed,
-            .total = 0,
-            .acc1 = seed +% xxh32_prime1 +% xxh32_prime2,
-            .acc2 = seed +% xxh32_prime2,
-            .acc3 = seed,
-            .acc4 = seed -% xxh32_prime1,
-            .buffer = undefined,
-            .buffer_len = 0,
-        };
-    }
-
-    pub fn update(self: *XxHash32, input: []const u8) void {
-        self.total += input.len;
-        var data = input;
-        if (self.buffer_len != 0) {
-            const want = 16 - self.buffer_len;
-            const take = @min(want, data.len);
-            @memcpy(self.buffer[self.buffer_len..][0..take], data[0..take]);
-            self.buffer_len += take;
-            data = data[take..];
-            if (self.buffer_len == 16) {
-                self.consume(&self.buffer);
-                self.buffer_len = 0;
-            }
-        }
-        while (data.len >= 16) {
-            self.consume(data[0..16]);
-            data = data[16..];
-        }
-        if (data.len != 0) {
-            @memcpy(self.buffer[0..data.len], data);
-            self.buffer_len = data.len;
-        }
-    }
-
-    fn consume(self: *XxHash32, lanes: []const u8) void {
-        self.acc1 = xxh32Round(self.acc1, std.mem.readInt(u32, lanes[0..4], .little));
-        self.acc2 = xxh32Round(self.acc2, std.mem.readInt(u32, lanes[4..8], .little));
-        self.acc3 = xxh32Round(self.acc3, std.mem.readInt(u32, lanes[8..12], .little));
-        self.acc4 = xxh32Round(self.acc4, std.mem.readInt(u32, lanes[12..16], .little));
-    }
-
-    pub fn final(self: *const XxHash32) u32 {
-        var hash: u32 = undefined;
-        if (self.total >= 16) {
-            hash = std.math.rotl(u32, self.acc1, 1) +% std.math.rotl(u32, self.acc2, 7) +% std.math.rotl(u32, self.acc3, 12) +% std.math.rotl(u32, self.acc4, 18);
-        } else {
-            hash = self.seed +% xxh32_prime5;
-        }
-        hash +%= @truncate(self.total);
-        var rest: []const u8 = if (self.buffer_len != 0) self.buffer[0..self.buffer_len] else &.{};
-        var index: usize = 0;
-        while (index + 4 <= rest.len) : (index += 4) {
-            hash = std.math.rotl(u32, hash +% std.mem.readInt(u32, rest[index..][0..4], .little) *% xxh32_prime3, 17) *% xxh32_prime4;
-        }
-        while (index < rest.len) : (index += 1) {
-            hash = std.math.rotl(u32, hash +% @as(u32, rest[index]) *% xxh32_prime5, 11) *% xxh32_prime1;
-        }
-        hash ^= hash >> 15;
-        hash *%= xxh32_prime2;
-        hash ^= hash >> 13;
-        hash *%= xxh32_prime3;
-        hash ^= hash >> 16;
-        return hash;
-    }
-};
 
 pub fn xxh32(input: []const u8) u32 {
     var hasher = XxHash32.init(0);
@@ -364,6 +361,31 @@ test "crc32 matches the published vectors" {
     try std.testing.expectEqual(crc32("123456789"), hash.final());
 }
 
+test "crc32 matches std.hash.Crc32 across sizes" {
+    // Sizes hit every tail bucket, and the split update exercises the streaming state
+    // across kernel switches.
+    var rng = std.Random.DefaultPrng.init(0xC32C);
+    const allocator = std.testing.allocator;
+    var size: usize = 0;
+    while (size <= 1024) : (size += 1) {
+        const buf = try allocator.alloc(u8, size);
+        rng.random().bytes(buf);
+        try std.testing.expectEqual(std.hash.Crc32.hash(buf), crc32(buf));
+        allocator.free(buf);
+    }
+    var big: usize = 4096;
+    while (big <= 1 << 20) : (big += 65521) {
+        const buf = try allocator.alloc(u8, big);
+        rng.random().bytes(buf);
+        try std.testing.expectEqual(std.hash.Crc32.hash(buf), crc32(buf));
+        var hash = Crc32.init();
+        hash.update(buf[0 .. big / 3]);
+        hash.update(buf[big / 3 ..]);
+        try std.testing.expectEqual(std.hash.Crc32.hash(buf), hash.final());
+        allocator.free(buf);
+    }
+}
+
 test "xxh64 matches the published vectors" {
     try std.testing.expectEqual(@as(u64, 0xEF46DB3751D8E999), xxh64(""));
     try std.testing.expectEqual(@as(u64, 0xD24EC4F1A98C6E5B), xxh64("a"));
@@ -371,4 +393,55 @@ test "xxh64 matches the published vectors" {
     hasher.update("hello ");
     hasher.update("world");
     try std.testing.expectEqual(xxh64("hello world"), hasher.final());
+}
+
+test "crc64 xz matches the reference vectors" {
+    var hash = XzCrc64.init();
+    hash.update("123456789");
+    try std.testing.expectEqual(@as(u64, 0x995DC9BBDF1939FA), hash.final());
+    var hasher = XzCrc64.init();
+    hasher.update("1234");
+    hasher.update("56789");
+    try std.testing.expectEqual(@as(u64, 0x995DC9BBDF1939FA), hasher.final());
+}
+
+test "crc64 xz fold matches the byte table across sizes" {
+    // The portable byte table is the reference, because that is the only path a non-aarch64 target runs.
+    var rng = std.Random.DefaultPrng.init(0xC64C);
+    const allocator = std.testing.allocator;
+    const table = comptime blk: {
+        @setEvalBranchQuota(10000);
+        var t: [256]u64 = undefined;
+        for (0..256) |i| {
+            var crc: u64 = @intCast(i);
+            for (0..8) |_| {
+                crc = if (crc & 1 != 0) (crc >> 1) ^ 0xC96C5795D7870F42 else crc >> 1;
+            }
+            t[i] = crc;
+        }
+        break :blk t;
+    };
+    var size: usize = 0;
+    while (size <= 2048) : (size += 1) {
+        const buf = try allocator.alloc(u8, size);
+        rng.random().bytes(buf);
+        var fast = XzCrc64.init();
+        fast.update(buf);
+        var raw: u64 = ~@as(u64, 0);
+        for (buf) |b| raw = (raw >> 8) ^ table[(raw ^ b) & 0xff];
+        try std.testing.expectEqual(~raw, fast.final());
+        allocator.free(buf);
+    }
+    var big: usize = 4096;
+    while (big <= 1 << 20) : (big += 65521) {
+        const buf = try allocator.alloc(u8, big);
+        rng.random().bytes(buf);
+        var fast = XzCrc64.init();
+        fast.update(buf[0 .. big / 3]);
+        fast.update(buf[big / 3 ..]);
+        var raw: u64 = ~@as(u64, 0);
+        for (buf) |b| raw = (raw >> 8) ^ table[(raw ^ b) & 0xff];
+        try std.testing.expectEqual(~raw, fast.final());
+        allocator.free(buf);
+    }
 }
