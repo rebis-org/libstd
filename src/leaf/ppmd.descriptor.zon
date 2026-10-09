@@ -1,6 +1,3 @@
-// Component class slice. Identity and policy are frozen ABI: renaming or
-// re-identifying a component is a breaking change, caught by the comptime
-// assertions in kernel/catalog.zig.
 .{
     .id = .{ .low = "0x6e6b82f08d910411", .high = "0xa7a351053d6d4011" },
     .name = "ppmd",

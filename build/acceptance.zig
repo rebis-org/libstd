@@ -177,11 +177,10 @@ fn addOracles(b: *std.Build, ctx: *common.Context, refs: cmd.Refs) void {
 
     const compose_ab_module = b.createModule(.{
         .root_source_file = b.path("src/compose_ab.zig"),
-        .target = ctx.target,
+        .target = modules.withKernelFeatures(ctx.target),
         .optimize = ctx.optimize,
     });
     compose_ab_module.addImport("options", ctx.options);
-    modules.maybeAddCrcAsm(b, compose_ab_module, ctx.target, ctx.portable);
     const compose_ab_exe = b.addExecutable(.{ .name = "compose_ab", .root_module = compose_ab_module });
     const compose_ab_run = b.addRunArtifact(compose_ab_exe);
     app.run.step.dependOn(&compose_ab_run.step);
@@ -222,12 +221,11 @@ fn addBenchmark(b: *std.Build, ctx: *common.Context, refs: cmd.Refs) void {
     // kernel and no dylib.
     const bypass_module = b.createModule(.{
         .root_source_file = b.path("src/bypass.zig"),
-        .target = ref_target,
+        .target = modules.withKernelFeatures(ref_target),
         .optimize = ctx.optimize,
     });
     bypass_module.addImport("options", ctx.options);
     bypass_module.addImport("nucleus", bench_nucleus);
-    modules.maybeAddCrcAsm(b, bypass_module, ref_target, ctx.portable);
     const app = addAcceptanceApp(b, ctx, "benchmark", modules.benchmark, ref_target, ctx.optimize, &.{
         .{ .name = "components", .module = bench_components_module },
         .{ .name = "bypass", .module = bypass_module },

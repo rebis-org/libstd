@@ -1,8 +1,8 @@
 .{
-    .id = .{ .low = "0x6e6b82f08d910413", .high = "0xa7a351053d6d4013" },
-    .name = "bcj",
+    .id = .{ .low = "0x6e6b82f08d910418", .high = "0xa7a351053d6d4018" },
+    .name = "bcj2",
     .class = "filter",
-    .verbs = .{ "encode", "decode" },
+    .verbs = .{"decode"},
     .parameters = .{},
     .capabilities = .{},
     .sizing = "unavailable",

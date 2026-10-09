@@ -12,6 +12,7 @@ const limits_prim = @import("../common/primitive/limits.zig");
 const Limits = limits_prim.Limits;
 const measurement = @import("../common/primitive/measurement.zig");
 const bcj = @import("../leaf/bcj.zig");
+const bcj2 = @import("../leaf/bcj2.zig");
 const bzip2 = @import("../leaf/bzip2.zig");
 const deflate = @import("../leaf/deflate.zig");
 const delta = @import("../leaf/delta.zig");
@@ -39,6 +40,7 @@ pub const CoderMethod = enum {
     arm64,
     riscv,
     ppmd,
+    bcj2,
 };
 
 pub const SevenZipEntry = struct {
@@ -75,6 +77,9 @@ pub const SevenZipInfo = struct {
     aes_iv_size: u8 = 0,
     folder: ?*const Folder = null,
     substream_offset: u64 = 0,
+    // Per packed-stream sizes of the entry's folder (one stream for ordinary folders, four for
+    // BCJ2), pointing into the streams-info workspace slice.
+    pack_stream_sizes: []const u64 = &.{},
 };
 
 pub const SevenZipDecodeOptions = struct {
@@ -100,6 +105,7 @@ const method_sparc_id = [1]u8{0x09};
 const method_arm64_id = [1]u8{0x0A};
 const method_riscv_id = [1]u8{0x0B};
 const method_ppmd_id = [3]u8{ 0x03, 0x04, 0x01 };
+const method_7z_bcj2_id = [4]u8{ 0x03, 0x03, 0x01, 0x1B };
 const method_7z_bcj_x86_id = [4]u8{ 0x03, 0x03, 0x01, 0x03 };
 const method_7z_bcj_ppc_id = [4]u8{ 0x03, 0x03, 0x02, 0x05 };
 const method_7z_bcj_ia64_id = [4]u8{ 0x03, 0x03, 0x04, 0x01 };
@@ -131,6 +137,7 @@ fn methodId(method: CoderMethod) []const u8 {
         .arm64 => &method_7z_bcj_arm64_id,
         .riscv => &method_7z_bcj_riscv_id,
         .ppmd => &method_ppmd_id,
+        .bcj2 => &method_7z_bcj2_id,
     };
 }
 
@@ -150,6 +157,7 @@ fn methodFromId(id: []const u8) Failure!CoderMethod {
     if (std.mem.eql(u8, id, &method_arm64_id)) return .arm64;
     if (std.mem.eql(u8, id, &method_riscv_id)) return .riscv;
     if (std.mem.eql(u8, id, &method_ppmd_id)) return .ppmd;
+    if (std.mem.eql(u8, id, &method_7z_bcj2_id)) return .bcj2;
     if (std.mem.eql(u8, id, &method_7z_bcj_x86_id)) return .x86;
     if (std.mem.eql(u8, id, &method_7z_bcj_ppc_id)) return .ppc;
     if (std.mem.eql(u8, id, &method_7z_bcj_ia64_id)) return .ia64;
@@ -168,7 +176,7 @@ fn coderAttributeSize(method: CoderMethod) usize {
         .lzma2 => 1,
         .delta => 1,
         .ppmd => 5,
-        .x86, .ppc, .ia64, .arm, .armt, .sparc, .arm64, .riscv => 0,
+        .x86, .ppc, .ia64, .arm, .armt, .sparc, .arm64, .riscv, .bcj2 => 0,
     };
 }
 
@@ -214,6 +222,7 @@ fn packEntry(entry: SevenZipEntry, workspace: *Workspace, limits: Limits, failur
     }
     const unpacked_crc = checksum.crc32(entry.data);
     const compressed_entry = switch (entry.method) {
+        .bcj2 => return error.InvalidCall, // Decode-only; creation never emits BCJ2.
         .copy => blk: {
             if (entry.filter != null) return error.InvalidCall;
             if (entry.data.len > limits.encoded_bytes) return error.ResourceLimit;
@@ -323,7 +332,7 @@ fn packAllEntries(entries: []const SevenZipEntry, workspace: *Workspace, limits:
             continue;
         }
         // One folder and one continuous codec stream per run, so coder state
-        // carries across the substreams as in 7-Zip's solid folders.
+        // carries across the substreams as in ip7z/7zip's solid folders.
         if ((entries[i].method == .lzma2 or entries[i].method == .ppmd) and !entries[i].encrypted) {
             var j = i + 1;
             while (j < entries.len and !isEmptyEntry(entries[j]) and entries[j].method == entries[i].method and !entries[j].encrypted and entries[j].filter == entries[i].filter) j += 1;
@@ -537,6 +546,11 @@ pub fn sevenZipDecodeOrdinal(archive_bytes: []const u8, workspace: *Workspace, l
             const decoded = try ppmd.decode(decrypted_packed, decode_output, scratch, options);
             if (decoded != decode_target_len) return error.InvalidData;
         },
+        .bcj2 => {
+            const folder = entry.folder orelse return error.InvalidData;
+            const written = try decodeBcj2Folder(folder, entry.pack_stream_sizes, decrypted_packed, decode_output[0..decode_target_len], workspace, limits);
+            if (written != decode_target_len) return error.InvalidData;
+        },
         else => return error.Unsupported,
     }
     if (entry.folder) |folder| {
@@ -556,6 +570,52 @@ pub fn sevenZipDecodeOrdinal(archive_bytes: []const u8, workspace: *Workspace, l
 fn readLzma2Prop(attributes: []const u8) Failure!u8 {
     if (attributes.len != 1) return error.InvalidData;
     return attributes[0];
+}
+
+// Recombines a BCJ2 folder. Each of the four inputs is a raw packed stream or the decoded
+// output of one of the folder's compressor coders, per `folder.bcj2_sources`.
+fn decodeBcj2Folder(folder: *const Folder, pack_sizes: []const u64, packed_data: []const u8, output: []u8, workspace: *Workspace, limits: Limits) Failure!usize {
+    if (!folder.bcj2 or pack_sizes.len != 4) return error.InvalidData;
+    var packed_offset: usize = 0;
+    var packed_slices: [4][]const u8 = undefined;
+    for (0..4) |k| {
+        const size = std.math.cast(usize, pack_sizes[k]) orelse return error.ResourceLimit;
+        packed_offset = try bounds.addUsize(packed_offset, size);
+        if (packed_offset > packed_data.len) return error.InvalidData;
+        packed_slices[k] = packed_data[packed_offset - size .. packed_offset];
+    }
+    var substreams: [4][]const u8 = undefined;
+    for (0..4) |k| {
+        const source = folder.bcj2_sources[k];
+        const ordinal = std.math.cast(usize, source.pack_ordinal) orelse return error.ResourceLimit;
+        if (ordinal >= 4) return error.InvalidData;
+        const slice = packed_slices[ordinal];
+        if (source.producer) |coder_index| {
+            if (coder_index >= folder.coders.len) return error.InvalidData;
+            substreams[k] = try decodeBcj2Substream(folder.coders[coder_index], slice, workspace, limits);
+        } else {
+            substreams[k] = slice;
+        }
+    }
+    return bcj2.decode(substreams[0], substreams[1], substreams[2], substreams[3], output);
+}
+
+fn decodeBcj2Substream(coder: ParsedCoder, packed_data: []const u8, workspace: *Workspace, limits: Limits) Failure![]const u8 {
+    switch (coder.method) {
+        .copy => return packed_data,
+        .lzma2 => {
+            const dictionary = lzma2.dictionarySizeFromProperties(try readLzma2Prop(coder.attributes));
+            if (dictionary < lzma.dictionary_min or dictionary > lzma.dictionary_max) return error.Unsupported;
+            const options: lzma2.Options = .{ .dictionary_size = dictionary, .properties = lzma2.defaultProperties(dictionary), .max_work = limits.codec_work };
+            const scratch = try workspace.take(u8, lzma2.decodeWorkspaceSize(dictionary));
+            const decoded_size = try lzma2.decodedSize(packed_data, scratch, options);
+            if (decoded_size > limits.decoded_bytes) return error.ResourceLimit;
+            const buffer = try workspace.take(u8, decoded_size);
+            const decoded = try lzma2.decode(packed_data, buffer, scratch, options);
+            return buffer[0..decoded];
+        },
+        else => return error.Unsupported,
+    }
 }
 
 fn parsePpmdOptions(attributes: []const u8, unpack_size: usize, codec_work: u64) Failure!ppmd.Options {
@@ -703,11 +763,24 @@ const ParsedCoder = struct {
     num_out_streams: u64,
 };
 
+const Bond = struct {
+    in_index: u64,
+    coder_index: u64,
+};
+
+// Where one of a BCJ2 coder's four inputs comes from: a raw packed stream at the ordinal,
+// or the decoded output of a compressor coder (whose own input is at `pack_ordinal`).
+const Bcj2Source = struct {
+    pack_ordinal: u64,
+    producer: ?usize = null,
+};
+
 const Folder = struct {
     num_substreams: u64,
     substream_sizes: []u64,
     substream_crcs: []const u32,
     pack_index: usize,
+    num_pack_streams: u64 = 1,
     method: CoderMethod,
     attributes: []const u8,
     num_in_streams: u64,
@@ -719,6 +792,12 @@ const Folder = struct {
     aes_iv: [16]u8 = @splat(0),
     aes_iv_size: u8 = 0,
     coders: []const ParsedCoder = &.{},
+    bonds: []const Bond = &.{},
+    packed_inputs: []const u64 = &.{},
+    bcj2: bool = false,
+    // Where the BCJ2 coder's four inputs begin in the input stream index space.
+    bcj2_in_base: u64 = 0,
+    bcj2_sources: [4]Bcj2Source = undefined,
     unpack_size: u64 = 0,
 };
 
@@ -777,10 +856,15 @@ fn parseStreamsInfo(cursor: *binary.ReadCursor, workspace: *Workspace) Failure!S
         }
     }
     if (!has_pack or !has_unpack) return error.InvalidData;
-    if (pack_sizes.len != folders.len) return error.InvalidData;
-    for (folders, 0..) |folder, i| {
-        if (folder.pack_index != i) return error.InvalidData;
+    // Packed streams are per-folder runs, and a BCJ2 folder owns four, so the runs tile the
+    // pack size array in folder order.
+    var next_pack_index: usize = 0;
+    for (folders) |*folder| {
+        folder.pack_index = next_pack_index;
+        const run = std.math.cast(usize, folder.num_pack_streams) orelse return error.ResourceLimit;
+        next_pack_index = try bounds.addUsize(next_pack_index, run);
     }
+    if (next_pack_index != pack_sizes.len) return error.InvalidData;
     return .{
         .pack_pos = pack_pos,
         .pack_sizes = pack_sizes,
@@ -803,7 +887,9 @@ fn parseFolders(cursor: *binary.ReadCursor, workspace: *Workspace) Failure![]Fol
     const folders = try workspace.take(Folder, folder_count);
     for (folders) |*folder| {
         const num_coders = try readUint64(cursor);
-        if (num_coders < 1 or num_coders > 4) return error.Unsupported;
+        // A BCJ2 folder carries four compressor coders and the recombiner, so the bound leaves
+        // headroom without going open-ended.
+        if (num_coders < 1 or num_coders > 8) return error.Unsupported;
         const coder_count = std.math.cast(usize, num_coders) orelse return error.ResourceLimit;
         const coders = try workspace.take(ParsedCoder, coder_count);
         for (coders) |*coder| {
@@ -813,42 +899,93 @@ fn parseFolders(cursor: *binary.ReadCursor, workspace: *Workspace) Failure![]Fol
         var aes: AesCoderProps = .{ .num_cycles = 0, .salt = &.{}, .iv = @splat(0), .iv_size = 0 };
         var data_coder_count: usize = 0;
         var last_data: ?ParsedCoder = null;
+        var bcj2_idx: ?usize = null;
+        var filter_present = false;
         var folder_in_streams: u64 = 0;
         var folder_out_streams: u64 = 0;
-        for (coders) |coder| {
+        const coder_in_base = try workspace.take(u64, coder_count);
+        const coder_out_base = try workspace.take(u64, coder_count);
+        for (coders, 0..) |coder, i| {
+            coder_in_base[i] = folder_in_streams;
+            coder_out_base[i] = folder_out_streams;
             folder_in_streams = try bounds.addUsize(folder_in_streams, coder.num_in_streams);
             folder_out_streams = try bounds.addUsize(folder_out_streams, coder.num_out_streams);
             if (std.mem.eql(u8, coder.method_id, &method_7z_aes_id)) {
                 if (encrypted) return error.Unsupported;
                 encrypted = true;
                 aes = try parse7zAesProps(coder.attributes);
+            } else if (coder.method == .bcj2) {
+                if (bcj2_idx != null) return error.Unsupported;
+                bcj2_idx = i;
+            } else if (isFilterMethod(coder.method)) {
+                filter_present = true;
             } else {
-                if (!isFilterMethod(coder.method)) {
-                    data_coder_count += 1;
-                    last_data = coder;
-                }
+                data_coder_count += 1;
+                last_data = coder;
             }
         }
         if (data_coder_count == 0 or (encrypted and data_coder_count != 1)) return error.Unsupported;
-        const data_coder = last_data.?;
-        const method = data_coder.method;
-        const attributes = data_coder.attributes;
-        const num_in_streams = data_coder.num_in_streams;
-        const num_out_streams = data_coder.num_out_streams;
+        if (bcj2_idx != null and (encrypted or filter_present)) return error.Unsupported;
+        var method = last_data.?.method;
+        var attributes = last_data.?.attributes;
+        var num_in_streams = last_data.?.num_in_streams;
+        var num_out_streams = last_data.?.num_out_streams;
+        var bonds: []const Bond = &.{};
+        var packed_inputs: []const u64 = &.{};
+        var bcj2_sources: [4]Bcj2Source = undefined;
+        const bcj2_in_base = if (bcj2_idx) |i| coder_in_base[i] else 0;
         if (num_coders > 1) {
             const num_bonds = num_coders - 1;
+            const bond_count = std.math.cast(usize, num_bonds) orelse return error.ResourceLimit;
+            const bond_list = try workspace.take(Bond, bond_count);
             var bond: u64 = 0;
             while (bond < num_bonds) : (bond += 1) {
                 const in_index = try readUint64(cursor);
                 const coder_index = try readUint64(cursor);
                 if (in_index >= folder_in_streams or coder_index >= num_coders) return error.InvalidData;
+                // An input stream feeds from exactly one place, so a repeat means a malformed folder.
+                for (bond_list[0..@intCast(bond)]) |existing| {
+                    if (existing.in_index == in_index) return error.InvalidData;
+                }
+                bond_list[@intCast(bond)] = .{ .in_index = in_index, .coder_index = coder_index };
             }
+            bonds = bond_list;
             const num_packed_streams = folder_in_streams - num_bonds;
+            if (num_packed_streams == 0) return error.InvalidData;
             if (num_packed_streams != 1) {
+                const packed_count = std.math.cast(usize, num_packed_streams) orelse return error.ResourceLimit;
+                const packed_list = try workspace.take(u64, packed_count);
                 var packed_index: u64 = 0;
                 while (packed_index < num_packed_streams) : (packed_index += 1) {
                     const index = try readUint64(cursor);
                     if (index >= folder_in_streams) return error.InvalidData;
+                    packed_list[@intCast(packed_index)] = index;
+                }
+                packed_inputs = packed_list;
+            }
+        }
+        if (bcj2_idx) |bi| {
+            method = .bcj2;
+            attributes = coders[bi].attributes;
+            num_in_streams = coders[bi].num_in_streams;
+            num_out_streams = coders[bi].num_out_streams;
+            for (0..4) |k| {
+                const global_in = bcj2_in_base + k;
+                var producer: ?usize = null;
+                for (bonds) |existing| {
+                    if (existing.in_index == global_in) producer = @intCast(existing.coder_index);
+                }
+                if (producer) |ci| {
+                    if (coders[ci].num_in_streams != 1 or coders[ci].method == .bcj2) return error.Unsupported;
+                    bcj2_sources[k] = .{
+                        .pack_ordinal = try packedOrdinal(packed_inputs, folder_in_streams - bonds.len, coder_in_base[ci]),
+                        .producer = ci,
+                    };
+                } else {
+                    bcj2_sources[k] = .{
+                        .pack_ordinal = try packedOrdinal(packed_inputs, folder_in_streams - bonds.len, global_in),
+                        .producer = null,
+                    };
                 }
             }
         }
@@ -857,6 +994,7 @@ fn parseFolders(cursor: *binary.ReadCursor, workspace: *Workspace) Failure![]Fol
             .substream_sizes = &.{},
             .substream_crcs = &.{},
             .pack_index = 0,
+            .num_pack_streams = if (bcj2_idx != null) folder_in_streams - bonds.len else 1,
             .method = method,
             .attributes = attributes,
             .num_in_streams = num_in_streams,
@@ -868,6 +1006,11 @@ fn parseFolders(cursor: *binary.ReadCursor, workspace: *Workspace) Failure![]Fol
             .aes_iv = aes.iv,
             .aes_iv_size = aes.iv_size,
             .coders = coders,
+            .bonds = bonds,
+            .packed_inputs = packed_inputs,
+            .bcj2 = bcj2_idx != null,
+            .bcj2_in_base = bcj2_in_base,
+            .bcj2_sources = bcj2_sources,
         };
     }
     const unpack_id = try cursor.readU8();
@@ -878,8 +1021,11 @@ fn parseFolders(cursor: *binary.ReadCursor, workspace: *Workspace) Failure![]Fol
         for (0..stream_count) |index| {
             arr[index] = try readUint64(cursor);
         }
-        folder.unpack_size = arr[stream_count - 1];
-        folder.substream_sizes = arr[stream_count - 1 ..][0..1];
+        // The folder's data is the one output no bond consumes. For the common single-coder
+        // folder that is the last (only) stream.
+        const sink = folderSinkOutput(folder) orelse (stream_count - 1);
+        folder.unpack_size = arr[sink];
+        folder.substream_sizes = arr[sink .. sink + 1];
     }
     while (cursor.remaining() > 0) {
         const id = try cursor.readU8();
@@ -891,8 +1037,51 @@ fn parseFolders(cursor: *binary.ReadCursor, workspace: *Workspace) Failure![]Fol
             }
         } else return error.Unsupported;
     }
-    for (folders, 0..) |*folder, i| folder.pack_index = i;
     return folders;
+}
+
+// Maps a global input stream index to its ordinal among the folder's packed streams. A
+// bonded (coder-fed) input has no packed ordinal.
+fn packedOrdinal(packed_inputs: []const u64, num_packed_streams: u64, global_in: u64) Failure!u64 {
+    if (packed_inputs.len != 0) {
+        for (packed_inputs, 0..) |input, ordinal| {
+            if (input == global_in) return ordinal;
+        }
+        return error.Unsupported;
+    }
+    if (num_packed_streams == 1 and global_in == 0) return 0;
+    return error.Unsupported;
+}
+
+// The global index of the folder output stream no bond consumes, if exactly one exists.
+fn folderSinkOutput(folder: *const Folder) ?usize {
+    var unbound: ?u64 = null;
+    var out_index: u64 = 0;
+    for (folder.coders) |coder| {
+        var local: u64 = 0;
+        while (local < coder.num_out_streams) : (local += 1) {
+            const global_out = out_index + local;
+            var consumed = false;
+            for (folder.bonds) |bond| {
+                if (folder.coders[bond.coder_index].num_out_streams == 1 and globalOutputBase(folder, bond.coder_index) == global_out) consumed = true;
+            }
+            if (!consumed) {
+                if (unbound != null) return null;
+                unbound = global_out;
+            }
+        }
+        out_index += coder.num_out_streams;
+    }
+    if (unbound) |sink| return std.math.cast(usize, sink);
+    return null;
+}
+
+fn globalOutputBase(folder: *const Folder, coder_index: u64) u64 {
+    var base: u64 = 0;
+    for (folder.coders[0..@intCast(coder_index)]) |coder| {
+        base += coder.num_out_streams;
+    }
+    return base;
 }
 
 fn parseCoder(cursor: *binary.ReadCursor, workspace: *Workspace) Failure!ParsedCoder {
@@ -910,7 +1099,10 @@ fn parseCoder(cursor: *binary.ReadCursor, workspace: *Workspace) Failure!ParsedC
         num_in_streams = try readUint64(cursor);
         num_out_streams = try readUint64(cursor);
     }
-    if (num_in_streams != 1 or num_out_streams != 1) return error.Unsupported;
+    if (method == .bcj2) {
+        // BCJ2 is the one many-to-one coder, with four sub-stream inputs and one output.
+        if (num_in_streams != 4 or num_out_streams != 1) return error.Unsupported;
+    } else if (num_in_streams != 1 or num_out_streams != 1) return error.Unsupported;
     const attributes = blk: {
         if (has_attributes) {
             const prop_size = try readUint64(cursor);
@@ -1134,6 +1326,7 @@ fn buildEntries(si: *const StreamsInfo, fi: *const FilesInfo, workspace: *Worksp
         var aes_iv_size: u8 = 0;
         var entry_folder: ?*const Folder = null;
         var file_substream_offset: u64 = 0;
+        var entry_pack_stream_sizes: []const u64 = &.{};
         if (!is_empty) {
             while (folder_index < si.folders.len) {
                 const folder_substream_count = std.math.cast(usize, si.folders[folder_index].num_substreams) orelse return error.ResourceLimit;
@@ -1148,7 +1341,12 @@ fn buildEntries(si: *const StreamsInfo, fi: *const FilesInfo, workspace: *Worksp
             if (substream_index >= folder.substream_sizes.len) return error.InvalidData;
             size = folder.substream_sizes[substream_index];
             if (size > limits.decoded_bytes) return error.ResourceLimit;
-            pack_size = si.pack_sizes[folder_index];
+            const pack_run = std.math.cast(usize, folder.num_pack_streams) orelse return error.ResourceLimit;
+            if (folder.pack_index + pack_run > si.pack_sizes.len) return error.InvalidData;
+            entry_pack_stream_sizes = si.pack_sizes[folder.pack_index..][0..pack_run];
+            for (entry_pack_stream_sizes) |stream_size| {
+                pack_size = try bounds.addU64(pack_size, stream_size);
+            }
             if (pack_size > limits.encoded_bytes) return error.ResourceLimit;
             data_offset = try bounds.addU64(start_header_size, try folderPackOffset(si, folder_index));
             method = folder.method;
@@ -1188,6 +1386,7 @@ fn buildEntries(si: *const StreamsInfo, fi: *const FilesInfo, workspace: *Worksp
             .aes_iv_size = aes_iv_size,
             .folder = entry_folder,
             .substream_offset = file_substream_offset,
+            .pack_stream_sizes = entry_pack_stream_sizes,
         };
     }
     if (folder_index != si.folders.len) return error.InvalidData;
@@ -1197,7 +1396,10 @@ fn buildEntries(si: *const StreamsInfo, fi: *const FilesInfo, workspace: *Worksp
 fn folderPackOffset(si: *const StreamsInfo, folder_index: usize) Failure!u64 {
     var offset = si.pack_pos;
     for (0..folder_index) |index| {
-        offset = try bounds.addU64(offset, si.pack_sizes[index]);
+        const run = std.math.cast(usize, si.folders[index].num_pack_streams) orelse return error.ResourceLimit;
+        for (0..run) |sub| {
+            offset = try bounds.addU64(offset, si.pack_sizes[si.folders[index].pack_index + sub]);
+        }
     }
     return offset;
 }
@@ -1962,4 +2164,152 @@ test "sevenzip decode captured failing encrypted archive" {
     defer allocator.free(out);
     const produced = try sevenZipDecodeOrdinal(&archive, &workspace, .{}, 0, out, .{ .password = "secret", .failure_cause = &cause });
     try testing.expectEqualSlices(u8, &corpus_data, out[0..produced]);
+}
+
+fn hexBytes(comptime len: usize, comptime hex: []const u8) [len]u8 {
+    var out: [len]u8 = undefined;
+    for (&out, 0..) |*byte, i| {
+        byte.* = std.fmt.parseInt(u8, hex[2 * i ..][0..2], 16) catch unreachable;
+    }
+    return out;
+}
+
+// Captured from ip7z/7zip 26.x CLI output (`7zz a -m0=BCJ2 -m1=LZMA2 -mx=5`) and inlined
+// as hex, so no binary fixture enters the tree.
+const bcj2_lzma2_7z_hex =
+    "377abcaf271c0004680dc853c101000000000000720000000000000003d82b46e0032b00285d00486bb62414e8bbc1f7" ++
+    "862bf0e75602d709b27284cbf7dc450308b8467a9684be00466f3cf4843800000000004f0000007300000097000000bb" ++
+    "000000df00000103000001270000014b0000016f00000193000001b7000001db000001ff00000223000002470000026b" ++
+    "0000028f000002b3000002d7000002fb0000031f00000343000003670000038b000003af000003d3000003f70000041b" ++
+    "0000043f0000046300000487000004ab000000300000001c000000540000003e00000078000000600000009c00000082" ++
+    "000000c0000000a4000000e4000000c600000108000000e80000012c0000010a000001500000012c000001740000014e" ++
+    "0000019800000170000001bc00000192000001e0000001b400000204000001d600000228000001f80000024c0000021a" ++
+    "000002700000023c000002940000025e000002b800000280000002dc000002a200000300000002c400000324000002e6" ++
+    "00000348000003080000036c0000032a000003900000034c000003b40000036e000003d800000390000003fc000003b2" ++
+    "00000420000003d400000444000003f600000468000004180000048c0000043a0000045c00bffffbffffffff41934e10" ++
+    "0001040600040930808081040d00070b01000221210100140303011b04010100000203040c832c84b000080a01f09180" ++
+    "b3000005011907000000000000001117006200720061006e00630068002e00620069006e000000190400000000140a01" ++
+    "0094d13ab09c57dd01150601002080a4810000" ++
+    "";
+const bcj2_branch_bin_hex =
+    "90909090909090909090e840000000909090909090e9e0ffffff0f8510000000cccccc90909090909090909090e84100" ++
+    "0000909090909090e9dfffffff0f8511000000cccccc90909090909090909090e842000000909090909090e9deffffff" ++
+    "0f8512000000cccccc90909090909090909090e843000000909090909090e9ddffffff0f8513000000cccccc90909090" ++
+    "909090909090e844000000909090909090e9dcffffff0f8514000000cccccc90909090909090909090e8450000009090" ++
+    "90909090e9dbffffff0f8515000000cccccc90909090909090909090e846000000909090909090e9daffffff0f851600" ++
+    "0000cccccc90909090909090909090e847000000909090909090e9d9ffffff0f8517000000cccccc9090909090909090" ++
+    "9090e848000000909090909090e9d8ffffff0f8518000000cccccc90909090909090909090e849000000909090909090" ++
+    "e9d7ffffff0f8519000000cccccc90909090909090909090e84a000000909090909090e9d6ffffff0f851a000000cccc" ++
+    "cc90909090909090909090e84b000000909090909090e9d5ffffff0f851b000000cccccc90909090909090909090e84c" ++
+    "000000909090909090e9d4ffffff0f851c000000cccccc90909090909090909090e84d000000909090909090e9d3ffff" ++
+    "ff0f851d000000cccccc90909090909090909090e84e000000909090909090e9d2ffffff0f851e000000cccccc909090" ++
+    "90909090909090e84f000000909090909090e9d1ffffff0f851f000000cccccc90909090909090909090e85000000090" ++
+    "9090909090e9d0ffffff0f8520000000cccccc90909090909090909090e851000000909090909090e9cfffffff0f8521" ++
+    "000000cccccc90909090909090909090e852000000909090909090e9ceffffff0f8522000000cccccc90909090909090" ++
+    "909090e853000000909090909090e9cdffffff0f8523000000cccccc90909090909090909090e8540000009090909090" ++
+    "90e9ccffffff0f8524000000cccccc90909090909090909090e855000000909090909090e9cbffffff0f8525000000cc" ++
+    "cccc90909090909090909090e856000000909090909090e9caffffff0f8526000000cccccc90909090909090909090e8" ++
+    "57000000909090909090e9c9ffffff0f8527000000cccccc90909090909090909090e858000000909090909090e9c8ff" ++
+    "ffff0f8528000000cccccc90909090909090909090e859000000909090909090e9c7ffffff0f8529000000cccccc9090" ++
+    "9090909090909090e85a000000909090909090e9c6ffffff0f852a000000cccccc90909090909090909090e85b000000" ++
+    "909090909090e9c5ffffff0f852b000000cccccc90909090909090909090e85c000000909090909090e9c4ffffff0f85" ++
+    "2c000000cccccc90909090909090909090e85d000000909090909090e9c3ffffff0f852d000000cccccc909090909090" ++
+    "90909090e85e000000909090909090e9c2ffffff0f852e000000cccccc90909090909090909090e85f00000090909090" ++
+    "9090e9c1ffffff0f852f000000cccccc90909090909090909090e860000000909090909090e9c0ffffff0f8530000000" ++
+    "cccccc90909090909090909090e861000000909090909090e9bfffffff0f8531000000cccccc90909090909090909090" ++
+    "";
+const aes256_7z_hex =
+    "377abcaf271c0004afccd57250000000000000006a00000000000000c7c6c908de6b8e456ffc7b5c50428e4e0b9f0a2c" ++
+    "8f9a7e14097bd39f4128ed576f1e1691e32584058270b96f019801c20e2211feea95d048689d6085e76e54220e5fd111" ++
+    "65e82a70ae0f01f6d058d99f8d8e336b0104060001095000070b0100022406f1070112530f65760b89ec46a2e4984b32" ++
+    "4173d47a1e2121010001000c45870800080a01434d78ec00000501190011150070006c00610069006e002e0074007800" ++
+    "74000000140a0100e6d43ab09c57dd01150601002080a4810000" ++
+    "";
+const aes_plain_txt_hex =
+    "54686520717569636b2062726f776e20666f78206a756d7073206f76657220746865206c617a7920646f672e0a546865" ++
+    "20717569636b2062726f776e20666f78206a756d7073206f76657220746865206c617a7920646f672e0a546865207175" ++
+    "69636b2062726f776e20666f78206a756d7073206f76657220746865206c617a7920646f672e0a54686520717569636b" ++
+    "2062726f776e20666f78206a756d7073206f76657220746865206c617a7920646f672e0a54686520717569636b206272" ++
+    "6f776e20666f78206a756d7073206f76657220746865206c617a7920646f672e0a54686520717569636b2062726f776e" ++
+    "20666f78206a756d7073206f76657220746865206c617a7920646f672e0a54686520717569636b2062726f776e20666f" ++
+    "78206a756d7073206f76657220746865206c617a7920646f672e0a54686520717569636b2062726f776e20666f78206a" ++
+    "756d7073206f76657220746865206c617a7920646f672e0a54686520717569636b2062726f776e20666f78206a756d70" ++
+    "73206f76657220746865206c617a7920646f672e0a54686520717569636b2062726f776e20666f78206a756d7073206f" ++
+    "76657220746865206c617a7920646f672e0a54686520717569636b2062726f776e20666f78206a756d7073206f766572" ++
+    "20746865206c617a7920646f672e0a54686520717569636b2062726f776e20666f78206a756d7073206f766572207468" ++
+    "65206c617a7920646f672e0a54686520717569636b2062726f776e20666f78206a756d7073206f76657220746865206c" ++
+    "617a7920646f672e0a54686520717569636b2062726f776e20666f78206a756d7073206f76657220746865206c617a79" ++
+    "20646f672e0a54686520717569636b2062726f776e20666f78206a756d7073206f76657220746865206c617a7920646f" ++
+    "672e0a54686520717569636b2062726f776e20666f78206a756d7073206f76657220746865206c617a7920646f672e0a" ++
+    "54686520717569636b2062726f776e20666f78206a756d7073206f76657220746865206c617a7920646f672e0a546865" ++
+    "20717569636b2062726f776e20666f78206a756d7073206f76657220746865206c617a7920646f672e0a546865207175" ++
+    "69636b2062726f776e20666f78206a756d7073206f76657220746865206c617a7920646f672e0a54686520717569636b" ++
+    "2062726f776e20666f78206a756d7073206f76657220746865206c617a7920646f672e0a54686520717569636b206272" ++
+    "6f776e20666f78206a756d7073206f76657220746865206c617a7920646f672e0a54686520717569636b2062726f776e" ++
+    "20666f78206a756d7073206f76657220746865206c617a7920646f672e0a54686520717569636b2062726f776e20666f" ++
+    "78206a756d7073206f76657220746865206c617a7920646f672e0a54686520717569636b2062726f776e20666f78206a" ++
+    "756d7073206f76657220746865206c617a7920646f672e0a54686520717569636b2062726f776e20666f78206a756d70" ++
+    "73206f76657220746865206c617a7920646f672e0a54686520717569636b2062726f776e20666f78206a756d7073206f" ++
+    "76657220746865206c617a7920646f672e0a54686520717569636b2062726f776e20666f78206a756d7073206f766572" ++
+    "20746865206c617a7920646f672e0a54686520717569636b2062726f776e20666f78206a756d7073206f766572207468" ++
+    "65206c617a7920646f672e0a54686520717569636b2062726f776e20666f78206a756d7073206f76657220746865206c" ++
+    "617a7920646f672e0a54686520717569636b2062726f776e20666f78206a756d7073206f76657220746865206c617a79" ++
+    "20646f672e0a54686520717569636b2062726f776e20666f78206a756d7073206f76657220746865206c617a7920646f" ++
+    "672e0a54686520717569636b2062726f776e20666f78206a756d7073206f76657220746865206c617a7920646f672e0a" ++
+    "54686520717569636b2062726f776e20666f78206a756d7073206f76657220746865206c617a7920646f672e0a546865" ++
+    "20717569636b2062726f776e20666f78206a756d7073206f76657220746865206c617a7920646f672e0a546865207175" ++
+    "69636b2062726f776e20666f78206a756d7073206f76657220746865206c617a7920646f672e0a54686520717569636b" ++
+    "2062726f776e20666f78206a756d7073206f76657220746865206c617a7920646f672e0a54686520717569636b206272" ++
+    "6f776e20666f78206a756d7073206f76657220746865206c617a7920646f672e0a54686520717569636b2062726f776e" ++
+    "20666f78206a756d7073206f76657220746865206c617a7920646f672e0a54686520717569636b2062726f776e20666f" ++
+    "78206a756d7073206f76657220746865206c617a7920646f672e0a54686520717569636b2062726f776e20666f78206a" ++
+    "756d7073206f76657220746865206c617a7920646f672e0a" ++
+    "";
+
+test "sevenzip decodes 7zz BCJ2 + LZMA2 folder" {
+    // The folder arrives as four packed streams: the LZMA2 main, call, and jump coders bonded
+    // into the BCJ2 recombiner, plus the raw range-coded bitmap.
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const archive_bytes = hexBytes(595, bcj2_lzma2_7z_hex);
+    const expected = hexBytes(1200, bcj2_branch_bin_hex);
+    const backing = try allocator.alloc(u8, 64 * 1024 * 1024);
+    defer allocator.free(backing);
+    var cause: crypto.FailureCause = .none;
+
+    var inspect_ws = try Workspace.init(backing.ptr, backing.len);
+    const info = try sevenZipInspectOrdinal(&archive_bytes, &inspect_ws, .{}, 0);
+    try testing.expectEqual(CoderMethod.bcj2, info.method);
+    try testing.expectEqual(expected.len, info.size);
+
+    var workspace = try Workspace.init(backing.ptr, backing.len);
+    const out = try allocator.alloc(u8, expected.len);
+    defer allocator.free(out);
+    const produced = try sevenZipDecodeOrdinal(&archive_bytes, &workspace, .{}, 0, out, .{ .failure_cause = &cause });
+    try testing.expectEqual(expected.len, produced);
+    try testing.expectEqualSlices(u8, &expected, out);
+}
+
+test "sevenzip decodes 7zz AES-256 encrypted archive" {
+    // Captured from `7zz a -ppassword123` (7zAES, 2^19 KDF rounds, LZMA2).
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const archive_bytes = hexBytes(218, aes256_7z_hex);
+    const expected = hexBytes(1800, aes_plain_txt_hex);
+    const backing = try allocator.alloc(u8, 64 * 1024 * 1024);
+    defer allocator.free(backing);
+    var cause: crypto.FailureCause = .none;
+
+    var workspace = try Workspace.init(backing.ptr, backing.len);
+    const out = try allocator.alloc(u8, expected.len);
+    defer allocator.free(out);
+    const produced = try sevenZipDecodeOrdinal(&archive_bytes, &workspace, .{}, 0, out, .{ .password = "password123", .failure_cause = &cause });
+    try testing.expectEqual(expected.len, produced);
+    try testing.expectEqualSlices(u8, &expected, out);
+
+    // A wrong password must fail instead of returning unauthenticated bytes.
+    var bad_ws = try Workspace.init(backing.ptr, backing.len);
+    if (sevenZipDecodeOrdinal(&archive_bytes, &bad_ws, .{}, 0, out, .{ .password = "wrong", .failure_cause = &cause })) |_| {
+        try testing.expect(false);
+    } else |_| {}
 }
