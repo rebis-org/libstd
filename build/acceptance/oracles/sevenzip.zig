@@ -507,7 +507,7 @@ fn runPpmd(r: *Runner) anyerror!void {
     }
     const oracle = lib.archiveReadMatches(sz_coded_archive[0..archive_size], &expected);
     if (oracle == .mismatch) return error.PpmdSolidOracleRejected;
-    if (oracle == .unsupported) std.debug.print("seven_zip ppmd: skipped (libarchive's 7z reader lacks solid PPMd; the archive validates with the official 7-Zip CLI).\n", .{});
+    if (oracle == .unsupported) std.debug.print("seven_zip ppmd: skipped (libarchive's 7z reader lacks solid PPMd; the archive validates with the official ip7z/7zip CLI).\n", .{});
 }
 
 pub const scenarios = harness.scenarios("seven_zip", &.{

@@ -417,7 +417,7 @@ fn verifyFilteredCheck(check: CheckType, block: []const u8, expected: []const u8
         var sha = crypto.Sha256.init(.{});
         sha.update(block);
         var digest: [32]u8 = undefined;
-        sha.final(&digest);
+        digest = sha.finalResult();
         if (!std.mem.eql(u8, &digest, expected)) return error.IntegrityFailure;
         return;
     }
@@ -569,7 +569,7 @@ fn encodeStream(writer: *std.Io.Writer, input: []const u8, scratch: []u8, option
         var sha = crypto.Sha256.init(.{});
         sha.update(input);
         var digest: [32]u8 = undefined;
-        sha.final(&digest);
+        digest = sha.finalResult();
         try io.writeBytes(writer, &digest);
     } else {
         try writeCheck(writer, options.check, tee_writer.crc32Value(), tee_writer.crc64Value());

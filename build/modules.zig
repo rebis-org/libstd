@@ -93,9 +93,19 @@ pub fn componentsWithNucleus(
     return .{ .nucleus = nucleus_module, .components = components_module };
 }
 
-pub fn maybeAddCrcAsm(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget, portable: bool) void {
-    if (!portable and target.result.cpu.arch == .aarch64)
-        module.addAssemblyFile(b.path("src/common/primitive/checksum/aarch64.S"));
+pub fn withKernelFeatures(target: std.Build.ResolvedTarget) std.Build.ResolvedTarget {
+    var adjusted = target;
+    if (adjusted.result.cpu.arch == .aarch64) {
+        const crc_feature = @backingInt(std.Target.aarch64.Feature.crc);
+        adjusted.query.cpu_features_add.addFeature(crc_feature);
+        adjusted.result.cpu.features.addFeature(crc_feature);
+        const crypto_feature = @backingInt(std.Target.aarch64.Feature.crypto);
+        adjusted.query.cpu_features_add.addFeature(crypto_feature);
+        adjusted.result.cpu.features.addFeature(crypto_feature);
+        // The crypto feature implies aes (std.Target.aarch64), and LLVM's aes implies
+        // pmull, which the CRC32 fold kernel multiplies with.
+    }
+    return adjusted;
 }
 
 pub fn createFor(
@@ -107,12 +117,7 @@ pub fn createFor(
 ) *std.Build.Module {
     var adjusted = target;
     if (!ctx.portable and spec.crc_kernel and adjusted.result.cpu.arch == .aarch64) {
-        const crc_feature = @backingInt(std.Target.aarch64.Feature.crc);
-        adjusted.query.cpu_features_add.addFeature(crc_feature);
-        adjusted.result.cpu.features.addFeature(crc_feature);
-        const crypto_feature = @backingInt(std.Target.aarch64.Feature.crypto);
-        adjusted.query.cpu_features_add.addFeature(crypto_feature);
-        adjusted.result.cpu.features.addFeature(crypto_feature);
+        adjusted = withKernelFeatures(adjusted);
     }
     const module = b.createModule(.{
         .root_source_file = b.path(spec.root),
@@ -120,7 +125,6 @@ pub fn createFor(
         .optimize = optimize,
     });
     if (ctx.sanitize_c) |sc| module.sanitize_c = sc;
-    if (spec.crc_kernel) maybeAddCrcAsm(b, module, target, ctx.portable);
     module.addImport("options", ctx.options);
     inline for (spec.imports) |import| {
         module.addImport(import.name, createFor(b, byName(import.module), target, optimize, ctx));
