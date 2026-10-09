@@ -1,6 +1,11 @@
 const std = @import("std");
 
 const Failure = @import("failure.zig").Failure;
+const sha1_seam = @import("hash/sha1/seam.zig");
+const sha256_seam = @import("hash/sha256/seam.zig");
+const hmac_seam = @import("hash/hmac/seam.zig");
+const pbkdf2_seam = @import("hash/pbkdf2/seam.zig");
+const aes_seam = @import("cipher/aes/seam.zig");
 
 pub const block_length = 16;
 pub const hmac_sha1_length = 20;
@@ -19,277 +24,25 @@ pub const FailureCause = enum {
     unsupported_algorithm,
 };
 
-pub const Sha256 = struct {
-    state: [8]u32,
-    buffer: [64]u8,
-    buffered: usize = 0,
-    total: u64 = 0,
+// Capability seams keep every block primitive swappable per capability; this
+// glue never names an implementation directly.
+pub const Sha256 = sha256_seam.Sha256;
+pub const Sha1 = sha1_seam.Sha1;
 
-    pub const Options = struct {};
-
-    pub fn init(_: Options) Sha256 {
-        // The buffer stays undefined until update fills it before any read.
-        return .{ .state = .{
-            0x6a09_e667, 0xbb67_ae85, 0x3c6e_f372, 0xa54f_f53a,
-            0x510e_527f, 0x9b05_688c, 0x1f83_d9ab, 0x5be0_cd19,
-        }, .buffer = undefined };
-    }
-
-    fn rotr(value: u32, amount: u32) u32 {
-        return std.math.rotr(u32, value, amount);
-    }
-
-    fn compress(self: *Sha256, block: *const [64]u8) void {
-        var w: [64]u32 = undefined;
-        for (0..16) |index| w[index] = std.mem.readInt(u32, block[4 * index ..][0..4], .big);
-        for (16..64) |index| {
-            const lower0 = rotr(w[index - 15], 7) ^ rotr(w[index - 15], 18) ^ (w[index - 15] >> 3);
-            const lower1 = rotr(w[index - 2], 17) ^ rotr(w[index - 2], 19) ^ (w[index - 2] >> 10);
-            w[index] = w[index - 16] +% lower0 +% w[index - 7] +% lower1;
-        }
-        var a = self.state[0];
-        var b = self.state[1];
-        var c = self.state[2];
-        var d = self.state[3];
-        var e = self.state[4];
-        var f = self.state[5];
-        var g = self.state[6];
-        var h = self.state[7];
-        for (0..64) |index| {
-            const upper1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
-            const choice = (e & f) ^ (~e & g);
-            const temp1 = h +% upper1 +% choice +% k[index] +% w[index];
-            const upper0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
-            const majority = (a & b) ^ (a & c) ^ (b & c);
-            const temp2 = upper0 +% majority;
-            h = g;
-            g = f;
-            f = e;
-            e = d +% temp1;
-            d = c;
-            c = b;
-            b = a;
-            a = temp1 +% temp2;
-        }
-        self.state[0] +%= a;
-        self.state[1] +%= b;
-        self.state[2] +%= c;
-        self.state[3] +%= d;
-        self.state[4] +%= e;
-        self.state[5] +%= f;
-        self.state[6] +%= g;
-        self.state[7] +%= h;
-    }
-
-    pub fn update(self: *Sha256, input: []const u8) void {
-        self.total +%= input.len;
-        var remaining = input;
-        if (self.buffered != 0) {
-            const take = @min(remaining.len, 64 - self.buffered);
-            @memcpy(self.buffer[self.buffered..][0..take], remaining[0..take]);
-            self.buffered += take;
-            remaining = remaining[take..];
-            if (self.buffered == 64) {
-                self.compress(&self.buffer);
-                self.buffered = 0;
-            }
-        }
-        while (remaining.len >= 64) {
-            self.compress(remaining[0..64]);
-            remaining = remaining[64..];
-        }
-        if (remaining.len != 0) {
-            @memcpy(self.buffer[0..remaining.len], remaining);
-            self.buffered = remaining.len;
-        }
-    }
-
-    pub fn final(self: *Sha256, out: []u8) void {
-        const bit_length = self.total *% 8;
-        self.buffer[self.buffered] = 0x80;
-        self.buffered += 1;
-        if (self.buffered > 56) {
-            @memset(self.buffer[self.buffered..], 0);
-            self.compress(&self.buffer);
-            self.buffered = 0;
-        }
-        @memset(self.buffer[self.buffered..56], 0);
-        std.mem.writeInt(u64, self.buffer[56..64], bit_length, .big);
-        self.compress(&self.buffer);
-        for (self.state, 0..) |word, index| std.mem.writeInt(u32, out[4 * index ..][0..4], word, .big);
-    }
-
-    const k = [_]u32{
-        0x428a_2f98, 0x7137_4491, 0xb5c0_fbcf, 0xe9b5_dba5,
-        0x3956_c25b, 0x59f1_11f1, 0x923f_82a4, 0xab1c_5ed5,
-        0xd807_aa98, 0x1283_5b01, 0x2431_85be, 0x550c_7dc3,
-        0x72be_5d74, 0x80de_b1fe, 0x9bdc_06a7, 0xc19b_f174,
-        0xe49b_69c1, 0xefbe_4786, 0x0fc1_9dc6, 0x240c_a1cc,
-        0x2de9_2c6f, 0x4a74_84aa, 0x5cb0_a9dc, 0x76f9_88da,
-        0x983e_5152, 0xa831_c66d, 0xb003_27c8, 0xbf59_7fc7,
-        0xc6e0_0bf3, 0xd5a7_9147, 0x06ca_6351, 0x1429_2967,
-        0x27b7_0a85, 0x2e1b_2138, 0x4d2c_6dfc, 0x5338_0d13,
-        0x650a_7354, 0x766a_0abb, 0x81c2_c92e, 0x9272_2c85,
-        0xa2bf_e8a1, 0xa81a_664b, 0xc24b_8b70, 0xc76c_51a3,
-        0xd192_e819, 0xd699_0624, 0xf40e_3585, 0x106a_a070,
-        0x19a4_c116, 0x1e37_6c08, 0x2748_774c, 0x34b0_bcb5,
-        0x391c_0cb3, 0x4ed8_aa4a, 0x5b9c_ca4f, 0x682e_6ff3,
-        0x748f_82ee, 0x78a5_636f, 0x84c8_7814, 0x8cc7_0208,
-        0x90be_fffa, 0xa450_6ceb, 0xbef9_a3f7, 0xc671_78f2,
-    };
-};
-
-pub const Sha1 = struct {
-    state: [5]u32,
-    buffer: [64]u8,
-    buffered: usize = 0,
-    total: u64 = 0,
-
-    pub const Options = struct {};
-
-    pub fn init(_: Options) Sha1 {
-        // The buffer stays undefined until update fills it before any read.
-        return .{ .state = .{ 0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476, 0xc3d2_e1f0 }, .buffer = undefined };
-    }
-
-    fn compress(self: *Sha1, block: *const [64]u8) void {
-        var w: [80]u32 = undefined;
-        for (0..16) |index| w[index] = std.mem.readInt(u32, block[4 * index ..][0..4], .big);
-        for (16..80) |index| {
-            w[index] = std.math.rotl(u32, w[index - 3] ^ w[index - 8] ^ w[index - 14] ^ w[index - 16], 1);
-        }
-        var a = self.state[0];
-        var b = self.state[1];
-        var c = self.state[2];
-        var d = self.state[3];
-        var e = self.state[4];
-        for (0..80) |index| {
-            const f: u32 = if (index < 20)
-                (b & c) | (~b & d)
-            else if (index < 40)
-                b ^ c ^ d
-            else if (index < 60)
-                (b & c) | (b & d) | (c & d)
-            else
-                b ^ c ^ d;
-            const k: u32 = if (index < 20)
-                0x5a82_7999
-            else if (index < 40)
-                0x6ed9_eba1
-            else if (index < 60)
-                0x8f1b_bcdc
-            else
-                0xca62_c1d6;
-            const temp = std.math.rotl(u32, a, 5) +% f +% e +% k +% w[index];
-            e = d;
-            d = c;
-            c = std.math.rotl(u32, b, 30);
-            b = a;
-            a = temp;
-        }
-        self.state[0] +%= a;
-        self.state[1] +%= b;
-        self.state[2] +%= c;
-        self.state[3] +%= d;
-        self.state[4] +%= e;
-    }
-
-    pub fn update(self: *Sha1, input: []const u8) void {
-        self.total +%= input.len;
-        var remaining = input;
-        if (self.buffered != 0) {
-            const take = @min(remaining.len, 64 - self.buffered);
-            @memcpy(self.buffer[self.buffered..][0..take], remaining[0..take]);
-            self.buffered += take;
-            remaining = remaining[take..];
-            if (self.buffered == 64) {
-                self.compress(&self.buffer);
-                self.buffered = 0;
-            }
-        }
-        while (remaining.len >= 64) {
-            self.compress(remaining[0..64]);
-            remaining = remaining[64..];
-        }
-        if (remaining.len != 0) {
-            @memcpy(self.buffer[0..remaining.len], remaining);
-            self.buffered = remaining.len;
-        }
-    }
-
-    pub fn final(self: *Sha1, out: []u8) void {
-        const bit_length = self.total *% 8;
-        self.buffer[self.buffered] = 0x80;
-        self.buffered += 1;
-        if (self.buffered > 56) {
-            @memset(self.buffer[self.buffered..], 0);
-            self.compress(&self.buffer);
-            self.buffered = 0;
-        }
-        @memset(self.buffer[self.buffered..56], 0);
-        std.mem.writeInt(u64, self.buffer[56..64], bit_length, .big);
-        self.compress(&self.buffer);
-        for (self.state, 0..) |word, index| std.mem.writeInt(u32, out[4 * index ..][0..4], word, .big);
-    }
-};
-
-fn Hmac(comptime H: type, comptime digest_length: usize) type {
-    return struct {
-        inner: H,
-        outer: H,
-
-        pub fn init(key: []const u8) @This() {
-            var key_block: [64]u8 = @splat(0);
-            if (key.len > 64) {
-                const digest = hash(key);
-                @memcpy(key_block[0..digest.len], &digest);
-            } else {
-                @memcpy(key_block[0..key.len], key);
-            }
-            var inner_pad: [64]u8 = undefined;
-            var outer_pad: [64]u8 = undefined;
-            for (key_block, 0..) |byte, index| {
-                inner_pad[index] = byte ^ 0x36;
-                outer_pad[index] = byte ^ 0x5c;
-            }
-            var inner = H.init(.{});
-            inner.update(&inner_pad);
-            var outer = H.init(.{});
-            outer.update(&outer_pad);
-            return .{ .inner = inner, .outer = outer };
-        }
-
-        pub fn update(self: *@This(), input: []const u8) void {
-            self.inner.update(input);
-        }
-
-        pub fn final(self: *@This(), out: []u8) void {
-            var digest: [digest_length]u8 = undefined;
-            self.inner.final(&digest);
-            self.outer.update(&digest);
-            self.outer.final(out);
-        }
-
-        fn hash(input: []const u8) [digest_length]u8 {
-            var hasher = H.init(.{});
-            hasher.update(input);
-            var digest: [digest_length]u8 = undefined;
-            hasher.final(&digest);
-            return digest;
-        }
-    };
-}
-
-pub const HmacSha1 = Hmac(Sha1, 20);
-pub const HmacSha256 = Hmac(Sha256, 32);
+pub const HmacSha1 = hmac_seam.HmacSha1;
+pub const HmacSha256 = hmac_seam.HmacSha256;
 pub const hmac_sha256_length = 32;
 
-fn sha1(input: []const u8) [20]u8 {
-    var hasher = Sha1.init(.{});
-    hasher.update(input);
-    var digest: [20]u8 = undefined;
-    hasher.final(&digest);
-    return digest;
+pub fn hmacSha1(out: *[hmac_sha1_length]u8, message: []const u8, key: []const u8) void {
+    var hmac = HmacSha1.init(key);
+    hmac.update(message);
+    hmac.final(out);
+}
+
+pub fn hmacSha256(out: *[hmac_sha256_length]u8, message: []const u8, key: []const u8) void {
+    var hmac = HmacSha256.init(key);
+    hmac.update(message);
+    hmac.final(out);
 }
 
 pub fn winzipKeyLength(strength: u8) Failure!usize {
@@ -305,173 +58,77 @@ pub fn winzipSaltLength(strength: u8) Failure!usize {
     return (try winzipKeyLength(strength)) / 2;
 }
 
-const AesKeySchedule = struct {
-    rounds: u8,
-    words: [60]u32,
+// 128- and 256-bit keys take the seam contexts; 192-bit keys take the
+// on-prem schedule, which std does not provide.
+const BlockCipher = union(enum) {
+    enc128: aes_seam.Aes128EncCtx,
+    dec128: aes_seam.Aes128DecCtx,
+    enc256: aes_seam.Aes256EncCtx,
+    dec256: aes_seam.Aes256DecCtx,
+    hw192_enc: aes_seam.Aes192Hw,
+    hw192_dec: aes_seam.Aes192Hw,
+
+    const Direction = enum { encrypt, decrypt };
+
+    fn init(key: []const u8, comptime direction: Direction) Failure!BlockCipher {
+        return switch (direction) {
+            .encrypt => switch (key.len) {
+                16 => .{ .enc128 = aes_seam.Aes128.initEnc(key[0..16].*) },
+                24 => .{ .hw192_enc = aes_seam.Aes192Hw.initEnc(key[0..24].*) },
+                32 => .{ .enc256 = aes_seam.Aes256.initEnc(key[0..32].*) },
+                else => error.InvalidCall,
+            },
+            .decrypt => switch (key.len) {
+                16 => .{ .dec128 = aes_seam.Aes128.initDec(key[0..16].*) },
+                24 => .{ .hw192_dec = aes_seam.Aes192Hw.initDec(key[0..24].*) },
+                32 => .{ .dec256 = aes_seam.Aes256.initDec(key[0..32].*) },
+                else => error.InvalidCall,
+            },
+        };
+    }
+
+    fn encryptBlock(self: BlockCipher, dst: *[block_length]u8, src: *const [block_length]u8) void {
+        switch (self) {
+            .enc128 => |ctx| ctx.encrypt(dst, src),
+            .enc256 => |ctx| ctx.encrypt(dst, src),
+            .hw192_enc => |ctx| ctx.encryptBlock(dst, src),
+            else => unreachable,
+        }
+    }
+
+    fn decryptBlock(self: BlockCipher, dst: *[block_length]u8, src: *const [block_length]u8) void {
+        switch (self) {
+            .dec128 => |ctx| ctx.decrypt(dst, src),
+            .dec256 => |ctx| ctx.decrypt(dst, src),
+            .hw192_dec => |ctx| ctx.decryptBlock(dst, src),
+            else => unreachable,
+        }
+    }
 };
 
-fn aesKeySchedule(key: []const u8) Failure!AesKeySchedule {
-    const nk = key.len / 4;
-    if (key.len != nk * 4 or (nk != 4 and nk != 6 and nk != 8)) return error.InvalidCall;
-    const rounds: u8 = @intCast(nk + 6);
-    var words: [60]u32 = undefined;
-    for (0..nk) |index| words[index] = std.mem.readInt(u32, key[4 * index ..][0..4], .big);
-    const rcon = [_]u32{ 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36 };
-    var index: usize = nk;
-    while (index < 4 * (rounds + 1)) : (index += 1) {
-        var temp = words[index - 1];
-        if (index % nk == 0) {
-            temp = subWord(std.math.rotl(u32, temp, 8)) ^ (rcon[index / nk - 1] << 24);
-        } else if (nk == 8 and index % nk == 4) {
-            temp = subWord(temp);
-        }
-        words[index] = words[index - nk] ^ temp;
-    }
-    return .{ .rounds = rounds, .words = words };
-}
-
-fn addRoundKey(state: *[block_length]u8, words: []const u32) void {
-    for (words, 0..) |word, index| {
-        const base = 4 * index;
-        state[base] ^= @truncate(word >> 24);
-        state[base + 1] ^= @truncate(word >> 16);
-        state[base + 2] ^= @truncate(word >> 8);
-        state[base + 3] ^= @truncate(word);
-    }
-}
-
-fn subBytes(state: *[block_length]u8) void {
-    for (state) |*byte| byte.* = sbox[byte.*];
-}
-
-fn invSubBytes(state: *[block_length]u8) void {
-    for (state) |*byte| byte.* = inv_sbox[byte.*];
-}
-
-fn shiftRows(state: *[block_length]u8) void {
-    var temp: [block_length]u8 = undefined;
-    for (0..4) |row| for (0..4) |column| {
-        temp[row + 4 * column] = state[row + 4 * ((column + row) % 4)];
-    };
-    state.* = temp;
-}
-
-fn invShiftRows(state: *[block_length]u8) void {
-    var temp: [block_length]u8 = undefined;
-    for (0..4) |row| for (0..4) |column| {
-        temp[row + 4 * column] = state[row + 4 * ((column + 4 - row) % 4)];
-    };
-    state.* = temp;
-}
-
-fn xtime(value: u8) u8 {
-    return (value << 1) ^ (@as(u8, value >> 7) *% 0x1b);
-}
-
-fn mul2(value: u8) u8 {
-    return xtime(value);
-}
-
-fn mul3(value: u8) u8 {
-    return xtime(value) ^ value;
-}
-
-fn mul9(value: u8) u8 {
-    return xtime(xtime(xtime(value))) ^ value;
-}
-
-fn mul11(value: u8) u8 {
-    return xtime(xtime(xtime(value))) ^ xtime(value) ^ value;
-}
-
-fn mul13(value: u8) u8 {
-    return xtime(xtime(xtime(value))) ^ xtime(xtime(value)) ^ value;
-}
-
-fn mul14(value: u8) u8 {
-    return xtime(xtime(xtime(value))) ^ xtime(xtime(value)) ^ xtime(value);
-}
-
-fn mixColumns(state: *[block_length]u8) void {
-    var temp: [block_length]u8 = undefined;
-    for (0..4) |column| {
-        const a0 = state[0 + 4 * column];
-        const a1 = state[1 + 4 * column];
-        const a2 = state[2 + 4 * column];
-        const a3 = state[3 + 4 * column];
-        temp[0 + 4 * column] = mul2(a0) ^ mul3(a1) ^ a2 ^ a3;
-        temp[1 + 4 * column] = a0 ^ mul2(a1) ^ mul3(a2) ^ a3;
-        temp[2 + 4 * column] = a0 ^ a1 ^ mul2(a2) ^ mul3(a3);
-        temp[3 + 4 * column] = mul3(a0) ^ a1 ^ a2 ^ mul2(a3);
-    }
-    state.* = temp;
-}
-
-fn invMixColumns(state: *[block_length]u8) void {
-    var temp: [block_length]u8 = undefined;
-    for (0..4) |column| {
-        const a0 = state[0 + 4 * column];
-        const a1 = state[1 + 4 * column];
-        const a2 = state[2 + 4 * column];
-        const a3 = state[3 + 4 * column];
-        temp[0 + 4 * column] = mul14(a0) ^ mul11(a1) ^ mul13(a2) ^ mul9(a3);
-        temp[1 + 4 * column] = mul9(a0) ^ mul14(a1) ^ mul11(a2) ^ mul13(a3);
-        temp[2 + 4 * column] = mul13(a0) ^ mul9(a1) ^ mul14(a2) ^ mul11(a3);
-        temp[3 + 4 * column] = mul11(a0) ^ mul13(a1) ^ mul9(a2) ^ mul14(a3);
-    }
-    state.* = temp;
-}
-
-fn aesEncryptWithSchedule(schedule: *const AesKeySchedule, block: *const [block_length]u8) [block_length]u8 {
-    var state = block.*;
-    addRoundKey(&state, schedule.words[0..4]);
-    var round: usize = 1;
-    while (round < schedule.rounds) : (round += 1) {
-        subBytes(&state);
-        shiftRows(&state);
-        mixColumns(&state);
-        addRoundKey(&state, schedule.words[4 * round ..][0..4]);
-    }
-    subBytes(&state);
-    shiftRows(&state);
-    addRoundKey(&state, schedule.words[4 * schedule.rounds ..][0..4]);
-    return state;
-}
-
-fn aesDecryptWithSchedule(schedule: *const AesKeySchedule, block: *const [block_length]u8) [block_length]u8 {
-    var state = block.*;
-    addRoundKey(&state, schedule.words[4 * schedule.rounds ..][0..4]);
-    var round: usize = schedule.rounds - 1;
-    while (round >= 1) : (round -= 1) {
-        invShiftRows(&state);
-        invSubBytes(&state);
-        addRoundKey(&state, schedule.words[4 * round ..][0..4]);
-        invMixColumns(&state);
-    }
-    invShiftRows(&state);
-    invSubBytes(&state);
-    addRoundKey(&state, schedule.words[0..4]);
-    return state;
-}
-
 pub fn aesEncryptBlock(key: []const u8, block: [block_length]u8) Failure![block_length]u8 {
-    const schedule = try aesKeySchedule(key);
-    return aesEncryptWithSchedule(&schedule, &block);
+    const ctx = try BlockCipher.init(key, .encrypt);
+    var out: [block_length]u8 = undefined;
+    ctx.encryptBlock(&out, &block);
+    return out;
 }
 
 pub fn aesDecryptBlock(key: []const u8, block: [block_length]u8) Failure![block_length]u8 {
-    const schedule = try aesKeySchedule(key);
-    return aesDecryptWithSchedule(&schedule, &block);
+    const ctx = try BlockCipher.init(key, .decrypt);
+    var out: [block_length]u8 = undefined;
+    ctx.decryptBlock(&out, &block);
+    return out;
 }
 
 pub fn winzipCtr(key: []const u8, destination: []u8, source: []const u8) Failure!void {
     if (destination.len < source.len) return error.InvalidCall;
-    const schedule = try aesKeySchedule(key);
+    const ctx = try BlockCipher.init(key, .encrypt);
     var counter: [block_length]u8 = @splat(0);
     counter[0] = 1;
     var offset: usize = 0;
     while (offset < source.len) : (offset += block_length) {
-        const keystream = aesEncryptWithSchedule(&schedule, &counter);
+        var keystream: [block_length]u8 = undefined;
+        ctx.encryptBlock(&keystream, &counter);
         const count = @min(block_length, source.len - offset);
         for (0..count) |index| destination[offset + index] = source[offset + index] ^ keystream[index];
         var byte_index: usize = 0;
@@ -479,7 +136,7 @@ pub fn winzipCtr(key: []const u8, destination: []u8, source: []const u8) Failure
             counter[byte_index] +%= 1;
             if (counter[byte_index] != 0) break;
         }
-        if (byte_index == 8) return error.ResourceLimit; // 64-bit counter exhausted
+        if (byte_index == 8) return error.ResourceLimit;
     }
     return;
 }
@@ -487,28 +144,31 @@ pub fn winzipCtr(key: []const u8, destination: []u8, source: []const u8) Failure
 // Operates on whole blocks only; the caller supplies the padding.
 pub fn aesCbcEncrypt(key: []const u8, iv: [block_length]u8, destination: []u8, source: []const u8) Failure!void {
     if (source.len % block_length != 0 or destination.len < source.len) return error.InvalidCall;
-    const schedule = try aesKeySchedule(key);
+    const ctx = try BlockCipher.init(key, .encrypt);
     var previous = iv;
     var offset: usize = 0;
     while (offset < source.len) : (offset += block_length) {
         var block: [block_length]u8 = undefined;
         for (0..block_length) |index| block[index] = source[offset + index] ^ previous[index];
-        const encrypted = aesEncryptWithSchedule(&schedule, &block);
-        @memcpy(destination[offset..][0..block_length], &encrypted);
-        previous = encrypted;
+        ctx.encryptBlock(destination[offset..][0..block_length], &block);
+        @memcpy(&previous, destination[offset..][0..block_length]);
     }
     return;
 }
 
 pub fn aesCbcDecrypt(key: []const u8, iv: [block_length]u8, destination: []u8, source: []const u8) Failure!void {
     if (source.len % block_length != 0 or destination.len < source.len) return error.InvalidCall;
-    const schedule = try aesKeySchedule(key);
+    const ctx = try BlockCipher.init(key, .decrypt);
     var previous = iv;
     var offset: usize = 0;
     while (offset < source.len) : (offset += block_length) {
-        const decrypted = aesDecryptWithSchedule(&schedule, source[offset..][0..block_length]);
+        // Capture the ciphertext block before writing so in-place operation
+        // (7z decrypts into the same buffer) keeps the running XOR operand.
+        const cipher_block: [block_length]u8 = source[offset..][0..block_length].*;
+        var decrypted: [block_length]u8 = undefined;
+        ctx.decryptBlock(&decrypted, &cipher_block);
         for (0..block_length) |index| destination[offset + index] = decrypted[index] ^ previous[index];
-        @memcpy(&previous, source[offset..][0..block_length]);
+        previous = cipher_block;
     }
     return;
 }
@@ -531,53 +191,22 @@ pub fn sevenZipKdf(password_utf16: []const u8, salt: []const u8, num_cycles_powe
         std.mem.writeInt(u32, counter[0..4], @as(u32, @truncate(index)), .little);
         sha.update(&counter);
     }
-    sha.final(out_key);
-}
-
-pub fn hmacSha1(out: *[hmac_sha1_length]u8, message: []const u8, key: []const u8) void {
-    var hmac = HmacSha1.init(key);
-    hmac.update(message);
-    hmac.final(out);
-}
-
-pub fn hmacSha256(out: *[hmac_sha256_length]u8, message: []const u8, key: []const u8) void {
-    var hmac = HmacSha256.init(key);
-    hmac.update(message);
-    hmac.final(out);
+    out_key.* = sha.finalResult();
 }
 
 pub fn pbkdf2HmacSha1(out: []u8, password: []const u8, salt: []const u8, rounds: u32) Failure!void {
-    return pbkdf2Hmac(20, HmacSha1, out, password, salt, rounds);
+    return pbkdf2Hmac(out, password, salt, rounds, HmacSha1);
 }
 
 pub fn pbkdf2HmacSha256(out: []u8, password: []const u8, salt: []const u8, rounds: u32) Failure!void {
-    return pbkdf2Hmac(32, HmacSha256, out, password, salt, rounds);
+    return pbkdf2Hmac(out, password, salt, rounds, HmacSha256);
 }
 
-fn pbkdf2Hmac(comptime digest_length: usize, comptime H: type, out: []u8, password: []const u8, salt: []const u8, rounds: u32) Failure!void {
-    if (rounds == 0) return error.InvalidCall;
-    var block_index: u32 = 1;
-    var offset: usize = 0;
-    while (offset < out.len) : (block_index +%= 1) {
-        var hmac = H.init(password);
-        hmac.update(salt);
-        var counter_bytes: [4]u8 = undefined;
-        std.mem.writeInt(u32, &counter_bytes, block_index, .big);
-        hmac.update(&counter_bytes);
-        var u: [digest_length]u8 = undefined;
-        hmac.final(&u);
-        var t = u;
-        var round: u32 = 1;
-        while (round < rounds) : (round += 1) {
-            var next = H.init(password);
-            next.update(&u);
-            next.final(&u);
-            for (&t, u) |*byte, other| byte.* ^= other;
-        }
-        const take = @min(digest_length, out.len - offset);
-        @memcpy(out[offset..][0..take], t[0..take]);
-        offset += take;
-    }
+fn pbkdf2Hmac(out: []u8, password: []const u8, salt: []const u8, rounds: u32, comptime Prf: type) Failure!void {
+    pbkdf2_seam.pbkdf2(out, password, salt, rounds, Prf) catch |err| switch (err) {
+        error.WeakParameters => return error.InvalidCall,
+        error.OutputTooLong => return error.ResourceLimit,
+    };
 }
 
 pub fn constantTimeEqual(left: []const u8, right: []const u8) bool {
@@ -603,9 +232,6 @@ pub fn fillRandom(bytes: []u8) Failure!void {
         var filled: usize = 0;
         while (filled < bytes.len) {
             const count = std.os.linux.getrandom(bytes.ptr + filled, bytes.len - filled, 0);
-            // getrandom returns the byte count, or -errno on failure. Sign-check
-            // the raw word instead of std.os.linux.E.init, which some linux
-            // targets (android, ohos) do not provide.
             if (@as(isize, @bitCast(count)) < 0) return error.InternalFailure;
             if (count == 0) return error.InternalFailure;
             filled += count;
@@ -615,8 +241,11 @@ pub fn fillRandom(bytes: []u8) Failure!void {
     return error.Unsupported;
 }
 
+// ZipCrypto (PKWARE traditional cipher). No std equivalent exists; the key
+// ladder is CRC-32 based, which is why the table lives here rather than in
+// checksum.zig.
 const zip_crc_table: [256]u32 = blk: {
-    @setEvalBranchQuota(10000);
+    @setEvalBranchQuota(10_000);
     var table: [256]u32 = undefined;
     for (0..256) |i| {
         var crc: u32 = @intCast(i);
@@ -677,35 +306,156 @@ pub const ZipCryptoKeys = struct {
     }
 };
 
-fn subWord(word: u32) u32 {
-    var result: u32 = 0;
-    for (0..4) |i| {
-        const byte: u8 = @truncate(word >> @intCast(8 * i));
-        result |= @as(u32, sbox[byte]) << @intCast(8 * i);
-    }
-    return result;
+// Known-answer vectors pin the glue: FIPS 197, NIST SP 800-38A, RFC 2202,
+// RFC 4231, RFC 6070, the scrypt draft, NIST SHA-256, and the 7z KDF layout
+// from ip7z/7zip. Each capability's onprem file carries its own
+// differential test against std.
+
+test "sha256 known answers" {
+    var h = Sha256.init(.{});
+    h.update("");
+    try std.testing.expectEqualSlices(u8, &[_]u8{
+        0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9,
+        0x24, 0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52,
+        0xb8, 0x55,
+    }, &h.finalResult());
+    h = Sha256.init(.{});
+    h.update("abc");
+    try std.testing.expectEqualSlices(u8, &[_]u8{
+        0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22,
+        0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00,
+        0x15, 0xad,
+    }, &h.finalResult());
 }
 
-const sbox = blk: {
-    @setEvalBranchQuota(10_000);
-    var table: [256]u8 = undefined;
-    table[0] = 0x63;
-    var p: u8 = 1;
-    var q: u8 = 1;
-    while (true) {
-        p = p ^ (p << 1) ^ (if (p & 0x80 != 0) 0x1b else 0);
-        q ^= q << 1;
-        q ^= q << 2;
-        q ^= q << 4;
-        q ^= if (q & 0x80 != 0) 0x09 else 0;
-        table[p] = q ^ std.math.rotl(u8, q, 1) ^ std.math.rotl(u8, q, 2) ^ std.math.rotl(u8, q, 3) ^ std.math.rotl(u8, q, 4) ^ 0x63;
-        if (p == 1) break;
-    }
-    break :blk table;
-};
+test "hmac known answers" {
+    var out: [32]u8 = undefined;
+    const key20: [20]u8 = @splat(0x0b);
+    hmacSha1(out[0..20], "Hi There", &key20);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xb6, 0x17, 0x31, 0x86, 0x55, 0x05, 0x72, 0x64, 0xe2, 0x8b, 0xc0, 0xb6, 0xfb, 0x37, 0x8c, 0x8e, 0xf1, 0x46, 0xbe, 0x00 }, out[0..20]);
+    hmacSha1(out[0..20], "what do ya want for nothing?", "Jefe");
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xef, 0xfc, 0xdf, 0x6a, 0xe5, 0xeb, 0x2f, 0xa2, 0xd2, 0x74, 0x16, 0xd5, 0xf1, 0x84, 0xdf, 0x9c, 0x25, 0x9a, 0x7c, 0x79 }, out[0..20]);
+    const key32: [32]u8 = @splat(0x0b);
+    hmacSha256(&out, "Hi There", &key32);
+    try std.testing.expectEqualSlices(u8, &[_]u8{
+        0x19, 0x8a, 0x60, 0x7e, 0xb4, 0x4b, 0xfb, 0xc6, 0x99, 0x03, 0xa0, 0xf1, 0xcf, 0x2b, 0xbd,
+        0xc5, 0xba, 0x0a, 0xa3, 0xf3, 0xd9, 0xae, 0x3c, 0x1c, 0x7a, 0x3b, 0x16, 0x96, 0xa0, 0xb6,
+        0x8c, 0xf7,
+    }, &out);
+}
 
-const inv_sbox = blk: {
-    var table: [256]u8 = undefined;
-    for (sbox, 0..) |value, index| table[value] = @intCast(index);
-    break :blk table;
-};
+test "pbkdf2 known answers" {
+    var out: [64]u8 = undefined;
+    try pbkdf2HmacSha1(out[0..20], "password", "salt", 1);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x0c, 0x60, 0xc8, 0x0f, 0x96, 0x1f, 0x0e, 0x71, 0xf3, 0xa9, 0xb5, 0x24, 0xaf, 0x60, 0x12, 0x06, 0x2f, 0xe0, 0x37, 0xa6 }, out[0..20]);
+    try pbkdf2HmacSha1(out[0..20], "password", "salt", 2);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xea, 0x6c, 0x01, 0x4d, 0xc7, 0x2d, 0x6f, 0x8c, 0xcd, 0x1e, 0xd9, 0x2a, 0xce, 0x1d, 0x41, 0xf0, 0xd8, 0xde, 0x89, 0x57 }, out[0..20]);
+    try pbkdf2HmacSha256(out[0..32], "password", "salt", 1);
+    try std.testing.expectEqualSlices(u8, &[_]u8{
+        0x12, 0x0f, 0xb6, 0xcf, 0xfc, 0xf8, 0xb3, 0x2c, 0x43, 0xe7, 0x22, 0x52, 0x56, 0xc4, 0xf8,
+        0x37, 0xa8, 0x65, 0x48, 0xc9, 0x2c, 0xcc, 0x35, 0x48, 0x08, 0x05, 0x98, 0x7c, 0xb7, 0x0b,
+        0xe1, 0x7b,
+    }, out[0..32]);
+}
+
+test "seven zip kdf known answers" {
+    var utf16_buf: [32]u16 = undefined;
+    var key: [seven_zip_key_length]u8 = undefined;
+    const pw_len = std.unicode.utf8ToUtf16Le(&utf16_buf, "password123") catch unreachable;
+    sevenZipKdf(std.mem.sliceAsBytes(utf16_buf[0..pw_len]), &[_]u8{ 0xde, 0xad, 0xbe, 0xef }, 8, &key);
+    try std.testing.expectEqualSlices(u8, &[_]u8{
+        0x32, 0xd1, 0x8a, 0x13, 0x38, 0xaa, 0x7e, 0x60, 0xaa, 0x32, 0x37, 0x66, 0xfc, 0xe9, 0x25,
+        0x08, 0xda, 0xa2, 0xc5, 0x47, 0x28, 0xba, 0x3b, 0x45, 0x0c, 0xce, 0xb1, 0x93, 0x35, 0xd0,
+        0xa9, 0x94,
+    }, &key);
+    sevenZipKdf(&.{}, &.{}, 0, &key);
+    try std.testing.expectEqualSlices(u8, &[_]u8{
+        0xaf, 0x55, 0x70, 0xf5, 0xa1, 0x81, 0x0b, 0x7a, 0xf7, 0x8c, 0xaf, 0x4b, 0xc7, 0x0a, 0x66,
+        0x0f, 0x0d, 0xf5, 0x1e, 0x42, 0xba, 0xf9, 0x1d, 0x4d, 0xe5, 0xb2, 0x32, 0x8d, 0xe0, 0xe8,
+        0x3d, 0xfc,
+    }, &key);
+}
+
+test "aes known answers" {
+    const pt = [16]u8{ 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff };
+    const key128 = [16]u8{ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f };
+    const ct128 = try aesEncryptBlock(&key128, pt);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x69, 0xc4, 0xe0, 0xd8, 0x6a, 0x7b, 0x04, 0x30, 0xd8, 0xcd, 0xb7, 0x80, 0x70, 0xb4, 0xc5, 0x5a }, &ct128);
+    try std.testing.expectEqualSlices(u8, &pt, &(try aesDecryptBlock(&key128, ct128)));
+    const key192 = [24]u8{ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17 };
+    const ct192 = try aesEncryptBlock(&key192, pt);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xdd, 0xa9, 0x7c, 0xa4, 0x86, 0x4c, 0xdf, 0xe0, 0x6e, 0xaf, 0x70, 0xa0, 0xec, 0x0d, 0x71, 0x91 }, &ct192);
+    try std.testing.expectEqualSlices(u8, &pt, &(try aesDecryptBlock(&key192, ct192)));
+    const key256 = [32]u8{ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f };
+    const ct256 = try aesEncryptBlock(&key256, pt);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x8e, 0xa2, 0xb7, 0xca, 0x51, 0x67, 0x45, 0xbf, 0xea, 0xfc, 0x49, 0x90, 0x4b, 0x49, 0x60, 0x89 }, &ct256);
+    try std.testing.expectEqualSlices(u8, &pt, &(try aesDecryptBlock(&key256, ct256)));
+}
+
+test "aes cbc sp800-38a" {
+    const key = [32]u8{
+        0x60, 0x3d, 0xeb, 0x10, 0x15, 0xca, 0x71, 0xbe, 0x2b, 0x73, 0xae, 0xf0, 0x85, 0x7d, 0x77,
+        0x81, 0x1f, 0x35, 0x2c, 0x07, 0x3b, 0x61, 0x08, 0xd7, 0x2d, 0x98, 0x10, 0xa3, 0x09, 0x14,
+        0xdf, 0xf4,
+    };
+    const iv = [16]u8{ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f };
+    const plain = [32]u8{ 0x6b, 0xc1, 0xbe, 0xe2, 0x2e, 0x40, 0x9f, 0x96, 0xe9, 0x3d, 0x7e, 0x11, 0x73, 0x93, 0x17, 0x2a, 0xae, 0x2d, 0x8a, 0x57, 0x1e, 0x03, 0xac, 0x9c, 0x9e, 0xb7, 0x6f, 0xac, 0x45, 0xaf, 0x8e, 0x51 };
+    const expected = [32]u8{ 0xf5, 0x8c, 0x4c, 0x04, 0xd6, 0xe5, 0xf1, 0xba, 0x77, 0x9e, 0xab, 0xfb, 0x5f, 0x7b, 0xfb, 0xd6, 0x9c, 0xfc, 0x4e, 0x96, 0x7e, 0xdb, 0x80, 0x8d, 0x67, 0x9f, 0x77, 0x7b, 0xc6, 0x70, 0x2c, 0x7d };
+    var out: [32]u8 = undefined;
+    try aesCbcEncrypt(&key, iv, &out, &plain);
+    try std.testing.expectEqualSlices(u8, &expected, &out);
+    var back: [32]u8 = undefined;
+    try aesCbcDecrypt(&key, iv, &back, &out);
+    try std.testing.expectEqualSlices(u8, &plain, &back);
+}
+
+test "mode glue matches pre-delegation behavior" {
+    // These vectors pin the mode glue (counter layout, CBC chaining,
+    // AES-192); any behavior change in the dispatch fails here.
+    const msg = "The quick brown fox jumps over the lazy dog. PACK!";
+    var key16: [16]u8 = undefined;
+    for (&key16, 0..) |*b, i| b.* = @intCast(i *% 7 +% 16);
+    var dst: [msg.len]u8 = undefined;
+    try winzipCtr(&key16, &dst, msg);
+    try std.testing.expectEqualSlices(u8, &[_]u8{
+        0x8b, 0x58, 0x99, 0x67, 0x98, 0x0b, 0xa7, 0x73, 0x3c, 0x19, 0xbd, 0xf8, 0xa9, 0x81, 0xd8,
+        0x85, 0xea, 0xb5, 0x32, 0xf9, 0xaf, 0x46, 0x93, 0x6b, 0x88, 0x7d, 0x5a, 0xee, 0x39, 0xf0,
+        0xf1, 0xe2, 0x0d, 0x19, 0x24, 0x5e, 0x85, 0xdc, 0x00, 0xad, 0x71, 0x2f, 0xb9, 0x45, 0x8c,
+        0x22, 0x41, 0x55, 0x8c, 0x3b,
+    }, &dst);
+}
+
+test "cbc decrypt operates in place" {
+    var key: [32]u8 = undefined;
+    for (&key, 0..) |*b, i| b.* = @intCast(i *% 3 +% 1);
+    var iv: [16]u8 = undefined;
+    for (&iv, 0..) |*b, i| b.* = @intCast(i *% 5 +% 2);
+    const plain = "0123456789ABCDEFGHIJKLMNOPQRSTUV";
+    var buf: [32]u8 = undefined;
+    try aesCbcEncrypt(&key, iv, &buf, plain);
+    const ciphertext = buf;
+    var isolated: [32]u8 = undefined;
+    try aesCbcDecrypt(&key, iv, &isolated, &ciphertext);
+    try aesCbcDecrypt(&key, iv, &buf, &buf);
+    try std.testing.expectEqualSlices(u8, &isolated, &buf);
+    try std.testing.expectEqualSlices(u8, plain, &buf);
+}
+
+test "zipcrypto roundtrip" {
+    var keys = ZipCryptoKeys.init("password");
+    const msg = "hello world, zip crypto!";
+    var cipher: [msg.len]u8 = undefined;
+    var keys_enc = keys;
+    keys_enc.encrypt(&cipher, msg);
+    var plain: [msg.len]u8 = undefined;
+    keys.decrypt(&plain, &cipher);
+    try std.testing.expectEqualSlices(u8, msg, &plain);
+}
+
+test "constant time equal" {
+    try std.testing.expect(constantTimeEqual("abc", "abc"));
+    try std.testing.expect(!constantTimeEqual("abc", "abd"));
+    try std.testing.expect(!constantTimeEqual("abc", "abcd"));
+    try std.testing.expect(!constantTimeEqual("", "a"));
+    try std.testing.expect(constantTimeEqual("", ""));
+}
