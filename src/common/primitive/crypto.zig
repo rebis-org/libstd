@@ -151,6 +151,28 @@ fn winzipCtrWith(comptime S: type, key: []const u8, destination: []u8, source: [
     var counter: [block_length]u8 = @splat(0);
     counter[0] = 1;
     var offset: usize = 0;
+    // Four counters per group hide the aese latency (std ctrSlice parallel shape).
+    if (comptime @hasDecl(S.Enc128, "encryptWide4")) {
+        var lo = std.mem.readInt(u64, counter[0..8], .little);
+        while (offset + 64 <= source.len and lo <= std.math.maxInt(u64) - 4) {
+            var counters: [64]u8 = undefined;
+            inline for (0..4) |j| {
+                counters[j * block_length ..][0..block_length].* = counter;
+                std.mem.writeInt(u64, counters[j * block_length ..][0..8], lo +% j, .little);
+            }
+            var keystream: [64]u8 = undefined;
+            switch (ctx) {
+                .enc128 => |c| c.encryptWide4(&keystream, &counters),
+                .enc256 => |c| c.encryptWide4(&keystream, &counters),
+                .hw192_enc => |c| c.encryptWide4(&keystream, &counters),
+                else => unreachable,
+            }
+            for (0..64) |index| destination[offset + index] = source[offset + index] ^ keystream[index];
+            offset += 64;
+            lo += 4;
+            std.mem.writeInt(u64, counter[0..8], lo, .little);
+        }
+    }
     while (offset < source.len) : (offset += block_length) {
         var keystream: [block_length]u8 = undefined;
         ctx.encryptBlock(&keystream, &counter);
