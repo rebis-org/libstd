@@ -1,6 +1,7 @@
 const std = @import("std");
 const failure = @import("../../common/primitive/failure.zig");
 const Failure = failure.Failure;
+const checksum = @import("../../common/primitive/checksum.zig");
 const bits = @import("bits.zig");
 const BitReader = bits.BitReader;
 const huffman = @import("huffman.zig");
@@ -115,6 +116,7 @@ pub const State = struct {
     // the reference restarts bit input per entry (Inp.InitBitInput in
     // UnpInitData, called for solid entries too). Holding a pointer would
     // mean parking a dangling one between files.
+    provider: checksum.Provider,
     br: BitReader,
     window: Window,
     mc: DecodeTable,
@@ -176,9 +178,11 @@ pub const State = struct {
         pending: []PendingFilter,
         filter_scratch: []u8,
         ppm_heap: []u8,
+        provider: checksum.Provider,
     ) Failure!void {
         if (table_pool.len < table_pool_words * 4) return error.InternalFailure;
         st.* = .{
+            .provider = provider,
             .br = undefined,
             .window = Window.init(window_buffer),
             .mc = .{},
@@ -409,7 +413,7 @@ pub const State = struct {
             for (0..code_size) |j| {
                 prog[j] = @intCast(try cr.readBits(8));
             }
-            st.filter_types[filt_pos] = rarvm.identifyFilter(prog[0..code_size]);
+            st.filter_types[filt_pos] = rarvm.identifyFilter(st.provider, prog[0..code_size]);
         }
 
         const filter = st.filter_types[filt_pos];
@@ -772,8 +776,9 @@ pub const Session = struct {
         pending: []PendingFilter,
         filter_scratch: []u8,
         ppm_heap: []u8,
+        provider: checksum.Provider,
     ) Failure!Session {
-        try State.init(st, window_buffer, table_pool, pending, filter_scratch, ppm_heap);
+        try State.init(st, window_buffer, table_pool, pending, filter_scratch, ppm_heap, provider);
         return .{ .state = st };
     }
 

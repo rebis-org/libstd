@@ -43,14 +43,15 @@ fn addJniBridge(b: *std.Build, library: *std.Build.Step.Compile) void {
 pub fn addArchive(
     b: *std.Build,
     ctx: *const common.Context,
+    distribution: manifest.Distribution,
 ) std.Build.LazyPath {
     const stage = b.addWriteFiles();
     _ = stage.add("AndroidManifest.xml", b.fmt(
         "<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\" package=\"dev.stdk\" android:versionName=\"{d}.{d}.{d}\" android:versionCode=\"{d}\" />\n",
         .{ ctx.version.major, ctx.version.minor, ctx.version.patch, versionCode(ctx.version) },
     ));
-    _ = stage.addCopyFile(ctx.generated.header, manifest.android.header);
-    _ = stage.addCopyFile(ctx.generated.catalog, manifest.android.catalog);
+    _ = stage.addCopyFile(ctx.generated.header, distribution.header);
+    _ = stage.addCopyFile(ctx.generated.catalog, distribution.catalog);
     _ = stage.addCopyFile(addClassesJar(b), "classes.jar");
     for (slices.android_abis) |abi| {
         const library = common.addLibrary(b, b.resolveTargetQuery(.{
@@ -62,5 +63,5 @@ pub fn addArchive(
         addJniBridge(b, library);
         _ = stage.addCopyFile(library.getEmittedBin(), abi.library);
     }
-    return common.addZipArchive(b, manifest.android, stage);
+    return common.addZipArchive(b, distribution, stage);
 }

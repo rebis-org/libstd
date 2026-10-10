@@ -14,6 +14,7 @@ const lib = @import("lib.zig");
 const lzma = @import("lzma.zig");
 const primitives = @import("primitives.zig");
 const protocol = @import("protocol.zig");
+const provider = @import("provider.zig");
 const registry_checks = @import("registry.zig");
 const seven_zip = @import("sevenzip.zig");
 const tar = @import("tar.zig");
@@ -122,6 +123,7 @@ const scenarios = scenario_block: {
         &interop.scenarios,
         &.{primitives.scenario},
         &checksum.scenarios,
+        &provider.scenarios,
         format_groups,
     };
     var total: usize = 0;

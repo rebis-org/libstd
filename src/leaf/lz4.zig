@@ -46,6 +46,7 @@ pub const Options = struct {
     content_checksum: bool = true,
     block_checksum: bool = false,
     acceleration: u32 = 1,
+    provider: checksum.Provider = checksum.default_provider,
     // Hash-chain search attempt budget per position, LZ4HC searchNum semantics
     // (0 keeps the default greedy parser).
     search_depth: u32 = 0,
@@ -92,9 +93,8 @@ pub fn frameContentSize(input: []const u8) Failure!?u64 {
 }
 
 pub fn decodedSize(input: []const u8, scratch: []u8, options: Options) Failure!usize {
-    _ = options;
     var counter = measurement.Counter.init(null);
-    return try decodeBlocks(input, &counter.writer, scratch);
+    return try decodeBlocks(input, &counter.writer, scratch, options.provider);
 }
 
 pub fn requiredSize(input: []const u8, scratch: []u8, options: Options) Failure!usize {
@@ -111,9 +111,8 @@ pub fn encode(input: []const u8, output: []u8, scratch: []u8, options: Options) 
 }
 
 pub fn decode(input: []const u8, output: []u8, scratch: []u8, options: Options) Failure!usize {
-    _ = options;
     var fixed = std.Io.Writer.fixed(output);
-    return try decodeBlocks(input, &fixed, scratch);
+    return try decodeBlocks(input, &fixed, scratch, options.provider);
 }
 
 pub fn decodeInPlace(input: []const u8, output: []u8, scratch: []u8, options: Options) Failure!usize {
@@ -130,7 +129,7 @@ pub fn encodeToWriter(input: []const u8, output: *std.Io.Writer, scratch: []u8, 
     if (options.block_checksum) flags |= flag_block_checksum;
     flags |= flag_content_size;
     if (options.content_checksum) flags |= flag_content_checksum;
-    var header_hasher = checksum.XxHash32.init(0);
+    var header_hasher = checksum.XxHash32.bind(options.provider, 0);
     output.writeByte(flags) catch return error.IoFailure;
     header_hasher.update(&.{flags});
     output.writeByte(block_size_byte) catch return error.IoFailure;
@@ -154,11 +153,11 @@ pub fn encodeToWriter(input: []const u8, output: *std.Io.Writer, scratch: []u8, 
         if (compressed_len >= block_len) {
             output.writeInt(u32, uncompressed_block | (std.math.cast(u32, block_len) orelse return error.ResourceLimit), .little) catch return error.IoFailure;
             output.writeAll(block) catch return error.IoFailure;
-            if (options.block_checksum) output.writeInt(u32, checksum.xxh32(block), .little) catch return error.IoFailure;
+            if (options.block_checksum) output.writeInt(u32, checksum.xxh32With(options.provider, block), .little) catch return error.IoFailure;
         } else {
             output.writeInt(u32, std.math.cast(u32, compressed_len) orelse return error.ResourceLimit, .little) catch return error.IoFailure;
             output.writeAll(block_buffer[0..compressed_len]) catch return error.IoFailure;
-            if (options.block_checksum) output.writeInt(u32, checksum.xxh32(block_buffer[0..compressed_len]), .little) catch return error.IoFailure;
+            if (options.block_checksum) output.writeInt(u32, checksum.xxh32With(options.provider, block_buffer[0..compressed_len]), .little) catch return error.IoFailure;
         }
         offset += block_len;
     }
@@ -168,15 +167,14 @@ pub fn encodeToWriter(input: []const u8, output: *std.Io.Writer, scratch: []u8, 
         output.writeByte(0) catch return error.IoFailure;
     }
     output.writeInt(u32, 0, .little) catch return error.IoFailure;
-    if (options.content_checksum) output.writeInt(u32, checksum.xxh32(input), .little) catch return error.IoFailure;
+    if (options.content_checksum) output.writeInt(u32, checksum.xxh32With(options.provider, input), .little) catch return error.IoFailure;
 }
 
 pub fn decodeToWriter(input: []const u8, output: *std.Io.Writer, scratch: []u8, options: Options) Failure!void {
-    _ = options;
-    _ = try decodeBlocks(input, output, scratch);
+    _ = try decodeBlocks(input, output, scratch, options.provider);
 }
 
-fn decodeBlocks(input: []const u8, output: *std.Io.Writer, scratch: []u8) Failure!usize {
+fn decodeBlocks(input: []const u8, output: *std.Io.Writer, scratch: []u8, provider: checksum.Provider) Failure!usize {
     if (scratch.len < block_size_max) return error.InsufficientCapacity;
     if (input.len < 7) return error.InvalidData;
     if (std.mem.readInt(u32, input[0..4], .little) != magic) return error.InvalidData;
@@ -199,9 +197,9 @@ fn decodeBlocks(input: []const u8, output: *std.Io.Writer, scratch: []u8) Failur
     if (input.len <= offset) return error.InvalidData;
     // Header_Checksum: the high byte of xxh32 over FLG..end-of-header.
     const stored_header_sum = input[offset];
-    if (stored_header_sum != @as(u8, @truncate(checksum.xxh32(input[4..offset]) >> 8))) return error.IntegrityFailure;
+    if (stored_header_sum != @as(u8, @truncate(checksum.xxh32With(provider, input[4..offset]) >> 8))) return error.IntegrityFailure;
     offset += 1;
-    var content_hasher = checksum.XxHash32.init(0);
+    var content_hasher = checksum.XxHash32.bind(provider, 0);
     var total: usize = 0;
     while (true) {
         if (input.len < offset + 4) return error.InvalidData;
@@ -216,7 +214,7 @@ fn decodeBlocks(input: []const u8, output: *std.Io.Writer, scratch: []u8) Failur
         if (flags & flag_block_checksum != 0) {
             if (input.len < offset + 4) return error.InvalidData;
             const stored_sum = std.mem.readInt(u32, input[offset..][0..4], .little);
-            if (stored_sum != checksum.xxh32(block_data)) return error.IntegrityFailure;
+            if (stored_sum != checksum.xxh32With(provider, block_data)) return error.IntegrityFailure;
             offset += 4;
         }
         if (is_stored) {

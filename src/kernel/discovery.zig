@@ -1,5 +1,5 @@
 const std = @import("std");
-const contract = @import("nucleus").contract;
+const contract = @import("interface").contract;
 pub const components = @import("components");
 
 // Table is comptime-small, so linear scan suffices. Hot dispatch lives in the drivers.
@@ -44,7 +44,7 @@ pub fn maxOrdinalFor(family: u16) u32 {
 }
 
 pub fn isSelectorKnown(family: u16, ordinal: u32) bool {
-    if (family == 0) return ordinal >= 1 and ordinal <= 5;
+    if (family == 0) return ordinal >= 1 and ordinal <= 6;
     if (ordinal == 0) return false;
     return ordinal <= maxOrdinalFor(family);
 }
