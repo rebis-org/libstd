@@ -20,7 +20,7 @@ var provider_output: [64 * 1024]u8 = undefined;
 
 fn roundtripWithProvider(r: *Runner, profile_id: harness.Id, mode: harness.Mode, provider: ?u64, extra_write: []const harness.Node, extra_read: []const harness.Node, encoded: []u8) !void {
     harness.setup(r, profile_id, mode);
-    corpus.select(r.corpus_index, &provider_input);
+    corpus.fillTiled(r.corpus_index, &provider_input);
     var write_nodes: [8]harness.Node = undefined;
     var count: usize = 0;
     nodesAppend(&write_nodes, &count, harness.sourceSpan(&provider_input));
@@ -93,7 +93,7 @@ pub fn runUnsupportedProvider(r: *Runner) anyerror!void {
     if (harness.both_servable) return;
     const unserved: u64 = if (comptime options.primitives_impl == .onprem) 1 else 0;
     harness.setup(r, harness.ids.gzip, harness.mode_stream);
-    corpus.select(r.corpus_index, &provider_input);
+    corpus.fillTiled(r.corpus_index, &provider_input);
     _ = harness.call(r, harness.ids.read, &.{
         harness.sourceSpan(&provider_input),
         harness.sinkSpan(&provider_output),
@@ -104,7 +104,7 @@ pub fn runUnsupportedProvider(r: *Runner) anyerror!void {
 
 pub fn runInvalidProviderValue(r: *Runner) anyerror!void {
     harness.setup(r, harness.ids.gzip, harness.mode_stream);
-    corpus.select(r.corpus_index, &provider_input);
+    corpus.fillTiled(r.corpus_index, &provider_input);
     _ = harness.call(r, harness.ids.read, &.{
         harness.sourceSpan(&provider_input),
         harness.sinkSpan(&provider_output),

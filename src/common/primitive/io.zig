@@ -23,8 +23,8 @@ pub fn readByteResuming(reader: *std.Io.Reader) Failure!u8 {
     return buffer[0];
 }
 
-pub fn writeBytes(writer: *std.Io.Writer, bytes: []const u8) Failure!void {
-    writer.writeAll(bytes) catch return error.IoFailure;
+pub fn writeBytes(writer: *std.Io.Writer, chunk: []const u8) Failure!void {
+    writer.writeAll(chunk) catch return error.IoFailure;
 }
 
 pub fn writeByte(writer: *std.Io.Writer, byte: u8) Failure!void {
@@ -35,31 +35,35 @@ pub const Sink = struct {
     bytes: []u8,
     offset: usize = 0,
 
-    pub fn write(self: *Sink, data: []const u8) Failure!void {
-        if (self.offset + data.len > self.bytes.len) return error.InsufficientCapacity;
-        @memcpy(self.bytes[self.offset..][0..data.len], data);
-        self.offset += data.len;
+    pub fn write(self: *Sink, chunk: []const u8) Failure!void {
+        if (self.offset + chunk.len > self.bytes.len) return error.InsufficientCapacity;
+        @memcpy(self.bytes[self.offset..][0..chunk.len], chunk);
+        self.offset += chunk.len;
     }
 
-    pub fn writeInt(self: *Sink, comptime T: type, value: T, endian: std.builtin.Endian) Failure!void {
-        var buffer: [@sizeOf(T)]u8 = undefined;
-        std.mem.writeInt(T, &buffer, value, endian);
-        try self.write(&buffer);
+    pub fn writeInt(self: *Sink, comptime T: type, int: T, endian: std.builtin.Endian) Failure!void {
+        var storage: [@sizeOf(T)]u8 = undefined;
+        std.mem.writeInt(T, &storage, int, endian);
+        try self.write(&storage);
     }
 };
 
+fn checkedLen(length: u64) Failure!usize {
+    return std.math.cast(usize, length) orelse return error.ResourceLimit;
+}
+
 pub fn checkedConstBytes(pointer: ?[*]const u8, length: u64) Failure![]const u8 {
-    const count = std.math.cast(usize, length) orelse return error.ResourceLimit;
+    const count = try checkedLen(length);
     if (count == 0) return &.{};
-    const data = pointer orelse return error.InvalidCall;
-    return data[0..count];
+    const base = pointer orelse return error.InvalidCall;
+    return base[0..count];
 }
 
 pub fn checkedMutBytes(pointer: ?[*]u8, length: u64) Failure![]u8 {
-    const count = std.math.cast(usize, length) orelse return error.ResourceLimit;
+    const count = try checkedLen(length);
     if (count == 0) return &.{};
-    const data = pointer orelse return error.InvalidCall;
-    return data[0..count];
+    const base = pointer orelse return error.InvalidCall;
+    return base[0..count];
 }
 
 pub const Workspace = struct {
@@ -68,10 +72,14 @@ pub const Workspace = struct {
     required_tracker: ?*usize = null,
 
     pub fn init(pointer: ?[*]u8, capacity: u64) Failure!Workspace {
-        return .{ .bytes = try checkedMutBytes(pointer, capacity) };
+        return initInner(pointer, capacity, null);
     }
 
     pub fn initTracked(pointer: ?[*]u8, capacity: u64, tracker: *usize) Failure!Workspace {
+        return initInner(pointer, capacity, tracker);
+    }
+
+    fn initInner(pointer: ?[*]u8, capacity: u64, tracker: ?*usize) Failure!Workspace {
         return .{ .bytes = try checkedMutBytes(pointer, capacity), .required_tracker = tracker };
     }
 

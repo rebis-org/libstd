@@ -29,13 +29,11 @@ pub fn assertExports(init: std.process.Init, library: []const u8) !void {
                 break true;
             }
         } else false;
-        if (!known) return error.UnexpectedExport;
+        if (!known) return error.unexpected_export;
         count += 1;
     }
-    if (count != exports.len) return error.MissingExport;
+    if (count != exports.len) return error.missing_export;
     for (found) |present| {
-        if (!present) return error.MissingExport;
+        if (!present) return error.missing_export;
     }
 }
-
-pub const assertSingleExport = assertExports;

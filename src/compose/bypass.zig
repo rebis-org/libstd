@@ -9,7 +9,7 @@ const sizing = @import("sizing.zig");
 pub const zstdEncodeHistoryLen = sizing.encodeHistoryLen;
 pub const zstdDecodeHistoryLen = sizing.decodeHistoryLen;
 
-// Kernel contributes nothing: caller wires spans straight to the leaf. Both paths run identical leaf code, so byte-identity is expected.
+// Caller wires spans straight to the leaf, so byte-identity is expected.
 
 pub fn zstdEncodeBound(input_len: usize, options: Options) usize {
     return zstd.encodedSizeBound(input_len, options);
@@ -24,7 +24,7 @@ fn mapFailure(err: anyerror) Failure {
     };
 }
 
-// Bounded sizing checks capacity against the analytic bound a priori and encodes once.
+// Bounded sizing checks capacity a priori and encodes once.
 pub fn zstdEncode(input: interface.span.ConstSpan, output: interface.span.Span, history: interface.span.Span, workspace: interface.span.Span, options: Options) Failure!usize {
     const bound = zstd.encodedSizeBound(input.len, options);
     if (output.len < bound) return error.InsufficientCapacity;
@@ -34,7 +34,7 @@ pub fn zstdEncode(input: interface.span.ConstSpan, output: interface.span.Span, 
     return zstd.encodeStream(&source, &sink, history.bytes(), aligned, options) catch |err| mapFailure(err);
 }
 
-// Caller supplies exactly-sized history/output spans. No padded staging unlike the kernel path.
+// Caller supplies exactly-sized spans with no padded staging.
 pub fn zstdDecodeStream(input: interface.span.ConstSpan, output: interface.span.Span, history: interface.span.Span, options: Options) Failure!usize {
     var source = std.Io.Reader.fixed(input.bytes());
     var sink = std.Io.Writer.fixed(output.bytes());

@@ -2,6 +2,8 @@ const std = @import("std");
 const failure = @import("../../common/primitive/failure.zig");
 const Failure = failure.Failure;
 const kernels = @import("../../common/kernels.zig");
+const window_mod = @import("window.zig");
+const common_sink = @import("../../common/sink.zig");
 
 // Nothing allocates: every table is caller-provided, and token-buffer
 // exhaustion returns InsufficientCapacity so the caller can size the buffer.
@@ -366,7 +368,7 @@ test "match finder replays through the window byte-exactly" {
     try std.testing.expect(toks.len < data.len);
 
     var window_buf: [1024]u8 = undefined;
-    var win = @import("window.zig").Window.init(&window_buf);
+    var win = window_mod.Window.init(&window_buf);
     for (toks) |tok| {
         switch (tok) {
             .literal => |b| win.putByte(b),
@@ -374,7 +376,7 @@ test "match finder replays through the window byte-exactly" {
         }
     }
     var out: [1024]u8 = undefined;
-    var bs = @import("../../common/sink.zig").BufferSink.init(&out);
+    var bs = common_sink.BufferSink.init(&out);
     try std.testing.expect(win.emitTo(bs.sink(), win.write_pos, data.len));
     try std.testing.expectEqualSlices(u8, data, out[0..data.len]);
 }

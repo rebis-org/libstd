@@ -29,13 +29,12 @@ fn statusFor(failure: Failure) u32 {
     };
 }
 
-// Source/destination aliasing traps as overlap (in-place is a different verb).
-// null with nonzero length returns a status, provenance violations trap.
-pub fn copy(output: Surface, input: ConstSurface) callconv(.c) u32 {
-    const destination = span.mutSpan(output.ptr, output.len) catch |failure| return statusFor(failure);
-    const source = span.constSpan(input.ptr, input.len) catch |failure| return statusFor(failure);
-    span.requireDisjoint(.{ .ptr = destination.ptr, .len = destination.len }, source, "Surface copy regions overlap.");
-    const limit = @min(destination.len, source.len);
-    destination.write(0, source.read(0, limit));
+// Source/destination aliasing traps as overlap.
+pub fn copy(destination: Surface, source: ConstSurface) callconv(.c) u32 {
+    const sink = span.mutSpan(destination.ptr, destination.len) catch |failure| return statusFor(failure);
+    const origin = span.constSpan(source.ptr, source.len) catch |failure| return statusFor(failure);
+    span.requireDisjoint(.{ .ptr = sink.ptr, .len = sink.len }, origin, "surface copy regions overlap.");
+    const limit = @min(sink.len, origin.len);
+    sink.write(0, origin.read(0, limit));
     return @backingInt(Status.ok);
 }

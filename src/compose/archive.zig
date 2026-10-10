@@ -72,7 +72,7 @@ fn parseCryptoParams(request: ?*Node, failure_cause: *crypto.FailureCause) Failu
         if (descriptor.kind != .profile) return error.InvalidCall;
         break :blk value;
     } else return error.InvalidCall;
-    if (!vocabulary.idEqual(profile_id, vocabulary.ids.crypto)) return error.InvalidCall;
+    if (!vocabulary.eql(profile_id, vocabulary.ids.crypto)) return error.InvalidCall;
     const password_node2 = password_node orelse return error.InvalidCall;
     const password = try resource.checkedConstBytes(password_node2.bytes, password_node2.byte_length);
     if (password.len == 0) return error.InvalidCall;
@@ -111,7 +111,7 @@ pub fn tarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
     if (command_mask == vocabulary.command_mask_read) {
         if (sink == null) {
             const archive = try materializeArchive(source_resource, &workspace, limits);
-            const count = try tar.tarInspectCount(archive);
+            const count = try tar.inspectCount(archive);
             response.byte_length = count;
             return;
         }
@@ -123,17 +123,17 @@ pub fn tarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
             comptime discovery.parameter("tar", "ordinal").ordinal,
         ));
         const archive = try materializeArchive(source_resource, &workspace, limits);
-        const entry = try tar.tarInspectOrdinal(archive, ordinal);
+        const entry = try tar.inspectOrdinal(archive, ordinal);
         const size = std.math.cast(usize, entry.size) orelse return error.ResourceLimit;
         if (size > limits.decoded_bytes) return error.ResourceLimit;
         try common.requireSinkCapacity(sink_resource, call, size);
         if (sink_resource.kind == .direct_write) {
             const output = try common.sinkDirectBuffer(sink_resource, size);
-            _ = try tar.tarDecodeOrdinal(archive, ordinal, output);
+            _ = try tar.decodeOrdinal(archive, ordinal, output);
         } else {
             if (entry.sparse != null) {
                 const staged = try workspace.take(u8, size);
-                _ = try tar.tarDecodeOrdinal(archive, ordinal, staged);
+                _ = try tar.decodeOrdinal(archive, ordinal, staged);
                 try common.commitBytesToSink(sink_resource, call, staged);
             } else {
                 const data = try bounds.slice(archive, entry.data_offset, entry.size);
@@ -144,21 +144,21 @@ pub fn tarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
     } else if (command_mask == vocabulary.command_mask_write) {
         try requireVerified(commit);
         const entries = try parseTarEntries(call.request, &workspace);
-        const required = try tar.tarArchiveSize(entries);
+        const required = try tar.archiveSize(entries);
         if (sink == null) {
             response.byte_length = required;
             return;
         }
         const sink_resource = sink.?;
         try common.requireSinkCapacity(sink_resource, call, required);
-        const scratch = try workspace.take(u8, tar.tar_scratch_size);
+        const scratch = try workspace.take(u8, tar.scratch_size);
         if (sink_resource.kind == .direct_write) {
             const output = try common.sinkDirectBuffer(sink_resource, required);
-            const written = try tar.tarEncode(entries, output, scratch);
+            const written = try tar.encode(entries, output, scratch);
             response.byte_length = written;
         } else {
             const staging = try workspace.take(u8, required);
-            const written = try tar.tarEncode(entries, staging, scratch);
+            const written = try tar.encode(entries, staging, scratch);
             try common.commitBytesToSink(sink_resource, call, staging[0..written]);
             response.byte_length = written;
         }
@@ -239,7 +239,7 @@ pub fn zipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
         var scratch_required: usize = 0;
         for (entries) |entry| {
             if (entry.method == 9) needs_deflate64 = true;
-            scratch_required = @max(scratch_required, zip.zipEncodeScratchSize(entry));
+            scratch_required = @max(scratch_required, zip.encodeScratchSize(entry));
         }
         const history = try workspace.take(u8, if (needs_deflate64) zip.deflate64_history_size else zip.deflate_history_size);
         const measurement_buffer = try workspace.take(u8, zip.deflate_measurement_buffer_size);
@@ -247,11 +247,11 @@ pub fn zipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
         var max_compressed: usize = 0;
         for (entries) |entry| {
             if (!entry.encrypted) continue;
-            const compressed = try zip.zipCompressedSize(entry, history, measurement_buffer, scratch);
+            const compressed = try zip.compressedSize(entry, history, measurement_buffer, scratch);
             max_compressed = @max(max_compressed, compressed);
         }
         const crypto_staging = if (max_compressed != 0) try workspace.take(u8, @max(max_compressed, zip.deflate_measurement_buffer_size)) else @as([]u8, &.{});
-        const required = zip.zipRequiredSize(entries, comment, history, measurement_buffer, scratch, &crypto_cause) catch |err| {
+        const required = zip.requiredSize(entries, comment, history, measurement_buffer, scratch, &crypto_cause) catch |err| {
             writeCryptoFailure(call, crypto_cause);
             return err;
         };
@@ -263,14 +263,14 @@ pub fn zipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
         try common.requireSinkCapacity(sink_resource, call, required);
         if (sink_resource.kind == .direct_write) {
             const output = try common.sinkDirectBuffer(sink_resource, required);
-            const written = zip.zipEncode(entries, comment, output, plan.provider, history, measurement_buffer, crypto_staging, scratch, &crypto_cause) catch |err| {
+            const written = zip.encode(entries, comment, output, plan.provider, history, measurement_buffer, crypto_staging, scratch, &crypto_cause) catch |err| {
                 writeCryptoFailure(call, crypto_cause);
                 return err;
             };
             response.byte_length = written;
         } else {
             const staging = try workspace.take(u8, required);
-            const written = zip.zipEncode(entries, comment, staging, plan.provider, history, measurement_buffer, crypto_staging, scratch, &crypto_cause) catch |err| {
+            const written = zip.encode(entries, comment, staging, plan.provider, history, measurement_buffer, crypto_staging, scratch, &crypto_cause) catch |err| {
                 writeCryptoFailure(call, crypto_cause);
                 return err;
             };
@@ -382,14 +382,14 @@ fn entryCount(request: ?*Node) usize {
 }
 
 fn isArchiveEntry(node: *abi.Node) bool {
-    if (!vocabulary.idEqual(node.id, vocabulary.ids.parameter)) return false;
+    if (!vocabulary.eql(node.id, vocabulary.ids.parameter)) return false;
     const sel = vocabulary.selectorOf(node.value_high);
     const entry = comptime discovery.parameter("tar", "entry");
     return sel.family == entry.family and sel.ordinal == entry.ordinal;
 }
 
-fn parseSevenZipEntries(request: ?*Node, workspace: *resource.Workspace, default_method: seven_zip.CoderMethod, allow_method: bool, crypto_params: ?CryptoParams) Failure![]const seven_zip.SevenZipEntry {
-    const entries = try workspace.take(seven_zip.SevenZipEntry, entryCount(request));
+fn parseSevenZipEntries(request: ?*Node, workspace: *resource.Workspace, default_method: seven_zip.CoderMethod, allow_method: bool, crypto_params: ?CryptoParams) Failure![]const seven_zip.Entry {
+    const entries = try workspace.take(seven_zip.Entry, entryCount(request));
     var index: usize = 0;
     var cursor = request;
     while (cursor) |node| : (cursor = node.next) {
@@ -407,7 +407,7 @@ fn parseSevenZipEntries(request: ?*Node, workspace: *resource.Workspace, default
         const name = if (name_node) |n| try resource.checkedConstBytes(n.bytes, n.byte_length) else &.{};
         const data = if (data_node) |n| try resource.checkedConstBytes(n.bytes, n.byte_length) else &.{};
         const method = if (method_node) |n| try parseSevenZipMethod(n) else default_method;
-        var entry: seven_zip.SevenZipEntry = .{ .name = name, .data = data, .method = method };
+        var entry: seven_zip.Entry = .{ .name = name, .data = data, .method = method };
         if (filter_node) |n| entry.filter = try parseSevenZipMethod(n);
         if (crypto_params) |params| {
             entry.encrypted = true;
@@ -653,8 +653,8 @@ fn archiveComment(request: ?*Node) Failure![]const u8 {
     return if (node) |n| try resource.checkedConstBytes(n.bytes, n.byte_length) else &.{};
 }
 
-fn parseTarEntries(request: ?*Node, workspace: *resource.Workspace) Failure![]const tar.TarEntry {
-    const entries = try workspace.take(tar.TarEntry, entryCount(request));
+fn parseTarEntries(request: ?*Node, workspace: *resource.Workspace) Failure![]const tar.Entry {
+    const entries = try workspace.take(tar.Entry, entryCount(request));
     var index: usize = 0;
     var cursor = request;
     while (cursor) |node| : (cursor = node.next) {
@@ -681,8 +681,8 @@ fn parseTarEntries(request: ?*Node, workspace: *resource.Workspace) Failure![]co
     return entries;
 }
 
-fn parseZipEntries(request: ?*Node, workspace: *resource.Workspace, crypto_params: ?CryptoParams) Failure![]const zip.ZipEntry {
-    const entries = try workspace.take(zip.ZipEntry, entryCount(request));
+fn parseZipEntries(request: ?*Node, workspace: *resource.Workspace, crypto_params: ?CryptoParams) Failure![]const zip.Entry {
+    const entries = try workspace.take(zip.Entry, entryCount(request));
     var index: usize = 0;
     var cursor = request;
     while (cursor) |node| : (cursor = node.next) {
@@ -693,7 +693,7 @@ fn parseZipEntries(request: ?*Node, workspace: *resource.Workspace, crypto_param
         const name = if (name_node) |n| try resource.checkedConstBytes(n.bytes, n.byte_length) else &.{};
         const data = if (data_node) |n| try resource.checkedConstBytes(n.bytes, n.byte_length) else &.{};
         const method: u16 = if (method_node) |n| @truncate(n.value_low) else 8;
-        var entry: zip.ZipEntry = .{ .name = name, .data = data, .method = method };
+        var entry: zip.Entry = .{ .name = name, .data = data, .method = method };
         if (crypto_params) |params| {
             entry.encrypted = true;
             entry.password = params.password;

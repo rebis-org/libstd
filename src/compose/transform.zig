@@ -671,11 +671,19 @@ fn parseBzip2Options(request: ?*Node, command_mask: u32) Failure!bzip2.Options {
     return options;
 }
 
-fn parseLzmaDictionary(request: ?*Node) Failure!u32 {
-    const node = node_graph.findSelector(request, comptime discovery.parameter("lzma", "dictionary").family, comptime discovery.parameter("lzma", "dictionary").ordinal) orelse return error.InvalidCall;
+fn parseDictionary(comptime component: []const u8, request: ?*Node, fallback: ?u32) Failure!u32 {
+    const param = comptime discovery.parameter(component, "dictionary");
+    const node = node_graph.findSelector(request, param.family, param.ordinal) orelse {
+        if (fallback) |size| return size;
+        return error.InvalidCall;
+    };
     const dictionary_size = std.math.cast(u32, node.value_low) orelse return error.InvalidCall;
     if (dictionary_size < lzma.dictionary_min or dictionary_size > lzma.dictionary_max) return error.InvalidCall;
     return dictionary_size;
+}
+
+fn parseLzmaDictionary(request: ?*Node) Failure!u32 {
+    return parseDictionary("lzma", request, null);
 }
 
 const LzmaMatchParams = struct {
@@ -914,10 +922,7 @@ pub fn lzma_fileHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Re
 }
 
 fn parseLzmaFileDictionary(request: ?*Node) Failure!u32 {
-    const node = node_graph.findSelector(request, comptime discovery.parameter("lzma-file", "dictionary").family, comptime discovery.parameter("lzma-file", "dictionary").ordinal) orelse return lzma_file.default_dictionary;
-    const dictionary_size = std.math.cast(u32, node.value_low) orelse return error.InvalidCall;
-    if (dictionary_size < lzma.dictionary_min or dictionary_size > lzma.dictionary_max) return error.InvalidCall;
-    return dictionary_size;
+    return parseDictionary("lzma-file", request, lzma_file.default_dictionary);
 }
 
 pub fn xzHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {

@@ -72,14 +72,18 @@ const known_commit = [_][]const u8{ "tentative", "confirmed" };
 
 // Verb groups map to command bits: a sizing verb answers a query, a decode verb
 // serves a read, and an encode verb serves a write.
+const sizing_verbs = [_][]const u8{ "required_size", "decoded_size", "encoded_size_bound", "inspect" };
+const decode_verbs = [_][]const u8{ "decode", "decode_stream", "decode_ordinal" };
+const encode_verbs = [_][]const u8{ "encode", "encode_stream", "encode_ordinal" };
+
 fn commandBitForVerb(verb: []const u8) ?u32 {
-    if (std.mem.eql(u8, verb, "required_size") or std.mem.eql(u8, verb, "decoded_size") or std.mem.eql(u8, verb, "encoded_size_bound") or std.mem.eql(u8, verb, "inspect")) return 1;
-    if (std.mem.eql(u8, verb, "decode") or std.mem.eql(u8, verb, "decode_stream") or std.mem.eql(u8, verb, "decode_ordinal")) return 2;
-    if (std.mem.eql(u8, verb, "encode") or std.mem.eql(u8, verb, "encode_stream") or std.mem.eql(u8, verb, "encode_ordinal")) return 4;
+    if (has(&sizing_verbs, verb)) return 1;
+    if (has(&decode_verbs, verb)) return 2;
+    if (has(&encode_verbs, verb)) return 4;
     return null;
 }
 
-fn contains(haystack: []const []const u8, needle: []const u8) bool {
+fn has(haystack: []const []const u8, needle: []const u8) bool {
     for (haystack) |item| if (std.mem.eql(u8, item, needle)) return true;
     return false;
 }
@@ -103,8 +107,8 @@ fn isSafeTag(text: []const u8) bool {
     return true;
 }
 
-fn quote(allocator: std.mem.Allocator, value: []const u8) ![]const u8 {
-    return allocator.print("\"{s}\"", .{value});
+fn quote(allocator: std.mem.Allocator, inner: []const u8) ![]const u8 {
+    return allocator.print("\"{s}\"", .{inner});
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -135,7 +139,7 @@ pub fn main(init: std.process.Init) !void {
         };
         try descriptors.append(allocator, parsed);
     }
-    const resolved_output_path = output_path orelse return error.MissingArgument;
+    const resolved_output_path = output_path orelse return error.missing_argument;
 
     std.mem.sort(RawDescriptor, descriptors.items, {}, struct {
         fn lessThan(_: void, left: RawDescriptor, right: RawDescriptor) bool {
@@ -144,33 +148,33 @@ pub fn main(init: std.process.Init) !void {
     }.lessThan);
 
     for (descriptors.items) |descriptor| {
-        if (!contains(&known_classes, descriptor.class)) return error.UnknownClass;
-        for (descriptor.verbs) |verb| if (!contains(&known_verbs, verb)) return error.UnknownVerb;
+        if (!has(&known_classes, descriptor.class)) return error.unknown_class;
+        for (descriptor.verbs) |verb| if (!has(&known_verbs, verb)) return error.unknown_verb;
         for (descriptor.parameters) |parameter| {
-            if (!contains(&known_representations, parameter.representation)) return error.UnknownRepresentation;
-            if (!isSafeText(parameter.name)) return error.UnsafeText;
+            if (!has(&known_representations, parameter.representation)) return error.unknown_representation;
+            if (!isSafeText(parameter.name)) return error.unsafe_text;
         }
-        for (descriptor.capabilities) |capability| if (!contains(&known_capabilities, capability)) return error.UnknownCapability;
-        if (!contains(&known_sizing, descriptor.sizing)) return error.UnknownSizing;
-        if (!contains(&known_commit, descriptor.commit)) return error.UnknownCommit;
-        if (!isSafeText(descriptor.name) or !isSafeTag(descriptor.name)) return error.UnsafeText;
-        if (!isSafeText(descriptor.id.low) or !isSafeText(descriptor.id.high)) return error.UnsafeText;
+        for (descriptor.capabilities) |capability| if (!has(&known_capabilities, capability)) return error.unknown_capability;
+        if (!has(&known_sizing, descriptor.sizing)) return error.unknown_sizing;
+        if (!has(&known_commit, descriptor.commit)) return error.unknown_commit;
+        if (!isSafeText(descriptor.name) or !isSafeTag(descriptor.name)) return error.unsafe_text;
+        if (!isSafeText(descriptor.id.low) or !isSafeText(descriptor.id.high)) return error.unsafe_text;
         if (descriptor.benchmark) |benchmark| {
-            if (!isSafeText(benchmark.row) or !isSafeText(benchmark.params)) return error.UnsafeText;
-            if (!isSafeText(benchmark.kind) or !isSafeText(benchmark.ext) or !isSafeText(benchmark.ref_params)) return error.UnsafeText;
-            if (benchmark.cmd) |text| if (!isSafeText(text)) return error.UnsafeText;
-            if (benchmark.lib) |text| if (!isSafeText(text)) return error.UnsafeText;
-            if (benchmark.bin) |text| if (!isSafeText(text)) return error.UnsafeText;
+            if (!isSafeText(benchmark.row) or !isSafeText(benchmark.params)) return error.unsafe_text;
+            if (!isSafeText(benchmark.kind) or !isSafeText(benchmark.ext) or !isSafeText(benchmark.ref_params)) return error.unsafe_text;
+            if (benchmark.cmd) |text| if (!isSafeText(text)) return error.unsafe_text;
+            if (benchmark.lib) |text| if (!isSafeText(text)) return error.unsafe_text;
+            if (benchmark.bin) |text| if (!isSafeText(text)) return error.unsafe_text;
             for (benchmark.tunings) |tuning| {
-                if (!isSafeText(tuning.name) or !isSafeText(tuning.ref_params)) return error.UnsafeText;
-                for (tuning.cmd_args) |arg| if (!isSafeText(arg)) return error.UnsafeText;
+                if (!isSafeText(tuning.name) or !isSafeText(tuning.ref_params)) return error.unsafe_text;
+                for (tuning.cmd_args) |arg| if (!isSafeText(arg)) return error.unsafe_text;
             }
         }
     }
     for (descriptors.items, 0..) |descriptor, index| {
         for (descriptors.items[index + 1 ..]) |other| {
-            if (std.mem.eql(u8, descriptor.name, other.name)) return error.DuplicateName;
-            if (std.mem.eql(u8, descriptor.id.low, other.id.low) and std.mem.eql(u8, descriptor.id.high, other.id.high)) return error.DuplicateId;
+            if (std.mem.eql(u8, descriptor.name, other.name)) return error.duplicate_name;
+            if (std.mem.eql(u8, descriptor.id.low, other.id.low) and std.mem.eql(u8, descriptor.id.high, other.id.high)) return error.duplicate_id;
         }
     }
 
@@ -188,19 +192,19 @@ pub fn main(init: std.process.Init) !void {
             try output.print(allocator, ".{{ .name = \"{s}\", .family = {d}, .ordinal = {d}, .representation = .{s} }}", .{ parameter.name, parameter.family, parameter.ordinal, parameter.representation });
         }
         try output.appendSlice(allocator, " }, .capabilities = ");
-        var bits: u32 = 0;
+        var capability_bits: u32 = 0;
         for (descriptor.capabilities) |capability| {
             for (known_capabilities, 0..) |bit_name, bit_index| {
                 if (std.mem.eql(u8, bit_name, capability)) {
-                    bits |= @as(u32, 1) << @intCast(bit_index);
+                    capability_bits |= @as(u32, 1) << @intCast(bit_index);
                 }
             }
         }
         var command_mask: u32 = 0;
         for (descriptor.verbs) |verb| {
-            command_mask |= commandBitForVerb(verb) orelse return error.UnknownVerb;
+            command_mask |= commandBitForVerb(verb) orelse return error.unknown_verb;
         }
-        try output.print(allocator, "{d}, .command_mask = {d}, .sizing = .{s}, .commit = .{s}, .limits = .{{ .window = {d}, .block = {d}, .history = {d} }}", .{ bits, command_mask, descriptor.sizing, descriptor.commit, descriptor.limits.window, descriptor.limits.block, descriptor.limits.history });
+        try output.print(allocator, "{d}, .command_mask = {d}, .sizing = .{s}, .commit = .{s}, .limits = .{{ .window = {d}, .block = {d}, .history = {d} }}", .{ capability_bits, command_mask, descriptor.sizing, descriptor.commit, descriptor.limits.window, descriptor.limits.block, descriptor.limits.history });
         if (descriptor.benchmark) |benchmark| {
             try output.print(allocator, ", .benchmark = .{{ .row = \"{s}\", .params = \"{s}\" }}", .{ benchmark.row, benchmark.params });
         }
@@ -250,9 +254,8 @@ pub fn main(init: std.process.Init) !void {
 }
 
 // The table derives every other identity from the descriptor, so a component is one
-// descriptor file plus one convention-named hook. A hyphen becomes an underscore in
-// the tag, and tagForName maps a profile name back to its tag.
-fn underscore(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+// descriptor file plus one convention-named hook.
+fn profileTag(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
     const tagged = try allocator.dupe(u8, name);
     for (tagged) |*character| {
         if (character.* == '-') character.* = '_';
@@ -263,11 +266,11 @@ fn underscore(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
 fn emitTagTable(allocator: std.mem.Allocator, output: *std.ArrayList(u8), descriptors: []const RawDescriptor) !void {
     try output.appendSlice(allocator, "\npub const ProfileTag = enum {\n");
     for (descriptors) |descriptor| {
-        try output.print(allocator, "    {s},\n", .{try underscore(allocator, descriptor.name)});
+        try output.print(allocator, "    {s},\n", .{try profileTag(allocator, descriptor.name)});
     }
     try output.appendSlice(allocator, "};\n\npub fn tagForName(name: []const u8) ?ProfileTag {\n");
     for (descriptors) |descriptor| {
-        try output.print(allocator, "    if (std.mem.eql(u8, name, \"{s}\")) return .{s};\n", .{ descriptor.name, try underscore(allocator, descriptor.name) });
+        try output.print(allocator, "    if (std.mem.eql(u8, name, \"{s}\")) return .{s};\n", .{ descriptor.name, try profileTag(allocator, descriptor.name) });
     }
     try output.appendSlice(allocator, "    return null;\n}\n");
 }

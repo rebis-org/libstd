@@ -13,7 +13,7 @@ pub fn addArchive(b: *std.Build, ctx: *const common.Context, distribution: manif
     for (slices.apple_slices) |slice| {
         // App Store validation requires MinimumOSVersion on every embedded
         // framework. It follows the slice's own deployment floor.
-        const plist_file = plist.add(b.fmt("Info-{s}.plist", .{slice.id}), b.fmt(framework_plist, .{ slices.framework_binary, slice.minimum }));
+        const plist_file = plist.add(b.fmt("Info-{s}.plist", .{slice.id}), b.fmt(framework_plist, .{ slices.framework_binary, ctx.version.major, ctx.version.minor, ctx.version.patch, ctx.version.major, ctx.version.minor, ctx.version.patch, slice.minimum }));
         create.addArg("-framework");
         create.addDirectoryArg(wrapFramework(b, buildSlice(b, ctx, slice), headers.getDirectory(), plist_file, slices.isMacos(slice)));
     }
@@ -41,6 +41,7 @@ pub fn addArchive(b: *std.Build, ctx: *const common.Context, distribution: manif
 }
 
 fn buildSlice(b: *std.Build, ctx: *const common.Context, slice: slices.AppleSlice) std.Build.LazyPath {
+    if (slice.arches.len > 4) @panic("An Apple slice carries at most four architectures.");
     const base = slice.library[0 .. slice.library.len - ".dylib".len];
     // Final leaf name, not a per-arch path: every slice shares one
     // bundle-relative LC_ID_DYLIB for @rpath resolution.
@@ -155,9 +156,9 @@ const framework_plist =
     \\    <key>CFBundlePackageType</key>
     \\    <string>FMWK</string>
     \\    <key>CFBundleShortVersionString</key>
-    \\    <string>1.0</string>
+    \\    <string>{d}.{d}.{d}</string>
     \\    <key>CFBundleVersion</key>
-    \\    <string>1</string>
+    \\    <string>{d}.{d}.{d}</string>
     \\    <key>MinimumOSVersion</key>
     \\    <string>{s}</string>
     \\</dict>

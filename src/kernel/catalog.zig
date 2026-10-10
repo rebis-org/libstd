@@ -6,44 +6,19 @@ const EnvelopeId = envelope.Id;
 const vocabulary = @import("vocabulary.zig");
 pub const Descriptor = vocabulary.Descriptor;
 
-// Wire values live in vocabulary. Per-component identity and limits live in descriptors.
-
-const all_capabilities = vocabulary.resource_capability_bit_read | vocabulary.resource_capability_bit_write | vocabulary.resource_capability_bit_size | vocabulary.resource_capability_bit_replay | vocabulary.resource_capability_bit_seek | vocabulary.resource_capability_bit_range;
-const archive_capabilities = vocabulary.resource_capability_bit_read | vocabulary.resource_capability_bit_write | vocabulary.resource_capability_bit_size | vocabulary.resource_capability_bit_replay;
-const all_commands_mask = vocabulary.command_mask_query | vocabulary.command_mask_read | vocabulary.command_mask_write;
-const read_write_mask = vocabulary.command_mask_read | vocabulary.command_mask_write;
-const query_read_mask = vocabulary.command_mask_query | vocabulary.command_mask_read;
-
-// Policy fields only. Behavioral policy lives in compose catalog.
-pub const ProfileRow = struct {
-    id: EnvelopeId,
-    name: []const u8,
-    command_mask: u32,
-    capability_mask: u32,
-    sizing: vocabulary.SizingMode,
-    commit: vocabulary.CommitMode,
-};
-
-// Policy is component data from descriptors. Fixture rows below are reference-only legacy.
-pub const fixture_rows = [_]ProfileRow{
-    .{ .id = vocabulary.ids.test_echo, .name = "test_echo", .command_mask = read_write_mask, .capability_mask = all_capabilities, .sizing = .metadata_exact, .commit = .confirmed },
-    .{ .id = vocabulary.ids.test_read, .name = "test_read", .command_mask = query_read_mask, .capability_mask = all_capabilities, .sizing = .metadata_exact, .commit = .confirmed },
-    .{ .id = vocabulary.ids.crypto, .name = "crypto", .command_mask = all_commands_mask, .capability_mask = archive_capabilities, .sizing = .metadata_exact, .commit = .confirmed },
-};
-
 pub fn descriptorFor(id: EnvelopeId) ?*const Descriptor {
     inline for (&vocabulary.protocol_rows) |*row| {
-        if (vocabulary.idEqual(id, row.id)) return row;
+        if (vocabulary.eql(id, row.id)) return row;
     }
     inline for (&profile_descriptors) |*descriptor| {
-        if (vocabulary.idEqual(id, descriptor.id)) return descriptor;
+        if (vocabulary.eql(id, descriptor.id)) return descriptor;
     }
     return null;
 }
 
 // An all-zero id means "no component requested", so it passes as known.
 pub fn isKnownId(id: EnvelopeId) bool {
-    if (vocabulary.idIsZero(id)) return true;
+    if (vocabulary.isZero(id)) return true;
     return descriptorFor(id) != null;
 }
 
@@ -75,13 +50,13 @@ pub const sorted_descriptors = blk: {
     for (0..result.len) |index| {
         var least = index;
         for (index + 1..result.len) |candidate| {
-            const left = result[candidate].id;
-            const right = result[least].id;
-            if (left.high < right.high or (left.high == right.high and left.low < right.low)) least = candidate;
+            const first = result[candidate].id;
+            const second = result[least].id;
+            if (first.high < second.high or (first.high == second.high and first.low < second.low)) least = candidate;
         }
-        const value = result[index];
+        const displaced = result[index];
         result[index] = result[least];
-        result[least] = value;
+        result[least] = displaced;
     }
     break :blk result;
 };
@@ -125,9 +100,7 @@ pub const catalog_json = blk: {
 };
 
 comptime {
-    // Renaming or re-iding a released profile is an ABI break. Every projection
-    // derives from this frozen identity table, and new components join it at
-    // release time.
+    // Renaming or re-iding a released profile breaks the ABI.
     const frozen_identities = [_]struct { name: []const u8, low: u64, high: u64 }{
         .{ .name = "bzip2", .low = 0x6e6b_82f0_8d91_0409, .high = 0xa7a3_5105_3d6d_4009 },
         .{ .name = "deflate", .low = 0x6e6b_82f0_8d91_0403, .high = 0xa7a3_5105_3d6d_4003 },
@@ -148,8 +121,8 @@ comptime {
     };
     for (frozen_identities) |frozen| {
         const component = discovery.findByName(frozen.name) orelse
-            @compileError("Released component has no descriptor: " ++ frozen.name ++ ".");
+            @compileError("released component has no descriptor: " ++ frozen.name ++ ".");
         if (component.id.low != frozen.low or component.id.high != frozen.high)
-            @compileError("Released component id drifted: " ++ frozen.name ++ ".");
+            @compileError("released component id drifted: " ++ frozen.name ++ ".");
     }
 }

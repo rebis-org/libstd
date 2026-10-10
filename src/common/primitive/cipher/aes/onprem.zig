@@ -195,24 +195,9 @@ fn KeySchedule(comptime Aes: type) type {
                 readWords(part, words[4..8]);
                 nk = 8;
             }
-            var index: usize = nk;
-            while (index < 4 * (rounds + 1)) : (index += 1) {
-                var temp = words[index - 1];
-                if (index % nk == 0) {
-                    temp = subWord(std.math.rotl(u32, temp, 8)) ^ (rcon[index / nk - 1] << 24);
-                } else if (nk == 8 and index % nk == 4) {
-                    temp = subWord(temp);
-                }
-                words[index] = words[index - nk] ^ temp;
-            }
+            expandWordLoop(words[0 .. 4 * (rounds + 1)], nk);
             var round_keys: [rounds + 1]Block = undefined;
-            for (0..rounds + 1) |round| {
-                var bytes: [16]u8 = undefined;
-                for (0..4) |word| {
-                    std.mem.writeInt(u32, bytes[4 * word ..][0..4], words[4 * round + word], .big);
-                }
-                round_keys[round] = Block.fromBytes(&bytes);
-            }
+            packRoundKeys(words[0 .. 4 * (rounds + 1)], round_keys[0..]);
             return .{ .round_keys = round_keys };
         }
 
@@ -225,11 +210,7 @@ fn KeySchedule(comptime Aes: type) type {
 
         pub fn invert(self: Self) Self {
             var round_keys: [rounds + 1]Block = undefined;
-            round_keys[0] = self.round_keys[rounds];
-            for (1..rounds) |index| {
-                round_keys[index] = self.round_keys[rounds - index].invMixColumns();
-            }
-            round_keys[rounds] = self.round_keys[0];
+            invertSchedule(self.round_keys[0..], round_keys[0..]);
             return .{ .round_keys = round_keys };
         }
 
@@ -351,31 +332,23 @@ pub fn AesDecryptCtx(comptime Aes: type) type {
     };
 }
 
-pub const Aes128 = struct {
-    pub const key_bits = 128;
-    pub const rounds = (key_bits - 64) / 32 + 8;
+fn AesParams(comptime bits: u16) type {
+    return struct {
+        pub const key_bits = bits;
+        pub const rounds = (bits - 64) / 32 + 8;
 
-    pub fn initEnc(key: [16]u8) AesEncryptCtx(Aes128) {
-        return AesEncryptCtx(Aes128).init(key);
-    }
+        pub fn initEnc(key: [bits / 8]u8) AesEncryptCtx(@This()) {
+            return AesEncryptCtx(@This()).init(key);
+        }
 
-    pub fn initDec(key: [16]u8) AesDecryptCtx(Aes128) {
-        return AesDecryptCtx(Aes128).init(key);
-    }
-};
+        pub fn initDec(key: [bits / 8]u8) AesDecryptCtx(@This()) {
+            return AesDecryptCtx(@This()).init(key);
+        }
+    };
+}
 
-pub const Aes256 = struct {
-    pub const key_bits = 256;
-    pub const rounds = (key_bits - 64) / 32 + 8;
-
-    pub fn initEnc(key: [32]u8) AesEncryptCtx(Aes256) {
-        return AesEncryptCtx(Aes256).init(key);
-    }
-
-    pub fn initDec(key: [32]u8) AesDecryptCtx(Aes256) {
-        return AesDecryptCtx(Aes256).init(key);
-    }
-};
+pub const Aes128 = AesParams(128);
+pub const Aes256 = AesParams(256);
 
 // AES-192 fills the same round-key walker from the word expansion; no
 // 16-byte key groups exist, so the vectorized schedule cannot apply.
@@ -389,22 +362,9 @@ pub const Aes192Hw = struct {
         for (0..6) |index| {
             words[index] = std.mem.readInt(u32, key[4 * index ..][0..4], .big);
         }
-        var index: usize = 6;
-        while (index < 52) : (index += 1) {
-            var temp = words[index - 1];
-            if (index % 6 == 0) {
-                temp = subWord(std.math.rotl(u32, temp, 8)) ^ (rcon[index / 6 - 1] << 24);
-            }
-            words[index] = words[index - 6] ^ temp;
-        }
+        expandWordLoop(words[0..], 6);
         var round_keys: [rounds + 1]Block = undefined;
-        for (0..rounds + 1) |round| {
-            var bytes: [16]u8 = undefined;
-            for (0..4) |word| {
-                std.mem.writeInt(u32, bytes[4 * word ..][0..4], words[4 * round + word], .big);
-            }
-            round_keys[round] = Block.fromBytes(&bytes);
-        }
+        packRoundKeys(&words, round_keys[0..]);
         return .{ .round_keys = round_keys };
     }
 
@@ -414,32 +374,67 @@ pub const Aes192Hw = struct {
 
     fn invert(self: Aes192Hw) Aes192Hw {
         var round_keys: [rounds + 1]Block = undefined;
-        round_keys[0] = self.round_keys[rounds];
-        for (1..rounds) |index| {
-            round_keys[index] = self.round_keys[rounds - index].invMixColumns();
-        }
-        round_keys[rounds] = self.round_keys[0];
+        invertSchedule(self.round_keys[0..], round_keys[0..]);
         return .{ .round_keys = round_keys };
     }
 
-    pub fn encryptBlock(self: Aes192Hw, dst: *[block_length]u8, src: *const [block_length]u8) void {
+    const BlockDirection = enum { encrypt, decrypt };
+
+    fn cryptBlock(self: Aes192Hw, dst: *[block_length]u8, src: *const [block_length]u8, comptime direction: BlockDirection) void {
         var t = Block.fromBytes(src).xorBlocks(self.round_keys[0]);
         inline for (1..rounds) |index| {
-            t = t.encrypt(self.round_keys[index]);
+            t = switch (direction) {
+                .encrypt => t.encrypt(self.round_keys[index]),
+                .decrypt => t.decrypt(self.round_keys[index]),
+            };
         }
-        t = t.encryptLast(self.round_keys[rounds]);
+        t = switch (direction) {
+            .encrypt => t.encryptLast(self.round_keys[rounds]),
+            .decrypt => t.decryptLast(self.round_keys[rounds]),
+        };
         dst.* = t.toBytes();
     }
 
+    pub fn encryptBlock(self: Aes192Hw, dst: *[block_length]u8, src: *const [block_length]u8) void {
+        cryptBlock(self, dst, src, .encrypt);
+    }
+
     pub fn decryptBlock(self: Aes192Hw, dst: *[block_length]u8, src: *const [block_length]u8) void {
-        var t = Block.fromBytes(src).xorBlocks(self.round_keys[0]);
-        inline for (1..rounds) |index| {
-            t = t.decrypt(self.round_keys[index]);
-        }
-        t = t.decryptLast(self.round_keys[rounds]);
-        dst.* = t.toBytes();
+        cryptBlock(self, dst, src, .decrypt);
     }
 };
+
+fn expandWordLoop(words: []u32, nk: usize) void {
+    var index: usize = nk;
+    while (index < words.len) : (index += 1) {
+        var temp = words[index - 1];
+        if (index % nk == 0) {
+            temp = subWord(std.math.rotl(u32, temp, 8)) ^ (rcon[index / nk - 1] << 24);
+        } else if (nk == 8 and index % nk == 4) {
+            temp = subWord(temp);
+        }
+        words[index] = words[index - nk] ^ temp;
+    }
+}
+
+fn packRoundKeys(words: []const u32, round_keys: []Block) void {
+    for (round_keys, 0..) |*key, round| {
+        var bytes: [16]u8 = undefined;
+        for (0..4) |word| {
+            std.mem.writeInt(u32, bytes[4 * word ..][0..4], words[4 * round + word], .big);
+        }
+        key.* = Block.fromBytes(&bytes);
+    }
+}
+
+fn invertSchedule(round_keys: []const Block, inverted: []Block) void {
+    const rounds = inverted.len - 1;
+    inverted[0] = round_keys[rounds];
+    for (1..rounds) |index| {
+        inverted[index] = round_keys[rounds - index].invMixColumns();
+    }
+    inverted[rounds] = round_keys[0];
+}
 
 const rcon = [_]u32{ 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36 };
 
@@ -461,28 +456,39 @@ fn addRoundKey(state: *[16]u8, key_bytes: *const [16]u8) void {
     }
 }
 
+fn subBytesWith(state: *[16]u8, table: *const [256]u8) void {
+    for (state) |*byte| byte.* = table[byte.*];
+}
+
 fn subBytes(state: *[16]u8) void {
-    for (state) |*byte| byte.* = sbox[byte.*];
+    subBytesWith(state, &sbox);
 }
 
 fn invSubBytes(state: *[16]u8) void {
-    for (state) |*byte| byte.* = inv_sbox[byte.*];
+    subBytesWith(state, &inv_sbox);
+}
+
+const ShiftDirection = enum { forward, inverse };
+
+fn shiftRowsTo(state: *[16]u8, comptime direction: ShiftDirection) void {
+    var temp: [16]u8 = undefined;
+    for (0..4) |row| {
+        for (0..4) |column| temp[row + 4 * column] = state[
+            row + 4 * switch (direction) {
+                .forward => (column + row) % 4,
+                .inverse => (column + 4 - row) % 4,
+            }
+        ];
+    }
+    state.* = temp;
 }
 
 fn shiftRows(state: *[16]u8) void {
-    var temp: [16]u8 = undefined;
-    for (0..4) |row| {
-        for (0..4) |column| temp[row + 4 * column] = state[row + 4 * ((column + row) % 4)];
-    }
-    state.* = temp;
+    shiftRowsTo(state, .forward);
 }
 
 fn invShiftRows(state: *[16]u8) void {
-    var temp: [16]u8 = undefined;
-    for (0..4) |row| {
-        for (0..4) |column| temp[row + 4 * column] = state[row + 4 * ((column + 4 - row) % 4)];
-    }
-    state.* = temp;
+    shiftRowsTo(state, .inverse);
 }
 
 fn xtime(byte: u8) u8 {
@@ -535,9 +541,9 @@ fn mul14(byte: u8) u8 {
     return xtime(xtime(xtime(byte))) ^ xtime(xtime(byte)) ^ xtime(byte);
 }
 
-fn gfMulReference(a_in: u8, b_in: u8) u8 {
-    var a = a_in;
-    var b = b_in;
+fn gfMulReference(multiplicand_in: u8, multiplier_in: u8) u8 {
+    var a = multiplicand_in;
+    var b = multiplier_in;
     var result: u8 = 0;
     for (0..8) |_| {
         if (b & 1 != 0) result ^= a;

@@ -35,8 +35,8 @@ var arc_state: ArcFixture = .{
 };
 
 fn arcBuildEntries(index: usize) void {
-    corpus.select(index, &arc_state.data1);
-    corpus.select(index, &arc_state.data2);
+    corpus.fillTiled(index, &arc_state.data1);
+    corpus.fillTiled(index, &arc_state.data2);
     arc_state.entry1 = harness.archiveEntryNode(
         &arc_state.name1,
         &arc_state.data_node1,

@@ -16,8 +16,8 @@ const Call = abi.Call;
 const vocabulary = @import("../kernel/vocabulary.zig");
 const Failure = vocabulary.Failure;
 const ids = vocabulary.ids;
-const idEqual = vocabulary.idEqual;
-const idIsZero = vocabulary.idIsZero;
+const eql = vocabulary.eql;
+const isZero = vocabulary.isZero;
 const commandMaskForId = vocabulary.commandMaskForId;
 const command_mask_query = vocabulary.command_mask_query;
 const command_mask_read = vocabulary.command_mask_read;
@@ -27,9 +27,16 @@ const compose_catalog = @import("catalog.zig");
 const hooks = @import("hooks.zig");
 const seam = @import("seam");
 
+fn fail(envelope: *Call, failure: Failure) u32 {
+    const mapped_failure = mapFailure(failure);
+    if (failure == error.Unsupported) if (unknownRequiredId(envelope.request)) |id| common.writeDiagnosticId(envelope, ids.diagnostic_subject, id);
+    common.writeDiagnostic(envelope, mapped_failure.status, mapped_failure.id);
+    return mapped_failure.status;
+}
+
 pub fn invoke(call: ?*Call) u32 {
     const envelope = call orelse return Status.invalid_call;
-    if (!envelope.valid()) {
+    if (!envelope.isValid()) {
         if (envelope.structure_size >= @sizeOf(Call)) common.writeDiagnostic(envelope, Status.invalid_call, ids.invalid_call);
         return Status.invalid_call;
     }
@@ -37,7 +44,7 @@ pub fn invoke(call: ?*Call) u32 {
         common.writeDiagnostic(envelope, Status.invalid_call, ids.invalid_call);
         return Status.invalid_call;
     };
-    if (!response.valid() or !idIsZero(response.id)) {
+    if (!response.isValid() or !isZero(response.id)) {
         common.writeDiagnostic(envelope, Status.invalid_call, ids.invalid_call);
         return Status.invalid_call;
     }
@@ -51,22 +58,16 @@ pub fn invoke(call: ?*Call) u32 {
     response.byte_length = 0;
     const command_mask = commandMaskForId(envelope.operation);
     node_graph.validateGraph(envelope.request, .in, command_mask) catch |failure| {
-        const mapped = mapFailure(failure);
-        if (failure == error.Unsupported) if (unknownRequiredId(envelope.request)) |id| common.writeDiagnosticId(envelope, ids.diagnostic_subject, id);
-        common.writeDiagnostic(envelope, mapped.status, mapped.id);
-        return mapped.status;
+        return fail(envelope, failure);
     };
     node_graph.validateGraph(response.child, .out, 0) catch |failure| {
-        const mapped = mapFailure(failure);
-        common.writeDiagnostic(envelope, mapped.status, mapped.id);
-        return mapped.status;
+        const mapped_failure = mapFailure(failure);
+        common.writeDiagnostic(envelope, mapped_failure.status, mapped_failure.id);
+        return mapped_failure.status;
     };
-    if (idIsZero(envelope.operation)) return writeCatalog(envelope, response);
+    if (isZero(envelope.operation)) return writeCatalog(envelope, response);
     dispatch(envelope, response) catch |failure| {
-        const mapped = mapFailure(failure);
-        if (failure == error.Unsupported) if (unknownRequiredId(envelope.request)) |id| common.writeDiagnosticId(envelope, ids.diagnostic_subject, id);
-        common.writeDiagnostic(envelope, mapped.status, mapped.id);
-        return mapped.status;
+        return fail(envelope, failure);
     };
     return Status.ok;
 }
@@ -90,15 +91,15 @@ fn dispatch(envelope: *Call, response: *Node) Failure!void {
     const command_mask = commandMaskForId(command_id);
     if (command_mask == 0) return error.Unsupported;
     const profile_node = try requireParameter(envelope.request, ids.profile);
-    const profile_id = parseId(profile_node);
+    const profile_id = nodeId(profile_node);
     const profile = descriptorFor(profile_id) orelse return error.Unsupported;
     if (profile.kind != .profile or (profile.command_mask & command_mask) == 0) return error.Unsupported;
     const tag = compose_catalog.profileTagForId(profile_id) orelse return error.Unsupported;
-    const is_query = idEqual(command_id, ids.query);
+    const is_query = eql(command_id, ids.query);
     var effective_command_mask = command_mask;
     if (is_query) {
         const target_node = try requireParameter(envelope.request, ids.target_command);
-        const effective_command_id = parseId(target_node);
+        const effective_command_id = nodeId(target_node);
         effective_command_mask = commandMaskForId(effective_command_id);
         if (effective_command_mask != command_mask_read and effective_command_mask != command_mask_write) return error.InvalidCall;
     }
@@ -141,7 +142,7 @@ fn dispatch(envelope: *Call, response: *Node) Failure!void {
     var plan = common.ExecutionPlan{
         .invocation = if (is_query) .query else if (effective_command_mask == command_mask_read) .read else .write,
         .profile_id = profile_id,
-        .target_command = if (is_query) parseId(try requireParameter(envelope.request, ids.target_command)) else null,
+        .target_command = if (is_query) nodeId(try requireParameter(envelope.request, ids.target_command)) else null,
         .policy = policy,
         .limits = limits,
         .capabilities = capabilities,
@@ -163,8 +164,8 @@ fn dispatch(envelope: *Call, response: *Node) Failure!void {
     try common.validateBoundary(envelope, &plan, source_node, sink_node);
     var source = try Resource.sourceFromNode(envelope, source_node, capabilities);
     var sink: ?Resource = if (sink_node) |node| try Resource.sinkFromNode(envelope, node, capabilities) else null;
-    const primary = if (is_query) &source else if (effective_command_mask == command_mask_read) &source else if (sink) |*sink_resource| sink_resource else return error.InvalidCall;
-    if ((primary.capabilities & policy.capabilities) != policy.capabilities) return error.Unsupported;
+    const selected = if (is_query) &source else if (effective_command_mask == command_mask_read) &source else if (sink) |*sink_resource| sink_resource else return error.InvalidCall;
+    if ((selected.capabilities & policy.capabilities) != policy.capabilities) return error.Unsupported;
     if (effective_sizing == .unavailable) return error.Unsupported;
     // Workspace requirement must be reported on every exit path, success or failure.
     defer if (plan.workspace_required != 0)
@@ -193,18 +194,18 @@ fn requireParameter(first: ?*Node, id: Id) Failure!*Node {
     return node_graph.findParameter(first, id) orelse error.InvalidCall;
 }
 
-fn parseId(node: *Node) Id {
+fn nodeId(node: *Node) Id {
     return .{ .low = node.value_low, .high = node.value_high };
 }
 
 fn parseCapabilities(node: ?*Node) u32 {
-    const present_node = node orelse return 0;
-    return @truncate(present_node.value_low);
+    const present = node orelse return 0;
+    return @truncate(present.value_low);
 }
 
 fn parseSizingMode(node: ?*Node, default: vocabulary.SizingMode) Failure!vocabulary.SizingMode {
-    const present_node = node orelse return default;
-    return switch (present_node.value_low) {
+    const present = node orelse return default;
+    return switch (present.value_low) {
         0 => .unavailable,
         1 => .metadata_exact,
         2 => .measured,
@@ -214,8 +215,8 @@ fn parseSizingMode(node: ?*Node, default: vocabulary.SizingMode) Failure!vocabul
 }
 
 fn parseCommitMode(node: ?*Node, default: vocabulary.CommitMode) Failure!vocabulary.CommitMode {
-    const present_node = node orelse return default;
-    return switch (present_node.value_low) {
+    const present = node orelse return default;
+    return switch (present.value_low) {
         0 => .tentative,
         1 => .confirmed,
         else => error.InvalidCall,
@@ -223,13 +224,13 @@ fn parseCommitMode(node: ?*Node, default: vocabulary.CommitMode) Failure!vocabul
 }
 
 fn parseProvider(node: ?*Node) Failure!seam.Provider {
-    const present_node = node orelse return seam.default_provider;
-    const provider: seam.Provider = switch (present_node.value_low) {
+    const present = node orelse return seam.default_provider;
+    const provider: seam.Provider = switch (present.value_low) {
         0 => .onprem,
         1 => .offprem,
         else => return error.InvalidCall,
     };
-    if (!seam.serves(provider)) return error.Unsupported;
+    if (!seam.isServed(provider)) return error.Unsupported;
     return provider;
 }
 

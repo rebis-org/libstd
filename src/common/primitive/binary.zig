@@ -16,52 +16,49 @@ pub const ReadCursor = struct {
         return self.buffer[self.pos..];
     }
 
+    fn take(self: *ReadCursor, count: usize) error{InvalidData}![]const u8 {
+        if (count > self.buffer.len - self.pos) return error.InvalidData;
+        const start = self.pos;
+        self.pos += count;
+        return self.buffer[start..][0..count];
+    }
+
     pub fn readU8(self: *ReadCursor) error{ InvalidData, ResourceLimit }!u8 {
-        if (self.pos >= self.buffer.len) return error.InvalidData;
-        const value = self.buffer[self.pos];
-        self.pos += 1;
-        return value;
+        return (try self.take(1))[0];
     }
 
-    pub fn readU32le(self: *ReadCursor) error{ InvalidData, ResourceLimit }!u32 {
-        const bytes = try self.readBytes(4);
-        return std.mem.readInt(u32, &bytes, .little);
+    pub fn readU32Le(self: *ReadCursor) error{ InvalidData, ResourceLimit }!u32 {
+        const raw = try self.readBytes(4);
+        return std.mem.readInt(u32, &raw, .little);
     }
 
-    pub fn readULEB128(self: *ReadCursor) error{ InvalidData, ResourceLimit }!u64 {
-        var value: u64 = 0;
+    pub fn readUleb128(self: *ReadCursor) error{ InvalidData, ResourceLimit }!u64 {
+        var decoded: u64 = 0;
         var shift: u6 = 0;
-        var index: usize = 0;
-        while (true) : (index += 1) {
-            if (index >= 10) return error.InvalidData;
-            const byte = try self.readU8();
-            const payload: u64 = byte & 0x7f;
-            if (shift == 63 and payload > 1) return error.ResourceLimit;
-            value |= payload << shift;
-            if ((byte & 0x80) == 0) return value;
+        var seen: usize = 0;
+        while (true) : (seen += 1) {
+            if (seen >= 10) return error.InvalidData;
+            const next = try self.readU8();
+            const low_bits: u64 = next & 0x7f;
+            if (shift == 63 and low_bits > 1) return error.ResourceLimit;
+            decoded |= low_bits << shift;
+            if ((next & 0x80) == 0) return decoded;
             if (shift >= 57) return error.ResourceLimit;
             shift += 7;
         }
     }
 
     pub fn readSlice(self: *ReadCursor, length: usize) error{ InvalidData, ResourceLimit }![]const u8 {
-        if (length > self.buffer.len - self.pos) return error.InvalidData;
-        const value = self.buffer[self.pos..][0..length];
-        self.pos += length;
-        return value;
+        return self.take(length);
     }
 
     pub fn advance(self: *ReadCursor, count: u64) error{ InvalidData, ResourceLimit }!void {
-        const byte_count = std.math.cast(usize, count) orelse return error.ResourceLimit;
-        if (byte_count > self.buffer.len - self.pos) return error.InvalidData;
-        self.pos += byte_count;
+        const steps = std.math.cast(usize, count) orelse return error.ResourceLimit;
+        _ = try self.take(steps);
     }
 
     pub fn readBytes(self: *ReadCursor, comptime length: u8) error{ InvalidData, ResourceLimit }![length]u8 {
-        if (self.buffer.len - self.pos < length) return error.InvalidData;
-        const value = self.buffer[self.pos..][0..length].*;
-        self.pos += length;
-        return value;
+        return (try self.take(length))[0..length].*;
     }
 };
 
@@ -77,20 +74,20 @@ pub const WriteCursor = struct {
         return self.pos;
     }
 
-    pub fn writeU8(self: *WriteCursor, value: u8) error{ InsufficientCapacity, ResourceLimit }!void {
+    pub fn writeU8(self: *WriteCursor, next: u8) error{ InsufficientCapacity, ResourceLimit }!void {
         if (self.pos >= self.buffer.len) return error.InsufficientCapacity;
-        self.buffer[self.pos] = value;
+        self.buffer[self.pos] = next;
         self.pos += 1;
     }
 
-    pub fn writeULEB128(self: *WriteCursor, value: u64) error{ InsufficientCapacity, ResourceLimit }!void {
-        var remaining_value = value;
+    pub fn writeUleb128(self: *WriteCursor, decoded: u64) error{ InsufficientCapacity, ResourceLimit }!void {
+        var rest = decoded;
         while (true) {
-            var byte: u8 = @truncate(remaining_value & 0x7f);
-            remaining_value >>= 7;
-            if (remaining_value != 0) byte |= 0x80;
-            try self.writeU8(byte);
-            if (remaining_value == 0) return;
+            var next: u8 = @truncate(rest & 0x7f);
+            rest >>= 7;
+            if (rest != 0) next |= 0x80;
+            try self.writeU8(next);
+            if (rest == 0) return;
         }
     }
 };

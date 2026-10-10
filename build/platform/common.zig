@@ -109,18 +109,23 @@ fn addLibraryFromModule(b: *std.Build, module: *std.Build.Module, linkage: std.b
     });
 }
 
-pub fn addGenerated(b: *std.Build) Generated {
-    const files = b.addWriteFiles();
-    // The catalog comes from the same comptime source that the discovery call serves.
-    // The scan path reads only options and portable; version, generated, and host go unread.
-    var scan_ctx = Context{
-        .target = b.graph.host,
-        .optimize = .Debug,
+fn scanContext(target: std.Build.ResolvedTarget, optimize: std.builtin.Optimize, portable: bool, options: *std.Build.Module, sanitize_c: ?std.zig.SanitizeC) Context {
+    return .{
+        .target = target,
+        .optimize = optimize,
         .version = undefined,
         .generated = undefined,
         .host = undefined,
-        .options = b.addOptions().createModule(),
+        .portable = portable,
+        .options = options,
+        .sanitize_c = sanitize_c,
     };
+}
+
+pub fn addGenerated(b: *std.Build) Generated {
+    const files = b.addWriteFiles();
+    // The catalog comes from the same comptime source that the discovery call serves.
+    var scan_ctx = scanContext(b.graph.host, .Debug, false, b.addOptions().createModule(), null);
     const modules_pair = modules.componentsWithInterface(b, &scan_ctx, b.graph.host, b.graph.host, .Debug);
     const components_module = modules_pair.components;
     const interface_module = modules_pair.interface;
@@ -161,17 +166,7 @@ pub fn addHostLibrariesWithOptions(
     options: *std.Build.Module,
     sanitize_c: ?std.zig.SanitizeC,
 ) HostLibraries {
-    // Module construction reads only portable; version, generated, and host go unread.
-    var ctx = Context{
-        .target = target,
-        .optimize = optimize,
-        .version = undefined,
-        .generated = undefined,
-        .host = undefined,
-        .portable = portable,
-        .options = options,
-        .sanitize_c = sanitize_c,
-    };
+    var ctx = scanContext(target, optimize, portable, options, sanitize_c);
     const module = rootModule(b, target, optimize, &ctx);
     const static_library = addLibraryFromModule(b, module, .static);
     const dynamic_library = addLibraryFromModule(b, module, .dynamic);
@@ -182,6 +177,11 @@ pub fn installGenerated(b: *std.Build, generated: Generated) void {
     b.getInstallStep().dependOn(&b.addInstallHeaderFile(generated.header, "stdk.h").step);
     b.getInstallStep().dependOn(&b.addInstallFile(generated.catalog, "stdk.catalog.json").step);
     b.getInstallStep().dependOn(&b.addInstallFile(generated.module_map, "module.modulemap").step);
+}
+
+pub fn stageHeaderCatalog(stage: *std.Build.Step.WriteFile, ctx: *const Context, distribution: manifest.Distribution) void {
+    _ = stage.addCopyFile(ctx.generated.header, distribution.header);
+    _ = stage.addCopyFile(ctx.generated.catalog, distribution.catalog);
 }
 
 pub fn addZipArchive(b: *std.Build, distribution: manifest.Distribution, stage: *std.Build.Step.WriteFile) std.Build.LazyPath {

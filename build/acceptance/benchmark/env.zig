@@ -75,7 +75,7 @@ pub const Env = struct {
         }
     };
 
-    // Mmap keeps pages resident across repeated passes. Heap fallback off POSIX.
+    // Mmap keeps pages resident across repeated passes.
     pub fn mapFile(self: *Env, path: []const u8, max: u64) !Mapped {
         if (builtin.os.tag == .windows) {
             const buf = try self.readFile(path, max);
@@ -108,9 +108,25 @@ pub const Env = struct {
     }
 };
 
-pub fn parseRuns(maybe: ?[]const u8) usize {
-    const v = maybe orelse return 1;
-    return std.fmt.parseInt(usize, v, 10) catch 1;
+fn parseOr(comptime T: type, raw: ?[]const u8, default: T, parse: fn ([]const u8) anyerror!T) T {
+    const text = raw orelse return default;
+    return parse(text) catch default;
+}
+
+fn parseUsize(text: []const u8) !usize {
+    return std.fmt.parseInt(usize, text, 10);
+}
+
+fn parseFloat(text: []const u8) !f64 {
+    return std.fmt.parseFloat(f64, text);
+}
+
+fn parseFlagBody(text: []const u8) !bool {
+    return !(text.len == 0 or std.mem.eql(u8, text, "0") or std.mem.eql(u8, text, "false") or std.mem.eql(u8, text, "no") or std.mem.eql(u8, text, "off"));
+}
+
+pub fn parseRuns(raw: ?[]const u8) usize {
+    return parseOr(usize, raw, 1, parseUsize);
 }
 
 pub const Gate = struct {
@@ -120,19 +136,18 @@ pub const Gate = struct {
     ratio_pct: f64 = 101.0,
 };
 
-pub fn parseFlag(maybe: ?[]const u8) bool {
-    const v = maybe orelse return false;
-    return !(v.len == 0 or std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "false") or std.mem.eql(u8, v, "no") or std.mem.eql(u8, v, "off"));
+pub fn parseFlag(raw: ?[]const u8) bool {
+    const text = raw orelse return false;
+    return parseFlagBody(text) catch false;
 }
 
-pub fn parseDefaultOn(maybe: ?[]const u8) bool {
-    const v = maybe orelse return true;
-    return parseFlag(v);
+pub fn parseDefaultOn(raw: ?[]const u8) bool {
+    const text = raw orelse return true;
+    return parseFlag(text);
 }
 
-pub fn parsePercent(maybe: ?[]const u8, default: f64) f64 {
-    const v = maybe orelse return default;
-    return std.fmt.parseFloat(f64, v) catch default;
+pub fn parsePercent(raw: ?[]const u8, default: f64) f64 {
+    return parseOr(f64, raw, default, parseFloat);
 }
 
 pub fn gate(environ_map: *const std.process.Environ.Map) Gate {
