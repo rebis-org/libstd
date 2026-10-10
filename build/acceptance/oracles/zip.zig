@@ -24,6 +24,18 @@ fn zipReadOrdinal0(r: *Runner, archive: []const u8, output: []u8, expected: []co
     }
 }
 
+// The entry's check value, not the CRC, detects a wrong password. A wrong
+// password clears that value once in 65536 attempts for WinZip AES and once
+// in 256 for ZipCrypto, and the CRC then rejects the stream instead.
+fn expectWrongPasswordRejected(r: *Runner, diag: *harness.CryptoDiag) !void {
+    if (r.status == abi.Status.integrity_failure) {
+        if (diag.wrong_password.value_low != 0) return error.WrongPasswordDiagnosticMismatch;
+        return;
+    }
+    try harness.requireStatus(r, abi.Status.invalid_data);
+    if (diag.wrong_password.value_low != abi.Status.invalid_data) return error.WrongPasswordDiagnosticMismatch;
+}
+
 fn expectCryptoRejection(r: *Runner, sink: []u8, password: []const u8, extra: harness.Node, entries: harness.Node, status: u32, diag: *harness.CryptoDiag, checked: *harness.Node) !void {
     try harness.expect(r, harness.ids.write, &.{
         harness.paramProfile(r.profile_id),
@@ -324,10 +336,8 @@ fn runEncrypted(r: *Runner) anyerror!void {
         harness.cryptoProfile(),
         harness.cryptoPasswordParam("wrong"),
     }, .{ .ctx = true, .diagnostic = &diag.diagnostic });
-    try harness.requireStatus(r, abi.Status.invalid_data);
-    if (diag.wrong_password.value_low != abi.Status.invalid_data or !harness.allBytesEqual(&output, 0xa5)) {
-        return error.WrongPasswordDiagnosticMismatch;
-    }
+    try expectWrongPasswordRejected(r, &diag);
+    if (!harness.allBytesEqual(&output, 0xa5)) return error.WrongPasswordDiagnosticMismatch;
     zip_enc_archive[64] ^= 0xff;
     const corrupted_nodes = &.{
         harness.archiveOrdinalParam(0),
@@ -473,8 +483,7 @@ fn runTraditional(r: *Runner) anyerror!void {
         harness.cryptoProfile(),
         harness.cryptoPasswordParam("wrong"),
     }, .{ .ctx = true, .diagnostic = &diag.diagnostic });
-    try harness.requireStatus(r, abi.Status.invalid_data);
-    if (diag.wrong_password.value_low != abi.Status.invalid_data) return error.TraditionalWrongPasswordDiagnosticMissing;
+    try expectWrongPasswordRejected(r, &diag);
     try makeTraditionalZip(r, 8);
     _ = try zipReadWithPassword(r, zip_trad_archive[0..zip_trad_archive_size], 0, &output, "s3cret");
     try harness.requireStatus(r, abi.Status.ok);
