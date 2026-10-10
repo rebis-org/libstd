@@ -12,7 +12,7 @@ var empty_storage: [1]u8 = .{0};
 // guess where a sentence ends.
 pub fn trap(violation: Violation, context: []const u8) noreturn {
     var buffer: [128]u8 = undefined;
-    const message = std.fmt.bufPrint(&buffer, "Nucleus trap: {s}: {s}\n", .{ @tagName(violation), context }) catch "Nucleus trap.\n";
+    const message = std.fmt.bufPrint(&buffer, "Interface trap: {s}: {s}\n", .{ @tagName(violation), context }) catch "Interface trap.\n";
     std.debug.print("{s}", .{message});
     std.posix.raise(std.posix.SIG.TRAP) catch {};
     unreachable;

@@ -94,14 +94,14 @@ fn addTrapRun(b: *std.Build, ctx: *const common.Context, target: std.Build.Resol
     return b.addRunArtifact(trap_exe);
 }
 
-fn addContractCheck(b: *std.Build, nucleus: *std.Build.Module, components: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.Optimize, sanitize_c: ?std.zig.SanitizeC, exe_name: []const u8, catalog: std.Build.LazyPath) *std.Build.Step.Run {
+fn addContractCheck(b: *std.Build, interface: *std.Build.Module, components: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.Optimize, sanitize_c: ?std.zig.SanitizeC, exe_name: []const u8, catalog: std.Build.LazyPath) *std.Build.Step.Run {
     const kernel_module = b.createModule(.{
         .root_source_file = b.path("src/kernel/root.zig"),
         .target = target,
         .optimize = optimize,
     });
     if (sanitize_c) |sc| kernel_module.sanitize_c = sc;
-    kernel_module.addImport("nucleus", nucleus);
+    kernel_module.addImport("interface", interface);
     kernel_module.addImport("components", components);
     const contract_module = b.createModule(.{
         .root_source_file = b.path("build/acceptance/oracles/contract.zig"),
@@ -109,7 +109,7 @@ fn addContractCheck(b: *std.Build, nucleus: *std.Build.Module, components: *std.
         .optimize = optimize,
     });
     if (sanitize_c) |sc| contract_module.sanitize_c = sc;
-    contract_module.addImport("nucleus", nucleus);
+    contract_module.addImport("interface", interface);
     contract_module.addImport("kernel", kernel_module);
     const contract_exe = b.addExecutable(.{ .name = exe_name, .root_module = contract_module });
     const contract_run = b.addRunArtifact(contract_exe);
@@ -132,7 +132,7 @@ fn linkBenchmarkExe(b: *std.Build, exe: *std.Build.Step.Compile, run: *std.Build
 }
 
 fn addOracles(b: *std.Build, ctx: *common.Context, refs: cmd.Refs) void {
-    const modules_pair = modules.componentsWithNucleus(b, ctx, ctx.target, ctx.target, ctx.optimize);
+    const modules_pair = modules.componentsWithInterface(b, ctx, ctx.target, ctx.target, ctx.optimize);
     const c_module = translateCModule(b, ctx.target, ctx.optimize);
     const ab_variant_baseline_module = abVariantModule(b, "baseline");
 
@@ -173,7 +173,7 @@ fn addOracles(b: *std.Build, ctx: *common.Context, refs: cmd.Refs) void {
     // Each scenario runs in its own process: a contract violation traps, so the
     // driver and the scenarios cannot share one address space.
     app.run.step.dependOn(&addTrapRun(b, ctx, ctx.target, ctx.optimize, "oracles_trap").step);
-    app.run.step.dependOn(&addContractCheck(b, modules_pair.nucleus, modules_pair.components, ctx.target, ctx.optimize, ctx.sanitize_c, "contract_check", ctx.generated.catalog).step);
+    app.run.step.dependOn(&addContractCheck(b, modules_pair.interface, modules_pair.components, ctx.target, ctx.optimize, ctx.sanitize_c, "contract_check", ctx.generated.catalog).step);
 
     const compose_ab_module = b.createModule(.{
         .root_source_file = b.path("src/compose_ab.zig"),
@@ -181,6 +181,7 @@ fn addOracles(b: *std.Build, ctx: *common.Context, refs: cmd.Refs) void {
         .optimize = ctx.optimize,
     });
     compose_ab_module.addImport("options", ctx.options);
+    compose_ab_module.addImport("seam", modules.create(b, modules.seam, ctx));
     const compose_ab_exe = b.addExecutable(.{ .name = "compose_ab", .root_module = compose_ab_module });
     const compose_ab_run = b.addRunArtifact(compose_ab_exe);
     app.run.step.dependOn(&compose_ab_run.step);
@@ -192,7 +193,7 @@ fn addOraclesUbsan(b: *std.Build, ctx: *common.Context, refs: cmd.Refs) void {
     ubsan_ctx.sanitize_c = .full;
     ubsan_ctx.host = common.addHostLibrariesWithOptions(b, ctx.target, ctx.optimize, ctx.portable, ctx.options, .full);
 
-    const modules_pair = modules.componentsWithNucleus(b, &ubsan_ctx, ctx.target, ctx.target, ctx.optimize);
+    const modules_pair = modules.componentsWithInterface(b, &ubsan_ctx, ctx.target, ctx.target, ctx.optimize);
     const c_module = translateCModule(b, ctx.target, ctx.optimize);
     const ab_variant_baseline_module = abVariantModule(b, "baseline");
 
@@ -203,7 +204,7 @@ fn addOraclesUbsan(b: *std.Build, ctx: *common.Context, refs: cmd.Refs) void {
     }, ubsan_ctx.host, "oracles_ubsan", "Run the oracle suite with UBSan");
     linkOracleRefs(app, refs, ctx.generated.catalog);
     app.run.step.dependOn(&addTrapRun(b, &ubsan_ctx, ctx.target, ctx.optimize, "oracles_trap_ubsan").step);
-    app.run.step.dependOn(&addContractCheck(b, modules_pair.nucleus, modules_pair.components, ctx.target, ctx.optimize, .full, "contract_check_ubsan", ctx.generated.catalog).step);
+    app.run.step.dependOn(&addContractCheck(b, modules_pair.interface, modules_pair.components, ctx.target, ctx.optimize, .full, "contract_check_ubsan", ctx.generated.catalog).step);
 
     // compose_ab is a throughput gate that flakes under contention, and the
     // sanitizer slowdown would fault it, so this step leaves it out.
@@ -212,11 +213,11 @@ fn addOraclesUbsan(b: *std.Build, ctx: *common.Context, refs: cmd.Refs) void {
 
 fn addBenchmark(b: *std.Build, ctx: *common.Context, refs: cmd.Refs) void {
     const ref_target = common.refTarget(b, ctx.target);
-    // The components target stays on ctx.target while the nucleus uses ref_target,
+    // The components target stays on ctx.target while the interface uses ref_target,
     // because the reference binaries need the parity code generation.
-    const modules_pair = modules.componentsWithNucleus(b, ctx, ctx.target, ref_target, ctx.optimize);
+    const modules_pair = modules.componentsWithInterface(b, ctx, ctx.target, ref_target, ctx.optimize);
     const bench_components_module = modules_pair.components;
-    const bench_nucleus = modules_pair.nucleus;
+    const bench_interface = modules_pair.interface;
     // The zstd leaf links directly: the bypass row wires substrate spans with no
     // kernel and no dylib.
     const bypass_module = b.createModule(.{
@@ -225,7 +226,7 @@ fn addBenchmark(b: *std.Build, ctx: *common.Context, refs: cmd.Refs) void {
         .optimize = ctx.optimize,
     });
     bypass_module.addImport("options", ctx.options);
-    bypass_module.addImport("nucleus", bench_nucleus);
+    bypass_module.addImport("interface", bench_interface);
     const app = addAcceptanceApp(b, ctx, "benchmark", modules.benchmark, ref_target, ctx.optimize, &.{
         .{ .name = "components", .module = bench_components_module },
         .{ .name = "bypass", .module = bypass_module },

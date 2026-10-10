@@ -35,14 +35,14 @@ const std_filters = [_]StdFilterEntry{
 // and the CRC alone accepts a truncated program. Any mismatch means corrupt
 // code, so the result is .none, which leaves the entry unverifiable (the
 // reference bails out of Prepare()).
-pub fn identifyFilter(code: []const u8) StandardFilter {
+pub fn identifyFilter(provider: checksum.Provider, code: []const u8) StandardFilter {
     if (code.len == 0) return .none;
 
     var xor_sum: u8 = 0;
     for (code[1..]) |code_byte| xor_sum ^= code_byte;
     if (xor_sum != code[0]) return .none;
 
-    const code_crc = checksum.crc32(code);
+    const code_crc = checksum.crc32With(provider, code);
     for (std_filters) |entry| {
         if (entry.crc == code_crc and entry.length == code.len) return entry.filter;
     }
@@ -362,10 +362,10 @@ fn itaniumSetBits(bundle: []u8, value: u32, bit_pos: usize, bit_count: u5) void 
 
 test "identifyFilter: rejects a bad xor byte, length, or crc" {
     var code = [_]u8{ 0xFF, 0x01, 0x02 };
-    try std.testing.expectEqual(StandardFilter.none, identifyFilter(&code));
+    try std.testing.expectEqual(StandardFilter.none, identifyFilter(checksum.default_provider, &code));
     code[0] = 0x01 ^ 0x02;
-    try std.testing.expectEqual(StandardFilter.none, identifyFilter(&code));
-    try std.testing.expectEqual(StandardFilter.none, identifyFilter(&[_]u8{}));
+    try std.testing.expectEqual(StandardFilter.none, identifyFilter(checksum.default_provider, &code));
+    try std.testing.expectEqual(StandardFilter.none, identifyFilter(checksum.default_provider, &[_]u8{}));
 }
 
 test "readData: 4-bit and 16-bit forms consume the reference widths" {

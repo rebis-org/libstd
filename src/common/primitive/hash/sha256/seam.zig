@@ -1,9 +1,9 @@
 const std = @import("std");
 const options = @import("options");
 const onprem = @import("onprem.zig");
+const seam = @import("seam");
 
-pub const Implementation = enum { onprem, offprem };
-pub const Sha256 = switch (options.sha256_impl) {
-    .onprem => onprem.Sha256,
-    .offprem => std.crypto.hash.sha2.Sha256,
-};
+pub const Onprem = onprem.Sha256;
+pub const Offprem = std.crypto.hash.sha2.Sha256;
+
+pub const Sha256 = seam.Digest(options.sha256_impl, Onprem, Offprem);

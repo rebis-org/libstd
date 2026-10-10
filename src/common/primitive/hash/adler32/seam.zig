@@ -1,14 +1,59 @@
 const std = @import("std");
 const options = @import("options");
 const onprem = @import("onprem.zig");
+const seam = @import("seam");
 
-// Callers pick an implementation per capability at build time; add a case here to
-// carry any other implementation that matches the same interface. Both
-// Both implementations expose the state as `adler` so the wrapper in
-// checksum.zig stays implementation-neutral.
-pub const Implementation = enum { onprem, offprem };
+pub const Onprem = onprem.Adler32;
+pub const Offprem = std.hash.Adler32;
 
 pub const Inner = switch (options.adler32_impl) {
-    .onprem => onprem.Adler32,
-    .offprem => std.hash.Adler32,
+    .onprem => FixedAdler(.onprem, Onprem),
+    .offprem => FixedAdler(.offprem, Offprem),
+    .mergeable => MergeableAdler(Onprem, Offprem),
 };
+
+// Both implementations expose the state as `adler`, so the wrapper in
+// checksum.zig stays implementation-neutral.
+fn FixedAdler(comptime tag: seam.Provider, comptime Impl: type) type {
+    return struct {
+        inner: Impl = .{},
+
+        pub fn bind(provider: seam.Provider) @This() {
+            std.debug.assert(provider == tag);
+            return .{};
+        }
+
+        pub fn update(self: *@This(), input: []const u8) void {
+            self.inner.update(input);
+        }
+
+        pub fn adler(self: *const @This()) u32 {
+            return self.inner.adler;
+        }
+    };
+}
+
+fn MergeableAdler(comptime On: type, comptime Off: type) type {
+    return struct {
+        state: seam.Pair(On, Off) = .{ .onprem = .{} },
+
+        pub fn bind(provider: seam.Provider) @This() {
+            return switch (provider) {
+                .onprem => .{ .state = .{ .onprem = .{} } },
+                .offprem => .{ .state = .{ .offprem = .{} } },
+            };
+        }
+
+        pub fn update(self: *@This(), input: []const u8) void {
+            switch (self.state) {
+                inline else => |*inner| inner.update(input),
+            }
+        }
+
+        pub fn adler(self: *const @This()) u32 {
+            switch (self.state) {
+                inline else => |*inner| return inner.adler,
+            }
+        }
+    };
+}

@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const checksum = @import("checksum.zig");
+const seam = @import("seam");
 
 // Selecting kinds through a comptime packed struct means a new checksum adds
 // one field here and one line in `per_kind`, not a new bool parameter at every
@@ -25,12 +26,16 @@ pub fn CountingTee(comptime kinds: Kinds) type {
         size: u64,
 
         pub fn init(downstream: ?*std.Io.Writer) @This() {
+            return initWithProvider(downstream, seam.default_provider);
+        }
+
+        pub fn initWithProvider(downstream: ?*std.Io.Writer, provider: seam.Provider) @This() {
             return .{
                 .writer = .{ .vtable = &vtable, .buffer = &.{}, .end = 0 },
                 .downstream = downstream,
-                .crc32 = checksum.Crc32.init(),
-                .crc64 = checksum.XzCrc64.init(),
-                .adler32 = checksum.Adler32.init(),
+                .crc32 = checksum.Crc32.bind(provider),
+                .crc64 = checksum.XzCrc64.bind(provider),
+                .adler32 = checksum.Adler32.bind(provider),
                 .size = 0,
             };
         }

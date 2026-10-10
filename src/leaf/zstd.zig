@@ -47,6 +47,7 @@ pub const Options = struct {
     skip_interior_insert: bool = false,
     double_hash: bool = true,
     row_match: bool = false,
+    provider: checksum.Provider = checksum.default_provider,
 };
 
 const LimitedReader = struct {
@@ -137,7 +138,8 @@ fn decodeWithOutput(input: *std.Io.Reader, output: *std.Io.Writer, history: []u8
         .content_size = null,
         .has_checksum = false,
         .in_place = in_place,
-        .checksummer = checksum.XxHash64.init(0),
+        .provider = options.provider,
+        .checksummer = checksum.XxHash64.bind(options.provider, 0),
         .block_buffer = undefined,
         .literal_state = undefined,
         .match_state = undefined,
@@ -232,13 +234,13 @@ pub fn trainWorkspaceSize() usize {
     return 2 * train_buckets * @sizeOf(u32);
 }
 
-fn trainHash(bytes: *const [train_d]u8) u32 {
-    var hasher = checksum.XxHash64.init(0);
+fn trainHash(provider: checksum.Provider, bytes: *const [train_d]u8) u32 {
+    var hasher = checksum.XxHash64.bind(provider, 0);
     hasher.update(bytes);
     return @truncate(hasher.final() >> @as(u6, @intCast(64 - train_f)));
 }
 
-pub fn trainDictionary(samples: []const []const u8, max_size: usize, output: []u8, scratch: []u8) TrainError!usize {
+pub fn trainDictionary(samples: []const []const u8, max_size: usize, output: []u8, scratch: []u8, provider: checksum.Provider) TrainError!usize {
     if (samples.len == 0) return error.InvalidCall;
     if (max_size < dictionary_header_size + 8) return error.InvalidCall;
     var total: usize = 0;
@@ -258,7 +260,7 @@ pub fn trainDictionary(samples: []const []const u8, max_size: usize, output: []u
     for (samples[0..train_count]) |sample| {
         if (sample.len < train_d) continue;
         for (0..sample.len - train_d + 1) |pos| {
-            freqs[trainHash(sample[pos..][0..train_d])] += 1;
+            freqs[trainHash(provider, sample[pos..][0..train_d])] += 1;
         }
     }
 
@@ -276,12 +278,12 @@ pub fn trainDictionary(samples: []const []const u8, max_size: usize, output: []u
             var end: usize = 0;
             var score: u64 = 0;
             while (end < sample.len - train_d + 1) {
-                const idx = trainHash(sample[end..][0..train_d]);
+                const idx = trainHash(provider, sample[end..][0..train_d]);
                 end += 1;
                 if (seg_freqs[idx] == 0) score += freqs[idx];
                 seg_freqs[idx] += 1;
                 if (end - begin == train_dmers_in_k + 1) {
-                    const leaving = trainHash(sample[begin..][0..train_d]);
+                    const leaving = trainHash(provider, sample[begin..][0..train_d]);
                     begin += 1;
                     seg_freqs[leaving] -= 1;
                     if (seg_freqs[leaving] == 0) score -= freqs[leaving];
@@ -293,14 +295,14 @@ pub fn trainDictionary(samples: []const []const u8, max_size: usize, output: []u
                 }
             }
             while (begin < end) : (begin += 1) {
-                const leaving = trainHash(sample[begin..][0..train_d]);
+                const leaving = trainHash(provider, sample[begin..][0..train_d]);
                 seg_freqs[leaving] -= 1;
             }
         }
         if (best_score == 0) break;
         @memcpy(&chosen, best_sample[best_begin..][0..train_k]);
         for (best_begin..best_begin + train_dmers_in_k) |pos| {
-            freqs[trainHash(best_sample[pos..][0..train_d])] = 0;
+            freqs[trainHash(provider, best_sample[pos..][0..train_d])] = 0;
         }
         @memcpy(output[dictionary_header_size + content_len ..][0..train_k], &chosen);
         content_len += train_k;
@@ -317,7 +319,7 @@ pub fn trainDictionary(samples: []const []const u8, max_size: usize, output: []u
         }
     }
 
-    var hasher = checksum.XxHash64.init(0);
+    var hasher = checksum.XxHash64.bind(provider, 0);
     for (samples) |sample| hasher.update(sample);
     const span: u64 = dictionary_id_max - dictionary_id_min;
     const dict_id: u32 = dictionary_id_min + @as(u32, @truncate(hasher.final() % span));
@@ -430,7 +432,7 @@ pub fn encodeFrame(output: *std.Io.Writer, content: []const u8, workspace: []u32
             dictionary_id = std.mem.readInt(u32, dict[4..8], .little);
     }
     try writeFrameHeader(&counted.writer, frame_len, options.window_size, dictionary_id);
-    var hasher = checksum.XxHash64.init(0);
+    var hasher = checksum.XxHash64.bind(options.provider, 0);
     try encodeBlocks(&counted.writer, content, content_start, workspace, options, &hasher);
     try writeU32le(&counted.writer, @truncate(hasher.final()));
     return std.math.cast(usize, counted.written()) orelse error.ResourceLimit;
@@ -2447,6 +2449,7 @@ const Decoder = struct {
     content_size: ?u64,
     has_checksum: bool,
     in_place: bool,
+    provider: checksum.Provider = checksum.default_provider,
     checksummer: checksum.XxHash64,
     block_buffer: [block_size_max]u8,
     literal_state: FseState,
@@ -2471,7 +2474,7 @@ const Decoder = struct {
         if (header.has_content_size and header.content_size > d.max_decoded) return error.ResourceLimit;
         d.content_size = if (header.has_content_size) header.content_size else null;
         d.has_checksum = header.has_checksum;
-        d.checksummer = checksum.XxHash64.init(0);
+        d.checksummer = checksum.XxHash64.bind(d.provider, 0);
         d.frame_output = 0;
         if (d.dictionary) |dictionary| {
             try d.loadDictionary(dictionary, header.dictionary_id);
@@ -3876,9 +3879,9 @@ test "zstd dictionary trainer selects deterministic segments" {
     const scratch = try allocator.alloc(u8, trainWorkspaceSize());
     defer allocator.free(scratch);
     var first: [24 * 1024]u8 = undefined;
-    const first_len = try trainDictionary(&samples, first.len, &first, scratch);
+    const first_len = try trainDictionary(&samples, first.len, &first, scratch, checksum.default_provider);
     var second: [24 * 1024]u8 = undefined;
-    const second_len = try trainDictionary(&samples, second.len, &second, scratch);
+    const second_len = try trainDictionary(&samples, second.len, &second, scratch, checksum.default_provider);
     try std.testing.expectEqual(first_len, second_len);
     if (!std.mem.eql(u8, first[0..first_len], second[0..first_len])) {
         std.debug.print("first length {d} differs at offset {d}: {x} vs {x}\n", .{ first_len, std.mem.indexOfDiff(u8, first[0..first_len], second[0..first_len]).?, first[std.mem.indexOfDiff(u8, first[0..first_len], second[0..first_len]).?], second[std.mem.indexOfDiff(u8, first[0..first_len], second[0..first_len]).?] });
@@ -3914,7 +3917,7 @@ test "zstd dictionary trainer produces a loadable dictionary" {
     const scratch = try allocator.alloc(u8, trainWorkspaceSize());
     defer allocator.free(scratch);
     var dict_buffer: [512]u8 = undefined;
-    const dict_len = try trainDictionary(&samples, dict_buffer.len, &dict_buffer, scratch);
+    const dict_len = try trainDictionary(&samples, dict_buffer.len, &dict_buffer, scratch, checksum.default_provider);
     try std.testing.expect(dict_len > dictionary_header_size);
     try std.testing.expectEqual(@as(u32, 0xEC30A437), std.mem.readInt(u32, dict_buffer[0..4], .little));
     const dict_id = std.mem.readInt(u32, dict_buffer[4..8], .little);
@@ -3962,7 +3965,7 @@ test "zstd encoder seeds dictionary matches and writes dictionary id" {
     const train_scratch = try allocator.alloc(u8, trainWorkspaceSize());
     defer allocator.free(train_scratch);
     var dict_buffer: [512]u8 = undefined;
-    const dict_len = try trainDictionary(&samples, dict_buffer.len, &dict_buffer, train_scratch);
+    const dict_len = try trainDictionary(&samples, dict_buffer.len, &dict_buffer, train_scratch, checksum.default_provider);
     const dictionary = dict_buffer[0..dict_len];
 
     // Input taken from the dictionary content itself: the no-dict encode has
@@ -4017,7 +4020,7 @@ test "zstd dictionary content accepts zero dictionary id" {
     const train_scratch = try allocator.alloc(u8, trainWorkspaceSize());
     defer allocator.free(train_scratch);
     var dict_buffer: [512]u8 = undefined;
-    const dict_len = try trainDictionary(&samples, dict_buffer.len, &dict_buffer, train_scratch);
+    const dict_len = try trainDictionary(&samples, dict_buffer.len, &dict_buffer, train_scratch, checksum.default_provider);
     // RFC 8878: Dictionary_ID 0 means unspecified and must still load.
     std.mem.writeInt(u32, dict_buffer[4..8], 0, .little);
     const content = try dictionaryContent(dict_buffer[0..dict_len]);

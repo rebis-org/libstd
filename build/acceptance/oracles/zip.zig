@@ -215,6 +215,47 @@ fn zipReadWithPassword(r: *Runner, archive: []const u8, ordinal: u64, output: []
     return @intCast(r.response.byte_length);
 }
 
+fn zipReadWithPasswordProvider(r: *Runner, archive: []const u8, ordinal: u64, output: []u8, password: []const u8, provider: u64) !usize {
+    var crypto: [5]harness.Node = undefined;
+    const crypto_count = cryptoNodes(password, null, null, null, &crypto);
+    var nodes: [8]harness.Node = undefined;
+    var count: usize = 0;
+    nodes[count] = harness.archiveOrdinalParam(ordinal);
+    count += 1;
+    nodes[count] = harness.sourceSpan(archive);
+    count += 1;
+    nodes[count] = harness.sinkSpan(output);
+    count += 1;
+    @memcpy(nodes[count..][0..crypto_count], crypto[0..crypto_count]);
+    count += crypto_count;
+    nodes[count] = harness.providerParam(provider);
+    count += 1;
+    _ = harness.call(r, harness.ids.read, nodes[0..count], .{ .ctx = true });
+    return @intCast(r.response.byte_length);
+}
+
+fn runProviderSelection(r: *Runner) anyerror!void {
+    if (!harness.offprem_servable) return;
+    setupZip(r);
+    corpus.select(r.corpus_index, &zip_small);
+    corpus.select(r.corpus_index, &zip_large);
+    var store1: EntryNodes = undefined;
+    var store2: EntryNodes = undefined;
+    const entry1 = entryWithMethod(&store1, "a.txt", &zip_small, 8);
+    const entry2 = entryWithMethod(&store2, "b.txt", &zip_large, 0);
+    var entries = [_]harness.Node{ entry1, entry2 };
+    harness.linkNodes(entries[0..]);
+    zip_enc_archive_size = try zipWriteWithCrypto(r, entries[0], &zip_enc_archive, "s3cret", null, null, null);
+    // The archive carries a random salt, so providers compare plaintexts, not archives.
+    var default_output: [zip_large.len]u8 = undefined;
+    const default_len = try zipReadWithPassword(r, zip_enc_archive[0..zip_enc_archive_size], 1, &default_output, "s3cret");
+    var provider_output: [zip_large.len]u8 = undefined;
+    const provider_len = try zipReadWithPasswordProvider(r, zip_enc_archive[0..zip_enc_archive_size], 1, &provider_output, "s3cret", 1);
+    if (provider_len != default_len) return error.ProviderReadLengthMismatch;
+    if (!std.mem.eql(u8, provider_output[0..provider_len], default_output[0..default_len])) return error.ProviderReadContentMismatch;
+    if (!std.mem.eql(u8, provider_output[0..zip_large.len], &zip_large)) return error.ProviderPlaintextMismatch;
+}
+
 fn runEncrypted(r: *Runner) anyerror!void {
     setupZip(r);
     corpus.select(r.corpus_index, &zip_small);
@@ -649,6 +690,7 @@ fn runRobust(r: *Runner) anyerror!void {
 
 pub const scenarios = harness.scenarios("zip", &.{
     .{ .label = "zip encrypted", .run = runEncrypted, .workspace_size = 65536 + 4096, .output_size = 1024, .encoded_size = 65536 },
+    .{ .label = "zip encrypted provider", .run = runProviderSelection, .workspace_size = 65536 + 4096, .output_size = 1024, .encoded_size = 65536 },
     .{ .label = "zip traditional", .run = runTraditional, .workspace_size = 65536 + 4096, .output_size = 1024, .encoded_size = 65536 },
     .{ .label = "zip methods", .run = runMethods, .workspace_size = 48 * 1024 * 1024, .output_size = 1024, .encoded_size = 65536 },
     .{ .label = "zip encode methods", .run = runEncodeMethods, .workspace_size = 48 * 1024 * 1024, .output_size = 1024, .encoded_size = 65536 },

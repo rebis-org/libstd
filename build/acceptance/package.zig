@@ -8,14 +8,16 @@ const symbols = @import("symbols.zig");
 
 pub fn main(init: std.process.Init) !void {
     var args = run.Args.init(init.minimal.args);
-    const host = try args.next(error.MissingArchive);
-    const android = try args.next(error.MissingArchive);
-    const apple = try args.next(error.MissingArchive);
-    const cjpm = try args.next(error.MissingArchive);
+    var archive_paths: [manifest.providers.len * 4][]const u8 = undefined;
+    var distributions: [manifest.providers.len * 4]manifest.Distribution = undefined;
+    inline for (manifest.providers, 0..) |provider, provider_index| {
+        inline for (.{ manifest.hostFor(provider), manifest.androidFor(provider), manifest.appleFor(provider), manifest.cjpmFor(provider) }, 0..) |distribution, form_index| {
+            archive_paths[provider_index * 4 + form_index] = try args.next(error.MissingArchive);
+            distributions[provider_index * 4 + form_index] = distribution;
+        }
+    }
     const dynamic_library = try args.next(error.MissingArchive);
     try args.done(error.UnexpectedArgument);
-    const archive_paths = [_][]const u8{ host, android, apple, cjpm };
-    const distributions = [_]*const manifest.Distribution{ &manifest.host, &manifest.android, &manifest.apple, &manifest.cjpm };
     var headers: [archive_paths.len]?[]u8 = @splat(null);
     var catalogs: [archive_paths.len]?[]u8 = @splat(null);
     defer {
@@ -32,9 +34,11 @@ pub fn main(init: std.process.Init) !void {
     }
     for (headers[1..]) |header| if (!std.mem.eql(u8, headers[0].?, header.?)) return error.HeaderMismatch;
     for (catalogs[1..]) |catalog| if (!std.mem.eql(u8, catalogs[0].?, catalog.?)) return error.CatalogMismatch;
-    for (manifest.android.android.?) |abi| try requireAndroidArchitecture(init, android, abi.library, abi.elf_machine);
-    for (slices.ohos_abis) |abi| try requireOhosArchitecture(init, cjpm, abi);
-    for (manifest.apple.apple.?) |slice| try requireAppleSlice(init, apple, slice);
+    inline for (manifest.providers, 0..) |provider, provider_index| {
+        for (manifest.androidFor(provider).android.?) |abi| try requireAndroidArchitecture(init, archive_paths[provider_index * 4 + 1], abi.library, abi.elf_machine);
+        for (slices.ohos_abis) |abi| try requireOhosArchitecture(init, archive_paths[provider_index * 4 + 3], abi);
+        for (manifest.appleFor(provider).apple.?) |slice| try requireAppleSlice(init, archive_paths[provider_index * 4 + 2], slice);
+    }
     try symbols.assertSingleExport(init, dynamic_library);
 }
 
