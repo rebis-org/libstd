@@ -3,11 +3,8 @@ const sink = @import("../../common/sink.zig");
 const Sink = sink.Sink;
 const kernels = @import("../../common/kernels.zig");
 
-// Circular LZ window over caller-provided storage. Distances are validated
-// against total_written, so bytes from a previous non-solid entry are never
-// reachable and reset() deliberately does not re-zero the buffer (the
-// reference leaves the same comment in its UnpInitData), a window-sized
-// memset per entry would dwarf decoding on archives of many small files.
+// Distances are validated against total_written, so reset must not re-zero the
+// buffer, because a window-sized memset per entry dwarfs decoding on small files.
 
 pub const Window = struct {
     buffer: []u8,
@@ -15,7 +12,6 @@ pub const Window = struct {
     write_pos: usize,
     total_written: u64,
 
-    // buffer.len must be a power of two.
     pub fn init(buffer: []u8) Window {
         std.debug.assert(buffer.len > 0 and (buffer.len & (buffer.len - 1)) == 0);
         return .{ .buffer = buffer, .mask = buffer.len - 1, .write_pos = 0, .total_written = 0 };
@@ -32,11 +28,8 @@ pub const Window = struct {
         self.total_written += 1;
     }
 
-    // An impossible distance (0 or beyond everything written) zero-fills
-    // instead of reading stale slots. Corrupt streams must not turn into
-    // plausible bytes. Wrap-free segments run on the shared match-copy
-    // ladder (the hot path for the short matches that dominate LZ output).
-    // the circular buffer only segments at the wrap points.
+    // An impossible distance zero-fills instead of reading stale slots, so a corrupt
+    // stream must not produce plausible bytes. Segments split only at the wrap points.
     pub fn copyMatch(self: *Window, distance: usize, length: usize) void {
         if (length == 0) return;
 
@@ -89,10 +82,8 @@ pub const Window = struct {
         return self.buffer[pos & self.mask];
     }
 
-    // A logically contiguous run can straddle the wrap point and leave as
-    // one or two spans. False means the bytes were overwritten since,
-    // returning whatever occupies those slots now would be a wrong answer in
-    // a right answer's shape, so callers must refuse.
+    // False means the requested bytes were overwritten, and returning the current
+    // slots would be a wrong answer in a right answer's shape, so callers must refuse.
     pub fn emitTo(self: *const Window, out: Sink, start_offset: usize, count: usize) bool {
         if (start_offset > self.buffer.len) return false;
         if (count > start_offset) return false;
@@ -109,14 +100,14 @@ test "window copy match variants" {
     var buf: [16]u8 = undefined;
     var win = Window.init(&buf);
     for ("AB") |c| win.putByte(c);
-    win.copyMatch(2, 4); // ABAB
+    win.copyMatch(2, 4);
     try std.testing.expectEqual(@as(u64, 6), win.total_written);
     try std.testing.expectEqualSlices(u8, "ABABAB", buf[0..6]);
 
-    win.copyMatch(0, 2); // invalid distance zero-fills
+    win.copyMatch(0, 2);
     try std.testing.expectEqual(@as(u8, 0), buf[6]);
 
-    win.copyMatch(1, 3); // RLE
+    win.copyMatch(1, 3);
     try std.testing.expectEqual(@as(u8, 0), buf[7]);
 }
 

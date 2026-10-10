@@ -2,8 +2,8 @@ const std = @import("std");
 const mem = std.mem;
 const math = std.math;
 
-// BLAKE2sp, RAR5's optional file checksum. The stdlib Blake2s exposes no tree
-// parameters (fanout, depth, inner length), so this follows the spec.
+// BLAKE2sp is the RAR5 optional file checksum. The stdlib Blake2s exposes no tree
+// parameters, so this implementation follows the spec directly.
 
 const iv = [8]u32{
     0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
@@ -167,8 +167,6 @@ pub fn blake2sp(data: []const u8, out: *[32]u8) void {
 }
 
 test "blake2sp matches the published vectors" {
-    // Vectors from the interop-verified rarz implementation (validated
-    // against official rar -htb archives end to end).
     const empty = [32]u8{
         0xdd, 0x0e, 0x89, 0x17, 0x76, 0x93, 0x3f, 0x43,
         0xc7, 0xd0, 0x32, 0xb0, 0x8a, 0x91, 0x7e, 0x25,

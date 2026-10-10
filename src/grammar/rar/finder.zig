@@ -3,10 +3,8 @@ const failure = @import("../../common/primitive/failure.zig");
 const Failure = failure.Failure;
 const kernels = @import("../../common/kernels.zig");
 
-// BT4 match finder. Positions inside matches get skip() updates (hash2/3
-// only). Tree insertions there buy little. Nothing allocates: all tables are
-// caller-provided, and token-buffer exhaustion is a clean
-// InsufficientCapacity for the caller to size against.
+// Nothing allocates: every table is caller-provided, and token-buffer
+// exhaustion returns InsufficientCapacity so the caller can size the buffer.
 
 pub const LzToken = union(enum) {
     literal: u8,
@@ -17,9 +15,9 @@ pub const LzToken = union(enum) {
 };
 
 pub const MatchFinder = struct {
-    hash: []u32, // 1 << hash_bits
-    hash2: []u32, // 1 << 16
-    hash3: []u32, // 1 << hash3_bits
+    hash: []u32,
+    hash2: []u32,
+    hash3: []u32,
     window_size: u32,
     min_match: u32,
     max_match: u32,
@@ -35,7 +33,7 @@ pub const MatchFinder = struct {
     pub const hash3_size: usize = 1 << hash3_bits;
 
     pub fn windowSizeFor(_: u32) u32 {
-        return 1 << 20; // 1 MiB dictionary, matching the writer's dict_bits=3
+        return 1 << 20; // The window must match the writer's 1 MiB dictionary.
     }
 
     pub fn init(
@@ -222,9 +220,8 @@ pub const MatchFinder = struct {
             }
         }
 
-        // Adaptive depth: if neither hash found a 3+ byte match, use a
-        // shallow tree walk. On incompressible data this saves enormous time
-        // since deep BT4 walks find nothing useful.
+        // Adaptive depth: a deep BT4 walk finds nothing useful on incompressible
+        // data, so use a shallow walk when neither hash found a 3-byte match.
         const effective_depth: u32 = if (best_len < 3) @min(self.bt_depth, 2) else self.bt_depth;
 
         const h = hash4(data, pos);
@@ -322,9 +319,8 @@ pub const MatchFinder = struct {
                             continue;
                         }
                     }
-                    // Original match was better or equal, emit it. Pos was
-                    // already inserted by findBT4Match, pos+1 by the lazy
-                    // check above. Insert the remaining positions.
+                    // Position pos is already in the tree from findBT4Match, and
+                    // pos + 1 from the lazy check above, so the loop starts at 2.
                     if (count >= tokens.len) return error.InsufficientCapacity;
                     tokens[count] = .{ .match = .{ .length = m.length, .distance = m.distance } };
                     count += 1;
@@ -337,14 +333,14 @@ pub const MatchFinder = struct {
                     if (count >= tokens.len) return error.InsufficientCapacity;
                     tokens[count] = .{ .match = .{ .length = m.length, .distance = m.distance } };
                     count += 1;
-                    var i: u32 = 1; // pos already in tree via findBT4Match
+                    var i: u32 = 1; // Position pos is already in the tree.
                     while (i < m.length) : (i += 1) {
                         if (pos + i < data.len) self.treeInsert(data, pos + i, bt_left, bt_right);
                     }
                     pos += m.length;
                 }
             } else {
-                // pos already inserted into the tree.
+                // Position pos is already in the tree.
                 if (count >= tokens.len) return error.InsufficientCapacity;
                 tokens[count] = .{ .literal = data[pos] };
                 count += 1;
