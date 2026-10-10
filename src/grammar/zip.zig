@@ -998,12 +998,18 @@ test "zip wrong password reports wrong_password cause" {
     var output: [128]u8 = undefined;
     for (0..entries.len) |ordinal| {
         cause = .none;
-        try testing.expectError(error.InvalidData, zipDecodeOrdinal(archive[0..written], ordinal, &output, .{
+        if (zipDecodeOrdinal(archive[0..written], ordinal, &output, .{
             .password = "wrong",
             .failure_cause = &cause,
             .staging = &staging,
-        }));
-        try testing.expectEqual(crypto.FailureCause.wrong_password, cause);
+        })) |_| {
+            try testing.expect(false);
+        } else |err| {
+            // The PKWARE check byte is one byte wide, so a wrong password clears
+            // it once in every 256 attempts, and past that only the CRC rejects.
+            try testing.expect(err == error.InvalidData or err == error.IntegrityFailure);
+            if (err == error.InvalidData) try testing.expectEqual(crypto.FailureCause.wrong_password, cause);
+        }
     }
 }
 
