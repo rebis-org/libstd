@@ -155,9 +155,9 @@ fn sevenZipReadExpected(r: *Runner, archive: []const u8, ordinal: u64, output: [
 
 fn runDecoded(r: *Runner) anyerror!void {
     setup7z(r, harness.ids.sevenzip);
-    corpus.select(r.corpus_index, &sz_dec_data1_buf);
-    corpus.select(r.corpus_index, &sz_dec_data2_buf);
-    corpus.select(r.corpus_index, &sz_dec_data3_buf);
+    corpus.fillTiled(r.corpus_index, &sz_dec_data1_buf);
+    corpus.fillTiled(r.corpus_index, &sz_dec_data2_buf);
+    corpus.fillTiled(r.corpus_index, &sz_dec_data3_buf);
     var store1: EntryNodes = undefined;
     var store2: EntryNodes = undefined;
     var store3: EntryNodes = undefined;
@@ -214,9 +214,9 @@ fn runDecoded(r: *Runner) anyerror!void {
 
 fn runCoded(r: *Runner) anyerror!void {
     setup7z(r, harness.ids.sevenzip);
-    corpus.select(r.corpus_index, &sz_coded_data2_buf);
-    corpus.select(r.corpus_index, &sz_coded_data3_buf);
-    corpus.select(r.corpus_index, &sz_small);
+    corpus.fillTiled(r.corpus_index, &sz_coded_data2_buf);
+    corpus.fillTiled(r.corpus_index, &sz_coded_data3_buf);
+    corpus.fillTiled(r.corpus_index, &sz_small);
     const methods = [_]u64{ 0, 1, 2, 3, 4 };
     for (methods) |method| {
         var store1: EntryNodes = undefined;
@@ -305,9 +305,9 @@ fn runCoded(r: *Runner) anyerror!void {
 
 fn runEncodeAdvanced(r: *Runner) anyerror!void {
     setup7z(r, harness.ids.sevenzip);
-    corpus.select(r.corpus_index, &sz_adv_payload);
-    corpus.select(r.corpus_index, &sz_small);
-    corpus.select(r.corpus_index, &sz_solid_data);
+    corpus.fillTiled(r.corpus_index, &sz_adv_payload);
+    corpus.fillTiled(r.corpus_index, &sz_small);
+    corpus.fillTiled(r.corpus_index, &sz_solid_data);
     const methods = [_]u64{ 5, 6, 14 };
     for (methods) |method| {
         var store: EntryNodes = undefined;
@@ -349,7 +349,7 @@ const sz_enc_password = "secret";
 
 fn runFilters(r: *Runner) anyerror!void {
     setup7z(r, harness.ids.sevenzip);
-    corpus.select(r.corpus_index, &sz_filter_payload);
+    corpus.fillTiled(r.corpus_index, &sz_filter_payload);
     // Filter + LZMA1 folders (x86/delta under legacy LZMA) plus the modern
     // LZMA2 pairing. Every archive round-trips through our reader and the
     // libarchive oracle where it can express the folder chain.
@@ -375,7 +375,7 @@ fn runFilters(r: *Runner) anyerror!void {
 fn runEncryptedProvider(r: *Runner) anyerror!void {
     if (!harness.offprem_servable) return;
     setup7z(r, harness.ids.sevenzip);
-    corpus.select(r.corpus_index, &sz_enc_data);
+    corpus.fillTiled(r.corpus_index, &sz_enc_data);
     var store: PlainNodes = undefined;
     const entry = entryPlain(&store, "m.txt", &sz_enc_data);
     const crypto_nodes = [_]harness.Node{
@@ -393,7 +393,7 @@ fn runEncryptedProvider(r: *Runner) anyerror!void {
 
 fn runEncrypted(r: *Runner) anyerror!void {
     setup7z(r, harness.ids.sevenzip);
-    corpus.select(r.corpus_index, &sz_enc_data);
+    corpus.fillTiled(r.corpus_index, &sz_enc_data);
     var store: PlainNodes = undefined;
     const entry = entryPlain(&store, "m.txt", &sz_enc_data);
     const crypto_nodes = [_]harness.Node{
@@ -506,7 +506,7 @@ var sz_ppmd_data: [600]u8 = undefined;
 // single continuous PPMd stream, and every substream decodes back exactly.
 fn runPpmd(r: *Runner) anyerror!void {
     setup7z(r, harness.ids.sevenzip);
-    corpus.select(r.corpus_index, &sz_ppmd_data);
+    corpus.fillTiled(r.corpus_index, &sz_ppmd_data);
     const parts = [_][]const u8{ sz_ppmd_data[0..200], sz_ppmd_data[200..400], sz_ppmd_data[400..600] };
     var stores: [3]EntryNodes = undefined;
     var nodes: [3]harness.Node = undefined;

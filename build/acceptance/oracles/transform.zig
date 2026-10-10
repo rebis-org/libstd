@@ -21,7 +21,7 @@ fn setupProfile(r: *Runner, profile_id: harness.Id) void {
     r.write_exact = true;
     r.invalid_status = abi.Status.invalid_data;
     r.invalid = &.{0x06};
-    corpus.select(r.corpus_index, r.corpus_buffer[0..]);
+    corpus.fillTiled(r.corpus_index, r.corpus_buffer[0..]);
 }
 
 fn runRoundtrip(r: *Runner, profile_id: harness.Id) anyerror!void {
@@ -50,7 +50,7 @@ var optimal_reference: [64 * 1024 + 4096]u8 = undefined;
 pub fn runGzipOptimal(r: *Runner) anyerror!void {
     setupProfile(r, harness.ids.gzip);
     r.write_exact = false;
-    corpus.select(r.corpus_index, optimal_input[0..]);
+    corpus.fillTiled(r.corpus_index, optimal_input[0..]);
     r.input = optimal_input[0..];
     try steps.writeSpan(&optimalParams, r);
     try steps.readSpan(&steps.noParams, r);
@@ -88,7 +88,7 @@ fn bzOracleFixture(r: *Runner) !void {
     var fixture_input: [65536]u8 = undefined;
     var compressed: [131072]u8 = undefined;
     var decoded: [65536]u8 = undefined;
-    corpus.select(r.corpus_index, &fixture_input);
+    corpus.fillTiled(r.corpus_index, &fixture_input);
     try harness.oracleFixture(r, lib.bzip2Compress, &fixture_input, &compressed, &decoded);
 }
 
@@ -299,7 +299,7 @@ var gzip_large_input: [64 * 1024]u8 = undefined;
 fn runGzipLarge(r: *Runner) anyerror!void {
     setupProfile(r, harness.ids.gzip);
     r.write_exact = false;
-    corpus.select(r.corpus_index, gzip_large_input[0..]);
+    corpus.fillTiled(r.corpus_index, gzip_large_input[0..]);
     r.input = gzip_large_input[0..];
     try steps.writeSpan(&steps.noParams, r);
     try steps.readSpan(&steps.noParams, r);
@@ -308,7 +308,7 @@ fn runGzipLarge(r: *Runner) anyerror!void {
 
 fn runGzipOracleFixture(r: *Runner) anyerror!void {
     setupProfile(r, harness.ids.gzip);
-    corpus.select(r.corpus_index, gzip_large_input[0..]);
+    corpus.fillTiled(r.corpus_index, gzip_large_input[0..]);
     var compressed: [64 * 1024 + 4096]u8 = undefined;
     try harness.oracleFixture(r, lib.gzipCompress, gzip_large_input[0..], &compressed, r.output);
 }
@@ -318,7 +318,7 @@ var gzip_staged_output: [64 * 1024]u8 = undefined;
 fn runGzipSinglePass(r: *Runner) anyerror!void {
     setupProfile(r, harness.ids.gzip);
     r.write_exact = false;
-    corpus.select(r.corpus_index, gzip_large_input[0..]);
+    corpus.fillTiled(r.corpus_index, gzip_large_input[0..]);
     r.input = gzip_large_input[0..];
     try steps.writeSpan(&steps.noParams, r);
     // Capacity == ISIZE engages the single-pass path.

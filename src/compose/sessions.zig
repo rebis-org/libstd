@@ -13,9 +13,8 @@ pub const StepResult = struct {
     downstream: u32 = 0,
     failure: ?Failure = null,
     // Driver-defined detail: the required capacity for insufficient_capacity,
-    // 0 where the failure carries no scalar. The C boundary copies it into the
-    // session record on failure.
-    failure_value: u64 = 0,
+    // 0 where the failure carries no scalar.
+    required_capacity: u64 = 0,
 };
 
 pub const Budgets = struct {
@@ -28,22 +27,22 @@ pub const Budgets = struct {
     max_work: u64 = std.math.maxInt(u64),
     max_entries: u64 = std.math.maxInt(u64),
 
+    fn charge(current: *u64, ceiling: u64, amount: usize) Failure!void {
+        const next = std.math.add(u64, current.*, amount) catch return error.ResourceLimit;
+        if (next > ceiling) return error.ResourceLimit;
+        current.* = next;
+    }
+
     pub fn addDecoded(self: *Budgets, amount: usize) Failure!void {
-        const next = std.math.add(u64, self.decoded, amount) catch return error.ResourceLimit;
-        if (next > self.max_decoded) return error.ResourceLimit;
-        self.decoded = next;
+        try charge(&self.decoded, self.max_decoded, amount);
     }
 
     pub fn addEncoded(self: *Budgets, amount: usize) Failure!void {
-        const next = std.math.add(u64, self.encoded, amount) catch return error.ResourceLimit;
-        if (next > self.max_encoded) return error.ResourceLimit;
-        self.encoded = next;
+        try charge(&self.encoded, self.max_encoded, amount);
     }
 
     pub fn addWork(self: *Budgets, amount: usize) Failure!void {
-        const next = std.math.add(u64, self.work, amount) catch return error.ResourceLimit;
-        if (next > self.max_work) return error.ResourceLimit;
-        self.work = next;
+        try charge(&self.work, self.max_work, amount);
     }
 };
 

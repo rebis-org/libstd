@@ -2,6 +2,8 @@ const std = @import("std");
 const checksum = @import("checksum");
 const harness = @import("harness.zig");
 
+const seed: u64 = 0x9e3779b97f4a7c15;
+
 fn crc32Ref(input: []const u8) u32 {
     var crc: u32 = 0xffff_ffff;
     for (input) |byte| {
@@ -15,12 +17,16 @@ fn crc32Ref(input: []const u8) u32 {
     return ~crc;
 }
 
-fn runSizes(r: *harness.Runner) !void {
-    _ = r;
+fn fillPage(gpa: std.mem.Allocator, len: usize) ![]u8 {
+    const page = try gpa.alloc(u8, len);
+    harness.xorshiftFill(page, seed);
+    return page;
+}
+
+fn runSizes() !void {
     const gpa = std.heap.page_allocator;
-    const page = try gpa.alloc(u8, 2 * 1024 * 1024 + 4096);
+    const page = try fillPage(gpa, 2 * 1024 * 1024 + 4096);
     defer gpa.free(page);
-    harness.xorshiftFill(page, 0x9e3779b97f4a7c15);
 
     const sizes = [_]usize{
         0,       1,   3,   7,   8,   15,  16,  31,   32,   33,   63,   64,   65,
@@ -35,19 +41,17 @@ fn runSizes(r: *harness.Runner) !void {
             const expected = crc32Ref(input);
             const got = checksum.crc32(input);
             if (got != expected) {
-                std.debug.print("Checksum mismatch: size {d}, offset {d}: got {x:0>8}, want {x:0>8}.\n", .{ size, off, got, expected });
-                return error.ChecksumMismatch;
+                std.debug.print("checksum mismatch: size {d}, offset {d}: got {x:0>8}, want {x:0>8}.\n", .{ size, off, got, expected });
+                return error.checksum_mismatch;
             }
         }
     }
 }
 
-fn runSplitUpdates(r: *harness.Runner, chunk_size: usize) !void {
-    _ = r;
+fn runSplitUpdates(chunk_size: usize) !void {
     const gpa = std.heap.page_allocator;
-    const data = try gpa.alloc(u8, 1048576);
+    const data = try fillPage(gpa, 1048576);
     defer gpa.free(data);
-    harness.xorshiftFill(data, 0x9e3779b97f4a7c15);
 
     var split = checksum.Crc32.init();
     var offset: usize = 0;
@@ -63,15 +67,17 @@ fn runSplitUpdates(r: *harness.Runner, chunk_size: usize) !void {
     const whole_digest = whole.final();
 
     if (split_digest != whole_digest or split_digest != crc32Ref(data)) {
-        std.debug.print("Split/whole mismatch: chunk {d}: split {x:0>8}, whole {x:0>8}, reference {x:0>8}.\n", .{ chunk_size, split_digest, whole_digest, crc32Ref(data) });
-        return error.SplitMismatch;
+        std.debug.print("split/whole mismatch: chunk {d}: split {x:0>8}, whole {x:0>8}, reference {x:0>8}.\n", .{ chunk_size, split_digest, whole_digest, crc32Ref(data) });
+        return error.split_mismatch;
     }
 }
 
-pub fn run(r: *harness.Runner) anyerror!void {
-    try runSizes(r);
-    try runSplitUpdates(r, 123); // sub-threshold chunks: serial path only
-    try runSplitUpdates(r, 300); // straddles 256 B threshold: exercises PMULL continuation
+pub fn run(_: *harness.Runner) anyerror!void {
+    try runSizes();
+    // Sub-threshold chunks stay on the serial path, while the larger size
+    // straddles the 256 byte threshold and exercises continuation.
+    try runSplitUpdates(123);
+    try runSplitUpdates(300);
 }
 
 pub const scenarios = harness.scenarios("checksum", &.{

@@ -12,12 +12,12 @@ pub fn main(init: std.process.Init) !void {
     var distributions: [manifest.providers.len * 4]manifest.Distribution = undefined;
     inline for (manifest.providers, 0..) |provider, provider_index| {
         inline for (.{ manifest.hostFor(provider), manifest.androidFor(provider), manifest.appleFor(provider), manifest.cjpmFor(provider) }, 0..) |distribution, form_index| {
-            archive_paths[provider_index * 4 + form_index] = try args.next(error.MissingArchive);
+            archive_paths[provider_index * 4 + form_index] = try args.next(error.missing_archive);
             distributions[provider_index * 4 + form_index] = distribution;
         }
     }
-    const dynamic_library = try args.next(error.MissingArchive);
-    try args.done(error.UnexpectedArgument);
+    const dynamic_library = try args.next(error.missing_archive);
+    try args.done(error.unexpected_argument);
     var headers: [archive_paths.len]?[]u8 = @splat(null);
     var catalogs: [archive_paths.len]?[]u8 = @splat(null);
     defer {
@@ -32,24 +32,20 @@ pub fn main(init: std.process.Init) !void {
         headers[index] = try extract(init, archive_paths[index], distribution.header);
         catalogs[index] = try extract(init, archive_paths[index], distribution.catalog);
     }
-    for (headers[1..]) |header| if (!std.mem.eql(u8, headers[0].?, header.?)) return error.HeaderMismatch;
-    for (catalogs[1..]) |catalog| if (!std.mem.eql(u8, catalogs[0].?, catalog.?)) return error.CatalogMismatch;
+    for (headers[1..]) |header| if (!std.mem.eql(u8, headers[0].?, header.?)) return error.header_mismatch;
+    for (catalogs[1..]) |catalog| if (!std.mem.eql(u8, catalogs[0].?, catalog.?)) return error.catalog_mismatch;
     inline for (manifest.providers, 0..) |provider, provider_index| {
-        for (manifest.androidFor(provider).android.?) |abi| try requireAndroidArchitecture(init, archive_paths[provider_index * 4 + 1], abi.library, abi.elf_machine);
-        for (slices.ohos_abis) |abi| try requireOhosArchitecture(init, archive_paths[provider_index * 4 + 3], abi);
+        for (manifest.androidFor(provider).android.?) |abi| try requireElfMachine(init, archive_paths[provider_index * 4 + 1], abi.zip_path, abi.elf_machine, error.invalid_android_library);
+        for (slices.ohos_abis) |abi| try requireOhosEntry(init, archive_paths[provider_index * 4 + 3], abi);
         for (manifest.appleFor(provider).apple.?) |slice| try requireAppleSlice(init, archive_paths[provider_index * 4 + 2], slice);
     }
-    try symbols.assertSingleExport(init, dynamic_library);
+    try symbols.assertExports(init, dynamic_library);
 }
 
-fn requireOhosArchitecture(init: std.process.Init, archive: []const u8, abi: slices.OhosAbi) !void {
+fn requireOhosEntry(init: std.process.Init, archive: []const u8, abi: slices.OhosAbi) !void {
     const entry = try print("stdk/libs/{s}/libstd.so", .{abi.triple});
     defer std.heap.page_allocator.free(entry);
-    const library = try extract(init, archive, entry);
-    defer std.heap.page_allocator.free(library);
-    if (library.len < 20 or !std.mem.eql(u8, library[0..4], "\x7fELF")) return error.InvalidOhosLibrary;
-    const machine = std.mem.readInt(u16, library[18..20], .little);
-    if (machine != abi.elf_machine) return error.InvalidOhosLibrary;
+    return requireElfMachine(init, archive, entry, abi.elf_machine, error.invalid_ohos_library);
 }
 
 fn print(comptime format: []const u8, args: anytype) ![]u8 {
@@ -61,21 +57,21 @@ fn extract(init: std.process.Init, archive: []const u8, entry: []const u8) ![]u8
 }
 
 fn requireEntries(entries: []const u8, expected: []const []const u8) !void {
-    for (expected) |entry| if (!containsEntry(entries, entry)) return error.MissingArchiveEntry;
+    for (expected) |entry| if (!hasEntry(entries, entry)) return error.missing_archive_entry;
 }
 
-fn containsEntry(entries: []const u8, expected: []const u8) bool {
+fn hasEntry(entries: []const u8, expected: []const u8) bool {
     var lines = std.mem.splitScalar(u8, entries, '\n');
     while (lines.next()) |entry| if (std.mem.eql(u8, entry, expected)) return true;
     return false;
 }
 
-fn requireAndroidArchitecture(init: std.process.Init, archive: []const u8, entry: []const u8, expected_machine: u16) !void {
+fn requireElfMachine(init: std.process.Init, archive: []const u8, entry: []const u8, expected_machine: u16, err: anyerror) !void {
     const library = try extract(init, archive, entry);
     defer std.heap.page_allocator.free(library);
-    if (library.len < 20 or !std.mem.eql(u8, library[0..4], "\x7fELF")) return error.InvalidAndroidLibrary;
+    if (library.len < 20 or !std.mem.eql(u8, library[0..4], "\x7fELF")) return err;
     const machine = std.mem.readInt(u16, library[18..20], .little);
-    if (machine != expected_machine) return error.InvalidAndroidLibrary;
+    if (machine != expected_machine) return err;
 }
 
 fn requireAppleSlice(init: std.process.Init, archive: []const u8, slice: slices.AppleSlice) !void {
@@ -93,7 +89,7 @@ fn requireAppleSlice(init: std.process.Init, archive: []const u8, slice: slices.
     defer std.heap.page_allocator.free(platform_text);
     const minimum_text = try print("minos {s}", .{slice.minimum});
     defer std.heap.page_allocator.free(minimum_text);
-    if (std.mem.indexOf(u8, stdout, platform_text) == null or std.mem.indexOf(u8, stdout, minimum_text) == null) return error.InvalidAppleLibrary;
+    if (std.mem.indexOf(u8, stdout, platform_text) == null or std.mem.indexOf(u8, stdout, minimum_text) == null) return error.invalid_apple_library;
     // App Store validation rejects embedded frameworks whose Info.plist
     // lacks MinimumOSVersion (90530/90360).
     const plist_entry = if (slices.isMacos(slice))
@@ -103,5 +99,5 @@ fn requireAppleSlice(init: std.process.Init, archive: []const u8, slice: slices.
     defer std.heap.page_allocator.free(plist_entry);
     const plist = try extract(init, archive, plist_entry);
     defer std.heap.page_allocator.free(plist);
-    if (std.mem.indexOf(u8, plist, "<key>MinimumOSVersion</key>") == null) return error.MissingMinimumOSVersion;
+    if (std.mem.indexOf(u8, plist, "<key>MinimumOSVersion</key>") == null) return error.missing_minimum_os_version;
 }

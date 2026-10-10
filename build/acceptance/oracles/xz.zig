@@ -231,9 +231,9 @@ fn runEdgeCases(r: *Runner) !void {
 
 pub fn runRoundtrip(r: *Runner) anyerror!void {
     setupXz(r);
-    corpus.select(r.corpus_index, &xz_corpus);
-    corpus.select(r.corpus_index, &xz_payload_a);
-    corpus.select(r.corpus_index, &xz_payload_b);
+    corpus.fillTiled(r.corpus_index, &xz_corpus);
+    corpus.fillTiled(r.corpus_index, &xz_payload_a);
+    corpus.fillTiled(r.corpus_index, &xz_payload_b);
     try runChecks(r);
     try runCallback(r);
     try runCombined(r);
@@ -303,7 +303,7 @@ fn runFilterCases(r: *Runner) !void {
 
 pub fn runFilters(r: *Runner) anyerror!void {
     setupXz(r);
-    corpus.select(r.corpus_index, &xz_corpus);
+    corpus.fillTiled(r.corpus_index, &xz_corpus);
     try runFilterCases(r);
 }
 
@@ -416,8 +416,8 @@ fn runOptionalBody(r: *Runner) !void {
 
 pub fn runOptional(r: *Runner) anyerror!void {
     setupXz(r);
-    corpus.select(r.corpus_index, &xz_payload_a);
-    corpus.select(r.corpus_index, &xz_payload_b);
+    corpus.fillTiled(r.corpus_index, &xz_payload_a);
+    corpus.fillTiled(r.corpus_index, &xz_payload_b);
     try runOptionalBody(r);
 }
 
@@ -508,7 +508,7 @@ fn runEncodeMultistream(r: *Runner) !void {
 
 pub fn runEncode(r: *Runner) anyerror!void {
     setupXz(r);
-    corpus.select(r.corpus_index, &xz_corpus);
+    corpus.fillTiled(r.corpus_index, &xz_corpus);
     try runEncodeFilters(r);
     try runEncodeSha256(r);
     try runEncodeInvalidFilter(r);

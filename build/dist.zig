@@ -39,19 +39,24 @@ pub fn expand(b: *std.Build, ctx: *common.Context) void {
             .apple = apple.addArchive(b, &pctx, manifest.appleFor(provider)),
             .cjpm = cjpm.addArchive(b, &pctx, manifest.cjpmFor(provider)),
         };
-        dist.dependOn(&b.addInstallFile(archives[index].host, manifest.hostFor(provider).archive).step);
-        dist.dependOn(&b.addInstallFile(archives[index].android, manifest.androidFor(provider).archive).step);
-        dist.dependOn(&b.addInstallFile(archives[index].apple, manifest.appleFor(provider).archive).step);
-        dist.dependOn(&b.addInstallFile(archives[index].cjpm, manifest.cjpmFor(provider).archive).step);
+        inline for (@typeInfo(common.ProviderArchives).@"struct".field_names) |field_name| {
+            if (comptime std.mem.eql(u8, field_name, "name")) continue;
+            const form = switch (comptime std.meta.stringToEnum(Kind, field_name) orelse .host) {
+                .host => manifest.hostFor(provider),
+                .android => manifest.androidFor(provider),
+                .apple => manifest.appleFor(provider),
+                .cjpm => manifest.cjpmFor(provider),
+            };
+            dist.dependOn(&b.addInstallFile(@field(archives[index], field_name), form.archive).step);
+        }
     }
     ctx.archives = archives;
 }
 
 fn addHostArchive(b: *std.Build, ctx: *const common.Context, distribution: manifest.Distribution) std.Build.LazyPath {
     const stage = b.addWriteFiles();
-    _ = stage.addCopyFile(ctx.generated.header, distribution.header);
+    common.stageHeaderCatalog(stage, ctx, distribution);
     _ = stage.addCopyFile(ctx.generated.module_map, "libstd/include/module.modulemap");
-    _ = stage.addCopyFile(ctx.generated.catalog, distribution.catalog);
     _ = stage.addCopyFile(ctx.host.static_library.getEmittedBin(), "libstd/lib/libstd.a");
     _ = stage.addCopyFile(ctx.host.dynamic_library.getEmittedBin(), "libstd/lib/libstd.dylib");
     return common.addZipArchive(b, distribution, stage);

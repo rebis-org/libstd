@@ -25,7 +25,7 @@ fn ensureCorpus(env: *env_mod.Env) ![]const u8 {
     for (env_mod.paths.corpus_candidates) |dir| {
         if (corpusComplete(env, dir)) return dir;
     }
-    std.debug.print("The Silesia corpus is missing. Downloading \"{s}\".\n", .{env_mod.silesia_url});
+    std.debug.print("silesia corpus is missing. downloading \"{s}\".\n", .{env_mod.silesia_url});
     try std.Io.Dir.cwd().createDirPath(env.io, env_mod.paths.corpus_dir);
     const download = try run.output(env.init, &.{ "curl", "-fsSL", "-o", env_mod.paths.corpus_zip, env_mod.silesia_url });
     env.allocator.free(download);
@@ -33,7 +33,7 @@ fn ensureCorpus(env: *env_mod.Env) ![]const u8 {
     for (env_mod.paths.corpus_candidates) |dir| {
         if (corpusComplete(env, dir)) return dir;
     }
-    return error.SilesiaCorpusMissing;
+    return error.silesia_corpus_missing;
 }
 
 fn produceArchive(env: *env_mod.Env, comptime row: matrix.Row, input_path: []const u8, output_path: []const u8) ![]u8 {
@@ -54,6 +54,15 @@ fn produceArchive(env: *env_mod.Env, comptime row: matrix.Row, input_path: []con
     const stdout = try run.outputCwd(env.init, env_mod.paths.work, &.{ rar_abs, "a", "-qo-", "-m0", "-idq", "out.rar", "input.bin" });
     env.allocator.free(stdout);
     return env.readFile(output_path, 1 << 31);
+}
+
+fn isSelected(row_name: []const u8, filter: ?[]const u8) bool {
+    const wanted = filter orelse return true;
+    return std.mem.eql(u8, row_name, wanted);
+}
+
+fn writeReport(env: *env_mod.Env, path: []const u8, report: []const u8) !void {
+    try env.writeFile(path, report);
 }
 
 fn availability(env: *env_mod.Env, comptime row: matrix.Row) [4]bool {
@@ -105,7 +114,7 @@ fn measureRow(env: *env_mod.Env, comptime row: matrix.Row, workspace: []u8) !met
             const ours_result = ours.transform(env, row, input, encoded, decoded, workspace);
             totals.add(.ours, ours_result);
             if (!ours_result.ok) {
-                std.debug.print("Benchmark \"{s}\" failed on \"{s}\" (input length {d}).\n", .{ row.name, name, input.len });
+                std.debug.print("benchmark \"{s}\" failed on \"{s}\" (input length {d}).\n", .{ row.name, name, input.len });
                 if (env.row != null) {
                     try env.writeFile(env_mod.paths.debug_ours, encoded[0..@min(ours_result.encoded, encoded.len)]);
                     try env.writeFile(env_mod.paths.debug_input, input);
@@ -140,8 +149,8 @@ pub fn main(init: std.process.Init) !void {
     harness.oracle_io = init.io;
     var args = std.process.Args.Iterator.init(init.minimal.args);
     _ = args.next();
-    const catalog_path = args.next() orelse return error.MissingCatalogArgument;
-    if (args.next() != null) return error.UnexpectedArgument;
+    const catalog_path = args.next() orelse return error.missing_catalog_argument;
+    if (args.next() != null) return error.unexpected_argument;
     _ = try harness.loadCatalog(catalog_path);
 
     var env = env_mod.Env{
@@ -185,17 +194,16 @@ pub fn main(init: std.process.Init) !void {
         defer run_report.deinit(env.allocator);
         try run_report.appendSlice(env.allocator, metric.header);
         inline for (matrix.rows, 0..) |row, idx| {
-            const selected = if (env.row) |filter| std.mem.eql(u8, row.name, filter) else true;
-            if (selected) {
+            if (isSelected(row.name, env.row)) {
                 if (run_index == 0) std.debug.print("benchmark {s} ...\n", .{row.name});
                 const totals = try measureRow(&env, row, workspace);
-                try metric.row(&run_report, env.allocator, row, totals, availability(&env, row));
+                try metric.emitMetricRow(&run_report, env.allocator, row, totals, availability(&env, row));
                 try per_row[idx].append(env.allocator, totals);
             }
         }
         const run_path = try env.allocator.print("zig-out/benchmark/report_{d}.txt", .{run_index});
         defer env.allocator.free(run_path);
-        try env.writeFile(run_path, run_report.items);
+        try writeReport(&env, run_path, run_report.items);
     }
 
     var report = std.ArrayList(u8).empty;
@@ -204,12 +212,11 @@ pub fn main(init: std.process.Init) !void {
     var results = std.ArrayList(gate.Result).empty;
     defer results.deinit(env.allocator);
     inline for (matrix.rows, 0..) |row, idx| {
-        const selected = if (env.row) |filter| std.mem.eql(u8, row.name, filter) else true;
-        if (selected) {
+        if (isSelected(row.name, env.row)) {
             const list = per_row[idx].items;
             const totals = if (list.len > 0) try metric.medianTotals(env.allocator, list, skip_warmup) else metric.Totals{};
             const available = availability(&env, row);
-            try metric.row(&report, env.allocator, row, totals, available);
+            try metric.emitMetricRow(&report, env.allocator, row, totals, available);
             if (gate_cfg.enabled) try results.append(env.allocator, gate.classify(row, totals, available, gate_cfg));
         }
     }
@@ -219,21 +226,21 @@ pub fn main(init: std.process.Init) !void {
     else
         null;
     defer if (row_report) |path| env.allocator.free(path);
-    try env.writeFile(row_report orelse env_mod.paths.report, report.items);
+    try writeReport(&env, row_report orelse env_mod.paths.report, report.items);
 
     if (gate_cfg.enabled) {
         gate.sort(results.items);
         var gate_report = std.ArrayList(u8).empty;
         defer gate_report.deinit(env.allocator);
         try gate_report.appendSlice(env.allocator, gate.header);
-        for (results.items) |result| try gate.row(&gate_report, env.allocator, result);
+        for (results.items) |result| try gate.emitGateRow(&gate_report, env.allocator, result);
         const row_gate: ?[]u8 = if (env.row) |filter|
             try env.allocator.print("zig-out/benchmark/gate_{s}.txt", .{filter})
         else
             null;
         defer if (row_gate) |path| env.allocator.free(path);
         const gate_path = row_gate orelse env_mod.paths.gate;
-        try env.writeFile(gate_path, gate_report.items);
+        try writeReport(&env, gate_path, gate_report.items);
         const summary = gate.summarize(results.items);
         std.debug.print("gate: {d} pass, {d} fail, {d} noisy, {d} unmeasurable, {d} unhealthy -> {s}\n", .{ summary.pass, summary.fail, summary.noisy, summary.unmeasurable, summary.unhealthy, gate_path });
         if (results.items.len > 0) {

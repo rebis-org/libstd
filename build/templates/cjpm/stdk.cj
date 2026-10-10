@@ -1,4 +1,4 @@
-// FFI bindings for the libstd C ABI (stdk.h, STDK_ABI_EPOCH 7).
+// FFI bindings for the libstd C ABI (stdk.h, STDK_ABI_EPOCH 8).
 // Foreign declarations are package-private in Cangjie; the public wrappers
 // below are the importable surface and encapsulate the unsafe calls.
 package stdk
