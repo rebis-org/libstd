@@ -1,4 +1,5 @@
 const std = @import("std");
+const options = @import("options");
 
 const abi = @import("abi.zig");
 pub const Id = abi.Id;
@@ -42,6 +43,35 @@ pub const protocol_resource_limit: u32 = 2;
 pub const protocol_resource_capabilities: u32 = 3;
 pub const protocol_sizing_mode: u32 = 4;
 pub const protocol_commit_mode: u32 = 5;
+pub const protocol_provider: u32 = 6;
+
+// False only in a uniform onprem build: no capability can serve the offprem
+// tag, so provider-selection scenarios step aside for the rejection scenario.
+pub const offprem_servable = blk: {
+    for (.{
+        options.sha256_impl,  options.sha1_impl,       options.hmac_impl,
+        options.pbkdf2_impl,  options.adler32_impl,    options.xxh32_impl,
+        options.xxh64_impl,   options.aes_impl,        options.crc32_impl,
+        options.crc64xz_impl, options.bzip2crc32_impl,
+    }) |impl| {
+        if (impl != .onprem) break :blk true;
+    }
+    break :blk false;
+};
+
+pub const onprem_servable = blk: {
+    for (.{
+        options.sha256_impl,  options.sha1_impl,       options.hmac_impl,
+        options.pbkdf2_impl,  options.adler32_impl,    options.xxh32_impl,
+        options.xxh64_impl,   options.aes_impl,        options.crc32_impl,
+        options.crc64xz_impl, options.bzip2crc32_impl,
+    }) |impl| {
+        if (impl != .offprem) break :blk true;
+    }
+    break :blk false;
+};
+
+pub const both_servable = offprem_servable and onprem_servable;
 pub const crypto_password: u32 = 1;
 pub const crypto_algorithm: u32 = 2;
 pub const crypto_kdf_rounds_limit: u32 = 3;
@@ -319,6 +349,10 @@ pub fn sizingModeParam(value: u64) Node {
 
 pub fn commitModeParam(value: u64) Node {
     return paramScalar(param_family_protocol, protocol_commit_mode, cmd_all, value);
+}
+
+pub fn providerParam(value: u64) Node {
+    return paramScalar(param_family_protocol, protocol_provider, cmd_all, value);
 }
 
 pub fn resourceLimitParam(value: u64) Node {

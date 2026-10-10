@@ -4,7 +4,7 @@
 package stdk
 
 // Status codes (stdk.h STDK_STATUS_*).
-public let STDK_ABI_EPOCH: UInt32 = 7
+public let STDK_ABI_EPOCH: UInt32 = 8
 public let STDK_STATUS_OK: UInt32 = 0
 public let STDK_STATUS_INVALID_CALL: UInt32 = 1
 public let STDK_STATUS_UNSUPPORTED: UInt32 = 2

@@ -72,10 +72,12 @@ fn addPackage(b: *std.Build, ctx: *common.Context) void {
     const archives = ctx.archives orelse @panic("The distribution units must expand before the checks units.");
     const package_exe = b.addExecutable(.{ .name = "package", .root_module = modules.create(b, modules.package, ctx) });
     const package_run = b.addRunArtifact(package_exe);
-    package_run.addFileArg(archives.host);
-    package_run.addFileArg(archives.android);
-    package_run.addFileArg(archives.apple);
-    package_run.addFileArg(archives.cjpm);
+    for (archives) |provider| {
+        package_run.addFileArg(provider.host);
+        package_run.addFileArg(provider.android);
+        package_run.addFileArg(provider.apple);
+        package_run.addFileArg(provider.cjpm);
+    }
     package_run.addFileArg(ctx.host.dynamic_library.getEmittedBin());
     b.step("package", "Check the distribution archives").dependOn(&package_run.step);
 }

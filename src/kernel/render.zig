@@ -12,7 +12,7 @@ pub const framework_module_map = renderFrameworkModuleMap();
 
 fn renderHeader() []const u8 {
     comptime {
-        var statuses: []const u8 = "#define STDK_ABI_EPOCH UINT32_C(7)\n";
+        var statuses: []const u8 = "#define STDK_ABI_EPOCH UINT32_C(8)\n";
         for (abi.Status.definitions) |status| statuses = statuses ++ std.fmt.comptimePrint("#define STDK_STATUS_{s} UINT32_C({d})\n", .{ status.name, status.value });
         const layouts = std.fmt.comptimePrint("#define STDK_SIZEOF_ID UINT32_C({d})\n#define STDK_SIZEOF_NODE UINT32_C({d})\n#define STDK_SIZEOF_CALL UINT32_C({d})\n", .{ @sizeOf(abi.Id), @sizeOf(abi.Node), @sizeOf(abi.Call) });
         const assertions = std.fmt.comptimePrint("STDK_STATIC_ASSERT(sizeof(stdk_id) == {d}, \"stdk_id size mismatch: the ABI fixes 16 bytes\");\nSTDK_STATIC_ASSERT(offsetof(stdk_call_envelope, operation) == {d}, \"stdk_call operation offset mismatch: the ABI fixes offset 8\");\nSTDK_STATIC_ASSERT(offsetof(stdk_node, id) == {d}, \"stdk_node id offset mismatch: the ABI fixes offset 8\");\n", .{ @sizeOf(abi.Id), @offsetOf(abi.Call, "operation"), @offsetOf(abi.Node, "id") });

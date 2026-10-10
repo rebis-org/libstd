@@ -12,6 +12,7 @@ pub const deflate_history_size = deflate.history_size;
 
 pub const Options = struct {
     deflate: deflate.Options,
+    provider: checksum.Provider = checksum.default_provider,
 };
 
 const window_size_max = 32768;
@@ -47,15 +48,15 @@ pub fn inspect(input: []const u8) Failure!Header {
     };
 }
 
-pub fn decodedSize(input: []const u8, history: []u8) Failure!usize {
+pub fn decodedSize(input: []const u8, history: []u8, provider: checksum.Provider) Failure!usize {
     if (history.len < deflate_history_size) return error.InsufficientCapacity;
     var counter = measurement.Counter.init(null);
-    _ = try decode(input, &counter.writer, history);
+    _ = try decode(input, &counter.writer, history, provider);
     return std.math.cast(usize, counter.written()) orelse error.ResourceLimit;
 }
 
 // One stream per call: the adler32 trailer ends the stream, so trailing bytes are an error.
-pub fn decode(input: []const u8, output: *std.Io.Writer, history: []u8) Failure!usize {
+pub fn decode(input: []const u8, output: *std.Io.Writer, history: []u8, provider: checksum.Provider) Failure!usize {
     if (history.len < deflate_history_size) return error.InsufficientCapacity;
     var source = std.Io.Reader.fixed(input);
     const cmf = source.takeByte() catch return error.InvalidData;
@@ -63,7 +64,7 @@ pub fn decode(input: []const u8, output: *std.Io.Writer, history: []u8) Failure!
     const header = try inspect(&.{ cmf, flg });
     if (header.has_dictionary) return error.Unsupported;
     if (header.window_size > window_size_max) return error.Unsupported;
-    var tee_writer = tee.CountingTee(.{ .adler32 = true }).init(output);
+    var tee_writer = tee.CountingTee(.{ .adler32 = true }).initWithProvider(output, provider);
     var inflater = deflate.Decompress.initSlice(input[header_size..], history);
     const produced = inflater.reader.streamRemaining(&tee_writer.writer) catch |err| {
         return switch (err) {
@@ -86,7 +87,7 @@ pub fn encodeStream(source: *std.Io.Reader, output: *std.Io.Writer, history: []u
     if (history.len < deflate_history_size) return error.InsufficientCapacity;
     try writeHeader(output);
     var compressor = try deflate.Compress.init(output, history, options.deflate);
-    var adler32 = checksum.Adler32.init();
+    var adler32 = checksum.Adler32.bind(options.provider);
     var buffer: [4096]u8 = undefined;
     while (true) {
         var sink = std.Io.Writer.fixed(&buffer);
@@ -124,11 +125,11 @@ test "zlib round trip restores the original input" {
     const info = try inspect(compressed);
     try std.testing.expectEqual(@as(u32, window_size_max), info.window_size);
     var counter = measurement.Counter.init(null);
-    const produced = try decode(compressed, &counter.writer, history);
+    const produced = try decode(compressed, &counter.writer, history, checksum.default_provider);
     try std.testing.expectEqual(input.len, produced);
     var source_out: [256]u8 = undefined;
     var out_sink = std.Io.Writer.fixed(&source_out);
-    _ = try decode(compressed, &out_sink, history);
+    _ = try decode(compressed, &out_sink, history, checksum.default_provider);
     try std.testing.expectEqualStrings(input, source_out[0..out_sink.end]);
 }
 
@@ -138,7 +139,7 @@ test "zlib rejects a preset dictionary and trailing bytes" {
     var discard_buffer: [0]u8 = .{};
     var discarding: std.Io.Writer.Discarding = .init(&discard_buffer);
     // 0x78/0x20 passes FCHECK ((0x78 << 8 | 0x20) % 31 == 0) and sets FDICT.
-    try std.testing.expectError(error.Unsupported, decode(&.{ 0x78, 0x20, 0x03, 0x00, 0, 0, 0, 1 }, &discarding.writer, history));
+    try std.testing.expectError(error.Unsupported, decode(&.{ 0x78, 0x20, 0x03, 0x00, 0, 0, 0, 1 }, &discarding.writer, history, checksum.default_provider));
     const input = "payload";
     var source = std.Io.Reader.fixed(input);
     var encoded: [64]u8 = undefined;
@@ -147,5 +148,5 @@ test "zlib rejects a preset dictionary and trailing bytes" {
     var with_garbage: [65]u8 = undefined;
     @memcpy(with_garbage[0..sink.end], encoded[0..sink.end]);
     with_garbage[sink.end] = 0;
-    try std.testing.expectError(error.InvalidData, decode(with_garbage[0 .. sink.end + 1], &discarding.writer, history));
+    try std.testing.expectError(error.InvalidData, decode(with_garbage[0 .. sink.end + 1], &discarding.writer, history, checksum.default_provider));
 }

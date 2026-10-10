@@ -8,12 +8,13 @@ const slices = @import("slices.zig");
 pub fn addArchive(
     b: *std.Build,
     ctx: *const common.Context,
+    distribution: manifest.Distribution,
 ) std.Build.LazyPath {
     const stage = b.addWriteFiles();
     _ = stage.add("stdk/cjpm.toml", tomlText(b, ctx));
     _ = stage.addCopyFile(b.path("build/templates/cjpm/stdk.cj"), "stdk/src/stdk.cj");
-    _ = stage.addCopyFile(ctx.generated.header, manifest.cjpm.header);
-    _ = stage.addCopyFile(ctx.generated.catalog, manifest.cjpm.catalog);
+    _ = stage.addCopyFile(ctx.generated.header, distribution.header);
+    _ = stage.addCopyFile(ctx.generated.catalog, distribution.catalog);
     for (slices.ohos_abis) |abi| {
         const resolved = b.resolveTargetQuery(.{
             .cpu_arch = abi.arch,
@@ -25,7 +26,7 @@ pub fn addArchive(
         _ = stage.addCopyFile(static_library.getEmittedBin(), b.fmt("stdk/libs/{s}/libstd.a", .{abi.triple}));
         _ = stage.addCopyFile(dynamic_library.getEmittedBin(), b.fmt("stdk/libs/{s}/libstd.so", .{abi.triple}));
     }
-    return common.addZipArchive(b, manifest.cjpm, stage);
+    return common.addZipArchive(b, distribution, stage);
 }
 
 fn tomlText(b: *std.Build, ctx: *const common.Context) []const u8 {

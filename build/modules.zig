@@ -14,10 +14,11 @@ pub const Module = struct {
     crc_kernel: bool = false,
 };
 
-pub const checksum = Module{ .name = "checksum", .root = "src/common/primitive/checksum.zig", .crc_kernel = true };
-pub const crypto = Module{ .name = "crypto", .root = "src/common/primitive/crypto.zig" };
+pub const seam = Module{ .name = "seam", .root = "src/common/primitive/seam.zig" };
+pub const checksum = Module{ .name = "checksum", .root = "src/common/primitive/checksum.zig", .imports = &.{.{ .name = "seam", .module = "seam" }}, .crc_kernel = true };
+pub const crypto = Module{ .name = "crypto", .root = "src/common/primitive/crypto.zig", .imports = &.{.{ .name = "seam", .module = "seam" }} };
 
-pub const library = Module{ .name = "library", .root = "src/root.zig", .crc_kernel = true };
+pub const library = Module{ .name = "library", .root = "src/root.zig", .imports = &.{.{ .name = "seam", .module = "seam" }}, .crc_kernel = true };
 pub const manifest = Module{ .name = "manifest", .root = "build/platform/manifest.zig" };
 pub const package = Module{
     .name = "package",
@@ -37,13 +38,13 @@ pub const oracles = Module{
         .{ .name = "crypto", .module = "crypto" },
     },
 };
-pub const nucleus = Module{ .name = "nucleus", .root = "src/nucleus/root.zig" };
-pub const grammar = Module{ .name = "grammar", .root = "src/grammar.zig", .crc_kernel = true };
+pub const interface = Module{ .name = "interface", .root = "src/interface/root.zig" };
+pub const grammar = Module{ .name = "grammar", .root = "src/grammar.zig", .imports = &.{.{ .name = "seam", .module = "seam" }}, .crc_kernel = true };
 pub const trap = Module{
     .name = "trap",
     .root = "build/acceptance/oracles/trap.zig",
     .imports = &.{
-        .{ .name = "nucleus", .module = "nucleus" },
+        .{ .name = "interface", .module = "interface" },
     },
 };
 pub const component = Module{ .name = "component", .root = "build/component.zig" };
@@ -56,7 +57,7 @@ pub const benchmark = Module{
     },
 };
 
-const importable = [_]Module{ checksum, crypto, library, manifest, harness, run, nucleus, grammar, trap, component };
+const importable = [_]Module{ seam, checksum, crypto, library, manifest, harness, run, interface, grammar, trap, component };
 
 fn byName(name: []const u8) Module {
     for (importable) |module| {
@@ -70,27 +71,27 @@ pub fn create(b: *std.Build, comptime spec: Module, ctx: *const common.Context) 
 }
 
 pub const Components = struct {
-    nucleus: *std.Build.Module,
+    interface: *std.Build.Module,
     components: *std.Build.Module,
 };
 
-pub fn componentsWithNucleus(
+pub fn componentsWithInterface(
     b: *std.Build,
     ctx: *const common.Context,
     components_target: std.Build.ResolvedTarget,
-    nucleus_target: std.Build.ResolvedTarget,
+    interface_target: std.Build.ResolvedTarget,
     optimize: std.builtin.Optimize,
 ) Components {
     const generated = common.descriptorScan(b, ctx);
-    const nucleus_module = createFor(b, nucleus, nucleus_target, optimize, ctx);
+    const interface_module = createFor(b, interface, interface_target, optimize, ctx);
     const components_module = b.createModule(.{
         .root_source_file = generated,
         .target = components_target,
         .optimize = optimize,
     });
     if (ctx.sanitize_c) |sc| components_module.sanitize_c = sc;
-    components_module.addImport("nucleus", nucleus_module);
-    return .{ .nucleus = nucleus_module, .components = components_module };
+    components_module.addImport("interface", interface_module);
+    return .{ .interface = interface_module, .components = components_module };
 }
 
 pub fn withKernelFeatures(target: std.Build.ResolvedTarget) std.Build.ResolvedTarget {
@@ -127,7 +128,31 @@ pub fn createFor(
     if (ctx.sanitize_c) |sc| module.sanitize_c = sc;
     module.addImport("options", ctx.options);
     inline for (spec.imports) |import| {
-        module.addImport(import.name, createFor(b, byName(import.module), target, optimize, ctx));
+        module.addImport(import.name, createShared(b, byName(import.module), target, optimize, ctx));
     }
+    return module;
+}
+
+// Imported modules must be single instances per (name, target, optimize): the
+// compiler rejects a file rooted in two instances of one module.
+var shared_modules: ?std.StringHashMap(*std.Build.Module) = null;
+
+fn createShared(
+    b: *std.Build,
+    comptime spec: Module,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.Optimize,
+    ctx: *const common.Context,
+) *std.Build.Module {
+    if (shared_modules == null) shared_modules = std.StringHashMap(*std.Build.Module).init(b.allocator);
+    const key = std.fmt.allocPrint(b.allocator, "{s}|{s}|{s}|{d}", .{
+        spec.name,
+        target.result.zigTriple(b.allocator) catch @panic("The shared module key cannot allocate the target triple."),
+        @tagName(optimize),
+        @intFromPtr(ctx.options),
+    }) catch @panic("The shared module key is out of memory.");
+    if (shared_modules.?.get(key)) |module| return module;
+    const module = createFor(b, spec, target, optimize, ctx);
+    shared_modules.?.put(key, module) catch @panic("The shared module registry is out of memory.");
     return module;
 }

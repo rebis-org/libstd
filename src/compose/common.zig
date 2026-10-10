@@ -8,6 +8,7 @@ const vocabulary = @import("../kernel/vocabulary.zig");
 const Failure = vocabulary.Failure;
 const node_graph = @import("../kernel/node.zig");
 const measurement = @import("../common/primitive/measurement.zig");
+const seam = @import("seam");
 const resource = @import("../kernel/resource.zig");
 const Resource = resource.Resource;
 const Limits = resource.Limits;
@@ -34,6 +35,7 @@ pub const ExecutionPlan = struct {
     policy: vocabulary.CommandPolicy,
     limits: Limits,
     capabilities: u32,
+    provider: seam.Provider = seam.default_provider,
     source_strategy: SourceSizing,
     workspace_plan: resource.WorkspacePlan,
     output_requirement: ?u64 = null,

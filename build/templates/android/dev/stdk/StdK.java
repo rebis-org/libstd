@@ -5,7 +5,7 @@ package dev.stdk;
  * inside the AAR, loaded once on class init.
  */
 public final class StdK {
-    public static final int ABI_EPOCH = 7;
+    public static final int ABI_EPOCH = 8;
     public static final int OK = 0;
     public static final int INVALID_CALL = 1;
     public static final int UNSUPPORTED = 2;
