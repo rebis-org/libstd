@@ -4,9 +4,8 @@ const Failure = failure.Failure;
 const bits = @import("bits.zig");
 const BitReader = bits.BitReader;
 
-// A filter region starts at `file_offset` inside the file, not inside the
-// region, because the E8 and Arm transforms relocate against true file
-// positions.
+// The E8 and Arm transforms relocate against true file positions, so
+// `file_offset` counts from the start of the file and not from the region.
 
 pub const FilterType = enum(u3) {
     delta = 0,
@@ -17,9 +16,9 @@ pub const FilterType = enum(u3) {
 
 pub const Filter = struct {
     filter_type: FilterType,
-    start: usize, // window-stream position of the region start
+    start: usize, // Position in the window stream, not in the file.
     length: usize,
-    channels: u8, // delta filter only (1-32)
+    channels: u8, // The delta filter uses 1 to 32 channels.
 };
 
 pub fn filterTypeFromRaw(filter_code: u3) ?FilterType {
@@ -35,11 +34,8 @@ pub fn filterTypeFromRaw(filter_code: u3) ?FilterType {
 // Largest region one RAR5 filter may cover (reference MAX_FILTER_BLOCK_SIZE).
 pub const max_filter_block: usize = 0x400000;
 
-// The E8 and E8E9 filters relocate against a FIXED 16 MB wrap constant (the
-// reference E8_WRAP), not the file size. An earlier reading used the file size
-// here, and every filtered region after the first then decoded to the wrong
-// bytes. The wrap constant and the file offset are separate quantities, and
-// the reference holds them two lines apart.
+// The E8 and E8E9 filters relocate against a FIXED 16 MB wrap constant
+// (E8_WRAP), not the file size, and the wrap constant is not the file offset.
 const e8_wrap: u32 = 0x1000000;
 
 pub fn applyFilter(data: []u8, filter: Filter, file_offset: u64, scratch: []u8) Failure!void {
@@ -53,9 +49,8 @@ pub fn applyFilter(data: []u8, filter: Filter, file_offset: u64, scratch: []u8) 
     }
 }
 
-// The inverse of a channel-sequential delta is a per-channel prefix sum.
-// Source and destination overlap, so the transform reads from `data` and
-// writes to the scratch copy, then copies back.
+// A channel-sequential delta inverts to a per-channel prefix sum. Source and
+// destination overlap, so the transform writes to the scratch copy.
 fn applyDelta(data: []u8, channels: u8, scratch: []u8) Failure!void {
     if (channels == 0 or data.len == 0) return;
     if (scratch.len < data.len) return error.InsufficientCapacity;
@@ -83,8 +78,7 @@ pub fn applyE8E9(data: []u8, file_offset: u64, e9: bool) void {
     while (i + 4 < data.len) {
         if (data[i] == 0xE8 or (e9 and data[i] == 0xE9)) {
             // Truncating to u32 before the modulo is safe because e8_wrap is a
-            // power of two that divides 2^32, which is what makes the
-            // reference's (uint)WrittenFileSize agree.
+            // power of two that divides 2^32.
             const offset: u32 = @truncate((@as(u64, i) + 1 +% file_offset) % e8_wrap);
             const addr = std.mem.readInt(u32, data[i + 1 ..][0..4], .little);
 
@@ -107,11 +101,8 @@ pub fn applyArm(data: []u8, file_offset: u64) void {
     var i: usize = 0;
     while (i + 3 < data.len) : (i += 4) {
         if (data[i + 3] == 0xEB) {
-            // An Arm BL instruction with the always condition encodes an unsigned
-            // 24-bit offset in the low three bytes. Only those bytes are
-            // written back, so the reference performs no sign extension. The
-            // offset counts instruction units, which is why it is divided by
-            // 4.
+            // The Arm BL offset is unsigned, occupies the low three bytes, and
+            // counts instruction units, so the code must not sign extend it.
             const low_byte: u32 = data[i];
             const mid_byte: u32 = data[i + 1];
             const high_byte: u32 = data[i + 2];
@@ -126,9 +117,8 @@ pub fn applyArm(data: []u8, file_offset: u64) void {
     }
 }
 
-// The wire size field (reference ReadFilterData): a 2-bit prefix gives the
-// byte count, from 1 to 4, and the value assembles little-endian, so the first
-// byte read holds the low 8 bits.
+// The wire size field (ReadFilterData) uses a 2-bit prefix for a byte count of
+// 1 to 4, then assembles the value little-endian.
 pub fn readFilterSize(br: *BitReader) Failure!usize {
     const byte_count: u3 = @intCast((try br.readBits(2)) + 1);
     var size: usize = 0;
@@ -165,7 +155,6 @@ test "e8 filter relocates against the wrap constant and the file offset" {
         applyE8E9(&d, 0x400, false);
         break :blk std.mem.readInt(u32, d[1..5], .little);
     };
-    // offset = (0 + 1 + file_offset) % E8_WRAP
     try std.testing.expectEqual(@as(u32, 0x0FFF), at_zero);
     try std.testing.expectEqual(@as(u32, 0x0BFF), at_offset);
 }
