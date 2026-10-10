@@ -1,4 +1,4 @@
-const contract = @import("nucleus").contract;
+const contract = @import("interface").contract;
 pub const SizingMode = contract.SizingMode;
 pub const CommitMode = contract.CommitMode;
 
@@ -53,6 +53,9 @@ pub const protocol_parameter = struct {
     pub const resource_capabilities: u32 = 3;
     pub const sizing_mode: u32 = 4;
     pub const commit_mode: u32 = 5;
+    // Provider selection for mergeable builds: value_low 0 is onprem, 1 is
+    // offprem. Absent means the boundary default.
+    pub const provider: u32 = 6;
     pub const target_command: u32 = 24;
 };
 

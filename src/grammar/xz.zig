@@ -48,6 +48,7 @@ pub const Options = struct {
     lazy: bool = false,
     nice_len: u32 = 273,
     match_finder: lzma.MatchFinder = .bt4,
+    provider: checksum.Provider = checksum.default_provider,
 };
 
 // One stream and one block fit the constant, and 1:1 filters add no bytes.
@@ -71,23 +72,23 @@ pub fn encodeWorkspaceSizeBt(dictionary_size: u32) usize {
     return lzma2.encodeWorkspaceSizeBt(dictionary_size) + 65536;
 }
 
-pub fn decodedSize(input: []const u8, scratch: []u8) Failure!usize {
-    if (try scanStreamSize(input)) |size| return size;
+pub fn decodedSize(input: []const u8, scratch: []u8, provider: checksum.Provider) Failure!usize {
+    if (try scanStreamSize(input, provider)) |size| return size;
     var counter = measurement.Counter.init(null);
     var sink = Sink{ .writer = &counter.writer, .buffer = null };
-    try decodeOutOfPlace(input, &sink, scratch);
+    try decodeOutOfPlace(input, &sink, scratch, provider);
     return std.math.cast(usize, counter.written()) orelse error.ResourceLimit;
 }
 
-fn scanStreamSize(input: []const u8) Failure!?usize {
+fn scanStreamSize(input: []const u8, provider: checksum.Provider) Failure!?usize {
     var cursor = binary.ReadCursor.init(input);
     var total: u64 = 0;
     while (cursor.remaining() > 0) {
-        const check = try decodeStreamHeader(&cursor);
+        const check = try decodeStreamHeader(&cursor, provider);
         // Append writes every backing slot and reads only below len, so undefined init is safe.
         var records: IndexRecordList = .{ .records = undefined };
         while (cursor.remaining() > 0 and cursor.buffer[cursor.pos] != 0x00) {
-            const block_header = try decodeBlockHeader(&cursor);
+            const block_header = try decodeBlockHeader(&cursor, provider);
             const uncompressed_size = block_header.uncompressed_size orelse return null;
             const compressed_size = if (block_header.compressed_size) |size|
                 size
@@ -122,23 +123,23 @@ fn scanStreamSize(input: []const u8) Failure!?usize {
             total = std.math.add(u64, total, uncompressed_size) catch return error.ResourceLimit;
         }
         const index_start = cursor.pos;
-        try decodeIndex(&cursor, records);
+        try decodeIndex(&cursor, records, provider);
         const index_size = cursor.pos - index_start;
-        try decodeStreamFooter(&cursor, check, index_size);
+        try decodeStreamFooter(&cursor, check, index_size, provider);
         try skipStreamPadding(&cursor);
     }
     return std.math.cast(usize, total) orelse return error.ResourceLimit;
 }
 
-pub fn decode(input: []const u8, output: []u8, scratch: []u8) Failure!usize {
+pub fn decode(input: []const u8, output: []u8, scratch: []u8, provider: checksum.Provider) Failure!usize {
     var sink = Sink{ .writer = null, .buffer = output };
-    try decodeOutOfPlace(input, &sink, scratch);
+    try decodeOutOfPlace(input, &sink, scratch, provider);
     return sink.offset;
 }
 
-pub fn decodeInPlace(input: []const u8, output: []u8, scratch: []u8) Failure!usize {
+pub fn decodeInPlace(input: []const u8, output: []u8, scratch: []u8, provider: checksum.Provider) Failure!usize {
     var sink = Sink{ .writer = null, .buffer = output };
-    try decodeStreams(input, &sink, scratch, true);
+    try decodeStreams(input, &sink, scratch, true, provider);
     return sink.offset;
 }
 
@@ -163,34 +164,34 @@ const Sink = struct {
     }
 };
 
-fn decodeOutOfPlace(input: []const u8, sink: *Sink, scratch: []u8) Failure!void {
-    try decodeStreams(input, sink, scratch, false);
+fn decodeOutOfPlace(input: []const u8, sink: *Sink, scratch: []u8, provider: checksum.Provider) Failure!void {
+    try decodeStreams(input, sink, scratch, false, provider);
 }
 
-fn decodeStreams(input: []const u8, sink: *Sink, scratch: []u8, in_place: bool) Failure!void {
+fn decodeStreams(input: []const u8, sink: *Sink, scratch: []u8, in_place: bool, provider: checksum.Provider) Failure!void {
     var cursor = binary.ReadCursor.init(input);
     while (cursor.remaining() > 0) {
-        const check = try decodeStreamHeader(&cursor);
+        const check = try decodeStreamHeader(&cursor, provider);
         // Append writes every backing slot and reads only below len, so undefined init is safe.
         var records: IndexRecordList = .{ .records = undefined };
         while (true) {
             if (cursor.remaining() == 0 or cursor.buffer[cursor.pos] == 0x00) break;
-            const record = try decodeBlock(&cursor, sink, scratch, check, in_place);
+            const record = try decodeBlock(&cursor, sink, scratch, check, in_place, provider);
             try records.append(record);
         }
         const index_start = cursor.pos;
-        try decodeIndex(&cursor, records);
+        try decodeIndex(&cursor, records, provider);
         const index_size = cursor.pos - index_start;
-        try decodeStreamFooter(&cursor, check, index_size);
+        try decodeStreamFooter(&cursor, check, index_size, provider);
         try skipStreamPadding(&cursor);
     }
 }
 
-fn decodeStreamHeader(cursor: *binary.ReadCursor) Failure!CheckType {
+fn decodeStreamHeader(cursor: *binary.ReadCursor, provider: checksum.Provider) Failure!CheckType {
     const bytes = try cursor.readSlice(stream_header_size);
     if (!std.mem.eql(u8, bytes[0..6], &header_magic)) return error.InvalidData;
     const flags_crc = std.mem.readInt(u32, bytes[8..12], .little);
-    try verifyCrc32(bytes[6..8], flags_crc);
+    try verifyCrc32(bytes[6..8], flags_crc, provider);
     if (bytes[6] != 0x00) return error.InvalidData;
     const check_type: u8 = bytes[7];
     if (check_type & 0xF0 != 0) return error.InvalidData;
@@ -207,8 +208,8 @@ fn checkTypeFromInt(value: u8) Failure!CheckType {
     };
 }
 
-fn verifyCrc32(bytes: []const u8, expected: u32) Failure!void {
-    var crc = checksum.Crc32.init();
+fn verifyCrc32(bytes: []const u8, expected: u32, provider: checksum.Provider) Failure!void {
+    var crc = checksum.Crc32.bind(provider);
     crc.update(bytes);
     if (crc.final() != expected) return error.IntegrityFailure;
 }
@@ -249,8 +250,8 @@ const Filter = union(enum) {
     lzma2: u8,
 };
 
-fn decodeBlock(cursor: *binary.ReadCursor, sink: *Sink, scratch: []u8, check: CheckType, in_place: bool) Failure!IndexRecord {
-    const block_header = try decodeBlockHeader(cursor);
+fn decodeBlock(cursor: *binary.ReadCursor, sink: *Sink, scratch: []u8, check: CheckType, in_place: bool, provider: checksum.Provider) Failure!IndexRecord {
+    const block_header = try decodeBlockHeader(cursor, provider);
     const compressed_data: ?[]const u8 = if (block_header.compressed_size) |size|
         try cursor.readSlice(size)
     else
@@ -292,7 +293,7 @@ fn decodeBlock(cursor: *binary.ReadCursor, sink: *Sink, scratch: []u8, check: Ch
         applyDecodeFilters(block_header.filters[0..block_header.filter_count], block_output[0..uncompressed_size]);
         sink.commitBlock(uncompressed_size);
     } else {
-        decode_tee = tee.Tee.init(sink.writer);
+        decode_tee = tee.Tee.initWithProvider(sink.writer, provider);
         var chunk_reader = std.Io.Reader.fixed(if (compressed_data) |data| data else cursor.remainingSlice());
         try lzma2.decodeStream(&chunk_reader, &decode_tee.?.writer, scratch[0..lzma_scratch_size], options);
         compressed_size = block_header.compressed_size orelse chunk_reader.seek;
@@ -306,7 +307,7 @@ fn decodeBlock(cursor: *binary.ReadCursor, sink: *Sink, scratch: []u8, check: Ch
     const check_bytes = try cursor.readSlice(checkSize(check));
     if (sink.buffer != null) {
         const block_output = sink.buffer.?[sink.offset - uncompressed_size ..][0..uncompressed_size];
-        try verifyFilteredCheck(check, block_output, check_bytes);
+        try verifyFilteredCheck(check, block_output, check_bytes, provider);
     } else if (block_header.filter_count == 1 and check != .sha256) {
         try verifyCheck(check, decode_tee.?.crc32Value(), decode_tee.?.crc64Value(), check_bytes);
     }
@@ -317,7 +318,7 @@ fn decodeBlock(cursor: *binary.ReadCursor, sink: *Sink, scratch: []u8, check: Ch
     };
 }
 
-fn decodeBlockHeader(cursor: *binary.ReadCursor) Failure!BlockInfo {
+fn decodeBlockHeader(cursor: *binary.ReadCursor, provider: checksum.Provider) Failure!BlockInfo {
     const header_start = cursor.pos;
     const size_byte = try cursor.readU8();
     const header_size = (@as(usize, size_byte & 0x3F) + 1) * 4;
@@ -333,7 +334,7 @@ fn decodeBlockHeader(cursor: *binary.ReadCursor) Failure!BlockInfo {
     const has_uncompressed_size = (flags_byte & 0x80) != 0;
     const requested_filter_count: usize = @as(usize, flags_byte & 0x03) + 1;
     const header_crc = std.mem.readInt(u32, header_bytes[header_size - 4 ..][0..4], .little);
-    try verifyCrc32(header_bytes[0 .. header_size - 4], header_crc);
+    try verifyCrc32(header_bytes[0 .. header_size - 4], header_crc, provider);
     var sub = binary.ReadCursor.init(header_bytes[2 .. header_size - 4]);
     const compressed_size: ?usize = if (has_compressed_size) blk: {
         const value = try sub.readULEB128();
@@ -412,9 +413,9 @@ fn applyDecodeFilters(filters: []const Filter, block: []u8) void {
     }
 }
 
-fn verifyFilteredCheck(check: CheckType, block: []const u8, expected: []const u8) Failure!void {
+fn verifyFilteredCheck(check: CheckType, block: []const u8, expected: []const u8, provider: checksum.Provider) Failure!void {
     if (check == .sha256) {
-        var sha = crypto.Sha256.init(.{});
+        var sha = crypto.Sha256.bind(provider, .{});
         sha.update(block);
         var digest: [32]u8 = undefined;
         digest = sha.finalResult();
@@ -424,14 +425,14 @@ fn verifyFilteredCheck(check: CheckType, block: []const u8, expected: []const u8
     switch (check) {
         .none => {},
         .crc32 => {
-            var crc = checksum.Crc32.init();
+            var crc = checksum.Crc32.bind(provider);
             crc.update(block);
             const actual: u32 = crc.final();
             const stored = std.mem.readInt(u32, expected[0..4], .little);
             if (actual != stored) return error.IntegrityFailure;
         },
         .crc64 => {
-            var crc = checksum.XzCrc64.init();
+            var crc = checksum.XzCrc64.bind(provider);
             crc.update(block);
             const actual: u64 = crc.final();
             const stored = std.mem.readInt(u64, expected[0..8], .little);
@@ -441,7 +442,7 @@ fn verifyFilteredCheck(check: CheckType, block: []const u8, expected: []const u8
     }
 }
 
-fn decodeIndex(cursor: *binary.ReadCursor, records: IndexRecordList) Failure!void {
+fn decodeIndex(cursor: *binary.ReadCursor, records: IndexRecordList, provider: checksum.Provider) Failure!void {
     const index_start = cursor.pos;
     if (cursor.remaining() == 0 or cursor.buffer[cursor.pos] != 0x00) return error.InvalidData;
     _ = try cursor.readU8();
@@ -461,14 +462,14 @@ fn decodeIndex(cursor: *binary.ReadCursor, records: IndexRecordList) Failure!voi
     const index_end = try bounds.addUsize(cursor.pos, 4);
     if (index_end > cursor.buffer.len) return error.InvalidData;
     const index_crc = std.mem.readInt(u32, cursor.buffer[cursor.pos..][0..4], .little);
-    try verifyCrc32(cursor.buffer[index_start..cursor.pos], index_crc);
+    try verifyCrc32(cursor.buffer[index_start..cursor.pos], index_crc, provider);
     cursor.pos = index_end;
 }
 
-fn decodeStreamFooter(cursor: *binary.ReadCursor, check: CheckType, index_size: usize) Failure!void {
+fn decodeStreamFooter(cursor: *binary.ReadCursor, check: CheckType, index_size: usize, provider: checksum.Provider) Failure!void {
     const footer = try cursor.readSlice(stream_footer_size);
     const footer_crc = std.mem.readInt(u32, footer[0..4], .little);
-    try verifyCrc32(footer[4..10], footer_crc);
+    try verifyCrc32(footer[4..10], footer_crc, provider);
     const backward_size: usize = std.mem.readInt(u32, footer[4..8], .little);
     if (index_size < 4 or index_size % 4 != 0) return error.IntegrityFailure;
     if (@as(u64, backward_size) + 1 != index_size / 4) return error.IntegrityFailure;
@@ -552,10 +553,10 @@ fn encodeStream(writer: *std.Io.Writer, input: []const u8, scratch: []u8, option
         try applyEncodeFilter(options.filters, options.delta_distance, buffer);
         break :blk buffer;
     } else input;
-    try writeStreamHeader(writer, options.check);
-    const block_header = try buildBlockHeader(input.len, dictionary_props, options.filters, options.delta_distance);
+    try writeStreamHeader(writer, options.check, options.provider);
+    const block_header = try buildBlockHeader(input.len, dictionary_props, options.filters, options.delta_distance, options.provider);
     try io.writeBytes(writer, block_header.slice());
-    var count_tee = tee.Tee.init(writer);
+    var count_tee = tee.Tee.initWithProvider(writer, options.provider);
     try lzma2.encodeToWriter(filtered, &count_tee.writer, lzma_scratch, lzma_options);
     const compressed_size = std.math.cast(usize, count_tee.size) orelse return error.ResourceLimit;
     const block_padding = blockPadding(compressed_size);
@@ -563,10 +564,10 @@ fn encodeStream(writer: *std.Io.Writer, input: []const u8, scratch: []u8, option
         const zeroes: [3]u8 = @splat(0);
         try io.writeBytes(writer, zeroes[0..block_padding]);
     }
-    var tee_writer = tee.Tee.init(null);
+    var tee_writer = tee.Tee.initWithProvider(null, options.provider);
     _ = tee_writer.writer.write(input) catch return error.IoFailure;
     if (options.check == .sha256) {
-        var sha = crypto.Sha256.init(.{});
+        var sha = crypto.Sha256.bind(options.provider, .{});
         sha.update(input);
         var digest: [32]u8 = undefined;
         digest = sha.finalResult();
@@ -576,8 +577,8 @@ fn encodeStream(writer: *std.Io.Writer, input: []const u8, scratch: []u8, option
     }
     const check_size = checkSize(options.check);
     const unpadded_size = try bounds.addUsize(block_header.slice().len, try bounds.addUsize(compressed_size, check_size));
-    const index_size = try writeIndex(writer, unpadded_size, input.len);
-    try writeStreamFooter(writer, options.check, index_size);
+    const index_size = try writeIndex(writer, unpadded_size, input.len, options.provider);
+    try writeStreamFooter(writer, options.check, index_size, options.provider);
 }
 
 fn applyEncodeFilter(filter: FilterChoice, delta_distance: u8, buffer: []u8) Failure!void {
@@ -602,9 +603,9 @@ fn bcjKindFromChoice(filter: FilterChoice) bcj.Kind {
     };
 }
 
-fn writeStreamHeader(writer: *std.Io.Writer, check: CheckType) Failure!void {
+fn writeStreamHeader(writer: *std.Io.Writer, check: CheckType, provider: checksum.Provider) Failure!void {
     const flags_bytes = [_]u8{ 0x00, @backingInt(check) };
-    var crc = checksum.Crc32.init();
+    var crc = checksum.Crc32.bind(provider);
     crc.update(&flags_bytes);
     try io.writeBytes(writer, &header_magic);
     try io.writeBytes(writer, &flags_bytes);
@@ -622,7 +623,7 @@ const BlockHeader = struct {
     }
 };
 
-fn buildBlockHeader(uncompressed_size: usize, dictionary_props: u8, filters: FilterChoice, delta_distance: u8) Failure!BlockHeader {
+fn buildBlockHeader(uncompressed_size: usize, dictionary_props: u8, filters: FilterChoice, delta_distance: u8, provider: checksum.Provider) Failure!BlockHeader {
     var content: [60]u8 = undefined;
     var cursor = binary.WriteCursor.init(&content);
     cursor.writeULEB128(uncompressed_size) catch return error.InternalFailure;
@@ -647,7 +648,7 @@ fn buildBlockHeader(uncompressed_size: usize, dictionary_props: u8, filters: Fil
         header.bytes[index] = 0;
         index += 1;
     }
-    var crc = checksum.Crc32.init();
+    var crc = checksum.Crc32.bind(provider);
     crc.update(header.bytes[0..index]);
     std.mem.writeInt(u32, header.bytes[index..][0..4], crc.final(), .little);
     return header;
@@ -680,7 +681,7 @@ fn blockPadding(data_size: usize) usize {
     return if (rem == 0) 0 else 4 - rem;
 }
 
-fn writeIndex(writer: *std.Io.Writer, unpadded_size: usize, uncompressed_size: usize) Failure!usize {
+fn writeIndex(writer: *std.Io.Writer, unpadded_size: usize, uncompressed_size: usize, provider: checksum.Provider) Failure!usize {
     var content: [48]u8 = undefined;
     var cursor = binary.WriteCursor.init(&content);
     cursor.writeU8(0x00) catch return error.InternalFailure;
@@ -689,7 +690,7 @@ fn writeIndex(writer: *std.Io.Writer, unpadded_size: usize, uncompressed_size: u
     cursor.writeULEB128(uncompressed_size) catch return error.InternalFailure;
     const content_size = cursor.written();
     const padding = blockPadding(content_size);
-    var crc = checksum.Crc32.init();
+    var crc = checksum.Crc32.bind(provider);
     crc.update(content[0..content_size]);
     if (padding > 0) {
         const zeroes: [3]u8 = @splat(0);
@@ -706,7 +707,7 @@ fn writeIndex(writer: *std.Io.Writer, unpadded_size: usize, uncompressed_size: u
     return content_size + padding + 4;
 }
 
-fn writeStreamFooter(writer: *std.Io.Writer, check: CheckType, index_size: usize) Failure!void {
+fn writeStreamFooter(writer: *std.Io.Writer, check: CheckType, index_size: usize, provider: checksum.Provider) Failure!void {
     if (index_size < 4 or index_size % 4 != 0) return error.InternalFailure;
     const backward_size = (index_size / 4) - 1;
     const backward_size_u32 = std.math.cast(u32, backward_size) orelse return error.InternalFailure;
@@ -716,7 +717,7 @@ fn writeStreamFooter(writer: *std.Io.Writer, check: CheckType, index_size: usize
     footer_tail[5] = @backingInt(check);
     footer_tail[6] = footer_magic[0];
     footer_tail[7] = footer_magic[1];
-    var crc = checksum.Crc32.init();
+    var crc = checksum.Crc32.bind(provider);
     crc.update(footer_tail[0..6]);
     var footer: [12]u8 = undefined;
     std.mem.writeInt(u32, footer[0..4], crc.final(), .little);
@@ -755,7 +756,7 @@ test "xz delta filter honors the requested distance" {
     defer allocator.free(decode_scratch);
     const output = try allocator.alloc(u8, input.len);
     defer allocator.free(output);
-    const decoded = try decode(encoded[0..encoded_len], output, decode_scratch);
+    const decoded = try decode(encoded[0..encoded_len], output, decode_scratch, checksum.default_provider);
     try std.testing.expectEqualSlices(u8, &input, output[0..decoded]);
 
     // The delta distance is carried in the block header, not hardcoded to 1.

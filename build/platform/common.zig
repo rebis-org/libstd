@@ -54,13 +54,6 @@ pub const HostLibraries = struct {
     dynamic_library: *std.Build.Step.Compile,
 };
 
-pub const Archives = struct {
-    host: std.Build.LazyPath,
-    android: std.Build.LazyPath,
-    apple: std.Build.LazyPath,
-    cjpm: std.Build.LazyPath,
-};
-
 pub const Context = struct {
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.Optimize,
@@ -68,10 +61,25 @@ pub const Context = struct {
     generated: Generated,
     host: HostLibraries,
     refs: ?cmd.Refs = null,
-    archives: ?Archives = null,
+    archives: ?[]const ProviderArchives = null,
     portable: bool = false,
     options: *std.Build.Module,
     sanitize_c: ?std.zig.SanitizeC = null,
+    dist_providers: []const DistProvider = &.{},
+};
+
+pub const DistProvider = struct {
+    name: []const u8,
+    options: *std.Build.Module,
+    host: HostLibraries,
+};
+
+pub const ProviderArchives = struct {
+    name: []const u8,
+    host: std.Build.LazyPath,
+    android: std.Build.LazyPath,
+    apple: std.Build.LazyPath,
+    cjpm: std.Build.LazyPath,
 };
 
 pub fn addLibrary(
@@ -86,10 +94,10 @@ pub fn addLibrary(
 
 pub fn rootModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.Optimize, ctx: *const Context) *std.Build.Module {
     const module = modules.createFor(b, modules.library, target, optimize, ctx);
-    // Discovery needs the generated table plus the nucleus import.
-    const modules_pair = modules.componentsWithNucleus(b, ctx, target, target, optimize);
+    // Discovery needs the generated table plus the interface import.
+    const modules_pair = modules.componentsWithInterface(b, ctx, target, target, optimize);
     module.addImport("components", modules_pair.components);
-    module.addImport("nucleus", modules_pair.nucleus);
+    module.addImport("interface", modules_pair.interface);
     return module;
 }
 
@@ -113,16 +121,16 @@ pub fn addGenerated(b: *std.Build) Generated {
         .host = undefined,
         .options = b.addOptions().createModule(),
     };
-    const modules_pair = modules.componentsWithNucleus(b, &scan_ctx, b.graph.host, b.graph.host, .Debug);
+    const modules_pair = modules.componentsWithInterface(b, &scan_ctx, b.graph.host, b.graph.host, .Debug);
     const components_module = modules_pair.components;
-    const nucleus_module = modules_pair.nucleus;
+    const interface_module = modules_pair.interface;
     const gen_module = b.createModule(.{
         .root_source_file = b.path("src/catalog_gen.zig"),
         .target = b.graph.host,
         .optimize = .Debug,
     });
     gen_module.addImport("components", components_module);
-    gen_module.addImport("nucleus", nucleus_module);
+    gen_module.addImport("interface", interface_module);
     const gen_exe = b.addExecutable(.{ .name = "catalog_gen", .root_module = gen_module });
     const gen_run = b.addRunArtifact(gen_exe);
     return .{
@@ -176,7 +184,7 @@ pub fn installGenerated(b: *std.Build, generated: Generated) void {
     b.getInstallStep().dependOn(&b.addInstallFile(generated.module_map, "module.modulemap").step);
 }
 
-pub fn addZipArchive(b: *std.Build, comptime distribution: manifest.Distribution, stage: *std.Build.Step.WriteFile) std.Build.LazyPath {
+pub fn addZipArchive(b: *std.Build, distribution: manifest.Distribution, stage: *std.Build.Step.WriteFile) std.Build.LazyPath {
     const zip = b.addSystemCommand(&.{ "zip", "-qry" });
     const archive = zip.addOutputFileArg(distribution.archive);
     zip.addArg(archiveRoot(distribution));
@@ -184,15 +192,13 @@ pub fn addZipArchive(b: *std.Build, comptime distribution: manifest.Distribution
     return archive;
 }
 
-fn archiveRoot(comptime distribution: manifest.Distribution) []const u8 {
-    return comptime blk: {
-        const entries = distribution.entries;
-        const first = entries[0];
-        const slash = std.mem.indexOfScalar(u8, first, '/') orelse break :blk ".";
-        const prefix = first[0 .. slash + 1];
-        for (entries[1..]) |entry| {
-            if (!std.mem.startsWith(u8, entry, prefix)) break :blk ".";
-        }
-        break :blk prefix[0 .. prefix.len - 1];
-    };
+fn archiveRoot(distribution: manifest.Distribution) []const u8 {
+    const entries = distribution.entries;
+    const first = entries[0];
+    const slash = std.mem.indexOfScalar(u8, first, '/') orelse return ".";
+    const prefix = first[0 .. slash + 1];
+    for (entries[1..]) |entry| {
+        if (!std.mem.startsWith(u8, entry, prefix)) return ".";
+    }
+    return prefix[0 .. prefix.len - 1];
 }

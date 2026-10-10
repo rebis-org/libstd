@@ -175,7 +175,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     var output: std.ArrayList(u8) = .empty;
-    try output.appendSlice(allocator, "const std = @import(\"std\");\nconst contract = @import(\"nucleus\").contract;\n\npub const descriptors = [_]contract.Descriptor{\n");
+    try output.appendSlice(allocator, "const std = @import(\"std\");\nconst contract = @import(\"interface\").contract;\n\npub const descriptors = [_]contract.Descriptor{\n");
     for (descriptors.items) |descriptor| {
         try output.print(allocator, "    .{{ .id = .{{ .low = {s}, .high = {s} }}, .name = \"{s}\", .class = .{s}, .verbs = &.{{ ", .{ descriptor.id.low, descriptor.id.high, descriptor.name, descriptor.class });
         for (descriptor.verbs, 0..) |verb, verb_index| {

@@ -13,34 +13,46 @@ pub const Unit = struct {
 
 pub const Kind = enum { host, android, apple, cjpm };
 
-pub const units = [_]Unit{
-    .{ .name = "libstd.zip", .kind = .host },
-    .{ .name = "stdk.aar", .kind = .android },
-    .{ .name = "StdK.XCFramework.zip", .kind = .apple },
-    .{ .name = "stdk.zip", .kind = .cjpm },
+pub const units = blk: {
+    var list: [manifest.providers.len * 4]Unit = undefined;
+    for (manifest.providers, 0..) |provider, index| {
+        list[index * 4] = .{ .name = "libstd." ++ provider ++ ".zip", .kind = .host };
+        list[index * 4 + 1] = .{ .name = "stdk." ++ provider ++ ".android.aar", .kind = .android };
+        list[index * 4 + 2] = .{ .name = "StdK." ++ provider ++ ".apple.zip", .kind = .apple };
+        list[index * 4 + 3] = .{ .name = "stdk." ++ provider ++ ".oh.zip", .kind = .cjpm };
+    }
+    break :blk list;
 };
 
 pub fn expand(b: *std.Build, ctx: *common.Context) void {
-    const archives = common.Archives{
-        .host = addHostArchive(b, ctx),
-        .android = android.addArchive(b, ctx),
-        .apple = apple.addArchive(b, ctx),
-        .cjpm = cjpm.addArchive(b, ctx),
-    };
-    ctx.archives = archives;
+    if (ctx.dist_providers.len != manifest.providers.len) @panic("The distribution needs one provider context per manifest provider.");
+    const archives = b.allocator.alloc(common.ProviderArchives, manifest.providers.len) catch @panic("The distribution registry is out of memory.");
     const dist = b.step("dist", "Build distribution archives");
-    dist.dependOn(&b.addInstallFile(archives.host, manifest.host.archive).step);
-    dist.dependOn(&b.addInstallFile(archives.android, manifest.android.archive).step);
-    dist.dependOn(&b.addInstallFile(archives.apple, manifest.apple.archive).step);
-    dist.dependOn(&b.addInstallFile(archives.cjpm, manifest.cjpm.archive).step);
+    inline for (manifest.providers, 0..) |provider, index| {
+        var pctx = ctx.*;
+        pctx.options = ctx.dist_providers[index].options;
+        pctx.host = ctx.dist_providers[index].host;
+        archives[index] = .{
+            .name = provider,
+            .host = addHostArchive(b, &pctx, manifest.hostFor(provider)),
+            .android = android.addArchive(b, &pctx, manifest.androidFor(provider)),
+            .apple = apple.addArchive(b, &pctx, manifest.appleFor(provider)),
+            .cjpm = cjpm.addArchive(b, &pctx, manifest.cjpmFor(provider)),
+        };
+        dist.dependOn(&b.addInstallFile(archives[index].host, manifest.hostFor(provider).archive).step);
+        dist.dependOn(&b.addInstallFile(archives[index].android, manifest.androidFor(provider).archive).step);
+        dist.dependOn(&b.addInstallFile(archives[index].apple, manifest.appleFor(provider).archive).step);
+        dist.dependOn(&b.addInstallFile(archives[index].cjpm, manifest.cjpmFor(provider).archive).step);
+    }
+    ctx.archives = archives;
 }
 
-fn addHostArchive(b: *std.Build, ctx: *common.Context) std.Build.LazyPath {
+fn addHostArchive(b: *std.Build, ctx: *const common.Context, distribution: manifest.Distribution) std.Build.LazyPath {
     const stage = b.addWriteFiles();
-    _ = stage.addCopyFile(ctx.generated.header, manifest.host.header);
+    _ = stage.addCopyFile(ctx.generated.header, distribution.header);
     _ = stage.addCopyFile(ctx.generated.module_map, "libstd/include/module.modulemap");
-    _ = stage.addCopyFile(ctx.generated.catalog, manifest.host.catalog);
+    _ = stage.addCopyFile(ctx.generated.catalog, distribution.catalog);
     _ = stage.addCopyFile(ctx.host.static_library.getEmittedBin(), "libstd/lib/libstd.a");
     _ = stage.addCopyFile(ctx.host.dynamic_library.getEmittedBin(), "libstd/lib/libstd.dylib");
-    return common.addZipArchive(b, manifest.host, stage);
+    return common.addZipArchive(b, distribution, stage);
 }

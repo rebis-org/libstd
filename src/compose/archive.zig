@@ -209,6 +209,7 @@ pub fn zipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
             .staging = decrypt_staging,
             .scratch = scratch,
             .history = history,
+            .provider = plan.provider,
         };
         if (sink_resource.kind == .direct_write) {
             const output = try common.sinkDirectBuffer(sink_resource, size);
@@ -262,14 +263,14 @@ pub fn zipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
         try common.requireSinkCapacity(sink_resource, call, required);
         if (sink_resource.kind == .direct_write) {
             const output = try common.sinkDirectBuffer(sink_resource, required);
-            const written = zip.zipEncode(entries, comment, output, history, measurement_buffer, crypto_staging, scratch, &crypto_cause) catch |err| {
+            const written = zip.zipEncode(entries, comment, output, plan.provider, history, measurement_buffer, crypto_staging, scratch, &crypto_cause) catch |err| {
                 writeCryptoFailure(call, crypto_cause);
                 return err;
             };
             response.byte_length = written;
         } else {
             const staging = try workspace.take(u8, required);
-            const written = zip.zipEncode(entries, comment, staging, history, measurement_buffer, crypto_staging, scratch, &crypto_cause) catch |err| {
+            const written = zip.zipEncode(entries, comment, staging, plan.provider, history, measurement_buffer, crypto_staging, scratch, &crypto_cause) catch |err| {
                 writeCryptoFailure(call, crypto_cause);
                 return err;
             };
@@ -301,7 +302,7 @@ fn sevenZipGeneric(comptime coded: bool, plan: *common.ExecutionPlan, source: ?*
         if (sink == null) {
             try common.checkSourceWorkspaceOverlap(call, source_resource);
             const archive = try common.materializeSource(.replay, source_resource, &workspace, limits.encoded_bytes);
-            const count = try seven_zip.sevenZipInspectCount(archive, &workspace, limits);
+            const count = try seven_zip.sevenZipInspectCount(archive, &workspace, limits, plan.provider);
             response.byte_length = count;
             return;
         }
@@ -314,7 +315,7 @@ fn sevenZipGeneric(comptime coded: bool, plan: *common.ExecutionPlan, source: ?*
             comptime discovery.parameter("tar", "ordinal").ordinal,
         ));
         const archive = try common.materializeSource(.replay, source_resource, &workspace, limits.encoded_bytes);
-        const entry = try seven_zip.sevenZipInspectOrdinal(archive, &workspace, limits, ordinal);
+        const entry = try seven_zip.sevenZipInspectOrdinal(archive, &workspace, limits, ordinal, plan.provider);
         if (!coded and entry.method != .copy) return error.Unsupported;
         const size = std.math.cast(usize, entry.size) orelse return error.ResourceLimit;
         if (size > limits.decoded_bytes) return error.ResourceLimit;
@@ -324,6 +325,7 @@ fn sevenZipGeneric(comptime coded: bool, plan: *common.ExecutionPlan, source: ?*
             .kdf_rounds_limit = if (crypto_params) |params| params.kdf_rounds_limit else 0,
             .password_lifetime = if (crypto_params) |params| params.password_lifetime else 0,
             .failure_cause = &crypto_cause,
+            .provider = plan.provider,
         };
         if (sink_resource.kind == .direct_write) {
             const output = try common.sinkDirectBuffer(sink_resource, size);
@@ -343,7 +345,7 @@ fn sevenZipGeneric(comptime coded: bool, plan: *common.ExecutionPlan, source: ?*
     } else if (command_mask == vocabulary.command_mask_write) {
         try requireVerified(commit);
         const entries = try parseSevenZipEntries(call.request, &workspace, .copy, coded, crypto_params);
-        const packed_entries = seven_zip.sevenZipPack(entries, &workspace, limits, &crypto_cause) catch |err| {
+        const packed_entries = seven_zip.sevenZipPack(entries, plan.provider, &workspace, limits, &crypto_cause) catch |err| {
             writeCryptoFailure(call, crypto_cause);
             return err;
         };
@@ -357,11 +359,11 @@ fn sevenZipGeneric(comptime coded: bool, plan: *common.ExecutionPlan, source: ?*
         try common.requireSinkCapacity(sink_resource, call, required);
         if (sink_resource.kind == .direct_write) {
             const output = try common.sinkDirectBuffer(sink_resource, required);
-            const written = try seven_zip.sevenZipWritePacked(entries, packed_entries, output, &workspace);
+            const written = try seven_zip.sevenZipWritePacked(entries, packed_entries, output, &workspace, plan.provider);
             response.byte_length = written;
         } else {
             const staging = try workspace.take(u8, required);
-            const written = try seven_zip.sevenZipWritePacked(entries, packed_entries, staging, &workspace);
+            const written = try seven_zip.sevenZipWritePacked(entries, packed_entries, staging, &workspace, plan.provider);
             try common.commitBytesToSink(sink_resource, call, staging[0..written]);
             response.byte_length = written;
         }
@@ -466,6 +468,7 @@ pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
                 .kdf_rounds_limit = if (crypto_params) |params| params.kdf_rounds_limit else 0,
                 .password_lifetime = if (crypto_params) |params| params.password_lifetime else 0,
                 .failure_cause = &failure_cause,
+                .provider = plan.provider,
             }) catch |err| {
                 writeCryptoFailure(call, failure_cause);
                 return err;
@@ -496,6 +499,7 @@ pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
             .kdf_rounds_limit = if (crypto_params) |params| params.kdf_rounds_limit else 0,
             .password_lifetime = if (crypto_params) |params| params.password_lifetime else 0,
             .failure_cause = &failure_cause,
+            .provider = plan.provider,
         };
         const entry = rar.rarInspectOrdinalOpts(archive, ordinal, limits.entries, decode_opts) catch |err| {
             writeCryptoFailure(call, failure_cause);
@@ -605,11 +609,11 @@ pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
         try common.requireSinkCapacity(sink_resource, call, required);
         if (sink_resource.kind == .direct_write) {
             const output = try common.sinkDirectBuffer(sink_resource, required);
-            const written = try rar_writer.rarEncode(entries, output, &ws);
+            const written = try rar_writer.rarEncode(entries, output, &ws, plan.provider);
             response.byte_length = written;
         } else {
             const staging_out = try workspace.take(u8, required);
-            const written = try rar_writer.rarEncode(entries, staging_out, &ws);
+            const written = try rar_writer.rarEncode(entries, staging_out, &ws, plan.provider);
             try common.commitBytesToSink(sink_resource, call, staging_out[0..written]);
             response.byte_length = written;
         }

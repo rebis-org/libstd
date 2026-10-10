@@ -1,6 +1,6 @@
 const envelope = @import("../kernel/envelope.zig");
 const EnvelopeId = envelope.Id;
-const contract = @import("nucleus").contract;
+const contract = @import("interface").contract;
 const vocabulary = @import("../kernel/vocabulary.zig");
 const discovery = @import("../kernel/discovery.zig");
 const components = @import("components");

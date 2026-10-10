@@ -1,10 +1,10 @@
 const std = @import("std");
-const nucleus = @import("nucleus");
+const interface = @import("interface");
 
-const span = nucleus.span;
-const lease = nucleus.lease;
-const block = nucleus.block;
-const surface = nucleus.surface;
+const span = interface.span;
+const lease = interface.lease;
+const block = interface.block;
+const surface = interface.surface;
 
 // Re-executes per scenario: contract violations trap the process, so driver and scenarios cannot share an address space.
 fn scenarioWritePastEnd() void {
@@ -197,7 +197,7 @@ fn trim(output: []const u8) []const u8 {
 
 fn substrateImportsFormatLayers(gpa: std.mem.Allocator, io: std.Io) !bool {
     const roots = [_][]const u8{ "../leaf", "../grammar", "../adapter", "../catalog" };
-    var dir = try std.Io.Dir.cwd().openDir(io, "src/nucleus", .{ .iterate = true });
+    var dir = try std.Io.Dir.cwd().openDir(io, "src/interface", .{ .iterate = true });
     defer dir.close(io);
     var walker = try dir.walk(gpa);
     defer walker.deinit();

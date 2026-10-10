@@ -2,13 +2,16 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const options = @import("options");
+const seam = @import("seam");
 
 // Zig inline asm cannot name the 32-bit register views, so the crc32 instructions bind
 // fixed X registers. The fold mirrors the vendor ip7z/7zip arm64 loop.
-const has_crc32 = builtin.cpu.arch == .aarch64 and !options.portable;
-const has_crc32_kernel = has_crc32 and builtin.cpu.has(.aarch64, .crc);
+const crc32_hw = builtin.cpu.arch == .aarch64 and !options.crc32_portable;
+const has_crc32_kernel = crc32_hw and builtin.cpu.has(.aarch64, .crc);
 // LLVM's aes feature implies pmull, which the fold kernel multiplies with.
-const has_pmull_kernel = has_crc32_kernel and builtin.cpu.has(.aarch64, .aes);
+const has_crc32_pmull = has_crc32_kernel and builtin.cpu.has(.aarch64, .aes);
+const crc64_hw = builtin.cpu.arch == .aarch64 and !options.crc64xz_portable;
+const has_crc64_pmull = crc64_hw and builtin.cpu.has(.aarch64, .aes);
 
 const crc_lane = @Vector(2, u64);
 
@@ -196,10 +199,25 @@ fn crc64Aarch64Fold(crc_in: u64, input: []const u8, comptime table: *const [256]
 // Folding pays off above this length; the threshold comes from a synthetic sweep.
 const crc_pmull_threshold = 256;
 
-pub const Crc32 = TableCrc(u32, 0xedb8_8320, true);
+const OnpremCrc32 = TableCrc(u32, 0xedb8_8320, true);
+const OnpremXzCrc64 = TableCrc(u64, 0xc96c5795d7870f42, true);
+const OnpremBzip2Crc32 = TableCrc(u32, 0x04c11db7, false);
+
+pub const Crc32 = seam.Checksum(options.crc32_impl, OnpremCrc32, std.hash.Crc32);
+pub const XzCrc64 = seam.Checksum(options.crc64xz_impl, OnpremXzCrc64, std.hash.crc.@"CRC-64/XZ");
+pub const Bzip2Crc32 = seam.Checksum(options.bzip2crc32_impl, OnpremBzip2Crc32, std.hash.crc.@"CRC-32/BZIP2");
+
+pub const Provider = seam.Provider;
+pub const default_provider = seam.default_provider;
 
 pub fn crc32(input: []const u8) u32 {
     var hash = Crc32.init();
+    hash.update(input);
+    return hash.final();
+}
+
+pub fn crc32With(provider: seam.Provider, input: []const u8) u32 {
+    var hash = Crc32.bind(provider);
     hash.update(input);
     return hash.final();
 }
@@ -219,6 +237,12 @@ pub fn xxh64(input: []const u8) u64 {
     return hasher.final();
 }
 
+pub fn xxh64With(provider: seam.Provider, input: []const u8) u64 {
+    var hasher = XxHash64.bind(provider, 0);
+    hasher.update(input);
+    return hasher.final();
+}
+
 pub const Adler32 = struct {
     inner: adler32_seam.Inner = .{},
 
@@ -226,12 +250,16 @@ pub const Adler32 = struct {
         return .{};
     }
 
+    pub fn bind(provider: seam.Provider) Adler32 {
+        return .{ .inner = adler32_seam.Inner.bind(provider) };
+    }
+
     pub fn update(self: *Adler32, input: []const u8) void {
         self.inner.update(input);
     }
 
     pub fn final(self: *const Adler32) u32 {
-        return self.inner.adler;
+        return self.inner.adler();
     }
 };
 
@@ -247,7 +275,7 @@ fn TableCrc(comptime T: type, comptime poly: T, comptime reflected: bool) type {
         pub fn update(self: *@This(), input: []const u8) void {
             if (comptime T == u32 and reflected) {
                 if (comptime has_crc32_kernel) {
-                    if (input.len >= crc_pmull_threshold and comptime has_pmull_kernel) {
+                    if (input.len >= crc_pmull_threshold and comptime has_crc32_pmull) {
                         self.state = crc32Aarch64Fold(self.state, input);
                     } else {
                         self.state = crc32Aarch64Scalar(self.state, input);
@@ -269,7 +297,7 @@ fn TableCrc(comptime T: type, comptime poly: T, comptime reflected: bool) type {
                 return;
             }
             if (comptime reflected) {
-                if (comptime T == u64 and has_pmull_kernel) {
+                if (comptime T == u64 and has_crc64_pmull) {
                     if (input.len >= crc_pmull_threshold) {
                         self.state = crc64Aarch64Fold(self.state, input, &table);
                         return;
@@ -293,10 +321,10 @@ fn TableCrc(comptime T: type, comptime poly: T, comptime reflected: bool) type {
                 var j: u32 = 0;
                 while (j < 8) : (j += 1) {
                     if (reflected) {
-                        if (crc & 1 != 0) crc = (crc >> 1) ^ poly else crc >>= 1;
+                        crc = if (crc & 1 != 0) (crc >> 1) ^ poly else crc >> 1;
                     } else {
                         const high: T = @as(T, 1) << @intCast(bits - 1);
-                        if (crc & high != 0) crc = (crc << 1) ^ poly else crc <<= 1;
+                        crc = if (crc & high != 0) (crc << 1) ^ poly else crc << 1;
                     }
                 }
                 t[i] = crc;
@@ -311,7 +339,7 @@ fn TableCrc(comptime T: type, comptime poly: T, comptime reflected: bool) type {
                 var crc: T = table[i];
                 t[0][i] = crc;
                 for (1..4) |k| {
-                    crc = table[@as(usize, @intCast(crc & 0xff))] ^ (crc >> 8);
+                    crc = table[@intCast(crc & 0xff)] ^ (crc >> 8);
                     t[k][i] = crc;
                 }
             }
@@ -320,11 +348,20 @@ fn TableCrc(comptime T: type, comptime poly: T, comptime reflected: bool) type {
     };
 }
 
-pub const Bzip2Crc32 = TableCrc(u32, 0x04c11db7, false);
-pub const XzCrc64 = TableCrc(u64, 0xc96c5795d7870f42, true);
-
 pub fn adler32(input: []const u8) u32 {
     var hasher = Adler32.init();
+    hasher.update(input);
+    return hasher.final();
+}
+
+pub fn adler32With(provider: seam.Provider, input: []const u8) u32 {
+    var hasher = Adler32.bind(provider);
+    hasher.update(input);
+    return hasher.final();
+}
+
+pub fn xxh32With(provider: seam.Provider, input: []const u8) u32 {
+    var hasher = XxHash32.bind(provider, 0);
     hasher.update(input);
     return hasher.final();
 }
@@ -405,6 +442,16 @@ test "crc64 xz matches the reference vectors" {
     try std.testing.expectEqual(@as(u64, 0x995DC9BBDF1939FA), hasher.final());
 }
 
+test "bzip2 crc32 matches the published check value" {
+    var hash = Bzip2Crc32.init();
+    hash.update("123456789");
+    try std.testing.expectEqual(@as(u32, 0xFC891918), hash.final());
+    var hasher = Bzip2Crc32.init();
+    hasher.update("1234");
+    hasher.update("56789");
+    try std.testing.expectEqual(@as(u32, 0xFC891918), hasher.final());
+}
+
 test "crc64 xz fold matches the byte table across sizes" {
     // The portable byte table is the reference, because that is the only path a non-aarch64 target runs.
     var rng = std.Random.DefaultPrng.init(0xC64C);
@@ -443,5 +490,55 @@ test "crc64 xz fold matches the byte table across sizes" {
         for (buf) |b| raw = (raw >> 8) ^ table[(raw ^ b) & 0xff];
         try std.testing.expectEqual(~raw, fast.final());
         allocator.free(buf);
+    }
+}
+
+test "checksum capabilities agree across providers when mergeable" {
+    const all_mergeable = options.crc32_impl == .mergeable and
+        options.crc64xz_impl == .mergeable and
+        options.bzip2crc32_impl == .mergeable and
+        options.xxh32_impl == .mergeable and
+        options.xxh64_impl == .mergeable and
+        options.adler32_impl == .mergeable;
+    if (!all_mergeable) return error.SkipZigTest;
+    var rng = std.Random.DefaultPrng.init(0xCC4C);
+    const allocator = std.testing.allocator;
+    var size: usize = 0;
+    while (size <= 512) : (size += 13) {
+        const buf = try allocator.alloc(u8, size);
+        defer allocator.free(buf);
+        rng.random().bytes(buf);
+        var crc_on = Crc32.bind(.onprem);
+        crc_on.update(buf);
+        var crc_off = Crc32.bind(.offprem);
+        crc_off.update(buf);
+        try std.testing.expectEqual(crc_on.final(), crc_off.final());
+        var xz_on = XzCrc64.bind(.onprem);
+        xz_on.update(buf[0 .. buf.len / 2]);
+        xz_on.update(buf[buf.len / 2 ..]);
+        var xz_off = XzCrc64.bind(.offprem);
+        xz_off.update(buf);
+        try std.testing.expectEqual(xz_on.final(), xz_off.final());
+        var bz_on = Bzip2Crc32.bind(.onprem);
+        bz_on.update(buf);
+        var bz_off = Bzip2Crc32.bind(.offprem);
+        bz_off.update(buf);
+        try std.testing.expectEqual(bz_on.final(), bz_off.final());
+        var x32_on = XxHash32.bind(.onprem, 0);
+        x32_on.update(buf);
+        var x32_off = XxHash32.bind(.offprem, 0);
+        x32_off.update(buf);
+        try std.testing.expectEqual(x32_on.final(), x32_off.final());
+        var x64_on = XxHash64.bind(.onprem, 0);
+        x64_on.update(buf[0 .. buf.len / 3]);
+        x64_on.update(buf[buf.len / 3 ..]);
+        var x64_off = XxHash64.bind(.offprem, 0);
+        x64_off.update(buf);
+        try std.testing.expectEqual(x64_on.final(), x64_off.final());
+        var ad_on = Adler32.bind(.onprem);
+        ad_on.update(buf);
+        var ad_off = Adler32.bind(.offprem);
+        ad_off.update(buf);
+        try std.testing.expectEqual(ad_on.final(), ad_off.final());
     }
 }

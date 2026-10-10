@@ -4,7 +4,7 @@ const common = @import("common.zig");
 const manifest = @import("manifest.zig");
 const slices = @import("slices.zig");
 
-pub fn addArchive(b: *std.Build, ctx: *const common.Context) std.Build.LazyPath {
+pub fn addArchive(b: *std.Build, ctx: *const common.Context, distribution: manifest.Distribution) std.Build.LazyPath {
     const headers = b.addWriteFiles();
     _ = headers.addCopyFile(ctx.generated.header, "stdk.h");
     _ = headers.addCopyFile(ctx.generated.framework_module_map, "module.modulemap");
@@ -37,7 +37,7 @@ pub fn addArchive(b: *std.Build, ctx: *const common.Context) std.Build.LazyPath 
     _ = archive.addOutputDirectoryArg("stage");
     archive.addDirectoryArg(framework);
     archive.addFileArg(ctx.generated.catalog);
-    return archive.addOutputFileArg(manifest.apple.archive);
+    return archive.addOutputFileArg(distribution.archive);
 }
 
 fn buildSlice(b: *std.Build, ctx: *const common.Context, slice: slices.AppleSlice) std.Build.LazyPath {

@@ -25,6 +25,7 @@ const command_mask_write = vocabulary.command_mask_write;
 const common = @import("common.zig");
 const compose_catalog = @import("catalog.zig");
 const hooks = @import("hooks.zig");
+const seam = @import("seam");
 
 pub fn invoke(call: ?*Call) u32 {
     const envelope = call orelse return Status.invalid_call;
@@ -144,6 +145,11 @@ fn dispatch(envelope: *Call, response: *Node) Failure!void {
         .policy = policy,
         .limits = limits,
         .capabilities = capabilities,
+        .provider = try parseProvider(node_graph.findSelector(
+            envelope.request,
+            vocabulary.parameter_family_protocol,
+            vocabulary.protocol_parameter.provider,
+        )),
         .source_strategy = switch (policy.sizing) {
             .metadata_exact => .require_size,
             .measured => .replay,
@@ -214,6 +220,17 @@ fn parseCommitMode(node: ?*Node, default: vocabulary.CommitMode) Failure!vocabul
         1 => .confirmed,
         else => error.InvalidCall,
     };
+}
+
+fn parseProvider(node: ?*Node) Failure!seam.Provider {
+    const present_node = node orelse return seam.default_provider;
+    const provider: seam.Provider = switch (present_node.value_low) {
+        0 => .onprem,
+        1 => .offprem,
+        else => return error.InvalidCall,
+    };
+    if (!seam.serves(provider)) return error.Unsupported;
+    return provider;
 }
 
 const MappedFailure = struct { status: u32, id: Id };

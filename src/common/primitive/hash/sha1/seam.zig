@@ -1,9 +1,9 @@
 const std = @import("std");
 const options = @import("options");
 const onprem = @import("onprem.zig");
+const seam = @import("seam");
 
-pub const Implementation = enum { onprem, offprem };
-pub const Sha1 = switch (options.sha1_impl) {
-    .onprem => onprem.Sha1,
-    .offprem => std.crypto.hash.Sha1,
-};
+pub const Onprem = onprem.Sha1;
+pub const Offprem = std.crypto.hash.Sha1;
+
+pub const Sha1 = seam.Digest(options.sha1_impl, Onprem, Offprem);

@@ -1,4 +1,4 @@
-// Rooted at src/: module confinement requires it for compose/ to reach leaf/ and nucleus/.
+// Rooted at src/: module confinement requires it for compose/ to reach leaf/ and interface/.
 pub const bypass = @import("compose/bypass.zig");
 pub const Options = bypass.Options;
 pub const zstdEncode = bypass.zstdEncode;

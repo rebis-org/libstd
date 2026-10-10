@@ -12,39 +12,54 @@ pub const Distribution = struct {
     android: ?[]const slices.AndroidAbi = null,
 };
 
-pub const host: Distribution = .{
-    .id = "host",
-    .archive = "libstd.zip",
-    .header = "libstd/include/stdk.h",
-    .catalog = "libstd/stdk.catalog.json",
-    .entries = hostEntries(),
-};
+pub const providers = [_][]const u8{ "onprem", "offprem", "mergeable" };
 
-pub const android: Distribution = .{
-    .id = "android",
-    .archive = "stdk.aar",
-    .header = "include/stdk.h",
-    .catalog = "assets/stdk.catalog.json",
-    .entries = androidEntries(),
-    .android = &slices.android_abis,
-};
+const host_entries = hostEntries();
+const android_entries = androidEntries();
+const apple_entries = appleEntries();
+const cjpm_entries = cjpmEntries();
 
-pub const apple: Distribution = .{
-    .id = "apple",
-    .archive = "StdK.XCFramework.zip",
-    .header = std.fmt.comptimePrint("StdK.xcframework/{s}/{s}/Headers/stdk.h", .{ slices.apple_slices[0].id, slices.framework_bundle }),
-    .catalog = "StdK.xcframework/stdk.catalog.json",
-    .entries = appleEntries(),
-    .apple = &slices.apple_slices,
-};
+pub fn hostFor(comptime provider: []const u8) Distribution {
+    return .{
+        .id = "host",
+        .archive = "libstd." ++ provider ++ ".zip",
+        .header = "libstd/include/stdk.h",
+        .catalog = "libstd/stdk.catalog.json",
+        .entries = host_entries,
+    };
+}
 
-pub const cjpm: Distribution = .{
-    .id = "cjpm",
-    .archive = "stdk.zip",
-    .header = "stdk/libs/include/stdk.h",
-    .catalog = "stdk/stdk.catalog.json",
-    .entries = cjpmEntries(),
-};
+pub fn androidFor(comptime provider: []const u8) Distribution {
+    return .{
+        .id = "android",
+        .archive = "stdk." ++ provider ++ ".android.aar",
+        .header = "include/stdk.h",
+        .catalog = "assets/stdk.catalog.json",
+        .entries = android_entries,
+        .android = &slices.android_abis,
+    };
+}
+
+pub fn appleFor(comptime provider: []const u8) Distribution {
+    return .{
+        .id = "apple",
+        .archive = "StdK." ++ provider ++ ".apple.zip",
+        .header = std.fmt.comptimePrint("StdK.xcframework/{s}/{s}/Headers/stdk.h", .{ slices.apple_slices[0].id, slices.framework_bundle }),
+        .catalog = "StdK.xcframework/stdk.catalog.json",
+        .entries = apple_entries,
+        .apple = &slices.apple_slices,
+    };
+}
+
+pub fn cjpmFor(comptime provider: []const u8) Distribution {
+    return .{
+        .id = "cjpm",
+        .archive = "stdk." ++ provider ++ ".oh.zip",
+        .header = "stdk/libs/include/stdk.h",
+        .catalog = "stdk/stdk.catalog.json",
+        .entries = cjpm_entries,
+    };
+}
 
 fn hostEntries() []const []const u8 {
     const entries: [5][]const u8 = .{

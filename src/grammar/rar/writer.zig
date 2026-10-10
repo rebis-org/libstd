@@ -3,6 +3,7 @@ const failure = @import("../../common/primitive/failure.zig");
 const Failure = failure.Failure;
 const bounds = @import("../../common/primitive/bounds.zig");
 const checksum = @import("../../common/primitive/checksum.zig");
+const crypto = @import("../../common/primitive/crypto.zig");
 const pack50 = @import("pack50.zig");
 const finder = @import("finder.zig");
 const rar = @import("../rar.zig");
@@ -159,6 +160,7 @@ const block_writer = struct {
         pos: usize,
         entry: RarEntry,
         packed_data: []const u8,
+        provider: crypto.Provider,
     ) Failure!usize {
         var file_flags: u64 = rar.rar5_file_mtime;
         if (entry.is_directory) {
@@ -167,7 +169,7 @@ const block_writer = struct {
             file_flags |= rar.rar5_file_crc32;
         }
         const attributes: u64 = if (entry.is_directory) 0x10 else 0x20;
-        const data_crc = if (entry.is_directory) 0 else checksum.crc32(entry.data);
+        const data_crc = if (entry.is_directory) 0 else checksum.crc32With(provider, entry.data);
 
         var body: [4200]u8 = undefined;
         var b: usize = 0;
@@ -259,7 +261,7 @@ pub fn rarWriteSize(entries: []const RarEntry, ws: *WriteBuffers) Failure!usize 
     return packEntries(entries, ws);
 }
 
-pub fn rarEncode(entries: []const RarEntry, output: []u8, ws: *WriteBuffers) Failure!usize {
+pub fn rarEncode(entries: []const RarEntry, output: []u8, ws: *WriteBuffers, provider: crypto.Provider) Failure!usize {
     const required = try rarWriteSize(entries, ws);
     if (output.len < required) return error.InsufficientCapacity;
 
@@ -274,7 +276,7 @@ pub fn rarEncode(entries: []const RarEntry, output: []u8, ws: *WriteBuffers) Fai
         const entry = entries[i];
         const packed_len = ws.packed_sizes[i];
         const packed_slice = ws.packed_buf[cursor .. cursor + packed_len];
-        pos = try block_writer.writeFileBlock(output, pos, entry, packed_slice);
+        pos = try block_writer.writeFileBlock(output, pos, entry, packed_slice, provider);
         cursor = try bounds.addUsize(cursor, packed_len);
     }
 
@@ -362,7 +364,7 @@ test "created archive round-trips through the facade reader (store and lz)" {
         const required = try rarWriteSize(&entries, &ws);
         const archive = try allocator.alloc(u8, required);
         defer allocator.free(archive);
-        const written = try rarEncode(&entries, archive, &ws);
+        const written = try rarEncode(&entries, archive, &ws, crypto.default_provider);
         try testing.expectEqual(required, written);
 
         try testing.expectEqual(@as(usize, 3), try rar.rarInspectCount(archive, 128));

@@ -3,6 +3,7 @@ const std = @import("std");
 const bounds = @import("../common/primitive/bounds.zig");
 const failure_prim = @import("../common/primitive/failure.zig");
 const Failure = failure_prim.Failure;
+const checksum = @import("../common/primitive/checksum.zig");
 const measurement = @import("../common/primitive/measurement.zig");
 const zstd = @import("../leaf/zstd.zig");
 
@@ -28,6 +29,7 @@ pub const Options = struct {
     max_chain: u32 = 32,
     nice_len: u32 = 64,
     search_window: u32 = 8,
+    provider: checksum.Provider = checksum.default_provider,
 };
 
 pub fn frameOptions(options: Options) zstd.Options {
@@ -38,6 +40,7 @@ pub fn frameOptions(options: Options) zstd.Options {
         .max_chain = options.max_chain,
         .nice_len = options.nice_len,
         .search_window = options.search_window,
+        .provider = options.provider,
     };
 }
 

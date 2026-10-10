@@ -41,7 +41,6 @@ jobs:
       - run: zig build exe -Doptimize=ReleaseSafe
       - run: zig build -Doptimize=ReleaseFast
       - run: zig build -Doptimize=ReleaseSmall
-      - run: zig build oracles -Doptimize=ReleaseSafe
       - run: zig build abi
       - run: brew install autoconf automake bison
       - if: inputs.benchmark
@@ -56,10 +55,10 @@ jobs:
         if: inputs.publish
         with:
           subject-path: |
-            zig-out/libstd.zip
-            zig-out/stdk.aar
-            zig-out/StdK.XCFramework.zip
-            zig-out/stdk.zip
+            zig-out/libstd.*.zip
+            zig-out/stdk.*.aar
+            zig-out/StdK.*.zip
+            zig-out/stdk.*.zip
           show-summary: false
       - id: version
         if: inputs.publish
@@ -99,10 +98,8 @@ jobs:
             --notes "$notes" \
             --prerelease \
             --latest=false \
-            zig-out/libstd.zip \
-            zig-out/stdk.aar \
-            zig-out/StdK.XCFramework.zip \
-            zig-out/stdk.zip
+            zig-out/*.zip \
+            zig-out/*.aar
       - if: inputs.publish
         env:
           GH_TOKEN: ${{ github.token }}
@@ -120,3 +117,24 @@ jobs:
           canary_tag="Stage"
           git tag -f -a "$canary_tag" -m "Staging $RELEASE_VERSION (tag: $SNAPSHOT_TAG)." "$GITHUB_SHA"
           git push --force origin "refs/tags/$canary_tag"
+
+  suite:
+    runs-on: xcode-27
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { impl: onprem, portable: false }
+          - { impl: offprem, portable: false }
+          - { impl: mergeable, portable: false }
+          - { impl: onprem, portable: true }
+          - { impl: mergeable, portable: true }
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          submodules: recursive
+      - uses: jdx/mise-action@v5.0.0
+        with:
+          install: true
+      - run: zig build unit -Dprimitives_impl=${{ matrix.impl }} -Dportable=${{ matrix.portable }}
+      - run: zig build oracles -Dprimitives_impl=${{ matrix.impl }} -Dportable=${{ matrix.portable }} -Doptimize=ReleaseSafe

@@ -15,6 +15,7 @@ pub const block_size_max = 900_000;
 pub const Options = struct {
     block_size: u32 = 900_000,
     max_work: u64 = std.math.maxInt(u64),
+    provider: checksum.Provider = checksum.default_provider,
 };
 
 pub fn decodeWorkspaceSize(max_block: u32) usize {
@@ -59,20 +60,20 @@ const group_size = 50;
 const max_alpha_size = 258;
 const max_code_len = 20;
 const max_selectors = 32768;
-pub fn decodedSize(input: []const u8, scratch: []u8) Failure!usize {
+pub fn decodedSize(input: []const u8, scratch: []u8, provider: checksum.Provider) Failure!usize {
     var counter = measurement.Counter.init(null);
-    try decodeInner(input, &counter.writer, scratch);
+    try decodeInner(input, &counter.writer, scratch, provider);
     return @intCast(counter.written());
 }
 
-pub fn decode(input: []const u8, output: []u8, scratch: []u8) Failure!usize {
+pub fn decode(input: []const u8, output: []u8, scratch: []u8, provider: checksum.Provider) Failure!usize {
     var fixed_writer = std.Io.Writer.fixed(output);
-    try decodeInner(input, &fixed_writer, scratch);
+    try decodeInner(input, &fixed_writer, scratch, provider);
     return fixed_writer.end;
 }
 
-pub fn decodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8) Failure!void {
-    try decodeInner(input, writer, scratch);
+pub fn decodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, provider: checksum.Provider) Failure!void {
+    try decodeInner(input, writer, scratch, provider);
 }
 
 pub fn requiredSize(input: []const u8, scratch: []u8, options: Options) Failure!usize {
@@ -93,7 +94,7 @@ pub fn encodedSizeBound(input_len: usize) usize {
     return (input_len *| 13) / 4 +| 16384;
 }
 
-fn decodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8) Failure!void {
+fn decodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, provider: checksum.Provider) Failure!void {
     var cursor: []const u8 = input;
     // Concatenated streams (cat a.bz2 b.bz2) decode back to back; each outer
     // pass consumes exactly one BZh stream through its EOS magic.
@@ -263,7 +264,7 @@ fn decodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8) Failure
                 }
             }
             // Packed successor gives one load per output byte. RLE rides the traversal.
-            var block_crc = Bzip2Crc32.init();
+            var block_crc = Bzip2Crc32.bind(provider);
             var out_buf: [4096]u8 = undefined;
             var out_len: usize = 0;
             var cur: u32 = orig_ptr;
@@ -383,7 +384,7 @@ fn encodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options
             }
         }
         // Block CRC covers raw input, so batch it over the consumed range.
-        var block_crc = Bzip2Crc32.init();
+        var block_crc = Bzip2Crc32.bind(options.provider);
         block_crc.update(chunk_input[0..consumed]);
         if (rle_len == 0) break;
         offset += consumed;
@@ -1201,7 +1202,7 @@ test "bzip2 concatenated streams decode in sequence" {
     defer allocator.free(decode_scratch);
     const output = try allocator.alloc(u8, input_a.len + input_b.len);
     defer allocator.free(output);
-    const decoded = try decode(joined, output, decode_scratch);
+    const decoded = try decode(joined, output, decode_scratch, checksum.default_provider);
     try std.testing.expectEqual(input_a.len + input_b.len, decoded);
     try std.testing.expectEqualSlices(u8, input_a, output[0..input_a.len]);
     try std.testing.expectEqualSlices(u8, input_b, output[input_a.len..][0..input_b.len]);
@@ -1215,5 +1216,5 @@ test "bzip2 concatenated streams decode in sequence" {
     garbage[len_a + 2] = 'Z';
     const garbage_scratch = try allocator.alloc(u8, try decodeWorkspaceSizeFor(garbage));
     defer allocator.free(garbage_scratch);
-    try std.testing.expectError(error.InvalidData, decode(garbage, output, garbage_scratch));
+    try std.testing.expectError(error.InvalidData, decode(garbage, output, garbage_scratch, checksum.default_provider));
 }

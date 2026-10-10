@@ -1,10 +1,9 @@
 const std = @import("std");
 const options = @import("options");
 const onprem = @import("onprem.zig");
+const seam = @import("seam");
 
-pub const Implementation = enum { onprem, offprem };
+pub const Onprem = onprem.XxHash32;
+pub const Offprem = std.hash.XxHash32;
 
-pub const XxHash32 = switch (options.xxh32_impl) {
-    .onprem => onprem.XxHash32,
-    .offprem => std.hash.XxHash32,
-};
+pub const XxHash32 = seam.ValueHash(options.xxh32_impl, Onprem, Offprem);

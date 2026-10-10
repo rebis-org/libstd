@@ -21,6 +21,7 @@ pub const Options = struct {
     name: []const u8,
     comment: []const u8,
     deflate: deflate.Options,
+    provider: checksum.Provider = checksum.default_provider,
 };
 
 const magic_1 = 0x1f;
@@ -42,10 +43,10 @@ pub fn encodedSizeBound(input_len: usize, options: Options) usize {
     return deflate.encodedSizeBound(input_len) +| wrapper_size;
 }
 
-pub fn decodedSize(input: []const u8, history: []u8) Failure!usize {
+pub fn decodedSize(input: []const u8, history: []u8, provider: checksum.Provider) Failure!usize {
     if (history.len < deflate_history_size) return error.InsufficientCapacity;
     var counter = measurement.Counter.init(null);
-    _ = try decode(input, &counter.writer, history);
+    _ = try decode(input, &counter.writer, history, provider);
     return std.math.cast(usize, counter.written()) orelse error.ResourceLimit;
 }
 
@@ -57,7 +58,7 @@ pub const SinglePass = union(enum) {
 // ISIZE only seeds the attempt. Commit needs the exact ISIZE count, a matching
 // CRC32, and the trailer at the end of the input. A mismatch defers to the
 // two-pass route.
-pub fn decodeSinglePass(input: []const u8, output: []u8, history: []u8) Failure!SinglePass {
+pub fn decodeSinglePass(input: []const u8, output: []u8, history: []u8, provider: checksum.Provider) Failure!SinglePass {
     if (history.len < deflate_history_size) return error.InsufficientCapacity;
     if (input.len >= std.math.maxInt(u32)) return .fallback;
     // The 10 byte header and the 8 byte trailer need 18 bytes before any deflate data is read.
@@ -71,10 +72,10 @@ pub fn decodeSinglePass(input: []const u8, output: []u8, history: []u8) Failure!
         fixed_header[index] = source.takeByte() catch return .fallback;
         index += 1;
     }
-    skipHeader(&source, &fixed_header) catch return .fallback;
+    skipHeader(&source, &fixed_header, provider) catch return .fallback;
     const data_start = source.seek;
     var sink_writer = std.Io.Writer.fixed(output);
-    var tee_writer = Crc32Tee.init(&sink_writer);
+    var tee_writer = Crc32Tee.initWithProvider(&sink_writer, provider);
     var inflater = deflate.Decompress.initSlice(input[data_start..], history);
     _ = inflater.reader.streamRemaining(&tee_writer.writer) catch return .fallback;
     source.seek = data_start + (inflater.inputBitsConsumed() + 7) / 8;
@@ -88,7 +89,7 @@ pub fn decodeSinglePass(input: []const u8, output: []u8, history: []u8) Failure!
     return .{ .decoded = @intCast(tee_writer.size) };
 }
 
-pub fn decode(input: []const u8, output: *std.Io.Writer, history: []u8) Failure!usize {
+pub fn decode(input: []const u8, output: *std.Io.Writer, history: []u8, provider: checksum.Provider) Failure!usize {
     if (history.len < deflate_history_size) return error.InsufficientCapacity;
     var source = std.Io.Reader.fixed(input);
     var total: usize = 0;
@@ -104,8 +105,8 @@ pub fn decode(input: []const u8, output: *std.Io.Writer, history: []u8) Failure!
             index += 1;
         }
         if (index == 0) break;
-        try skipHeader(&source, &fixed_header);
-        var tee_writer = Crc32Tee.init(output);
+        try skipHeader(&source, &fixed_header, provider);
+        var tee_writer = Crc32Tee.initWithProvider(output, provider);
         const data_start = source.seek;
         var inflater = deflate.Decompress.initSlice(input[data_start..], history);
         const produced = inflater.reader.streamRemaining(&tee_writer.writer) catch |err| {
@@ -131,7 +132,7 @@ pub fn encodeStream(source: *std.Io.Reader, output: *std.Io.Writer, history: []u
     try writeHeader(output, options);
     // Optimal mode carves scratch past deflate_history_size, so the full slice is required.
     var compressor = try deflate.Compress.init(output, history, options.deflate);
-    var crc32 = checksum.Crc32.init();
+    var crc32 = checksum.Crc32.bind(options.provider);
     var total: u64 = 0;
     var buffer: [4096]u8 = undefined;
     while (true) {
@@ -150,12 +151,12 @@ pub fn encodeStream(source: *std.Io.Reader, output: *std.Io.Writer, history: []u
     try writeTrailer(output, crc32.final(), total);
 }
 
-fn skipHeader(source: *std.Io.Reader, fixed_header: *[10]u8) Failure!void {
+fn skipHeader(source: *std.Io.Reader, fixed_header: *[10]u8, provider: checksum.Provider) Failure!void {
     if (fixed_header[0] != magic_1 or fixed_header[1] != magic_2) return error.InvalidData;
     if (fixed_header[2] != cm_deflate) return error.Unsupported;
     const flags = fixed_header[3];
     if (flags & reserved_flags != 0) return error.InvalidData;
-    var hasher = checksum.Crc32.init();
+    var hasher = checksum.Crc32.bind(provider);
     hasher.update(fixed_header);
     if (flags & flag_extra != 0) {
         const low = source.takeByte() catch return error.InvalidData;
@@ -194,7 +195,7 @@ fn writeHeader(writer: *std.Io.Writer, options: Options) Failure!void {
     if (options.extra.len != 0) flags |= flag_extra;
     if (options.name.len != 0) flags |= flag_name;
     if (options.comment.len != 0) flags |= flag_comment;
-    var hasher = checksum.Crc32.init();
+    var hasher = checksum.Crc32.bind(options.provider);
     var fixed_header: [10]u8 = undefined;
     fixed_header[0] = magic_1;
     fixed_header[1] = magic_2;

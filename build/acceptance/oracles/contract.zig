@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const contract = @import("nucleus").contract;
+const contract = @import("interface").contract;
 const kernel = @import("kernel");
 
 // Enumeration must cover class-shaped verbs and omit absent components (miss maps to unsupported).

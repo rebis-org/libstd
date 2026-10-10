@@ -33,9 +33,9 @@ pub fn pbkdf2(dk: []u8, password: []const u8, salt: []const u8, rounds: u32, com
 }
 
 test "pbkdf2 onprem matches the std oracle" {
-    const hmac = @import("../hmac/seam.zig");
-    const sha256 = @import("../sha256/seam.zig");
-    const Prf = hmac.Hmac(sha256.Sha256);
+    const hmac_onprem = @import("../hmac/onprem.zig");
+    const sha256_onprem = @import("../sha256/onprem.zig");
+    const Prf = hmac_onprem.Hmac(sha256_onprem.Sha256);
     var dk_ours: [70]u8 = undefined;
     var dk_theirs: [70]u8 = undefined;
     for ([_]u32{ 1, 2, 7, 1000 }) |rounds| {

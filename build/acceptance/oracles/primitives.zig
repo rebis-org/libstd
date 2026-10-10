@@ -43,25 +43,25 @@ fn sha1Hex(input: []const u8) [40]u8 {
 
 fn hmacSha1Hex(message: []const u8, key: []const u8) [40]u8 {
     var digest: [20]u8 = undefined;
-    crypto.hmacSha1(&digest, message, key);
+    crypto.hmacSha1(crypto.default_provider, &digest, message, key);
     return hexEncode(digest);
 }
 
 fn pbkdf2Sha1(password: []const u8, salt: []const u8, rounds: u32) [20]u8 {
     var output: [20]u8 = undefined;
-    crypto.pbkdf2HmacSha1(&output, password, salt, rounds) catch unreachable; // rounds >= 1 at every call site
+    crypto.pbkdf2HmacSha1(crypto.default_provider, &output, password, salt, rounds) catch unreachable; // rounds >= 1 at every call site
     return output;
 }
 
 fn hmacSha256Hex(message: []const u8, key: []const u8) [64]u8 {
     var digest: [32]u8 = undefined;
-    crypto.hmacSha256(&digest, message, key);
+    crypto.hmacSha256(crypto.default_provider, &digest, message, key);
     return hexEncode(digest);
 }
 
 fn pbkdf2Sha256(password: []const u8, salt: []const u8, rounds: u32) [32]u8 {
     var output: [32]u8 = undefined;
-    crypto.pbkdf2HmacSha256(&output, password, salt, rounds) catch unreachable; // rounds >= 1 at every call site
+    crypto.pbkdf2HmacSha256(crypto.default_provider, &output, password, salt, rounds) catch unreachable; // rounds >= 1 at every call site
     return output;
 }
 
@@ -152,16 +152,16 @@ fn runHmac() !void {
 }
 
 fn requireAesBlock(key: []const u8, plaintext: [16]u8, expected: []const u8) !void {
-    const encrypted = try crypto.aesEncryptBlock(key, plaintext);
+    const encrypted = try crypto.aesEncryptBlock(crypto.default_provider, key, plaintext);
     try require(std.mem.eql(u8, &encrypted, expected));
-    const decrypted = try crypto.aesDecryptBlock(key, encrypted);
+    const decrypted = try crypto.aesDecryptBlock(crypto.default_provider, key, encrypted);
     try require(std.mem.eql(u8, &decrypted, &plaintext));
 }
 
 fn requireCtr(key: []const u8, block_1: []const u8, block_ff: []const u8, block_100: []const u8) !void {
     var source: [16 * 257]u8 = @splat(0);
     var output: [16 * 257]u8 = undefined;
-    try crypto.winzipCtr(key, &output, &source);
+    try crypto.winzipCtr(crypto.default_provider, key, &output, &source);
     try require(std.mem.eql(u8, output[0..16], block_1));
     try require(std.mem.eql(u8, output[254 * 16 .. 255 * 16], block_ff));
     try require(std.mem.eql(u8, output[255 * 16 .. 256 * 16], block_100));
@@ -182,16 +182,16 @@ fn runAes() !void {
     const cbc_iv = [16]u8{ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f };
     const cbc_plaintext = [32]u8{ 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff };
     var cbc_output: [32]u8 = undefined;
-    try crypto.aesCbcEncrypt(&fips_256_key, cbc_iv, &cbc_output, &cbc_plaintext);
+    try crypto.aesCbcEncrypt(crypto.default_provider, &fips_256_key, cbc_iv, &cbc_output, &cbc_plaintext);
     try require(std.mem.eql(u8, &cbc_output, &.{ 0x78, 0xe1, 0x6b, 0x06, 0x81, 0x7a, 0x44, 0x53, 0xab, 0xef, 0x8a, 0x23, 0x5f, 0xa9, 0xfa, 0x51, 0x6a, 0xea, 0x1e, 0x89, 0x29, 0xf1, 0xa7, 0xa7, 0xee, 0xb3, 0x45, 0x08, 0x22, 0xe7, 0x66, 0xf8 }));
     var cbc_back: [32]u8 = undefined;
-    try crypto.aesCbcDecrypt(&fips_256_key, cbc_iv, &cbc_back, &cbc_output);
+    try crypto.aesCbcDecrypt(crypto.default_provider, &fips_256_key, cbc_iv, &cbc_back, &cbc_output);
     try require(std.mem.eql(u8, &cbc_back, &cbc_plaintext));
-    try crypto.aesCbcEncrypt(&fips_256_key, cbc_iv, &cbc_output, &.{});
+    try crypto.aesCbcEncrypt(crypto.default_provider, &fips_256_key, cbc_iv, &cbc_output, &.{});
     const invalid_key: [15]u8 = @splat(0);
     const zeros_16: [16]u8 = @splat(0);
     var invalid_out: [16]u8 = undefined;
-    if (crypto.winzipCtr(&invalid_key, &invalid_out, &zeros_16)) |_| return error.ExpectedInvalidCall else |err| {
+    if (crypto.winzipCtr(crypto.default_provider, &invalid_key, &invalid_out, &zeros_16)) |_| return error.ExpectedInvalidCall else |err| {
         try require(err == error.InvalidCall);
     }
 }

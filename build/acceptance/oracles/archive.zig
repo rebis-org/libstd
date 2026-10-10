@@ -354,6 +354,31 @@ const rar4_hp_fixture = [_]u8{
 
 const rar_encrypted_expected = "hello rar encrypted world. this entry is password protected.\n";
 
+fn runRarEncryptedProvider(r: *Runner) anyerror!void {
+    if (!harness.offprem_servable) return;
+    setupRar(r);
+    const encrypted_fixtures = [_]struct { bytes: []const u8, header_password: bool }{
+        .{ .bytes = &rar5_p_fixture, .header_password = false },
+        .{ .bytes = &rar5_hp_fixture, .header_password = true },
+        .{ .bytes = &rar4_p_fixture, .header_password = false },
+        .{ .bytes = &rar4_hp_fixture, .header_password = true },
+    };
+    for (encrypted_fixtures) |fixture| {
+        _ = harness.call(r, harness.ids.read, &.{
+            harness.archiveOrdinalParam(0),
+            harness.sourceSpan(fixture.bytes),
+            harness.sinkSpan(r.output),
+            harness.cryptoProfile(),
+            harness.cryptoPasswordParam("PASS"),
+            harness.providerParam(1),
+        }, .{ .ctx = true });
+        try harness.requireStatus(r, abi.Status.ok);
+        const produced = r.response.byte_length;
+        if (produced != rar_encrypted_expected.len) return error.RarEncryptedSizeMismatch;
+        if (!std.mem.eql(u8, r.output[0..produced], rar_encrypted_expected)) return error.RarEncryptedMismatch;
+    }
+}
+
 fn runRarEncrypted(r: *Runner) anyerror!void {
     setupRar(r);
     const encrypted_fixtures = [_]struct { bytes: []const u8, header_password: bool }{
@@ -599,6 +624,7 @@ pub const scenarios = harness.scenarios("archive", &.{
     .{ .name = "rar", .suite = "rar", .run = runRar, .workspace_size = 65536, .output_size = 64, .encoded_size = 4096 },
     .{ .name = "rar official", .suite = "rar", .run = runRarOfficial, .workspace_size = 12 * 1024 * 1024, .output_size = 48 * 1024, .encoded_size = 1024 },
     .{ .name = "rar encrypted", .suite = "rar", .run = runRarEncrypted, .workspace_size = 32 * 1024 * 1024, .output_size = 1024, .encoded_size = 1024 },
+    .{ .name = "rar encrypted provider", .suite = "rar", .run = runRarEncryptedProvider, .workspace_size = 32 * 1024 * 1024, .output_size = 1024, .encoded_size = 1024 },
     // PPMd at -m5 asks the decoder for ~139 MiB of model heap, the format's
     // own size, not a workaround: the encoder built its contexts that large.
     .{ .name = "rar ppm", .suite = "rar", .run = runRarPpm, .workspace_size = 176 * 1024 * 1024, .output_size = 2048, .encoded_size = 2048 },

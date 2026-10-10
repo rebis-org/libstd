@@ -372,6 +372,25 @@ fn runFilters(r: *Runner) anyerror!void {
     }
 }
 
+fn runEncryptedProvider(r: *Runner) anyerror!void {
+    if (!harness.offprem_servable) return;
+    setup7z(r, harness.ids.sevenzip);
+    corpus.select(r.corpus_index, &sz_enc_data);
+    var store: PlainNodes = undefined;
+    const entry = entryPlain(&store, "m.txt", &sz_enc_data);
+    const crypto_nodes = [_]harness.Node{
+        harness.cryptoProfile(),
+        harness.cryptoPasswordParam(sz_enc_password),
+    };
+    sz_enc_archive_size = try sevenZipWrite(r, entry, &sz_enc_archive, &crypto_nodes);
+    const read_nodes = [_]harness.Node{
+        harness.cryptoProfile(),
+        harness.cryptoPasswordParam(sz_enc_password),
+        harness.providerParam(1),
+    };
+    try sevenZipReadExpected(r, sz_enc_archive[0..sz_enc_archive_size], 0, &sz_enc_output, &sz_enc_data, &read_nodes);
+}
+
 fn runEncrypted(r: *Runner) anyerror!void {
     setup7z(r, harness.ids.sevenzip);
     corpus.select(r.corpus_index, &sz_enc_data);
@@ -515,6 +534,7 @@ pub const scenarios = harness.scenarios("seven_zip", &.{
     .{ .label = "seven_zip coded", .run = runCoded, .workspace_size = 64 * 1024 * 1024, .output_size = 1024, .encoded_size = 65536 },
     .{ .label = "seven_zip encode advanced", .run = runEncodeAdvanced, .workspace_size = 48 * 1024 * 1024, .output_size = 1024, .encoded_size = 65536 },
     .{ .label = "seven_zip encrypted", .run = runEncrypted, .workspace_size = 64 * 1024 * 1024, .output_size = 1024, .encoded_size = 65536 },
+    .{ .label = "seven_zip encrypted provider", .run = runEncryptedProvider, .workspace_size = 64 * 1024 * 1024, .output_size = 1024, .encoded_size = 65536 },
     .{ .label = "seven_zip filters", .run = runFilters, .workspace_size = 48 * 1024 * 1024, .output_size = 1024, .encoded_size = 65536 },
     .{ .label = "seven_zip solid", .run = skipped("seven_zip solid"), .workspace_size = 8 * 1024 * 1024, .output_size = 1024, .encoded_size = 65536 },
     .{ .label = "seven_zip ppmd", .run = runPpmd, .workspace_size = 32 * 1024 * 1024, .output_size = 1024, .encoded_size = 65536 },
