@@ -48,12 +48,12 @@ const Spec = struct {
 const sevenzip = struct {
     fn encode(_: *env_mod.Env, ref: Ref, input: []const u8, output: []u8) anyerror!Enc {
         var len: usize = 0;
-        if (ref_archive_create(ref.fmt, input.ptr, input.len, "input.bin", @intFromBool(ref.store), output.ptr, output.len, &len) != 0) return error.EncodeFailed;
+        if (ref_archive_create(ref.fmt, input.ptr, input.len, "input.bin", @intFromBool(ref.store), output.ptr, output.len, &len) != 0) return error.encode_failed;
         return .{ .len = len };
     }
     fn decode(_: *env_mod.Env, ref: Ref, data: []const u8, output: []u8) anyerror!usize {
         var len: usize = 0;
-        if (ref_archive_extract(ref.fmt, data.ptr, data.len, output.ptr, output.len, &len) != 0) return error.DecodeFailed;
+        if (ref_archive_extract(ref.fmt, data.ptr, data.len, output.ptr, output.len, &len) != 0) return error.decode_failed;
         return len;
     }
 };
@@ -62,10 +62,10 @@ const lzma7z = struct {
     fn encode(env: *env_mod.Env, ref: Ref, input: []const u8, output: []u8) anyerror!Enc {
         var len: usize = 0;
         if (ref_archive_create(0x0a, input.ptr, input.len, "input.bin", 0, output.ptr, output.len, &len) != 0 or len == 0 or len > output.len) {
-            const console = ref.console orelse return error.NoConsoleArchive;
+            const console = ref.console orelse return error.no_console_archive;
             const bytes = try env.readFile(console.path, 1 << 31);
             defer env.allocator.free(bytes);
-            if (bytes.len > output.len) return error.OutTooSmall;
+            if (bytes.len > output.len) return error.out_too_small;
             @memcpy(output[0..bytes.len], bytes);
             return .{ .len = bytes.len, .ns = console.encode_ns };
         }
@@ -73,7 +73,7 @@ const lzma7z = struct {
     }
     fn decode(_: *env_mod.Env, _: Ref, data: []const u8, output: []u8) anyerror!usize {
         var len: usize = 0;
-        if (ref_archive_extract(0x0a, data.ptr, data.len, output.ptr, output.len, &len) != 0) return error.DecodeFailed;
+        if (ref_archive_extract(0x0a, data.ptr, data.len, output.ptr, output.len, &len) != 0) return error.decode_failed;
         return len;
     }
 };
@@ -81,12 +81,12 @@ const lzma7z = struct {
 const zstd = struct {
     fn encode(_: *env_mod.Env, ref: Ref, input: []const u8, output: []u8) anyerror!Enc {
         const len = ZSTD_compress(output.ptr, output.len, input.ptr, input.len, @intCast(ref.level));
-        if (ZSTD_isError(len) != 0) return error.EncodeFailed;
+        if (ZSTD_isError(len) != 0) return error.encode_failed;
         return .{ .len = len };
     }
     fn decode(_: *env_mod.Env, _: Ref, data: []const u8, output: []u8) anyerror!usize {
         const len = ZSTD_decompress(output.ptr, output.len, data.ptr, data.len);
-        if (ZSTD_isError(len) != 0) return error.DecodeFailed;
+        if (ZSTD_isError(len) != 0) return error.decode_failed;
         return len;
     }
 };
@@ -94,12 +94,12 @@ const zstd = struct {
 const bzip2 = struct {
     fn encode(_: *env_mod.Env, ref: Ref, input: []const u8, output: []u8) anyerror!Enc {
         var len: u32 = @intCast(output.len);
-        if (BZ2_bzBuffToBuffCompress(output.ptr, &len, input.ptr, @intCast(input.len), @intCast(ref.level), 0, 30) != 0) return error.EncodeFailed;
+        if (BZ2_bzBuffToBuffCompress(output.ptr, &len, input.ptr, @intCast(input.len), @intCast(ref.level), 0, 30) != 0) return error.encode_failed;
         return .{ .len = len };
     }
     fn decode(_: *env_mod.Env, _: Ref, data: []const u8, output: []u8) anyerror!usize {
         var len: u32 = @intCast(output.len);
-        if (BZ2_bzBuffToBuffDecompress(output.ptr, &len, data.ptr, @intCast(data.len), 0, 0) != 0) return error.DecodeFailed;
+        if (BZ2_bzBuffToBuffDecompress(output.ptr, &len, data.ptr, @intCast(data.len), 0, 0) != 0) return error.decode_failed;
         return len;
     }
 };
@@ -107,27 +107,27 @@ const bzip2 = struct {
 const xz = struct {
     fn encode(_: *env_mod.Env, ref: Ref, input: []const u8, output: []u8) anyerror!Enc {
         var pos: usize = 0;
-        if (lzma_easy_buffer_encode(@intCast(ref.level), 4, null, input.ptr, input.len, output.ptr, &pos, output.len) != 0) return error.EncodeFailed;
+        if (lzma_easy_buffer_encode(@intCast(ref.level), 4, null, input.ptr, input.len, output.ptr, &pos, output.len) != 0) return error.encode_failed;
         return .{ .len = pos };
     }
     fn decode(_: *env_mod.Env, _: Ref, data: []const u8, output: []u8) anyerror!usize {
         var in_pos: usize = 0;
         var pos: usize = 0;
         var memlimit: u64 = 1 << 30;
-        if (lzma_stream_buffer_decode(&memlimit, 0, null, data.ptr, &in_pos, data.len, output.ptr, &pos, output.len) != 0) return error.DecodeFailed;
+        if (lzma_stream_buffer_decode(&memlimit, 0, null, data.ptr, &in_pos, data.len, output.ptr, &pos, output.len) != 0) return error.decode_failed;
         return pos;
     }
 };
 
-const fl2 = struct {
+const fast_lzma2 = struct {
     fn encode(_: *env_mod.Env, ref: Ref, input: []const u8, output: []u8) anyerror!Enc {
         const len = FL2_compress(output.ptr, output.len, input.ptr, input.len, @intCast(ref.level));
-        if (FL2_isError(len) != 0) return error.EncodeFailed;
+        if (FL2_isError(len) != 0) return error.encode_failed;
         return .{ .len = len };
     }
     fn decode(_: *env_mod.Env, _: Ref, data: []const u8, output: []u8) anyerror!usize {
         const len = FL2_decompress(output.ptr, output.len, data.ptr, data.len);
-        if (FL2_isError(len) != 0) return error.DecodeFailed;
+        if (FL2_isError(len) != 0) return error.decode_failed;
         return len;
     }
 };
@@ -135,12 +135,12 @@ const fl2 = struct {
 const zlib = struct {
     fn encode(_: *env_mod.Env, ref: Ref, input: []const u8, output: []u8) anyerror!Enc {
         var len: u32 = @intCast(output.len);
-        if (compress2(output.ptr, &len, input.ptr, @intCast(input.len), @intCast(ref.level)) != 0) return error.EncodeFailed;
+        if (compress2(output.ptr, &len, input.ptr, @intCast(input.len), @intCast(ref.level)) != 0) return error.encode_failed;
         return .{ .len = len };
     }
     fn decode(_: *env_mod.Env, _: Ref, data: []const u8, output: []u8) anyerror!usize {
         var len: u32 = @intCast(output.len);
-        if (uncompress(output.ptr, &len, data.ptr, @intCast(data.len)) != 0) return error.DecodeFailed;
+        if (uncompress(output.ptr, &len, data.ptr, @intCast(data.len)) != 0) return error.decode_failed;
         return len;
     }
 };
@@ -148,19 +148,19 @@ const zlib = struct {
 const lz4 = struct {
     fn encode(_: *env_mod.Env, _: Ref, input: []const u8, output: []u8) anyerror!Enc {
         const bound = LZ4F_compressFrameBound(input.len, null);
-        if (bound > output.len) return error.OutTooSmall;
+        if (bound > output.len) return error.out_too_small;
         const len = LZ4F_compressFrame(output.ptr, output.len, input.ptr, input.len, null);
-        if (LZ4F_isError(len) != 0) return error.EncodeFailed;
+        if (LZ4F_isError(len) != 0) return error.encode_failed;
         return .{ .len = len };
     }
     fn decode(_: *env_mod.Env, _: Ref, data: []const u8, output: []u8) anyerror!usize {
         var ctx: usize = 0;
-        if (LZ4F_isError(LZ4F_createDecompressionContext(&ctx, 100)) != 0) return error.DecodeFailed;
+        if (LZ4F_isError(LZ4F_createDecompressionContext(&ctx, 100)) != 0) return error.decode_failed;
         defer _ = LZ4F_freeDecompressionContext(ctx);
         var src_len = data.len;
         var dst_len = output.len;
         const result = LZ4F_decompress(ctx, output.ptr, &dst_len, data.ptr, &src_len, null);
-        if (LZ4F_isError(result) != 0) return error.DecodeFailed;
+        if (LZ4F_isError(result) != 0) return error.decode_failed;
         return dst_len;
     }
 };
@@ -170,12 +170,12 @@ const libzip = struct {
         const temp = try env.makePathZ("{s}/ref-libzip.zip", .{env_mod.paths.work});
         defer env.allocator.free(temp);
         var len: usize = 0;
-        if (ref_zip_create(input.ptr, input.len, "input.bin", @intFromBool(ref.store), temp.ptr, output.ptr, output.len, &len) != 0) return error.EncodeFailed;
+        if (ref_zip_create(input.ptr, input.len, "input.bin", @intFromBool(ref.store), temp.ptr, output.ptr, output.len, &len) != 0) return error.encode_failed;
         return .{ .len = len };
     }
     fn decode(_: *env_mod.Env, _: Ref, data: []const u8, output: []u8) anyerror!usize {
         var len: usize = 0;
-        if (ref_zip_extract(data.ptr, data.len, output.ptr, output.len, &len) != 0) return error.DecodeFailed;
+        if (ref_zip_extract(data.ptr, data.len, output.ptr, output.len, &len) != 0) return error.decode_failed;
         return len;
     }
 };
@@ -187,7 +187,7 @@ const unrar = struct {
         const destination = try env.makePathZ("{s}", .{env_mod.paths.work});
         defer env.allocator.free(destination);
         var len: usize = 0;
-        if (ref_unrar_extract(data.ptr, data.len, temp.ptr, destination.ptr, output.ptr, output.len, &len) != 0) return error.DecodeFailed;
+        if (ref_unrar_extract(data.ptr, data.len, temp.ptr, destination.ptr, output.ptr, output.len, &len) != 0) return error.decode_failed;
         return len;
     }
 };
@@ -201,7 +201,7 @@ fn get(kind: matrix.Lib) Spec {
         .lzma7z => .{ .encode = lzma7z.encode, .decode = lzma7z.decode },
         .libzip => .{ .encode = libzip.encode, .decode = libzip.decode },
         .unrar => .{ .decode = unrar.decode },
-        .fast_lzma2 => .{ .encode = fl2.encode, .decode = fl2.decode },
+        .fast_lzma2 => .{ .encode = fast_lzma2.encode, .decode = fast_lzma2.decode },
         .zlib => .{ .encode = zlib.encode, .decode = zlib.decode },
         .lz4 => .{ .encode = lz4.encode, .decode = lz4.decode },
     };

@@ -8,8 +8,8 @@ const gzip = @import("grammar/gzip.zig");
 // Rooted at src/: module confinement requires it for mains reaching the whole tree.
 var failures: usize = 0;
 
-fn check(ok_condition: bool, label: []const u8) void {
-    if (ok_condition) {
+fn check(ok: bool, label: []const u8) void {
+    if (ok) {
         std.debug.print("ok {s}\n", .{label});
     } else {
         std.debug.print("FAIL {s}\n", .{label});

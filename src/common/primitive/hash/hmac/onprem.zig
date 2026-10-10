@@ -7,7 +7,6 @@ pub fn Hmac(comptime H: type) type {
         const Self = @This();
 
         pub const mac_length = H.digest_length;
-        pub const key_length = 32;
 
         inner: H,
         outer: H,

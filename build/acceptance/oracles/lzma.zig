@@ -48,7 +48,7 @@ fn longRoundtrip(r: *Runner) !void {
     var long_input: [600]u8 = undefined;
     var long_compressed: [768]u8 = undefined;
     var long_decompressed: [768]u8 = undefined;
-    corpus.select(r.corpus_index, &long_input);
+    corpus.fillTiled(r.corpus_index, &long_input);
     var nodes = steps.build(&lzmaParams, r, &.{ harness.sourceSpan(&long_input), harness.sinkSpan(&long_compressed) });
     _ = harness.call(r, harness.ids.write, nodes.items[0..nodes.len], .{ .ctx = true });
     try harness.requireStatus(r, abi.Status.ok);
@@ -113,7 +113,7 @@ fn limitQueryRead(r: *Runner) !void {
 
 fn runRoundtrip(r: *Runner, profile_id: harness.Id, invalid: []const u8, extra_steps: []const *const fn (r: *Runner) anyerror!void) anyerror!void {
     var lzma_corpus_buffer: [72]u8 = undefined;
-    corpus.select(r.corpus_index, &lzma_corpus_buffer);
+    corpus.fillTiled(r.corpus_index, &lzma_corpus_buffer);
     setupLzma(r, profile_id, 4096);
     r.input = lzma_corpus_buffer[0..48];
     r.invalid = invalid;
@@ -155,7 +155,7 @@ fn lzmaFileForeign(r: *Runner) !void {
 }
 
 fn lzmaFileWrite(r: *Runner) !void {
-    corpus.select(r.corpus_index, &lzma_file_input);
+    corpus.fillTiled(r.corpus_index, &lzma_file_input);
     setupLzma(r, harness.ids.lzma_file, 4096);
     r.input = &lzma_file_input;
     // The profile writes the 13-byte container itself: properties, dictionary,
@@ -240,7 +240,7 @@ pub fn runLzmaFile(r: *Runner) anyerror!void {
 
 pub fn runLzmaLarge(r: *Runner) anyerror!void {
     var input: [1 << 20]u8 = undefined;
-    corpus.select(r.corpus_index, &input);
+    corpus.fillTiled(r.corpus_index, &input);
     setupLzma(r, harness.ids.lzma, 128 << 20);
     r.lzma_match_finder = 0;
     r.input = &input;
@@ -556,17 +556,17 @@ const CountingSourceContext = struct {
 fn countingSourceCallback(c: *harness.Call) callconv(.c) u32 {
     const ctx: *CountingSourceContext = @ptrCast(@alignCast(c.callback_context orelse return abi.Status.unsupported));
     const response = c.response orelse return abi.Status.unsupported;
-    if (abi.idEqual(c.operation, catalog.callback_size)) {
+    if (abi.isIdEqual(c.operation, catalog.callback_size)) {
         ctx.size_calls += 1;
         response.value_low = ctx.data.len;
         return abi.Status.ok;
     }
-    if (abi.idEqual(c.operation, catalog.callback_rewind)) {
+    if (abi.isIdEqual(c.operation, catalog.callback_rewind)) {
         ctx.rewind_calls += 1;
         ctx.offset = 0;
         return abi.Status.ok;
     }
-    if (abi.idEqual(c.operation, catalog.callback_read)) {
+    if (abi.isIdEqual(c.operation, catalog.callback_read)) {
         ctx.read_calls += 1;
         const remaining = ctx.data.len - ctx.offset;
         const capacity: usize = @intCast(response.byte_capacity);
@@ -707,7 +707,7 @@ fn runLzma2SingleByte(r: *Runner) !void {
 
 fn runLzma2PackBounds(r: *Runner) !void {
     var input: [512]u8 = undefined;
-    corpus.select(r.corpus_index, &input);
+    corpus.fillTiled(r.corpus_index, &input);
     setupLzma(r, harness.ids.lzma2, 4096);
     r.input = &input;
     try steps.queryWrite(&lzmaParams, r);
@@ -757,7 +757,7 @@ fn runLzma2TruncatedHeader(r: *Runner) !void {
 
 fn runLzma2CorruptPayload(r: *Runner) !void {
     var input: [48]u8 = undefined;
-    corpus.select(r.corpus_index, &input);
+    corpus.fillTiled(r.corpus_index, &input);
     setupLzma(r, harness.ids.lzma2, 4096);
     r.input = &input;
     try steps.queryWrite(&lzmaParams, r);
@@ -907,7 +907,7 @@ pub fn runScanTiming(r: *Runner) !void {
 }
 
 fn abEncodeAndWrite(r: *Runner, profile_id: harness.Id, dictionary: u64, finder: ?u64, input: []const u8, label: []const u8) !void {
-    const mode = if (abi.idEqual(profile_id, harness.ids.xz)) harness.mode_xz else harness.mode_stream;
+    const mode = if (abi.isIdEqual(profile_id, harness.ids.xz)) harness.mode_xz else harness.mode_stream;
     harness.setup(r, profile_id, mode);
     r.lzma_dictionary = dictionary;
     r.input = input;
@@ -940,7 +940,7 @@ fn abEncodeAndWrite(r: *Runner, profile_id: harness.Id, dictionary: u64, finder:
 fn runLzmaAbCorpus(r: *Runner) !void {
     var input: [48]u8 = undefined;
     for (0..4) |corpus_index| {
-        corpus.select(corpus_index, &input);
+        corpus.fillTiled(corpus_index, &input);
         const suffix = try r.gpa.print("corpus_{d}", .{corpus_index});
         defer r.gpa.free(suffix);
         const dict: u64 = @max(input.len, 4096);

@@ -1,8 +1,7 @@
 const std = @import("std");
 
-// Three intentional stems: Kind uses the released profile stem (seven_zip),
-// Cmd mirrors the reference binary name (7zz), Lib mirrors the bridge module
-// name (sevenzip). Do not unify the spellings.
+// Kind uses the released profile stem (seven_zip); Cmd mirrors the
+// reference binary name (7zz); Lib mirrors the bridge module name.
 pub const Kind = enum { gzip, bzip2, lzma, lzma2, lzma_file, xz, zstd, tar, zip, seven_zip, rar, zlib, lz4 };
 pub const Cmd = enum { sevenzz, zstd, xz, bzip2, gzip, tar, ziptool, unrar, lzma, lz4 };
 pub const Lib = enum { sevenzip, zstd, bzip2, xz, lzma7z, libzip, unrar, fast_lzma2, zlib, lz4 };
@@ -36,17 +35,21 @@ pub const Base = struct {
 // Rows derive from descriptors, so removing one removes its rows with no central edits.
 const generated = @import("components");
 
+fn enumFor(comptime T: type, comptime what: []const u8, comptime name: []const u8) T {
+    return std.meta.stringToEnum(T, name) orelse @compileError("unknown benchmark " ++ what ++ ": " ++ name ++ ".");
+}
+
 fn kindFor(comptime name: []const u8) Kind {
     if (std.mem.eql(u8, name, "7z")) return .seven_zip;
-    return std.meta.stringToEnum(Kind, name) orelse @compileError("Unknown benchmark kind: " ++ name ++ ".");
+    return enumFor(Kind, "kind", name);
 }
 
 fn cmdFor(comptime name: []const u8) Cmd {
-    return std.meta.stringToEnum(Cmd, name) orelse @compileError("Unknown benchmark cmd: " ++ name ++ ".");
+    return enumFor(Cmd, "cmd", name);
 }
 
 fn libFor(comptime name: []const u8) Lib {
-    return std.meta.stringToEnum(Lib, name) orelse @compileError("Unknown benchmark lib: " ++ name ++ ".");
+    return enumFor(Lib, "lib", name);
 }
 
 const derived_bases = blk: {

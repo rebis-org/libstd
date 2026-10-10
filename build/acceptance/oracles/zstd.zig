@@ -31,7 +31,7 @@ fn setupProfile(r: *Runner) void {
     r.write_exact = false;
     r.invalid_status = abi.Status.invalid_data;
     r.invalid = &.{ 0x28, 0xb5, 0x2f, 0xfd, 0x00 };
-    corpus.select(r.corpus_index, r.corpus_buffer[0..]);
+    corpus.fillTiled(r.corpus_index, r.corpus_buffer[0..]);
     r.input = r.corpus_buffer[0..32];
 }
 
@@ -48,7 +48,7 @@ fn large(comptime params: steps.Params) fn (*Runner) anyerror!void {
     return struct {
         fn run(r: *Runner) anyerror!void {
             var input: [1 << 20]u8 = undefined;
-            corpus.select(r.corpus_index, &input);
+            corpus.fillTiled(r.corpus_index, &input);
             harness.setup(r, harness.ids.zstd, harness.mode_xz);
             r.input = &input;
             r.write_exact = false;
@@ -63,7 +63,7 @@ fn large(comptime params: steps.Params) fn (*Runner) anyerror!void {
 fn foreignEncode(r: *Runner) anyerror!void {
     harness.setup(r, harness.ids.zstd, harness.mode_xz);
     var input: [64 * 1024]u8 = undefined;
-    corpus.select(r.corpus_index, &input);
+    corpus.fillTiled(r.corpus_index, &input);
     const ref_size = lib.zstdCompress(&input, r.encoded) orelse return error.ZstdOracleRejectedInput;
     if (ref_size == 0 or ref_size >= r.encoded.len) return error.ZstdOracleOutputSize;
     r.encoded_len = ref_size;

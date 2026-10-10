@@ -57,7 +57,7 @@ pub const benchmark = Module{
     },
 };
 
-const importable = [_]Module{ seam, checksum, crypto, library, manifest, harness, run, interface, grammar, trap, component };
+const importable = [_]Module{ seam, checksum, crypto, library, manifest, package, abi_exports, harness, run, oracles, interface, grammar, trap, component, benchmark };
 
 fn byName(name: []const u8) Module {
     for (importable) |module| {

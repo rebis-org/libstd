@@ -157,7 +157,7 @@ fn expectQuickBrown(r: *Runner, archive: []const u8, output: []u8) !void {
 
 fn tarEncEntryTypes(r: *Runner) !void {
     var tar_corpus_buffer: [445]u8 = undefined;
-    corpus.select(r.corpus_index, &tar_corpus_buffer);
+    corpus.fillTiled(r.corpus_index, &tar_corpus_buffer);
     var store_file: EntryNodes = undefined;
     var store_dir: EntryNodes = undefined;
     var store_link: EntryNodes = undefined;
@@ -195,7 +195,7 @@ fn tarEncEntryTypes(r: *Runner) !void {
 fn tarEncPaxName(r: *Runner) !void {
     const long_name = "thisisaverylongfilenamethatexceedstheustarnamefieldcapacityandcannotbesplitintoprefixandnamepartssoapaxpathrecordisrequiredforthistest.txt";
     var payload: [32]u8 = undefined;
-    corpus.select(r.corpus_index, &payload);
+    corpus.fillTiled(r.corpus_index, &payload);
     var store: EntryNodes = undefined;
     const entry = entryWithType(&store, long_name, &payload, 0, null, null);
     const archive_size = try tarEncode(r, entry);
@@ -218,7 +218,7 @@ fn tarEncPaxName(r: *Runner) !void {
 
 fn tarEncPaxUid(r: *Runner) !void {
     var tar_corpus_buffer: [445]u8 = undefined;
-    corpus.select(r.corpus_index, &tar_corpus_buffer);
+    corpus.fillTiled(r.corpus_index, &tar_corpus_buffer);
     var store: EntryNodes = undefined;
     const entry = entryWithType(&store, "uidpax.txt", &tar_corpus_buffer, 0, null, @as(u64, 1) << 22);
     const archive_size = try tarEncode(r, entry);
@@ -244,7 +244,7 @@ fn tarEncErrors(r: *Runner) !void {
     const entry_bad_link = entryWithType(&store_bad_link, "badlink", &.{}, '2', "", null);
     try harness.expect(r, harness.ids.write, &tarWrite(entry_bad_link, &tar_archive), .{}, abi.Status.invalid_call);
     var tar_corpus_buffer: [445]u8 = undefined;
-    corpus.select(r.corpus_index, &tar_corpus_buffer);
+    corpus.fillTiled(r.corpus_index, &tar_corpus_buffer);
     var store_bad_dir: EntryNodes = undefined;
     const entry_bad_dir = entryWithType(&store_bad_dir, "baddir/", &tar_corpus_buffer, '5', null, null);
     try harness.expect(r, harness.ids.write, &tarWrite(entry_bad_dir, &tar_archive), .{}, abi.Status.invalid_call);

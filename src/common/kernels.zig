@@ -6,14 +6,14 @@ const build_options = @import("options");
 // target feature. Other targets keep the portable word-at-a-time path.
 const vector_match_copy = !build_options.portable and builtin.target.cpu.arch == .aarch64;
 
-pub fn matchLen8(buf: []const u8, a: usize, b: usize, max: usize) usize {
+pub fn matchLen8(window: []const u8, first: usize, second: usize, max_len: usize) usize {
     var len: usize = 0;
-    while (len + 8 <= max) {
-        const xor = std.mem.readInt(u64, buf[a + len ..][0..8], .little) ^ std.mem.readInt(u64, buf[b + len ..][0..8], .little);
+    while (len + 8 <= max_len) {
+        const xor = std.mem.readInt(u64, window[first + len ..][0..8], .little) ^ std.mem.readInt(u64, window[second + len ..][0..8], .little);
         if (xor != 0) return len + @ctz(xor) / 8;
         len += 8;
     }
-    while (len < max and buf[a + len] == buf[b + len]) len += 1;
+    while (len < max_len and window[first + len] == window[second + len]) len += 1;
     return len;
 }
 
@@ -24,83 +24,81 @@ pub const CopyMatchCfg = struct {
 
 // Short copies dominate, so inline ladders avoid per-call memcpy/memset overhead.
 // Wrappers gate length and supply their own fallback.
-pub inline fn copyMatchCore(comptime cfg: CopyMatchCfg, buf: []u8, dst: usize, dist: u32, len: usize) cfg.Ret {
-    const src = dst - dist;
-    if (dist >= len) {
-        copyShort16(buf[dst..][0..len], buf[src..][0..len]);
-    } else if (dist >= 16) {
+fn copyChunked(window: []u8, out_off: usize, src_off: usize, copy_len: usize, comptime width: usize) void {
+    var pos: usize = 0;
+    while (pos + width <= copy_len) : (pos += width) {
+        window[out_off + pos ..][0..width].* = window[src_off + pos ..][0..width].*;
+    }
+    if (pos < copy_len) {
+        window[out_off + copy_len - width ..][0..width].* = window[src_off + copy_len - width ..][0..width].*;
+    }
+}
+
+pub inline fn copyMatchCore(comptime cfg: CopyMatchCfg, window: []u8, out_off: usize, distance: u32, copy_len: usize) cfg.Ret {
+    const src_off = out_off - distance;
+    if (distance >= copy_len) {
+        copyShort16(window[out_off..][0..copy_len], window[src_off..][0..copy_len]);
+    } else if (distance >= 16) {
         // Chunks read only finalized bytes. The last chunk overlaps.
-        var i: usize = 0;
-        while (i + 16 <= len) : (i += 16) {
-            buf[dst + i ..][0..16].* = buf[src + i ..][0..16].*;
-        }
-        if (i < len) {
-            buf[dst + len - 16 ..][0..16].* = buf[src + len - 16 ..][0..16].*;
-        }
-    } else if (dist >= 8) {
-        var i: usize = 0;
-        while (i + 8 <= len) : (i += 8) {
-            buf[dst + i ..][0..8].* = buf[src + i ..][0..8].*;
-        }
-        if (i < len) {
-            buf[dst + len - 8 ..][0..8].* = buf[src + len - 8 ..][0..8].*;
-        }
-    } else if (dist == 1) {
-        if (len >= 16) {
-            const v: @Vector(16, u8) = @splat(buf[src]);
-            var i: usize = 0;
-            while (i + 16 <= len) : (i += 16) {
-                buf[dst + i ..][0..16].* = v;
+        copyChunked(window, out_off, src_off, copy_len, 16);
+    } else if (distance >= 8) {
+        copyChunked(window, out_off, src_off, copy_len, 8);
+    } else if (distance == 1) {
+        if (copy_len >= 16) {
+            const splat: @Vector(16, u8) = @splat(window[src_off]);
+            var pos: usize = 0;
+            while (pos + 16 <= copy_len) : (pos += 16) {
+                window[out_off + pos ..][0..16].* = splat;
             }
-            if (i < len) buf[dst + len - 16 ..][0..16].* = v;
+            if (pos < copy_len) window[out_off + copy_len - 16 ..][0..16].* = splat;
         } else {
             switch (cfg.short_one) {
                 .byte_widen => {
                     // Word widening beats a memset call at this size.
-                    const w: u64 = @as(u64, buf[src]) * 0x0101_0101_0101_0101;
-                    if (len >= 8) {
-                        std.mem.writeInt(u64, buf[dst..][0..8], w, .little);
-                        std.mem.writeInt(u64, buf[dst + len - 8 ..][0..8], w, .little);
-                    } else if (len >= 4) {
-                        const w32: u32 = @truncate(w);
-                        std.mem.writeInt(u32, buf[dst..][0..4], w32, .little);
-                        std.mem.writeInt(u32, buf[dst + len - 4 ..][0..4], w32, .little);
+                    const repeated: u64 = @as(u64, window[src_off]) * 0x0101_0101_0101_0101;
+                    if (copy_len >= 8) {
+                        std.mem.writeInt(u64, window[out_off..][0..8], repeated, .little);
+                        std.mem.writeInt(u64, window[out_off + copy_len - 8 ..][0..8], repeated, .little);
+                    } else if (copy_len >= 4) {
+                        const low32: u32 = @truncate(repeated);
+                        std.mem.writeInt(u32, window[out_off..][0..4], low32, .little);
+                        std.mem.writeInt(u32, window[out_off + copy_len - 4 ..][0..4], low32, .little);
                     } else {
-                        for (0..len) |i| buf[dst + i] = buf[src];
+                        for (0..copy_len) |i| window[out_off + i] = window[src_off];
                     }
                 },
                 .memset => {
-                    @memset(buf[dst..][0..len], buf[src]);
+                    @memset(window[out_off..][0..copy_len], window[src_off]);
                 },
             }
         }
     } else {
-        copyMatchPeriodWiden(buf, dst, dist, len);
+        copyMatchPeriodWiden(window, out_off, distance, copy_len);
     }
-    if (cfg.Ret == usize) return dst + len;
+    if (cfg.Ret == usize) return out_off + copy_len;
 }
 
-pub inline fn copyMatch(buf: []u8, dst: usize, dist: u32, len: u32) void {
+pub inline fn copyMatch(window: []u8, out_off: usize, distance: u32, copy_len: u32) void {
     if (comptime vector_match_copy) {
-        if (len <= 273) {
+        if (copy_len <= 273) {
             return copyMatchCore(.{
                 .Ret = void,
                 .short_one = .byte_widen,
-            }, buf, dst, dist, len);
+            }, window, out_off, distance, copy_len);
         }
     }
 
-    const src = dst - dist;
-    if (dist >= len) {
-        @memcpy(buf[dst..][0..len], buf[src..][0..len]);
+    const src_off = out_off - distance;
+    if (distance >= copy_len) {
+        @memcpy(window[out_off..][0..copy_len], window[src_off..][0..copy_len]);
         return;
     }
-    var out = dst;
-    var rest: usize = len;
-    var covered: usize = dist;
+    var out = out_off;
+    var rest: usize = copy_len;
+    var covered: usize = distance;
     while (rest > 0) {
         const chunk = @min(covered, rest);
-        @memcpy(buf[out..][0..chunk], buf[out - covered ..][0..chunk]);
+        @memcpy(window[out..][0..chunk], window[out - covered ..][0..chunk]);
         out += chunk;
         rest -= chunk;
         covered += chunk;
@@ -130,20 +128,20 @@ pub inline fn copyShort16(dst: []u8, src: []const u8) void {
 
 // Small-offset overlap copy: byte-widen the period to at least one word, then
 // finish with word-at-a-time copies that read only finalized bytes.
-fn copyMatchPeriodWiden(buf: []u8, dst: usize, offset: usize, length: usize) void {
+fn copyMatchPeriodWiden(window: []u8, out_off: usize, distance: usize, copy_len: usize) void {
     var done: usize = 0;
-    var period: usize = offset;
-    while (period < 8 and done < length) {
-        const take = @min(period, length - done);
-        var j: usize = 0;
-        while (j < take) : (j += 1) buf[dst + done + j] = buf[dst + done + j - period];
+    var period: usize = distance;
+    while (period < 8 and done < copy_len) {
+        const take = @min(period, copy_len - done);
+        var pos: usize = 0;
+        while (pos < take) : (pos += 1) window[out_off + done + pos] = window[out_off + done + pos - period];
         done += take;
         period += take;
     }
-    var i: usize = done;
-    while (i + 8 <= length) : (i += 8) {
-        const word = std.mem.readInt(u64, buf[dst + i - period ..][0..8], .little);
-        std.mem.writeInt(u64, buf[dst + i ..][0..8], word, .little);
+    var cursor: usize = done;
+    while (cursor + 8 <= copy_len) : (cursor += 8) {
+        const word = std.mem.readInt(u64, window[out_off + cursor - period ..][0..8], .little);
+        std.mem.writeInt(u64, window[out_off + cursor ..][0..8], word, .little);
     }
-    while (i < length) : (i += 1) buf[dst + i] = buf[dst + i - period];
+    while (cursor < copy_len) : (cursor += 1) window[out_off + cursor] = window[out_off + cursor - period];
 }

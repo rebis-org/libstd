@@ -7,7 +7,7 @@ pub const Node = abi.Node;
 pub const Call = abi.Call;
 pub const Callback = abi.Callback;
 pub const Status = abi.Status;
-pub const idEqual = abi.idEqual;
+pub const isIdEqual = abi.isIdEqual;
 pub const catalog = @import("catalog.zig");
 
 pub const cap_read: u32 = 1 << 0;
@@ -625,11 +625,11 @@ pub fn call(r: *Runner, operation: Id, nodes: []const Node, opts: CallOpts) u32 
 }
 
 fn capabilitiesForOperation(r: *Runner, operation: Id) u64 {
-    return if (abi.idEqual(operation, ids.query)) r.caps_query else r.caps_io;
+    return if (abi.isIdEqual(operation, ids.query)) r.caps_query else r.caps_io;
 }
 
 fn commitModeForOperation(r: *Runner, operation: Id) u64 {
-    return if (abi.idEqual(operation, ids.read)) r.commit_read else r.commit_write;
+    return if (abi.isIdEqual(operation, ids.read)) r.commit_read else r.commit_write;
 }
 
 pub fn requireStatus(r: *Runner, expected: u32) !void {
@@ -664,7 +664,7 @@ pub fn spanCall(r: *Runner, operation: Id, source: []const u8, sink: []u8) !void
 // Only a write records the frame length: a read reports the decoded size, which must not overwrite it.
 pub fn spanProduce(r: *Runner, operation: Id, nodes: []const Node) !void {
     try expect(r, operation, nodes, .{ .ctx = true }, Status.ok);
-    if (abi.idEqual(operation, ids.write)) r.encoded_len = @intCast(r.response.byte_length);
+    if (abi.isIdEqual(operation, ids.write)) r.encoded_len = @intCast(r.response.byte_length);
 }
 
 pub fn capacityDiagnostic(required_id: Id, available_id: Id, required: *Node, available: *Node) Node {
@@ -773,19 +773,19 @@ pub const SinkBufferContext = struct {
 pub fn sourceCallback(envelope: *Call) callconv(.c) u32 {
     const source_context: *SourceCallbackContext = @ptrCast(@alignCast(envelope.callback_context orelse return Status.unsupported));
     const response = envelope.response orelse return Status.unsupported;
-    if (abi.idEqual(envelope.operation, catalog.callback_size)) {
+    if (abi.isIdEqual(envelope.operation, catalog.callback_size)) {
         response.value_low = source_context.data.len;
         return Status.ok;
     }
-    if (abi.idEqual(envelope.operation, catalog.callback_rewind)) {
+    if (abi.isIdEqual(envelope.operation, catalog.callback_rewind)) {
         source_context.offset = 0;
         return Status.ok;
     }
-    if (abi.idEqual(envelope.operation, catalog.callback_seek)) {
+    if (abi.isIdEqual(envelope.operation, catalog.callback_seek)) {
         source_context.offset = @intCast(envelope.request.?.value_low);
         return Status.ok;
     }
-    if (abi.idEqual(envelope.operation, catalog.callback_read)) {
+    if (abi.isIdEqual(envelope.operation, catalog.callback_read)) {
         const remaining = source_context.data.len - source_context.offset;
         const capacity: usize = @intCast(response.byte_capacity);
         const n = @min(capacity, remaining);
@@ -803,7 +803,7 @@ pub fn sourceCallback(envelope: *Call) callconv(.c) u32 {
 pub fn sinkCallback(envelope: *Call) callconv(.c) u32 {
     const sink_context: *SinkCallbackContext = @ptrCast(@alignCast(envelope.callback_context orelse return Status.unsupported));
     const response = envelope.response orelse return Status.unsupported;
-    if (abi.idEqual(envelope.operation, catalog.callback_write)) {
+    if (abi.isIdEqual(envelope.operation, catalog.callback_write)) {
         var n: usize = @intCast(envelope.request.?.byte_length);
         if (n > 2) n = 2;
         const new_total = sink_context.accepted_total + n;
@@ -821,7 +821,7 @@ pub fn sinkCallback(envelope: *Call) callconv(.c) u32 {
 pub fn sinkBufferCallback(envelope: *Call) callconv(.c) u32 {
     const sink_context: *SinkBufferContext = @ptrCast(@alignCast(envelope.callback_context orelse return Status.unsupported));
     const response = envelope.response orelse return Status.unsupported;
-    if (abi.idEqual(envelope.operation, catalog.callback_write)) {
+    if (abi.isIdEqual(envelope.operation, catalog.callback_write)) {
         var n: usize = @intCast(envelope.request.?.byte_length);
         if (n > sink_context.accept_limit) n = sink_context.accept_limit;
         if (sink_context.offset + n > sink_context.buffer.len) n = sink_context.buffer.len - sink_context.offset;

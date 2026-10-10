@@ -163,9 +163,9 @@ pub fn roundtripTruncate(comptime extra: Params, r: *Runner) !void {
 }
 
 pub fn foreignTool(r: *Runner) !void {
-    const valid = if (abi.idEqual(r.profile_id, harness.ids.gzip))
+    const valid = if (abi.isIdEqual(r.profile_id, harness.ids.gzip))
         lib.gzipValid(r.encoded[0..r.encoded_len])
-    else if (abi.idEqual(r.profile_id, harness.ids.bzip2))
+    else if (abi.isIdEqual(r.profile_id, harness.ids.bzip2))
         lib.bzip2Valid(r.encoded[0..r.encoded_len])
     else
         return error.UnsupportedForeignTool;

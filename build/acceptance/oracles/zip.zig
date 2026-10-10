@@ -249,8 +249,8 @@ fn zipReadWithPasswordProvider(r: *Runner, archive: []const u8, ordinal: u64, ou
 fn runProviderSelection(r: *Runner) anyerror!void {
     if (!harness.offprem_servable) return;
     setupZip(r);
-    corpus.select(r.corpus_index, &zip_small);
-    corpus.select(r.corpus_index, &zip_large);
+    corpus.fillTiled(r.corpus_index, &zip_small);
+    corpus.fillTiled(r.corpus_index, &zip_large);
     var store1: EntryNodes = undefined;
     var store2: EntryNodes = undefined;
     const entry1 = entryWithMethod(&store1, "a.txt", &zip_small, 8);
@@ -270,8 +270,8 @@ fn runProviderSelection(r: *Runner) anyerror!void {
 
 fn runEncrypted(r: *Runner) anyerror!void {
     setupZip(r);
-    corpus.select(r.corpus_index, &zip_small);
-    corpus.select(r.corpus_index, &zip_large);
+    corpus.fillTiled(r.corpus_index, &zip_small);
+    corpus.fillTiled(r.corpus_index, &zip_large);
     var store1: EntryNodes = undefined;
     var store2: EntryNodes = undefined;
     const entry1 = entryWithMethod(&store1, "a.txt", &zip_small, 8);
@@ -459,8 +459,8 @@ fn makeTraditionalZip(r: *Runner, method: u64) !void {
 
 fn runTraditional(r: *Runner) anyerror!void {
     setupZip(r);
-    corpus.select(r.corpus_index, &zip_small);
-    corpus.select(r.corpus_index, &zip_big);
+    corpus.fillTiled(r.corpus_index, &zip_small);
+    corpus.fillTiled(r.corpus_index, &zip_big);
     try makeTraditionalZip(r, 0);
     var output: [1024]u8 = undefined;
     _ = try zipReadWithPassword(r, zip_trad_archive[0..zip_trad_archive_size], 0, &output, "s3cret");
@@ -504,7 +504,7 @@ var zip_methods_saved_sizes: [4]usize = @splat(0);
 
 fn runMethods(r: *Runner) anyerror!void {
     setupZip(r);
-    corpus.select(r.corpus_index, &zip_large);
+    corpus.fillTiled(r.corpus_index, &zip_large);
     const crc = harness.crc32Ieee(&zip_large);
     var output: [1024]u8 = undefined;
     if (lib.bzip2Compress(&zip_large, &zip_methods_bz_saved)) |bz_size| {
@@ -602,7 +602,7 @@ fn runMethods(r: *Runner) anyerror!void {
 
 fn runEncodeMethods(r: *Runner) anyerror!void {
     setupZip(r);
-    corpus.select(r.corpus_index, &zip_encmethods_payload);
+    corpus.fillTiled(r.corpus_index, &zip_encmethods_payload);
     const methods = [_]u16{ 12, 14, 93, 95, 9, 98 };
     var archive: [65536]u8 = undefined;
     var output: [1024]u8 = undefined;
@@ -641,7 +641,7 @@ fn runEncodeMethods(r: *Runner) anyerror!void {
 
 fn runRobust(r: *Runner) anyerror!void {
     setupZip(r);
-    corpus.select(r.corpus_index, &zip_small);
+    corpus.fillTiled(r.corpus_index, &zip_small);
     var store: EntryNodes = undefined;
     const entry = entryWithMethod(&store, "sfx.txt", &zip_small, 8);
     const size = try zipWriteWithCrypto(r, entry, &zip_enc_archive, "", null, null, null);

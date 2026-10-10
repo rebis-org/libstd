@@ -58,7 +58,7 @@ pub const Node = extern struct {
         };
     }
 
-    pub fn valid(self: *const Node) bool {
+    pub fn isValid(self: *const Node) bool {
         return self.structure_size >= @sizeOf(Node) and self.flags & ~(node_flag_optional | node_flag_callback_resource) == 0 and std.mem.allEqual(u64, &self.reserved, 0);
     }
 };
@@ -94,7 +94,7 @@ pub const Call = extern struct {
         };
     }
 
-    pub fn valid(self: *const Call) bool {
+    pub fn isValid(self: *const Call) bool {
         return self.structure_size >= @sizeOf(Call) and self.flags == 0 and std.mem.allEqual(u64, &self.reserved, 0);
     }
 };

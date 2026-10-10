@@ -1608,8 +1608,8 @@ pub fn DecompressOf(comptime variant: enum { deflate, deflate64 }) type {
 
 pub const Decompress = DecompressOf(.deflate);
 pub const Decompress64 = DecompressOf(.deflate64);
-const fixed_lit_tree = buildTreeValue(10, 9216, &fixed_lit_lengths, false, false) catch @compileError("The fixed Huffman literal table failed to build.");
-const fixed_dist_tree = buildTreeValue(8, 4096, &fixed_dist_lengths, false, false) catch @compileError("The fixed Huffman distance table failed to build.");
+const fixed_lit_tree = buildTreeValue(10, 9216, &fixed_lit_lengths, false, false) catch @compileError("the fixed huffman literal table failed to build.");
+const fixed_dist_tree = buildTreeValue(8, 4096, &fixed_dist_lengths, false, false) catch @compileError("the fixed huffman distance table failed to build.");
 
 fn buildTreeValue(comptime max_root_bits: u5, comptime max_sub: usize, lengths: []const u8, allow_single: bool, allow_empty: bool) error{InvalidData}!Tree(max_root_bits, max_sub) {
     @setEvalBranchQuota(1_000_000);

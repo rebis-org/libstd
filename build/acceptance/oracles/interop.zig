@@ -70,7 +70,7 @@ fn cross(
     reference: RefCodec,
 ) anyerror!void {
     harness.setup(r, profile, mode);
-    corpus.select(r.corpus_index, r.corpus_buffer[0..]);
+    corpus.fillTiled(r.corpus_index, r.corpus_buffer[0..]);
     r.input = r.corpus_buffer[0..];
     r.sink_accept = 3;
     r.write_exact = true;

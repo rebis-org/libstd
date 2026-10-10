@@ -126,23 +126,23 @@ fn aesBlockWith(comptime S: type, comptime direction: BlockCipher(S).Direction, 
 pub fn aesEncryptBlock(provider: Provider, key: []const u8, block: [block_length]u8) Failure![block_length]u8 {
     if (comptime options.aes_impl == .mergeable) {
         return switch (provider) {
-            .onprem => aesBlockWith(aes_seam.SuiteOnprem, .encrypt, key, block),
-            .offprem => aesBlockWith(aes_seam.SuiteOffprem, .encrypt, key, block),
+            .onprem => aesBlockWith(aes_seam.suite_onprem, .encrypt, key, block),
+            .offprem => aesBlockWith(aes_seam.suite_offprem, .encrypt, key, block),
         };
     }
     std.debug.assert(provider == default_provider);
-    return aesBlockWith(aes_seam.Suite, .encrypt, key, block);
+    return aesBlockWith(aes_seam.suite, .encrypt, key, block);
 }
 
 pub fn aesDecryptBlock(provider: Provider, key: []const u8, block: [block_length]u8) Failure![block_length]u8 {
     if (comptime options.aes_impl == .mergeable) {
         return switch (provider) {
-            .onprem => aesBlockWith(aes_seam.SuiteOnprem, .decrypt, key, block),
-            .offprem => aesBlockWith(aes_seam.SuiteOffprem, .decrypt, key, block),
+            .onprem => aesBlockWith(aes_seam.suite_onprem, .decrypt, key, block),
+            .offprem => aesBlockWith(aes_seam.suite_offprem, .decrypt, key, block),
         };
     }
     std.debug.assert(provider == default_provider);
-    return aesBlockWith(aes_seam.Suite, .decrypt, key, block);
+    return aesBlockWith(aes_seam.suite, .decrypt, key, block);
 }
 
 fn winzipCtrWith(comptime S: type, key: []const u8, destination: []u8, source: []const u8) Failure!void {
@@ -169,12 +169,12 @@ fn winzipCtrWith(comptime S: type, key: []const u8, destination: []u8, source: [
 pub fn winzipCtr(provider: Provider, key: []const u8, destination: []u8, source: []const u8) Failure!void {
     if (comptime options.aes_impl == .mergeable) {
         return switch (provider) {
-            .onprem => winzipCtrWith(aes_seam.SuiteOnprem, key, destination, source),
-            .offprem => winzipCtrWith(aes_seam.SuiteOffprem, key, destination, source),
+            .onprem => winzipCtrWith(aes_seam.suite_onprem, key, destination, source),
+            .offprem => winzipCtrWith(aes_seam.suite_offprem, key, destination, source),
         };
     }
     std.debug.assert(provider == default_provider);
-    return winzipCtrWith(aes_seam.Suite, key, destination, source);
+    return winzipCtrWith(aes_seam.suite, key, destination, source);
 }
 
 // Operates on whole blocks only; the caller supplies the padding.
@@ -195,12 +195,12 @@ fn aesCbcEncryptWith(comptime S: type, key: []const u8, iv: [block_length]u8, de
 pub fn aesCbcEncrypt(provider: Provider, key: []const u8, iv: [block_length]u8, destination: []u8, source: []const u8) Failure!void {
     if (comptime options.aes_impl == .mergeable) {
         return switch (provider) {
-            .onprem => aesCbcEncryptWith(aes_seam.SuiteOnprem, key, iv, destination, source),
-            .offprem => aesCbcEncryptWith(aes_seam.SuiteOffprem, key, iv, destination, source),
+            .onprem => aesCbcEncryptWith(aes_seam.suite_onprem, key, iv, destination, source),
+            .offprem => aesCbcEncryptWith(aes_seam.suite_offprem, key, iv, destination, source),
         };
     }
     std.debug.assert(provider == default_provider);
-    return aesCbcEncryptWith(aes_seam.Suite, key, iv, destination, source);
+    return aesCbcEncryptWith(aes_seam.suite, key, iv, destination, source);
 }
 
 fn aesCbcDecryptWith(comptime S: type, key: []const u8, iv: [block_length]u8, destination: []u8, source: []const u8) Failure!void {
@@ -223,12 +223,12 @@ fn aesCbcDecryptWith(comptime S: type, key: []const u8, iv: [block_length]u8, de
 pub fn aesCbcDecrypt(provider: Provider, key: []const u8, iv: [block_length]u8, destination: []u8, source: []const u8) Failure!void {
     if (comptime options.aes_impl == .mergeable) {
         return switch (provider) {
-            .onprem => aesCbcDecryptWith(aes_seam.SuiteOnprem, key, iv, destination, source),
-            .offprem => aesCbcDecryptWith(aes_seam.SuiteOffprem, key, iv, destination, source),
+            .onprem => aesCbcDecryptWith(aes_seam.suite_onprem, key, iv, destination, source),
+            .offprem => aesCbcDecryptWith(aes_seam.suite_offprem, key, iv, destination, source),
         };
     }
     std.debug.assert(provider == default_provider);
-    return aesCbcDecryptWith(aes_seam.Suite, key, iv, destination, source);
+    return aesCbcDecryptWith(aes_seam.suite, key, iv, destination, source);
 }
 
 pub fn winzipDeriveKey(provider: Provider, password: []const u8, salt: []const u8, key_length: usize, out: []u8) Failure!void {
@@ -278,14 +278,14 @@ fn pbkdf2Hmac(comptime PrfOnprem: type, comptime PrfOffprem: type, provider: Pro
     };
 }
 
-pub fn constantTimeEqual(left: []const u8, right: []const u8) bool {
+pub fn constantTimeEql(first: []const u8, second: []const u8) bool {
     // No early return on length mismatch: timing depends only on the public
     // lengths, never on where the contents first differ.
-    var accumulator: u8 = @truncate(left.len ^ right.len);
-    const common = @min(left.len, right.len);
-    for (left[0..common], right[0..common]) |l, r| accumulator |= l ^ r;
-    for (left[common..]) |l| accumulator |= l;
-    for (right[common..]) |r| accumulator |= r;
+    var accumulator: u8 = @truncate(first.len ^ second.len);
+    const common = @min(first.len, second.len);
+    for (first[0..common], second[0..common]) |l, r| accumulator |= l ^ r;
+    for (first[common..]) |l| accumulator |= l;
+    for (second[common..]) |r| accumulator |= r;
     return accumulator == 0;
 }
 
@@ -405,7 +405,7 @@ test "fixed digest bind rejects the other provider" {
     try std.testing.expectEqualSlices(u8, &plain.finalResult(), &via_bind);
 }
 
-test "sha256 known answers" {
+test "sha256 matches fips vectors" {
     var h = Sha256.init(.{});
     h.update("");
     try std.testing.expectEqualSlices(u8, &[_]u8{
@@ -422,7 +422,7 @@ test "sha256 known answers" {
     }, &h.finalResult());
 }
 
-test "hmac known answers" {
+test "hmac matches rfc 2202 vectors" {
     var out: [32]u8 = undefined;
     const key20: [20]u8 = @splat(0x0b);
     hmacSha1(default_provider, out[0..20], "Hi There", &key20);
@@ -438,7 +438,7 @@ test "hmac known answers" {
     }, &out);
 }
 
-test "pbkdf2 known answers" {
+test "pbkdf2 matches rfc 6070 vectors" {
     var out: [64]u8 = undefined;
     try pbkdf2HmacSha1(default_provider, out[0..20], "password", "salt", 1);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0x0c, 0x60, 0xc8, 0x0f, 0x96, 0x1f, 0x0e, 0x71, 0xf3, 0xa9, 0xb5, 0x24, 0xaf, 0x60, 0x12, 0x06, 0x2f, 0xe0, 0x37, 0xa6 }, out[0..20]);
@@ -452,7 +452,7 @@ test "pbkdf2 known answers" {
     }, out[0..32]);
 }
 
-test "seven zip kdf known answers" {
+test "seven zip kdf matches vendor vectors" {
     var utf16_buf: [32]u16 = undefined;
     var key: [seven_zip_key_length]u8 = undefined;
     const pw_len = std.unicode.utf8ToUtf16Le(&utf16_buf, "password123") catch unreachable;
@@ -470,7 +470,7 @@ test "seven zip kdf known answers" {
     }, &key);
 }
 
-test "aes known answers" {
+test "aes matches fips 197 vectors" {
     const pt = [16]u8{ 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff };
     const key128 = [16]u8{ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f };
     const ct128 = try aesEncryptBlock(default_provider, &key128, pt);
@@ -486,7 +486,7 @@ test "aes known answers" {
     try std.testing.expectEqualSlices(u8, &pt, &(try aesDecryptBlock(default_provider, &key256, ct256)));
 }
 
-test "aes cbc sp800-38a" {
+test "aes cbc matches sp800-38a vectors" {
     const key = [32]u8{
         0x60, 0x3d, 0xeb, 0x10, 0x15, 0xca, 0x71, 0xbe, 0x2b, 0x73, 0xae, 0xf0, 0x85, 0x7d, 0x77,
         0x81, 0x1f, 0x35, 0x2c, 0x07, 0x3b, 0x61, 0x08, 0xd7, 0x2d, 0x98, 0x10, 0xa3, 0x09, 0x14,
@@ -535,7 +535,7 @@ test "cbc decrypt operates in place" {
     try std.testing.expectEqualSlices(u8, plain, &buf);
 }
 
-test "zipcrypto roundtrip" {
+test "zipcrypto encrypts then decrypts" {
     var keys = ZipCryptoKeys.init("password");
     const msg = "hello world, zip crypto!";
     var cipher: [msg.len]u8 = undefined;
@@ -546,12 +546,12 @@ test "zipcrypto roundtrip" {
     try std.testing.expectEqualSlices(u8, msg, &plain);
 }
 
-test "constant time equal" {
-    try std.testing.expect(constantTimeEqual("abc", "abc"));
-    try std.testing.expect(!constantTimeEqual("abc", "abd"));
-    try std.testing.expect(!constantTimeEqual("abc", "abcd"));
-    try std.testing.expect(!constantTimeEqual("", "a"));
-    try std.testing.expect(constantTimeEqual("", ""));
+test "constant time eql distinguishes inputs" {
+    try std.testing.expect(constantTimeEql("abc", "abc"));
+    try std.testing.expect(!constantTimeEql("abc", "abd"));
+    try std.testing.expect(!constantTimeEql("abc", "abcd"));
+    try std.testing.expect(!constantTimeEql("", "a"));
+    try std.testing.expect(constantTimeEql("", ""));
 }
 
 test "both providers agree on the mode glue when mergeable" {

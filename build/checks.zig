@@ -38,13 +38,15 @@ fn addHeaderProbe(b: *std.Build, zig: []const u8, driver: []const u8, std_flag: 
 
 fn addAbi(b: *std.Build, ctx: *common.Context) void {
     const zig = b.graph.zig_exe;
-    // There is no -fsyntax-only mode: objecting to /dev/null proves that the header
-    // parses as C23 and C++26 without linking.
-    const c_header = addHeaderProbe(b, zig, "cc", "-std=c23", b.path("build/acceptance/header.c"), ctx.generated.header_dir);
-    const cpp_header = addHeaderProbe(b, zig, "c++", "-std=c++2c", b.path("build/acceptance/header.cpp"), ctx.generated.header_dir);
     const abi = b.step("abi", "Check the ABI contract of the generated header and library");
-    abi.dependOn(&c_header.step);
-    abi.dependOn(&cpp_header.step);
+    // No -fsyntax-only mode exists, so objecting to /dev/null proves parsing.
+    inline for (.{
+        .{ "cc", "-std=c23", "build/acceptance/header.c" },
+        .{ "c++", "-std=c++2c", "build/acceptance/header.cpp" },
+    }) |probe_spec| {
+        const probe = addHeaderProbe(b, zig, probe_spec[0], probe_spec[1], b.path(probe_spec[2]), ctx.generated.header_dir);
+        abi.dependOn(&probe.step);
+    }
     abi.dependOn(&ctx.host.dynamic_library.step);
     const abi_exports = b.addExecutable(.{
         .name = "abi_exports",
@@ -73,10 +75,10 @@ fn addPackage(b: *std.Build, ctx: *common.Context) void {
     const package_exe = b.addExecutable(.{ .name = "package", .root_module = modules.create(b, modules.package, ctx) });
     const package_run = b.addRunArtifact(package_exe);
     for (archives) |provider| {
-        package_run.addFileArg(provider.host);
-        package_run.addFileArg(provider.android);
-        package_run.addFileArg(provider.apple);
-        package_run.addFileArg(provider.cjpm);
+        inline for (@typeInfo(common.ProviderArchives).@"struct".field_names) |field_name| {
+            if (comptime std.mem.eql(u8, field_name, "name")) continue;
+            package_run.addFileArg(@field(provider, field_name));
+        }
     }
     package_run.addFileArg(ctx.host.dynamic_library.getEmittedBin());
     b.step("package", "Check the distribution archives").dependOn(&package_run.step);

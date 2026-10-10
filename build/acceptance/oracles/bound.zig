@@ -163,7 +163,7 @@ var roundtrip_input: [64 * 1024]u8 = undefined;
 var bound_sink: [384 * 1024]u8 = undefined;
 
 fn runRoundtrip(r: *Runner) anyerror!void {
-    corpus.select(r.corpus_index, &roundtrip_input);
+    corpus.fillTiled(r.corpus_index, &roundtrip_input);
     const input = roundtrip_input[0..];
     for (cases) |case| {
         setupCase(r, case);
@@ -180,7 +180,7 @@ fn runRoundtrip(r: *Runner) anyerror!void {
 }
 
 fn runCapacity(r: *Runner) anyerror!void {
-    corpus.select(r.corpus_index, &roundtrip_input);
+    corpus.fillTiled(r.corpus_index, &roundtrip_input);
     const input = roundtrip_input[0..];
     for (cases) |case| {
         setupCase(r, case);
@@ -233,8 +233,8 @@ fn pathologicalInputs() [4][]const u8 {
     fillRandom(path_mixed[0 .. 2 << 20], 0x94d049bb133111eb);
     @memset(path_mixed[2 << 20 .. 4 << 20], 0xa7);
     fillPeriod(path_mixed[4 << 20 .. 6 << 20], 4, 0x2545f4914f6cdd1d);
-    corpus.select(1, path_mixed[6 << 20 .. 8 << 20]);
-    corpus.select(1, path_mixed_small[0 .. 1 << 20]);
+    corpus.fillTiled(1, path_mixed[6 << 20 .. 8 << 20]);
+    corpus.fillTiled(1, path_mixed_small[0 .. 1 << 20]);
     @memcpy(path_mixed_small[1 << 20 ..][0 .. 64 * 1024], path_mixed[0 .. 64 * 1024]);
     @memset(path_mixed_small[(1 << 20) + 64 * 1024 ..][0 .. 64 * 1024], 0xa7);
     fillPeriod(path_mixed_small[(1 << 20) + 2 * 64 * 1024 ..][0 .. 64 * 1024], 4, 0x2545f4914f6cdd1d);
@@ -271,10 +271,10 @@ fn runPathological(r: *Runner) anyerror!void {
     for ([_]usize{ 0, 1, 64 * 1024, 1 << 20 }) |size| {
         for (cases) |case| try checkAtBound(r, case, path_random[0..@min(size, pathCap(case.kind))]);
     }
-    corpus.select(2, &zstd_dict);
+    corpus.fillTiled(2, &zstd_dict);
     const dict_case = Case{ .kind = .zstd, .params = &zstd_window, .dictionary = &zstd_dict };
     for (inputs) |input| try checkAtBound(r, dict_case, input);
-    corpus.select(3, &dict_text);
+    corpus.fillTiled(3, &dict_text);
     try checkAtBound(r, dict_case, &dict_text);
 }
 
@@ -282,7 +282,7 @@ var callback_direct: [384 * 1024]u8 = undefined;
 var callback_sink_buffer: [384 * 1024]u8 = undefined;
 
 fn runCallback(r: *Runner) anyerror!void {
-    corpus.select(r.corpus_index, &roundtrip_input);
+    corpus.fillTiled(r.corpus_index, &roundtrip_input);
     const input = roundtrip_input[0..];
     for (cases) |case| {
         setupCase(r, case);
@@ -365,7 +365,7 @@ fn runMisuse(r: *Runner) !void {
 }
 
 fn runGzipHeaders(r: *Runner) anyerror!void {
-    corpus.select(r.corpus_index, &roundtrip_input);
+    corpus.fillTiled(r.corpus_index, &roundtrip_input);
     const input = roundtrip_input[0..];
     harness.setup(r, harness.ids.gzip, harness.mode_stream);
     const name = "payload.txt";

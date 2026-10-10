@@ -9,12 +9,12 @@ pub const Limits = struct {
     nesting_depth: u64 = std.math.maxInt(u64),
     codec_work: u64 = std.math.maxInt(u64),
 
-    pub fn fromScalar(value: u64) Limits {
-        const limit = if (value == 0) std.math.maxInt(u64) else value;
+    pub fn fromScalar(scalar: u64) Limits {
+        const ceiling = if (scalar == 0) std.math.maxInt(u64) else scalar;
         return .{
-            .encoded_bytes = limit,
-            .decoded_bytes = limit,
-            .codec_work = limit,
+            .encoded_bytes = ceiling,
+            .decoded_bytes = ceiling,
+            .codec_work = ceiling,
         };
     }
 };

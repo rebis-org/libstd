@@ -60,14 +60,17 @@ pub fn libraryEntry(slice: AppleSlice) []const u8 {
 }
 
 pub const AndroidAbi = struct {
-    library: []const u8,
+    zip_path: []const u8,
     arch: std.Target.Cpu.Arch,
     elf_machine: u16,
 };
 
+pub const elf_aarch64: u16 = 183;
+pub const elf_x86_64: u16 = 62;
+
 pub const android_abis = [_]AndroidAbi{
-    .{ .library = "jni/arm64-v8a/libstd.so", .arch = .aarch64, .elf_machine = 183 },
-    .{ .library = "jni/x86_64/libstd.so", .arch = .x86_64, .elf_machine = 62 },
+    .{ .zip_path = "jni/arm64-v8a/libstd.so", .arch = .aarch64, .elf_machine = elf_aarch64 },
+    .{ .zip_path = "jni/x86_64/libstd.so", .arch = .x86_64, .elf_machine = elf_x86_64 },
 };
 
 // HarmonyOS (OHOS) targets for the cjpm package: cjc names these
@@ -79,6 +82,6 @@ pub const OhosAbi = struct {
 };
 
 pub const ohos_abis = [_]OhosAbi{
-    .{ .triple = "aarch64-linux-ohos", .arch = .aarch64, .elf_machine = 183 },
-    .{ .triple = "x86_64-linux-ohos", .arch = .x86_64, .elf_machine = 62 },
+    .{ .triple = "aarch64-linux-ohos", .arch = .aarch64, .elf_machine = elf_aarch64 },
+    .{ .triple = "x86_64-linux-ohos", .arch = .x86_64, .elf_machine = elf_x86_64 },
 };

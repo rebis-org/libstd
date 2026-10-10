@@ -56,26 +56,23 @@ pub fn CountingTee(comptime kinds: Kinds) type {
             return self.crc64.final();
         }
 
-        fn drain(writer: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
-            const self: *@This() = @fieldParentPtr("writer", writer);
-            if (data.len == 0) return 0;
-            var total: usize = 0;
-            for (data[0 .. data.len - 1]) |chunk| total += chunk.len;
-            total += data[data.len - 1].len * splat;
-            if (total == 0) return 0;
-            if (self.downstream) |out| {
-                for (data[0 .. data.len - 1]) |chunk| out.writeAll(chunk) catch return error.WriteFailed;
-                const last = data[data.len - 1];
-                for (0..splat) |_| out.writeAll(last) catch return error.WriteFailed;
-            }
+        fn feed(self: *@This(), part: []const u8) std.Io.Writer.Error!void {
+            if (self.downstream) |out| out.writeAll(part) catch return error.WriteFailed;
             inline for (kind_fields) |kind| {
-                if (comptime @field(kinds, @tagName(kind))) {
-                    const hasher = &@field(self, @tagName(kind));
-                    for (data[0 .. data.len - 1]) |chunk| hasher.update(chunk);
-                    const last = data[data.len - 1];
-                    for (0..splat) |_| hasher.update(last);
-                }
+                if (comptime @field(kinds, @tagName(kind))) @field(self, @tagName(kind)).update(part);
             }
+        }
+
+        fn drain(writer: *std.Io.Writer, chunks: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+            const self: *@This() = @fieldParentPtr("writer", writer);
+            if (chunks.len == 0) return 0;
+            var total: usize = 0;
+            for (chunks[0 .. chunks.len - 1]) |part| total += part.len;
+            total += chunks[chunks.len - 1].len * splat;
+            if (total == 0) return 0;
+            for (chunks[0 .. chunks.len - 1]) |part| try self.feed(part);
+            const last = chunks[chunks.len - 1];
+            for (0..splat) |_| try self.feed(last);
             self.size = std.math.add(u64, self.size, total) catch return error.WriteFailed;
             return total;
         }

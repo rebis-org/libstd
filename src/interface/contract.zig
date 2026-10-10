@@ -50,16 +50,6 @@ pub const Parameter = struct {
     representation: Representation,
 };
 
-// Bit ordering is frozen for oracle-pin compatibility.
-pub const Capability = struct {
-    pub const read: u32 = 1;
-    pub const write: u32 = 2;
-    pub const size: u32 = 4;
-    pub const replay: u32 = 8;
-    pub const seek: u32 = 16;
-    pub const range: u32 = 32;
-};
-
 pub const Limits = struct {
     window: u64 = 0,
     block: u64 = 0,
@@ -85,6 +75,6 @@ pub const Descriptor = struct {
     benchmark: ?Benchmark = null,
 };
 
-pub fn idEqual(left: Id, right: Id) bool {
-    return left.low == right.low and left.high == right.high;
+pub fn eql(first: Id, second: Id) bool {
+    return first.low == second.low and first.high == second.high;
 }

@@ -12,8 +12,7 @@ pub const Inner = switch (options.adler32_impl) {
     .mergeable => MergeableAdler(Onprem, Offprem),
 };
 
-// Both implementations expose the state as `adler`, so the wrapper in
-// checksum.zig stays implementation-neutral.
+// Both implementations carry the state as `adler`, so the finalizer reads the field directly.
 fn FixedAdler(comptime tag: seam.Provider, comptime Impl: type) type {
     return struct {
         inner: Impl = .{},
@@ -27,7 +26,7 @@ fn FixedAdler(comptime tag: seam.Provider, comptime Impl: type) type {
             self.inner.update(input);
         }
 
-        pub fn adler(self: *const @This()) u32 {
+        pub fn final(self: *const @This()) u32 {
             return self.inner.adler;
         }
     };
@@ -50,7 +49,7 @@ fn MergeableAdler(comptime On: type, comptime Off: type) type {
             }
         }
 
-        pub fn adler(self: *const @This()) u32 {
+        pub fn final(self: *const @This()) u32 {
             switch (self.state) {
                 inline else => |*inner| return inner.adler,
             }

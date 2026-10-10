@@ -36,26 +36,40 @@ const session_pairs = [_]SessionPair{
 
 const SessionKind = enum { gzip_decode, deflate_decode };
 
+const SessionImpl = struct {
+    storage: *const fn () usize,
+    session: *const fn ([]u8, sessions.Budgets) Failure!Session,
+};
+
+const session_impls = [_]SessionImpl{
+    .{ .storage = drivers.gzipDecodeStorage, .session = drivers.gzipDecodeSession },
+    .{ .storage = drivers.deflateDecodeStorage, .session = drivers.deflateDecodeSession },
+};
+
+fn implFor(kind: SessionKind) SessionImpl {
+    return session_impls[@backingInt(kind)];
+}
+
 fn matchSessionKind(component: [*:0]const u8, verb: [*:0]const u8) ?SessionKind {
     const component_name = std.mem.span(component);
     const verb_name = std.mem.span(verb);
     for (session_pairs, 0..) |pair, index| {
         if (std.mem.eql(u8, component_name, pair.component) and std.mem.eql(u8, verb_name, pair.verb)) {
-            return switch (index) {
-                0 => .gzip_decode,
-                1 => .deflate_decode,
-                else => unreachable,
-            };
+            return @fromBackingInt(@intCast(index));
         }
     }
     return null;
 }
 
+fn checkAlive(handle: ?*anyopaque) ?*Session {
+    const session: *Session = @ptrCast(@alignCast(handle orelse return null));
+    if (session.ops == &destroyed_ops) return null;
+    return session;
+}
+
 export fn stdk_session_storage(component: [*:0]const u8, verb: [*:0]const u8) callconv(.c) u64 {
-    return switch (matchSessionKind(component, verb) orelse return 0) {
-        .gzip_decode => driverStateOffset() + drivers.gzipDecodeStorage(),
-        .deflate_decode => driverStateOffset() + drivers.deflateDecodeStorage(),
-    };
+    const kind = matchSessionKind(component, verb) orelse return 0;
+    return driverStateOffset() + implFor(kind).storage();
 }
 
 // Layout is [Session record][driver state] so creation never collides with managed state.
@@ -70,10 +84,7 @@ fn createWithBudgets(
     const bytes = storage orelse return envelope.Status.invalid_call;
     if (storage_len < driverStateOffset()) return envelope.Status.insufficient_capacity;
     const state_storage = bytes[driverStateOffset()..storage_len];
-    const session = switch (kind) {
-        .gzip_decode => drivers.gzipDecodeSession(state_storage, budgets) catch |failure| return failureStatus(failure),
-        .deflate_decode => drivers.deflateDecodeSession(state_storage, budgets) catch |failure| return failureStatus(failure),
-    };
+    const session = implFor(kind).session(state_storage, budgets) catch |failure| return failureStatus(failure);
     std.mem.bytesAsValue(Session, bytes[0..@sizeOf(Session)]).* = session;
     return envelope.Status.ok;
 }
@@ -123,9 +134,8 @@ export fn stdk_session_step(
     counts_out: ?*[2]u64,
     state_out: ?*c_int,
 ) callconv(.c) u32 {
-    const session: *Session = @ptrCast(@alignCast(handle orelse return envelope.Status.invalid_call));
+    const session = checkAlive(handle) orelse return envelope.Status.invalid_call;
     const counts = counts_out orelse return envelope.Status.invalid_call;
-    if (session.ops == &destroyed_ops) return envelope.Status.invalid_call;
     const input_slice: []const u8 = if (input) |ptr| ptr[0..input_len] else &.{};
     const output_slice: []u8 = if (output) |ptr| ptr[0..output_len] else &.{};
     const result = session.step(input_slice, output_slice, end_of_input != 0);
@@ -138,7 +148,7 @@ export fn stdk_session_step(
     };
     if (result.status == .failed) {
         session.failure_status = failureStatus(result.failure orelse error.InternalFailure);
-        session.failure_detail = result.failure_value;
+        session.failure_detail = result.required_capacity;
         return failureStatus(result.failure orelse error.InternalFailure);
     }
     return envelope.Status.ok;
@@ -153,8 +163,7 @@ export fn stdk_session_failure(
     status_out: ?*u32,
     detail_out: ?*u64,
 ) callconv(.c) u32 {
-    const session: *Session = @ptrCast(@alignCast(handle orelse return envelope.Status.invalid_call));
-    if (session.ops == &destroyed_ops) return envelope.Status.invalid_call;
+    const session = checkAlive(handle) orelse return envelope.Status.invalid_call;
     if (status_out) |status| status.* = session.failure_status;
     if (detail_out) |detail| detail.* = session.failure_detail;
     return envelope.Status.ok;

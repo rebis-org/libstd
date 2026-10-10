@@ -30,12 +30,18 @@ fn addClassesJar(b: *std.Build) std.Build.LazyPath {
 fn addJniBridge(b: *std.Build, library: *std.Build.Step.Compile) void {
     const java_home = b.graph.environ_map.get("JAVA_HOME") orelse
         @panic("The Android archive needs JAVA_HOME to find jni.h.");
+    const jni_platform = switch (b.graph.host.result.os.tag) {
+        .macos => "darwin",
+        .linux => "linux",
+        .windows => "win32",
+        else => "linux",
+    };
     library.root_module.addIncludePath(b.path("build/templates/android/jni/shim"));
     library.root_module.addCSourceFile(.{
         .file = b.path("build/templates/android/jni/stdk.c"),
         .flags = &.{
             b.fmt("-I{s}", .{b.pathJoin(&.{ java_home, "include" })}),
-            b.fmt("-I{s}", .{b.pathJoin(&.{ java_home, "include", "darwin" })}),
+            b.fmt("-I{s}", .{b.pathJoin(&.{ java_home, "include", jni_platform })}),
         },
     });
 }
@@ -50,8 +56,7 @@ pub fn addArchive(
         "<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\" package=\"dev.stdk\" android:versionName=\"{d}.{d}.{d}\" android:versionCode=\"{d}\" />\n",
         .{ ctx.version.major, ctx.version.minor, ctx.version.patch, versionCode(ctx.version) },
     ));
-    _ = stage.addCopyFile(ctx.generated.header, distribution.header);
-    _ = stage.addCopyFile(ctx.generated.catalog, distribution.catalog);
+    common.stageHeaderCatalog(stage, ctx, distribution);
     _ = stage.addCopyFile(addClassesJar(b), "classes.jar");
     for (slices.android_abis) |abi| {
         const library = common.addLibrary(b, b.resolveTargetQuery(.{
@@ -61,7 +66,7 @@ pub fn addArchive(
             .android_api_level = android_api_level,
         }), ctx.optimize, .dynamic, ctx);
         addJniBridge(b, library);
-        _ = stage.addCopyFile(library.getEmittedBin(), abi.library);
+        _ = stage.addCopyFile(library.getEmittedBin(), abi.zip_path);
     }
     return common.addZipArchive(b, distribution, stage);
 }

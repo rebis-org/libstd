@@ -18,11 +18,11 @@ pub fn limitedLengths(freqs: []const u32, lengths: []u8, limit: u8) void {
         lengths[used[0]] = 1;
         return;
     }
-    for (1..count) |i| {
-        const symbol = used[i];
-        var j = i;
-        while (j > 0 and freqs[used[j - 1]] > freqs[symbol]) : (j -= 1) used[j] = used[j - 1];
-        used[j] = symbol;
+    for (1..count) |hole| {
+        const symbol = used[hole];
+        var candidate = hole;
+        while (candidate > 0 and freqs[used[candidate - 1]] > freqs[symbol]) : (candidate -= 1) used[candidate] = used[candidate - 1];
+        used[candidate] = symbol;
     }
     var weight: [max_nodes]u32 = undefined;
     var parent: [max_nodes]u16 = undefined;
@@ -50,18 +50,18 @@ pub fn limitedLengths(freqs: []const u32, lengths: []u8, limit: u8) void {
     for (0..count) |i| bl_count[@min(depth[i], limit)] += 1;
     // Overflow counts in 2^-limit units, so each pull-up repairs two units.
     while (overflow > 0) {
-        var bits: usize = limit - 1;
-        while (bl_count[bits] == 0) bits -= 1;
-        bl_count[bits] -= 1;
-        bl_count[bits + 1] += 2;
+        var width: usize = limit - 1;
+        while (bl_count[width] == 0) width -= 1;
+        bl_count[width] -= 1;
+        bl_count[width + 1] += 2;
         bl_count[limit] -= 1;
         overflow -= 2;
     }
     var position: usize = 0;
-    var bits: usize = limit;
-    while (bits >= 1) : (bits -= 1) {
-        for (0..bl_count[bits]) |_| {
-            lengths[used[position]] = @intCast(bits);
+    var width: usize = limit;
+    while (width >= 1) : (width -= 1) {
+        for (0..bl_count[width]) |_| {
+            lengths[used[position]] = @intCast(width);
             position += 1;
         }
     }

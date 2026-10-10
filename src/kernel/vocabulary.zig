@@ -8,9 +8,7 @@ const envelope = @import("envelope.zig");
 const Id = envelope.Id;
 const Status = envelope.Status;
 
-// Wire values are frozen ABI. Per-profile policy lives in compose, per-component
-// declaration in the descriptor files.
-
+// Wire values are frozen ABI.
 pub const DescriptorKind = enum(u32) {
     command,
     parameter,
@@ -134,9 +132,9 @@ pub fn directionOf(selector_value: Selector) Direction {
 }
 
 pub fn commandMaskForId(id: Id) u32 {
-    if (idEqual(id, ids.query)) return command_mask_query;
-    if (idEqual(id, ids.read)) return command_mask_read;
-    if (idEqual(id, ids.write)) return command_mask_write;
+    if (eql(id, ids.query)) return command_mask_query;
+    if (eql(id, ids.read)) return command_mask_read;
+    if (eql(id, ids.write)) return command_mask_write;
     return 0;
 }
 
@@ -267,10 +265,10 @@ pub const error_map = [_]ErrorMap{
     .{ .failure = error.IoFailure, .name = "io_failure", .status = Status.io_failure, .diagnostic = ids.io_failure },
 };
 
-pub fn idEqual(left: Id, right: Id) bool {
-    return left.low == right.low and left.high == right.high;
+pub fn eql(first: Id, second: Id) bool {
+    return first.low == second.low and first.high == second.high;
 }
 
-pub fn idIsZero(id: Id) bool {
-    return idEqual(id, .{ .low = 0, .high = 0 });
+pub fn isZero(id: Id) bool {
+    return eql(id, .{ .low = 0, .high = 0 });
 }

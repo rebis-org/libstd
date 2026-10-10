@@ -337,20 +337,20 @@ fn decodeBlockHeader(cursor: *binary.ReadCursor, provider: checksum.Provider) Fa
     try verifyCrc32(header_bytes[0 .. header_size - 4], header_crc, provider);
     var sub = binary.ReadCursor.init(header_bytes[2 .. header_size - 4]);
     const compressed_size: ?usize = if (has_compressed_size) blk: {
-        const value = try sub.readULEB128();
+        const value = try sub.readUleb128();
         if (value == 0) return error.InvalidData;
         break :blk std.math.cast(usize, value) orelse return error.ResourceLimit;
     } else null;
     const uncompressed_size: ?usize = if (has_uncompressed_size)
-        std.math.cast(usize, try sub.readULEB128()) orelse return error.ResourceLimit
+        std.math.cast(usize, try sub.readUleb128()) orelse return error.ResourceLimit
     else
         null;
     var dictionary_props: ?u8 = null;
     var filters: [4]Filter = undefined;
     var filter_count: usize = 0;
     for (0..requested_filter_count) |_| {
-        const filter_id = try sub.readULEB128();
-        const props_size = try sub.readULEB128();
+        const filter_id = try sub.readUleb128();
+        const props_size = try sub.readUleb128();
         if (props_size > sub.remaining()) return error.InvalidData;
         switch (filter_id) {
             0x21 => {
@@ -446,11 +446,11 @@ fn decodeIndex(cursor: *binary.ReadCursor, records: IndexRecordList, provider: c
     const index_start = cursor.pos;
     if (cursor.remaining() == 0 or cursor.buffer[cursor.pos] != 0x00) return error.InvalidData;
     _ = try cursor.readU8();
-    const record_count = try cursor.readULEB128();
+    const record_count = try cursor.readUleb128();
     if (record_count != records.len) return error.IntegrityFailure;
     for (records.slice()) |expected| {
-        const unpadded = try cursor.readULEB128();
-        const uncompressed = try cursor.readULEB128();
+        const unpadded = try cursor.readUleb128();
+        const uncompressed = try cursor.readUleb128();
         if (unpadded != expected.unpadded_size or uncompressed != expected.uncompressed_size) return error.IntegrityFailure;
     }
     const content_size = cursor.pos - index_start;
@@ -626,14 +626,14 @@ const BlockHeader = struct {
 fn buildBlockHeader(uncompressed_size: usize, dictionary_props: u8, filters: FilterChoice, delta_distance: u8, provider: checksum.Provider) Failure!BlockHeader {
     var content: [60]u8 = undefined;
     var cursor = binary.WriteCursor.init(&content);
-    cursor.writeULEB128(uncompressed_size) catch return error.InternalFailure;
+    cursor.writeUleb128(uncompressed_size) catch return error.InternalFailure;
     if (filters != .none) {
-        cursor.writeULEB128(filterId(filters)) catch return error.InternalFailure;
-        cursor.writeULEB128(filterPropsSize(filters)) catch return error.InternalFailure;
+        cursor.writeUleb128(filterId(filters)) catch return error.InternalFailure;
+        cursor.writeUleb128(filterPropsSize(filters)) catch return error.InternalFailure;
         if (filters == .delta) cursor.writeU8(delta_distance) catch return error.InternalFailure;
     }
-    cursor.writeULEB128(0x21) catch return error.InternalFailure;
-    cursor.writeULEB128(1) catch return error.InternalFailure;
+    cursor.writeUleb128(0x21) catch return error.InternalFailure;
+    cursor.writeUleb128(1) catch return error.InternalFailure;
     cursor.writeU8(dictionary_props) catch return error.InternalFailure;
     const content_size = cursor.written();
     const header_without_crc = 2 + content_size;
@@ -685,9 +685,9 @@ fn writeIndex(writer: *std.Io.Writer, unpadded_size: usize, uncompressed_size: u
     var content: [48]u8 = undefined;
     var cursor = binary.WriteCursor.init(&content);
     cursor.writeU8(0x00) catch return error.InternalFailure;
-    cursor.writeULEB128(1) catch return error.InternalFailure;
-    cursor.writeULEB128(unpadded_size) catch return error.InternalFailure;
-    cursor.writeULEB128(uncompressed_size) catch return error.InternalFailure;
+    cursor.writeUleb128(1) catch return error.InternalFailure;
+    cursor.writeUleb128(unpadded_size) catch return error.InternalFailure;
+    cursor.writeUleb128(uncompressed_size) catch return error.InternalFailure;
     const content_size = cursor.written();
     const padding = blockPadding(content_size);
     var crc = checksum.Crc32.bind(provider);

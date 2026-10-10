@@ -22,6 +22,14 @@ pub const Adler32 = struct {
         return self.adler;
     }
 
+    fn step16(s1: *u32, s2: *u32, block: *const [16]u8) void {
+        comptime var j: usize = 0;
+        inline while (j < 16) : (j += 1) {
+            s1.* +%= block[j];
+            s2.* +%= s1.*;
+        }
+    }
+
     fn permute(state: u32, input: []const u8) u32 {
         var s1 = state & 0xffff;
         var s2 = (state >> 16) & 0xffff;
@@ -44,22 +52,14 @@ pub const Adler32 = struct {
             while (index + nmax <= input.len) {
                 var done: usize = 0;
                 while (done < rounds) : (done += 1) {
-                    comptime var j: usize = 0;
-                    inline while (j < 16) : (j += 1) {
-                        s1 +%= input[index + j];
-                        s2 +%= s1;
-                    }
+                    step16(&s1, &s2, input[index..][0..16]);
                     index += 16;
                 }
                 s1 %= base;
                 s2 %= base;
             }
             while (index + 16 <= input.len) : (index += 16) {
-                comptime var j: usize = 0;
-                inline while (j < 16) : (j += 1) {
-                    s1 +%= input[index + j];
-                    s2 +%= s1;
-                }
+                step16(&s1, &s2, input[index..][0..16]);
             }
             while (index < input.len) : (index += 1) {
                 s1 +%= input[index];

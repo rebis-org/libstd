@@ -42,14 +42,12 @@ const Result = struct {
     }
 };
 
-fn spawn(init: std.process.Init, argv: []const []const u8, cwd: ?[]const u8) Result {
+fn spawn(init: std.process.Init, argv: []const []const u8, cwd: ?[]const u8) !Result {
     const options = std.process.RunOptions{
         .argv = argv,
         .cwd = if (cwd) |path| .{ .path = path } else .inherit,
     };
-    const result = std.process.run(std.heap.page_allocator, init.io, options) catch {
-        return .{ .term = .{ .exited = 1 }, .stdout = &.{}, .stderr = &.{} };
-    };
+    const result = try std.process.run(std.heap.page_allocator, init.io, options);
     return .{ .term = result.term, .stdout = result.stdout, .stderr = result.stderr };
 }
 
@@ -58,10 +56,11 @@ pub fn output(init: std.process.Init, argv: []const []const u8) ![]u8 {
 }
 
 pub fn outputCwd(init: std.process.Init, cwd: ?[]const u8, argv: []const []const u8) ![]u8 {
-    var result = spawn(init, argv, cwd);
+    var result = spawn(init, argv, cwd) catch return error.spawn_failed;
     if (!result.success()) {
+        std.debug.print("command failed: {s}\n{s}\n", .{ argv[0], result.stderr });
         result.deinit();
-        return error.CommandFailed;
+        return error.command_failed;
     }
     return result.detach();
 }
@@ -72,7 +71,7 @@ pub fn silent(init: std.process.Init, argv: []const []const u8) !void {
 }
 
 pub fn exitCode(init: std.process.Init, argv: []const []const u8) u8 {
-    var result = spawn(init, argv, null);
+    var result = spawn(init, argv, null) catch return 1;
     defer result.deinit();
     return switch (result.term) {
         .exited => |code| code,

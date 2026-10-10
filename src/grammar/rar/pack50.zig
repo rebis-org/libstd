@@ -9,6 +9,9 @@ const finder_mod = @import("finder.zig");
 const MatchFinder = finder_mod.MatchFinder;
 const LzToken = finder_mod.LzToken;
 const unpack50 = @import("unpack50.zig");
+const filters50 = @import("filters50.zig");
+const facade = @import("../rar.zig");
+const common_sink = @import("../../common/sink.zig");
 
 // Nothing allocates. Staging needs 2x the input plus slack because the worst case is
 // ~8 bits per symbol plus the tables, and matches only shrink it.
@@ -469,17 +472,17 @@ test "compress block round-trips through the unpack50 decoder" {
     // window bytes, then filter_scratch_extra of working space sliced at max_filter_block.
     var window_buf: [4096]u8 = undefined;
     var pool: [unpack50.table_pool_words * 4]u16 = undefined;
-    var pending: [unpack50.max_pending_filters]@import("filters50.zig").Filter = undefined;
+    var pending: [unpack50.max_pending_filters]filters50.Filter = undefined;
     const filter_scratch = try std.heap.page_allocator.alloc(
         u8,
-        window_buf.len + @import("../rar.zig").filter_scratch_extra,
+        window_buf.len + facade.filter_scratch_extra,
     );
     defer std.heap.page_allocator.free(filter_scratch);
     var st: unpack50.State = undefined;
     var session = try unpack50.Session.init(&st, &window_buf, &pool, &pending, filter_scratch, false);
 
     var out: [4096]u8 = undefined;
-    var bs = @import("../../common/sink.zig").BufferSink.init(&out);
+    var bs = common_sink.BufferSink.init(&out);
     try session.decodeFile(compressed[0..written], data.len, false, bs.sink());
     try std.testing.expect(!bs.overflowed);
     try std.testing.expectEqualSlices(u8, data, out[0..data.len]);

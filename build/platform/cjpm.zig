@@ -13,8 +13,7 @@ pub fn addArchive(
     const stage = b.addWriteFiles();
     _ = stage.add("stdk/cjpm.toml", tomlText(b, ctx));
     _ = stage.addCopyFile(b.path("build/templates/cjpm/stdk.cj"), "stdk/src/stdk.cj");
-    _ = stage.addCopyFile(ctx.generated.header, distribution.header);
-    _ = stage.addCopyFile(ctx.generated.catalog, distribution.catalog);
+    common.stageHeaderCatalog(stage, ctx, distribution);
     for (slices.ohos_abis) |abi| {
         const resolved = b.resolveTargetQuery(.{
             .cpu_arch = abi.arch,
@@ -42,14 +41,14 @@ fn tomlText(b: *std.Build, ctx: *const common.Context) []const u8 {
         \\  output-type = "static"
         \\  src-dir = "src"
         \\
-    , .{ ctx.version.major, ctx.version.minor, ctx.version.patch })) catch @panic("OOM");
+    , .{ ctx.version.major, ctx.version.minor, ctx.version.patch })) catch @panic("the cjpm manifest is out of memory.");
     for (slices.ohos_abis) |abi| {
         text.appendSlice(b.allocator, b.fmt(
             \\
             \\[target.{s}.ffi.c]
             \\  std = {{ path = "libs/{s}" }}
             \\
-        , .{ abi.triple, abi.triple })) catch @panic("OOM");
+        , .{ abi.triple, abi.triple })) catch @panic("the cjpm target entry is out of memory.");
     }
     return text.items;
 }

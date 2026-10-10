@@ -211,9 +211,7 @@ pub const Provider = seam.Provider;
 pub const default_provider = seam.default_provider;
 
 pub fn crc32(input: []const u8) u32 {
-    var hash = Crc32.init();
-    hash.update(input);
-    return hash.final();
+    return crc32With(default_provider, input);
 }
 
 pub fn crc32With(provider: seam.Provider, input: []const u8) u32 {
@@ -232,9 +230,7 @@ pub const XxHash64 = xxh64_seam.XxHash64;
 pub const XxHash32 = xxh32_seam.XxHash32;
 
 pub fn xxh64(input: []const u8) u64 {
-    var hasher = XxHash64.init(0);
-    hasher.update(input);
-    return hasher.final();
+    return xxh64With(default_provider, input);
 }
 
 pub fn xxh64With(provider: seam.Provider, input: []const u8) u64 {
@@ -259,9 +255,13 @@ pub const Adler32 = struct {
     }
 
     pub fn final(self: *const Adler32) u32 {
-        return self.inner.adler();
+        return self.inner.final();
     }
 };
+
+pub fn adler32(input: []const u8) u32 {
+    return adler32With(default_provider, input);
+}
 
 fn TableCrc(comptime T: type, comptime poly: T, comptime reflected: bool) type {
     const bits = @bitSizeOf(T);
@@ -348,26 +348,18 @@ fn TableCrc(comptime T: type, comptime poly: T, comptime reflected: bool) type {
     };
 }
 
-pub fn adler32(input: []const u8) u32 {
-    var hasher = Adler32.init();
-    hasher.update(input);
-    return hasher.final();
-}
-
 pub fn adler32With(provider: seam.Provider, input: []const u8) u32 {
     var hasher = Adler32.bind(provider);
     hasher.update(input);
     return hasher.final();
 }
 
-pub fn xxh32With(provider: seam.Provider, input: []const u8) u32 {
-    var hasher = XxHash32.bind(provider, 0);
-    hasher.update(input);
-    return hasher.final();
+pub fn xxh32(input: []const u8) u32 {
+    return xxh32With(default_provider, input);
 }
 
-pub fn xxh32(input: []const u8) u32 {
-    var hasher = XxHash32.init(0);
+pub fn xxh32With(provider: seam.Provider, input: []const u8) u32 {
+    var hasher = XxHash32.bind(provider, 0);
     hasher.update(input);
     return hasher.final();
 }

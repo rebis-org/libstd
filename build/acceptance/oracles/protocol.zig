@@ -7,7 +7,7 @@ const Runner = harness.Runner;
 
 fn setup(r: *Runner) !void {
     harness.setup(r, harness.ids.test_echo, harness.mode_protocol);
-    corpus.select(r.corpus_index, r.corpus_buffer[0..]);
+    corpus.fillTiled(r.corpus_index, r.corpus_buffer[0..]);
     r.input = r.corpus_buffer[0..];
 }
 

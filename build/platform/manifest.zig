@@ -80,7 +80,7 @@ fn androidEntries() []const []const u8 {
         tmp[1] = "include/stdk.h";
         tmp[2] = "assets/stdk.catalog.json";
         tmp[3] = "classes.jar";
-        inline for (slices.android_abis, 0..) |abi, index| tmp[4 + index] = abi.library;
+        inline for (slices.android_abis, 0..) |abi, index| tmp[4 + index] = abi.zip_path;
         break :blk tmp;
     };
     return &entries;
@@ -94,19 +94,12 @@ fn appleEntries() []const []const u8 {
         tmp[1] = "StdK.xcframework/stdk.catalog.json";
         inline for (slices.apple_slices, 0..) |slice, index| {
             const root = std.fmt.comptimePrint("StdK.xcframework/{s}/{s}", .{ slice.id, slices.framework_bundle });
-            if (slices.isMacos(slice)) {
-                tmp[2 + 5 * index] = root ++ "/Versions/A/" ++ slices.framework_binary;
-                tmp[2 + 5 * index + 1] = root ++ "/Versions/A/Headers/stdk.h";
-                tmp[2 + 5 * index + 2] = root ++ "/Versions/A/Headers/module.modulemap";
-                tmp[2 + 5 * index + 3] = root ++ "/Versions/A/Modules/module.modulemap";
-                tmp[2 + 5 * index + 4] = root ++ "/Versions/A/Resources/Info.plist";
-            } else {
-                tmp[2 + 5 * index] = root ++ "/" ++ slices.framework_binary;
-                tmp[2 + 5 * index + 1] = root ++ "/Headers/stdk.h";
-                tmp[2 + 5 * index + 2] = root ++ "/Headers/module.modulemap";
-                tmp[2 + 5 * index + 3] = root ++ "/Modules/module.modulemap";
-                tmp[2 + 5 * index + 4] = root ++ "/Info.plist";
-            }
+            const prefix = if (slices.isMacos(slice)) "Versions/A/" else "";
+            tmp[2 + 5 * index] = root ++ "/" ++ prefix ++ slices.framework_binary;
+            tmp[2 + 5 * index + 1] = root ++ "/" ++ prefix ++ "Headers/stdk.h";
+            tmp[2 + 5 * index + 2] = root ++ "/" ++ prefix ++ "Headers/module.modulemap";
+            tmp[2 + 5 * index + 3] = root ++ "/" ++ prefix ++ "Modules/module.modulemap";
+            tmp[2 + 5 * index + 4] = if (slices.isMacos(slice)) root ++ "/Versions/A/Resources/Info.plist" else root ++ "/Info.plist";
         }
         break :blk tmp;
     };

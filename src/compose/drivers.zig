@@ -70,13 +70,7 @@ pub const GzipDecodeState = struct {
             }
             self.inflater.input.slice.pos = 0;
         }
-        self.leftover = self.pending_len;
-        if (input.len > self.pending.len - self.pending_len) {
-            result.failure_value = input.len - (self.pending.len - self.pending_len);
-            return error.InsufficientCapacity;
-        }
-        @memcpy(self.pending[self.pending_len..][0..input.len], input);
-        self.pending_len += input.len;
+        try appendStaged(self.pending[0..], &self.pending_len, &self.leftover, input, result);
         self.inflater.input.slice.data = self.pending[0..self.pending_len];
     }
 
@@ -85,6 +79,16 @@ pub const GzipDecodeState = struct {
         return if (self.phase == .deflate) self.inflater.input.slice.pos else self.frame_pos;
     }
 };
+
+fn appendStaged(pending: []u8, pending_len: *usize, leftover: *usize, input: []const u8, result: *StepResult) Failure!void {
+    leftover.* = pending_len.*;
+    if (input.len > pending.len - pending_len.*) {
+        result.required_capacity = input.len - (pending.len - pending_len.*);
+        return error.InsufficientCapacity;
+    }
+    @memcpy(pending[pending_len.*..][0..input.len], input);
+    pending_len.* += input.len;
+}
 
 pub fn gzipDecodeStorage() usize {
     return std.mem.alignForward(usize, @sizeOf(GzipDecodeState), 16) + deflate.history_size;
@@ -403,13 +407,7 @@ pub const DeflateDecodeState = struct {
             self.pending_len -= consumed;
             self.inflater.input.slice.pos = 0;
         }
-        self.leftover = self.pending_len;
-        if (input.len > self.pending.len - self.pending_len) {
-            result.failure_value = input.len - (self.pending.len - self.pending_len);
-            return error.InsufficientCapacity;
-        }
-        @memcpy(self.pending[self.pending_len..][0..input.len], input);
-        self.pending_len += input.len;
+        try appendStaged(self.pending[0..], &self.pending_len, &self.leftover, input, result);
         self.inflater.input.slice.data = self.pending[0..self.pending_len];
     }
 };
@@ -450,17 +448,10 @@ pub fn deflateDecodeSession(storage: []u8, budgets: sessions.Budgets) error{Insu
     return .{ .state = state, .ops = &deflate_decode_ops };
 }
 
-fn deflateFramingFailed(result: *StepResult, consumed: usize, failure: Failure) StepResult {
-    result.consumed = consumed;
-    result.status = .failed;
-    result.failure = failure;
-    return result.*;
-}
-
 pub fn deflateDecodeStep(state: *DeflateDecodeState, input: []const u8, output: []u8, end_of_input: bool) StepResult {
     var result = StepResult{};
     state.restage(input, &result) catch |failure| {
-        return deflateFramingFailed(&result, 0, failure);
+        return framingFailed(&result, 0, failure);
     };
     if (!state.started) {
         state.inflater = deflate.Decompress.initSlice(state.pending[0..state.pending_len], state.history);
@@ -474,7 +465,7 @@ pub fn deflateDecodeStep(state: *DeflateDecodeState, input: []const u8, output: 
             if (partial > 0) {
                 result.produced += partial;
                 state.budgets.addDecoded(partial) catch |failure| {
-                    return deflateFramingFailed(&result, input.len, failure);
+                    return framingFailed(&result, input.len, failure);
                 };
             }
             const starved = state.inflater.input.slice.pos == state.pending_len;
@@ -484,11 +475,11 @@ pub fn deflateDecodeStep(state: *DeflateDecodeState, input: []const u8, output: 
                 result.status = .open;
                 return result;
             }
-            return deflateFramingFailed(&result, input.len, error.InvalidData);
+            return framingFailed(&result, input.len, error.InvalidData);
         };
         result.produced += emitted;
         state.budgets.addDecoded(emitted) catch |failure| {
-            return deflateFramingFailed(&result, input.len, failure);
+            return framingFailed(&result, input.len, failure);
         };
     }
     if (state.inflater.state == .end) {
@@ -504,7 +495,7 @@ pub fn deflateDecodeStep(state: *DeflateDecodeState, input: []const u8, output: 
         const consumed_bits = state.inflater.inputBitsConsumed();
         state.stream_end = (consumed_bits + 7) / 8;
         if (state.stream_end != state.pending_len) {
-            return deflateFramingFailed(&result, input.len, error.InvalidData);
+            return framingFailed(&result, input.len, error.InvalidData);
         }
         result.consumed = input.len;
         result.status = .done;
@@ -512,7 +503,7 @@ pub fn deflateDecodeStep(state: *DeflateDecodeState, input: []const u8, output: 
     }
     result.consumed = input.len;
     if (end_of_input and state.inflater.input.slice.pos == state.pending_len) {
-        return deflateFramingFailed(&result, input.len, error.InvalidData);
+        return framingFailed(&result, input.len, error.InvalidData);
     }
     result.status = .open;
     return result;

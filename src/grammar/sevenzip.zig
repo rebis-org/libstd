@@ -43,7 +43,7 @@ pub const CoderMethod = enum {
     bcj2,
 };
 
-pub const SevenZipEntry = struct {
+pub const Entry = struct {
     name: []const u8,
     data: []const u8,
     method: CoderMethod = .copy,
@@ -61,7 +61,7 @@ pub const SevenZipEntry = struct {
     password_lifetime: u64 = 0,
 };
 
-pub const SevenZipInfo = struct {
+pub const Info = struct {
     name: []const u8,
     size: u64,
     is_directory: bool,
@@ -209,7 +209,7 @@ fn packBuffer(comptime codec: type, method: CoderMethod, input: []const u8, unpa
     return .{ .method = method, .data = packed_data, .crc = unpacked_crc, .pack_size = packed_size, .unpack_size = input.len };
 }
 
-fn packEntry(entry: SevenZipEntry, provider: crypto.Provider, workspace: *Workspace, limits: Limits, failure_cause: *crypto.FailureCause) Failure!PackedEntry {
+fn packEntry(entry: Entry, provider: crypto.Provider, workspace: *Workspace, limits: Limits, failure_cause: *crypto.FailureCause) Failure!PackedEntry {
     if (entry.encrypted) {
         if (entry.password.len == 0) return error.InvalidCall;
         if (entry.num_cycles_power > crypto.seven_zip_cycles_max) return error.InvalidCall;
@@ -323,7 +323,7 @@ fn applyEncodeFilter(method: CoderMethod, data: []u8) Failure!void {
     }
 }
 
-fn packAllEntries(entries: []const SevenZipEntry, provider: crypto.Provider, workspace: *Workspace, limits: Limits, failure_cause: *crypto.FailureCause) Failure![]const PackedEntry {
+fn packAllEntries(entries: []const Entry, provider: crypto.Provider, workspace: *Workspace, limits: Limits, failure_cause: *crypto.FailureCause) Failure![]const PackedEntry {
     const packed_entries = try workspace.take(PackedEntry, nonEmptyCount(entries));
     var index: usize = 0;
     var i: usize = 0;
@@ -393,12 +393,12 @@ fn packAllEntries(entries: []const SevenZipEntry, provider: crypto.Provider, wor
     return packed_entries[0..index];
 }
 
-pub fn sevenZipPack(entries: []const SevenZipEntry, provider: crypto.Provider, workspace: *Workspace, limits: Limits, failure_cause: *crypto.FailureCause) Failure![]const PackedEntry {
+pub fn sevenZipPack(entries: []const Entry, provider: crypto.Provider, workspace: *Workspace, limits: Limits, failure_cause: *crypto.FailureCause) Failure![]const PackedEntry {
     failure_cause.* = .none;
     return try packAllEntries(entries, provider, workspace, limits, failure_cause);
 }
 
-fn requiredSizeFromPacked(entries: []const SevenZipEntry, packed_entries: []const PackedEntry, workspace: *Workspace) Failure!usize {
+fn requiredSizeFromPacked(entries: []const Entry, packed_entries: []const PackedEntry, workspace: *Workspace) Failure!usize {
     var total_pack_size: usize = 0;
     const plan = try buildFolderPlan(packed_entries, workspace);
     for (plan) |folder| total_pack_size = try bounds.addUsize(total_pack_size, packed_entries[folder.first].data.len);
@@ -409,11 +409,11 @@ fn requiredSizeFromPacked(entries: []const SevenZipEntry, packed_entries: []cons
     return std.math.cast(usize, total) orelse error.ResourceLimit;
 }
 
-pub fn sevenZipPackedSize(entries: []const SevenZipEntry, packed_entries: []const PackedEntry, workspace: *Workspace) Failure!usize {
+pub fn sevenZipPackedSize(entries: []const Entry, packed_entries: []const PackedEntry, workspace: *Workspace) Failure!usize {
     return try requiredSizeFromPacked(entries, packed_entries, workspace);
 }
 
-fn writeArchive(output: []u8, entries: []const SevenZipEntry, packed_entries: []const PackedEntry, workspace: *Workspace, provider: crypto.Provider) Failure!usize {
+fn writeArchive(output: []u8, entries: []const Entry, packed_entries: []const PackedEntry, workspace: *Workspace, provider: crypto.Provider) Failure!usize {
     const required = try requiredSizeFromPacked(entries, packed_entries, workspace);
     if (output.len < required) return error.InsufficientCapacity;
     var total_pack_size: usize = 0;
@@ -440,7 +440,7 @@ fn writeArchive(output: []u8, entries: []const SevenZipEntry, packed_entries: []
     return required;
 }
 
-pub fn sevenZipWritePacked(entries: []const SevenZipEntry, packed_entries: []const PackedEntry, output: []u8, workspace: *Workspace, provider: crypto.Provider) Failure!usize {
+pub fn sevenZipWritePacked(entries: []const Entry, packed_entries: []const PackedEntry, output: []u8, workspace: *Workspace, provider: crypto.Provider) Failure!usize {
     return try writeArchive(output, entries, packed_entries, workspace, provider);
 }
 
@@ -449,7 +449,7 @@ pub fn sevenZipInspectCount(archive_bytes: []const u8, workspace: *Workspace, li
     return loaded.count;
 }
 
-pub fn sevenZipInspectOrdinal(archive_bytes: []const u8, workspace: *Workspace, limits: Limits, ordinal: u64, provider: crypto.Provider) Failure!SevenZipInfo {
+pub fn sevenZipInspectOrdinal(archive_bytes: []const u8, workspace: *Workspace, limits: Limits, ordinal: u64, provider: crypto.Provider) Failure!Info {
     const loaded = try loadArchive(archive_bytes, workspace, limits, provider);
     if (ordinal >= loaded.count) return error.InvalidData;
     return loaded.entries[ordinal];
@@ -694,7 +694,7 @@ fn bcjKindFromMethod(method: CoderMethod) bcj.Kind {
 const LoadedArchive = struct {
     data: []const u8,
     count: u64,
-    entries: []const SevenZipInfo,
+    entries: []const Info,
 };
 
 fn readAt(data: []const u8, offset: u64, buffer: []u8) Failure!void {
@@ -1305,9 +1305,9 @@ fn skipArchiveProperties(cursor: *binary.ReadCursor) Failure!void {
     }
 }
 
-fn buildEntries(si: *const StreamsInfo, fi: *const FilesInfo, workspace: *Workspace, limits: Limits) Failure![]const SevenZipInfo {
+fn buildEntries(si: *const StreamsInfo, fi: *const FilesInfo, workspace: *Workspace, limits: Limits) Failure![]const Info {
     const count = fi.names.len;
-    const entries = try workspace.take(SevenZipInfo, count);
+    const entries = try workspace.take(Info, count);
     var folder_index: usize = 0;
     var substream_index: usize = 0;
     var substream_offset: u64 = 0;
@@ -1414,7 +1414,7 @@ fn folderOutputSize(folder: *const Folder) Failure!usize {
     return total;
 }
 
-fn writeHeader(writer: *std.Io.Writer, entries: []const SevenZipEntry, packed_entries: []const PackedEntry, workspace: *Workspace) Failure!void {
+fn writeHeader(writer: *std.Io.Writer, entries: []const Entry, packed_entries: []const PackedEntry, workspace: *Workspace) Failure!void {
     try io.writeBytes(writer, &.{0x01});
     try io.writeBytes(writer, &.{0x04});
     try writeStreamsInfo(writer, entries, packed_entries, workspace);
@@ -1449,7 +1449,7 @@ fn buildFolderPlan(packed_entries: []const PackedEntry, workspace: *Workspace) F
     return plan[0..plan_count];
 }
 
-fn folderUnpackSize(entries: []const SevenZipEntry, folder: FolderPlan) Failure!usize {
+fn folderUnpackSize(entries: []const Entry, folder: FolderPlan) Failure!usize {
     var total: usize = 0;
     var index: usize = 0;
     for (entries) |entry| {
@@ -1465,7 +1465,7 @@ fn folderUnpackSize(entries: []const SevenZipEntry, folder: FolderPlan) Failure!
     return total;
 }
 
-fn writeStreamsInfo(writer: *std.Io.Writer, entries: []const SevenZipEntry, packed_entries: []const PackedEntry, workspace: *Workspace) Failure!void {
+fn writeStreamsInfo(writer: *std.Io.Writer, entries: []const Entry, packed_entries: []const PackedEntry, workspace: *Workspace) Failure!void {
     const plan = try buildFolderPlan(packed_entries, workspace);
     try io.writeBytes(writer, &.{0x06});
     try writeUint64(writer, 0);
@@ -1591,17 +1591,17 @@ fn writeCoderAttributes(writer: *std.Io.Writer, method: CoderMethod, unpacked_cr
     }
 }
 
-fn writeFilesInfo(writer: *std.Io.Writer, entries: []const SevenZipEntry, workspace: *Workspace) Failure!void {
+fn writeFilesInfo(writer: *std.Io.Writer, entries: []const Entry, workspace: *Workspace) Failure!void {
     try io.writeBytes(writer, &.{0x05});
     try writeUint64(writer, entries.len);
     const empty_count = emptyCount(entries);
     if (empty_count > 0) {
         try writeSizedProperty(writer, workspace, 0x0E, struct {
-            entries: []const SevenZipEntry,
+            entries: []const Entry,
 
             fn write(self: @This(), w: *std.Io.Writer) Failure!void {
                 try writeBitVector(w, self.entries.len, struct {
-                    entries: []const SevenZipEntry,
+                    entries: []const Entry,
 
                     fn get(c: @This(), i: usize) bool {
                         return isEmptyEntry(c.entries[i]);
@@ -1610,12 +1610,12 @@ fn writeFilesInfo(writer: *std.Io.Writer, entries: []const SevenZipEntry, worksp
             }
         }{ .entries = entries });
         try writeSizedProperty(writer, workspace, 0x0F, struct {
-            entries: []const SevenZipEntry,
+            entries: []const Entry,
 
             fn write(self: @This(), w: *std.Io.Writer) Failure!void {
                 const empty_count2 = emptyCount(self.entries);
                 try writeBitVector(w, empty_count2, struct {
-                    entries: []const SevenZipEntry,
+                    entries: []const Entry,
 
                     fn get(c: @This(), i: usize) bool {
                         return emptyFileAt(c.entries, i);
@@ -1625,7 +1625,7 @@ fn writeFilesInfo(writer: *std.Io.Writer, entries: []const SevenZipEntry, worksp
         }{ .entries = entries });
     }
     try writeSizedProperty(writer, workspace, 0x11, struct {
-        entries: []const SevenZipEntry,
+        entries: []const Entry,
 
         fn write(self: @This(), w: *std.Io.Writer) Failure!void {
             try io.writeBytes(w, &.{0x00});
@@ -1635,7 +1635,7 @@ fn writeFilesInfo(writer: *std.Io.Writer, entries: []const SevenZipEntry, worksp
         }
     }{ .entries = entries });
     try writeSizedProperty(writer, workspace, 0x14, struct {
-        entries: []const SevenZipEntry,
+        entries: []const Entry,
 
         fn write(self: @This(), w: *std.Io.Writer) Failure!void {
             try io.writeBytes(w, &.{ 0x01, 0x00 });
@@ -1646,7 +1646,7 @@ fn writeFilesInfo(writer: *std.Io.Writer, entries: []const SevenZipEntry, worksp
         }
     }{ .entries = entries });
     try writeSizedProperty(writer, workspace, 0x15, struct {
-        entries: []const SevenZipEntry,
+        entries: []const Entry,
 
         fn write(self: @This(), w: *std.Io.Writer) Failure!void {
             try io.writeBytes(w, &.{ 0x01, 0x00 });
@@ -1684,15 +1684,15 @@ fn writeSizedProperty(writer: *std.Io.Writer, workspace: *Workspace, id: u8, ctx
     try io.writeBytes(writer, buffer);
 }
 
-fn isEmptyEntry(entry: SevenZipEntry) bool {
+fn isEmptyEntry(entry: Entry) bool {
     return entry.data.len == 0 or (entry.name.len > 0 and entry.name[entry.name.len - 1] == '/');
 }
 
-fn isDirectoryEntry(entry: SevenZipEntry) bool {
+fn isDirectoryEntry(entry: Entry) bool {
     return entry.name.len > 0 and entry.name[entry.name.len - 1] == '/';
 }
 
-fn nonEmptyCount(entries: []const SevenZipEntry) usize {
+fn nonEmptyCount(entries: []const Entry) usize {
     var count: usize = 0;
     for (entries) |entry| {
         if (!isEmptyEntry(entry)) count += 1;
@@ -1700,7 +1700,7 @@ fn nonEmptyCount(entries: []const SevenZipEntry) usize {
     return count;
 }
 
-fn emptyCount(entries: []const SevenZipEntry) usize {
+fn emptyCount(entries: []const Entry) usize {
     var count: usize = 0;
     for (entries) |entry| {
         if (isEmptyEntry(entry)) count += 1;
@@ -1708,7 +1708,7 @@ fn emptyCount(entries: []const SevenZipEntry) usize {
     return count;
 }
 
-fn emptyFileAt(entries: []const SevenZipEntry, index: usize) bool {
+fn emptyFileAt(entries: []const Entry, index: usize) bool {
     var seen: usize = 0;
     for (entries) |entry| {
         if (isEmptyEntry(entry)) {
@@ -1991,7 +1991,7 @@ test "sevenzip ppmd solid grouping roundtrip" {
     var repetitive: [4096]u8 = undefined;
     for (&repetitive, 0..) |*byte, i| byte.* = @truncate(i / 97);
     const datas = [_][]const u8{ repetitive[0..1500], repetitive[500..2000], repetitive[1000..2500] };
-    const entries = [_]SevenZipEntry{
+    const entries = [_]Entry{
         .{ .name = "a.bin", .data = datas[0], .method = .ppmd },
         .{ .name = "b.bin", .data = datas[1], .method = .ppmd },
         .{ .name = "c.bin", .data = datas[2], .method = .ppmd },
@@ -2028,7 +2028,7 @@ test "sevenzip encrypted roundtrip with salt and custom cycles" {
     const data = "seven zip secret seven zip secret seven zip secret";
     var salt: [16]u8 = undefined;
     for (&salt, 0..) |*byte, i| byte.* = @intCast(i + 1);
-    const entries = [_]SevenZipEntry{
+    const entries = [_]Entry{
         .{ .name = "enc.bin", .data = data, .method = .copy, .encrypted = true, .password = "pw", .num_cycles_power = 10, .salt = salt, .salt_length = 16 },
     };
     var workspace = try Workspace.init(backing.ptr, backing.len);
@@ -2074,7 +2074,7 @@ test "sevenzip folder plan stays consistent across directory and encryption brea
     // breaks the solid run at the directory, so the header must declare two
     // folders / two pack streams — one folder here used to lose the second
     // entry's bytes entirely.
-    const with_dir = [_]SevenZipEntry{
+    const with_dir = [_]Entry{
         .{ .name = "a.bin", .data = first, .method = .lzma2 },
         .{ .name = "sub/", .data = &.{}, .method = .copy },
         .{ .name = "b.bin", .data = second, .method = .lzma2 },
@@ -2098,7 +2098,7 @@ test "sevenzip folder plan stays consistent across directory and encryption brea
 
     // Case 2: two encrypted lzma2 entries. Encryption never joins solid runs,
     // so each entry is its own folder with its own pack stream and IV.
-    const encrypted_pair = [_]SevenZipEntry{
+    const encrypted_pair = [_]Entry{
         .{ .name = "enc-a.bin", .data = first, .method = .lzma2, .encrypted = true, .password = "pw" },
         .{ .name = "enc-b.bin", .data = second, .method = .lzma2, .encrypted = true, .password = "pw" },
     };
@@ -2127,7 +2127,7 @@ test "sevenzip encrypted lzma2 entry roundtrips" {
     const corpus_01 = "Squdgy fez, blank jimp crwth vox!";
     for (&repetitive, 0..) |*byte, i| byte.* = corpus_01[i % corpus_01.len];
     const data = repetitive[0..97];
-    const entries = [_]SevenZipEntry{
+    const entries = [_]Entry{
         .{ .name = "l2.txt", .data = data, .method = .lzma2, .encrypted = true, .password = "pw" },
     };
     var workspace = try Workspace.init(backing.ptr, backing.len);

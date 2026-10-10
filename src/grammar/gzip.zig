@@ -55,9 +55,8 @@ pub const SinglePass = union(enum) {
     fallback: void,
 };
 
-// ISIZE only seeds the attempt. Commit needs the exact ISIZE count, a matching
-// CRC32, and the trailer at the end of the input. A mismatch defers to the
-// two-pass route.
+// ISIZE only seeds the attempt; commit needs exact count, CRC32, and trailer.
+// Mismatch defers to the two-pass route.
 pub fn decodeSinglePass(input: []const u8, output: []u8, history: []u8, provider: checksum.Provider) Failure!SinglePass {
     if (history.len < deflate_history_size) return error.InsufficientCapacity;
     if (input.len >= std.math.maxInt(u32)) return .fallback;

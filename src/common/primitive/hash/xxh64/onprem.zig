@@ -35,25 +35,25 @@ pub const XxHash64 = struct {
 
     pub fn update(self: *Self, input: []const u8) void {
         self.total += input.len;
-        var data = input;
+        var rest_input = input;
         if (self.buffered != 0) {
             const want = 32 - self.buffered;
-            const take = @min(want, data.len);
-            @memcpy(self.buffer[self.buffered..][0..take], data[0..take]);
+            const take = @min(want, rest_input.len);
+            @memcpy(self.buffer[self.buffered..][0..take], rest_input[0..take]);
             self.buffered += take;
-            data = data[take..];
+            rest_input = rest_input[take..];
             if (self.buffered == 32) {
                 self.consumeStripe(&self.buffer);
                 self.buffered = 0;
             }
         }
-        while (data.len >= 32) {
-            self.consumeStripe(data[0..32]);
-            data = data[32..];
+        while (rest_input.len >= 32) {
+            self.consumeStripe(rest_input[0..32]);
+            rest_input = rest_input[32..];
         }
-        if (data.len != 0) {
-            @memcpy(self.buffer[0..data.len], data);
-            self.buffered = data.len;
+        if (rest_input.len != 0) {
+            @memcpy(self.buffer[0..rest_input.len], rest_input);
+            self.buffered = rest_input.len;
         }
     }
 
@@ -117,19 +117,19 @@ test "xxh64 onprem matches the std oracle" {
         const buf = try std.testing.allocator.alloc(u8, size);
         defer std.testing.allocator.free(buf);
         rng.random().bytes(buf);
-        var ours = XxHash64.init(0);
-        ours.update(buf[0 .. size / 2]);
-        ours.update(buf[size / 2 ..]);
-        var theirs = std.hash.XxHash64.init(0);
-        theirs.update(buf);
-        try std.testing.expectEqual(theirs.final(), ours.final());
+        var actual = XxHash64.init(0);
+        actual.update(buf[0 .. size / 2]);
+        actual.update(buf[size / 2 ..]);
+        var expected = std.hash.XxHash64.init(0);
+        expected.update(buf);
+        try std.testing.expectEqual(expected.final(), actual.final());
     }
     const long = try std.testing.allocator.alloc(u8, 1 << 20);
     defer std.testing.allocator.free(long);
     rng.random().bytes(long);
-    var ours = XxHash64.init(0);
-    ours.update(long);
-    var theirs = std.hash.XxHash64.init(0);
-    theirs.update(long);
-    try std.testing.expectEqual(theirs.final(), ours.final());
+    var actual = XxHash64.init(0);
+    actual.update(long);
+    var expected = std.hash.XxHash64.init(0);
+    expected.update(long);
+    try std.testing.expectEqual(expected.final(), actual.final());
 }

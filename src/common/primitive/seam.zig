@@ -21,19 +21,20 @@ const capability_impls = .{
 
 // A fixed capability keeps its own provider regardless of the tag, so the
 // boundary rejects a tag only when no capability can serve it at all.
-pub fn serves(provider: Provider) bool {
-    const sets = comptime blk: {
-        var offprem_served = false;
-        var onprem_served = false;
-        for (capability_impls) |impl| {
-            if (impl != .onprem) offprem_served = true;
-            if (impl != .offprem) onprem_served = true;
-        }
-        break :blk .{ .offprem = offprem_served, .onprem = onprem_served };
-    };
+const served = blk: {
+    var offprem_served = false;
+    var onprem_served = false;
+    for (capability_impls) |impl| {
+        if (impl != .onprem) offprem_served = true;
+        if (impl != .offprem) onprem_served = true;
+    }
+    break :blk .{ .offprem = offprem_served, .onprem = onprem_served };
+};
+
+pub fn isServed(provider: Provider) bool {
     return switch (provider) {
-        .onprem => sets.onprem,
-        .offprem => sets.offprem,
+        .onprem => served.onprem,
+        .offprem => served.offprem,
     };
 }
 
@@ -277,7 +278,6 @@ fn FixedMac(comptime tag: Provider, comptime Impl: type) type {
         inner: Impl,
 
         pub const mac_length = Impl.mac_length;
-        pub const key_length = Impl.key_length;
 
         pub fn init(key: []const u8) @This() {
             return .{ .inner = Impl.init(key) };
@@ -307,7 +307,6 @@ fn MergeableMac(comptime On: type, comptime Off: type) type {
         state: Pair(On, Off),
 
         pub const mac_length = On.mac_length;
-        pub const key_length = On.key_length;
 
         pub fn init(key: []const u8) @This() {
             return bind(default_provider, key);

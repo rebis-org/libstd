@@ -21,8 +21,8 @@ pub fn requireSinkCapacity(sink: *Resource, call: *Call, required: usize) Failur
     }
 }
 
-pub fn commitBytesToSink(sink: *Resource, call: *Call, bytes: []const u8) Failure!void {
-    sink.writeAll(bytes) catch |failure| return mapSinkError(failure, call, sink);
+pub fn commitBytesToSink(sink: *Resource, call: *Call, chunk: []const u8) Failure!void {
+    sink.writeAll(chunk) catch |failure| return mapSinkError(failure, call, sink);
 }
 
 pub const SourceSizing = enum { budget, require_size, size_or_budget, replay };
@@ -43,6 +43,12 @@ pub const ExecutionPlan = struct {
     workspace_available: usize = 0,
 };
 
+fn budgetRequest(workspace: *resource.Workspace, limit: u64) usize {
+    const remaining = workspace.bytes.len - workspace.cursor;
+    const capped = std.math.cast(usize, limit) orelse remaining;
+    return @min(remaining, capped);
+}
+
 pub fn materializeSource(comptime sizing: SourceSizing, source: *Resource, workspace: *resource.Workspace, limit: u64) Failure![]const u8 {
     return switch (source.kind) {
         .direct_read => |bytes| {
@@ -53,9 +59,7 @@ pub fn materializeSource(comptime sizing: SourceSizing, source: *Resource, works
             if (sizing != .budget) try source.requireCapability(resource.capability_bit_replay);
             const request = switch (sizing) {
                 .budget => request_block: {
-                    const remaining = workspace.bytes.len - workspace.cursor;
-                    const capped = std.math.cast(usize, limit) orelse remaining;
-                    break :request_block @min(remaining, capped);
+                    break :request_block budgetRequest(workspace, limit);
                 },
                 .require_size => request_block: {
                     try source.requireCapability(resource.capability_bit_size);
@@ -69,9 +73,7 @@ pub fn materializeSource(comptime sizing: SourceSizing, source: *Resource, works
                         if (total > limit) return error.ResourceLimit;
                         break :request_block std.math.cast(usize, total) orelse return error.ResourceLimit;
                     }
-                    const remaining = workspace.bytes.len - workspace.cursor;
-                    const capped = std.math.cast(usize, limit) orelse remaining;
-                    break :request_block @min(remaining, capped);
+                    break :request_block budgetRequest(workspace, limit);
                 },
                 .replay => request_block: {
                     var buffer: [4096]u8 = undefined;
@@ -148,7 +150,7 @@ pub fn planOutputSize(source: *Resource, sizing: vocabulary.SizingMode, limits: 
 
 pub fn writeDiagnostic(call: *Call, status: u32, id: Id) void {
     const diagnostic = call.diagnostic orelse return;
-    if (!diagnostic.valid()) return;
+    if (!diagnostic.isValid()) return;
     diagnostic.id = id;
     diagnostic.value_low = status;
     diagnostic.value_high = 0;
@@ -156,36 +158,42 @@ pub fn writeDiagnostic(call: *Call, status: u32, id: Id) void {
     diagnostic.child = null;
 }
 
-pub fn writeDiagnosticScalar(call: *Call, id: Id, value: u64) void {
+fn writeDiagnosticValue(call: *Call, id: Id, low: u64, high: u64) void {
     const diagnostic = call.diagnostic orelse return;
-    if (!diagnostic.valid()) return;
+    if (!diagnostic.isValid()) return;
     const output = node_graph.findChild(diagnostic, id) catch return orelse return;
     if (output.bytes != null or output.byte_capacity != 0 or output.byte_length != 0 or output.child != null) return;
-    output.value_low = value;
-    output.value_high = 0;
+    output.value_low = low;
+    output.value_high = high;
+}
+
+pub fn writeDiagnosticScalar(call: *Call, id: Id, value: u64) void {
+    writeDiagnosticValue(call, id, value, 0);
 }
 
 pub fn writeDiagnosticId(call: *Call, id: Id, value: Id) void {
-    const diagnostic = call.diagnostic orelse return;
-    if (!diagnostic.valid()) return;
-    const output = node_graph.findChild(diagnostic, id) catch return orelse return;
-    if (output.bytes != null or output.byte_capacity != 0 or output.byte_length != 0 or output.child != null) return;
-    output.value_low = value.low;
-    output.value_high = value.high;
+    writeDiagnosticValue(call, id, value.low, value.high);
+}
+
+fn writeCapacityPair(call: *Call, required_id: Id, available_id: Id, required: u64, available: u64) void {
+    writeDiagnosticScalar(call, required_id, required);
+    writeDiagnosticScalar(call, available_id, available);
 }
 
 pub fn writeCapacityDiagnostic(call: *Call, required: u64, available: u64) void {
-    writeDiagnosticScalar(call, vocabulary.ids.diagnostic_required_capacity, required);
-    writeDiagnosticScalar(call, vocabulary.ids.diagnostic_available_capacity, available);
+    writeCapacityPair(call, vocabulary.ids.diagnostic_required_capacity, vocabulary.ids.diagnostic_available_capacity, required, available);
 }
 
 pub fn writeWorkspaceCapacityDiagnostic(call: *Call, required: u64, available: u64) void {
-    writeDiagnosticScalar(call, vocabulary.ids.workspace_required_capacity, required);
-    writeDiagnosticScalar(call, vocabulary.ids.workspace_available_capacity, available);
+    writeCapacityPair(call, vocabulary.ids.workspace_required_capacity, vocabulary.ids.workspace_available_capacity, required, available);
 }
 
 pub fn writeDownstreamDiagnostic(call: *Call, status: u32) void {
     writeDiagnosticScalar(call, vocabulary.ids.diagnostic_downstream_status, status);
+}
+
+fn overlapsWorkspace(workspace_ptr: usize, workspace_len: usize, ptr: usize, len: usize) Failure!void {
+    if (try spanOverlap(workspace_ptr, workspace_len, ptr, len)) return error.InvalidCall;
 }
 
 pub fn checkWorkspaceOverlap(call: *Call, source: *Resource, sink: *Resource) Failure!void {
@@ -193,25 +201,17 @@ pub fn checkWorkspaceOverlap(call: *Call, source: *Resource, sink: *Resource) Fa
     const workspace_ptr = @intFromPtr(call.workspace.?);
     const workspace_len = call.workspace_capacity;
     if (source.kind == .direct_read) {
-        const ptr = @intFromPtr(source.kind.direct_read.ptr);
-        const len = source.kind.direct_read.len;
-        if (try spanOverlap(workspace_ptr, workspace_len, ptr, len)) return error.InvalidCall;
+        try overlapsWorkspace(workspace_ptr, workspace_len, @intFromPtr(source.kind.direct_read.ptr), source.kind.direct_read.len);
     }
     if (sink.kind == .direct_write) {
-        const ptr = @intFromPtr(sink.kind.direct_write.ptr);
-        const len = sink.kind.direct_write.len;
-        if (try spanOverlap(workspace_ptr, workspace_len, ptr, len)) return error.InvalidCall;
+        try overlapsWorkspace(workspace_ptr, workspace_len, @intFromPtr(sink.kind.direct_write.ptr), sink.kind.direct_write.len);
     }
 }
 
 pub fn checkSourceWorkspaceOverlap(call: *Call, source: *Resource) Failure!void {
     if (call.workspace == null or call.workspace_capacity == 0) return;
     if (source.kind != .direct_read) return;
-    const workspace_ptr = @intFromPtr(call.workspace.?);
-    const workspace_len = call.workspace_capacity;
-    const ptr = @intFromPtr(source.kind.direct_read.ptr);
-    const len = source.kind.direct_read.len;
-    if (try spanOverlap(workspace_ptr, workspace_len, ptr, len)) return error.InvalidCall;
+    try overlapsWorkspace(@intFromPtr(call.workspace.?), call.workspace_capacity, @intFromPtr(source.kind.direct_read.ptr), source.kind.direct_read.len);
 }
 
 pub fn validateBoundary(call: *Call, plan: *const ExecutionPlan, source_node: ?*Node, sink_node: ?*Node) Failure!void {
@@ -243,11 +243,11 @@ pub fn validateBoundary(call: *Call, plan: *const ExecutionPlan, source_node: ?*
     }
 }
 
-pub fn spanOverlap(a_ptr: usize, a_len: usize, b_ptr: usize, b_len: usize) Failure!bool {
-    if (a_len == 0 or b_len == 0) return false;
-    const a_end = std.math.add(usize, a_ptr, a_len) catch return error.ResourceLimit;
-    const b_end = std.math.add(usize, b_ptr, b_len) catch return error.ResourceLimit;
-    return a_ptr < b_end and b_ptr < a_end;
+pub fn spanOverlap(first_ptr: usize, first_len: usize, second_ptr: usize, second_len: usize) Failure!bool {
+    if (first_len == 0 or second_len == 0) return false;
+    const first_end = std.math.add(usize, first_ptr, first_len) catch return error.ResourceLimit;
+    const second_end = std.math.add(usize, second_ptr, second_len) catch return error.ResourceLimit;
+    return first_ptr < second_end and second_ptr < first_end;
 }
 
 pub fn checkSourceSinkOverlap(source: *Resource, sink: *Resource) Failure!void {

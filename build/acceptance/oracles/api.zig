@@ -39,7 +39,7 @@ extern fn stdk_session_destroy(session: ?*anyopaque) u32;
 
 fn run(r: *harness.Runner) anyerror!void {
     harness.setup(r, harness.ids.gzip, harness.mode_stream);
-    corpus.select(r.corpus_index, r.corpus_buffer[0..]);
+    corpus.fillTiled(r.corpus_index, r.corpus_buffer[0..]);
     r.input = r.corpus_buffer[0..];
     try steps.writeSpan(&steps.noParams, r);
 

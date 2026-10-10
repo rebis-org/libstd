@@ -6,16 +6,22 @@ pub const Violation = enum { out_of_bounds, use_after_free, lease_violation, ove
 
 var empty_storage: [1]u8 = .{0};
 
-// Contract violations trap: out-of-provenance access is a bug, never a
-// survivable runtime condition. Data-dependent failures stay in Failure.
-// Context strings are complete sentences, so the trap message never has to
-// guess where a sentence ends.
+// Contract violations trap: out-of-provenance access is a bug, never a survivable condition.
 pub fn trap(violation: Violation, context: []const u8) noreturn {
-    var buffer: [128]u8 = undefined;
-    const message = std.fmt.bufPrint(&buffer, "Interface trap: {s}: {s}\n", .{ @tagName(violation), context }) catch "Interface trap.\n";
+    var message_storage: [128]u8 = undefined;
+    const message = std.fmt.bufPrint(&message_storage, "interface trap: {s}: {s}\n", .{ @tagName(violation), context }) catch "interface trap.\n";
     std.debug.print("{s}", .{message});
     std.posix.raise(std.posix.SIG.TRAP) catch {};
     unreachable;
+}
+
+fn checkRange(total: usize, offset: usize, length: usize) void {
+    if (offset > total or length > total - offset) trap(.out_of_bounds, "subspan is out of bounds.");
+}
+
+pub fn overlaps(first_start: usize, first_len: usize, second_start: usize, second_len: usize) bool {
+    if (first_len == 0 or second_len == 0) return false;
+    return first_start < second_start + second_len and second_start < first_start + first_len;
 }
 
 pub const Span = struct {
@@ -27,7 +33,7 @@ pub const Span = struct {
     }
 
     pub fn sub(self: Span, offset: usize, length: usize) Span {
-        if (offset > self.len or length > self.len - offset) trap(.out_of_bounds, "Subspan is out of bounds.");
+        checkRange(self.len, offset, length);
         return .{ .ptr = self.ptr + offset, .len = length };
     }
 
@@ -35,8 +41,8 @@ pub const Span = struct {
         return self.sub(offset, length).bytes();
     }
 
-    pub fn write(self: Span, offset: usize, data: []const u8) void {
-        @memcpy(self.sub(offset, data.len).bytes(), data);
+    pub fn write(self: Span, offset: usize, chunk: []const u8) void {
+        @memcpy(self.sub(offset, chunk.len).bytes(), chunk);
     }
 };
 
@@ -49,7 +55,7 @@ pub const ConstSpan = struct {
     }
 
     pub fn sub(self: ConstSpan, offset: usize, length: usize) ConstSpan {
-        if (offset > self.len or length > self.len - offset) trap(.out_of_bounds, "Subspan is out of bounds.");
+        checkRange(self.len, offset, length);
         return .{ .ptr = self.ptr + offset, .len = length };
     }
 
@@ -63,15 +69,15 @@ fn SpanFor(comptime Pointer: type) type {
     return switch (Pointer) {
         [*]u8 => Span,
         [*]const u8 => ConstSpan,
-        else => @compileError("Unsupported span pointer type."),
+        else => @compileError("unsupported span pointer type."),
     };
 }
 
-fn spanFrom(comptime Pointer: type, pointer: ?Pointer, length: u64) Failure!SpanFor(Pointer) {
+fn spanFrom(comptime Pointer: type, base: ?Pointer, length: u64) Failure!SpanFor(Pointer) {
     const count = std.math.cast(usize, length) orelse return error.ResourceLimit;
     if (count == 0) return .{ .ptr = &empty_storage, .len = 0 };
-    const data = pointer orelse return error.InvalidCall;
-    return .{ .ptr = data, .len = count };
+    const live = base orelse return error.InvalidCall;
+    return .{ .ptr = live, .len = count };
 }
 
 pub fn mutSpan(pointer: ?[*]u8, length: u64) Failure!Span {
@@ -82,14 +88,9 @@ pub fn constSpan(pointer: ?[*]const u8, length: u64) Failure!ConstSpan {
     return spanFrom([*]const u8, pointer, length);
 }
 
-// Independently handed spans must not alias. Overlap is a caller contract violation.
-pub fn requireDisjoint(left: ConstSpan, right: ConstSpan, context: []const u8) void {
-    const left_start = @intFromPtr(left.ptr);
-    const right_start = @intFromPtr(right.ptr);
-    if (left.len == 0 or right.len == 0) return;
-    const left_end = left_start + left.len;
-    const right_end = right_start + right.len;
-    if (left_start < right_end and right_start < left_end) trap(.overlap, context);
+// Independently handed spans must not alias.
+pub fn requireDisjoint(first: ConstSpan, second: ConstSpan, context: []const u8) void {
+    if (overlaps(@intFromPtr(first.ptr), first.len, @intFromPtr(second.ptr), second.len)) trap(.overlap, context);
 }
 
 test "span algebra: read, write, and sub round trip" {

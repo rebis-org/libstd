@@ -8,50 +8,39 @@ const seam = @import("seam");
 
 const std_aes = std.crypto.core.aes;
 
-const StdAes128Enc = struct {
-    inner: std_aes.AesEncryptCtx(std_aes.Aes128),
-    pub fn init(key: [16]u8) @This() {
-        return .{ .inner = std_aes.Aes128.initEnc(key) };
-    }
-    pub fn encrypt(self: @This(), dst: *[16]u8, src: *const [16]u8) void {
-        self.inner.encrypt(dst, src);
-    }
-};
+const StdDirection = enum { encrypt, decrypt };
 
-const StdAes128Dec = struct {
-    inner: std_aes.AesDecryptCtx(std_aes.Aes128),
-    pub fn init(key: [16]u8) @This() {
-        return .{ .inner = std_aes.Aes128.initDec(key) };
-    }
-    pub fn decrypt(self: @This(), dst: *[16]u8, src: *const [16]u8) void {
-        self.inner.decrypt(dst, src);
-    }
-};
+fn StdCtx(comptime Params: type, comptime direction: StdDirection) type {
+    const Ctx = switch (direction) {
+        .encrypt => std_aes.AesEncryptCtx(Params),
+        .decrypt => std_aes.AesDecryptCtx(Params),
+    };
+    return struct {
+        inner: Ctx,
 
-const StdAes256Enc = struct {
-    inner: std_aes.AesEncryptCtx(std_aes.Aes256),
-    pub fn init(key: [32]u8) @This() {
-        return .{ .inner = std_aes.Aes256.initEnc(key) };
-    }
-    pub fn encrypt(self: @This(), dst: *[16]u8, src: *const [16]u8) void {
-        self.inner.encrypt(dst, src);
-    }
-};
+        pub fn init(key: [Params.key_bits / 8]u8) @This() {
+            return .{ .inner = switch (direction) {
+                .encrypt => Params.initEnc(key),
+                .decrypt => Params.initDec(key),
+            } };
+        }
 
-const StdAes256Dec = struct {
-    inner: std_aes.AesDecryptCtx(std_aes.Aes256),
-    pub fn init(key: [32]u8) @This() {
-        return .{ .inner = std_aes.Aes256.initDec(key) };
-    }
-    pub fn decrypt(self: @This(), dst: *[16]u8, src: *const [16]u8) void {
-        self.inner.decrypt(dst, src);
-    }
-};
+        pub fn encrypt(self: @This(), dst: *[16]u8, src: *const [16]u8) void {
+            if (direction != .encrypt) @compileError("a decrypt context cannot encrypt.");
+            self.inner.encrypt(dst, src);
+        }
 
-pub const Aes128EncCtx = seam.CipherCtx(options.aes_impl, onprem.AesEncryptCtx(onprem.Aes128), StdAes128Enc);
-pub const Aes128DecCtx = seam.CipherCtx(options.aes_impl, onprem.AesDecryptCtx(onprem.Aes128), StdAes128Dec);
-pub const Aes256EncCtx = seam.CipherCtx(options.aes_impl, onprem.AesEncryptCtx(onprem.Aes256), StdAes256Enc);
-pub const Aes256DecCtx = seam.CipherCtx(options.aes_impl, onprem.AesDecryptCtx(onprem.Aes256), StdAes256Dec);
+        pub fn decrypt(self: @This(), dst: *[16]u8, src: *const [16]u8) void {
+            if (direction != .decrypt) @compileError("an encrypt context cannot decrypt.");
+            self.inner.decrypt(dst, src);
+        }
+    };
+}
+
+const StdAes128Enc = StdCtx(std_aes.Aes128, .encrypt);
+const StdAes128Dec = StdCtx(std_aes.Aes128, .decrypt);
+const StdAes256Enc = StdCtx(std_aes.Aes256, .encrypt);
+const StdAes256Dec = StdCtx(std_aes.Aes256, .decrypt);
 
 pub const Aes192Hw = struct {
     inner: onprem.Aes192Hw,
@@ -82,22 +71,22 @@ pub const Aes192Hw = struct {
 };
 
 // Mode operations monomorphize over a suite, so block loops never dispatch per block.
-pub const SuiteOnprem = struct {
+pub const suite_onprem = struct {
     pub const Enc128 = onprem.AesEncryptCtx(onprem.Aes128);
     pub const Dec128 = onprem.AesDecryptCtx(onprem.Aes128);
     pub const Enc256 = onprem.AesEncryptCtx(onprem.Aes256);
     pub const Dec256 = onprem.AesDecryptCtx(onprem.Aes256);
 };
 
-pub const SuiteOffprem = struct {
+pub const suite_offprem = struct {
     pub const Enc128 = StdAes128Enc;
     pub const Dec128 = StdAes128Dec;
     pub const Enc256 = StdAes256Enc;
     pub const Dec256 = StdAes256Dec;
 };
 
-pub const Suite = switch (options.aes_impl) {
-    .onprem => SuiteOnprem,
-    .offprem => SuiteOffprem,
-    .mergeable => SuiteOnprem,
+pub const suite = switch (options.aes_impl) {
+    .onprem => suite_onprem,
+    .offprem => suite_offprem,
+    .mergeable => suite_onprem,
 };

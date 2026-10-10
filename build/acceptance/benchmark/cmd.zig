@@ -35,6 +35,11 @@ pub const Cmd = struct {
     decode: ?Spec = null,
 };
 
+const encode_qc: []const Arg = &.{ .bin, .{ .lit = "-q" }, .{ .lit = "-c" }, .extra, .input };
+const decode_qdc: []const Arg = &.{ .bin, .{ .lit = "-q" }, .{ .lit = "-dc" }, .archive };
+const encode_c: []const Arg = &.{ .bin, .{ .lit = "-c" }, .extra, .input };
+const decode_dc: []const Arg = &.{ .bin, .{ .lit = "-dc" }, .archive };
+
 const cmds = struct {
     const sevenzz = Cmd{
         .exe = "7zz",
@@ -43,23 +48,23 @@ const cmds = struct {
     };
     const zstd = Cmd{
         .exe = "zstd",
-        .encode = .{ .out = .stdout, .args = &.{ .bin, .{ .lit = "-q" }, .{ .lit = "-c" }, .extra, .input } },
-        .decode = .{ .out = .stdout, .args = &.{ .bin, .{ .lit = "-q" }, .{ .lit = "-dc" }, .archive } },
+        .encode = .{ .out = .stdout, .args = encode_qc },
+        .decode = .{ .out = .stdout, .args = decode_qdc },
     };
     const xz = Cmd{
         .exe = "xz",
         .encode = .{ .out = .stdout, .args = &.{ .bin, .{ .lit = "-q" }, .lzma, .{ .lit = "-c" }, .extra, .input }, .lzma = &.{.{ .lit = "--format=lzma" }} },
-        .decode = .{ .out = .stdout, .args = &.{ .bin, .{ .lit = "-q" }, .{ .lit = "-dc" }, .archive } },
+        .decode = .{ .out = .stdout, .args = decode_qdc },
     };
     const bzip2 = Cmd{
         .exe = "bzip2",
-        .encode = .{ .out = .stdout, .args = &.{ .bin, .{ .lit = "-c" }, .extra, .input } },
-        .decode = .{ .out = .stdout, .args = &.{ .bin, .{ .lit = "-dc" }, .archive } },
+        .encode = .{ .out = .stdout, .args = encode_c },
+        .decode = .{ .out = .stdout, .args = decode_dc },
     };
     const gzip = Cmd{
         .exe = "gzip",
-        .encode = .{ .out = .stdout, .args = &.{ .bin, .{ .lit = "-c" }, .extra, .input } },
-        .decode = .{ .out = .stdout, .args = &.{ .bin, .{ .lit = "-dc" }, .archive } },
+        .encode = .{ .out = .stdout, .args = encode_c },
+        .decode = .{ .out = .stdout, .args = decode_dc },
     };
     const tar = Cmd{
         .exe = "tar",
@@ -82,8 +87,8 @@ const cmds = struct {
     };
     const lz4 = Cmd{
         .exe = "lz4",
-        .encode = .{ .out = .stdout, .args = &.{ .bin, .{ .lit = "-q" }, .{ .lit = "-c" }, .extra, .input } },
-        .decode = .{ .out = .stdout, .args = &.{ .bin, .{ .lit = "-q" }, .{ .lit = "-dc" }, .archive } },
+        .encode = .{ .out = .stdout, .args = encode_qc },
+        .decode = .{ .out = .stdout, .args = decode_qdc },
     };
 };
 
@@ -177,7 +182,7 @@ fn argv(
 }
 
 pub fn encode(env: *env_mod.Env, comptime cmd: Cmd, bin: []const u8, input: []const u8, output: []const u8, ext: []const u8, store: bool, extra: []const []const u8) !usize {
-    const spec = cmd.encode orelse return error.Unsupported;
+    const spec = cmd.encode orelse return error.unsupported;
     const args = try argv(env, spec.args, spec.store, spec.lzma, extra, bin, input, output, "", ext, store);
     const stdout = try run.output(env.init, args.items[0..args.len]);
     defer env.allocator.free(stdout);
@@ -186,7 +191,7 @@ pub fn encode(env: *env_mod.Env, comptime cmd: Cmd, bin: []const u8, input: []co
 }
 
 pub fn decode(env: *env_mod.Env, comptime cmd: Cmd, bin: []const u8, archive: []const u8) ![]u8 {
-    const spec = cmd.decode orelse return error.Unsupported;
+    const spec = cmd.decode orelse return error.unsupported;
     const args = try argv(env, spec.args, &.{}, &.{}, &.{}, bin, "", "", archive, "", false);
     const stdout = try run.output(env.init, args.items[0..args.len]);
     if (spec.out == .stdout) return stdout;

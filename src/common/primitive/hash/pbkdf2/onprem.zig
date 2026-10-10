@@ -9,26 +9,26 @@ pub fn pbkdf2(dk: []u8, password: []const u8, salt: []const u8, rounds: u32, com
     if (rounds < 1) return error.WeakParameters;
     if (dk.len / Prf.mac_length >= std.math.maxInt(u32)) return error.OutputTooLong;
 
-    var block_index: u32 = 1;
+    var block_counter: u32 = 1;
     var offset: usize = 0;
-    while (offset < dk.len) : (block_index +%= 1) {
+    while (offset < dk.len) : (block_counter +%= 1) {
         var prf = Prf.init(password);
         prf.update(salt);
-        var counter_bytes: [4]u8 = undefined;
-        std.mem.writeInt(u32, &counter_bytes, block_index, .big);
-        prf.update(&counter_bytes);
-        var u: [Prf.mac_length]u8 = prf.finalResult();
-        var t = u;
+        var counter_be: [4]u8 = undefined;
+        std.mem.writeInt(u32, &counter_be, block_counter, .big);
+        prf.update(&counter_be);
+        var block_mac: [Prf.mac_length]u8 = prf.finalResult();
+        var xor_acc = block_mac;
         var round: u32 = 1;
         while (round < rounds) : (round += 1) {
-            var next = Prf.init(password);
-            next.update(&u);
-            u = next.finalResult();
-            for (&t, u) |*byte, other| byte.* ^= other;
+            var iter = Prf.init(password);
+            iter.update(&block_mac);
+            block_mac = iter.finalResult();
+            for (&xor_acc, block_mac) |*byte, other| byte.* ^= other;
         }
-        const take = @min(Prf.mac_length, dk.len - offset);
-        @memcpy(dk[offset..][0..take], t[0..take]);
-        offset += take;
+        const copy_len = @min(Prf.mac_length, dk.len - offset);
+        @memcpy(dk[offset..][0..copy_len], xor_acc[0..copy_len]);
+        offset += copy_len;
     }
 }
 

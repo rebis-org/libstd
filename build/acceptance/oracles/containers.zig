@@ -14,7 +14,7 @@ fn setupContainer(r: *Runner, profile_id: harness.Id) void {
     r.write_exact = true;
     r.invalid_status = abi.Status.invalid_data;
     r.invalid = &.{0x06};
-    corpus.select(r.corpus_index, r.corpus_buffer[0..]);
+    corpus.fillTiled(r.corpus_index, r.corpus_buffer[0..]);
 }
 
 fn runZlib(r: *Runner) anyerror!void {
@@ -25,7 +25,7 @@ fn runZlib(r: *Runner) anyerror!void {
     var fixture_input: [65536]u8 = undefined;
     var compressed: [131072]u8 = undefined;
     var decoded: [65536]u8 = undefined;
-    corpus.select(r.corpus_index, &fixture_input);
+    corpus.fillTiled(r.corpus_index, &fixture_input);
     try harness.oracleFixture(r, lib.zlibCompress, &fixture_input, &compressed, &decoded);
     // Adler mismatch is an integrity failure, not silent corruption.
     r.encoded[r.encoded_len - 1] ^= 0xff;
@@ -42,7 +42,7 @@ fn runLz4(r: *Runner) anyerror!void {
     var fixture_input: [65536]u8 = undefined;
     var compressed: [131072]u8 = undefined;
     var decoded: [65536]u8 = undefined;
-    corpus.select(r.corpus_index, &fixture_input);
+    corpus.fillTiled(r.corpus_index, &fixture_input);
     try harness.oracleFixture(r, lib.lz4Compress, &fixture_input, &compressed, &decoded);
     // Content-checksum mismatch is an integrity failure.
     r.encoded[r.encoded_len - 1] ^= 0xff;

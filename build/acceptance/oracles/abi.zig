@@ -82,7 +82,7 @@ pub const Call = extern struct {
 
 pub extern fn stdk_call(call: *Call) callconv(.c) u32;
 
-pub fn idEqual(left: Id, right: Id) bool {
+pub fn isIdEqual(left: Id, right: Id) bool {
     return left.low == right.low and left.high == right.high;
 }
 

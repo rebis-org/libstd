@@ -4,8 +4,9 @@
 #ifndef STDK_JNI_STDLIB_SHIM
 #define STDK_JNI_STDLIB_SHIM
 #ifndef NULL
-    #define NULL ((void*) 0)
+    #define NULL 0
 #endif
-void* malloc(unsigned long);
+typedef __SIZE_TYPE__ size_t;
+void* malloc(size_t);
 void free(void*);
 #endif

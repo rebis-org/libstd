@@ -6,7 +6,7 @@ const Failure = failure_prim.Failure;
 const io = @import("../common/primitive/io.zig");
 
 const block_size: u64 = 512;
-pub const tar_scratch_size: usize = @intCast(block_size);
+pub const scratch_size: usize = @intCast(block_size);
 const typeflag_regular: u8 = '0';
 const typeflag_gnu_long_name: u8 = 'L';
 const typeflag_gnu_long_link: u8 = 'K';
@@ -26,7 +26,7 @@ pub const SparseInfo = struct {
     segments: [max_sparse_segments]SparseSegment,
 };
 
-pub const TarEntry = struct {
+pub const Entry = struct {
     name: []const u8,
     data: []const u8,
     link_name: []const u8 = &.{},
@@ -39,7 +39,7 @@ pub const TarEntry = struct {
     devminor: u32 = 0,
 };
 
-pub const TarEntryInfo = struct {
+pub const EntryInfo = struct {
     name: []const u8,
     prefix: []const u8,
     link_name: []const u8,
@@ -63,7 +63,7 @@ const NameParts = struct {
     uses_long_name: bool,
 };
 
-pub fn tarArchiveSize(entries: []const TarEntry) Failure!u64 {
+pub fn archiveSize(entries: []const Entry) Failure!u64 {
     var total: u64 = 1024;
     for (entries) |entry| {
         const parts = try tarNameParts(entry.name);
@@ -79,10 +79,10 @@ pub fn tarArchiveSize(entries: []const TarEntry) Failure!u64 {
     return total;
 }
 
-pub fn tarEncode(entries: []const TarEntry, output: []u8, scratch: []u8) Failure!usize {
-    const required = try tarArchiveSize(entries);
+pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Failure!usize {
+    const required = try archiveSize(entries);
     if (output.len < required) return error.InsufficientCapacity;
-    if (scratch.len < tar_scratch_size) return error.InsufficientCapacity;
+    if (scratch.len < scratch_size) return error.InsufficientCapacity;
     var sink = io.Sink{ .bytes = output };
     for (entries) |entry| {
         const parts = try tarNameParts(entry.name);
@@ -100,13 +100,13 @@ pub fn tarEncode(entries: []const TarEntry, output: []u8, scratch: []u8) Failure
         try sink.write(entry.data);
         try tarWritePadding(&sink, scratch, data_size);
     }
-    @memset(scratch[0..tar_scratch_size], 0);
-    try sink.write(scratch[0..tar_scratch_size]);
-    try sink.write(scratch[0..tar_scratch_size]);
+    @memset(scratch[0..scratch_size], 0);
+    try sink.write(scratch[0..scratch_size]);
+    try sink.write(scratch[0..scratch_size]);
     return sink.offset;
 }
 
-fn writePaxRecords(entry: TarEntry, data_size: u64, uses_long_name: bool, buffer: []u8) Failure!usize {
+fn writePaxRecords(entry: Entry, data_size: u64, uses_long_name: bool, buffer: []u8) Failure!usize {
     var written: usize = 0;
     if (uses_long_name) written = try paxStringRecord(buffer, "path", entry.name);
     if (entry.link_name.len > 100) {
@@ -228,14 +228,14 @@ fn paxNumberRecord(buffer: []u8, key: []const u8, value: u64, base: u8) Failure!
     return pos;
 }
 
-pub fn tarInspectCount(archive: []const u8) Failure!u64 {
+pub fn inspectCount(archive: []const u8) Failure!u64 {
     var reader = Reader{ .archive = archive };
     var count: u64 = 0;
     while (try reader.next()) |_| count = try bounds.addU64(count, 1);
     return count;
 }
 
-pub fn tarInspectOrdinal(archive: []const u8, ordinal: u64) Failure!TarEntryInfo {
+pub fn inspectOrdinal(archive: []const u8, ordinal: u64) Failure!EntryInfo {
     var reader = Reader{ .archive = archive };
     while (try reader.next()) |entry| {
         if (entry.ordinal == ordinal) return entry;
@@ -243,8 +243,8 @@ pub fn tarInspectOrdinal(archive: []const u8, ordinal: u64) Failure!TarEntryInfo
     return error.InvalidData;
 }
 
-pub fn tarDecodeOrdinal(archive: []const u8, ordinal: u64, output: []u8) Failure!usize {
-    const entry = try tarInspectOrdinal(archive, ordinal);
+pub fn decodeOrdinal(archive: []const u8, ordinal: u64, output: []u8) Failure!usize {
+    const entry = try inspectOrdinal(archive, ordinal);
     const size = std.math.cast(usize, entry.size) orelse return error.ResourceLimit;
     if (output.len < size) return error.InsufficientCapacity;
     if (entry.sparse) |sparse| {
@@ -378,8 +378,8 @@ fn tarExtensionSize(value: []const u8) Failure!u64 {
 }
 
 fn tarWriteHeader(sink: *io.Sink, scratch: []u8, name: []const u8, prefix: []const u8, link_name: []const u8, mode: u32, uid: u32, gid: u32, modification_time: u64, typeflag: u8, size: u64, devmajor: u32, devminor: u32) Failure!void {
-    if (scratch.len < tar_scratch_size) return error.InsufficientCapacity;
-    const block = scratch[0..tar_scratch_size];
+    if (scratch.len < scratch_size) return error.InsufficientCapacity;
+    const block = scratch[0..scratch_size];
     @memset(block, 0);
     tarWriteField(block[0..100], name);
     tarWriteNumber(block[100..108], mode);
@@ -411,8 +411,8 @@ fn tarWriteHeader(sink: *io.Sink, scratch: []u8, name: []const u8, prefix: []con
 fn tarWritePadding(sink: *io.Sink, scratch: []u8, size: u64) Failure!void {
     const padding = (block_size - size % block_size) % block_size;
     if (padding != 0) {
-        if (scratch.len < tar_scratch_size) return error.InsufficientCapacity;
-        @memset(scratch[0..tar_scratch_size], 0);
+        if (scratch.len < scratch_size) return error.InsufficientCapacity;
+        @memset(scratch[0..scratch_size], 0);
         try sink.write(scratch[0..@intCast(padding)]);
     }
 }
@@ -452,7 +452,7 @@ const Reader = struct {
     global_pax: Pax = .{},
     local_pax: Pax = .{},
 
-    fn readHeader(self: *Reader) Failure!TarEntryInfo {
+    fn readHeader(self: *Reader) Failure!EntryInfo {
         const header = try bounds.slice(self.archive, self.offset, block_size);
         const recorded_checksum = try tarNumber(header[148..156]);
         if (recorded_checksum != tarChecksum(header)) return error.IntegrityFailure;
@@ -481,7 +481,7 @@ const Reader = struct {
         if (self.offset > self.archive.len) return error.InvalidData;
     }
 
-    fn parseOldGnuSparse(self: *Reader, entry: *TarEntryInfo) Failure!SparseInfo {
+    fn parseOldGnuSparse(self: *Reader, entry: *EntryInfo) Failure!SparseInfo {
         var info = SparseInfo{ .realsize = 0, .segment_count = 0, .segments = undefined };
         const header = try bounds.slice(self.archive, entry.header_offset, block_size);
         info.realsize = try tarNumber(header[483..495]);
@@ -510,7 +510,7 @@ const Reader = struct {
         return info;
     }
 
-    fn sparseFromPax(self: *Reader, entry: *TarEntryInfo, pax: Pax) Failure!?SparseInfo {
+    fn sparseFromPax(self: *Reader, entry: *EntryInfo, pax: Pax) Failure!?SparseInfo {
         if (pax.sparse_major == null and pax.sparse_size == null and pax.sparse_realsize == null and pax.sparse_map == null and pax.sparse_pax == null) return null;
         // Every branch assigns info wholesale before any field is read, so undefined init is safe.
         var info: SparseInfo = undefined;
@@ -545,7 +545,7 @@ const Reader = struct {
         return info;
     }
 
-    fn next(self: *Reader) Failure!?TarEntryInfo {
+    fn next(self: *Reader) Failure!?EntryInfo {
         while (self.offset < self.archive.len) {
             const block = try bounds.slice(self.archive, self.offset, block_size);
             if (isZeroBlock(block)) {
@@ -630,7 +630,7 @@ const Reader = struct {
     }
 };
 
-fn tarValidateSparseHeader(entry: TarEntryInfo) Failure!void {
+fn tarValidateSparseHeader(entry: EntryInfo) Failure!void {
     _ = entry;
 }
 
@@ -853,7 +853,7 @@ fn tarParsePax(data: []const u8) Failure!Pax {
     return attributes;
 }
 
-fn tarApplyPax(entry: *TarEntryInfo, attributes: Pax) Failure!void {
+fn tarApplyPax(entry: *EntryInfo, attributes: Pax) Failure!void {
     if (attributes.path) |path| {
         if (path.len == 0 or std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidData;
         entry.name = path;
@@ -869,18 +869,18 @@ fn tarApplyPax(entry: *TarEntryInfo, attributes: Pax) Failure!void {
 
 test "tar device entries roundtrip devmajor and devminor" {
     const testing = std.testing;
-    const entries = [_]TarEntry{
+    const entries = [_]Entry{
         .{ .name = "dev/null", .data = &.{}, .typeflag = '3', .mode = 0o666, .devmajor = 1, .devminor = 3 },
         .{ .name = "regular.txt", .data = "hello", .typeflag = '0' },
     };
     var archive: [4096]u8 = undefined;
     var scratch: [4096]u8 = undefined;
-    const written = try tarEncode(&entries, &archive, &scratch);
-    const info = try tarInspectOrdinal(archive[0..written], 0);
+    const written = try encode(&entries, &archive, &scratch);
+    const info = try inspectOrdinal(archive[0..written], 0);
     try testing.expectEqual(@as(u8, '3'), info.typeflag);
     try testing.expectEqual(@as(u32, 1), info.devmajor);
     try testing.expectEqual(@as(u32, 3), info.devminor);
-    const plain = try tarInspectOrdinal(archive[0..written], 1);
+    const plain = try inspectOrdinal(archive[0..written], 1);
     try testing.expectEqual(@as(u32, 0), plain.devmajor);
     try testing.expectEqual(@as(u32, 0), plain.devminor);
 }

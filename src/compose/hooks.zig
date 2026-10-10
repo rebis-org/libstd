@@ -18,9 +18,7 @@ const transform = @import("transform.zig");
 
 const ProfileHook = *const fn (plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void;
 
-// Convention dispatch: the hook for a tag lives in transform.zig or archive.zig
-// as `<tag>Hook`, so a new component needs no edit here. A missing declaration
-// is an explicit unsupported, never a fallthrough.
+// Convention dispatch: the hook for a tag lives as `<tag>Hook`.
 fn unsupportedHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
     _ = plan;
     _ = source;
@@ -39,7 +37,7 @@ const handler_map = blk: {
     const tag_info = @typeInfo(components.ProfileTag).@"enum";
     var entries: [tag_info.field_names.len]struct { []const u8, ProfileHook } = undefined;
     for (tag_info.field_names, 0..) |field_name, index| {
-        // Both fixtures share the single echo hook, which predates the `<tag>Hook` naming convention.
+        // Both fixtures share the single echo hook.
         if (std.mem.eql(u8, field_name, "test_echo") or std.mem.eql(u8, field_name, "test_read")) {
             entries[index] = .{ field_name, transform.testHook };
             continue;

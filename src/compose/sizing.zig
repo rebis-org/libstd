@@ -1,6 +1,6 @@
 const zstd = @import("../leaf/zstd.zig");
 
-// Single-sourced: envelope and bypass paths must agree exactly or framing diverges output. Frame boundaries reset matchfinder history, so this is output-correctness, not a hint.
+// Single-sourced: envelope and bypass paths must agree exactly or framing diverges output.
 
 pub fn encodeHistoryLen(input_len: usize, dict_len: usize, options: zstd.Options) usize {
     const frame_budget = if (zstd.useDfast(options) or zstd.useRowMatch(options))

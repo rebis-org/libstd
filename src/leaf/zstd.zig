@@ -162,7 +162,7 @@ fn decodeWithOutput(input: *std.Io.Reader, output: *std.Io.Writer, history: []u8
         .literal_stream_index = 0,
     };
     while (true) {
-        const magic = readU32le(&limited.interface) catch |err| switch (err) {
+        const magic = readU32Le(&limited.interface) catch |err| switch (err) {
             error.EndOfStream => break,
             error.ReadFailed => return error.IoFailure,
         };
@@ -172,7 +172,7 @@ fn decodeWithOutput(input: *std.Io.Reader, output: *std.Io.Writer, history: []u8
                 return err;
             };
         } else if (magic >= skippable_magic_min and magic <= skippable_magic_max) {
-            const size = readU32le(&limited.interface) catch |err| switch (err) {
+            const size = readU32Le(&limited.interface) catch |err| switch (err) {
                 error.EndOfStream => return error.InvalidData,
                 error.ReadFailed => return error.IoFailure,
             };
@@ -195,14 +195,8 @@ pub fn decodedSize(input: []const u8, history: []u8, options: Options) DecodeErr
     return try decodeStream(&source, &counter.writer, history, options);
 }
 
-// Dictionary training: formatted dictionary with minimal valid entropy tables
-// (a one-symbol literal Huffman table and two-symbol FSE tables in the repeat
-// modes, serialized exactly as FSE_writeNCount would) plus sample content.
-// The trainer selects content by concatenating samples up to the size cap. It
-// trades the ratio gains of COVER-style segment selection for a deterministic
-// bounded pass, which keeps the whole trainer allocation-free.
-// 8 (magic + dict id) + 2 (Huffman direct weights) + 6 (three 2-byte FSE
-// tables) + 12 (three rep offsets).
+// Formatted dictionary with minimal valid entropy tables plus concatenated sample content.
+// Deterministic bounded pass, so the whole trainer stays allocation-free.
 pub const dictionary_header_size = 28;
 pub const dictionary_id_min: u32 = 32768;
 pub const dictionary_id_max: u32 = (1 << 31) - 1;
@@ -217,11 +211,8 @@ pub fn trainedDictionaryBound(total_sample_bytes: usize) usize {
     return total_sample_bytes +| dictionary_header_size;
 }
 
-// Fastcover-style segment selection (ZDICT_trainFromBuffer_fastCover
-// semantics, deterministic by construction): hash every d-byte prefix in the
-// training split into 2^f buckets, then greedily pick the k-byte window whose
-// distinct d-mers carry the most remaining training frequency, zeroing the
-// covered buckets after each pick.
+// Fastcover-style segment selection with deterministic greedy picks.
+// Covered buckets zero after each pick, so ties resolve to the earliest window.
 const train_d: usize = 8;
 const train_k: usize = 50;
 const train_f: usize = 17;
@@ -2298,13 +2289,13 @@ pub fn scanContentSize(input: *std.Io.Reader, max_window: u32) DecodeError!usize
     if (max_window < window_size_min or max_window > window_size_max) return error.Unsupported;
     var total: u64 = 0;
     while (true) {
-        const magic = readU32le(input) catch |err| switch (err) {
+        const magic = readU32Le(input) catch |err| switch (err) {
             error.EndOfStream => break,
             error.ReadFailed => return error.IoFailure,
         };
         if (magic != frame_magic) {
             if (magic >= skippable_magic_min and magic <= skippable_magic_max) {
-                const size = readU32le(input) catch |err| switch (err) {
+                const size = readU32Le(input) catch |err| switch (err) {
                     error.EndOfStream => return error.InvalidData,
                     error.ReadFailed => return error.IoFailure,
                 };
@@ -2404,9 +2395,8 @@ const BackwardBitStream = struct {
     }
 };
 
-// Parses a formatted dictionary and returns its content (the window bytes a
-// codec may reference). Raw-content dictionaries (no magic) are their own
-// content.
+// Parses a formatted dictionary and returns its referenceable content.
+// Raw-content dictionaries without magic are their own content.
 pub fn dictionaryContent(dictionary: []const u8) DecodeError![]const u8 {
     if (dictionary.len < 8) return error.InvalidData;
     if (std.mem.readInt(u32, dictionary[0..4], .little) != dictionary_magic) return dictionary;
@@ -2430,9 +2420,9 @@ pub fn dictionaryContent(dictionary: []const u8) DecodeError![]const u8 {
         const decoded = try decodeFseTable(cursor.remainingSlice(), 36, 9, &literal_entries);
         cursor.pos += decoded.consumed;
     }
-    _ = try cursor.readU32le();
-    _ = try cursor.readU32le();
-    _ = try cursor.readU32le();
+    _ = try cursor.readU32Le();
+    _ = try cursor.readU32Le();
+    _ = try cursor.readU32Le();
     return cursor.remainingSlice();
 }
 
@@ -2516,7 +2506,7 @@ const Decoder = struct {
             if (d.frame_output != cs) return error.InvalidData;
         }
         if (d.has_checksum) {
-            const stored = try d.readU32le();
+            const stored = try d.readU32Le();
             const actual: u32 = @truncate(d.checksummer.final());
             if (stored != actual) return error.IntegrityFailure;
         }
@@ -2567,9 +2557,9 @@ const Decoder = struct {
             d.literal_state.accuracy_log = @intCast(std.math.log2_int(usize, decoded.table_size));
             d.literal_state.table = .{ .fse = d.literal_state.entries[0..decoded.table_size] };
         }
-        const recent_offset_1 = try cursor.readU32le();
-        const recent_offset_2 = try cursor.readU32le();
-        const recent_offset_3 = try cursor.readU32le();
+        const recent_offset_1 = try cursor.readU32Le();
+        const recent_offset_2 = try cursor.readU32Le();
+        const recent_offset_3 = try cursor.readU32Le();
         const content = cursor.remainingSlice();
         if (content.len > d.history.len) return error.ResourceLimit;
         if (recent_offset_1 == 0 or recent_offset_2 == 0 or recent_offset_3 == 0) return error.InvalidData;
@@ -3034,7 +3024,7 @@ const Decoder = struct {
         };
     }
 
-    fn readU32le(d: *Decoder) DecodeError!u32 {
+    fn readU32Le(d: *Decoder) DecodeError!u32 {
         var bytes: [4]u8 = undefined;
         var target = std.Io.Writer.fixed(&bytes);
         try streamExact(d.input, &target, 4);
@@ -3042,7 +3032,7 @@ const Decoder = struct {
     }
 };
 
-fn readU32le(reader: *std.Io.Reader) error{ EndOfStream, ReadFailed }!u32 {
+fn readU32Le(reader: *std.Io.Reader) error{ EndOfStream, ReadFailed }!u32 {
     var bytes: [4]u8 = undefined;
     var target = std.Io.Writer.fixed(&bytes);
     reader.streamExact(&target, 4) catch |err| switch (err) {
