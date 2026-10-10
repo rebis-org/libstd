@@ -10,9 +10,8 @@ const MatchFinder = finder_mod.MatchFinder;
 const LzToken = finder_mod.LzToken;
 const unpack50 = @import("unpack50.zig");
 
-// Nothing allocates. The staging buffer cannot exceed 2x the input plus slack:
-// the worst case is ~8 bits per symbol plus the tables, and matches only
-// shrink it.
+// Nothing allocates. Staging needs 2x the input plus slack because the worst case is
+// ~8 bits per symbol plus the tables, and matches only shrink it.
 
 const nc: u16 = unpack50.nc;
 const dc: u16 = unpack50.dc_rar5;
@@ -22,7 +21,6 @@ const rc: u16 = unpack50.rc;
 const code_length_symbols: u16 = 20;
 const total_symbols: usize = nc + dc + ldc + rc;
 
-// Caller buffer sizes (see writer.zig for the archive-level plan).
 pub const max_expansion = 2;
 pub const output_slack = 8192;
 
@@ -60,7 +58,7 @@ pub const WorkspacesSizes = struct {
 };
 
 const CLSymbol = struct {
-    symbol: u8, // 0-15 direct length, 16-17 repeat previous, 18-19 zero run
+    symbol: u8, // Values 0-15 are direct lengths, 16-17 repeat the previous, and 18-19 encode zero runs.
     extra: u32,
     extra_bits: u5,
 };
@@ -119,9 +117,8 @@ pub fn compressBlock(
             },
             .match => |match| {
                 if (findRepeatDistance(prev_distances, match.distance)) |repeat_index| {
-                    // The repeat path adds no distance bonus, so the raw
-                    // length goes to the RD table. The repeat-distance symbol
-                    // is 258 + repeat_index.
+                    // The repeat path adds no distance bonus, so the raw length goes to
+                    // the RD table, and the repeat-distance symbol is 258 + repeat_index.
                     ld_freq[258 + repeat_index] += 1;
                     rotatePrevDistances(&prev_distances, repeat_index);
                     const length_encoding = slots.encodeLengthSlot(match.length);
@@ -190,9 +187,8 @@ pub fn compressBlock(
     var cl_codes: [code_length_symbols]u32 = undefined;
     computeCanonicalCodes(&cl_lengths, &cl_codes);
 
-    // Stage 1: the 20 CL lengths, 4 bits each. A 15 is an escape: a following
-    // 0 means a real length of 15, and any other value is a zero run of
-    // (value + 2).
+    // Stage 1 writes the 20 CL lengths in 4 bits each. A 15 escape is followed by
+    // 0 for a real length of 15, or by a zero-run count of value + 2.
     {
         var i: usize = 0;
         while (i < code_length_symbols) {
@@ -359,16 +355,14 @@ fn encodeCLSymbols(
             while (i + run < combined_lengths.len and combined_lengths[i + run] == code_length) : (run += 1) {}
             while (run > 0) {
                 if (run >= 11) {
-                    // Symbol 17 repeats the previous length 11 to 138 times,
-                    // as 11 + readBits(7).
+                    // Symbol 17 repeats the previous length 11 to 138 times, as 11 + readBits(7).
                     const emit_count = @min(run, 138);
                     symbols[count.*] = .{ .symbol = 17, .extra = @intCast(emit_count - 11), .extra_bits = 7 };
                     count.* += 1;
                     run -= emit_count;
                     i += emit_count;
                 } else if (run >= 3) {
-                    // Symbol 16 repeats the previous length 3 to 10 times, as
-                    // 3 + readBits(3).
+                    // Symbol 16 repeats the previous length 3 to 10 times, as 3 + readBits(3).
                     const emit_count = @min(run, 10);
                     symbols[count.*] = .{ .symbol = 16, .extra = @intCast(emit_count - 3), .extra_bits = 3 };
                     count.* += 1;
@@ -471,9 +465,8 @@ test "compress block round-trips through the unpack50 decoder" {
     };
     const written = try compressBlock(data, 3, true, ws, &compressed);
 
-    // Decode through the real engine. The scratch must mirror the compose
-    // layout: window bytes first, then filter_scratch_extra of working
-    // space. The decoder slices the latter at max_filter_block.
+    // Decode through the real engine. The scratch mirrors the compose layout:
+    // window bytes, then filter_scratch_extra of working space sliced at max_filter_block.
     var window_buf: [4096]u8 = undefined;
     var pool: [unpack50.table_pool_words * 4]u16 = undefined;
     var pending: [unpack50.max_pending_filters]@import("filters50.zig").Filter = undefined;

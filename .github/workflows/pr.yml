@@ -1,4 +1,5 @@
-name: PR status label
+name: PR
+
 on:
   pull_request_target:
     types:
@@ -7,8 +8,10 @@ on:
       - closed
       - assigned
       - unassigned
+
 jobs:
   label:
+    name: Label
     permissions:
       issues: write
       pull-requests: write

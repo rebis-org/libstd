@@ -4,11 +4,8 @@ const Failure = failure.Failure;
 const bits = @import("bits.zig");
 const BitReader = bits.BitReader;
 
-// PPMd variant H, the model RAR3 "text compression" blocks use. Pointers are
-// u32 offsets into a caller-provided heap slice, dereferenced through packed
-// extern views (same technique as the 7z PPMd leaf). Offset 0 is unreachable
-// successor stubs are recorded after the pText increment, so it serves as
-// NULL and the reference's `ptr <= pText` guards work verbatim on offsets.
+// PPMd variant H: pointers are u32 offsets into a caller-provided heap slice. Offset 0 is
+// unreachable, so it serves as NULL and the reference's `ptr <= pText` guards work on offsets.
 
 const int_bits: u5 = 7;
 const period_bits: u5 = 7;
@@ -66,13 +63,12 @@ inline fn freeBlockAt(heap: []u8, off: u32) *FreeBlock {
     return @ptrCast(@alignCast(heap[off..][0..@sizeOf(FreeBlock)]));
 }
 
-// A binary context stores its single state behind the context header, so the
-// state offset is the context offset plus the header size.
+// A binary context stores its single state behind its 12-byte header, so the state offset is the context offset plus 2.
 inline fn ctxOneState(ctx_off: u32) u32 {
     return ctx_off + 2;
 }
 
-// Held outside the heap like the reference's stack-local UpState.
+// A local snapshot, because the heap is mutated while the state is held.
 const LocalState = struct {
     sym: u8,
     freq: u8,
@@ -99,10 +95,8 @@ const RangeCoder = struct {
     high_count: u32,
     scale: u32,
 
-    // The reference GetChar reads raw bytes from an over-allocated input
-    // buffer and returns stale bytes at EOF, relying on the model's guards to
-    // notice corruption. Returning 0 on exhaustion has the same property:
-    // deterministic garbage the guards catch, never a panic.
+    // Exhaustion returns 0 so the model guards see deterministic garbage and reject the stream
+    // instead of panicking.
     fn getByte(br: *BitReader) u32 {
         return br.readBits(8) catch 0;
     }
@@ -114,8 +108,7 @@ const RangeCoder = struct {
         for (0..4) |_| self.code = (self.code << 8) | getByte(br);
     }
 
-    // (code-low)/(range /= scale). A zero divisor is corrupt-stream state the
-    // C original would crash on. Report corruption instead.
+    // A zero scale or a zero range means the stream is corrupt, so report corruption instead of dividing.
     fn currentCount(self: *RangeCoder) Failure!u32 {
         if (self.scale == 0) return error.InvalidData;
         self.range /= self.scale;
@@ -134,8 +127,7 @@ const RangeCoder = struct {
         self.range *%= self.high_count -% self.low_count;
     }
 
-    // ARI_DEC_NORMALIZE. The `||` short-circuit matters: when the top bytes of
-    // low and low+range already differ, range is NOT reset even if small.
+    // ARI_DEC_NORMALIZE.
     fn normalize(self: *RangeCoder, br: *BitReader) void {
         while (true) {
             if ((self.low ^ (self.low +% self.range)) >= (1 << 24)) {
@@ -157,7 +149,7 @@ const n_indexes = n1 + n2 + n3 + n4;
 
 const SubAllocator = struct {
     heap: []u8,
-    pool_bytes: u32, // the ORIGINAL byte size requested
+    pool_bytes: u32,
     glue_count: u8,
     indx2units: [n_indexes]u8,
     units2indx: [128]u8,
@@ -191,10 +183,8 @@ const SubAllocator = struct {
         self.pool_bytes = 0;
     }
 
-    // heap must be at least (sa_size_mb << 20) bytes. The caller sizes the
-    // slice before the stream's requested model size is known, so a stream
-    // asking for more than the caller provisioned is refused here. The pool
-    // is 4-byte aligned inside the slice so u32 fields load directly.
+    // The heap must hold at least (sa_size_mb << 20) bytes, and the pool is 4-byte aligned inside the
+    // slice so u32 fields load directly. A stream larger than the provisioned pool is refused here.
     fn start(self: *SubAllocator, heap: []u8, sa_size_mb: u32) bool {
         const pool_bytes: u32 = sa_size_mb << 20;
         if (self.pool_bytes == pool_bytes) return true;
@@ -213,9 +203,8 @@ const SubAllocator = struct {
         self.ptext = 0;
 
         const pool_bytes = self.pool_bytes;
-        // 7/8 of the pool for units, 1/8 for the text area. UNIT_SIZE ==
-        // FIXED_UNIT_SIZE collapses the reference's Real*/Fake* split except
-        // for the +UNIT_SIZE remainder compensation, kept verbatim.
+        // The pool splits 7/8 for units and 1/8 for the text area. Because UNIT_SIZE equals FIXED_UNIT_SIZE,
+        // only the +UNIT_SIZE remainder compensation of the split remains.
         const size2: u32 = unit_size * (pool_bytes / 8 / unit_size * 7);
         const size1: u32 = pool_bytes - size2;
         const real_size1: u32 = size1 / unit_size * unit_size + unit_size;
@@ -284,9 +273,8 @@ const SubAllocator = struct {
         self.insertNode(p, self.units2indx[udiff - 1]);
     }
 
-    // GlueFreeBlocks. The reference threads a stack-local sentinel node (sentinel)
-    // into the doubly-linked list. The sentinel's links live in locals and
-    // accesses route through S0 comparisons instead.
+    // The sentinel link value for the doubly-linked free block list. Its own links live in locals, so
+    // every access compares against this value.
     const sentinel: u32 = 0xFFFFFFFF;
 
     fn glueFreeBlocks(self: *SubAllocator) void {
@@ -296,7 +284,6 @@ const SubAllocator = struct {
 
         if (self.lo_unit != self.hi_unit) heap[self.lo_unit] = 0;
 
-        // Phase 1: drain the free lists into one stamped, doubly-linked list.
         for (0..n_indexes) |i| {
             while (self.free_list[i] != null_off) {
                 const p = self.removeNode(i);
@@ -311,12 +298,11 @@ const SubAllocator = struct {
             }
         }
 
-        // Phase 2: merge physically adjacent stamped blocks.
         var p = sentinel_next;
         while (p != sentinel) : (p = freeBlockAt(heap, p).next) {
             while (true) {
                 const p1 = p + unitsToBytes(freeBlockAt(heap, p).units);
-                if (p1 + unit_size > heap.len) break; // guard. Unreachable for valid states
+                if (p1 + unit_size > heap.len) break; // Unreachable for a valid model.
                 const next_block = freeBlockAt(heap, p1);
                 if (next_block.stamp != 0xFFFF) break;
                 const total: u32 = @as(u32, freeBlockAt(heap, p).units) + next_block.units;
@@ -329,7 +315,6 @@ const SubAllocator = struct {
             }
         }
 
-        // Phase 3: re-insert, chopping >128-unit runs.
         while (sentinel_next != sentinel) {
             p = sentinel_next;
             {
@@ -364,8 +349,7 @@ const SubAllocator = struct {
             if (i == n_indexes) {
                 self.glue_count -%= 1;
                 const bytes: u32 = unitsToBytes(self.indx2units[indx]);
-                // FIXED_UNIT_SIZE == UNIT_SIZE, so the reference's separate
-                // fake-units bookkeeping moves in lockstep with the real one.
+                // FIXED_UNIT_SIZE equals UNIT_SIZE, so the fake-units bookkeeping moves in lockstep with the real one.
                 if (self.fake_units_start > self.ptext and
                     self.fake_units_start - self.ptext > bytes)
                 {
@@ -446,8 +430,7 @@ const See2 = struct {
         };
     }
 
-    // Signed arithmetic exactly as the reference: `short RetVal = (short)Summ
-    // >> Shift` sign-extends, and the return converts through int to uint.
+    // The mean is signed: the truncated shift sign-extends, and the return converts through int to uint.
     fn getMean(self: *See2) u32 {
         const ret: i32 = @as(i16, @bitCast(self.summ)) >> @intCast(self.shift);
         self.summ -%= @bitCast(@as(i16, @truncate(ret)));
@@ -466,7 +449,7 @@ const See2 = struct {
     }
 };
 
-// GET_MEAN(SUMM,SHIFT,ROUND) from the reference.
+// GET_MEAN(SUMM,SHIFT,ROUND).
 inline fn getRoundedMean(summ: u32, comptime shift: u5, comptime round: u5) u32 {
     return (summ + (@as(u32, 1) << (shift - round))) >> shift;
 }
@@ -482,7 +465,7 @@ pub const PpmModel = struct {
     dummy_see2: See2,
     min_context: u32,
     max_context: u32,
-    found_state: u32, // state offset, null_off when escaped
+    found_state: u32, // State offset; null_off when the symbol escaped.
     num_masked: u32,
     init_esc: u32,
     order_fall: i32,
@@ -509,8 +492,6 @@ pub const PpmModel = struct {
         return m;
     }
 
-    // heap: caller-provided pool. The stream names its model size in MiB and
-    // anything up to heap.len is accepted, larger is refused.
     pub fn startModel(self: *Self, heap: []u8, max_order: u32, heap_mb: u32) Failure!void {
         self.esc_count = 1;
         self.max_order = max_order;
@@ -541,9 +522,8 @@ pub const PpmModel = struct {
         self.dummy_see2 = .{ .summ = 0, .shift = period_bits, .count = 64 };
     }
 
-    // ModelPPM::DecodeInit. The reference peeks the PPM-block flag without
-    // consuming, so this first byte read must stay bit-aligned with it.
-    // consuming even one flag bit desynchronises the whole stream.
+    // ModelPPM::DecodeInit. The first byte read must stay bit-aligned with the PPM-block flag, because
+    // consuming one flag bit desynchronises the whole stream.
     pub fn decodeInit(self: *Self, br: *BitReader, heap: []u8, esc_char: *u8) Failure!bool {
         var max_order: u32 = RangeCoder.getByte(br);
         const reset = (max_order & 0x20) != 0;
@@ -567,8 +547,7 @@ pub const PpmModel = struct {
         return self.min_context != null_off;
     }
 
-    // ModelPPM::DecodeChar. Returns the decoded byte, or InvalidData on
-    // corrupt data (the reference's -1).
+    // ModelPPM::DecodeChar. An offset outside the heap is corrupt-stream state and returns error.InvalidData.
     pub fn decodeChar(self: *Self, br: *BitReader) Failure!u32 {
         const heap = self.sub.heap;
         if (self.min_context <= self.sub.ptext or self.min_context > self.sub.heap_end)
@@ -654,7 +633,7 @@ pub const PpmModel = struct {
         }
     }
 
-    // Reset after data error, allowing safe resuming (CleanUp).
+    // Restores a minimal model so the caller can resume the next block after a data error.
     pub fn cleanUp(self: *Self, heap: []u8) void {
         self.sub.stop();
         self.startModel(heap, 2, 1) catch {};
@@ -677,7 +656,7 @@ pub const PpmModel = struct {
         const heap = self.sub.heap;
         const ctx = ctxAt(heap, ctx_off);
         const old_ns: u32 = ctx.num_stats;
-        if (old_ns == 0) return; // A corrupt heap; the callers' guards surface it.
+        if (old_ns == 0) return; // A zero count means a corrupt heap; the callers' guards surface it.
         var i: u32 = old_ns - 1;
         const stats = ctx.stats;
 
@@ -778,7 +757,7 @@ pub const PpmModel = struct {
                         if (stAt(heap, p).sym != stAt(heap, self.found_state).sym) {
                             while (true) {
                                 p += state_size;
-                                if (p + state_size > heap.len) return null_off; // guard
+                                if (p + state_size > heap.len) return null_off;
                                 if (stAt(heap, p).sym == stAt(heap, self.found_state).sym) break;
                             }
                         }
@@ -791,7 +770,7 @@ pub const PpmModel = struct {
                     pc = stAt(heap, p).succ();
                     break;
                 }
-                if (nps >= max_parents) return null_off; // reference guard
+                if (nps >= max_parents) return null_off;
                 ps[nps] = p;
                 nps += 1;
                 if (ctxAt(heap, pc).suffix == null_off) break;
@@ -810,7 +789,7 @@ pub const PpmModel = struct {
             if (stAt(heap, pp).sym != up.sym) {
                 while (true) {
                     pp += state_size;
-                    if (pp + state_size > heap.len) return null_off; // guard
+                    if (pp + state_size > heap.len) return null_off;
                     if (stAt(heap, pp).sym == up.sym) break;
                 }
             }
@@ -971,9 +950,8 @@ pub const PpmModel = struct {
         self.hi_bits_flag = self.hb2flag[stAt(heap, self.found_state).sym];
         const cctx = ctxAt(heap, c);
         const suffix_ns: usize = ctxAt(heap, cctx.suffix).num_stats;
-        // Saturating indexes: a corrupt heap can hold zero frequencies or a
-        // zero-stats suffix. The C original would index garbage, we take the
-        // escape path and let the guards/CRC surface it.
+        // A corrupt heap can hold a zero frequency or a zero-stats suffix, so the indexes saturate and the
+        // escape path lets the guards and the CRC surface the corruption.
         const freq_idx: usize = @as(usize, rs_state.freq) -| 1;
         if (suffix_ns == 0) {
             self.found_state = null_off;
@@ -989,7 +967,7 @@ pub const PpmModel = struct {
         const bs = &self.bin_summ[freq_idx][bs_idx];
 
         const shifted = self.coder.currentShiftCount(tot_bits) catch {
-            // Range collapse: force the escape path. Guards will surface it.
+            // A collapsed range is corrupt-stream state, so force the escape path and let the guards surface it.
             self.found_state = null_off;
             self.coder.low_count = 0;
             self.coder.high_count = bin_scale;
@@ -1102,7 +1080,7 @@ pub const PpmModel = struct {
         const cctx = ctxAt(heap, c);
         const num_stats: u32 = cctx.num_stats;
         if (unmasked_count == 0) {
-            // Nothing left unmasked. The reference would index ns2indx[-1].
+            // An empty unmasked set has no ns2indx entry, so the model falls back to the dummy SEE2.
             self.coder.scale = 1;
             return &self.dummy_see2;
         }

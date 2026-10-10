@@ -2,8 +2,14 @@ name: Release
 
 on:
   workflow_dispatch:
+    inputs:
+      benchmark:
+        description: Run the benchmark campaign.
+        type: boolean
+        default: false
 
 permissions:
+  actions: write
   contents: write
   attestations: write
   id-token: write
@@ -15,6 +21,8 @@ concurrency:
 
 jobs:
   release:
+    name: Release
     uses: ./.github/workflows/build.yml
     with:
       publish: true
+      benchmark: ${{ inputs.benchmark }}

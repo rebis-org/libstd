@@ -12,12 +12,10 @@ const sink = @import("../../common/sink.zig");
 const emit = @import("emit.zig");
 const Sink = sink.Sink;
 
-// Every buffer is caller-provided: the window is dictionary-sized, the decode
-// tables share a u16 pool, and the filter scratch covers the largest filter
-// region. A real entry carries only a handful of filters, so a full pending
-// list means the stream is undecodable and is refused, not guessed at.
+// A real entry carries only a handful of filters, so a full pending list means
+// the stream is undecodable, and the parser refuses it instead of guessing.
 
-pub const nc: u16 = 306; // 256 literals + 6 control + 44 length slots
+pub const nc: u16 = 306; // The alphabet holds 256 literals, 6 control, and 44 length slots.
 pub const dc_rar5: u16 = 64;
 pub const dc_rar7: u16 = 80;
 pub const ldc: u16 = 16;
@@ -30,8 +28,6 @@ pub const max_pending_filters: usize = 4096;
 
 const LengthEntry = struct { base: u32, extra: u5 };
 
-// RAR5 slot-to-length mapping. Slots 0-7 map directly to lengths 2 to 9. Slot
-// 8 and above group in fours with LBits = slot / 4 - 1.
 const length_table: [rc]LengthEntry = blk: {
     var table: [rc]LengthEntry = undefined;
     for (0..8) |i| {
@@ -45,9 +41,8 @@ const length_table: [rc]LengthEntry = blk: {
     break :blk table;
 };
 
-// The longest single LZ match (reference MAX_INC_LZ_MATCH). One symbol can grow
-// the unflushed span by at most this, so it sets how close to a full window the
-// streaming path may run.
+// MAX_INC_LZ_MATCH is the longest single LZ match. One symbol can grow the
+// unflushed span by at most this, so it bounds the window headroom.
 const max_lz_match: usize = 0x1001 + 3;
 
 pub const State = struct {
@@ -73,7 +68,7 @@ pub const State = struct {
     pub fn init(
         st: *State,
         window_buffer: []u8,
-        table_pool: []u16, // table_pool_words * 4
+        table_pool: []u16, // The byte size is table_pool_words * 4.
         pending: []filters.Filter,
         filter_scratch: []u8,
         is_rar7: bool,
@@ -121,9 +116,8 @@ pub fn decodeLengthSlot(br: *BitReader, slot: u32) Failure!u32 {
     return entry.base + try br.readBits(entry.extra);
 }
 
-// Wide bit reads for RAR7 distances, where the extra bits reach 38. Sequential
-// composition keeps the reference bit order: the earlier-read bits are the more
-// significant ones.
+// RAR7 distances need up to 38 extra bits. The earlier-read bits are the more
+// significant ones, so the sequential reads below keep the wire bit order.
 fn readWideBits(br: *BitReader, bit_count: u6) Failure!u64 {
     if (bit_count == 0) return 0;
     if (bit_count <= 31) return try br.readBits(@intCast(bit_count));
@@ -142,8 +136,6 @@ pub fn decodeDistance(br: *BitReader, dd: *const DecodeTable, ldd: *const Decode
     if (extra_bits < 4) {
         distance += try br.readBits(@intCast(extra_bits));
     } else {
-        // The high bits come first, then the low 4 bits come from the LDD
-        // table.
         const high_extra: u6 = extra_bits - 4;
         if (high_extra > 0) {
             distance += (try readWideBits(br, high_extra)) << 4;
@@ -158,9 +150,8 @@ fn readTables(st: *State) Failure!void {
     const br = &st.br;
     const pool = st.tablePool();
 
-    // Stage 1: the 20 CL lengths, 4 bits each. A 15 is an escape: a following
-    // 0 means a real length of 15, and any other value is a zero run of
-    // (value + 2).
+    // The 20 CL lengths are 4 bits each. A 15 is an escape: a following 0 means
+    // a real length of 15, and any other value is a zero run of (value + 2).
     var cl_lengths: [code_length_symbols]u8 = @splat(0);
     {
         var cl_index: usize = 0;
@@ -188,9 +179,8 @@ fn readTables(st: *State) Failure!void {
     var cl_table = try huffman.makeDecodeTables(&cl_lengths, pool[0 * table_pool_words ..][0..table_pool_words]);
     if (!cl_table.valid) return error.InvalidData;
 
-    // Stage 2: code lengths for the full alphabet. RAR5 assigns the lengths
-    // directly, with no delta across blocks, unlike RAR3. Symbols 16-19 are
-    // repeat and zero runs.
+    // RAR5 assigns code lengths for the full alphabet directly, with no delta
+    // across blocks. Symbols 16 to 19 encode repeat and zero runs.
     const dc: u16 = if (st.is_rar7) dc_rar7 else dc_rar5;
     const total_symbols: usize = @as(usize, nc) + dc + ldc + rc;
     var code_lengths: [max_total_symbols]u8 = @splat(0);
@@ -251,11 +241,8 @@ fn readTables(st: *State) Failure!void {
     st.tables_loaded = true;
 }
 
-// Filter descriptor wire format (reference unpack50 ReadFilter): start delta
-// (ReadFilterData), length (ReadFilterData), 3-bit filter type, and for DELTA
-// a 5-bit channel count minus one. The start is a FORWARD delta from the
-// current write position, so every filter is known before any byte of its
-// region is decoded.
+// Filter descriptor wire format: start delta, length, 3-bit filter type, and for
+// DELTA a 5-bit channel count minus one. The start delta is FORWARD.
 fn parseFilterDescriptor(st: *State) Failure!void {
     const br = &st.br;
 
@@ -283,17 +270,15 @@ fn parseFilterDescriptor(st: *State) Failure!void {
     st.pending_count += 1;
 }
 
-// No look-back reserve is needed: a filter start is a forward delta from the
-// position where its descriptor appears, so every filter is known before any
-// byte of its region decodes. The cap below therefore covers all of them.
+// A filter start is a FORWARD delta from the position where its descriptor
+// appears, so no look-back reserve is needed and the cap below covers them all.
 fn flushDecoded(st: *State, limit: u64) Failure!void {
     const out = st.stream_out orelse return;
     const produced = st.window.write_pos - st.entry_start;
     var emit_upto: usize = @intCast(@min(@as(u64, produced), limit));
 
     // Never emit INTO an unapplied filter's region: cap the span at the first
-    // filter that it would split. The filter is applied whole on a later
-    // flush, once its region has fully decoded.
+    // filter it would split, and apply that filter whole on a later flush.
     for (st.pending[0..st.pending_count]) |filter| {
         if (filter.length == 0) continue;
         const filter_start = filter.start - st.entry_start;
@@ -305,9 +290,8 @@ fn flushDecoded(st: *State, limit: u64) Failure!void {
     }
 
     if (emit_upto <= st.flushed) {
-        // Nothing emittable while a filter's region is still decoding. Only
-        // fatal when the window is about to wrap over unemitted data. A
-        // filter genuinely larger than the window. Unverifiable, not damaged.
+        // Nothing emittable while a filter's region is still decoding. Only a
+        // filter larger than the window is fatal, and that is unverifiable rather than damaged.
         if (produced - st.flushed + max_lz_match >= st.window.buffer.len) {
             return error.Unsupported;
         }
@@ -319,8 +303,7 @@ fn flushDecoded(st: *State, limit: u64) Failure!void {
     if (back > st.window.buffer.len) return error.InvalidData;
 
     // A filter starting BEFORE the flushed mark lost part of its region to an
-    // earlier emit. Unreachable while the cap above holds. Kept because a
-    // stale assumption here fails as silent wrong output.
+    // earlier emit, so a stale assumption here fails as silent wrong output.
     for (st.pending[0..st.pending_count]) |filter| {
         if (filter.length == 0) continue;
         const filter_start = filter.start - st.entry_start;
@@ -420,9 +403,8 @@ fn decodeBlock(st: *State, unpacked_size: u64) Failure!bool {
             st.window.copyMatch(@intCast(distance), @intCast(length));
             st.written_size += @as(u64, length);
         } else {
-            // A new match (symbol 262 and above). The decoder adds back the
-            // distance-dependent bonus that the encoder subtracted: +1 past
-            // 0x100, +2 past 0x2000, +3 past 0x40000.
+            // A new match (symbol 262 and above) adds back the bonus the encoder
+            // subtracted: +1 past 0x100, +2 past 0x2000, +3 past 0x40000.
             const length_slot: u32 = symbol - 262;
             var length = try decodeLengthSlot(br, length_slot);
             const distance = try decodeDistance(br, &st.dd, &st.ldd);
@@ -467,8 +449,6 @@ pub const Session = struct {
         return .{ .state = st };
     }
 
-    // Reference UnpInitData(false) plus UnpInitData50(false). Note how little
-    // v50 resets compared to v29: UnpInitData50 is just TablesRead5=false.
     fn resetForNewStream(self: *Session) void {
         const st = self.state;
         st.window.reset();
@@ -478,11 +458,8 @@ pub const Session = struct {
         st.tables_loaded = false;
     }
 
-    // `solid` is the entry's own flag: a solid entry keeps the window and the
-    // tables (the reference relies on TablesRead5 to decode the first solid
-    // block even when its header lacks TablePresent). Filters are per entry
-    // even in a solid archive. InitFilters() runs outside the `if (!Solid)`
-    // with the comment "Filters never share several solid files".
+    // A solid entry keeps the window and the tables, so its first block decodes
+    // even when the header lacks TablePresent. Filters stay per entry.
     pub fn decodeFile(
         self: *Session,
         packed_data: []const u8,
@@ -524,10 +501,8 @@ pub const Session = struct {
         // the cursor actually moved rather than assuming it moved out_size.
         const consumed = st.window.write_pos - start_pos;
 
-        // Filters MUST be staged, never applied in the window: later solid
-        // entries match back into earlier entries' window regions, so
-        // in-place filtering corrupts them. Staging also linearises wrapped
-        // regions in FILE coordinates.
+        // Filters MUST be staged, never applied in the window, because later
+        // solid entries match back into earlier window regions. Staging also linearises wrapped regions in FILE coordinates.
         try emit.emitSpan(
             &st.window,
             out,
@@ -543,9 +518,8 @@ pub const Session = struct {
     }
 };
 
-// E8/E8E9 relocate branch targets using the block's offset WITHIN THE FILE:
-// `start` is a window-stream position, so the entry start (ctx) converts it.
-// in a solid stream the two differ by everything decoded before this entry.
+// E8/E8E9 relocate branch targets by the block's offset WITHIN THE FILE, so the
+// entry start converts the window-stream position in a solid stream too.
 fn applyFilter50(entry_start: usize, f: *filters.Filter, region: []u8, scratch: []u8) Failure!void {
     try filters.applyFilter(region, f.*, @intCast(f.start - entry_start), scratch);
 }

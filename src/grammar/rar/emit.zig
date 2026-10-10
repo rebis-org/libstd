@@ -4,14 +4,8 @@ const Failure = failure.Failure;
 const sink = @import("../../common/sink.zig");
 const window_mod = @import("window.zig");
 
-// Filtered-emit discipline shared by the v29 and v50 unpackers. If no pending
-// filter touches the span, the window emits straight to the sink. Otherwise
-// the span is materialised and every fully-contained filter is applied to the
-// staged copy: the window must keep the RAW LZ bytes, because later solid
-// entries match back into earlier entries' window regions. A filter that
-// touches but is not contained in the span means block geometry disagrees
-// with the stream: refuse rather than transform a partial range. The caller
-// advances its flushed mark.
+// The window must keep the RAW LZ bytes, because later solid entries match back
+// into earlier window regions, so apply each filter to a staged copy instead.
 pub fn emitSpan(
     window: *window_mod.Window,
     out: sink.Sink,
