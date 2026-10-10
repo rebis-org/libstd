@@ -305,7 +305,20 @@ fn TableCrc(comptime T: type, comptime poly: T, comptime reflected: bool) type {
                 }
                 for (input) |b| self.state = (self.state >> 8) ^ table[(self.state ^ b) & 0xff];
             } else {
-                for (input) |b| self.state = (self.state << 8) ^ table[((self.state >> (bits - 8)) ^ b) & 0xff];
+                // Slicing-by-4 over big-endian words (zlib braid structure).
+                var crc = self.state;
+                var i: usize = 0;
+                while (i + 4 <= input.len) : (i += 4) {
+                    crc ^= std.mem.readInt(u32, input[i..][0..4], .big);
+                    crc = tables[3][(crc >> 24) & 0xff] ^
+                        tables[2][((crc >> 16) & 0xff)] ^
+                        tables[1][((crc >> 8) & 0xff)] ^
+                        tables[0][crc & 0xff];
+                }
+                while (i < input.len) : (i += 1) {
+                    crc = (crc << 8) ^ table[((crc >> (bits - 8)) ^ input[i]) & 0xff];
+                }
+                self.state = crc;
             }
         }
 
@@ -335,12 +348,22 @@ fn TableCrc(comptime T: type, comptime poly: T, comptime reflected: bool) type {
         const tables: [4][256]T = blk: {
             @setEvalBranchQuota(10000);
             var t: [4][256]T = undefined;
-            for (0..256) |i| {
-                var crc: T = table[i];
-                t[0][i] = crc;
+            if (reflected) {
+                for (0..256) |i| {
+                    var crc: T = table[i];
+                    t[0][i] = crc;
+                    for (1..4) |k| {
+                        crc = table[@intCast(crc & 0xff)] ^ (crc >> 8);
+                        t[k][i] = crc;
+                    }
+                }
+            } else {
+                for (0..256) |i| t[0][i] = table[i];
                 for (1..4) |k| {
-                    crc = table[@intCast(crc & 0xff)] ^ (crc >> 8);
-                    t[k][i] = crc;
+                    for (0..256) |i| {
+                        const prev = t[k - 1][i];
+                        t[k][i] = (prev << 8) ^ table[(prev >> (bits - 8)) & 0xff];
+                    }
                 }
             }
             break :blk t;
