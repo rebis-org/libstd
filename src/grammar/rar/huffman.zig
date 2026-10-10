@@ -4,10 +4,8 @@ const Failure = failure.Failure;
 const bits = @import("bits.zig");
 const BitReader = bits.BitReader;
 
-// Range-boundary decode tables in the reference form (the DecodeLen, DecodePos,
-// and DecodeNum arrays of unrar), which accepts the slightly over-committed
-// tables that real archives contain. decode_num lives in caller storage, so the
-// whole decode context carves out of one workspace.
+// The DecodeLen, DecodePos, and DecodeNum tables accept the over-committed
+// tables that real archives contain, and DecodeNum lives in caller storage.
 
 pub const max_code_length: u5 = 15;
 pub const max_quick_bits: u5 = 9;
@@ -28,11 +26,8 @@ pub const DecodeTable = struct {
     valid: bool = false,
 };
 
-// Reads a code-length-alphabet table: `count` 4-bit lengths, then the decode
-// table built from them. With `escapes` (v29), a 15 is an ESCAPE, the next
-// 4 bits are a zero-run count, 0 meaning the length really is 15, and a run
-// that overruns `count` is truncated, as in the reference. V20 has no escape
-// and reads its lengths verbatim.
+// With `escapes` (v29), a length of 15 is an ESCAPE and the next 4 bits give a
+// zero-run count, where 0 means the length is 15 and an overrun truncates.
 pub fn readCodeLengthTable(br: *BitReader, count: usize, comptime escapes: bool, storage: []u16) Failure!DecodeTable {
     var lengths: [64]u8 = @splat(0);
     var i: usize = 0;
@@ -43,8 +38,8 @@ pub fn readCodeLengthTable(br: *BitReader, count: usize, comptime escapes: bool,
             if (zero_count == 0) {
                 lengths[i] = 15;
             } else {
-                // ZeroCount+2 zeros. The loop increment lands past the run
-                // (the reference does I-- after its inner while).
+                // The escape means ZeroCount + 2 zeros, and `i -|= 1` returns
+                // the step that the loop increment below takes after the run.
                 var remaining: u32 = @as(u32, zero_count) + 2;
                 while (remaining > 0 and i < count) : (remaining -= 1) {
                     lengths[i] = 0;
@@ -60,7 +55,7 @@ pub fn readCodeLengthTable(br: *BitReader, count: usize, comptime escapes: bool,
     return makeDecodeTables(lengths[0..count], storage);
 }
 
-// storage.len bounds the table: every present symbol must fit.
+// The table is bounded by storage.len, so every present symbol must fit.
 pub fn makeDecodeTables(code_lengths: []const u8, storage: []u16) Failure!DecodeTable {
     var table = DecodeTable{};
     table.max_num = @intCast(code_lengths.len);
@@ -78,10 +73,10 @@ pub fn makeDecodeTables(code_lengths: []const u8, storage: []u16) Failure!Decode
         table.decode_pos[len] = total_symbols;
         total_symbols += len_count[len];
     }
-    table.decode_len[max_code_length + 1] = 0x10000; // sentinel for the slow path
+    table.decode_len[max_code_length + 1] = 0x10000; // The 0x10000 sentinel ends the 64K offset space that the slow path walks.
     table.decode_pos[max_code_length + 1] = total_symbols;
 
-    if (total_symbols == 0) return table; // invalid: nothing to decode
+    if (total_symbols == 0) return table; // A zero count leaves the table invalid.
     if (total_symbols > storage.len) return error.InternalFailure;
 
     table.decode_num = storage[0..total_symbols];
@@ -189,7 +184,7 @@ test "decode table builds canonical ranges" {
 }
 
 test "decode number round-trips short codes" {
-    // Codes: A=0, B=10, C=11. Stream A B C A = 0x58.
+    // Canonical codes A=0, B=10, and C=11 pack the stream A B C A into 0x58.
     const code_lengths = [_]u8{ 1, 2, 2 };
     var storage: [3]u16 = undefined;
     const table = try makeDecodeTables(&code_lengths, &storage);
@@ -205,7 +200,7 @@ test "decode number handles codes longer than the quick width" {
     const code_lengths = [_]u8{ 1, 2, 3, 11, 11 };
     var storage: [5]u16 = undefined;
     const table = try makeDecodeTables(&code_lengths, &storage);
-    // Symbol 3 (code 1792) then symbol 4 (code 1793).
+    // The 11-bit codes 1792 and 1793 stand for symbols 3 and 4.
     const data = [_]u8{ 0xE0, 0x1C, 0x04 };
     var br = BitReader.init(&data);
     try std.testing.expectEqual(@as(u16, 3), try decodeNumber(&br, &table));

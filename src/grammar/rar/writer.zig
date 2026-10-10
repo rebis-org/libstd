@@ -8,22 +8,18 @@ const pack50 = @import("pack50.zig");
 const finder = @import("finder.zig");
 const rar = @import("../rar.zig");
 
-// RAR5 archive creation (store or LZ). The facade (../rar.zig) owns reading.
-// this file owns writing: entry serialization, the packed region, and the
-// block compressor handoff.
-
 pub const RarEntry = struct {
     name: []const u8,
     data: []const u8 = &.{},
     mtime: u32 = 0,
     is_directory: bool = false,
-    method: u8 = 0, // 0 = store, 1-5 = LZ level
+    method: u8 = 0, // 0 = store, 1-5 = LZ level.
 };
 
 pub const pack50Sizes = pack50.workspacesFor;
 pub const LzToken = finder.LzToken;
 
-// Write-side buffers, all caller-provided.
+// Every buffer is caller-provided, so this struct never allocates.
 pub const WriteBuffers = struct {
     hash: []u32,
     hash2: []u32,
@@ -31,12 +27,11 @@ pub const WriteBuffers = struct {
     bt_left: []u32,
     bt_right: []u32,
     tokens: []finder.LzToken,
-    staging: []u8, // block compressor staging: 2x input + slack
-    packed_buf: []u8, // all entries' packed data, laid out back to back
+    staging: []u8,
+    packed_buf: []u8, // All entries' packed data, laid out back to back.
     packed_sizes: []usize,
 };
 
-// Per-entry packed-size bound used to lay out `packed`.
 pub fn packedBound(entry: RarEntry) usize {
     if (entry.is_directory or entry.data.len == 0 or entry.method == 0) return entry.data.len;
     return entry.data.len * pack50.max_expansion + pack50.output_slack;
@@ -67,7 +62,7 @@ fn vintSize(value: u64) usize {
     return size;
 }
 
-// compression_info: algo 0, solid 0, method 1-5, dict_bits 3 (1 MiB window).
+// The compression_info field sets algo 0, solid 0, method 1-5, and dict_bits 3 (1 MiB window).
 fn compressionInfoVint(method: u3) u64 {
     return (@as(u64, method) << 7) | (@as(u64, 3) << 10);
 }
@@ -78,8 +73,7 @@ const block_writer = struct {
     fn emitHeader(out: []u8, pos: usize, contents: []const u8) Failure!usize {
         var size_buf: [10]u8 = undefined;
         const size_len = writeVint(contents.len, &size_buf);
-        // The header CRC covers the size vint plus the contents, matching the
-        // reader, which checksums from the size field through the body end.
+        // The CRC range must match the reader, which checksums from the size field through the body end.
         var crc_state = checksum.Crc32.init();
         crc_state.update(size_buf[0..size_len]);
         crc_state.update(contents);
@@ -94,8 +88,7 @@ const block_writer = struct {
     }
 
     fn mainBlockSize() usize {
-        // type(1) + flags(1) + archive_flags(1) = 3 contents bytes. One-byte
-        // size vint. 4 CRC bytes.
+        // Contents are type, flags, and archive flags (3 bytes), plus a one-byte size vint and 4 CRC bytes.
         return 4 + 1 + 3;
     }
 
@@ -103,13 +96,13 @@ const block_writer = struct {
         var contents: [8]u8 = undefined;
         var c: usize = 0;
         c += writeVint(rar.rar5_type_main, contents[c..]);
-        c += writeVint(0, contents[c..]); // header flags
-        c += writeVint(0, contents[c..]); // archive flags
+        c += writeVint(0, contents[c..]);
+        c += writeVint(0, contents[c..]);
         return emitHeader(out, pos, contents[0..c]);
     }
 
     fn endBlockSize() usize {
-        // type(1) + flags(1) + end_flags(1) = 3 contents bytes.
+        // Contents are type, flags, and end flags (3 bytes), plus a one-byte size vint and 4 CRC bytes.
         return 4 + 1 + 3;
     }
 
@@ -117,12 +110,11 @@ const block_writer = struct {
         var contents: [8]u8 = undefined;
         var c: usize = 0;
         c += writeVint(rar.rar5_type_end, contents[c..]);
-        c += writeVint(0, contents[c..]); // header flags
-        c += writeVint(0, contents[c..]); // end flags
+        c += writeVint(0, contents[c..]);
+        c += writeVint(0, contents[c..]);
         return emitHeader(out, pos, contents[0..c]);
     }
 
-    // Header-only size for a file block carrying `packed_len` bytes of data.
     fn fileBlockSize(entry: RarEntry, packed_len: usize) usize {
         var file_flags: u64 = rar.rar5_file_mtime;
         if (entry.is_directory) {
@@ -136,18 +128,16 @@ const block_writer = struct {
         body += vintSize(file_flags);
         body += vintSize(if (entry.is_directory) 0 else entry.data.len);
         body += vintSize(attributes);
-        body += 4; // mtime
-        if (!entry.is_directory) body += 4; // crc32
+        body += 4;
+        if (!entry.is_directory) body += 4;
         body += vintSize(if (entry.method == 0) 0 else compressionInfoVint(@intCast(entry.method)));
-        body += vintSize(1); // host_os unix (RAR5 table: 0=windows, 1=unix)
+        body += vintSize(1); // The host_os value 1 means unix (RAR5 table: 0=windows, 1=unix).
         body += vintSize(entry.name.len);
         body += entry.name.len;
 
         var contents: usize = 0;
         contents += vintSize(rar.rar5_type_file);
-        // The walk requires HFL_DATA on file blocks. Winrar sets it even for
-        // zero-length payloads (data_size 0), and omitting it for empty files
-        // broke our own write→read round trips.
+        // The walk requires HFL_DATA on file blocks, and the RAR5 table sets it even when data_size is 0.
         contents += vintSize(if (entry.is_directory) 0 else rar.rar5_flag_data);
         if (!entry.is_directory) contents += vintSize(packed_len);
         contents += body;
@@ -183,7 +173,7 @@ const block_writer = struct {
             b += 4;
         }
         b += writeVint(if (entry.method == 0) 0 else compressionInfoVint(@intCast(entry.method)), body[b..]);
-        b += writeVint(1, body[b..]); // host_os unix (RAR5 table)
+        b += writeVint(1, body[b..]); // The host_os value 1 means unix.
         b += writeVint(entry.name.len, body[b..]);
         @memcpy(body[b..][0..entry.name.len], entry.name);
         b += entry.name.len;
@@ -215,16 +205,14 @@ fn checkWriteEntries(entries: []const RarEntry) Failure!void {
     if (entries.len > 65535) return error.ResourceLimit;
 }
 
-// Compress every LZ entry into its slot of the packed region, returning the
-// total archive size. Shared by the sizing query and the commit pass (each
-// runs it afresh (the two-pass shape the zip writer established).
+// The sizing query and the commit pass each run this, so one encode compresses twice.
 fn packEntries(entries: []const RarEntry, ws: *WriteBuffers) Failure!usize {
     var total: usize = rar.rar5_signature.len + block_writer.mainBlockSize() + block_writer.endBlockSize();
     var packed_cursor: usize = 0;
     for (entries, 0..) |entry, i| {
         const packed_len: usize = if (entry.is_directory or entry.data.len == 0 or entry.method == 0) blk: {
-            // The writer reads every entry back from the packed region, so a stored entry
-            // must lay its raw bytes there.
+            // The encode pass reads every entry back from the packed region, so a stored
+            // entry must lay its raw bytes there.
             if (ws.packed_buf.len - packed_cursor < entry.data.len) return error.InternalFailure;
             @memcpy(ws.packed_buf[packed_cursor .. packed_cursor + entry.data.len], entry.data);
             break :blk entry.data.len;
@@ -325,8 +313,7 @@ test "created archive round-trips through the facade reader (store and lz)" {
         const entries = [_]RarEntry{
             .{ .name = "m1.txt", .data = data1, .method = method },
             .{ .name = "m2.txt", .data = &data2, .method = method },
-            // Empty files must round trip: the block carries HFL_DATA with
-            // data_size 0, matching what the official rar binary writes.
+            // An empty file round trips because the block carries HFL_DATA with data_size 0.
             .{ .name = "empty.txt", .data = "", .method = method },
         };
         const sizes = pack50.workspacesFor(@max(data1.len, data2.len));

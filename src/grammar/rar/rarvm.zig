@@ -5,10 +5,8 @@ const bits = @import("bits.zig");
 const BitReader = bits.BitReader;
 const checksum = @import("../../common/primitive/checksum.zig");
 
-// RAR3 ships its filters as bytecode programs, but only six are ever emitted
-// and modern unrar dispatches them straight to native code, so this file keys
-// them by CRC32 and length too. Any other program leaves the entry
-// unverifiable, and must never pass through unfiltered.
+// Only six standard filter programs exist, so a program matches only when its
+// CRC32 and its length both match. Any other program must stay unverifiable.
 
 pub const StandardFilter = enum {
     none,
@@ -30,11 +28,8 @@ const std_filters = [_]StdFilterEntry{
     .{ .length = 216, .crc = 0xbc85e701, .filter = .audio },
 };
 
-// Byte 0 is an XOR checksum over bytes 1..n, and both the length and the
-// CRC32 must match one of the six: the length alone does not distinguish them,
-// and the CRC alone accepts a truncated program. Any mismatch means corrupt
-// code, so the result is .none, which leaves the entry unverifiable (the
-// reference bails out of Prepare()).
+// Byte 0 is an XOR checksum over bytes 1..n. The CRC32 alone accepts a
+// truncated program, so the length must match too, and a mismatch returns .none.
 pub fn identifyFilter(provider: checksum.Provider, code: []const u8) StandardFilter {
     if (code.len == 0) return .none;
 
@@ -49,9 +44,8 @@ pub fn identifyFilter(provider: checksum.Provider, code: []const u8) StandardFil
     return .none;
 }
 
-// The RarVM variable-width integer (reference RarVM::ReadData). The top two
-// bits select the width, and the 0x4000 width has a sub-case that
-// sign-extends a small negative value.
+// A variable-width integer uses the top two bits to select the width. The
+// 0x4000 width has a sub-case that sign-extends a small negative value.
 pub fn readData(br: *BitReader) Failure!u32 {
     const head_bits = try br.peekBits(16);
     switch (head_bits & 0xc000) {
@@ -84,10 +78,8 @@ pub fn readData(br: *BitReader) Failure!u32 {
     }
 }
 
-// A false result means the parameters are out of range, so the caller must
-// report the entry unverifiable. The reference filters a VM image at
-// Mem + BlockSize; reading from a copy and writing back over `data` gives the
-// same transform without the scratch copy.
+// A false result means the parameters are out of range, so the caller must report the entry unverifiable.
+// Each filter reads from scratch, because writing over the destination would overwrite unread input.
 pub fn applyFilter(
     filter: StandardFilter,
     data: []u8,
@@ -231,11 +223,8 @@ pub fn applyFilter(
             return true;
         },
         .rgb => {
-            // The reference predictor sums the left, upper, and upper-left
-            // neighbors and keeps the one whose absolute difference from
-            // that sum is the smallest, which is the Paeth choice. The
-            // encoder stored red and blue as differences from green, so
-            // green is added back to both channels afterwards.
+            // The predictor sums the left, upper, and upper-left neighbors, then keeps the one with the smallest absolute difference from that sum.
+            // The encoder stored red and blue as differences from green, so green must be added back afterwards.
             const width_reg = init_r[0];
             if (width_reg < 3) return false;
             const width: usize = width_reg - 3;
@@ -286,10 +275,8 @@ pub fn applyFilter(
             return true;
         },
         .itanium => {
-            // An IA-64 instruction bundle is 16 bytes that hold three 41-bit slots
-            // and one 5-bit template. In each slot whose op type is a branch,
-            // which is 5, the encoder made the 20-bit target absolute, so
-            // convert it back.
+            // An IA-64 instruction bundle is 16 bytes that hold three 41-bit slots and one 5-bit template.
+            // In every slot whose op type is 5, which is a branch, the encoder made the 20-bit target absolute, so convert it back.
             if (data_size < 21) return false;
             var file_offset: u32 = init_r[6] >> 4;
 
@@ -319,15 +306,13 @@ pub fn applyFilter(
     }
 }
 
-// The E8 filter normalizes against a FIXED 16 MB image size (reference
-// FileSize), not the size of the file being decoded.
+// The E8 filter normalizes against a fixed 16 MB image size, not the size of the file being decoded.
 const e8_wrap: u32 = 0x1000000;
 
-// The reference caps delta channels at MAX3_UNPACK_CHANNELS.
+// The delta filter caps channels at MAX3_UNPACK_CHANNELS.
 const max_channels: usize = 1024;
 
-// The absolute difference of the wrapped 32-bit values that the RGB predictor
-// compares, which matches the reference abs((int)(Predicted - X)).
+// The RGB predictor compares wrapped 32-bit differences, so a pair that crosses the sign bit differs from the mathematical difference.
 fn absDiff(predicted: u32, neighbor: u32) u32 {
     const diff: i32 = @bitCast(predicted -% neighbor);
     return @abs(diff);

@@ -1,0 +1,122 @@
+name: Cache
+
+on:
+  workflow_call:
+    inputs:
+      profile:
+        description: Command set to run once the caches are restored.
+        type: string
+        required: true
+      impl:
+        description: Primitive seam implementation the build configures.
+        type: string
+        required: true
+      portable:
+        description: Restrict primitive seams to their portable paths.
+        type: boolean
+        required: true
+      export:
+        description: Hand the archives this run produced to the caller's release job.
+        type: boolean
+        required: false
+        default: false
+      benchmark:
+        description: Run the benchmark campaign.
+        type: boolean
+        required: false
+        default: false
+
+jobs:
+  cached:
+    name: Cached run
+    runs-on: xcode-27
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v7.0.1
+        with:
+          submodules: recursive
+      - name: Install the toolchain
+        uses: jdx/mise-action@v5.1.1
+        with:
+          install: true
+      - id: keys
+        name: Resolve cache keys
+        run: |
+          zig="$(zig version)"
+          vendor="$(git submodule status --recursive | sha256sum | cut -d' ' -f1)"
+          cache="$(zig env | sed -n 's/^[[:space:]]*\.global_cache_dir = "\(.*\)",$/\1/p')"
+          [ -d "$cache" ] || { echo "unresolved zig global cache: '$cache'" >&2; exit 1; }
+          {
+            echo "zig=$zig"
+            echo "vendor=$vendor"
+            echo "cache=$cache"
+          } >> "$GITHUB_OUTPUT"
+      - name: Restore the dependency cache
+        uses: actions/cache@v6.1.0
+        with:
+          path: ${{ steps.keys.outputs.cache }}
+          key: zig-global-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-${{ hashFiles('build.zig.zon', 'pkg/**') }}
+          restore-keys: |
+            zig-global-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-
+      - name: Restore the project cache
+        uses: actions/cache@v6.1.0
+        with:
+          path: .zig-cache
+          key: zig-project-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-${{ steps.keys.outputs.vendor }}-${{ inputs.impl }}-${{ inputs.portable }}-${{ hashFiles('build.zig', 'build.zig.zon', 'build/**', 'src/**', 'pkg/**') }}
+          restore-keys: |
+            zig-project-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-${{ steps.keys.outputs.vendor }}-${{ inputs.impl }}-${{ inputs.portable }}-
+            zig-project-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-${{ steps.keys.outputs.vendor }}-
+            zig-project-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-
+      - name: Restore the Homebrew cache
+        uses: actions/cache@v6.1.0
+        if: inputs.profile == 'build'
+        with:
+          path: ~/Library/Caches/Homebrew
+          key: brew-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.mise.toml') }}
+          restore-keys: |
+            brew-${{ runner.os }}-${{ runner.arch }}-
+      - name: Restore the benchmark cache
+        uses: actions/cache@v6.1.0
+        if: inputs.benchmark
+        with:
+          path: |
+            zig-out/benchmark/bin/pkgs
+            zig-out/benchmark/corpus
+          key: benchmark-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-${{ hashFiles('build/acceptance/benchmark/command.zig', 'build/acceptance/benchmark/env.zig') }}
+          restore-keys: |
+            benchmark-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-
+      - name: Build and package
+        if: inputs.profile == 'build'
+        run: |
+          zig build exe -Doptimize=Debug
+          zig build exe -Doptimize=ReleaseSafe
+          zig build -Doptimize=ReleaseFast
+          zig build -Doptimize=ReleaseSmall
+          zig build abi
+          brew install autoconf automake bison
+          [ "${{ inputs.benchmark }}" = true ] && zig build benchmark -Doptimize=ReleaseFast
+          brew install llvm
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+          zig build dist -Doptimize=ReleaseFast
+          zig build package -Doptimize=ReleaseFast
+      - name: Export the archives
+        uses: actions/upload-artifact@v7.0.2
+        if: inputs.export
+        with:
+          name: dist
+          path: |
+            zig-out/libstd.*.zip
+            zig-out/stdk.*.aar
+            zig-out/StdK.*.zip
+            zig-out/stdk.*.zip
+          if-no-files-found: error
+          retention-days: 7
+      - name: Run the test suites
+        if: inputs.profile == 'suite'
+        run: |
+          case "${{ inputs.impl }}" in
+            onprem|offprem|mergeable) ;;
+            *) echo "unknown primitive implementation" >&2; exit 1 ;;
+          esac
+          zig build unit -Dprimitives_impl=${{ inputs.impl }} -Dportable=${{ inputs.portable }}
+          zig build oracles -Dprimitives_impl=${{ inputs.impl }} -Dportable=${{ inputs.portable }} -Doptimize=ReleaseSafe

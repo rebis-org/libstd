@@ -2,11 +2,8 @@ const std = @import("std");
 const failure = @import("../../common/primitive/failure.zig");
 const Failure = failure.Failure;
 
-// RAR packs codes MSB-first within each byte, so every decode table in this
-// library reads bits in that order. The reader is hard-bounded by default.
-// V29 opts into zero padding because its end-of-block marker peeks 16 bits
-// to reach the final 1 to 2 bits; the reference reads an over-allocated
-// buffer the same way.
+// RAR packs codes MSB-first within each byte. V29 uses zero padding because its
+// end-of-block marker peeks 16 bits to reach the final 1 to 2 bits.
 
 pub const default_pad_bytes: usize = 32;
 
@@ -39,9 +36,8 @@ pub const BitReader = struct {
         return (self.bytes.len + self.pad_bytes) * 8;
     }
 
-    // A stream that ends mid-code can still exit cleanly. This records whether
-    // the reader moved into the padding, so a caller can tell a complete decode
-    // from one that ran out instead of trusting the exit status.
+    // A stream can end mid-code and still exit cleanly, so a caller must check
+    // this flag to tell a complete decode from one that ran out.
     pub fn hasOverrun(self: *const BitReader) bool {
         return self.bit_pos > self.bytes.len * 8;
     }
@@ -72,8 +68,8 @@ pub const BitReader = struct {
         const shift: u6 = @intCast(64 - count);
         const result: u32 = @intCast(self.pending_bits >> shift);
         self.pending_bits <<= @intCast(count);
-        // Saturating: inside the padding region the bit buffer holds fewer bits
-        // than the call asks for. The rest are implicit zeros.
+        // Inside the padding region the buffer holds fewer bits than the call asks
+        // for, so the count saturates and the remaining bits are implicit zeros.
         self.pending_bit_count -= @min(count, self.pending_bit_count);
         self.bit_pos += count;
         return result;
@@ -249,7 +245,6 @@ test "bit writer round-trips through the reader" {
 test "bit writer refuses a full buffer" {
     var buf: [1]u8 = undefined;
     var bw = BitWriter.init(&buf);
-    // The first byte flushes. The second trips the capacity check inside
-    // writeBits, before flush.
+    // The capacity error surfaces in writeBits, because that is where the flush runs.
     try std.testing.expectError(error.InsufficientCapacity, bw.writeBits(0xFFFF, 16));
 }

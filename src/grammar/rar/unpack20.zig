@@ -10,34 +10,27 @@ const Window = window_mod.Window;
 const sink = @import("../../common/sink.zig");
 const Sink = sink.Sink;
 
-// RAR 2.x (v20/v26) decoder. Unlike v29: no byte alignment before table
-// reads, no length-15 escape, and its own rep-match bonus a tier lower. The
-// old-distance ring is a true circular buffer. Every match pushes its
-// distance at the cursor, so v29-style rotation desynchronises it. Tables
-// are verbatim from the reference (unpack20.cpp): a derived table agreed
-// with the reference only where it inherited the reference's bugs, and no
-// formula reproduces DBits saturating at 16.
+// RAR 2.x (v20/v26) code length tables must stay literal, because no closed form reproduces DBits saturating at 16.
+// Every match pushes its distance at the write cursor, so the old-distance ring must stay circular.
 
 const nc20: u16 = 298;
-const mc20: u16 = 257; // audio alphabet: 256 deltas + the table-refresh code
+const mc20: u16 = 257; // Audio alphabet: 256 deltas plus the table-refresh code.
 const dc20: u16 = 48;
 const rc20: u16 = 28;
-const bc20: u16 = 19; // NOT 20, v29's BC30 is 20. Reading a 20th length desynchronises every table read
+const bc20: u16 = 19; // Not 20, because v29's BC30 is 20, and a 20th length desynchronises every table read.
 
 const max_audio_channels: u8 = 4;
 
-// Largest symbol-length table a v20 block can declare: four audio channels
-// (4*257) outsize the LZ layout (298+48+28 = 374), reference UnpOldTable20.
+// Largest symbol-length table a v20 block can declare: four audio channels at 4*257 outsize the LZ layout of 374.
 const old_table_size: usize = @as(usize, mc20) * @as(usize, max_audio_channels);
 
 pub const table_pool_words: usize = @as(usize, nc20) + dc20 + rc20 + @as(usize, mc20) * max_audio_channels;
 
-// Reference SDDecode / SDBits for the 2-byte short matches (symbols 261..268).
+// Symbols 261 to 268 select a 2-byte match from these distances and extra bit counts.
 const short_distances = [8]u32{ 0, 4, 8, 16, 32, 64, 128, 192 };
 const short_distance_bits = [8]u5{ 2, 2, 3, 4, 5, 6, 6, 6 };
 
-// Reference LDecode, RAW. The caller adds +3 (new match, symbol >= 270) or
-// +2 (rep-distance match, symbols 257..260).
+// The caller adds +3 for a new match (symbol 270 or above) or +2 for a rep-distance match (symbols 257 to 260).
 const length_bases = [rc20]u32{
     0,   1,   2,   3,   4,  5,  6,  7,
     8,   10,  12,  14,  16, 20, 24, 28,
@@ -47,7 +40,7 @@ const length_bases = [rc20]u32{
 const length_match_base: u32 = 3;
 const length_rep_base: u32 = 2;
 
-// Reference LBits, groups of FOUR after the eight zero-width slots.
+// Extra bits rise in groups of four after the eight zero-width slots.
 const length_extra_bits = [rc20]u5{
     0, 0, 0, 0, 0, 0, 0, 0,
     1, 1, 1, 1, 2, 2, 2, 2,
@@ -55,8 +48,7 @@ const length_extra_bits = [rc20]u5{
     5, 5, 5, 5,
 };
 
-// Reference DDecode (48 entries). V20's distance table is its own, not the
-// v29 one, and not slot/2-1 either.
+// The RAR 2.x distance table is its own, so it is neither the v29 one nor slot/2-1.
 const dist_decode = [dc20]u32{
     0,      1,      2,      3,      4,      6,      8,      12,
     16,     24,     32,     48,     64,     96,     128,    192,
@@ -66,7 +58,7 @@ const dist_decode = [dc20]u32{
     524288, 589824, 655360, 720896, 786432, 851968, 917504, 983040,
 };
 
-// Reference DBits, SATURATES at 16 for the high slots.
+// The bit counts saturate at 16 for the high slots.
 const dist_bits = [dc20]u5{
     0,  0,  0,  0,  1,  1,  2,  2,
     3,  3,  4,  4,  5,  5,  6,  6,
@@ -86,11 +78,8 @@ fn decodeDistance(slot: u32, br: *BitReader) Failure!u32 {
     return distance;
 }
 
-// RAR 2.0 audio-mode channel state, reference-exact (DecodeAudio /
-// AudioVariables). The predictor adapts every 32 samples by scanning an
-// 11-bucket accumulator of absolute prediction differences and nudges
-// exactly one coefficient toward the winning bucket, with asymmetric clamps
-// ([-17, 16]: the guard is `>= -16` BEFORE the decrement).
+// The predictor adapts every 32 samples by nudging one coefficient toward the bucket with the smallest accumulated difference.
+// The clamp is asymmetric, [-17, 16], because each guard tests `>= -16` before the decrement.
 const AudioChannel = struct {
     k1: i32 = 0,
     k2: i32 = 0,
@@ -106,8 +95,7 @@ const AudioChannel = struct {
     byte_count: u32 = 0,
     last_char: i32 = 0,
 
-    // `delta_symbol` is the Huffman-decoded symbol (0..255). The channel
-    // delta is SHARED across channels (reference UnpChannelDelta).
+    // The channel delta is shared across channels, so this pointer carries state between calls.
     fn decode(self: *AudioChannel, channel_delta: *i32, delta_symbol: u32) u8 {
         self.byte_count +%= 1;
         self.d4 = self.d3;
@@ -122,7 +110,7 @@ const AudioChannel = struct {
 
         const sample: u32 = @as(u32, @bitCast(predicted_sample)) -% delta_symbol;
 
-        // The reference's D = ((signed char)Delta) << 3, computed unsigned.
+        // The reference scales the difference as a sign-extended byte shifted left by 3.
         const signed_delta: i32 = @as(i8, @bitCast(@as(u8, @truncate(delta_symbol))));
         const scaled_delta: i32 = @bitCast(@as(u32, @bitCast(signed_delta)) << 3);
 
@@ -197,17 +185,14 @@ const AudioChannel = struct {
 };
 
 const Decoder = struct {
-    // By value, not by pointer: a solid Session outlives any single file, and
-    // the reference restarts bit input per entry (Inp.InitBitInput in
-    // UnpInitData, called for solid entries too).
+    // A solid session outlives a single file, and bit input restarts for every entry, so the reader is stored by value.
     br: BitReader,
     window: Window,
     literal_table: DecodeTable,
     distance_table: DecodeTable,
     length_table: DecodeTable,
     audio_tables: [max_audio_channels]DecodeTable,
-    // Reference OldDist, a CIRCULAR buffer of the last four match distances,
-    // with old_dist_ptr as the write cursor.
+    // The four distances form a circular buffer whose cursor wraps instead of rotating the slots.
     old_dist: [4]u32,
     old_dist_ptr: u32,
     last_distance: u32,
@@ -220,10 +205,9 @@ const Decoder = struct {
     audio_block: bool,
     audio_channels: u8,
     cur_channel: u8,
-    // Previous block's symbol lengths (reference UnpOldTable20). V20 encodes
-    // each block as a 4-bit DELTA against this, so it must persist.
+    // Each block encodes its lengths as a 4-bit delta against the previous block, so these lengths must persist.
     old_table: [old_table_size]u8,
-    // Shared cross-channel prediction delta (reference UnpChannelDelta).
+    // The prediction delta is shared across all channels.
     channel_delta: i32,
     tables_loaded: bool,
     audio_state: [max_audio_channels]AudioChannel,
@@ -287,13 +271,11 @@ fn tablePoolSlice(st: *Decoder, index: usize, comptime size: usize) []u16 {
 fn readTables(st: *Decoder) Failure!void {
     const br = &st.br;
 
-    // NO byte alignment here. V20's ReadTables20 goes straight to getbits(),
-    // copying v29's align discards up to 7 bits. Invisible until a mid-stream
-    // table refresh (symbol 269) needs an entry spanning two blocks.
+    // V20 reads tables without byte alignment, because aligning discards up to 7 bits.
+    // The loss stays invisible until a table refresh (symbol 269) needs an entry that spans two blocks.
 
-    // Flag bits out of one peeked word (reference ReadTables20): 0x8000 =
-    // audio block, 0x4000 clear = zero the old table, then 2 more bits give
-    // the channel count when audio (TableSize = MC20 * channels).
+    // One peeked word holds the flag bits: 0x8000 marks an audio block and 0x4000 clear zeroes the old table.
+    // Two more bits give the channel count of an audio block, so the table size is MC20 * channels.
     const bit_field = try br.peekBits(16);
     st.audio_block = (bit_field & 0x8000) != 0;
 
@@ -312,13 +294,11 @@ fn readTables(st: *Decoder) Failure!void {
         table_size = nc20 + dc20 + rc20;
     }
 
-    // The 19 code-length-alphabet lengths, 4 bits each. Unlike v29, v20 has
-    // NO length-15 escape here (readCodeLengthTable with escapes=false).
+    // The code-length alphabet has no length-15 escape here, unlike the v29 one.
     var code_length_table = try huffman.readCodeLengthTable(br, bc20, false, tablePoolSlice(st, 0, bc20));
 
-    // 4-bit DELTAs against the previous block's lengths (why old_table must
-    // persist). V20's escape mapping is its own, do not copy v29's. 16
-    // repeats 3+read(2), 17 zeros 3+read(3), 18/19 zeros 11+read(7).
+    // Lengths are 4-bit deltas against the previous block, so symbol 16 repeats 3 + read(2).
+    // Symbols 17 to 19 zero 3 + read(3) or 11 + read(7), which is the v20 mapping, not the v29 one.
     var code_lengths: [old_table_size]u8 = @splat(0);
     var i: u16 = 0;
     while (i < table_size) {
@@ -327,7 +307,7 @@ fn readTables(st: *Decoder) Failure!void {
             code_lengths[i] = @intCast((symbol + st.old_table[i]) & 0x0f);
             i += 1;
         } else if (symbol == 16) {
-            if (i == 0) return error.InvalidData; // nothing to repeat
+            if (i == 0) return error.InvalidData;
             var repeat_count: u32 = 3 + try br.readBits(2);
             while (repeat_count > 0 and i < table_size) : (repeat_count -= 1) {
                 code_lengths[i] = code_lengths[i - 1];
@@ -374,10 +354,8 @@ fn decodeLength(br: *BitReader, length_table: *const DecodeTable) Failure!u32 {
     return base;
 }
 
-// Emit decoded bytes before the circular window overwrites them. V20 has no
-// VM filters. Its multimedia mode is an inline decode path, not a
-// post-transform over a finished region, so unlike unpack29 there is nothing
-// that needs to reach backwards, and no reserve is held back.
+// V20 has no VM filters and its multimedia mode decodes inline, so nothing reaches backwards and no reserve is held back.
+// Decoded bytes must be emitted before the circular window overwrites them.
 fn flushDecoded(st: *Decoder, keep: usize) Failure!void {
     const out = st.stream_out orelse return;
     const produced = st.window.write_pos - st.entry_start;
@@ -391,8 +369,7 @@ fn flushDecoded(st: *Decoder, keep: usize) Failure!void {
     st.flushed += count;
 }
 
-// How much may accumulate unflushed before the window wraps over it. Half the
-// window keeps the emit cheap while leaving ample slack for a long match.
+// Half the window keeps the emit cheap while leaving ample slack for a long match.
 fn flushThreshold(st: *const Decoder) usize {
     return st.window.buffer.len / 2;
 }
@@ -456,12 +433,9 @@ fn unpackLzBlock(st: *Decoder) Failure!void {
             st.written_size += 1;
         } else if (symbol == 256) {
             if (st.last_distance == 0 or st.last_length == 0) {
-                continue; // no previous match to repeat
+                continue;
             }
-            // The reference routes this through CopyString20 too, so it ALSO
-            // pushes the distance and advances the cursor. Omitting the push
-            // leaves the circular buffer out of step with the encoder's, so
-            // every later rep match reads a stale slot.
+            // A rep match pushes its distance and advances the cursor, because a missing push makes every later rep match read a stale slot.
             st.old_dist[st.old_dist_ptr] = st.last_distance;
             st.old_dist_ptr = (st.old_dist_ptr +% 1) & 3;
             st.window.copyMatch(st.last_distance, st.last_length);
@@ -469,14 +443,12 @@ fn unpackLzBlock(st: *Decoder) Failure!void {
         } else if (symbol >= 257 and symbol <= 260) {
             const dist_idx: u32 = symbol - 257;
 
-            // Count back from the write cursor: OldDist[(ptr - (dist_idx+1))
-            // & 3]. V20 never rotates. The next match push advances the cursor.
+            // The old-distance slot counts back from the write cursor, because V20 never rotates the ring.
             const dist = st.old_dist[(st.old_dist_ptr -% (dist_idx + 1)) & 3];
 
             var length = try decodeLength(br, &st.length_table);
 
-            // v20's rep bonus starts a tier lower than v29's: +1 past 0x101,
-            // then +1 past 0x2000, +1 past 0x40000.
+            // The bonus tiers start at 0x101, 0x2000, and 0x40000, one tier lower than v29.
             if (dist >= 0x101) {
                 length += 1;
                 if (dist >= 0x2000) {
@@ -485,8 +457,6 @@ fn unpackLzBlock(st: *Decoder) Failure!void {
                 }
             }
 
-            // A rep match pushes its distance back in as well, the reference
-            // reaches CopyString20 here exactly as the new-match path does.
             st.old_dist[st.old_dist_ptr] = dist;
             st.old_dist_ptr = (st.old_dist_ptr +% 1) & 3;
             st.last_distance = dist;
@@ -508,7 +478,7 @@ fn unpackLzBlock(st: *Decoder) Failure!void {
             st.written_size += 2;
         } else if (symbol == 269) {
             st.tables_loaded = false;
-            return; // main loop re-reads tables
+            return;
         } else if (symbol >= 270) {
             const length_slot: u32 = symbol - 270;
             if (length_slot >= rc20) return error.InvalidData;
@@ -525,8 +495,7 @@ fn unpackLzBlock(st: *Decoder) Failure!void {
             const dist_sym = try huffman.decodeNumber(br, &st.distance_table);
             const dist = try decodeDistance(dist_sym, br);
 
-            // Distance-dependent length bonus, reference: if (Distance>=0x2000)
-            // { Length++. If (Distance>=0x40000) Length++. }.
+            // A new match gains a byte past 0x2000 and another past 0x40000, and it has no tier at 0x101.
             if (dist >= 0x2000) {
                 length += 1;
                 if (dist >= 0x40000) length += 1;
@@ -559,9 +528,7 @@ pub const Session = struct {
         return .{ .state = st };
     }
 
-    // Reference UnpInitData(false) + UnpInitData20(false): everything a
-    // non-solid entry starts over from. A solid entry runs NONE of this,
-    // which is the whole point.
+    // Only a non-solid entry resets this state, because a solid entry continues from the previous one.
     fn resetForNewStream(self: *Session) void {
         const st = self.state;
         st.window.reset();
@@ -569,7 +536,7 @@ pub const Session = struct {
         st.old_dist_ptr = 0;
         st.last_distance = 0;
         st.last_length = 0;
-        // memset(&BlockTables,0,...), force a re-read rather than inheriting.
+        // Zero the tables so the next block re-reads them instead of inheriting stale lengths.
         st.freeTables();
         st.tables_loaded = false;
         st.audio_block = false;
@@ -580,8 +547,7 @@ pub const Session = struct {
         st.old_table = @splat(0);
     }
 
-    // The reference gate is `if ((!Solid || !TablesRead2) && !ReadTables20())`
-    // A solid entry neither re-reads tables nor resets the window.
+    // A solid entry must neither re-read tables nor reset the window.
     pub fn decodeFile(
         self: *Session,
         packed_data: []const u8,
@@ -593,8 +559,7 @@ pub const Session = struct {
 
         if (!solid) self.resetForNewStream();
 
-        // Always restarted, solid or not: each entry has its own packed
-        // region (Inp.InitBitInput sits outside the `if (!Solid)`).
+        // Bit input restarts for every entry, solid or not, because each entry has its own packed region.
         st.br = BitReader.init(packed_data);
         st.written_size = 0;
         st.unpacked_size = unpacked_size;
@@ -603,17 +568,15 @@ pub const Session = struct {
 
         const start_pos = st.window.write_pos;
 
-        // Entries larger than the window MUST stream out as they decode. Held
-        // entirely in the window they lose their opening bytes. V20
-        // dictionaries are 64 KB-1 MB, so an ordinary file can exceed them.
+        // An entry larger than the window must stream out as it decodes, because a window-held entry loses its opening bytes.
+        // A RAR 2.x dictionary ranges from 64 KB to 1 MB, so an ordinary file can exceed the window.
         st.entry_start = start_pos;
         st.flushed = 0;
         st.stream_out = if (unpacked_size > st.window.buffer.len) out else null;
         defer st.stream_out = null;
 
         unpackLoop(st) catch |err| {
-            // Producing the declared number of bytes and then running out of
-            // input is success, not truncation.
+            // Running out of input after the declared byte count is success, not truncation.
             if (st.written_size < st.unpacked_size) return err;
         };
 
@@ -623,8 +586,7 @@ pub const Session = struct {
         }
 
         const out_size: usize = @intCast(@min(st.written_size, st.unpacked_size));
-        // A trailing match may overshoot the declared size, so measure how far
-        // the cursor actually moved rather than assuming it moved out_size.
+        // A trailing match can overshoot the declared size, so measure how far the cursor actually moved.
         const consumed = st.window.write_pos - start_pos;
         if (!st.window.emitTo(out, consumed, out_size)) {
             return error.InvalidData;
@@ -660,10 +622,6 @@ test "v20 distance decode for small slots" {
 }
 
 test "audio decode traces the reference for the first samples" {
-    // Hand-traced from unrar DecodeAudio with all-zero initial state:
-    // sample 1, Delta=42: prediction 0, Ch = -42, byte 214, ChannelDelta -42.
-    // sample 2, Delta=0: prediction 8*(-42)>>3 = -42, Ch = -42, byte 214,
-    // ChannelDelta decays to 0.
     var ch = AudioChannel{};
     var cd: i32 = 0;
     try std.testing.expectEqual(@as(u8, 214), ch.decode(&cd, 42));
@@ -692,7 +650,6 @@ test "old-distance ring: rep matches count back and every match pushes" {
     session.resetForNewStream();
     st.old_dist = [_]u32{ 10, 20, 30, 40 };
     st.old_dist_ptr = 0;
-    // Symbol 257 (rep idx 0) reads OldDist[(ptr - 1) & 3] = OldDist[3].
     const dist = st.old_dist[(st.old_dist_ptr -% (0 + 1)) & 3];
     try std.testing.expectEqual(@as(u32, 40), dist);
     st.old_dist[st.old_dist_ptr] = dist;
