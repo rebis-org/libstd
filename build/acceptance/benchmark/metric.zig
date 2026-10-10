@@ -103,53 +103,49 @@ pub fn ratio(bytes: usize, encoded: usize) f64 {
     return @as(f64, @floatFromInt(bytes)) / @as(f64, @floatFromInt(encoded));
 }
 
-fn cellRatio(buf: *[16]u8, totals: Totals, side: Side, show: bool) []const u8 {
-    return tsv.cell(buf, "{d:.3}", ratio(totals.input_bytes, totals.encoded[@backingInt(side)]), show);
+fn cellFor(buf: *[16]u8, comptime format: []const u8, value: f64, show: bool) []const u8 {
+    return tsv.cell(buf, format, value, show);
 }
 
-fn cellMibps(buf: *[16]u8, bytes: usize, ns: u64, show: bool) []const u8 {
-    return tsv.cell(buf, "{d:.1}", mibps(bytes, ns), show);
+fn cellRatio(buffer: *[16]u8, totals: Totals, side: Side, show: bool) []const u8 {
+    return cellFor(buffer, "{d:.3}", ratio(totals.input_bytes, totals.encoded[@backingInt(side)]), show);
 }
+
+fn cellMibps(buffer: *[16]u8, bytes: usize, ns: u64, show: bool) []const u8 {
+    return cellFor(buffer, "{d:.1}", mibps(bytes, ns), show);
+}
+
+const missing_labels = [_][]const u8{ "cmd missing", "lib missing", "bin missing" };
 
 fn coverage(allocator: std.mem.Allocator, totals: Totals, available: [4]bool) ![]const u8 {
     if (!totals.ok[@backingInt(Side.ours)]) return "failed";
     var parts: [3][]const u8 = undefined;
-    var n: usize = 0;
-    if (!available[1]) {
-        parts[n] = "cmd missing";
-        n += 1;
+    var count: usize = 0;
+    for (missing_labels, 1..) |label, side| {
+        if (!available[side]) {
+            parts[count] = label;
+            count += 1;
+        }
     }
-    if (!available[2]) {
-        parts[n] = "lib missing";
-        n += 1;
-    }
-    if (!available[3]) {
-        parts[n] = "bin missing";
-        n += 1;
-    }
-    if (n > 0) return std.mem.join(allocator, ", ", parts[0..n]);
+    if (count > 0) return std.mem.join(allocator, ", ", parts[0..count]);
     if (!totals.ok[1] or !totals.ok[2] or !totals.ok[3]) return "ref failed";
     return "ok";
 }
 
-pub fn row(report: *std.ArrayList(u8), allocator: std.mem.Allocator, r: matrix.Row, totals: Totals, available: [4]bool) !void {
-    const show = !r.decode_only;
+pub fn emitMetricRow(report: *std.ArrayList(u8), allocator: std.mem.Allocator, candidate: matrix.Row, totals: Totals, available: [4]bool) !void {
+    const show = !candidate.decode_only;
     const coverage_text = try coverage(allocator, totals, available);
-    var cells: [13][16]u8 = undefined;
-    const values = [_][]const u8{
-        cellRatio(&cells[0], totals, .ours, show),
-        cellMibps(&cells[1], totals.input_bytes, totals.encode_ns[0], show),
-        cellMibps(&cells[2], totals.input_bytes, totals.decode_ns[0], true),
-        cellRatio(&cells[3], totals, .cmd, available[1] and show),
-        cellMibps(&cells[4], totals.input_bytes, totals.encode_ns[1], available[1] and show),
-        cellMibps(&cells[5], totals.input_bytes, totals.decode_ns[1], available[1]),
-        cellRatio(&cells[6], totals, .lib, available[2] and show),
-        cellMibps(&cells[7], totals.input_bytes, totals.encode_ns[2], available[2] and show),
-        cellMibps(&cells[8], totals.input_bytes, totals.decode_ns[2], available[2]),
-        cellRatio(&cells[9], totals, .bin, available[3] and show),
-        cellMibps(&cells[10], totals.input_bytes, totals.encode_ns[3], available[3] and show),
-        cellMibps(&cells[11], totals.input_bytes, totals.decode_ns[3], available[3]),
-        coverage_text,
-    };
-    try tsv.emitRow(report, allocator, &.{ r.row_type, r.ref_params, r.name }, &values);
+    var cells: [12][16]u8 = undefined;
+    var values: [13][]const u8 = undefined;
+    inline for ([_]Side{ .ours, .cmd, .lib, .bin }, 0..) |side, side_pos| {
+        const side_index = @backingInt(side);
+        const show_encode = if (side == .ours) show else available[side_index] and show;
+        const show_decode = if (side == .ours) true else available[side_index];
+        const base = side_pos * 3;
+        values[base] = cellRatio(&cells[base], totals, side, show_encode);
+        values[base + 1] = cellMibps(&cells[base + 1], totals.input_bytes, totals.encode_ns[side_index], show_encode);
+        values[base + 2] = cellMibps(&cells[base + 2], totals.input_bytes, totals.decode_ns[side_index], show_decode);
+    }
+    values[12] = coverage_text;
+    try tsv.emitRow(report, allocator, &.{ candidate.row_type, candidate.ref_params, candidate.name }, &values);
 }

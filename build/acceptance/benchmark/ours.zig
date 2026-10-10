@@ -45,41 +45,45 @@ fn profileOf(kind: matrix.Kind) harness.Id {
     };
 }
 
-fn confirmed(kind: matrix.Kind) bool {
+fn isConfirmed(kind: matrix.Kind) bool {
     return kind == .xz or kind == .zstd;
 }
 
-fn add(buffer: *Buf, node: harness.Node) void {
+fn pushNode(buffer: *Buf, node: harness.Node) void {
     buffer.nodes[buffer.len] = node;
     buffer.len += 1;
 }
 
-fn build(buffer: *Buf, write: bool, row: matrix.Row, source: []const u8, sink: []u8, bound: bool) void {
-    buffer.len = 0;
-    add(buffer, harness.paramProfile(profileOf(row.kind)));
-    add(buffer, if (row.archive and write) harness.scalarNode(harness.ids.source) else harness.sourceSpan(source));
-    add(buffer, harness.sinkSpan(sink));
+fn pushParams(buffer: *Buf, row: matrix.Row) void {
     for (row.params) |param| {
-        add(buffer, harness.paramScalar(param.family, param.ordinal, harness.cmd_all, param.value));
+        pushNode(buffer, harness.paramScalar(param.family, param.ordinal, harness.cmd_all, param.value));
     }
-    add(buffer, harness.capabilityParam(ours_caps));
-    add(buffer, harness.sizingModeParam(if (row.archive) harness.size_metadata_exact else harness.size_measured));
-    add(buffer, harness.commitModeParam(if (write and row.archive or confirmed(row.kind)) harness.commit_confirmed else harness.commit_tentative));
-    if (bound and write and !row.archive) add(buffer, harness.scalarNode(harness.ids.size_bound));
+}
+
+fn buildQuery(buffer: *Buf, write: bool, row: matrix.Row, source: []const u8, sink: []u8, bound: bool) void {
+    buffer.len = 0;
+    pushNode(buffer, harness.paramProfile(profileOf(row.kind)));
+    pushNode(buffer, if (row.archive and write) harness.scalarNode(harness.ids.source) else harness.sourceSpan(source));
+    pushNode(buffer, harness.sinkSpan(sink));
+    pushParams(buffer, row);
+    pushNode(buffer, harness.capabilityParam(ours_caps));
+    pushNode(buffer, harness.sizingModeParam(if (row.archive) harness.size_metadata_exact else harness.size_measured));
+    pushNode(buffer, harness.commitModeParam(if (write and row.archive or isConfirmed(row.kind)) harness.commit_confirmed else harness.commit_tentative));
+    if (bound and write and !row.archive) pushNode(buffer, harness.scalarNode(harness.ids.size_bound));
     if (row.archive) {
         if (write) {
             const entry = if (row.method)
                 harness.archiveEntryMethod(&buffer.entry, "input.bin", source, 0)
             else
                 harness.archiveEntryNode(&buffer.entry.name, &buffer.entry.data, "input.bin", source);
-            add(buffer, entry);
+            pushNode(buffer, entry);
         } else {
-            add(buffer, harness.archiveOrdinalParam(0));
+            pushNode(buffer, harness.archiveOrdinalParam(0));
         }
     }
 }
 
-fn invoke(env: *env_mod.Env, buffer: *Buf, write: bool, workspace: []u8) Invoke {
+fn invokeKernel(env: *env_mod.Env, buffer: *Buf, write: bool, workspace: []u8) Invoke {
     harness.linkNodes(buffer.nodes[0..buffer.len]);
     var response = harness.Node.init();
     const t0 = env.now();
@@ -87,11 +91,11 @@ fn invoke(env: *env_mod.Env, buffer: *Buf, write: bool, workspace: []u8) Invoke 
     return .{ .status = status, .len = @intCast(response.byte_length), .ns = env.now() - t0 };
 }
 
-fn decode(env: *env_mod.Env, buffer: *Buf, row: matrix.Row, archive: []const u8, expected: []const u8, decoded: []u8, workspace: []u8) metric.Metric {
-    build(buffer, false, row, archive, decoded, false);
-    const result = invoke(env, buffer, false, workspace);
+fn decodeVerify(env: *env_mod.Env, buffer: *Buf, row: matrix.Row, archive: []const u8, expected: []const u8, decoded: []u8, workspace: []u8) metric.Metric {
+    buildQuery(buffer, false, row, archive, decoded, false);
+    const result = invokeKernel(env, buffer, false, workspace);
     if (result.status != 0) {
-        std.debug.print("Benchmark read failed: status {d}, output length {d}, input length {d}.\n", .{ result.status, result.len, archive.len });
+        std.debug.print("benchmark read failed: status {d}, output length {d}, input length {d}.\n", .{ result.status, result.len, archive.len });
     }
     return .{
         .decode_ns = result.ns,
@@ -102,27 +106,31 @@ fn decode(env: *env_mod.Env, buffer: *Buf, row: matrix.Row, archive: []const u8,
 pub fn transform(env: *env_mod.Env, row: matrix.Row, input: []const u8, encoded: []u8, decoded: []u8, workspace: []u8) metric.Metric {
     if (row.bypass) return bypassTransform(env, row, input, encoded, decoded, workspace);
     var buffer = freshBuf();
-    build(&buffer, true, row, input, encoded, env.bounded);
-    const write_result = invoke(env, &buffer, true, workspace);
+    buildQuery(&buffer, true, row, input, encoded, env.bounded);
+    const write_result = invokeKernel(env, &buffer, true, workspace);
     if (write_result.status != 0 or write_result.len == 0 or write_result.len > encoded.len) {
-        std.debug.print("Benchmark write failed: status {d}, output length {d}.\n", .{ write_result.status, write_result.len });
+        std.debug.print("benchmark write failed: status {d}, output length {d}.\n", .{ write_result.status, write_result.len });
         return .{ .encode_ns = write_result.ns, .ok = false };
     }
-    const read_result = decode(env, &buffer, row, encoded[0..write_result.len], input, decoded, workspace);
+    const read_result = decodeVerify(env, &buffer, row, encoded[0..write_result.len], input, decoded, workspace);
     return .{ .encode_ns = write_result.ns, .decode_ns = read_result.decode_ns, .encoded = write_result.len, .ok = read_result.ok };
 }
 
 // Bypass row caller-wires the zstd leaf with no kernel in the loop. The untimed kernel transform proves byte-identity.
+fn castOr(comptime T: type, value: u64, fallback: T) T {
+    return std.math.cast(T, value) orelse fallback;
+}
+
 fn bypassOptions(row: matrix.Row) bypass.Options {
     var options: bypass.Options = .{ .window_size = 1 << 21 };
     for (row.params) |param| {
         switch (param.ordinal) {
-            1 => options.window_size = std.math.cast(u32, param.value) orelse options.window_size,
+            1 => options.window_size = castOr(u32, param.value, options.window_size),
             2 => {},
-            3 => options.hash_bits = std.math.cast(u5, param.value) orelse options.hash_bits,
-            4 => options.max_chain = std.math.cast(u32, param.value) orelse options.max_chain,
-            5 => options.nice_len = std.math.cast(u32, param.value) orelse options.nice_len,
-            6 => options.search_window = std.math.cast(u32, param.value) orelse options.search_window,
+            3 => options.hash_bits = castOr(u5, param.value, options.hash_bits),
+            4 => options.max_chain = castOr(u32, param.value, options.max_chain),
+            5 => options.nice_len = castOr(u32, param.value, options.nice_len),
+            6 => options.search_window = castOr(u32, param.value, options.search_window),
             7 => options.lazy = param.value != 0,
             8 => options.skip_interior_insert = param.value != 0,
             9 => options.double_hash = param.value != 0,
@@ -178,24 +186,22 @@ fn bypassTransform(env: *env_mod.Env, row: matrix.Row, input: []const u8, encode
 pub fn encodedBound(row: matrix.Row, input: []const u8, workspace: []u8) !usize {
     var buffer = freshBuf();
     buffer.len = 0;
-    add(&buffer, harness.paramProfile(profileOf(row.kind)));
-    add(&buffer, harness.paramTargetCommand(harness.ids.write));
-    add(&buffer, harness.sourceSpan(input));
-    for (row.params) |param| {
-        add(&buffer, harness.paramScalar(param.family, param.ordinal, harness.cmd_all, param.value));
-    }
-    add(&buffer, harness.capabilityParam(harness.cap_read | harness.cap_size | harness.cap_replay));
-    add(&buffer, harness.sizingModeParam(harness.size_measured));
-    add(&buffer, harness.commitModeParam(if (confirmed(row.kind)) harness.commit_confirmed else harness.commit_tentative));
-    add(&buffer, harness.scalarNode(harness.ids.size_bound));
+    pushNode(&buffer, harness.paramProfile(profileOf(row.kind)));
+    pushNode(&buffer, harness.paramTargetCommand(harness.ids.write));
+    pushNode(&buffer, harness.sourceSpan(input));
+    pushParams(&buffer, row);
+    pushNode(&buffer, harness.capabilityParam(harness.cap_read | harness.cap_size | harness.cap_replay));
+    pushNode(&buffer, harness.sizingModeParam(harness.size_measured));
+    pushNode(&buffer, harness.commitModeParam(if (isConfirmed(row.kind)) harness.commit_confirmed else harness.commit_tentative));
+    pushNode(&buffer, harness.scalarNode(harness.ids.size_bound));
     harness.linkNodes(buffer.nodes[0..buffer.len]);
     var response = harness.Node.init();
     const status = harness.invoke(harness.ids.query, &buffer.nodes[0], &response, workspace.ptr, workspace.len, null, null, null);
-    if (status != 0) return error.BoundQueryFailed;
+    if (status != 0) return error.bound_query_failed;
     return @intCast(response.byte_length);
 }
 
 pub fn decodeOnly(env: *env_mod.Env, row: matrix.Row, archive: []const u8, expected: []const u8, decoded: []u8, workspace: []u8) metric.Metric {
     var buffer = freshBuf();
-    return decode(env, &buffer, row, archive, expected, decoded, workspace);
+    return decodeVerify(env, &buffer, row, archive, expected, decoded, workspace);
 }

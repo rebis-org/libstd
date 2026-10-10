@@ -7,10 +7,8 @@ const checksum = @import("../common/primitive/checksum.zig");
 const measurement = @import("../common/primitive/measurement.zig");
 const zstd = @import("../leaf/zstd.zig");
 
-// Zstandard seekable format (contrib/seekable_format spec 0.1.0): independent
-// zstd frames followed by a skippable frame carrying the seek table, whose
-// footer magic must be the last bytes of the file. A skippable frame header is
-// 8 bytes: the magic and the size of the frame payload.
+// Seekable format: independent frames plus a trailing skippable seek table.
+// Frame magic first, footer magic last.
 
 const frame_magic: u32 = 0xFD2FB528;
 const skippable_magic: u32 = 0x184D2A5E;

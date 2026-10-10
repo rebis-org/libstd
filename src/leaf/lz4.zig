@@ -246,11 +246,8 @@ fn hash4(value: u32) usize {
     return (value *% hash_prime) >> @intCast(32 - hash_log);
 }
 
-// Mirrors LZ4_compress_generic_validated for one segment with no dictionary:
-// skip escalation, catch-up, and the test-next-position step. A probe reads and
-// writes the same slot, so the first probe after a match uses the carried hash,
-// never the slot the test-next step wrote for the current position; that
-// self-match would emit offset 0.
+// Mirrors LZ4_compress_generic_validated: the carried hash keeps fresh searches from self-matching.
+// A self-match would emit the corrupt offset 0 the reference never produces.
 fn compressBlock(input: []const u8, output: []u8, hash_table: []u32, acceleration: u32) usize {
     @memset(hash_table, 0);
     var op: usize = 0;
@@ -357,9 +354,8 @@ fn compressBlock(input: []const u8, output: []u8, hash_table: []u32, acceleratio
     return emitLastLiterals(input[anchor..], output, op);
 }
 
-// LZ4HC-class parser: every position enters a per-bucket chain, a match search
-// walks the chain within the attempt budget, and a one-position lazy step keeps
-// the longer of the two candidate matches (LZ4HC_compress_hashChain semantics).
+// LZ4HC-class parser: per-bucket chains with a one-position lazy step.
+// Attempt budget bounds every chain walk.
 fn compressBlockHc(input: []const u8, output: []u8, head: []u32, chain: []u32, search_depth: u32) usize {
     @memset(head, 0);
     const input_len = input.len;
@@ -398,10 +394,8 @@ fn compressBlockHc(input: []const u8, output: []u8, head: []u32, chain: []u32, s
 
 const HcMatch = struct { match_index: usize, match_len: usize };
 
-// Insert position ip into its bucket chain and search the chain that preceded it
-// (mirroring LZ4HC_InsertAndGetWiderMatch: inserting first keeps the walk from
-// self-matching). The attempt budget decrements per candidate, and the chain
-// strictly decreases, so the window check also bounds the walk.
+// Insert-then-search per LZ4HC_InsertAndGetWiderMatch, so the walk never self-matches.
+// Decreasing chains plus the window check bound every walk.
 fn hcSearch(input: []const u8, head: []u32, chain: []u32, ip: usize, attempts: *u32, match_limit: usize) HcMatch {
     const hash_slot = hash4(std.mem.readInt(u32, input[ip..][0..4], .little));
     var candidate = head[hash_slot];

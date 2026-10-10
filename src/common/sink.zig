@@ -8,38 +8,38 @@ const std = @import("std");
 
 pub const Sink = struct {
     ctx: *anyopaque,
-    write_fn: *const fn (ctx: *anyopaque, bytes: []const u8) void,
+    write_fn: *const fn (ctx: *anyopaque, chunk: []const u8) void,
 
-    pub inline fn write(self: Sink, bytes: []const u8) void {
-        self.write_fn(self.ctx, bytes);
+    pub inline fn write(self: Sink, chunk: []const u8) void {
+        self.write_fn(self.ctx, chunk);
     }
 };
 
 pub const BufferSink = struct {
-    buf: []u8,
+    storage: []u8,
     len: usize = 0,
     overflowed: bool = false,
 
-    pub fn init(buf: []u8) BufferSink {
-        return .{ .buf = buf };
+    pub fn init(storage: []u8) BufferSink {
+        return .{ .storage = storage };
     }
 
     pub fn sink(self: *BufferSink) Sink {
         return .{ .ctx = self, .write_fn = writeImpl };
     }
 
-    fn writeImpl(ctx: *anyopaque, bytes: []const u8) void {
+    fn writeImpl(ctx: *anyopaque, chunk: []const u8) void {
         const self: *BufferSink = @ptrCast(@alignCast(ctx));
-        const room = self.buf.len - self.len;
-        if (bytes.len > room) {
+        const room = self.storage.len - self.len;
+        if (chunk.len > room) {
             self.overflowed = true;
             if (room == 0) return;
-            @memcpy(self.buf[self.len..][0..room], bytes[0..room]);
+            @memcpy(self.storage[self.len..][0..room], chunk[0..room]);
             self.len += room;
             return;
         }
-        @memcpy(self.buf[self.len..][0..bytes.len], bytes);
-        self.len += bytes.len;
+        @memcpy(self.storage[self.len..][0..chunk.len], chunk);
+        self.len += chunk.len;
     }
 };
 
@@ -52,26 +52,26 @@ pub const DiscardSink = struct {
         return .{ .ctx = self, .write_fn = writeImpl };
     }
 
-    fn writeImpl(ctx: *anyopaque, bytes: []const u8) void {
+    fn writeImpl(ctx: *anyopaque, chunk: []const u8) void {
         const self: *DiscardSink = @ptrCast(@alignCast(ctx));
-        self.len += bytes.len;
+        self.len += chunk.len;
     }
 };
 
 test "buffer sink flags overflow instead of truncating silently" {
-    var buf: [4]u8 = undefined;
-    var bs = BufferSink.init(&buf);
-    const s = bs.sink();
-    s.write("abcdef");
-    try std.testing.expect(bs.overflowed);
-    try std.testing.expectEqual(@as(usize, 4), bs.len);
-    try std.testing.expectEqualSlices(u8, "abcd", &buf);
+    var storage: [4]u8 = undefined;
+    var overflow = BufferSink.init(&storage);
+    const view = overflow.sink();
+    view.write("abcdef");
+    try std.testing.expect(overflow.overflowed);
+    try std.testing.expectEqual(@as(usize, 4), overflow.len);
+    try std.testing.expectEqualSlices(u8, "abcd", &storage);
 }
 
 test "discard sink counts without storing" {
-    var ds = DiscardSink{};
-    const s = ds.sink();
-    s.write("hello ");
-    s.write("world");
-    try std.testing.expectEqual(@as(u64, 11), ds.len);
+    var dropped = DiscardSink{};
+    const view = dropped.sink();
+    view.write("hello ");
+    view.write("world");
+    try std.testing.expectEqual(@as(u64, 11), dropped.len);
 }

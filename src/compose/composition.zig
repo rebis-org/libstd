@@ -1,6 +1,6 @@
 const std = @import("std");
 
-// Reader machinery only refills buffered readers, so chunks stage through a small buffer. Handed bytes are permanently consumed, so accounting uses returned counts.
+// Reader machinery only refills buffered readers, so chunks stage through a small buffer.
 pub const ChunkInput = struct {
     reader: std.Io.Reader,
     chunk: []const u8 = &.{},
@@ -12,8 +12,8 @@ pub const ChunkInput = struct {
         return .{ .reader = .{ .buffer = buffer, .seek = 0, .end = 0, .vtable = &.{ .stream = stream, .discard = discard, .rebase = rebase } } };
     }
 
-    pub fn stage(self: *ChunkInput, data: []const u8) void {
-        self.chunk = data;
+    pub fn stage(self: *ChunkInput, staged: []const u8) void {
+        self.chunk = staged;
         self.pos = 0;
         self.starved = false;
     }

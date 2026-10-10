@@ -79,9 +79,8 @@ const low_coder_count = 1 << num_pos_bits_max;
 const mid_coder_count = 1 << num_pos_bits_max;
 const literal_probs_count = 0x300;
 
-// No copy fallback: 10 bits per byte covers the converged cost plus transient wrongness.
-// A strict clamp bound is about 7 times larger. The constant absorbs the cache byte, the
-// flush, and the end marker.
+// No copy fallback: 10 bits per byte covers converged cost plus transient wrongness.
+// Constant absorbs the cache byte, the flush, and the end marker.
 pub fn encodedSizeBound(input_len: usize) usize {
     return input_len +| (input_len / 4) +| 64;
 }
