@@ -83,7 +83,8 @@ jobs:
             dist/*.aar
           [[ "$(gh release view "$tag" --json isImmutable --jq .isImmutable)" == true ]] \
             || { gh release delete "$tag" --yes --cleanup-tag; exit 1; }
-          git tag -f -a Stage -m "Staging $version (tag: $tag)." "$GITHUB_SHA"
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            tag -f -a Stage -m "Staging $version (tag: $tag)." "$GITHUB_SHA"
           git push --force origin refs/tags/Stage
 
   prune:
