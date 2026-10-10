@@ -65,6 +65,10 @@ pub const Aes192Hw = struct {
         self.inner.encryptBlock(dst, src);
     }
 
+    pub fn encryptWide4(self: Aes192Hw, dst: *[64]u8, src: *const [64]u8) void {
+        self.inner.encryptWide4(dst, src);
+    }
+
     pub fn decryptBlock(self: Aes192Hw, dst: *[16]u8, src: *const [16]u8) void {
         self.inner.decryptBlock(dst, src);
     }
