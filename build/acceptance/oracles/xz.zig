@@ -85,7 +85,7 @@ fn runChecks(r: *Runner) !void {
 fn runCallback(r: *Runner) !void {
     var stream1: [4096]u8 = undefined;
     var output: [256]u8 = undefined;
-    var source_ctx = harness.SourceCallbackContext{ .data = xz_corpus[0..32] };
+    var source_ctx = harness.SourceCursor{ .data = xz_corpus[0..32] };
     _ = harness.call(r, harness.ids.write, &.{
         harness.lzmaDictionaryParam(r.lzma_dictionary),
         harness.sourceCallbackNode(0, 0),

@@ -7,7 +7,7 @@ const slices = @import("slices.zig");
 // [ffi.c] entries name the native library each target links.
 pub fn addArchive(
     b: *std.Build,
-    ctx: *const common.Context,
+    ctx: *const common.Settings,
     distribution: manifest.Distribution,
 ) std.Build.LazyPath {
     const stage = b.addWriteFiles();
@@ -28,7 +28,7 @@ pub fn addArchive(
     return common.addZipArchive(b, distribution, stage);
 }
 
-fn tomlText(b: *std.Build, ctx: *const common.Context) []const u8 {
+fn tomlText(b: *std.Build, ctx: *const common.Settings) []const u8 {
     var text: std.ArrayList(u8) = .empty;
     text.appendSlice(b.allocator, b.fmt(
         \\[package]

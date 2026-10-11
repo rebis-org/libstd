@@ -537,7 +537,7 @@ pub const encoder_frame_size_max = 1 << 26;
 const encoder_zip_frame_budget = 1 << 22;
 const encoder_block_size_max = 128 * 1024;
 const encoder_no_position = std.math.maxInt(u32);
-const encoder_block_seq_u32s = (encoder_block_size_max * @sizeOf(SeqData) + 3) / 4;
+const encoder_block_seq_u32s = (encoder_block_size_max * @sizeOf(Sequence) + 3) / 4;
 const encoder_block_lit_u32s = (encoder_block_size_max + 3) / 4;
 const encoder_block_section_u32s = (3 * encoder_block_size_max + 3) / 4;
 const encoder_workspace_u32_count = hash_size + encoder_zip_frame_budget + encoder_block_section_u32s;
@@ -577,7 +577,7 @@ pub fn encodedSizeBound(input_len: usize, options: Options) usize {
     return input_len +| 3 *| (input_len / encoder_block_size_max + frames) +| 18 *| frames +| 8;
 }
 
-const SeqData = struct {
+const Sequence = struct {
     literal_length: u32,
     literal_code: u8,
     literal_extra: u32,
@@ -619,7 +619,7 @@ fn encodeBlock(output: *std.Io.Writer, content: []const u8, block_start: usize, 
         try writeByte(output, first_byte);
         return;
     }
-    const seq_data = std.mem.bytesAsSlice(SeqData, std.mem.sliceAsBytes(block_workspace[0..encoder_block_seq_u32s]));
+    const seq_data = std.mem.bytesAsSlice(Sequence, std.mem.sliceAsBytes(block_workspace[0..encoder_block_seq_u32s]));
     const literal_buf = std.mem.sliceAsBytes(block_workspace[encoder_block_seq_u32s..][0..encoder_block_lit_u32s])[0..encoder_block_size_max];
     var literal_freq: [256]u32 = undefined;
     var literal_count: usize = 0;
@@ -692,7 +692,7 @@ fn countLiteralFreqs(literals: []const u8, freq: *[256]u32) void {
     for (0..256) |s| freq[s] = lanes[0][s] + lanes[1][s] + lanes[2][s] + lanes[3][s];
 }
 
-fn appendSequence(seq_data: []SeqData, seq_count: *usize, literal_buf: []u8, literal_count: *usize, src: []const u8, literal_start: usize, literal_end: usize, match_len: usize, offset: u32, repeat_offsets: *[3]u32) void {
+fn appendSequence(seq_data: []Sequence, seq_count: *usize, literal_buf: []u8, literal_count: *usize, src: []const u8, literal_start: usize, literal_end: usize, match_len: usize, offset: u32, repeat_offsets: *[3]u32) void {
     const literal_run = src[literal_start..literal_end];
     // Short literal runs dominate. Word-wise copies beat a memcpy call there.
     var copied: usize = 0;
@@ -724,7 +724,7 @@ fn appendSequence(seq_data: []SeqData, seq_count: *usize, literal_buf: []u8, lit
     seq_count.* += 1;
 }
 
-fn finishBlock(output: *std.Io.Writer, src: []const u8, literal_buf: []const u8, seq_data: []const SeqData, literal_freq: *[256]u32, literal_table: []const FseEntry, match_table: []const FseEntry, offset_table: []const FseEntry, is_last: bool, block_workspace: []u32, prev: *PrevFseTables) EncodeError!void {
+fn finishBlock(output: *std.Io.Writer, src: []const u8, literal_buf: []const u8, seq_data: []const Sequence, literal_freq: *[256]u32, literal_table: []const FseEntry, match_table: []const FseEntry, offset_table: []const FseEntry, is_last: bool, block_workspace: []u32, prev: *PrevFseTables) EncodeError!void {
     const literal_count = literal_buf.len;
     const seq_count = seq_data.len;
     const raw_size = 3 + src.len;
@@ -781,7 +781,7 @@ fn encodeBlockDfast(output: *std.Io.Writer, content: []const u8, block_start: us
         try writeByte(output, first_byte);
         return;
     }
-    const seq_data = std.mem.bytesAsSlice(SeqData, std.mem.sliceAsBytes(block_workspace[0..encoder_block_seq_u32s]));
+    const seq_data = std.mem.bytesAsSlice(Sequence, std.mem.sliceAsBytes(block_workspace[0..encoder_block_seq_u32s]));
     const literal_buf = std.mem.sliceAsBytes(block_workspace[encoder_block_seq_u32s..][0..encoder_block_lit_u32s])[0..encoder_block_size_max];
     var literal_freq: [256]u32 = undefined;
     var literal_count: usize = 0;
@@ -996,7 +996,7 @@ fn encodeBlockRow(output: *std.Io.Writer, content: []const u8, block_start: usiz
         try writeByte(output, first_byte);
         return;
     }
-    const seq_data = std.mem.bytesAsSlice(SeqData, std.mem.sliceAsBytes(block_workspace[0..encoder_block_seq_u32s]));
+    const seq_data = std.mem.bytesAsSlice(Sequence, std.mem.sliceAsBytes(block_workspace[0..encoder_block_seq_u32s]));
     const literal_buf = std.mem.sliceAsBytes(block_workspace[encoder_block_seq_u32s..][0..encoder_block_lit_u32s])[0..encoder_block_size_max];
     var literal_freq: [256]u32 = undefined;
     var literal_count: usize = 0;
@@ -1673,7 +1673,7 @@ fn writeCompressedLiteralHeader(out: []u8, regen: usize, compressed: usize) void
     }
 }
 
-fn buildSequenceSection(seqs: []const SeqData, literal_table: []const FseEntry, match_table: []const FseEntry, offset_table: []const FseEntry, prev: *PrevFseTables, out: []u8, section: *[]const u8) bool {
+fn buildSequenceSection(seqs: []const Sequence, literal_table: []const FseEntry, match_table: []const FseEntry, offset_table: []const FseEntry, prev: *PrevFseTables, out: []u8, section: *[]const u8) bool {
     const n = seqs.len;
     if (n == 0) {
         if (out.len < 1) return false;
@@ -2501,12 +2501,12 @@ const Decoder = struct {
     provider: checksum.Provider = checksum.default_provider,
     checksummer: checksum.XxHash64,
     block_buffer: [block_size_max]u8,
-    literal_state: FseState,
-    match_state: FseState,
-    offset_state: FseState,
-    prev_literal_state: FseState,
-    prev_match_state: FseState,
-    prev_offset_state: FseState,
+    literal_state: FseDecoder,
+    match_state: FseDecoder,
+    offset_state: FseDecoder,
+    prev_literal_state: FseDecoder,
+    prev_match_state: FseDecoder,
+    prev_offset_state: FseDecoder,
     prev_tables_valid: bool,
     repeat_offsets: [3]u32,
     huffman_tree: ?HuffmanTree,
@@ -2888,7 +2888,7 @@ const Decoder = struct {
         }
     }
 
-    fn fseState(d: *Decoder, choice: FseChoice) *FseState {
+    fn fseDecoder(d: *Decoder, choice: FseChoice) *FseDecoder {
         return switch (choice) {
             .literal => &d.literal_state,
             .match => &d.match_state,
@@ -2919,7 +2919,7 @@ const Decoder = struct {
     }
 
     fn applyRepeatTable(d: *Decoder, choice: FseChoice) void {
-        const state = d.fseState(choice);
+        const state = d.fseDecoder(choice);
         const prev = switch (choice) {
             .literal => &d.prev_literal_state,
             .match => &d.prev_match_state,
@@ -2934,7 +2934,7 @@ const Decoder = struct {
     }
 
     fn prepareFseTable(d: *Decoder, choice: FseChoice, mode: SequenceMode, cursor: *ReadCursor) DecodeError!void {
-        const state = d.fseState(choice);
+        const state = d.fseDecoder(choice);
         switch (mode) {
             .predefined => {
                 const probs = switch (choice) {
@@ -3198,14 +3198,14 @@ const FseTable = union(enum) {
     rle: u8,
 };
 
-const FseState = struct {
+const FseDecoder = struct {
     state: u16,
     table: FseTable,
     accuracy_log: u4,
     entries: [1 << 9]DecodeEntry,
 };
 
-fn fseTableOrRle(state: *const FseState, kind: TableKind, storage: *[1]DecodeEntry) []const DecodeEntry {
+fn fseTableOrRle(state: *const FseDecoder, kind: TableKind, storage: *[1]DecodeEntry) []const DecodeEntry {
     return switch (state.table) {
         .fse => |t| t,
         .rle => |s| blk: {

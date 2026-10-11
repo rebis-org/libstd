@@ -197,7 +197,7 @@ fn runRar(data: []const u8) anyerror!void {
     if (count == 0) return;
     var window: [1 << 20]u8 = undefined;
     var table_pool: [rar.table_pool_words]u16 = undefined;
-    var state_store: [(rar.max_state_bytes + 7) / 8]u64 = undefined;
+    var state_store: [(rar.max_unpacker_bytes + 7) / 8]u64 = undefined;
     var pending50: [rar.max_pending50]rar.PendingFilter50 = undefined;
     var pending29: [rar.max_pending29]rar.PendingFilter29 = undefined;
     var filter_scratch: [window.len + rar.filter_scratch_extra]u8 = undefined;

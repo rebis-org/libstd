@@ -177,7 +177,7 @@ fn runDecoded(r: *Runner) anyerror!void {
     var downstream = harness.scalarNode(harness.ids.diagnostic_downstream_status);
     var diagnostic = harness.node(null, 0);
     diagnostic.child = &downstream;
-    var fail_ctx = harness.SinkCallbackContext{ .fail_after = 5 };
+    var fail_ctx = harness.SinkBudget{ .fail_after = 5 };
     _ = harness.call(r, harness.ids.read, &.{
         harness.sourceSpan(sz_dec_archive[0..sz_dec_archive_size]),
         harness.sinkCallbackNode(0, 0),
@@ -402,7 +402,7 @@ fn runEncrypted(r: *Runner) anyerror!void {
     };
     sz_enc_archive_size = try sevenZipWrite(r, entry, &sz_enc_archive, &crypto_nodes);
     try sevenZipReadExpected(r, sz_enc_archive[0..sz_enc_archive_size], 0, &sz_enc_output, &sz_enc_data, &crypto_nodes);
-    var source_ctx = harness.SourceCallbackContext{ .data = sz_enc_archive[0..sz_enc_archive_size] };
+    var source_ctx = harness.SourceCursor{ .data = sz_enc_archive[0..sz_enc_archive_size] };
     @memset(&sz_enc_output, 0xa5);
     _ = harness.call(r, harness.ids.read, &.{
         harness.archiveOrdinalParam(0),

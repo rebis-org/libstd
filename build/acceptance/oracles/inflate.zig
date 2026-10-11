@@ -22,7 +22,7 @@ fn readAs(r: *harness.Runner, profile_id: harness.Id, encoded: []const u8, out: 
 
 fn readGzipCallbackSink(r: *harness.Runner, encoded: []const u8, out: []u8) u32 {
     harness.setup(r, harness.ids.gzip, harness.mode_stream);
-    var ctx = harness.SinkBufferContext{ .buffer = out, .accept_limit = std.math.maxInt(usize) };
+    var ctx = harness.SinkBuffer{ .buffer = out, .accept_limit = std.math.maxInt(usize) };
     return harness.call(r, harness.ids.read, &.{ harness.sourceSpan(encoded), harness.sinkCallbackNode(0, 0) }, .{ .ctx = true, .callback = harness.sinkBufferCallback, .context = &ctx });
 }
 

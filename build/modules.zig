@@ -66,7 +66,7 @@ fn byName(name: []const u8) Module {
     @compileError("unknown module: " ++ name ++ ".");
 }
 
-pub fn create(b: *std.Build, comptime spec: Module, ctx: *const common.Context) *std.Build.Module {
+pub fn create(b: *std.Build, comptime spec: Module, ctx: *const common.Settings) *std.Build.Module {
     return createFor(b, spec, b.graph.host, .Debug, ctx);
 }
 
@@ -77,7 +77,7 @@ pub const Components = struct {
 
 pub fn componentsWithInterface(
     b: *std.Build,
-    ctx: *const common.Context,
+    ctx: *const common.Settings,
     components_target: std.Build.ResolvedTarget,
     interface_target: std.Build.ResolvedTarget,
     optimize: std.builtin.Optimize,
@@ -126,7 +126,7 @@ pub fn createFor(
     comptime spec: Module,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.Optimize,
-    ctx: *const common.Context,
+    ctx: *const common.Settings,
 ) *std.Build.Module {
     var adjusted = target;
     if (!ctx.portable and spec.crc_kernel and (adjusted.result.cpu.arch == .aarch64 or adjusted.result.cpu.arch == .x86_64)) {
@@ -154,7 +154,7 @@ fn createShared(
     comptime spec: Module,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.Optimize,
-    ctx: *const common.Context,
+    ctx: *const common.Settings,
 ) *std.Build.Module {
     if (shared_modules == null) shared_modules = std.StringHashMap(*std.Build.Module).init(b.allocator);
     const key = std.fmt.allocPrint(b.allocator, "{s}|{s}|{s}|{d}", .{

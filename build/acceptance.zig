@@ -17,7 +17,7 @@ pub const units = [_]Unit{
     .{ .name = "benchmark", .kind = .benchmark },
 };
 
-pub fn expand(b: *std.Build, ctx: *common.Context) void {
+pub fn expand(b: *std.Build, ctx: *common.Settings) void {
     const refs = ctx.refs orelse @panic("The vendor units must expand before the acceptance units.");
     inline for (units) |unit| switch (unit.kind) {
         .oracles => addOracles(b, ctx, refs),
@@ -33,7 +33,7 @@ const AcceptanceApp = struct {
 
 fn addAcceptanceApp(
     b: *std.Build,
-    ctx: *common.Context,
+    ctx: *common.Settings,
     name: []const u8,
     comptime spec: modules.Module,
     target: std.Build.ResolvedTarget,
@@ -72,7 +72,7 @@ fn abVariantModule(b: *std.Build, name: []const u8) *std.Build.Module {
     return variant.createModule();
 }
 
-fn skipVariantHostLibraries(b: *std.Build, ctx: *const common.Context) common.HostLibraries {
+fn skipVariantHostLibraries(b: *std.Build, ctx: *const common.Settings) common.HostLibraries {
     const skip_options = b.addOptions();
     skip_options.addOption(bool, "portable", ctx.portable);
     return common.addHostLibrariesWithOptions(b, ctx.target, ctx.optimize, ctx.portable, skip_options.createModule(), ctx.sanitize_c);
@@ -88,7 +88,7 @@ fn linkOracleRefs(app: AcceptanceApp, refs: cmd.Refs, catalog: std.Build.LazyPat
     app.run.addFileArg(catalog);
 }
 
-fn addTrapRun(b: *std.Build, ctx: *const common.Context, target: std.Build.ResolvedTarget, optimize: std.builtin.Optimize, exe_name: []const u8) *std.Build.Step.Run {
+fn addTrapRun(b: *std.Build, ctx: *const common.Settings, target: std.Build.ResolvedTarget, optimize: std.builtin.Optimize, exe_name: []const u8) *std.Build.Step.Run {
     const trap_module = modules.createFor(b, modules.trap, target, optimize, ctx);
     const trap_exe = b.addExecutable(.{ .name = exe_name, .root_module = trap_module });
     return b.addRunArtifact(trap_exe);
@@ -133,7 +133,7 @@ fn linkBenchmarkExe(b: *std.Build, exe: *std.Build.Step.Compile, run: *std.Build
 
 fn addOracleApp(
     b: *std.Build,
-    ctx: *common.Context,
+    ctx: *common.Settings,
     refs: cmd.Refs,
     exe_name: []const u8,
     variant_name: []const u8,
@@ -170,7 +170,7 @@ fn addAbComparison(b: *std.Build, baseline_exe: *std.Build.Step.Compile, skip_ex
     b.step("oracles_ab", "Compare LZMA encode output between the baseline and skip variants").dependOn(&diff.step);
 }
 
-fn addOracles(b: *std.Build, ctx: *common.Context, refs: cmd.Refs) void {
+fn addOracles(b: *std.Build, ctx: *common.Settings, refs: cmd.Refs) void {
     const modules_pair = modules.componentsWithInterface(b, ctx, ctx.target, ctx.target, ctx.optimize);
     const c_module = translateCModule(b, ctx.target, ctx.optimize);
 
@@ -198,7 +198,7 @@ fn addOracles(b: *std.Build, ctx: *common.Context, refs: cmd.Refs) void {
     app.run.step.dependOn(&compose_ab_run.step);
 }
 
-fn addOraclesUbsan(b: *std.Build, ctx: *common.Context, refs: cmd.Refs) void {
+fn addOraclesUbsan(b: *std.Build, ctx: *common.Settings, refs: cmd.Refs) void {
     // Zig 0.16 ships no ASan runtime, so UBSan is the only implementable sanitizer step.
     var ubsan_ctx = ctx.*;
     ubsan_ctx.sanitize_c = .full;
@@ -218,7 +218,7 @@ fn addOraclesUbsan(b: *std.Build, ctx: *common.Context, refs: cmd.Refs) void {
 
 fn addBenchmarkApp(
     b: *std.Build,
-    ctx: *common.Context,
+    ctx: *common.Settings,
     refs: cmd.Refs,
     exe_name: []const u8,
     host: common.HostLibraries,
@@ -243,7 +243,7 @@ fn addBenchmarkApp(
     return app;
 }
 
-fn addBenchmark(b: *std.Build, ctx: *common.Context, refs: cmd.Refs) void {
+fn addBenchmark(b: *std.Build, ctx: *common.Settings, refs: cmd.Refs) void {
     const ref_target = common.refTarget(b, ctx.target);
     // The components target stays on ctx.target while the interface uses ref_target,
     // because the reference binaries need the parity code generation.
@@ -272,7 +272,7 @@ fn addBenchmark(b: *std.Build, ctx: *common.Context, refs: cmd.Refs) void {
     _ = addBenchmarkApp(b, ctx, refs, "benchmark_skip", skip_host, "benchmark_skip", "Run the Silesia codec benchmark against the encode A/B variant slot", ref_target, bench_components_module, null, macos_sdk_usr_lib, ctx.generated.catalog);
 }
 
-fn macosSdkUsrLib(b: *std.Build, ctx: *common.Context) ?[]const u8 {
+fn macosSdkUsrLib(b: *std.Build, ctx: *common.Settings) ?[]const u8 {
     const sdk = std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &ctx.target.result) orelse return null;
     defer b.allocator.free(sdk);
     return b.fmt("{s}/usr/lib", .{sdk});

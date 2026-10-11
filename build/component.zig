@@ -14,11 +14,11 @@ const RawLimits = struct {
     history: u64 = 0,
 };
 
-const RawParameterValue = struct { family: u16, ordinal: u32, value: u64 };
+const RawParam = struct { family: u16, ordinal: u32, value: u64 };
 
 const RawTuning = struct {
     name: []const u8 = "",
-    params: []const RawParameterValue = &.{},
+    params: []const RawParam = &.{},
     ref_params: []const u8 = "",
     cmd_args: []const []const u8 = &.{},
     lib_level: ?i32 = null,

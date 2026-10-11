@@ -4,7 +4,7 @@ const common = @import("common.zig");
 const manifest = @import("manifest.zig");
 const slices = @import("slices.zig");
 
-pub fn addArchive(b: *std.Build, ctx: *const common.Context, distribution: manifest.Distribution) std.Build.LazyPath {
+pub fn addArchive(b: *std.Build, ctx: *const common.Settings, distribution: manifest.Distribution) std.Build.LazyPath {
     const headers = b.addWriteFiles();
     _ = headers.addCopyFile(ctx.generated.header, "stdk.h");
     _ = headers.addCopyFile(ctx.generated.framework_module_map, "module.modulemap");
@@ -40,7 +40,7 @@ pub fn addArchive(b: *std.Build, ctx: *const common.Context, distribution: manif
     return archive.addOutputFileArg(distribution.archive);
 }
 
-fn buildSlice(b: *std.Build, ctx: *const common.Context, slice: slices.AppleSlice) std.Build.LazyPath {
+fn buildSlice(b: *std.Build, ctx: *const common.Settings, slice: slices.AppleSlice) std.Build.LazyPath {
     if (slice.arches.len > 4) @panic("An Apple slice carries at most four architectures.");
     const base = slice.library[0 .. slice.library.len - ".dylib".len];
     // Final leaf name, not a per-arch path: every slice shares one
@@ -52,7 +52,7 @@ fn buildSlice(b: *std.Build, ctx: *const common.Context, slice: slices.AppleSlic
     return universal(b, base, libraries[0..slice.arches.len]);
 }
 
-fn buildArch(b: *std.Build, ctx: *const common.Context, name: []const u8, install_name: []const u8, arch: slices.AppleArch) std.Build.LazyPath {
+fn buildArch(b: *std.Build, ctx: *const common.Settings, name: []const u8, install_name: []const u8, arch: slices.AppleArch) std.Build.LazyPath {
     const target = b.resolveTargetQuery(targetQuery(arch));
     if (arch.zig) {
         const lib = common.addLibrary(b, target, .ReleaseFast, .dynamic, ctx);

@@ -35,7 +35,7 @@ const lzma2_invalid_props = [_]u8{ 0xC0, 0x00, 0x00, 0x00, 0x05, 0x5d };
 
 fn sinkCallbackWriteParity(r: *Runner) !void {
     var callback_compressed: [256]u8 = undefined;
-    var sink_ctx = harness.SinkBufferContext{ .buffer = &callback_compressed, .accept_limit = std.math.maxInt(usize) };
+    var sink_ctx = harness.SinkBuffer{ .buffer = &callback_compressed, .accept_limit = std.math.maxInt(usize) };
     const nodes = steps.build(&lzmaParams, r, &.{ harness.sourceSpan(r.input), harness.sinkCallbackNode(0, 0) });
     _ = harness.call(r, harness.ids.write, nodes.items[0..nodes.len], .{ .ctx = true, .callback = harness.sinkBufferCallback, .context = &sink_ctx });
     try harness.requireStatus(r, abi.Status.ok);
@@ -545,7 +545,7 @@ fn runLzmaFileDeclaredLess(r: *Runner) !void {
     if (!std.mem.eql(u8, &output, input[0..declared])) return error.LessPrefixMismatch;
 }
 
-const CountingSourceContext = struct {
+const CountingSource = struct {
     data: []const u8,
     offset: usize = 0,
     size_calls: usize = 0,
@@ -554,7 +554,7 @@ const CountingSourceContext = struct {
 };
 
 fn countingSourceCallback(c: *harness.Call) callconv(.c) u32 {
-    const ctx: *CountingSourceContext = @ptrCast(@alignCast(c.callback_context orelse return abi.Status.unsupported));
+    const ctx: *CountingSource = @ptrCast(@alignCast(c.callback_context orelse return abi.Status.unsupported));
     const response = c.response orelse return abi.Status.unsupported;
     if (abi.isIdEqual(c.operation, catalog.callback_size)) {
         ctx.size_calls += 1;
@@ -588,7 +588,7 @@ fn runLzmaFileSourceOnce(r: *Runner) !void {
     setupLzma(r, harness.ids.lzma_file, 4096);
     const encoded_len = try lzmaAloneEncode(r, input, input.len, &encoded);
     var output: [input.len]u8 = undefined;
-    var ctx = CountingSourceContext{ .data = encoded[0..encoded_len] };
+    var ctx = CountingSource{ .data = encoded[0..encoded_len] };
     _ = harness.call(r, harness.ids.read, &.{
         harness.sourceCallbackNode(0, 0),
         harness.sinkSpan(&output),
@@ -626,7 +626,7 @@ fn runLzmaFileMarkerMode(r: *Runner) !void {
         return error.MarkerDirectMismatch;
     }
     var callback_output: [input.len]u8 = undefined;
-    var sink_ctx = harness.SinkBufferContext{ .buffer = &callback_output, .accept_limit = std.math.maxInt(usize) };
+    var sink_ctx = harness.SinkBuffer{ .buffer = &callback_output, .accept_limit = std.math.maxInt(usize) };
     _ = harness.call(r, harness.ids.read, &.{
         harness.sourceSpan(encoded[0..encoded_len]),
         harness.sinkCallbackNode(0, 0),

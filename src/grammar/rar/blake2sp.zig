@@ -23,15 +23,15 @@ const sigma = [10][16]u8{
     .{ 10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0 },
 };
 
-const State = struct {
+const Node = struct {
     h: [8]u32,
     t: u64,
     buf: [64]u8,
     buf_len: u8,
     last_node: bool,
 
-    fn initFromParams(param_block: [32]u8) State {
-        var state: State = undefined;
+    fn initFromParams(param_block: [32]u8) Node {
+        var state: Node = undefined;
         state.h = iv;
         for (&state.h, 0..) |*hword, i| {
             hword.* ^= mem.readInt(u32, param_block[i * 4 ..][0..4], .little);
@@ -54,7 +54,7 @@ const State = struct {
         return p;
     }
 
-    fn update(self: *State, data: []const u8) void {
+    fn update(self: *Node, data: []const u8) void {
         var off: usize = 0;
         if (self.buf_len != 0 and @as(usize, self.buf_len) + data.len > 64) {
             off = 64 - @as(usize, self.buf_len);
@@ -72,7 +72,7 @@ const State = struct {
         self.buf_len += @as(u8, @intCast(remainder.len));
     }
 
-    fn final(self: *State, out: *[32]u8) void {
+    fn final(self: *Node, out: *[32]u8) void {
         @memset(self.buf[self.buf_len..], 0);
         self.t += self.buf_len;
         self.compress(&self.buf, true);
@@ -81,7 +81,7 @@ const State = struct {
         }
     }
 
-    fn compress(self: *State, block: *const [64]u8, last: bool) void {
+    fn compress(self: *Node, block: *const [64]u8, last: bool) void {
         var m: [16]u32 = undefined;
         var v: [16]u32 = undefined;
         for (&m, 0..) |*r, i| r.* = mem.readInt(u32, block[4 * i ..][0..4], .little);
@@ -125,22 +125,22 @@ const parallelism: usize = 8;
 const block_size: usize = 64;
 const buf_size: usize = parallelism * block_size;
 
-fn initLeaf(leaf_index: u32) State {
-    const param_block = State.makeParamBlock(32, parallelism, 2, leaf_index, 0, 32);
-    var state = State.initFromParams(param_block);
+fn initLeaf(leaf_index: u32) Node {
+    const param_block = Node.makeParamBlock(32, parallelism, 2, leaf_index, 0, 32);
+    var state = Node.initFromParams(param_block);
     if (leaf_index == parallelism - 1) state.last_node = true;
     return state;
 }
 
-fn initRoot() State {
-    const param_block = State.makeParamBlock(32, parallelism, 2, 0, 1, 32);
-    var state = State.initFromParams(param_block);
+fn initRoot() Node {
+    const param_block = Node.makeParamBlock(32, parallelism, 2, 0, 1, 32);
+    var state = Node.initFromParams(param_block);
     state.last_node = true;
     return state;
 }
 
 pub fn blake2sp(data: []const u8, out: *[32]u8) void {
-    var leaves: [parallelism]State = undefined;
+    var leaves: [parallelism]Node = undefined;
     for (&leaves, 0..) |*leaf, i| leaf.* = initLeaf(@intCast(i));
 
     var offset: usize = 0;

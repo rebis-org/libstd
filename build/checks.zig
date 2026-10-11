@@ -18,7 +18,7 @@ pub const units = [_]Unit{
     .{ .name = "package", .kind = .package },
 };
 
-pub fn expand(b: *std.Build, ctx: *common.Context) void {
+pub fn expand(b: *std.Build, ctx: *common.Settings) void {
     inline for (units) |unit| switch (unit.kind) {
         .abi => addAbi(b, ctx),
         .exe => addExe(b, ctx),
@@ -36,7 +36,7 @@ fn addHeaderProbe(b: *std.Build, zig: []const u8, driver: []const u8, std_flag: 
     return probe;
 }
 
-fn addAbi(b: *std.Build, ctx: *common.Context) void {
+fn addAbi(b: *std.Build, ctx: *common.Settings) void {
     const zig = b.graph.zig_exe;
     const abi = b.step("abi", "Check the ABI contract of the generated header and library");
     // No -fsyntax-only mode exists, so objecting to /dev/null proves parsing.
@@ -57,7 +57,7 @@ fn addAbi(b: *std.Build, ctx: *common.Context) void {
     abi.dependOn(&abi_exports_run.step);
 }
 
-fn addExe(b: *std.Build, ctx: *common.Context) void {
+fn addExe(b: *std.Build, ctx: *common.Settings) void {
     const exe = b.step("exe", "Build the host static and dynamic libraries");
     exe.dependOn(&ctx.host.static_library.step);
     exe.dependOn(&ctx.host.dynamic_library.step);
@@ -65,12 +65,12 @@ fn addExe(b: *std.Build, ctx: *common.Context) void {
     b.installArtifact(ctx.host.dynamic_library);
 }
 
-fn addRender(b: *std.Build, ctx: *common.Context) void {
+fn addRender(b: *std.Build, ctx: *common.Settings) void {
     b.step("render", "Generate the catalog, header, and module map").dependOn(ctx.generated.step);
     common.installGenerated(b, ctx.generated);
 }
 
-fn addPackage(b: *std.Build, ctx: *common.Context) void {
+fn addPackage(b: *std.Build, ctx: *common.Settings) void {
     const archives = ctx.archives orelse @panic("The distribution units must expand before the checks units.");
     const package_exe = b.addExecutable(.{ .name = "package", .root_module = modules.create(b, modules.package, ctx) });
     const package_run = b.addRunArtifact(package_exe);

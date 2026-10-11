@@ -127,28 +127,28 @@ fn MergeableDigest(comptime On: type, comptime Off: type) type {
     };
 }
 
-pub fn ValueHash(comptime mode: Mode, comptime On: type, comptime Off: type) type {
+pub fn Hash(comptime mode: Mode, comptime On: type, comptime Off: type) type {
     return switch (mode) {
-        .onprem => FixedValueHash(.onprem, On),
-        .offprem => FixedValueHash(.offprem, Off),
-        .mergeable => MergeableValueHash(On, Off),
+        .onprem => FixedHash(.onprem, On),
+        .offprem => FixedHash(.offprem, Off),
+        .mergeable => MergeableHash(On, Off),
     };
 }
 
-fn valueHashSeed(comptime Impl: type) type {
+fn hashSeed(comptime Impl: type) type {
     return @typeInfo(@TypeOf(Impl.init)).@"fn".param_types[0].?;
 }
 
-fn valueHashFinal(comptime Impl: type) type {
+fn hashFinal(comptime Impl: type) type {
     return @typeInfo(@TypeOf(Impl.final)).@"fn".return_type.?;
 }
 
-fn FixedValueHash(comptime tag: Provider, comptime Impl: type) type {
+fn FixedHash(comptime tag: Provider, comptime Impl: type) type {
     return struct {
         inner: Impl,
 
-        pub const Seed = valueHashSeed(Impl);
-        pub const Final = valueHashFinal(Impl);
+        pub const Seed = hashSeed(Impl);
+        pub const Final = hashFinal(Impl);
 
         pub fn init(seed: Seed) @This() {
             return .{ .inner = Impl.init(seed) };
@@ -169,12 +169,12 @@ fn FixedValueHash(comptime tag: Provider, comptime Impl: type) type {
     };
 }
 
-fn MergeableValueHash(comptime On: type, comptime Off: type) type {
+fn MergeableHash(comptime On: type, comptime Off: type) type {
     return struct {
         state: Pair(On, Off),
 
-        pub const Seed = valueHashSeed(On);
-        pub const Final = valueHashFinal(On);
+        pub const Seed = hashSeed(On);
+        pub const Final = hashFinal(On);
 
         pub fn init(seed: Seed) @This() {
             return bind(default_provider, seed);
@@ -213,7 +213,7 @@ fn FixedChecksum(comptime tag: Provider, comptime Impl: type) type {
     return struct {
         inner: Impl,
 
-        pub const Final = valueHashFinal(Impl);
+        pub const Final = hashFinal(Impl);
 
         pub fn init() @This() {
             return .{ .inner = Impl.init() };
@@ -238,7 +238,7 @@ fn MergeableChecksum(comptime On: type, comptime Off: type) type {
     return struct {
         state: Pair(On, Off),
 
-        pub const Final = valueHashFinal(On);
+        pub const Final = hashFinal(On);
 
         pub fn init() @This() {
             return bind(default_provider);
