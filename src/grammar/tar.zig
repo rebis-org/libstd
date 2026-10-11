@@ -112,18 +112,18 @@ fn writePaxRecords(entry: Entry, data_size: u64, uses_long_name: bool, buffer: [
     if (entry.link_name.len > 100) {
         written += try paxRecord(buffer[written..], "linkpath", entry.link_name);
     }
-    if (entry.mode > 0o7777777) written += try paxNumberRecord(buffer[written..], "mode", entry.mode, 8);
+    if (entry.mode > 0o7777777) written += try paxNumberRecord(buffer[written..], "mode", entry.mode);
     if (entry.uid > 0o7777777) {
-        written += try paxNumberRecord(buffer[written..], "uid", entry.uid, 10);
+        written += try paxNumberRecord(buffer[written..], "uid", entry.uid);
     }
     if (entry.gid > 0o7777777) {
-        written += try paxNumberRecord(buffer[written..], "gid", entry.gid, 10);
+        written += try paxNumberRecord(buffer[written..], "gid", entry.gid);
     }
     if (data_size > 0o7777777777) {
-        written += try paxNumberRecord(buffer[written..], "size", data_size, 10);
+        written += try paxNumberRecord(buffer[written..], "size", data_size);
     }
     if (entry.modification_time > 0o7777777777) {
-        written += try paxNumberRecord(buffer[written..], "mtime", entry.modification_time, 10);
+        written += try paxNumberRecord(buffer[written..], "mtime", entry.modification_time);
     }
     return written;
 }
@@ -172,14 +172,14 @@ fn paxRecord(buffer: []u8, key: []const u8, payload: []const u8) Failure!usize {
     return pos;
 }
 
-fn paxNumberRecord(buffer: []u8, key: []const u8, value: u64, base: u8) Failure!usize {
+fn paxNumberRecord(buffer: []u8, key: []const u8, value: u64) Failure!usize {
     var digits: [32]u8 = undefined;
     var n = value;
     var digit_count: usize = 0;
     while (true) {
-        digits[digit_count] = "0123456789"[@intCast(n % base)];
+        digits[digit_count] = '0' + @as(u8, @truncate(n % 10));
         digit_count += 1;
-        n /= base;
+        n /= 10;
         if (n == 0) break;
     }
     var i: usize = 0;
@@ -846,4 +846,26 @@ test "tar device entries roundtrip devmajor and devminor" {
     const plain = try inspectOrdinal(archive[0..written], 1);
     try testing.expectEqual(@as(u32, 0), plain.devmajor);
     try testing.expectEqual(@as(u32, 0), plain.devminor);
+}
+
+test "tar pax records roundtrip long names and out of octal fields" {
+    const testing = std.testing;
+    var long_name: [124]u8 = undefined;
+    @memset(&long_name, 'a');
+    const entries = [_]Entry{
+        .{ .name = &long_name, .data = "long payload", .mode = 0o10000000, .uid = 0o20000000, .modification_time = 0o200000000000 },
+        .{ .name = "regular.txt", .data = "hello" },
+    };
+    var archive: [8192]u8 = undefined;
+    var scratch: [4096]u8 = undefined;
+    const written = try encode(&entries, &archive, &scratch);
+    try testing.expectEqual(@as(u64, 2), try inspectCount(archive[0..written]));
+    const info = try inspectOrdinal(archive[0..written], 0);
+    try testing.expectEqualSlices(u8, &long_name, info.name);
+    try testing.expectEqual(@as(u32, 0o10000000), info.mode);
+    try testing.expectEqual(@as(u32, 0o20000000), info.uid);
+    try testing.expectEqual(@as(u64, 0o200000000000), info.modification_time);
+    var out: [64]u8 = undefined;
+    const size = try decodeOrdinal(archive[0..written], 0, &out);
+    try testing.expectEqualStrings("long payload", out[0..size]);
 }

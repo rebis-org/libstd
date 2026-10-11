@@ -52,11 +52,19 @@ fn checkedLen(length: u64) Failure!usize {
     return std.math.cast(usize, length) orelse return error.ResourceLimit;
 }
 
-fn checkedSlice(comptime Ptr: type, pointer: ?Ptr, length: u64) Failure![]@typeInfo(Ptr).pointer.child {
+fn Slice(comptime Ptr: type) type {
+    const info = @typeInfo(Ptr).pointer;
+    return if (info.attrs.@"const") []const info.child else []info.child;
+}
+
+fn checkedSlice(comptime Ptr: type, pointer: ?Ptr, length: u64) Failure!Slice(Ptr) {
     const count = try checkedLen(length);
     if (count == 0) return &.{};
     const base = pointer orelse return error.InvalidCall;
-    return base[0..count];
+    // Slicing a comptime-known pointer yields a const slice, so the mutable case casts back onto caller-owned memory.
+    const slice = base[0..count];
+    if (comptime @typeInfo(Ptr).pointer.attrs.@"const") return slice;
+    return @constCast(slice);
 }
 
 pub fn checkedConstBytes(pointer: ?[*]const u8, length: u64) Failure![]const u8 {

@@ -65,19 +65,13 @@ pub fn decodeSinglePass(input: []const u8, output: []u8, history: []u8, provider
     const claimed_size = std.mem.readInt(u32, input[input.len - 4 ..][0..4], .little);
     if (output.len < claimed_size) return .fallback;
     var source = std.Io.Reader.fixed(input);
-    var fixed_header: [10]u8 = undefined;
-    var index: usize = 0;
-    while (index < fixed_header.len) {
-        fixed_header[index] = source.takeByte() catch return .fallback;
-        index += 1;
-    }
-    skipHeader(&source, &fixed_header, provider) catch return .fallback;
+    const header = parseHeader(input, provider) catch return .fallback;
+    source.seek = header.len;
     const data_start = source.seek;
     var sink_writer = std.Io.Writer.fixed(output);
     var tee_writer = Crc32Tee.initWithProvider(&sink_writer, provider);
-    var inflater = deflate.Decompress.initSlice(input[data_start..], history);
-    _ = inflater.reader.streamRemaining(&tee_writer.writer) catch return .fallback;
-    source.seek = data_start + (inflater.inputBitsConsumed() + 7) / 8;
+    const inflated = inflatePayload(input, data_start, history, &tee_writer.writer) catch return .fallback;
+    source.seek = data_start + inflated.consumed;
     var trailer: [8]u8 = undefined;
     var trailer_sink = std.Io.Writer.fixed(&trailer);
     source.streamExact(&trailer_sink, 8) catch return .fallback;
@@ -93,29 +87,20 @@ pub fn decode(input: []const u8, output: *std.Io.Writer, history: []u8, provider
     var source = std.Io.Reader.fixed(input);
     var total: usize = 0;
     while (true) {
-        var fixed_header: [10]u8 = undefined;
-        var index: usize = 0;
-        while (index < fixed_header.len) {
-            const byte = source.takeByte() catch {
-                if (index == 0) break;
-                return error.InvalidData;
-            };
-            fixed_header[index] = byte;
-            index += 1;
-        }
-        if (index == 0) break;
-        try skipHeader(&source, &fixed_header, provider);
+        if (source.seek == input.len) break;
+        const member_start = source.seek;
+        const header = try parseHeader(input[member_start..], provider);
+        source.seek = member_start + header.len;
         var tee_writer = Crc32Tee.initWithProvider(output, provider);
         const data_start = source.seek;
-        var inflater = deflate.Decompress.initSlice(input[data_start..], history);
-        const produced = inflater.reader.streamRemaining(&tee_writer.writer) catch |err| {
+        const inflated = inflatePayload(input, data_start, history, &tee_writer.writer) catch |err| {
             return switch (err) {
                 error.WriteFailed => error.IoFailure,
                 else => error.InvalidData,
             };
         };
-        total = try bounds.addUsize(total, produced);
-        source.seek = data_start + (inflater.inputBitsConsumed() + 7) / 8;
+        total = try bounds.addUsize(total, inflated.produced);
+        source.seek = data_start + inflated.consumed;
         var trailer: [8]u8 = undefined;
         var trailer_sink = std.Io.Writer.fixed(&trailer);
         source.streamExact(&trailer_sink, 8) catch return error.InvalidData;
@@ -150,39 +135,66 @@ pub fn encodeStream(source: *std.Io.Reader, output: *std.Io.Writer, history: []u
     try writeTrailer(output, crc32.final(), total);
 }
 
-fn skipHeader(source: *std.Io.Reader, fixed_header: *[10]u8, provider: checksum.Provider) Failure!void {
-    if (fixed_header[0] != magic_1 or fixed_header[1] != magic_2) return error.InvalidData;
-    if (fixed_header[2] != cm_deflate) return error.Unsupported;
-    const flags = fixed_header[3];
+fn parseHeader(input: []const u8, provider: checksum.Provider) Failure!HeaderTail {
+    if (input.len < 10) return error.InvalidData;
+    const fixed = input[0..10];
+    if (fixed[0] != magic_1 or fixed[1] != magic_2) return error.InvalidData;
+    if (fixed[2] != cm_deflate) return error.Unsupported;
+    const flags = fixed[3];
     if (flags & reserved_flags != 0) return error.InvalidData;
     var hasher = checksum.Crc32.bind(provider);
-    hasher.update(fixed_header);
+    hasher.update(fixed);
+    var cursor: usize = fixed.len;
+    var extra: []const u8 = &.{};
+    var name: []const u8 = &.{};
+    var comment: []const u8 = &.{};
     if (flags & flag_extra != 0) {
-        const low = source.takeByte() catch return error.InvalidData;
-        const high = source.takeByte() catch return error.InvalidData;
-        hasher.update(&.{ low, high });
-        var remaining: u16 = (@as(u16, high) << 8) | low;
-        while (remaining != 0) : (remaining -= 1) {
-            const byte = source.takeByte() catch return error.InvalidData;
-            hasher.update(&.{byte});
-        }
+        if (input.len - cursor < 2) return error.InvalidData;
+        const remaining: usize = (@as(usize, input[cursor + 1]) << 8) | input[cursor];
+        hasher.update(input[cursor..][0..2]);
+        cursor += 2;
+        if (input.len - cursor < remaining) return error.InvalidData;
+        extra = input[cursor .. cursor + remaining];
+        hasher.update(extra);
+        cursor += remaining;
     }
-    if (flags & flag_name != 0) try skipCString(source, &hasher);
-    if (flags & flag_comment != 0) try skipCString(source, &hasher);
+    if (flags & flag_name != 0) {
+        const end = std.mem.indexOfScalarPos(u8, input, cursor, 0) orelse return error.InvalidData;
+        name = input[cursor..end];
+        hasher.update(input[cursor .. end + 1]);
+        cursor = end + 1;
+    }
+    if (flags & flag_comment != 0) {
+        const end = std.mem.indexOfScalarPos(u8, input, cursor, 0) orelse return error.InvalidData;
+        comment = input[cursor..end];
+        hasher.update(input[cursor .. end + 1]);
+        cursor = end + 1;
+    }
     if (flags & flag_header_crc != 0) {
-        const low = source.takeByte() catch return error.InvalidData;
-        const high = source.takeByte() catch return error.InvalidData;
-        const stored_crc = (@as(u16, high) << 8) | low;
+        if (input.len - cursor < 2) return error.InvalidData;
+        const stored_crc = (@as(u16, input[cursor + 1]) << 8) | input[cursor];
         if (stored_crc != @as(u16, @truncate(hasher.final()))) return error.IntegrityFailure;
+        cursor += 2;
     }
+    return .{ .extra = extra, .name = name, .comment = comment, .len = cursor };
 }
 
-fn skipCString(source: *std.Io.Reader, hasher: *checksum.Crc32) Failure!void {
-    while (true) {
-        const byte = source.takeByte() catch return error.InvalidData;
-        hasher.update(&.{byte});
-        if (byte == 0) return;
-    }
+const HeaderTail = struct {
+    extra: []const u8,
+    name: []const u8,
+    comment: []const u8,
+    len: usize,
+};
+
+const Inflated = struct {
+    produced: usize,
+    consumed: usize,
+};
+
+fn inflatePayload(input: []const u8, data_start: usize, history: []u8, output: *std.Io.Writer) !Inflated {
+    var inflater = deflate.Decompress.initSlice(input[data_start..], history);
+    const produced = try inflater.reader.streamRemaining(output);
+    return .{ .produced = produced, .consumed = (inflater.inputBitsConsumed() + 7) / 8 };
 }
 
 fn writeHeader(writer: *std.Io.Writer, options: Options) Failure!void {
@@ -276,52 +288,13 @@ pub fn inspectMembers(input: []const u8, history: []u8, provider: checksum.Provi
 
 fn inspectMember(input: []const u8, history: []u8, provider: checksum.Provider) Failure!MemberInfo {
     if (history.len < deflate_history_size) return error.InsufficientCapacity;
-    var cursor: usize = 0;
-    if (input[0] != magic_1 or input[1] != magic_2) return error.InvalidData;
-    if (input[2] != cm_deflate) return error.Unsupported;
-    const flags = input[3];
-    if (flags & reserved_flags != 0) return error.InvalidData;
-    var hasher = checksum.Crc32.bind(provider);
-    hasher.update(input[0..10]);
-    cursor = 10;
-    var extra: []const u8 = &.{};
-    var name: []const u8 = &.{};
-    var comment: []const u8 = &.{};
-    if (flags & flag_extra != 0) {
-        if (input.len - cursor < 2) return error.InvalidData;
-        const remaining: usize = (@as(usize, input[cursor + 1]) << 8) | input[cursor];
-        hasher.update(input[cursor..][0..2]);
-        cursor += 2;
-        if (input.len - cursor < remaining) return error.InvalidData;
-        extra = input[cursor .. cursor + remaining];
-        hasher.update(extra);
-        cursor += remaining;
-    }
-    if (flags & flag_name != 0) {
-        const end = std.mem.indexOfScalarPos(u8, input, cursor, 0) orelse return error.InvalidData;
-        name = input[cursor..end];
-        hasher.update(input[cursor .. end + 1]);
-        cursor = end + 1;
-    }
-    if (flags & flag_comment != 0) {
-        const end = std.mem.indexOfScalarPos(u8, input, cursor, 0) orelse return error.InvalidData;
-        comment = input[cursor..end];
-        hasher.update(input[cursor .. end + 1]);
-        cursor = end + 1;
-    }
-    if (flags & flag_header_crc != 0) {
-        if (input.len - cursor < 2) return error.InvalidData;
-        const stored_crc = (@as(u16, input[cursor + 1]) << 8) | input[cursor];
-        if (stored_crc != @as(u16, @truncate(hasher.final()))) return error.IntegrityFailure;
-        cursor += 2;
-    }
+    const tail = try parseHeader(input, provider);
 
-    const data_start = cursor;
+    const data_start = tail.len;
     var counter = measurement.Counter.init(null);
     var tee_writer = Crc32Tee.initWithProvider(&counter.writer, provider);
-    var inflater = deflate.Decompress.initSlice(input[data_start..], history);
-    _ = inflater.reader.streamRemaining(&tee_writer.writer) catch return error.InvalidData;
-    const data_size = (inflater.inputBitsConsumed() + 7) / 8;
+    const inflated = inflatePayload(input, data_start, history, &tee_writer.writer) catch return error.InvalidData;
+    const data_size = inflated.consumed;
     const trailer_at = data_start + data_size;
     if (input.len - trailer_at < 8) return error.InvalidData;
     const stored_crc = std.mem.readInt(u32, input[trailer_at..][0..4], .little);
@@ -331,11 +304,11 @@ fn inspectMember(input: []const u8, history: []u8, provider: checksum.Provider) 
         .modification_time = std.mem.readInt(u32, input[4..8], .little),
         .extra_flags = input[8],
         .operating_system = input[9],
-        .text = flags & flag_text != 0,
-        .header_crc = flags & flag_header_crc != 0,
-        .extra = extra,
-        .name = name,
-        .comment = comment,
+        .text = input[3] & flag_text != 0,
+        .header_crc = input[3] & flag_header_crc != 0,
+        .extra = tail.extra,
+        .name = tail.name,
+        .comment = tail.comment,
         .data_offset = data_start,
         .data_size = data_size,
         .decoded_size = stored_size,
