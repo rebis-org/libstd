@@ -36,7 +36,7 @@ pub fn descriptorScan(b: *std.Build, ctx: *const Settings) std.Build.LazyPath {
     const module = modules.create(b, modules.component, ctx);
     const exe = b.addExecutable(.{ .name = "component", .root_module = module });
     const run = b.addRunArtifact(exe);
-    for (descriptorPaths(b)) |path| run.addFileArg(b.path(path));
+    for (descriptorPaths(b)) |path| run.addFileArg2(b.path(path), .{});
     return run.addOutputFileArg("components.generated.zig");
 }
 
@@ -56,7 +56,7 @@ pub const HostLibraries = struct {
 
 pub const Settings = struct {
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.Optimize,
+    optimize: std.lang.Optimize,
     version: std.SemanticVersion,
     generated: Generated,
     host: HostLibraries,
@@ -85,14 +85,14 @@ pub const ProviderArchives = struct {
 pub fn addLibrary(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.Optimize,
-    linkage: std.builtin.LinkMode,
+    optimize: std.lang.Optimize,
+    linkage: std.lang.LinkMode,
     ctx: *const Settings,
 ) *std.Build.Step.Compile {
     return addLibraryFromModule(b, rootModule(b, target, optimize, ctx), linkage);
 }
 
-pub fn rootModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.Optimize, ctx: *const Settings) *std.Build.Module {
+pub fn rootModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, ctx: *const Settings) *std.Build.Module {
     const module = modules.createFor(b, modules.library, target, optimize, ctx);
     // Discovery needs the generated table plus the interface import.
     const modules_pair = modules.componentsWithInterface(b, ctx, target, target, optimize);
@@ -101,7 +101,7 @@ pub fn rootModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std
     return module;
 }
 
-fn addLibraryFromModule(b: *std.Build, module: *std.Build.Module, linkage: std.builtin.LinkMode) *std.Build.Step.Compile {
+fn addLibraryFromModule(b: *std.Build, module: *std.Build.Module, linkage: std.lang.LinkMode) *std.Build.Step.Compile {
     return b.addLibrary(.{
         .name = "std",
         .root_module = module,
@@ -109,7 +109,7 @@ fn addLibraryFromModule(b: *std.Build, module: *std.Build.Module, linkage: std.b
     });
 }
 
-fn scanContext(target: std.Build.ResolvedTarget, optimize: std.builtin.Optimize, portable: bool, options: *std.Build.Module, sanitize_c: ?std.zig.SanitizeC) Settings {
+fn scanContext(target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, portable: bool, options: *std.Build.Module, sanitize_c: ?std.zig.SanitizeC) Settings {
     return .{
         .target = target,
         .optimize = optimize,
@@ -125,14 +125,14 @@ fn scanContext(target: std.Build.ResolvedTarget, optimize: std.builtin.Optimize,
 pub fn addGenerated(b: *std.Build) Generated {
     const files = b.addWriteFiles();
     // The catalog comes from the same comptime source that the discovery call serves.
-    var scan_ctx = scanContext(b.graph.host, .Debug, false, b.addOptions().createModule(), null);
-    const modules_pair = modules.componentsWithInterface(b, &scan_ctx, b.graph.host, b.graph.host, .Debug);
+    var scan_ctx = scanContext(b.graph.host, .debug, false, b.addOptions().createModule(), null);
+    const modules_pair = modules.componentsWithInterface(b, &scan_ctx, b.graph.host, b.graph.host, .debug);
     const components_module = modules_pair.components;
     const interface_module = modules_pair.interface;
     const gen_module = b.createModule(.{
         .root_source_file = b.path("src/catalog_gen.zig"),
         .target = b.graph.host,
-        .optimize = .Debug,
+        .optimize = .debug,
     });
     gen_module.addImport("components", components_module);
     gen_module.addImport("interface", interface_module);
@@ -151,7 +151,7 @@ pub fn addGenerated(b: *std.Build) Generated {
 pub fn addHostLibraries(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.Optimize,
+    optimize: std.lang.Optimize,
     portable: bool,
     options: *std.Build.Module,
 ) HostLibraries {
@@ -161,7 +161,7 @@ pub fn addHostLibraries(
 pub fn addHostLibrariesWithOptions(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.Optimize,
+    optimize: std.lang.Optimize,
     portable: bool,
     options: *std.Build.Module,
     sanitize_c: ?std.zig.SanitizeC,

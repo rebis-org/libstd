@@ -10,7 +10,7 @@ const flags = [_][]const u8{
 pub fn addReference(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.Optimize,
+    optimize: std.lang.Optimize,
     exe: *std.Build.Step.Compile,
 ) *std.Build.Step.Compile {
     const module = b.createModule(.{

@@ -64,7 +64,7 @@ pub const Env = struct {
     pub const Mapped = struct {
         bytes: []const u8,
         alloc: ?[]u8 = null,
-        map: if (builtin.os.tag == .windows) @TypeOf(null) else ?[]align(std.heap.page_size_min) const u8 = null,
+        map: if (builtin.target.os.tag == .windows) @TypeOf(null) else ?[]align(std.heap.page_size_min) const u8 = null,
 
         pub fn release(self: Mapped, allocator: std.mem.Allocator) void {
             if (self.alloc) |buf| {
@@ -77,7 +77,7 @@ pub const Env = struct {
 
     // Mmap keeps pages resident across repeated passes.
     pub fn mapFile(self: *Env, path: []const u8, max: u64) !Mapped {
-        if (builtin.os.tag == .windows) {
+        if (builtin.target.os.tag == .windows) {
             const buf = try self.readFile(path, max);
             return .{ .bytes = buf, .alloc = buf };
         }
@@ -87,7 +87,7 @@ pub const Env = struct {
         if (file_size > max) return error.FileTooBig;
         if (file_size == 0) return .{ .bytes = &.{} };
         // Darwin uses the packed-struct PROT form. Other POSIX targets use the enum.
-        const read_prot: std.posix.PROT = switch (builtin.os.tag) {
+        const read_prot: std.posix.PROT = switch (builtin.target.os.tag) {
             .macos, .ios, .tvos, .watchos, .visionos, .maccatalyst, .driverkit => .{ .READ = true },
             else => .READ,
         };
