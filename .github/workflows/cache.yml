@@ -88,17 +88,17 @@ jobs:
       - name: Build and package
         if: inputs.profile == 'build'
         run: |
-          zig build exe -Doptimize=Debug
-          zig build exe -Doptimize=ReleaseSafe
-          zig build -Doptimize=ReleaseFast
-          zig build -Doptimize=ReleaseSmall
+          zig build exe -Doptimize=debug
+          zig build exe -Doptimize=safe
+          zig build -Doptimize=fast
+          zig build -Doptimize=small
           zig build abi
           brew install autoconf automake bison
-          [ "${{ inputs.benchmark }}" = true ] && zig build benchmark -Doptimize=ReleaseFast
+          [ "${{ inputs.benchmark }}" = true ] && zig build benchmark -Doptimize=fast
           brew install llvm
           echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
-          zig build dist -Doptimize=ReleaseFast
-          zig build package -Doptimize=ReleaseFast
+          zig build dist -Doptimize=fast
+          zig build package -Doptimize=fast
       - name: Export the archives
         uses: actions/upload-artifact@v7.0.2
         if: inputs.export
@@ -119,4 +119,4 @@ jobs:
             *) echo "unknown primitive implementation" >&2; exit 1 ;;
           esac
           zig build unit -Dprimitives_impl=${{ inputs.impl }} -Dportable=${{ inputs.portable }}
-          zig build oracles -Dprimitives_impl=${{ inputs.impl }} -Dportable=${{ inputs.portable }} -Doptimize=ReleaseSafe
+          zig build oracles -Dprimitives_impl=${{ inputs.impl }} -Dportable=${{ inputs.portable }} -Doptimize=safe
