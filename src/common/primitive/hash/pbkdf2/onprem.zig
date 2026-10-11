@@ -12,16 +12,18 @@ pub fn pbkdf2(dk: []u8, password: []const u8, salt: []const u8, rounds: u32, com
     var block_counter: u32 = 1;
     var offset: usize = 0;
     while (offset < dk.len) : (block_counter +%= 1) {
-        var prf = Prf.init(password);
-        prf.update(salt);
+        // The password pads never change across rounds, so bind once per block.
+        const base = Prf.init(password);
+        var first = base;
+        first.update(salt);
         var counter_be: [4]u8 = undefined;
         std.mem.writeInt(u32, &counter_be, block_counter, .big);
-        prf.update(&counter_be);
-        var block_mac: [Prf.mac_length]u8 = prf.finalResult();
+        first.update(&counter_be);
+        var block_mac: [Prf.mac_length]u8 = first.finalResult();
         var xor_acc = block_mac;
         var round: u32 = 1;
         while (round < rounds) : (round += 1) {
-            var iter = Prf.init(password);
+            var iter = base;
             iter.update(&block_mac);
             block_mac = iter.finalResult();
             for (&xor_acc, block_mac) |*byte, other| byte.* ^= other;
