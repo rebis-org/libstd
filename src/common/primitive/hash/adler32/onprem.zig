@@ -8,7 +8,7 @@ const options = @import("options");
 // NEON is baseline on aarch64, so the wide path needs no extra target feature;
 // the portable flag turns it off.
 
-const has_neon = builtin.cpu.arch == .aarch64 and !options.adler32_portable;
+const has_neon = builtin.target.cpu.arch == .aarch64 and !options.adler32_portable;
 
 // Lane k covers bytes 4k..4k+3, so its weights count down from 16-4k.
 const lane_weights = [4]@Vector(4, u32){
