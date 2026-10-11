@@ -53,22 +53,18 @@ pub const Resource = struct {
         };
     }
 
-    fn fromNode(call: *abi.Call, node: *abi.Node, capabilities: u32, comptime is_sink: bool) Failure!Resource {
-        if (node.flags & abi.node_flag_callback_resource != 0) {
-            return callbackResource(call, node.value_low, node.value_high, capabilities, !is_sink);
-        }
-        if (is_sink) {
-            return direct(.{ .direct_write = try checkedMutBytes(node.bytes, node.byte_capacity) }, capabilities);
-        }
-        return direct(.{ .direct_read = try checkedConstBytes(node.bytes, node.byte_length) }, capabilities);
+    fn fromCallback(call: *abi.Call, node: *abi.Node, capabilities: u32, comptime reading: bool) Failure!Resource {
+        return callbackResource(call, node.value_low, node.value_high, capabilities, reading);
     }
 
     pub fn sourceFromNode(call: *abi.Call, node: *abi.Node, capabilities: u32) Failure!Resource {
-        return fromNode(call, node, capabilities, false);
+        if (node.flags & abi.node_flag_callback_resource != 0) return fromCallback(call, node, capabilities, true);
+        return direct(.{ .direct_read = try checkedConstBytes(node.bytes, node.byte_length) }, capabilities);
     }
 
     pub fn sinkFromNode(call: *abi.Call, node: *abi.Node, capabilities: u32) Failure!Resource {
-        return fromNode(call, node, capabilities, true);
+        if (node.flags & abi.node_flag_callback_resource != 0) return fromCallback(call, node, capabilities, false);
+        return direct(.{ .direct_write = try checkedMutBytes(node.bytes, node.byte_capacity) }, capabilities);
     }
 
     pub fn hasCapability(self: Resource, bit: u32) bool {
@@ -93,8 +89,7 @@ pub const Resource = struct {
 
     pub fn rewind(self: *Resource) Failure!void {
         switch (self.kind) {
-            .direct_read => self.offset = 0,
-            .direct_write => self.offset = 0,
+            .direct_read, .direct_write => self.offset = 0,
             .callback_read => _ = try self.invoke(vocabulary.ids.callback_rewind, null, null),
             .callback_write => {},
         }

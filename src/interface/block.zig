@@ -4,14 +4,13 @@ const span = @import("span.zig");
 const Span = span.Span;
 const Failure = span.Failure;
 
-// Generation lives in a header prefix. Free bumps it and every access re-reads it.
 pub const Block = struct {
     storage: []u8,
     generation: u64,
 
     pub const header_len: usize = @sizeOf(u64);
 
-    fn loadGeneration(storage: []u8) u64 {
+    pub fn loadGeneration(storage: []u8) u64 {
         return std.mem.readInt(u64, storage[0..header_len], .little);
     }
 
@@ -47,7 +46,7 @@ pub const TrackedSpan = struct {
     span: Span,
 
     fn check(self: TrackedSpan) void {
-        const current = std.mem.readInt(u64, self.owner.storage[0..Block.header_len], .little);
+        const current = Block.loadGeneration(self.owner.storage);
         if (current != self.generation) span.trap(.use_after_free, "tracked span is stale: the block was freed or reused.");
     }
 

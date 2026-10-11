@@ -92,12 +92,12 @@ pub fn packSelector(
     return (@as(u64, family) << 48) | (@as(u64, ordinal) << 16) | (@as(u64, attributes) << 8) | @as(u64, command_mask & parameter_flag_command_mask);
 }
 
-pub fn selectorOf(value_high: u64) Selector {
+pub fn selectorOf(selector_bits: u64) Selector {
     return .{
-        .family = @truncate(value_high >> 48),
-        .ordinal = @truncate(value_high >> 16),
-        .attributes = @truncate(value_high >> 8),
-        .flags = @truncate(value_high),
+        .family = @truncate(selector_bits >> 48),
+        .ordinal = @truncate(selector_bits >> 16),
+        .attributes = @truncate(selector_bits >> 8),
+        .flags = @truncate(selector_bits),
     };
 }
 
@@ -107,28 +107,36 @@ pub fn isSelectorValid(selector_value: Selector) bool {
     return cardinalityFieldOf(selector_value.attributes) <= 1;
 }
 
+pub fn fieldOf(attributes: u8, comptime shift: u6) u2 {
+    return @truncate(attributes >> shift);
+}
+
 pub fn representationFieldOf(attributes: u8) u2 {
-    return @truncate(attributes >> parameter_rep_shift);
+    return fieldOf(attributes, parameter_rep_shift);
 }
 
 pub fn cardinalityFieldOf(attributes: u8) u2 {
-    return @truncate(attributes >> parameter_card_shift);
+    return fieldOf(attributes, parameter_card_shift);
 }
 
 pub fn directionFieldOf(attributes: u8) u2 {
-    return @truncate(attributes >> parameter_dir_shift);
+    return fieldOf(attributes, parameter_dir_shift);
+}
+
+fn attributeOf(selector_value: Selector, comptime shift: u6, comptime T: type) T {
+    return @fromBackingInt(@intCast(fieldOf(selector_value.attributes, shift)));
 }
 
 pub fn representationOf(selector_value: Selector) Representation {
-    return @fromBackingInt(@intCast(representationFieldOf(selector_value.attributes)));
+    return attributeOf(selector_value, parameter_rep_shift, Representation);
 }
 
 pub fn cardinalityOf(selector_value: Selector) Cardinality {
-    return @fromBackingInt(@intCast(cardinalityFieldOf(selector_value.attributes)));
+    return attributeOf(selector_value, parameter_card_shift, Cardinality);
 }
 
 pub fn directionOf(selector_value: Selector) Direction {
-    return @fromBackingInt(@intCast(directionFieldOf(selector_value.attributes)));
+    return attributeOf(selector_value, parameter_dir_shift, Direction);
 }
 
 pub fn commandMaskForId(id: Id) u32 {
@@ -265,8 +273,8 @@ pub const error_map = [_]ErrorMap{
     .{ .failure = error.IoFailure, .name = "io_failure", .status = Status.io_failure, .diagnostic = ids.io_failure },
 };
 
-pub fn eql(first: Id, second: Id) bool {
-    return first.low == second.low and first.high == second.high;
+pub fn eql(left: Id, right: Id) bool {
+    return left.low == right.low and left.high == right.high;
 }
 
 pub fn isZero(id: Id) bool {

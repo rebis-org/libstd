@@ -97,22 +97,25 @@ pub fn materializeSource(comptime sizing: SourceSizing, source: *Resource, works
     };
 }
 
-pub fn measureOutputSize(source: *Resource, limits: Limits) Failure!u64 {
+pub fn measureSource(source: *Resource, limit: u64) Failure!usize {
     if (source.hasCapability(resource.capability_bit_size)) {
         const total = try source.size();
-        if (total > limits.encoded_bytes) return error.ResourceLimit;
-        return total;
+        if (total > limit) return error.ResourceLimit;
+        return std.math.cast(usize, total) orelse error.ResourceLimit;
     }
-    if (source.hasCapability(resource.capability_bit_replay)) {
-        var counter = measurement.Counter.init(null);
-        var bounded: resource.BoundedReader = undefined;
-        bounded.init(source, limits.encoded_bytes);
-        const bytes_produced = std.Io.Reader.streamRemaining(&bounded.reader, &counter.writer) catch |failure| return mapStreamError(failure);
-        if (bytes_produced > limits.encoded_bytes) return error.ResourceLimit;
-        try source.rewind();
-        return bytes_produced;
-    }
-    return error.Unsupported;
+    if (!source.hasCapability(resource.capability_bit_replay)) return error.Unsupported;
+    var counter = measurement.Counter.init(null);
+    var bounded_source: resource.BoundedReader = undefined;
+    bounded_source.init(source, limit);
+    _ = std.Io.Reader.streamRemaining(&bounded_source.reader, &counter.writer) catch |failure| return mapStreamError(failure);
+    try source.rewind();
+    const total = counter.written();
+    if (total > limit) return error.ResourceLimit;
+    return std.math.cast(usize, total) orelse error.ResourceLimit;
+}
+
+pub fn measureOutputSize(source: *Resource, limits: Limits) Failure!u64 {
+    return measureSource(source, limits.encoded_bytes);
 }
 
 fn mapStreamError(failure: anyerror) Failure {
@@ -196,22 +199,25 @@ fn overlapsWorkspace(workspace_ptr: usize, workspace_len: usize, ptr: usize, len
     if (try spanOverlap(workspace_ptr, workspace_len, ptr, len)) return error.InvalidCall;
 }
 
+fn workspaceRange(call: *Call) ?struct { ptr: usize, len: usize } {
+    if (call.workspace == null or call.workspace_capacity == 0) return null;
+    return .{ .ptr = @intFromPtr(call.workspace.?), .len = call.workspace_capacity };
+}
+
 pub fn checkWorkspaceOverlap(call: *Call, source: *Resource, sink: *Resource) Failure!void {
-    if (call.workspace == null or call.workspace_capacity == 0) return;
-    const workspace_ptr = @intFromPtr(call.workspace.?);
-    const workspace_len = call.workspace_capacity;
+    const range = workspaceRange(call) orelse return;
     if (source.kind == .direct_read) {
-        try overlapsWorkspace(workspace_ptr, workspace_len, @intFromPtr(source.kind.direct_read.ptr), source.kind.direct_read.len);
+        try overlapsWorkspace(range.ptr, range.len, @intFromPtr(source.kind.direct_read.ptr), source.kind.direct_read.len);
     }
     if (sink.kind == .direct_write) {
-        try overlapsWorkspace(workspace_ptr, workspace_len, @intFromPtr(sink.kind.direct_write.ptr), sink.kind.direct_write.len);
+        try overlapsWorkspace(range.ptr, range.len, @intFromPtr(sink.kind.direct_write.ptr), sink.kind.direct_write.len);
     }
 }
 
 pub fn checkSourceWorkspaceOverlap(call: *Call, source: *Resource) Failure!void {
-    if (call.workspace == null or call.workspace_capacity == 0) return;
+    const range = workspaceRange(call) orelse return;
     if (source.kind != .direct_read) return;
-    try overlapsWorkspace(@intFromPtr(call.workspace.?), call.workspace_capacity, @intFromPtr(source.kind.direct_read.ptr), source.kind.direct_read.len);
+    try overlapsWorkspace(range.ptr, range.len, @intFromPtr(source.kind.direct_read.ptr), source.kind.direct_read.len);
 }
 
 pub fn validateBoundary(call: *Call, plan: *const ExecutionPlan, source_node: ?*Node, sink_node: ?*Node) Failure!void {

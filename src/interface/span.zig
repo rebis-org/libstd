@@ -15,11 +15,11 @@ pub fn trap(violation: Violation, context: []const u8) noreturn {
     unreachable;
 }
 
-fn checkRange(total: usize, offset: usize, length: usize) void {
+pub fn checkRange(total: usize, offset: usize, length: usize) void {
     if (offset > total or length > total - offset) trap(.out_of_bounds, "subspan is out of bounds.");
 }
 
-pub fn overlaps(first_start: usize, first_len: usize, second_start: usize, second_len: usize) bool {
+pub fn hasOverlap(first_start: usize, first_len: usize, second_start: usize, second_len: usize) bool {
     if (first_len == 0 or second_len == 0) return false;
     return first_start < second_start + second_len and second_start < first_start + first_len;
 }
@@ -90,7 +90,7 @@ pub fn constSpan(pointer: ?[*]const u8, length: u64) Failure!ConstSpan {
 
 // Independently handed spans must not alias.
 pub fn requireDisjoint(first: ConstSpan, second: ConstSpan, context: []const u8) void {
-    if (overlaps(@intFromPtr(first.ptr), first.len, @intFromPtr(second.ptr), second.len)) trap(.overlap, context);
+    if (hasOverlap(@intFromPtr(first.ptr), first.len, @intFromPtr(second.ptr), second.len)) trap(.overlap, context);
 }
 
 test "span algebra: read, write, and sub round trip" {

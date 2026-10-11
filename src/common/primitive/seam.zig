@@ -347,15 +347,11 @@ pub fn CipherCtx(comptime mode: Mode, comptime On: type, comptime Off: type) typ
     };
 }
 
-fn cipherCtxKey(comptime Impl: type) type {
-    return @typeInfo(@TypeOf(Impl.init)).@"fn".param_types[0].?;
-}
-
 fn FixedCipherCtx(comptime tag: Provider, comptime Impl: type) type {
     return struct {
         inner: Impl,
 
-        pub const Key = cipherCtxKey(Impl);
+        pub const Key = hashSeed(Impl);
 
         pub fn init(key: Key) @This() {
             return .{ .inner = Impl.init(key) };
@@ -380,7 +376,7 @@ fn MergeableCipherCtx(comptime On: type, comptime Off: type) type {
     return struct {
         state: Pair(On, Off),
 
-        pub const Key = cipherCtxKey(On);
+        pub const Key = hashSeed(On);
 
         pub fn init(key: Key) @This() {
             return bind(default_provider, key);

@@ -109,11 +109,11 @@ fn dispatch(envelope: *Call, response: *Node) Failure!void {
         if (is_query) effective_command_mask else 0,
     ) orelse return error.Unsupported;
     const sizing = try parseSizingMode(
-        node_graph.findSelector(envelope.request, vocabulary.parameter_family_protocol, vocabulary.protocol_parameter.sizing_mode),
+        protocolParam(envelope.request, vocabulary.protocol_parameter.sizing_mode),
         policy.sizing,
     );
     const commit = try parseCommitMode(
-        node_graph.findSelector(envelope.request, vocabulary.parameter_family_protocol, vocabulary.protocol_parameter.commit_mode),
+        protocolParam(envelope.request, vocabulary.protocol_parameter.commit_mode),
         policy.commit,
     );
     const strict_modes = tag != .test_echo and tag != .test_read;
@@ -127,14 +127,12 @@ fn dispatch(envelope: *Call, response: *Node) Failure!void {
         if (policy.sizing != .measured or effective_command_mask != command_mask_write) return error.Unsupported;
         effective_sizing = .bounded;
     }
-    const limits = Limits.fromScalar(node_graph.parseU64(node_graph.findSelector(
+    const limits = Limits.fromScalar(node_graph.parseU64(protocolParam(
         envelope.request,
-        vocabulary.parameter_family_protocol,
         vocabulary.protocol_parameter.resource_limit,
     )));
-    const capabilities = parseCapabilities(node_graph.findSelector(
+    const capabilities = parseCapabilities(protocolParam(
         envelope.request,
-        vocabulary.parameter_family_protocol,
         vocabulary.protocol_parameter.resource_capabilities,
     ));
     const source_node = try requireParameter(envelope.request, ids.source);
@@ -146,9 +144,8 @@ fn dispatch(envelope: *Call, response: *Node) Failure!void {
         .policy = policy,
         .limits = limits,
         .capabilities = capabilities,
-        .provider = try parseProvider(node_graph.findSelector(
+        .provider = try parseProvider(protocolParam(
             envelope.request,
-            vocabulary.parameter_family_protocol,
             vocabulary.protocol_parameter.provider,
         )),
         .source_strategy = switch (policy.sizing) {
@@ -196,6 +193,10 @@ fn requireParameter(first: ?*Node, id: Id) Failure!*Node {
 
 fn nodeId(node: *Node) Id {
     return .{ .low = node.value_low, .high = node.value_high };
+}
+
+fn protocolParam(request: ?*Node, comptime field: u32) ?*Node {
+    return node_graph.findSelector(request, vocabulary.parameter_family_protocol, field);
 }
 
 fn parseCapabilities(node: ?*Node) u32 {

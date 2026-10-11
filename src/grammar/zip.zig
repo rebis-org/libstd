@@ -348,12 +348,8 @@ fn writeCentralZip64(sink: *io.Sink, compressed: usize, uncompressed: usize, loc
 }
 
 fn validatePath(name: []const u8, flags: u16) Failure!void {
-    if (name.len == 0 or std.mem.indexOfScalar(u8, name, '\\') != null or name[0] == '/' or (name.len >= 2 and std.ascii.isAlphabetic(name[0]) and name[1] == ':')) return error.InvalidData;
+    if (bounds.isAbsoluteOrTraversal(name) or (name.len >= 2 and std.ascii.isAlphabetic(name[0]) and name[1] == ':')) return error.InvalidData;
     if (flags & 0x0800 != 0 and !std.unicode.utf8ValidateSlice(name)) return error.InvalidData;
-    var segments = std.mem.splitScalar(u8, name, '/');
-    while (segments.next()) |segment| {
-        if (std.mem.eql(u8, segment, "..")) return error.InvalidData;
-    }
 }
 
 pub fn compressedSize(entry: Entry, history: []u8, measurement_buffer: []u8, scratch: []u8) Failure!usize {
