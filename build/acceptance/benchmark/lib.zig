@@ -19,8 +19,11 @@ extern fn lzma_stream_buffer_decode(memlimit: ?*u64, flags: u32, allocator: ?*an
 extern fn FL2_compress(destination: [*]u8, destination_capacity: usize, source: [*]const u8, source_size: usize, compressionLevel: c_int) usize;
 extern fn FL2_decompress(destination: [*]u8, destination_capacity: usize, source: [*]const u8, source_size: usize) usize;
 extern fn FL2_isError(code: usize) c_uint;
-extern fn compress2(destination: [*]u8, dest_len: *u32, source: [*]const u8, source_len: u32, level: c_int) c_int;
-extern fn uncompress(destination: [*]u8, dest_len: *u32, source: [*]const u8, source_len: u32) c_int;
+// zlib sizes its length parameters with uLong (unsigned long), which is 8 bytes
+// on every LP64 target. A narrower declared type lets zlib's 64-bit store into
+// dest_len spill past the caller's slot.
+extern fn compress2(destination: [*]u8, dest_len: *usize, source: [*]const u8, source_len: usize, level: c_int) c_int;
+extern fn uncompress(destination: [*]u8, dest_len: *usize, source: [*]const u8, source_len: usize) c_int;
 extern fn LZ4F_compressFrameBound(src_size: usize, preferences: ?*const anyopaque) usize;
 extern fn LZ4F_compressFrame(destination: [*]u8, dst_capacity: usize, source: [*]const u8, src_size: usize, preferences: ?*const anyopaque) usize;
 extern fn LZ4F_isError(code: usize) c_uint;
@@ -134,13 +137,13 @@ const fast_lzma2 = struct {
 
 const zlib = struct {
     fn encode(_: *env_mod.Env, ref: Ref, input: []const u8, output: []u8) anyerror!Enc {
-        var len: u32 = @intCast(output.len);
-        if (compress2(output.ptr, &len, input.ptr, @intCast(input.len), @intCast(ref.level)) != 0) return error.encode_failed;
+        var len: usize = output.len;
+        if (compress2(output.ptr, &len, input.ptr, input.len, @intCast(ref.level)) != 0) return error.encode_failed;
         return .{ .len = len };
     }
     fn decode(_: *env_mod.Env, _: Ref, data: []const u8, output: []u8) anyerror!usize {
-        var len: u32 = @intCast(output.len);
-        if (uncompress(output.ptr, &len, data.ptr, @intCast(data.len)) != 0) return error.decode_failed;
+        var len: usize = output.len;
+        if (uncompress(output.ptr, &len, data.ptr, data.len) != 0) return error.decode_failed;
         return len;
     }
 };
