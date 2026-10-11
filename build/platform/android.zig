@@ -23,7 +23,7 @@ fn addClassesJar(b: *std.Build) std.Build.LazyPath {
         ,
         "_",  "unused",
     });
-    compile.addFileArg(b.path("build/templates/android/dev/stdk/StdK.java"));
+    compile.addFileArg2(b.path("build/templates/android/dev/stdk/StdK.java"), .{});
     return compile.addOutputFileArg("classes.jar");
 }
 

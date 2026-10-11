@@ -67,7 +67,7 @@ fn byName(name: []const u8) Module {
 }
 
 pub fn create(b: *std.Build, comptime spec: Module, ctx: *const common.Settings) *std.Build.Module {
-    return createFor(b, spec, b.graph.host, .Debug, ctx);
+    return createFor(b, spec, b.graph.host, .debug, ctx);
 }
 
 pub const Components = struct {
@@ -80,7 +80,7 @@ pub fn componentsWithInterface(
     ctx: *const common.Settings,
     components_target: std.Build.ResolvedTarget,
     interface_target: std.Build.ResolvedTarget,
-    optimize: std.builtin.Optimize,
+    optimize: std.lang.Optimize,
 ) Components {
     const generated = common.descriptorScan(b, ctx);
     const interface_module = createFor(b, interface, interface_target, optimize, ctx);
@@ -125,7 +125,7 @@ pub fn createFor(
     b: *std.Build,
     comptime spec: Module,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.Optimize,
+    optimize: std.lang.Optimize,
     ctx: *const common.Settings,
 ) *std.Build.Module {
     var adjusted = target;
@@ -153,11 +153,11 @@ fn createShared(
     b: *std.Build,
     comptime spec: Module,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.Optimize,
+    optimize: std.lang.Optimize,
     ctx: *const common.Settings,
 ) *std.Build.Module {
     if (shared_modules == null) shared_modules = std.StringHashMap(*std.Build.Module).init(b.allocator);
-    const key = std.fmt.allocPrint(b.allocator, "{s}|{s}|{s}|{d}", .{
+    const key = b.allocator.print("{s}|{s}|{s}|{d}", .{
         spec.name,
         target.result.zigTriple(b.allocator) catch @panic("The shared module key cannot allocate the target triple."),
         @tagName(optimize),

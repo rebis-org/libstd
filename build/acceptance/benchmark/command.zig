@@ -122,7 +122,7 @@ fn cmake(b: *std.Build, source: []const u8, build_dir: []const u8, options: []co
 
 fn copyOut(b: *std.Build, dep: *std.Build.Step, source: []const u8, name: []const u8) std.Build.LazyPath {
     const copy = b.addSystemCommand(&.{"cp"});
-    copy.addFileArg(b.path(source));
+    copy.addFileArg2(b.path(source), .{});
     copy.step.dependOn(dep);
     return copy.addOutputFileArg(name);
 }
@@ -162,7 +162,7 @@ fn addBinaryFetch(b: *std.Build, ctx: *const common.Settings, ref: BinaryRef) *s
         .root_module = b.createModule(.{
             .root_source_file = b.path("build/acceptance/benchmark/ref/binary.zig"),
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
             .imports = &.{.{ .name = "run", .module = modules.create(b, modules.run, ctx) }},
         }),
     });
@@ -308,7 +308,7 @@ fn addUnrar(b: *std.Build) struct { cmd: *std.Build.Step.InstallFile, lib: std.B
     const make_lib = b.addSystemCommand(&.{ "sh", "-c", "make clean && make -j4 lib" });
     make_lib.setCwd(b.path("vendor/unrar"));
     const copy = b.addSystemCommand(&.{"cp"});
-    copy.addFileArg(b.path("vendor/unrar/libunrar.a"));
+    copy.addFileArg2(b.path("vendor/unrar/libunrar.a"), .{});
     copy.step.dependOn(&make_lib.step);
     const lib = copy.addOutputFileArg("libunrar.a");
     const make_cmd = b.addSystemCommand(&.{ "sh", "-c", "make clean && make -j4" });

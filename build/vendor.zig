@@ -24,7 +24,7 @@ fn addVendorTests(b: *std.Build, refs: cmd.Refs, ctx: *common.Settings) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("build/acceptance/tests/vendor.zig"),
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
             .imports = &.{.{ .name = "run", .module = modules.create(b, modules.run, ctx) }},
         }),
     });
