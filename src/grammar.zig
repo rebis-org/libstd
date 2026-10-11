@@ -14,4 +14,5 @@ test {
     _ = @import("grammar/xz.zig");
     _ = @import("leaf/lz4.zig");
     _ = @import("leaf/zstd.zig");
+    _ = @import("testing/fuzz/decode.zig");
 }

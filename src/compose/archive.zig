@@ -299,10 +299,20 @@ fn sevenZipGeneric(comptime coded: bool, plan: *common.ExecutionPlan, source: ?*
         return err;
     };
     if (command_mask == vocabulary.command_mask_read) {
+        const load_options: seven_zip.SevenZipLoadOptions = .{
+            .password = if (crypto_params) |params| params.password else null,
+            .kdf_rounds_limit = if (crypto_params) |params| params.kdf_rounds_limit else 0,
+            .password_lifetime = if (crypto_params) |params| params.password_lifetime else 0,
+            .failure_cause = &crypto_cause,
+            .provider = plan.provider,
+        };
         if (sink == null) {
             try common.checkSourceWorkspaceOverlap(call, source_resource);
             const archive = try common.materializeSource(.replay, source_resource, &workspace, limits.encoded_bytes);
-            const count = try seven_zip.sevenZipInspectCount(archive, &workspace, limits, plan.provider);
+            const count = seven_zip.sevenZipInspectCountEx(archive, &workspace, limits, &load_options) catch |err| {
+                writeCryptoFailure(call, crypto_cause);
+                return err;
+            };
             response.byte_length = count;
             return;
         }
@@ -315,7 +325,10 @@ fn sevenZipGeneric(comptime coded: bool, plan: *common.ExecutionPlan, source: ?*
             comptime discovery.parameter("tar", "ordinal").ordinal,
         ));
         const archive = try common.materializeSource(.replay, source_resource, &workspace, limits.encoded_bytes);
-        const entry = try seven_zip.sevenZipInspectOrdinal(archive, &workspace, limits, ordinal, plan.provider);
+        const entry = seven_zip.sevenZipInspectOrdinalEx(archive, &workspace, limits, ordinal, &load_options) catch |err| {
+            writeCryptoFailure(call, crypto_cause);
+            return err;
+        };
         if (!coded and entry.method != .copy) return error.Unsupported;
         const size = std.math.cast(usize, entry.size) orelse return error.ResourceLimit;
         if (size > limits.decoded_bytes) return error.ResourceLimit;
@@ -344,12 +357,29 @@ fn sevenZipGeneric(comptime coded: bool, plan: *common.ExecutionPlan, source: ?*
         response.byte_length = size;
     } else if (command_mask == vocabulary.command_mask_write) {
         try requireVerified(commit);
+        // Header policy: 0 = stored header (default), 1 = -mhc (encoded
+        // header), 2 = -mhe (AES-256-encrypted header, stored). Both match
+        // the reference writer's byte shapes; -mhe never compresses there.
+        const header_encode = node_graph.parseU64(node_graph.findSelector(
+            call.request,
+            comptime discovery.parameter("sevenzip", "header_encode").family,
+            comptime discovery.parameter("sevenzip", "header_encode").ordinal,
+        ));
+        if (header_encode > 2) return error.InvalidCall;
+        const header_options: seven_zip.SevenZipHeaderOptions = .{
+            .compress = header_encode == 1,
+            .encrypt = header_encode == 2,
+            .password = if (crypto_params) |params| params.password else &.{},
+            .kdf_rounds_limit = if (crypto_params) |params| params.kdf_rounds_limit else 0,
+            .password_lifetime = if (crypto_params) |params| params.password_lifetime else 0,
+            .failure_cause = &crypto_cause,
+        };
         const entries = try parseSevenZipEntries(call.request, &workspace, .copy, coded, crypto_params);
         const packed_entries = seven_zip.sevenZipPack(entries, plan.provider, &workspace, limits, &crypto_cause) catch |err| {
             writeCryptoFailure(call, crypto_cause);
             return err;
         };
-        const required = try seven_zip.sevenZipPackedSize(entries, packed_entries, &workspace);
+        const required = try seven_zip.sevenZipPackedSize(entries, packed_entries, &workspace, plan.provider, limits, header_options);
         if (sink == null) {
             response.byte_length = required;
             return;
@@ -359,11 +389,11 @@ fn sevenZipGeneric(comptime coded: bool, plan: *common.ExecutionPlan, source: ?*
         try common.requireSinkCapacity(sink_resource, call, required);
         if (sink_resource.kind == .direct_write) {
             const output = try common.sinkDirectBuffer(sink_resource, required);
-            const written = try seven_zip.sevenZipWritePacked(entries, packed_entries, output, &workspace, plan.provider);
+            const written = try seven_zip.sevenZipWritePacked(entries, packed_entries, output, &workspace, plan.provider, limits, header_options);
             response.byte_length = written;
         } else {
             const staging = try workspace.take(u8, required);
-            const written = try seven_zip.sevenZipWritePacked(entries, packed_entries, staging, &workspace, plan.provider);
+            const written = try seven_zip.sevenZipWritePacked(entries, packed_entries, staging, &workspace, plan.provider, limits, header_options);
             try common.commitBytesToSink(sink_resource, call, staging[0..written]);
             response.byte_length = written;
         }
@@ -561,22 +591,32 @@ pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
         response.byte_length = size;
     } else if (command_mask == vocabulary.command_mask_write) {
         try requireVerified(commit);
-        // The RAR writer has no encryption path; refuse crypto parameters
-        // outright instead of silently producing a plaintext archive.
         var crypto_cause: crypto.FailureCause = .none;
-        if (parseCryptoParams(call.request, &crypto_cause) catch |err| {
+        const crypto_params = parseCryptoParams(call.request, &crypto_cause) catch |err| {
             writeCryptoFailure(call, crypto_cause);
             return err;
-        } != null) {
-            writeCryptoFailure(call, crypto_cause);
-            return error.Unsupported;
-        }
+        };
+        // 1 = encrypt file data (-p, implied by a password), 2 = encrypt
+        // headers as well (-hp). Both need the password channel.
+        const header_encode = node_graph.parseU64(node_graph.findSelector(
+            call.request,
+            comptime discovery.parameter("rar", "header_encode").family,
+            comptime discovery.parameter("rar", "header_encode").ordinal,
+        ));
+        if (header_encode > 2) return error.InvalidCall;
         const entries = try parseRarEntries(call.request, &workspace);
+        const write_options: rar_writer.WriteOptions = .{
+            .password = if (crypto_params) |params| params.password else &.{},
+            .encrypt_headers = header_encode == 2,
+            .kdf_rounds_limit = if (crypto_params) |params| params.kdf_rounds_limit else 0,
+            .failure_cause = &crypto_cause,
+        };
+        if (write_options.encrypt_headers and write_options.password.len == 0) return error.InvalidCall;
         var max_input: usize = 0;
         var packed_total: usize = 0;
         for (entries) |entry| {
             max_input = @max(max_input, entry.data.len);
-            packed_total = try bounds.addUsize(packed_total, rar_writer.packedBound(entry));
+            packed_total = try bounds.addUsize(packed_total, rar_writer.packedBoundEx(entry, write_options.password.len != 0 and !entry.is_directory));
         }
         const sizes = rar_writer.pack50Sizes(max_input);
         const hash = try workspace.take(u32, sizes.hash_words);
@@ -588,6 +628,8 @@ pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
         const staging = try workspace.take(u8, sizes.staging_bytes);
         const packed_buf = try workspace.take(u8, packed_total);
         const packed_sizes = try workspace.take(usize, entries.len);
+        const crypt_salts = try workspace.take([16]u8, entries.len);
+        const crypt_ivs = try workspace.take([16]u8, entries.len);
         var ws: rar_writer.WriteBuffers = .{
             .hash = hash,
             .hash2 = hash2,
@@ -598,8 +640,13 @@ pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
             .staging = staging,
             .packed_buf = packed_buf,
             .packed_sizes = packed_sizes,
+            .crypt_salts = crypt_salts,
+            .crypt_ivs = crypt_ivs,
         };
-        const required = try rar_writer.rarWriteSize(entries, &ws);
+        const required = rar_writer.rarWriteSizeEx(entries, &ws, write_options) catch |err| {
+            writeCryptoFailure(call, crypto_cause);
+            return err;
+        };
         if (sink == null) {
             response.byte_length = required;
             return;
@@ -609,11 +656,11 @@ pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
         try common.requireSinkCapacity(sink_resource, call, required);
         if (sink_resource.kind == .direct_write) {
             const output = try common.sinkDirectBuffer(sink_resource, required);
-            const written = try rar_writer.rarEncode(entries, output, &ws, plan.provider);
+            const written = try rar_writer.rarEncodeEx(entries, output, &ws, plan.provider, write_options);
             response.byte_length = written;
         } else {
             const staging_out = try workspace.take(u8, required);
-            const written = try rar_writer.rarEncode(entries, staging_out, &ws, plan.provider);
+            const written = try rar_writer.rarEncodeEx(entries, staging_out, &ws, plan.provider, write_options);
             try common.commitBytesToSink(sink_resource, call, staging_out[0..written]);
             response.byte_length = written;
         }
@@ -694,6 +741,15 @@ fn parseZipEntries(request: ?*Node, workspace: *resource.Workspace, crypto_param
         const data = if (data_node) |n| try resource.checkedConstBytes(n.bytes, n.byte_length) else &.{};
         const method: u16 = if (method_node) |n| @truncate(n.value_low) else 8;
         var entry: zip.Entry = .{ .name = name, .data = data, .method = method };
+        // A nonzero value writes the streaming shape: zeroed local sizes and
+        // a data descriptor after the entry data.
+        if (node_graph.parseU64(node_graph.findSelector(
+            node.child,
+            comptime discovery.parameter("zip", "data_descriptor").family,
+            comptime discovery.parameter("zip", "data_descriptor").ordinal,
+        )) != 0) {
+            entry.flags |= 0x0008;
+        }
         if (crypto_params) |params| {
             entry.encrypted = true;
             entry.password = params.password;

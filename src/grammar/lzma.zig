@@ -110,3 +110,43 @@ test "lzma file container round trip restores the original input" {
     const produced = try decode(encoded[0..encoded_len], decoded, scratch);
     try std.testing.expectEqualSlices(u8, &input, decoded[0..produced]);
 }
+
+pub const HeaderInfo = struct {
+    properties: lzma.Properties,
+    dictionary_size: u32,
+    // null when the header declares the maximum u64, the marker form.
+    unpack_size: ?u64,
+    has_marker: bool,
+};
+
+// Parses the 13-byte lzma-alone header without touching the payload.
+pub fn inspect(input: []const u8) Failure!HeaderInfo {
+    const options = try decodeOptions(input);
+    return .{
+        .properties = options.properties,
+        .dictionary_size = options.properties.dictionary_size,
+        .unpack_size = options.unpack_size,
+        .has_marker = options.marker_required,
+    };
+}
+
+test "inspect parses the lzma-alone header" {
+    const allocator = std.testing.allocator;
+    const data = "header inspection payload, header inspection payload";
+    const properties: lzma.Properties = .{ .lc = 3, .lp = 0, .pb = 2, .dictionary_size = default_dictionary };
+    const bound = encodedSizeBound(data.len);
+    const encoded = try allocator.alloc(u8, bound);
+    defer allocator.free(encoded);
+    const scratch = try allocator.alloc(u8, lzma.encodeWorkspaceSizeBt(properties));
+    defer allocator.free(scratch);
+    const encoded_len = try encode(data, encoded, scratch, .{
+        .properties = properties,
+        .unpack_size = data.len,
+        .marker_required = false,
+    });
+    const info = try inspect(encoded[0..encoded_len]);
+    try std.testing.expectEqual(@as(u64, data.len), info.unpack_size.?);
+    try std.testing.expect(!info.has_marker);
+    try std.testing.expectEqual(default_dictionary, info.dictionary_size);
+    try std.testing.expectEqual(@as(u8, 3), info.properties.lc);
+}

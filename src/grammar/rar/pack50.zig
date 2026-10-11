@@ -76,49 +76,35 @@ pub fn compressBlock(
     if (input.len == 0) return error.InvalidCall;
 
     var finder = try MatchFinder.init(ws.hash, ws.hash2, ws.hash3, MatchFinder.windowSizeFor(level), level);
-    const raw_tokens = try finder.compress(input, ws.tokens, ws.bt_left, ws.bt_right);
+    const tokens = try finder.compress(input, ws.tokens, ws.bt_left, ws.bt_right);
 
     // The decoder adds the distance-dependent bonus back, so an adjusted
-    // length below 2 has no slot. Replace those matches with literals.
-    var token_count: usize = 0;
-    var input_pos: usize = 0;
-    for (raw_tokens) |token| {
-        switch (token) {
-            .literal => {
-                raw_tokens[token_count] = token;
-                token_count += 1;
-                input_pos += 1;
-            },
-            .match => |match| {
-                const adjusted_length = slots.adjustLengthForDistance(match.length, match.distance);
-                if (adjusted_length < 2) {
-                    for (0..match.length) |i| {
-                        raw_tokens[token_count] = .{ .literal = input[input_pos + i] };
-                        token_count += 1;
-                    }
-                } else {
-                    raw_tokens[token_count] = token;
-                    token_count += 1;
-                }
-                input_pos += match.length;
-            },
-        }
-    }
-    const tokens = raw_tokens[0..token_count];
-
+    // length below 2 has no slot. Both passes below demote such matches to
+    // literals; an in-place pre-pass would be unsafe because a demotion can
+    // expand past the not-yet-read tail of the token buffer.
     var ld_freq: [nc]u32 = @splat(0);
     var dd_freq: [dc]u32 = @splat(0);
     var ldd_freq: [ldc]u32 = @splat(0);
     var rd_freq: [rc]u32 = @splat(0);
 
     var prev_distances: [4]u32 = .{ 0, 0, 0, 0 };
+    var freq_input_pos: usize = 0;
 
     for (tokens) |token| {
         switch (token) {
             .literal => |byte| {
                 ld_freq[byte] += 1;
+                freq_input_pos += 1;
             },
             .match => |match| {
+                const adjusted_length = slots.adjustLengthForDistance(match.length, match.distance);
+                if (adjusted_length < 2) {
+                    for (0..match.length) |i| {
+                        ld_freq[input[freq_input_pos + i]] += 1;
+                    }
+                    freq_input_pos += match.length;
+                    continue;
+                }
                 if (findRepeatDistance(prev_distances, match.distance)) |repeat_index| {
                     // The repeat path adds no distance bonus, so the raw length goes to
                     // the RD table, and the repeat-distance symbol is 258 + repeat_index.
@@ -127,7 +113,6 @@ pub fn compressBlock(
                     const length_encoding = slots.encodeLengthSlot(match.length);
                     rd_freq[length_encoding.slot] += 1;
                 } else {
-                    const adjusted_length = slots.adjustLengthForDistance(match.length, match.distance);
                     const length_encoding = slots.encodeLengthSlot(adjusted_length);
                     ld_freq[262 + length_encoding.slot] += 1;
 
@@ -142,6 +127,7 @@ pub fn compressBlock(
                     prev_distances[1] = prev_distances[0];
                     prev_distances[0] = match.distance;
                 }
+                freq_input_pos += match.length;
             },
         }
     }
@@ -229,12 +215,23 @@ pub fn compressBlock(
     }
 
     prev_distances = .{ 0, 0, 0, 0 };
+    var emit_input_pos: usize = 0;
     for (tokens) |token| {
         switch (token) {
             .literal => |byte| {
                 try bw.writeBits(ld_codes[byte], @intCast(ld_lengths[byte]));
+                emit_input_pos += 1;
             },
             .match => |match| {
+                const adjusted_length = slots.adjustLengthForDistance(match.length, match.distance);
+                if (adjusted_length < 2) {
+                    for (0..match.length) |i| {
+                        const byte = input[emit_input_pos + i];
+                        try bw.writeBits(ld_codes[byte], @intCast(ld_lengths[byte]));
+                    }
+                    emit_input_pos += match.length;
+                    continue;
+                }
                 if (findRepeatDistance(prev_distances, match.distance)) |repeat_index| {
                     const repeat_symbol: usize = 258 + repeat_index;
                     try bw.writeBits(ld_codes[repeat_symbol], @intCast(ld_lengths[repeat_symbol]));
@@ -246,7 +243,6 @@ pub fn compressBlock(
                         try bw.writeBits(length_encoding.extra, length_encoding.extra_bits);
                     }
                 } else {
-                    const adjusted_length = slots.adjustLengthForDistance(match.length, match.distance);
                     const length_encoding = slots.encodeLengthSlot(adjusted_length);
                     const match_symbol: usize = 262 + length_encoding.slot;
                     try bw.writeBits(ld_codes[match_symbol], @intCast(ld_lengths[match_symbol]));
@@ -268,6 +264,7 @@ pub fn compressBlock(
                     prev_distances[1] = prev_distances[0];
                     prev_distances[0] = match.distance;
                 }
+                emit_input_pos += match.length;
             },
         }
     }

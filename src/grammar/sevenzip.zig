@@ -398,34 +398,214 @@ pub fn sevenZipPack(entries: []const Entry, provider: crypto.Provider, workspace
     return try packAllEntries(entries, provider, workspace, limits, failure_cause);
 }
 
-fn requiredSizeFromPacked(entries: []const Entry, packed_entries: []const PackedEntry, workspace: *Workspace) Failure!usize {
+fn requiredSizeFromPacked(entries: []const Entry, packed_entries: []const PackedEntry, workspace: *Workspace, provider: crypto.Provider, limits: Limits, header_options: SevenZipHeaderOptions) Failure!usize {
     var total_pack_size: usize = 0;
     const plan = try buildFolderPlan(packed_entries, workspace);
     for (plan) |folder| total_pack_size = try bounds.addUsize(total_pack_size, packed_entries[folder.first].data.len);
+    const header = try encodeHeaderBytes(entries, packed_entries, workspace, provider, limits, header_options);
     var counter = measurement.Counter.init(null);
-    try writeHeader(&counter.writer, entries, packed_entries, workspace);
-    const header_size = counter.written();
-    const total = try bounds.addUsize(try bounds.addUsize(start_header_size, total_pack_size), std.math.cast(usize, header_size) orelse return error.ResourceLimit);
+    try writeNextHeader(&counter.writer, &header, total_pack_size);
+    const header_struct_size = std.math.cast(usize, counter.written()) orelse return error.ResourceLimit;
+    const packs_and_header = try bounds.addUsize(total_pack_size, header.pack_size);
+    const total = try bounds.addUsize(start_header_size, try bounds.addUsize(packs_and_header, header_struct_size));
     return std.math.cast(usize, total) orelse error.ResourceLimit;
 }
 
-pub fn sevenZipPackedSize(entries: []const Entry, packed_entries: []const PackedEntry, workspace: *Workspace) Failure!usize {
-    return try requiredSizeFromPacked(entries, packed_entries, workspace);
+pub fn sevenZipPackedSize(entries: []const Entry, packed_entries: []const PackedEntry, workspace: *Workspace, provider: crypto.Provider, limits: Limits, header_options: SevenZipHeaderOptions) Failure!usize {
+    return try requiredSizeFromPacked(entries, packed_entries, workspace, provider, limits, header_options);
 }
 
-fn writeArchive(output: []u8, entries: []const Entry, packed_entries: []const PackedEntry, workspace: *Workspace, provider: crypto.Provider) Failure!usize {
-    const required = try requiredSizeFromPacked(entries, packed_entries, workspace);
+// Archive-level header policy for the write path: -mhc (compress the header
+// into a packed stream) and -mhe (AES-256-encrypt the header, stored, not
+// compressed). The stored-under-encryption shape matches the reference
+// 7zOut.cpp writer, whose -mhe folder is a single AES coder; an encrypted
+// compressed header (AES+LZMA) is spec-legal and readable here, but the
+// reference reader rejects it, so composition never emits it.
+pub const SevenZipHeaderOptions = struct {
+    compress: bool = false,
+    encrypt: bool = false,
+    password: []const u8 = &.{},
+    // 0 selects the default 2^19 rounds, otherwise the power is written
+    // verbatim (1..24), matching the file-data knob.
+    num_cycles_power: u8 = 0,
+    kdf_rounds_limit: u64 = 0,
+    password_lifetime: u64 = 0,
+    failure_cause: ?*crypto.FailureCause = null,
+};
+
+// The prepared next-header: `stored` is what the start header points at
+// (either the raw header bytes or the kEncodedHeader structure), and `pack`
+// is the compressed/encrypted header stream placed just before it.
+const HeaderEncode = struct {
+    stored: []const u8 = &.{},
+    pack: []const u8 = &.{},
+    pack_size: usize = 0,
+    unpack_size: usize = 0,
+    encrypted: bool = false,
+    compressed: bool = false,
+    cycles: u8 = 0,
+    iv: [16]u8 = @splat(0),
+    pack_crc: u32 = 0,
+    unpack_crc: u32 = 0,
+    encoded: bool = false,
+};
+
+fn encryptHeaderBytes(cleartext: []const u8, workspace: *Workspace, provider: crypto.Provider, header_options: SevenZipHeaderOptions) Failure!struct { data: []const u8, cycles: u8, iv: [16]u8 } {
+    if (header_options.password.len == 0) return error.InvalidCall;
+    if (header_options.num_cycles_power > crypto.seven_zip_cycles_max) return error.InvalidCall;
+    const cycles = if (header_options.num_cycles_power == 0) crypto.seven_zip_default_cycles else header_options.num_cycles_power;
+    const rounds: u64 = @as(u64, 1) << @intCast(cycles);
+    if (header_options.kdf_rounds_limit != 0 and header_options.kdf_rounds_limit < rounds) {
+        if (header_options.failure_cause) |cause| cause.* = .kdf_limit;
+        return error.ResourceLimit;
+    }
+    const password_utf16 = try passwordToUtf16(header_options.password, workspace);
+    var key: [crypto.seven_zip_key_length]u8 = undefined;
+    crypto.sevenZipKdf(provider, password_utf16, &.{}, cycles, &key);
+    const padded_size = std.mem.alignForward(usize, cleartext.len, crypto.block_length);
+    if (header_options.password_lifetime != 0 and padded_size > header_options.password_lifetime) {
+        if (header_options.failure_cause) |cause| cause.* = .password_lifetime;
+        return error.ResourceLimit;
+    }
+    const encrypted_data = try workspace.take(u8, padded_size);
+    @memset(encrypted_data[cleartext.len..], 0);
+    @memcpy(encrypted_data[0..cleartext.len], cleartext);
+    var iv: [16]u8 = undefined;
+    try crypto.fillRandom(&iv);
+    try crypto.aesCbcEncrypt(provider, &key, iv, encrypted_data, encrypted_data);
+    return .{ .data = encrypted_data, .cycles = cycles, .iv = iv };
+}
+
+fn encodeHeaderBytes(entries: []const Entry, packed_entries: []const PackedEntry, workspace: *Workspace, provider: crypto.Provider, limits: Limits, header_options: SevenZipHeaderOptions) Failure!HeaderEncode {
+    var counter = measurement.Counter.init(null);
+    try writeHeader(&counter.writer, entries, packed_entries, workspace);
+    const header_size = std.math.cast(usize, counter.written()) orelse return error.ResourceLimit;
+    const header_bytes = try workspace.take(u8, header_size);
+    var fixed = std.Io.Writer.fixed(header_bytes);
+    try writeHeader(&fixed, entries, packed_entries, workspace);
+    const unpack_crc = checksum.crc32With(provider, header_bytes);
+    if (!header_options.compress and !header_options.encrypt) {
+        return .{ .stored = header_bytes, .unpack_size = header_size, .unpack_crc = unpack_crc };
+    }
+    if (header_options.encrypt and !header_options.compress) {
+        // The -mhe shape: one AES coder over the stored header. The folder's
+        // recorded unpack size is the real header size; the zero padding is
+        // stripped by the reader, as in 7-Zip's own archives.
+        const encrypted = try encryptHeaderBytes(header_bytes, workspace, provider, header_options);
+        return .{
+            .pack = encrypted.data,
+            .pack_size = encrypted.data.len,
+            .unpack_size = header_size,
+            .encrypted = true,
+            .cycles = encrypted.cycles,
+            .iv = encrypted.iv,
+            .pack_crc = checksum.crc32With(provider, encrypted.data),
+            .unpack_crc = unpack_crc,
+            .encoded = true,
+        };
+    }
+    const properties = lzma2.defaultProperties(default_dictionary);
+    const lzma_options: lzma.Options = .{ .properties = properties, .unpack_size = header_size, .marker_required = false, .max_work = limits.codec_work };
+    const scratch = try workspace.take(u8, lzma.encodeWorkspaceSizeBt(properties));
+    const packed_size = try lzma.requiredSize(header_bytes, scratch, lzma_options);
+    const compressed = try workspace.take(u8, packed_size);
+    _ = try lzma.encode(header_bytes, compressed, scratch, lzma_options);
+    if (!header_options.encrypt) {
+        return .{
+            .pack = compressed,
+            .pack_size = compressed.len,
+            .unpack_size = header_size,
+            .compressed = true,
+            .pack_crc = checksum.crc32With(provider, compressed),
+            .unpack_crc = unpack_crc,
+            .encoded = true,
+        };
+    }
+    const encrypted = try encryptHeaderBytes(compressed, workspace, provider, header_options);
+    return .{
+        .pack = encrypted.data,
+        .pack_size = encrypted.data.len,
+        .unpack_size = header_size,
+        .encrypted = true,
+        .compressed = true,
+        .cycles = encrypted.cycles,
+        .iv = encrypted.iv,
+        .pack_crc = checksum.crc32With(provider, encrypted.data),
+        .unpack_crc = unpack_crc,
+        .encoded = true,
+    };
+}
+
+// Writes the next-header bytes: the raw header, or the kEncodedHeader
+// structure naming `pack_offset` (the header stream's position after the
+// start header, past the data pack streams).
+fn writeNextHeader(writer: *std.Io.Writer, header: *const HeaderEncode, pack_offset: u64) Failure!void {
+    if (!header.encoded) {
+        try io.writeBytes(writer, header.stored);
+        return;
+    }
+    try io.writeBytes(writer, &.{k_encoded_header});
+    try io.writeBytes(writer, &.{0x06});
+    try writeUint64(writer, pack_offset);
+    try writeUint64(writer, 1);
+    try io.writeBytes(writer, &.{0x09});
+    try writeUint64(writer, header.pack_size);
+    try io.writeBytes(writer, &.{0x00});
+    try io.writeBytes(writer, &.{0x07});
+    try io.writeBytes(writer, &.{0x0B});
+    try writeUint64(writer, 1);
+    try io.writeBytes(writer, &.{0x00});
+    const num_coders: usize = @as(usize, if (header.encrypted) 1 else 0) + @as(usize, if (header.compressed) 1 else 0);
+    try writeUint64(writer, num_coders);
+    if (header.encrypted) {
+        const aes_flags: u8 = @as(u8, @intCast(method_7z_aes_id.len)) | 0x20;
+        try io.writeBytes(writer, &.{aes_flags});
+        try io.writeBytes(writer, &method_7z_aes_id);
+        const iv_size: usize = 16;
+        // The size halves are a 1-bit high part plus a 4-bit low part that
+        // sum to the size, so 16 is high=1 low=15 (see parse7zAesProps).
+        const iv_high: u8 = @intCast(iv_size >> 4);
+        var props: [2 + 16]u8 = undefined;
+        props[0] = header.cycles | (iv_high << 6);
+        props[1] = @as(u8, @intCast(iv_size - iv_high));
+        @memcpy(props[2..][0..iv_size], &header.iv);
+        try writeUint64(writer, 2 + iv_size);
+        try io.writeBytes(writer, props[0 .. 2 + iv_size]);
+    }
+    if (header.compressed) try writeFolderCoder(writer, .lzma, header.unpack_crc);
+    if (header.encrypted and header.compressed) {
+        try writeUint64(writer, 1);
+        try writeUint64(writer, 0);
+    }
+    try io.writeBytes(writer, &.{0x0C});
+    // A lone AES coder records the real header size (the padding is stripped
+    // by the reader); an AES coder feeding a compressor records its padded
+    // output, as in the file-data folder convention.
+    if (header.encrypted and header.compressed) try writeUint64(writer, header.pack_size);
+    try writeUint64(writer, header.unpack_size);
+    try io.writeBytes(writer, &.{0x0A});
+    try io.writeBytes(writer, &.{0x01});
+    var unpack_digest: [4]u8 = undefined;
+    std.mem.writeInt(u32, &unpack_digest, header.unpack_crc, .little);
+    try io.writeBytes(writer, &unpack_digest);
+    try io.writeBytes(writer, &.{0x00});
+    try io.writeBytes(writer, &.{0x00});
+}
+
+fn writeArchive(output: []u8, entries: []const Entry, packed_entries: []const PackedEntry, workspace: *Workspace, provider: crypto.Provider, limits: Limits, header_options: SevenZipHeaderOptions) Failure!usize {
+    const required = try requiredSizeFromPacked(entries, packed_entries, workspace, provider, limits, header_options);
     if (output.len < required) return error.InsufficientCapacity;
     var total_pack_size: usize = 0;
     const plan = try buildFolderPlan(packed_entries, workspace);
     for (plan) |folder| total_pack_size = try bounds.addUsize(total_pack_size, packed_entries[folder.first].data.len);
-    const header_offset = start_header_size + total_pack_size;
+    const header = try encodeHeaderBytes(entries, packed_entries, workspace, provider, limits, header_options);
+    const header_offset = start_header_size + total_pack_size + header.pack_size;
     var header_writer = std.Io.Writer.fixed(output[header_offset..]);
-    try writeHeader(&header_writer, entries, packed_entries, workspace);
+    try writeNextHeader(&header_writer, &header, total_pack_size);
     const header_size = header_writer.end;
     const header_crc = checksum.crc32With(provider, output[header_offset..][0..header_size]);
     var start_header: [20]u8 = undefined;
-    std.mem.writeInt(u64, start_header[0..8], total_pack_size, .little);
+    std.mem.writeInt(u64, start_header[0..8], total_pack_size + header.pack_size, .little);
     std.mem.writeInt(u64, start_header[8..16], header_size, .little);
     std.mem.writeInt(u32, start_header[16..20], header_crc, .little);
     const start_header_crc = checksum.crc32With(provider, &start_header);
@@ -437,27 +617,47 @@ fn writeArchive(output: []u8, entries: []const Entry, packed_entries: []const Pa
     for (plan) |folder| {
         try sink.write(packed_entries[folder.first].data);
     }
+    try sink.write(header.pack);
     return required;
 }
 
-pub fn sevenZipWritePacked(entries: []const Entry, packed_entries: []const PackedEntry, output: []u8, workspace: *Workspace, provider: crypto.Provider) Failure!usize {
-    return try writeArchive(output, entries, packed_entries, workspace, provider);
+pub fn sevenZipWritePacked(entries: []const Entry, packed_entries: []const PackedEntry, output: []u8, workspace: *Workspace, provider: crypto.Provider, limits: Limits, header_options: SevenZipHeaderOptions) Failure!usize {
+    return try writeArchive(output, entries, packed_entries, workspace, provider, limits, header_options);
 }
 
 pub fn sevenZipInspectCount(archive_bytes: []const u8, workspace: *Workspace, limits: Limits, provider: crypto.Provider) Failure!u64 {
-    const loaded = try loadArchive(archive_bytes, workspace, limits, provider);
+    var cause: crypto.FailureCause = .none;
+    const options: SevenZipLoadOptions = .{ .failure_cause = &cause, .provider = provider };
+    return try sevenZipInspectCountEx(archive_bytes, workspace, limits, &options);
+}
+
+pub fn sevenZipInspectCountEx(archive_bytes: []const u8, workspace: *Workspace, limits: Limits, options: *const SevenZipLoadOptions) Failure!u64 {
+    const loaded = try loadArchive(archive_bytes, workspace, limits, options);
     return loaded.count;
 }
 
 pub fn sevenZipInspectOrdinal(archive_bytes: []const u8, workspace: *Workspace, limits: Limits, ordinal: u64, provider: crypto.Provider) Failure!Info {
-    const loaded = try loadArchive(archive_bytes, workspace, limits, provider);
+    var cause: crypto.FailureCause = .none;
+    const options: SevenZipLoadOptions = .{ .failure_cause = &cause, .provider = provider };
+    return try sevenZipInspectOrdinalEx(archive_bytes, workspace, limits, ordinal, &options);
+}
+
+pub fn sevenZipInspectOrdinalEx(archive_bytes: []const u8, workspace: *Workspace, limits: Limits, ordinal: u64, options: *const SevenZipLoadOptions) Failure!Info {
+    const loaded = try loadArchive(archive_bytes, workspace, limits, options);
     if (ordinal >= loaded.count) return error.InvalidData;
     return loaded.entries[ordinal];
 }
 
 pub fn sevenZipDecodeOrdinal(archive_bytes: []const u8, workspace: *Workspace, limits: Limits, ordinal: u64, output: []u8, decode_options: SevenZipDecodeOptions) Failure!usize {
     decode_options.failure_cause.* = .none;
-    const loaded = try loadArchive(archive_bytes, workspace, limits, decode_options.provider);
+    const load_options: SevenZipLoadOptions = .{
+        .password = decode_options.password,
+        .kdf_rounds_limit = decode_options.kdf_rounds_limit,
+        .password_lifetime = decode_options.password_lifetime,
+        .failure_cause = decode_options.failure_cause,
+        .provider = decode_options.provider,
+    };
+    const loaded = try loadArchive(archive_bytes, workspace, limits, &load_options);
     if (ordinal >= loaded.count) return error.InvalidData;
     const entry = loaded.entries[ordinal];
     const size = std.math.cast(usize, entry.size) orelse return error.ResourceLimit;
@@ -474,38 +674,9 @@ pub fn sevenZipDecodeOrdinal(archive_bytes: []const u8, workspace: *Workspace, l
         }
     }
     const pack_size = std.math.cast(usize, entry.pack_size) orelse return error.ResourceLimit;
-    const decrypted_packed = blk: {
-        if (!entry.encrypted) {
-            const packed_data = try workspace.take(u8, pack_size);
-            try readAt(loaded.data, entry.data_offset, packed_data);
-            break :blk packed_data;
-        }
-        const password = decode_options.password orelse return error.Unsupported;
-        const rounds: u64 = if (entry.aes_num_cycles == 0x3F) 0 else @as(u64, 1) << @intCast(entry.aes_num_cycles);
-        if (decode_options.kdf_rounds_limit != 0 and rounds > decode_options.kdf_rounds_limit) {
-            decode_options.failure_cause.* = .kdf_limit;
-            return error.ResourceLimit;
-        }
-        if (decode_options.password_lifetime != 0 and pack_size > decode_options.password_lifetime) {
-            decode_options.failure_cause.* = .password_lifetime;
-            return error.ResourceLimit;
-        }
-        const packed_data = try workspace.take(u8, pack_size);
-        try readAt(loaded.data, entry.data_offset, packed_data);
-        const password_utf16 = try passwordToUtf16(password, workspace);
-        var key: [crypto.seven_zip_key_length]u8 = undefined;
-        if (entry.aes_num_cycles == 0x3F) {
-            var key_material: [64]u8 = @splat(0);
-            @memcpy(key_material[0..entry.aes_salt.len], entry.aes_salt);
-            @memcpy(key_material[entry.aes_salt.len..][0..password_utf16.len], password_utf16);
-            @memcpy(&key, key_material[0..32]);
-        } else {
-            crypto.sevenZipKdf(decode_options.provider, password_utf16, entry.aes_salt, entry.aes_num_cycles, &key);
-        }
-        const decrypted = try workspace.take(u8, pack_size);
-        try crypto.aesCbcDecrypt(decode_options.provider, &key, entry.aes_iv, decrypted, packed_data);
-        break :blk decrypted;
-    };
+    const packed_data = try workspace.take(u8, pack_size);
+    try readAt(loaded.data, entry.data_offset, packed_data);
+    const decrypted_packed = try aesDecryptStream(entry.encrypted, entry.aes_num_cycles, entry.aes_salt, entry.aes_iv, packed_data, workspace, &load_options);
     switch (entry.method) {
         .copy => {
             if (decrypted_packed.len != decode_target_len and !entry.encrypted) return error.InvalidData;
@@ -704,7 +875,20 @@ fn readAt(data: []const u8, offset: u64, buffer: []u8) Failure!void {
     @memcpy(buffer, data[start..end]);
 }
 
-fn loadArchive(data: []const u8, workspace: *Workspace, limits: Limits, provider: crypto.Provider) Failure!LoadedArchive {
+// Options for the archive-level load (inspect and decode paths share it): the
+// password channel serves both file-data and encoded-header decryption.
+pub const SevenZipLoadOptions = struct {
+    password: ?[]const u8 = null,
+    kdf_rounds_limit: u64 = 0,
+    password_lifetime: u64 = 0,
+    failure_cause: *crypto.FailureCause,
+    provider: crypto.Provider = crypto.default_provider,
+};
+
+const k_header: u8 = 0x01;
+const k_encoded_header: u8 = 0x17;
+
+fn loadArchive(data: []const u8, workspace: *Workspace, limits: Limits, options: *const SevenZipLoadOptions) Failure!LoadedArchive {
     if (data.len > limits.encoded_bytes) return error.ResourceLimit;
     var archive: LoadedArchive = .{
         .data = data,
@@ -716,7 +900,7 @@ fn loadArchive(data: []const u8, workspace: *Workspace, limits: Limits, provider
     if (!std.mem.eql(u8, start_buffer[0..6], &signature)) return error.InvalidData;
     if (!std.mem.eql(u8, start_buffer[6..8], &version)) return error.Unsupported;
     const recorded_start_crc = std.mem.readInt(u32, start_buffer[8..12], .little);
-    const start_header_crc = checksum.crc32With(provider, start_buffer[12..32]);
+    const start_header_crc = checksum.crc32With(options.provider, start_buffer[12..32]);
     if (recorded_start_crc != start_header_crc) return error.IntegrityFailure;
     const next_header_offset = std.mem.readInt(u64, start_buffer[12..20], .little);
     const next_header_size = std.mem.readInt(u64, start_buffer[20..28], .little);
@@ -726,17 +910,24 @@ fn loadArchive(data: []const u8, workspace: *Workspace, limits: Limits, provider
     const header_size_usize = std.math.cast(usize, next_header_size) orelse return error.ResourceLimit;
     const header_buffer = try workspace.take(u8, header_size_usize);
     try readAt(archive.data, header_start, header_buffer);
-    if (checksum.crc32With(provider, header_buffer) != recorded_header_crc) return error.IntegrityFailure;
-    var cursor = binary.ReadCursor.init(header_buffer);
+    if (checksum.crc32With(options.provider, header_buffer) != recorded_header_crc) return error.IntegrityFailure;
+    var header_bytes: []const u8 = header_buffer;
+    var cursor = binary.ReadCursor.init(header_bytes);
     const header_id = try cursor.readU8();
-    if (header_id != 0x01) return error.Unsupported;
+    if (header_id == k_encoded_header) {
+        header_bytes = try decodeEncodedHeader(data, &cursor, workspace, limits, options);
+        cursor = binary.ReadCursor.init(header_bytes);
+        if (try cursor.readU8() != k_header) return error.InvalidData;
+    } else if (header_id != k_header) {
+        return error.Unsupported;
+    }
     var streams: ?StreamsInfo = null;
     var files: ?FilesInfo = null;
     while (cursor.remaining() > 0) {
         const id = try cursor.readU8();
         if (id == 0x00) break;
         switch (id) {
-            0x04 => streams = try parseStreamsInfo(&cursor, workspace),
+            0x04 => streams = try parseStreamsInfo(&cursor, workspace, false),
             0x05 => files = try parseFilesInfo(&cursor, workspace),
             0x02 => try skipArchiveProperties(&cursor),
             else => return error.Unsupported,
@@ -747,6 +938,128 @@ fn loadArchive(data: []const u8, workspace: *Workspace, limits: Limits, provider
     archive.entries = try buildEntries(&si, &fi, workspace, limits);
     archive.count = archive.entries.len;
     return archive;
+}
+
+// A next-header id of kEncodedHeader (0x17) means the header itself rides in a
+// packed stream: a StreamsInfo describing one folder, usually LZMA, optionally
+// behind the 7z AES-256 coder (-mhe=on). Decrypting and decompressing yields
+// the ordinary kHeader bytes, which are then parsed as if stored directly.
+fn decodeEncodedHeader(archive_data: []const u8, cursor: *binary.ReadCursor, workspace: *Workspace, limits: Limits, options: *const SevenZipLoadOptions) Failure![]const u8 {
+    // StreamsInfo (with its own terminating kEnd, per 7zOut.cpp's encoded
+    // header writer) is the whole of the structure: nothing may follow it.
+    const si = try parseStreamsInfo(cursor, workspace, true);
+    if (cursor.remaining() != 0) return error.InvalidData;
+    if (si.folders.len != 1) return error.Unsupported;
+    const folder = &si.folders[0];
+    if (folder.bcj2) return error.Unsupported;
+    if (folder.num_pack_streams != 1 or si.pack_sizes.len != 1) return error.Unsupported;
+    for (folder.coders) |coder| {
+        if (isFilterMethod(coder.method)) return error.Unsupported;
+    }
+    const unpack_size = std.math.cast(usize, folder.unpack_size) orelse return error.ResourceLimit;
+    if (unpack_size == 0) return error.InvalidData;
+    if (unpack_size > limits.metadata_records) return error.ResourceLimit;
+    const pack_size = std.math.cast(usize, si.pack_sizes[0]) orelse return error.ResourceLimit;
+    if (pack_size > limits.encoded_bytes) return error.ResourceLimit;
+    const pack_pos = std.math.cast(usize, si.pack_pos) orelse return error.ResourceLimit;
+    const packed_data = try workspace.take(u8, pack_size);
+    try readAt(archive_data, try bounds.addUsize(start_header_size, pack_pos), packed_data);
+    if (si.pack_crcs.len == 1 and si.pack_crcs[0] != 0 and
+        checksum.crc32With(options.provider, packed_data) != si.pack_crcs[0])
+    {
+        return error.IntegrityFailure;
+    }
+    const output = try workspace.take(u8, unpack_size);
+    decodeFolderStream(folder, packed_data, output, workspace, limits, options) catch |err| {
+        if (folder.encrypted) options.failure_cause.* = .wrong_password;
+        return err;
+    };
+    if (folder.substream_crcs.len == 1 and folder.substream_crcs[0] != 0 and
+        checksum.crc32With(options.provider, output) != folder.substream_crcs[0])
+    {
+        if (folder.encrypted) options.failure_cause.* = .wrong_password;
+        return error.IntegrityFailure;
+    }
+    return output;
+}
+
+// Decrypts (when the folder carries the 7z AES coder) and decodes one packed
+// stream into output, whose length the caller derives from the folder's unpack
+// size. Shared by the encoded-header path and, through it, every header form.
+fn decodeFolderStream(folder: *const Folder, packed_data: []const u8, output: []u8, workspace: *Workspace, limits: Limits, options: *const SevenZipLoadOptions) Failure!void {
+    const decrypted = try aesDecryptFolder(folder, packed_data, workspace, options);
+    switch (folder.method) {
+        .copy => {
+            if (decrypted.len < output.len) return error.InvalidData;
+            @memcpy(output, decrypted[0..output.len]);
+        },
+        .deflate => {
+            const history = try workspace.take(u8, deflate.history_size);
+            var source_reader = std.Io.Reader.fixed(decrypted);
+            var dest_writer = std.Io.Writer.fixed(output);
+            var inflater = deflate.Decompress.init(&source_reader, history);
+            _ = inflater.reader.streamRemaining(&dest_writer) catch return error.InvalidData;
+            if (dest_writer.end != output.len) return error.InvalidData;
+        },
+        .bzip2 => {
+            const scratch = try workspace.take(u8, try bzip2.decodeWorkspaceSizeFor(decrypted));
+            const decoded = try bzip2.decode(decrypted, output, scratch, options.provider);
+            if (decoded != output.len) return error.InvalidData;
+        },
+        .lzma => {
+            const properties = try parseLzmaProperties(folder.attributes);
+            const lzma_options: lzma.Options = .{ .properties = properties, .unpack_size = output.len, .marker_required = false, .max_work = limits.codec_work };
+            const scratch = try workspace.take(u8, lzma.decodeWorkspaceSize(properties));
+            const decoded = try lzma.decode(decrypted, output, scratch, lzma_options);
+            if (decoded != output.len) return error.InvalidData;
+        },
+        .lzma2 => {
+            const dictionary = lzma2.dictionarySizeFromProperties(try readLzma2Prop(folder.attributes));
+            if (dictionary < lzma.dictionary_min or dictionary > lzma.dictionary_max) return error.Unsupported;
+            const lzma2_options: lzma2.Options = .{ .dictionary_size = dictionary, .properties = lzma2.defaultProperties(dictionary), .max_work = limits.codec_work };
+            const scratch = try workspace.take(u8, lzma2.decodeWorkspaceSize(dictionary));
+            const decoded = try lzma2.decode(decrypted, output, scratch, lzma2_options);
+            if (decoded != output.len) return error.InvalidData;
+        },
+        .ppmd => {
+            const ppmd_options = try parsePpmdOptions(folder.attributes, output.len, limits.codec_work);
+            const scratch = try workspace.take(u8, ppmd.decodeWorkspaceSize(ppmd_options.mem_size));
+            const decoded = try ppmd.decode(decrypted, output, scratch, ppmd_options);
+            if (decoded != output.len) return error.InvalidData;
+        },
+        else => return error.Unsupported,
+    }
+}
+
+fn aesDecryptFolder(folder: *const Folder, packed_data: []const u8, workspace: *Workspace, options: *const SevenZipLoadOptions) Failure![]const u8 {
+    return aesDecryptStream(folder.encrypted, folder.aes_num_cycles, folder.aes_salt, folder.aes_iv, packed_data, workspace, options);
+}
+
+fn aesDecryptStream(encrypted: bool, num_cycles: u8, salt: []const u8, iv: [16]u8, packed_data: []const u8, workspace: *Workspace, options: *const SevenZipLoadOptions) Failure![]const u8 {
+    if (!encrypted) return packed_data;
+    const password = options.password orelse return error.Unsupported;
+    const rounds: u64 = if (num_cycles == 0x3F) 0 else @as(u64, 1) << @intCast(num_cycles);
+    if (options.kdf_rounds_limit != 0 and rounds > options.kdf_rounds_limit) {
+        options.failure_cause.* = .kdf_limit;
+        return error.ResourceLimit;
+    }
+    if (options.password_lifetime != 0 and packed_data.len > options.password_lifetime) {
+        options.failure_cause.* = .password_lifetime;
+        return error.ResourceLimit;
+    }
+    const password_utf16 = try passwordToUtf16(password, workspace);
+    var key: [crypto.seven_zip_key_length]u8 = undefined;
+    if (num_cycles == 0x3F) {
+        var key_material: [64]u8 = @splat(0);
+        @memcpy(key_material[0..salt.len], salt);
+        @memcpy(key_material[salt.len..][0..password_utf16.len], password_utf16);
+        @memcpy(&key, key_material[0..32]);
+    } else {
+        crypto.sevenZipKdf(options.provider, password_utf16, salt, num_cycles, &key);
+    }
+    const decrypted = try workspace.take(u8, packed_data.len);
+    try crypto.aesCbcDecrypt(options.provider, &key, iv, decrypted, packed_data);
+    return decrypted;
 }
 
 const StreamsInfo = struct {
@@ -816,7 +1129,7 @@ const FilesInfo = struct {
     names: []const []const u8,
 };
 
-fn parseStreamsInfo(cursor: *binary.ReadCursor, workspace: *Workspace) Failure!StreamsInfo {
+fn parseStreamsInfo(cursor: *binary.ReadCursor, workspace: *Workspace, comptime aes_only_folders: bool) Failure!StreamsInfo {
     var pack_pos: u64 = 0;
     var pack_sizes: []const u64 = &.{};
     var pack_crcs: []const u32 = &.{};
@@ -848,7 +1161,7 @@ fn parseStreamsInfo(cursor: *binary.ReadCursor, workspace: *Workspace) Failure!S
             },
             0x07 => {
                 has_unpack = true;
-                folders = try parseFolders(cursor, workspace);
+                folders = try parseFolders(cursor, workspace, aes_only_folders);
             },
             0x08 => {
                 try parseSubStreamsInfo(cursor, workspace, folders);
@@ -874,7 +1187,7 @@ fn parseStreamsInfo(cursor: *binary.ReadCursor, workspace: *Workspace) Failure!S
     };
 }
 
-fn parseFolders(cursor: *binary.ReadCursor, workspace: *Workspace) Failure![]Folder {
+fn parseFolders(cursor: *binary.ReadCursor, workspace: *Workspace, comptime aes_only_folders: bool) Failure![]Folder {
     const folder_id = try cursor.readU8();
     if (folder_id != 0x0B) {
         return error.InvalidData;
@@ -925,12 +1238,22 @@ fn parseFolders(cursor: *binary.ReadCursor, workspace: *Workspace) Failure![]Fol
                 last_data = coder;
             }
         }
-        if (data_coder_count == 0 or (encrypted and data_coder_count != 1)) return error.Unsupported;
+        // An AES-only folder is the -mhe encoded-header shape (stored header,
+        // one AES coder); file-data folders always carry a real data coder.
+        if (data_coder_count == 0) {
+            if (!(aes_only_folders and encrypted)) return error.Unsupported;
+        } else if (encrypted and data_coder_count != 1) return error.Unsupported;
         if (bcj2_idx != null and (encrypted or filter_present)) return error.Unsupported;
-        var method = last_data.?.method;
-        var attributes = last_data.?.attributes;
-        var num_in_streams = last_data.?.num_in_streams;
-        var num_out_streams = last_data.?.num_out_streams;
+        var method: CoderMethod = .copy;
+        var attributes: []const u8 = &.{};
+        var num_in_streams: u64 = 1;
+        var num_out_streams: u64 = 1;
+        if (last_data) |data_coder| {
+            method = data_coder.method;
+            attributes = data_coder.attributes;
+            num_in_streams = data_coder.num_in_streams;
+            num_out_streams = data_coder.num_out_streams;
+        }
         var bonds: []const Bond = &.{};
         var packed_inputs: []const u64 = &.{};
         var bcj2_sources: [4]Bcj2Source = undefined;
@@ -2004,10 +2327,10 @@ test "sevenzip ppmd solid grouping roundtrip" {
     // independent packing gives every entry its own non-empty stream.
     try testing.expect(packed_entries[0].data.len > 0);
     for (packed_entries[1..]) |p| try testing.expectEqual(@as(usize, 0), p.data.len);
-    const total = try sevenZipPackedSize(&entries, packed_entries, &workspace);
+    const total = try sevenZipPackedSize(&entries, packed_entries, &workspace, crypto.default_provider, .{}, .{});
     const archive = try allocator.alloc(u8, total);
     defer allocator.free(archive);
-    const written = try sevenZipWritePacked(&entries, packed_entries, archive, &workspace, crypto.default_provider);
+    const written = try sevenZipWritePacked(&entries, packed_entries, archive, &workspace, crypto.default_provider, .{}, .{});
     try testing.expectEqual(total, written);
 
     for (datas, 0..) |data, i| {
@@ -2034,10 +2357,10 @@ test "sevenzip encrypted roundtrip with salt and custom cycles" {
     var workspace = try Workspace.init(backing.ptr, backing.len);
     var cause: crypto.FailureCause = .none;
     const packed_entries = try sevenZipPack(&entries, crypto.default_provider, &workspace, .{}, &cause);
-    const total = try sevenZipPackedSize(&entries, packed_entries, &workspace);
+    const total = try sevenZipPackedSize(&entries, packed_entries, &workspace, crypto.default_provider, .{}, .{});
     const archive = try allocator.alloc(u8, total);
     defer allocator.free(archive);
-    const written = try sevenZipWritePacked(&entries, packed_entries, archive, &workspace, crypto.default_provider);
+    const written = try sevenZipWritePacked(&entries, packed_entries, archive, &workspace, crypto.default_provider, .{}, .{});
     try testing.expectEqual(total, written);
 
     var decode_ws = try Workspace.init(backing.ptr, backing.len);
@@ -2082,10 +2405,10 @@ test "sevenzip folder plan stays consistent across directory and encryption brea
     var workspace = try Workspace.init(backing.ptr, backing.len);
     var cause: crypto.FailureCause = .none;
     const packed_dir = try sevenZipPack(&with_dir, crypto.default_provider, &workspace, .{}, &cause);
-    const total_dir = try sevenZipPackedSize(&with_dir, packed_dir, &workspace);
+    const total_dir = try sevenZipPackedSize(&with_dir, packed_dir, &workspace, crypto.default_provider, .{}, .{});
     const archive_dir = try allocator.alloc(u8, total_dir);
     defer allocator.free(archive_dir);
-    const written_dir = try sevenZipWritePacked(&with_dir, packed_dir, archive_dir, &workspace, crypto.default_provider);
+    const written_dir = try sevenZipWritePacked(&with_dir, packed_dir, archive_dir, &workspace, crypto.default_provider, .{}, .{});
     try testing.expectEqual(total_dir, written_dir);
     // Ordinals 0 and 2: ordinal 1 is the directory entry between them.
     for ([_][]const u8{ first, second }, 0..) |data, i| {
@@ -2104,10 +2427,10 @@ test "sevenzip folder plan stays consistent across directory and encryption brea
     };
     var enc_workspace = try Workspace.init(backing.ptr, backing.len);
     const packed_enc = try sevenZipPack(&encrypted_pair, crypto.default_provider, &enc_workspace, .{}, &cause);
-    const total_enc = try sevenZipPackedSize(&encrypted_pair, packed_enc, &enc_workspace);
+    const total_enc = try sevenZipPackedSize(&encrypted_pair, packed_enc, &enc_workspace, crypto.default_provider, .{}, .{});
     const archive_enc = try allocator.alloc(u8, total_enc);
     defer allocator.free(archive_enc);
-    const written_enc = try sevenZipWritePacked(&encrypted_pair, packed_enc, archive_enc, &enc_workspace, crypto.default_provider);
+    const written_enc = try sevenZipWritePacked(&encrypted_pair, packed_enc, archive_enc, &enc_workspace, crypto.default_provider, .{}, .{});
     try testing.expectEqual(total_enc, written_enc);
     for ([_][]const u8{ first, second }, 0..) |data, i| {
         var decode_ws = try Workspace.init(backing.ptr, backing.len);
@@ -2133,16 +2456,79 @@ test "sevenzip encrypted lzma2 entry roundtrips" {
     var workspace = try Workspace.init(backing.ptr, backing.len);
     var cause: crypto.FailureCause = .none;
     const packed_entries = try sevenZipPack(&entries, crypto.default_provider, &workspace, .{}, &cause);
-    const total = try sevenZipPackedSize(&entries, packed_entries, &workspace);
+    const total = try sevenZipPackedSize(&entries, packed_entries, &workspace, crypto.default_provider, .{}, .{});
     const archive = try allocator.alloc(u8, total);
     defer allocator.free(archive);
-    const written = try sevenZipWritePacked(&entries, packed_entries, archive, &workspace, crypto.default_provider);
+    const written = try sevenZipWritePacked(&entries, packed_entries, archive, &workspace, crypto.default_provider, .{}, .{});
     try testing.expectEqual(total, written);
     var decode_ws = try Workspace.init(backing.ptr, backing.len);
     const out = try allocator.alloc(u8, data.len);
     defer allocator.free(out);
     const produced = try sevenZipDecodeOrdinal(archive, &decode_ws, .{}, 0, out, .{ .password = "pw", .failure_cause = &cause });
     try testing.expectEqualSlices(u8, data, out[0..produced]);
+}
+
+test "sevenzip encoded headers roundtrip in both modes" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const backing = try allocator.alloc(u8, 96 * 1024 * 1024);
+    defer allocator.free(backing);
+    var repetitive: [600]u8 = undefined;
+    const corpus_01 = "Squdgy fez, blank jimp crwth vox!";
+    for (&repetitive, 0..) |*byte, i| byte.* = corpus_01[i % corpus_01.len];
+    const data = repetitive[0..600];
+    const entries = [_]Entry{
+        .{ .name = "inner/a.txt", .data = data, .method = .lzma2 },
+        .{ .name = "inner/b.txt", .data = data, .method = .lzma2 },
+        .{ .name = "inner", .data = &.{} },
+    };
+    const modes = [_]SevenZipHeaderOptions{
+        .{ .compress = true },
+        .{ .encrypt = true, .password = "header-secret" },
+    };
+    for (modes) |mode| {
+        var workspace = try Workspace.init(backing.ptr, backing.len);
+        var cause: crypto.FailureCause = .none;
+        const packed_entries = try sevenZipPack(&entries, crypto.default_provider, &workspace, .{}, &cause);
+        const total = try sevenZipPackedSize(&entries, packed_entries, &workspace, crypto.default_provider, .{}, mode);
+        const archive = try allocator.alloc(u8, total);
+        defer allocator.free(archive);
+        const written = try sevenZipWritePacked(&entries, packed_entries, archive, &workspace, crypto.default_provider, .{}, mode);
+        try testing.expectEqual(total, written);
+        // The next header no longer starts with kHeader: it is the encoded
+        // structure whose first byte is kEncodedHeader.
+        const next_header_size = std.mem.readInt(u64, archive[20..28], .little);
+        const next_header_offset = std.mem.readInt(u64, archive[12..20], .little);
+        try testing.expectEqual(@as(u64, k_encoded_header), archive[start_header_size + next_header_offset]);
+        try testing.expect(next_header_size < total);
+
+        var decode_ws = try Workspace.init(backing.ptr, backing.len);
+        const count = try sevenZipInspectCountEx(archive, &decode_ws, .{}, &.{
+            .password = if (mode.encrypt) "header-secret" else null,
+            .failure_cause = &cause,
+        });
+        try testing.expectEqual(@as(u64, 3), count);
+        const out = try allocator.alloc(u8, data.len);
+        defer allocator.free(out);
+        const produced = try sevenZipDecodeOrdinal(archive, &decode_ws, .{}, 0, out, .{
+            .password = if (mode.encrypt) "header-secret" else null,
+            .failure_cause = &cause,
+        });
+        try testing.expectEqualSlices(u8, data, out[0..produced]);
+        if (mode.encrypt) {
+            var fail_ws = try Workspace.init(backing.ptr, backing.len);
+            try testing.expectError(error.Unsupported, sevenZipInspectCountEx(archive, &fail_ws, .{}, &.{ .failure_cause = &cause }));
+            var wrong_ws = try Workspace.init(backing.ptr, backing.len);
+            // The wrong password surfaces wherever the garbage stream first
+            // fails: the LZMA property byte, the decompressor, or the header
+            // CRC. The contract is the failure cause, not the exact stage.
+            _ = sevenZipDecodeOrdinal(archive, &wrong_ws, .{}, 0, out, .{
+                .password = "wrong",
+                .failure_cause = &cause,
+            }) catch {};
+            try testing.expectEqual(crypto.FailureCause.wrong_password, cause);
+        }
+    }
 }
 
 test "sevenzip decode captured failing encrypted archive" {

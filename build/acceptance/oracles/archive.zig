@@ -616,7 +616,114 @@ pub fn runRarOfficial(r: *Runner) anyerror!void {
     }
 }
 
+var rarw_payload: [445]u8 = undefined;
+var rarw_archive: [16384]u8 = undefined;
+const rarw_password = "PASS";
+
+fn rarwWrite(r: *Runner, entry: harness.Node, archive: []u8, extra: []const harness.Node) !usize {
+    var nodes: [14]harness.Node = undefined;
+    var count: usize = 0;
+    nodes[count] = harness.paramTargetCommand(harness.ids.write);
+    count += 1;
+    nodes[count] = harness.scalarNode(harness.ids.source);
+    count += 1;
+    nodes[count] = harness.capabilityParam(arc_caps);
+    count += 1;
+    nodes[count] = harness.sizingModeParam(harness.size_metadata_exact);
+    count += 1;
+    nodes[count] = harness.commitModeParam(harness.commit_confirmed);
+    count += 1;
+    @memcpy(nodes[count..][0..extra.len], extra);
+    count += extra.len;
+    nodes[count] = entry;
+    count += 1;
+    _ = harness.call(r, harness.ids.query, nodes[0..count], .{});
+    try harness.requireStatus(r, abi.Status.ok);
+    const size: usize = @intCast(r.response.byte_length);
+    count = 0;
+    nodes[count] = harness.scalarNode(harness.ids.source);
+    count += 1;
+    nodes[count] = harness.sinkSpan(archive[0..size]);
+    count += 1;
+    nodes[count] = harness.capabilityParam(arc_caps);
+    count += 1;
+    nodes[count] = harness.sizingModeParam(harness.size_metadata_exact);
+    count += 1;
+    nodes[count] = harness.commitModeParam(harness.commit_confirmed);
+    count += 1;
+    @memcpy(nodes[count..][0..extra.len], extra);
+    count += extra.len;
+    nodes[count] = entry;
+    count += 1;
+    _ = harness.call(r, harness.ids.write, nodes[0..count], .{});
+    try harness.requireStatus(r, abi.Status.ok);
+    return size;
+}
+
+fn rarwReadBack(r: *Runner, archive: []const u8, expected: []const u8, crypto: []const harness.Node) !void {
+    var nodes: [8]harness.Node = undefined;
+    var count: usize = 0;
+    nodes[count] = harness.archiveOrdinalParam(0);
+    count += 1;
+    nodes[count] = harness.sourceSpan(archive);
+    count += 1;
+    nodes[count] = harness.sinkSpan(r.output);
+    count += 1;
+    @memcpy(nodes[count..][0..crypto.len], crypto);
+    count += crypto.len;
+    @memset(r.output, 0xa5);
+    _ = harness.call(r, harness.ids.read, nodes[0..count], .{ .ctx = true });
+    try harness.requireStatus(r, abi.Status.ok);
+    if (r.response.byte_length != expected.len or !std.mem.eql(u8, r.output[0..expected.len], expected)) return error.RarWriteEncryptedMismatch;
+}
+
+// RAR5 creation with -p and -hp: the envelope round-trips both shapes, the
+// wrong password fails with the wrong-password cause and an untouched sink,
+// and -hp hides the entry list without a password. (The official unrar
+// binary validates the byte shapes in the benchmark harness's fixture
+// pipeline; libarchive does not read encrypted RAR.)
+fn runRarWriteEncrypted(r: *Runner) anyerror!void {
+    setupRar(r);
+    corpus.fillTiled(r.corpus_index, &rarw_payload);
+    var store: harness.ArchiveEntryNodes = undefined;
+    const entry = harness.archiveEntryMethod(&store, "enc.txt", &rarw_payload, 3);
+    const crypto = [_]harness.Node{ harness.cryptoProfile(), harness.cryptoPasswordParam(rarw_password) };
+
+    const p_size = try rarwWrite(r, entry, &rarw_archive, &crypto);
+    try rarwReadBack(r, rarw_archive[0..p_size], &rarw_payload, &crypto);
+
+    const hp_extra = [_]harness.Node{ harness.cryptoProfile(), harness.cryptoPasswordParam(rarw_password), harness.rarHeaderEncodeParam(2) };
+    const hp_size = try rarwWrite(r, entry, &rarw_archive, &hp_extra);
+    try rarwReadBack(r, rarw_archive[0..hp_size], &rarw_payload, &crypto);
+
+    // Without the password the -hp entry list cannot even be enumerated.
+    _ = harness.call(r, harness.ids.query, &.{
+        harness.paramTargetCommand(harness.ids.read),
+        harness.sourceSpan(rarw_archive[0..hp_size]),
+        harness.capabilityParam(arc_caps),
+        harness.sizingModeParam(harness.size_metadata_exact),
+        harness.commitModeParam(harness.commit_tentative),
+    }, .{});
+    try harness.requireStatus(r, abi.Status.unsupported);
+
+    var diag: harness.CryptoDiag = undefined;
+    harness.cryptoDiag(&diag);
+    var out2: [rarw_payload.len]u8 = undefined;
+    @memset(&out2, 0xa5);
+    _ = harness.call(r, harness.ids.read, &.{
+        harness.archiveOrdinalParam(0),
+        harness.sourceSpan(rarw_archive[0..hp_size]),
+        harness.sinkSpan(&out2),
+        harness.cryptoProfile(),
+        harness.cryptoPasswordParam("wrong"),
+    }, .{ .ctx = true, .diagnostic = &diag.diagnostic });
+    try harness.requireStatus(r, abi.Status.integrity_failure);
+    if (diag.wrong_password.value_low != abi.Status.invalid_data) return error.RarWriteWrongPasswordMismatch;
+    if (!harness.allBytesEqual(&out2, 0xa5)) return error.RarWriteWrongPasswordWroteSink;
+}
+
 pub const scenarios = harness.scenarios("archive", &.{
+    .{ .label = "archive rar write encrypted", .run = runRarWriteEncrypted, .workspace_size = 48 * 1024 * 1024, .output_size = 1024, .encoded_size = 16384 },
     .{ .label = "archive tar", .run = runTar, .workspace_size = 65536, .output_size = 512, .encoded_size = 4096 },
     .{ .label = "archive zip", .run = runZip, .workspace_size = 65536 + 4096, .output_size = 512, .encoded_size = 4096 },
     .{ .label = "archive rar", .run = runRarArchive, .workspace_size = 12 * 1024 * 1024, .output_size = 512, .encoded_size = 4096 },

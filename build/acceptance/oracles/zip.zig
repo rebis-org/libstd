@@ -697,8 +697,42 @@ fn runRobust(r: *Runner) anyerror!void {
     if (oracle == .mismatch) return error.ZipForeignRejected;
 }
 
+// The data-descriptor (streaming) shape: bit 3 in both headers, zeroed
+// local sizes, signature plus CRC and sizes after the entry data, and the
+// reference reader agrees on the content.
+fn runDataDescriptor(r: *Runner) anyerror!void {
+    setupZip(r);
+    corpus.fillTiled(r.corpus_index, &zip_large);
+    var store: EntryNodes = undefined;
+    const entry = entryWithMethod(&store, "dd.txt", &zip_large, 8);
+    var dd_node: harness.Node = harness.zipDataDescriptorParam(1);
+    store.method.next = &dd_node;
+    var archive: [4096]u8 = undefined;
+    const size = try zipWriteWithCrypto(r, entry, &archive, "", null, null, null);
+    var output: [zip_large.len]u8 = undefined;
+    try zipReadOrdinal0(r, archive[0..size], &output, &zip_large);
+    if (archive[6] & 0x08 == 0) return error.DescriptorLocalFlagMissing;
+    for (archive[14..26]) |byte| {
+        if (byte != 0) return error.DescriptorLocalSizesNotZeroed;
+    }
+    var found = false;
+    var scan: usize = 30 + "dd.txt".len;
+    while (scan + 16 <= size) : (scan += 1) {
+        if (std.mem.eql(u8, archive[scan..][0..4], &[4]u8{ 0x50, 0x4b, 0x07, 0x08 })) {
+            const crc = std.mem.readInt(u32, archive[scan + 4 ..][0..4], .little);
+            if (crc == harness.crc32Ieee(&zip_large)) found = true;
+            break;
+        }
+    }
+    if (!found) return error.DescriptorRecordMissing;
+    const expected = [_]lib.ExpectedEntry{.{ .name = "dd.txt", .data = &zip_large }};
+    const oracle = lib.archiveReadMatches(archive[0..size], &expected);
+    if (oracle != .ok) return error.DescriptorOracleRejected;
+}
+
 pub const scenarios = harness.scenarios("zip", &.{
     .{ .label = "zip encrypted", .run = runEncrypted, .workspace_size = 65536 + 4096, .output_size = 1024, .encoded_size = 65536 },
+    .{ .label = "zip data descriptor", .run = runDataDescriptor, .workspace_size = 65536 + 4096, .output_size = 1024, .encoded_size = 4096 },
     .{ .label = "zip encrypted provider", .run = runProviderSelection, .workspace_size = 65536 + 4096, .output_size = 1024, .encoded_size = 65536 },
     .{ .label = "zip traditional", .run = runTraditional, .workspace_size = 65536 + 4096, .output_size = 1024, .encoded_size = 65536 },
     .{ .label = "zip methods", .run = runMethods, .workspace_size = 48 * 1024 * 1024, .output_size = 1024, .encoded_size = 65536 },
