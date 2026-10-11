@@ -5,16 +5,7 @@ const harness = @import("harness.zig");
 const seed: u64 = 0x9e3779b97f4a7c15;
 
 fn crc32Ref(input: []const u8) u32 {
-    var crc: u32 = 0xffff_ffff;
-    for (input) |byte| {
-        var value = crc ^ byte;
-        var bit: u5 = 0;
-        while (bit < 8) : (bit += 1) {
-            crc = if ((value & 1) != 0) (value >> 1) ^ 0xedb8_8320 else value >> 1;
-            value = crc;
-        }
-    }
-    return ~crc;
+    return harness.crc32Ieee(input);
 }
 
 fn fillPage(gpa: std.mem.Allocator, len: usize) ![]u8 {

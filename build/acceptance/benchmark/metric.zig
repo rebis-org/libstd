@@ -103,16 +103,16 @@ pub fn ratio(bytes: usize, encoded: usize) f64 {
     return @as(f64, @floatFromInt(bytes)) / @as(f64, @floatFromInt(encoded));
 }
 
-fn cellFor(buf: *[16]u8, comptime format: []const u8, value: f64, show: bool) []const u8 {
-    return tsv.cell(buf, format, value, show);
+pub fn decodeOk(len: usize, expected: []const u8, decoded: []u8) bool {
+    return len == expected.len and std.mem.eql(u8, decoded[0..expected.len], expected);
 }
 
 fn cellRatio(buffer: *[16]u8, totals: Totals, side: Side, show: bool) []const u8 {
-    return cellFor(buffer, "{d:.3}", ratio(totals.input_bytes, totals.encoded[@backingInt(side)]), show);
+    return tsv.cell(buffer, "{d:.3}", ratio(totals.input_bytes, totals.encoded[@backingInt(side)]), show);
 }
 
 fn cellMibps(buffer: *[16]u8, bytes: usize, ns: u64, show: bool) []const u8 {
-    return cellFor(buffer, "{d:.1}", mibps(bytes, ns), show);
+    return tsv.cell(buffer, "{d:.1}", mibps(bytes, ns), show);
 }
 
 const missing_labels = [_][]const u8{ "cmd missing", "lib missing", "bin missing" };

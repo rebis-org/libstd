@@ -8,21 +8,26 @@ const modules = @import("build/modules.zig");
 
 const version = std.SemanticVersion.parse(package.version) catch @compileError("version must be semantic");
 
+const Implementation = enum { onprem, offprem, mergeable };
+const capabilities = .{ "sha256", "sha1", "hmac", "pbkdf2", "adler32", "xxh32", "xxh64", "aes", "crc32", "crc64xz", "bzip2crc32" };
+
+fn putCapability(options: *std.Build.Step.Options, comptime capability: []const u8, selected: Implementation, portable_flag: bool) void {
+    options.addOption(Implementation, capability ++ "_impl", selected);
+    options.addOption(bool, capability ++ "_portable", portable_flag);
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const portable = b.option(bool, "portable", "Compatible implementation for primitive seam") orelse false;
-    const Implementation = enum { onprem, offprem, mergeable };
-    const capabilities = .{ "sha256", "sha1", "hmac", "pbkdf2", "adler32", "xxh32", "xxh64", "aes", "crc32", "crc64xz", "bzip2crc32" };
     const primitives_impl = b.option(Implementation, "primitives_impl", "Default implementation for primitive seam") orelse .onprem;
     const options = b.addOptions();
     options.addOption(bool, "portable", portable);
     options.addOption(Implementation, "primitives_impl", primitives_impl);
     inline for (capabilities) |capability| {
         const selected = b.option(Implementation, capability ++ "_impl", "Implementation for the " ++ capability ++ " capability") orelse primitives_impl;
-        options.addOption(Implementation, capability ++ "_impl", selected);
         const capability_portable = b.option(bool, capability ++ "_portable", "Portable-only paths for the " ++ capability ++ " capability") orelse portable;
-        options.addOption(bool, capability ++ "_portable", capability_portable);
+        putCapability(options, capability, selected, capability_portable);
         if (selected == .offprem and capability_portable) {
             std.debug.print("invalid configuration: the " ++ capability ++ " capability is offprem while its portable flag is set; portable governs onprem paths only. use -D" ++ capability ++ "_portable=false or an onprem or mergeable provider.\n", .{});
             std.process.exit(1);
@@ -35,8 +40,7 @@ pub fn build(b: *std.Build) void {
         provider_options.addOption(bool, "portable", false);
         provider_options.addOption(Implementation, "primitives_impl", impl);
         inline for (capabilities) |capability| {
-            provider_options.addOption(Implementation, capability ++ "_impl", impl);
-            provider_options.addOption(bool, capability ++ "_portable", false);
+            putCapability(provider_options, capability, impl, false);
         }
         const provider_options_module = provider_options.createModule();
         dist_providers[index] = .{

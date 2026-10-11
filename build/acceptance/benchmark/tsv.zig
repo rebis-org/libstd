@@ -16,18 +16,14 @@ pub fn gap(buffer: *[16]u8, gap_value: ?f64) []const u8 {
     return formatCell(buffer, "{d:.1}", value * 100.0);
 }
 
-fn appendTabbed(report: *std.ArrayList(u8), allocator: std.mem.Allocator, columns: []const []const u8) !void {
-    for (columns) |column| {
-        try report.appendSlice(allocator, "\t");
-        try report.appendSlice(allocator, column);
-    }
-}
-
 pub fn emitRow(report: *std.ArrayList(u8), allocator: std.mem.Allocator, first: []const []const u8, values: []const []const u8) !void {
     for (first, 0..) |column, index| {
         if (index > 0) try report.appendSlice(allocator, "\t");
         try report.appendSlice(allocator, column);
     }
-    try appendTabbed(report, allocator, values);
+    for (values) |column| {
+        try report.appendSlice(allocator, "\t");
+        try report.appendSlice(allocator, column);
+    }
     try report.appendSlice(allocator, "\n");
 }

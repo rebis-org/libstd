@@ -99,7 +99,7 @@ fn decodeVerify(env: *env_mod.Env, buffer: *Buf, row: matrix.Row, archive: []con
     }
     return .{
         .decode_ns = result.ns,
-        .ok = result.status == 0 and result.len == expected.len and std.mem.eql(u8, decoded[0..expected.len], expected),
+        .ok = result.status == 0 and metric.decodeOk(result.len, expected, decoded),
     };
 }
 

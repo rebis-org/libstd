@@ -225,7 +225,7 @@ fn timedDecode(env: *env_mod.Env, f: *const fn (env: *env_mod.Env, ref: Ref, dat
         return;
     };
     m.decode_ns = env.now() - t1;
-    m.ok = len == expected.len and std.mem.eql(u8, decoded[0..expected.len], expected);
+    m.ok = metric.decodeOk(len, expected, decoded);
 }
 
 pub fn measure(env: *env_mod.Env, ref: Ref, input: []const u8, encoded: []u8, decoded: []u8) metric.Metric {
