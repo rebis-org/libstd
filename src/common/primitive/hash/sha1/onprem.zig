@@ -9,37 +9,37 @@ const merkle = @import("../merkle.zig");
 pub const Sha1 = merkle.Digest(5, 20, .{ 0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0 }, compressSha1);
 
 fn compressSha1(state: *align(16) [5]u32, block: *const [64]u8) void {
-    var w: [80]u32 = undefined;
+    // Circular schedule with comptime-dispatched round groups removes both
+    // per-round switches and the 80-word stack frame.
+    var w: [16]u32 = undefined;
     for (0..16) |index| {
         w[index] = std.mem.readInt(u32, block[4 * index ..][0..4], .big);
-    }
-    for (16..80) |index| {
-        w[index] = std.math.rotl(u32, w[index - 3] ^ w[index - 8] ^ w[index - 14] ^ w[index - 16], @as(u32, 1));
     }
     var a = state[0];
     var b = state[1];
     var c = state[2];
     var d = state[3];
     var e = state[4];
-    for (0..80) |index| {
-        const f: u32 = switch (index / 20) {
-            0 => (b & c) | (~b & d),
-            1 => b ^ c ^ d,
-            2 => (b & c) | (b & d) | (c & d),
-            else => b ^ c ^ d,
-        };
-        const k: u32 = switch (index / 20) {
-            0 => 0x5A827999,
-            1 => 0x6ED9EBA1,
-            2 => 0x8F1BBCDC,
-            else => 0xCA62C1D6,
-        };
-        const t = std.math.rotl(u32, a, @as(u32, 5)) +% f +% e +% k +% w[index];
-        e = d;
-        d = c;
-        c = std.math.rotl(u32, b, @as(u32, 30));
-        b = a;
-        a = t;
+    inline for ([4]u32{ 0x5A827999, 0x6ED9EBA1, 0x8F1BBCDC, 0xCA62C1D6 }, 0..) |k, group| {
+        inline for (0..20) |round| {
+            const index: usize = group * 20 + round;
+            if (index >= 16) {
+                const value = w[(index - 3) & 15] ^ w[(index - 8) & 15] ^ w[(index - 14) & 15] ^ w[index & 15];
+                w[index & 15] = std.math.rotl(u32, value, @as(u32, 1));
+            }
+            const f: u32 = switch (group) {
+                0 => (b & c) | (~b & d),
+                1 => b ^ c ^ d,
+                2 => (b & c) | (b & d) | (c & d),
+                else => b ^ c ^ d,
+            };
+            const t = std.math.rotl(u32, a, @as(u32, 5)) +% f +% e +% k +% w[index & 15];
+            e = d;
+            d = c;
+            c = std.math.rotl(u32, b, @as(u32, 30));
+            b = a;
+            a = t;
+        }
     }
     state[0] +%= a;
     state[1] +%= b;
