@@ -72,6 +72,10 @@ pub const Aes192Hw = struct {
     pub fn decryptBlock(self: Aes192Hw, dst: *[16]u8, src: *const [16]u8) void {
         self.inner.decryptBlock(dst, src);
     }
+
+    pub fn decryptWide4(self: Aes192Hw, dst: *[64]u8, src: *const [64]u8) void {
+        self.inner.decryptWide4(dst, src);
+    }
 };
 
 // Mode operations monomorphize over a suite, so block loops never dispatch per block.
