@@ -21,10 +21,28 @@ pub const Verb = enum {
 
 pub fn verbsFor(class: Class) []const Verb {
     return switch (class) {
-        .slice => &.{ .required_size, .decoded_size, .encoded_size_bound, .encode, .decode },
-        .streaming => &.{ .encode_stream, .decode_stream, .decoded_size, .encoded_size_bound },
-        .grammar => &.{ .inspect, .decode_ordinal, .encode_ordinal },
-        .filter => &.{ .encode, .decode },
+        .slice => &.{
+            .required_size,
+            .decoded_size,
+            .encoded_size_bound,
+            .encode,
+            .decode,
+        },
+        .streaming => &.{
+            .encode_stream,
+            .decode_stream,
+            .decoded_size,
+            .encoded_size_bound,
+        },
+        .grammar => &.{
+            .inspect,
+            .decode_ordinal,
+            .encode_ordinal,
+        },
+        .filter => &.{
+            .encode,
+            .decode,
+        },
     };
 }
 
@@ -75,6 +93,6 @@ pub const Descriptor = struct {
     benchmark: ?Benchmark = null,
 };
 
-pub fn eql(first: Id, second: Id) bool {
-    return first.low == second.low and first.high == second.high;
+pub fn eql(left: Id, right: Id) bool {
+    return left.low == right.low and left.high == right.high;
 }

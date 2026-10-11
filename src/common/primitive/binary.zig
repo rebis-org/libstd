@@ -62,6 +62,10 @@ pub const ReadCursor = struct {
     }
 };
 
+pub fn utf16LeUnits(code_point: u21) usize {
+    return if (code_point < 0x10000) 1 else 2;
+}
+
 pub const WriteCursor = struct {
     buffer: []u8,
     pos: usize,
@@ -72,6 +76,19 @@ pub const WriteCursor = struct {
 
     pub fn written(self: WriteCursor) usize {
         return self.pos;
+    }
+
+    pub fn writeUtf16Le(self: *WriteCursor, code_point: u21) error{InsufficientCapacity}!void {
+        if (self.pos + 2 * utf16LeUnits(code_point) > self.buffer.len) return error.InsufficientCapacity;
+        if (code_point < 0x10000) {
+            std.mem.writeInt(u16, self.buffer[self.pos..][0..2], @intCast(code_point), .little);
+            self.pos += 2;
+        } else {
+            const high = @as(u32, code_point) - 0x10000;
+            std.mem.writeInt(u16, self.buffer[self.pos..][0..2], @intCast(0xD800 + (high >> 10)), .little);
+            std.mem.writeInt(u16, self.buffer[self.pos + 2 ..][0..2], @intCast(0xDC00 + (high & 0x3FF)), .little);
+            self.pos += 4;
+        }
     }
 
     pub fn writeU8(self: *WriteCursor, next: u8) error{ InsufficientCapacity, ResourceLimit }!void {

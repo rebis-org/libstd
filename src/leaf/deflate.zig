@@ -1032,17 +1032,7 @@ fn mergeCandidates(output: []u32, chain: []const u32, side_length: usize, side_d
 }
 
 inline fn matchLength(history: []const u8, cand: usize, pos: usize, available: usize) usize {
-    var length: usize = 0;
-    if (builtin.target.cpu.arch.endian() == .little) {
-        while (length + 8 <= available) {
-            const back = std.mem.readInt(u64, history[cand + length ..][0..8], .little);
-            const front = std.mem.readInt(u64, history[pos + length ..][0..8], .little);
-            if (back != front) return length + (@ctz(back ^ front) >> 3);
-            length += 8;
-        }
-    }
-    while (length < available and history[cand + length] == history[pos + length]) length += 1;
-    return length;
+    return kernels.matchLen8(history, cand, pos, available);
 }
 
 // Local bit buffer keeps the hot loop in registers.

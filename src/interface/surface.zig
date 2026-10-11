@@ -29,10 +29,9 @@ fn statusFor(failure: Failure) u32 {
     };
 }
 
-// Source/destination aliasing traps as overlap.
-pub fn copy(destination: Surface, source: ConstSurface) callconv(.c) u32 {
-    const sink = span.mutSpan(destination.ptr, destination.len) catch |failure| return statusFor(failure);
-    const origin = span.constSpan(source.ptr, source.len) catch |failure| return statusFor(failure);
+pub fn copy(sink_surface: Surface, origin_surface: ConstSurface) callconv(.c) u32 {
+    const sink = span.mutSpan(sink_surface.ptr, sink_surface.len) catch |failure| return statusFor(failure);
+    const origin = span.constSpan(origin_surface.ptr, origin_surface.len) catch |failure| return statusFor(failure);
     span.requireDisjoint(.{ .ptr = sink.ptr, .len = sink.len }, origin, "surface copy regions overlap.");
     const limit = @min(sink.len, origin.len);
     sink.write(0, origin.read(0, limit));

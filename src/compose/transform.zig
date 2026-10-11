@@ -34,6 +34,31 @@ fn requireReplay(source: *Resource, sizing: vocabulary.SizingMode, commit: vocab
     if (!source.hasCapability(resource.capability_bit_read) or !source.hasCapability(resource.capability_bit_replay)) return error.Unsupported;
 }
 
+fn optNode(request: ?*Node, comptime component: []const u8, comptime name: []const u8) ?*Node {
+    const param = comptime discovery.parameter(component, name);
+    return node_graph.findSelector(request, param.family, param.ordinal);
+}
+
+fn optCast(request: ?*Node, comptime component: []const u8, comptime name: []const u8, comptime T: type) Failure!?T {
+    const node = optNode(request, component, name) orelse return null;
+    return std.math.cast(T, node.value_low) orelse error.InvalidCall;
+}
+
+fn optTruncate(request: ?*Node, comptime component: []const u8, comptime name: []const u8, comptime T: type) ?T {
+    const node = optNode(request, component, name) orelse return null;
+    return @truncate(node.value_low);
+}
+
+fn optBool(request: ?*Node, comptime component: []const u8, comptime name: []const u8) bool {
+    const node = optNode(request, component, name) orelse return false;
+    return node.value_low != 0;
+}
+
+fn optBytes(request: ?*Node, comptime component: []const u8, comptime name: []const u8) Failure!?[]const u8 {
+    const node = optNode(request, component, name) orelse return null;
+    return try resource.checkedConstBytes(node.bytes, node.byte_length);
+}
+
 pub fn testHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
     _ = command_mask;
     const source_resource = source orelse return error.InvalidCall;
@@ -93,7 +118,7 @@ pub fn deflateHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Reso
         response.byte_length = output_size;
     } else if (command_mask == vocabulary.command_mask_write) {
         const output_size = if (sizing == .bounded) blk: {
-            const input_len = try measureSourceLength(source_resource, limits.decoded_bytes);
+            const input_len = try common.measureSource(source_resource, limits.decoded_bytes);
             const bound = deflate.encodedSizeBound(input_len);
             if (bound > limits.encoded_bytes) return error.ResourceLimit;
             break :blk bound;
@@ -161,7 +186,7 @@ pub fn gzipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resourc
         }
     } else if (command_mask == vocabulary.command_mask_write) {
         const output_size = if (sizing == .bounded) blk: {
-            const input_len = try measureSourceLength(source_resource, limits.decoded_bytes);
+            const input_len = try common.measureSource(source_resource, limits.decoded_bytes);
             const bound = gzip.encodedSizeBound(input_len, options);
             if (bound > limits.encoded_bytes) return error.ResourceLimit;
             break :blk bound;
@@ -198,52 +223,26 @@ fn parseGzipOptions(request: ?*Node, command_mask: u32) Failure!gzip.Options {
         .comment = &.{},
         .deflate = try parseDeflateOptions(request, command_mask),
     };
-    if (node_graph.findSelector(request, comptime discovery.parameter("gzip", "modification_time").family, comptime discovery.parameter("gzip", "modification_time").ordinal)) |node| {
-        options.modification_time = @truncate(node.value_low);
-    }
-    if (node_graph.findSelector(request, comptime discovery.parameter("gzip", "extra_flags").family, comptime discovery.parameter("gzip", "extra_flags").ordinal)) |node| {
-        options.extra_flags = @truncate(node.value_low);
-    }
-    if (node_graph.findSelector(request, comptime discovery.parameter("gzip", "operating_system").family, comptime discovery.parameter("gzip", "operating_system").ordinal)) |node| {
-        options.operating_system = @truncate(node.value_low);
-    }
-    if (node_graph.findSelector(request, comptime discovery.parameter("gzip", "text").family, comptime discovery.parameter("gzip", "text").ordinal)) |node| {
-        options.text = node.value_low != 0;
-    }
-    if (node_graph.findSelector(request, comptime discovery.parameter("gzip", "header_crc").family, comptime discovery.parameter("gzip", "header_crc").ordinal)) |node| {
-        options.header_crc = node.value_low != 0;
-    }
-    if (node_graph.findSelector(request, comptime discovery.parameter("gzip", "extra").family, comptime discovery.parameter("gzip", "extra").ordinal)) |node| {
-        options.extra = try resource.checkedConstBytes(node.bytes, node.byte_length);
-    }
-    if (node_graph.findSelector(request, comptime discovery.parameter("gzip", "name").family, comptime discovery.parameter("gzip", "name").ordinal)) |node| {
-        options.name = try resource.checkedConstBytes(node.bytes, node.byte_length);
-    }
-    if (node_graph.findSelector(request, comptime discovery.parameter("gzip", "comment").family, comptime discovery.parameter("gzip", "comment").ordinal)) |node| {
-        options.comment = try resource.checkedConstBytes(node.bytes, node.byte_length);
-    }
+    if (optTruncate(request, "gzip", "modification_time", u32)) |value| options.modification_time = value;
+    if (optTruncate(request, "gzip", "extra_flags", u8)) |value| options.extra_flags = value;
+    if (optTruncate(request, "gzip", "operating_system", u8)) |value| options.operating_system = value;
+    options.text = optBool(request, "gzip", "text");
+    options.header_crc = optBool(request, "gzip", "header_crc");
+    if (try optBytes(request, "gzip", "extra")) |value| options.extra = value;
+    if (try optBytes(request, "gzip", "name")) |value| options.name = value;
+    if (try optBytes(request, "gzip", "comment")) |value| options.comment = value;
     return options;
 }
 
 fn parseDeflateOptions(request: ?*Node, command_mask: u32) Failure!deflate.Options {
     var options = deflate_options;
     if (command_mask != vocabulary.command_mask_write and command_mask != vocabulary.command_mask_query) return options;
-    if (node_graph.findSelector(request, comptime discovery.parameter("deflate", "good").family, comptime discovery.parameter("deflate", "good").ordinal)) |node| {
-        options.good = std.math.cast(u16, node.value_low) orelse return error.InvalidCall;
-    }
-    if (node_graph.findSelector(request, comptime discovery.parameter("deflate", "nice").family, comptime discovery.parameter("deflate", "nice").ordinal)) |node| {
-        options.nice = std.math.cast(u16, node.value_low) orelse return error.InvalidCall;
-    }
-    if (node_graph.findSelector(request, comptime discovery.parameter("deflate", "lazy").family, comptime discovery.parameter("deflate", "lazy").ordinal)) |node| {
-        options.lazy = std.math.cast(u16, node.value_low) orelse return error.InvalidCall;
-    }
-    if (node_graph.findSelector(request, comptime discovery.parameter("deflate", "chain").family, comptime discovery.parameter("deflate", "chain").ordinal)) |node| {
-        options.chain = std.math.cast(u16, node.value_low) orelse return error.InvalidCall;
-    }
-    if (node_graph.findSelector(request, comptime discovery.parameter("deflate", "optimal").family, comptime discovery.parameter("deflate", "optimal").ordinal)) |node| {
-        options.optimal = node.value_low != 0;
-    }
-    if (node_graph.findSelector(request, comptime discovery.parameter("deflate", "strategy").family, comptime discovery.parameter("deflate", "strategy").ordinal)) |node| {
+    if (try optCast(request, "deflate", "good", u16)) |value| options.good = value;
+    if (try optCast(request, "deflate", "nice", u16)) |value| options.nice = value;
+    if (try optCast(request, "deflate", "lazy", u16)) |value| options.lazy = value;
+    if (try optCast(request, "deflate", "chain", u16)) |value| options.chain = value;
+    if (optNode(request, "deflate", "optimal")) |node| options.optimal = node.value_low != 0;
+    if (optNode(request, "deflate", "strategy")) |node| {
         if (node.value_low > @backingInt(deflate.Strategy.rle)) return error.InvalidCall;
         options.strategy = @fromBackingInt(@intCast(node.value_low));
     }
@@ -325,7 +324,7 @@ pub fn zlibHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resourc
         }
     } else if (command_mask == vocabulary.command_mask_write) {
         const output_size = if (sizing == .bounded) blk: {
-            const input_len = try measureSourceLength(source_resource, limits.decoded_bytes);
+            const input_len = try common.measureSource(source_resource, limits.decoded_bytes);
             const bound = zlib.encodedSizeBound(input_len, options);
             if (bound > limits.encoded_bytes) return error.ResourceLimit;
             break :blk bound;
@@ -360,21 +359,11 @@ pub fn lz4Hook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
 fn parseLz4Options(request: ?*Node, command_mask: u32) Failure!lz4.Options {
     var options: lz4.Options = .{};
     if (command_mask != vocabulary.command_mask_write and command_mask != vocabulary.command_mask_query) return options;
-    if (node_graph.findSelector(request, comptime discovery.parameter("lz4", "block_size").family, comptime discovery.parameter("lz4", "block_size").ordinal)) |node| {
-        options.block_size = std.math.cast(u32, node.value_low) orelse return error.InvalidCall;
-    }
-    if (node_graph.findSelector(request, comptime discovery.parameter("lz4", "block_checksum").family, comptime discovery.parameter("lz4", "block_checksum").ordinal)) |node| {
-        options.block_checksum = node.value_low != 0;
-    }
-    if (node_graph.findSelector(request, comptime discovery.parameter("lz4", "content_checksum").family, comptime discovery.parameter("lz4", "content_checksum").ordinal)) |node| {
-        options.content_checksum = node.value_low != 0;
-    }
-    if (node_graph.findSelector(request, comptime discovery.parameter("lz4", "acceleration").family, comptime discovery.parameter("lz4", "acceleration").ordinal)) |node| {
-        options.acceleration = std.math.cast(u32, node.value_low) orelse return error.InvalidCall;
-    }
-    if (node_graph.findSelector(request, comptime discovery.parameter("lz4", "search_depth").family, comptime discovery.parameter("lz4", "search_depth").ordinal)) |node| {
-        options.search_depth = std.math.cast(u32, node.value_low) orelse return error.InvalidCall;
-    }
+    if (try optCast(request, "lz4", "block_size", u32)) |value| options.block_size = value;
+    if (optNode(request, "lz4", "block_checksum")) |node| options.block_checksum = node.value_low != 0;
+    if (optNode(request, "lz4", "content_checksum")) |node| options.content_checksum = node.value_low != 0;
+    if (try optCast(request, "lz4", "acceleration", u32)) |value| options.acceleration = value;
+    if (try optCast(request, "lz4", "search_depth", u32)) |value| options.search_depth = value;
     return options;
 }
 
@@ -383,9 +372,9 @@ pub fn zstd_seekableHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: 
     try requireReplay(source_resource, sizing, commit, false);
     var options = zstd_seekable.Options{ .provider = plan.provider };
     if (command_mask == vocabulary.command_mask_write or command_mask == vocabulary.command_mask_query) {
-        if (node_graph.findSelector(call.request, comptime discovery.parameter("zstd-seekable", "frame_size").family, comptime discovery.parameter("zstd-seekable", "frame_size").ordinal)) |node| {
-            options.frame_size = std.math.cast(u32, node.value_low) orelse return error.InvalidCall;
-            if (options.frame_size < zstd_seekable.frame_size_min or options.frame_size > zstd_seekable.frame_size_max) return error.InvalidCall;
+        if (try optCast(call.request, "zstd-seekable", "frame_size", u32)) |frame_size| {
+            if (frame_size < zstd_seekable.frame_size_min or frame_size > zstd_seekable.frame_size_max) return error.InvalidCall;
+            options.frame_size = frame_size;
         }
     }
     const frame_options = zstd_seekable.frameOptions(options);
@@ -457,7 +446,6 @@ pub fn zdictHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resour
         if (sink) |sink_resource| try common.checkWorkspaceOverlap(call, source_resource, sink_resource);
         var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
         const input = try common.materializeSource(.require_size, source_resource, &workspace, limits.encoded_bytes);
-        // Reading a dictionary extracts its content: the raw window bytes.
         const content = zstd.dictionaryContent(input) catch |err| switch (err) {
             error.InvalidData, error.Unsupported, error.ResourceLimit, error.IoFailure, error.IntegrityFailure => |e| return e,
         };
@@ -472,8 +460,7 @@ pub fn zdictHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resour
         return;
     }
     if (command_mask != vocabulary.command_mask_write and command_mask != vocabulary.command_mask_query) return error.Unsupported;
-    const sample_node = node_graph.findSelector(call.request, comptime discovery.parameter("zdict", "sample_size").family, comptime discovery.parameter("zdict", "sample_size").ordinal) orelse return error.InvalidCall;
-    const sample_size = std.math.cast(usize, sample_node.value_low) orelse return error.InvalidCall;
+    const sample_size = (try optCast(call.request, "zdict", "sample_size", usize)) orelse return error.InvalidCall;
     if (sample_size == 0) return error.InvalidCall;
     var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
     const input = try common.materializeSource(.require_size, source_resource, &workspace, limits.decoded_bytes);
@@ -558,7 +545,7 @@ pub fn zstdHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resourc
         if (sink) |sink_resource| try common.checkWorkspaceOverlap(call, source_resource, sink_resource);
         var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
         const dict_len = if (dictionary) |dict| dict.len else 0;
-        const input_len = try measureSourceLength(source_resource, limits.decoded_bytes);
+        const input_len = try common.measureSource(source_resource, limits.decoded_bytes);
         const frame_budget = if (zstd.useDfast(options) or zstd.useRowMatch(options))
             @min(input_len, zstd.encoder_frame_size_max)
         else
@@ -595,61 +582,32 @@ pub fn zstdHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resourc
     }
 }
 
-fn measureSourceLength(source: *Resource, limit: u64) Failure!usize {
-    if (source.hasCapability(resource.capability_bit_size)) {
-        const total = try source.size();
-        if (total > limit) return error.ResourceLimit;
-        return std.math.cast(usize, total) orelse error.ResourceLimit;
-    }
-    if (!source.hasCapability(resource.capability_bit_replay)) return error.Unsupported;
-    var counter = measurement.Counter.init(null);
-    var bounded_source: resource.BoundedReader = undefined;
-    bounded_source.init(source, limit);
-    _ = std.Io.Reader.streamRemaining(&bounded_source.reader, &counter.writer) catch return error.IoFailure;
-    try source.rewind();
-    const total = counter.written();
-    if (total > limit) return error.ResourceLimit;
-    return std.math.cast(usize, total) orelse error.ResourceLimit;
-}
-
 fn parseZstdOptions(request: ?*Node, command_mask: u32) Failure!zstd.Options {
     var options: zstd.Options = .{
-        .window_size = try parseZstdWindow(node_graph.findSelector(request, comptime discovery.parameter("zstd", "window").family, comptime discovery.parameter("zstd", "window").ordinal)),
-        .dictionary = try parseZstdDictionary(node_graph.findSelector(request, comptime discovery.parameter("zstd", "dictionary").family, comptime discovery.parameter("zstd", "dictionary").ordinal)),
+        .window_size = try parseZstdWindow(optNode(request, "zstd", "window")),
+        .dictionary = try parseZstdDictionary(optNode(request, "zstd", "dictionary")),
     };
     if (command_mask == vocabulary.command_mask_write or command_mask == vocabulary.command_mask_query) {
-        if (node_graph.findSelector(request, comptime discovery.parameter("zstd", "hash_bits").family, comptime discovery.parameter("zstd", "hash_bits").ordinal)) |node| {
-            const hash_bits = std.math.cast(u5, node.value_low) orelse return error.InvalidCall;
+        if (try optCast(request, "zstd", "hash_bits", u5)) |hash_bits| {
             if (hash_bits < 10 or hash_bits > 17) return error.InvalidCall;
             options.hash_bits = hash_bits;
         }
-        if (node_graph.findSelector(request, comptime discovery.parameter("zstd", "max_chain").family, comptime discovery.parameter("zstd", "max_chain").ordinal)) |node| {
-            const max_chain = std.math.cast(u32, node.value_low) orelse return error.InvalidCall;
+        if (try optCast(request, "zstd", "max_chain", u32)) |max_chain| {
             if (max_chain == 0) return error.InvalidCall;
             options.max_chain = max_chain;
         }
-        if (node_graph.findSelector(request, comptime discovery.parameter("zstd", "nice_len").family, comptime discovery.parameter("zstd", "nice_len").ordinal)) |node| {
-            const nice_len = std.math.cast(u32, node.value_low) orelse return error.InvalidCall;
+        if (try optCast(request, "zstd", "nice_len", u32)) |nice_len| {
             if (nice_len < 3) return error.InvalidCall;
             options.nice_len = nice_len;
         }
-        if (node_graph.findSelector(request, comptime discovery.parameter("zstd", "search_window").family, comptime discovery.parameter("zstd", "search_window").ordinal)) |node| {
-            const search_window = std.math.cast(u32, node.value_low) orelse return error.InvalidCall;
+        if (try optCast(request, "zstd", "search_window", u32)) |search_window| {
             if (search_window == 0) return error.InvalidCall;
             options.search_window = search_window;
         }
-        if (node_graph.findSelector(request, comptime discovery.parameter("zstd", "lazy").family, comptime discovery.parameter("zstd", "lazy").ordinal)) |node| {
-            options.lazy = node.value_low != 0;
-        }
-        if (node_graph.findSelector(request, comptime discovery.parameter("zstd", "skip_interior_insert").family, comptime discovery.parameter("zstd", "skip_interior_insert").ordinal)) |node| {
-            options.skip_interior_insert = node.value_low != 0;
-        }
-        if (node_graph.findSelector(request, comptime discovery.parameter("zstd", "double_hash").family, comptime discovery.parameter("zstd", "double_hash").ordinal)) |node| {
-            options.double_hash = node.value_low != 0;
-        }
-        if (node_graph.findSelector(request, comptime discovery.parameter("zstd", "row_match").family, comptime discovery.parameter("zstd", "row_match").ordinal)) |node| {
-            options.row_match = node.value_low != 0;
-        }
+        if (optNode(request, "zstd", "lazy")) |node| options.lazy = node.value_low != 0;
+        if (optNode(request, "zstd", "skip_interior_insert")) |node| options.skip_interior_insert = node.value_low != 0;
+        if (optNode(request, "zstd", "double_hash")) |node| options.double_hash = node.value_low != 0;
+        if (optNode(request, "zstd", "row_match")) |node| options.row_match = node.value_low != 0;
     }
     return options;
 }
@@ -677,8 +635,7 @@ pub fn bzip2Hook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resour
 fn parseBzip2Options(request: ?*Node, command_mask: u32) Failure!bzip2.Options {
     var options: bzip2.Options = .{};
     if (command_mask == vocabulary.command_mask_write or command_mask == vocabulary.command_mask_query) {
-        if (node_graph.findSelector(request, comptime discovery.parameter("bzip2", "block_size").family, comptime discovery.parameter("bzip2", "block_size").ordinal)) |node| {
-            const block_size = std.math.cast(u32, node.value_low) orelse return error.InvalidCall;
+        if (try optCast(request, "bzip2", "block_size", u32)) |block_size| {
             if (block_size < bzip2.block_size_min or block_size > bzip2.block_size_max) return error.InvalidCall;
             options.block_size = block_size;
         }
@@ -687,12 +644,10 @@ fn parseBzip2Options(request: ?*Node, command_mask: u32) Failure!bzip2.Options {
 }
 
 fn parseDictionary(comptime component: []const u8, request: ?*Node, fallback: ?u32) Failure!u32 {
-    const param = comptime discovery.parameter(component, "dictionary");
-    const node = node_graph.findSelector(request, param.family, param.ordinal) orelse {
+    const dictionary_size = (try optCast(request, component, "dictionary", u32)) orelse {
         if (fallback) |size| return size;
         return error.InvalidCall;
     };
-    const dictionary_size = std.math.cast(u32, node.value_low) orelse return error.InvalidCall;
     if (dictionary_size < lzma.dictionary_min or dictionary_size > lzma.dictionary_max) return error.InvalidCall;
     return dictionary_size;
 }
@@ -712,19 +667,19 @@ const LzmaMatchParams = struct {
 fn parseLzmaMatchParams(request: ?*Node, command_mask: u32) Failure!LzmaMatchParams {
     var params = LzmaMatchParams{};
     if (command_mask != vocabulary.command_mask_write and command_mask != vocabulary.command_mask_query) return params;
-    if (node_graph.findSelector(request, comptime discovery.parameter("lzma", "match_finder_depth").family, comptime discovery.parameter("lzma", "match_finder_depth").ordinal)) |node| {
-        params.match_finder_depth = std.math.cast(u32, node.value_low) orelse return error.InvalidCall;
-        if (params.match_finder_depth == 0) return error.InvalidCall;
+    if (try optCast(request, "lzma", "match_finder_depth", u32)) |depth| {
+        if (depth == 0) return error.InvalidCall;
+        params.match_finder_depth = depth;
     }
-    if (node_graph.findSelector(request, comptime discovery.parameter("lzma", "lazy").family, comptime discovery.parameter("lzma", "lazy").ordinal)) |node| {
+    if (optNode(request, "lzma", "lazy")) |node| {
         params.lazy = node.value_low != 0;
         params.lazy_set = true;
     }
-    if (node_graph.findSelector(request, comptime discovery.parameter("lzma", "nice_len").family, comptime discovery.parameter("lzma", "nice_len").ordinal)) |node| {
-        params.nice_len = std.math.cast(u32, node.value_low) orelse return error.InvalidCall;
-        if (params.nice_len < 2 or params.nice_len > 273) return error.InvalidCall;
+    if (try optCast(request, "lzma", "nice_len", u32)) |nice_len| {
+        if (nice_len < 2 or nice_len > 273) return error.InvalidCall;
+        params.nice_len = nice_len;
     }
-    if (node_graph.findSelector(request, comptime discovery.parameter("lzma", "match_finder").family, comptime discovery.parameter("lzma", "match_finder").ordinal)) |node| {
+    if (optNode(request, "lzma", "match_finder")) |node| {
         params.match_finder = switch (node.value_low) {
             0 => .hash_chain,
             1 => .bt4,
@@ -738,27 +693,23 @@ fn parseLzmaMatchParams(request: ?*Node, command_mask: u32) Failure!LzmaMatchPar
     return params;
 }
 
-pub fn lzmaHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
+fn lzmaFamilyHook(comptime Codec: type, plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
     const dictionary_size = try parseLzmaDictionary(call.request);
     const properties = lzma2.defaultProperties(dictionary_size);
     const params = try parseLzmaMatchParams(call.request, command_mask);
-    const encode_workspace = if (params.match_finder == .bt4) lzma.encodeWorkspaceSizeBt(properties) else lzma.encodeWorkspaceSize(properties);
-    return bufferCodecHook(lzma, plan, source, sink, call, response, sizing, commit, limits, command_mask, lzma.decodeWorkspaceSize(properties), encode_workspace, .{
-        .properties = properties,
-        .unpack_size = null,
-        .marker_required = true,
-        .max_work = limits.codec_work,
-        .match_finder_depth = params.match_finder_depth,
-        .lazy = params.lazy,
-        .nice_len = params.nice_len,
-        .match_finder = params.match_finder,
-    });
-}
-
-pub fn lzma2Hook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
-    const dictionary_size = try parseLzmaDictionary(call.request);
-    const properties = lzma2.defaultProperties(dictionary_size);
-    const params = try parseLzmaMatchParams(call.request, command_mask);
+    if (Codec == lzma) {
+        const encode_workspace = if (params.match_finder == .bt4) lzma.encodeWorkspaceSizeBt(properties) else lzma.encodeWorkspaceSize(properties);
+        return bufferCodecHook(lzma, plan, source, sink, call, response, sizing, commit, limits, command_mask, lzma.decodeWorkspaceSize(properties), encode_workspace, .{
+            .properties = properties,
+            .unpack_size = null,
+            .marker_required = true,
+            .max_work = limits.codec_work,
+            .match_finder_depth = params.match_finder_depth,
+            .lazy = params.lazy,
+            .nice_len = params.nice_len,
+            .match_finder = params.match_finder,
+        });
+    }
     const encode_workspace = if (params.match_finder == .bt4) lzma2.encodeWorkspaceSizeBt(dictionary_size) else lzma2.encodeWorkspaceSize(dictionary_size);
     return bufferCodecHook(lzma2, plan, source, sink, call, response, sizing, commit, limits, command_mask, lzma2.decodeWorkspaceSize(dictionary_size), encode_workspace, .{
         .dictionary_size = dictionary_size,
@@ -769,6 +720,14 @@ pub fn lzma2Hook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resour
         .nice_len = params.nice_len,
         .match_finder = params.match_finder,
     });
+}
+
+pub fn lzmaHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
+    return lzmaFamilyHook(lzma, plan, source, sink, call, response, sizing, commit, limits, command_mask);
+}
+
+pub fn lzma2Hook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
+    return lzmaFamilyHook(lzma2, plan, source, sink, call, response, sizing, commit, limits, command_mask);
 }
 
 fn bufferCodecHook(comptime Codec: type, plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32, decode_workspace: usize, encode_workspace: usize, options: Codec.Options) Failure!void {

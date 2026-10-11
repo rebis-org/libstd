@@ -4,39 +4,39 @@ const catalog = @import("./catalog.zig");
 const discovery = @import("./discovery.zig");
 const Failure = vocabulary.Failure;
 
-const max_depth = 32;
-const max_count = 1024;
+const max_graph_depth = 32;
+const max_node_count = 1024;
 
 pub fn validateGraph(siblings: ?*abi.Node, direction: vocabulary.Direction, command_mask: u32) Failure!void {
-    var tracker = Traversal{
+    var traversal = Traversal{
         .direction = direction,
         .command_mask = command_mask,
     };
-    try validateNode(siblings, &tracker, 0);
+    try validateNode(siblings, &traversal, 0);
 }
 
 const Traversal = struct {
     direction: vocabulary.Direction,
     command_mask: u32,
     count: usize = 0,
-    ancestors: [max_depth + 1]?*abi.Node = @splat(null),
+    ancestors: [max_graph_depth + 1]?*abi.Node = @splat(null),
 };
 
-fn validateNode(siblings: ?*abi.Node, tracker: *Traversal, depth: usize) Failure!void {
-    if (depth > max_depth) return error.ResourceLimit;
+fn validateNode(siblings: ?*abi.Node, traversal: *Traversal, depth: usize) Failure!void {
+    if (depth > max_graph_depth) return error.ResourceLimit;
     var cursor = siblings;
     while (cursor) |node| {
-        if (tracker.count == max_count) return error.ResourceLimit;
-        tracker.count += 1;
+        if (traversal.count == max_node_count) return error.ResourceLimit;
+        traversal.count += 1;
         if (!node.isValid()) return error.InvalidCall;
-        for (tracker.ancestors[0..depth]) |ancestor| {
+        for (traversal.ancestors[0..depth]) |ancestor| {
             if (ancestor == node) return error.InvalidCall;
         }
         if (vocabulary.eql(node.id, vocabulary.ids.parameter)) {
             const selector = vocabulary.selectorOf(node.value_high);
-            try validateParameter(node, siblings, tracker, selector);
+            try validateParameter(node, siblings, traversal, selector);
             if (vocabulary.representationOf(selector) == .node_chain) {
-                try validateChildren(node, tracker, depth);
+                try validateChildren(node, traversal, depth);
             }
             cursor = node.next;
             continue;
@@ -52,27 +52,27 @@ fn validateNode(siblings: ?*abi.Node, tracker: *Traversal, depth: usize) Failure
         const entry = descriptor.?;
         switch (entry.kind) {
             .parameter => {
-                if (!isDirectionAccepted(entry.direction, tracker.direction)) return error.Unsupported;
-                if (tracker.direction == .in and (entry.command_mask & tracker.command_mask) == 0) return error.Unsupported;
+                if (!isDirectionAccepted(entry.direction, traversal.direction)) return error.Unsupported;
+                if (traversal.direction == .in and (entry.command_mask & traversal.command_mask) == 0) return error.Unsupported;
             },
             .diagnostic => {
-                if (tracker.direction != .out) return error.Unsupported;
+                if (traversal.direction != .out) return error.Unsupported;
             },
             else => return error.Unsupported,
         }
-        try checkRepresentation(node, entry.representation, false);
+        try validateRepresentation(node, entry.representation, false);
         if (entry.cardinality == .singleton and hasDuplicateSibling(siblings, node)) return error.InvalidCall;
         if (entry.representation == .node_chain) {
-            try validateChildren(node, tracker, depth);
+            try validateChildren(node, traversal, depth);
         }
         cursor = node.next;
     }
 }
 
-fn validateChildren(node: *abi.Node, tracker: *Traversal, depth: usize) Failure!void {
-    tracker.ancestors[depth] = node;
-    try validateNode(node.child, tracker, depth + 1);
-    tracker.ancestors[depth] = null;
+fn validateChildren(node: *abi.Node, traversal: *Traversal, depth: usize) Failure!void {
+    traversal.ancestors[depth] = node;
+    try validateNode(node.child, traversal, depth + 1);
+    traversal.ancestors[depth] = null;
 }
 
 fn isDirectionAccepted(declared: vocabulary.Direction, used: vocabulary.Direction) bool {
@@ -83,7 +83,7 @@ fn isDirectionAccepted(declared: vocabulary.Direction, used: vocabulary.Directio
     };
 }
 
-fn checkRepresentation(node: *abi.Node, representation: vocabulary.Representation, allow_value_high: bool) Failure!void {
+fn validateRepresentation(node: *abi.Node, representation: vocabulary.Representation, allow_value_high: bool) Failure!void {
     switch (representation) {
         .scalar_words => {
             if (node.bytes != null or node.byte_capacity != 0 or node.byte_length != 0 or node.child != null) return error.InvalidCall;
@@ -115,13 +115,38 @@ fn siblingKey(node: *abi.Node) SiblingKey {
     return .{ .id = node.id, .selector = 0 };
 }
 
-fn validateParameter(node: *abi.Node, siblings: ?*abi.Node, tracker: *Traversal, selector: vocabulary.Selector) Failure!void {
+fn validateParameter(node: *abi.Node, siblings: ?*abi.Node, traversal: *Traversal, selector: vocabulary.Selector) Failure!void {
     if (!vocabulary.isSelectorValid(selector)) return error.InvalidCall;
     if (!discovery.isSelectorKnown(selector.family, selector.ordinal)) return error.Unsupported;
-    if (!isDirectionAccepted(vocabulary.directionOf(selector), tracker.direction)) return error.Unsupported;
-    if (tracker.direction == .in and (selector.flags & tracker.command_mask) == 0) return error.Unsupported;
-    try checkRepresentation(node, vocabulary.representationOf(selector), true);
+    if (!isDirectionAccepted(vocabulary.directionOf(selector), traversal.direction)) return error.Unsupported;
+    if (traversal.direction == .in and (selector.flags & traversal.command_mask) == 0) return error.Unsupported;
+    try validateRepresentation(node, vocabulary.representationOf(selector), true);
     if (vocabulary.cardinalityOf(selector) == .singleton and hasDuplicateSibling(siblings, node)) return error.InvalidCall;
+}
+
+fn findIf(siblings: ?*abi.Node, context: anytype, comptime matches: fn (*abi.Node, @TypeOf(context)) bool) ?*abi.Node {
+    var cursor = siblings;
+    while (cursor) |node| : (cursor = node.next) {
+        if (matches(node, context)) return node;
+    }
+    return null;
+}
+
+fn isDuplicateCandidate(node: *abi.Node, wanted: SiblingKey) bool {
+    const key = siblingKey(node);
+    return vocabulary.eql(key.id, wanted.id) and key.selector == wanted.selector;
+}
+
+fn isIdMatch(node: *abi.Node, id: abi.Id) bool {
+    return vocabulary.eql(node.id, id);
+}
+
+const SelectorQuery = struct { family: u16, ordinal: u32 };
+
+fn isSelectorMatch(node: *abi.Node, query: SelectorQuery) bool {
+    if (!vocabulary.eql(node.id, vocabulary.ids.parameter)) return false;
+    const selector = vocabulary.selectorOf(node.value_high);
+    return selector.family == query.family and selector.ordinal == query.ordinal;
 }
 
 fn hasDuplicateSibling(siblings: ?*abi.Node, target: *abi.Node) bool {
@@ -129,28 +154,17 @@ fn hasDuplicateSibling(siblings: ?*abi.Node, target: *abi.Node) bool {
     var cursor = siblings;
     while (cursor) |node| : (cursor = node.next) {
         if (node == target) return false;
-        const key = siblingKey(node);
-        if (vocabulary.eql(key.id, wanted.id) and key.selector == wanted.selector) return true;
+        if (isDuplicateCandidate(node, wanted)) return true;
     }
     return false;
 }
 
 pub fn findParameter(siblings: ?*abi.Node, id: abi.Id) ?*abi.Node {
-    var cursor = siblings;
-    while (cursor) |node| : (cursor = node.next) {
-        if (vocabulary.eql(node.id, id)) return node;
-    }
-    return null;
+    return findIf(siblings, id, isIdMatch);
 }
 
 pub fn findSelector(siblings: ?*abi.Node, family: u16, ordinal: u32) ?*abi.Node {
-    var cursor = siblings;
-    while (cursor) |node| : (cursor = node.next) {
-        if (!vocabulary.eql(node.id, vocabulary.ids.parameter)) continue;
-        const selector = vocabulary.selectorOf(node.value_high);
-        if (selector.family == family and selector.ordinal == ordinal) return node;
-    }
-    return null;
+    return findIf(siblings, SelectorQuery{ .family = family, .ordinal = ordinal }, isSelectorMatch);
 }
 
 pub fn findChild(parent: *abi.Node, id: abi.Id) Failure!?*abi.Node {
@@ -165,6 +179,6 @@ pub fn findChild(parent: *abi.Node, id: abi.Id) Failure!?*abi.Node {
 }
 
 pub fn parseU64(node: ?*abi.Node) u64 {
-    const present = node orelse return 0;
-    return present.value_low;
+    const found = node orelse return 0;
+    return found.value_low;
 }
