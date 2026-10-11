@@ -36,7 +36,7 @@ pub fn addArchive(b: *std.Build, ctx: *const common.Settings, distribution: mani
     });
     _ = archive.addOutputDirectoryArg("stage");
     archive.addDirectoryArg(framework);
-    archive.addFileArg(ctx.generated.catalog);
+    archive.addFileArg2(ctx.generated.catalog, .{});
     return archive.addOutputFileArg(distribution.archive);
 }
 
@@ -55,23 +55,23 @@ fn buildSlice(b: *std.Build, ctx: *const common.Settings, slice: slices.AppleSli
 fn buildArch(b: *std.Build, ctx: *const common.Settings, name: []const u8, install_name: []const u8, arch: slices.AppleArch) std.Build.LazyPath {
     const target = b.resolveTargetQuery(targetQuery(arch));
     if (arch.zig) {
-        const lib = common.addLibrary(b, target, .ReleaseFast, .dynamic, ctx);
+        const lib = common.addLibrary(b, target, .fast, .dynamic, ctx);
         lib.install_name = install_name;
         return lib.getEmittedBin();
     }
     const object = b.addObject(.{
         .name = b.fmt("std-{s}", .{name}),
-        .root_module = common.rootModule(b, target, .ReleaseFast, ctx),
+        .root_module = common.rootModule(b, target, .fast, ctx),
     });
     const link = b.addSystemCommand(&.{ "xcrun", "--sdk", arch.sdk, "clang", "-target", arch.triple, "-dynamiclib" });
-    link.addFileArg(object.getEmittedBin());
+    link.addFileArg2(object.getEmittedBin(), .{});
     link.addArgs(&.{ "-install_name", install_name, "-o" });
     return link.addOutputFileArg(b.fmt("{s}.dylib", .{name}));
 }
 
 fn universal(b: *std.Build, output_name: []const u8, libraries: []const std.Build.LazyPath) std.Build.LazyPath {
     const lipo = b.addSystemCommand(&.{ "lipo", "-create" });
-    for (libraries) |library| lipo.addFileArg(library);
+    for (libraries) |library| lipo.addFileArg2(library, .{});
     lipo.addArg("-output");
     return lipo.addOutputFileArg(b.fmt("{s}.dylib", .{output_name}));
 }
@@ -133,9 +133,9 @@ fn wrapFramework(b: *std.Build, library: std.Build.LazyPath, headers: std.Build.
         "sh",
     });
     const wrapped = command.addOutputDirectoryArg(slices.framework_bundle);
-    command.addFileArg(library);
+    command.addFileArg2(library, .{});
     command.addDirectoryArg(headers);
-    command.addFileArg(plist);
+    command.addFileArg2(plist, .{});
     command.addArg(if (versioned) "versioned" else "flat");
     return wrapped;
 }

@@ -30,8 +30,8 @@ pub fn expand(b: *std.Build, ctx: *common.Settings) void {
 fn addHeaderProbe(b: *std.Build, zig: []const u8, driver: []const u8, std_flag: []const u8, source: std.Build.LazyPath, header_dir: std.Build.LazyPath) *std.Build.Step.Run {
     const probe = b.addSystemCommand(&.{ zig, driver, std_flag });
     probe.addDirectoryArg2(header_dir, .{ .prefix = "-I" });
-    probe.addFileArg(source);
-    probe.addArgs(&.{ "-o", if (builtin.os.tag == .windows) "NUL" else "/dev/null" });
+    probe.addFileArg2(source, .{});
+    probe.addArgs(&.{ "-o", if (builtin.target.os.tag == .windows) "NUL" else "/dev/null" });
     probe.step.dependOn(b.getInstallStep());
     return probe;
 }
@@ -53,7 +53,7 @@ fn addAbi(b: *std.Build, ctx: *common.Settings) void {
         .root_module = modules.create(b, modules.abi_exports, ctx),
     });
     const abi_exports_run = b.addRunArtifact(abi_exports);
-    abi_exports_run.addFileArg(ctx.host.dynamic_library.getEmittedBin());
+    abi_exports_run.addFileArg2(ctx.host.dynamic_library.getEmittedBin(), .{});
     abi.dependOn(&abi_exports_run.step);
 }
 
@@ -77,9 +77,9 @@ fn addPackage(b: *std.Build, ctx: *common.Settings) void {
     for (archives) |provider| {
         inline for (@typeInfo(common.ProviderArchives).@"struct".field_names) |field_name| {
             if (comptime std.mem.eql(u8, field_name, "name")) continue;
-            package_run.addFileArg(@field(provider, field_name));
+            package_run.addFileArg2(@field(provider, field_name), .{});
         }
     }
-    package_run.addFileArg(ctx.host.dynamic_library.getEmittedBin());
+    package_run.addFileArg2(ctx.host.dynamic_library.getEmittedBin(), .{});
     b.step("package", "Check the distribution archives").dependOn(&package_run.step);
 }
