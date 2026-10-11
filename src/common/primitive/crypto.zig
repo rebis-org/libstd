@@ -246,6 +246,25 @@ fn aesCbcDecryptWith(comptime S: type, key: []const u8, iv: [block_length]u8, de
     const ctx = try BlockCipher(S).init(key, .decrypt);
     var previous = iv;
     var offset: usize = 0;
+    // Four blocks in parallel hide the aesd latency; ciphertexts are staged
+    // first so in-place operation keeps the chaining operand.
+    if (comptime @hasDecl(S.Dec128, "decryptWide4")) {
+        while (offset + 64 <= source.len) {
+            var cipher: [64]u8 = undefined;
+            @memcpy(&cipher, source[offset..][0..64]);
+            var raw: [64]u8 = undefined;
+            switch (ctx) {
+                .dec128 => |c| c.decryptWide4(&raw, &cipher),
+                .dec256 => |c| c.decryptWide4(&raw, &cipher),
+                .hw192_dec => |c| c.decryptWide4(&raw, &cipher),
+                else => unreachable,
+            }
+            for (0..block_length) |index| destination[offset + index] = raw[index] ^ previous[index];
+            for (block_length..64) |index| destination[offset + index] = raw[index] ^ cipher[index - block_length];
+            @memcpy(&previous, cipher[48..64]);
+            offset += 64;
+        }
+    }
     while (offset < source.len) : (offset += block_length) {
         // Capture the ciphertext block before writing so in-place operation
         // (7z decrypts into the same buffer) keeps the running XOR operand.
