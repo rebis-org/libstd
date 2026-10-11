@@ -3,6 +3,9 @@ const builtin = @import("builtin");
 
 const options = @import("options");
 const seam = @import("seam");
+const xxh32_seam = @import("hash/xxh32/seam.zig");
+const xxh64_seam = @import("hash/xxh64/seam.zig");
+const adler32_seam = @import("hash/adler32/seam.zig");
 
 // Zig inline asm cannot name the 32-bit register views, so the crc32 instructions bind
 // fixed X registers. The fold mirrors the vendor ip7z/7zip arm64 loop.
@@ -210,21 +213,19 @@ pub const Bzip2Crc32 = seam.Checksum(options.bzip2crc32_impl, OnpremBzip2Crc32, 
 pub const Provider = seam.Provider;
 pub const default_provider = seam.default_provider;
 
+fn seal(comptime H: type, bound: H, input: []const u8) @typeInfo(@TypeOf(H.final)).@"fn".return_type.? {
+    var hash = bound;
+    hash.update(input);
+    return hash.final();
+}
+
 pub fn crc32(input: []const u8) u32 {
     return crc32With(default_provider, input);
 }
 
 pub fn crc32With(provider: seam.Provider, input: []const u8) u32 {
-    var hash = Crc32.bind(provider);
-    hash.update(input);
-    return hash.final();
+    return seal(Crc32, Crc32.bind(provider), input);
 }
-
-// xxHash and Adler32 route through their capability seams; each seam can
-// point at the on-prem port, std, or any compatible implementation.
-const xxh32_seam = @import("hash/xxh32/seam.zig");
-const xxh64_seam = @import("hash/xxh64/seam.zig");
-const adler32_seam = @import("hash/adler32/seam.zig");
 
 pub const XxHash64 = xxh64_seam.XxHash64;
 pub const XxHash32 = xxh32_seam.XxHash32;
@@ -234,30 +235,10 @@ pub fn xxh64(input: []const u8) u64 {
 }
 
 pub fn xxh64With(provider: seam.Provider, input: []const u8) u64 {
-    var hasher = XxHash64.bind(provider, 0);
-    hasher.update(input);
-    return hasher.final();
+    return seal(XxHash64, XxHash64.bind(provider, 0), input);
 }
 
-pub const Adler32 = struct {
-    inner: adler32_seam.Inner = .{},
-
-    pub fn init() Adler32 {
-        return .{};
-    }
-
-    pub fn bind(provider: seam.Provider) Adler32 {
-        return .{ .inner = adler32_seam.Inner.bind(provider) };
-    }
-
-    pub fn update(self: *Adler32, input: []const u8) void {
-        self.inner.update(input);
-    }
-
-    pub fn final(self: *const Adler32) u32 {
-        return self.inner.final();
-    }
-};
+pub const Adler32 = adler32_seam.Inner;
 
 pub fn adler32(input: []const u8) u32 {
     return adler32With(default_provider, input);
@@ -372,9 +353,7 @@ fn TableCrc(comptime T: type, comptime poly: T, comptime reflected: bool) type {
 }
 
 pub fn adler32With(provider: seam.Provider, input: []const u8) u32 {
-    var hasher = Adler32.bind(provider);
-    hasher.update(input);
-    return hasher.final();
+    return seal(Adler32, Adler32.bind(provider), input);
 }
 
 pub fn xxh32(input: []const u8) u32 {
@@ -382,9 +361,7 @@ pub fn xxh32(input: []const u8) u32 {
 }
 
 pub fn xxh32With(provider: seam.Provider, input: []const u8) u32 {
-    var hasher = XxHash32.bind(provider, 0);
-    hasher.update(input);
-    return hasher.final();
+    return seal(XxHash32, XxHash32.bind(provider, 0), input);
 }
 
 test "xxh32 matches the published vectors" {

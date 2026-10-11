@@ -108,9 +108,9 @@ pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Failure!usize
 
 fn writePaxRecords(entry: Entry, data_size: u64, uses_long_name: bool, buffer: []u8) Failure!usize {
     var written: usize = 0;
-    if (uses_long_name) written = try paxStringRecord(buffer, "path", entry.name);
+    if (uses_long_name) written = try paxRecord(buffer, "path", entry.name);
     if (entry.link_name.len > 100) {
-        written += try paxStringRecord(buffer[written..], "linkpath", entry.link_name);
+        written += try paxRecord(buffer[written..], "linkpath", entry.link_name);
     }
     if (entry.mode > 0o7777777) written += try paxNumberRecord(buffer[written..], "mode", entry.mode, 8);
     if (entry.uid > 0o7777777) {
@@ -128,8 +128,7 @@ fn writePaxRecords(entry: Entry, data_size: u64, uses_long_name: bool, buffer: [
     return written;
 }
 
-fn paxStringRecord(buffer: []u8, key: []const u8, value: []const u8) Failure!usize {
-    const content_len = key.len + 1 + value.len + 1;
+fn paxPrefixLen(content_len: usize) usize {
     var len_count: usize = 1;
     while (true) {
         const total_est = len_count + 1 + content_len;
@@ -143,30 +142,31 @@ fn paxStringRecord(buffer: []u8, key: []const u8, value: []const u8) Failure!usi
         if (count == len_count) break;
         len_count = count;
     }
-    var len_digits: [32]u8 = undefined;
+    return len_count;
+}
+
+fn paxRecord(buffer: []u8, key: []const u8, payload: []const u8) Failure!usize {
+    const content_len = key.len + 1 + payload.len + 1;
+    const len_count = paxPrefixLen(content_len);
     const total = len_count + 1 + content_len;
+    if (total > buffer.len) return error.InvalidCall;
     var m = total;
     var len_index = len_count;
     while (true) {
         len_index -= 1;
-        len_digits[len_index] = '0' + @as(u8, @truncate(m % 10));
+        buffer[len_index] = '0' + @as(u8, @truncate(m % 10));
         m /= 10;
         if (len_index == 0) break;
     }
-    if (total > buffer.len) return error.InvalidCall;
-    var pos: usize = 0;
-    for (0..len_count) |i| {
-        buffer[pos] = len_digits[i];
-        pos += 1;
-    }
+    var pos = len_count;
     buffer[pos] = ' ';
     pos += 1;
     @memcpy(buffer[pos..][0..key.len], key);
     pos += key.len;
     buffer[pos] = '=';
     pos += 1;
-    @memcpy(buffer[pos..][0..value.len], value);
-    pos += value.len;
+    @memcpy(buffer[pos..][0..payload.len], payload);
+    pos += payload.len;
     buffer[pos] = '\n';
     pos += 1;
     return pos;
@@ -182,50 +182,13 @@ fn paxNumberRecord(buffer: []u8, key: []const u8, value: u64, base: u8) Failure!
         n /= base;
         if (n == 0) break;
     }
-    const content_len = key.len + 1 + digit_count + 1;
-    var len_count: usize = 1;
-    while (true) {
-        const total_est = len_count + 1 + content_len;
-        var m = total_est;
-        var count: usize = 0;
-        while (true) {
-            count += 1;
-            m /= 10;
-            if (m == 0) break;
-        }
-        if (count == len_count) break;
-        len_count = count;
+    var i: usize = 0;
+    while (i < digit_count / 2) : (i += 1) {
+        const t = digits[i];
+        digits[i] = digits[digit_count - 1 - i];
+        digits[digit_count - 1 - i] = t;
     }
-    var len_digits: [32]u8 = undefined;
-    const total = len_count + 1 + content_len;
-    var m = total;
-    var len_index = len_count;
-    while (true) {
-        len_index -= 1;
-        len_digits[len_index] = '0' + @as(u8, @truncate(m % 10));
-        m /= 10;
-        if (len_index == 0) break;
-    }
-    if (total > buffer.len) return error.InvalidCall;
-    var pos: usize = 0;
-    for (0..len_count) |i| {
-        buffer[pos] = len_digits[i];
-        pos += 1;
-    }
-    buffer[pos] = ' ';
-    pos += 1;
-    @memcpy(buffer[pos..][0..key.len], key);
-    pos += key.len;
-    buffer[pos] = '=';
-    pos += 1;
-    while (digit_count > 0) {
-        digit_count -= 1;
-        buffer[pos] = digits[digit_count];
-        pos += 1;
-    }
-    buffer[pos] = '\n';
-    pos += 1;
-    return pos;
+    return paxRecord(buffer, key, digits[0..digit_count]);
 }
 
 pub fn inspectCount(archive: []const u8) Failure!u64 {

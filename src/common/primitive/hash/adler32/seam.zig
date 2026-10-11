@@ -17,6 +17,10 @@ fn FixedAdler(comptime tag: seam.Provider, comptime Impl: type) type {
     return struct {
         inner: Impl = .{},
 
+        pub fn init() @This() {
+            return .{};
+        }
+
         pub fn bind(provider: seam.Provider) @This() {
             std.debug.assert(provider == tag);
             return .{};
@@ -35,6 +39,10 @@ fn FixedAdler(comptime tag: seam.Provider, comptime Impl: type) type {
 fn MergeableAdler(comptime On: type, comptime Off: type) type {
     return struct {
         state: seam.Pair(On, Off) = .{ .onprem = .{} },
+
+        pub fn init() @This() {
+            return .{};
+        }
 
         pub fn bind(provider: seam.Provider) @This() {
             return switch (provider) {
