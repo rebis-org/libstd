@@ -35,8 +35,10 @@ const hash_log = 12;
 const hash_size = 1 << hash_log;
 const hash_prime: u32 = 2654435761;
 // The LZ4HC matcher needs a wider hash plus a chain slot per position, so its
-// tables cost more than the greedy tables.
-const hc_hash_log = 15;
+// tables cost more than the greedy tables. The chain window is the format's
+// 64 KiB distance: a 32 KiB window aliases after 32768 positions and can never
+// emit the offsets in (32768, 65535] (the reference's chainTable is 1<<16).
+const hc_hash_log = 16;
 const hc_hash_size = 1 << hc_hash_log;
 const hc_mask = hc_hash_size - 1;
 const header_size_max = 4 + 2 + 8 + 4 + 1;
@@ -50,6 +52,9 @@ pub const Options = struct {
     // Hash-chain search attempt budget per position, LZ4HC searchNum semantics
     // (0 keeps the default greedy parser).
     search_depth: u32 = 0,
+    // Decode work ceiling charged as input plus produced bytes, mirroring the
+    // adapter's bound so a one-pass read and the measured route agree.
+    max_work: u64 = std.math.maxInt(u64),
 };
 
 fn blockSizeCode(block_size: u32) Failure!u8 {
@@ -111,12 +116,88 @@ pub fn encode(input: []const u8, output: []u8, scratch: []u8, options: Options) 
 }
 
 pub fn decode(input: []const u8, output: []u8, scratch: []u8, options: Options) Failure!usize {
-    var fixed = std.Io.Writer.fixed(output);
-    return try decodeBlocks(input, &fixed, scratch, options.provider);
+    _ = scratch;
+    return decodeBlocksInto(input, output, options);
 }
 
 pub fn decodeInPlace(input: []const u8, output: []u8, scratch: []u8, options: Options) Failure!usize {
-    return try decode(input, output, scratch, options);
+    return decode(input, output, scratch, options);
+}
+
+// Blocks decode straight into the caller's span, so a read of a frame with a
+// direct sink needs no counting pass and no per-block staging. A span overrun
+// answers insufficient_capacity: the adapter re-runs the measured route, which
+// separates a too-small sink from a corrupt stream.
+fn decodeBlocksInto(input: []const u8, output: []u8, options: Options) Failure!usize {
+    if (input.len < 7) return error.InvalidData;
+    if (std.mem.readInt(u32, input[0..4], .little) != magic) return error.InvalidData;
+    const flags = input[4];
+    if ((flags & 0xC0) != version_bits) return error.Unsupported;
+    if (flags & flag_block_independence == 0) return error.Unsupported;
+    if (flags & flag_dict_id != 0) return error.Unsupported;
+    const block_size_byte = input[5];
+    const block_code = (block_size_byte >> 4) & 0x07;
+    if (block_code < 4 or block_code > 7) return error.InvalidData;
+    const max_block: usize = @as(usize, 65536) << @intCast(2 * (@as(usize, block_code) - 4));
+    var offset: usize = 6;
+    var content_size: ?u64 = null;
+    if (flags & flag_content_size != 0) {
+        if (input.len < offset + 8) return error.InvalidData;
+        content_size = std.mem.readInt(u64, input[offset..][0..8], .little);
+        offset += 8;
+    }
+    if (flags & flag_dict_id != 0) offset += 4;
+    if (input.len <= offset) return error.InvalidData;
+    // Header_Checksum: the high byte of xxh32 over FLG..end-of-header.
+    const stored_header_sum = input[offset];
+    if (stored_header_sum != @as(u8, @truncate(checksum.xxh32With(options.provider, input[4..offset]) >> 8))) return error.IntegrityFailure;
+    offset += 1;
+    var content_hasher = checksum.XxHash32.bind(options.provider, 0);
+    var total: usize = 0;
+    while (true) {
+        if (input.len < offset + 4) return error.InvalidData;
+        const block_size_field = std.mem.readInt(u32, input[offset..][0..4], .little);
+        offset += 4;
+        if (block_size_field == 0) break;
+        const is_stored = (block_size_field & uncompressed_block) != 0;
+        const block_len: usize = @intCast(block_size_field & ~uncompressed_block);
+        if (input.len < offset + block_len) return error.InvalidData;
+        const block_data = input[offset .. offset + block_len];
+        offset += block_len;
+        if (flags & flag_block_checksum != 0) {
+            if (input.len < offset + 4) return error.InvalidData;
+            const stored_sum = std.mem.readInt(u32, input[offset..][0..4], .little);
+            if (stored_sum != checksum.xxh32With(options.provider, block_data)) return error.IntegrityFailure;
+            offset += 4;
+        }
+        const room = output.len - total;
+        if (is_stored) {
+            if (block_len > max_block) return error.InvalidData;
+            if (block_len > room) return error.InsufficientCapacity;
+            @memcpy(output[total..][0..block_len], block_data);
+            content_hasher.update(block_data);
+            total += block_len;
+        } else {
+            const produced = decompressBlock(block_data, output[total..]) catch |err| return switch (err) {
+                error.InvalidData => error.InvalidData,
+                error.OutputTooSmall => error.InsufficientCapacity,
+            };
+            content_hasher.update(output[total .. total + produced]);
+            total += produced;
+        }
+        if (input.len + total > options.max_work) return error.ResourceLimit;
+    }
+    if (flags & flag_content_checksum != 0) {
+        if (input.len < offset + 4) return error.InvalidData;
+        const stored_sum = std.mem.readInt(u32, input[offset..][0..4], .little);
+        if (stored_sum != content_hasher.final()) return error.IntegrityFailure;
+        offset += 4;
+    }
+    if (offset != input.len) return error.InvalidData;
+    if (content_size) |expected| {
+        if (expected != total) return error.IntegrityFailure;
+    }
+    return total;
 }
 
 pub fn encodeToWriter(input: []const u8, output: *std.Io.Writer, scratch: []u8, options: Options) Failure!void {
@@ -475,7 +556,7 @@ fn emitLastLiterals(literals: []const u8, output: []u8, op_start: usize) usize {
     return op + lit_len;
 }
 
-fn decompressBlock(input: []const u8, output: []u8) error{InvalidData}!usize {
+fn decompressBlock(input: []const u8, output: []u8) error{ InvalidData, OutputTooSmall }!usize {
     var ip: usize = 0;
     var op: usize = 0;
     while (true) {
@@ -494,8 +575,14 @@ fn decompressBlock(input: []const u8, output: []u8) error{InvalidData}!usize {
             }
         }
         if (input.len - ip < lit_len) return error.InvalidData;
-        if (output.len - op < lit_len) return error.InvalidData;
-        @memcpy(output[op .. op + lit_len], input[ip .. ip + lit_len]);
+        if (output.len - op < lit_len) return error.OutputTooSmall;
+        if (lit_len <= 16 and input.len - ip >= 16 and output.len - op >= 16) {
+            // Short literal runs dominate, so the reference copies 16 bytes unconditionally
+            // behind an end guard rather than call memcpy per sequence.
+            output[op..][0..16].* = input[ip..][0..16].*;
+        } else {
+            @memcpy(output[op .. op + lit_len], input[ip .. ip + lit_len]);
+        }
         op += lit_len;
         ip += lit_len;
         if (ip == input.len) break;
@@ -514,7 +601,7 @@ fn decompressBlock(input: []const u8, output: []u8) error{InvalidData}!usize {
                 if (value != 255) break;
             }
         }
-        if (output.len - op < match_len) return error.InvalidData;
+        if (output.len - op < match_len) return error.OutputTooSmall;
         kernels.copyMatch(output, op, offset, std.math.cast(u32, match_len) orelse return error.InvalidData);
         op += match_len;
     }
@@ -582,7 +669,9 @@ test "lz4 corrupt blocks rejected" {
     if (result) |produced| {
         try std.testing.expect(!std.mem.eql(u8, input, output[0..produced]));
     } else |err| {
-        try std.testing.expect(err == error.InvalidData or err == error.IntegrityFailure);
+        // A corrupted block either fails its input-side checks or overruns the span,
+        // which the leaf reports as insufficient_capacity and the adapter resolves.
+        try std.testing.expect(err == error.InvalidData or err == error.IntegrityFailure or err == error.InsufficientCapacity);
     }
 }
 

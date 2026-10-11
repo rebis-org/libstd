@@ -753,13 +753,41 @@ fn buildHuffmanGroups(mtfv: []const u16, n_mtf: usize, alpha_size: u32, group_le
         for (0..n_groups) |g| {
             for (0..alpha_size) |s| group_freq[g][s] = 1;
         }
+        // The six-group case pairs two lengths per word, so one load adds two
+        // accumulators (the reference's len_pack fast track).
+        var len_pack: [max_alpha_size][3]u32 = undefined;
+        if (n_groups == max_groups) {
+            for (0..alpha_size) |v| {
+                len_pack[v][0] = (@as(u32, group_lens[1][v]) << 16) | group_lens[0][v];
+                len_pack[v][1] = (@as(u32, group_lens[3][v]) << 16) | group_lens[2][v];
+                len_pack[v][2] = (@as(u32, group_lens[5][v]) << 16) | group_lens[4][v];
+            }
+        }
         for (0..n_selectors) |s| {
             const chunk = mtfv[s * group_size .. @min((s + 1) * group_size, n_mtf)];
             // One pass with independent accumulators. Separate passes serialize on one register.
             var costs: [max_groups]u32 = @splat(0);
-            for (chunk) |sym| {
-                var g: usize = 0;
-                while (g < n_groups) : (g += 1) costs[g] += group_lens[g][sym];
+            if (n_groups == max_groups and chunk.len == group_size) {
+                // A half sums at most 50 lengths of 20 bits, so no half carries into its neighbor.
+                var cost01: u32 = 0;
+                var cost23: u32 = 0;
+                var cost45: u32 = 0;
+                for (chunk) |sym| {
+                    cost01 += len_pack[sym][0];
+                    cost23 += len_pack[sym][1];
+                    cost45 += len_pack[sym][2];
+                }
+                costs[0] = cost01 & 0xffff;
+                costs[1] = cost01 >> 16;
+                costs[2] = cost23 & 0xffff;
+                costs[3] = cost23 >> 16;
+                costs[4] = cost45 & 0xffff;
+                costs[5] = cost45 >> 16;
+            } else {
+                for (chunk) |sym| {
+                    var g: usize = 0;
+                    while (g < n_groups) : (g += 1) costs[g] += group_lens[g][sym];
+                }
             }
             var best_group: usize = 0;
             var best_cost: u32 = std.math.maxInt(u32);
@@ -1003,10 +1031,12 @@ const BitReader = struct {
 
 const BitWriter = struct {
     writer: *std.Io.Writer,
-    buffer: u32,
-    bits: u5,
+    // MSB-first stream packed from the low end of the container: the oldest bits sit
+    // at the top of the valid region, so a whole drain is one big-endian store.
+    buffer: u64 = 0,
+    bits: u7 = 0,
     // Batched locally so the writer vtable fires once per buffer, not per byte.
-    pending: [512]u8,
+    pending: [512]u8 = undefined,
     pending_len: usize = 0,
 
     fn init(writer: *std.Io.Writer) BitWriter {
@@ -1039,30 +1069,37 @@ const BitWriter = struct {
     }
 
     fn writeBits(self: *BitWriter, n: u6, value: u64) Failure!void {
-        var remaining = n;
-        const v = value;
-        while (remaining > 0) {
-            const take = @min(remaining, @as(u6, 31));
-            self.buffer <<= @intCast(take);
-            self.buffer |= @as(u32, @intCast(v >> (remaining - take))) & ((@as(u32, 1) << take) - 1);
-            self.bits += take;
-            remaining -= take;
-            while (self.bits >= 8) {
-                const byte: u8 = @intCast(self.buffer >> (self.bits - 8));
-                try self.emit(byte);
-                self.bits -= 8;
-                self.buffer &= (@as(u32, 1) << self.bits) - 1;
-            }
+        // Callers write at most 24 bits, so the container never fills in one call and
+        // the drain below leaves fewer than 8 bits behind.
+        self.buffer = (self.buffer << @intCast(n)) | (value & ((@as(u64, 1) << n) - 1));
+        self.bits += n;
+        if (self.bits < 32) return;
+        if (self.pending_len + 8 > self.pending.len) {
+            try io.writeBytes(self.writer, self.pending[0..self.pending_len]);
+            self.pending_len = 0;
         }
+        // The wide store covers the drained bytes; the partial tail is overwritten next call.
+        std.mem.writeInt(u64, self.pending[self.pending_len..][0..8], self.buffer << @intCast(64 - self.bits), .big);
+        const written: u7 = self.bits >> 3;
+        self.pending_len += written;
+        self.bits &= 7;
+        self.buffer &= (@as(u64, 1) << @intCast(self.bits)) - 1;
     }
 
     fn flush(self: *BitWriter) Failure!void {
-        if (self.bits > 0) {
-            const byte: u8 = @intCast(self.buffer << (8 - self.bits));
-            try self.emit(byte);
-            self.bits = 0;
-            self.buffer = 0;
+        // Batched calls leave up to 31 bits behind, so the tail drains whole bytes
+        // first and the final partial byte shifts the remainder to the top.
+        while (self.bits >= 8) {
+            self.bits -= 8;
+            try self.emit(@truncate(self.buffer >> @as(u6, @intCast(self.bits))));
+            self.buffer &= (@as(u64, 1) << @intCast(self.bits)) - 1;
         }
+        if (self.bits > 0) {
+            const byte: u8 = @intCast(self.buffer << @as(u6, @intCast(8 - self.bits)));
+            try self.emit(byte);
+        }
+        self.bits = 0;
+        self.buffer = 0;
         if (self.pending_len > 0) {
             try io.writeBytes(self.writer, self.pending[0..self.pending_len]);
             self.pending_len = 0;

@@ -253,8 +253,9 @@ fn encodeWorkspaceSizeFor(properties: Properties, use_bt: bool) usize {
     plan.take(u8, properties.dictionary_size) catch return 0;
     plan.take(u32, matchFinderChainSize(properties.dictionary_size)) catch return 0;
     if (use_bt) {
-        plan.take(u32, matchFinderChainSize(properties.dictionary_size)) catch return 0;
-        plan.take(u32, matchFinderChainSize(properties.dictionary_size)) catch return 0;
+        // One interleaved region holds both children of every node, so a descent
+        // step touches one cache line instead of two.
+        plan.take(u32, 2 * matchFinderChainSize(properties.dictionary_size)) catch return 0;
     }
     plan.take(u32, matchFinderHashSize(properties.dictionary_size)) catch return 0;
     plan.take(u32, @as(usize, 1) << match_finder_hash2_bits) catch return 0;
@@ -1366,8 +1367,7 @@ pub const Encoder = struct {
     total_pos: u32,
     head: []u32,
     chain: []u32,
-    left: []u32,
-    right: []u32,
+    son: []u32,
     hash2: []u32,
     hash3: []u32,
     hash_mask: u32,
@@ -1411,8 +1411,7 @@ pub const Encoder = struct {
         var workspace = try io.Workspace.init(scratch.ptr, scratch.len);
         const dictionary = try workspace.take(u8, properties.dictionary_size);
         const chain = try workspace.take(u32, matchFinderChainSize(properties.dictionary_size));
-        const left = if (options.match_finder == .bt4) try workspace.take(u32, matchFinderChainSize(properties.dictionary_size)) else @constCast(&.{});
-        const right = if (options.match_finder == .bt4) try workspace.take(u32, matchFinderChainSize(properties.dictionary_size)) else @constCast(&.{});
+        const son = if (options.match_finder == .bt4) try workspace.take(u32, 2 * matchFinderChainSize(properties.dictionary_size)) else @constCast(&.{});
         const head = try workspace.take(u32, matchFinderHashSize(properties.dictionary_size));
         const hash2 = try workspace.take(u32, @as(usize, 1) << match_finder_hash2_bits);
         const hash3 = try workspace.take(u32, @as(usize, 1) << match_finder_hash3_bits);
@@ -1429,8 +1428,7 @@ pub const Encoder = struct {
             .total_pos = 0,
             .head = head,
             .chain = chain,
-            .left = left,
-            .right = right,
+            .son = son,
             .hash2 = hash2,
             .hash3 = hash3,
             .hash_mask = @intCast(matchFinderHashSize(properties.dictionary_size) - 1),
@@ -1756,8 +1754,8 @@ pub const Encoder = struct {
         const length_limit: usize = @min(self.input.len - position, max_match_len);
         const hash = self.hash4(position);
         const slot = abs_pos % self.chain_window;
-        var ptr0: *u32 = &self.right[slot];
-        var ptr1: *u32 = &self.left[slot];
+        var ptr0: *u32 = &self.son[slot * 2 + 1];
+        var ptr1: *u32 = &self.son[slot * 2];
         ptr0.* = 0;
         ptr1.* = 0;
         var cur = self.head[hash];
@@ -1772,6 +1770,7 @@ pub const Encoder = struct {
             if (cur == abs_pos) break;
             const distance = abs_pos - cur;
             const pair_slot = if (slot >= distance) slot - distance else self.chain_window + slot - distance;
+            const pair = pair_slot * 2;
             var length = @min(length0, length1);
             if (cur >= input_base) {
                 const candidate_offset = @as(usize, cur) - input_base;
@@ -1783,13 +1782,13 @@ pub const Encoder = struct {
                 }
                 if (input[candidate_offset + length] < input[position + length]) {
                     ptr1.* = cur;
-                    cur = self.right[pair_slot];
-                    ptr1 = &self.right[pair_slot];
+                    cur = self.son[pair + 1];
+                    ptr1 = &self.son[pair + 1];
                     length1 = length;
                 } else {
                     ptr0.* = cur;
-                    cur = self.left[pair_slot];
-                    ptr0 = &self.left[pair_slot];
+                    cur = self.son[pair];
+                    ptr0 = &self.son[pair];
                     length0 = length;
                 }
                 continue;
@@ -1806,13 +1805,13 @@ pub const Encoder = struct {
             }
             if (self.byteAt(cur + length) < input[position + length]) {
                 ptr1.* = cur;
-                cur = self.right[pair_slot];
-                ptr1 = &self.right[pair_slot];
+                cur = self.son[pair + 1];
+                ptr1 = &self.son[pair + 1];
                 length1 = length;
             } else {
                 ptr0.* = cur;
-                cur = self.left[pair_slot];
-                ptr0 = &self.left[pair_slot];
+                cur = self.son[pair];
+                ptr0 = &self.son[pair];
                 length0 = length;
             }
         }
@@ -2297,8 +2296,8 @@ pub const Encoder = struct {
         const length_limit: usize = @min(self.input.len - position, max_match_len);
         const hash = self.hash4(position);
         const slot = abs_pos % self.chain_window;
-        var ptr0: *u32 = &self.right[slot];
-        var ptr1: *u32 = &self.left[slot];
+        var ptr0: *u32 = &self.son[slot * 2 + 1];
+        var ptr1: *u32 = &self.son[slot * 2];
         ptr0.* = 0;
         ptr1.* = 0;
         var cur = self.head[hash];
@@ -2315,6 +2314,7 @@ pub const Encoder = struct {
             if (cur == abs_pos) break;
             const distance = abs_pos - cur;
             const pair_slot = if (slot >= distance) slot - distance else self.chain_window + slot - distance;
+            const pair = pair_slot * 2;
             const candidate_position = cur;
             var length = @min(length0, length1);
             if (candidate_position >= input_base) {
@@ -2331,21 +2331,21 @@ pub const Encoder = struct {
                             count += 1;
                         }
                         if (length == length_limit or length >= self.nice_len) {
-                            ptr1.* = self.left[pair_slot];
-                            ptr0.* = self.right[pair_slot];
+                            ptr1.* = self.son[pair];
+                            ptr0.* = self.son[pair + 1];
                             return count;
                         }
                     }
                 }
                 if (input[candidate_offset + length] < input[position + length]) {
                     ptr1.* = cur;
-                    cur = self.right[pair_slot];
-                    ptr1 = &self.right[pair_slot];
+                    cur = self.son[pair + 1];
+                    ptr1 = &self.son[pair + 1];
                     length1 = length;
                 } else {
                     ptr0.* = cur;
-                    cur = self.left[pair_slot];
-                    ptr0 = &self.left[pair_slot];
+                    cur = self.son[pair];
+                    ptr0 = &self.son[pair];
                     length0 = length;
                 }
                 continue;
@@ -2366,8 +2366,8 @@ pub const Encoder = struct {
                         count += 1;
                     }
                     if (length == length_limit or length >= self.nice_len) {
-                        ptr1.* = self.left[pair_slot];
-                        ptr0.* = self.right[pair_slot];
+                        ptr1.* = self.son[pair];
+                        ptr0.* = self.son[pair + 1];
                         return count;
                     }
                 }
@@ -2375,13 +2375,13 @@ pub const Encoder = struct {
             const order_input_byte = input[position + length];
             if (self.byteAt(candidate_position + length) < order_input_byte) {
                 ptr1.* = cur;
-                cur = self.right[pair_slot];
-                ptr1 = &self.right[pair_slot];
+                cur = self.son[pair + 1];
+                ptr1 = &self.son[pair + 1];
                 length1 = length;
             } else {
                 ptr0.* = cur;
-                cur = self.left[pair_slot];
-                ptr0 = &self.left[pair_slot];
+                cur = self.son[pair];
+                ptr0 = &self.son[pair];
                 length0 = length;
             }
         }

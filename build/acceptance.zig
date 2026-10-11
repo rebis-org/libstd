@@ -259,6 +259,7 @@ fn addBenchmark(b: *std.Build, ctx: *common.Context, refs: cmd.Refs) void {
     });
     bypass_module.addImport("options", ctx.options);
     bypass_module.addImport("interface", bench_interface);
+    bypass_module.addImport("seam", modules.createFor(b, modules.seam, ref_target, ctx.optimize, ctx));
     // The SDK path exists only for a Darwin target, and the expansion runs for every -Dtarget.
     const macos_sdk_usr_lib: ?[]const u8 = if (ref_target.result.os.tag.isDarwin())
         macosSdkUsrLib(b, ctx) orelse

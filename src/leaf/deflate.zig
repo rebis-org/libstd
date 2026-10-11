@@ -955,7 +955,7 @@ pub const Compress64 = CompressOf(.deflate64);
 const Match = struct { length: usize, distance: u32 };
 
 fn hash4(bytes: []const u8) u32 {
-    const word = @as(u32, bytes[0]) | (@as(u32, bytes[1]) << 8) | (@as(u32, bytes[2]) << 16) | (@as(u32, bytes[3]) << 24);
+    const word = std.mem.readInt(u32, bytes[0..4], .little);
     var h = word *% 0x9E37_79B1;
     h ^= h >> 16;
     return h & (hash_size - 1);
