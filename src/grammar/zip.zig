@@ -82,8 +82,9 @@ pub fn requiredSize(entries: []const Entry, archive_comment: []const u8, history
             return error.ResourceLimit;
         }
         const local_offset = local_total;
+        const descriptor = entry.flags & 0x0008 != 0 and !(entry.encrypted and !entry.zipcrypto);
         central_total = try bounds.addUsize(central_total, 46 + entry.name.len + entry.extra.len + centralZip64Length(try bounds.addUsize(compressed, overhead), entry.data.len, local_offset) + (if (entry.encrypted and !entry.zipcrypto) winzip_aes_extra_record_length else 0) + entry.comment.len);
-        local_total = try bounds.addUsize(local_total, try bounds.addUsize(30 + entry.name.len + entry.extra.len + localZip64Length(try bounds.addUsize(compressed, overhead), entry.data.len) + (if (entry.encrypted and !entry.zipcrypto) winzip_aes_extra_record_length else 0), try bounds.addUsize(compressed, overhead)));
+        local_total = try bounds.addUsize(local_total, try bounds.addUsize(30 + entry.name.len + entry.extra.len + localZip64Length(try bounds.addUsize(compressed, overhead), entry.data.len, descriptor) + (if (entry.encrypted and !entry.zipcrypto) winzip_aes_extra_record_length else 0) + dataDescriptorLength(try bounds.addUsize(compressed, overhead), entry.data.len, descriptor), try bounds.addUsize(compressed, overhead)));
     }
     const needs_zip64 = entries.len >= std.math.maxInt(u16) or central_total >= std.math.maxInt(u32) or local_total >= std.math.maxInt(u32);
     return try bounds.addUsize(try bounds.addUsize(local_total, central_total), try bounds.addUsize(22 + archive_comment.len, if (needs_zip64) 76 else 0));
@@ -99,24 +100,27 @@ pub fn encode(entries: []const Entry, archive_comment: []const u8, output: []u8,
         const overhead = try aesOverhead(entry);
         const stored_size = try bounds.addUsize(compressed, overhead);
         const zip64 = stored_size >= std.math.maxInt(u32) or entry.data.len >= std.math.maxInt(u32);
-        const extra_length = try bounds.addUsize(try bounds.addUsize(entry.extra.len, if (entry.encrypted and !entry.zipcrypto) winzip_aes_extra_record_length else 0), localZip64Length(stored_size, entry.data.len));
+        const descriptor = entry.flags & 0x0008 != 0 and !(entry.encrypted and !entry.zipcrypto);
+        const descriptor_len = dataDescriptorLength(stored_size, entry.data.len, descriptor);
+        const extra_length = try bounds.addUsize(try bounds.addUsize(entry.extra.len, if (entry.encrypted and !entry.zipcrypto) winzip_aes_extra_record_length else 0), localZip64Length(stored_size, entry.data.len, descriptor));
         try putU32(&sink, local_signature);
         try putU16(&sink, if (entry.encrypted and !entry.zipcrypto) winzip_aes_version_needed else if (zip64) 45 else zipVersionNeeded(entry.method));
         try putU16(&sink, if (entry.encrypted and !entry.zipcrypto) entry.flags | 1 else effectiveFlags(entry));
         try putU16(&sink, if (entry.encrypted and !entry.zipcrypto) winzip_aes_method else entry.method);
         try putU16(&sink, entry.dos_time);
         try putU16(&sink, entry.dos_date);
-        try putU32(&sink, if (entry.encrypted and !entry.zipcrypto) 0 else checksum.crc32With(provider, entry.data));
-        try putU32(&sink, if (zip64) std.math.maxInt(u32) else std.math.cast(u32, stored_size) orelse return error.ResourceLimit);
-        try putU32(&sink, if (zip64) std.math.maxInt(u32) else std.math.cast(u32, entry.data.len) orelse return error.ResourceLimit);
+        try putU32(&sink, if (entry.encrypted and !entry.zipcrypto) 0 else if (descriptor) 0 else checksum.crc32With(provider, entry.data));
+        try putU32(&sink, if (descriptor) 0 else if (zip64) std.math.maxInt(u32) else std.math.cast(u32, stored_size) orelse return error.ResourceLimit);
+        try putU32(&sink, if (descriptor) 0 else if (zip64) std.math.maxInt(u32) else std.math.cast(u32, entry.data.len) orelse return error.ResourceLimit);
         try putU16(&sink, @intCast(entry.name.len));
         try putU16(&sink, std.math.cast(u16, extra_length) orelse return error.ResourceLimit);
         try sink.write(entry.name);
-        try writeLocalZip64(&sink, stored_size, entry.data.len);
+        try writeLocalZip64(&sink, stored_size, entry.data.len, descriptor);
         try sink.write(entry.extra);
         if (entry.encrypted and !entry.zipcrypto) try writeAesExtra(&sink, entry);
         try writeData(&sink, entry, provider, history, staging, scratch);
-        offsets = try bounds.addUsize(offsets, 30 + entry.name.len + extra_length + stored_size);
+        if (descriptor) try writeDataDescriptor(&sink, entry, stored_size, checksum.crc32With(provider, entry.data), provider);
+        offsets = try bounds.addUsize(offsets, 30 + entry.name.len + extra_length + stored_size + descriptor_len);
     }
     const central_offset = offsets;
     var local_offset: usize = 0;
@@ -125,7 +129,8 @@ pub fn encode(entries: []const Entry, archive_comment: []const u8, output: []u8,
         const overhead = try aesOverhead(entry);
         const stored_size = try bounds.addUsize(compressed, overhead);
         const zip64 = stored_size >= std.math.maxInt(u32) or entry.data.len >= std.math.maxInt(u32) or local_offset >= std.math.maxInt(u32);
-        const local_extra = localZip64Length(stored_size, entry.data.len);
+        const descriptor = entry.flags & 0x0008 != 0 and !(entry.encrypted and !entry.zipcrypto);
+        const local_extra = localZip64Length(stored_size, entry.data.len, descriptor);
         const central_extra = centralZip64Length(stored_size, entry.data.len, local_offset);
         const extra_length = try bounds.addUsize(try bounds.addUsize(entry.extra.len, if (entry.encrypted and !entry.zipcrypto) winzip_aes_extra_record_length else 0), central_extra);
         try putU32(&sink, central_signature);
@@ -150,7 +155,7 @@ pub fn encode(entries: []const Entry, archive_comment: []const u8, output: []u8,
         try sink.write(entry.extra);
         if (entry.encrypted and !entry.zipcrypto) try writeAesExtra(&sink, entry);
         try sink.write(entry.comment);
-        local_offset = try bounds.addUsize(local_offset, 30 + entry.name.len + entry.extra.len + (if (entry.encrypted and !entry.zipcrypto) winzip_aes_extra_record_length else 0) + local_extra + stored_size);
+        local_offset = try bounds.addUsize(local_offset, 30 + entry.name.len + entry.extra.len + (if (entry.encrypted and !entry.zipcrypto) winzip_aes_extra_record_length else 0) + local_extra + stored_size + dataDescriptorLength(stored_size, entry.data.len, descriptor));
     }
     const central_size = sink.offset - central_offset;
     const needs_zip64 = entries.len >= std.math.maxInt(u16) or central_size >= std.math.maxInt(u32) or central_offset >= std.math.maxInt(u32);
@@ -185,7 +190,9 @@ pub fn encode(entries: []const Entry, archive_comment: []const u8, output: []u8,
 
 fn validateEntry(entry: Entry) Failure!void {
     if (entry.name.len == 0 or entry.name.len > std.math.maxInt(u16) or entry.extra.len > std.math.maxInt(u16) or entry.comment.len > std.math.maxInt(u16)) return error.InvalidCall;
-    if (entry.flags & ~@as(u16, 0x0800) != 0 or (entry.flags & 0x0800 != 0 and !std.unicode.utf8ValidateSlice(entry.name))) return error.Unsupported;
+    // The writable flag set is UTF-8 names (0x0800) and the data-descriptor
+    // marker (0x0008); the descriptor is emitted after the entry data.
+    if (entry.flags & ~@as(u16, 0x0800 | 0x0008) != 0 or (entry.flags & 0x0800 != 0 and !std.unicode.utf8ValidateSlice(entry.name))) return error.Unsupported;
     try validatePath(entry.name, entry.flags);
     switch (entry.method) {
         0, 8, 9, 12, 14, 93, 95, 98 => {},
@@ -209,6 +216,30 @@ fn effectiveFlags(entry: Entry) u16 {
     if (entry.method == 14) flags |= 0x0002;
     if (entry.encrypted) flags |= 0x0001;
     return flags;
+}
+
+const data_descriptor_signature: u32 = 0x08074b50;
+
+// The trailing descriptor per flagged entry: signature, CRC, and the two
+// sizes in the same width the headers use.
+fn dataDescriptorLength(stored_size: usize, data_len: usize, descriptor: bool) usize {
+    if (!descriptor) return 0;
+    const zip64 = stored_size >= std.math.maxInt(u32) or data_len >= std.math.maxInt(u32);
+    return if (zip64) 4 + 4 + 8 + 8 else 4 + 4 + 4 + 4;
+}
+
+fn writeDataDescriptor(sink: *io.Sink, entry: Entry, stored_size: usize, crc: u32, provider: crypto.Provider) Failure!void {
+    _ = provider;
+    const zip64 = stored_size >= std.math.maxInt(u32) or entry.data.len >= std.math.maxInt(u32);
+    try putU32(sink, data_descriptor_signature);
+    try putU32(sink, crc);
+    if (zip64) {
+        try putU64(sink, stored_size);
+        try putU64(sink, entry.data.len);
+    } else {
+        try putU32(sink, std.math.cast(u32, stored_size) orelse return error.ResourceLimit);
+        try putU32(sink, std.math.cast(u32, entry.data.len) orelse return error.ResourceLimit);
+    }
 }
 
 fn zipVersionNeeded(method: u16) u16 {
@@ -270,7 +301,11 @@ fn zipValidateExtra(extra: []const u8) Failure!void {
     }
 }
 
-fn localZip64Length(compressed: usize, uncompressed: usize) usize {
+fn localZip64Length(compressed: usize, uncompressed: usize, descriptor: bool) usize {
+    // With bit 3 set the local header carries no sizes at all, so the zip64
+    // extra stays out of the local record; the central directory is
+    // authoritative for every reader.
+    if (descriptor) return 0;
     return if (compressed >= std.math.maxInt(u32) or uncompressed >= std.math.maxInt(u32)) 20 else 0;
 }
 
@@ -294,8 +329,8 @@ fn putU64(sink: *io.Sink, value: u64) Failure!void {
     try sink.writeInt(u64, value, .little);
 }
 
-fn writeLocalZip64(sink: *io.Sink, compressed: usize, uncompressed: usize) Failure!void {
-    if (localZip64Length(compressed, uncompressed) == 0) return;
+fn writeLocalZip64(sink: *io.Sink, compressed: usize, uncompressed: usize, descriptor: bool) Failure!void {
+    if (localZip64Length(compressed, uncompressed, descriptor) == 0) return;
     try putU16(sink, zip64_extra_id);
     try putU16(sink, 16);
     try putU64(sink, uncompressed);

@@ -1107,12 +1107,20 @@ const BitWriter = struct {
     }
 };
 
+const huff_root_bits = 10;
+const huff_root_size = 1 << huff_root_bits;
+// Entry: (len << 10) | symbol, 0 = no code with this root prefix (walk the
+// legacy limit/base path, which stays exact for codes over root bits).
+const huff_len_shift = 10;
+const huff_sym_mask = (1 << huff_len_shift) - 1;
+
 const HuffTable = struct {
     min_len: u8,
     max_len: u8,
     limit: [max_code_len + 1]u32,
     base: [max_code_len + 2]u32,
     perm: [max_alpha_size]u16,
+    root: [huff_root_size]u16,
 };
 
 fn buildHuffTable(lens: []const u8, alpha_size: u32) Failure!HuffTable {
@@ -1175,10 +1183,60 @@ fn buildHuffTable(lens: []const u8, alpha_size: u32) Failure!HuffTable {
     while (len <= table.max_len) : (len += 1) {
         table.base[len] = ((table.limit[len - 1] + 1) << 1) - table.base[len];
     }
+    // Root table over the next root_bits stream bits: canonical codes in
+    // symbol order within each length, exactly the perm assignment above.
+    @memset(&table.root, 0);
+    {
+        var codes: [max_alpha_size]u32 = undefined;
+        var next_code: u32 = 0;
+        len = table.min_len;
+        while (len <= table.max_len) : (len += 1) {
+            sym = 0;
+            while (sym < alpha_size) : (sym += 1) {
+                if (lens[sym] == len) {
+                    codes[sym] = next_code;
+                    next_code += 1;
+                }
+            }
+            next_code <<= 1;
+        }
+        sym = 0;
+        while (sym < alpha_size) : (sym += 1) {
+            const code = codes[sym];
+            // Over-subscribed length sets (corrupt streams) overflow the
+            // canonical walk; the legacy limit/base path rejects them at
+            // decode time, so the root only fills provably-valid prefixes.
+            if (code >= (@as(u32, 1) << @intCast(lens[sym]))) continue;
+            const entry: u16 = (@as(u16, @intCast(lens[sym])) << huff_len_shift) | @as(u16, @intCast(sym));
+            if (lens[sym] <= huff_root_bits) {
+                const spread: u5 = @intCast(huff_root_bits - lens[sym]);
+                const start: usize = @as(usize, code) << spread;
+                const end: usize = @as(usize, @min((@as(u64, code) + 1) << spread, huff_root_size));
+                var slot = start;
+                while (slot < end) : (slot += 1) {
+                    table.root[slot] = entry;
+                }
+            }
+            // Codes over root bits leave their root slot at 0, routing the
+            // decode through the legacy walk; nothing to fill.
+        }
+    }
     return table;
 }
 
 fn decodeHuffman(br: *BitReader, table: *const HuffTable) Failure!u32 {
+    // Root lookup first: one table load resolves every code up to root bits,
+    // which is the overwhelmingly common shape. Longer codes and the exact
+    // legacy error behavior fall through to the limit/base walk below.
+    while (br.bit_count < huff_root_bits and br.byte_pos < br.bytes.len) try br.refill();
+    if (br.bit_count >= huff_root_bits) {
+        const peek: u32 = @intCast((br.bits >> @intCast(br.bit_count - huff_root_bits)) & (huff_root_size - 1));
+        const entry = table.root[peek];
+        if (entry != 0) {
+            br.bit_count -= @as(u8, @intCast(entry >> huff_len_shift));
+            return entry & huff_sym_mask;
+        }
+    }
     while (br.bit_count < 15 and br.byte_pos < br.bytes.len) try br.refill();
     if (br.bit_count >= 15) {
         const z15: u32 = @intCast((br.bits >> @intCast(br.bit_count - 15)) & 0x7FFF);

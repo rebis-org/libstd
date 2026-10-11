@@ -243,6 +243,10 @@ fn parseDeflateOptions(request: ?*Node, command_mask: u32) Failure!deflate.Optio
     if (node_graph.findSelector(request, comptime discovery.parameter("deflate", "optimal").family, comptime discovery.parameter("deflate", "optimal").ordinal)) |node| {
         options.optimal = node.value_low != 0;
     }
+    if (node_graph.findSelector(request, comptime discovery.parameter("deflate", "strategy").family, comptime discovery.parameter("deflate", "strategy").ordinal)) |node| {
+        if (node.value_low > @backingInt(deflate.Strategy.rle)) return error.InvalidCall;
+        options.strategy = @fromBackingInt(@intCast(node.value_low));
+    }
     return options;
 }
 
@@ -992,6 +996,11 @@ pub fn xzHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource,
         }
     }
     const params = try parseLzmaMatchParams(call.request, command_mask);
+    const block_size = std.math.cast(u32, node_graph.parseU64(node_graph.findSelector(
+        call.request,
+        comptime discovery.parameter("xz", "block_size").family,
+        comptime discovery.parameter("xz", "block_size").ordinal,
+    ))) orelse return error.InvalidCall;
     if (command_mask == vocabulary.command_mask_read) {
         var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
         const scratch = try workspace.take(u8, xz.decodeWorkspaceSize(dictionary_size));
@@ -1010,10 +1019,12 @@ pub fn xzHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource,
         response.byte_length = output_size;
     } else if (command_mask == vocabulary.command_mask_write) {
         var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
-        const encode_workspace = if (params.match_finder == .bt4) xz.encodeWorkspaceSizeBt(dictionary_size) else xz.encodeWorkspaceSize(dictionary_size);
-        const scratch = try workspace.take(u8, encode_workspace);
         const input = try common.materializeSource(.require_size, source_resource, &workspace, limits.decoded_bytes);
         if (input.len > limits.decoded_bytes) return error.ResourceLimit;
+        const encode_workspace = if (params.match_finder == .bt4) xz.encodeWorkspaceSizeBt(dictionary_size) else xz.encodeWorkspaceSize(dictionary_size);
+        // Beyond the encoder workspace: index records per block, plus the
+        // 1:1 filter staging when a filter chain is active.
+        const scratch = try workspace.take(u8, encode_workspace + xz.blockRecordScratchSize(input.len, block_size) + (if (filters != .none) input.len else 0));
         const options = xz.Options{
             .dictionary_size = dictionary_size,
             .check = check,
@@ -1023,9 +1034,10 @@ pub fn xzHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource,
             .lazy = params.lazy,
             .nice_len = params.nice_len,
             .match_finder = params.match_finder,
+            .block_size = block_size,
             .provider = plan.provider,
         };
-        const output_size = if (sizing == .bounded) xz.encodedSizeBound(input.len) else try xz.requiredSize(input, scratch, options);
+        const output_size = if (sizing == .bounded) xz.encodedSizeBound(input.len, options.block_size) else try xz.requiredSize(input, scratch, options);
         if (output_size > limits.encoded_bytes) return error.ResourceLimit;
         if (input.len + output_size > limits.codec_work) return error.ResourceLimit;
         if (sink) |sink_resource| {

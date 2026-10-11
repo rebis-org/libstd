@@ -18,6 +18,8 @@ const magic: u32 = 0x184D2204;
 const version_bits: u8 = 0x40; // LZ4 frame spec fixes the version field at 01.
 const flag_block_independence: u8 = 0x20;
 const flag_block_checksum: u8 = 0x10;
+// Linked blocks reach at most a 16-bit offset back across block boundaries.
+const window_size: usize = 64 * 1024;
 const flag_content_size: u8 = 0x08;
 const flag_content_checksum: u8 = 0x04;
 const flag_dict_id: u8 = 0x01;
@@ -72,7 +74,9 @@ pub fn encodeWorkspaceSize() usize {
 }
 
 pub fn decodeWorkspaceSize() usize {
-    return block_size_max;
+    // One block buffer plus the rolling 64 KiB history that dependent
+    // (linked) frames may reach into across block boundaries.
+    return block_size_max + window_size;
 }
 
 // Worst case: every block stores raw plus its size word. Compressed blocks stay
@@ -127,14 +131,14 @@ pub fn decodeInPlace(input: []const u8, output: []u8, scratch: []u8, options: Op
 // Blocks decode straight into the caller's span, so a read of a frame with a
 // direct sink needs no counting pass and no per-block staging. A span overrun
 // answers insufficient_capacity: the adapter re-runs the measured route, which
-// separates a too-small sink from a corrupt stream.
+// separates a too-small sink from a corrupt stream. Dependent (linked) blocks
+// read their history from the decoded span itself.
 fn decodeBlocksInto(input: []const u8, output: []u8, options: Options) Failure!usize {
     if (input.len < 7) return error.InvalidData;
     if (std.mem.readInt(u32, input[0..4], .little) != magic) return error.InvalidData;
     const flags = input[4];
     if ((flags & 0xC0) != version_bits) return error.Unsupported;
-    if (flags & flag_block_independence == 0) return error.Unsupported;
-    if (flags & flag_dict_id != 0) return error.Unsupported;
+    const linked = flags & flag_block_independence == 0;
     const block_size_byte = input[5];
     const block_code = (block_size_byte >> 4) & 0x07;
     if (block_code < 4 or block_code > 7) return error.InvalidData;
@@ -146,6 +150,9 @@ fn decodeBlocksInto(input: []const u8, output: []u8, options: Options) Failure!u
         content_size = std.mem.readInt(u64, input[offset..][0..8], .little);
         offset += 8;
     }
+    // A dictionary ID declares an external dictionary the frame may
+    // reference; without it, matches reaching before the frame start still
+    // fail as invalid data below.
     if (flags & flag_dict_id != 0) offset += 4;
     if (input.len <= offset) return error.InvalidData;
     // Header_Checksum: the high byte of xxh32 over FLG..end-of-header.
@@ -171,6 +178,8 @@ fn decodeBlocksInto(input: []const u8, output: []u8, options: Options) Failure!u
             offset += 4;
         }
         const room = output.len - total;
+        const prefix_len = if (linked) @min(total, window_size) else 0;
+        const prefix = output[total - prefix_len .. total];
         if (is_stored) {
             if (block_len > max_block) return error.InvalidData;
             if (block_len > room) return error.InsufficientCapacity;
@@ -178,7 +187,7 @@ fn decodeBlocksInto(input: []const u8, output: []u8, options: Options) Failure!u
             content_hasher.update(block_data);
             total += block_len;
         } else {
-            const produced = decompressBlock(block_data, output[total..]) catch |err| return switch (err) {
+            const produced = decompressBlock(block_data, output[total..], prefix) catch |err| return switch (err) {
                 error.InvalidData => error.InvalidData,
                 error.OutputTooSmall => error.InsufficientCapacity,
             };
@@ -256,13 +265,12 @@ pub fn decodeToWriter(input: []const u8, output: *std.Io.Writer, scratch: []u8, 
 }
 
 fn decodeBlocks(input: []const u8, output: *std.Io.Writer, scratch: []u8, provider: checksum.Provider) Failure!usize {
-    if (scratch.len < block_size_max) return error.InsufficientCapacity;
+    if (scratch.len < decodeWorkspaceSize()) return error.InsufficientCapacity;
     if (input.len < 7) return error.InvalidData;
     if (std.mem.readInt(u32, input[0..4], .little) != magic) return error.InvalidData;
     const flags = input[4];
     if ((flags & 0xC0) != version_bits) return error.Unsupported;
-    if (flags & flag_block_independence == 0) return error.Unsupported;
-    if (flags & flag_dict_id != 0) return error.Unsupported;
+    const linked = flags & flag_block_independence == 0;
     const block_size_byte = input[5];
     const block_code = (block_size_byte >> 4) & 0x07;
     if (block_code < 4 or block_code > 7) return error.InvalidData;
@@ -274,6 +282,9 @@ fn decodeBlocks(input: []const u8, output: *std.Io.Writer, scratch: []u8, provid
         content_size = std.mem.readInt(u64, input[offset..][0..8], .little);
         offset += 8;
     }
+    // A dictionary ID declares an external dictionary the frame may
+    // reference; without it, matches reaching before the frame start still
+    // fail as invalid data in the block decode.
     if (flags & flag_dict_id != 0) offset += 4;
     if (input.len <= offset) return error.InvalidData;
     // Header_Checksum: the high byte of xxh32 over FLG..end-of-header.
@@ -281,6 +292,9 @@ fn decodeBlocks(input: []const u8, output: *std.Io.Writer, scratch: []u8, provid
     if (stored_header_sum != @as(u8, @truncate(checksum.xxh32With(provider, input[4..offset]) >> 8))) return error.IntegrityFailure;
     offset += 1;
     var content_hasher = checksum.XxHash32.bind(provider, 0);
+    const block_buffer = scratch[0..max_block];
+    const history = scratch[max_block..][0..window_size];
+    var history_len: usize = 0;
     var total: usize = 0;
     while (true) {
         if (input.len < offset + 4) return error.InvalidData;
@@ -298,16 +312,30 @@ fn decodeBlocks(input: []const u8, output: *std.Io.Writer, scratch: []u8, provid
             if (stored_sum != checksum.xxh32With(provider, block_data)) return error.IntegrityFailure;
             offset += 4;
         }
-        if (is_stored) {
-            if (block_len > max_block) return error.InvalidData;
-            output.writeAll(block_data) catch return error.IoFailure;
-            content_hasher.update(block_data);
-            total = try bounds.addUsize(total, block_len);
-        } else {
-            const produced = decompressBlock(block_data, scratch[0..max_block]) catch return error.InvalidData;
-            output.writeAll(scratch[0..produced]) catch return error.IoFailure;
-            content_hasher.update(scratch[0..produced]);
-            total = try bounds.addUsize(total, produced);
+        const produced: usize = blk: {
+            if (is_stored) {
+                if (block_len > max_block) return error.InvalidData;
+                output.writeAll(block_data) catch return error.IoFailure;
+                content_hasher.update(block_data);
+                break :blk block_len;
+            }
+            const decoded = decompressBlock(block_data, block_buffer, history[0..history_len]) catch return error.InvalidData;
+            output.writeAll(block_buffer[0..decoded]) catch return error.IoFailure;
+            content_hasher.update(block_buffer[0..decoded]);
+            break :blk decoded;
+        };
+        total = try bounds.addUsize(total, produced);
+        if (linked) {
+            const produced_bytes = if (is_stored) block_data else block_buffer[0..produced];
+            if (produced_bytes.len >= window_size) {
+                @memcpy(history, produced_bytes[produced_bytes.len - window_size ..][0..window_size]);
+                history_len = window_size;
+            } else {
+                const keep = @min(history_len, window_size - produced_bytes.len);
+                std.mem.copyForwards(u8, history[0..keep], history[history_len - keep ..][0..keep]);
+                @memcpy(history[keep..][0..produced_bytes.len], produced_bytes);
+                history_len = keep + produced_bytes.len;
+            }
         }
     }
     if (flags & flag_content_checksum != 0) {
@@ -329,7 +357,9 @@ fn hash4(value: u32) usize {
 
 // Mirrors LZ4_compress_generic_validated: the carried hash keeps fresh searches from self-matching.
 // A self-match would emit the corrupt offset 0 the reference never produces.
-fn compressBlock(input: []const u8, output: []u8, hash_table: []u32, acceleration: u32) usize {
+// Exposed for the session boundary's stepped encode: compresses one
+// independent block; the caller owns the frame framing.
+pub fn compressBlock(input: []const u8, output: []u8, hash_table: []u32, acceleration: u32) usize {
     @memset(hash_table, 0);
     var op: usize = 0;
     const input_len = input.len;
@@ -399,7 +429,10 @@ fn compressBlock(input: []const u8, output: []u8, hash_table: []u32, acceleratio
         while (true) {
             std.mem.writeInt(u16, output[op..][0..2], @intCast(ip - match), .little);
             op += 2;
-            const match_len = kernels.matchLen8(input, match + min_match, ip + min_match, match_limit - ip);
+            // The match must end by match_limit so the last 5 bytes stay
+            // literals; the compared span starts past the 4-byte prefix, so
+            // the cap is match_limit - ip - min_match.
+            const match_len = kernels.matchLen8(input, match + min_match, ip + min_match, match_limit - ip - min_match);
             ip += match_len + min_match;
             if (match_len >= match_len_mask) {
                 output[token_pos] += match_len_mask;
@@ -556,7 +589,12 @@ fn emitLastLiterals(literals: []const u8, output: []u8, op_start: usize) usize {
     return op + lit_len;
 }
 
-fn decompressBlock(input: []const u8, output: []u8) error{ InvalidData, OutputTooSmall }!usize {
+// Decompresses one block. `prefix` is up to 64 KiB of already-decoded
+// history (empty for independent blocks or the first block of a dependent
+// frame); matches may reach into it when the frame links blocks.
+// Exposed for the session boundary's stepped decode: decodes one block with
+// `prefix` as up-to-64 KiB of linked-block history.
+pub fn decompressBlock(input: []const u8, output: []u8, prefix: []const u8) error{ InvalidData, OutputTooSmall }!usize {
     var ip: usize = 0;
     var op: usize = 0;
     while (true) {
@@ -589,7 +627,6 @@ fn decompressBlock(input: []const u8, output: []u8) error{ InvalidData, OutputTo
         if (input.len - ip < 2) return error.InvalidData;
         const offset = std.mem.readInt(u16, input[ip..][0..2], .little);
         ip += 2;
-        if (offset == 0 or offset > op) return error.InvalidData;
         var match_len: usize = (token & 0x0f) + min_match;
         if ((token & 0x0f) == match_len_mask) {
             while (true) {
@@ -602,7 +639,36 @@ fn decompressBlock(input: []const u8, output: []u8) error{ InvalidData, OutputTo
             }
         }
         if (output.len - op < match_len) return error.OutputTooSmall;
-        kernels.copyMatch(output, op, offset, std.math.cast(u32, match_len) orelse return error.InvalidData);
+        if (offset == 0) return error.InvalidData;
+        if (offset <= op) {
+            kernels.copyMatch(output, op, offset, std.math.cast(u32, match_len) orelse return error.InvalidData);
+        } else {
+            // The match reaches before this block into the linked history.
+            const reach = offset - op;
+            if (reach > prefix.len) return error.InvalidData;
+            var src_pos: usize = prefix.len - reach;
+            var remaining = match_len;
+            var dst = op;
+            while (remaining > 0) {
+                if (src_pos < prefix.len) {
+                    const n = @min(remaining, prefix.len - src_pos);
+                    @memcpy(output[dst..][0..n], prefix[src_pos..][0..n]);
+                    dst += n;
+                    src_pos += n;
+                    remaining -= n;
+                } else {
+                    // The source crossed into this block; the offset against
+                    // freshly written bytes stays constant, and chunking at
+                    // the current distance keeps overlapping copies correct.
+                    const rel = src_pos - prefix.len;
+                    const n = @min(remaining, dst - rel);
+                    @memcpy(output[dst..][0..n], output[rel..][0..n]);
+                    dst += n;
+                    src_pos += n;
+                    remaining -= n;
+                }
+            }
+        }
         op += match_len;
     }
     return op;
@@ -765,4 +831,92 @@ test "lz4 frame verifies content size and header checksum" {
     defer allocator.free(bad_sum);
     bad_sum[14] ^= 0xFF;
     try std.testing.expectError(error.IntegrityFailure, decode(bad_sum, output, decode_scratch, .{}));
+}
+
+test "lz4 dependent blocks reach into the previous block" {
+    const allocator = std.testing.allocator;
+    // Frame: 64 KiB block size, linked blocks, content size present.
+    // Block 0 is stored (64 bytes of 0x11). Block 1 is compressed: four
+    // literals then an 8-byte match whose 68-byte offset reaches back into
+    // block 0's history.
+    var frame: [256]u8 = undefined;
+    var len: usize = 0;
+    std.mem.writeInt(u32, frame[len..][0..4], magic, .little);
+    len += 4;
+    const flags: u8 = version_bits | flag_content_size;
+    frame[len] = flags;
+    len += 1;
+    frame[len] = 4 << 4; // BD: 64 KiB max block
+    len += 1;
+    std.mem.writeInt(u64, frame[len..][0..8], 77, .little);
+    len += 8;
+    frame[len] = @truncate(checksum.xxh32With(checksum.default_provider, frame[4..len]) >> 8);
+    len += 1;
+    std.mem.writeInt(u32, frame[len..][0..4], uncompressed_block | 64, .little);
+    len += 4;
+    @memset(frame[len..][0..64], 0x11);
+    len += 64;
+    // Sequence 1: four literals then an 8-byte match reaching 68 back into
+    // block 0. Sequence 2 (final): one literal, as the block format requires.
+    const block1 = [_]u8{ 0x44, 'a', 'b', 'c', 'd', 68, 0, 0x10, 'z' };
+    std.mem.writeInt(u32, frame[len..][0..4], block1.len, .little);
+    len += 4;
+    @memcpy(frame[len..][0..block1.len], &block1);
+    len += block1.len;
+    std.mem.writeInt(u32, frame[len..][0..4], 0, .little);
+    len += 4;
+
+    const decode_scratch = try allocator.alloc(u8, decodeWorkspaceSize());
+    defer allocator.free(decode_scratch);
+    var output: [77]u8 = undefined;
+    const decoded = try decode(frame[0..len], &output, decode_scratch, .{});
+    try std.testing.expectEqual(@as(usize, 77), decoded);
+    try std.testing.expectEqualSlices(u8, "abcd", output[64..68]);
+    for (output[68..76]) |byte| try std.testing.expectEqual(@as(u8, 0x11), byte);
+    try std.testing.expectEqual(@as(u8, 'z'), output[76]);
+    const expected_block0: [64]u8 = @splat(0x11);
+    try std.testing.expectEqualSlices(u8, &expected_block0, output[0..64]);
+
+    // A match reaching before the frame start (no history there) is invalid.
+    var bad = frame;
+    const block1_at = 4 + 1 + 1 + 8 + 1 + 4 + 64 + 4;
+    bad[block1_at + 5] = 200; // offset 200 > 4 + 64 of available history
+    try std.testing.expectError(error.InvalidData, decode(bad[0..len], &output, decode_scratch, .{}));
+}
+
+test "lz4 dictionary id flag parses and skips" {
+    const allocator = std.testing.allocator;
+    var frame: [128]u8 = undefined;
+    var len: usize = 0;
+    std.mem.writeInt(u32, frame[len..][0..4], magic, .little);
+    len += 4;
+    const flags: u8 = version_bits | flag_content_size | flag_dict_id;
+    frame[len] = flags;
+    len += 1;
+    frame[len] = 7 << 4; // BD: 4 MiB max block
+    len += 1;
+    std.mem.writeInt(u64, frame[len..][0..8], 5, .little);
+    len += 8;
+    std.mem.writeInt(u32, frame[len..][0..4], 0xDEADBEEF, .little); // dictionary ID
+    len += 4;
+    frame[len] = @truncate(checksum.xxh32With(checksum.default_provider, frame[4..len]) >> 8);
+    len += 1;
+    std.mem.writeInt(u32, frame[len..][0..4], uncompressed_block | 5, .little);
+    len += 4;
+    @memcpy(frame[len..][0..5], "hello");
+    len += 5;
+    std.mem.writeInt(u32, frame[len..][0..4], 0, .little);
+    len += 4;
+
+    const decode_scratch = try allocator.alloc(u8, decodeWorkspaceSize());
+    defer allocator.free(decode_scratch);
+    var output: [5]u8 = undefined;
+    const decoded = try decode(frame[0..len], &output, decode_scratch, .{});
+    try std.testing.expectEqual(@as(usize, 5), decoded);
+    try std.testing.expectEqualSlices(u8, "hello", &output);
+
+    // The dictionary ID participates in the header checksum.
+    var bad = frame;
+    bad[4 + 1 + 1 + 8] ^= 0x01;
+    try std.testing.expectError(error.IntegrityFailure, decode(bad[0..len], &output, decode_scratch, .{}));
 }

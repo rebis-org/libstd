@@ -48,12 +48,30 @@ pub const Options = struct {
     lazy: bool = false,
     nice_len: u32 = 273,
     match_finder: lzma.MatchFinder = .bt4,
+    // 0 writes the input as a single block; otherwise the input splits into
+    // independent blocks of at most this many bytes, each with its own
+    // header, check, and index record (xz --block-size).
+    block_size: u32 = 0,
     provider: checksum.Provider = checksum.default_provider,
 };
 
+// Record scratch the multi-block index needs: one 16-byte (unpadded,
+// uncompressed) pair per block. Callers add this to the encode workspace
+// when Options.block_size is nonzero.
+pub fn blockRecordScratchSize(input_len: usize, block_size: u32) usize {
+    if (block_size == 0) return 0;
+    const blocks = (input_len + block_size - 1) / block_size;
+    return @max(1, blocks) * 16;
+}
+
 // One stream and one block fit the constant, and 1:1 filters add no bytes.
-pub fn encodedSizeBound(input_len: usize) usize {
-    return lzma2.encodedSizeBound(input_len) +| 128;
+// Every additional block adds a bounded header, padding, check, and index
+// record; 192 bytes covers the worst case with margin.
+pub fn encodedSizeBound(input_len: usize, block_size: u32) usize {
+    const base = lzma2.encodedSizeBound(input_len) +| 128;
+    if (block_size == 0) return base;
+    const blocks = (input_len + block_size - 1) / block_size;
+    return base +| @max(1, blocks) *| 192;
 }
 
 pub fn decodeWorkspaceSize(dictionary_size: u32) usize {
@@ -531,12 +549,17 @@ fn encodeInternal(input: []const u8, writer: *std.Io.Writer, scratch: []u8, opti
 }
 
 fn encodeStream(writer: *std.Io.Writer, input: []const u8, scratch: []u8, options: Options) Failure!void {
+    if (options.block_size != 0 and options.block_size < 4096) return error.InvalidCall;
     const dictionary_props = lzma2.propertiesFromDictionarySize(options.dictionary_size);
     const dictionary_size = lzma2.dictionarySizeFromProperties(dictionary_props);
     const lzma_scratch_size = if (options.match_finder == .bt4) lzma2.encodeWorkspaceSizeBt(dictionary_size) else lzma2.encodeWorkspaceSize(dictionary_size);
-    if (scratch.len < lzma_scratch_size) return error.InsufficientCapacity;
+    // The index needs one (unpadded, uncompressed) pair per block even for
+    // the single-block default, so the record carve is never empty.
+    const record_size = @max(16, blockRecordScratchSize(input.len, options.block_size));
+    if (scratch.len < lzma_scratch_size + record_size) return error.InsufficientCapacity;
     const lzma_scratch = scratch[0..lzma_scratch_size];
     const remaining_scratch = scratch[lzma_scratch_size..];
+    const records = remaining_scratch[0..record_size];
     const lzma_options = lzma2.Options{
         .dictionary_size = dictionary_size,
         .properties = lzma2.defaultProperties(dictionary_size),
@@ -547,37 +570,47 @@ fn encodeStream(writer: *std.Io.Writer, input: []const u8, scratch: []u8, option
         .match_finder = options.match_finder,
     };
     const filtered = if (options.filters != .none) blk: {
-        if (remaining_scratch.len < input.len) return error.InsufficientCapacity;
-        const buffer = remaining_scratch[0..input.len];
+        if (remaining_scratch.len < record_size + input.len) return error.InsufficientCapacity;
+        const buffer = remaining_scratch[record_size..][0..input.len];
         @memcpy(buffer, input);
         try applyEncodeFilter(options.filters, options.delta_distance, buffer);
         break :blk buffer;
     } else input;
     try writeStreamHeader(writer, options.check, options.provider);
-    const block_header = try buildBlockHeader(input.len, dictionary_props, options.filters, options.delta_distance, options.provider);
-    try io.writeBytes(writer, block_header.slice());
-    var count_tee = tee.Tee.initWithProvider(writer, options.provider);
-    try lzma2.encodeToWriter(filtered, &count_tee.writer, lzma_scratch, lzma_options);
-    const compressed_size = std.math.cast(usize, count_tee.size) orelse return error.ResourceLimit;
-    const block_padding = blockPadding(compressed_size);
-    if (block_padding > 0) {
-        const zeroes: [3]u8 = @splat(0);
-        try io.writeBytes(writer, zeroes[0..block_padding]);
-    }
-    var tee_writer = tee.Tee.initWithProvider(null, options.provider);
-    _ = tee_writer.writer.write(input) catch return error.IoFailure;
-    if (options.check == .sha256) {
-        var sha = crypto.Sha256.bind(options.provider, .{});
-        sha.update(input);
-        var digest: [32]u8 = undefined;
-        digest = sha.finalResult();
-        try io.writeBytes(writer, &digest);
-    } else {
-        try writeCheck(writer, options.check, tee_writer.crc32Value(), tee_writer.crc64Value());
-    }
     const check_size = checkSize(options.check);
-    const unpadded_size = try bounds.addUsize(block_header.slice().len, try bounds.addUsize(compressed_size, check_size));
-    const index_size = try writeIndex(writer, unpadded_size, input.len, options.provider);
+    const chunk_count: usize = if (options.block_size == 0) 1 else @max(1, (input.len + options.block_size - 1) / options.block_size);
+    var chunk_start: usize = 0;
+    for (0..chunk_count) |chunk_index| {
+        const chunk_end = if (options.block_size == 0) input.len else @min(input.len, chunk_start + options.block_size);
+        const chunk = if (options.filters != .none) filtered[chunk_start..chunk_end] else input[chunk_start..chunk_end];
+        const plain_chunk = input[chunk_start..chunk_end];
+        const block_header = try buildBlockHeader(plain_chunk.len, dictionary_props, options.filters, options.delta_distance, options.provider);
+        try io.writeBytes(writer, block_header.slice());
+        var count_tee = tee.Tee.initWithProvider(writer, options.provider);
+        try lzma2.encodeToWriter(chunk, &count_tee.writer, lzma_scratch, lzma_options);
+        const compressed_size = std.math.cast(usize, count_tee.size) orelse return error.ResourceLimit;
+        const block_padding = blockPadding(compressed_size);
+        if (block_padding > 0) {
+            const zeroes: [3]u8 = @splat(0);
+            try io.writeBytes(writer, zeroes[0..block_padding]);
+        }
+        var tee_writer = tee.Tee.initWithProvider(null, options.provider);
+        _ = tee_writer.writer.write(plain_chunk) catch return error.IoFailure;
+        if (options.check == .sha256) {
+            var sha = crypto.Sha256.bind(options.provider, .{});
+            sha.update(plain_chunk);
+            var digest: [32]u8 = undefined;
+            digest = sha.finalResult();
+            try io.writeBytes(writer, &digest);
+        } else {
+            try writeCheck(writer, options.check, tee_writer.crc32Value(), tee_writer.crc64Value());
+        }
+        const unpadded = try bounds.addUsize(block_header.slice().len, try bounds.addUsize(compressed_size, check_size));
+        std.mem.writeInt(u64, records[chunk_index * 16 ..][0..8], std.math.cast(u64, unpadded) orelse return error.ResourceLimit, .little);
+        std.mem.writeInt(u64, records[chunk_index * 16 ..][8..16], std.math.cast(u64, plain_chunk.len) orelse return error.ResourceLimit, .little);
+        chunk_start = chunk_end;
+    }
+    const index_size = try writeIndex(writer, records[0 .. chunk_count * 16], options.provider);
     try writeStreamFooter(writer, options.check, index_size, options.provider);
 }
 
@@ -681,30 +714,55 @@ fn blockPadding(data_size: usize) usize {
     return if (rem == 0) 0 else 4 - rem;
 }
 
-fn writeIndex(writer: *std.Io.Writer, unpadded_size: usize, uncompressed_size: usize, provider: checksum.Provider) Failure!usize {
-    var content: [48]u8 = undefined;
-    var cursor = binary.WriteCursor.init(&content);
-    cursor.writeU8(0x00) catch return error.InternalFailure;
-    cursor.writeUleb128(1) catch return error.InternalFailure;
-    cursor.writeUleb128(unpadded_size) catch return error.InternalFailure;
-    cursor.writeUleb128(uncompressed_size) catch return error.InternalFailure;
-    const content_size = cursor.written();
-    const padding = blockPadding(content_size);
+fn writeIndex(writer: *std.Io.Writer, records: []const u8, provider: checksum.Provider) Failure!usize {
     var crc = checksum.Crc32.bind(provider);
-    crc.update(content[0..content_size]);
+    var content_size: usize = 0;
+    var indicator = [_]u8{0x00};
+    try io.writeBytes(writer, &indicator);
+    crc.update(&indicator);
+    content_size += 1;
+    var count_buf: [10]u8 = undefined;
+    const count_len = uleb128(records.len / 16, &count_buf);
+    try io.writeBytes(writer, count_buf[0..count_len]);
+    crc.update(count_buf[0..count_len]);
+    content_size += count_len;
+    var number_buf: [10]u8 = undefined;
+    for (0..records.len / 16) |index| {
+        const unpadded = std.mem.readInt(u64, records[index * 16 ..][0..8], .little);
+        const unpacked = std.mem.readInt(u64, records[index * 16 ..][8..16], .little);
+        const unpadded_len = uleb128(unpadded, &number_buf);
+        try io.writeBytes(writer, number_buf[0..unpadded_len]);
+        crc.update(number_buf[0..unpadded_len]);
+        content_size += unpadded_len;
+        const unpacked_len = uleb128(unpacked, &number_buf);
+        try io.writeBytes(writer, number_buf[0..unpacked_len]);
+        crc.update(number_buf[0..unpacked_len]);
+        content_size += unpacked_len;
+    }
+    const padding = blockPadding(content_size);
     if (padding > 0) {
         const zeroes: [3]u8 = @splat(0);
+        try io.writeBytes(writer, zeroes[0..padding]);
         crc.update(zeroes[0..padding]);
     }
     var crc_bytes: [4]u8 = undefined;
     std.mem.writeInt(u32, &crc_bytes, crc.final(), .little);
-    try io.writeBytes(writer, content[0..content_size]);
-    if (padding > 0) {
-        const zeroes: [3]u8 = @splat(0);
-        try io.writeBytes(writer, zeroes[0..padding]);
-    }
     try io.writeBytes(writer, &crc_bytes);
     return content_size + padding + 4;
+}
+
+fn uleb128(value: u64, buffer: *[10]u8) usize {
+    var v = value;
+    var len: usize = 0;
+    while (true) {
+        var byte: u8 = @truncate(v & 0x7F);
+        v >>= 7;
+        if (v != 0) byte |= 0x80;
+        buffer[len] = byte;
+        len += 1;
+        if (v == 0) break;
+    }
+    return len;
 }
 
 fn writeStreamFooter(writer: *std.Io.Writer, check: CheckType, index_size: usize, provider: checksum.Provider) Failure!void {
@@ -741,15 +799,15 @@ test "xz delta filter honors the requested distance" {
     const dictionary_size: u32 = 1 << 20;
     const scratch = try allocator.alloc(u8, encodeWorkspaceSizeBt(dictionary_size));
     defer allocator.free(scratch);
-    const bound = encodedSizeBound(input.len);
-    const encoded = try allocator.alloc(u8, bound);
-    defer allocator.free(encoded);
     const options: Options = .{
         .dictionary_size = dictionary_size,
         .check = .crc32,
         .filters = .delta,
         .delta_distance = 4,
     };
+    const bound = encodedSizeBound(input.len, options.block_size);
+    const encoded = try allocator.alloc(u8, bound);
+    defer allocator.free(encoded);
     const encoded_len = try encode(&input, encoded, scratch, options);
 
     const decode_scratch = try allocator.alloc(u8, decodeWorkspaceSize(dictionary_size));
@@ -790,4 +848,97 @@ fn findBlockHeader(stream: []const u8) ?u8 {
     if (i + 2 >= end) return null;
     if (stream[i] != 0x03 or stream[i + 1] != 1) return null;
     return stream[i + 2];
+}
+
+test "xz multi-block output roundtrips through our decoder and the index" {
+    const allocator = std.testing.allocator;
+    var input: [100 * 1024]u8 = undefined;
+    for (&input, 0..) |*byte, i| byte.* = @truncate(i *% 31 +% (i >> 7));
+    const dictionary_size: u32 = 1 << 20;
+    const options: Options = .{
+        .dictionary_size = dictionary_size,
+        .check = .crc32,
+        .block_size = 32 * 1024,
+    };
+    const scratch = try allocator.alloc(u8, encodeWorkspaceSizeBt(dictionary_size) + blockRecordScratchSize(input.len, options.block_size));
+    defer allocator.free(scratch);
+    const bound = encodedSizeBound(input.len, options.block_size);
+    const encoded = try allocator.alloc(u8, bound);
+    defer allocator.free(encoded);
+    const encoded_len = try encode(&input, encoded, scratch, options);
+
+    const decode_scratch = try allocator.alloc(u8, decodeWorkspaceSize(dictionary_size));
+    defer allocator.free(decode_scratch);
+    const output = try allocator.alloc(u8, input.len);
+    defer allocator.free(output);
+    const decoded = try decode(encoded[0..encoded_len], output, decode_scratch, checksum.default_provider);
+    try std.testing.expectEqualSlices(u8, &input, output[0..decoded]);
+
+    // The index names four blocks (three full, one remainder).
+    const footer = encoded_len - stream_footer_size;
+    const backward_size = @as(usize, std.mem.readInt(u32, encoded[footer + 4 ..][0..4], .little)) + 1;
+    const index_size = backward_size * 4;
+    const index = encoded[footer - index_size .. footer];
+    try std.testing.expectEqual(@as(u8, 0x00), index[0]);
+    try std.testing.expectEqual(@as(u8, 4), index[1]);
+
+    // The block size floor is enforced.
+    var rejected: Options = options;
+    rejected.block_size = 1024;
+    try std.testing.expectError(error.InvalidCall, encode(&input, encoded, scratch, rejected));
+}
+
+pub const BlockRecord = struct {
+    unpadded_size: u64,
+    uncompressed_size: u64,
+};
+
+// Enumerates a stream's blocks without retaining their data: every block is
+// decoded into a discard sink (so streams without header sizes still walk
+// correctly) and its index shape is recorded. `records` bounds the count; a
+// stream with more blocks answers resource_limit. The scratch requirement is
+// the same as decode's.
+pub fn inspectBlocks(input: []const u8, records: []BlockRecord, scratch: []u8, provider: checksum.Provider) Failure!usize {
+    var cursor = binary.ReadCursor.init(input);
+    const check = try decodeStreamHeader(&cursor, provider);
+    var counter = measurement.Counter.init(null);
+    var sink = Sink{ .writer = &counter.writer, .buffer = null };
+    var count: usize = 0;
+    while (true) {
+        if (cursor.remaining() == 0 or cursor.buffer[cursor.pos] == 0x00) break;
+        const record = try decodeBlock(&cursor, &sink, scratch, check, false, provider);
+        if (count >= records.len) return error.ResourceLimit;
+        records[count] = .{ .unpadded_size = record.unpadded_size, .uncompressed_size = record.uncompressed_size };
+        count += 1;
+    }
+    return count;
+}
+
+test "inspectBlocks enumerates a multi-block stream" {
+    const allocator = std.testing.allocator;
+    var input: [100 * 1024]u8 = undefined;
+    for (&input, 0..) |*byte, i| byte.* = @truncate(i *% 31 +% (i >> 7));
+    const dictionary_size: u32 = 1 << 20;
+    const options: Options = .{
+        .dictionary_size = dictionary_size,
+        .check = .crc32,
+        .block_size = 32 * 1024,
+    };
+    const scratch = try allocator.alloc(u8, encodeWorkspaceSizeBt(dictionary_size) + blockRecordScratchSize(input.len, options.block_size));
+    defer allocator.free(scratch);
+    const encoded = try allocator.alloc(u8, encodedSizeBound(input.len, options.block_size));
+    defer allocator.free(encoded);
+    const encoded_len = try encode(&input, encoded, scratch, options);
+    const decode_scratch = try allocator.alloc(u8, decodeWorkspaceSize(dictionary_size));
+    defer allocator.free(decode_scratch);
+
+    var records: [8]BlockRecord = undefined;
+    const count = try inspectBlocks(encoded[0..encoded_len], &records, decode_scratch, checksum.default_provider);
+    try std.testing.expectEqual(@as(usize, 4), count);
+    var total: u64 = 0;
+    for (records[0..count]) |record| {
+        try std.testing.expect(record.unpadded_size > 0 and record.uncompressed_size > 0);
+        total += record.uncompressed_size;
+    }
+    try std.testing.expectEqual(@as(u64, input.len), total);
 }

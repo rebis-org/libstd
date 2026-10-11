@@ -13,12 +13,26 @@ const use_vector_match_copy = !build_options.portable and builtin.target.cpu.arc
 pub const history_size = 2 * window_size;
 pub const measurement_buffer_size = 64;
 
+pub const Strategy = enum(u8) {
+    // Automatic per-block choice: stored, fixed, or dynamic, whichever is smallest.
+    default,
+    // Every block is stored (uncompressed). The match finder does not run.
+    stored,
+    // Dynamic Huffman blocks are never emitted; stored still wins when smaller.
+    fixed,
+    // Literals only: the match finder does not run, so all symbols are literals.
+    huffman_only,
+    // Matches are limited to distance one (run-length encoding).
+    rle,
+};
+
 pub const Options = struct {
     good: u16,
     nice: u16,
     lazy: u16,
     chain: u16,
     optimal: bool = false,
+    strategy: Strategy = .default,
 };
 
 const window_size = 32768;
@@ -320,6 +334,7 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
             if (options.nice < min_match or options.nice > config.max_match) return error.InvalidCall;
             if (options.lazy > options.nice) return error.InvalidCall;
             if (options.chain == 0) return error.InvalidCall;
+            if (options.optimal and options.strategy != .default) return error.InvalidCall;
             var optimal: ?*OptimalScratch = null;
             if (options.optimal) {
                 const base = @intFromPtr(history.ptr) + config.history_size;
@@ -711,8 +726,11 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
 
         fn step(c: *@This()) std.Io.Writer.Error!void {
             const pos = c.cursor;
+            // Stored and Huffman-only strategies never benefit from matches:
+            // the hash inserts and chain walks are skipped entirely.
+            const find_matches = c.options.strategy != .stored and c.options.strategy != .huffman_only;
             var head_candidate: u32 = no_position;
-            if (c.end - pos >= min_match + 1) head_candidate = c.insert(pos);
+            if (find_matches and c.end - pos >= min_match + 1) head_candidate = c.insert(pos);
             var current_length: usize = min_match - 1;
             var current_distance: u32 = 0;
             if (head_candidate != no_position and (c.pending_len < c.options.lazy or c.pending_len < min_match)) {
@@ -771,6 +789,11 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
             while (candidate != no_position and budget > 0) : (budget -= 1) {
                 const distance = position -% candidate;
                 if (distance == 0 or distance > config.window_size) break;
+                // Z_RLE keeps only distance-one matches.
+                if (c.options.strategy == .rle and distance != 1) {
+                    candidate = prev[(pos - distance) & (config.window_size - 1)];
+                    continue;
+                }
                 const cand = pos - distance;
                 if (best_length < available and history[cand + best_length] == history[pos + best_length] and history[cand + best_length - 1] == history[pos + best_length - 1]) {
                     const match_length = matchLength(history, cand, pos, available);
@@ -863,7 +886,9 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
             for (0..dist_alphabet) |symbol| dynamic_bits += dist_freq[symbol] * dist_lengths[symbol];
             for (0..cl_alphabet) |symbol| dynamic_bits += cl_freq[symbol] * cl_lengths[symbol];
             const stored_bits = 3 + (8 - (c.bit_count + 3) % 8) % 8 + 32 + 8 * span;
-            if (stored_bits < fixed_bits and stored_bits < dynamic_bits) {
+            // Strategy overrides: stored emits verbatim blocks; fixed bars
+            // dynamic Huffman codes (stored still wins when smaller).
+            if (c.options.strategy == .stored or (stored_bits < fixed_bits and stored_bits < dynamic_bits)) {
                 try c.writeBits(@intFromBool(final), 1);
                 try c.writeBits(0, 2);
                 const pad: u6 = @intCast((8 - c.bit_count % 8) % 8);
@@ -875,7 +900,7 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
                     c.failed = true;
                     return error.WriteFailed;
                 };
-            } else if (fixed_bits <= dynamic_bits) {
+            } else if (c.options.strategy == .fixed or fixed_bits <= dynamic_bits) {
                 try c.writeBits(@intFromBool(final), 1);
                 try c.writeBits(1, 2);
                 try c.emitTokens(tokens, &fixed_lit_codes, &fixed_lit_lengths, &fixed_dist_codes, &fixed_dist_lengths);
@@ -1617,4 +1642,84 @@ fn buildTreeValue(comptime max_root_bits: u5, comptime max_sub: usize, lengths: 
     var tree: Tree(max_root_bits, max_sub) = undefined;
     try buildTree(lengths, &tree, max_root_bits, allow_single, allow_empty);
     return tree;
+}
+
+test "deflate strategies roundtrip and shape blocks" {
+    const std_testing = std.testing;
+    var input: [4096]u8 = undefined;
+    for (&input, 0..) |*b, i| b.* = if (i % 17 < 13) @as(u8, 'a') + @as(u8, @intCast(i % 7)) else @as(u8, @intCast(i & 0xFF));
+
+    const strategies = [_]Strategy{ .stored, .fixed, .huffman_only, .rle, .default };
+    for (strategies) |strategy| {
+        var history: [history_size]u8 = undefined;
+        var encoded: [encodedSizeBound(input.len) + 16]u8 = undefined;
+        var fixed_writer = std.Io.Writer.fixed(&encoded);
+        var compressor = try Compress.init(&fixed_writer, &history, .{ .good = 8, .nice = 128, .lazy = 16, .chain = 32, .strategy = strategy });
+        var source_reader = std.Io.Reader.fixed(&input);
+        _ = std.Io.Reader.streamRemaining(&source_reader, &compressor.writer) catch return error.CompressStream;
+        try compressor.finish();
+
+        var decode_history: [history_size]u8 = undefined;
+        var source = std.Io.Reader.fixed(encoded[0..fixed_writer.end]);
+        var dest: [input.len]u8 = undefined;
+        var dest_writer = std.Io.Writer.fixed(&dest);
+        var inflater = Decompress.init(&source, &decode_history);
+        _ = inflater.reader.streamRemaining(&dest_writer) catch return error.InflateStream;
+        try std_testing.expectEqualSlices(u8, &input, &dest);
+    }
+
+    // Stored strategy: the first block header carries BTYPE 00.
+    {
+        var history: [history_size]u8 = undefined;
+        var encoded: [64]u8 = undefined;
+        var fixed_writer = std.Io.Writer.fixed(&encoded);
+        var compressor = try Compress.init(&fixed_writer, &history, .{ .good = 8, .nice = 128, .lazy = 16, .chain = 8, .strategy = .stored });
+        var source_reader = std.Io.Reader.fixed("stored strategy payload");
+        _ = std.Io.Reader.streamRemaining(&source_reader, &compressor.writer) catch return error.CompressStream;
+        try compressor.finish();
+        try std_testing.expectEqual(@as(u8, 0), encoded[0] & 0x06);
+    }
+
+    // Fixed strategy on skewed data: dynamic would win by default, so this
+    // proves the override. First block header carries BTYPE 01.
+    {
+        var history: [history_size]u8 = undefined;
+        var encoded: [256]u8 = undefined;
+        var fixed_writer = std.Io.Writer.fixed(&encoded);
+        var compressor = try Compress.init(&fixed_writer, &history, .{ .good = 8, .nice = 128, .lazy = 16, .chain = 8, .strategy = .fixed });
+        var skewed: [200]u8 = @splat('a');
+        var source_reader = std.Io.Reader.fixed(&skewed);
+        _ = std.Io.Reader.streamRemaining(&source_reader, &compressor.writer) catch return error.CompressStream;
+        try compressor.finish();
+        try std_testing.expectEqual(@as(u8, 2), encoded[0] & 0x06);
+    }
+
+    // Huffman-only emits no matches, so repetitive input cannot compress
+    // below its literal-only fixed encoding; default does.
+    {
+        var history: [history_size]u8 = undefined;
+        var encoded_lit: [256]u8 = undefined;
+        var w1 = std.Io.Writer.fixed(&encoded_lit);
+        var c1 = try Compress.init(&w1, &history, .{ .good = 8, .nice = 128, .lazy = 16, .chain = 8, .strategy = .huffman_only });
+        var repetitive: [200]u8 = @splat('x');
+        var r1 = std.Io.Reader.fixed(&repetitive);
+        _ = std.Io.Reader.streamRemaining(&r1, &c1.writer) catch return error.CompressStream;
+        try c1.finish();
+        var history2: [history_size]u8 = undefined;
+        var encoded_def: [256]u8 = undefined;
+        var w2 = std.Io.Writer.fixed(&encoded_def);
+        var c2 = try Compress.init(&w2, &history2, .{ .good = 8, .nice = 128, .lazy = 16, .chain = 8 });
+        var r2 = std.Io.Reader.fixed(&repetitive);
+        _ = std.Io.Reader.streamRemaining(&r2, &c2.writer) catch return error.CompressStream;
+        try c2.finish();
+        try std_testing.expect(w1.end > w2.end);
+    }
+
+    // The optimal parser composes only with the default strategy.
+    {
+        var history: [history_size + optimal_workspace_size]u8 = undefined;
+        var sink_buf: [8]u8 = undefined;
+        var sink = std.Io.Writer.fixed(&sink_buf);
+        try std_testing.expectError(error.InvalidCall, Compress.init(&sink, &history, .{ .good = 8, .nice = 128, .lazy = 16, .chain = 8, .optimal = true, .strategy = .rle }));
+    }
 }

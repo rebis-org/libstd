@@ -232,3 +232,168 @@ fn writeTrailer(writer: *std.Io.Writer, crc32: u32, uncompressed_size: u64) Fail
     writer.writeInt(u32, crc32, .little) catch return error.IoFailure;
     writer.writeInt(u32, @truncate(uncompressed_size), .little) catch return error.IoFailure;
 }
+
+pub const MemberInfo = struct {
+    modification_time: u32,
+    extra_flags: u8,
+    operating_system: u8,
+    text: bool,
+    header_crc: bool,
+    extra: []const u8,
+    name: []const u8,
+    comment: []const u8,
+    // Compressed payload span, including the byte-aligned padding bit.
+    data_offset: usize,
+    data_size: usize,
+    decoded_size: usize,
+    crc32: u32,
+    // The whole member: header, payload, and trailer.
+    total_size: usize,
+};
+
+pub const MemberIterator = struct {
+    input: []const u8,
+    history: []u8,
+    provider: checksum.Provider,
+    offset: usize = 0,
+
+    pub fn next(self: *MemberIterator) Failure!?MemberInfo {
+        if (self.offset >= self.input.len) return null;
+        if (self.input.len - self.offset < 18) return error.InvalidData;
+        const member = try inspectMember(self.input[self.offset..], self.history, self.provider);
+        self.offset = try bounds.addUsize(self.offset, member.total_size);
+        return member;
+    }
+};
+
+// Enumerates the members of a (possibly concatenated) gzip stream. Each next
+// call parses one member strictly: the deflate payload is decoded and the
+// trailer CRC and ISIZE are verified, so a corrupt member fails at its
+// ordinal rather than silently ending the walk.
+pub fn inspectMembers(input: []const u8, history: []u8, provider: checksum.Provider) MemberIterator {
+    return .{ .input = input, .history = history, .provider = provider };
+}
+
+fn inspectMember(input: []const u8, history: []u8, provider: checksum.Provider) Failure!MemberInfo {
+    if (history.len < deflate_history_size) return error.InsufficientCapacity;
+    var cursor: usize = 0;
+    if (input[0] != magic_1 or input[1] != magic_2) return error.InvalidData;
+    if (input[2] != cm_deflate) return error.Unsupported;
+    const flags = input[3];
+    if (flags & reserved_flags != 0) return error.InvalidData;
+    var hasher = checksum.Crc32.bind(provider);
+    hasher.update(input[0..10]);
+    cursor = 10;
+    var extra: []const u8 = &.{};
+    var name: []const u8 = &.{};
+    var comment: []const u8 = &.{};
+    if (flags & flag_extra != 0) {
+        if (input.len - cursor < 2) return error.InvalidData;
+        const remaining: usize = (@as(usize, input[cursor + 1]) << 8) | input[cursor];
+        hasher.update(input[cursor..][0..2]);
+        cursor += 2;
+        if (input.len - cursor < remaining) return error.InvalidData;
+        extra = input[cursor .. cursor + remaining];
+        hasher.update(extra);
+        cursor += remaining;
+    }
+    if (flags & flag_name != 0) {
+        const end = std.mem.indexOfScalarPos(u8, input, cursor, 0) orelse return error.InvalidData;
+        name = input[cursor..end];
+        hasher.update(input[cursor .. end + 1]);
+        cursor = end + 1;
+    }
+    if (flags & flag_comment != 0) {
+        const end = std.mem.indexOfScalarPos(u8, input, cursor, 0) orelse return error.InvalidData;
+        comment = input[cursor..end];
+        hasher.update(input[cursor .. end + 1]);
+        cursor = end + 1;
+    }
+    if (flags & flag_header_crc != 0) {
+        if (input.len - cursor < 2) return error.InvalidData;
+        const stored_crc = (@as(u16, input[cursor + 1]) << 8) | input[cursor];
+        if (stored_crc != @as(u16, @truncate(hasher.final()))) return error.IntegrityFailure;
+        cursor += 2;
+    }
+
+    const data_start = cursor;
+    var counter = measurement.Counter.init(null);
+    var tee_writer = Crc32Tee.initWithProvider(&counter.writer, provider);
+    var inflater = deflate.Decompress.initSlice(input[data_start..], history);
+    _ = inflater.reader.streamRemaining(&tee_writer.writer) catch return error.InvalidData;
+    const data_size = (inflater.inputBitsConsumed() + 7) / 8;
+    const trailer_at = data_start + data_size;
+    if (input.len - trailer_at < 8) return error.InvalidData;
+    const stored_crc = std.mem.readInt(u32, input[trailer_at..][0..4], .little);
+    const stored_size = std.mem.readInt(u32, input[trailer_at + 4 ..][0..4], .little);
+    if (stored_crc != tee_writer.crc32Value() or stored_size != @as(u32, @truncate(tee_writer.size))) return error.IntegrityFailure;
+    return .{
+        .modification_time = std.mem.readInt(u32, input[4..8], .little),
+        .extra_flags = input[8],
+        .operating_system = input[9],
+        .text = flags & flag_text != 0,
+        .header_crc = flags & flag_header_crc != 0,
+        .extra = extra,
+        .name = name,
+        .comment = comment,
+        .data_offset = data_start,
+        .data_size = data_size,
+        .decoded_size = stored_size,
+        .crc32 = stored_crc,
+        .total_size = trailer_at + 8,
+    };
+}
+
+test "inspectMembers enumerates concatenated members with their fields" {
+    var first: [256]u8 = undefined;
+    var second: [256]u8 = undefined;
+    const options_a: Options = .{
+        .modification_time = 0x01020304,
+        .extra_flags = 2,
+        .operating_system = 3,
+        .text = false,
+        .header_crc = true,
+        .extra = &.{ 1, 2, 3 },
+        .name = "first.bin",
+        .comment = "note",
+        .deflate = .{ .good = 8, .nice = 128, .lazy = 16, .chain = 8 },
+    };
+    const options_b: Options = .{
+        .modification_time = 0,
+        .extra_flags = 0,
+        .operating_system = 255,
+        .text = false,
+        .header_crc = false,
+        .extra = &.{},
+        .name = "",
+        .comment = "",
+        .deflate = .{ .good = 8, .nice = 128, .lazy = 16, .chain = 8 },
+    };
+    const payload_a = "first member payload, first member payload, first";
+    const payload_b = "second!";
+    var history: [deflate_history_size]u8 = undefined;
+    var r1 = std.Io.Reader.fixed(payload_a);
+    var w1 = std.Io.Writer.fixed(&first);
+    try encodeStream(&r1, &w1, &history, options_a);
+    var r2 = std.Io.Reader.fixed(payload_b);
+    var w2 = std.Io.Writer.fixed(&second);
+    try encodeStream(&r2, &w2, &history, options_b);
+    var combined: [512]u8 = undefined;
+    @memcpy(combined[0..w1.end], first[0..w1.end]);
+    @memcpy(combined[w1.end .. w1.end + w2.end], second[0..w2.end]);
+    const total = w1.end + w2.end;
+
+    var iterator = inspectMembers(combined[0..total], &history, checksum.default_provider);
+    const m1 = (try iterator.next()).?;
+    try std.testing.expectEqualSlices(u8, "first.bin", m1.name);
+    try std.testing.expectEqualSlices(u8, "note", m1.comment);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, m1.extra);
+    try std.testing.expectEqual(@as(u32, 0x01020304), m1.modification_time);
+    try std.testing.expectEqual(payload_a.len, m1.decoded_size);
+    try std.testing.expect(m1.data_offset < total and m1.total_size < total);
+    const m2 = (try iterator.next()).?;
+    try std.testing.expectEqual(payload_b.len, m2.decoded_size);
+    try std.testing.expectEqual(@as(usize, 255), m2.operating_system);
+    try std.testing.expectEqual(total, m1.total_size + m2.total_size);
+    try std.testing.expect((try iterator.next()) == null);
+}

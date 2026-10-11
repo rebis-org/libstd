@@ -32,9 +32,15 @@ const SessionPair = struct { component: [:0]const u8, verb: [:0]const u8 };
 const session_pairs = [_]SessionPair{
     .{ .component = "gzip", .verb = "decode" },
     .{ .component = "deflate", .verb = "decode" },
+    .{ .component = "zlib", .verb = "decode" },
+    .{ .component = "deflate", .verb = "encode" },
+    .{ .component = "gzip", .verb = "encode" },
+    .{ .component = "zlib", .verb = "encode" },
+    .{ .component = "lz4", .verb = "decode" },
+    .{ .component = "lz4", .verb = "encode" },
 };
 
-const SessionKind = enum { gzip_decode, deflate_decode };
+const SessionKind = enum { gzip_decode, deflate_decode, zlib_decode, deflate_encode, gzip_encode, zlib_encode, lz4_decode, lz4_encode };
 
 const SessionImpl = struct {
     storage: *const fn () usize,
@@ -44,6 +50,12 @@ const SessionImpl = struct {
 const session_impls = [_]SessionImpl{
     .{ .storage = drivers.gzipDecodeStorage, .session = drivers.gzipDecodeSession },
     .{ .storage = drivers.deflateDecodeStorage, .session = drivers.deflateDecodeSession },
+    .{ .storage = drivers.zlibDecodeStorage, .session = drivers.zlibDecodeSession },
+    .{ .storage = drivers.deflateEncodeStorage, .session = drivers.deflateEncodeSession },
+    .{ .storage = drivers.gzipEncodeStorage, .session = drivers.gzipEncodeSession },
+    .{ .storage = drivers.zlibEncodeStorage, .session = drivers.zlibEncodeSession },
+    .{ .storage = drivers.lz4DecodeStorage, .session = drivers.lz4DecodeSession },
+    .{ .storage = drivers.lz4EncodeStorage, .session = drivers.lz4EncodeSession },
 };
 
 fn implFor(kind: SessionKind) SessionImpl {

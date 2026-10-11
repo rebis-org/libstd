@@ -1,12 +1,11 @@
-// Component class grammar. Identity and policy are frozen ABI: renaming or
-// re-identifying a component is a breaking change, caught by the comptime
-// assertions in kernel/catalog.zig.
 .{
     .id = .{ .low = "0x6e6b82f08d910408", .high = "0xa7a351053d6d4008" },
     .name = "sevenzip",
     .class = "grammar",
     .verbs = .{ "inspect", "decode_ordinal", "encode_ordinal" },
-    .parameters = .{},
+    .parameters = .{
+        .{ .name = "header_encode", .family = 14, .ordinal = 1, .representation = "scalar_words" },
+    },
     .capabilities = .{ "read", "write", "size", "replay" },
     .sizing = "metadata_exact",
     .commit = "tentative",
