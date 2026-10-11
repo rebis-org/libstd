@@ -292,7 +292,20 @@ fn TableCrc(comptime T: type, comptime poly: T, comptime reflected: bool) type {
                         return;
                     }
                 }
-                for (input) |b| self.state = (self.state >> 8) ^ table[(self.state ^ b) & 0xff];
+                // Slicing-by-4 over little-endian words; the 64-bit fold keeps
+                // the upper half via the trailing shift.
+                var crc = self.state;
+                var i: usize = 0;
+                while (i + 4 <= input.len) : (i += 4) {
+                    crc = tables[3][(crc ^ input[i]) & 0xff] ^
+                        tables[2][((crc >> 8) ^ input[i + 1]) & 0xff] ^
+                        tables[1][((crc >> 16) ^ input[i + 2]) & 0xff] ^
+                        tables[0][((crc >> 24) ^ input[i + 3]) & 0xff] ^ (crc >> 32);
+                }
+                while (i < input.len) : (i += 1) {
+                    crc = (crc >> 8) ^ table[(crc ^ input[i]) & 0xff];
+                }
+                self.state = crc;
             } else {
                 // Slicing-by-4 over big-endian words (zlib braid structure).
                 var crc = self.state;
