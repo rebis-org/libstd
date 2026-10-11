@@ -143,7 +143,7 @@ pub fn tarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
         response.byte_length = size;
     } else if (command_mask == vocabulary.command_mask_write) {
         try requireVerified(commit);
-        const entries = try parseTarEntries(call.request, &workspace);
+        const entries = try collectEntries(tar.Entry, call.request, &workspace, NoCtx{}, fillTarEntry);
         const required = try tar.archiveSize(entries);
         if (sink == null) {
             response.byte_length = required;
@@ -233,7 +233,7 @@ pub fn zipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
                 return error.Unsupported;
             }
         }
-        const entries = try parseZipEntries(call.request, &workspace, crypto_params);
+        const entries = try collectEntries(zip.Entry, call.request, &workspace, crypto_params, fillZipEntry);
         const comment = try archiveComment(call.request);
         var needs_deflate64 = false;
         var scratch_required: usize = 0;
@@ -374,7 +374,7 @@ fn sevenZipGeneric(comptime coded: bool, plan: *common.ExecutionPlan, source: ?*
             .password_lifetime = if (crypto_params) |params| params.password_lifetime else 0,
             .failure_cause = &crypto_cause,
         };
-        const entries = try parseSevenZipEntries(call.request, &workspace, .copy, coded, crypto_params);
+        const entries = try collectEntries(seven_zip.Entry, call.request, &workspace, SevenZipFillCtx{ .default_method = .copy, .allow_method = coded, .crypto = crypto_params }, fillSevenZipEntry);
         const packed_entries = seven_zip.sevenZipPack(entries, plan.provider, &workspace, limits, &crypto_cause) catch |err| {
             writeCryptoFailure(call, crypto_cause);
             return err;
@@ -418,37 +418,54 @@ fn isArchiveEntry(node: *abi.Node) bool {
     return sel.family == entry.family and sel.ordinal == entry.ordinal;
 }
 
-fn parseSevenZipEntries(request: ?*Node, workspace: *resource.Workspace, default_method: seven_zip.CoderMethod, allow_method: bool, crypto_params: ?CryptoParams) Failure![]const seven_zip.Entry {
-    const entries = try workspace.take(seven_zip.Entry, entryCount(request));
+fn entryNameData(child: ?*Node) Failure!struct { name: []const u8, data: []const u8 } {
+    const name_node = node_graph.findSelector(child, comptime discovery.parameter("tar", "entry_name").family, comptime discovery.parameter("tar", "entry_name").ordinal);
+    const data_node = node_graph.findSelector(child, comptime discovery.parameter("tar", "entry_data").family, comptime discovery.parameter("tar", "entry_data").ordinal);
+    return .{
+        .name = if (name_node) |n| try resource.checkedConstBytes(n.bytes, n.byte_length) else &.{},
+        .data = if (data_node) |n| try resource.checkedConstBytes(n.bytes, n.byte_length) else &.{},
+    };
+}
+
+const NoCtx = struct {};
+
+fn collectEntries(comptime E: type, request: ?*Node, workspace: *resource.Workspace, ctx: anytype, comptime fill: anytype) Failure![]const E {
+    var entries = try workspace.take(E, entryCount(request));
     var index: usize = 0;
     var cursor = request;
     while (cursor) |node| : (cursor = node.next) {
         if (!isArchiveEntry(node)) continue;
-        const name_node = node_graph.findSelector(node.child, comptime discovery.parameter("tar", "entry_name").family, comptime discovery.parameter("tar", "entry_name").ordinal);
-        const data_node = node_graph.findSelector(node.child, comptime discovery.parameter("tar", "entry_data").family, comptime discovery.parameter("tar", "entry_data").ordinal);
-        const method_node = if (allow_method)
-            node_graph.findSelector(node.child, comptime discovery.parameter("tar", "entry_method").family, comptime discovery.parameter("tar", "entry_method").ordinal)
-        else
-            null;
-        const filter_node = if (allow_method)
-            node_graph.findSelector(node.child, comptime discovery.parameter("tar", "entry_filter").family, comptime discovery.parameter("tar", "entry_filter").ordinal)
-        else
-            null;
-        const name = if (name_node) |n| try resource.checkedConstBytes(n.bytes, n.byte_length) else &.{};
-        const data = if (data_node) |n| try resource.checkedConstBytes(n.bytes, n.byte_length) else &.{};
-        const method = if (method_node) |n| try parseSevenZipMethod(n) else default_method;
-        var entry: seven_zip.Entry = .{ .name = name, .data = data, .method = method };
-        if (filter_node) |n| entry.filter = try parseSevenZipMethod(n);
-        if (crypto_params) |params| {
-            entry.encrypted = true;
-            entry.password = params.password;
-            entry.kdf_rounds_limit = params.kdf_rounds_limit;
-            entry.password_lifetime = params.password_lifetime;
-        }
-        entries[index] = entry;
+        try fill(&entries[index], node, ctx);
         index += 1;
     }
     return entries;
+}
+
+const SevenZipFillCtx = struct {
+    default_method: seven_zip.CoderMethod,
+    allow_method: bool,
+    crypto: ?CryptoParams,
+};
+
+fn fillSevenZipEntry(entry: *seven_zip.Entry, node: *Node, ctx: SevenZipFillCtx) Failure!void {
+    const parts = try entryNameData(node.child);
+    const method_node = if (ctx.allow_method)
+        node_graph.findSelector(node.child, comptime discovery.parameter("tar", "entry_method").family, comptime discovery.parameter("tar", "entry_method").ordinal)
+    else
+        null;
+    const filter_node = if (ctx.allow_method)
+        node_graph.findSelector(node.child, comptime discovery.parameter("tar", "entry_filter").family, comptime discovery.parameter("tar", "entry_filter").ordinal)
+    else
+        null;
+    const method = if (method_node) |n| try parseSevenZipMethod(n) else ctx.default_method;
+    entry.* = .{ .name = parts.name, .data = parts.data, .method = method };
+    if (filter_node) |n| entry.filter = try parseSevenZipMethod(n);
+    if (ctx.crypto) |params| {
+        entry.encrypted = true;
+        entry.password = params.password;
+        entry.kdf_rounds_limit = params.kdf_rounds_limit;
+        entry.password_lifetime = params.password_lifetime;
+    }
 }
 
 fn parseSevenZipMethod(node: *Node) Failure!seven_zip.CoderMethod {
@@ -604,7 +621,7 @@ pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
             comptime discovery.parameter("rar", "header_encode").ordinal,
         ));
         if (header_encode > 2) return error.InvalidCall;
-        const entries = try parseRarEntries(call.request, &workspace);
+        const entries = try collectEntries(rar_writer.RarEntry, call.request, &workspace, NoCtx{}, fillRarEntry);
         const write_options: rar_writer.WriteOptions = .{
             .password = if (crypto_params) |params| params.password else &.{},
             .encrypt_headers = header_encode == 2,
@@ -669,30 +686,19 @@ pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
     }
 }
 
-fn parseRarEntries(request: ?*Node, workspace: *resource.Workspace) Failure![]const rar_writer.RarEntry {
-    const entries = try workspace.take(rar_writer.RarEntry, entryCount(request));
-    var index: usize = 0;
-    var cursor = request;
-    while (cursor) |node| : (cursor = node.next) {
-        if (!isArchiveEntry(node)) continue;
-        const name_node = node_graph.findSelector(node.child, comptime discovery.parameter("tar", "entry_name").family, comptime discovery.parameter("tar", "entry_name").ordinal);
-        const data_node = node_graph.findSelector(node.child, comptime discovery.parameter("tar", "entry_data").family, comptime discovery.parameter("tar", "entry_data").ordinal);
-        const method_node = node_graph.findSelector(node.child, comptime discovery.parameter("tar", "entry_method").family, comptime discovery.parameter("tar", "entry_method").ordinal);
-        const mtime_node = node_graph.findSelector(node.child, comptime discovery.parameter("tar", "entry_mtime").family, comptime discovery.parameter("tar", "entry_mtime").ordinal);
-        const name = if (name_node) |n| try resource.checkedConstBytes(n.bytes, n.byte_length) else &.{};
-        if (!std.unicode.utf8ValidateSlice(name)) return error.InvalidCall;
-        const data = if (data_node) |n| try resource.checkedConstBytes(n.bytes, n.byte_length) else &.{};
-        const method: u8 = if (method_node) |n| @truncate(n.value_low) else 0;
-        const mtime: u64 = if (mtime_node) |n| node_graph.parseU64(n) else 0;
-        entries[index] = .{
-            .name = name,
-            .data = data,
-            .mtime = @truncate(mtime),
-            .method = method,
-        };
-        index += 1;
-    }
-    return entries;
+fn fillRarEntry(entry: *rar_writer.RarEntry, node: *Node, _: NoCtx) Failure!void {
+    const parts = try entryNameData(node.child);
+    const method_node = node_graph.findSelector(node.child, comptime discovery.parameter("tar", "entry_method").family, comptime discovery.parameter("tar", "entry_method").ordinal);
+    const mtime_node = node_graph.findSelector(node.child, comptime discovery.parameter("tar", "entry_mtime").family, comptime discovery.parameter("tar", "entry_mtime").ordinal);
+    if (!std.unicode.utf8ValidateSlice(parts.name)) return error.InvalidCall;
+    const method: u8 = if (method_node) |n| @truncate(n.value_low) else 0;
+    const mtime: u64 = if (mtime_node) |n| node_graph.parseU64(n) else 0;
+    entry.* = .{
+        .name = parts.name,
+        .data = parts.data,
+        .mtime = @truncate(mtime),
+        .method = method,
+    };
 }
 
 fn archiveComment(request: ?*Node) Failure![]const u8 {
@@ -700,66 +706,43 @@ fn archiveComment(request: ?*Node) Failure![]const u8 {
     return if (node) |n| try resource.checkedConstBytes(n.bytes, n.byte_length) else &.{};
 }
 
-fn parseTarEntries(request: ?*Node, workspace: *resource.Workspace) Failure![]const tar.Entry {
-    const entries = try workspace.take(tar.Entry, entryCount(request));
-    var index: usize = 0;
-    var cursor = request;
-    while (cursor) |node| : (cursor = node.next) {
-        if (!isArchiveEntry(node)) continue;
-        const name_node = node_graph.findSelector(node.child, comptime discovery.parameter("tar", "entry_name").family, comptime discovery.parameter("tar", "entry_name").ordinal);
-        const data_node = node_graph.findSelector(node.child, comptime discovery.parameter("tar", "entry_data").family, comptime discovery.parameter("tar", "entry_data").ordinal);
-        const typeflag_node = node_graph.findSelector(node.child, comptime discovery.parameter("tar", "entry_typeflag").family, comptime discovery.parameter("tar", "entry_typeflag").ordinal);
-        const link_name_node = node_graph.findSelector(node.child, comptime discovery.parameter("tar", "entry_link_name").family, comptime discovery.parameter("tar", "entry_link_name").ordinal);
-        const uid_node = node_graph.findSelector(node.child, comptime discovery.parameter("tar", "entry_uid").family, comptime discovery.parameter("tar", "entry_uid").ordinal);
-        const mtime_node = node_graph.findSelector(node.child, comptime discovery.parameter("tar", "entry_mtime").family, comptime discovery.parameter("tar", "entry_mtime").ordinal);
-        const name = if (name_node) |n| try resource.checkedConstBytes(n.bytes, n.byte_length) else &.{};
-        const data = if (data_node) |n| try resource.checkedConstBytes(n.bytes, n.byte_length) else &.{};
-        const typeflag: u8 = if (typeflag_node) |n| blk: {
-            break :blk @truncate(n.value_low);
-        } else 0;
-        const link_name = if (link_name_node) |n| try resource.checkedConstBytes(n.bytes, n.byte_length) else &.{};
-        const uid: u32 = if (uid_node) |n| blk: {
-            break :blk @truncate(n.value_low);
-        } else 0;
-        const mtime: u64 = if (mtime_node) |n| node_graph.parseU64(n) else 0;
-        entries[index] = .{ .name = name, .data = data, .link_name = link_name, .uid = uid, .modification_time = mtime, .typeflag = typeflag };
-        index += 1;
-    }
-    return entries;
+fn fillTarEntry(entry: *tar.Entry, node: *Node, _: NoCtx) Failure!void {
+    const parts = try entryNameData(node.child);
+    const typeflag_node = node_graph.findSelector(node.child, comptime discovery.parameter("tar", "entry_typeflag").family, comptime discovery.parameter("tar", "entry_typeflag").ordinal);
+    const link_name_node = node_graph.findSelector(node.child, comptime discovery.parameter("tar", "entry_link_name").family, comptime discovery.parameter("tar", "entry_link_name").ordinal);
+    const uid_node = node_graph.findSelector(node.child, comptime discovery.parameter("tar", "entry_uid").family, comptime discovery.parameter("tar", "entry_uid").ordinal);
+    const mtime_node = node_graph.findSelector(node.child, comptime discovery.parameter("tar", "entry_mtime").family, comptime discovery.parameter("tar", "entry_mtime").ordinal);
+    const typeflag: u8 = if (typeflag_node) |n| blk: {
+        break :blk @truncate(n.value_low);
+    } else 0;
+    const link_name = if (link_name_node) |n| try resource.checkedConstBytes(n.bytes, n.byte_length) else &.{};
+    const uid: u32 = if (uid_node) |n| blk: {
+        break :blk @truncate(n.value_low);
+    } else 0;
+    const mtime: u64 = if (mtime_node) |n| node_graph.parseU64(n) else 0;
+    entry.* = .{ .name = parts.name, .data = parts.data, .link_name = link_name, .uid = uid, .modification_time = mtime, .typeflag = typeflag };
 }
 
-fn parseZipEntries(request: ?*Node, workspace: *resource.Workspace, crypto_params: ?CryptoParams) Failure![]const zip.Entry {
-    const entries = try workspace.take(zip.Entry, entryCount(request));
-    var index: usize = 0;
-    var cursor = request;
-    while (cursor) |node| : (cursor = node.next) {
-        if (!isArchiveEntry(node)) continue;
-        const name_node = node_graph.findSelector(node.child, comptime discovery.parameter("tar", "entry_name").family, comptime discovery.parameter("tar", "entry_name").ordinal);
-        const data_node = node_graph.findSelector(node.child, comptime discovery.parameter("tar", "entry_data").family, comptime discovery.parameter("tar", "entry_data").ordinal);
-        const method_node = node_graph.findSelector(node.child, comptime discovery.parameter("tar", "entry_method").family, comptime discovery.parameter("tar", "entry_method").ordinal);
-        const name = if (name_node) |n| try resource.checkedConstBytes(n.bytes, n.byte_length) else &.{};
-        const data = if (data_node) |n| try resource.checkedConstBytes(n.bytes, n.byte_length) else &.{};
-        const method: u16 = if (method_node) |n| @truncate(n.value_low) else 8;
-        var entry: zip.Entry = .{ .name = name, .data = data, .method = method };
-        // A nonzero value writes the streaming shape: zeroed local sizes and
-        // a data descriptor after the entry data.
-        if (node_graph.parseU64(node_graph.findSelector(
-            node.child,
-            comptime discovery.parameter("zip", "data_descriptor").family,
-            comptime discovery.parameter("zip", "data_descriptor").ordinal,
-        )) != 0) {
-            entry.flags |= 0x0008;
-        }
-        if (crypto_params) |params| {
-            entry.encrypted = true;
-            entry.password = params.password;
-            entry.zipcrypto = params.algorithm == 0;
-            if (!entry.zipcrypto) entry.aes_strength = params.algorithm;
-            entry.kdf_rounds_limit = params.kdf_rounds_limit;
-            entry.password_lifetime = params.password_lifetime;
-        }
-        entries[index] = entry;
-        index += 1;
+fn fillZipEntry(entry: *zip.Entry, node: *Node, crypto_params: ?CryptoParams) Failure!void {
+    const parts = try entryNameData(node.child);
+    const method_node = node_graph.findSelector(node.child, comptime discovery.parameter("tar", "entry_method").family, comptime discovery.parameter("tar", "entry_method").ordinal);
+    const method: u16 = if (method_node) |n| @truncate(n.value_low) else 8;
+    entry.* = .{ .name = parts.name, .data = parts.data, .method = method };
+    // A nonzero value writes the streaming shape: zeroed local sizes and
+    // a data descriptor after the entry data.
+    if (node_graph.parseU64(node_graph.findSelector(
+        node.child,
+        comptime discovery.parameter("zip", "data_descriptor").family,
+        comptime discovery.parameter("zip", "data_descriptor").ordinal,
+    )) != 0) {
+        entry.flags |= 0x0008;
     }
-    return entries;
+    if (crypto_params) |params| {
+        entry.encrypted = true;
+        entry.password = params.password;
+        entry.zipcrypto = params.algorithm == 0;
+        if (!entry.zipcrypto) entry.aes_strength = params.algorithm;
+        entry.kdf_rounds_limit = params.kdf_rounds_limit;
+        entry.password_lifetime = params.password_lifetime;
+    }
 }
