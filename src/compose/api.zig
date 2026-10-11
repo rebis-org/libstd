@@ -10,64 +10,42 @@ const Failure = @import("../common/primitive/failure.zig").Failure;
 
 const Session = sessions.Session;
 
+const vocabulary = @import("../kernel/vocabulary.zig");
+
 fn failureStatus(failure: Failure) u32 {
-    return switch (failure) {
-        error.InvalidCall => envelope.Status.invalid_call,
-        error.Unsupported => envelope.Status.unsupported,
-        error.InsufficientCapacity => envelope.Status.insufficient_capacity,
-        error.InvalidData => envelope.Status.invalid_data,
-        error.IntegrityFailure => envelope.Status.integrity_failure,
-        error.ResourceLimit => envelope.Status.resource_limit,
-        else => envelope.Status.internal_failure,
-    };
+    inline for (vocabulary.error_map) |entry| if (failure == entry.failure) return entry.status;
+    return envelope.Status.internal_failure;
 }
 
-// The session-able surface, single-sourced for matchSessionKind, sizing, and
+// The session-able surface, single-sourced for matchSessionIndex, sizing, and
 // the catalog projection. Ordering is ABI once released: append only.
-const SessionPair = struct { component: [:0]const u8, verb: [:0]const u8 };
+const SessionDef = struct {
+    component: [:0]const u8,
+    verb: [:0]const u8,
+    storage: *const fn () usize,
+    session: *const fn ([]u8, sessions.Budgets) Failure!Session,
+};
 // The write-side pair (tar/write) was removed from the public boundary: its
 // store-only, fixed-mode framing could not express the tar profile's
 // typeflags, links, modes, or pax long names, and misled hosts away from the
 // envelope path. A full-surface tar write session can re-enter as a v2 pair.
-const session_pairs = [_]SessionPair{
-    .{ .component = "gzip", .verb = "decode" },
-    .{ .component = "deflate", .verb = "decode" },
-    .{ .component = "zlib", .verb = "decode" },
-    .{ .component = "deflate", .verb = "encode" },
-    .{ .component = "gzip", .verb = "encode" },
-    .{ .component = "zlib", .verb = "encode" },
-    .{ .component = "lz4", .verb = "decode" },
-    .{ .component = "lz4", .verb = "encode" },
+const session_defs = [_]SessionDef{
+    .{ .component = "gzip", .verb = "decode", .storage = drivers.gzipDecodeStorage, .session = drivers.gzipDecodeSession },
+    .{ .component = "deflate", .verb = "decode", .storage = drivers.deflateDecodeStorage, .session = drivers.deflateDecodeSession },
+    .{ .component = "zlib", .verb = "decode", .storage = drivers.zlibDecodeStorage, .session = drivers.zlibDecodeSession },
+    .{ .component = "deflate", .verb = "encode", .storage = drivers.deflateEncodeStorage, .session = drivers.deflateEncodeSession },
+    .{ .component = "gzip", .verb = "encode", .storage = drivers.gzipEncodeStorage, .session = drivers.gzipEncodeSession },
+    .{ .component = "zlib", .verb = "encode", .storage = drivers.zlibEncodeStorage, .session = drivers.zlibEncodeSession },
+    .{ .component = "lz4", .verb = "decode", .storage = drivers.lz4DecodeStorage, .session = drivers.lz4DecodeSession },
+    .{ .component = "lz4", .verb = "encode", .storage = drivers.lz4EncodeStorage, .session = drivers.lz4EncodeSession },
 };
 
-const SessionKind = enum { gzip_decode, deflate_decode, zlib_decode, deflate_encode, gzip_encode, zlib_encode, lz4_decode, lz4_encode };
-
-const SessionImpl = struct {
-    storage: *const fn () usize,
-    session: *const fn ([]u8, sessions.Budgets) Failure!Session,
-};
-
-const session_impls = [_]SessionImpl{
-    .{ .storage = drivers.gzipDecodeStorage, .session = drivers.gzipDecodeSession },
-    .{ .storage = drivers.deflateDecodeStorage, .session = drivers.deflateDecodeSession },
-    .{ .storage = drivers.zlibDecodeStorage, .session = drivers.zlibDecodeSession },
-    .{ .storage = drivers.deflateEncodeStorage, .session = drivers.deflateEncodeSession },
-    .{ .storage = drivers.gzipEncodeStorage, .session = drivers.gzipEncodeSession },
-    .{ .storage = drivers.zlibEncodeStorage, .session = drivers.zlibEncodeSession },
-    .{ .storage = drivers.lz4DecodeStorage, .session = drivers.lz4DecodeSession },
-    .{ .storage = drivers.lz4EncodeStorage, .session = drivers.lz4EncodeSession },
-};
-
-fn implFor(kind: SessionKind) SessionImpl {
-    return session_impls[@backingInt(kind)];
-}
-
-fn matchSessionKind(component: [*:0]const u8, verb: [*:0]const u8) ?SessionKind {
+fn matchSessionIndex(component: [*:0]const u8, verb: [*:0]const u8) ?usize {
     const component_name = std.mem.span(component);
     const verb_name = std.mem.span(verb);
-    for (session_pairs, 0..) |pair, index| {
-        if (std.mem.eql(u8, component_name, pair.component) and std.mem.eql(u8, verb_name, pair.verb)) {
-            return @fromBackingInt(@intCast(index));
+    for (session_defs, 0..) |def, index| {
+        if (std.mem.eql(u8, component_name, def.component) and std.mem.eql(u8, verb_name, def.verb)) {
+            return index;
         }
     }
     return null;
@@ -80,8 +58,8 @@ fn checkAlive(handle: ?*anyopaque) ?*Session {
 }
 
 export fn stdk_session_storage(component: [*:0]const u8, verb: [*:0]const u8) callconv(.c) u64 {
-    const kind = matchSessionKind(component, verb) orelse return 0;
-    return driverStateOffset() + implFor(kind).storage();
+    const index = matchSessionIndex(component, verb) orelse return 0;
+    return driverStateOffset() + session_defs[index].storage();
 }
 
 // Layout is [Session record][driver state] so creation never collides with managed state.
@@ -92,11 +70,11 @@ fn createWithBudgets(
     storage_len: u64,
     budgets: sessions.Budgets,
 ) u32 {
-    const kind = matchSessionKind(component, verb) orelse return envelope.Status.unsupported;
+    const index = matchSessionIndex(component, verb) orelse return envelope.Status.unsupported;
     const bytes = storage orelse return envelope.Status.invalid_call;
     if (storage_len < driverStateOffset()) return envelope.Status.insufficient_capacity;
     const state_storage = bytes[driverStateOffset()..storage_len];
-    const session = implFor(kind).session(state_storage, budgets) catch |failure| return failureStatus(failure);
+    const session = session_defs[index].session(state_storage, budgets) catch |failure| return failureStatus(failure);
     std.mem.bytesAsValue(Session, bytes[0..@sizeOf(Session)]).* = session;
     return envelope.Status.ok;
 }
@@ -186,15 +164,15 @@ export fn stdk_session_failure(
 // instead of hardcoding them. The leading "v1:" is the format version and
 // the retirement mechanism: pairs are append-only within a version, and a
 // breaking change (removal or new field shape) bumps the prefix so hosts
-// can gate on it. Ordering matches session_pairs and is ABI once released.
+// can gate on it. Ordering matches session_defs and is ABI once released.
 export fn stdk_session_catalog() callconv(.c) [*:0]const u8 {
     return session_catalog_text;
 }
 
 const session_catalog_text: [:0]const u8 = blk: {
     var text: [:0]const u8 = "v1:";
-    for (session_pairs, 0..) |pair, index| {
-        const entry = pair.component ++ "/" ++ pair.verb;
+    for (session_defs, 0..) |def, index| {
+        const entry = def.component ++ "/" ++ def.verb;
         text = if (index == 0) text ++ entry else text ++ "," ++ entry;
     }
     break :blk text;

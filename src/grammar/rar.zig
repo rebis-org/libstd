@@ -290,26 +290,16 @@ fn rar4Kdf(password_utf16le: []const u8, salt: ?[]const u8, opts: DecodeOptions)
 }
 
 fn passwordToUtf16Le(password: []const u8, utf16le: []u8) Failure![]u8 {
-    var units: usize = 0;
+    var cursor = binary.WriteCursor.init(utf16le);
     var i: usize = 0;
     while (i < password.len) {
         const len = std.unicode.utf8ByteSequenceLength(password[i]) catch return error.InvalidData;
         if (i + len > password.len) return error.InvalidData;
         const code_point = std.unicode.utf8Decode(password[i..][0..len]) catch return error.InvalidData;
         i += len;
-        if (code_point < 0x10000) {
-            if ((units + 1) * 2 > utf16le.len) return error.ResourceLimit;
-            std.mem.writeInt(u16, utf16le[2 * units ..][0..2], @intCast(code_point), .little);
-            units += 1;
-        } else {
-            if ((units + 2) * 2 > utf16le.len) return error.ResourceLimit;
-            const high = @as(u32, code_point) - 0x10000;
-            std.mem.writeInt(u16, utf16le[2 * units ..][0..2], @intCast(0xD800 + (high >> 10)), .little);
-            std.mem.writeInt(u16, utf16le[2 * units + 2 ..][0..2], @intCast(0xDC00 + (high & 0x3FF)), .little);
-            units += 2;
-        }
+        cursor.writeUtf16Le(code_point) catch return error.ResourceLimit;
     }
-    return utf16le[0 .. 2 * units];
+    return utf16le[0..cursor.pos];
 }
 
 const Rar5Block = struct {
@@ -1178,8 +1168,8 @@ fn replayCompressed(
                 bufs.filter_scratch,
                 target.unpack_version == 70,
             );
-            var replay: ReplayCtx50 = .{ .session = &session, .archive = archive, .locate = locate, .output = output, .opts = opts, .bufs = bufs };
-            try walkEntriesOpts(archive, opts, &replay, replayVisit50);
+            var replay: ReplayCtx(unpack50.Session) = .{ .session = &session, .archive = archive, .locate = locate, .output = output, .opts = opts, .bufs = bufs };
+            try walkEntriesOpts(archive, opts, &replay, replayVisitCtx(unpack50.Session));
         },
         .rar4 => {
             switch (target.unpack_version) {
@@ -1196,8 +1186,8 @@ fn replayCompressed(
                         bufs.ppm_heap,
                         opts.provider,
                     );
-                    var replay: ReplayCtx29 = .{ .session = &session, .archive = archive, .locate = locate, .output = output, .opts = opts, .bufs = bufs };
-                    try walkEntriesOpts(archive, opts, &replay, replayVisit29);
+                    var replay: ReplayCtx(unpack29.Session) = .{ .session = &session, .archive = archive, .locate = locate, .output = output, .opts = opts, .bufs = bufs };
+                    try walkEntriesOpts(archive, opts, &replay, replayVisitCtx(unpack29.Session));
                 },
                 20, 26 => {
                     if (bufs.table_pool.len < unpack20.table_pool_words) return error.InternalFailure;
@@ -1207,8 +1197,8 @@ fn replayCompressed(
                         bufs.window[0..window_len],
                         bufs.table_pool[0..unpack20.table_pool_words],
                     );
-                    var replay: ReplayCtx20 = .{ .session = &session, .archive = archive, .locate = locate, .output = output, .opts = opts, .bufs = bufs };
-                    try walkEntriesOpts(archive, opts, &replay, replayVisit20);
+                    var replay: ReplayCtx(unpack20.Session) = .{ .session = &session, .archive = archive, .locate = locate, .output = output, .opts = opts, .bufs = bufs };
+                    try walkEntriesOpts(archive, opts, &replay, replayVisitCtx(unpack20.Session));
                 },
                 else => return error.Unsupported,
             }
@@ -1216,37 +1206,21 @@ fn replayCompressed(
     }
 }
 
-const ReplayCtx50 = struct {
-    session: *unpack50.Session,
-    archive: []const u8,
-    locate: *const LocateCtx,
-    output: []u8,
-    opts: DecodeOptions,
-    bufs: *DecodeBuffers,
-};
-const ReplayCtx29 = struct {
-    session: *unpack29.Session,
-    archive: []const u8,
-    locate: *const LocateCtx,
-    output: []u8,
-    opts: DecodeOptions,
-    bufs: *DecodeBuffers,
-};
-const ReplayCtx20 = struct {
-    session: *unpack20.Session,
-    archive: []const u8,
-    locate: *const LocateCtx,
-    output: []u8,
-    opts: DecodeOptions,
-    bufs: *DecodeBuffers,
-};
+fn ReplayCtx(comptime Session: type) type {
+    return struct {
+        session: *Session,
+        archive: []const u8,
+        locate: *const LocateCtx,
+        output: []u8,
+        opts: DecodeOptions,
+        bufs: *DecodeBuffers,
+    };
+}
 
-fn replayVisit50(ctx: *ReplayCtx50, entry: Entry) Failure!void {
-    try replayVisit(ctx.session, ctx.archive, ctx.locate, entry, ctx.output, ctx.opts, ctx.bufs);
-}
-fn replayVisit29(ctx: *ReplayCtx29, entry: Entry) Failure!void {
-    try replayVisit(ctx.session, ctx.archive, ctx.locate, entry, ctx.output, ctx.opts, ctx.bufs);
-}
-fn replayVisit20(ctx: *ReplayCtx20, entry: Entry) Failure!void {
-    try replayVisit(ctx.session, ctx.archive, ctx.locate, entry, ctx.output, ctx.opts, ctx.bufs);
+fn replayVisitCtx(comptime Session: type) fn (*ReplayCtx(Session), Entry) Failure!void {
+    return struct {
+        fn visit(ctx: *ReplayCtx(Session), entry: Entry) Failure!void {
+            try replayVisit(ctx.session, ctx.archive, ctx.locate, entry, ctx.output, ctx.opts, ctx.bufs);
+        }
+    }.visit;
 }

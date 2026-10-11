@@ -121,52 +121,42 @@ const default_deflate_options: deflate.Options = .{ .good = 8, .nice = 128, .laz
 const default_ppmd_order: u32 = 8;
 const default_ppmd_mem: u32 = 4 << 20;
 
+// Every known method id, primaries first: methodId takes the first row per
+// method, while decode also accepts the single-byte and 7z-bcj aliases.
+const method_ids = [_]struct { method: CoderMethod, id: []const u8 }{
+    .{ .method = .copy, .id = &method_copy_id },
+    .{ .method = .lzma, .id = &method_lzma_id },
+    .{ .method = .lzma2, .id = &method_lzma2_id },
+    .{ .method = .deflate, .id = &method_deflate_id },
+    .{ .method = .bzip2, .id = &method_bzip2_id },
+    .{ .method = .delta, .id = &method_delta_id },
+    .{ .method = .x86, .id = &method_7z_bcj_x86_id },
+    .{ .method = .ppc, .id = &method_7z_bcj_ppc_id },
+    .{ .method = .ia64, .id = &method_7z_bcj_ia64_id },
+    .{ .method = .arm, .id = &method_7z_bcj_arm_id },
+    .{ .method = .armt, .id = &method_7z_bcj_armt_id },
+    .{ .method = .sparc, .id = &method_7z_bcj_sparc_id },
+    .{ .method = .arm64, .id = &method_7z_bcj_arm64_id },
+    .{ .method = .riscv, .id = &method_7z_bcj_riscv_id },
+    .{ .method = .ppmd, .id = &method_ppmd_id },
+    .{ .method = .bcj2, .id = &method_7z_bcj2_id },
+    .{ .method = .x86, .id = &method_x86_id },
+    .{ .method = .ppc, .id = &method_ppc_id },
+    .{ .method = .ia64, .id = &method_ia64_id },
+    .{ .method = .arm, .id = &method_arm_id },
+    .{ .method = .armt, .id = &method_armt_id },
+    .{ .method = .sparc, .id = &method_sparc_id },
+    .{ .method = .arm64, .id = &method_arm64_id },
+    .{ .method = .riscv, .id = &method_riscv_id },
+};
+
 fn methodId(method: CoderMethod) []const u8 {
-    return switch (method) {
-        .copy => &method_copy_id,
-        .lzma => &method_lzma_id,
-        .lzma2 => &method_lzma2_id,
-        .deflate => &method_deflate_id,
-        .bzip2 => &method_bzip2_id,
-        .delta => &method_delta_id,
-        .x86 => &method_7z_bcj_x86_id,
-        .ppc => &method_7z_bcj_ppc_id,
-        .ia64 => &method_7z_bcj_ia64_id,
-        .arm => &method_7z_bcj_arm_id,
-        .armt => &method_7z_bcj_armt_id,
-        .sparc => &method_7z_bcj_sparc_id,
-        .arm64 => &method_7z_bcj_arm64_id,
-        .riscv => &method_7z_bcj_riscv_id,
-        .ppmd => &method_ppmd_id,
-        .bcj2 => &method_7z_bcj2_id,
-    };
+    inline for (method_ids) |row| if (row.method == method) return row.id;
+    unreachable;
 }
 
 fn methodFromId(id: []const u8) Failure!CoderMethod {
-    if (std.mem.eql(u8, id, &method_copy_id)) return .copy;
-    if (std.mem.eql(u8, id, &method_lzma_id)) return .lzma;
-    if (std.mem.eql(u8, id, &method_lzma2_id)) return .lzma2;
-    if (std.mem.eql(u8, id, &method_deflate_id)) return .deflate;
-    if (std.mem.eql(u8, id, &method_bzip2_id)) return .bzip2;
-    if (std.mem.eql(u8, id, &method_delta_id)) return .delta;
-    if (std.mem.eql(u8, id, &method_x86_id)) return .x86;
-    if (std.mem.eql(u8, id, &method_ppc_id)) return .ppc;
-    if (std.mem.eql(u8, id, &method_ia64_id)) return .ia64;
-    if (std.mem.eql(u8, id, &method_arm_id)) return .arm;
-    if (std.mem.eql(u8, id, &method_armt_id)) return .armt;
-    if (std.mem.eql(u8, id, &method_sparc_id)) return .sparc;
-    if (std.mem.eql(u8, id, &method_arm64_id)) return .arm64;
-    if (std.mem.eql(u8, id, &method_riscv_id)) return .riscv;
-    if (std.mem.eql(u8, id, &method_ppmd_id)) return .ppmd;
-    if (std.mem.eql(u8, id, &method_7z_bcj2_id)) return .bcj2;
-    if (std.mem.eql(u8, id, &method_7z_bcj_x86_id)) return .x86;
-    if (std.mem.eql(u8, id, &method_7z_bcj_ppc_id)) return .ppc;
-    if (std.mem.eql(u8, id, &method_7z_bcj_ia64_id)) return .ia64;
-    if (std.mem.eql(u8, id, &method_7z_bcj_arm_id)) return .arm;
-    if (std.mem.eql(u8, id, &method_7z_bcj_armt_id)) return .armt;
-    if (std.mem.eql(u8, id, &method_7z_bcj_sparc_id)) return .sparc;
-    if (std.mem.eql(u8, id, &method_7z_bcj_arm64_id)) return .arm64;
-    if (std.mem.eql(u8, id, &method_7z_bcj_riscv_id)) return .riscv;
+    inline for (method_ids) |row| if (std.mem.eql(u8, id, row.id)) return row.method;
     return error.Unsupported;
 }
 
@@ -2198,22 +2188,11 @@ fn passwordToUtf16(password: []const u8, workspace: *Workspace) Failure![]const 
     const view = std.unicode.Utf8View.init(password) catch return error.InvalidData;
     var byte_len: usize = 0;
     var it = view.iterator();
-    while (it.nextCodepoint()) |cp| byte_len = try bounds.addUsize(byte_len, if (cp < 0x10000) 2 else 4);
+    while (it.nextCodepoint()) |cp| byte_len = try bounds.addUsize(byte_len, 2 * binary.utf16LeUnits(cp));
     const bytes = try workspace.take(u8, byte_len);
-    var offset: usize = 0;
+    var cursor = binary.WriteCursor.init(bytes);
     var encode_it = view.iterator();
-    while (encode_it.nextCodepoint()) |cp| {
-        if (cp < 0x10000) {
-            std.mem.writeInt(u16, bytes[offset..][0..2], @intCast(cp), .little);
-            offset += 2;
-        } else {
-            const high: u16 = @intCast(0xD800 + ((cp - 0x10000) >> 10));
-            const low: u16 = @intCast(0xDC00 + ((cp - 0x10000) & 0x3FF));
-            std.mem.writeInt(u16, bytes[offset..][0..2], high, .little);
-            std.mem.writeInt(u16, bytes[offset + 2 ..][0..2], low, .little);
-            offset += 4;
-        }
-    }
+    while (encode_it.nextCodepoint()) |cp| try cursor.writeUtf16Le(cp);
     return bytes;
 }
 

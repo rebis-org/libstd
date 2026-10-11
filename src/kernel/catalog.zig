@@ -7,11 +7,8 @@ const vocabulary = @import("vocabulary.zig");
 pub const Descriptor = vocabulary.Descriptor;
 
 pub fn descriptorFor(id: EnvelopeId) ?*const Descriptor {
-    inline for (&vocabulary.protocol_rows) |*row| {
+    inline for (&sorted_descriptors) |*row| {
         if (vocabulary.eql(id, row.id)) return row;
-    }
-    inline for (&profile_descriptors) |*descriptor| {
-        if (vocabulary.eql(id, descriptor.id)) return descriptor;
     }
     return null;
 }
@@ -41,7 +38,11 @@ const profile_descriptors = blk: {
     break :blk list;
 };
 
-// Sorted by id for a stable catalog document.
+fn isIdLessThan(left: EnvelopeId, right: EnvelopeId) bool {
+    return left.high < right.high or (left.high == right.high and left.low < right.low);
+}
+
+// Stable catalog document order.
 pub const sorted_descriptors = blk: {
     @setEvalBranchQuota(100_000);
     var result: [vocabulary.protocol_rows.len + profile_descriptors.len]Descriptor = undefined;
@@ -50,9 +51,7 @@ pub const sorted_descriptors = blk: {
     for (0..result.len) |index| {
         var least = index;
         for (index + 1..result.len) |candidate| {
-            const first = result[candidate].id;
-            const second = result[least].id;
-            if (first.high < second.high or (first.high == second.high and first.low < second.low)) least = candidate;
+            if (isIdLessThan(result[candidate].id, result[least].id)) least = candidate;
         }
         const displaced = result[index];
         result[index] = result[least];
@@ -64,9 +63,9 @@ pub const sorted_descriptors = blk: {
 // Single comptime source, so discovery and the packaged artifact cannot drift.
 pub const catalog_json = blk: {
     @setEvalBranchQuota(500_000);
-    var descriptors: []const u8 = "";
+    var descriptor_json: []const u8 = "";
     for (sorted_descriptors, 0..) |descriptor, index| {
-        descriptors = descriptors ++ std.fmt.comptimePrint(
+        descriptor_json = descriptor_json ++ std.fmt.comptimePrint(
             "    {{" ++
                 "\"id\":{{\"low\":\"0x{x:0>16}\",\"high\":\"0x{x:0>16}\"}}," ++
                 "\"name\":\"{s}\"," ++
@@ -96,7 +95,7 @@ pub const catalog_json = blk: {
             },
         );
     }
-    break :blk "{\n  \"epoch\": 8,\n  \"parameter_selector\": \"value_high: family(16)|ordinal(32)|attrs(8)|flags(8); value_low: scalar value\",\n  \"descriptors\": [\n" ++ descriptors ++ "  ]\n}\n";
+    break :blk "{\n  \"epoch\": 8,\n  \"parameter_selector\": \"value_high: family(16)|ordinal(32)|attrs(8)|flags(8); value_low: scalar value\",\n  \"descriptors\": [\n" ++ descriptor_json ++ "  ]\n}\n";
 };
 
 comptime {

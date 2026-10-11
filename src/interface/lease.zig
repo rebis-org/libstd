@@ -29,7 +29,7 @@ pub const Registry = struct {
         if (memory.len == 0) return error.InvalidCall;
         for (self.slots[0..self.used]) |slot| {
             if (!slot.live) continue;
-            if (span_module.overlaps(@intFromPtr(memory.ptr), memory.len, slot.base, slot.len)) return error.InvalidCall;
+            if (span_module.hasOverlap(@intFromPtr(memory.ptr), memory.len, slot.base, slot.len)) return error.InvalidCall;
         }
         if (self.used == self.slots.len) return error.ResourceLimit;
         const token = self.next_token;
@@ -45,22 +45,14 @@ pub const Registry = struct {
     }
 
     pub fn revoke(self: *Registry, leased: Lease) void {
-        for (self.slots[0..self.used]) |*slot| {
-            if (slot.token == leased.token) {
-                slot.live = false;
-                return;
-            }
-        }
+        if (findSlotIndex(self, leased)) |index| self.slots[index].live = false;
     }
 
     pub fn span(self: *Registry, leased: Lease, offset: usize, length: usize) Span {
-        for (self.slots[0..self.used]) |slot| {
-            if (slot.token != leased.token) continue;
-            if (!slot.live) span_module.trap(.lease_violation, "lease was revoked.");
-            if (offset > slot.len or length > slot.len - offset) span_module.trap(.out_of_bounds, "lease subspan is out of bounds.");
-            return .{ .ptr = @ptrFromInt(slot.base + offset), .len = length };
-        }
-        span_module.trap(.lease_violation, "lease token is unknown.");
+        const slot = self.slots[findSlotIndex(self, leased) orelse span_module.trap(.lease_violation, "lease token is unknown.")];
+        if (!slot.live) span_module.trap(.lease_violation, "lease was revoked.");
+        span_module.checkRange(slot.len, offset, length);
+        return .{ .ptr = @ptrFromInt(slot.base + offset), .len = length };
     }
 
     pub fn constSpan(self: *Registry, leased: Lease, offset: usize, length: usize) ConstSpan {
@@ -68,3 +60,10 @@ pub const Registry = struct {
         return .{ .ptr = view.ptr, .len = view.len };
     }
 };
+
+fn findSlotIndex(self: *Registry, leased: Lease) ?usize {
+    for (self.slots[0..self.used], 0..) |slot, index| {
+        if (slot.token == leased.token) return index;
+    }
+    return null;
+}

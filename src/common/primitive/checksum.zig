@@ -219,12 +219,20 @@ fn seal(comptime H: type, bound: H, input: []const u8) @typeInfo(@TypeOf(H.final
     return hash.final();
 }
 
+fn sealUnit(comptime H: type, provider: seam.Provider, input: []const u8) @typeInfo(@TypeOf(H.final)).@"fn".return_type.? {
+    return seal(H, H.bind(provider), input);
+}
+
+fn sealSeeded(comptime H: type, provider: seam.Provider, seed: anytype, input: []const u8) @typeInfo(@TypeOf(H.final)).@"fn".return_type.? {
+    return seal(H, H.bind(provider, seed), input);
+}
+
 pub fn crc32(input: []const u8) u32 {
     return crc32With(default_provider, input);
 }
 
 pub fn crc32With(provider: seam.Provider, input: []const u8) u32 {
-    return seal(Crc32, Crc32.bind(provider), input);
+    return sealUnit(Crc32, provider, input);
 }
 
 pub const XxHash64 = xxh64_seam.XxHash64;
@@ -235,7 +243,7 @@ pub fn xxh64(input: []const u8) u64 {
 }
 
 pub fn xxh64With(provider: seam.Provider, input: []const u8) u64 {
-    return seal(XxHash64, XxHash64.bind(provider, 0), input);
+    return sealSeeded(XxHash64, provider, 0, input);
 }
 
 pub const Adler32 = adler32_seam.Inner;
@@ -353,7 +361,7 @@ fn TableCrc(comptime T: type, comptime poly: T, comptime reflected: bool) type {
 }
 
 pub fn adler32With(provider: seam.Provider, input: []const u8) u32 {
-    return seal(Adler32, Adler32.bind(provider), input);
+    return sealUnit(Adler32, provider, input);
 }
 
 pub fn xxh32(input: []const u8) u32 {
@@ -361,7 +369,7 @@ pub fn xxh32(input: []const u8) u32 {
 }
 
 pub fn xxh32With(provider: seam.Provider, input: []const u8) u32 {
-    return seal(XxHash32, XxHash32.bind(provider, 0), input);
+    return sealSeeded(XxHash32, provider, 0, input);
 }
 
 test "xxh32 matches the published vectors" {

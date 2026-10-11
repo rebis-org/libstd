@@ -304,8 +304,7 @@ fn tarChecksum(block: []const u8) u64 {
 }
 
 fn tarValidName(name: []const u8) Failure!void {
-    if (name.len == 0 or std.mem.indexOfScalar(u8, name, 0) != null) return error.InvalidCall;
-    if (name[0] == '/' or std.mem.indexOfScalar(u8, name, '\\') != null) return error.InvalidCall;
+    if (bounds.isAbsoluteOrTraversal(name) or std.mem.indexOfScalar(u8, name, 0) != null) return error.InvalidCall;
     const trimmed = if (name[name.len - 1] == '/') name[0 .. name.len - 1] else name;
     if (trimmed.len == 0) return error.InvalidCall;
     var components = std.mem.splitScalar(u8, trimmed, '/');

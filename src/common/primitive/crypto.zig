@@ -125,6 +125,10 @@ fn aesBlockWith(comptime S: type, comptime direction: BlockCipher(S).Direction, 
     return out;
 }
 
+fn assertFixed(provider: Provider) void {
+    std.debug.assert(provider == default_provider);
+}
+
 fn aesBlock(comptime direction: BlockCipher(aes_seam.suite_onprem).Direction, provider: Provider, key: []const u8, block: [block_length]u8) Failure![block_length]u8 {
     if (comptime options.aes_impl == .mergeable) {
         return switch (provider) {
@@ -132,7 +136,7 @@ fn aesBlock(comptime direction: BlockCipher(aes_seam.suite_onprem).Direction, pr
             .offprem => aesBlockWith(aes_seam.suite_offprem, direction, key, block),
         };
     }
-    std.debug.assert(provider == default_provider);
+    assertFixed(provider);
     return aesBlockWith(aes_seam.suite, direction, key, block);
 }
 
@@ -194,7 +198,7 @@ pub fn winzipCtr(provider: Provider, key: []const u8, destination: []u8, source:
             .offprem => winzipCtrWith(aes_seam.suite_offprem, key, destination, source),
         };
     }
-    std.debug.assert(provider == default_provider);
+    assertFixed(provider);
     return winzipCtrWith(aes_seam.suite, key, destination, source);
 }
 
@@ -226,7 +230,7 @@ fn aesCbc(comptime direction: BlockCipher(aes_seam.suite_onprem).Direction, prov
             },
         };
     }
-    std.debug.assert(provider == default_provider);
+    assertFixed(provider);
     return switch (direction) {
         .encrypt => aesCbcEncryptWith(aes_seam.suite, key, iv, destination, source),
         .decrypt => aesCbcDecryptWith(aes_seam.suite, key, iv, destination, source),
@@ -286,7 +290,7 @@ pub fn sevenZipKdf(provider: Provider, password_utf16: []const u8, salt: []const
             .offprem => sevenZipKdfWith(sha256_seam.Offprem, password_utf16, salt, num_cycles_power, out_key),
         };
     }
-    std.debug.assert(provider == default_provider);
+    assertFixed(provider);
     return sevenZipKdfWith(sha256_seam.Sha256, password_utf16, salt, num_cycles_power, out_key);
 }
 

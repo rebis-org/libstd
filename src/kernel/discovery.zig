@@ -8,26 +8,26 @@ pub fn enumerate() []const contract.Descriptor {
 }
 
 pub fn findByName(name: []const u8) ?*const contract.Descriptor {
-    return findDescriptor(name, null);
+    return findDescriptor(.{ .by_name = name });
 }
 
 pub fn findById(id: contract.Id) ?*const contract.Descriptor {
-    return findDescriptor(null, id);
+    return findDescriptor(.{ .by_id = id });
 }
 
-fn findDescriptor(name: ?[]const u8, id: ?contract.Id) ?*const contract.Descriptor {
+pub const Lookup = union(enum) { by_name: []const u8, by_id: contract.Id };
+
+fn findDescriptor(lookup: Lookup) ?*const contract.Descriptor {
     @setEvalBranchQuota(10_000);
     for (&components.descriptors) |*descriptor| {
-        if (name) |wanted| {
-            if (std.mem.eql(u8, descriptor.name, wanted)) return descriptor;
-        } else if (id) |wanted| {
-            if (contract.eql(descriptor.id, wanted)) return descriptor;
+        switch (lookup) {
+            .by_name => |wanted| if (std.mem.eql(u8, descriptor.name, wanted)) return descriptor,
+            .by_id => |wanted| if (contract.eql(descriptor.id, wanted)) return descriptor,
         }
     }
     return null;
 }
 
-// Ordinals are component data.
 pub fn parameter(comptime component_name: []const u8, comptime parameter_name: []const u8) contract.Parameter {
     @setEvalBranchQuota(10_000);
     const component = findByName(component_name) orelse @compileError("unknown component \"" ++ component_name ++ "\": no descriptor declares this name.");

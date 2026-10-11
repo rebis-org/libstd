@@ -29,6 +29,10 @@ pub const Status = struct {
 pub const node_flag_optional: u32 = 1;
 pub const node_flag_callback_resource: u32 = 2;
 
+fn hasValidSizeAndReserved(structure_size: u32, expected: usize, reserved: []const u64) bool {
+    return structure_size >= expected and std.mem.allEqual(u64, reserved, 0);
+}
+
 pub const Node = extern struct {
     structure_size: u32,
     flags: u32,
@@ -59,7 +63,7 @@ pub const Node = extern struct {
     }
 
     pub fn isValid(self: *const Node) bool {
-        return self.structure_size >= @sizeOf(Node) and self.flags & ~(node_flag_optional | node_flag_callback_resource) == 0 and std.mem.allEqual(u64, &self.reserved, 0);
+        return hasValidSizeAndReserved(self.structure_size, @sizeOf(Node), &self.reserved) and self.flags & ~(node_flag_optional | node_flag_callback_resource) == 0;
     }
 };
 
@@ -95,7 +99,7 @@ pub const Call = extern struct {
     }
 
     pub fn isValid(self: *const Call) bool {
-        return self.structure_size >= @sizeOf(Call) and self.flags == 0 and std.mem.allEqual(u64, &self.reserved, 0);
+        return hasValidSizeAndReserved(self.structure_size, @sizeOf(Call), &self.reserved) and self.flags == 0;
     }
 };
 

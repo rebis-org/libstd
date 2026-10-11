@@ -96,15 +96,35 @@ fn appendStaged(pending: []u8, pending_len: *usize, leftover: *usize, input: []c
     pending_len.* += input.len;
 }
 
+fn stateSize(comptime T: type) usize {
+    return std.mem.alignForward(usize, @sizeOf(T), 16);
+}
+
+fn carveHistory(comptime T: type, storage: []u8, comptime history_len: usize) error{InsufficientCapacity}!struct { state: *T, history: []u8 } {
+    const size = stateSize(T);
+    if (storage.len < size + history_len) return error.InsufficientCapacity;
+    return .{
+        .state = @ptrCast(@alignCast(storage.ptr)),
+        .history = storage[size..][0..history_len],
+    };
+}
+
+fn restageInflated(inflater: *deflate.Decompress, pending: []u8, pending_len: *usize, leftover: *usize, input: []const u8, result: *StepResult) Failure!void {
+    const consumed = inflater.input.slice.pos;
+    try compactPending(pending, pending_len, consumed);
+    if (consumed > 0) inflater.input.slice.pos = 0;
+    try appendStaged(pending, pending_len, leftover, input, result);
+    inflater.input.slice.data = pending[0..pending_len.*];
+}
+
 pub fn gzipDecodeStorage() usize {
-    return std.mem.alignForward(usize, @sizeOf(GzipDecode), 16) + deflate.history_size;
+    return stateSize(GzipDecode) + deflate.history_size;
 }
 
 pub fn gzipDecodeInit(storage: []u8, budgets: sessions.Budgets) error{InsufficientCapacity}!*GzipDecode {
-    const state_size = std.mem.alignForward(usize, @sizeOf(GzipDecode), 16);
-    if (storage.len < state_size + deflate.history_size) return error.InsufficientCapacity;
-    const state: *GzipDecode = @ptrCast(@alignCast(storage.ptr));
-    const history = storage[state_size..][0..deflate.history_size];
+    const carved = try carveHistory(GzipDecode, storage, deflate.history_size);
+    const state = carved.state;
+    const history = carved.history;
     // pending/fixed/trailer stay undefined until the header/trailer parse writes them before any read.
     state.* = .{
         .inflater = undefined,
@@ -408,23 +428,18 @@ pub const DeflateDecode = struct {
     budgets: sessions.Budgets,
 
     fn restage(self: *DeflateDecode, input: []const u8, result: *StepResult) Failure!void {
-        const consumed = self.inflater.input.slice.pos;
-        try compactPending(self.pending[0..], &self.pending_len, consumed);
-        if (consumed > 0) self.inflater.input.slice.pos = 0;
-        try appendStaged(self.pending[0..], &self.pending_len, &self.leftover, input, result);
-        self.inflater.input.slice.data = self.pending[0..self.pending_len];
+        return restageInflated(&self.inflater, self.pending[0..], &self.pending_len, &self.leftover, input, result);
     }
 };
 
 pub fn deflateDecodeStorage() usize {
-    return std.mem.alignForward(usize, @sizeOf(DeflateDecode), 16) + deflate.history_size;
+    return stateSize(DeflateDecode) + deflate.history_size;
 }
 
 pub fn deflateDecodeInit(storage: []u8, budgets: sessions.Budgets) error{InsufficientCapacity}!*DeflateDecode {
-    const state_size = std.mem.alignForward(usize, @sizeOf(DeflateDecode), 16);
-    if (storage.len < state_size + deflate.history_size) return error.InsufficientCapacity;
-    const state: *DeflateDecode = @ptrCast(@alignCast(storage.ptr));
-    const history = storage[state_size..][0..deflate.history_size];
+    const carved = try carveHistory(DeflateDecode, storage, deflate.history_size);
+    const state = carved.state;
+    const history = carved.history;
     state.* = .{
         .inflater = deflate.Decompress.initSlice(&.{}, history),
         .history = history,
@@ -477,7 +492,6 @@ pub fn deflateDecodeStep(state: *DeflateDecode, input: []const u8, output: []u8,
     }
     if (state.inflater.state == .end) {
         if (state.inflater.reader.seek < state.inflater.reader.end) {
-            // Stream ended with decoded bytes still buffered in the reader.
             result.consumed = input.len;
             result.status = .open;
             return result;
@@ -525,23 +539,18 @@ pub const ZlibDecode = struct {
     budgets: sessions.Budgets,
 
     fn restage(self: *ZlibDecode, input: []const u8, result: *StepResult) Failure!void {
-        const consumed = self.inflater.input.slice.pos;
-        try compactPending(self.pending[0..], &self.pending_len, consumed);
-        if (consumed > 0) self.inflater.input.slice.pos = 0;
-        try appendStaged(self.pending[0..], &self.pending_len, &self.leftover, input, result);
-        self.inflater.input.slice.data = self.pending[0..self.pending_len];
+        return restageInflated(&self.inflater, self.pending[0..], &self.pending_len, &self.leftover, input, result);
     }
 };
 
 pub fn zlibDecodeStorage() usize {
-    return std.mem.alignForward(usize, @sizeOf(ZlibDecode), 16) + deflate.history_size;
+    return stateSize(ZlibDecode) + deflate.history_size;
 }
 
 pub fn zlibDecodeInit(storage: []u8, budgets: sessions.Budgets) error{InsufficientCapacity}!*ZlibDecode {
-    const state_size = std.mem.alignForward(usize, @sizeOf(ZlibDecode), 16);
-    if (storage.len < state_size + deflate.history_size) return error.InsufficientCapacity;
-    const state: *ZlibDecode = @ptrCast(@alignCast(storage.ptr));
-    const history = storage[state_size..][0..deflate.history_size];
+    const carved = try carveHistory(ZlibDecode, storage, deflate.history_size);
+    const state = carved.state;
+    const history = carved.history;
     state.* = .{
         .inflater = undefined,
         .history = history,
@@ -741,14 +750,13 @@ const deflate_encode_options: deflate.Options = .{ .good = 8, .nice = 128, .lazy
 
 fn deflateEncodeStorageImpl(wrap: EncodeWrap) usize {
     _ = wrap;
-    return std.mem.alignForward(usize, @sizeOf(DeflateEncode), 16) + deflate.history_size;
+    return stateSize(DeflateEncode) + deflate.history_size;
 }
 
 fn deflateEncodeInitImpl(storage: []u8, budgets: sessions.Budgets) error{InsufficientCapacity}!*DeflateEncode {
-    const state_size = std.mem.alignForward(usize, @sizeOf(DeflateEncode), 16);
-    if (storage.len < state_size + deflate.history_size) return error.InsufficientCapacity;
-    const state: *DeflateEncode = @ptrCast(@alignCast(storage.ptr));
-    const history = storage[state_size..][0..deflate.history_size];
+    const carved = try carveHistory(DeflateEncode, storage, deflate.history_size);
+    const state = carved.state;
+    const history = carved.history;
     state.* = .{
         .compressor = undefined,
         .history = history,
@@ -926,12 +934,11 @@ pub const Lz4Decode = struct {
 };
 
 pub fn lz4DecodeStorage() usize {
-    const state_size = std.mem.alignForward(usize, @sizeOf(Lz4Decode), 16);
-    return state_size + lz4.block_size_max + lz4_window_len;
+    return stateSize(Lz4Decode) + lz4.block_size_max + lz4_window_len;
 }
 
 pub fn lz4DecodeInit(storage: []u8, budgets: sessions.Budgets) error{InsufficientCapacity}!*Lz4Decode {
-    const state_size = std.mem.alignForward(usize, @sizeOf(Lz4Decode), 16);
+    const state_size = stateSize(Lz4Decode);
     if (storage.len < state_size + lz4.block_size_max + lz4_window_len) return error.InsufficientCapacity;
     const state: *Lz4Decode = @ptrCast(@alignCast(storage.ptr));
     state.* = .{
@@ -1150,13 +1157,13 @@ pub const Lz4Encode = struct {
 };
 
 pub fn lz4EncodeStorage() usize {
-    const state_size = std.mem.alignForward(usize, @sizeOf(Lz4Encode), 16);
+    const state_size = stateSize(Lz4Encode);
     // Hash table for the greedy parser plus one block bound.
     return state_size + lz4.encodeWorkspaceSize();
 }
 
 pub fn lz4EncodeInit(storage: []u8, budgets: sessions.Budgets) error{InsufficientCapacity}!*Lz4Encode {
-    const state_size = std.mem.alignForward(usize, @sizeOf(Lz4Encode), 16);
+    const state_size = stateSize(Lz4Encode);
     if (storage.len < state_size + lz4.encodeWorkspaceSize()) return error.InsufficientCapacity;
     const state: *Lz4Encode = @ptrCast(@alignCast(storage.ptr));
     const workspace = storage[state_size..][0..lz4.encodeWorkspaceSize()];
