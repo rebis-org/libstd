@@ -38,16 +38,18 @@ pub const HmacSha1 = hmac_seam.HmacSha1;
 pub const HmacSha256 = hmac_seam.HmacSha256;
 pub const hmac_sha256_length = 32;
 
-pub fn hmacSha1(provider: Provider, out: *[hmac_sha1_length]u8, message: []const u8, key: []const u8) void {
-    var hmac = HmacSha1.bind(provider, key);
+pub fn hmacWith(comptime H: type, provider: Provider, out: *[H.mac_length]u8, message: []const u8, key: []const u8) void {
+    var hmac = H.bind(provider, key);
     hmac.update(message);
     hmac.final(out);
 }
 
+pub fn hmacSha1(provider: Provider, out: *[hmac_sha1_length]u8, message: []const u8, key: []const u8) void {
+    hmacWith(HmacSha1, provider, out, message, key);
+}
+
 pub fn hmacSha256(provider: Provider, out: *[hmac_sha256_length]u8, message: []const u8, key: []const u8) void {
-    var hmac = HmacSha256.bind(provider, key);
-    hmac.update(message);
-    hmac.final(out);
+    hmacWith(HmacSha256, provider, out, message, key);
 }
 
 pub fn winzipKeyLength(strength: u8) Failure!usize {
@@ -123,26 +125,23 @@ fn aesBlockWith(comptime S: type, comptime direction: BlockCipher(S).Direction, 
     return out;
 }
 
-pub fn aesEncryptBlock(provider: Provider, key: []const u8, block: [block_length]u8) Failure![block_length]u8 {
+fn aesBlock(comptime direction: BlockCipher(aes_seam.suite_onprem).Direction, provider: Provider, key: []const u8, block: [block_length]u8) Failure![block_length]u8 {
     if (comptime options.aes_impl == .mergeable) {
         return switch (provider) {
-            .onprem => aesBlockWith(aes_seam.suite_onprem, .encrypt, key, block),
-            .offprem => aesBlockWith(aes_seam.suite_offprem, .encrypt, key, block),
+            .onprem => aesBlockWith(aes_seam.suite_onprem, direction, key, block),
+            .offprem => aesBlockWith(aes_seam.suite_offprem, direction, key, block),
         };
     }
     std.debug.assert(provider == default_provider);
-    return aesBlockWith(aes_seam.suite, .encrypt, key, block);
+    return aesBlockWith(aes_seam.suite, direction, key, block);
+}
+
+pub fn aesEncryptBlock(provider: Provider, key: []const u8, block: [block_length]u8) Failure![block_length]u8 {
+    return aesBlock(.encrypt, provider, key, block);
 }
 
 pub fn aesDecryptBlock(provider: Provider, key: []const u8, block: [block_length]u8) Failure![block_length]u8 {
-    if (comptime options.aes_impl == .mergeable) {
-        return switch (provider) {
-            .onprem => aesBlockWith(aes_seam.suite_onprem, .decrypt, key, block),
-            .offprem => aesBlockWith(aes_seam.suite_offprem, .decrypt, key, block),
-        };
-    }
-    std.debug.assert(provider == default_provider);
-    return aesBlockWith(aes_seam.suite, .decrypt, key, block);
+    return aesBlock(.decrypt, provider, key, block);
 }
 
 fn winzipCtrWith(comptime S: type, key: []const u8, destination: []u8, source: []const u8) Failure!void {
@@ -214,15 +213,28 @@ fn aesCbcEncryptWith(comptime S: type, key: []const u8, iv: [block_length]u8, de
     return;
 }
 
-pub fn aesCbcEncrypt(provider: Provider, key: []const u8, iv: [block_length]u8, destination: []u8, source: []const u8) Failure!void {
+fn aesCbc(comptime direction: BlockCipher(aes_seam.suite_onprem).Direction, provider: Provider, key: []const u8, iv: [block_length]u8, destination: []u8, source: []const u8) Failure!void {
     if (comptime options.aes_impl == .mergeable) {
         return switch (provider) {
-            .onprem => aesCbcEncryptWith(aes_seam.suite_onprem, key, iv, destination, source),
-            .offprem => aesCbcEncryptWith(aes_seam.suite_offprem, key, iv, destination, source),
+            .onprem => switch (direction) {
+                .encrypt => aesCbcEncryptWith(aes_seam.suite_onprem, key, iv, destination, source),
+                .decrypt => aesCbcDecryptWith(aes_seam.suite_onprem, key, iv, destination, source),
+            },
+            .offprem => switch (direction) {
+                .encrypt => aesCbcEncryptWith(aes_seam.suite_offprem, key, iv, destination, source),
+                .decrypt => aesCbcDecryptWith(aes_seam.suite_offprem, key, iv, destination, source),
+            },
         };
     }
     std.debug.assert(provider == default_provider);
-    return aesCbcEncryptWith(aes_seam.suite, key, iv, destination, source);
+    return switch (direction) {
+        .encrypt => aesCbcEncryptWith(aes_seam.suite, key, iv, destination, source),
+        .decrypt => aesCbcDecryptWith(aes_seam.suite, key, iv, destination, source),
+    };
+}
+
+pub fn aesCbcEncrypt(provider: Provider, key: []const u8, iv: [block_length]u8, destination: []u8, source: []const u8) Failure!void {
+    return aesCbc(.encrypt, provider, key, iv, destination, source);
 }
 
 fn aesCbcDecryptWith(comptime S: type, key: []const u8, iv: [block_length]u8, destination: []u8, source: []const u8) Failure!void {
@@ -243,14 +255,7 @@ fn aesCbcDecryptWith(comptime S: type, key: []const u8, iv: [block_length]u8, de
 }
 
 pub fn aesCbcDecrypt(provider: Provider, key: []const u8, iv: [block_length]u8, destination: []u8, source: []const u8) Failure!void {
-    if (comptime options.aes_impl == .mergeable) {
-        return switch (provider) {
-            .onprem => aesCbcDecryptWith(aes_seam.suite_onprem, key, iv, destination, source),
-            .offprem => aesCbcDecryptWith(aes_seam.suite_offprem, key, iv, destination, source),
-        };
-    }
-    std.debug.assert(provider == default_provider);
-    return aesCbcDecryptWith(aes_seam.suite, key, iv, destination, source);
+    return aesCbc(.decrypt, provider, key, iv, destination, source);
 }
 
 pub fn winzipDeriveKey(provider: Provider, password: []const u8, salt: []const u8, key_length: usize, out: []u8) Failure!void {
@@ -376,23 +381,18 @@ pub const ZipCryptoKeys = struct {
         return @truncate(product >> 8);
     }
 
-    pub fn encryptByte(self: *ZipCryptoKeys) u8 {
-        return self.decryptByte();
-    }
-
     pub fn encrypt(self: *ZipCryptoKeys, destination: []u8, source: []const u8) void {
         for (source, 0..) |plain, index| {
-            const cipher = self.encryptByte() ^ plain;
+            destination[index] = self.decryptByte() ^ plain;
             self.update(plain);
-            destination[index] = cipher;
         }
     }
 
     pub fn decrypt(self: *ZipCryptoKeys, destination: []u8, source: []const u8) void {
         for (source, 0..) |cipher, index| {
             const plain = self.decryptByte() ^ cipher;
-            self.update(plain);
             destination[index] = plain;
+            self.update(plain);
         }
     }
 };

@@ -52,18 +52,19 @@ fn checkedLen(length: u64) Failure!usize {
     return std.math.cast(usize, length) orelse return error.ResourceLimit;
 }
 
-pub fn checkedConstBytes(pointer: ?[*]const u8, length: u64) Failure![]const u8 {
+fn checkedSlice(comptime Ptr: type, pointer: ?Ptr, length: u64) Failure![]@typeInfo(Ptr).pointer.child {
     const count = try checkedLen(length);
     if (count == 0) return &.{};
     const base = pointer orelse return error.InvalidCall;
     return base[0..count];
 }
 
+pub fn checkedConstBytes(pointer: ?[*]const u8, length: u64) Failure![]const u8 {
+    return checkedSlice([*]const u8, pointer, length);
+}
+
 pub fn checkedMutBytes(pointer: ?[*]u8, length: u64) Failure![]u8 {
-    const count = try checkedLen(length);
-    if (count == 0) return &.{};
-    const base = pointer orelse return error.InvalidCall;
-    return base[0..count];
+    return checkedSlice([*]u8, pointer, length);
 }
 
 pub const Workspace = struct {
@@ -72,15 +73,13 @@ pub const Workspace = struct {
     required_tracker: ?*usize = null,
 
     pub fn init(pointer: ?[*]u8, capacity: u64) Failure!Workspace {
-        return initInner(pointer, capacity, null);
+        return .{ .bytes = try checkedMutBytes(pointer, capacity) };
     }
 
     pub fn initTracked(pointer: ?[*]u8, capacity: u64, tracker: *usize) Failure!Workspace {
-        return initInner(pointer, capacity, tracker);
-    }
-
-    fn initInner(pointer: ?[*]u8, capacity: u64, tracker: ?*usize) Failure!Workspace {
-        return .{ .bytes = try checkedMutBytes(pointer, capacity), .required_tracker = tracker };
+        var self = try init(pointer, capacity);
+        self.required_tracker = tracker;
+        return self;
     }
 
     pub fn take(self: *Workspace, comptime T: type, count: usize) Failure![]T {
