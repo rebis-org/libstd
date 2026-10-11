@@ -96,28 +96,21 @@ pub fn componentsWithInterface(
 
 pub fn withKernelFeatures(target: std.Build.ResolvedTarget) std.Build.ResolvedTarget {
     var adjusted = target;
-    if (adjusted.result.cpu.arch == .aarch64) {
-        const crc_feature = @backingInt(std.Target.aarch64.Feature.crc);
-        adjusted.query.cpu_features_add.addFeature(crc_feature);
-        adjusted.result.cpu.features.addFeature(crc_feature);
-        const crypto_feature = @backingInt(std.Target.aarch64.Feature.crypto);
-        adjusted.query.cpu_features_add.addFeature(crypto_feature);
-        adjusted.result.cpu.features.addFeature(crypto_feature);
-        // The crypto feature implies aes (std.Target.aarch64), and LLVM's aes implies
-        // pmull, which the CRC32 fold kernel multiplies with.
-    }
-    if (adjusted.result.cpu.arch == .x86_64) {
-        const sha_feature = @backingInt(std.Target.x86.Feature.sha);
-        adjusted.query.cpu_features_add.addFeature(sha_feature);
-        adjusted.result.cpu.features.addFeature(sha_feature);
-        const avx2_feature = @backingInt(std.Target.x86.Feature.avx2);
-        adjusted.query.cpu_features_add.addFeature(avx2_feature);
-        adjusted.result.cpu.features.addFeature(avx2_feature);
-        const aes_feature = @backingInt(std.Target.x86.Feature.aes);
-        adjusted.query.cpu_features_add.addFeature(aes_feature);
-        adjusted.result.cpu.features.addFeature(aes_feature);
-        // Non-portable x86_64 builds require SHA-NI, AVX2, and AES-NI; portable builds keep the scalar arms.
-    }
+    const arch = adjusted.result.cpu.arch;
+    const aarch64_features = [_]std.Target.aarch64.Feature{ .crc, .crypto };
+    const x86_features = [_]std.Target.x86.Feature{ .sha, .avx2, .aes };
+    if (arch == .aarch64) for (aarch64_features) |feature| {
+        const bit = @backingInt(feature);
+        adjusted.query.cpu_features_add.addFeature(bit);
+        adjusted.result.cpu.features.addFeature(bit);
+    };
+    if (arch == .x86_64) for (x86_features) |feature| {
+        const bit = @backingInt(feature);
+        adjusted.query.cpu_features_add.addFeature(bit);
+        adjusted.result.cpu.features.addFeature(bit);
+    };
+    // Non-portable x86_64 builds require SHA-NI, AVX2, and AES-NI; portable builds keep the scalar arms.
+    // AArch64 crypto implies aes/pmull, which the CRC32 fold kernel multiplies with.
     return adjusted;
 }
 

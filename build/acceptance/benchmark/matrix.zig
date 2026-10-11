@@ -44,14 +44,6 @@ fn kindFor(comptime name: []const u8) Kind {
     return enumFor(Kind, "kind", name);
 }
 
-fn cmdFor(comptime name: []const u8) Cmd {
-    return enumFor(Cmd, "cmd", name);
-}
-
-fn libFor(comptime name: []const u8) Lib {
-    return enumFor(Lib, "lib", name);
-}
-
 const derived_bases = blk: {
     @setEvalBranchQuota(100_000);
     var list: []const Base = &.{};
@@ -70,7 +62,7 @@ const derived_bases = blk: {
             }
             break :blk2 tunings;
         };
-        list = list ++ &[_]Base{.{ .name = benchmark.row, .kind = kindFor(benchmark.kind), .ext = benchmark.ext, .cmd = if (benchmark.cmd) |value| cmdFor(value) else null, .lib = if (benchmark.lib) |value| libFor(value) else null, .bin = if (benchmark.bin) |value| cmdFor(value) else null, .fmt = benchmark.fmt, .store = benchmark.store, .archive = benchmark.archive, .method = benchmark.method, .decode_only = benchmark.decode_only, .ref_params = benchmark.ref_params, .tunings = tuning_list }};
+        list = list ++ &[_]Base{.{ .name = benchmark.row, .kind = kindFor(benchmark.kind), .ext = benchmark.ext, .cmd = if (benchmark.cmd) |value| enumFor(Cmd, "cmd", value) else null, .lib = if (benchmark.lib) |value| enumFor(Lib, "lib", value) else null, .bin = if (benchmark.bin) |value| enumFor(Cmd, "cmd", value) else null, .fmt = benchmark.fmt, .store = benchmark.store, .archive = benchmark.archive, .method = benchmark.method, .decode_only = benchmark.decode_only, .ref_params = benchmark.ref_params, .tunings = tuning_list }};
     }
     break :blk list;
 };
