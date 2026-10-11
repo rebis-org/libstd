@@ -106,6 +106,18 @@ pub fn withKernelFeatures(target: std.Build.ResolvedTarget) std.Build.ResolvedTa
         // The crypto feature implies aes (std.Target.aarch64), and LLVM's aes implies
         // pmull, which the CRC32 fold kernel multiplies with.
     }
+    if (adjusted.result.cpu.arch == .x86_64) {
+        const sha_feature = @backingInt(std.Target.x86.Feature.sha);
+        adjusted.query.cpu_features_add.addFeature(sha_feature);
+        adjusted.result.cpu.features.addFeature(sha_feature);
+        const avx2_feature = @backingInt(std.Target.x86.Feature.avx2);
+        adjusted.query.cpu_features_add.addFeature(avx2_feature);
+        adjusted.result.cpu.features.addFeature(avx2_feature);
+        const aes_feature = @backingInt(std.Target.x86.Feature.aes);
+        adjusted.query.cpu_features_add.addFeature(aes_feature);
+        adjusted.result.cpu.features.addFeature(aes_feature);
+        // Non-portable x86_64 builds require SHA-NI, AVX2, and AES-NI; portable builds keep the scalar arms.
+    }
     return adjusted;
 }
 
@@ -117,7 +129,7 @@ pub fn createFor(
     ctx: *const common.Context,
 ) *std.Build.Module {
     var adjusted = target;
-    if (!ctx.portable and spec.crc_kernel and adjusted.result.cpu.arch == .aarch64) {
+    if (!ctx.portable and spec.crc_kernel and (adjusted.result.cpu.arch == .aarch64 or adjusted.result.cpu.arch == .x86_64)) {
         adjusted = withKernelFeatures(adjusted);
     }
     const module = b.createModule(.{
