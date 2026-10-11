@@ -7,7 +7,7 @@ const merkle = @import("../merkle.zig");
 // FIPS 180-4.
 // The scalar loop is needed as a portable fallback for targets without the aarch64 sha2 extension.
 
-const has_x86sha = !options.portable and builtin.cpu.arch == .x86_64 and builtin.zig_backend != .stage2_c and builtin.cpu.hasAll(.x86, &.{ .sha, .avx2 });
+const has_x86sha = !options.portable and builtin.target.cpu.arch == .x86_64 and builtin.zig_backend != .stage2_c and builtin.target.cpu.hasAll(.x86, &.{ .sha, .avx2 });
 
 const initial_state: [8]u32 = .{
     0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
@@ -20,7 +20,7 @@ fn compressSha256(state: *align(16) [8]u32, block: *const [64]u8) void {
         compressX8664(state, block);
         return;
     }
-    if (comptime builtin.cpu.arch == .aarch64 and builtin.zig_backend != .stage2_c and builtin.cpu.has(.aarch64, .sha2)) {
+    if (comptime builtin.target.cpu.arch == .aarch64 and builtin.zig_backend != .stage2_c and builtin.target.cpu.has(.aarch64, .sha2)) {
         var w: [64]u32 align(16) = undefined;
         for (0..16) |index| {
             w[index] = std.mem.readInt(u32, block[4 * index ..][0..4], .big);

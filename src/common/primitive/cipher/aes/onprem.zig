@@ -10,13 +10,13 @@ pub const block_length = 16;
 
 const Repr = @Vector(2, u64);
 
-const has_arm8 = builtin.cpu.arch == .aarch64 and
+const has_arm8 = builtin.target.cpu.arch == .aarch64 and
     builtin.zig_backend != .stage2_c and
-    builtin.cpu.has(.aarch64, .aes);
+    builtin.target.cpu.has(.aarch64, .aes);
 
-const has_aesni = !options.portable and builtin.cpu.arch == .x86_64 and
+const has_aesni = !options.portable and builtin.target.cpu.arch == .x86_64 and
     builtin.zig_backend != .stage2_c and
-    builtin.cpu.has(.x86, .aes);
+    builtin.target.cpu.has(.x86, .aes);
 
 pub const Block = if (has_arm8) BlockArm8 else if (has_aesni) BlockAesNi else BlockSoft;
 
