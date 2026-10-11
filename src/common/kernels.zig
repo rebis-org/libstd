@@ -6,7 +6,7 @@ const build_options = @import("options");
 // target feature. Other targets keep the portable word-at-a-time path.
 const vector_match_copy = !build_options.portable and builtin.target.cpu.arch == .aarch64;
 
-pub fn matchLen8(window: []const u8, first: usize, second: usize, max_len: usize) usize {
+pub inline fn matchLen8(window: []const u8, first: usize, second: usize, max_len: usize) usize {
     var len: usize = 0;
     while (len + 8 <= max_len) {
         const xor = std.mem.readInt(u64, window[first + len ..][0..8], .little) ^ std.mem.readInt(u64, window[second + len ..][0..8], .little);

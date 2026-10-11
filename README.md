@@ -8,6 +8,8 @@ Library (for standard) in Zig as XCFramework, cjpm and AAR
 ## Credits
 
 - [ziglang/zig](https://codeberg.org/ziglang/zig) (MIT)
+- [ghostty-org/ghostty](https://github.com/ghostty-org/ghostty) (MIT)
+- [tigerbeetle/tigerbeetle](https://github.com/tigerbeetle/tigerbeetle) (Apache-2.0)
 
 ## License
 

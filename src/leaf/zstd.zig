@@ -486,9 +486,9 @@ fn encodeBlocks(output: *std.Io.Writer, content: []const u8, content_start: usiz
     var literal_table: [1 << 6]FseEntry = undefined;
     var match_table: [1 << 6]FseEntry = undefined;
     var offset_table: [1 << 5]FseEntry = undefined;
-    buildFseTable(&default_literal_probs, &literal_table) catch return error.InvalidData;
-    buildFseTable(&default_match_probs, &match_table) catch return error.InvalidData;
-    buildFseTable(&default_offset_probs, &offset_table) catch return error.InvalidData;
+    buildFseEncoderSpread(&default_literal_probs, &literal_table) catch return error.InvalidData;
+    buildFseEncoderSpread(&default_match_probs, &match_table) catch return error.InvalidData;
+    buildFseEncoderSpread(&default_offset_probs, &offset_table) catch return error.InvalidData;
     const frame_len = content.len - content_start;
     const head = workspace[0..hash_size];
     @memset(head, encoder_no_position);
@@ -806,6 +806,11 @@ fn encodeBlockDfast(output: *std.Io.Writer, content: []const u8, block_start: us
             inner: while (true) {
                 const pos_abs = block_start + ip;
                 const hs0 = hash5At(content, pos_abs, short_bits);
+                // The frame content streams through once: the hardware prefetcher does
+                // not see past the hash tables, so the probe lines arrive two positions
+                // early (the vendor prefetches ip+128 and ip+256 on this path).
+                @prefetch(content.ptr + block_start + ip + 128, .{ .rw = .read, .locality = 3, .cache = .data });
+                @prefetch(content.ptr + block_start + ip + 256, .{ .rw = .read, .locality = 3, .cache = .data });
                 const idxs0 = chain[hs0];
                 head[hl0] = @intCast(pos_abs);
                 chain[hs0] = @intCast(pos_abs);
@@ -1016,6 +1021,8 @@ fn encodeBlockRow(output: *std.Io.Writer, content: []const u8, block_start: usiz
             inner: while (true) {
                 const pos_abs = block_start + ip;
                 const curr: u32 = @intCast(pos_abs);
+                @prefetch(content.ptr + block_start + ip + 128, .{ .rw = .read, .locality = 3, .cache = .data });
+                @prefetch(content.ptr + block_start + ip + 256, .{ .rw = .read, .locality = 3, .cache = .data });
                 var stored = false;
                 // Built at the head of the one-ahead path before any read, so `undefined` is safe.
                 var probe1: RowProbe = undefined;
@@ -1093,27 +1100,27 @@ fn encodeBlockRow(output: *std.Io.Writer, content: []const u8, block_start: usiz
     try finishBlock(output, src, literal_buf[0..literal_count], seq_data[0..seq_count], &literal_freq, literal_table, match_table, offset_table, is_last, block_workspace, prev);
 }
 
-fn readU32At(content: []const u8, pos: usize) u32 {
+inline fn readU32At(content: []const u8, pos: usize) u32 {
     return std.mem.readInt(u32, content[pos..][0..4], .little);
 }
 
-fn readU64At(content: []const u8, pos: usize) u64 {
+inline fn readU64At(content: []const u8, pos: usize) u64 {
     return std.mem.readInt(u64, content[pos..][0..8], .little);
 }
 
-fn hash5At(content: []const u8, pos: usize, bits: u5) u32 {
+inline fn hash5At(content: []const u8, pos: usize, bits: u5) u32 {
     const word = readU64At(content, pos);
     const shift: u6 = @intCast(64 - @as(u7, bits));
     return @truncate(((word << 24) *% 889523592379) >> shift);
 }
 
-fn hash8At(content: []const u8, pos: usize, bits: u5) u32 {
+inline fn hash8At(content: []const u8, pos: usize, bits: u5) u32 {
     const word = readU64At(content, pos);
     const shift: u6 = @intCast(64 - @as(u7, bits));
     return @truncate((word *% 0xCF1BBCDCB7A56463) >> shift);
 }
 
-fn countMatchLen(content: []const u8, match_pos: usize, scan_pos: usize, end: usize) usize {
+inline fn countMatchLen(content: []const u8, match_pos: usize, scan_pos: usize, end: usize) usize {
     const max_len = end - @max(match_pos, scan_pos);
     return kernels.matchLen8(content, match_pos, scan_pos, max_len);
 }
@@ -1435,7 +1442,7 @@ fn buildFseTreeSection(weights: []const u4, out: []u8) ?[]const u8 {
     const norm = normalizeFseCounts(&weight_freq, 12, 6, 6, &normalized) orelse return null;
     const table_size: usize = @as(usize, 1) << norm.log;
     var table_buf: [64]FseEntry = undefined;
-    buildFseTable(normalized[0..norm.count], table_buf[0..table_size]) catch return null;
+    buildFseEncoderSpread(normalized[0..norm.count], table_buf[0..table_size]) catch return null;
     var ncount_buf: [128]u8 = undefined;
     const ncount = writeNCounts(&ncount_buf, normalized[0..norm.count], norm.log) orelse return null;
     var stream_buf: [256]u8 = undefined;
@@ -1494,6 +1501,55 @@ fn fseEncodeWeightStream(symbols: []const u4, normalized: []const i16, norm_log:
     writer.writeBits(cstate2, norm_log) catch return null;
     writer.writeBits(cstate1, norm_log) catch return null;
     return writer.finish() catch return null;
+}
+
+// The encoder's spread table keeps the symbol per position, which the FSE state
+// derivation reads. The decoder builds its packed entry instead.
+fn buildFseEncoderSpread(values: []const i16, entries: []FseEntry) error{InvalidData}!void {
+    const table_size: u16 = @intCast(entries.len);
+    const accuracy_log = std.math.log2_int(u16, table_size);
+    const table_mask = entries.len - 1;
+    const step = (entries.len >> 1) + (entries.len >> 3) + 3;
+    var symbol_next: [256]u16 = undefined;
+    var high_threshold = entries.len;
+    // -1 symbols sit at the high end of the table.
+    for (values, 0..) |value, symbol| {
+        if (value == -1) {
+            if (high_threshold == 0) return error.InvalidData;
+            high_threshold -= 1;
+            entries[high_threshold] = .{
+                .symbol = @intCast(symbol),
+                .baseline = 0,
+                .bits = accuracy_log,
+            };
+            symbol_next[symbol] = 1;
+        } else if (value == 0) {
+            symbol_next[symbol] = 0;
+        } else {
+            symbol_next[symbol] = @intCast(value);
+        }
+    }
+    var position: usize = 0;
+    for (values, 0..) |value, symbol| {
+        if (value <= 0) continue;
+        const probability: usize = @intCast(value);
+        for (0..probability) |_| {
+            entries[position].symbol = @intCast(symbol);
+            position = (position + step) & table_mask;
+            while (position >= high_threshold) {
+                position = (position + step) & table_mask;
+            }
+        }
+    }
+    if (position != 0) return error.InvalidData;
+    for (0..entries.len) |index| {
+        const symbol = entries[index].symbol;
+        const next_state = symbol_next[symbol];
+        symbol_next[symbol] = next_state + 1;
+        const bits = accuracy_log - std.math.log2_int(u16, next_state);
+        entries[index].bits = bits;
+        entries[index].baseline = (@as(u16, next_state) << bits) - table_size;
+    }
 }
 
 fn buildFseEncoderTable(normalized: []const i16, table: []const FseEntry) FseEncoderTable {
@@ -1812,7 +1868,7 @@ fn planMode(n: usize, symbols: []const u8, freq: *const [256]u32, symbol_count: 
     if (normalizeFseCounts(freq, symbol_count, max_log, start_log, &normalized)) |norm| {
         const table_size = @as(usize, 1) << norm.log;
         if (table_size <= table_buf.len) fse_candidate: {
-            buildFseTable(normalized[0..norm.count], table_buf[0..table_size]) catch break :fse_candidate;
+            buildFseEncoderSpread(normalized[0..norm.count], table_buf[0..table_size]) catch break :fse_candidate;
             if (estimateFseBits(table_buf[0..table_size], freq, symbol_count, norm.log)) |bits| {
                 if (writeNCounts(ncount_buf, normalized[0..norm.count], norm.log)) |ncount| {
                     // Description costs ncount bytes. Compare totals in bits.
@@ -2387,7 +2443,10 @@ const BackwardBitStream = struct {
 
     inline fn read(self: *BackwardBitStream, count: u6) DecodeError!u64 {
         if (count == 0) return 0;
-        self.refill();
+        // Refill drops whole consumed bytes and reloads below the live bits, so the
+        // unconsumed prefix and the remaining count are invariant: a container that
+        // already holds count bits answers without it.
+        if (self.valid() < count) self.refill();
         if (self.remaining() < count) return error.InvalidData;
         const value = self.peek(count);
         self.skip(count);
@@ -2405,19 +2464,19 @@ pub fn dictionaryContent(dictionary: []const u8) DecodeError![]const u8 {
     var cursor = binary.ReadCursor.init(dictionary[8..]);
     var tree: HuffmanTree = .{ .nodes = undefined };
     try decodeHuffmanTree(&cursor, &tree);
-    var offset_entries: [1 << 8]FseEntry = undefined;
+    var offset_entries: [1 << 8]DecodeEntry = undefined;
     {
-        const decoded = try decodeFseTable(cursor.remainingSlice(), 32, 8, &offset_entries);
+        const decoded = try decodeFseTable(cursor.remainingSlice(), 32, 8, &offset_entries, .offset);
         cursor.pos += decoded.consumed;
     }
-    var match_entries: [1 << 9]FseEntry = undefined;
+    var match_entries: [1 << 9]DecodeEntry = undefined;
     {
-        const decoded = try decodeFseTable(cursor.remainingSlice(), 53, 9, &match_entries);
+        const decoded = try decodeFseTable(cursor.remainingSlice(), 53, 9, &match_entries, .match);
         cursor.pos += decoded.consumed;
     }
-    var literal_entries: [1 << 9]FseEntry = undefined;
+    var literal_entries: [1 << 9]DecodeEntry = undefined;
     {
-        const decoded = try decodeFseTable(cursor.remainingSlice(), 36, 9, &literal_entries);
+        const decoded = try decodeFseTable(cursor.remainingSlice(), 36, 9, &literal_entries, .literal);
         cursor.pos += decoded.consumed;
     }
     _ = try cursor.readU32Le();
@@ -2540,19 +2599,19 @@ const Decoder = struct {
         d.huffman_tree = .{ .nodes = undefined };
         try decodeHuffmanTree(&cursor, &d.huffman_tree.?);
         {
-            const decoded = try decodeFseTable(cursor.remainingSlice(), 32, 8, &d.offset_state.entries);
+            const decoded = try decodeFseTable(cursor.remainingSlice(), 32, 8, &d.offset_state.entries, .offset);
             cursor.pos += decoded.consumed;
             d.offset_state.accuracy_log = @intCast(std.math.log2_int(usize, decoded.table_size));
             d.offset_state.table = .{ .fse = d.offset_state.entries[0..decoded.table_size] };
         }
         {
-            const decoded = try decodeFseTable(cursor.remainingSlice(), 53, 9, &d.match_state.entries);
+            const decoded = try decodeFseTable(cursor.remainingSlice(), 53, 9, &d.match_state.entries, .match);
             cursor.pos += decoded.consumed;
             d.match_state.accuracy_log = @intCast(std.math.log2_int(usize, decoded.table_size));
             d.match_state.table = .{ .fse = d.match_state.entries[0..decoded.table_size] };
         }
         {
-            const decoded = try decodeFseTable(cursor.remainingSlice(), 36, 9, &d.literal_state.entries);
+            const decoded = try decodeFseTable(cursor.remainingSlice(), 36, 9, &d.literal_state.entries, .literal);
             cursor.pos += decoded.consumed;
             d.literal_state.accuracy_log = @intCast(std.math.log2_int(usize, decoded.table_size));
             d.literal_state.table = .{ .fse = d.literal_state.entries[0..decoded.table_size] };
@@ -2620,13 +2679,12 @@ const Decoder = struct {
             match_state = @intCast(try seq_bits.read(d.match_state.accuracy_log));
         }
 
-        var literal_rle: [1]FseEntry = undefined;
-        var match_rle: [1]FseEntry = undefined;
-        var offset_rle: [1]FseEntry = undefined;
-        const literal_table = fseTableOrRle(&d.literal_state, &literal_rle);
-        const match_table = fseTableOrRle(&d.match_state, &match_rle);
-        const offset_table = fseTableOrRle(&d.offset_state, &offset_rle);
-
+        var literal_rle: [1]DecodeEntry = undefined;
+        var match_rle: [1]DecodeEntry = undefined;
+        var offset_rle: [1]DecodeEntry = undefined;
+        const literal_table = fseTableOrRle(&d.literal_state, .literal, &literal_rle);
+        const match_table = fseTableOrRle(&d.match_state, .match, &match_rle);
+        const offset_table = fseTableOrRle(&d.offset_state, .offset, &offset_rle);
         var reps = d.repeat_offsets;
         var literal_written: usize = 0;
         var decoded_count: usize = 0;
@@ -2638,26 +2696,23 @@ const Decoder = struct {
             const offset_entry = offset_table[offset_state];
             const match_entry = match_table[match_state];
             const literal_entry = literal_table[literal_state];
+            if (offset_entry.extra_bits == fse_invalid_extra or match_entry.extra_bits == fse_invalid_extra or literal_entry.extra_bits == fse_invalid_extra) return error.InvalidData;
 
-            const offset_code = offset_entry.symbol;
-            const offset_extra: u32 = @intCast(try seq_bits.read(@intCast(offset_code)));
-            const offset_value = (@as(u32, 1) << @intCast(offset_code)) + offset_extra;
+            const offset_extra: u32 = @intCast(try seq_bits.read(@intCast(offset_entry.extra_bits)));
+            const offset_value = offset_entry.base_value + offset_extra;
 
-            const match_symbol = match_entry.symbol;
-            if (match_symbol >= match_length_code_table.len) return error.InvalidData;
-            const match_len_code = match_length_code_table[match_symbol];
-            const match_extra: u32 = @intCast(try seq_bits.read(@intCast(match_len_code[1])));
-            const match_length = match_len_code[0] + match_extra;
+            const match_extra: u32 = @intCast(try seq_bits.read(@intCast(match_entry.extra_bits)));
+            const match_length = match_entry.base_value + match_extra;
 
-            const literal_symbol = literal_entry.symbol;
-            if (literal_symbol >= literals_length_code_table.len) return error.InvalidData;
-            const literal_len_code = literals_length_code_table[literal_symbol];
-            const literal_extra: u32 = @intCast(try seq_bits.read(@intCast(literal_len_code[1])));
-            const literal_length = literal_len_code[0] + literal_extra;
+            const literal_extra: u32 = @intCast(try seq_bits.read(@intCast(literal_entry.extra_bits)));
+            const literal_length = literal_entry.base_value + literal_extra;
 
             const offset = computeOffsetValue(offset_value, literal_length, &reps);
             if (offset == 0) return error.InvalidData;
-
+            // The match source loads while the literal run is emitted, so its line
+            // starts early. The guard keeps the hint off a corrupt stream's wild offset.
+            const write_base = d.history_end + decoded_count;
+            if (offset <= write_base) @prefetch(d.history[write_base - offset ..].ptr, .{ .rw = .read, .locality = 3, .cache = .data });
             if (literal_length > 0) {
                 if (literal_written + literal_length > literals.regenerated_size) return error.InvalidData;
                 if (decoded_count + literal_length > block_size_max) return error.InvalidData;
@@ -2793,8 +2848,8 @@ const Decoder = struct {
                         return error.InvalidData;
                     }
                     if (len2 != 0 and len1 + len2 <= avail and emitted + 2 <= dest.len) {
-                        dest[emitted] = @truncate(entry);
-                        dest[emitted + 1] = @truncate(entry >> 8);
+                        // The entry packs both symbols little-endian in its low 16 bits.
+                        std.mem.writeInt(u16, dest[emitted..][0..2], @truncate(entry), .little);
                         bits.skip(len1 + len2);
                         emitted += 2;
                     } else {
@@ -2892,8 +2947,13 @@ const Decoder = struct {
                     .match => 6,
                     .offset => 5,
                 };
+                const kind: TableKind = switch (choice) {
+                    .literal => .literal,
+                    .match => .match,
+                    .offset => .offset,
+                };
                 const table_size = @as(usize, 1) << accuracy_log;
-                buildFseTable(probs, state.entries[0..table_size]) catch return error.InvalidData;
+                buildFseTable(probs, state.entries[0..table_size], kind) catch return error.InvalidData;
                 state.table = .{ .fse = state.entries[0..table_size] };
                 state.accuracy_log = accuracy_log;
             },
@@ -2912,7 +2972,12 @@ const Decoder = struct {
                     .match => 9,
                     .offset => 8,
                 };
-                const decoded = decodeFseTable(cursor.remainingSlice(), max_symbol_count, max_log, &state.entries) catch return error.InvalidData;
+                const kind: TableKind = switch (choice) {
+                    .literal => .literal,
+                    .match => .match,
+                    .offset => .offset,
+                };
+                const decoded = try decodeFseTable(cursor.remainingSlice(), max_symbol_count, max_log, &state.entries, kind);
                 cursor.pos += decoded.consumed;
                 state.table = .{ .fse = state.entries[0..decoded.table_size] };
                 state.accuracy_log = @intCast(std.math.log2_int(usize, decoded.table_size));
@@ -3106,14 +3171,30 @@ fn literalStreamCount(literals: *const LiteralsSection) usize {
 
 const FseChoice = enum { literal, match, offset };
 
+// The encoder's spread table: the symbol at each table position plus the state
+// transition the coder walks. The decoder reads its own packed entry below.
 const FseEntry = struct {
     symbol: u8,
     baseline: u16,
     bits: u8,
 };
 
+// One word per decode-table entry carries the state transition and the decoded
+// fields, so the sequence loop loads once where it loaded a 6-byte entry plus a
+// second code table. The layout mirrors the vendor's ZSTD_seqSymbol.
+const DecodeEntry = struct {
+    baseline: u16,
+    bits: u8,
+    extra_bits: u8,
+    base_value: u32,
+};
+
+// No valid extra-bit count reaches this, so the marker rejects an RLE table
+// whose symbol falls outside the stream's code table.
+const fse_invalid_extra: u8 = 0xFF;
+
 const FseTable = union(enum) {
-    fse: []const FseEntry,
+    fse: []const DecodeEntry,
     rle: u8,
 };
 
@@ -3121,16 +3202,45 @@ const FseState = struct {
     state: u16,
     table: FseTable,
     accuracy_log: u4,
-    entries: [1 << 9]FseEntry,
+    entries: [1 << 9]DecodeEntry,
 };
 
-fn fseTableOrRle(state: *const FseState, storage: *[1]FseEntry) []const FseEntry {
+fn fseTableOrRle(state: *const FseState, kind: TableKind, storage: *[1]DecodeEntry) []const DecodeEntry {
     return switch (state.table) {
         .fse => |t| t,
-        .rle => |s| {
-            storage[0] = .{ .symbol = s, .bits = 0, .baseline = 0 };
-            return storage[0..1];
+        .rle => |s| blk: {
+            const fields = entryFields(kind, s);
+            storage[0] = .{ .baseline = 0, .bits = 0, .extra_bits = fields.extra, .base_value = fields.base };
+            break :blk storage[0..1];
         },
+    };
+}
+
+// Which code table a decode table serves. The Huffman weight stream is the fourth
+// user: its symbol is the weight itself.
+const TableKind = enum { literal, match, offset, weight };
+
+// The RLE symbol is a raw byte, so a symbol past the stream's code table marks
+// the entry invalid and the sequence loop rejects it where the old per-symbol
+// bounds checks did. An offset symbol past 31 also removes the shift overflow
+// the old `1 << symbol` form allowed.
+const CodeFields = struct { base: u32, extra: u8 };
+
+fn entryFields(kind: TableKind, symbol: u16) CodeFields {
+    return switch (kind) {
+        .literal => if (symbol < literals_length_code_table.len)
+            .{ .base = literals_length_code_table[symbol][0], .extra = literals_length_code_table[symbol][1] }
+        else
+            .{ .base = 0, .extra = fse_invalid_extra },
+        .match => if (symbol < match_length_code_table.len)
+            .{ .base = match_length_code_table[symbol][0], .extra = match_length_code_table[symbol][1] }
+        else
+            .{ .base = 0, .extra = fse_invalid_extra },
+        .offset => if (symbol < 32)
+            .{ .base = @as(u32, 1) << @intCast(symbol), .extra = @intCast(symbol) }
+        else
+            .{ .base = 0, .extra = fse_invalid_extra },
+        .weight => .{ .base = @intCast(symbol), .extra = 0 },
     };
 }
 
@@ -3471,7 +3581,7 @@ fn splitLiteralStreams(size_format: u2, data: []const u8) DecodeError!LiteralsSt
     const s1 = std.mem.readInt(u16, data[0..2], .little);
     const s2 = std.mem.readInt(u16, data[2..4], .little);
     const s3 = std.mem.readInt(u16, data[4..6], .little);
-    const start1 = 6;
+    const start1: usize = 6;
     const start2 = start1 + s1;
     const start3 = start2 + s2;
     const start4 = start3 + s3;
@@ -3491,8 +3601,8 @@ fn decodeHuffmanTree(cursor: *ReadCursor, tree: *HuffmanTree) DecodeError!void {
     if (header < 128) {
         const compressed_size = header;
         const compressed = try cursor.readSlice(compressed_size);
-        var entries: [1 << 6]FseEntry = undefined;
-        const decoded = decodeFseTable(compressed, 256, 6, &entries) catch return error.InvalidData;
+        var entries: [1 << 6]DecodeEntry = undefined;
+        const decoded = try decodeFseTable(compressed, 256, 6, &entries, .weight);
         const accuracy_log = std.math.log2_int(usize, decoded.table_size);
         const remaining = compressed[decoded.consumed..];
         symbol_count = assignHuffmanWeights(remaining, accuracy_log, &entries, &weights) catch return error.InvalidData;
@@ -3515,7 +3625,7 @@ fn decodeHuffmanTree(cursor: *ReadCursor, tree: *HuffmanTree) DecodeError!void {
 fn assignHuffmanWeights(
     buffer: []const u8,
     accuracy_log: u16,
-    entries: []const FseEntry,
+    entries: []const DecodeEntry,
     weights: *[256]u4,
 ) DecodeError!usize {
     var reader = try ReverseBitReader.init(buffer);
@@ -3527,10 +3637,10 @@ fn assignHuffmanWeights(
         var read_count: u16 = 0;
         const even_bits = reader.readBitsAny(u32, even_data.bits) catch return error.InvalidData;
         read_count = even_bits.count;
-        weights[i] = std.math.cast(u4, even_data.symbol) orelse return error.InvalidData;
+        weights[i] = std.math.cast(u4, even_data.base_value) orelse return error.InvalidData;
         i += 1;
         if (read_count < even_data.bits) {
-            weights[i] = std.math.cast(u4, entries[odd_state].symbol) orelse return error.InvalidData;
+            weights[i] = std.math.cast(u4, entries[odd_state].base_value) orelse return error.InvalidData;
             i += 1;
             break;
         }
@@ -3538,11 +3648,11 @@ fn assignHuffmanWeights(
         const odd_data = entries[odd_state];
         const odd_bits = reader.readBitsAny(u32, odd_data.bits) catch return error.InvalidData;
         read_count = odd_bits.count;
-        weights[i] = std.math.cast(u4, odd_data.symbol) orelse return error.InvalidData;
+        weights[i] = std.math.cast(u4, odd_data.base_value) orelse return error.InvalidData;
         i += 1;
         if (read_count < odd_data.bits) {
             if (i == 255) return error.InvalidData;
-            weights[i] = std.math.cast(u4, entries[even_state].symbol) orelse return error.InvalidData;
+            weights[i] = std.math.cast(u4, entries[even_state].base_value) orelse return error.InvalidData;
             i += 1;
             break;
         }
@@ -3699,7 +3809,8 @@ fn decodeFseTable(
     bytes: []const u8,
     expected_symbol_count: usize,
     max_accuracy_log: u4,
-    entries: []FseEntry,
+    entries: []DecodeEntry,
+    kind: TableKind,
 ) DecodeError!struct { table_size: usize, consumed: usize } {
     var window = NCountWindow{ .bytes = bytes };
     const accuracy_log_biased = try window.peek(4);
@@ -3752,27 +3863,33 @@ fn decodeFseTable(
     if (charnum > expected_symbol_count) return error.InvalidData;
     if (charnum < 2) return error.InvalidData;
     const table_size = @as(usize, 1) << accuracy_log;
-    buildFseTable(norm[0..charnum], entries[0..table_size]) catch return error.InvalidData;
+    buildFseTable(norm[0..charnum], entries[0..table_size], kind) catch return error.InvalidData;
     return .{ .table_size = table_size, .consumed = (window.total + 7) / 8 };
 }
 
-fn buildFseTable(values: []const i16, entries: []FseEntry) error{InvalidData}!void {
+fn buildFseTable(values: []const i16, entries: []DecodeEntry, kind: TableKind) error{InvalidData}!void {
     const table_size: u16 = @intCast(entries.len);
     const accuracy_log = std.math.log2_int(u16, table_size);
     const table_mask = entries.len - 1;
     const step = (entries.len >> 1) + (entries.len >> 3) + 3;
     var symbol_next: [256]u16 = undefined;
+    // The entry carries no symbol field, so the spread keeps the symbol per
+    // position for the state-transition pass.
+    var placed: [512]u8 = undefined;
     var high_threshold = entries.len;
     // -1 symbols sit at the high end of the table.
     for (values, 0..) |value, symbol| {
         if (value == -1) {
             if (high_threshold == 0) return error.InvalidData;
             high_threshold -= 1;
+            const fields = entryFields(kind, @intCast(symbol));
             entries[high_threshold] = .{
-                .symbol = @intCast(symbol),
                 .baseline = 0,
                 .bits = accuracy_log,
+                .extra_bits = fields.extra,
+                .base_value = fields.base,
             };
+            placed[high_threshold] = @intCast(symbol);
             symbol_next[symbol] = 1;
         } else if (value == 0) {
             symbol_next[symbol] = 0;
@@ -3785,7 +3902,14 @@ fn buildFseTable(values: []const i16, entries: []FseEntry) error{InvalidData}!vo
         if (value <= 0) continue;
         const probability: usize = @intCast(value);
         for (0..probability) |_| {
-            entries[position].symbol = @intCast(symbol);
+            const fields = entryFields(kind, @intCast(symbol));
+            entries[position] = .{
+                .baseline = 0,
+                .bits = 0,
+                .extra_bits = fields.extra,
+                .base_value = fields.base,
+            };
+            placed[position] = @intCast(symbol);
             position = (position + step) & table_mask;
             while (position >= high_threshold) {
                 position = (position + step) & table_mask;
@@ -3794,7 +3918,7 @@ fn buildFseTable(values: []const i16, entries: []FseEntry) error{InvalidData}!vo
     }
     if (position != 0) return error.InvalidData;
     for (0..entries.len) |index| {
-        const symbol = entries[index].symbol;
+        const symbol = placed[index];
         const next_state = symbol_next[symbol];
         symbol_next[symbol] = next_state + 1;
         const bits = accuracy_log - std.math.log2_int(u16, next_state);
