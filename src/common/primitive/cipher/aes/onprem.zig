@@ -1,6 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+const options = @import("options");
+
 // FIPS-197.
 // AES-192 needs the classic word expansion because the vectorized schedule requires 16-byte key groups.
 
@@ -12,7 +14,11 @@ const has_arm8 = builtin.cpu.arch == .aarch64 and
     builtin.zig_backend != .stage2_c and
     builtin.cpu.has(.aarch64, .aes);
 
-pub const Block = if (has_arm8) BlockArm8 else BlockSoft;
+const has_aesni = !options.portable and builtin.cpu.arch == .x86_64 and
+    builtin.zig_backend != .stage2_c and
+    builtin.cpu.has(.x86, .aes);
+
+pub const Block = if (has_arm8) BlockArm8 else if (has_aesni) BlockAesNi else BlockSoft;
 
 const BlockArm8 = struct {
     repr: Repr,
@@ -145,6 +151,72 @@ const BlockSoft = struct {
     }
 };
 
+// Legacy AES-NI rounds (std crypto/aes/aesni.zig, VEX forms lowered to
+// two-operand). Dormant unless the target carries the extension.
+const BlockAesNi = struct {
+    repr: Repr,
+
+    pub fn fromBytes(bytes: *const [16]u8) BlockAesNi {
+        return .{ .repr = std.mem.bytesToValue(Repr, bytes) };
+    }
+
+    pub fn toBytes(block: BlockAesNi) [16]u8 {
+        return std.mem.toBytes(block.repr);
+    }
+
+    fn xorBlocks(first: BlockAesNi, second: BlockAesNi) BlockAesNi {
+        return .{ .repr = first.repr ^ second.repr };
+    }
+
+    pub fn encrypt(block: BlockAesNi, round_key: BlockAesNi) BlockAesNi {
+        return .{ .repr = asm (
+            \\ movdqa %[in], %[out]
+            \\ aesenc %[rk], %[out]
+            : [out] "=&x" (-> Repr),
+            : [in] "x" (block.repr),
+              [rk] "x" (round_key.repr),
+        ) };
+    }
+
+    pub fn encryptLast(block: BlockAesNi, round_key: BlockAesNi) BlockAesNi {
+        return .{ .repr = asm (
+            \\ movdqa %[in], %[out]
+            \\ aesenclast %[rk], %[out]
+            : [out] "=&x" (-> Repr),
+            : [in] "x" (block.repr),
+              [rk] "x" (round_key.repr),
+        ) };
+    }
+
+    pub fn decrypt(block: BlockAesNi, inv_round_key: BlockAesNi) BlockAesNi {
+        return .{ .repr = asm (
+            \\ movdqa %[in], %[out]
+            \\ aesdec %[rk], %[out]
+            : [out] "=&x" (-> Repr),
+            : [in] "x" (block.repr),
+              [rk] "x" (inv_round_key.repr),
+        ) };
+    }
+
+    pub fn decryptLast(block: BlockAesNi, inv_round_key: BlockAesNi) BlockAesNi {
+        return .{ .repr = asm (
+            \\ movdqa %[in], %[out]
+            \\ aesdeclast %[rk], %[out]
+            : [out] "=&x" (-> Repr),
+            : [in] "x" (block.repr),
+              [rk] "x" (inv_round_key.repr),
+        ) };
+    }
+
+    pub fn invMixColumns(block: BlockAesNi) BlockAesNi {
+        return .{ .repr = asm (
+            \\ aesimc %[in], %[out]
+            : [out] "=x" (-> Repr),
+            : [in] "x" (block.repr),
+        ) };
+    }
+};
+
 fn KeySchedule(comptime Aes: type) type {
     const rounds = Aes.rounds;
 
@@ -157,30 +229,30 @@ fn KeySchedule(comptime Aes: type) type {
         round_keys: [rounds + 1]Block,
 
         fn expand128(first: *Block) Self {
-            if (comptime !has_arm8) return expandScalar(first, null);
+            if (comptime !has_arm8 and !has_aesni) return expandScalar(first, null);
             var round_keys: [11]Block = undefined;
             const rcs = [_]u8{ 1, 2, 4, 8, 16, 32, 64, 128, 27, 54 };
             inline for (rcs, 0..) |rc, round| {
                 round_keys[round] = first.*;
-                first.repr = schedule128(rc, first.repr);
+                first.repr = nextKey128(rc, first.repr);
             }
             round_keys[rcs.len] = first.*;
             return .{ .round_keys = round_keys };
         }
 
         fn expand256(first: *Block, second: *Block) Self {
-            if (comptime !has_arm8) return expandScalar(first, second);
+            if (comptime !has_arm8 and !has_aesni) return expandScalar(first, second);
             var round_keys: [15]Block = undefined;
             const rcs = [_]u8{ 1, 2, 4, 8, 16, 32 };
             round_keys[0] = first.*;
             inline for (rcs, 0..) |rc, round| {
                 round_keys[round * 2 + 1] = second.*;
-                first.repr = schedule256(false, rc, second.repr, first.repr);
+                first.repr = nextKey256(false, rc, second.repr, first.repr);
                 round_keys[round * 2 + 2] = first.*;
-                second.repr = schedule256(true, rc, first.repr, second.repr);
+                second.repr = nextKey256(true, rc, first.repr, second.repr);
             }
             round_keys[rcs.len * 2 + 1] = second.*;
-            first.repr = schedule256(false, 64, second.repr, first.repr);
+            first.repr = nextKey256(false, 64, second.repr, first.repr);
             round_keys[rcs.len * 2 + 2] = first.*;
             return .{ .round_keys = round_keys };
         }
@@ -272,6 +344,64 @@ fn KeySchedule(comptime Aes: type) type {
                   [tx] "x" (tx),
                   [zero] "x" (@as(Repr, .{ 0, 0 })),
                   [mask] "x" (if (second) mask2 else mask1),
+            );
+        }
+
+        fn nextKey128(comptime rc: u8, t: Repr) Repr {
+            if (comptime has_arm8) return schedule128(rc, t);
+            return nkFirst(rc, t, t);
+        }
+
+        fn nextKey256(comptime second: bool, comptime rc: u8, t: Repr, tx: Repr) Repr {
+            if (comptime has_arm8) return schedule256(second, rc, t, tx);
+            if (comptime second) return nkSecond(t, tx);
+            return nkFirst(rc, t, tx);
+        }
+
+        // AES-NI assist expansion (Intel AES-NI whitepaper 128-bit
+        // sequence). The shift cascade accumulates: each stage folds the
+        // previous shift further, matching the VEX schedule term by term.
+        fn nkFirst(comptime rc: u8, t: Repr, tx: Repr) Repr {
+            var s: Repr = undefined;
+            var s2: Repr = undefined;
+            var ts: Repr = undefined;
+
+            return asm (
+                \\ aeskeygenassist %[rc], %[t], %[s]
+                \\ pshufd $0xff, %[s], %[s2]
+                \\ movdqa %[tx], %[r]
+                \\ movdqa %[r], %[ts]
+                \\ pslldq $4, %[ts]
+                \\ pxor %[ts], %[r]
+                \\ pslldq $4, %[ts]
+                \\ pxor %[ts], %[r]
+                \\ pslldq $4, %[ts]
+                \\ pxor %[ts], %[r]
+                \\ pxor %[s2], %[r]
+                : [r] "=&x" (-> Repr),
+                  [s] "=&x" (s),
+                  [s2] "=&x" (s2),
+                  [ts] "=&x" (ts),
+                : [rc] "n" (rc),
+                  [t] "x" (t),
+                  [tx] "x" (tx),
+            );
+        }
+
+        fn nkSecond(t: Repr, tx: Repr) Repr {
+            var s: Repr = undefined;
+            var s2: Repr = undefined;
+
+            return asm (
+                \\ aeskeygenassist $0, %[t], %[s]
+                \\ pshufd $0xaa, %[s], %[s2]
+                \\ movdqa %[tx], %[r]
+                \\ pxor %[s2], %[r]
+                : [r] "=&x" (-> Repr),
+                  [s] "=&x" (s),
+                  [s2] "=&x" (s2),
+                : [t] "x" (t),
+                  [tx] "x" (tx),
             );
         }
     };
@@ -680,4 +810,53 @@ test "aes onprem matches the std oracle" {
     const dec192 = Aes192Hw.initDec(key192);
     dec192.decryptBlock(&back, &out);
     try std.testing.expectEqualSlices(u8, &pt, &back);
+}
+
+test "aesni block rounds match the software tables" {
+    if (comptime !has_aesni) return error.SkipZigTest;
+    var rng = std.Random.DefaultPrng.init(0xAE51);
+    var i: usize = 0;
+    while (i < 512) : (i += 1) {
+        var block_bytes: [16]u8 = undefined;
+        var key_bytes: [16]u8 = undefined;
+        rng.random().bytes(&block_bytes);
+        rng.random().bytes(&key_bytes);
+        const hw = BlockAesNi.fromBytes(&block_bytes);
+        const sw = BlockSoft.fromBytes(&block_bytes);
+        const hw_key = BlockAesNi.fromBytes(&key_bytes);
+        const sw_key = BlockSoft.fromBytes(&key_bytes);
+        try std.testing.expectEqualSlices(u8, &sw.encrypt(sw_key).toBytes(), &hw.encrypt(hw_key).toBytes());
+        try std.testing.expectEqualSlices(u8, &sw.encryptLast(sw_key).toBytes(), &hw.encryptLast(hw_key).toBytes());
+        try std.testing.expectEqualSlices(u8, &sw.decrypt(sw_key).toBytes(), &hw.decrypt(hw_key).toBytes());
+        try std.testing.expectEqualSlices(u8, &sw.decryptLast(sw_key).toBytes(), &hw.decryptLast(hw_key).toBytes());
+        try std.testing.expectEqualSlices(u8, &sw.invMixColumns().toBytes(), &hw.invMixColumns().toBytes());
+    }
+}
+
+test "aesni schedule matches the word expansion" {
+    if (comptime !has_aesni) return error.SkipZigTest;
+    var rng = std.Random.DefaultPrng.init(0xAE5C);
+    var i: usize = 0;
+    while (i < 64) : (i += 1) {
+        var key128: [16]u8 = undefined;
+        var key256: [32]u8 = undefined;
+        rng.random().bytes(&key128);
+        rng.random().bytes(&key256);
+        var first_hw = Block.fromBytes(&key128);
+        const hw128 = KeySchedule(Aes128).expand128(&first_hw);
+        var first_sw = Block.fromBytes(&key128);
+        const sw128 = KeySchedule(Aes128).expandScalar(&first_sw, null);
+        for (hw128.round_keys, sw128.round_keys) |hw_key, sw_key| {
+            try std.testing.expectEqualSlices(u8, &sw_key.toBytes(), &hw_key.toBytes());
+        }
+        var head_hw = Block.fromBytes(key256[0..16]);
+        var tail_hw = Block.fromBytes(key256[16..32]);
+        const hw256 = KeySchedule(Aes256).expand256(&head_hw, &tail_hw);
+        var head_sw = Block.fromBytes(key256[0..16]);
+        var tail_sw = Block.fromBytes(key256[16..32]);
+        const sw256 = KeySchedule(Aes256).expandScalar(&head_sw, &tail_sw);
+        for (hw256.round_keys, sw256.round_keys) |hw_key, sw_key| {
+            try std.testing.expectEqualSlices(u8, &sw_key.toBytes(), &hw_key.toBytes());
+        }
+    }
 }
