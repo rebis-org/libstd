@@ -47,9 +47,9 @@ const DecodeOutcome = struct {
 
 fn allocStateStorage(allocator: std.mem.Allocator) ![]u8 {
     const plan = drivers.gzipDecodeStorage();
-    const raw = try allocator.alloc(u8, plan + @alignOf(drivers.GzipDecodeState));
+    const raw = try allocator.alloc(u8, plan + @alignOf(drivers.GzipDecode));
     const base = @intFromPtr(raw.ptr);
-    const aligned = std.mem.alignForward(usize, base, @alignOf(drivers.GzipDecodeState));
+    const aligned = std.mem.alignForward(usize, base, @alignOf(drivers.GzipDecode));
     return raw[aligned - base ..][0..plan];
 }
 
@@ -84,7 +84,7 @@ fn decodeKernel(allocator: std.mem.Allocator, compressed: []const u8, budgets: s
 
 fn decodeBypass(allocator: std.mem.Allocator, compressed: []const u8) !DecodeOutcome {
     const storage = try allocStateStorage(allocator);
-    const state = try drivers.gzipDecodeStateInit(storage, .{});
+    const state = try drivers.gzipDecodeInit(storage, .{});
     var output: std.ArrayList(u8) = .empty;
     var steps: usize = 0;
     var pos: usize = 0;
@@ -220,7 +220,7 @@ pub fn main(init: std.process.Init) !void {
         const reent_a = try allocStateStorage(allocator);
         const reent_b = try allocStateStorage(allocator);
         var session_a = try drivers.gzipDecodeSession(reent_a, .{});
-        const state_b = try drivers.gzipDecodeStateInit(reent_b, .{});
+        const state_b = try drivers.gzipDecodeInit(reent_b, .{});
         var out_a: std.ArrayList(u8) = .empty;
         var out_b: std.ArrayList(u8) = .empty;
         var pos_a: usize = 0;

@@ -24,7 +24,7 @@ pub const units = blk: {
     break :blk list;
 };
 
-pub fn expand(b: *std.Build, ctx: *common.Context) void {
+pub fn expand(b: *std.Build, ctx: *common.Settings) void {
     if (ctx.dist_providers.len != manifest.providers.len) @panic("The distribution needs one provider context per manifest provider.");
     const archives = b.allocator.alloc(common.ProviderArchives, manifest.providers.len) catch @panic("The distribution registry is out of memory.");
     const dist = b.step("dist", "Build distribution archives");
@@ -53,7 +53,7 @@ pub fn expand(b: *std.Build, ctx: *common.Context) void {
     ctx.archives = archives;
 }
 
-fn addHostArchive(b: *std.Build, ctx: *const common.Context, distribution: manifest.Distribution) std.Build.LazyPath {
+fn addHostArchive(b: *std.Build, ctx: *const common.Settings, distribution: manifest.Distribution) std.Build.LazyPath {
     const stage = b.addWriteFiles();
     common.stageHeaderCatalog(stage, ctx, distribution);
     _ = stage.addCopyFile(ctx.generated.module_map, "libstd/include/module.modulemap");

@@ -75,7 +75,7 @@ pub fn readSpan(comptime extra: Params, r: *Runner) !void {
 }
 
 pub fn writeCallbackSource(comptime extra: Params, r: *Runner) !void {
-    var source_ctx = harness.SourceCallbackContext{ .data = r.input };
+    var source_ctx = harness.SourceCursor{ .data = r.input };
     const nodes = build(extra, r, &.{ harness.sourceCallbackNode(0, 0), harness.sinkSpan(r.encoded) });
     _ = harness.call(r, harness.ids.write, nodes.items[0..nodes.len], .{ .ctx = true, .callback = harness.sourceCallback, .context = &source_ctx });
     try harness.requireStatus(r, abi.Status.ok);
@@ -85,7 +85,7 @@ pub fn writeCallbackSource(comptime extra: Params, r: *Runner) !void {
 
 pub fn readCallbackSink(comptime extra: Params, r: *Runner) !void {
     const accept_limit: usize = if (r.sink_accept != 0) @intCast(r.sink_accept) else std.math.maxInt(usize);
-    var sink_ctx = harness.SinkBufferContext{ .buffer = r.output, .accept_limit = accept_limit };
+    var sink_ctx = harness.SinkBuffer{ .buffer = r.output, .accept_limit = accept_limit };
     const nodes = build(extra, r, &.{ harness.sourceSpan(r.encoded[0..r.encoded_len]), harness.sinkCallbackNode(0, 0) });
     _ = harness.call(r, harness.ids.read, nodes.items[0..nodes.len], .{ .ctx = true, .callback = harness.sinkBufferCallback, .context = &sink_ctx });
     try harness.requireStatus(r, abi.Status.ok);

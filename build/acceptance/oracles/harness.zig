@@ -756,38 +756,38 @@ pub fn expectWorkspaceCapacity(r: *Runner, operation: Id, nodes: []const Node, o
     return expectCapacityIds(ids.workspace_required_capacity, ids.workspace_available_capacity, r, operation, nodes, opts, expected_required, expected_available, unchanged);
 }
 
-pub const SourceCallbackContext = struct {
+pub const SourceCursor = struct {
     data: []const u8,
     offset: usize = 0,
 };
 
-pub const SinkCallbackContext = struct {
+pub const SinkBudget = struct {
     accepted_total: usize = 0,
     fail_after: usize,
     last_status: u32 = Status.ok,
 };
 
-pub fn sinkFailureInit(sink_context: *SinkCallbackContext, downstream: *Node, diagnostic: *Node) void {
+pub fn sinkFailureInit(sink_context: *SinkBudget, downstream: *Node, diagnostic: *Node) void {
     sink_context.* = .{ .fail_after = 5 };
     downstream.* = scalarNode(ids.diagnostic_downstream_status);
     diagnostic.* = node(null, 0);
     diagnostic.child = downstream;
 }
 
-pub fn expectSinkFailure(r: *Runner, sink_context: *const SinkCallbackContext, downstream: *const Node) !void {
+pub fn expectSinkFailure(r: *Runner, sink_context: *const SinkBudget, downstream: *const Node) !void {
     try requireStatus(r, Status.io_failure);
     if (sink_context.accepted_total != 4) return error.CallbackAcceptedTotalMismatch;
     if (downstream.value_low != Status.insufficient_capacity) return error.DownstreamStatusMismatch;
 }
 
-pub const SinkBufferContext = struct {
+pub const SinkBuffer = struct {
     buffer: []u8,
     offset: usize = 0,
     accept_limit: usize,
 };
 
 pub fn sourceCallback(envelope: *Call) callconv(.c) u32 {
-    const source_context: *SourceCallbackContext = @ptrCast(@alignCast(envelope.callback_context orelse return Status.unsupported));
+    const source_context: *SourceCursor = @ptrCast(@alignCast(envelope.callback_context orelse return Status.unsupported));
     const response = envelope.response orelse return Status.unsupported;
     if (abi.isIdEqual(envelope.operation, catalog.callback_size)) {
         response.value_low = source_context.data.len;
@@ -817,7 +817,7 @@ pub fn sourceCallback(envelope: *Call) callconv(.c) u32 {
 }
 
 pub fn sinkCallback(envelope: *Call) callconv(.c) u32 {
-    const sink_context: *SinkCallbackContext = @ptrCast(@alignCast(envelope.callback_context orelse return Status.unsupported));
+    const sink_context: *SinkBudget = @ptrCast(@alignCast(envelope.callback_context orelse return Status.unsupported));
     const response = envelope.response orelse return Status.unsupported;
     if (abi.isIdEqual(envelope.operation, catalog.callback_write)) {
         var n: usize = @intCast(envelope.request.?.byte_length);
@@ -835,7 +835,7 @@ pub fn sinkCallback(envelope: *Call) callconv(.c) u32 {
 }
 
 pub fn sinkBufferCallback(envelope: *Call) callconv(.c) u32 {
-    const sink_context: *SinkBufferContext = @ptrCast(@alignCast(envelope.callback_context orelse return Status.unsupported));
+    const sink_context: *SinkBuffer = @ptrCast(@alignCast(envelope.callback_context orelse return Status.unsupported));
     const response = envelope.response orelse return Status.unsupported;
     if (abi.isIdEqual(envelope.operation, catalog.callback_write)) {
         var n: usize = @intCast(envelope.request.?.byte_length);

@@ -32,7 +32,7 @@ pub fn descriptorPaths(b: *std.Build) [][]const u8 {
     return list.items;
 }
 
-pub fn descriptorScan(b: *std.Build, ctx: *const Context) std.Build.LazyPath {
+pub fn descriptorScan(b: *std.Build, ctx: *const Settings) std.Build.LazyPath {
     const module = modules.create(b, modules.component, ctx);
     const exe = b.addExecutable(.{ .name = "component", .root_module = module });
     const run = b.addRunArtifact(exe);
@@ -54,7 +54,7 @@ pub const HostLibraries = struct {
     dynamic_library: *std.Build.Step.Compile,
 };
 
-pub const Context = struct {
+pub const Settings = struct {
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.Optimize,
     version: std.SemanticVersion,
@@ -87,12 +87,12 @@ pub fn addLibrary(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.Optimize,
     linkage: std.builtin.LinkMode,
-    ctx: *const Context,
+    ctx: *const Settings,
 ) *std.Build.Step.Compile {
     return addLibraryFromModule(b, rootModule(b, target, optimize, ctx), linkage);
 }
 
-pub fn rootModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.Optimize, ctx: *const Context) *std.Build.Module {
+pub fn rootModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.Optimize, ctx: *const Settings) *std.Build.Module {
     const module = modules.createFor(b, modules.library, target, optimize, ctx);
     // Discovery needs the generated table plus the interface import.
     const modules_pair = modules.componentsWithInterface(b, ctx, target, target, optimize);
@@ -109,7 +109,7 @@ fn addLibraryFromModule(b: *std.Build, module: *std.Build.Module, linkage: std.b
     });
 }
 
-fn scanContext(target: std.Build.ResolvedTarget, optimize: std.builtin.Optimize, portable: bool, options: *std.Build.Module, sanitize_c: ?std.zig.SanitizeC) Context {
+fn scanContext(target: std.Build.ResolvedTarget, optimize: std.builtin.Optimize, portable: bool, options: *std.Build.Module, sanitize_c: ?std.zig.SanitizeC) Settings {
     return .{
         .target = target,
         .optimize = optimize,
@@ -179,7 +179,7 @@ pub fn installGenerated(b: *std.Build, generated: Generated) void {
     b.getInstallStep().dependOn(&b.addInstallFile(generated.module_map, "module.modulemap").step);
 }
 
-pub fn stageHeaderCatalog(stage: *std.Build.Step.WriteFile, ctx: *const Context, distribution: manifest.Distribution) void {
+pub fn stageHeaderCatalog(stage: *std.Build.Step.WriteFile, ctx: *const Settings, distribution: manifest.Distribution) void {
     _ = stage.addCopyFile(ctx.generated.header, distribution.header);
     _ = stage.addCopyFile(ctx.generated.catalog, distribution.catalog);
 }

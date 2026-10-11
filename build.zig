@@ -47,7 +47,7 @@ pub fn build(b: *std.Build) void {
     }
     const generated = common.addGenerated(b);
     const host = common.addHostLibraries(b, target, optimize, portable, options_module);
-    var ctx = common.Context{
+    var ctx = common.Settings{
         .target = target,
         .optimize = optimize,
         .version = version,

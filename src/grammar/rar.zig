@@ -109,18 +109,18 @@ pub const DecodeBuffers = struct {
     filter_scratch: []u8,
     ppm_heap: []u8,
 
-    pub fn state50(self: *DecodeBuffers) Failure!*unpack50.State {
-        if (self.state.len < @sizeOf(unpack50.State)) return error.InternalFailure;
+    pub fn state50(self: *DecodeBuffers) Failure!*unpack50.Unpacker {
+        if (self.state.len < @sizeOf(unpack50.Unpacker)) return error.InternalFailure;
         return @ptrCast(@alignCast(self.state.ptr));
     }
 
-    pub fn state29(self: *DecodeBuffers) Failure!*unpack29.State {
-        if (self.state.len < @sizeOf(unpack29.State)) return error.InternalFailure;
+    pub fn state29(self: *DecodeBuffers) Failure!*unpack29.Unpacker {
+        if (self.state.len < @sizeOf(unpack29.Unpacker)) return error.InternalFailure;
         return @ptrCast(@alignCast(self.state.ptr));
     }
 
-    pub fn state20(self: *DecodeBuffers) Failure!*unpack20.State {
-        if (self.state.len < @sizeOf(unpack20.State)) return error.InternalFailure;
+    pub fn state20(self: *DecodeBuffers) Failure!*unpack20.Decoder {
+        if (self.state.len < @sizeOf(unpack20.Decoder)) return error.InternalFailure;
         return @ptrCast(@alignCast(self.state.ptr));
     }
 };
@@ -995,7 +995,7 @@ pub fn rarInspectOrdinalOpts(archive: []const u8, ordinal: usize, max_entries: u
 
 // The largest engine state. The caller carves one buffer this big
 // and the active engine is constructed in place.
-pub const max_state_bytes = @max(@sizeOf(unpack50.State), @max(@sizeOf(unpack29.State), @sizeOf(unpack20.State)));
+pub const max_unpacker_bytes = @max(@sizeOf(unpack50.Unpacker), @max(@sizeOf(unpack29.Unpacker), @sizeOf(unpack20.Decoder)));
 
 // Pass 1: locate the target entry, the ordinal where its compression group started, and
 // the largest dictionary that any group member declares, which sizes the shared session.

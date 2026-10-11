@@ -309,7 +309,7 @@ fn runEncrypted(r: *Runner) anyerror!void {
     if (r.response.byte_length != zip_large.len or !std.mem.eql(u8, output2[0..zip_large.len], &zip_large)) {
         return error.EncryptedOrdinalMismatch;
     }
-    var source_ctx = harness.SourceCallbackContext{ .data = zip_enc_archive[0..zip_enc_archive_size] };
+    var source_ctx = harness.SourceCursor{ .data = zip_enc_archive[0..zip_enc_archive_size] };
     _ = harness.call(r, harness.ids.read, &.{
         harness.archiveOrdinalParam(0),
         harness.sourceCallbackNode(0, 0),

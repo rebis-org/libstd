@@ -290,7 +290,7 @@ fn runCallback(r: *Runner) anyerror!void {
         if (bound > callback_direct.len) return error.BoundRange;
         const direct_len = try writeSpan(r, case, input, callback_direct[0..bound], true);
 
-        var source_ctx = harness.SourceCallbackContext{ .data = input };
+        var source_ctx = harness.SourceCursor{ .data = input };
         var source_nodes: [9]harness.Node = undefined;
         var source_count: usize = 0;
         source_nodes[source_count] = harness.paramSizingBound();
@@ -304,7 +304,7 @@ fn runCallback(r: *Runner) anyerror!void {
         try harness.requireStatus(r, abi.Status.ok);
         if (r.response.byte_length != direct_len or !std.mem.eql(u8, bound_sink[0..direct_len], callback_direct[0..direct_len])) return error.CallbackSourceMismatch;
 
-        var sink_ctx = harness.SinkBufferContext{ .buffer = &callback_sink_buffer, .accept_limit = std.math.maxInt(usize) };
+        var sink_ctx = harness.SinkBuffer{ .buffer = &callback_sink_buffer, .accept_limit = std.math.maxInt(usize) };
         var sink_nodes: [9]harness.Node = undefined;
         var sink_count: usize = 0;
         sink_nodes[sink_count] = harness.paramSizingBound();
@@ -318,7 +318,7 @@ fn runCallback(r: *Runner) anyerror!void {
         try harness.requireStatus(r, abi.Status.ok);
         if (sink_ctx.offset != direct_len or !std.mem.eql(u8, callback_sink_buffer[0..direct_len], callback_direct[0..direct_len])) return error.CallbackSinkMismatch;
 
-        var fail_ctx: harness.SinkCallbackContext = undefined;
+        var fail_ctx: harness.SinkBudget = undefined;
         var downstream: harness.Node = undefined;
         var diagnostic: harness.Node = undefined;
         harness.sinkFailureInit(&fail_ctx, &downstream, &diagnostic);

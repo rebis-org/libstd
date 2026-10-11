@@ -300,7 +300,7 @@ fn tarSparseOld(r: *Runner) !void {
     var output: [2048]u8 = undefined;
     try expectQuickBrown(r, archive[0..pos], &output);
     var cb_output: [100]u8 = undefined;
-    var cb = harness.SinkBufferContext{ .buffer = &cb_output, .accept_limit = cb_output.len };
+    var cb = harness.SinkBuffer{ .buffer = &cb_output, .accept_limit = cb_output.len };
     _ = harness.call(r, harness.ids.read, &.{
         harness.archiveOrdinalParam(0),
         harness.sourceSpan(archive[0..pos]),

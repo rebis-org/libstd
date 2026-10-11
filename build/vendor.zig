@@ -12,13 +12,13 @@ pub const units = [_]Unit{
     .{ .name = "vendor" },
 };
 
-pub fn expand(b: *std.Build, ctx: *common.Context) void {
+pub fn expand(b: *std.Build, ctx: *common.Settings) void {
     const refs = cmd.add(b, ctx);
     ctx.refs = refs;
     addVendorTests(b, refs, ctx);
 }
 
-fn addVendorTests(b: *std.Build, refs: cmd.Refs, ctx: *common.Context) void {
+fn addVendorTests(b: *std.Build, refs: cmd.Refs, ctx: *common.Settings) void {
     const test_exe = b.addExecutable(.{
         .name = "vendor",
         .root_module = b.createModule(.{

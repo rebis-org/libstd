@@ -155,7 +155,7 @@ fn archiveFileName(url: []const u8) []const u8 {
     return url[std.mem.lastIndexOfScalar(u8, url, '/').? + 1 ..];
 }
 
-fn addBinaryFetch(b: *std.Build, ctx: *const common.Context, ref: BinaryRef) *std.Build.Step.Run {
+fn addBinaryFetch(b: *std.Build, ctx: *const common.Settings, ref: BinaryRef) *std.Build.Step.Run {
     const stage = b.fmt("{s}/{s}.d", .{ bin_pkgs_dir, archiveFileName(ref.url) });
     const fetch_exe = b.addExecutable(.{
         .name = "binary_fetch",
@@ -174,7 +174,7 @@ fn addBinaryFetch(b: *std.Build, ctx: *const common.Context, ref: BinaryRef) *st
     return fetch;
 }
 
-fn addBinaryRefs(b: *std.Build, ctx: *const common.Context) struct { sevenzz: *std.Build.Step.InstallFile, rar: *std.Build.Step.InstallFile, unrar: *std.Build.Step.InstallFile } {
+fn addBinaryRefs(b: *std.Build, ctx: *const common.Settings) struct { sevenzz: *std.Build.Step.InstallFile, rar: *std.Build.Step.InstallFile, unrar: *std.Build.Step.InstallFile } {
     var fetches: [binary_refs.len]?*std.Build.Step.Run = @splat(null);
     var installs: [3]?*std.Build.Step.InstallFile = .{ null, null, null };
     for (binary_refs, 0..) |ref, i| {
@@ -342,7 +342,7 @@ fn addLz4(b: *std.Build) struct { cmd: *std.Build.Step.InstallFile, lib: std.Bui
     };
 }
 
-pub fn add(b: *std.Build, ctx: *const common.Context) Refs {
+pub fn add(b: *std.Build, ctx: *const common.Settings) Refs {
     const seven = addSevenZz(b);
     const zstd = addZstd(b);
     const xz = addXz(b);

@@ -38,9 +38,9 @@ fn renderFrameworkModuleMap() []const u8 {
     });
 }
 
-const TemplateValue = struct { marker: []const u8, value: []const u8 };
+const Replacement = struct { marker: []const u8, value: []const u8 };
 
-fn substitute(comptime template: []const u8, comptime values: []const TemplateValue) []const u8 {
+fn substitute(comptime template: []const u8, comptime values: []const Replacement) []const u8 {
     var output = template;
     inline for (values) |replacement| {
         const index = std.mem.indexOf(u8, output, replacement.marker) orelse @compileError("header template marker is missing.");

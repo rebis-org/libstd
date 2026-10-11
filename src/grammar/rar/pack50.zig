@@ -475,7 +475,7 @@ test "compress block round-trips through the unpack50 decoder" {
         window_buf.len + facade.filter_scratch_extra,
     );
     defer std.heap.page_allocator.free(filter_scratch);
-    var st: unpack50.State = undefined;
+    var st: unpack50.Unpacker = undefined;
     var session = try unpack50.Session.init(&st, &window_buf, &pool, &pending, filter_scratch, false);
 
     var out: [4096]u8 = undefined;

@@ -34,7 +34,7 @@ comptime {
     }
 }
 
-pub fn expand(b: *std.Build, ctx: *common.Context) void {
+pub fn expand(b: *std.Build, ctx: *common.Settings) void {
     inline for (registry_fields.field_names) |name| {
         @field(registry, name).expand(b, ctx);
     }

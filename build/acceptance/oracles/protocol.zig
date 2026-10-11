@@ -81,7 +81,7 @@ fn echoWriteSpan(r: *Runner) !void {
 
 fn echoCallbackSource(r: *Runner) !void {
     var output: [64]u8 = @splat(0xa5);
-    var source_ctx = harness.SourceCallbackContext{ .data = r.input };
+    var source_ctx = harness.SourceCursor{ .data = r.input };
     _ = harness.call(r, harness.ids.read, &.{
         harness.sourceCallbackNode(0, 0),
         harness.sinkSpan(&output),
@@ -133,7 +133,7 @@ fn limitReject(r: *Runner) !void {
 
 fn callbackDownstream(r: *Runner) !void {
     const input = "partial";
-    var callback_ctx: harness.SinkCallbackContext = undefined;
+    var callback_ctx: harness.SinkBudget = undefined;
     var downstream: harness.Node = undefined;
     var diagnostic: harness.Node = undefined;
     harness.sinkFailureInit(&callback_ctx, &downstream, &diagnostic);

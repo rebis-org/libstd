@@ -20,14 +20,14 @@ const state_size: u32 = 6;
 
 const null_off: u32 = 0;
 
-const Ctx = extern struct {
+const Subrange = extern struct {
     num_stats: u16,
     summ_freq: u16,
     stats: u32,
     suffix: u32,
 };
 
-const StateView = extern struct {
+const OccurrenceView = extern struct {
     sym: u8,
     freq: u8,
     succ_lo: u16,
@@ -35,10 +35,10 @@ const StateView = extern struct {
 
     // The successor is one u32 in the wire layout. The view splits it into
     // two u16 halves to keep the packed struct at the 6-byte PPMd stride.
-    inline fn succ(self: *const StateView) u32 {
+    inline fn succ(self: *const OccurrenceView) u32 {
         return @as(u32, self.succ_hi) << 16 | self.succ_lo;
     }
-    inline fn setSucc(self: *StateView, v: u32) void {
+    inline fn setSucc(self: *OccurrenceView, v: u32) void {
         self.succ_lo = @truncate(v);
         self.succ_hi = @truncate(v >> 16);
     }
@@ -51,12 +51,12 @@ const FreeBlock = extern struct {
     prev: u32,
 };
 
-inline fn ctxAt(heap: []u8, off: u32) *Ctx {
-    return @ptrCast(@alignCast(heap[off..][0..@sizeOf(Ctx)]));
+inline fn ctxAt(heap: []u8, off: u32) *Subrange {
+    return @ptrCast(@alignCast(heap[off..][0..@sizeOf(Subrange)]));
 }
 
-inline fn stAt(heap: []u8, off: u32) *StateView {
-    return @ptrCast(@alignCast(heap[off..][0..@sizeOf(StateView)]));
+inline fn stAt(heap: []u8, off: u32) *OccurrenceView {
+    return @ptrCast(@alignCast(heap[off..][0..@sizeOf(OccurrenceView)]));
 }
 
 inline fn freeBlockAt(heap: []u8, off: u32) *FreeBlock {
@@ -69,16 +69,16 @@ inline fn ctxOneState(ctx_off: u32) u32 {
 }
 
 // A local snapshot, because the heap is mutated while the state is held.
-const LocalState = struct {
+const Occurrence = struct {
     sym: u8,
     freq: u8,
     succ: u32,
 
-    fn load(heap: []const u8, s: u32) LocalState {
+    fn load(heap: []const u8, s: u32) Occurrence {
         const v = stAt(@constCast(heap), s);
         return .{ .sym = v.sym, .freq = v.freq, .succ = @as(u32, v.succ_hi) << 16 | v.succ_lo };
     }
-    fn store(self: LocalState, heap: []u8, s: u32) void {
+    fn store(self: Occurrence, heap: []u8, s: u32) void {
         const v = stAt(heap, s);
         v.sym = self.sym;
         v.freq = self.freq;
@@ -465,7 +465,7 @@ pub const PpmModel = struct {
     dummy_see2: See2,
     min_context: u32,
     max_context: u32,
-    found_state: u32, // State offset; null_off when the symbol escaped.
+    found_state: u32, // Occurrence offset; null_off when the symbol escaped.
     num_masked: u32,
     init_esc: u32,
     order_fall: i32,
@@ -639,7 +639,7 @@ pub const PpmModel = struct {
         self.startModel(heap, 2, 1) catch {};
     }
 
-    fn createChild(self: *Self, ctx_off: u32, parent_state_off: u32, initial_state: LocalState) u32 {
+    fn createChild(self: *Self, ctx_off: u32, parent_state_off: u32, initial_state: Occurrence) u32 {
         const child_off = self.sub.allocContext();
         if (child_off != null_off) {
             const heap = self.sub.heap;
@@ -703,7 +703,7 @@ pub const PpmModel = struct {
             const new_ns = old_ns - zeros;
             ctx.num_stats = @intCast(new_ns);
             if (new_ns == 1) {
-                var only_state = LocalState.load(heap, stats);
+                var only_state = Occurrence.load(heap, stats);
                 var esc_freq_scaled = esc_freq;
                 while (true) {
                     only_state.freq -= only_state.freq >> 1;
@@ -778,7 +778,7 @@ pub const PpmModel = struct {
         }
         if (nps == 0) return pc;
 
-        var up: LocalState = .{
+        var up: Occurrence = .{
             .sym = heap[up_branch],
             .freq = 0,
             .succ = up_branch + 1,
@@ -814,7 +814,7 @@ pub const PpmModel = struct {
 
     fn updateModel(self: *Self) Failure!void {
         const heap = self.sub.heap;
-        const found_snapshot = LocalState.load(heap, self.found_state);
+        const found_snapshot = Occurrence.load(heap, self.found_state);
         var found_succ = found_snapshot.succ;
         var p: u32 = null_off;
 
@@ -1247,8 +1247,8 @@ test "startModel refuses a heap smaller than the requested model size" {
 }
 
 test "extern views preserve the packed six-byte state stride" {
-    try std.testing.expectEqual(@as(usize, 6), @sizeOf(StateView));
-    try std.testing.expectEqual(@as(usize, 12), @sizeOf(Ctx));
+    try std.testing.expectEqual(@as(usize, 6), @sizeOf(OccurrenceView));
+    try std.testing.expectEqual(@as(usize, 12), @sizeOf(Subrange));
     try std.testing.expectEqual(@as(usize, 12), @sizeOf(FreeBlock));
     var heap: [4 * 1024 * 1024]u8 = undefined;
     var m = PpmModel.init();
