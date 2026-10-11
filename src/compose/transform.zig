@@ -349,6 +349,7 @@ pub fn zlibHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resourc
 pub fn lz4Hook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
     var options = try parseLz4Options(call.request, command_mask);
     options.provider = plan.provider;
+    options.max_work = limits.codec_work;
     return bufferCodecHook(lz4, plan, source, sink, call, response, sizing, commit, limits, command_mask, lz4.decodeWorkspaceSize(), lz4.encodeWorkspaceSize(), options);
 }
 
@@ -525,11 +526,21 @@ pub fn zstdHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resourc
             try common.requireSinkCapacity(sink_resource, call, output_size);
             var source_reader = std.Io.Reader.fixed(input);
             if (dictionary == null and output_size >= history_base_size) {
-                const staging = try workspace.take(u8, output_size + zstd.block_size_max);
-                var in_place_options = options;
-                in_place_options.max_decoded_bytes = output_size;
-                _ = try zstd.decodeInPlace(&source_reader, staging, in_place_options);
-                try common.commitBytesToSink(sink_resource, call, staging[0..output_size]);
+                if (sink_resource.kind == .direct_write and common.sinkCapacity(sink_resource) >= output_size + zstd.block_size_max) {
+                    // The decoder works in place, so the span holds the output plus one
+                    // block of window slack. A corrupt frame can leave a tentative prefix
+                    // and its working suffix.
+                    const output = try common.sinkDirectBuffer(sink_resource, output_size + zstd.block_size_max);
+                    var in_place_options = options;
+                    in_place_options.max_decoded_bytes = output_size;
+                    _ = try zstd.decodeInPlace(&source_reader, output, in_place_options);
+                } else {
+                    const staging = try workspace.take(u8, output_size + zstd.block_size_max);
+                    var in_place_options = options;
+                    in_place_options.max_decoded_bytes = output_size;
+                    _ = try zstd.decodeInPlace(&source_reader, staging, in_place_options);
+                    try common.commitBytesToSink(sink_resource, call, staging[0..output_size]);
+                }
             } else {
                 const history = planned_history orelse try workspace.take(u8, history_base_size);
                 const staging = try workspace.take(u8, output_size);
@@ -767,14 +778,41 @@ fn bufferCodecHook(comptime Codec: type, plan: *common.ExecutionPlan, source: ?*
         if (sink) |sink_resource| {
             try common.checkWorkspaceOverlap(call, source_resource, sink_resource);
             if (!sink_resource.hasCapability(resource.capability_bit_write)) return error.Unsupported;
-            if (sink_resource.kind == .direct_write and try codecKnownOutputSize(Codec, options) == null and (Codec == lzma or Codec == bzip2)) {
+            var direct_route = false;
+            if (Codec == lz4 and sink_resource.kind == .direct_write) {
+                // One decode into workspace staging sized by the frame's declared
+                // content size: a rejected read leaves the sink untouched, exactly like
+                // the counted route, and the checksum failure still arrives from the leaf.
+                if (try lz4.frameContentSize(input)) |declared| {
+                    const size = std.math.cast(usize, declared) orelse return error.ResourceLimit;
+                    if (size <= limits.decoded_bytes and input.len + size <= limits.codec_work) {
+                        const staging = try workspace.take(u8, size);
+                        if (codecDecodeDirectInPlace(Codec, input, staging, scratch, options)) |produced| {
+                            if (produced > limits.decoded_bytes) return error.ResourceLimit;
+                            try common.requireSinkCapacity(sink_resource, call, produced);
+                            try common.commitBytesToSink(sink_resource, call, staging[0..produced]);
+                            response.byte_length = produced;
+                            direct_route = true;
+                        } else |err| switch (err) {
+                            // A span overrun means the declared size lied small: the measured
+                            // route counts the true size and reports the exact status.
+                            error.InsufficientCapacity => {},
+                            else => return err,
+                        }
+                    }
+                }
+            }
+            if (!direct_route and sink_resource.kind == .direct_write and try codecKnownOutputSize(Codec, options) == null and (Codec == lzma or Codec == bzip2)) {
                 // No size preflight: the produced length comes back from the codec. lzma2 is excluded because chunk headers give a cheap size and in-place is faster.
                 const output = try common.sinkDirectBuffer(sink_resource, common.sinkCapacity(sink_resource));
                 if (input.len + output.len > limits.codec_work) return error.ResourceLimit;
-                const produced = try codecDecodeDirect(Codec, input, output, scratch, options);
-                if (produced > limits.decoded_bytes) return error.ResourceLimit;
-                response.byte_length = produced;
-            } else {
+                if (codecDecodeDirect(Codec, input, output, scratch, options)) |produced| {
+                    if (produced > limits.decoded_bytes) return error.ResourceLimit;
+                    response.byte_length = produced;
+                    direct_route = true;
+                } else |err| return err;
+            }
+            if (!direct_route) {
                 const output_size = if (try codecKnownOutputSize(Codec, options)) |size| size else try codecDecodedSize(Codec, input, scratch, options);
                 if (output_size > limits.decoded_bytes) return error.ResourceLimit;
                 if (input.len + output_size > limits.codec_work) return error.ResourceLimit;
