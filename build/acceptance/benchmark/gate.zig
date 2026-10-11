@@ -30,29 +30,22 @@ pub const Summary = struct {
 
 pub const header = "class\tworst_gap_pct\tformat\tratio_gap_pct\tc_mibps_gap_pct\td_mibps_gap_pct\n";
 
-fn bestBy(totals: metric.Totals, available: [4]bool, context: anytype, score: fn (@TypeOf(context), metric.Totals, usize) f64) ?f64 {
+fn bestRatio(totals: metric.Totals, available: [4]bool) ?f64 {
     var best: f64 = 0;
     for (1..4) |side| {
         if (!available[side] or !totals.ok[side]) continue;
-        best = @max(best, score(context, totals, side));
+        best = @max(best, metric.ratio(totals.input_bytes, totals.encoded[side]));
     }
     return if (best > 0) best else null;
 }
 
-fn ratioScore(_: void, totals: metric.Totals, side: usize) f64 {
-    return metric.ratio(totals.input_bytes, totals.encoded[side]);
-}
-
-fn speedScore(ns: [4]u64, totals: metric.Totals, side: usize) f64 {
-    return metric.mibps(totals.input_bytes, ns[side]);
-}
-
-fn bestRatio(totals: metric.Totals, available: [4]bool) ?f64 {
-    return bestBy(totals, available, {}, ratioScore);
-}
-
 fn bestSpeed(ns: [4]u64, totals: metric.Totals, available: [4]bool) ?f64 {
-    return bestBy(totals, available, ns, speedScore);
+    var best: f64 = 0;
+    for (1..4) |side| {
+        if (!available[side] or !totals.ok[side]) continue;
+        best = @max(best, metric.mibps(totals.input_bytes, ns[side]));
+    }
+    return if (best > 0) best else null;
 }
 
 fn speedGap(ours: f64, target: ?f64) ?f64 {

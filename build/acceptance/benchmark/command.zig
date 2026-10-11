@@ -151,6 +151,15 @@ fn gnu(b: *std.Build, cwd: []const u8, argv: []const []const u8, dummy_dir: std.
     return step;
 }
 
+fn gnuChain(b: *std.Build, cwd: []const u8, dummy_dir: std.Build.LazyPath, pre: ?*std.Build.Step, bootstrap_argv: []const []const u8, configure_argv: []const []const u8, make_argv: []const []const u8) *std.Build.Step.Run {
+    const bootstrap = gnu(b, cwd, bootstrap_argv, dummy_dir);
+    if (pre) |dep| bootstrap.step.dependOn(dep);
+    const configure = gnu(b, cwd, configure_argv, dummy_dir);
+    configure.step.dependOn(&bootstrap.step);
+    const make_step = gnu(b, cwd, make_argv, dummy_dir);
+    make_step.step.dependOn(&configure.step);
+    return make_step;
+}
 fn archiveFileName(url: []const u8) []const u8 {
     return url[std.mem.lastIndexOfScalar(u8, url, '/').? + 1 ..];
 }
@@ -211,13 +220,19 @@ fn addSevenZz(b: *std.Build) struct { sevenzz: *std.Build.Step.InstallFile, lzma
     };
 }
 
-fn addZstd(b: *std.Build) struct { cmd: *std.Build.Step.InstallFile, lib: std.Build.LazyPath } {
-    const make_zstd_cmd = make(b, "vendor/zstd", &.{ "make", "zstd-release" });
-    const make_zstd_lib = make(b, "vendor/zstd", &.{ "make", "lib-release" });
+fn addMakePair(b: *std.Build, cwd: []const u8, cmd_arg: []const u8, cmd_src: []const u8, cmd_name: []const u8, lib_arg: []const u8, lib_src: []const u8, lib_name: []const u8) MakePair {
+    const make_cmd = make(b, cwd, &.{ "make", cmd_arg });
+    const make_lib = make(b, cwd, &.{ "make", lib_arg });
     return .{
-        .cmd = installOut(b, &make_zstd_cmd.step, "vendor/zstd/programs/zstd", "zstd"),
-        .lib = copyOut(b, &make_zstd_lib.step, "vendor/zstd/lib/libzstd.a", "libzstd.a"),
+        .cmd = installOut(b, &make_cmd.step, cmd_src, cmd_name),
+        .lib = copyOut(b, &make_lib.step, lib_src, lib_name),
     };
+}
+
+const MakePair = struct { cmd: *std.Build.Step.InstallFile, lib: std.Build.LazyPath };
+
+fn addZstd(b: *std.Build) MakePair {
+    return addMakePair(b, "vendor/zstd", "zstd-release", "vendor/zstd/programs/zstd", "zstd", "lib-release", "vendor/zstd/lib/libzstd.a", "libzstd.a");
 }
 
 fn addXz(b: *std.Build) struct { cmd: *std.Build.Step.InstallFile, lib: std.Build.LazyPath } {
@@ -268,22 +283,13 @@ fn addTexinfoDummy(b: *std.Build) std.Build.LazyPath {
 }
 
 fn addGzip(b: *std.Build, dummy_dir: std.Build.LazyPath) *std.Build.Step.InstallFile {
-    const bootstrap = gnu(b, "vendor/gzip", &.{ "./bootstrap", "--skip-po" }, dummy_dir);
-    const configure = gnu(b, "vendor/gzip", &.{"./configure"}, dummy_dir);
-    configure.step.dependOn(&bootstrap.step);
-    const make_gzip = gnu(b, "vendor/gzip", &.{ "make", "-j4" }, dummy_dir);
-    make_gzip.step.dependOn(&configure.step);
+    const make_gzip = gnuChain(b, "vendor/gzip", dummy_dir, null, &.{ "./bootstrap", "--skip-po" }, &.{"./configure"}, &.{ "make", "-j4" });
     return installOut(b, &make_gzip.step, "vendor/gzip/gzip", "gzip");
 }
 
 fn addTar(b: *std.Build, dummy_dir: std.Build.LazyPath) *std.Build.Step.InstallFile {
     const check_bison = b.addSystemCommand(&.{ "sh", "-c", "if [ ! -x /opt/homebrew/opt/bison/bin/bison ]; then echo 'GNU tar build requires bison >= 2.4 (for example Homebrew bison); install it and retry' >&2; exit 1; fi" });
-    const bootstrap = gnu(b, "vendor/tar", &.{ "sh", "-c", "export PATH=\"/opt/homebrew/opt/bison/bin:$PATH\"; exec ./bootstrap --skip-po" }, dummy_dir);
-    bootstrap.step.dependOn(&check_bison.step);
-    const configure = gnu(b, "vendor/tar", &.{ "sh", "-c", "export PATH=\"/opt/homebrew/opt/bison/bin:$PATH\"; exec ./configure --disable-nls" }, dummy_dir);
-    configure.step.dependOn(&bootstrap.step);
-    const make_tar = gnu(b, "vendor/tar", &.{ "sh", "-c", "export PATH=\"/opt/homebrew/opt/bison/bin:$PATH\"; exec make -j4 LIBS=-liconv" }, dummy_dir);
-    make_tar.step.dependOn(&configure.step);
+    const make_tar = gnuChain(b, "vendor/tar", dummy_dir, &check_bison.step, &.{ "sh", "-c", "export PATH=\"/opt/homebrew/opt/bison/bin:$PATH\"; exec ./bootstrap --skip-po" }, &.{ "sh", "-c", "export PATH=\"/opt/homebrew/opt/bison/bin:$PATH\"; exec ./configure --disable-nls" }, &.{ "sh", "-c", "export PATH=\"/opt/homebrew/opt/bison/bin:$PATH\"; exec make -j4 LIBS=-liconv" });
     return installOut(b, &make_tar.step, "vendor/tar/src/tar", "tar");
 }
 
@@ -333,13 +339,8 @@ fn addFastLzma2(b: *std.Build) struct { lib: std.Build.LazyPath, test_run: *std.
     return .{ .lib = lib, .test_run = make_test };
 }
 
-fn addLz4(b: *std.Build) struct { cmd: *std.Build.Step.InstallFile, lib: std.Build.LazyPath } {
-    const make_cmd = make(b, "vendor/lz4", &.{ "make", "lz4-release" });
-    const make_lib = make(b, "vendor/lz4", &.{ "make", "lib-release" });
-    return .{
-        .cmd = installOut(b, &make_cmd.step, "vendor/lz4/programs/lz4", "lz4"),
-        .lib = copyOut(b, &make_lib.step, "vendor/lz4/lib/liblz4.a", "liblz4.a"),
-    };
+fn addLz4(b: *std.Build) MakePair {
+    return addMakePair(b, "vendor/lz4", "lz4-release", "vendor/lz4/programs/lz4", "lz4", "lib-release", "vendor/lz4/lib/liblz4.a", "liblz4.a");
 }
 
 pub fn add(b: *std.Build, ctx: *const common.Settings) Refs {

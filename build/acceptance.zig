@@ -72,6 +72,12 @@ fn abVariantModule(b: *std.Build, name: []const u8) *std.Build.Module {
     return variant.createModule();
 }
 
+fn makeModule(b: *std.Build, root: []const u8, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, sanitize_c: ?std.zig.SanitizeC) *std.Build.Module {
+    const module = b.createModule(.{ .root_source_file = b.path(root), .target = target, .optimize = optimize });
+    if (sanitize_c) |sc| module.sanitize_c = sc;
+    return module;
+}
+
 fn skipVariantHostLibraries(b: *std.Build, ctx: *const common.Settings) common.HostLibraries {
     const skip_options = b.addOptions();
     skip_options.addOption(bool, "portable", ctx.portable);
@@ -95,20 +101,10 @@ fn addTrapRun(b: *std.Build, ctx: *const common.Settings, target: std.Build.Reso
 }
 
 fn addContractCheck(b: *std.Build, interface: *std.Build.Module, components: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, sanitize_c: ?std.zig.SanitizeC, exe_name: []const u8, catalog: std.Build.LazyPath) *std.Build.Step.Run {
-    const kernel_module = b.createModule(.{
-        .root_source_file = b.path("src/kernel/root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    if (sanitize_c) |sc| kernel_module.sanitize_c = sc;
+    const kernel_module = makeModule(b, "src/kernel/root.zig", target, optimize, sanitize_c);
     kernel_module.addImport("interface", interface);
     kernel_module.addImport("components", components);
-    const contract_module = b.createModule(.{
-        .root_source_file = b.path("build/acceptance/oracles/contract.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    if (sanitize_c) |sc| contract_module.sanitize_c = sc;
+    const contract_module = makeModule(b, "build/acceptance/oracles/contract.zig", target, optimize, sanitize_c);
     contract_module.addImport("interface", interface);
     contract_module.addImport("kernel", kernel_module);
     const contract_exe = b.addExecutable(.{ .name = exe_name, .root_module = contract_module });
@@ -199,7 +195,7 @@ fn addOracles(b: *std.Build, ctx: *common.Settings, refs: cmd.Refs) void {
 }
 
 fn addOraclesUbsan(b: *std.Build, ctx: *common.Settings, refs: cmd.Refs) void {
-    // Zig 0.16 ships no ASan runtime, so UBSan is the only implementable sanitizer step.
+    // Zig 0.17 ships no ASan runtime, so UBSan is the only implementable sanitizer step.
     var ubsan_ctx = ctx.*;
     ubsan_ctx.sanitize_c = .full;
     ubsan_ctx.host = common.addHostLibrariesWithOptions(b, ctx.target, ctx.optimize, ctx.portable, ctx.options, .full);

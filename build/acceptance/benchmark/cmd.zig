@@ -208,7 +208,7 @@ fn timedDecode(env: *env_mod.Env, comptime cmd: Cmd, started: u64, bin: []const 
     };
     defer env.allocator.free(bytes);
     m.decode_ns = env.now() - started;
-    m.ok = bytes.len == input.len and std.mem.eql(u8, bytes[0..input.len], input);
+    m.ok = metric.decodeOk(bytes.len, input, bytes);
 }
 
 pub fn measure(env: *env_mod.Env, comptime id: matrix.Cmd, bin: []const u8, input_path: []const u8, output_path: []const u8, ext: []const u8, store: bool, extra: []const []const u8, input: []const u8) metric.Metric {
