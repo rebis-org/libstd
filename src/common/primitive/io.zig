@@ -41,7 +41,7 @@ pub const Sink = struct {
         self.offset += chunk.len;
     }
 
-    pub fn writeInt(self: *Sink, comptime T: type, int: T, endian: std.builtin.Endian) Failure!void {
+    pub fn writeInt(self: *Sink, comptime T: type, int: T, endian: std.lang.Endian) Failure!void {
         var storage: [@sizeOf(T)]u8 = undefined;
         std.mem.writeInt(T, &storage, int, endian);
         try self.write(&storage);

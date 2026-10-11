@@ -9,12 +9,12 @@ const adler32_seam = @import("hash/adler32/seam.zig");
 
 // Zig inline asm cannot name the 32-bit register views, so the crc32 instructions bind
 // fixed X registers. The fold mirrors the vendor ip7z/7zip arm64 loop.
-const crc32_hw = builtin.cpu.arch == .aarch64 and !options.crc32_portable;
-const has_crc32_kernel = crc32_hw and builtin.cpu.has(.aarch64, .crc);
+const crc32_hw = builtin.target.cpu.arch == .aarch64 and !options.crc32_portable;
+const has_crc32_kernel = crc32_hw and builtin.target.cpu.has(.aarch64, .crc);
 // LLVM's aes feature implies pmull, which the fold kernel multiplies with.
-const has_crc32_pmull = has_crc32_kernel and builtin.cpu.has(.aarch64, .aes);
-const crc64_hw = builtin.cpu.arch == .aarch64 and !options.crc64xz_portable;
-const has_crc64_pmull = crc64_hw and builtin.cpu.has(.aarch64, .aes);
+const has_crc32_pmull = has_crc32_kernel and builtin.target.cpu.has(.aarch64, .aes);
+const crc64_hw = builtin.target.cpu.arch == .aarch64 and !options.crc64xz_portable;
+const has_crc64_pmull = crc64_hw and builtin.target.cpu.has(.aarch64, .aes);
 
 const crc_lane = @Vector(2, u64);
 
