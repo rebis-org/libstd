@@ -15,7 +15,13 @@ pub fn refTarget(b: *std.Build, target: std.Build.ResolvedTarget) std.Build.Reso
 // Each descriptor is a file argument, because a directory argument is unfingerprinted.
 pub fn descriptorPaths(b: *std.Build) [][]const u8 {
     var list: std.ArrayList([]const u8) = .empty;
-    var dir = std.Io.Dir.cwd().openDir(b.graph.io, "src", .{ .iterate = true }) catch @panic("The component scan cannot open src.");
+    // The enumeration itself observes configuration-time state, so declare it:
+    // a new, deleted, renamed, or edited descriptor must invalidate the
+    // configure cache. dependOnDirectoryContents is not recursive, so the
+    // top-level directory catches new subdirectories while each parent
+    // directory catches entry changes one level down.
+    b.dependOnDirectoryContents(b.path("src"));
+    var dir = b.root.openDir(b.graph.io, "src", .{ .iterate = true }) catch @panic("The component scan cannot open src.");
     defer dir.close(b.graph.io);
     var walker = dir.walk(b.allocator) catch @panic("The component scan cannot start a walk of src.");
     while (walker.next(b.graph.io) catch @panic("The component scan cannot continue the walk of src.")) |entry| {
@@ -23,6 +29,9 @@ pub fn descriptorPaths(b: *std.Build) [][]const u8 {
         if (!std.mem.endsWith(u8, entry.path, ".descriptor.zon")) continue;
         const rel = b.allocator.print("src/{s}", .{entry.path}) catch @panic("The component scan is out of memory.");
         list.append(b.allocator, rel) catch @panic("The component scan is out of memory.");
+        b.dependOnFileContents(b.path(rel));
+        const parent = rel[0 .. std.mem.lastIndexOfScalar(u8, rel, '/') orelse unreachable];
+        b.dependOnDirectoryContents(b.path(parent));
     }
     std.mem.sort([]const u8, list.items, {}, struct {
         fn lessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
