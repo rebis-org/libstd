@@ -6,7 +6,9 @@
     .name = "rar",
     .class = "grammar",
     .verbs = .{ "inspect", "decode_ordinal", "encode_ordinal" },
-    .parameters = .{},
+    .parameters = .{
+        .{ .name = "header_encode", .family = 15, .ordinal = 1, .representation = "scalar_words" },
+    },
     .capabilities = .{ "read", "write", "size", "replay" },
     .sizing = "metadata_exact",
     .commit = "tentative",

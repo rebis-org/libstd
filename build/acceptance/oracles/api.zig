@@ -172,10 +172,144 @@ fn run(r: *harness.Runner) anyerror!void {
     if (std.mem.indexOf(u8, catalog_check, "deflate/decode") == null) return error.CatalogMissingDeflate;
 }
 
-pub const scenarios = harness.scenarios("api", &.{}, &.{.{
-    .name = "session api boundary",
-    .run = run,
-    .workspace_size = 1 << 20,
-    .output_size = 64,
-    .encoded_size = 64,
-}});
+// Encode sessions pump the corpus through in chunks and the envelope reads
+// the frame back; the zlib decode session walks an envelope-made frame.
+fn runExtended(r: *harness.Runner) anyerror!void {
+    var counts: [2]u64 = undefined;
+    var state: c_int = 0;
+
+    // zlib decode: the envelope's zlib frame decodes chunked through the boundary.
+    harness.setup(r, harness.ids.zlib, harness.mode_stream);
+    corpus.fillTiled(r.corpus_index, r.corpus_buffer[0..]);
+    r.input = r.corpus_buffer[0..];
+    try steps.writeSpan(&steps.noParams, r);
+    try steps.queryRead(&steps.noParams, r);
+    try steps.readSpan(&steps.noParams, r);
+    const zlib_storage_len = stdk_session_storage("zlib", "decode");
+    if (zlib_storage_len == 0 or zlib_storage_len > r.workspace.len) return error.ZlibStorageSize;
+    const zlib_storage = r.workspace.ptr;
+    if (stdk_session_create("zlib", "decode", zlib_storage, zlib_storage_len) != abi.Status.ok) return error.ZlibCreateFailed;
+    var decoded: [64]u8 = undefined;
+    var pos: usize = 0;
+    var out_pos: usize = 0;
+    var guard: usize = 0;
+    while (guard < 64) : (guard += 1) {
+        const take = @min(65536, r.encoded_len - pos);
+        const chunk = r.encoded[pos..][0..take];
+        const end = pos + take == r.encoded_len;
+        const status = stdk_session_step(zlib_storage, chunk.ptr, chunk.len, decoded[out_pos..].ptr, decoded.len - out_pos, @intFromBool(end), &counts, &state);
+        if (status != abi.Status.ok) return error.ZlibStepFailed;
+        pos += @intCast(counts[0]);
+        out_pos += @intCast(counts[1]);
+        if (state == 1) break;
+        if (state < 0) return error.ZlibStepCorrupt;
+    }
+    if (out_pos != r.input.len or !std.mem.eql(u8, decoded[0..out_pos], r.input)) return error.ZlibSessionMismatch;
+    if (stdk_session_destroy(zlib_storage) != abi.Status.ok) return error.DestroyFailed;
+    // A corrupted adler trailer fails as an integrity failure.
+    if (stdk_session_create("zlib", "decode", zlib_storage, zlib_storage_len) != abi.Status.ok) return error.ZlibCreateFailed;
+    r.encoded[r.encoded_len - 1] ^= 0xFF;
+    const corrupt_status = stdk_session_step(zlib_storage, r.encoded.ptr, r.encoded_len, decoded[0..].ptr, decoded.len, 1, &counts, &state);
+    r.encoded[r.encoded_len - 1] ^= 0xFF;
+    if (corrupt_status != abi.Status.integrity_failure) return error.ZlibCorruptAccepted;
+    if (stdk_session_destroy(zlib_storage) != abi.Status.ok) return error.DestroyFailed;
+
+    // Encode sessions: deflate, gzip, and zlib frames built chunk by chunk
+    // read back through the envelope byte-exact.
+    const encode_cases = [_]struct { component: [*:0]const u8, profile: harness.Id }{
+        .{ .component = "deflate", .profile = harness.ids.deflate },
+        .{ .component = "gzip", .profile = harness.ids.gzip },
+        .{ .component = "zlib", .profile = harness.ids.zlib },
+        .{ .component = "lz4", .profile = harness.ids.lz4 },
+    };
+    for (encode_cases) |case| {
+        const storage_len = stdk_session_storage(case.component, "encode");
+        if (storage_len == 0 or storage_len > r.workspace.len) return error.EncodeStorageSize;
+        const storage = r.workspace.ptr;
+        if (stdk_session_create(case.component, "encode", storage, storage_len) != abi.Status.ok) return error.EncodeCreateFailed;
+        var produced: usize = 0;
+        pos = 0;
+        guard = 0;
+        var failed = false;
+        while (guard < 64) : (guard += 1) {
+            const take = @min(4096, r.input.len - pos);
+            const end = pos + take == r.input.len;
+            const status = stdk_session_step(storage, r.input[pos..].ptr, take, r.encoded[produced..].ptr, r.encoded.len - produced, @intFromBool(end), &counts, &state);
+            if (status != abi.Status.ok) {
+                failed = true;
+                break;
+            }
+            pos += @intCast(counts[0]);
+            produced += @intCast(counts[1]);
+            if (state == 1) break;
+        }
+        if (failed or state != 1) return error.EncodeSessionFailed;
+        if (stdk_session_destroy(storage) != abi.Status.ok) return error.DestroyFailed;
+
+        harness.setup(r, case.profile, harness.mode_stream);
+        const frame = r.encoded[0..produced];
+        try harness.spanProduce(r, harness.ids.read, &.{
+            harness.sourceSpan(frame),
+            harness.sinkSpan(decoded[0..]),
+        });
+        try harness.requireStatus(r, abi.Status.ok);
+        if (r.response.byte_length != r.input.len or !std.mem.eql(u8, decoded[0..r.input.len], r.input)) return error.EncodeRoundtripMismatch;
+    }
+
+    // lz4 decode: the envelope's lz4 frame decodes chunked through the
+    // boundary, and a corrupt content checksum fails as integrity.
+    harness.setup(r, harness.ids.lz4, harness.mode_stream);
+    r.input = r.corpus_buffer[0..];
+    try steps.writeSpan(&steps.noParams, r);
+    const lz4_storage_len = stdk_session_storage("lz4", "decode");
+    if (lz4_storage_len == 0 or lz4_storage_len > r.workspace.len) return error.Lz4StorageSize;
+    const lz4_storage = r.workspace.ptr;
+    if (stdk_session_create("lz4", "decode", lz4_storage, lz4_storage_len) != abi.Status.ok) return error.Lz4CreateFailed;
+    @memset(&decoded, 0);
+    pos = 0;
+    out_pos = 0;
+    guard = 0;
+    while (guard < 64) : (guard += 1) {
+        const take = @min(65536, r.encoded_len - pos);
+        const chunk = r.encoded[pos..][0..take];
+        const end = pos + take == r.encoded_len;
+        const status = stdk_session_step(lz4_storage, chunk.ptr, chunk.len, decoded[out_pos..].ptr, decoded.len - out_pos, @intFromBool(end), &counts, &state);
+        if (status != abi.Status.ok) return error.Lz4StepFailed;
+        pos += @intCast(counts[0]);
+        out_pos += @intCast(counts[1]);
+        if (state == 1) break;
+        if (state < 0) return error.Lz4StepCorrupt;
+    }
+    if (out_pos != r.input.len or !std.mem.eql(u8, decoded[0..out_pos], r.input)) return error.Lz4SessionMismatch;
+    if (stdk_session_destroy(lz4_storage) != abi.Status.ok) return error.DestroyFailed;
+    if (stdk_session_create("lz4", "decode", lz4_storage, lz4_storage_len) != abi.Status.ok) return error.Lz4CreateFailed;
+    r.encoded[r.encoded_len - 1] ^= 0xFF;
+    const lz4_corrupt = stdk_session_step(lz4_storage, r.encoded.ptr, r.encoded_len, decoded[0..].ptr, decoded.len, 1, &counts, &state);
+    r.encoded[r.encoded_len - 1] ^= 0xFF;
+    if (lz4_corrupt != abi.Status.integrity_failure) return error.Lz4CorruptAccepted;
+    if (stdk_session_destroy(lz4_storage) != abi.Status.ok) return error.DestroyFailed;
+
+    const catalog = std.mem.span(stdk_session_catalog());
+    for ([_][]const u8{ "zlib/decode", "deflate/encode", "gzip/encode", "zlib/encode", "lz4/decode", "lz4/encode" }) |pair| {
+        if (std.mem.indexOf(u8, catalog, pair) == null) return error.CatalogMissingPair;
+    }
+}
+
+pub const scenarios = harness.scenarios("api", &.{}, &.{
+    .{
+        .name = "session api boundary",
+        .run = run,
+        .workspace_size = 1 << 20,
+        .output_size = 64,
+        .encoded_size = 64,
+    },
+    .{
+        .name = "session api extended boundary",
+        .run = runExtended,
+        // lz4 sessions stage a full 4 MiB block on each side, so the
+        // stepped boundary needs multi-megabyte session storage.
+        .workspace_size = 16 << 20,
+        .output_size = 64,
+        .encoded_size = 4096,
+    },
+});

@@ -490,6 +490,73 @@ fn runEncrypted(r: *Runner) anyerror!void {
     if (r.response.byte_length != 53) return error.Copy53FixtureMismatch;
 }
 
+// Encoded headers (-mhc compressed, -mhe encrypted): the next header rides in
+// a packed stream, so -mhe inspect needs the password channel and the header
+// bytes are no longer visible in the archive. The fixtures pin the decoder
+// against archives the official 7-Zip CLI produced.
+fn runEncodedHeaders(r: *Runner) anyerror!void {
+    setup7z(r, harness.ids.sevenzip);
+    corpus.fillTiled(r.corpus_index, &sz_enc_data);
+    var store: PlainNodes = undefined;
+    const entry = entryPlain(&store, "m.txt", &sz_enc_data);
+
+    const mhc_nodes = [_]harness.Node{harness.sevenzipHeaderEncodeParam(1)};
+    const mhc_size = try sevenZipWrite(r, entry, &sz_enc_archive, &mhc_nodes);
+    try sevenZipReadExpected(r, sz_enc_archive[0..mhc_size], 0, &sz_enc_output, &sz_enc_data, &.{});
+    const expected = [_]lib.ExpectedEntry{.{ .name = "m.txt", .data = &sz_enc_data }};
+    const oracle = lib.archiveReadMatches(sz_enc_archive[0..mhc_size], &expected);
+    if (oracle == .mismatch) return error.EncodedHeaderOracleRejected;
+    if (oracle == .unsupported) std.debug.print("seven_zip encoded header: skipped (libarchive cannot read encoded headers).\n", .{});
+
+    const mhe_write_nodes = [_]harness.Node{
+        harness.cryptoProfile(),
+        harness.cryptoPasswordParam(sz_enc_password),
+        harness.sevenzipHeaderEncodeParam(2),
+    };
+    const mhe_read_nodes = [_]harness.Node{
+        harness.cryptoProfile(),
+        harness.cryptoPasswordParam(sz_enc_password),
+    };
+    const mhe_size = try sevenZipWrite(r, entry, &sz_enc_archive, &mhe_write_nodes);
+    // Without the password the encrypted header cannot even be enumerated.
+    _ = harness.call(r, harness.ids.query, &.{
+        harness.paramTargetCommand(harness.ids.read),
+        harness.sourceSpan(sz_enc_archive[0..mhe_size]),
+        harness.capabilityParam(sz_caps),
+        harness.sizingModeParam(harness.size_metadata_exact),
+        harness.commitModeParam(harness.commit_tentative),
+    }, .{});
+    try harness.requireStatus(r, abi.Status.unsupported);
+    try sevenZipReadExpected(r, sz_enc_archive[0..mhe_size], 0, &sz_enc_output, &sz_enc_data, &mhe_read_nodes);
+    // The wrong password fails at the decoded-header CRC: an integrity
+    // failure carrying the wrong-password cause, with the sink untouched.
+    var diag: harness.CryptoDiag = undefined;
+    harness.cryptoDiag(&diag);
+    @memset(&sz_enc_output, 0xa5);
+    _ = harness.call(r, harness.ids.read, &.{
+        harness.archiveOrdinalParam(0),
+        harness.sourceSpan(sz_enc_archive[0..mhe_size]),
+        harness.sinkSpan(&sz_enc_output),
+        harness.cryptoProfile(),
+        harness.cryptoPasswordParam("wrong"),
+    }, .{ .ctx = true, .diagnostic = &diag.diagnostic });
+    try harness.requireStatus(r, abi.Status.integrity_failure);
+    if (diag.wrong_password.value_low != abi.Status.invalid_data) return error.EncodedHeaderWrongPasswordMismatch;
+    if (!harness.allBytesEqual(&sz_enc_output, 0xa5)) return error.EncodedHeaderWrongPasswordWroteSink;
+
+    // 7-Zip-CLI fixtures pin the decoder against the reference byte shape;
+    // their content is a fixed pattern, so only the length is asserted (the
+    // corpus fill varies by runner index, as in the encrypted fixtures above).
+    @memset(&sz_enc_output, 0xa5);
+    _ = try sevenZipRead(r, &fixtures.sz_encoded_header_fixture, 0, &sz_enc_output, &.{});
+    try harness.requireStatus(r, abi.Status.ok);
+    if (r.response.byte_length != 97) return error.EncodedHeaderFixtureMismatch;
+    @memset(&sz_enc_output, 0xa5);
+    _ = try sevenZipRead(r, &fixtures.sz_encrypted_header_fixture, 0, &sz_enc_output, &mhe_read_nodes);
+    try harness.requireStatus(r, abi.Status.ok);
+    if (r.response.byte_length != 97) return error.EncryptedHeaderFixtureMismatch;
+}
+
 // No system library covers these interops: report skip and pass.
 fn skipped(comptime label: []const u8) fn (*Runner) anyerror!void {
     return struct {
@@ -535,6 +602,7 @@ pub const scenarios = harness.scenarios("seven_zip", &.{
     .{ .label = "seven_zip encode advanced", .run = runEncodeAdvanced, .workspace_size = 48 * 1024 * 1024, .output_size = 1024, .encoded_size = 65536 },
     .{ .label = "seven_zip encrypted", .run = runEncrypted, .workspace_size = 64 * 1024 * 1024, .output_size = 1024, .encoded_size = 65536 },
     .{ .label = "seven_zip encrypted provider", .run = runEncryptedProvider, .workspace_size = 64 * 1024 * 1024, .output_size = 1024, .encoded_size = 65536 },
+    .{ .label = "seven_zip encoded headers", .run = runEncodedHeaders, .workspace_size = 64 * 1024 * 1024, .output_size = 1024, .encoded_size = 65536 },
     .{ .label = "seven_zip filters", .run = runFilters, .workspace_size = 48 * 1024 * 1024, .output_size = 1024, .encoded_size = 65536 },
     .{ .label = "seven_zip solid", .run = skipped("seven_zip solid"), .workspace_size = 8 * 1024 * 1024, .output_size = 1024, .encoded_size = 65536 },
     .{ .label = "seven_zip ppmd", .run = runPpmd, .workspace_size = 32 * 1024 * 1024, .output_size = 1024, .encoded_size = 65536 },

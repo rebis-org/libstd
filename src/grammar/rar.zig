@@ -178,16 +178,16 @@ pub const rar5_file_directory: u64 = 0x0001;
 pub const rar5_file_mtime: u64 = 0x0002;
 pub const rar5_file_crc32: u64 = 0x0004;
 const rar5_file_size_unknown: u64 = 0x0008;
-const rar5_extra_crypt: u64 = 0x01;
-const rar5_extra_hash: u64 = 0x02;
+pub const rar5_extra_crypt: u64 = 0x01;
+pub const rar5_extra_hash: u64 = 0x02;
 const rar5_extra_redir: u64 = 0x05;
 const rar5_hash_blake2sp: u64 = 0x00;
 
-const Rar5Keys = struct { key: [32]u8, hash_key: [32]u8, pswcheck: [32]u8 };
+pub const Rar5Keys = struct { key: [32]u8, hash_key: [32]u8, pswcheck: [32]u8 };
 
 // The decryption step that RAR5 needs because its PBKDF2-HMAC-SHA256 covers the
 // first block only; the hash key and the password check continue the same chain 16 times each.
-fn rar5Kdf(password: []const u8, salt: *const [16]u8, lg2count: u8, opts: DecodeOptions) Failure!Rar5Keys {
+pub fn rar5Kdf(password: []const u8, salt: *const [16]u8, lg2count: u8, opts: DecodeOptions) Failure!Rar5Keys {
     if (lg2count > rar5_kdf_lg2_count_max) return error.Unsupported;
     const rounds: u64 = @as(u64, 1) << @intCast(lg2count);
     if (opts.kdf_rounds_limit != 0 and rounds > opts.kdf_rounds_limit) {
@@ -221,7 +221,7 @@ fn rar5Kdf(password: []const u8, salt: *const [16]u8, lg2count: u8, opts: Decode
     return keys;
 }
 
-fn rar5PswCheck(kdf_value: *const [32]u8) [8]u8 {
+pub fn rar5PswCheck(kdf_value: *const [32]u8) [8]u8 {
     var check: [8]u8 = @splat(0);
     for (kdf_value, 0..) |byte, i| check[i % 8] ^= byte;
     return check;
@@ -229,7 +229,7 @@ fn rar5PswCheck(kdf_value: *const [32]u8) [8]u8 {
 
 // The RAR5 conversion of a file CRC32 for an encrypted entry: an HMAC-SHA256 of the
 // little-endian CRC, folded bytewise into 32 bits (unrar ConvertHashToMAC).
-fn rar5CrcMac(provider: crypto.Provider, crc: u32, hash_key: *const [32]u8) u32 {
+pub fn rar5CrcMac(provider: crypto.Provider, crc: u32, hash_key: *const [32]u8) u32 {
     var raw: [4]u8 = undefined;
     std.mem.writeInt(u32, &raw, crc, .little);
     var digest: [32]u8 = undefined;
@@ -409,8 +409,8 @@ fn parseRar5FileBody(cursor: *binary.ReadCursor, flags: u64, extra_size: u64, re
     }
 }
 
-const rar5_crypt_pswcheck: u64 = 0x0001;
-const rar5_crypt_hashmac: u64 = 0x0002;
+pub const rar5_crypt_pswcheck: u64 = 0x0001;
+pub const rar5_crypt_hashmac: u64 = 0x0002;
 
 fn parseRar5Block(archive: []const u8, cursor: *usize, provider: crypto.Provider) Failure!Rar5Block {
     const crc_offset = cursor.*;
@@ -543,7 +543,10 @@ fn walkRar5(archive: []const u8, offset: usize, opts: DecodeOptions, ctx: anytyp
                 const password = opts.password orelse return error.Unsupported;
                 const keys = try rar5Kdf(password, &header.enc_salt, header.enc_lg2count, opts);
                 if (header.enc_pswcheck) |expected| {
-                    if (!crypto.constantTimeEql(&rar5PswCheck(&keys.pswcheck), &expected)) return error.IntegrityFailure;
+                    if (!crypto.constantTimeEql(&rar5PswCheck(&keys.pswcheck), &expected)) {
+                        if (opts.failure_cause) |cause| cause.* = .wrong_password;
+                        return error.IntegrityFailure;
+                    }
                 }
                 header_crypt = keys;
             },
@@ -596,7 +599,13 @@ fn walkRar5(archive: []const u8, offset: usize, opts: DecodeOptions, ctx: anytyp
                     const compat_flag = (header.compression >> 20) & 1 != 0;
                     const version: u8 = if (algo_raw == 0) 50 else if (algo_raw == 1) (if (compat_flag) @as(u8, 50) else 70) else algo_raw;
                     if (method == 0) {
-                        if (header.data_size != header.unpacked_size) return error.Unsupported;
+                        // An encrypted stored file still pads its data to the
+                        // AES block, so data_size can exceed unpacked_size by
+                        // up to 15 bytes; plaintext stored must match exactly.
+                        if (header.crypt) |c| {
+                            if (c != .rar5) return error.Unsupported;
+                            if (header.data_size < header.unpacked_size or header.data_size > header.unpacked_size + 15) return error.Unsupported;
+                        } else if (header.data_size != header.unpacked_size) return error.Unsupported;
                         entry.method = 0;
                     } else {
                         if (method > 5) return error.Unsupported;
@@ -1002,6 +1011,9 @@ const LocateCtx = struct {
 
 fn locateVisit(ctx: *LocateCtx, entry: Entry) Failure!void {
     if (entry.is_directory) return;
+    // Entries past the target cannot affect its group: a later non-solid
+    // entry must not reset the window maximum the target's replay needs.
+    if (ctx.ordinal > ctx.target) return;
     if (!entry.solid) {
         ctx.last_group_start = ctx.ordinal;
         ctx.group_max_window = 0;
@@ -1039,7 +1051,10 @@ fn entryPayload(entry: Entry, archive: []const u8, opts: DecodeOptions, bufs: *D
             }
             const keys = try rar5Kdf(password, &c.salt, c.lg2count, opts);
             if (c.pswcheck) |expected| {
-                if (!crypto.constantTimeEql(&rar5PswCheck(&keys.pswcheck), &expected)) return error.InvalidData;
+                if (!crypto.constantTimeEql(&rar5PswCheck(&keys.pswcheck), &expected)) {
+                    if (opts.failure_cause) |cause| cause.* = .wrong_password;
+                    return error.InvalidData;
+                }
             }
             crypto.aesCbcDecrypt(opts.provider, keys.key[0..], c.iv, bufs.packed_stage[0..payload.len], payload) catch return error.InvalidData;
         },

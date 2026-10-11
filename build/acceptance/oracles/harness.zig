@@ -375,12 +375,28 @@ pub fn xzFiltersParam(value: u64) Node {
     return paramScalar(param_family_xz, xz_filters, cmd_query_write, value);
 }
 
+pub const param_family_sevenzip: u16 = 14;
+pub const sevenzip_header_encode: u32 = 1;
+pub fn sevenzipHeaderEncodeParam(value: u64) Node {
+    return paramScalar(param_family_sevenzip, sevenzip_header_encode, cmd_all, value);
+}
+
 pub fn cryptoPasswordParam(bytes: []const u8) Node {
     return paramBytes(param_family_crypto, crypto_password, cmd_all, bytes);
 }
 
 pub fn cryptoAlgorithmParam(value: u64) Node {
     return paramScalar(param_family_crypto, crypto_algorithm, cmd_all, value);
+}
+
+pub const zip_data_descriptor: u32 = 5;
+pub const param_family_rar: u16 = 15;
+pub const rar_header_encode: u32 = 1;
+pub fn rarHeaderEncodeParam(value: u64) Node {
+    return paramScalar(param_family_rar, rar_header_encode, cmd_all, value);
+}
+pub fn zipDataDescriptorParam(value: u64) Node {
+    return paramScalar(param_family_crypto, zip_data_descriptor, cmd_all, value);
 }
 
 pub fn cryptoKdfLimitParam(value: u64) Node {

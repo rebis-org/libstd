@@ -9,6 +9,7 @@
         .{ .name = "lazy", .family = 8, .ordinal = 3, .representation = "scalar_words" },
         .{ .name = "chain", .family = 8, .ordinal = 4, .representation = "scalar_words" },
         .{ .name = "optimal", .family = 8, .ordinal = 5, .representation = "scalar_words" },
+        .{ .name = "strategy", .family = 8, .ordinal = 6, .representation = "scalar_words" },
     },
     .capabilities = .{ "read", "replay" },
     .sizing = "measured",
