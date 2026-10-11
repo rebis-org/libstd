@@ -20,14 +20,14 @@ const bin_shift = 14;
 const init_bin_esc = [_]u16{ 0x3CDD, 0x1F3F, 0x59BF, 0x48F3, 0x64A1, 0x5ABC, 0x6632, 0x6051 };
 const exp_escape = [_]u8{ 25, 14, 9, 7, 5, 5, 4, 4, 4, 3, 3, 3, 2, 2, 2, 2 };
 
-const State = extern struct {
+const Occurrence = extern struct {
     symbol: u8,
     freq: u8,
     successor_low: u16,
     successor_high: u16,
 };
 
-const Context = extern struct {
+const Subrange = extern struct {
     num_stats: u16,
     summ_freq: u16,
     stats: u32,
@@ -299,11 +299,11 @@ const Model = struct {
         return @intCast(@intFromPtr(p) - @intFromPtr(self.base));
     }
 
-    inline fn ctx(self: *Model, off: u32) *Context {
+    inline fn ctx(self: *Model, off: u32) *Subrange {
         return @ptrFromInt(@intFromPtr(self.base) + off);
     }
 
-    inline fn state(self: *Model, off: u32) *State {
+    inline fn state(self: *Model, off: u32) *Occurrence {
         return @ptrFromInt(@intFromPtr(self.base) + off);
     }
 
@@ -311,23 +311,23 @@ const Model = struct {
         return @ptrFromInt(@intFromPtr(self.base) + off);
     }
 
-    inline fn statsOf(self: *Model, c: *Context) [*]State {
+    inline fn statsOf(self: *Model, c: *Subrange) [*]Occurrence {
         return @ptrFromInt(@intFromPtr(self.base) + c.stats);
     }
 
-    inline fn oneState(c: *Context) *State {
+    inline fn oneState(c: *Subrange) *Occurrence {
         return @ptrCast(&c.summ_freq);
     }
 
-    inline fn suffixOf(self: *Model, c: *Context) *Context {
+    inline fn suffixOf(self: *Model, c: *Subrange) *Subrange {
         return self.ctx(c.suffix);
     }
 
-    inline fn successor(s: *const State) u32 {
+    inline fn successor(s: *const Occurrence) u32 {
         return @as(u32, s.successor_low) | (@as(u32, s.successor_high) << 16);
     }
 
-    inline fn setSuccessor(s: *State, succ_off: u32) void {
+    inline fn setSuccessor(s: *Occurrence, succ_off: u32) void {
         s.successor_low = @truncate(succ_off);
         s.successor_high = @truncate(succ_off >> 16);
     }
@@ -527,7 +527,7 @@ const Model = struct {
         min_ctx.stats = self.found_state;
         var i: usize = 0;
         while (i < 256) : (i += 1) {
-            const s = self.state(self.found_state + @as(u32, @intCast(i)) * @sizeOf(State));
+            const s = self.state(self.found_state + @as(u32, @intCast(i)) * @sizeOf(Occurrence));
             s.symbol = @intCast(i);
             s.freq = 1;
             s.successor_low = 0;
@@ -577,7 +577,7 @@ const Model = struct {
 
     fn createSuccessors(self: *Model, skip: bool) ?u32 {
         // All fields assigned after the suffix walk, so `undefined` is safe.
-        var up_state: State = undefined;
+        var up_state: Occurrence = undefined;
         var c_off = self.min_context;
         var c = self.ctx(c_off);
         const up_branch = Model.successor(self.state(self.found_state));
@@ -590,7 +590,7 @@ const Model = struct {
         const found_symbol = self.state(self.found_state).symbol;
         while (c.suffix != 0) {
             // Assigned in both branches before use, so `undefined` is safe.
-            var s: *State = undefined;
+            var s: *Occurrence = undefined;
             c_off = c.suffix;
             c = self.ctx(c_off);
             if (c.num_stats != 1) {
@@ -771,7 +771,7 @@ const Model = struct {
     fn rescale(self: *Model) void {
         const min_ctx = self.ctx(self.min_context);
         const stats = self.statsOf(min_ctx);
-        var s: [*]State = @ptrCast(self.state(self.found_state));
+        var s: [*]Occurrence = @ptrCast(self.state(self.found_state));
         {
             const moved = s[0];
             while (s != stats) {
@@ -867,14 +867,14 @@ const Model = struct {
     }
 
     fn update1(self: *Model) void {
-        const s: [*]State = @ptrCast(self.state(self.found_state));
+        const s: [*]Occurrence = @ptrCast(self.state(self.found_state));
         s[0].freq += 4;
         self.ctx(self.min_context).summ_freq += 4;
         if (s[0].freq > (s - 1)[0].freq) {
             const tmp = s[0];
             s[0] = (s - 1)[0];
             (s - 1)[0] = tmp;
-            self.found_state = self.ref(s) - @sizeOf(State);
+            self.found_state = self.ref(s) - @sizeOf(Occurrence);
             if (self.state(self.found_state).freq > max_freq) self.rescale();
         }
         self.nextContext();

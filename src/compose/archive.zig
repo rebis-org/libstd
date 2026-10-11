@@ -572,7 +572,7 @@ pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
             .packed_stage = packed_stage,
         };
         if (entry.method != 0) {
-            const state_words = try workspace.take(u64, (rar.max_state_bytes + 7) / 8);
+            const state_words = try workspace.take(u64, (rar.max_unpacker_bytes + 7) / 8);
             const window_buf = try workspace.take(u8, window_len);
             const table_pool = try workspace.take(u16, rar.table_pool_words);
             const pending50 = try workspace.take(rar.PendingFilter50, rar.max_pending50);

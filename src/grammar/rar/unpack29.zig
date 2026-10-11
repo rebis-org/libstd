@@ -97,7 +97,7 @@ const length_extra_bits = [rc]u5{
 
 const BlockMode = enum { lz, ppm_mode };
 
-pub const State = struct {
+pub const Unpacker = struct {
     // By value: bit input restarts per entry, including for solid entries, so a
     // pointer would have to stay parked between files.
     provider: checksum.Provider,
@@ -147,7 +147,7 @@ pub const State = struct {
     filter_scratch: []u8,
 
     pub fn init(
-        st: *State,
+        st: *Unpacker,
         window_buffer: []u8,
         table_pool: []u16,
         pending: []PendingFilter,
@@ -195,7 +195,7 @@ pub const State = struct {
 
     // A non-solid entry discards inherited tables without tearing down the window
     // or the PPM model, so the table release stays separate from the full reset.
-    pub fn freeTables(st: *State) void {
+    pub fn freeTables(st: *Unpacker) void {
         st.mc = .{};
         st.dc_t = .{};
         st.ldc_t = .{};
@@ -203,7 +203,7 @@ pub const State = struct {
         st.tables_loaded = false;
     }
 
-    pub fn readTables(st: *State) Failure!bool {
+    pub fn readTables(st: *Unpacker) Failure!bool {
         const pool = st.table_pool;
 
         st.br.alignByte();
@@ -287,7 +287,7 @@ pub const State = struct {
     }
 
     // RAR guarantees a filter program never crosses a Huffman block boundary.
-    fn readVMCode(st: *State) Failure!void {
+    fn readVMCode(st: *Unpacker) Failure!void {
         const first_byte: u32 = try st.br.readBits(8);
         var length: u32 = (first_byte & 7) + 1;
         if (length == 7) {
@@ -305,7 +305,7 @@ pub const State = struct {
         try st.addVMCode(first_byte, code_buf[0..length]);
     }
 
-    fn addVMCode(st: *State, first_byte: u32, code: []const u8) Failure!void {
+    fn addVMCode(st: *Unpacker, first_byte: u32, code: []const u8) Failure!void {
         // RarVM::ReadData peeks 16 bits and consumes as few as 6, so a 7-byte
         // record overruns the buffer mid-read; zero padding makes that harmless.
         var padded: [max_vm_code_size + 8]u8 = undefined;
@@ -389,7 +389,7 @@ pub const State = struct {
     }
 
     // Rep-distance matches use the +2 base and no distance-dependent bonus.
-    fn decodeLength(st: *State) Failure!u32 {
+    fn decodeLength(st: *Unpacker) Failure!u32 {
         const slot = try huffman.decodeNumber(&st.br, &st.rc_t);
         if (slot >= rc) return error.InvalidData;
         const base = length_bases[slot] + length_rep_base;
@@ -398,7 +398,7 @@ pub const State = struct {
         return base + try st.br.readBits(extra);
     }
 
-    fn decodeDistance(st: *State) Failure!u32 {
+    fn decodeDistance(st: *Unpacker) Failure!u32 {
         const slot = try huffman.decodeNumber(&st.br, &st.dc_t);
         if (slot >= dc) return error.InvalidData;
 
@@ -436,7 +436,7 @@ pub const State = struct {
         return distance;
     }
 
-    fn rotatePrevDistances(st: *State, index: usize) void {
+    fn rotatePrevDistances(st: *Unpacker, index: usize) void {
         const dist = st.prev_distances[index];
         var i: usize = index;
         while (i > 0) : (i -= 1) {
@@ -445,7 +445,7 @@ pub const State = struct {
         st.prev_distances[0] = dist;
     }
 
-    fn processLzSymbol(st: *State) Failure!bool {
+    fn processLzSymbol(st: *Unpacker) Failure!bool {
         const symbol = try huffman.decodeNumber(&st.br, &st.mc);
 
         if (symbol < 256) {
@@ -556,7 +556,7 @@ pub const State = struct {
 
     // PPMEscChar selects the in-band escape: 0 ends the PPM encoding, 1 is the escape
     // byte, 2 ends the entry, 3 is a VM filter program, 4 an LZ match, and 5 an RLE run.
-    fn processPpmSymbol(st: *State) Failure!bool {
+    fn processPpmSymbol(st: *Unpacker) Failure!bool {
         if (st.ppm_model == null) return error.Unsupported;
         var model = &st.ppm_model.?;
         const ch = model.decodeChar(&st.br) catch return error.InvalidData;
@@ -625,7 +625,7 @@ pub const State = struct {
 
     // The `keep` bytes stay unemitted so a filter recorded just after its data was
     // decoded still covers its region; a filter reaching further back is refused.
-    fn flushDecoded(st: *State, keep: usize, limit: u64) Failure!void {
+    fn flushDecoded(st: *Unpacker, keep: usize, limit: u64) Failure!void {
         const out = st.stream_out orelse return;
         const produced = st.window.write_pos - st.entry_start;
         // A final match may overshoot the declared size, so never emit past it.
@@ -654,7 +654,7 @@ pub const State = struct {
 
     // Run to the end-of-block marker, not to unpacked_size: the marker carries the
     // "new table" bit the next solid entry needs, and a trailing match may overshoot.
-    pub fn decompressLoop(st: *State, unpacked_size: u64) Failure!void {
+    pub fn decompressLoop(st: *Unpacker, unpacked_size: u64) Failure!void {
         if (!st.tables_loaded) {
             _ = try st.readTables();
         }
@@ -691,10 +691,10 @@ pub const State = struct {
 };
 
 pub const Session = struct {
-    state: *State,
+    state: *Unpacker,
 
     pub fn init(
-        st: *State,
+        st: *Unpacker,
         window_buffer: []u8,
         table_pool: []u16,
         pending: []PendingFilter,
@@ -702,7 +702,7 @@ pub const Session = struct {
         ppm_heap: []u8,
         provider: checksum.Provider,
     ) Failure!Session {
-        try State.init(st, window_buffer, table_pool, pending, filter_scratch, ppm_heap, provider);
+        try Unpacker.init(st, window_buffer, table_pool, pending, filter_scratch, ppm_heap, provider);
         return .{ .state = st };
     }
 

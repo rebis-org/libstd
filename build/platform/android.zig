@@ -48,7 +48,7 @@ fn addJniBridge(b: *std.Build, library: *std.Build.Step.Compile) void {
 
 pub fn addArchive(
     b: *std.Build,
-    ctx: *const common.Context,
+    ctx: *const common.Settings,
     distribution: manifest.Distribution,
 ) std.Build.LazyPath {
     const stage = b.addWriteFiles();

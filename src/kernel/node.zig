@@ -8,21 +8,21 @@ const max_depth = 32;
 const max_count = 1024;
 
 pub fn validateGraph(siblings: ?*abi.Node, direction: vocabulary.Direction, command_mask: u32) Failure!void {
-    var tracker = Context{
+    var tracker = Traversal{
         .direction = direction,
         .command_mask = command_mask,
     };
     try validateNode(siblings, &tracker, 0);
 }
 
-const Context = struct {
+const Traversal = struct {
     direction: vocabulary.Direction,
     command_mask: u32,
     count: usize = 0,
     ancestors: [max_depth + 1]?*abi.Node = @splat(null),
 };
 
-fn validateNode(siblings: ?*abi.Node, tracker: *Context, depth: usize) Failure!void {
+fn validateNode(siblings: ?*abi.Node, tracker: *Traversal, depth: usize) Failure!void {
     if (depth > max_depth) return error.ResourceLimit;
     var cursor = siblings;
     while (cursor) |node| {
@@ -69,7 +69,7 @@ fn validateNode(siblings: ?*abi.Node, tracker: *Context, depth: usize) Failure!v
     }
 }
 
-fn validateChildren(node: *abi.Node, tracker: *Context, depth: usize) Failure!void {
+fn validateChildren(node: *abi.Node, tracker: *Traversal, depth: usize) Failure!void {
     tracker.ancestors[depth] = node;
     try validateNode(node.child, tracker, depth + 1);
     tracker.ancestors[depth] = null;
@@ -115,7 +115,7 @@ fn siblingKey(node: *abi.Node) SiblingKey {
     return .{ .id = node.id, .selector = 0 };
 }
 
-fn validateParameter(node: *abi.Node, siblings: ?*abi.Node, tracker: *Context, selector: vocabulary.Selector) Failure!void {
+fn validateParameter(node: *abi.Node, siblings: ?*abi.Node, tracker: *Traversal, selector: vocabulary.Selector) Failure!void {
     if (!vocabulary.isSelectorValid(selector)) return error.InvalidCall;
     if (!discovery.isSelectorKnown(selector.family, selector.ordinal)) return error.Unsupported;
     if (!isDirectionAccepted(vocabulary.directionOf(selector), tracker.direction)) return error.Unsupported;

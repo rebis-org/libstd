@@ -184,7 +184,7 @@ const AudioChannel = struct {
     }
 };
 
-const Decoder = struct {
+pub const Decoder = struct {
     // A solid session outlives a single file, and bit input restarts for every entry, so the reader is stored by value.
     br: BitReader,
     window: Window,
@@ -513,8 +513,6 @@ fn unpackLzBlock(st: *Decoder) Failure!void {
         }
     }
 }
-
-pub const State = Decoder;
 
 pub const Session = struct {
     state: *Decoder,

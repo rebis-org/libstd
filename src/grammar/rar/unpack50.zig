@@ -45,7 +45,7 @@ const length_table: [rc]LengthEntry = blk: {
 // unflushed span by at most this, so it bounds the window headroom.
 const max_lz_match: usize = 0x1001 + 3;
 
-pub const State = struct {
+pub const Unpacker = struct {
     br: BitReader,
     window: Window,
     ld: DecodeTable,
@@ -66,7 +66,7 @@ pub const State = struct {
     filter_scratch: []u8,
 
     pub fn init(
-        st: *State,
+        st: *Unpacker,
         window_buffer: []u8,
         table_pool: []u16, // The byte size is table_pool_words * 4.
         pending: []filters.Filter,
@@ -96,11 +96,11 @@ pub const State = struct {
         };
     }
 
-    fn tablePool(st: *State) []u16 {
+    fn tablePool(st: *Unpacker) []u16 {
         return st.table_pool;
     }
 
-    pub fn freeTables(st: *State) void {
+    pub fn freeTables(st: *Unpacker) void {
         st.ld = .{};
         st.dd = .{};
         st.ldd = .{};
@@ -146,7 +146,7 @@ pub fn decodeDistance(br: *BitReader, dd: *const DecodeTable, ldd: *const Decode
     return distance + 1;
 }
 
-fn readTables(st: *State) Failure!void {
+fn readTables(st: *Unpacker) Failure!void {
     const br = &st.br;
     const pool = st.tablePool();
 
@@ -243,7 +243,7 @@ fn readTables(st: *State) Failure!void {
 
 // Filter descriptor wire format: start delta, length, 3-bit filter type, and for
 // DELTA a 5-bit channel count minus one. The start delta is FORWARD.
-fn parseFilterDescriptor(st: *State) Failure!void {
+fn parseFilterDescriptor(st: *Unpacker) Failure!void {
     const br = &st.br;
 
     const block_start_delta = try filters.readFilterSize(br);
@@ -272,7 +272,7 @@ fn parseFilterDescriptor(st: *State) Failure!void {
 
 // A filter start is a FORWARD delta from the position where its descriptor
 // appears, so no look-back reserve is needed and the cap below covers them all.
-fn flushDecoded(st: *State, limit: u64) Failure!void {
+fn flushDecoded(st: *Unpacker, limit: u64) Failure!void {
     const out = st.stream_out orelse return;
     const produced = st.window.write_pos - st.entry_start;
     var emit_upto: usize = @intCast(@min(@as(u64, produced), limit));
@@ -329,7 +329,7 @@ fn flushDecoded(st: *State, limit: u64) Failure!void {
     st.flushed += count;
 }
 
-fn decodeBlock(st: *State, unpacked_size: u64) Failure!bool {
+fn decodeBlock(st: *Unpacker, unpacked_size: u64) Failure!bool {
     const br = &st.br;
 
     br.alignByte();
@@ -433,19 +433,19 @@ fn decodeBlock(st: *State, unpacked_size: u64) Failure!bool {
 }
 
 pub const Session = struct {
-    state: *State,
+    state: *Unpacker,
 
-    // In place: the caller carves the State out of its own storage, because
+    // In place: the caller carves the Unpacker out of its own storage, because
     // the struct holds about 9 KB of decode tables, so nothing here allocates.
     pub fn init(
-        st: *State,
+        st: *Unpacker,
         window_buffer: []u8,
         table_pool: []u16,
         pending: []filters.Filter,
         filter_scratch: []u8,
         is_rar7: bool,
     ) Failure!Session {
-        try State.init(st, window_buffer, table_pool, pending, filter_scratch, is_rar7);
+        try Unpacker.init(st, window_buffer, table_pool, pending, filter_scratch, is_rar7);
         return .{ .state = st };
     }
 

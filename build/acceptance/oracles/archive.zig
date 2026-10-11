@@ -110,7 +110,7 @@ fn arcReadOrdinal(r: *Runner, ordinal: u64, expected: []const u8) !void {
 }
 
 fn arcReadCallback0(r: *Runner) !void {
-    var source_ctx = harness.SourceCallbackContext{ .data = arc_state.archive[0..arc_state.archive_size] };
+    var source_ctx = harness.SourceCursor{ .data = arc_state.archive[0..arc_state.archive_size] };
     _ = harness.call(r, harness.ids.read, &.{
         harness.archiveOrdinalParam(0),
         harness.sourceCallbackNode(0, 0),
@@ -123,7 +123,7 @@ fn arcReadCallback0(r: *Runner) !void {
 }
 
 fn arcWriteCallbackSource(r: *Runner) !void {
-    var source_ctx = harness.SourceCallbackContext{ .data = &.{} };
+    var source_ctx = harness.SourceCursor{ .data = &.{} };
     _ = harness.call(r, harness.ids.write, &.{
         harness.paramProfile(r.profile_id),
         harness.sourceCallbackNode(0, 0),
@@ -138,7 +138,7 @@ fn arcWriteCallbackSource(r: *Runner) !void {
 }
 
 fn arcReadCallbackSink(r: *Runner) !void {
-    var sink_ctx = harness.SinkBufferContext{ .buffer = r.output, .accept_limit = std.math.maxInt(usize) };
+    var sink_ctx = harness.SinkBuffer{ .buffer = r.output, .accept_limit = std.math.maxInt(usize) };
     _ = harness.call(r, harness.ids.read, &.{
         harness.archiveOrdinalParam(0),
         harness.sourceSpan(arc_state.archive[0..arc_state.archive_size]),
@@ -471,7 +471,7 @@ pub fn runRar(r: *Runner) anyerror!void {
         harness.sourceSpan(rar_fixture[0 .. rar_fixture.len - 5]),
         harness.sinkSpan(r.output),
     }, .{ .ctx = true }, r.output);
-    var source_ctx = harness.SourceCallbackContext{ .data = &rar_fixture };
+    var source_ctx = harness.SourceCursor{ .data = &rar_fixture };
     _ = harness.call(r, harness.ids.read, &.{
         harness.archiveOrdinalParam(0),
         harness.sourceCallbackNode(0, 0),
@@ -479,7 +479,7 @@ pub fn runRar(r: *Runner) anyerror!void {
     }, .{ .ctx = true, .callback = harness.sourceCallback, .context = &source_ctx });
     try harness.requireStatus(r, abi.Status.ok);
     try rarCheckOutput(r, null);
-    var sink_ctx = harness.SinkBufferContext{ .buffer = r.output, .accept_limit = r.output.len };
+    var sink_ctx = harness.SinkBuffer{ .buffer = r.output, .accept_limit = r.output.len };
     _ = harness.call(r, harness.ids.read, &.{
         harness.archiveOrdinalParam(0),
         harness.sourceSpan(&rar_fixture),

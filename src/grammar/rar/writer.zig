@@ -493,7 +493,7 @@ test "created archive round-trips through the facade reader (store and lz)" {
 
     const window = try allocator.alloc(u8, 1 << 20);
     defer allocator.free(window);
-    const state_store = try allocator.alloc(u64, (rar.max_state_bytes + 7) / 8);
+    const state_store = try allocator.alloc(u64, (rar.max_unpacker_bytes + 7) / 8);
     defer allocator.free(state_store);
     const table_pool = try allocator.alloc(u16, rar.table_pool_words);
     defer allocator.free(table_pool);
@@ -583,7 +583,7 @@ test "created encrypted archives roundtrip through the facade reader" {
 
     const window = try allocator.alloc(u8, 1 << 20);
     defer allocator.free(window);
-    const state_store = try allocator.alloc(u64, (rar.max_state_bytes + 7) / 8);
+    const state_store = try allocator.alloc(u64, (rar.max_unpacker_bytes + 7) / 8);
     defer allocator.free(state_store);
     const table_pool = try allocator.alloc(u16, rar.table_pool_words);
     defer allocator.free(table_pool);

@@ -1258,7 +1258,7 @@ pub fn DecompressOf(comptime variant: enum { deflate, deflate64 }) type {
         input: Input,
         bits: u64,
         bit_count: u7,
-        state: State,
+        state: Phase,
         final: bool,
         fixed: bool,
         stored_remaining: u16,
@@ -1266,7 +1266,7 @@ pub fn DecompressOf(comptime variant: enum { deflate, deflate64 }) type {
         distance_tree: Tree(8, 4096),
         failed: bool,
 
-        const State = enum { header, stored_copy, tables, data, end };
+        const Phase = enum { header, stored_copy, tables, data, end };
 
         const Input = union(enum) {
             reader: *std.Io.Reader,
@@ -1477,7 +1477,7 @@ pub fn DecompressOf(comptime variant: enum { deflate, deflate64 }) type {
             }
         }
 
-        // Locals keep per-symbol work in registers. State writes back on exit.
+        // Locals keep per-symbol work in registers. Phase writes back on exit.
         fn decodeDataSlice(d: *@This(), lit: anytype, distance_tree: anytype) InflateError!void {
             const r = &d.reader;
             if (lit.empty) return error.InvalidData;

@@ -273,7 +273,7 @@ fn gzSmallSinkRead(r: *Runner) !void {
 fn gzCallbackSinkFailure(r: *Runner) !void {
     try harness.spanCall(r, harness.ids.write, r.input, r.encoded);
     // Callback sinks keep the staged route with committed-prefix progress reporting.
-    var fail_ctx: harness.SinkCallbackContext = undefined;
+    var fail_ctx: harness.SinkBudget = undefined;
     var downstream: harness.Node = undefined;
     var diagnostic: harness.Node = undefined;
     harness.sinkFailureInit(&fail_ctx, &downstream, &diagnostic);
@@ -324,7 +324,7 @@ fn runGzipSinglePass(r: *Runner) anyerror!void {
     // Capacity == ISIZE engages the single-pass path.
     try harness.spanCall(r, harness.ids.read, r.encoded[0..r.encoded_len], r.output);
     if (r.response.byte_length != r.input.len or !std.mem.eql(u8, r.output[0..r.input.len], r.input)) return error.SinglePassReadMismatch;
-    var sink_ctx = harness.SinkBufferContext{ .buffer = &gzip_staged_output, .accept_limit = std.math.maxInt(usize) };
+    var sink_ctx = harness.SinkBuffer{ .buffer = &gzip_staged_output, .accept_limit = std.math.maxInt(usize) };
     _ = harness.call(r, harness.ids.read, &.{
         harness.sourceSpan(r.encoded[0..r.encoded_len]),
         harness.sinkCallbackNode(0, 0),
