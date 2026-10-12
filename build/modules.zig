@@ -64,6 +64,7 @@ pub const micro = Module{
     .root = "build/micro/main.zig",
     .imports = &.{
         .{ .name = "checksum", .module = "checksum" },
+        .{ .name = "crypto", .module = "crypto" },
     },
 };
 
