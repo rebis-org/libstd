@@ -110,6 +110,19 @@ pub fn rootModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std
     return module;
 }
 
+// Attach the library's import closure to the package-manager module created
+// with b.addModule in build.zig, so a dependent build consuming
+// dep.module("libstd") compiles out of the box. In this build the module is
+// inert (nothing imports it); a dependent build compiles only this instance,
+// so the shared source files never sit in two compiled modules at once.
+pub fn attachPackageImports(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, ctx: *const Settings) void {
+    module.addImport("options", ctx.options);
+    module.addImport("seam", modules.shared(b, modules.seam, target, optimize, ctx));
+    const modules_pair = modules.componentsWithInterface(b, ctx, target, target, optimize);
+    module.addImport("components", modules_pair.components);
+    module.addImport("interface", modules_pair.interface);
+}
+
 fn addLibraryFromModule(b: *std.Build, module: *std.Build.Module, linkage: std.lang.LinkMode) *std.Build.Step.Compile {
     return b.addLibrary(.{
         .name = "std",
