@@ -19,6 +19,9 @@ pub const checksum = Module{ .name = "checksum", .root = "src/common/primitive/c
 pub const crypto = Module{ .name = "crypto", .root = "src/common/primitive/crypto.zig", .imports = &.{.{ .name = "seam", .module = "seam" }} };
 
 pub const library = Module{ .name = "library", .root = "src/root.zig", .imports = &.{.{ .name = "seam", .module = "seam" }}, .crc_kernel = true };
+// Package-manager entry: the same import closure as the
+// library module, rooted at the package door instead of the boundary file.
+pub const pkg = Module{ .name = "libstd", .root = "main.zig", .imports = &.{.{ .name = "seam", .module = "seam" }}, .crc_kernel = true };
 pub const manifest = Module{ .name = "manifest", .root = "build/platform/manifest.zig" };
 pub const package = Module{
     .name = "package",
@@ -121,21 +124,39 @@ pub fn createFor(
     optimize: std.lang.Optimize,
     ctx: *const common.Settings,
 ) *std.Build.Module {
-    var adjusted = target;
-    if (!ctx.portable and spec.crc_kernel and (adjusted.result.cpu.arch == .aarch64 or adjusted.result.cpu.arch == .x86_64)) {
-        adjusted = withKernelFeatures(adjusted);
-    }
     const module = b.createModule(.{
         .root_source_file = b.path(spec.root),
-        .target = adjusted,
+        .target = kernelAdjustedTarget(spec, target, ctx.portable),
         .optimize = optimize,
     });
     if (ctx.sanitize_c) |sc| module.sanitize_c = sc;
     module.addImport("options", ctx.options);
     inline for (spec.imports) |import| {
-        module.addImport(import.name, createShared(b, byName(import.module), target, optimize, ctx));
+        module.addImport(import.name, shared(b, byName(import.module), target, optimize, ctx));
     }
     return module;
+}
+
+// crc_kernel specs ask for the hardware feature set the optimized paths are
+// built against; portable builds and other architectures stay on the
+// unadjusted target so the software arms remain the only paths.
+pub fn kernelAdjustedTarget(comptime spec: Module, target: std.Build.ResolvedTarget, portable: bool) std.Build.ResolvedTarget {
+    if (!portable and spec.crc_kernel and (target.result.cpu.arch == .aarch64 or target.result.cpu.arch == .x86_64)) {
+        return withKernelFeatures(target);
+    }
+    return target;
+}
+
+// Single-instance import for callers outside this file (the package-manager
+// module in build.zig); see createShared for the dedupe rule.
+pub fn shared(
+    b: *std.Build,
+    comptime spec: Module,
+    target: std.Build.ResolvedTarget,
+    optimize: std.lang.Optimize,
+    ctx: *const common.Settings,
+) *std.Build.Module {
+    return createShared(b, spec, target, optimize, ctx);
 }
 
 // Imported modules must be single instances per (name, target, optimize): the

@@ -61,6 +61,16 @@ pub fn build(b: *std.Build) void {
         .options = options_module,
         .dist_providers = &dist_providers,
     };
+    // Package-manager exposure for Zig consumers:
+    // b.dependency("libstd", .{}).module("libstd") compiles the boundary and
+    // the bypass facade with the selected provider options; in this build
+    // the module stays inert because nothing imports it.
+    const package_module = b.addModule("libstd", .{
+        .root_source_file = b.path("main.zig"),
+        .target = modules.kernelAdjustedTarget(modules.pkg, target, portable),
+        .optimize = optimize,
+    });
+    common.attachPackageImports(b, package_module, target, optimize, &ctx);
     units.expand(b, &ctx);
     _ = units.addListingStep(b);
 
