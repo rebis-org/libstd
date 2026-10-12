@@ -1,17 +1,19 @@
 const std = @import("std");
 
-const bounds = @import("../common/primitive/bounds.zig");
-const checksum = @import("../common/primitive/checksum.zig");
-const crypto = @import("../common/primitive/crypto.zig");
-const failure_prim = @import("../common/primitive/failure.zig");
-const io = @import("../common/primitive/io.zig");
-const measurement = @import("../common/primitive/measurement.zig");
-const xz = @import("../grammar/xz.zig");
-const bzip2 = @import("../leaf/bzip2.zig");
-const deflate = @import("../leaf/deflate.zig");
-const lzma = @import("../leaf/lzma.zig");
-const ppmd_zip = @import("../leaf/ppmd/zip.zig");
-const zstd = @import("../leaf/zstd.zig");
+const bounds = @import("../../common/primitive/bounds.zig");
+const checksum = @import("../../common/primitive/checksum.zig");
+const crypto = @import("../../common/primitive/crypto.zig");
+const failure_prim = @import("../../common/primitive/failure.zig");
+const io = @import("../../common/primitive/io.zig");
+const measurement = @import("../../common/primitive/measurement.zig");
+const xz = @import("../../grammar/xz/onprem.zig");
+const bzip2 = @import("../../leaf/bzip2/onprem.zig");
+const deflate = @import("../../leaf/deflate/onprem.zig");
+const deflate_seam = @import("../../leaf/deflate/seam.zig");
+const lzma = @import("../../leaf/lzma/onprem.zig");
+const lzma_seam = @import("../../leaf/lzma/seam.zig");
+const ppmd_zip = @import("../../leaf/ppmd/zip.zig");
+const zstd = @import("../../leaf/zstd/onprem.zig");
 
 const winzip_aes_hmac_length = crypto.winzip_hmac_length;
 const winzip_aes_verify_length = crypto.winzip_verify_length;
@@ -362,7 +364,7 @@ pub fn compressedSize(entry: Entry, history: []u8, measurement_buffer: []u8, scr
             var compressor = try deflate.Compress.init(&counter.writer, history[0..deflate_history_size], deflate_options);
             compressor.writer.writeAll(entry.data) catch return error.InternalFailure;
             compressor.finish() catch return error.InternalFailure;
-            return std.math.cast(usize, counter.written()) orelse error.ResourceLimit;
+            return measurement.measuredLength(&counter);
         },
         9 => {
             if (history.len < deflate64_history_size or measurement_buffer.len < deflate_measurement_buffer_size) return error.InsufficientCapacity;
@@ -370,7 +372,7 @@ pub fn compressedSize(entry: Entry, history: []u8, measurement_buffer: []u8, scr
             var compressor = try deflate.Compress64.init(&counter.writer, history[0..deflate64_history_size], deflate_options);
             compressor.writer.writeAll(entry.data) catch return error.InternalFailure;
             compressor.finish() catch return error.InternalFailure;
-            return std.math.cast(usize, counter.written()) orelse error.ResourceLimit;
+            return measurement.measuredLength(&counter);
         },
         12 => {
             const required = bzip2.encodeWorkspaceSize(bzip2_block_default);
@@ -410,7 +412,7 @@ fn zipZstdEncodeSize(input: []const u8, scratch: []u8) Failure!usize {
     var counter = measurement.Counter.init(null);
     var source = std.Io.Reader.fixed(input);
     _ = zstd.encodeStream(&source, &counter.writer, zhistory, workspace, .{ .window_size = window }) catch |err| return encodeMap(err);
-    return std.math.cast(usize, counter.written()) orelse error.ResourceLimit;
+    return measurement.measuredLength(&counter);
 }
 
 fn writeData(sink: *io.Sink, entry: Entry, provider: crypto.Provider, history: []u8, staging: []u8, scratch: []u8) Failure!void {
@@ -702,8 +704,8 @@ fn zipDecompress(entry: Info, compressed: []const u8, output: []u8, options: Zip
             if (options.history.len < deflate_history_size) return error.InsufficientCapacity;
             var source = std.Io.Reader.fixed(compressed);
             var writer = std.Io.Writer.fixed(output[0..entry.uncompressed_size]);
-            var inflater = deflate.Decompress.init(&source, options.history[0..deflate_history_size]);
-            inflater.reader.streamExact64(&writer, entry.uncompressed_size) catch return error.InvalidData;
+            var inflater = deflate_seam.Decode.initBound(options.provider, &source, options.history[0..deflate_history_size]) catch return error.Unsupported;
+            inflater.readerPtr().streamExact64(&writer, entry.uncompressed_size) catch return error.InvalidData;
             if (writer.end != entry.uncompressed_size or source.seek != compressed.len) return error.InvalidData;
             return entry.uncompressed_size;
         },
@@ -736,7 +738,7 @@ fn zipDecompress(entry: Info, compressed: []const u8, output: []u8, options: Zip
                 .unpack_size = entry.uncompressed_size,
                 .marker_required = entry.flags & 2 != 0,
             };
-            const decoded = try lzma.decode(compressed[9..], output[0..entry.uncompressed_size], options.scratch[0..scratch_size], lzma_options);
+            const decoded = try lzma_seam.decode(options.provider, compressed[9..], output[0..entry.uncompressed_size], options.scratch[0..scratch_size], lzma_options);
             if (decoded != entry.uncompressed_size) return error.InvalidData;
             return decoded;
         },
@@ -1056,6 +1058,10 @@ test "zip kdf_rounds_limit gates winzip aes" {
 }
 
 test "zip aes128 single entry fits a 512-byte buffer" {
+    // See the decode gate above: a mixed build cannot serve one call with
+    // both arms, and an offprem tag has no encoder at all.
+    if (!deflate_seam.encodeServed(checksum.default_provider) or !deflate_seam.decodeServed(checksum.default_provider)) return;
+
     const testing = std.testing;
     const data = "0123456789abcdef0123456789abcdef";
     const entries = [_]Entry{

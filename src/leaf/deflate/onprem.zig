@@ -3,12 +3,12 @@ const std = @import("std");
 
 const build_options = @import("options");
 
-const kernels = @import("../common/kernels.zig");
-const huffman = @import("../common/primitive/huffman.zig");
+const kernels = @import("../../common/kernels.zig");
+const failure_prim = @import("../../common/primitive/failure.zig");
+const huffman = @import("../../common/primitive/huffman.zig");
 
-// NEON is baseline on aarch64, so the wide match-copy path needs no extra
-// target feature. Other targets keep the portable word-at-a-time path.
-const use_vector_match_copy = !build_options.portable and builtin.target.cpu.arch == .aarch64;
+const use_vector_match_copy = kernels.vector_match_copy;
+const Failure = failure_prim.Failure;
 
 pub const history_size = 2 * window_size;
 pub const measurement_buffer_size = 64;
@@ -976,6 +976,26 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
 }
 
 pub const Compress = CompressOf(.deflate);
+
+// The one feed loop every gzip and zlib frame encodes through: the source is
+// batched into chunks so the compressor and the frame's checksum each see a
+// whole chunk, and the fed byte count comes back for the frame trailer.
+pub fn feed(comptime Checksum: type, source: *std.Io.Reader, compressor: *Compress, checksum: *Checksum) Failure!u64 {
+    var buffer: [4096]u8 = undefined;
+    var total: u64 = 0;
+    while (true) {
+        var staging = std.Io.Writer.fixed(&buffer);
+        const count = source.stream(&staging, std.Io.Limit.limited(buffer.len)) catch |err| {
+            if (err == error.EndOfStream) break;
+            return error.IoFailure;
+        };
+        if (count == 0) break;
+        checksum.update(buffer[0..count]);
+        total = std.math.add(u64, total, count) catch return error.ResourceLimit;
+        compressor.writer.writeAll(buffer[0..count]) catch return error.IoFailure;
+    }
+    return total;
+}
 pub const Compress64 = CompressOf(.deflate64);
 const Match = struct { length: usize, distance: u32 };
 
@@ -1305,6 +1325,53 @@ pub fn DecompressOf(comptime variant: enum { deflate, deflate64 }) type {
                 .reader => |r| r.seek * 8 - self.bit_count,
                 .slice => |s| s.pos * 8 - self.bit_count,
             };
+        }
+
+        // Seam binding points (src/leaf/deflate/seam.zig): the provider tag
+        // binds at construction and the decode loop never dispatches. A
+        // mismatched tag is an unsupported request, never a silent fallback.
+        // The tag type is the caller's seam Provider; `anytype` keeps this
+        // engine free of module imports (module confinement).
+        pub fn initBound(provider: anytype, input: *std.Io.Reader, history: []u8) error{Unsupported}!@This() {
+            if (provider != .onprem) return error.Unsupported;
+            return init(input, history);
+        }
+
+        pub fn initSliceBound(provider: anytype, data: []const u8, history: []u8) error{Unsupported}!@This() {
+            if (provider != .onprem) return error.Unsupported;
+            return initSlice(data, history);
+        }
+
+        // Resume a fresh member at a byte position the framing read ahead to.
+        pub fn setFramePos(self: *@This(), pos: usize) void {
+            self.input.slice.pos = pos;
+            self.bits = 0;
+            self.bit_count = 0;
+        }
+
+        // Session-driver surface (src/compose/drivers.zig): framing pokes the
+        // inflater between steps; these cover every poke both arms share.
+        pub fn streamPosition(self: *const @This()) usize {
+            return self.input.slice.pos;
+        }
+
+        pub fn restage(self: *@This(), data: []const u8, pos: usize) void {
+            // Mid-member restage: the partial-byte bit state belongs to the
+            // byte at `pos` after compaction and must survive.
+            self.input.slice.data = data;
+            self.input.slice.pos = pos;
+        }
+
+        pub fn atEnd(self: *const @This()) bool {
+            return self.state == .end;
+        }
+
+        pub fn clearFailure(self: *@This()) void {
+            self.failed = false;
+        }
+
+        pub fn readerPtr(self: *@This()) *std.Io.Reader {
+            return &self.reader;
         }
 
         fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {

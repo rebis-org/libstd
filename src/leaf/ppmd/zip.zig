@@ -101,7 +101,7 @@ pub fn decode(input: []const u8, output: []u8, scratch: []u8, options: Options) 
 pub fn requiredSize(input: []const u8, scratch: []u8, options: Options) Failure!usize {
     var counter = measurement.Counter.init(null);
     try encodeInner(input, &counter.writer, scratch, options);
-    return std.math.cast(usize, counter.written()) orelse error.ResourceLimit;
+    return measurement.measuredLength(&counter);
 }
 
 pub fn encode(input: []const u8, output: []u8, scratch: []u8, options: Options) Failure!usize {

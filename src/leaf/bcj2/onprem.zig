@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const failure_prim = @import("../common/primitive/failure.zig");
+const failure_prim = @import("../../common/primitive/failure.zig");
 
 const Failure = failure_prim.Failure;
 

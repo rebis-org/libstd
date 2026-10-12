@@ -3,23 +3,10 @@ const std = @import("std");
 const Failure = @import("failure.zig").Failure;
 
 pub fn readByte(reader: *std.Io.Reader) Failure!u8 {
-    return readByteResuming(reader) catch |failure| switch (failure) {
-        error.Starved => error.IoFailure,
-        else => |other| other,
-    };
-}
-
-// Starvation-preserving variant for stepped (session) drivers: a reader that
-// has no bytes ready raises Starved so the driver can suspend and re-enter,
-// while genuine read errors stay IoFailure.
-pub fn readByteResuming(reader: *std.Io.Reader) Failure!u8 {
     var buffer: [1]u8 = undefined;
     var iovecs = [_][]u8{buffer[0..]};
-    const bytes_read = reader.readVec(&iovecs) catch |failure| switch (failure) {
-        error.EndOfStream => return error.Starved,
-        else => return error.IoFailure,
-    };
-    if (bytes_read == 0) return error.Starved;
+    const bytes_read = reader.readVec(&iovecs) catch return error.IoFailure;
+    if (bytes_read == 0) return error.IoFailure;
     return buffer[0];
 }
 
@@ -36,7 +23,7 @@ pub const Sink = struct {
     offset: usize = 0,
 
     pub fn write(self: *Sink, chunk: []const u8) Failure!void {
-        if (self.offset + chunk.len > self.bytes.len) return error.InsufficientCapacity;
+        if (chunk.len > self.bytes.len - self.offset) return error.InsufficientCapacity;
         @memcpy(self.bytes[self.offset..][0..chunk.len], chunk);
         self.offset += chunk.len;
     }
@@ -48,17 +35,13 @@ pub const Sink = struct {
     }
 };
 
-fn checkedLen(length: u64) Failure!usize {
-    return std.math.cast(usize, length) orelse return error.ResourceLimit;
-}
-
 fn Slice(comptime Ptr: type) type {
     const info = @typeInfo(Ptr).pointer;
     return if (info.attrs.@"const") []const info.child else []info.child;
 }
 
 fn checkedSlice(comptime Ptr: type, pointer: ?Ptr, length: u64) Failure!Slice(Ptr) {
-    const count = try checkedLen(length);
+    const count = std.math.cast(usize, length) orelse return error.ResourceLimit;
     if (count == 0) return &.{};
     const base = pointer orelse return error.InvalidCall;
     // Slicing a comptime-known pointer yields a const slice, so the mutable case casts back onto caller-owned memory.

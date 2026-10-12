@@ -5,7 +5,19 @@ const build_options = @import("options");
 
 // NEON is baseline on aarch64, so the wide match-copy path needs no extra
 // target feature. Other targets keep the portable word-at-a-time path.
-const vector_match_copy = !build_options.portable and builtin.target.cpu.arch == .aarch64;
+pub const vector_match_copy = !build_options.portable and builtin.target.cpu.arch == .aarch64;
+
+// One short-run copy per codec, one answer for whether the wide path applies.
+pub inline fn splatShort(dst: []u8, byte: u8) void {
+    if (dst.len < 16) {
+        for (dst) |*out| out.* = byte;
+        return;
+    }
+    const splat: @Vector(16, u8) = @splat(byte);
+    var pos: usize = 0;
+    while (pos + 16 <= dst.len) : (pos += 16) dst[pos..][0..16].* = splat;
+    dst[dst.len - 16 ..][0..16].* = splat;
+}
 
 pub inline fn matchLen8(window: []const u8, first: usize, second: usize, max_len: usize) usize {
     var len: usize = 0;
@@ -46,12 +58,7 @@ pub inline fn copyMatchCore(comptime cfg: CopyMatchCfg, window: []u8, out_off: u
         copyChunked(window, out_off, src_off, copy_len, 8);
     } else if (distance == 1) {
         if (copy_len >= 16) {
-            const splat: @Vector(16, u8) = @splat(window[src_off]);
-            var pos: usize = 0;
-            while (pos + 16 <= copy_len) : (pos += 16) {
-                window[out_off + pos ..][0..16].* = splat;
-            }
-            if (pos < copy_len) window[out_off + copy_len - 16 ..][0..16].* = splat;
+            splatShort(window[out_off..][0..copy_len], window[src_off]);
         } else {
             switch (cfg.short_one) {
                 .byte_widen => {

@@ -9,18 +9,18 @@ const std = @import("std");
 const checksum = @import("../../common/primitive/checksum.zig");
 const crypto = @import("../../common/primitive/crypto.zig");
 const io = @import("../../common/primitive/io.zig");
-const gzip = @import("../../grammar/gzip.zig");
-const lzma_alone = @import("../../grammar/lzma.zig");
-const rar = @import("../../grammar/rar.zig");
-const sevenzip = @import("../../grammar/sevenzip.zig");
-const tar = @import("../../grammar/tar.zig");
-const xz = @import("../../grammar/xz.zig");
-const zip = @import("../../grammar/zip.zig");
-const zlib = @import("../../grammar/zlib.zig");
-const bzip2 = @import("../../leaf/bzip2.zig");
-const deflate = @import("../../leaf/deflate.zig");
-const lz4 = @import("../../leaf/lz4.zig");
-const zstd = @import("../../leaf/zstd.zig");
+const gzip = @import("../../grammar/gzip/onprem.zig");
+const lzma_alone = @import("../../grammar/lzma/onprem.zig");
+const rar = @import("../../grammar/rar/onprem.zig");
+const sevenzip = @import("../../grammar/sevenzip/onprem.zig");
+const tar = @import("../../grammar/tar/onprem.zig");
+const xz = @import("../../grammar/xz/onprem.zig");
+const zip = @import("../../grammar/zip/onprem.zig");
+const zlib = @import("../../grammar/zlib/onprem.zig");
+const bzip2 = @import("../../leaf/bzip2/onprem.zig");
+const deflate = @import("../../leaf/deflate/onprem.zig");
+const lz4 = @import("../../leaf/lz4/onprem.zig");
+const zstd = @import("../../leaf/zstd/onprem.zig");
 
 const testing = std.testing;
 
@@ -128,7 +128,7 @@ test "fuzz xz decode" {
 fn runLzmaAlone(data: []const u8) anyerror!void {
     var scratch: [4096]u8 = undefined;
     var out: [max_output]u8 = undefined;
-    _ = lzma_alone.decode(data, &out, &scratch) catch {};
+    _ = lzma_alone.decode(data, &out, &scratch, @import("../../leaf/lzma/seam.zig").default_provider) catch {};
 }
 
 test "fuzz lzma alone decode" {

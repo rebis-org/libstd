@@ -1,22 +1,24 @@
 const std = @import("std");
 
 const measurement = @import("../common/primitive/measurement.zig");
-const gzip = @import("../grammar/gzip.zig");
-const lzma_file = @import("../grammar/lzma.zig");
-const xz = @import("../grammar/xz.zig");
-const zlib = @import("../grammar/zlib.zig");
-const zstd_seekable = @import("../grammar/zstd_seekable.zig");
+const gzip = @import("../grammar/gzip/onprem.zig");
+const lzma_file = @import("../grammar/lzma/onprem.zig");
+const xz = @import("../grammar/xz/onprem.zig");
+const zlib = @import("../grammar/zlib/onprem.zig");
+const zstd_seekable = @import("../grammar/zstd_seekable/onprem.zig");
 const discovery = @import("../kernel/discovery.zig");
 const abi = @import("../kernel/envelope.zig");
 const node_graph = @import("../kernel/node.zig");
 const resource = @import("../kernel/resource.zig");
 const vocabulary = @import("../kernel/vocabulary.zig");
-const bzip2 = @import("../leaf/bzip2.zig");
-const deflate = @import("../leaf/deflate.zig");
-const lz4 = @import("../leaf/lz4.zig");
-const lzma = @import("../leaf/lzma.zig");
-const lzma2 = @import("../leaf/lzma2.zig");
-const zstd = @import("../leaf/zstd.zig");
+const bzip2 = @import("../leaf/bzip2/onprem.zig");
+const deflate = @import("../leaf/deflate/onprem.zig");
+const deflate_seam = @import("../leaf/deflate/seam.zig");
+const lz4 = @import("../leaf/lz4/onprem.zig");
+const lzma = @import("../leaf/lzma/onprem.zig");
+const lzma2 = @import("../leaf/lzma2/onprem.zig");
+const zstd = @import("../leaf/zstd/onprem.zig");
+const zstd_seam = @import("../leaf/zstd/seam.zig");
 const common = @import("common.zig");
 const zstd_sizing = @import("sizing.zig");
 
@@ -105,13 +107,12 @@ pub fn deflateHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Reso
     if (command_mask == vocabulary.command_mask_read) {
         const output_size = try planDeflateDecode(source_resource, history, limits.encoded_bytes, limits.decoded_bytes);
         if (sink) |sink_resource| {
-            if (!sink_resource.hasCapability(resource.capability_bit_write)) return error.Unsupported;
-            try common.requireSinkCapacity(sink_resource, call, output_size);
+            try common.requireSink(sink_resource, call, output_size);
             var bounded_source: resource.BoundedReader = undefined;
             bounded_source.init(source_resource, limits.encoded_bytes);
             var bounded_sink = resource.BoundedWriter.init(sink_resource, limits.decoded_bytes);
-            var inflater = deflate.Decompress.init(&bounded_source.reader, history);
-            _ = inflater.reader.streamRemaining(&bounded_sink.writer) catch |err| return common.mapSinkError(switch (err) {
+            var inflater = deflate_seam.Decode.initBound(plan.provider, &bounded_source.reader, history) catch return error.Unsupported;
+            _ = inflater.readerPtr().streamRemaining(&bounded_sink.writer) catch |err| return common.mapSinkError(switch (err) {
                 error.WriteFailed => error.IoFailure,
                 else => error.InvalidData,
             }, call, sink_resource);
@@ -125,8 +126,7 @@ pub fn deflateHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Reso
             break :blk bound;
         } else try planCountedEncode(source_resource, limits.decoded_bytes, limits.encoded_bytes, true, deflateEncodeStream, .{ .history = history, .options = deflate_opts });
         if (sink) |sink_resource| {
-            if (!sink_resource.hasCapability(resource.capability_bit_write)) return error.Unsupported;
-            try common.requireSinkCapacity(sink_resource, call, output_size);
+            try common.requireSink(sink_resource, call, output_size);
             var bounded_source: resource.BoundedReader = undefined;
             bounded_source.init(source_resource, limits.decoded_bytes);
             var bounded_sink = resource.BoundedWriter.init(sink_resource, limits.encoded_bytes);
@@ -162,7 +162,7 @@ pub fn gzipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resourc
         };
         if (input.len > limits.encoded_bytes) return error.ResourceLimit;
         if (sink) |sink_resource| {
-            if (sink_resource.kind == .direct_write and sink_resource.hasCapability(resource.capability_bit_write)) {
+            if (plan.provider == .onprem and sink_resource.kind == .direct_write and sink_resource.hasCapability(resource.capability_bit_write)) {
                 // Single-pass: fallback recomputes exact size before further writes, so capacity never fails post-write. Carve-out: aborted fast path may leave a tentative prefix.
                 switch (try gzip.decodeSinglePass(input, sink_resource.kind.direct_write, history, plan.provider)) {
                     .decoded => |produced| {
@@ -177,8 +177,7 @@ pub fn gzipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resourc
         const output_size = try gzip.decodedSize(input, history, plan.provider);
         if (output_size > limits.decoded_bytes) return error.ResourceLimit;
         if (sink) |sink_resource| {
-            if (!sink_resource.hasCapability(resource.capability_bit_write)) return error.Unsupported;
-            try common.requireSinkCapacity(sink_resource, call, output_size);
+            try common.requireSink(sink_resource, call, output_size);
             var bounded_sink = resource.BoundedWriter.init(sink_resource, limits.decoded_bytes);
             const produced = gzip.decode(input, &bounded_sink.writer, history, plan.provider) catch |err| return common.mapSinkError(err, call, sink_resource);
             response.byte_length = produced;
@@ -193,8 +192,7 @@ pub fn gzipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resourc
             break :blk bound;
         } else try planCountedEncode(source_resource, limits.decoded_bytes, limits.encoded_bytes, true, gzipEncodeStream, .{ .history = history, .options = options });
         if (sink) |sink_resource| {
-            if (!sink_resource.hasCapability(resource.capability_bit_write)) return error.Unsupported;
-            try common.requireSinkCapacity(sink_resource, call, output_size);
+            try common.requireSink(sink_resource, call, output_size);
             var bounded_source: resource.BoundedReader = undefined;
             bounded_source.init(source_resource, limits.decoded_bytes);
             var bounded_sink = resource.BoundedWriter.init(sink_resource, limits.encoded_bytes);
@@ -290,6 +288,8 @@ fn planDeflateDecode(source: *Resource, history: []u8, encoded_limit: u64, decod
     var bounded_source: resource.BoundedReader = undefined;
     bounded_source.init(source, encoded_limit);
     var counter = measurement.Counter.init(null);
+    // The counting pass answers a size, so the arm choice is output-neutral;
+    // the committing decode below binds the provider for real.
     var inflater = deflate.Decompress.init(&bounded_source.reader, history);
     _ = inflater.reader.streamRemaining(&counter.writer) catch return error.InvalidData;
     try source.rewind();
@@ -315,8 +315,7 @@ pub fn zlibHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resourc
         if (output_size > limits.decoded_bytes) return error.ResourceLimit;
         if (sink) |sink_resource| {
             try common.checkWorkspaceOverlap(call, source_resource, sink_resource);
-            if (!sink_resource.hasCapability(resource.capability_bit_write)) return error.Unsupported;
-            try common.requireSinkCapacity(sink_resource, call, output_size);
+            try common.requireSink(sink_resource, call, output_size);
             var bounded_sink = resource.BoundedWriter.init(sink_resource, limits.decoded_bytes);
             const produced = zlib.decode(input, &bounded_sink.writer, history, plan.provider) catch |err| return common.mapSinkError(err, call, sink_resource);
             response.byte_length = produced;
@@ -331,8 +330,7 @@ pub fn zlibHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resourc
             break :blk bound;
         } else try planCountedEncode(source_resource, limits.decoded_bytes, limits.encoded_bytes, true, zlibEncodeStream, .{ .history = history, .options = options });
         if (sink) |sink_resource| {
-            if (!sink_resource.hasCapability(resource.capability_bit_write)) return error.Unsupported;
-            try common.requireSinkCapacity(sink_resource, call, output_size);
+            try common.requireSink(sink_resource, call, output_size);
             var bounded_source: resource.BoundedReader = undefined;
             bounded_source.init(source_resource, limits.decoded_bytes);
             var bounded_sink = resource.BoundedWriter.init(sink_resource, limits.encoded_bytes);
@@ -388,8 +386,7 @@ pub fn zstd_seekableHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: 
         const output_size = try zstd_seekable.decodedSize(input, history, options);
         if (output_size > limits.decoded_bytes) return error.ResourceLimit;
         if (sink) |sink_resource| {
-            if (!sink_resource.hasCapability(resource.capability_bit_write)) return error.Unsupported;
-            try common.requireSinkCapacity(sink_resource, call, output_size);
+            try common.requireSink(sink_resource, call, output_size);
             if (sink_resource.kind == .direct_write) {
                 const output = try common.sinkDirectBuffer(sink_resource, output_size);
                 var fixed = std.Io.Writer.fixed(output);
@@ -416,14 +413,13 @@ pub fn zstd_seekableHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: 
         } else blk: {
             var counter = measurement.Counter.init(null);
             try zstd_seekable.encodeToWriter(input, &counter.writer, history, workspace_u32, entries, options);
-            const exact = std.math.cast(usize, counter.written()) orelse return error.ResourceLimit;
+            const exact = try measurement.measuredLength(&counter);
             if (exact > limits.encoded_bytes) return error.ResourceLimit;
             break :blk exact;
         };
         if (input.len + output_size > limits.codec_work) return error.ResourceLimit;
         if (sink) |sink_resource| {
-            if (!sink_resource.hasCapability(resource.capability_bit_write)) return error.Unsupported;
-            try common.requireSinkCapacity(sink_resource, call, output_size);
+            try common.requireSink(sink_resource, call, output_size);
             const staging = try workspace.take(u8, output_size);
             const produced = try zstd_seekable.encode(input, staging, history, workspace_u32, entries, options);
             if (sizing == .bounded) {
@@ -508,14 +504,13 @@ pub fn zstdHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resourc
             error.Unsupported => blk: {
                 const history = try workspace.take(u8, history_base_size);
                 planned_history = history;
-                break :blk try zstd.decodedSize(input, history, options);
+                break :blk try zstd_seam.decodedSize(options.provider, input, history, options);
             },
             else => return err,
         };
         if (output_size > limits.decoded_bytes) return error.ResourceLimit;
         if (sink) |sink_resource| {
-            if (!sink_resource.hasCapability(resource.capability_bit_write)) return error.Unsupported;
-            try common.requireSinkCapacity(sink_resource, call, output_size);
+            try common.requireSink(sink_resource, call, output_size);
             var source_reader = std.Io.Reader.fixed(input);
             if (dictionary == null and output_size >= history_base_size) {
                 if (sink_resource.kind == .direct_write and common.sinkCapacity(sink_resource) >= output_size + zstd.block_size_max) {
@@ -525,19 +520,19 @@ pub fn zstdHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resourc
                     const output = try common.sinkDirectBuffer(sink_resource, output_size + zstd.block_size_max);
                     var in_place_options = options;
                     in_place_options.max_decoded_bytes = output_size;
-                    _ = try zstd.decodeInPlace(&source_reader, output, in_place_options);
+                    _ = try zstd_seam.decodeInPlace(options.provider, &source_reader, output, in_place_options);
                 } else {
                     const staging = try workspace.take(u8, output_size + zstd.block_size_max);
                     var in_place_options = options;
                     in_place_options.max_decoded_bytes = output_size;
-                    _ = try zstd.decodeInPlace(&source_reader, staging, in_place_options);
+                    _ = try zstd_seam.decodeInPlace(options.provider, &source_reader, staging, in_place_options);
                     try common.commitBytesToSink(sink_resource, call, staging[0..output_size]);
                 }
             } else {
                 const history = planned_history orelse try workspace.take(u8, history_base_size);
                 const staging = try workspace.take(u8, output_size);
                 var decode_sink = std.Io.Writer.fixed(staging);
-                _ = try zstd.decodeStream(&source_reader, &decode_sink, history, options);
+                _ = try zstd_seam.decodeStream(options.provider, &source_reader, &decode_sink, history, options);
                 try common.commitBytesToSink(sink_resource, call, staging);
             }
         }
@@ -562,8 +557,7 @@ pub fn zstdHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resourc
             break :blk bound;
         } else try planCountedEncode(source_resource, limits.decoded_bytes, limits.encoded_bytes, false, zstdEncodeStream, .{ .history = history, .workspace = encoder_workspace, .options = encode_options });
         if (sink) |sink_resource| {
-            if (!sink_resource.hasCapability(resource.capability_bit_write)) return error.Unsupported;
-            try common.requireSinkCapacity(sink_resource, call, output_size);
+            try common.requireSink(sink_resource, call, output_size);
             const staging = try workspace.take(u8, output_size);
             var bounded_source: resource.BoundedReader = undefined;
             bounded_source.init(source_resource, limits.decoded_bytes);
@@ -807,8 +801,7 @@ fn bufferCodecHook(comptime Codec: type, plan: *common.ExecutionPlan, source: ?*
         if (input.len + output_size > limits.codec_work) return error.ResourceLimit;
         if (sink) |sink_resource| {
             try common.checkWorkspaceOverlap(call, source_resource, sink_resource);
-            if (!sink_resource.hasCapability(resource.capability_bit_write)) return error.Unsupported;
-            try common.requireSinkCapacity(sink_resource, call, output_size);
+            try common.requireSink(sink_resource, call, output_size);
             if (sink_resource.kind == .direct_write) {
                 const output = try common.sinkDirectBuffer(sink_resource, output_size);
                 const produced = try Codec.encode(input, output, scratch, options);
@@ -872,18 +865,17 @@ pub fn lzma_fileHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Re
         if (input.len < lzma_file.header_size) return error.InvalidData;
         const options = try lzma_file.decodeOptions(input);
         const scratch = try workspace.take(u8, lzma.decodeWorkspaceSize(options.properties));
-        const output_size = if (options.unpack_size) |size| std.math.cast(usize, size) orelse return error.ResourceLimit else try lzma_file.decodedSize(input, scratch);
+        const output_size = if (options.unpack_size) |size| std.math.cast(usize, size) orelse return error.ResourceLimit else try lzma_file.decodedSize(input, scratch, plan.provider);
         if (output_size > limits.decoded_bytes) return error.ResourceLimit;
         if (sink) |sink_resource| {
             try common.checkWorkspaceOverlap(call, source_resource, sink_resource);
-            if (!sink_resource.hasCapability(resource.capability_bit_write)) return error.Unsupported;
-            try common.requireSinkCapacity(sink_resource, call, output_size);
+            try common.requireSink(sink_resource, call, output_size);
             if (sink_resource.kind == .direct_write) {
                 const output = try common.sinkDirectBuffer(sink_resource, output_size);
-                _ = try lzma_file.decodeInPlace(input, output, scratch);
+                _ = try lzma_file.decodeInPlace(input, output, scratch, plan.provider);
             } else {
                 var bounded_sink = resource.BoundedWriter.init(sink_resource, limits.decoded_bytes);
-                lzma_file.decodeToWriter(input, &bounded_sink.writer, scratch) catch |err| return common.mapSinkError(err, call, sink_resource);
+                lzma_file.decodeToWriter(input, &bounded_sink.writer, scratch, plan.provider) catch |err| return common.mapSinkError(err, call, sink_resource);
             }
         }
         response.byte_length = output_size;
@@ -905,8 +897,7 @@ pub fn lzma_fileHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Re
         if (input.len + output_size > limits.codec_work) return error.ResourceLimit;
         if (sink) |sink_resource| {
             try common.checkWorkspaceOverlap(call, source_resource, sink_resource);
-            if (!sink_resource.hasCapability(resource.capability_bit_write)) return error.Unsupported;
-            try common.requireSinkCapacity(sink_resource, call, output_size);
+            try common.requireSink(sink_resource, call, output_size);
             const staging = try workspace.take(u8, output_size);
             const produced = try lzma_file.encode(input, staging, scratch, options);
             if (sizing == .bounded) {
@@ -970,8 +961,7 @@ pub fn xzHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource,
         if (output_size > limits.decoded_bytes) return error.ResourceLimit;
         if (input.len + output_size > limits.codec_work) return error.ResourceLimit;
         if (sink) |sink_resource| {
-            if (!sink_resource.hasCapability(resource.capability_bit_write)) return error.Unsupported;
-            try common.requireSinkCapacity(sink_resource, call, output_size);
+            try common.requireSink(sink_resource, call, output_size);
             const staging = try workspace.take(u8, output_size);
             _ = try xz.decodeInPlace(input, staging, scratch, plan.provider);
             try common.commitBytesToSink(sink_resource, call, staging);
@@ -1001,8 +991,7 @@ pub fn xzHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource,
         if (output_size > limits.encoded_bytes) return error.ResourceLimit;
         if (input.len + output_size > limits.codec_work) return error.ResourceLimit;
         if (sink) |sink_resource| {
-            if (!sink_resource.hasCapability(resource.capability_bit_write)) return error.Unsupported;
-            try common.requireSinkCapacity(sink_resource, call, output_size);
+            try common.requireSink(sink_resource, call, output_size);
             const staging = try workspace.take(u8, output_size);
             const produced = try xz.encode(input, staging, scratch, options);
             if (sizing == .bounded) {

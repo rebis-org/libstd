@@ -42,15 +42,11 @@ fn validateNode(siblings: ?*abi.Node, traversal: *Traversal, depth: usize) Failu
             cursor = node.next;
             continue;
         }
-        const descriptor = catalog.descriptorFor(node.id);
-        if (descriptor == null) {
-            if ((node.flags & abi.node_flag_optional) != 0) {
-                cursor = node.next;
-                continue;
-            }
-            return error.Unsupported;
-        }
-        const entry = descriptor.?;
+        const entry = catalog.descriptorFor(node.id) orelse {
+            if ((node.flags & abi.node_flag_optional) == 0) return error.Unsupported;
+            cursor = node.next;
+            continue;
+        };
         switch (entry.kind) {
             .parameter => {
                 if (!isDirectionAccepted(entry.direction, traversal.direction)) return error.Unsupported;

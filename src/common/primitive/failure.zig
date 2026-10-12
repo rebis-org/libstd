@@ -6,10 +6,15 @@ pub const Failure = error{
     InvalidData,
     IntegrityFailure,
     IoFailure,
-    // The reader had no bytes ready at a suspension-safe boundary. Only the
-    // resumable read path raises it. The classic readByte maps it back to
-    // IoFailure so existing callers keep one flat failure surface.
-    Starved,
     ResourceLimit,
     InternalFailure,
 };
+
+// A std-backed arm's own errors fold onto the flat surface, so the boundary
+// sees one error set whatever provider ran.
+pub fn fromStd(failure: anyerror) Failure {
+    return switch (failure) {
+        error.OutOfMemory => error.InsufficientCapacity,
+        else => error.InvalidData,
+    };
+}

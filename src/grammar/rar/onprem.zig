@@ -1,16 +1,16 @@
 const std = @import("std");
 
-const binary = @import("../common/primitive/binary.zig");
-const bounds = @import("../common/primitive/bounds.zig");
-const checksum = @import("../common/primitive/checksum.zig");
-const crypto = @import("../common/primitive/crypto.zig");
-const failure_prim = @import("../common/primitive/failure.zig");
-const sink = @import("../common/sink.zig");
-const blake2sp = @import("rar/blake2sp.zig");
-const filters50 = @import("rar/filters50.zig");
-const unpack20 = @import("rar/unpack20.zig");
-const unpack29 = @import("rar/unpack29.zig");
-const unpack50 = @import("rar/unpack50.zig");
+const binary = @import("../../common/primitive/binary.zig");
+const bounds = @import("../../common/primitive/bounds.zig");
+const checksum = @import("../../common/primitive/checksum.zig");
+const crypto = @import("../../common/primitive/crypto.zig");
+const failure_prim = @import("../../common/primitive/failure.zig");
+const sink = @import("../../common/sink.zig");
+const blake2sp = @import("blake2sp.zig");
+const filters50 = @import("filters50.zig");
+const unpack20 = @import("unpack20.zig");
+const unpack29 = @import("unpack29.zig");
+const unpack50 = @import("unpack50.zig");
 
 const Failure = failure_prim.Failure;
 pub const PendingFilter50 = filters50.Filter;
@@ -20,6 +20,8 @@ pub const max_pending29 = unpack29.max_pending_filters;
 pub const max_pending50 = unpack50.max_pending_filters;
 
 // Every buffer comes from the caller, so the decode path allocates nothing.
+
+pub const Family = enum { rar4, rar5 };
 
 pub const RarInfo = struct {
     name: []const u8,
@@ -33,7 +35,7 @@ pub const RarInfo = struct {
     ordinal: usize,
     // The walk resolves the engine and the window before the caller sizes the
     // buffers, so the decode path never has to ask again. The window is 0 for a store entry.
-    family: enum { rar4, rar5 } = .rar5,
+    family: Family = .rar5,
     method: u8 = 0,
     unpack_version: u8 = 0,
     window_bytes: u64 = 0,
@@ -45,7 +47,7 @@ pub const RarInfo = struct {
 
 pub const Entry = struct {
     info: RarInfo,
-    family: enum { rar4, rar5 },
+    family: Family,
     is_directory: bool,
     // The normalized method, where 0 is store and 1-5 are LZ levels. RAR4 takes the
     // low nibble of the 0x30-0x35 byte, and RAR5 the method field of the compression info.
@@ -96,8 +98,6 @@ pub const DecodeOptions = struct {
 
 const rar5_kdf_lg2_count_max = 24;
 
-const Family = @TypeOf(@as(Entry, undefined).family);
-
 pub const rar4_signature = [7]u8{ 0x52, 0x61, 0x72, 0x21, 0x1a, 0x07, 0x00 };
 const sfx_scan_limit: usize = 1024 * 1024;
 
@@ -136,7 +136,6 @@ pub const table_pool_words = unpack50.table_pool_words * 4;
 
 // The window ceilings per family: RAR4 caps at 4 MB (dict code 6), and RAR5 declares
 // its own (base 0x20000 << dict_bits, 4-bit exponent for v50).
-pub const max_rar4_window: usize = 4 * 1024 * 1024;
 pub const max_rar5_window_bits: u6 = 31; // 0x20000 << 14 is already 2^31, so a wider window does not fit the address space.
 
 fn detectFamily(archive: []const u8, provider: crypto.Provider) Failure!struct { family: Family, offset: usize } {
@@ -664,7 +663,6 @@ const rar4_lhd_solid: u16 = 0x0010;
 const rar4_host_unix: u8 = 3;
 const rar4_mhd_volume: u16 = 0x0001;
 const rar4_mhd_password: u16 = 0x0080;
-const rar4_mhd_protect: u16 = 0x0040;
 const rar4_window_mask: u16 = 0x00e0;
 const rar4_window_directory: u16 = 0x00e0;
 
@@ -942,10 +940,6 @@ fn walkEntriesOpts(archive: []const u8, opts: DecodeOptions, ctx: anytype, compt
     }
 }
 
-fn walkEntries(archive: []const u8, ctx: anytype, comptime visit: fn (@TypeOf(ctx), Entry) Failure!void) Failure!void {
-    try walkEntriesOpts(archive, .{}, ctx, visit);
-}
-
 pub fn rarInspectCount(archive: []const u8, max_entries: u64) Failure!usize {
     return rarInspectCountOpts(archive, max_entries, .{});
 }
@@ -970,10 +964,6 @@ fn findVisit(ctx: *FindCtx, entry: Entry) Failure!void {
         ctx.found = entry.info;
     }
     ctx.ordinal = try bounds.addUsize(ctx.ordinal, 1);
-}
-
-pub fn rarInspectOrdinal(archive: []const u8, ordinal: usize, max_entries: u64) Failure!RarInfo {
-    return rarInspectOrdinalOpts(archive, ordinal, max_entries, .{});
 }
 
 pub fn rarInspectOrdinalOpts(archive: []const u8, ordinal: usize, max_entries: u64, opts: DecodeOptions) Failure!RarInfo {

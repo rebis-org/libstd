@@ -4,18 +4,14 @@ const seam = @import("seam");
 
 const checksum = @import("checksum.zig");
 
-// Selecting kinds through a comptime packed struct means a new checksum adds
-// one field here and one line in `per_kind`, not a new bool parameter at every
+// Selecting checksums through a comptime packed struct means a new checksum
+// adds one field here and one field on the tee, not a bool parameter at every
 // call site.
 pub const Kinds = packed struct {
     crc32: bool = false,
     crc64: bool = false,
     adler32: bool = false,
 };
-
-pub const Kind = enum { crc32, crc64, adler32 };
-
-const kind_fields = std.enums.values(Kind);
 
 pub fn CountingTee(comptime kinds: Kinds) type {
     return struct {
@@ -59,8 +55,8 @@ pub fn CountingTee(comptime kinds: Kinds) type {
 
         fn feed(self: *@This(), part: []const u8) std.Io.Writer.Error!void {
             if (self.downstream) |out| out.writeAll(part) catch return error.WriteFailed;
-            inline for (kind_fields) |kind| {
-                if (comptime @field(kinds, @tagName(kind))) @field(self, @tagName(kind)).update(part);
+            inline for (comptime @typeInfo(Kinds).@"struct".field_names) |name| {
+                if (@field(kinds, name)) @field(self, name).update(part);
             }
         }
 

@@ -23,21 +23,22 @@ pub const ReadCursor = struct {
         return self.buffer[start..][0..count];
     }
 
-    pub fn readU8(self: *ReadCursor) error{ InvalidData, ResourceLimit }!u8 {
+    pub fn readU8(self: *ReadCursor) error{InvalidData}!u8 {
         return (try self.take(1))[0];
     }
 
-    pub fn readU32Le(self: *ReadCursor) error{ InvalidData, ResourceLimit }!u32 {
+    pub fn readU32Le(self: *ReadCursor) error{InvalidData}!u32 {
         const raw = try self.readBytes(4);
         return std.mem.readInt(u32, &raw, .little);
     }
 
+    // The shift bound is what terminates a maximally long encoding: a tenth
+    // byte would push the value past 64 bits, so it is a resource limit
+    // rather than malformed input.
     pub fn readUleb128(self: *ReadCursor) error{ InvalidData, ResourceLimit }!u64 {
         var decoded: u64 = 0;
         var shift: u6 = 0;
-        var seen: usize = 0;
-        while (true) : (seen += 1) {
-            if (seen >= 10) return error.InvalidData;
+        while (true) {
             const next = try self.readU8();
             const low_bits: u64 = next & 0x7f;
             if (shift == 63 and low_bits > 1) return error.ResourceLimit;
@@ -48,7 +49,7 @@ pub const ReadCursor = struct {
         }
     }
 
-    pub fn readSlice(self: *ReadCursor, length: usize) error{ InvalidData, ResourceLimit }![]const u8 {
+    pub fn readSlice(self: *ReadCursor, length: usize) error{InvalidData}![]const u8 {
         return self.take(length);
     }
 
@@ -57,7 +58,7 @@ pub const ReadCursor = struct {
         _ = try self.take(steps);
     }
 
-    pub fn readBytes(self: *ReadCursor, comptime length: u8) error{ InvalidData, ResourceLimit }![length]u8 {
+    pub fn readBytes(self: *ReadCursor, comptime length: u8) error{InvalidData}![length]u8 {
         return (try self.take(length))[0..length].*;
     }
 };
@@ -91,13 +92,13 @@ pub const WriteCursor = struct {
         }
     }
 
-    pub fn writeU8(self: *WriteCursor, next: u8) error{ InsufficientCapacity, ResourceLimit }!void {
+    pub fn writeU8(self: *WriteCursor, next: u8) error{InsufficientCapacity}!void {
         if (self.pos >= self.buffer.len) return error.InsufficientCapacity;
         self.buffer[self.pos] = next;
         self.pos += 1;
     }
 
-    pub fn writeUleb128(self: *WriteCursor, decoded: u64) error{ InsufficientCapacity, ResourceLimit }!void {
+    pub fn writeUleb128(self: *WriteCursor, decoded: u64) error{InsufficientCapacity}!void {
         var rest = decoded;
         while (true) {
             var next: u8 = @truncate(rest & 0x7f);

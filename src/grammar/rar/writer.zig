@@ -4,8 +4,8 @@ const bounds = @import("../../common/primitive/bounds.zig");
 const checksum = @import("../../common/primitive/checksum.zig");
 const crypto = @import("../../common/primitive/crypto.zig");
 const failure = @import("../../common/primitive/failure.zig");
-const rar = @import("../rar.zig");
 const finder = @import("finder.zig");
+const rar = @import("onprem.zig");
 const pack50 = @import("pack50.zig");
 
 const Failure = failure.Failure;
