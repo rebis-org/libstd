@@ -1,17 +1,15 @@
 const std = @import("std");
 
-const failure_prim = @import("../common/primitive/failure.zig");
-const io = @import("../common/primitive/io.zig");
-const measurement = @import("../common/primitive/measurement.zig");
-const lzma = @import("lzma.zig");
+const failure_prim = @import("../../common/primitive/failure.zig");
+const io = @import("../../common/primitive/io.zig");
+const measurement = @import("../../common/primitive/measurement.zig");
+const lzma = @import("../lzma/onprem.zig");
 
 const Failure = failure_prim.Failure;
 
 pub const chunk_max_unpacked: usize = 1 << 20;
 const chunk_min_unpacked: usize = 4 * 1024;
 
-// The format fixes lc and lp at 3 and 0 for LZMA2, so only the dictionary
-// size varies between streams.
 pub fn defaultProperties(dictionary_size: u32) lzma.Properties {
     return .{ .lc = 3, .lp = 0, .pb = 2, .dictionary_size = dictionary_size };
 }
@@ -212,7 +210,7 @@ pub fn decodedSize(input: []const u8, scratch: []u8, options: Options) Failure!u
     var source = std.Io.Reader.fixed(input);
     var counter = measurement.Counter.init(null);
     try decodeStream(&source, &counter.writer, scratch, options);
-    return std.math.cast(usize, counter.written()) orelse error.ResourceLimit;
+    return measurement.measuredLength(&counter);
 }
 
 fn scanDecodedSize(input: []const u8) Failure!?usize {
@@ -267,7 +265,7 @@ fn scanDecodedSize(input: []const u8) Failure!?usize {
 pub fn requiredSize(input: []const u8, scratch: []u8, options: Options) Failure!usize {
     var counter = measurement.Counter.init(null);
     try encodeStreamInner(input, &counter.writer, scratch, options);
-    return std.math.cast(usize, counter.written()) orelse error.ResourceLimit;
+    return measurement.measuredLength(&counter);
 }
 
 pub fn encode(input: []const u8, output: []u8, scratch: []u8, options: Options) Failure!usize {

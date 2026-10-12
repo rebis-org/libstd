@@ -3,17 +3,14 @@ const std = @import("std");
 
 const build_options = @import("options");
 
-const kernels = @import("../common/kernels.zig");
-const binary = @import("../common/primitive/binary.zig");
-const checksum = @import("../common/primitive/checksum.zig");
-const huffman = @import("../common/primitive/huffman.zig");
-const tee = @import("../common/primitive/tee.zig");
+const kernels = @import("../../common/kernels.zig");
+const binary = @import("../../common/primitive/binary.zig");
+const checksum = @import("../../common/primitive/checksum.zig");
+const huffman = @import("../../common/primitive/huffman.zig");
+const tee = @import("../../common/primitive/tee.zig");
 
+const vector_match_copy = kernels.vector_match_copy;
 const ReadCursor = binary.ReadCursor;
-
-// NEON is baseline on aarch64, so the wide match-copy path needs no extra
-// target feature. Other targets keep the portable word-at-a-time path.
-const vector_match_copy = !build_options.portable and builtin.target.cpu.arch == .aarch64;
 
 pub const block_size_max = 1 << 17;
 pub const window_size_min = 1024;
@@ -208,10 +205,6 @@ pub const TrainError = error{
     ResourceLimit,
 };
 
-pub fn trainedDictionaryBound(total_sample_bytes: usize) usize {
-    return total_sample_bytes +| dictionary_header_size;
-}
-
 // Fastcover-style segment selection with deterministic greedy picks.
 // Covered buckets zero after each pick, so ties resolve to the earliest window.
 const train_d: usize = 8;
@@ -256,7 +249,7 @@ pub fn trainDictionary(samples: []const []const u8, max_size: usize, output: []u
         }
     }
 
-    // Greedy selection over the test split; ties keep the earliest window.
+    // Ties keep the earliest window.
     @memset(seg_freqs, 0);
     var chosen: [train_k]u8 = undefined;
     var content_len: usize = 0;
@@ -2786,20 +2779,7 @@ const Decoder = struct {
             },
             .rle => {
                 const byte = literals.streams.one[0];
-                if (comptime vector_match_copy) {
-                    if (dest.len >= 16) {
-                        const v: @Vector(16, u8) = @splat(byte);
-                        var i: usize = 0;
-                        while (i + 16 <= dest.len) : (i += 16) {
-                            dest[i..][0..16].* = v;
-                        }
-                        if (i < dest.len) dest[dest.len - 16 ..][0..16].* = v;
-                    } else {
-                        for (dest) |*out| out.* = byte;
-                    }
-                } else {
-                    @memset(dest, byte);
-                }
+                if (comptime vector_match_copy) kernels.splatShort(dest, byte) else @memset(dest, byte);
             },
             .compressed, .treeless => {
                 if (legacy.*) {

@@ -8,12 +8,11 @@ const modules = @import("build/modules.zig");
 
 const version = std.SemanticVersion.parse(package.version) catch @compileError("version must be semantic");
 
-const Implementation = enum { onprem, offprem, mergeable };
-const capabilities = .{ "sha256", "sha1", "hmac", "pbkdf2", "adler32", "xxh32", "xxh64", "aes", "crc32", "crc64xz", "bzip2crc32" };
+const Implementation = common.Implementation;
+const capabilities = common.capabilities;
 
 fn putCapability(options: *std.Build.Step.Options, comptime capability: []const u8, selected: Implementation, portable_flag: bool) void {
-    options.addOption(Implementation, capability ++ "_impl", selected);
-    options.addOption(bool, capability ++ "_portable", portable_flag);
+    common.putCapability(options, capability, selected, portable_flag);
 }
 
 pub fn build(b: *std.Build) void {
@@ -33,15 +32,23 @@ pub fn build(b: *std.Build) void {
             std.process.exit(1);
         }
     }
+    const leaf_impl = b.option(Implementation, "leaf_impl", "Implementation for the leaf codec layer") orelse primitives_impl;
+    const grammar_impl = b.option(Implementation, "grammar_impl", "Implementation for the grammar container layer") orelse primitives_impl;
+    options.addOption(Implementation, "leaf_impl", leaf_impl);
+    options.addOption(Implementation, "grammar_impl", grammar_impl);
+    if (leaf_impl == .offprem and portable) {
+        std.debug.print("invalid configuration: the leaf layer is offprem while the portable flag is set; portable governs onprem paths only. use -Dportable=false or an onprem or mergeable provider.\n", .{});
+        std.process.exit(1);
+    }
+    if (grammar_impl == .offprem and portable) {
+        std.debug.print("invalid configuration: the grammar layer is offprem while the portable flag is set; portable governs onprem paths only. use -Dportable=false or an onprem or mergeable provider.\n", .{});
+        std.process.exit(1);
+    }
     const options_module = options.createModule();
     var dist_providers: [3]common.DistProvider = undefined;
     inline for ([_]Implementation{ .onprem, .offprem, .mergeable }, 0..) |impl, index| {
         const provider_options = b.addOptions();
-        provider_options.addOption(bool, "portable", false);
-        provider_options.addOption(Implementation, "primitives_impl", impl);
-        inline for (capabilities) |capability| {
-            putCapability(provider_options, capability, impl, false);
-        }
+        common.putUniformOptions(provider_options, impl, false);
         const provider_options_module = provider_options.createModule();
         dist_providers[index] = .{
             .name = @tagName(impl),

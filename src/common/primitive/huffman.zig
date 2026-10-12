@@ -1,9 +1,13 @@
 // Deflate tops out at 288 symbols; the RAR5 writer reaches 306.
+const std = @import("std");
+
 const max_alphabet = 512;
 const max_nodes = 2 * max_alphabet;
 const max_code_len = 15;
 
 pub fn limitedLengths(freqs: []const u32, lengths: []u8, limit: u8) void {
+    std.debug.assert(freqs.len <= max_alphabet);
+    std.debug.assert(limit >= 1 and limit <= max_code_len);
     @memset(lengths, 0);
     var used: [max_alphabet]u16 = undefined;
     var count: usize = 0;
@@ -45,13 +49,16 @@ pub fn limitedLengths(freqs: []const u32, lengths: []u8, limit: u8) void {
         depth[node] = depth[parent[node]] + 1;
     }
     var bl_count: [max_code_len + 2]u16 = @splat(0);
-    var overflow: u32 = 0;
+    // An odd count underflows to -1 in the reference and ends the loop there,
+    // so an unsigned counter has to stop on the same boundary.
+    var overflow: i32 = 0;
     for (0..2 * count - 1) |node_index| overflow += @intFromBool(depth[node_index] > limit);
     for (0..count) |i| bl_count[@min(depth[i], limit)] += 1;
     // Overflow counts in 2^-limit units, so each pull-up repairs two units.
     while (overflow > 0) {
         var width: usize = limit - 1;
-        while (bl_count[width] == 0) width -= 1;
+        while (width > 0 and bl_count[width] == 0) width -= 1;
+        std.debug.assert(width > 0);
         bl_count[width] -= 1;
         bl_count[width + 1] += 2;
         bl_count[limit] -= 1;

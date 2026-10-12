@@ -8,6 +8,10 @@ const onprem = @import("onprem.zig");
 // AES-192 stays on-prem because std ships no 192-bit context; either provider
 // tag resolves to the on-prem schedule.
 const std_aes = std.crypto.core.aes;
+// The 192-bit schedule has no std context, so it is the same type under every
+// provider tag; matching the std suite's method names lets one suite-shaped
+// accessor serve all three key sizes.
+pub const Aes192Hw = onprem.Aes192Hw;
 
 const StdDirection = enum { encrypt, decrypt };
 
@@ -42,42 +46,6 @@ const StdAes128Enc = StdCtx(std_aes.Aes128, .encrypt);
 const StdAes128Dec = StdCtx(std_aes.Aes128, .decrypt);
 const StdAes256Enc = StdCtx(std_aes.Aes256, .encrypt);
 const StdAes256Dec = StdCtx(std_aes.Aes256, .decrypt);
-
-pub const Aes192Hw = struct {
-    inner: onprem.Aes192Hw,
-
-    pub fn initEnc(key: [24]u8) Aes192Hw {
-        return .{ .inner = onprem.Aes192Hw.initEnc(key) };
-    }
-
-    pub fn initDec(key: [24]u8) Aes192Hw {
-        return .{ .inner = onprem.Aes192Hw.initDec(key) };
-    }
-
-    pub fn bindEnc(_: seam.Provider, key: [24]u8) Aes192Hw {
-        return initEnc(key);
-    }
-
-    pub fn bindDec(_: seam.Provider, key: [24]u8) Aes192Hw {
-        return initDec(key);
-    }
-
-    pub fn encryptBlock(self: Aes192Hw, dst: *[16]u8, src: *const [16]u8) void {
-        self.inner.encryptBlock(dst, src);
-    }
-
-    pub fn encryptWide4(self: Aes192Hw, dst: *[64]u8, src: *const [64]u8) void {
-        self.inner.encryptWide4(dst, src);
-    }
-
-    pub fn decryptBlock(self: Aes192Hw, dst: *[16]u8, src: *const [16]u8) void {
-        self.inner.decryptBlock(dst, src);
-    }
-
-    pub fn decryptWide4(self: Aes192Hw, dst: *[64]u8, src: *const [64]u8) void {
-        self.inner.decryptWide4(dst, src);
-    }
-};
 
 // Mode operations monomorphize over a suite, so block loops never dispatch per block.
 pub const suite_onprem = struct {

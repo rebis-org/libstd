@@ -1,12 +1,12 @@
 const std = @import("std");
 
-const bounds = @import("../common/primitive/bounds.zig");
-const checksum = @import("../common/primitive/checksum.zig");
-const failure_prim = @import("../common/primitive/failure.zig");
-const io = @import("../common/primitive/io.zig");
-const measurement = @import("../common/primitive/measurement.zig");
-const tee = @import("../common/primitive/tee.zig");
-const deflate = @import("../leaf/deflate.zig");
+const checksum = @import("../../common/primitive/checksum.zig");
+const failure_prim = @import("../../common/primitive/failure.zig");
+const io = @import("../../common/primitive/io.zig");
+const measurement = @import("../../common/primitive/measurement.zig");
+const tee = @import("../../common/primitive/tee.zig");
+const deflate = @import("../../leaf/deflate/onprem.zig");
+const deflate_seam = @import("../../leaf/deflate/seam.zig");
 
 const Failure = failure_prim.Failure;
 pub const deflate_history_size = deflate.history_size;
@@ -19,7 +19,6 @@ pub const Options = struct {
 const window_size_max = 32768;
 const cinfo_max = 7;
 const cm_deflate = 8;
-const fcheck_bits = 5;
 const flag_dictionary = 0x20;
 const level_default = 2;
 const header_size = 2;
@@ -32,7 +31,6 @@ pub fn encodedSizeBound(input_len: usize, options: Options) usize {
 
 pub const Header = struct {
     window_size: u32,
-    level: u8,
     has_dictionary: bool,
 };
 
@@ -44,7 +42,6 @@ pub fn inspect(input: []const u8) Failure!Header {
     if ((@as(u32, cmf) << 8 | flg) % 31 != 0) return error.InvalidData;
     return .{
         .window_size = @as(u32, 1) << @intCast((cmf >> 4) + 8),
-        .level = flg >> 6,
         .has_dictionary = (flg & flag_dictionary) != 0,
     };
 }
@@ -53,7 +50,7 @@ pub fn decodedSize(input: []const u8, history: []u8, provider: checksum.Provider
     if (history.len < deflate_history_size) return error.InsufficientCapacity;
     var counter = measurement.Counter.init(null);
     _ = try decode(input, &counter.writer, history, provider);
-    return std.math.cast(usize, counter.written()) orelse error.ResourceLimit;
+    return measurement.measuredLength(&counter);
 }
 
 // One stream per call: the adler32 trailer ends the stream, so trailing bytes are an error.
@@ -66,8 +63,8 @@ pub fn decode(input: []const u8, output: *std.Io.Writer, history: []u8, provider
     if (header.has_dictionary) return error.Unsupported;
     if (header.window_size > window_size_max) return error.Unsupported;
     var tee_writer = tee.CountingTee(.{ .adler32 = true }).initWithProvider(output, provider);
-    var inflater = deflate.Decompress.initSlice(input[header_size..], history);
-    const produced = inflater.reader.streamRemaining(&tee_writer.writer) catch |err| {
+    var inflater = deflate_seam.Decode.initSliceBound(provider, input[header_size..], history) catch return error.Unsupported;
+    const produced = inflater.readerPtr().streamRemaining(&tee_writer.writer) catch |err| {
         return switch (err) {
             error.WriteFailed => error.IoFailure,
             else => error.InvalidData,
@@ -89,18 +86,7 @@ pub fn encodeStream(source: *std.Io.Reader, output: *std.Io.Writer, history: []u
     try writeHeader(output);
     var compressor = try deflate.Compress.init(output, history, options.deflate);
     var adler32 = checksum.Adler32.bind(options.provider);
-    var buffer: [4096]u8 = undefined;
-    while (true) {
-        var sink = std.Io.Writer.fixed(&buffer);
-        const count = source.stream(&sink, std.Io.Limit.limited(buffer.len)) catch |err| {
-            if (err == error.EndOfStream) break;
-            return error.IoFailure;
-        };
-        if (count == 0) break;
-        const part = buffer[0..count];
-        adler32.update(part);
-        compressor.writer.writeAll(part) catch return error.IoFailure;
-    }
+    _ = try deflate.feed(checksum.Adler32, source, &compressor, &adler32);
     compressor.finish() catch return error.IoFailure;
     output.writeInt(u32, adler32.final(), .big) catch return error.IoFailure;
 }
@@ -115,6 +101,10 @@ fn writeHeader(writer: *std.Io.Writer) Failure!void {
 }
 
 test "zlib round trip restores the original input" {
+    // See the decode gate above: a mixed build cannot serve one call with
+    // both arms.
+    if (!deflate_seam.decodeServed(checksum.default_provider)) return;
+
     const history = try std.testing.allocator.alloc(u8, deflate_history_size);
     defer std.testing.allocator.free(history);
     const input = "the quick brown fox jumps over the lazy dog, again and again and again";
@@ -135,6 +125,10 @@ test "zlib round trip restores the original input" {
 }
 
 test "zlib rejects a preset dictionary and trailing bytes" {
+    // See the decode gate above: a mixed build cannot serve one call with
+    // both arms.
+    if (!deflate_seam.decodeServed(checksum.default_provider)) return;
+
     const history = try std.testing.allocator.alloc(u8, deflate_history_size);
     defer std.testing.allocator.free(history);
     var discard_buffer: [0]u8 = .{};

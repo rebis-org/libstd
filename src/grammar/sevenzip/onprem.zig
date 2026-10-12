@@ -1,21 +1,24 @@
 const std = @import("std");
 
-const binary = @import("../common/primitive/binary.zig");
-const bounds = @import("../common/primitive/bounds.zig");
-const checksum = @import("../common/primitive/checksum.zig");
-const crypto = @import("../common/primitive/crypto.zig");
-const failure_prim = @import("../common/primitive/failure.zig");
-const io = @import("../common/primitive/io.zig");
-const limits_prim = @import("../common/primitive/limits.zig");
-const measurement = @import("../common/primitive/measurement.zig");
-const bcj = @import("../leaf/bcj.zig");
-const bcj2 = @import("../leaf/bcj2.zig");
-const bzip2 = @import("../leaf/bzip2.zig");
-const deflate = @import("../leaf/deflate.zig");
-const delta = @import("../leaf/delta.zig");
-const lzma = @import("../leaf/lzma.zig");
-const lzma2 = @import("../leaf/lzma2.zig");
-const ppmd = @import("../leaf/ppmd.zig");
+const binary = @import("../../common/primitive/binary.zig");
+const bounds = @import("../../common/primitive/bounds.zig");
+const checksum = @import("../../common/primitive/checksum.zig");
+const crypto = @import("../../common/primitive/crypto.zig");
+const failure_prim = @import("../../common/primitive/failure.zig");
+const io = @import("../../common/primitive/io.zig");
+const limits_prim = @import("../../common/primitive/limits.zig");
+const measurement = @import("../../common/primitive/measurement.zig");
+const bcj = @import("../../leaf/bcj/onprem.zig");
+const bcj2 = @import("../../leaf/bcj2/onprem.zig");
+const bzip2 = @import("../../leaf/bzip2/onprem.zig");
+const deflate = @import("../../leaf/deflate/onprem.zig");
+const deflate_seam = @import("../../leaf/deflate/seam.zig");
+const delta = @import("../../leaf/delta/onprem.zig");
+const lzma = @import("../../leaf/lzma/onprem.zig");
+const lzma_seam = @import("../../leaf/lzma/seam.zig");
+const lzma2 = @import("../../leaf/lzma2/onprem.zig");
+const lzma2_seam = @import("../../leaf/lzma2/seam.zig");
+const ppmd = @import("../../leaf/ppmd/onprem.zig");
 
 const Failure = failure_prim.Failure;
 const Workspace = io.Workspace;
@@ -396,7 +399,7 @@ fn requiredSizeFromPacked(entries: []const Entry, packed_entries: []const Packed
     const header = try encodeHeaderBytes(entries, packed_entries, workspace, provider, limits, header_options);
     var counter = measurement.Counter.init(null);
     try writeNextHeader(&counter.writer, &header, total_pack_size);
-    const header_struct_size = std.math.cast(usize, counter.written()) orelse return error.ResourceLimit;
+    const header_struct_size = try measurement.measuredLength(&counter);
     const packs_and_header = try bounds.addUsize(total_pack_size, header.pack_size);
     const total = try bounds.addUsize(start_header_size, try bounds.addUsize(packs_and_header, header_struct_size));
     return std.math.cast(usize, total) orelse error.ResourceLimit;
@@ -470,7 +473,7 @@ fn encryptHeaderBytes(cleartext: []const u8, workspace: *Workspace, provider: cr
 fn encodeHeaderBytes(entries: []const Entry, packed_entries: []const PackedEntry, workspace: *Workspace, provider: crypto.Provider, limits: Limits, header_options: SevenZipHeaderOptions) Failure!HeaderEncode {
     var counter = measurement.Counter.init(null);
     try writeHeader(&counter.writer, entries, packed_entries, workspace);
-    const header_size = std.math.cast(usize, counter.written()) orelse return error.ResourceLimit;
+    const header_size = try measurement.measuredLength(&counter);
     const header_bytes = try workspace.take(u8, header_size);
     var fixed = std.Io.Writer.fixed(header_bytes);
     try writeHeader(&fixed, entries, packed_entries, workspace);
@@ -616,12 +619,6 @@ pub fn sevenZipWritePacked(entries: []const Entry, packed_entries: []const Packe
     return try writeArchive(output, entries, packed_entries, workspace, provider, limits, header_options);
 }
 
-pub fn sevenZipInspectCount(archive_bytes: []const u8, workspace: *Workspace, limits: Limits, provider: crypto.Provider) Failure!u64 {
-    var cause: crypto.FailureCause = .none;
-    const options: SevenZipLoadOptions = .{ .failure_cause = &cause, .provider = provider };
-    return try sevenZipInspectCountEx(archive_bytes, workspace, limits, &options);
-}
-
 pub fn sevenZipInspectCountEx(archive_bytes: []const u8, workspace: *Workspace, limits: Limits, options: *const SevenZipLoadOptions) Failure!u64 {
     const loaded = try loadArchive(archive_bytes, workspace, limits, options);
     return loaded.count;
@@ -678,8 +675,8 @@ pub fn sevenZipDecodeOrdinal(archive_bytes: []const u8, workspace: *Workspace, l
             const history = try workspace.take(u8, deflate.history_size);
             var source_reader = std.Io.Reader.fixed(decrypted_packed);
             var dest_writer = std.Io.Writer.fixed(decode_output);
-            var inflater = deflate.Decompress.init(&source_reader, history);
-            _ = inflater.reader.streamRemaining(&dest_writer) catch return error.InvalidData;
+            var inflater = deflate_seam.Decode.initBound(decode_options.provider, &source_reader, history) catch return error.Unsupported;
+            _ = inflater.readerPtr().streamRemaining(&dest_writer) catch return error.InvalidData;
             if (dest_writer.end != decode_target_len) return error.InvalidData;
         },
         .bzip2 => {
@@ -692,7 +689,7 @@ pub fn sevenZipDecodeOrdinal(archive_bytes: []const u8, workspace: *Workspace, l
             const properties = try parseLzmaProperties(entry.attributes);
             const options: lzma.Options = .{ .properties = properties, .unpack_size = decode_target_len, .marker_required = false, .max_work = limits.codec_work };
             const scratch = try workspace.take(u8, lzma.decodeWorkspaceSize(properties));
-            const decoded = try lzma.decode(decrypted_packed, decode_output, scratch, options);
+            const decoded = try lzma_seam.decode(decode_options.provider, decrypted_packed, decode_output, scratch, options);
             if (decoded != decode_target_len) return error.InvalidData;
         },
         .lzma2 => {
@@ -700,7 +697,7 @@ pub fn sevenZipDecodeOrdinal(archive_bytes: []const u8, workspace: *Workspace, l
             if (dictionary < lzma.dictionary_min or dictionary > lzma.dictionary_max) return error.Unsupported;
             const options: lzma2.Options = .{ .dictionary_size = dictionary, .properties = lzma2.defaultProperties(dictionary), .max_work = limits.codec_work };
             const scratch = try workspace.take(u8, lzma2.decodeWorkspaceSize(dictionary));
-            const decoded = try lzma2.decode(decrypted_packed, decode_output, scratch, options);
+            const decoded = try lzma2_seam.decode(decode_options.provider, decrypted_packed, decode_output, scratch, options);
             if (decoded != decode_target_len) return error.InvalidData;
         },
         .ppmd => {
@@ -711,7 +708,7 @@ pub fn sevenZipDecodeOrdinal(archive_bytes: []const u8, workspace: *Workspace, l
         },
         .bcj2 => {
             const folder = entry.folder orelse return error.InvalidData;
-            const written = try decodeBcj2Folder(folder, entry.pack_stream_sizes, decrypted_packed, decode_output[0..decode_target_len], workspace, limits);
+            const written = try decodeBcj2Folder(folder, entry.pack_stream_sizes, decrypted_packed, decode_output[0..decode_target_len], workspace, limits, decode_options.provider);
             if (written != decode_target_len) return error.InvalidData;
         },
         else => return error.Unsupported,
@@ -737,7 +734,7 @@ fn readLzma2Prop(attributes: []const u8) Failure!u8 {
 
 // Recombines a BCJ2 folder. Each of the four inputs is a raw packed stream or the decoded
 // output of one of the folder's compressor coders, per `folder.bcj2_sources`.
-fn decodeBcj2Folder(folder: *const Folder, pack_sizes: []const u64, packed_data: []const u8, output: []u8, workspace: *Workspace, limits: Limits) Failure!usize {
+fn decodeBcj2Folder(folder: *const Folder, pack_sizes: []const u64, packed_data: []const u8, output: []u8, workspace: *Workspace, limits: Limits, provider: lzma2_seam.Provider) Failure!usize {
     if (!folder.bcj2 or pack_sizes.len != 4) return error.InvalidData;
     var packed_offset: usize = 0;
     var packed_slices: [4][]const u8 = undefined;
@@ -755,7 +752,7 @@ fn decodeBcj2Folder(folder: *const Folder, pack_sizes: []const u64, packed_data:
         const slice = packed_slices[ordinal];
         if (source.producer) |coder_index| {
             if (coder_index >= folder.coders.len) return error.InvalidData;
-            substreams[k] = try decodeBcj2Substream(folder.coders[coder_index], slice, workspace, limits);
+            substreams[k] = try decodeBcj2Substream(folder.coders[coder_index], slice, workspace, limits, provider);
         } else {
             substreams[k] = slice;
         }
@@ -763,7 +760,7 @@ fn decodeBcj2Folder(folder: *const Folder, pack_sizes: []const u64, packed_data:
     return bcj2.decode(substreams[0], substreams[1], substreams[2], substreams[3], output);
 }
 
-fn decodeBcj2Substream(coder: ParsedCoder, packed_data: []const u8, workspace: *Workspace, limits: Limits) Failure![]const u8 {
+fn decodeBcj2Substream(coder: ParsedCoder, packed_data: []const u8, workspace: *Workspace, limits: Limits, provider: lzma2_seam.Provider) Failure![]const u8 {
     switch (coder.method) {
         .copy => return packed_data,
         .lzma2 => {
@@ -771,10 +768,10 @@ fn decodeBcj2Substream(coder: ParsedCoder, packed_data: []const u8, workspace: *
             if (dictionary < lzma.dictionary_min or dictionary > lzma.dictionary_max) return error.Unsupported;
             const options: lzma2.Options = .{ .dictionary_size = dictionary, .properties = lzma2.defaultProperties(dictionary), .max_work = limits.codec_work };
             const scratch = try workspace.take(u8, lzma2.decodeWorkspaceSize(dictionary));
-            const decoded_size = try lzma2.decodedSize(packed_data, scratch, options);
+            const decoded_size = try lzma2_seam.decodedSize(provider, packed_data, scratch, options);
             if (decoded_size > limits.decoded_bytes) return error.ResourceLimit;
             const buffer = try workspace.take(u8, decoded_size);
-            const decoded = try lzma2.decode(packed_data, buffer, scratch, options);
+            const decoded = try lzma2_seam.decode(provider, packed_data, buffer, scratch, options);
             return buffer[0..decoded];
         },
         else => return error.Unsupported,
@@ -840,15 +837,17 @@ fn isFilterMethod(method: CoderMethod) bool {
 }
 
 fn bcjKindFromMethod(method: CoderMethod) bcj.Kind {
+    // The bare filter ids live in the method table above; this is the one
+    // remaining step from a 7z coder to the leaf that applies its filter.
     return switch (method) {
-        .x86 => .x86,
-        .ppc => .ppc,
-        .ia64 => .ia64,
-        .arm => .arm,
-        .armt => .armt,
-        .sparc => .sparc,
-        .arm64 => .arm64,
-        .riscv => .riscv,
+        .x86 => bcj.fromId(method_x86_id[0]).?,
+        .ppc => bcj.fromId(method_ppc_id[0]).?,
+        .ia64 => bcj.fromId(method_ia64_id[0]).?,
+        .arm => bcj.fromId(method_arm_id[0]).?,
+        .armt => bcj.fromId(method_armt_id[0]).?,
+        .sparc => bcj.fromId(method_sparc_id[0]).?,
+        .arm64 => bcj.fromId(method_arm64_id[0]).?,
+        .riscv => bcj.fromId(method_riscv_id[0]).?,
         else => unreachable,
     };
 }
@@ -988,8 +987,8 @@ fn decodeFolderStream(folder: *const Folder, packed_data: []const u8, output: []
             const history = try workspace.take(u8, deflate.history_size);
             var source_reader = std.Io.Reader.fixed(decrypted);
             var dest_writer = std.Io.Writer.fixed(output);
-            var inflater = deflate.Decompress.init(&source_reader, history);
-            _ = inflater.reader.streamRemaining(&dest_writer) catch return error.InvalidData;
+            var inflater = deflate_seam.Decode.initBound(options.provider, &source_reader, history) catch return error.Unsupported;
+            _ = inflater.readerPtr().streamRemaining(&dest_writer) catch return error.InvalidData;
             if (dest_writer.end != output.len) return error.InvalidData;
         },
         .bzip2 => {
@@ -1001,7 +1000,7 @@ fn decodeFolderStream(folder: *const Folder, packed_data: []const u8, output: []
             const properties = try parseLzmaProperties(folder.attributes);
             const lzma_options: lzma.Options = .{ .properties = properties, .unpack_size = output.len, .marker_required = false, .max_work = limits.codec_work };
             const scratch = try workspace.take(u8, lzma.decodeWorkspaceSize(properties));
-            const decoded = try lzma.decode(decrypted, output, scratch, lzma_options);
+            const decoded = try lzma_seam.decode(options.provider, decrypted, output, scratch, lzma_options);
             if (decoded != output.len) return error.InvalidData;
         },
         .lzma2 => {
@@ -1009,7 +1008,7 @@ fn decodeFolderStream(folder: *const Folder, packed_data: []const u8, output: []
             if (dictionary < lzma.dictionary_min or dictionary > lzma.dictionary_max) return error.Unsupported;
             const lzma2_options: lzma2.Options = .{ .dictionary_size = dictionary, .properties = lzma2.defaultProperties(dictionary), .max_work = limits.codec_work };
             const scratch = try workspace.take(u8, lzma2.decodeWorkspaceSize(dictionary));
-            const decoded = try lzma2.decode(decrypted, output, scratch, lzma2_options);
+            const decoded = try lzma2_seam.decode(options.provider, decrypted, output, scratch, lzma2_options);
             if (decoded != output.len) return error.InvalidData;
         },
         .ppmd => {
@@ -1098,10 +1097,7 @@ const Folder = struct {
     aes_iv_size: u8 = 0,
     coders: []const ParsedCoder = &.{},
     bonds: []const Bond = &.{},
-    packed_inputs: []const u64 = &.{},
     bcj2: bool = false,
-    // Where the BCJ2 coder's four inputs begin in the input stream index space.
-    bcj2_in_base: u64 = 0,
     bcj2_sources: [4]Bcj2Source = undefined,
     unpack_size: u64 = 0,
 };
@@ -1114,7 +1110,6 @@ const AesCoderProps = struct {
 };
 
 const FilesInfo = struct {
-    num_files: u64,
     empty_streams: []const bool,
     empty_files: []const bool,
     names: []const []const u8,
@@ -1322,9 +1317,7 @@ fn parseFolders(cursor: *binary.ReadCursor, workspace: *Workspace, comptime aes_
             .aes_iv_size = aes.iv_size,
             .coders = coders,
             .bonds = bonds,
-            .packed_inputs = packed_inputs,
             .bcj2 = bcj2_idx != null,
-            .bcj2_in_base = bcj2_in_base,
             .bcj2_sources = bcj2_sources,
         };
     }
@@ -1602,7 +1595,6 @@ fn parseFilesInfo(cursor: *binary.ReadCursor, workspace: *Workspace) Failure!Fil
         if (id >= 0x0E and id <= 0x11 and sub.remaining() != 0) return error.InvalidData;
     }
     return .{
-        .num_files = num_files,
         .empty_streams = empty_streams,
         .empty_files = empty_files,
         .names = names,
@@ -2197,31 +2189,6 @@ fn passwordToUtf16(password: []const u8, workspace: *Workspace) Failure![]const 
     return bytes;
 }
 
-fn writeBoolVector(writer: *std.Io.Writer, count: usize, ctx: anytype) Failure!void {
-    if (count == 0) return;
-    const all_false = blk: {
-        var all = true;
-        for (0..count) |i| if (ctx.get(i)) {
-            all = false;
-            break;
-        };
-        break :blk all;
-    };
-    if (all_false) {
-        try io.writeBytes(writer, &.{0x00});
-        return;
-    }
-    try io.writeBytes(writer, &.{0x01});
-    var byte: u8 = 0;
-    for (0..count) |i| {
-        if (ctx.get(i)) byte |= @as(u8, 0x80) >> @intCast(i % 8);
-        if ((i + 1) % 8 == 0 or i + 1 == count) {
-            try io.writeBytes(writer, &.{byte});
-            byte = 0;
-        }
-    }
-}
-
 fn writeBitVector(writer: *std.Io.Writer, count: usize, ctx: anytype) Failure!void {
     if (count == 0) return;
     var byte: u8 = 0;
@@ -2286,6 +2253,9 @@ fn writeUint64(writer: *std.Io.Writer, value: u64) Failure!void {
 }
 
 test "sevenzip ppmd solid grouping roundtrip" {
+    // A mixed provider build serves no single tag for both the checksum
+    // and codec arms; run where the default tag serves the codec.
+    if (!deflate_seam.decodeServed(checksum.default_provider)) return;
     const testing = std.testing;
     const allocator = testing.allocator;
     const backing = try allocator.alloc(u8, 64 * 1024 * 1024);
@@ -2324,6 +2294,9 @@ test "sevenzip ppmd solid grouping roundtrip" {
 }
 
 test "sevenzip encrypted roundtrip with salt and custom cycles" {
+    // A mixed provider build serves no single tag for both the checksum
+    // and codec arms; run where the default tag serves the codec.
+    if (!deflate_seam.decodeServed(checksum.default_provider)) return;
     const testing = std.testing;
     const allocator = testing.allocator;
     const backing = try allocator.alloc(u8, 64 * 1024 * 1024);
@@ -2364,6 +2337,9 @@ test "sevenzip encrypted roundtrip with salt and custom cycles" {
 }
 
 test "sevenzip folder plan stays consistent across directory and encryption breaks" {
+    // A mixed provider build serves no single tag for both the checksum
+    // and codec arms; run where the default tag serves the codec.
+    if (!deflate_seam.decodeServed(checksum.default_provider)) return;
     const testing = std.testing;
     const allocator = testing.allocator;
     const backing = try allocator.alloc(u8, 96 * 1024 * 1024);
@@ -2422,6 +2398,9 @@ test "sevenzip folder plan stays consistent across directory and encryption brea
 }
 
 test "sevenzip encrypted lzma2 entry roundtrips" {
+    // A mixed provider build serves no single tag for both the checksum
+    // and codec arms; run where the default tag serves the codec.
+    if (!deflate_seam.decodeServed(checksum.default_provider)) return;
     const testing = std.testing;
     const allocator = testing.allocator;
     const backing = try allocator.alloc(u8, 96 * 1024 * 1024);
@@ -2449,6 +2428,9 @@ test "sevenzip encrypted lzma2 entry roundtrips" {
 }
 
 test "sevenzip encoded headers roundtrip in both modes" {
+    // A mixed provider build serves no single tag for both the checksum
+    // and codec arms; run where the default tag serves the codec.
+    if (!deflate_seam.decodeServed(checksum.default_provider)) return;
     const testing = std.testing;
     const allocator = testing.allocator;
     const backing = try allocator.alloc(u8, 96 * 1024 * 1024);
@@ -2512,6 +2494,9 @@ test "sevenzip encoded headers roundtrip in both modes" {
 }
 
 test "sevenzip decode captured failing encrypted archive" {
+    // A mixed provider build serves no single tag for both the checksum
+    // and codec arms; run where the default tag serves the codec.
+    if (!deflate_seam.decodeServed(checksum.default_provider)) return;
     const testing = std.testing;
     const allocator = testing.allocator;
     const hex = "377abcaf271c0004b264b2a5300000000000000061000000000000008558bbbb2b72c63fac9cfd34eaca9f16e66742cea052cbb171699629473766c1fb2c5dbf512f7ea0868dbd6dbb3fc9357fc34c640104060001093000070b0100022406f1070112530fb5ab02e1850647c55791b562eef5860f2121011001000c306100080a011ccdcb5000000501110f006c0032002e007400780074000000140a0100000000000000000015060100200000000000";
@@ -2634,6 +2619,9 @@ const aes_plain_txt_hex =
     "";
 
 test "sevenzip decodes 7zz BCJ2 + LZMA2 folder" {
+    // A mixed provider build serves no single tag for both the checksum
+    // and codec arms; run where the default tag serves the codec.
+    if (!deflate_seam.decodeServed(checksum.default_provider)) return;
     // The folder arrives as four packed streams: the LZMA2 main, call, and jump coders bonded
     // into the BCJ2 recombiner, plus the raw range-coded bitmap.
     const testing = std.testing;
@@ -2658,6 +2646,9 @@ test "sevenzip decodes 7zz BCJ2 + LZMA2 folder" {
 }
 
 test "sevenzip decodes 7zz AES-256 encrypted archive" {
+    // A mixed provider build serves no single tag for both the checksum
+    // and codec arms; run where the default tag serves the codec.
+    if (!deflate_seam.decodeServed(checksum.default_provider)) return;
     // Captured from `7zz a -ppassword123` (7zAES, 2^19 KDF rounds, LZMA2).
     const testing = std.testing;
     const allocator = testing.allocator;

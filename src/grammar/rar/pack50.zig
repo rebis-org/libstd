@@ -3,10 +3,10 @@ const std = @import("std");
 const failure = @import("../../common/primitive/failure.zig");
 const primitive_huffman = @import("../../common/primitive/huffman.zig");
 const common_sink = @import("../../common/sink.zig");
-const facade = @import("../rar.zig");
 const bits = @import("bits.zig");
 const filters50 = @import("filters50.zig");
 const finder_mod = @import("finder.zig");
+const facade = @import("onprem.zig");
 const slots = @import("slots.zig");
 const unpack50 = @import("unpack50.zig");
 
@@ -26,9 +26,6 @@ const total_symbols: usize = nc + dc + ldc + rc;
 
 pub const max_expansion = 2;
 pub const output_slack = 8192;
-
-pub const token_bytes_per_input = @sizeOf(LzToken);
-pub const tree_bytes_per_input = 2 * @sizeOf(u32);
 
 pub const Workspaces = struct {
     hash: []u32,

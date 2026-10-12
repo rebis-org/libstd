@@ -1,17 +1,16 @@
 const std = @import("std");
 
-const kernels = @import("../common/kernels.zig");
-const bounds = @import("../common/primitive/bounds.zig");
-const checksum = @import("../common/primitive/checksum.zig");
-const failure_prim = @import("../common/primitive/failure.zig");
-const measurement = @import("../common/primitive/measurement.zig");
+const kernels = @import("../../common/kernels.zig");
+const bounds = @import("../../common/primitive/bounds.zig");
+const checksum = @import("../../common/primitive/checksum.zig");
+const failure_prim = @import("../../common/primitive/failure.zig");
+const measurement = @import("../../common/primitive/measurement.zig");
 
 const Failure = failure_prim.Failure;
 
 // Frame layout follows the "LZ4 Frame Format Description" spec; the block codec
 // mirrors the reference greedy parser in vendor/lz4.
 
-pub const block_size_min: u32 = 64 * 1024;
 pub const block_size_max: u32 = 4 * 1024 * 1024;
 pub const block_size_default: u32 = block_size_max;
 
@@ -60,6 +59,18 @@ pub const Options = struct {
     max_work: u64 = std.math.maxInt(u64),
 };
 
+// LZ4 length extension: a length at or above the 15 nibble cap emits 255
+// bytes per the block format until the remainder fits one byte.
+fn writeLengthExtension(output: []u8, op: *usize, length: usize) void {
+    var rest = length;
+    while (rest >= 255) : (rest -= 255) {
+        output[op.*] = 255;
+        op.* += 1;
+    }
+    output[op.*] = @intCast(rest);
+    op.* += 1;
+}
+
 fn blockSizeCode(block_size: u32) Failure!u8 {
     return switch (block_size) {
         64 * 1024 => 4,
@@ -75,8 +86,8 @@ pub fn encodeWorkspaceSize() usize {
 }
 
 pub fn decodeWorkspaceSize() usize {
-    // One block buffer plus the rolling 64 KiB history that dependent
-    // (linked) frames may reach into across block boundaries.
+    // The 64 KiB history is part of the contract: dependent (linked) frames
+    // reach into it across block boundaries.
     return block_size_max + window_size;
 }
 
@@ -111,7 +122,7 @@ pub fn requiredSize(input: []const u8, scratch: []u8, options: Options) Failure!
     // Exact encoded size: one counting encode pass, mirroring the measured policy.
     var counter = measurement.Counter.init(null);
     try encodeToWriter(input, &counter.writer, scratch, options);
-    return std.math.cast(usize, counter.written()) orelse error.ResourceLimit;
+    return measurement.measuredLength(&counter);
 }
 
 pub fn encode(input: []const u8, output: []u8, scratch: []u8, options: Options) Failure!usize {
@@ -414,13 +425,7 @@ pub fn compressBlock(input: []const u8, output: []u8, hash_table: []u32, acceler
             const lit_len = ip - anchor;
             if (lit_len >= lit_len_mask) {
                 output[token_pos] = lit_len_mask << 4;
-                var rest = lit_len - lit_len_mask;
-                while (rest >= 255) : (rest -= 255) {
-                    output[op] = 255;
-                    op += 1;
-                }
-                output[op] = @intCast(rest);
-                op += 1;
+                writeLengthExtension(output, &op, lit_len - lit_len_mask);
             } else {
                 output[token_pos] = @as(u8, @intCast(lit_len)) << 4;
             }
@@ -437,13 +442,7 @@ pub fn compressBlock(input: []const u8, output: []u8, hash_table: []u32, acceler
             ip += match_len + min_match;
             if (match_len >= match_len_mask) {
                 output[token_pos] += match_len_mask;
-                var rest = match_len - match_len_mask;
-                while (rest >= 255) : (rest -= 255) {
-                    output[op] = 255;
-                    op += 1;
-                }
-                output[op] = @intCast(rest);
-                op += 1;
+                writeLengthExtension(output, &op, match_len - match_len_mask);
             } else {
                 output[token_pos] += @as(u8, @intCast(match_len));
             }
@@ -539,13 +538,7 @@ fn emitSequence(input: []const u8, output: []u8, op_start: usize, anchor: usize,
     const lit_len = ip - anchor;
     if (lit_len >= lit_len_mask) {
         output[token_pos] = lit_len_mask << 4;
-        var rest = lit_len - lit_len_mask;
-        while (rest >= 255) : (rest -= 255) {
-            output[op] = 255;
-            op += 1;
-        }
-        output[op] = @intCast(rest);
-        op += 1;
+        writeLengthExtension(output, &op, lit_len - lit_len_mask);
     } else {
         output[token_pos] = @as(u8, @intCast(lit_len)) << 4;
     }
@@ -556,13 +549,7 @@ fn emitSequence(input: []const u8, output: []u8, op_start: usize, anchor: usize,
     const encoded_match_len = match_len - min_match;
     if (encoded_match_len >= match_len_mask) {
         output[token_pos] += match_len_mask;
-        var rest = encoded_match_len - match_len_mask;
-        while (rest >= 255) : (rest -= 255) {
-            output[op] = 255;
-            op += 1;
-        }
-        output[op] = @intCast(rest);
-        op += 1;
+        writeLengthExtension(output, &op, encoded_match_len - match_len_mask);
     } else {
         output[token_pos] += @as(u8, @intCast(encoded_match_len));
     }
@@ -575,13 +562,7 @@ fn emitLastLiterals(literals: []const u8, output: []u8, op_start: usize) usize {
     if (lit_len >= lit_len_mask) {
         output[op] = lit_len_mask << 4;
         op += 1;
-        var rest = lit_len - lit_len_mask;
-        while (rest >= 255) : (rest -= 255) {
-            output[op] = 255;
-            op += 1;
-        }
-        output[op] = @intCast(rest);
-        op += 1;
+        writeLengthExtension(output, &op, lit_len - lit_len_mask);
     } else {
         output[op] = @as(u8, @intCast(lit_len)) << 4;
         op += 1;

@@ -1,12 +1,13 @@
 const std = @import("std");
 
-const bounds = @import("../common/primitive/bounds.zig");
-const checksum = @import("../common/primitive/checksum.zig");
-const failure_prim = @import("../common/primitive/failure.zig");
-const io = @import("../common/primitive/io.zig");
-const measurement = @import("../common/primitive/measurement.zig");
-const tee = @import("../common/primitive/tee.zig");
-const deflate = @import("../leaf/deflate.zig");
+const bounds = @import("../../common/primitive/bounds.zig");
+const checksum = @import("../../common/primitive/checksum.zig");
+const failure_prim = @import("../../common/primitive/failure.zig");
+const io = @import("../../common/primitive/io.zig");
+const measurement = @import("../../common/primitive/measurement.zig");
+const tee = @import("../../common/primitive/tee.zig");
+const deflate = @import("../../leaf/deflate/onprem.zig");
+const deflate_seam = @import("../../leaf/deflate/seam.zig");
 
 const Failure = failure_prim.Failure;
 pub const deflate_history_size = deflate.history_size;
@@ -34,6 +35,9 @@ const flag_extra = 0x04;
 const flag_name = 0x08;
 const flag_comment = 0x10;
 const reserved_flags = 0xe0;
+const trailer_len = 8;
+// The 10 byte header and the 8 byte trailer need 18 bytes before any deflate data is read.
+const minimum_member_len = 18;
 
 pub fn encodedSizeBound(input_len: usize, options: Options) usize {
     var wrapper_size: usize = 18;
@@ -48,7 +52,7 @@ pub fn decodedSize(input: []const u8, history: []u8, provider: checksum.Provider
     if (history.len < deflate_history_size) return error.InsufficientCapacity;
     var counter = measurement.Counter.init(null);
     _ = try decode(input, &counter.writer, history, provider);
-    return std.math.cast(usize, counter.written()) orelse error.ResourceLimit;
+    return measurement.measuredLength(&counter);
 }
 
 pub const SinglePass = union(enum) {
@@ -56,58 +60,65 @@ pub const SinglePass = union(enum) {
     fallback: void,
 };
 
+const Member = struct {
+    header: HeaderTail,
+    data_start: usize,
+    data_size: usize,
+    decoded_size: usize,
+    crc32: u32,
+
+    fn total(self: Member) usize {
+        return self.data_start + self.data_size + trailer_len;
+    }
+};
+
+// The one member read: header, payload, and the verified trailer. Single-pass
+// and two-pass decoding and the inspector all resolve a member through this,
+// so they cannot disagree on where a member ends or what verifies it.
+fn readMember(input: []const u8, at: usize, history: []u8, output: *std.Io.Writer, provider: checksum.Provider) Failure!Member {
+    const header = try parseHeader(input[at..], provider);
+    const data_start = at + header.len;
+    var tee_writer = Crc32Tee.initWithProvider(output, provider);
+    const inflated = inflatePayload(input, data_start, history, &tee_writer.writer, provider) catch |err| return switch (err) {
+        error.WriteFailed => error.IoFailure,
+        else => error.InvalidData,
+    };
+    const trailer_at = data_start + inflated.consumed;
+    if (input.len - trailer_at < trailer_len) return error.InvalidData;
+    const stored_crc = std.mem.readInt(u32, input[trailer_at..][0..4], .little);
+    const stored_size = std.mem.readInt(u32, input[trailer_at + 4 ..][0..4], .little);
+    if (stored_crc != tee_writer.crc32Value() or stored_size != @as(u32, @truncate(tee_writer.size))) return error.IntegrityFailure;
+    return .{
+        .header = header,
+        .data_start = data_start,
+        .data_size = inflated.consumed,
+        .decoded_size = stored_size,
+        .crc32 = stored_crc,
+    };
+}
+
 // ISIZE only seeds the attempt; commit needs exact count, CRC32, and trailer.
 // Mismatch defers to the two-pass route.
 pub fn decodeSinglePass(input: []const u8, output: []u8, history: []u8, provider: checksum.Provider) Failure!SinglePass {
     if (history.len < deflate_history_size) return error.InsufficientCapacity;
     if (input.len >= std.math.maxInt(u32)) return .fallback;
-    // The 10 byte header and the 8 byte trailer need 18 bytes before any deflate data is read.
-    if (input.len < 18) return .fallback;
+    if (input.len < minimum_member_len) return .fallback;
     const claimed_size = std.mem.readInt(u32, input[input.len - 4 ..][0..4], .little);
     if (output.len < claimed_size) return .fallback;
-    var source = std.Io.Reader.fixed(input);
-    const header = parseHeader(input, provider) catch return .fallback;
-    source.seek = header.len;
-    const data_start = source.seek;
     var sink_writer = std.Io.Writer.fixed(output);
-    var tee_writer = Crc32Tee.initWithProvider(&sink_writer, provider);
-    const inflated = inflatePayload(input, data_start, history, &tee_writer.writer) catch return .fallback;
-    source.seek = data_start + inflated.consumed;
-    var trailer: [8]u8 = undefined;
-    var trailer_sink = std.Io.Writer.fixed(&trailer);
-    source.streamExact(&trailer_sink, 8) catch return .fallback;
-    if (source.seek != input.len) return .fallback;
-    const stored_crc = std.mem.readInt(u32, trailer[0..4], .little);
-    const stored_size = std.mem.readInt(u32, trailer[4..8], .little);
-    if (tee_writer.size != stored_size or stored_crc != tee_writer.crc32Value()) return .fallback;
-    return .{ .decoded = @intCast(tee_writer.size) };
+    const member = readMember(input, 0, history, &sink_writer, provider) catch return .fallback;
+    if (member.total() != input.len) return .fallback;
+    return .{ .decoded = member.decoded_size };
 }
 
 pub fn decode(input: []const u8, output: *std.Io.Writer, history: []u8, provider: checksum.Provider) Failure!usize {
     if (history.len < deflate_history_size) return error.InsufficientCapacity;
-    var source = std.Io.Reader.fixed(input);
     var total: usize = 0;
-    while (true) {
-        if (source.seek == input.len) break;
-        const member_start = source.seek;
-        const header = try parseHeader(input[member_start..], provider);
-        source.seek = member_start + header.len;
-        var tee_writer = Crc32Tee.initWithProvider(output, provider);
-        const data_start = source.seek;
-        const inflated = inflatePayload(input, data_start, history, &tee_writer.writer) catch |err| {
-            return switch (err) {
-                error.WriteFailed => error.IoFailure,
-                else => error.InvalidData,
-            };
-        };
-        total = try bounds.addUsize(total, inflated.produced);
-        source.seek = data_start + inflated.consumed;
-        var trailer: [8]u8 = undefined;
-        var trailer_sink = std.Io.Writer.fixed(&trailer);
-        source.streamExact(&trailer_sink, 8) catch return error.InvalidData;
-        const stored_crc = std.mem.readInt(u32, trailer[0..4], .little);
-        const stored_size = std.mem.readInt(u32, trailer[4..8], .little);
-        if (stored_crc != tee_writer.crc32Value() or stored_size != @as(u32, @truncate(tee_writer.size))) return error.IntegrityFailure;
+    var at: usize = 0;
+    while (at < input.len) {
+        const member = try readMember(input, at, history, output, provider);
+        total = try bounds.addUsize(total, member.decoded_size);
+        at = member.total();
     }
     return total;
 }
@@ -118,20 +129,7 @@ pub fn encodeStream(source: *std.Io.Reader, output: *std.Io.Writer, history: []u
     // Optimal mode carves scratch past deflate_history_size, so the full slice is required.
     var compressor = try deflate.Compress.init(output, history, options.deflate);
     var crc32 = checksum.Crc32.bind(options.provider);
-    var total: u64 = 0;
-    var buffer: [4096]u8 = undefined;
-    while (true) {
-        var sink = std.Io.Writer.fixed(&buffer);
-        const count = source.stream(&sink, std.Io.Limit.limited(buffer.len)) catch |err| {
-            if (err == error.EndOfStream) break;
-            return error.IoFailure;
-        };
-        if (count == 0) break;
-        const part = buffer[0..count];
-        crc32.update(part);
-        total = try bounds.addU64(total, @intCast(count));
-        compressor.writer.writeAll(part) catch return error.IoFailure;
-    }
+    const total = try deflate.feed(checksum.Crc32, source, &compressor, &crc32);
     compressor.finish() catch return error.IoFailure;
     try writeTrailer(output, crc32.final(), total);
 }
@@ -192,9 +190,9 @@ const Inflated = struct {
     consumed: usize,
 };
 
-fn inflatePayload(input: []const u8, data_start: usize, history: []u8, output: *std.Io.Writer) !Inflated {
-    var inflater = deflate.Decompress.initSlice(input[data_start..], history);
-    const produced = try inflater.reader.streamRemaining(output);
+fn inflatePayload(input: []const u8, data_start: usize, history: []u8, output: *std.Io.Writer, provider: checksum.Provider) !Inflated {
+    var inflater = deflate_seam.Decode.initSliceBound(provider, input[data_start..], history) catch return error.Unsupported;
+    const produced = try inflater.readerPtr().streamRemaining(output);
     return .{ .produced = produced, .consumed = (inflater.inputBitsConsumed() + 7) / 8 };
 }
 
@@ -272,7 +270,7 @@ pub const MemberIterator = struct {
 
     pub fn next(self: *MemberIterator) Failure!?MemberInfo {
         if (self.offset >= self.input.len) return null;
-        if (self.input.len - self.offset < 18) return error.InvalidData;
+        if (self.input.len - self.offset < minimum_member_len) return error.InvalidData;
         const member = try inspectMember(self.input[self.offset..], self.history, self.provider);
         self.offset = try bounds.addUsize(self.offset, member.total_size);
         return member;
@@ -289,36 +287,30 @@ pub fn inspectMembers(input: []const u8, history: []u8, provider: checksum.Provi
 
 fn inspectMember(input: []const u8, history: []u8, provider: checksum.Provider) Failure!MemberInfo {
     if (history.len < deflate_history_size) return error.InsufficientCapacity;
-    const tail = try parseHeader(input, provider);
-
-    const data_start = tail.len;
     var counter = measurement.Counter.init(null);
-    var tee_writer = Crc32Tee.initWithProvider(&counter.writer, provider);
-    const inflated = inflatePayload(input, data_start, history, &tee_writer.writer) catch return error.InvalidData;
-    const data_size = inflated.consumed;
-    const trailer_at = data_start + data_size;
-    if (input.len - trailer_at < 8) return error.InvalidData;
-    const stored_crc = std.mem.readInt(u32, input[trailer_at..][0..4], .little);
-    const stored_size = std.mem.readInt(u32, input[trailer_at + 4 ..][0..4], .little);
-    if (stored_crc != tee_writer.crc32Value() or stored_size != @as(u32, @truncate(tee_writer.size))) return error.IntegrityFailure;
+    const member = try readMember(input, 0, history, &counter.writer, provider);
     return .{
         .modification_time = std.mem.readInt(u32, input[4..8], .little),
         .extra_flags = input[8],
         .operating_system = input[9],
         .text = input[3] & flag_text != 0,
         .header_crc = input[3] & flag_header_crc != 0,
-        .extra = tail.extra,
-        .name = tail.name,
-        .comment = tail.comment,
-        .data_offset = data_start,
-        .data_size = data_size,
-        .decoded_size = stored_size,
-        .crc32 = stored_crc,
-        .total_size = trailer_at + 8,
+        .extra = member.header.extra,
+        .name = member.header.name,
+        .comment = member.header.comment,
+        .data_offset = member.data_start,
+        .data_size = member.data_size,
+        .decoded_size = member.decoded_size,
+        .crc32 = member.crc32,
+        .total_size = member.total(),
     };
 }
 
 test "inspectMembers enumerates concatenated members with their fields" {
+    // See the decode gate above: a mixed build cannot serve one call with
+    // both arms.
+    if (!deflate_seam.decodeServed(checksum.default_provider)) return;
+
     var first: [256]u8 = undefined;
     var second: [256]u8 = undefined;
     const options_a: Options = .{

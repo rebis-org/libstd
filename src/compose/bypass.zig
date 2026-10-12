@@ -2,7 +2,8 @@ const std = @import("std");
 
 const interface = @import("interface");
 
-const zstd = @import("../leaf/zstd.zig");
+const zstd = @import("../leaf/zstd/onprem.zig");
+const zstd_seam = @import("../leaf/zstd/seam.zig");
 const sizing = @import("sizing.zig");
 
 pub const Failure = interface.span.Failure;
@@ -21,6 +22,7 @@ pub fn zstdEncodeBound(input_len: usize, options: Options) usize {
 fn mapFailure(err: anyerror) Failure {
     return switch (err) {
         error.ResourceLimit => error.ResourceLimit,
+        error.Unsupported => error.Unsupported,
         else => error.InvalidData,
     };
 }
@@ -39,7 +41,7 @@ pub fn zstdEncode(input: interface.span.ConstSpan, output: interface.span.Span, 
 pub fn zstdDecodeStream(input: interface.span.ConstSpan, output: interface.span.Span, history: interface.span.Span, options: Options) Failure!usize {
     var source = std.Io.Reader.fixed(input.bytes());
     var sink = std.Io.Writer.fixed(output.bytes());
-    return zstd.decodeStream(&source, &sink, history.bytes(), options) catch |err| mapFailure(err);
+    return zstd_seam.decodeStream(options.provider, &source, &sink, history.bytes(), options) catch |err| mapFailure(err);
 }
 
 fn alignWorkspace(workspace: interface.span.Span) Failure![]u32 {

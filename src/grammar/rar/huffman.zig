@@ -171,10 +171,6 @@ pub fn decodeNumber(br: *BitReader, table: *const DecodeTable) Failure!u16 {
     return table.decode_num[@intCast(n)];
 }
 
-pub fn resetTable(table: *DecodeTable) void {
-    table.* = .{};
-}
-
 test "decode table builds canonical ranges" {
     const code_lengths = [_]u8{ 1, 2, 2 };
     var storage: [3]u16 = undefined;

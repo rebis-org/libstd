@@ -1,14 +1,14 @@
 const std = @import("std");
 
-const bounds = @import("../common/primitive/bounds.zig");
-const failure_prim = @import("../common/primitive/failure.zig");
-const io = @import("../common/primitive/io.zig");
+const bounds = @import("../../common/primitive/bounds.zig");
+const failure_prim = @import("../../common/primitive/failure.zig");
+const io = @import("../../common/primitive/io.zig");
 
 const Failure = failure_prim.Failure;
 
 const block_size: u64 = 512;
 pub const scratch_size: usize = @intCast(block_size);
-const typeflag_regular: u8 = '0';
+pub const typeflag_regular: u8 = '0';
 const typeflag_gnu_long_name: u8 = 'L';
 const typeflag_gnu_long_link: u8 = 'K';
 const typeflag_gnu_sparse: u8 = 'S';
@@ -336,10 +336,6 @@ fn tarDataSize(typeflag: u8, data: []const u8) Failure!u64 {
     };
 }
 
-fn tarExtensionSize(value: []const u8) Failure!u64 {
-    return bounds.addU64(block_size, try tarAligned(try bounds.addU64(value.len, 1)));
-}
-
 fn tarWriteHeader(sink: *io.Sink, scratch: []u8, name: []const u8, prefix: []const u8, link_name: []const u8, mode: u32, uid: u32, gid: u32, modification_time: u64, typeflag: u8, size: u64, devmajor: u32, devminor: u32) Failure!void {
     if (scratch.len < scratch_size) return error.InsufficientCapacity;
     const block = scratch[0..scratch_size];
@@ -378,14 +374,6 @@ fn tarWritePadding(sink: *io.Sink, scratch: []u8, size: u64) Failure!void {
         @memset(scratch[0..scratch_size], 0);
         try sink.write(scratch[0..@intCast(padding)]);
     }
-}
-
-fn tarWriteExtension(sink: *io.Sink, scratch: []u8, typeflag: u8, value: []const u8) Failure!void {
-    const size = try bounds.addU64(value.len, 1);
-    try tarWriteHeader(sink, scratch, "././@LongLink", &.{}, &.{}, 0, 0, 0, 0, typeflag, size, 0, 0);
-    try sink.write(value);
-    try sink.write(&.{0});
-    try tarWritePadding(sink, scratch, size);
 }
 
 const Pax = struct {
@@ -540,7 +528,6 @@ const Reader = struct {
                     try self.advance(physical_size);
                 },
                 typeflag_gnu_sparse => {
-                    try tarValidateSparseHeader(entry);
                     const sparse = try self.parseOldGnuSparse(&entry);
                     entry.size = sparse.realsize;
                     entry.sparse = sparse;
@@ -592,10 +579,6 @@ const Reader = struct {
         return error.InvalidData;
     }
 };
-
-fn tarValidateSparseHeader(entry: EntryInfo) Failure!void {
-    _ = entry;
-}
 
 fn parseSparseEntries(info: *SparseInfo, chunk_sum: *u64, bytes: []const u8, count: usize) Failure!void {
     var index: usize = 0;

@@ -1,7 +1,6 @@
 const std = @import("std");
 
-// Merkle-Damgård skeleton shared by the short FIPS 180 digests: 64-byte blocks,
-// 0x80 padding, 64-bit big-endian bit length, big-endian state words out.
+// The Merkle-Damgård skeleton every short FIPS 180 digest shares.
 pub fn Digest(
     comptime state_len: usize,
     comptime digest_len: usize,
@@ -22,12 +21,6 @@ pub fn Digest(
 
         pub fn init(_: Options) Self {
             return .{ .state = initial };
-        }
-
-        pub fn hash(input: []const u8, out: *[digest_length]u8, options: Options) void {
-            var hasher = Self.init(options);
-            hasher.update(input);
-            hasher.final(out);
         }
 
         pub fn update(self: *Self, input: []const u8) void {

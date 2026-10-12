@@ -5,11 +5,11 @@ const seam = @import("seam");
 
 const onprem = @import("onprem.zig");
 
-pub const WeakParametersError = error{WeakParameters};
-pub const OutputTooLongError = error{OutputTooLong};
+pub const OutputTooLongError = onprem.OutputTooLongError;
+pub const WeakParametersError = onprem.WeakParametersError;
 
-// Whole-operation monomorphization: the PRF pair travels with the provider, so
-// the rounds loop never dispatches per iteration.
+// The PRF pair travels with the provider, so the rounds loop never dispatches
+// per iteration.
 pub fn pbkdf2(comptime PrfOnprem: type, comptime PrfOffprem: type, provider: seam.Provider, dk: []u8, password: []const u8, salt: []const u8, rounds: u32) (WeakParametersError || OutputTooLongError)!void {
     switch (options.pbkdf2_impl) {
         .onprem => {

@@ -15,6 +15,13 @@ const Limits = resource.Limits;
 const Resource = resource.Resource;
 const Failure = vocabulary.Failure;
 
+// A sink must accept writes and have the capacity before any byte is
+// produced; every transform and archive hook states this pair first.
+pub fn requireSink(sink: *Resource, call: *Call, required: usize) Failure!void {
+    if (!sink.hasCapability(resource.capability_bit_write)) return error.Unsupported;
+    return requireSinkCapacity(sink, call, required);
+}
+
 pub fn requireSinkCapacity(sink: *Resource, call: *Call, required: usize) Failure!void {
     const capacity = sinkCapacity(sink);
     if (required > capacity) {
@@ -28,19 +35,15 @@ pub fn commitBytesToSink(sink: *Resource, call: *Call, chunk: []const u8) Failur
 }
 
 pub const SourceSizing = enum { budget, require_size, size_or_budget, replay };
-pub const Invocation = enum { query, read, write };
 
 pub const ExecutionPlan = struct {
-    invocation: Invocation,
     profile_id: Id,
-    target_command: ?Id = null,
     policy: vocabulary.CommandPolicy,
     limits: Limits,
     capabilities: u32,
     provider: seam.Provider = seam.default_provider,
     source_strategy: SourceSizing,
     workspace_plan: resource.WorkspacePlan,
-    output_requirement: ?u64 = null,
     workspace_required: usize = 0,
     workspace_available: usize = 0,
 };

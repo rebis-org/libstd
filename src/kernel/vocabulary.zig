@@ -81,18 +81,6 @@ pub const Selector = struct {
     flags: u8,
 };
 
-pub fn packSelector(
-    family: u16,
-    ordinal: u32,
-    representation: Representation,
-    cardinality: Cardinality,
-    direction: Direction,
-    command_mask: u32,
-) u64 {
-    const attributes = @as(u8, @intCast(@backingInt(representation))) | (@as(u8, @intCast(@backingInt(cardinality))) << parameter_card_shift) | (@as(u8, @intCast(@backingInt(direction))) << parameter_dir_shift);
-    return (@as(u64, family) << 48) | (@as(u64, ordinal) << 16) | (@as(u64, attributes) << 8) | @as(u64, command_mask & parameter_flag_command_mask);
-}
-
 pub fn selectorOf(selector_bits: u64) Selector {
     return .{
         .family = @truncate(selector_bits >> 48),
@@ -105,23 +93,11 @@ pub fn selectorOf(selector_bits: u64) Selector {
 pub fn isSelectorValid(selector_value: Selector) bool {
     if (selector_value.attributes & parameter_attr_reserved_mask != 0) return false;
     if (selector_value.flags & parameter_flag_reserved_mask != 0) return false;
-    return cardinalityFieldOf(selector_value.attributes) <= 1;
+    return fieldOf(selector_value.attributes, parameter_card_shift) <= 1;
 }
 
-pub fn fieldOf(attributes: u8, comptime shift: u6) u2 {
+fn fieldOf(attributes: u8, comptime shift: u6) u2 {
     return @truncate(attributes >> shift);
-}
-
-pub fn representationFieldOf(attributes: u8) u2 {
-    return fieldOf(attributes, parameter_rep_shift);
-}
-
-pub fn cardinalityFieldOf(attributes: u8) u2 {
-    return fieldOf(attributes, parameter_card_shift);
-}
-
-pub fn directionFieldOf(attributes: u8) u2 {
-    return fieldOf(attributes, parameter_dir_shift);
 }
 
 fn attributeOf(selector_value: Selector, comptime shift: u6, comptime T: type) T {
@@ -209,13 +185,12 @@ pub const protocol_rows = [_]Descriptor{
     .{ .id = ids.workspace_available_capacity, .name = "workspace_available_capacity", .kind = .diagnostic, .representation = .node_chain },
 };
 
+// How a profile answers one direction: the three facts the boundary needs, and
+// nothing that restates the command that selected them.
 pub const CommandPolicy = struct {
-    command: u32,
-    target: u32 = 0,
     capabilities: u32,
     sizing: SizingMode,
     commit: CommitMode,
-    limit_dimensions: u32 = 0,
 };
 
 pub const ids = struct {

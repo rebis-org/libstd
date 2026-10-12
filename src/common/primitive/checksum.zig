@@ -31,11 +31,11 @@ const crc_k0: crc_lane = .{ 0x000000008f352d95, 0x000000001d9513d7 };
 const crc_k1: crc_lane = .{ 0x00000000ae689191, 0x00000000ccaa009e };
 const crc_k2: crc_lane = .{ 0x00000000f1da05aa, 0x0000000081256527 };
 
-fn crc32x(crc: u32, data: u64) u32 {
+fn crc32x(crc: u32, word: u64) u32 {
     return asm ("crc32x w8, w8, x9"
         : [ret] "={x8}" (-> u32),
         : [crc] "{x8}" (crc),
-          [data] "{x9}" (data),
+          [word] "{x9}" (word),
     );
 }
 
@@ -71,8 +71,8 @@ fn pmull2(a: crc_lane, b: crc_lane) crc_lane {
     );
 }
 
-fn foldLane(lane: crc_lane, data: crc_lane, k: crc_lane) crc_lane {
-    return pmull1(lane, k) ^ data ^ pmull2(lane, k);
+fn foldLane(lane: crc_lane, input: crc_lane, k: crc_lane) crc_lane {
+    return pmull1(lane, k) ^ input ^ pmull2(lane, k);
 }
 
 fn crc32Aarch64Scalar(crc_in: u32, input: []const u8) u32 {
@@ -218,18 +218,11 @@ pub const Crc32 = seam.Checksum(options.crc32_impl, OnpremCrc32, std.hash.Crc32)
 pub const XzCrc64 = seam.Checksum(options.crc64xz_impl, OnpremXzCrc64, std.hash.crc.@"CRC-64/XZ");
 pub const Bzip2Crc32 = seam.Checksum(options.bzip2crc32_impl, OnpremBzip2Crc32, std.hash.crc.@"CRC-32/BZIP2");
 
+// A one-shot over any bound checksum: bind, feed the whole input, finish.
 fn seal(comptime H: type, bound: H, input: []const u8) @typeInfo(@TypeOf(H.final)).@"fn".return_type.? {
     var hash = bound;
     hash.update(input);
     return hash.final();
-}
-
-fn sealUnit(comptime H: type, provider: seam.Provider, input: []const u8) @typeInfo(@TypeOf(H.final)).@"fn".return_type.? {
-    return seal(H, H.bind(provider), input);
-}
-
-fn sealSeeded(comptime H: type, provider: seam.Provider, seed: anytype, input: []const u8) @typeInfo(@TypeOf(H.final)).@"fn".return_type.? {
-    return seal(H, H.bind(provider, seed), input);
 }
 
 pub fn crc32(input: []const u8) u32 {
@@ -237,7 +230,7 @@ pub fn crc32(input: []const u8) u32 {
 }
 
 pub fn crc32With(provider: seam.Provider, input: []const u8) u32 {
-    return sealUnit(Crc32, provider, input);
+    return seal(Crc32, Crc32.bind(provider), input);
 }
 
 pub fn xxh64(input: []const u8) u64 {
@@ -245,7 +238,7 @@ pub fn xxh64(input: []const u8) u64 {
 }
 
 pub fn xxh64With(provider: seam.Provider, input: []const u8) u64 {
-    return sealSeeded(XxHash64, provider, 0, input);
+    return seal(XxHash64, XxHash64.bind(provider, 0), input);
 }
 
 pub fn adler32(input: []const u8) u32 {
@@ -374,7 +367,7 @@ fn TableCrc(comptime T: type, comptime poly: T, comptime reflected: bool) type {
 }
 
 pub fn adler32With(provider: seam.Provider, input: []const u8) u32 {
-    return sealUnit(Adler32, provider, input);
+    return seal(Adler32, Adler32.bind(provider), input);
 }
 
 pub fn xxh32(input: []const u8) u32 {
@@ -382,7 +375,7 @@ pub fn xxh32(input: []const u8) u32 {
 }
 
 pub fn xxh32With(provider: seam.Provider, input: []const u8) u32 {
-    return sealSeeded(XxHash32, provider, 0, input);
+    return seal(XxHash32, XxHash32.bind(provider, 0), input);
 }
 
 test "xxh32 matches the published vectors" {

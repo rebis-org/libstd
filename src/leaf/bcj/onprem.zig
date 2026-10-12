@@ -13,6 +13,12 @@ pub const Kind = enum(u8) {
 
 pub const Direction = enum { encode, decode };
 
+// The filter ids are this leaf's wire vocabulary, so a wrapper that has to map
+// between them reads them here rather than restating the table.
+pub fn fromId(id: u8) ?Kind {
+    return std.enums.fromInt(Kind, id);
+}
+
 pub fn alignment(kind: Kind) u32 {
     return switch (kind) {
         .x86 => 1,
@@ -26,30 +32,30 @@ pub fn alignment(kind: Kind) u32 {
     };
 }
 
-pub fn decode(kind: Kind, start_offset: u32, code_bytes: []u8) void {
+// RISC-V is the only filter whose reference spells its two directions as
+// separate routines, so its arm cannot follow the shared name.
+fn apply(kind: Kind, start_offset: u32, code_bytes: []u8, comptime direction: Direction) void {
     switch (kind) {
-        .x86 => x86Code(code_bytes, start_offset, .decode),
-        .ppc => ppcCode(code_bytes, start_offset, .decode),
-        .ia64 => ia64Code(code_bytes, start_offset, .decode),
-        .arm => armCode(code_bytes, start_offset, .decode),
-        .armt => armThumbCode(code_bytes, start_offset, .decode),
-        .sparc => sparcCode(code_bytes, start_offset, .decode),
-        .arm64 => arm64Code(code_bytes, start_offset, .decode),
-        .riscv => riscvDecode(code_bytes, start_offset),
+        .x86 => x86Code(code_bytes, start_offset, direction),
+        .ppc => ppcCode(code_bytes, start_offset, direction),
+        .ia64 => ia64Code(code_bytes, start_offset, direction),
+        .arm => armCode(code_bytes, start_offset, direction),
+        .armt => armThumbCode(code_bytes, start_offset, direction),
+        .sparc => sparcCode(code_bytes, start_offset, direction),
+        .arm64 => arm64Code(code_bytes, start_offset, direction),
+        inline else => if (direction == .decode)
+            riscvDecode(code_bytes, start_offset)
+        else
+            riscvEncode(code_bytes, start_offset),
     }
 }
 
+pub fn decode(kind: Kind, start_offset: u32, code_bytes: []u8) void {
+    apply(kind, start_offset, code_bytes, .decode);
+}
+
 pub fn encode(kind: Kind, start_offset: u32, code_bytes: []u8) void {
-    switch (kind) {
-        .x86 => x86Code(code_bytes, start_offset, .encode),
-        .ppc => ppcCode(code_bytes, start_offset, .encode),
-        .ia64 => ia64Code(code_bytes, start_offset, .encode),
-        .arm => armCode(code_bytes, start_offset, .encode),
-        .armt => armThumbCode(code_bytes, start_offset, .encode),
-        .sparc => sparcCode(code_bytes, start_offset, .encode),
-        .arm64 => arm64Code(code_bytes, start_offset, .encode),
-        .riscv => riscvEncode(code_bytes, start_offset),
-    }
+    apply(kind, start_offset, code_bytes, .encode);
 }
 
 const mask_to_bit_number = [_]u8{ 0, 1, 2, 2, 3 };

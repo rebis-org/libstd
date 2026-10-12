@@ -87,47 +87,47 @@ pub const MatchFinder = struct {
         };
     }
 
-    fn hash2val(data: []const u8, pos: usize) u32 {
-        return @as(u32, data[pos]) | (@as(u32, data[pos + 1]) << 8);
+    fn hash2val(bytes: []const u8, pos: usize) u32 {
+        return @as(u32, bytes[pos]) | (@as(u32, bytes[pos + 1]) << 8);
     }
 
-    fn hash3val(data: []const u8, pos: usize) u32 {
-        const v: u32 = @as(u32, data[pos]) |
-            (@as(u32, data[pos + 1]) << 8) |
-            (@as(u32, data[pos + 2]) << 16);
+    fn hash3val(bytes: []const u8, pos: usize) u32 {
+        const v: u32 = @as(u32, bytes[pos]) |
+            (@as(u32, bytes[pos + 1]) << 8) |
+            (@as(u32, bytes[pos + 2]) << 16);
         return (v *% 0x56A3B17D) >> (32 - hash3_bits);
     }
 
-    fn hash4(data: []const u8, pos: usize) u32 {
-        if (pos + 3 >= data.len) return 0;
-        const v: u32 = @as(u32, data[pos]) |
-            (@as(u32, data[pos + 1]) << 8) |
-            (@as(u32, data[pos + 2]) << 16) |
-            (@as(u32, data[pos + 3]) << 24);
+    fn hash4(bytes: []const u8, pos: usize) u32 {
+        if (pos + 3 >= bytes.len) return 0;
+        const v: u32 = @as(u32, bytes[pos]) |
+            (@as(u32, bytes[pos + 1]) << 8) |
+            (@as(u32, bytes[pos + 2]) << 16) |
+            (@as(u32, bytes[pos + 3]) << 24);
         return (v *% 0x9E3779B1) >> (32 - hash_bits);
     }
 
-    fn extendMatch(data: []const u8, a: usize, b: usize, start: u32, max_len: u32) u32 {
-        return @intCast(kernels.matchLen8(data, a + start, b + start, max_len - start) + start);
+    fn extendMatch(bytes: []const u8, a: usize, b: usize, start: u32, max_len: u32) u32 {
+        return @intCast(kernels.matchLen8(bytes, a + start, b + start, max_len - start) + start);
     }
 
     fn treeInsert(
         self: *MatchFinder,
-        data: []const u8,
+        bytes: []const u8,
         pos: u32,
         bt_left: []u32,
         bt_right: []u32,
     ) void {
-        if (pos + 3 >= data.len) {
-            if (pos + 1 < data.len) self.hash2[hash2val(data, pos)] = pos + 1;
-            if (pos + 2 < data.len) self.hash3[hash3val(data, pos)] = pos + 1;
+        if (pos + 3 >= bytes.len) {
+            if (pos + 1 < bytes.len) self.hash2[hash2val(bytes, pos)] = pos + 1;
+            if (pos + 2 < bytes.len) self.hash3[hash3val(bytes, pos)] = pos + 1;
             return;
         }
 
-        self.hash2[hash2val(data, pos)] = pos + 1;
-        self.hash3[hash3val(data, pos)] = pos + 1;
+        self.hash2[hash2val(bytes, pos)] = pos + 1;
+        self.hash3[hash3val(bytes, pos)] = pos + 1;
 
-        const h = hash4(data, pos);
+        const h = hash4(bytes, pos);
         var cur = self.hash[h];
         self.hash[h] = pos + 1;
 
@@ -142,10 +142,10 @@ pub const MatchFinder = struct {
             if (pos <= match_pos) break;
             if (pos - match_pos > self.window_size) break;
 
-            const max_len = @min(self.max_match, @as(u32, @intCast(data.len - pos)));
-            const max_src = @min(max_len, @as(u32, @intCast(data.len - match_pos)));
+            const max_len = @min(self.max_match, @as(u32, @intCast(bytes.len - pos)));
+            const max_src = @min(max_len, @as(u32, @intCast(bytes.len - match_pos)));
             const limit = @min(max_len, max_src);
-            const common = extendMatch(data, pos, match_pos, @min(best_left_len, best_right_len), limit);
+            const common = extendMatch(bytes, pos, match_pos, @min(best_left_len, best_right_len), limit);
 
             if (common >= limit or common >= self.nice_len) {
                 left_ptr.* = bt_left[match_pos];
@@ -153,7 +153,7 @@ pub const MatchFinder = struct {
                 return;
             }
 
-            if (common < limit and data[pos + common] < data[match_pos + common]) {
+            if (common < limit and bytes[pos + common] < bytes[match_pos + common]) {
                 right_ptr.* = cur;
                 right_ptr = &bt_left[match_pos];
                 cur = bt_left[match_pos];
@@ -174,18 +174,18 @@ pub const MatchFinder = struct {
 
     fn findBT4Match(
         self: *MatchFinder,
-        data: []const u8,
+        bytes: []const u8,
         pos: u32,
         bt_left: []u32,
         bt_right: []u32,
     ) ?MatchResult {
-        if (pos + 3 >= data.len) return null;
+        if (pos + 3 >= bytes.len) return null;
 
-        const h2 = hash2val(data, pos);
+        const h2 = hash2val(bytes, pos);
         const h2_prev = self.hash2[h2];
         self.hash2[h2] = pos + 1;
 
-        const h3 = hash3val(data, pos);
+        const h3 = hash3val(bytes, pos);
         const h3_prev = self.hash3[h3];
         self.hash3[h3] = pos + 1;
 
@@ -196,7 +196,7 @@ pub const MatchFinder = struct {
             const mp: u32 = h2_prev - 1;
             if (pos > mp) {
                 const dist = pos - mp;
-                if (dist <= self.window_size and data[mp] == data[pos] and data[mp + 1] == data[pos + 1]) {
+                if (dist <= self.window_size and bytes[mp] == bytes[pos] and bytes[mp + 1] == bytes[pos + 1]) {
                     best_len = 2;
                     best_dist = dist;
                 }
@@ -208,14 +208,14 @@ pub const MatchFinder = struct {
             if (pos > mp) {
                 const dist = pos - mp;
                 if (dist <= self.window_size and
-                    data[mp] == data[pos] and
-                    data[mp + 1] == data[pos + 1] and
-                    data[mp + 2] == data[pos + 2])
+                    bytes[mp] == bytes[pos] and
+                    bytes[mp + 1] == bytes[pos + 1] and
+                    bytes[mp + 2] == bytes[pos + 2])
                 {
-                    const max_len = @min(self.max_match, @as(u32, @intCast(data.len - pos)));
-                    const max_src = @min(max_len, @as(u32, @intCast(data.len - mp)));
+                    const max_len = @min(self.max_match, @as(u32, @intCast(bytes.len - pos)));
+                    const max_src = @min(max_len, @as(u32, @intCast(bytes.len - mp)));
                     const limit = @min(max_len, max_src);
-                    const actual_len = extendMatch(data, pos, mp, 3, limit);
+                    const actual_len = extendMatch(bytes, pos, mp, 3, limit);
                     if (actual_len > best_len) {
                         best_len = actual_len;
                         best_dist = dist;
@@ -228,7 +228,7 @@ pub const MatchFinder = struct {
         // data, so use a shallow walk when neither hash found a 3-byte match.
         const effective_depth: u32 = if (best_len < 3) @min(self.bt_depth, 2) else self.bt_depth;
 
-        const h = hash4(data, pos);
+        const h = hash4(bytes, pos);
         var cur = self.hash[h];
         self.hash[h] = pos + 1;
 
@@ -244,10 +244,10 @@ pub const MatchFinder = struct {
             const dist = pos - match_pos;
             if (dist > self.window_size) break;
 
-            const max_len = @min(self.max_match, @as(u32, @intCast(data.len - pos)));
-            const max_src = @min(max_len, @as(u32, @intCast(data.len - match_pos)));
+            const max_len = @min(self.max_match, @as(u32, @intCast(bytes.len - pos)));
+            const max_src = @min(max_len, @as(u32, @intCast(bytes.len - match_pos)));
             const limit = @min(max_len, max_src);
-            const common = extendMatch(data, pos, match_pos, @min(best_left_len, best_right_len), limit);
+            const common = extendMatch(bytes, pos, match_pos, @min(best_left_len, best_right_len), limit);
 
             if (common > best_len) {
                 best_len = common;
@@ -262,7 +262,7 @@ pub const MatchFinder = struct {
                 }
             }
 
-            if (common < limit and data[pos + common] < data[match_pos + common]) {
+            if (common < limit and bytes[pos + common] < bytes[match_pos + common]) {
                 right_ptr.* = cur;
                 right_ptr = &bt_left[match_pos];
                 cur = bt_left[match_pos];
@@ -286,29 +286,29 @@ pub const MatchFinder = struct {
 
     pub fn compress(
         self: *MatchFinder,
-        data: []const u8,
+        bytes: []const u8,
         tokens: []LzToken,
         bt_left: []u32,
         bt_right: []u32,
     ) Failure![]LzToken {
-        if (bt_left.len < data.len or bt_right.len < data.len) return error.InternalFailure;
+        if (bt_left.len < bytes.len or bt_right.len < bytes.len) return error.InternalFailure;
         @memset(bt_left, 0);
         @memset(bt_right, 0);
 
-        if (data.len == 0) return tokens[0..0];
+        if (bytes.len == 0) return tokens[0..0];
 
         var count: usize = 0;
         var pos: u32 = 0;
-        while (pos < data.len) {
-            const match_result = self.findBT4Match(data, pos, bt_left, bt_right);
+        while (pos < bytes.len) {
+            const match_result = self.findBT4Match(bytes, pos, bt_left, bt_right);
 
             if (match_result) |m| {
-                if (self.lazy and pos + 1 < data.len) {
-                    const next_match = self.findBT4Match(data, pos + 1, bt_left, bt_right);
+                if (self.lazy and pos + 1 < bytes.len) {
+                    const next_match = self.findBT4Match(bytes, pos + 1, bt_left, bt_right);
                     if (next_match) |nm| {
                         if (nm.length > m.length + 1) {
                             if (count >= tokens.len) return error.InsufficientCapacity;
-                            tokens[count] = .{ .literal = data[pos] };
+                            tokens[count] = .{ .literal = bytes[pos] };
                             count += 1;
                             pos += 1;
 
@@ -317,7 +317,7 @@ pub const MatchFinder = struct {
                             count += 1;
                             var i: u32 = 1;
                             while (i < nm.length) : (i += 1) {
-                                if (pos + i < data.len) self.treeInsert(data, pos + i, bt_left, bt_right);
+                                if (pos + i < bytes.len) self.treeInsert(bytes, pos + i, bt_left, bt_right);
                             }
                             pos += nm.length;
                             continue;
@@ -330,7 +330,7 @@ pub const MatchFinder = struct {
                     count += 1;
                     var i: u32 = 2;
                     while (i < m.length) : (i += 1) {
-                        if (pos + i < data.len) self.treeInsert(data, pos + i, bt_left, bt_right);
+                        if (pos + i < bytes.len) self.treeInsert(bytes, pos + i, bt_left, bt_right);
                     }
                     pos += m.length;
                 } else {
@@ -339,14 +339,14 @@ pub const MatchFinder = struct {
                     count += 1;
                     var i: u32 = 1; // Position pos is already in the tree.
                     while (i < m.length) : (i += 1) {
-                        if (pos + i < data.len) self.treeInsert(data, pos + i, bt_left, bt_right);
+                        if (pos + i < bytes.len) self.treeInsert(bytes, pos + i, bt_left, bt_right);
                     }
                     pos += m.length;
                 }
             } else {
                 // Position pos is already in the tree.
                 if (count >= tokens.len) return error.InsufficientCapacity;
-                tokens[count] = .{ .literal = data[pos] };
+                tokens[count] = .{ .literal = bytes[pos] };
                 count += 1;
                 pos += 1;
             }
@@ -365,9 +365,9 @@ test "match finder replays through the window byte-exactly" {
     var tokens: [1024]LzToken = undefined;
 
     var mf = try MatchFinder.init(&hash, &hash2, &hash3, 4096, 3);
-    const data = "The quick brown fox jumps over the lazy dog. The quick brown fox!";
-    const toks = try mf.compress(data, &tokens, &bt_left, &bt_right);
-    try std.testing.expect(toks.len < data.len);
+    const bytes = "The quick brown fox jumps over the lazy dog. The quick brown fox!";
+    const toks = try mf.compress(bytes, &tokens, &bt_left, &bt_right);
+    try std.testing.expect(toks.len < bytes.len);
 
     var window_buf: [1024]u8 = undefined;
     var win = window_mod.Window.init(&window_buf);
@@ -379,8 +379,8 @@ test "match finder replays through the window byte-exactly" {
     }
     var out: [1024]u8 = undefined;
     var bs = common_sink.BufferSink.init(&out);
-    try std.testing.expect(win.emitTo(bs.sink(), win.write_pos, data.len));
-    try std.testing.expectEqualSlices(u8, data, out[0..data.len]);
+    try std.testing.expect(win.emitTo(bs.sink(), win.write_pos, bytes.len));
+    try std.testing.expectEqualSlices(u8, bytes, out[0..bytes.len]);
 }
 
 test "match finder handles all-literal data" {
@@ -392,8 +392,8 @@ test "match finder handles all-literal data" {
     var tokens: [64]LzToken = undefined;
 
     var mf = try MatchFinder.init(&hash, &hash2, &hash3, 4096, 3);
-    const data = "abcdefghijklmnop";
-    const toks = try mf.compress(data, &tokens, &bt_left, &bt_right);
-    try std.testing.expectEqual(data.len, toks.len);
+    const bytes = "abcdefghijklmnop";
+    const toks = try mf.compress(bytes, &tokens, &bt_left, &bt_right);
+    try std.testing.expectEqual(bytes.len, toks.len);
     for (toks) |tok| try std.testing.expect(tok == .literal);
 }

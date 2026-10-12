@@ -10,8 +10,8 @@ const vocabulary = @import("../kernel/vocabulary.zig");
 const compose_catalog = @import("catalog.zig");
 const common = @import("common.zig");
 const hooks = @import("hooks.zig");
-const catalog_json = @import("../kernel/catalog.zig").catalog_json;
 
+const catalog_json = kernel_catalog.catalog_json;
 const descriptorFor = kernel_catalog.descriptorFor;
 const isKnownId = kernel_catalog.isKnownId;
 const Call = abi.Call;
@@ -22,94 +22,76 @@ const Limits = resource.Limits;
 const Resource = resource.Resource;
 const Failure = vocabulary.Failure;
 const commandMaskForId = vocabulary.commandMaskForId;
-const command_mask_query = vocabulary.command_mask_query;
 const command_mask_read = vocabulary.command_mask_read;
 const command_mask_write = vocabulary.command_mask_write;
 const eql = vocabulary.eql;
 const ids = vocabulary.ids;
 const isZero = vocabulary.isZero;
 
-fn fail(envelope: *Call, failure: Failure) u32 {
-    const mapped_failure = mapFailure(failure);
-    if (failure == error.Unsupported) if (unknownRequiredId(envelope.request)) |id| common.writeDiagnosticId(envelope, ids.diagnostic_subject, id);
-    common.writeDiagnostic(envelope, mapped_failure.status, mapped_failure.id);
-    return mapped_failure.status;
+const MappedFailure = struct { status: u32, id: Id };
+
+fn mapFailure(failure: Failure) MappedFailure {
+    inline for (vocabulary.error_map) |entry| if (failure == entry.failure) return .{ .status = entry.status, .id = entry.diagnostic };
+    return .{ .status = Status.internal_failure, .id = ids.internal_failure };
+}
+
+fn report(call: *Call, failure: Failure) u32 {
+    const mapped = mapFailure(failure);
+    common.writeDiagnostic(call, mapped.status, mapped.id);
+    return mapped.status;
+}
+
+// An unsupported request usually names the id it could not place, and that id
+// is more actionable than the generic diagnostic the status would otherwise carry.
+fn fail(call: *Call, failure: Failure) u32 {
+    if (failure == error.Unsupported) if (unknownRequiredId(call.request)) |id| common.writeDiagnosticId(call, ids.diagnostic_subject, id);
+    return report(call, failure);
 }
 
 pub fn invoke(call: ?*Call) u32 {
     const envelope = call orelse return Status.invalid_call;
-    if (!envelope.isValid()) {
-        if (envelope.structure_size >= @sizeOf(Call)) common.writeDiagnostic(envelope, Status.invalid_call, ids.invalid_call);
-        return Status.invalid_call;
-    }
-    const response = envelope.response orelse {
-        common.writeDiagnostic(envelope, Status.invalid_call, ids.invalid_call);
-        return Status.invalid_call;
-    };
-    if (!response.isValid() or !isZero(response.id)) {
-        common.writeDiagnostic(envelope, Status.invalid_call, ids.invalid_call);
-        return Status.invalid_call;
-    }
+    if (!envelope.isValid()) return if (envelope.structure_size >= @sizeOf(Call)) report(envelope, error.InvalidCall) else Status.invalid_call;
+    const response = envelope.response orelse return report(envelope, error.InvalidCall);
+    if (!response.isValid() or !isZero(response.id)) return report(envelope, error.InvalidCall);
     if (envelope.diagnostic) |diagnostic| {
-        node_graph.validateGraph(diagnostic.child, .out, 0) catch |err| {
-            return mapFailure(err).status;
-        };
+        node_graph.validateGraph(diagnostic.child, .out, 0) catch |failure| return mapFailure(failure).status;
     }
     response.value_low = 0;
     response.value_high = 0;
     response.byte_length = 0;
-    const command_mask = commandMaskForId(envelope.operation);
-    node_graph.validateGraph(envelope.request, .in, command_mask) catch |failure| {
-        return fail(envelope, failure);
-    };
-    node_graph.validateGraph(response.child, .out, 0) catch |failure| {
-        const mapped_failure = mapFailure(failure);
-        common.writeDiagnostic(envelope, mapped_failure.status, mapped_failure.id);
-        return mapped_failure.status;
-    };
+    node_graph.validateGraph(envelope.request, .in, commandMaskForId(envelope.operation)) catch |failure| return fail(envelope, failure);
+    node_graph.validateGraph(response.child, .out, 0) catch |failure| return report(envelope, failure);
     if (isZero(envelope.operation)) return writeCatalog(envelope, response);
-    dispatch(envelope, response) catch |failure| {
-        return fail(envelope, failure);
-    };
+    dispatch(envelope, response) catch |failure| return fail(envelope, failure);
     return Status.ok;
 }
 
 fn writeCatalog(call: *Call, response: *Node) u32 {
+    // The length answers before the capacity check so a host that sized its
+    // buffer from this call can retry without reading the diagnostics.
     response.byte_length = catalog_json.len;
     if (response.byte_capacity < catalog_json.len) {
         common.writeCapacityDiagnostic(call, catalog_json.len, response.byte_capacity);
         return Status.insufficient_capacity;
     }
-    const output = response.bytes orelse {
-        common.writeDiagnostic(call, Status.invalid_call, ids.invalid_call);
-        return Status.invalid_call;
-    };
+    const output = response.bytes orelse return report(call, error.InvalidCall);
     @memcpy(output[0..catalog_json.len], catalog_json);
     return Status.ok;
 }
 
 fn dispatch(envelope: *Call, response: *Node) Failure!void {
-    const command_id = envelope.operation;
-    const command_mask = commandMaskForId(command_id);
+    const command_mask = commandMaskForId(envelope.operation);
     if (command_mask == 0) return error.Unsupported;
-    const profile_node = try requireParameter(envelope.request, ids.profile);
-    const profile_id = nodeId(profile_node);
+    const profile_id = nodeId(try requireParameter(envelope.request, ids.profile));
     const profile = descriptorFor(profile_id) orelse return error.Unsupported;
     if (profile.kind != .profile or (profile.command_mask & command_mask) == 0) return error.Unsupported;
     const tag = compose_catalog.profileTagForId(profile_id) orelse return error.Unsupported;
-    const is_query = eql(command_id, ids.query);
-    var effective_command_mask = command_mask;
-    if (is_query) {
-        const target_node = try requireParameter(envelope.request, ids.target_command);
-        const effective_command_id = nodeId(target_node);
-        effective_command_mask = commandMaskForId(effective_command_id);
-        if (effective_command_mask != command_mask_read and effective_command_mask != command_mask_write) return error.InvalidCall;
-    }
-    const policy = compose_catalog.commandPolicyFor(
-        profile_id,
-        if (is_query) command_mask_query else effective_command_mask,
-        if (is_query) effective_command_mask else 0,
-    ) orelse return error.Unsupported;
+    const is_query = eql(envelope.operation, ids.query);
+    const direction = if (is_query)
+        try queryDirection(envelope.request)
+    else
+        command_mask;
+    const policy = compose_catalog.commandPolicyFor(profile_id, direction) orelse return error.Unsupported;
     const sizing = try parseSizingMode(
         protocolParam(envelope.request, vocabulary.protocol_parameter.sizing_mode),
         policy.sizing,
@@ -118,17 +100,13 @@ fn dispatch(envelope: *Call, response: *Node) Failure!void {
         protocolParam(envelope.request, vocabulary.protocol_parameter.commit_mode),
         policy.commit,
     );
-    const strict_modes = tag != .test_echo and tag != .test_read;
-    if (strict_modes) {
-        if (sizing != policy.sizing) return error.Unsupported;
-        if (commit != policy.commit) return error.Unsupported;
-    }
+    // Fixtures run every sizing and commit pairing; released profiles do not.
+    if (tag != .test_echo and tag != .test_read and (sizing != policy.sizing or commit != policy.commit)) return error.Unsupported;
     // size_bound only opts measured writes into bounded sizing. Other targets map to unsupported as parameter misuse.
-    var effective_sizing = sizing;
-    if (node_graph.findParameter(envelope.request, ids.size_bound) != null) {
-        if (policy.sizing != .measured or effective_command_mask != command_mask_write) return error.Unsupported;
-        effective_sizing = .bounded;
-    }
+    const effective_sizing = if (node_graph.findParameter(envelope.request, ids.size_bound) == null) sizing else bounded: {
+        if (policy.sizing != .measured or direction != command_mask_write) return error.Unsupported;
+        break :bounded vocabulary.SizingMode.bounded;
+    };
     const limits = Limits.fromScalar(node_graph.parseU64(protocolParam(
         envelope.request,
         vocabulary.protocol_parameter.resource_limit,
@@ -140,9 +118,7 @@ fn dispatch(envelope: *Call, response: *Node) Failure!void {
     const source_node = try requireParameter(envelope.request, ids.source);
     const sink_node = if (is_query) null else try requireParameter(envelope.request, ids.sink);
     var plan = common.ExecutionPlan{
-        .invocation = if (is_query) .query else if (effective_command_mask == command_mask_read) .read else .write,
         .profile_id = profile_id,
-        .target_command = if (is_query) nodeId(try requireParameter(envelope.request, ids.target_command)) else null,
         .policy = policy,
         .limits = limits,
         .capabilities = capabilities,
@@ -152,10 +128,7 @@ fn dispatch(envelope: *Call, response: *Node) Failure!void {
         )),
         .source_strategy = switch (policy.sizing) {
             .metadata_exact => .require_size,
-            .measured => .replay,
-            .materialization => .budget,
-            .unavailable => .budget,
-            .bounded => .replay,
+            else => if (policy.sizing == .materialization or policy.sizing == .unavailable) .budget else .replay,
         },
         .workspace_plan = resource.WorkspacePlan.init(envelope.workspace),
         .workspace_available = std.math.cast(usize, envelope.workspace_capacity) orelse std.math.maxInt(usize),
@@ -163,13 +136,21 @@ fn dispatch(envelope: *Call, response: *Node) Failure!void {
     try common.validateBoundary(envelope, &plan, source_node, sink_node);
     var source = try Resource.sourceFromNode(envelope, source_node, capabilities);
     var sink: ?Resource = if (sink_node) |node| try Resource.sinkFromNode(envelope, node, capabilities) else null;
-    const selected = if (is_query) &source else if (effective_command_mask == command_mask_read) &source else if (sink) |*sink_resource| sink_resource else return error.InvalidCall;
+    const selected = if (is_query) &source else if (direction == command_mask_read) &source else if (sink) |*sink_resource| sink_resource else return error.InvalidCall;
     if ((selected.capabilities & policy.capabilities) != policy.capabilities) return error.Unsupported;
     if (effective_sizing == .unavailable) return error.Unsupported;
     // Workspace requirement must be reported on every exit path, success or failure.
     defer if (plan.workspace_required != 0)
         common.writeWorkspaceCapacityDiagnostic(envelope, plan.workspace_required, plan.workspace_available);
-    try hooks.dispatchToProfileHook(profile.id, &plan, &source, if (sink) |*sink_resource| sink_resource else null, envelope, response, effective_sizing, commit, limits, effective_command_mask);
+    try hooks.dispatchToProfileHook(profile.id, &plan, &source, if (sink) |*sink_resource| sink_resource else null, envelope, response, effective_sizing, commit, limits, direction);
+}
+
+// A query names the direction it measures, so the direction is resolved from
+// the request before any policy or capability question is asked.
+fn queryDirection(request: ?*Node) Failure!u32 {
+    const direction = commandMaskForId(nodeId(try requireParameter(request, ids.target_command)));
+    if (direction != command_mask_read and direction != command_mask_write) return error.InvalidCall;
+    return direction;
 }
 
 fn unknownRequiredId(first: ?*Node) ?Id {
@@ -235,11 +216,4 @@ fn parseProvider(node: ?*Node) Failure!seam.Provider {
     };
     if (!seam.isServed(provider)) return error.Unsupported;
     return provider;
-}
-
-const MappedFailure = struct { status: u32, id: Id };
-
-fn mapFailure(failure: Failure) MappedFailure {
-    inline for (vocabulary.error_map) |entry| if (failure == entry.failure) return .{ .status = entry.status, .id = entry.diagnostic };
-    return .{ .status = Status.internal_failure, .id = ids.internal_failure };
 }
