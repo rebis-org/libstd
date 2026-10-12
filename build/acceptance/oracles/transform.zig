@@ -4,8 +4,9 @@ const abi = @import("abi.zig");
 const corpus = @import("corpus.zig");
 const harness = @import("harness.zig");
 const lib = @import("lib.zig");
-const Runner = harness.Runner;
 const steps = @import("steps.zig");
+
+const Runner = harness.Runner;
 
 fn optimalParams(_: *Runner, out: *[steps.MaxExtra]harness.Node) usize {
     out[0] = harness.paramScalar(harness.param_family_deflate, harness.deflate_optimal, harness.cmd_all, 1);

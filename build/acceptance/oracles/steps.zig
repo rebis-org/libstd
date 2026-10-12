@@ -2,8 +2,9 @@ const std = @import("std");
 
 const abi = @import("abi.zig");
 const harness = @import("harness.zig");
-const Runner = harness.Runner;
 const lib = @import("lib.zig");
+
+const Runner = harness.Runner;
 
 pub const MaxExtra = 4;
 pub const Params = *const fn (r: *Runner, out: *[MaxExtra]harness.Node) usize;

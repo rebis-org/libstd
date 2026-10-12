@@ -3,8 +3,9 @@ const std = @import("std");
 const abi = @import("abi.zig");
 const corpus = @import("corpus.zig");
 const harness = @import("harness.zig");
-const Runner = harness.Runner;
 const lib = @import("lib.zig");
+
+const Runner = harness.Runner;
 
 fn setupTar(r: *Runner) void {
     harness.setup(r, harness.ids.tar, harness.mode_archive);

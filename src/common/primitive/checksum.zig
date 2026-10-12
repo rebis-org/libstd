@@ -1,14 +1,22 @@
-const std = @import("std");
 const builtin = @import("builtin");
+const std = @import("std");
 
 const options = @import("options");
 const seam = @import("seam");
+
+const adler32_seam = @import("hash/adler32/seam.zig");
 const xxh32_seam = @import("hash/xxh32/seam.zig");
 const xxh64_seam = @import("hash/xxh64/seam.zig");
-const adler32_seam = @import("hash/adler32/seam.zig");
+
+pub const Provider = seam.Provider;
+pub const default_provider = seam.default_provider;
+pub const Adler32 = adler32_seam.Inner;
+pub const XxHash32 = xxh32_seam.XxHash32;
+pub const XxHash64 = xxh64_seam.XxHash64;
 
 // Zig inline asm cannot name the 32-bit register views, so the crc32 instructions bind
 // fixed X registers. The fold mirrors the vendor ip7z/7zip arm64 loop.
+
 const crc32_hw = builtin.target.cpu.arch == .aarch64 and !options.crc32_portable;
 const has_crc32_kernel = crc32_hw and builtin.target.cpu.has(.aarch64, .crc);
 // LLVM's aes feature implies pmull, which the fold kernel multiplies with.
@@ -210,9 +218,6 @@ pub const Crc32 = seam.Checksum(options.crc32_impl, OnpremCrc32, std.hash.Crc32)
 pub const XzCrc64 = seam.Checksum(options.crc64xz_impl, OnpremXzCrc64, std.hash.crc.@"CRC-64/XZ");
 pub const Bzip2Crc32 = seam.Checksum(options.bzip2crc32_impl, OnpremBzip2Crc32, std.hash.crc.@"CRC-32/BZIP2");
 
-pub const Provider = seam.Provider;
-pub const default_provider = seam.default_provider;
-
 fn seal(comptime H: type, bound: H, input: []const u8) @typeInfo(@TypeOf(H.final)).@"fn".return_type.? {
     var hash = bound;
     hash.update(input);
@@ -235,9 +240,6 @@ pub fn crc32With(provider: seam.Provider, input: []const u8) u32 {
     return sealUnit(Crc32, provider, input);
 }
 
-pub const XxHash64 = xxh64_seam.XxHash64;
-pub const XxHash32 = xxh32_seam.XxHash32;
-
 pub fn xxh64(input: []const u8) u64 {
     return xxh64With(default_provider, input);
 }
@@ -245,8 +247,6 @@ pub fn xxh64(input: []const u8) u64 {
 pub fn xxh64With(provider: seam.Provider, input: []const u8) u64 {
     return sealSeeded(XxHash64, provider, 0, input);
 }
-
-pub const Adler32 = adler32_seam.Inner;
 
 pub fn adler32(input: []const u8) u32 {
     return adler32With(default_provider, input);

@@ -1,5 +1,7 @@
 const std = @import("std");
+
 const failure = @import("../../common/primitive/failure.zig");
+
 const Failure = failure.Failure;
 
 // RAR packs codes MSB-first within each byte. V29 uses zero padding because its

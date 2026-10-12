@@ -1,17 +1,19 @@
 const std = @import("std");
 
+const seam = @import("seam");
+
+const measurement = @import("../common/primitive/measurement.zig");
 const abi = @import("../kernel/envelope.zig");
+const node_graph = @import("../kernel/node.zig");
+const resource = @import("../kernel/resource.zig");
+const vocabulary = @import("../kernel/vocabulary.zig");
+
+const Call = abi.Call;
 const Id = abi.Id;
 const Node = abi.Node;
-const Call = abi.Call;
-const vocabulary = @import("../kernel/vocabulary.zig");
-const Failure = vocabulary.Failure;
-const node_graph = @import("../kernel/node.zig");
-const measurement = @import("../common/primitive/measurement.zig");
-const seam = @import("seam");
-const resource = @import("../kernel/resource.zig");
-const Resource = resource.Resource;
 const Limits = resource.Limits;
+const Resource = resource.Resource;
+const Failure = vocabulary.Failure;
 
 pub fn requireSinkCapacity(sink: *Resource, call: *Call, required: usize) Failure!void {
     const capacity = sinkCapacity(sink);

@@ -1,8 +1,10 @@
 const std = @import("std");
+
 const failure = @import("../../common/primitive/failure.zig");
-const Failure = failure.Failure;
 const sink = @import("../../common/sink.zig");
 const window_mod = @import("window.zig");
+
+const Failure = failure.Failure;
 
 // The window must keep the RAW LZ bytes, because later solid entries match back
 // into earlier window regions, so apply each filter to a staged copy instead.

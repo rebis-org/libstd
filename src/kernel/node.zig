@@ -1,7 +1,8 @@
-const abi = @import("./envelope.zig");
-const vocabulary = @import("./vocabulary.zig");
 const catalog = @import("./catalog.zig");
 const discovery = @import("./discovery.zig");
+const abi = @import("./envelope.zig");
+const vocabulary = @import("./vocabulary.zig");
+
 const Failure = vocabulary.Failure;
 
 const max_graph_depth = 32;

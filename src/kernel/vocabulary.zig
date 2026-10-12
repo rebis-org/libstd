@@ -1,10 +1,11 @@
 const contract = @import("interface").contract;
-pub const SizingMode = contract.SizingMode;
-pub const CommitMode = contract.CommitMode;
 
 const failure = @import("../common/primitive/failure.zig");
-pub const Failure = failure.Failure;
 const envelope = @import("envelope.zig");
+
+pub const CommitMode = contract.CommitMode;
+pub const SizingMode = contract.SizingMode;
+pub const Failure = failure.Failure;
 const Id = envelope.Id;
 const Status = envelope.Status;
 

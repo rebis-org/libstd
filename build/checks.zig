@@ -1,5 +1,5 @@
-const std = @import("std");
 const builtin = @import("builtin");
+const std = @import("std");
 
 const modules = @import("modules.zig");
 const common = @import("platform/common.zig");

@@ -1,10 +1,12 @@
 const std = @import("std");
+
 const options = @import("options");
-const onprem = @import("onprem.zig");
 const seam = @import("seam");
 
-pub const Onprem = onprem.Adler32;
+const onprem = @import("onprem.zig");
+
 pub const Offprem = std.hash.Adler32;
+pub const Onprem = onprem.Adler32;
 
 pub const Inner = switch (options.adler32_impl) {
     .onprem => FixedAdler(.onprem, Onprem),

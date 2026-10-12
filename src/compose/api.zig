@@ -1,16 +1,14 @@
 const std = @import("std");
 
 const envelope = @import("../kernel/envelope.zig");
+const vocabulary = @import("../kernel/vocabulary.zig");
 const drivers = @import("drivers.zig");
 const sessions = @import("sessions.zig");
 const Failure = @import("../common/primitive/failure.zig").Failure;
 
 // Caller-owned storage: the handle IS the storage pointer, so no allocator, registry, or global state and sessions stay isolated.
 // Destroy nulls the ops word so post-destroy steps fail deterministically. No span constructor because it would be a no-op.
-
 const Session = sessions.Session;
-
-const vocabulary = @import("../kernel/vocabulary.zig");
 
 fn failureStatus(failure: Failure) u32 {
     inline for (vocabulary.error_map) |entry| if (failure == entry.failure) return entry.status;

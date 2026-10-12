@@ -1,8 +1,9 @@
 const std = @import("std");
+
 const span = @import("span.zig");
 
-const Span = span.Span;
 const Failure = span.Failure;
+const Span = span.Span;
 
 pub const Block = struct {
     storage: []u8,

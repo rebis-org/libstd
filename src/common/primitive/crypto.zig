@@ -1,13 +1,23 @@
 const std = @import("std");
-const options = @import("options");
 
-const Failure = @import("failure.zig").Failure;
+const options = @import("options");
 const seam = @import("seam");
-const sha1_seam = @import("hash/sha1/seam.zig");
-const sha256_seam = @import("hash/sha256/seam.zig");
+
+const aes_seam = @import("cipher/aes/seam.zig");
 const hmac_seam = @import("hash/hmac/seam.zig");
 const pbkdf2_seam = @import("hash/pbkdf2/seam.zig");
-const aes_seam = @import("cipher/aes/seam.zig");
+const sha1_seam = @import("hash/sha1/seam.zig");
+const sha256_seam = @import("hash/sha256/seam.zig");
+const Failure = @import("failure.zig").Failure;
+
+pub const Provider = seam.Provider;
+pub const default_provider = seam.default_provider;
+pub const HmacSha1 = hmac_seam.HmacSha1;
+pub const HmacSha256 = hmac_seam.HmacSha256;
+pub const Sha1 = sha1_seam.Sha1;
+// Capability seams keep every block primitive swappable per capability; this
+// glue never names an implementation directly.
+pub const Sha256 = sha256_seam.Sha256;
 
 pub const block_length = 16;
 pub const hmac_sha1_length = 20;
@@ -18,9 +28,6 @@ pub const winzip_pbkdf2_rounds = 1000;
 pub const seven_zip_cycles_max = 24;
 pub const seven_zip_default_cycles = 19;
 
-pub const Provider = seam.Provider;
-pub const default_provider = seam.default_provider;
-
 pub const FailureCause = enum {
     none,
     wrong_password,
@@ -29,13 +36,6 @@ pub const FailureCause = enum {
     unsupported_algorithm,
 };
 
-// Capability seams keep every block primitive swappable per capability; this
-// glue never names an implementation directly.
-pub const Sha256 = sha256_seam.Sha256;
-pub const Sha1 = sha1_seam.Sha1;
-
-pub const HmacSha1 = hmac_seam.HmacSha1;
-pub const HmacSha256 = hmac_seam.HmacSha256;
 pub const hmac_sha256_length = 32;
 
 pub fn hmacWith(comptime H: type, provider: Provider, out: *[H.mac_length]u8, message: []const u8, key: []const u8) void {

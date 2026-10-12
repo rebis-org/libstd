@@ -1,13 +1,14 @@
 const std = @import("std");
 
 const checksum = @import("../common/primitive/checksum.zig");
-const Bzip2Crc32 = checksum.Bzip2Crc32;
 const failure_prim = @import("../common/primitive/failure.zig");
-const Failure = failure_prim.Failure;
-pub const DecodeError = Failure;
-pub const EncodeError = Failure;
 const io = @import("../common/primitive/io.zig");
 const measurement = @import("../common/primitive/measurement.zig");
+
+pub const DecodeError = Failure;
+pub const EncodeError = Failure;
+const Bzip2Crc32 = checksum.Bzip2Crc32;
+const Failure = failure_prim.Failure;
 
 pub const block_size_min = 100_000;
 pub const block_size_max = 900_000;

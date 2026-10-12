@@ -1,7 +1,11 @@
 const std = @import("std");
 
+// Rows derive from descriptors, so removing one removes its rows with no central edits.
+const generated = @import("components");
+
 // Kind uses the released profile stem (seven_zip); Cmd mirrors the
 // reference binary name (7zz); Lib mirrors the bridge module name.
+
 pub const Kind = enum { gzip, bzip2, lzma, lzma2, lzma_file, xz, zstd, tar, zip, seven_zip, rar, zlib, lz4 };
 pub const Cmd = enum { sevenzz, zstd, xz, bzip2, gzip, tar, ziptool, unrar, lzma, lz4 };
 pub const Lib = enum { sevenzip, zstd, bzip2, xz, lzma7z, libzip, unrar, fast_lzma2, zlib, lz4 };
@@ -31,9 +35,6 @@ pub const Base = struct {
     decode_only: bool = false,
     ref_params: []const u8 = "",
 };
-
-// Rows derive from descriptors, so removing one removes its rows with no central edits.
-const generated = @import("components");
 
 fn enumFor(comptime T: type, comptime what: []const u8, comptime name: []const u8) T {
     return std.meta.stringToEnum(T, name) orelse @compileError("unknown benchmark " ++ what ++ ": " ++ name ++ ".");

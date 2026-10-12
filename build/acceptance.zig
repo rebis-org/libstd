@@ -1,5 +1,7 @@
 const std = @import("std");
 
+const Translator = @import("translate_c").Translator;
+
 const cmd = @import("acceptance/benchmark/command.zig");
 const sevenzip = @import("acceptance/benchmark/ref/sevenzip.zig");
 const modules = @import("modules.zig");
@@ -51,8 +53,6 @@ fn addAcceptanceApp(
     b.step(step_name, step_description).dependOn(&run.step);
     return .{ .exe = exe, .run = run };
 }
-
-const Translator = @import("translate_c").Translator;
 
 fn translateCModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) *std.Build.Module {
     // C translation moved out of the toolchain in 0.17.0: the ZSF translate-c

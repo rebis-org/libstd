@@ -1,13 +1,14 @@
 const std = @import("std");
 
 const interface = @import("interface");
-pub const Failure = interface.span.Failure;
 
 const zstd = @import("../leaf/zstd.zig");
-pub const Options = zstd.Options;
 const sizing = @import("sizing.zig");
-pub const zstdEncodeHistoryLen = sizing.encodeHistoryLen;
+
+pub const Failure = interface.span.Failure;
+pub const Options = zstd.Options;
 pub const zstdDecodeHistoryLen = sizing.decodeHistoryLen;
+pub const zstdEncodeHistoryLen = sizing.encodeHistoryLen;
 
 // Caller wires spans straight to the leaf, so byte-identity is expected.
 

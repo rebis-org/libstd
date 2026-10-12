@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const failure = @import("failure.zig");
+
 const Failure = failure.Failure;
 
 fn add(comptime T: type, augend: T, addend: T) Failure!T {

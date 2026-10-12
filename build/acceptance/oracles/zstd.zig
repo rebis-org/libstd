@@ -4,8 +4,9 @@ const abi = @import("abi.zig");
 const corpus = @import("corpus.zig");
 const harness = @import("harness.zig");
 const lib = @import("lib.zig");
-const Runner = harness.Runner;
 const steps = @import("steps.zig");
+
+const Runner = harness.Runner;
 
 fn baseParams(out: *[steps.MaxExtra]harness.Node) usize {
     out[0] = harness.paramScalar(harness.param_family_zstd, harness.zstd_window, harness.cmd_all, 1 << 22);

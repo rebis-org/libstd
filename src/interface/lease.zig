@@ -1,8 +1,8 @@
 const span_module = @import("span.zig");
 
-const Span = span_module.Span;
 const ConstSpan = span_module.ConstSpan;
 const Failure = span_module.Failure;
+const Span = span_module.Span;
 
 // Caller frees are unobservable, so memory is leased per session.
 pub const Lease = struct {

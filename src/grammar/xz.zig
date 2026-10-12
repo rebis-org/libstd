@@ -5,7 +5,6 @@ const bounds = @import("../common/primitive/bounds.zig");
 const checksum = @import("../common/primitive/checksum.zig");
 const crypto = @import("../common/primitive/crypto.zig");
 const failure_prim = @import("../common/primitive/failure.zig");
-const Failure = failure_prim.Failure;
 const io = @import("../common/primitive/io.zig");
 const measurement = @import("../common/primitive/measurement.zig");
 const tee = @import("../common/primitive/tee.zig");
@@ -13,6 +12,8 @@ const bcj = @import("../leaf/bcj.zig");
 const delta = @import("../leaf/delta.zig");
 const lzma = @import("../leaf/lzma.zig");
 const lzma2 = @import("../leaf/lzma2.zig");
+
+const Failure = failure_prim.Failure;
 
 pub const header_magic = [6]u8{ 0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00 };
 pub const footer_magic = [2]u8{ 0x59, 0x5A };
