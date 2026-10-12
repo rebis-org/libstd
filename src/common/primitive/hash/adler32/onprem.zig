@@ -2,6 +2,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 
 const options = @import("options");
+const seam = @import("seam");
 
 // RFC 1950.
 // The 16-way unrolled inner loop defers the modulo to one reduction per NMAX bytes.
@@ -127,25 +128,5 @@ pub const Adler32 = struct {
 };
 
 test "adler32 onprem matches the std oracle" {
-    var rng = std.Random.DefaultPrng.init(0xA012);
-    var size: usize = 0;
-    while (size <= 1024) : (size += 1) {
-        const buf = try std.testing.allocator.alloc(u8, size);
-        defer std.testing.allocator.free(buf);
-        rng.random().bytes(buf);
-        var ours = Adler32.init();
-        ours.update(buf[0 .. size / 2]);
-        ours.update(buf[size / 2 ..]);
-        var theirs: std.hash.Adler32 = .{};
-        theirs.update(buf);
-        try std.testing.expectEqual(theirs.adler, ours.final());
-    }
-    const long = try std.testing.allocator.alloc(u8, 1 << 20);
-    defer std.testing.allocator.free(long);
-    rng.random().bytes(long);
-    var ours = Adler32.init();
-    ours.update(long);
-    var theirs: std.hash.Adler32 = .{};
-    theirs.update(long);
-    try std.testing.expectEqual(theirs.adler, ours.final());
+    try seam.expectAgreement(Adler32.init(), std.hash.Adler32{}, 0xA012, false, "adler");
 }

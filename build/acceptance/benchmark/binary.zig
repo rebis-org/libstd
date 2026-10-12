@@ -46,7 +46,7 @@ fn download(io: std.Io, url: []const u8, path: []const u8) !void {
 fn extractMember(io: std.Io, iterator: *std.tar.Iterator, entry: std.tar.Iterator.File, stage_dir: []const u8, member: []const u8) !void {
     const dest = try std.heap.page_allocator.print("{s}/{s}", .{ stage_dir, member });
     defer std.heap.page_allocator.free(dest);
-    if (std.mem.lastIndexOfScalar(u8, dest, '/')) |slash| {
+    if (std.mem.findScalarLast(u8, dest, '/')) |slash| {
         try std.Io.Dir.cwd().createDirPath(io, dest[0..slash]);
     }
     var file = try std.Io.Dir.cwd().createFile(io, dest, .{ .truncate = true, .permissions = @fromBackingInt(@intCast(0o755)) });
@@ -80,8 +80,8 @@ fn extract(io: std.Io, init: std.process.Init, archive: []const u8, stage_dir: [
         return error.unsupported_archive;
     }
 
-    var name_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    var link_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var name_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var link_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     var iterator = std.tar.Iterator.init(&gzip.reader, .{
         .file_name_buffer = &name_buffer,
         .link_name_buffer = &link_buffer,
@@ -130,7 +130,9 @@ pub fn main(init: std.process.Init) !void {
     if (std.Io.Dir.cwd().access(io, archive_path, .{})) |_| {
         const digest = try sha256File(io, archive_path);
         confirmed = std.mem.eql(u8, &digest, &expected);
-    } else |_| {}
+    } else |_| {
+        // A cache miss leaves confirmed false and falls through to the download.
+    }
     if (!confirmed) {
         std.debug.print("downloading {s}\n", .{url});
         try download(io, url, archive_path);

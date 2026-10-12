@@ -43,10 +43,10 @@ const Replacement = struct { marker: []const u8, value: []const u8 };
 fn substitute(comptime template: []const u8, comptime values: []const Replacement) []const u8 {
     var output = template;
     inline for (values) |replacement| {
-        const index = std.mem.indexOf(u8, output, replacement.marker) orelse @compileError("header template marker is missing.");
-        if (std.mem.indexOfPos(u8, output, index + replacement.marker.len, replacement.marker) != null) @compileError("header template marker must be unique.");
+        const index = std.mem.find(u8, output, replacement.marker) orelse @compileError("header template marker is missing.");
+        if (std.mem.findPos(u8, output, index + replacement.marker.len, replacement.marker) != null) @compileError("header template marker must be unique.");
         output = output[0..index] ++ replacement.value ++ output[index + replacement.marker.len ..];
     }
-    if (std.mem.indexOf(u8, output, "@STDK_") != null) @compileError("template has an unresolved standard-kit marker.");
+    if (std.mem.find(u8, output, "@STDK_") != null) @compileError("template has an unresolved standard-kit marker.");
     return output;
 }

@@ -17,7 +17,7 @@ fn lzmaParams(r: *Runner, out: *[steps.MaxExtra]harness.Node) usize {
     out[0] = harness.lzmaDictionaryParam(r.lzma_dictionary);
     var count: usize = 1;
     if (r.lzma_match_finder) |value| {
-        out[count] = harness.paramScalar(harness.param_family_lzma, harness.lzma_match_finder, harness.cmd_all, value);
+        out[count] = harness.paramScalar(harness.param_family_lzma, harness.lzma_match_finder, harness.cmds, value);
         count += 1;
     }
     return count;
@@ -816,40 +816,40 @@ fn scanSize(input: []const u8) !?usize {
             need_properties = true;
             need_dictionary_reset = true;
         } else if (need_dictionary_reset) {
-            return error.InvalidData;
+            return error.DataFailure;
         }
         if (control & 0x80 != 0) {
-            if (pos + 2 > input.len) return error.InvalidData;
+            if (pos + 2 > input.len) return error.DataFailure;
             const unpack_size = (((@as(usize, control & 0x0F) << 16) | (@as(usize, input[pos]) << 8) | input[pos + 1]) + 1);
             pos += 2;
-            if (pos + 2 > input.len) return error.InvalidData;
+            if (pos + 2 > input.len) return error.DataFailure;
             const pack_size = ((@as(usize, input[pos]) << 8) | input[pos + 1]) + 1;
             pos += 2;
-            if (unpack_size > chunk_max_unpacked_local or pack_size < 5 or pack_size > max_pack_size) return error.InvalidData;
+            if (unpack_size > chunk_max_unpacked_local or pack_size < 5 or pack_size > max_pack_size) return error.DataFailure;
             if (control >= control_lzma_new_props) {
-                if (pos >= input.len) return error.InvalidData;
+                if (pos >= input.len) return error.DataFailure;
                 pos += 1;
                 need_properties = false;
                 if (control >= control_lzma_new_props_reset_dic) need_dictionary_reset = false;
             } else {
-                if (need_properties) return error.InvalidData;
+                if (need_properties) return error.DataFailure;
             }
             pos += pack_size;
-            if (pos > input.len) return error.InvalidData;
-            total = std.math.add(usize, total, unpack_size) catch return error.ResourceLimit;
+            if (pos > input.len) return error.DataFailure;
+            total = std.math.add(usize, total, unpack_size) catch return error.ResourceFailure;
         } else {
-            if (control != control_copy_reset_dic and control != control_copy) return error.InvalidData;
-            if (pos + 2 > input.len) return error.InvalidData;
+            if (control != control_copy_reset_dic and control != control_copy) return error.DataFailure;
+            if (pos + 2 > input.len) return error.DataFailure;
             const unpack_size = ((@as(usize, input[pos]) << 8) | input[pos + 1]) + 1;
             pos += 2;
-            if (unpack_size > chunk_max_unpacked_local) return error.InvalidData;
+            if (unpack_size > chunk_max_unpacked_local) return error.DataFailure;
             if (need_dictionary_reset) need_dictionary_reset = false;
             pos += unpack_size;
-            if (pos > input.len) return error.InvalidData;
-            total = std.math.add(usize, total, unpack_size) catch return error.ResourceLimit;
+            if (pos > input.len) return error.DataFailure;
+            total = std.math.add(usize, total, unpack_size) catch return error.ResourceFailure;
         }
     }
-    return error.InvalidData;
+    return error.DataFailure;
 }
 
 pub fn runScanTiming(r: *Runner) !void {
@@ -907,6 +907,15 @@ pub fn runScanTiming(r: *Runner) !void {
     });
 }
 
+fn abEncodeMatrix(r: *Runner, input: []const u8) !void {
+    try abEncodeAndWrite(r, harness.ids.lzma, 4096, 0, input, "lzma_hc.bin");
+    try abEncodeAndWrite(r, harness.ids.lzma, 4096, 1, input, "lzma_bt4.bin");
+    try abEncodeAndWrite(r, harness.ids.lzma2, 4096, 0, input, "lzma2_hc.bin");
+    try abEncodeAndWrite(r, harness.ids.lzma2, 4096, 1, input, "lzma2_bt4.bin");
+    try abEncodeAndWrite(r, harness.ids.xz, 4096, 0, input, "xz_hc.bin");
+    try abEncodeAndWrite(r, harness.ids.xz, 4096, 1, input, "xz_bt4.bin");
+}
+
 fn abEncodeAndWrite(r: *Runner, profile_id: harness.Id, dictionary: u64, finder: ?u64, input: []const u8, label: []const u8) !void {
     const mode = if (abi.isIdEqual(profile_id, harness.ids.xz)) harness.mode_xz else harness.mode_stream;
     harness.setup(r, profile_id, mode);
@@ -923,13 +932,13 @@ fn abEncodeAndWrite(r: *Runner, profile_id: harness.Id, dictionary: u64, finder:
     };
     const encoded_len: usize = r.encoded_len;
 
-    const dir = try std.fs.path.join(r.gpa, &.{
+    const dir = try std.Io.Dir.path.join(r.gpa, &.{
         "zig-out", "oracles", "ab", ab_variant.name, r.scenario_name,
     });
     defer r.gpa.free(dir);
-    const path = try std.fs.path.join(r.gpa, &.{ dir, label });
+    const path = try std.Io.Dir.path.join(r.gpa, &.{ dir, label });
     defer r.gpa.free(path);
-    if (std.fs.path.dirname(path)) |parent| {
+    if (std.Io.Dir.path.dirname(path)) |parent| {
         try std.Io.Dir.cwd().createDirPath(harness.oracle_io, parent);
     }
     try std.Io.Dir.cwd().writeFile(harness.oracle_io, .{
@@ -974,24 +983,14 @@ fn runLzmaAbZeros(r: *Runner) !void {
 
 fn runLzmaAbSameByte(r: *Runner) !void {
     const input: [1024]u8 = @splat(0xa5);
-    try abEncodeAndWrite(r, harness.ids.lzma, 4096, 0, &input, "lzma_hc.bin");
-    try abEncodeAndWrite(r, harness.ids.lzma, 4096, 1, &input, "lzma_bt4.bin");
-    try abEncodeAndWrite(r, harness.ids.lzma2, 4096, 0, &input, "lzma2_hc.bin");
-    try abEncodeAndWrite(r, harness.ids.lzma2, 4096, 1, &input, "lzma2_bt4.bin");
-    try abEncodeAndWrite(r, harness.ids.xz, 4096, 0, &input, "xz_hc.bin");
-    try abEncodeAndWrite(r, harness.ids.xz, 4096, 1, &input, "xz_bt4.bin");
+    try abEncodeMatrix(r, &input);
 }
 
 fn runLzmaAbRandom(r: *Runner) !void {
     var input: [1024]u8 = undefined;
     var prng = std.Random.DefaultPrng.init(0xc09f10);
     prng.fill(&input);
-    try abEncodeAndWrite(r, harness.ids.lzma, 4096, 0, &input, "lzma_hc.bin");
-    try abEncodeAndWrite(r, harness.ids.lzma, 4096, 1, &input, "lzma_bt4.bin");
-    try abEncodeAndWrite(r, harness.ids.lzma2, 4096, 0, &input, "lzma2_hc.bin");
-    try abEncodeAndWrite(r, harness.ids.lzma2, 4096, 1, &input, "lzma2_bt4.bin");
-    try abEncodeAndWrite(r, harness.ids.xz, 4096, 0, &input, "xz_hc.bin");
-    try abEncodeAndWrite(r, harness.ids.xz, 4096, 1, &input, "xz_bt4.bin");
+    try abEncodeMatrix(r, &input);
 }
 
 fn runLzmaAbSparseRuns(r: *Runner) !void {
@@ -1001,24 +1000,14 @@ fn runLzmaAbSparseRuns(r: *Runner) !void {
         const byte: u8 = @truncate((i / 64) + 1);
         @memset(input[i..][0..@min(64, input.len - i)], byte);
     }
-    try abEncodeAndWrite(r, harness.ids.lzma, 4096, 0, &input, "lzma_hc.bin");
-    try abEncodeAndWrite(r, harness.ids.lzma, 4096, 1, &input, "lzma_bt4.bin");
-    try abEncodeAndWrite(r, harness.ids.lzma2, 4096, 0, &input, "lzma2_hc.bin");
-    try abEncodeAndWrite(r, harness.ids.lzma2, 4096, 1, &input, "lzma2_bt4.bin");
-    try abEncodeAndWrite(r, harness.ids.xz, 4096, 0, &input, "xz_hc.bin");
-    try abEncodeAndWrite(r, harness.ids.xz, 4096, 1, &input, "xz_bt4.bin");
+    try abEncodeMatrix(r, &input);
 }
 
 fn runLzmaAbText(r: *Runner) !void {
     const pattern = "the quick brown fox jumps over the lazy dog 0123456789 ";
     var input: [2000]u8 = undefined;
     for (&input, 0..) |*b, i| b.* = pattern[i % pattern.len];
-    try abEncodeAndWrite(r, harness.ids.lzma, 4096, 0, &input, "lzma_hc.bin");
-    try abEncodeAndWrite(r, harness.ids.lzma, 4096, 1, &input, "lzma_bt4.bin");
-    try abEncodeAndWrite(r, harness.ids.lzma2, 4096, 0, &input, "lzma2_hc.bin");
-    try abEncodeAndWrite(r, harness.ids.lzma2, 4096, 1, &input, "lzma2_bt4.bin");
-    try abEncodeAndWrite(r, harness.ids.xz, 4096, 0, &input, "xz_hc.bin");
-    try abEncodeAndWrite(r, harness.ids.xz, 4096, 1, &input, "xz_bt4.bin");
+    try abEncodeMatrix(r, &input);
 }
 
 fn runLzmaAbAlternating(r: *Runner) !void {
@@ -1028,12 +1017,7 @@ fn runLzmaAbAlternating(r: *Runner) !void {
         const byte: u8 = if ((i / 32) & 1 == 0) @as(u8, 'a') + @as(u8, @truncate((i / 64) % 26)) else 0;
         @memset(input[i..][0..@min(32, input.len - i)], byte);
     }
-    try abEncodeAndWrite(r, harness.ids.lzma, 4096, 0, &input, "lzma_hc.bin");
-    try abEncodeAndWrite(r, harness.ids.lzma, 4096, 1, &input, "lzma_bt4.bin");
-    try abEncodeAndWrite(r, harness.ids.lzma2, 4096, 0, &input, "lzma2_hc.bin");
-    try abEncodeAndWrite(r, harness.ids.lzma2, 4096, 1, &input, "lzma2_bt4.bin");
-    try abEncodeAndWrite(r, harness.ids.xz, 4096, 0, &input, "xz_hc.bin");
-    try abEncodeAndWrite(r, harness.ids.xz, 4096, 1, &input, "xz_bt4.bin");
+    try abEncodeMatrix(r, &input);
 }
 
 fn runLzmaAbZerosChunkBoundary(r: *Runner) !void {

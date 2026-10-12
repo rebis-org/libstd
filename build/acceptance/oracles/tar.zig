@@ -55,13 +55,16 @@ fn tarPaxRecord(buffer: []u8, key: []const u8, value: []const u8) usize {
     var total: usize = 0;
     var digits: [32]u8 = undefined;
     for (1..64) |length| {
-        const digit_text = std.fmt.bufPrint(&digits, "{d}", .{length}) catch return 0;
+        var digit_writer: std.Io.Writer = std.Io.Writer.fixed(&digits);
+        digit_writer.print("{d}", .{length}) catch return 0;
+        const digit_text = digit_writer.buffered();
         total = digit_text.len + 1 + content + 1;
         if (total == length) break;
     }
     if (total >= buffer.len) return 0;
-    const text = std.fmt.bufPrint(buffer[0..buffer.len], "{d} {s}={s}\n", .{ total, key, value }) catch return 0;
-    return text.len;
+    var field_writer: std.Io.Writer = std.Io.Writer.fixed(buffer[0..buffer.len]);
+    field_writer.print("{d} {s}={s}\n", .{ total, key, value }) catch return 0;
+    return field_writer.buffered().len;
 }
 
 const EntryNodes = struct {
@@ -270,11 +273,6 @@ fn tarSparseReadOrdinal(r: *Runner, archive: []const u8, ordinal: u64, output: [
     }, .{ .ctx = true });
 }
 
-fn sparseExpected(offset: usize, length: usize, output: []const u8, data: []const u8) bool {
-    if (offset + length > output.len) return false;
-    return std.mem.eql(u8, output[offset .. offset + length], data);
-}
-
 fn tarSparseOld(r: *Runner) !void {
     var archive: [16384]u8 = undefined;
     var block: [512]u8 = undefined;
@@ -381,8 +379,8 @@ fn buildPaxSparse(pax_records: []const []const u8, file_name: []const u8, map_da
     @memset(&sparse_archive, 0);
     @memset(&pax_data, 0);
     for (pax_records) |record| {
-        const key = record[0..std.mem.indexOfScalar(u8, record, '=').?];
-        const value = record[std.mem.indexOfScalar(u8, record, '=').? + 1 ..];
+        const key = record[0..std.mem.findScalar(u8, record, '=').?];
+        const value = record[std.mem.findScalar(u8, record, '=').? + 1 ..];
         pax_len += tarPaxRecord(pax_data[pax_len..], key, value);
     }
     tarFillHeader(&block, "pax/", 'x', pax_len, null);

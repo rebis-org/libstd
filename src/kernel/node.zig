@@ -24,42 +24,41 @@ const Traversal = struct {
 };
 
 fn validateNode(siblings: ?*abi.Node, traversal: *Traversal, depth: usize) Failure!void {
-    if (depth > max_graph_depth) return error.ResourceLimit;
+    if (depth > max_graph_depth) return error.ResourceFailure;
     var cursor = siblings;
     while (cursor) |node| {
-        if (traversal.count == max_node_count) return error.ResourceLimit;
+        if (traversal.count == max_node_count) return error.ResourceFailure;
         traversal.count += 1;
-        if (!node.isValid()) return error.InvalidCall;
+        if (!node.isValid()) return error.CallFailure;
         for (traversal.ancestors[0..depth]) |ancestor| {
-            if (ancestor == node) return error.InvalidCall;
+            if (ancestor == node) return error.CallFailure;
         }
+        var representation: vocabulary.Representation = undefined;
         if (vocabulary.eql(node.id, vocabulary.ids.parameter)) {
             const selector = vocabulary.selectorOf(node.value_high);
             try validateParameter(node, siblings, traversal, selector);
-            if (vocabulary.representationOf(selector) == .node_chain) {
-                try validateChildren(node, traversal, depth);
+            representation = vocabulary.representationOf(selector);
+        } else {
+            const entry = catalog.descriptorFor(node.id) orelse {
+                if ((node.flags & abi.node_flag_optional) == 0) return error.UnsupportedFailure;
+                cursor = node.next;
+                continue;
+            };
+            switch (entry.kind) {
+                .parameter => {
+                    if (!isDirectionAccepted(entry.direction, traversal.direction)) return error.UnsupportedFailure;
+                    if (traversal.direction == .in and (entry.command_mask & traversal.command_mask) == 0) return error.UnsupportedFailure;
+                },
+                .diagnostic => {
+                    if (traversal.direction != .out) return error.UnsupportedFailure;
+                },
+                else => return error.UnsupportedFailure,
             }
-            cursor = node.next;
-            continue;
+            try validateRepresentation(node, entry.representation, false);
+            if (entry.cardinality == .singleton and hasDuplicateSibling(siblings, node)) return error.CallFailure;
+            representation = entry.representation;
         }
-        const entry = catalog.descriptorFor(node.id) orelse {
-            if ((node.flags & abi.node_flag_optional) == 0) return error.Unsupported;
-            cursor = node.next;
-            continue;
-        };
-        switch (entry.kind) {
-            .parameter => {
-                if (!isDirectionAccepted(entry.direction, traversal.direction)) return error.Unsupported;
-                if (traversal.direction == .in and (entry.command_mask & traversal.command_mask) == 0) return error.Unsupported;
-            },
-            .diagnostic => {
-                if (traversal.direction != .out) return error.Unsupported;
-            },
-            else => return error.Unsupported,
-        }
-        try validateRepresentation(node, entry.representation, false);
-        if (entry.cardinality == .singleton and hasDuplicateSibling(siblings, node)) return error.InvalidCall;
-        if (entry.representation == .node_chain) {
+        if (representation == .node_chain) {
             try validateChildren(node, traversal, depth);
         }
         cursor = node.next;
@@ -83,21 +82,21 @@ fn isDirectionAccepted(declared: vocabulary.Direction, used: vocabulary.Directio
 fn validateRepresentation(node: *abi.Node, representation: vocabulary.Representation, allow_value_high: bool) Failure!void {
     switch (representation) {
         .scalar_words => {
-            if (node.bytes != null or node.byte_capacity != 0 or node.byte_length != 0 or node.child != null) return error.InvalidCall;
+            if (node.bytes != null or node.byte_capacity != 0 or node.byte_length != 0 or node.child != null) return error.CallFailure;
         },
         .node_chain => {
-            if (node.bytes != null or node.byte_capacity != 0 or node.byte_length != 0) return error.InvalidCall;
+            if (node.bytes != null or node.byte_capacity != 0 or node.byte_length != 0) return error.CallFailure;
         },
         .bytes => {
-            if (node.child != null or node.byte_length > node.byte_capacity) return error.InvalidCall;
+            if (node.child != null or node.byte_length > node.byte_capacity) return error.CallFailure;
             if ((node.flags & abi.node_flag_callback_resource) != 0) {
-                if (node.bytes != null or node.byte_capacity != 0) return error.InvalidCall;
+                if (node.bytes != null or node.byte_capacity != 0) return error.CallFailure;
             } else {
-                if (node.value_low != 0 or (!allow_value_high and node.value_high != 0) or (node.byte_capacity != 0 and node.bytes == null)) return error.InvalidCall;
+                if (node.value_low != 0 or (!allow_value_high and node.value_high != 0) or (node.byte_capacity != 0 and node.bytes == null)) return error.CallFailure;
             }
         },
         .none => {
-            if (node.bytes != null or node.byte_capacity != 0 or node.byte_length != 0 or node.child != null or node.value_low != 0 or node.value_high != 0) return error.InvalidCall;
+            if (node.bytes != null or node.byte_capacity != 0 or node.byte_length != 0 or node.child != null or node.value_low != 0 or node.value_high != 0) return error.CallFailure;
         },
     }
 }
@@ -113,12 +112,12 @@ fn siblingKey(node: *abi.Node) SiblingKey {
 }
 
 fn validateParameter(node: *abi.Node, siblings: ?*abi.Node, traversal: *Traversal, selector: vocabulary.Selector) Failure!void {
-    if (!vocabulary.isSelectorValid(selector)) return error.InvalidCall;
-    if (!discovery.isSelectorKnown(selector.family, selector.ordinal)) return error.Unsupported;
-    if (!isDirectionAccepted(vocabulary.directionOf(selector), traversal.direction)) return error.Unsupported;
-    if (traversal.direction == .in and (selector.flags & traversal.command_mask) == 0) return error.Unsupported;
+    if (!vocabulary.isSelectorValid(selector)) return error.CallFailure;
+    if (!discovery.isSelectorKnown(selector.family, selector.ordinal)) return error.UnsupportedFailure;
+    if (!isDirectionAccepted(vocabulary.directionOf(selector), traversal.direction)) return error.UnsupportedFailure;
+    if (traversal.direction == .in and (selector.flags & traversal.command_mask) == 0) return error.UnsupportedFailure;
     try validateRepresentation(node, vocabulary.representationOf(selector), true);
-    if (vocabulary.cardinalityOf(selector) == .singleton and hasDuplicateSibling(siblings, node)) return error.InvalidCall;
+    if (vocabulary.cardinalityOf(selector) == .singleton and hasDuplicateSibling(siblings, node)) return error.CallFailure;
 }
 
 fn findIf(siblings: ?*abi.Node, context: anytype, comptime matches: fn (*abi.Node, @TypeOf(context)) bool) ?*abi.Node {
@@ -169,7 +168,7 @@ pub fn findChild(parent: *abi.Node, id: abi.Id) Failure!?*abi.Node {
     var cursor = parent.child;
     while (cursor) |node| : (cursor = node.next) {
         if (!vocabulary.eql(node.id, id)) continue;
-        if (match != null) return error.InvalidCall;
+        if (match != null) return error.CallFailure;
         match = node;
     }
     return match;

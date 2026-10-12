@@ -8,12 +8,8 @@ const harness = @import("harness.zig");
 
 const Runner = harness.Runner;
 
-// Provider-selection coverage: existing scenarios run every call with no
-// provider parameter, which is the absent-means-onprem case. These scenarios
-// pin the explicit parameter: roundtrips per format must agree byte for byte
-// between the boundary default and the offprem provider, a provider no
-// capability can serve is rejected with unsupported, and unknown values are
-// invalid_call.
+// Pins the explicit provider parameter: roundtrips agree byte for byte across
+// providers, unservable tags fail unsupported, unknown values are invalid_call.
 
 var provider_input: [64 * 1024]u8 = undefined;
 var provider_encoded: [80 * 1024]u8 = undefined;
@@ -24,38 +20,33 @@ fn roundtripWithProvider(r: *Runner, profile_id: harness.Id, mode: harness.Mode,
     harness.setup(r, profile_id, mode);
     corpus.fillTiled(r.corpus_index, &provider_input);
     var write_nodes: [8]harness.Node = undefined;
-    var count: usize = 0;
-    nodesAppend(&write_nodes, &count, harness.sourceSpan(&provider_input));
-    nodesAppend(&write_nodes, &count, harness.sinkSpan(encoded));
+    var list = harness.NodeList{ .nodes = &write_nodes };
+    list.push(harness.sourceSpan(&provider_input));
+    list.push(harness.sinkSpan(encoded));
     for (extra_write) |extra| {
-        nodesAppend(&write_nodes, &count, extra);
+        list.push(extra);
     }
     if (provider) |value| {
-        nodesAppend(&write_nodes, &count, harness.providerParam(value));
+        list.push(harness.providerParam(value));
     }
-    try harness.spanProduce(r, harness.ids.write, write_nodes[0..count]);
+    try harness.spanProduce(r, harness.ids.write, list.items());
     var read_nodes: [6]harness.Node = undefined;
-    var read_count: usize = 0;
-    nodesAppend(&read_nodes, &read_count, harness.sourceSpan(encoded[0..r.encoded_len]));
-    nodesAppend(&read_nodes, &read_count, harness.sinkSpan(&provider_output));
+    var read_list = harness.NodeList{ .nodes = &read_nodes };
+    read_list.push(harness.sourceSpan(encoded[0..r.encoded_len]));
+    read_list.push(harness.sinkSpan(&provider_output));
     for (extra_read) |extra| {
-        nodesAppend(&read_nodes, &read_count, extra);
+        read_list.push(extra);
     }
     if (provider) |value| {
-        nodesAppend(&read_nodes, &read_count, harness.providerParam(value));
+        read_list.push(harness.providerParam(value));
     }
-    _ = harness.call(r, harness.ids.read, read_nodes[0..read_count], .{ .ctx = true });
+    _ = harness.call(r, harness.ids.read, read_list.items(), .{ .ctx = true });
     if (r.status != abi.Status.ok) {
         std.debug.print("provider roundtrip read failed: status {d} provider {?d}\n", .{ r.status, provider });
         return error.ProviderRoundtripReadFailed;
     }
     if (r.response.byte_length != provider_input.len) return error.ProviderRoundtripLengthMismatch;
     if (!std.mem.eql(u8, provider_output[0..provider_input.len], &provider_input)) return error.ProviderRoundtripContentMismatch;
-}
-
-fn nodesAppend(nodes: []harness.Node, count: *usize, node: harness.Node) void {
-    nodes[count.*] = node;
-    count.* += 1;
 }
 
 fn providersAgree(r: *Runner, profile_id: harness.Id, mode: harness.Mode, extra_write: []const harness.Node, extra_read: []const harness.Node) anyerror!void {
@@ -73,7 +64,7 @@ pub fn runGzipProvider(r: *Runner) anyerror!void {
 }
 
 pub fn runZstdProvider(r: *Runner) anyerror!void {
-    const window = [_]harness.Node{harness.paramScalar(harness.param_family_zstd, harness.zstd_window, harness.cmd_all, 1 << 22)};
+    const window = [_]harness.Node{harness.paramScalar(harness.param_family_zstd, harness.zstd_window, harness.cmds, 1 << 22)};
     try providersAgree(r, harness.ids.zstd, harness.mode_xz, &window, &window);
 }
 

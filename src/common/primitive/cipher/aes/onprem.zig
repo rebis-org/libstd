@@ -407,6 +407,30 @@ fn KeySchedule(comptime Aes: type) type {
     };
 }
 
+// Four live blocks hide the aes round-instruction latency (std modes parallel shape).
+fn wide4(
+    round_keys: anytype,
+    dst: *[64]u8,
+    src: *const [64]u8,
+    comptime rounds: usize,
+    comptime op: fn (Block, Block) Block,
+    comptime op_last: fn (Block, Block) Block,
+) void {
+    var blocks: [4]Block = undefined;
+    inline for (&blocks, 0..) |*block, index| {
+        block.* = Block.fromBytes(src[index * 16 ..][0..16]).xorBlocks(round_keys[0]);
+    }
+    inline for (1..rounds) |round| {
+        inline for (&blocks) |*block| {
+            block.* = op(block.*, round_keys[round]);
+        }
+    }
+    inline for (&blocks, 0..) |*block, index| {
+        block.* = op_last(block.*, round_keys[rounds]);
+        dst[index * 16 ..][0..16].* = block.toBytes();
+    }
+}
+
 pub fn AesEncryptCtx(comptime Aes: type) type {
     const rounds = Aes.rounds;
 
@@ -436,27 +460,8 @@ pub fn AesEncryptCtx(comptime Aes: type) type {
             dst.* = t.toBytes();
         }
 
-        // Four live blocks hide the aese latency (std modes parallel shape).
         pub fn encryptWide4(ctx: Self, dst: *[64]u8, src: *const [64]u8) void {
-            const round_keys = ctx.key_schedule.round_keys;
-            var b0 = Block.fromBytes(src[0..16]).xorBlocks(round_keys[0]);
-            var b1 = Block.fromBytes(src[16..32]).xorBlocks(round_keys[0]);
-            var b2 = Block.fromBytes(src[32..48]).xorBlocks(round_keys[0]);
-            var b3 = Block.fromBytes(src[48..64]).xorBlocks(round_keys[0]);
-            inline for (1..rounds) |index| {
-                b0 = b0.encrypt(round_keys[index]);
-                b1 = b1.encrypt(round_keys[index]);
-                b2 = b2.encrypt(round_keys[index]);
-                b3 = b3.encrypt(round_keys[index]);
-            }
-            b0 = b0.encryptLast(round_keys[rounds]);
-            b1 = b1.encryptLast(round_keys[rounds]);
-            b2 = b2.encryptLast(round_keys[rounds]);
-            b3 = b3.encryptLast(round_keys[rounds]);
-            dst[0..16].* = b0.toBytes();
-            dst[16..32].* = b1.toBytes();
-            dst[32..48].* = b2.toBytes();
-            dst[48..64].* = b3.toBytes();
+            wide4(&ctx.key_schedule.round_keys, dst, src, rounds, Block.encrypt, Block.encryptLast);
         }
     };
 }
@@ -483,27 +488,8 @@ pub fn AesDecryptCtx(comptime Aes: type) type {
             dst.* = t.toBytes();
         }
 
-        // Four live blocks hide the aesd latency, mirroring encryptWide4.
         pub fn decryptWide4(ctx: Self, dst: *[64]u8, src: *const [64]u8) void {
-            const round_keys = ctx.key_schedule.round_keys;
-            var b0 = Block.fromBytes(src[0..16]).xorBlocks(round_keys[0]);
-            var b1 = Block.fromBytes(src[16..32]).xorBlocks(round_keys[0]);
-            var b2 = Block.fromBytes(src[32..48]).xorBlocks(round_keys[0]);
-            var b3 = Block.fromBytes(src[48..64]).xorBlocks(round_keys[0]);
-            inline for (1..rounds) |index| {
-                b0 = b0.decrypt(round_keys[index]);
-                b1 = b1.decrypt(round_keys[index]);
-                b2 = b2.decrypt(round_keys[index]);
-                b3 = b3.decrypt(round_keys[index]);
-            }
-            b0 = b0.decryptLast(round_keys[rounds]);
-            b1 = b1.decryptLast(round_keys[rounds]);
-            b2 = b2.decryptLast(round_keys[rounds]);
-            b3 = b3.decryptLast(round_keys[rounds]);
-            dst[0..16].* = b0.toBytes();
-            dst[16..32].* = b1.toBytes();
-            dst[32..48].* = b2.toBytes();
-            dst[48..64].* = b3.toBytes();
+            wide4(&ctx.key_schedule.round_keys, dst, src, rounds, Block.decrypt, Block.decryptLast);
         }
     };
 }
@@ -575,52 +561,16 @@ pub const Aes192Hw = struct {
         cryptBlock(self, dst, src, .encrypt);
     }
 
-    // Four live blocks hide the aese latency (std modes parallel shape).
     pub fn encryptWide4(self: Aes192Hw, dst: *[64]u8, src: *const [64]u8) void {
-        var b0 = Block.fromBytes(src[0..16]).xorBlocks(self.round_keys[0]);
-        var b1 = Block.fromBytes(src[16..32]).xorBlocks(self.round_keys[0]);
-        var b2 = Block.fromBytes(src[32..48]).xorBlocks(self.round_keys[0]);
-        var b3 = Block.fromBytes(src[48..64]).xorBlocks(self.round_keys[0]);
-        inline for (1..rounds) |index| {
-            b0 = b0.encrypt(self.round_keys[index]);
-            b1 = b1.encrypt(self.round_keys[index]);
-            b2 = b2.encrypt(self.round_keys[index]);
-            b3 = b3.encrypt(self.round_keys[index]);
-        }
-        b0 = b0.encryptLast(self.round_keys[rounds]);
-        b1 = b1.encryptLast(self.round_keys[rounds]);
-        b2 = b2.encryptLast(self.round_keys[rounds]);
-        b3 = b3.encryptLast(self.round_keys[rounds]);
-        dst[0..16].* = b0.toBytes();
-        dst[16..32].* = b1.toBytes();
-        dst[32..48].* = b2.toBytes();
-        dst[48..64].* = b3.toBytes();
+        wide4(&self.round_keys, dst, src, rounds, Block.encrypt, Block.encryptLast);
     }
 
     pub fn decrypt(self: Aes192Hw, dst: *[block_length]u8, src: *const [block_length]u8) void {
         cryptBlock(self, dst, src, .decrypt);
     }
 
-    // Four live blocks hide the aesd latency, mirroring encryptWide4.
     pub fn decryptWide4(self: Aes192Hw, dst: *[64]u8, src: *const [64]u8) void {
-        var b0 = Block.fromBytes(src[0..16]).xorBlocks(self.round_keys[0]);
-        var b1 = Block.fromBytes(src[16..32]).xorBlocks(self.round_keys[0]);
-        var b2 = Block.fromBytes(src[32..48]).xorBlocks(self.round_keys[0]);
-        var b3 = Block.fromBytes(src[48..64]).xorBlocks(self.round_keys[0]);
-        inline for (1..rounds) |index| {
-            b0 = b0.decrypt(self.round_keys[index]);
-            b1 = b1.decrypt(self.round_keys[index]);
-            b2 = b2.decrypt(self.round_keys[index]);
-            b3 = b3.decrypt(self.round_keys[index]);
-        }
-        b0 = b0.decryptLast(self.round_keys[rounds]);
-        b1 = b1.decryptLast(self.round_keys[rounds]);
-        b2 = b2.decryptLast(self.round_keys[rounds]);
-        b3 = b3.decryptLast(self.round_keys[rounds]);
-        dst[0..16].* = b0.toBytes();
-        dst[16..32].* = b1.toBytes();
-        dst[32..48].* = b2.toBytes();
-        dst[48..64].* = b3.toBytes();
+        wide4(&self.round_keys, dst, src, rounds, Block.decrypt, Block.decryptLast);
     }
 };
 

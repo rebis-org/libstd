@@ -209,7 +209,7 @@ fn forgedSelector(r: *Runner) !void {
     const input = "x";
     var output: [16]u8 = @splat(0xa5);
     var forged = harness.scalarNode(harness.ids.parameter);
-    forged.value_high = harness.paramSelector(99, 1, 0x11, harness.cmd_all);
+    forged.value_high = harness.paramSelector(99, 1, 0x11, harness.cmds);
     try harness.reject(r, harness.ids.read, &.{
         harness.paramProfile(harness.ids.test_echo),
         harness.sourceSpan(input),
@@ -251,7 +251,7 @@ fn depthLimit(r: *Runner) !void {
     var nodes: [40]harness.Node = undefined;
     for (&nodes, 0..) |*n, i| {
         n.* = harness.scalarNode(harness.ids.parameter);
-        n.value_high = harness.paramSelector(harness.param_family_archive, harness.archive_entry, 0x17, harness.cmd_all);
+        n.value_high = harness.paramSelector(harness.param_family_archive, harness.archive_entry, 0x17, harness.cmds);
         if (i + 1 < nodes.len) n.child = &nodes[i + 1];
     }
     r.response = harness.node(null, 0);
@@ -261,7 +261,7 @@ fn depthLimit(r: *Runner) !void {
 
 fn cycleReject(r: *Runner) !void {
     var first = harness.scalarNode(harness.ids.parameter);
-    first.value_high = harness.paramSelector(harness.param_family_archive, harness.archive_entry, 0x17, harness.cmd_all);
+    first.value_high = harness.paramSelector(harness.param_family_archive, harness.archive_entry, 0x17, harness.cmds);
     var second = harness.scalarNode(harness.ids.parameter);
     second.value_high = first.value_high;
     first.child = &second;

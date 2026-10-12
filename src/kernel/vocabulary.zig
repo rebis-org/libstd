@@ -239,12 +239,12 @@ pub const ids = struct {
 };
 
 pub const error_map = [_]ErrorMap{
-    .{ .failure = error.InvalidCall, .name = "invalid_call", .status = Status.invalid_call, .diagnostic = ids.invalid_call },
-    .{ .failure = error.Unsupported, .name = "unsupported", .status = Status.unsupported, .diagnostic = ids.unsupported },
+    .{ .failure = error.CallFailure, .name = "invalid_call", .status = Status.invalid_call, .diagnostic = ids.invalid_call },
+    .{ .failure = error.UnsupportedFailure, .name = "unsupported", .status = Status.unsupported, .diagnostic = ids.unsupported },
     .{ .failure = error.InternalFailure, .name = "internal_failure", .status = Status.internal_failure, .diagnostic = ids.internal_failure },
-    .{ .failure = error.ResourceLimit, .name = "resource_limit", .status = Status.resource_limit, .diagnostic = ids.diagnostic_resource_limit },
-    .{ .failure = error.InsufficientCapacity, .name = "insufficient_capacity", .status = Status.insufficient_capacity, .diagnostic = ids.insufficient_capacity },
-    .{ .failure = error.InvalidData, .name = "invalid_data", .status = Status.invalid_data, .diagnostic = ids.invalid_data },
+    .{ .failure = error.ResourceFailure, .name = "resource_limit", .status = Status.resource_limit, .diagnostic = ids.diagnostic_resource_limit },
+    .{ .failure = error.CapacityFailure, .name = "insufficient_capacity", .status = Status.insufficient_capacity, .diagnostic = ids.insufficient_capacity },
+    .{ .failure = error.DataFailure, .name = "invalid_data", .status = Status.invalid_data, .diagnostic = ids.invalid_data },
     .{ .failure = error.IntegrityFailure, .name = "integrity_failure", .status = Status.integrity_failure, .diagnostic = ids.integrity_failure },
     .{ .failure = error.IoFailure, .name = "io_failure", .status = Status.io_failure, .diagnostic = ids.io_failure },
 };

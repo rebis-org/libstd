@@ -96,66 +96,53 @@ fn setupCase(r: *Runner, case: Case) void {
     harness.setup(r, profileId(case.kind), if (confirmed) harness.mode_xz else harness.mode_stream);
 }
 
-fn addParams(nodes: []harness.Node, count: *usize, case: Case) void {
+fn addParams(list: *harness.NodeList, case: Case) void {
     for (case.params) |p| {
-        nodes[count.*] = harness.paramScalar(p.family, p.ordinal, harness.cmd_all, p.value);
-        count.* += 1;
+        list.push(harness.paramScalar(p.family, p.ordinal, harness.cmds, p.value));
     }
     if (case.dictionary) |dict| {
-        nodes[count.*] = harness.paramBytes(harness.param_family_zstd, harness.zstd_dictionary, harness.cmd_all, dict);
-        count.* += 1;
+        list.push(harness.paramBytes(harness.param_family_zstd, harness.zstd_dictionary, harness.cmds, dict));
     }
 }
 
 fn queryWriteSize(r: *Runner, case: Case, input: []const u8, bound: bool) !usize {
     var nodes: [12]harness.Node = undefined;
-    var count: usize = 0;
+    var list = harness.NodeList{ .nodes = &nodes };
     if (bound) {
-        nodes[count] = harness.paramSizingBound();
-        count += 1;
+        list.push(harness.paramSizingBound());
     }
-    nodes[count] = harness.paramTargetCommand(harness.ids.write);
-    count += 1;
-    nodes[count] = harness.sourceSpan(input);
-    count += 1;
-    addParams(&nodes, &count, case);
-    nodes[count] = harness.capabilityParam(r.caps_query);
-    count += 1;
-    nodes[count] = harness.sizingModeParam(r.sizing);
-    count += 1;
-    nodes[count] = harness.commitModeParam(r.commit_write);
-    count += 1;
-    _ = harness.call(r, harness.ids.query, nodes[0..count], .{});
+    list.push(harness.paramTargetCommand(harness.ids.write));
+    list.push(harness.sourceSpan(input));
+    addParams(&list, case);
+    list.push(harness.capabilityParam(r.caps_query));
+    list.push(harness.sizingModeParam(r.sizing));
+    list.push(harness.commitModeParam(r.commit_write));
+    _ = harness.call(r, harness.ids.query, list.items(), .{});
     try harness.requireStatus(r, abi.Status.ok);
     return @intCast(r.response.byte_length);
 }
 
 fn writeSpan(r: *Runner, case: Case, input: []const u8, sink: []u8, bound: bool) !usize {
     var nodes: [9]harness.Node = undefined;
-    var count: usize = 0;
+    var list = harness.NodeList{ .nodes = &nodes };
     if (bound) {
-        nodes[count] = harness.paramSizingBound();
-        count += 1;
+        list.push(harness.paramSizingBound());
     }
-    nodes[count] = harness.sourceSpan(input);
-    count += 1;
-    nodes[count] = harness.sinkSpan(sink);
-    count += 1;
-    addParams(&nodes, &count, case);
-    _ = harness.call(r, harness.ids.write, nodes[0..count], .{ .ctx = true });
+    list.push(harness.sourceSpan(input));
+    list.push(harness.sinkSpan(sink));
+    addParams(&list, case);
+    _ = harness.call(r, harness.ids.write, list.items(), .{ .ctx = true });
     try harness.requireStatus(r, abi.Status.ok);
     return @intCast(r.response.byte_length);
 }
 
 fn readBack(r: *Runner, case: Case, encoded: []const u8, output: []u8, input: []const u8) !void {
     var nodes: [9]harness.Node = undefined;
-    var count: usize = 0;
-    nodes[count] = harness.sourceSpan(encoded);
-    count += 1;
-    nodes[count] = harness.sinkSpan(output);
-    count += 1;
-    addParams(&nodes, &count, case);
-    _ = harness.call(r, harness.ids.read, nodes[0..count], .{ .ctx = true });
+    var list = harness.NodeList{ .nodes = &nodes };
+    list.push(harness.sourceSpan(encoded));
+    list.push(harness.sinkSpan(output));
+    addParams(&list, case);
+    _ = harness.call(r, harness.ids.read, list.items(), .{ .ctx = true });
     try harness.requireStatus(r, abi.Status.ok);
     if (r.response.byte_length != input.len or !std.mem.eql(u8, output[0..input.len], input)) return error.BoundReadMismatch;
 }
@@ -188,15 +175,12 @@ fn runCapacity(r: *Runner) anyerror!void {
         const bound = try queryWriteSize(r, case, input, true);
         if (bound > r.encoded.len) return error.BoundRange;
         var nodes: [9]harness.Node = undefined;
-        var count: usize = 0;
-        nodes[count] = harness.paramSizingBound();
-        count += 1;
-        nodes[count] = harness.sourceSpan(input);
-        count += 1;
-        nodes[count] = harness.sinkSpan(r.encoded[0 .. bound - 1]);
-        count += 1;
-        addParams(&nodes, &count, case);
-        try harness.expectCapacity(r, harness.ids.write, nodes[0..count], .{ .ctx = true }, bound, bound - 1, r.encoded[0 .. bound - 1]);
+        var list = harness.NodeList{ .nodes = &nodes };
+        list.push(harness.paramSizingBound());
+        list.push(harness.sourceSpan(input));
+        list.push(harness.sinkSpan(r.encoded[0 .. bound - 1]));
+        addParams(&list, case);
+        try harness.expectCapacity(r, harness.ids.write, list.items(), .{ .ctx = true }, bound, bound - 1, r.encoded[0 .. bound - 1]);
         const produced = try writeSpan(r, case, input, r.encoded[0..bound], true);
         if (produced > bound) return error.BoundViolated;
     }
@@ -293,29 +277,23 @@ fn runCallback(r: *Runner) anyerror!void {
 
         var source_ctx = harness.SourceCursor{ .data = input };
         var source_nodes: [9]harness.Node = undefined;
-        var source_count: usize = 0;
-        source_nodes[source_count] = harness.paramSizingBound();
-        source_count += 1;
-        source_nodes[source_count] = harness.sourceCallbackNode(0, 0);
-        source_count += 1;
-        source_nodes[source_count] = harness.sinkSpan(bound_sink[0..bound]);
-        source_count += 1;
-        addParams(&source_nodes, &source_count, case);
-        _ = harness.call(r, harness.ids.write, source_nodes[0..source_count], .{ .ctx = true, .callback = harness.sourceCallback, .context = &source_ctx });
+        var source_list = harness.NodeList{ .nodes = &source_nodes };
+        source_list.push(harness.paramSizingBound());
+        source_list.push(harness.sourceCallbackNode(0, 0));
+        source_list.push(harness.sinkSpan(bound_sink[0..bound]));
+        addParams(&source_list, case);
+        _ = harness.call(r, harness.ids.write, source_list.items(), .{ .ctx = true, .callback = harness.sourceCallback, .context = &source_ctx });
         try harness.requireStatus(r, abi.Status.ok);
         if (r.response.byte_length != direct_len or !std.mem.eql(u8, bound_sink[0..direct_len], callback_direct[0..direct_len])) return error.CallbackSourceMismatch;
 
         var sink_ctx = harness.SinkBuffer{ .buffer = &callback_sink_buffer, .accept_limit = std.math.maxInt(usize) };
         var sink_nodes: [9]harness.Node = undefined;
-        var sink_count: usize = 0;
-        sink_nodes[sink_count] = harness.paramSizingBound();
-        sink_count += 1;
-        sink_nodes[sink_count] = harness.sourceSpan(input);
-        sink_count += 1;
-        sink_nodes[sink_count] = harness.sinkCallbackNode(0, 0);
-        sink_count += 1;
-        addParams(&sink_nodes, &sink_count, case);
-        _ = harness.call(r, harness.ids.write, sink_nodes[0..sink_count], .{ .ctx = true, .callback = harness.sinkBufferCallback, .context = &sink_ctx });
+        var sink_list = harness.NodeList{ .nodes = &sink_nodes };
+        sink_list.push(harness.paramSizingBound());
+        sink_list.push(harness.sourceSpan(input));
+        sink_list.push(harness.sinkCallbackNode(0, 0));
+        addParams(&sink_list, case);
+        _ = harness.call(r, harness.ids.write, sink_list.items(), .{ .ctx = true, .callback = harness.sinkBufferCallback, .context = &sink_ctx });
         try harness.requireStatus(r, abi.Status.ok);
         if (sink_ctx.offset != direct_len or !std.mem.eql(u8, callback_sink_buffer[0..direct_len], callback_direct[0..direct_len])) return error.CallbackSinkMismatch;
 
@@ -323,7 +301,7 @@ fn runCallback(r: *Runner) anyerror!void {
         var downstream: harness.Node = undefined;
         var diagnostic: harness.Node = undefined;
         harness.sinkFailureInit(&fail_ctx, &downstream, &diagnostic);
-        _ = harness.call(r, harness.ids.write, sink_nodes[0..sink_count], .{ .ctx = true, .callback = harness.sinkCallback, .context = &fail_ctx, .diagnostic = &diagnostic });
+        _ = harness.call(r, harness.ids.write, sink_list.items(), .{ .ctx = true, .callback = harness.sinkCallback, .context = &fail_ctx, .diagnostic = &diagnostic });
         try harness.expectSinkFailure(r, &fail_ctx, &downstream);
     }
 }
@@ -383,24 +361,17 @@ fn runGzipHeaders(r: *Runner) anyerror!void {
         harness.gzipExtraParam(&extra),
     };
     var nodes: [14]harness.Node = undefined;
-    var count: usize = 0;
-    nodes[count] = harness.paramSizingBound();
-    count += 1;
-    nodes[count] = harness.paramTargetCommand(harness.ids.write);
-    count += 1;
-    nodes[count] = harness.sourceSpan(input);
-    count += 1;
+    var list = harness.NodeList{ .nodes = &nodes };
+    list.push(harness.paramSizingBound());
+    list.push(harness.paramTargetCommand(harness.ids.write));
+    list.push(harness.sourceSpan(input));
     for (header_nodes) |node| {
-        nodes[count] = node;
-        count += 1;
+        list.push(node);
     }
-    nodes[count] = harness.capabilityParam(r.caps_query);
-    count += 1;
-    nodes[count] = harness.sizingModeParam(r.sizing);
-    count += 1;
-    nodes[count] = harness.commitModeParam(r.commit_write);
-    count += 1;
-    _ = harness.call(r, harness.ids.query, nodes[0..count], .{});
+    list.push(harness.capabilityParam(r.caps_query));
+    list.push(harness.sizingModeParam(r.sizing));
+    list.push(harness.commitModeParam(r.commit_write));
+    _ = harness.call(r, harness.ids.query, list.items(), .{});
     try harness.requireStatus(r, abi.Status.ok);
     const bound: usize = @intCast(r.response.byte_length);
     if (bound > bound_sink.len) return error.BoundRange;

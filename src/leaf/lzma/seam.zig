@@ -1,11 +1,8 @@
 const std = @import("std");
 
 const build_options = @import("options");
-// lzma decode seam, the coarse contract shape shared with the zstd seam:
-// one dispatch per call, never per symbol or block. The comptime flavor (a
-// fixed leaf_impl build) inlines to the arm's own function; the runtime
-// flavor (mergeable) binds the provider tag per call. Fixed builds reject
-// the other tag explicitly instead of serving it silently.
+// One dispatch per call, never per symbol or block; fixed builds reject the
+// other tag explicitly.
 pub const Provider = @import("seam").Provider;
 
 const offprem = @import("offprem.zig");
@@ -18,11 +15,8 @@ pub const default_provider: Provider = switch (build_options.leaf_impl) {
     .offprem => .offprem,
 };
 
-// Fixed builds reject the other tag explicitly instead of serving it
-// silently; the mergeable build binds the tag per call. One dispatch per
-// call, never per symbol or block.
-fn requireServed(provider: Provider, comptime served: Provider) error{Unsupported}!void {
-    if (provider != served) return error.Unsupported;
+fn requireServed(provider: Provider, comptime served: Provider) error{UnsupportedFailure}!void {
+    if (provider != served) return error.UnsupportedFailure;
 }
 pub fn decode(provider: Provider, input: []const u8, output: []u8, scratch: []u8, options: onprem.Options) Failure!usize {
     return switch (build_options.leaf_impl) {

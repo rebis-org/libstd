@@ -112,15 +112,15 @@ const RangeCoder = struct {
 
     // A zero scale or a zero range means the stream is corrupt, so report corruption instead of dividing.
     fn currentCount(self: *RangeCoder) Failure!u32 {
-        if (self.scale == 0) return error.InvalidData;
+        if (self.scale == 0) return error.DataFailure;
         self.range /= self.scale;
-        if (self.range == 0) return error.InvalidData;
+        if (self.range == 0) return error.DataFailure;
         return (self.code -% self.low) / self.range;
     }
 
     fn currentShiftCount(self: *RangeCoder, shift: u5) Failure!u32 {
         self.range >>= shift;
-        if (self.range == 0) return error.InvalidData;
+        if (self.range == 0) return error.DataFailure;
         return (self.code -% self.low) / self.range;
     }
 
@@ -497,7 +497,7 @@ pub const PpmModel = struct {
     pub fn startModel(self: *Self, heap: []u8, max_order: u32, heap_mb: u32) Failure!void {
         self.esc_count = 1;
         self.max_order = max_order;
-        if (!self.sub.start(heap, heap_mb)) return error.InsufficientCapacity;
+        if (!self.sub.start(heap, heap_mb)) return error.CapacityFailure;
         try self.restartModelRare();
         self.ns2bsindx[0] = 2 * 0;
         self.ns2bsindx[1] = 2 * 1;
@@ -549,18 +549,18 @@ pub const PpmModel = struct {
         return self.min_context != null_off;
     }
 
-    // ModelPPM::DecodeChar. An offset outside the heap is corrupt-stream state and returns error.InvalidData.
+    // ModelPPM::DecodeChar. An offset outside the heap is corrupt-stream state and returns error.DataFailure.
     pub fn decodeChar(self: *Self, br: *BitReader) Failure!u32 {
         const heap = self.sub.heap;
         if (self.min_context <= self.sub.ptext or self.min_context > self.sub.heap_end)
-            return error.InvalidData;
+            return error.DataFailure;
         const min_ctx = ctxAt(heap, self.min_context);
         if (min_ctx.num_stats != 1) {
             const stats = min_ctx.stats;
             if (stats <= self.sub.ptext or stats > self.sub.heap_end)
-                return error.InvalidData;
+                return error.DataFailure;
             if (!try self.decodeSymbol1(self.min_context))
-                return error.InvalidData;
+                return error.DataFailure;
         } else {
             self.decodeBinSymbol(self.min_context);
         }
@@ -572,11 +572,11 @@ pub const PpmModel = struct {
                 self.min_context = ctxAt(heap, self.min_context).suffix;
                 if (self.min_context <= self.sub.ptext or
                     self.min_context > self.sub.heap_end)
-                    return error.InvalidData;
+                    return error.DataFailure;
                 if (ctxAt(heap, self.min_context).num_stats != self.num_masked) break;
             }
             if (!try self.decodeSymbol2(self.min_context))
-                return error.InvalidData;
+                return error.DataFailure;
             self.coder.decodeUpdate();
         }
         const symbol: u32 = stAt(heap, self.found_state).sym;
@@ -597,7 +597,7 @@ pub const PpmModel = struct {
         self.sub.initPool();
         self.init_rl = -@as(i32, @intCast(@min(self.max_order, 12))) - 1;
         const mc = self.sub.allocContext();
-        if (mc == null_off) return error.InvalidData;
+        if (mc == null_off) return error.DataFailure;
         self.min_context = mc;
         self.max_context = mc;
         const heap = self.sub.heap;
@@ -607,7 +607,7 @@ pub const PpmModel = struct {
         root.num_stats = 256;
         root.summ_freq = 256 + 1;
         const stats = self.sub.allocUnits(256 / 2);
-        if (stats == null_off) return error.InvalidData;
+        if (stats == null_off) return error.DataFailure;
         root.stats = stats;
         self.found_state = stats;
         self.run_length = self.init_rl;
@@ -829,7 +829,7 @@ pub const PpmModel = struct {
                 if (stAt(heap, p).sym != found_snapshot.sym) {
                     while (true) {
                         p += state_size;
-                        if (p + state_size > heap.len) return error.InvalidData;
+                        if (p + state_size > heap.len) return error.DataFailure;
                         if (stAt(heap, p).sym == found_snapshot.sym) break;
                     }
                     if (stAt(heap, p).freq >= stAt(heap, p - state_size).freq) {
@@ -934,7 +934,7 @@ pub const PpmModel = struct {
                 pc.summ_freq = pc.summ_freq +% @as(u16, @truncate(cf));
             }
             const np2 = pc.stats + ns1 * state_size;
-            if (np2 + state_size > heap.len) return error.InvalidData;
+            if (np2 + state_size > heap.len) return error.DataFailure;
             const nstate = stAt(heap, np2);
             nstate.setSucc(successor);
             nstate.sym = found_snapshot.sym;
@@ -1015,7 +1015,7 @@ pub const PpmModel = struct {
     fn decodeSymbol1(self: *Self, c: u32) Failure!bool {
         const heap = self.sub.heap;
         const cctx = ctxAt(heap, c);
-        if (cctx.num_stats == 0) return error.InvalidData;
+        if (cctx.num_stats == 0) return error.DataFailure;
         self.coder.scale = cctx.summ_freq;
         var p = cctx.stats;
         const count = try self.coder.currentCount();
@@ -1039,7 +1039,7 @@ pub const PpmModel = struct {
         var i: u32 = cctx.num_stats - 1;
         while (true) {
             p += state_size;
-            if (p + state_size > heap.len) return error.InvalidData;
+            if (p + state_size > heap.len) return error.DataFailure;
             hi_cnt += stAt(heap, p).freq;
             if (hi_cnt > count) break;
             i -= 1;
@@ -1104,7 +1104,7 @@ pub const PpmModel = struct {
     fn decodeSymbol2(self: *Self, c: u32) Failure!bool {
         const heap = self.sub.heap;
         const cctx = ctxAt(heap, c);
-        if (self.num_masked >= cctx.num_stats) return error.InvalidData;
+        if (self.num_masked >= cctx.num_stats) return error.DataFailure;
         var i: u32 = cctx.num_stats - self.num_masked;
         const psee = self.makeEscFreq2(c, i);
         var ps: [256]u32 = undefined;
@@ -1114,11 +1114,11 @@ pub const PpmModel = struct {
         while (true) {
             while (true) {
                 p +%= state_size;
-                if (p + state_size > heap.len) return error.InvalidData;
+                if (p + state_size > heap.len) return error.DataFailure;
                 if (self.char_mask[stAt(heap, p).sym] != self.esc_count) break;
             }
             hi_cnt += stAt(heap, p).freq;
-            if (nps >= 256) return error.InvalidData;
+            if (nps >= 256) return error.DataFailure;
             ps[nps] = p;
             nps += 1;
             i -= 1;
@@ -1136,7 +1136,7 @@ pub const PpmModel = struct {
                 acc += stAt(heap, p).freq;
                 if (acc > count) break;
                 pi += 1;
-                if (pi >= nps) return error.InvalidData;
+                if (pi >= nps) return error.DataFailure;
                 p = ps[pi];
             }
             self.coder.high_count = acc;
@@ -1245,7 +1245,7 @@ test "model restart builds the 256-symbol root" {
 test "startModel refuses a heap smaller than the requested model size" {
     var heap: [1024 * 1024]u8 = undefined;
     var m = PpmModel.init();
-    try std.testing.expectError(error.InsufficientCapacity, m.startModel(&heap, 4, 4));
+    try std.testing.expectError(error.CapacityFailure, m.startModel(&heap, 4, 4));
 }
 
 test "extern views preserve the packed six-byte state stride" {

@@ -100,29 +100,32 @@ pub const catalog_json = blk: {
 };
 
 comptime {
-    // Renaming or re-iding a released profile breaks the ABI.
-    const frozen_identities = [_]struct { name: []const u8, low: u64, high: u64 }{
-        .{ .name = "bzip2", .low = 0x6e6b_82f0_8d91_0409, .high = 0xa7a3_5105_3d6d_4009 },
-        .{ .name = "deflate", .low = 0x6e6b_82f0_8d91_0403, .high = 0xa7a3_5105_3d6d_4003 },
-        .{ .name = "gzip", .low = 0x6e6b_82f0_8d91_0404, .high = 0xa7a3_5105_3d6d_4004 },
-        .{ .name = "lzma", .low = 0x6e6b_82f0_8d91_040a, .high = 0xa7a3_5105_3d6d_400a },
-        .{ .name = "lzma-file", .low = 0x6e6b_82f0_8d91_040b, .high = 0xa7a3_5105_3d6d_400b },
-        .{ .name = "lzma2", .low = 0x6e6b_82f0_8d91_040c, .high = 0xa7a3_5105_3d6d_400c },
-        .{ .name = "lz4", .low = 0x6e6b_82f0_8d91_0415, .high = 0xa7a3_5105_3d6d_4015 },
-        .{ .name = "rar", .low = 0x6e6b_82f0_8d91_040f, .high = 0xa7a3_5105_3d6d_400f },
-        .{ .name = "sevenzip", .low = 0x6e6b_82f0_8d91_0408, .high = 0xa7a3_5105_3d6d_4008 },
-        .{ .name = "tar", .low = 0x6e6b_82f0_8d91_0405, .high = 0xa7a3_5105_3d6d_4005 },
-        .{ .name = "xz", .low = 0x6e6b_82f0_8d91_040d, .high = 0xa7a3_5105_3d6d_400d },
-        .{ .name = "zip", .low = 0x6e6b_82f0_8d91_0406, .high = 0xa7a3_5105_3d6d_4006 },
-        .{ .name = "zlib", .low = 0x6e6b_82f0_8d91_0414, .high = 0xa7a3_5105_3d6d_4014 },
-        .{ .name = "zdict", .low = 0x6e6b_82f0_8d91_0417, .high = 0xa7a3_5105_3d6d_4017 },
-        .{ .name = "zstd", .low = 0x6e6b_82f0_8d91_0407, .high = 0xa7a3_5105_3d6d_4007 },
-        .{ .name = "zstd-seekable", .low = 0x6e6b_82f0_8d91_0416, .high = 0xa7a3_5105_3d6d_4016 },
+    // Released identities are a fixed 120-bit prefix plus a per-component
+    // ordinal byte; renaming or re-iding a released profile breaks the ABI.
+    const frozen = [_]struct { name: []const u8, ordinal: u8 }{
+        .{ .name = "bzip2", .ordinal = 0x09 },
+        .{ .name = "deflate", .ordinal = 0x03 },
+        .{ .name = "gzip", .ordinal = 0x04 },
+        .{ .name = "lzma", .ordinal = 0x0a },
+        .{ .name = "lzma-file", .ordinal = 0x0b },
+        .{ .name = "lzma2", .ordinal = 0x0c },
+        .{ .name = "lz4", .ordinal = 0x15 },
+        .{ .name = "rar", .ordinal = 0x0f },
+        .{ .name = "sevenzip", .ordinal = 0x08 },
+        .{ .name = "tar", .ordinal = 0x05 },
+        .{ .name = "xz", .ordinal = 0x0d },
+        .{ .name = "zip", .ordinal = 0x06 },
+        .{ .name = "zlib", .ordinal = 0x14 },
+        .{ .name = "zdict", .ordinal = 0x17 },
+        .{ .name = "zstd", .ordinal = 0x07 },
+        .{ .name = "zstd-seekable", .ordinal = 0x16 },
     };
-    for (frozen_identities) |frozen| {
-        const component = discovery.findByName(frozen.name) orelse
-            @compileError("released component has no descriptor: " ++ frozen.name ++ ".");
-        if (component.id.low != frozen.low or component.id.high != frozen.high)
-            @compileError("released component id drifted: " ++ frozen.name ++ ".");
+    for (frozen) |entry| {
+        const component = discovery.findByName(entry.name) orelse
+            @compileError("released component has no descriptor: " ++ entry.name ++ ".");
+        const low = @as(u64, 0x6e6b_82f0_8d91_0400) | entry.ordinal;
+        const high = @as(u64, 0xa7a3_5105_3d6d_4000) | entry.ordinal;
+        if (component.id.low != low or component.id.high != high)
+            @compileError("released component id drifted: " ++ entry.name ++ ".");
     }
 }

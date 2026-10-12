@@ -338,3 +338,39 @@ fn MergeableMac(comptime On: type, comptime Off: type) type {
         }
     };
 }
+
+// The differential contract the seam stitches together: sweep every input
+// width against the paired std implementation, splitting updates at each size.
+pub fn expectAgreement(pristine_ours: anytype, pristine_theirs: anytype, seed: u64, comptime digest: bool, comptime theirs_field: ?[]const u8) !void {
+    var rng = std.Random.DefaultPrng.init(seed);
+    var size: usize = 0;
+    while (size <= 1024) : (size += 1) {
+        const buf = try std.testing.allocator.alloc(u8, size);
+        defer std.testing.allocator.free(buf);
+        rng.random().bytes(buf);
+        var ours = pristine_ours;
+        var theirs = pristine_theirs;
+        ours.update(buf[0 .. size / 2]);
+        ours.update(buf[size / 2 ..]);
+        theirs.update(buf);
+        try agree(&ours, &theirs, digest, theirs_field);
+    }
+    const long = try std.testing.allocator.alloc(u8, 1 << 20);
+    defer std.testing.allocator.free(long);
+    rng.random().bytes(long);
+    var ours = pristine_ours;
+    var theirs = pristine_theirs;
+    ours.update(long);
+    theirs.update(long);
+    try agree(&ours, &theirs, digest, theirs_field);
+}
+
+fn agree(ours: anytype, theirs: anytype, comptime digest: bool, comptime theirs_field: ?[]const u8) !void {
+    if (digest) {
+        try std.testing.expectEqual(theirs.finalResult(), ours.finalResult());
+    } else if (theirs_field) |field| {
+        try std.testing.expectEqual(@field(theirs.*, field), ours.final());
+    } else {
+        try std.testing.expectEqual(theirs.final(), ours.final());
+    }
+}

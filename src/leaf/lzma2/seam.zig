@@ -1,17 +1,8 @@
 const std = @import("std");
 
 const build_options = @import("options");
-// lzma2 decode seam, the coarse contract shape shared with the zstd and
-// lzma seams: one dispatch per call, never per chunk or symbol. The
-// comptime flavor (a fixed leaf_impl build) inlines to the arm's own
-// function; the runtime flavor (mergeable) binds the provider tag per
-// call. Fixed builds reject the other tag explicitly instead of serving
-// it silently.
-//
-// The offprem arm records the accepted incompleteness of std lzma2 in its
-// offprem file: the history buffer grows with the decoded size, so a
-// stream that outgrows the scratch answers insufficient_capacity and the
-// caller picks onprem for those.
+// One dispatch per call, never per chunk or symbol; see offprem.zig for the
+// incompleteness choosing std accepts.
 pub const Provider = @import("seam").Provider;
 
 const offprem = @import("offprem.zig");
@@ -26,11 +17,8 @@ pub const default_provider: Provider = switch (build_options.leaf_impl) {
     .offprem => .offprem,
 };
 
-// Fixed builds reject the other tag explicitly instead of serving it
-// silently; the mergeable build binds the tag per call. One dispatch per
-// call, never per symbol or block.
-fn requireServed(provider: Provider, comptime served: Provider) error{Unsupported}!void {
-    if (provider != served) return error.Unsupported;
+fn requireServed(provider: Provider, comptime served: Provider) error{UnsupportedFailure}!void {
+    if (provider != served) return error.UnsupportedFailure;
 }
 pub fn decode(provider: Provider, input: []const u8, output: []u8, scratch: []u8, options: Options) Failure!usize {
     return switch (build_options.leaf_impl) {

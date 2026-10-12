@@ -30,7 +30,7 @@ fn unsupportedHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Reso
     _ = commit;
     _ = limits;
     _ = command_mask;
-    return error.Unsupported;
+    return error.UnsupportedFailure;
 }
 
 const handler_map = blk: {
@@ -56,7 +56,7 @@ const handler_map = blk: {
 };
 
 pub fn dispatchToProfileHook(profile_id: Id, plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
-    const tag = catalog.profileTagForId(profile_id) orelse return error.Unsupported;
-    const hook = handler_map.get(@tagName(tag)) orelse return error.Unsupported;
+    const tag = catalog.profileTagForId(profile_id) orelse return error.UnsupportedFailure;
+    const hook = handler_map.get(@tagName(tag)) orelse return error.UnsupportedFailure;
     return hook(plan, source, sink, call, response, sizing, commit, limits, command_mask);
 }

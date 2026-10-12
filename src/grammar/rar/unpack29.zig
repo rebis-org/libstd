@@ -221,7 +221,7 @@ pub const Unpacker = struct {
                 st.ppm_model = PpmModel.init();
             }
             const ok = st.ppm_model.?.decodeInit(&st.br, st.ppm_heap, &st.ppm_esc_char) catch false;
-            if (!ok) return error.InvalidData;
+            if (!ok) return error.DataFailure;
             return false;
         }
 
@@ -241,7 +241,7 @@ pub const Unpacker = struct {
         // The 20 code-length-alphabet lengths are 4 bits each, and a 15 is an ESCAPE
         // rather than a literal length.
         var bc_table = try huffman.readCodeLengthTable(&st.br, bc, true, pool[0 * table_pool_words ..][0..table_pool_words]);
-        if (!bc_table.valid) return error.InvalidData;
+        if (!bc_table.valid) return error.DataFailure;
 
         var code_lengths: [total_code_lengths]u8 = @splat(0);
         var i: usize = 0;
@@ -258,7 +258,7 @@ pub const Unpacker = struct {
                     11 + try st.br.readBits(7);
                 // Symbol 16 cannot appear first: there is nothing to repeat and
                 // code_lengths[i - 1] would underflow.
-                if (i == 0) return error.InvalidData;
+                if (i == 0) return error.DataFailure;
                 var remaining = n;
                 while (remaining > 0 and i < total_code_lengths) : (remaining -= 1) {
                     code_lengths[i] = code_lengths[i - 1];
@@ -297,7 +297,7 @@ pub const Unpacker = struct {
         } else if (length == 8) {
             length = try st.br.readBits(16);
         }
-        if (length == 0 or length > max_vm_code_size) return error.InvalidData;
+        if (length == 0 or length > max_vm_code_size) return error.DataFailure;
 
         var code_buf: [max_vm_code_size]u8 = undefined;
         for (0..length) |j| {
@@ -327,7 +327,7 @@ pub const Unpacker = struct {
             filt_pos = st.last_filter;
         }
         if (filt_pos > st.filter_count or filt_pos >= max_filters) {
-            return error.InvalidData;
+            return error.DataFailure;
         }
         st.last_filter = filt_pos;
         const new_filter = (filt_pos == st.filter_count);
@@ -359,8 +359,8 @@ pub const Unpacker = struct {
 
         if (new_filter) {
             const code_size = try rarvm.readData(&cr);
-            if (code_size == 0 or code_size >= 0x10000) return error.InvalidData;
-            if (code_size > max_vm_code_size) return error.InvalidData;
+            if (code_size == 0 or code_size >= 0x10000) return error.DataFailure;
+            if (code_size > max_vm_code_size) return error.DataFailure;
             var prog: [max_vm_code_size]u8 = undefined;
             for (0..code_size) |j| {
                 prog[j] = @intCast(try cr.readBits(8));
@@ -393,7 +393,7 @@ pub const Unpacker = struct {
     // Rep-distance matches use the +2 base and no distance-dependent bonus.
     fn decodeLength(st: *Unpacker) Failure!u32 {
         const slot = try huffman.decodeNumber(&st.br, &st.rc_t);
-        if (slot >= rc) return error.InvalidData;
+        if (slot >= rc) return error.DataFailure;
         const base = length_bases[slot] + length_rep_base;
         const extra = length_extra_bits[slot];
         if (extra == 0) return base;
@@ -402,7 +402,7 @@ pub const Unpacker = struct {
 
     fn decodeDistance(st: *Unpacker) Failure!u32 {
         const slot = try huffman.decodeNumber(&st.br, &st.dc_t);
-        if (slot >= dc) return error.InvalidData;
+        if (slot >= dc) return error.DataFailure;
 
         var distance: u32 = dist_decode[slot] + 1;
         const table_bits = dist_bits[slot];
@@ -480,7 +480,7 @@ pub const Unpacker = struct {
 
         if (symbol == 258) {
             if (st.last_distance == 0 or st.last_length == 0) {
-                return error.InvalidData;
+                return error.DataFailure;
             }
             st.window.copyMatch(st.last_distance, @intCast(st.last_length));
             st.written_size += st.last_length;
@@ -523,7 +523,7 @@ pub const Unpacker = struct {
 
         if (symbol >= 271) {
             const length_slot: u32 = symbol - 271;
-            if (length_slot >= rc) return error.InvalidData;
+            if (length_slot >= rc) return error.DataFailure;
 
             const base = length_bases[length_slot] + length_match_base;
             const extra = length_extra_bits[length_slot];
@@ -553,18 +553,18 @@ pub const Unpacker = struct {
             return true;
         }
 
-        return error.InvalidData;
+        return error.DataFailure;
     }
 
     // PPMEscChar selects the in-band escape: 0 ends the PPM encoding, 1 is the escape
     // byte, 2 ends the entry, 3 is a VM filter program, 4 an LZ match, and 5 an RLE run.
     fn processPpmSymbol(st: *Unpacker) Failure!bool {
-        if (st.ppm_model == null) return error.Unsupported;
+        if (st.ppm_model == null) return error.UnsupportedFailure;
         var model = &st.ppm_model.?;
-        const ch = model.decodeChar(&st.br) catch return error.InvalidData;
+        const ch = model.decodeChar(&st.br) catch return error.DataFailure;
 
         if (ch == st.ppm_esc_char) {
-            const next = model.decodeChar(&st.br) catch return error.InvalidData;
+            const next = model.decodeChar(&st.br) catch return error.DataFailure;
             switch (next) {
                 0 => {
                     // End of the PPM encoding, not of the entry.
@@ -573,20 +573,20 @@ pub const Unpacker = struct {
                 },
                 2 => return false,
                 3 => {
-                    const first_byte = model.decodeChar(&st.br) catch return error.InvalidData;
+                    const first_byte = model.decodeChar(&st.br) catch return error.DataFailure;
                     var length: u32 = (first_byte & 7) + 1;
                     if (length == 7) {
-                        const b1 = model.decodeChar(&st.br) catch return error.InvalidData;
+                        const b1 = model.decodeChar(&st.br) catch return error.DataFailure;
                         length = b1 + 7;
                     } else if (length == 8) {
-                        const b1 = model.decodeChar(&st.br) catch return error.InvalidData;
-                        const b2 = model.decodeChar(&st.br) catch return error.InvalidData;
+                        const b1 = model.decodeChar(&st.br) catch return error.DataFailure;
+                        const b2 = model.decodeChar(&st.br) catch return error.DataFailure;
                         length = b1 * 256 + b2;
                     }
-                    if (length == 0 or length > max_vm_code_size) return error.InvalidData;
+                    if (length == 0 or length > max_vm_code_size) return error.DataFailure;
                     var code_buf: [max_vm_code_size]u8 = undefined;
                     for (0..length) |j| {
-                        const b = model.decodeChar(&st.br) catch return error.InvalidData;
+                        const b = model.decodeChar(&st.br) catch return error.DataFailure;
                         code_buf[j] = @intCast(b & 0xFF);
                     }
                     try st.addVMCode(first_byte, code_buf[0..length]);
@@ -595,17 +595,17 @@ pub const Unpacker = struct {
                 4 => {
                     var distance: u32 = 0;
                     for (0..3) |_| {
-                        const b = model.decodeChar(&st.br) catch return error.InvalidData;
+                        const b = model.decodeChar(&st.br) catch return error.DataFailure;
                         distance = (distance << 8) + (b & 0xFF);
                     }
-                    const len_b = model.decodeChar(&st.br) catch return error.InvalidData;
+                    const len_b = model.decodeChar(&st.br) catch return error.DataFailure;
                     const length = (len_b & 0xFF) + 32;
                     st.window.copyMatch(distance + 2, length);
                     st.written_size += length;
                     return true;
                 },
                 5 => {
-                    const len_b = model.decodeChar(&st.br) catch return error.InvalidData;
+                    const len_b = model.decodeChar(&st.br) catch return error.DataFailure;
                     const length = (len_b & 0xFF) + 4;
                     st.window.copyMatch(1, length);
                     st.written_size += length;
@@ -636,7 +636,7 @@ pub const Unpacker = struct {
 
         const count = emit_upto - st.flushed;
         const back = produced - st.flushed;
-        if (back > st.window.buffer.len) return error.InvalidData;
+        if (back > st.window.buffer.len) return error.DataFailure;
 
         // The staged copy sits above the max_filter_block transform scratch, so both always fit.
         try emit.emitSpan(
@@ -687,7 +687,7 @@ pub const Unpacker = struct {
                 }
             }
 
-            if (st.written_size > overshoot_limit) return error.InvalidData;
+            if (st.written_size > overshoot_limit) return error.DataFailure;
         }
     }
 };
@@ -772,7 +772,7 @@ pub const Session = struct {
 
         // An unidentified or unimplemented filter program makes the LZ output
         // incomplete, and incomplete output is the worst outcome for an integrity tool.
-        if (st.unsupported_filter_seen) return error.Unsupported;
+        if (st.unsupported_filter_seen) return error.UnsupportedFailure;
 
         if (st.stream_out != null) {
             try st.flushDecoded(0, unpacked_size);
@@ -802,10 +802,10 @@ pub const Session = struct {
 // R[6] carries the region's byte offset within the file, while start is already
 // file-absolute.
 fn applyFilter29(_: void, pf: *PendingFilter, region: []u8, scratch: []u8) Failure!void {
-    if (region.len > scratch.len) return error.Unsupported;
+    if (region.len > scratch.len) return error.UnsupportedFailure;
     var init_r = pf.init_r;
     init_r[6] = @truncate(pf.start);
-    if (!rarvm.applyFilter(pf.filter, region, scratch, init_r)) return error.Unsupported;
+    if (!rarvm.applyFilter(pf.filter, region, scratch, init_r)) return error.UnsupportedFailure;
 }
 
 test "length tables are the verbatim reference tables" {

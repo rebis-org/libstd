@@ -1,6 +1,9 @@
 const std = @import("std");
 
-pub const Failure = error{ InvalidCall, ResourceLimit, InsufficientCapacity, InvalidData };
+// The interface module cannot import the primitive failure set, and it never
+// needs to: a span crossing only answers these two. Naming the exact set keeps
+// the substrate vocabulary from becoming a second, divergent one.
+pub const Failure = error{ CallFailure, ResourceFailure };
 
 pub const Violation = enum { out_of_bounds, use_after_free, lease_violation, overlap };
 
@@ -9,7 +12,8 @@ const empty_storage: [1]u8 = .{0};
 // Contract violations trap: out-of-provenance access is a bug, never a survivable condition.
 pub fn trap(violation: Violation, context: []const u8) noreturn {
     var message_storage: [128]u8 = undefined;
-    const message = std.fmt.bufPrint(&message_storage, "interface trap: {s}: {s}\n", .{ @tagName(violation), context }) catch "interface trap.\n";
+    var message_writer: std.Io.Writer = std.Io.Writer.fixed(&message_storage);
+    const message = if (message_writer.print("interface trap: {s}: {s}\n", .{ @tagName(violation), context })) |_| message_writer.buffered() else |_| "interface trap.\n";
     std.debug.print("{s}", .{message});
     std.posix.raise(std.posix.SIG.TRAP) catch {};
     unreachable;
@@ -21,64 +25,49 @@ pub fn checkRange(total: usize, offset: usize, length: usize) void {
 
 pub fn hasOverlap(first_start: usize, first_len: usize, second_start: usize, second_len: usize) bool {
     if (first_len == 0 or second_len == 0) return false;
-    return first_start < second_start + second_len and second_start < first_start + first_len;
+    // Caller-supplied lengths reach here as u64, so an end offset can wrap. The
+    // subtraction form stays correct on wrap, where a wrapped end reads as
+    // disjoint and the caller traps on the copy instead of reading past it.
+    return second_start < first_start +| first_len and first_start < second_start +| second_len;
 }
 
-pub const Span = struct {
-    ptr: [*]u8,
-    len: usize,
-
-    pub fn bytes(self: Span) []u8 {
-        return self.ptr[0..self.len];
-    }
-
-    pub fn sub(self: Span, offset: usize, length: usize) Span {
-        checkRange(self.len, offset, length);
-        return .{ .ptr = self.ptr + offset, .len = length };
-    }
-
-    pub fn read(self: Span, offset: usize, length: usize) []u8 {
-        return self.sub(offset, length).bytes();
-    }
-
-    pub fn write(self: Span, offset: usize, chunk: []const u8) void {
-        @memcpy(self.sub(offset, chunk.len).bytes(), chunk);
-    }
-};
-
-pub const ConstSpan = struct {
-    ptr: [*]const u8,
-    len: usize,
-
-    pub fn bytes(self: ConstSpan) []const u8 {
-        return self.ptr[0..self.len];
-    }
-
-    pub fn sub(self: ConstSpan, offset: usize, length: usize) ConstSpan {
-        checkRange(self.len, offset, length);
-        return .{ .ptr = self.ptr + offset, .len = length };
-    }
-
-    pub fn read(self: ConstSpan, offset: usize, length: usize) []const u8 {
-        return self.sub(offset, length).bytes();
-    }
-};
-
-// Sole conversion from raw envelope pointers, so every boundary crossing is checked once.
+// One span algebra for both mutabilities: the view a span hands out carries the
+// span's own mutability, so a const span cannot be written through its type.
 fn SpanFor(comptime Pointer: type) type {
-    return switch (Pointer) {
-        [*]u8 => Span,
-        [*]const u8 => ConstSpan,
-        else => @compileError("unsupported span pointer type."),
+    const View = if (Pointer == [*]const u8) []const u8 else []u8;
+    return struct {
+        ptr: Pointer,
+        len: usize,
+
+        pub fn bytes(self: @This()) View {
+            return self.ptr[0..self.len];
+        }
+
+        pub fn sub(self: @This(), offset: usize, length: usize) @This() {
+            checkRange(self.len, offset, length);
+            return .{ .ptr = self.ptr + offset, .len = length };
+        }
+
+        pub fn read(self: @This(), offset: usize, length: usize) View {
+            return self.sub(offset, length).bytes();
+        }
+
+        pub fn write(self: @This(), offset: usize, chunk: []const u8) void {
+            if (View == []const u8) @compileError("a const span cannot be written.");
+            @memcpy(self.sub(offset, chunk.len).bytes(), chunk);
+        }
     };
 }
 
+pub const Span = SpanFor([*]u8);
+pub const ConstSpan = SpanFor([*]const u8);
+
 fn spanFrom(comptime Pointer: type, base: ?Pointer, length: u64) Failure!SpanFor(Pointer) {
-    const count = std.math.cast(usize, length) orelse return error.ResourceLimit;
+    const count = std.math.cast(usize, length) orelse return error.ResourceFailure;
     // A zero length never dereferences the pointer, so the immutable empty
     // storage stands in for the null a caller may legitimately pass.
     if (count == 0) return .{ .ptr = @constCast(&empty_storage), .len = 0 };
-    const live = base orelse return error.InvalidCall;
+    const live = base orelse return error.CallFailure;
     return .{ .ptr = live, .len = count };
 }
 

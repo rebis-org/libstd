@@ -68,8 +68,8 @@ pub fn archiveSize(entries: []const Entry) Failure!u64 {
     var total: u64 = 1024;
     for (entries) |entry| {
         const parts = try tarNameParts(entry.name);
-        if (std.mem.indexOfScalar(u8, entry.link_name, 0) != null) return error.InvalidCall;
-        if ((entry.typeflag == '1' or entry.typeflag == '2') and entry.link_name.len == 0) return error.InvalidCall;
+        if (std.mem.findScalar(u8, entry.link_name, 0) != null) return error.CallFailure;
+        if ((entry.typeflag == '1' or entry.typeflag == '2') and entry.link_name.len == 0) return error.CallFailure;
         const data_size = try tarDataSize(entry.typeflag, entry.data);
         var pax_buffer: [512]u8 = undefined;
         const pax_len = try writePaxRecords(entry, data_size, parts.uses_long_name, &pax_buffer);
@@ -82,13 +82,13 @@ pub fn archiveSize(entries: []const Entry) Failure!u64 {
 
 pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Failure!usize {
     const required = try archiveSize(entries);
-    if (output.len < required) return error.InsufficientCapacity;
-    if (scratch.len < scratch_size) return error.InsufficientCapacity;
+    if (output.len < required) return error.CapacityFailure;
+    if (scratch.len < scratch_size) return error.CapacityFailure;
     var sink = io.Sink{ .bytes = output };
     for (entries) |entry| {
         const parts = try tarNameParts(entry.name);
-        if (std.mem.indexOfScalar(u8, entry.link_name, 0) != null) return error.InvalidCall;
-        if ((entry.typeflag == '1' or entry.typeflag == '2') and entry.link_name.len == 0) return error.InvalidCall;
+        if (std.mem.findScalar(u8, entry.link_name, 0) != null) return error.CallFailure;
+        if ((entry.typeflag == '1' or entry.typeflag == '2') and entry.link_name.len == 0) return error.CallFailure;
         const data_size = try tarDataSize(entry.typeflag, entry.data);
         var pax_buffer: [512]u8 = undefined;
         const pax_len = try writePaxRecords(entry, data_size, parts.uses_long_name, &pax_buffer);
@@ -150,7 +150,7 @@ fn paxRecord(buffer: []u8, key: []const u8, payload: []const u8) Failure!usize {
     const content_len = key.len + 1 + payload.len + 1;
     const len_count = paxPrefixLen(content_len);
     const total = len_count + 1 + content_len;
-    if (total > buffer.len) return error.InvalidCall;
+    if (total > buffer.len) return error.CallFailure;
     var m = total;
     var len_index = len_count;
     while (true) {
@@ -204,21 +204,21 @@ pub fn inspectOrdinal(archive: []const u8, ordinal: u64) Failure!EntryInfo {
     while (try reader.next()) |entry| {
         if (entry.ordinal == ordinal) return entry;
     }
-    return error.InvalidData;
+    return error.DataFailure;
 }
 
 pub fn decodeOrdinal(archive: []const u8, ordinal: u64, output: []u8) Failure!usize {
     const entry = try inspectOrdinal(archive, ordinal);
-    const size = std.math.cast(usize, entry.size) orelse return error.ResourceLimit;
-    if (output.len < size) return error.InsufficientCapacity;
+    const size = std.math.cast(usize, entry.size) orelse return error.ResourceFailure;
+    if (output.len < size) return error.CapacityFailure;
     if (entry.sparse) |sparse| {
         if (size == 0) return 0;
         @memset(output[0..size], 0);
         var stream_offset: u64 = 0;
         for (sparse.segments[0..sparse.segment_count]) |segment| {
-            const start = std.math.cast(usize, segment.offset) orelse return error.InvalidData;
-            const count = std.math.cast(usize, segment.num_bytes) orelse return error.InvalidData;
-            if (start > size or count > size - start) return error.InvalidData;
+            const start = std.math.cast(usize, segment.offset) orelse return error.DataFailure;
+            const count = std.math.cast(usize, segment.num_bytes) orelse return error.DataFailure;
+            if (start > size or count > size - start) return error.DataFailure;
             const chunk = try bounds.slice(archive, try bounds.addU64(entry.data_offset, stream_offset), count);
             @memcpy(output[start..][0..count], chunk);
             stream_offset = try bounds.addU64(stream_offset, segment.num_bytes);
@@ -240,17 +240,17 @@ fn tarAligned(size: u64) Failure!u64 {
 }
 
 fn tarField(field: []const u8) []const u8 {
-    return field[0 .. std.mem.indexOfScalar(u8, field, 0) orelse field.len];
+    return field[0 .. std.mem.findScalar(u8, field, 0) orelse field.len];
 }
 
 fn tarNumber(field: []const u8) Failure!u64 {
-    if (field.len == 0) return error.InvalidData;
+    if (field.len == 0) return error.DataFailure;
     if (field[0] & 0x80 != 0) {
-        if (field[0] & 0x40 != 0) return error.InvalidData;
+        if (field[0] & 0x40 != 0) return error.DataFailure;
         var value: u64 = field[0] & 0x7f;
         for (field[1..]) |byte| {
-            value = std.math.mul(u64, value, 256) catch return error.InvalidData;
-            value = std.math.add(u64, value, byte) catch return error.InvalidData;
+            value = std.math.mul(u64, value, 256) catch return error.DataFailure;
+            value = std.math.add(u64, value, byte) catch return error.DataFailure;
         }
         return value;
     }
@@ -260,12 +260,12 @@ fn tarNumber(field: []const u8) Failure!u64 {
     var value: u64 = 0;
     var index = start;
     while (index < field.len and field[index] >= '0' and field[index] <= '7') : (index += 1) {
-        value = std.math.mul(u64, value, 8) catch return error.InvalidData;
-        value = std.math.add(u64, value, field[index] - '0') catch return error.InvalidData;
+        value = std.math.mul(u64, value, 8) catch return error.DataFailure;
+        value = std.math.add(u64, value, field[index] - '0') catch return error.DataFailure;
     }
-    if (index == start) return error.InvalidData;
+    if (index == start) return error.DataFailure;
     while (index < field.len) : (index += 1) {
-        if (field[index] != 0 and field[index] != ' ') return error.InvalidData;
+        if (field[index] != 0 and field[index] != ' ') return error.DataFailure;
     }
     return value;
 }
@@ -305,12 +305,12 @@ fn tarChecksum(block: []const u8) u64 {
 }
 
 fn tarValidName(name: []const u8) Failure!void {
-    if (bounds.isAbsoluteOrTraversal(name) or std.mem.indexOfScalar(u8, name, 0) != null) return error.InvalidCall;
+    if (bounds.isAbsoluteOrTraversal(name) or std.mem.findScalar(u8, name, 0) != null) return error.CallFailure;
     const trimmed = if (name[name.len - 1] == '/') name[0 .. name.len - 1] else name;
-    if (trimmed.len == 0) return error.InvalidCall;
+    if (trimmed.len == 0) return error.CallFailure;
     var components = std.mem.splitScalar(u8, trimmed, '/');
     while (components.next()) |component| {
-        if (component.len == 0 or std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, "..")) return error.InvalidCall;
+        if (component.len == 0 or std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, "..")) return error.CallFailure;
     }
 }
 
@@ -331,13 +331,13 @@ fn tarNameParts(name: []const u8) Failure!NameParts {
 fn tarDataSize(typeflag: u8, data: []const u8) Failure!u64 {
     return switch (typeflag) {
         0, typeflag_regular, '7' => data.len,
-        '1', '2', '3', '4', '5', '6' => if (data.len == 0) 0 else error.InvalidCall,
-        else => error.InvalidCall,
+        '1', '2', '3', '4', '5', '6' => if (data.len == 0) 0 else error.CallFailure,
+        else => error.CallFailure,
     };
 }
 
 fn tarWriteHeader(sink: *io.Sink, scratch: []u8, name: []const u8, prefix: []const u8, link_name: []const u8, mode: u32, uid: u32, gid: u32, modification_time: u64, typeflag: u8, size: u64, devmajor: u32, devminor: u32) Failure!void {
-    if (scratch.len < scratch_size) return error.InsufficientCapacity;
+    if (scratch.len < scratch_size) return error.CapacityFailure;
     const block = scratch[0..scratch_size];
     @memset(block, 0);
     tarWriteField(block[0..100], name);
@@ -370,7 +370,7 @@ fn tarWriteHeader(sink: *io.Sink, scratch: []u8, name: []const u8, prefix: []con
 fn tarWritePadding(sink: *io.Sink, scratch: []u8, size: u64) Failure!void {
     const padding = (block_size - size % block_size) % block_size;
     if (padding != 0) {
-        if (scratch.len < scratch_size) return error.InsufficientCapacity;
+        if (scratch.len < scratch_size) return error.CapacityFailure;
         @memset(scratch[0..scratch_size], 0);
         try sink.write(scratch[0..@intCast(padding)]);
     }
@@ -413,14 +413,14 @@ const Reader = struct {
             .name = tarField(header[0..100]),
             .prefix = tarField(header[345..500]),
             .link_name = tarField(header[157..257]),
-            .mode = std.math.cast(u32, try tarNumber(header[100..108])) orelse return error.InvalidData,
-            .uid = std.math.cast(u32, try tarNumber(header[108..116])) orelse return error.InvalidData,
-            .gid = std.math.cast(u32, try tarNumber(header[116..124])) orelse return error.InvalidData,
+            .mode = std.math.cast(u32, try tarNumber(header[100..108])) orelse return error.DataFailure,
+            .uid = std.math.cast(u32, try tarNumber(header[108..116])) orelse return error.DataFailure,
+            .gid = std.math.cast(u32, try tarNumber(header[116..124])) orelse return error.DataFailure,
             .size = size,
             .modification_time = try tarNumber(header[136..148]),
             .typeflag = header[156],
-            .devmajor = std.math.cast(u32, try tarNumber(header[329..337])) orelse return error.InvalidData,
-            .devminor = std.math.cast(u32, try tarNumber(header[337..345])) orelse return error.InvalidData,
+            .devmajor = std.math.cast(u32, try tarNumber(header[329..337])) orelse return error.DataFailure,
+            .devminor = std.math.cast(u32, try tarNumber(header[337..345])) orelse return error.DataFailure,
             .ordinal = 0,
             .header_offset = self.offset,
             .data_offset = data_offset,
@@ -429,7 +429,7 @@ const Reader = struct {
 
     fn advance(self: *Reader, size: u64) Failure!void {
         self.offset = try bounds.addU64(try bounds.addU64(self.offset, block_size), try tarAligned(size));
-        if (self.offset > self.archive.len) return error.InvalidData;
+        if (self.offset > self.archive.len) return error.DataFailure;
     }
 
     fn parseOldGnuSparse(self: *Reader, entry: *EntryInfo) Failure!SparseInfo {
@@ -448,7 +448,7 @@ const Reader = struct {
             extension_blocks += 1;
             extension_offset = try bounds.addU64(extension_offset, block_size);
         }
-        if (chunk_sum != entry.size) return error.InvalidData;
+        if (chunk_sum != entry.size) return error.DataFailure;
         if (info.realsize == 0) {
             for (info.segments[0..info.segment_count]) |segment| {
                 info.realsize = @max(info.realsize, try bounds.addU64(segment.offset, segment.num_bytes));
@@ -457,7 +457,7 @@ const Reader = struct {
         try validateSparseInfo(info);
         entry.data_offset = try bounds.addU64(entry.header_offset, (extension_blocks + 1) * block_size);
         self.offset = try bounds.addU64(entry.data_offset, try tarAligned(entry.size));
-        if (self.offset > self.archive.len) return error.InvalidData;
+        if (self.offset > self.archive.len) return error.DataFailure;
         return info;
     }
 
@@ -465,7 +465,7 @@ const Reader = struct {
         if (pax.sparse_major == null and pax.sparse_size == null and pax.sparse_realsize == null and pax.sparse_map == null and pax.sparse_pax == null) return null;
         // Every branch assigns info wholesale before any field is read, so undefined init is safe.
         var info: SparseInfo = undefined;
-        const realsize = pax.sparse_realsize orelse pax.sparse_size orelse return error.InvalidData;
+        const realsize = pax.sparse_realsize orelse pax.sparse_size orelse return error.DataFailure;
         if (pax.sparse_map) |map| {
             info = try parseSparseMapString(map, realsize);
         } else if (pax.sparse_pax) |pax_data| {
@@ -474,18 +474,18 @@ const Reader = struct {
             info = .{ .realsize = realsize, .segment_count = 0, .segments = undefined };
         }
         if (pax.sparse_major) |major| {
-            if (major != 1) return error.Unsupported;
-            const minor = pax.sparse_minor orelse return error.InvalidData;
-            if (minor != 0) return error.Unsupported;
+            if (major != 1) return error.UnsupportedFailure;
+            const minor = pax.sparse_minor orelse return error.DataFailure;
+            if (minor != 0) return error.UnsupportedFailure;
             const map_start = entry.data_offset;
             const map_bytes = try readSparseMapData(self.archive, map_start, &info);
             const map_padded = try tarAligned(map_bytes);
             entry.data_offset = try bounds.addU64(entry.data_offset, map_padded);
-            if (entry.size < map_padded) return error.InvalidData;
+            if (entry.size < map_padded) return error.DataFailure;
             entry.size -= map_padded;
         }
         if (pax.sparse_numblocks) |count| {
-            if (count != info.segment_count) return error.InvalidData;
+            if (count != info.segment_count) return error.DataFailure;
         }
         try validateSparseInfo(info);
         if (pax.sparse_name) |name| {
@@ -501,7 +501,7 @@ const Reader = struct {
             const block = try bounds.slice(self.archive, self.offset, block_size);
             if (isZeroBlock(block)) {
                 const remaining = try bounds.slice(self.archive, self.offset, self.archive.len - @as(usize, @intCast(self.offset)));
-                if (remaining.len < 1024 or !isZeroBlock(remaining)) return error.InvalidData;
+                if (remaining.len < 1024 or !isZeroBlock(remaining)) return error.DataFailure;
                 return null;
             }
             var entry = try self.readHeader();
@@ -509,17 +509,17 @@ const Reader = struct {
             const data = try bounds.slice(self.archive, entry.data_offset, physical_size);
             switch (entry.typeflag) {
                 typeflag_gnu_long_name => {
-                    if (self.long_name != null) return error.InvalidData;
+                    if (self.long_name != null) return error.DataFailure;
                     self.long_name = tarField(data);
                     try self.advance(physical_size);
                 },
                 typeflag_gnu_long_link => {
-                    if (self.long_link != null) return error.InvalidData;
+                    if (self.long_link != null) return error.DataFailure;
                     self.long_link = tarField(data);
                     try self.advance(physical_size);
                 },
                 typeflag_pax => {
-                    if (!tarPaxEmpty(self.local_pax)) return error.InvalidData;
+                    if (!tarPaxEmpty(self.local_pax)) return error.DataFailure;
                     self.local_pax = try tarParsePax(data);
                     try self.advance(physical_size);
                 },
@@ -576,7 +576,7 @@ const Reader = struct {
                 },
             }
         }
-        return error.InvalidData;
+        return error.DataFailure;
     }
 };
 
@@ -592,8 +592,8 @@ fn parseSparseEntries(info: *SparseInfo, chunk_sum: *u64, bytes: []const u8, cou
 }
 
 fn addSparseSegment(info: *SparseInfo, chunk_sum: *u64, offset: u64, num_bytes: u64) Failure!void {
-    if (num_bytes == 0) return error.InvalidData;
-    if (info.segment_count >= max_sparse_segments) return error.Unsupported;
+    if (num_bytes == 0) return error.DataFailure;
+    if (info.segment_count >= max_sparse_segments) return error.UnsupportedFailure;
     info.segments[info.segment_count] = .{ .offset = offset, .num_bytes = num_bytes };
     info.segment_count += 1;
     chunk_sum.* = try bounds.addU64(chunk_sum.*, num_bytes);
@@ -602,9 +602,9 @@ fn addSparseSegment(info: *SparseInfo, chunk_sum: *u64, offset: u64, num_bytes: 
 fn validateSparseInfo(info: SparseInfo) Failure!void {
     var previous_end: u64 = 0;
     for (info.segments[0..info.segment_count]) |segment| {
-        if (segment.num_bytes == 0 or segment.offset < previous_end) return error.InvalidData;
+        if (segment.num_bytes == 0 or segment.offset < previous_end) return error.DataFailure;
         const end = try bounds.addU64(segment.offset, segment.num_bytes);
-        if (end > info.realsize) return error.InvalidData;
+        if (end > info.realsize) return error.DataFailure;
         previous_end = end;
     }
 }
@@ -623,7 +623,7 @@ fn parseSparseMapString(map: []const u8, realsize: u64) Failure!SparseInfo {
             pending_offset = value;
         }
     }
-    if (pending_offset != null) return error.InvalidData;
+    if (pending_offset != null) return error.DataFailure;
     return info;
 }
 
@@ -635,34 +635,34 @@ fn parseSparsePaxPairs(data: []const u8, realsize: u64) Failure!SparseInfo {
     while (offset < data.len) {
         const length_start = offset;
         while (offset < data.len and data[offset] >= '0' and data[offset] <= '9') : (offset += 1) {}
-        if (offset == length_start or offset == data.len or data[offset] != ' ') return error.InvalidData;
+        if (offset == length_start or offset == data.len or data[offset] != ' ') return error.DataFailure;
         const record_length = try tarDecimal(data[length_start..offset]);
-        const length = std.math.cast(usize, record_length) orelse return error.ResourceLimit;
-        if (length > data.len - length_start or length <= offset - length_start + 2) return error.InvalidData;
+        const length = std.math.cast(usize, record_length) orelse return error.ResourceFailure;
+        if (length > data.len - length_start or length <= offset - length_start + 2) return error.DataFailure;
         const record = data[length_start .. length_start + length];
-        if (record[record.len - 1] != '\n') return error.InvalidData;
+        if (record[record.len - 1] != '\n') return error.DataFailure;
         const assignment = record[offset - length_start + 1 .. record.len - 1];
-        const equals = std.mem.indexOfScalar(u8, assignment, '=') orelse return error.InvalidData;
+        const equals = std.mem.findScalar(u8, assignment, '=') orelse return error.DataFailure;
         const key = assignment[0..equals];
         const value = assignment[equals + 1 ..];
         if (std.mem.eql(u8, key, "GNU.sparse.offset")) {
-            if (pending_offset != null) return error.InvalidData;
+            if (pending_offset != null) return error.DataFailure;
             pending_offset = try tarDecimal(value);
         } else if (std.mem.eql(u8, key, "GNU.sparse.numbytes")) {
-            const segment_offset = pending_offset orelse return error.InvalidData;
+            const segment_offset = pending_offset orelse return error.DataFailure;
             try addSparseSegment(&info, &chunk_sum, segment_offset, try tarDecimal(value));
             pending_offset = null;
         }
         offset = length_start + length;
     }
-    if (pending_offset != null) return error.InvalidData;
+    if (pending_offset != null) return error.DataFailure;
     return info;
 }
 
 fn readSparseMapData(archive: []const u8, start: u64, info: *SparseInfo) Failure!u64 {
     var offset = start;
     const count = try readSparseLine(archive, &offset);
-    if (count > max_sparse_segments) return error.Unsupported;
+    if (count > max_sparse_segments) return error.UnsupportedFailure;
     var chunk_sum: u64 = 0;
     var index: u64 = 0;
     while (index < count) : (index += 1) {
@@ -670,7 +670,7 @@ fn readSparseMapData(archive: []const u8, start: u64, info: *SparseInfo) Failure
         const num_bytes = try readSparseLine(archive, &offset);
         try addSparseSegment(info, &chunk_sum, segment_offset, num_bytes);
     }
-    if (count != info.segment_count) return error.InvalidData;
+    if (count != info.segment_count) return error.DataFailure;
     return offset - start;
 }
 
@@ -678,24 +678,24 @@ fn readSparseLine(archive: []const u8, offset: *u64) Failure!u64 {
     var value: u64 = 0;
     var digits: usize = 0;
     while (true) {
-        if (offset.* >= archive.len) return error.InvalidData;
+        if (offset.* >= archive.len) return error.DataFailure;
         const byte = archive[@intCast(offset.*)];
         offset.* += 1;
         if (byte == '\n') {
-            if (digits == 0) return error.InvalidData;
+            if (digits == 0) return error.DataFailure;
             return value;
         }
-        if (byte < '0' or byte > '9') return error.InvalidData;
+        if (byte < '0' or byte > '9') return error.DataFailure;
         digits += 1;
-        value = std.math.mul(u64, value, 10) catch return error.InvalidData;
-        value = std.math.add(u64, value, byte - '0') catch return error.InvalidData;
+        value = std.math.mul(u64, value, 10) catch return error.DataFailure;
+        value = std.math.add(u64, value, byte - '0') catch return error.DataFailure;
     }
 }
 
 fn tarValidateType(typeflag: u8) Failure!void {
     switch (typeflag) {
         0, typeflag_regular, '1', '2', '3', '4', '5', '6', '7' => {},
-        else => return error.Unsupported,
+        else => return error.UnsupportedFailure,
     }
 }
 
@@ -722,12 +722,12 @@ fn tarMergePax(target: *Pax, updates: Pax) void {
 }
 
 fn tarDecimal(value: []const u8) Failure!u64 {
-    if (value.len == 0) return error.InvalidData;
+    if (value.len == 0) return error.DataFailure;
     var result: u64 = 0;
     for (value) |byte| {
-        if (byte < '0' or byte > '9') return error.InvalidData;
-        result = std.math.mul(u64, result, 10) catch return error.InvalidData;
-        result = std.math.add(u64, result, byte - '0') catch return error.InvalidData;
+        if (byte < '0' or byte > '9') return error.DataFailure;
+        result = std.math.mul(u64, result, 10) catch return error.DataFailure;
+        result = std.math.add(u64, result, byte - '0') catch return error.DataFailure;
     }
     return result;
 }
@@ -738,58 +738,58 @@ fn tarParsePax(data: []const u8) Failure!Pax {
     while (offset < data.len) {
         const length_start = offset;
         while (offset < data.len and data[offset] >= '0' and data[offset] <= '9') : (offset += 1) {}
-        if (offset == length_start or offset == data.len or data[offset] != ' ') return error.InvalidData;
+        if (offset == length_start or offset == data.len or data[offset] != ' ') return error.DataFailure;
         const record_length = try tarDecimal(data[length_start..offset]);
-        const length = std.math.cast(usize, record_length) orelse return error.ResourceLimit;
-        if (length > data.len - length_start or length <= offset - length_start + 2) return error.InvalidData;
+        const length = std.math.cast(usize, record_length) orelse return error.ResourceFailure;
+        if (length > data.len - length_start or length <= offset - length_start + 2) return error.DataFailure;
         const record = data[length_start .. length_start + length];
-        if (record[record.len - 1] != '\n') return error.InvalidData;
+        if (record[record.len - 1] != '\n') return error.DataFailure;
         const assignment = record[offset - length_start + 1 .. record.len - 1];
-        const equals = std.mem.indexOfScalar(u8, assignment, '=') orelse return error.InvalidData;
+        const equals = std.mem.findScalar(u8, assignment, '=') orelse return error.DataFailure;
         const key = assignment[0..equals];
         const value = assignment[equals + 1 ..];
         if (std.mem.eql(u8, key, "path")) {
-            if (attributes.path != null) return error.InvalidData;
+            if (attributes.path != null) return error.DataFailure;
             attributes.path = value;
         } else if (std.mem.eql(u8, key, "linkpath")) {
-            if (attributes.link_name != null) return error.InvalidData;
+            if (attributes.link_name != null) return error.DataFailure;
             attributes.link_name = value;
         } else if (std.mem.eql(u8, key, "size")) {
-            if (attributes.size != null) return error.InvalidData;
+            if (attributes.size != null) return error.DataFailure;
             attributes.size = try tarDecimal(value);
         } else if (std.mem.eql(u8, key, "uid")) {
-            if (attributes.uid != null) return error.InvalidData;
-            attributes.uid = std.math.cast(u32, try tarDecimal(value)) orelse return error.InvalidData;
+            if (attributes.uid != null) return error.DataFailure;
+            attributes.uid = std.math.cast(u32, try tarDecimal(value)) orelse return error.DataFailure;
         } else if (std.mem.eql(u8, key, "gid")) {
-            if (attributes.gid != null) return error.InvalidData;
-            attributes.gid = std.math.cast(u32, try tarDecimal(value)) orelse return error.InvalidData;
+            if (attributes.gid != null) return error.DataFailure;
+            attributes.gid = std.math.cast(u32, try tarDecimal(value)) orelse return error.DataFailure;
         } else if (std.mem.eql(u8, key, "mode")) {
-            if (attributes.mode != null) return error.InvalidData;
-            attributes.mode = std.math.cast(u32, try tarDecimal(value)) orelse return error.InvalidData;
+            if (attributes.mode != null) return error.DataFailure;
+            attributes.mode = std.math.cast(u32, try tarDecimal(value)) orelse return error.DataFailure;
         } else if (std.mem.eql(u8, key, "mtime")) {
-            if (attributes.modification_time != null) return error.InvalidData;
-            const seconds_end = std.mem.indexOfScalar(u8, value, '.') orelse value.len;
+            if (attributes.modification_time != null) return error.DataFailure;
+            const seconds_end = std.mem.findScalar(u8, value, '.') orelse value.len;
             attributes.modification_time = try tarDecimal(value[0..seconds_end]);
         } else if (std.mem.eql(u8, key, "GNU.sparse.major")) {
-            if (attributes.sparse_major != null) return error.InvalidData;
+            if (attributes.sparse_major != null) return error.DataFailure;
             attributes.sparse_major = try tarDecimal(value);
         } else if (std.mem.eql(u8, key, "GNU.sparse.minor")) {
-            if (attributes.sparse_minor != null) return error.InvalidData;
+            if (attributes.sparse_minor != null) return error.DataFailure;
             attributes.sparse_minor = try tarDecimal(value);
         } else if (std.mem.eql(u8, key, "GNU.sparse.name")) {
-            if (attributes.sparse_name != null) return error.InvalidData;
+            if (attributes.sparse_name != null) return error.DataFailure;
             attributes.sparse_name = value;
         } else if (std.mem.eql(u8, key, "GNU.sparse.size")) {
-            if (attributes.sparse_size != null) return error.InvalidData;
+            if (attributes.sparse_size != null) return error.DataFailure;
             attributes.sparse_size = try tarDecimal(value);
         } else if (std.mem.eql(u8, key, "GNU.sparse.realsize")) {
-            if (attributes.sparse_realsize != null) return error.InvalidData;
+            if (attributes.sparse_realsize != null) return error.DataFailure;
             attributes.sparse_realsize = try tarDecimal(value);
         } else if (std.mem.eql(u8, key, "GNU.sparse.numblocks")) {
-            if (attributes.sparse_numblocks != null) return error.InvalidData;
+            if (attributes.sparse_numblocks != null) return error.DataFailure;
             attributes.sparse_numblocks = try tarDecimal(value);
         } else if (std.mem.eql(u8, key, "GNU.sparse.map")) {
-            if (attributes.sparse_map != null) return error.InvalidData;
+            if (attributes.sparse_map != null) return error.DataFailure;
             attributes.sparse_map = value;
         } else if (std.mem.startsWith(u8, key, "GNU.sparse.offset") or std.mem.startsWith(u8, key, "GNU.sparse.numbytes")) {
             if (attributes.sparse_pax == null) attributes.sparse_pax = data;
@@ -801,7 +801,7 @@ fn tarParsePax(data: []const u8) Failure!Pax {
 
 fn tarApplyPax(entry: *EntryInfo, attributes: Pax) Failure!void {
     if (attributes.path) |path| {
-        if (path.len == 0 or std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidData;
+        if (path.len == 0 or std.mem.findScalar(u8, path, 0) != null) return error.DataFailure;
         entry.name = path;
         entry.prefix = &.{};
     }

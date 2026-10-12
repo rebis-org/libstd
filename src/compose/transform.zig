@@ -31,10 +31,10 @@ const Failure = vocabulary.Failure;
 const deflate_options: deflate.Options = .{ .good = 8, .nice = 128, .lazy = 16, .chain = 8 };
 
 fn requireReplay(source: *Resource, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, comptime confirmed: bool) Failure!void {
-    if (sizing != .measured and sizing != .bounded) return error.Unsupported;
+    if (sizing != .measured and sizing != .bounded) return error.UnsupportedFailure;
     const expected: vocabulary.CommitMode = if (confirmed) .confirmed else .tentative;
-    if (commit != expected) return error.Unsupported;
-    if (!source.hasCapability(resource.capability_bit_read) or !source.hasCapability(resource.capability_bit_replay)) return error.Unsupported;
+    if (commit != expected) return error.UnsupportedFailure;
+    if (!source.hasCapability(resource.capability_bit_read) or !source.hasCapability(resource.capability_bit_replay)) return error.UnsupportedFailure;
 }
 
 fn optNode(request: ?*Node, comptime component: []const u8, comptime name: []const u8) ?*Node {
@@ -44,12 +44,7 @@ fn optNode(request: ?*Node, comptime component: []const u8, comptime name: []con
 
 fn optCast(request: ?*Node, comptime component: []const u8, comptime name: []const u8, comptime T: type) Failure!?T {
     const node = optNode(request, component, name) orelse return null;
-    return std.math.cast(T, node.value_low) orelse error.InvalidCall;
-}
-
-fn optTruncate(request: ?*Node, comptime component: []const u8, comptime name: []const u8, comptime T: type) ?T {
-    const node = optNode(request, component, name) orelse return null;
-    return @truncate(node.value_low);
+    return std.math.cast(T, node.value_low) orelse error.CallFailure;
 }
 
 fn optBool(request: ?*Node, comptime component: []const u8, comptime name: []const u8) bool {
@@ -64,15 +59,15 @@ fn optBytes(request: ?*Node, comptime component: []const u8, comptime name: []co
 
 pub fn testHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
     _ = command_mask;
-    const source_resource = source orelse return error.InvalidCall;
-    const sink_resource = sink orelse return error.InvalidCall;
+    const source_resource = source orelse return error.CallFailure;
+    const sink_resource = sink orelse return error.CallFailure;
     var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
     const output_size = try common.planOutputSize(source_resource, sizing, limits, &workspace);
     try common.requireSinkCapacity(sink_resource, call, output_size);
     const staging_required: usize = if (commit == .confirmed) output_size else 0;
     if (workspace.bytes.len < staging_required) {
         common.writeCapacityDiagnostic(call, staging_required, workspace.bytes.len);
-        return error.InsufficientCapacity;
+        return error.CapacityFailure;
     }
     if (commit == .confirmed) {
         const staging = try workspace.take(u8, output_size);
@@ -99,7 +94,7 @@ pub fn testHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resourc
 }
 
 pub fn deflateHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
-    const source_resource = source orelse return error.InvalidCall;
+    const source_resource = source orelse return error.CallFailure;
     try requireReplay(source_resource, sizing, commit, false);
     const deflate_opts = try parseDeflateOptions(call.request, command_mask);
     var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
@@ -111,10 +106,10 @@ pub fn deflateHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Reso
             var bounded_source: resource.BoundedReader = undefined;
             bounded_source.init(source_resource, limits.encoded_bytes);
             var bounded_sink = resource.BoundedWriter.init(sink_resource, limits.decoded_bytes);
-            var inflater = deflate_seam.Decode.initBound(plan.provider, &bounded_source.reader, history) catch return error.Unsupported;
+            var inflater = deflate_seam.Decode.initBound(plan.provider, &bounded_source.reader, history) catch return error.UnsupportedFailure;
             _ = inflater.readerPtr().streamRemaining(&bounded_sink.writer) catch |err| return common.mapSinkError(switch (err) {
                 error.WriteFailed => error.IoFailure,
-                else => error.InvalidData,
+                else => error.DataFailure,
             }, call, sink_resource);
         }
         response.byte_length = output_size;
@@ -122,7 +117,7 @@ pub fn deflateHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Reso
         const output_size = if (sizing == .bounded) blk: {
             const input_len = try common.measureSource(source_resource, limits.decoded_bytes);
             const bound = deflate.encodedSizeBound(input_len);
-            if (bound > limits.encoded_bytes) return error.ResourceLimit;
+            if (bound > limits.encoded_bytes) return error.ResourceFailure;
             break :blk bound;
         } else try planCountedEncode(source_resource, limits.decoded_bytes, limits.encoded_bytes, true, deflateEncodeStream, .{ .history = history, .options = deflate_opts });
         if (sink) |sink_resource| {
@@ -133,19 +128,16 @@ pub fn deflateHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Reso
             var compressor = try deflate.Compress.init(&bounded_sink.writer, history, deflate_opts);
             _ = std.Io.Reader.streamRemaining(&bounded_source.reader, &compressor.writer) catch return common.mapSinkError(error.IoFailure, call, sink_resource);
             compressor.finish() catch return common.mapSinkError(error.IoFailure, call, sink_resource);
-            if (sizing == .bounded) {
-                response.byte_length = try common.boundedProduced(&bounded_sink, limits.encoded_bytes, output_size);
-                return;
-            }
+            if (try common.respondWrite(response, sizing, &bounded_sink, limits.encoded_bytes, output_size)) return;
         }
         response.byte_length = output_size;
     } else {
-        return error.Unsupported;
+        return error.UnsupportedFailure;
     }
 }
 
 pub fn gzipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
-    const source_resource = source orelse return error.InvalidCall;
+    const source_resource = source orelse return error.CallFailure;
     try requireReplay(source_resource, sizing, commit, false);
     var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
     const options = blk: {
@@ -158,15 +150,15 @@ pub fn gzipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resourc
         const input = switch (source_resource.kind) {
             .direct_read => |bytes| bytes,
             .callback_read => try common.materializeSource(.budget, source_resource, &workspace, limits.encoded_bytes),
-            else => return error.Unsupported,
+            else => return error.UnsupportedFailure,
         };
-        if (input.len > limits.encoded_bytes) return error.ResourceLimit;
+        if (input.len > limits.encoded_bytes) return error.ResourceFailure;
         if (sink) |sink_resource| {
             if (plan.provider == .onprem and sink_resource.kind == .direct_write and sink_resource.hasCapability(resource.capability_bit_write)) {
                 // Single-pass: fallback recomputes exact size before further writes, so capacity never fails post-write. Carve-out: aborted fast path may leave a tentative prefix.
                 switch (try gzip.decodeSinglePass(input, sink_resource.kind.direct_write, history, plan.provider)) {
                     .decoded => |produced| {
-                        if (produced > limits.decoded_bytes) return error.ResourceLimit;
+                        if (produced > limits.decoded_bytes) return error.ResourceFailure;
                         response.byte_length = produced;
                         return;
                     },
@@ -175,7 +167,7 @@ pub fn gzipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resourc
             }
         }
         const output_size = try gzip.decodedSize(input, history, plan.provider);
-        if (output_size > limits.decoded_bytes) return error.ResourceLimit;
+        if (output_size > limits.decoded_bytes) return error.ResourceFailure;
         if (sink) |sink_resource| {
             try common.requireSink(sink_resource, call, output_size);
             var bounded_sink = resource.BoundedWriter.init(sink_resource, limits.decoded_bytes);
@@ -188,7 +180,7 @@ pub fn gzipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resourc
         const output_size = if (sizing == .bounded) blk: {
             const input_len = try common.measureSource(source_resource, limits.decoded_bytes);
             const bound = gzip.encodedSizeBound(input_len, options);
-            if (bound > limits.encoded_bytes) return error.ResourceLimit;
+            if (bound > limits.encoded_bytes) return error.ResourceFailure;
             break :blk bound;
         } else try planCountedEncode(source_resource, limits.decoded_bytes, limits.encoded_bytes, true, gzipEncodeStream, .{ .history = history, .options = options });
         if (sink) |sink_resource| {
@@ -197,16 +189,13 @@ pub fn gzipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resourc
             bounded_source.init(source_resource, limits.decoded_bytes);
             var bounded_sink = resource.BoundedWriter.init(sink_resource, limits.encoded_bytes);
             gzip.encodeStream(&bounded_source.reader, &bounded_sink.writer, history, options) catch |err| return common.mapSinkError(err, call, sink_resource);
-            if (sizing == .bounded) {
-                response.byte_length = try common.boundedProduced(&bounded_sink, limits.encoded_bytes, output_size);
-                return;
-            }
+            if (try common.respondWrite(response, sizing, &bounded_sink, limits.encoded_bytes, output_size)) return;
             response.byte_length = output_size;
         } else {
             response.byte_length = output_size;
         }
     } else {
-        return error.Unsupported;
+        return error.UnsupportedFailure;
     }
 }
 
@@ -222,9 +211,9 @@ fn parseGzipOptions(request: ?*Node, command_mask: u32) Failure!gzip.Options {
         .comment = &.{},
         .deflate = try parseDeflateOptions(request, command_mask),
     };
-    if (optTruncate(request, "gzip", "modification_time", u32)) |value| options.modification_time = value;
-    if (optTruncate(request, "gzip", "extra_flags", u8)) |value| options.extra_flags = value;
-    if (optTruncate(request, "gzip", "operating_system", u8)) |value| options.operating_system = value;
+    if (try optCast(request, "gzip", "modification_time", u32)) |value| options.modification_time = value;
+    if (try optCast(request, "gzip", "extra_flags", u8)) |value| options.extra_flags = value;
+    if (try optCast(request, "gzip", "operating_system", u8)) |value| options.operating_system = value;
     options.text = optBool(request, "gzip", "text");
     options.header_crc = optBool(request, "gzip", "header_crc");
     if (try optBytes(request, "gzip", "extra")) |value| options.extra = value;
@@ -242,7 +231,7 @@ fn parseDeflateOptions(request: ?*Node, command_mask: u32) Failure!deflate.Optio
     if (try optCast(request, "deflate", "chain", u16)) |value| options.chain = value;
     if (optNode(request, "deflate", "optimal")) |node| options.optimal = node.value_low != 0;
     if (optNode(request, "deflate", "strategy")) |node| {
-        if (node.value_low > @backingInt(deflate.Strategy.rle)) return error.InvalidCall;
+        if (node.value_low > @backingInt(deflate.Strategy.rle)) return error.CallFailure;
         options.strategy = @fromBackingInt(@intCast(node.value_low));
     }
     return options;
@@ -261,9 +250,9 @@ fn planCountedEncode(source: *Resource, decoded_limit: u64, encoded_limit: u64, 
         try encode_fn(&bounded_source.reader, &counter.writer, args);
     }
     const output_size = counter.written();
-    if (output_size > encoded_limit) return error.ResourceLimit;
+    if (output_size > encoded_limit) return error.ResourceFailure;
     try source.rewind();
-    return std.math.cast(usize, output_size) orelse error.ResourceLimit;
+    return std.math.cast(usize, output_size) orelse error.ResourceFailure;
 }
 
 fn gzipEncodeStream(input: *std.Io.Reader, output: *std.Io.Writer, args: anytype) Failure!void {
@@ -291,15 +280,15 @@ fn planDeflateDecode(source: *Resource, history: []u8, encoded_limit: u64, decod
     // The counting pass answers a size, so the arm choice is output-neutral;
     // the committing decode below binds the provider for real.
     var inflater = deflate.Decompress.init(&bounded_source.reader, history);
-    _ = inflater.reader.streamRemaining(&counter.writer) catch return error.InvalidData;
+    _ = inflater.reader.streamRemaining(&counter.writer) catch return error.DataFailure;
     try source.rewind();
     const output_size = counter.written();
-    if (output_size > decoded_limit) return error.ResourceLimit;
-    return std.math.cast(usize, output_size) orelse error.ResourceLimit;
+    if (output_size > decoded_limit) return error.ResourceFailure;
+    return std.math.cast(usize, output_size) orelse error.ResourceFailure;
 }
 
 pub fn zlibHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
-    const source_resource = source orelse return error.InvalidCall;
+    const source_resource = source orelse return error.CallFailure;
     try requireReplay(source_resource, sizing, commit, false);
     var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
     const options = zlib.Options{ .deflate = try parseDeflateOptions(call.request, command_mask), .provider = plan.provider };
@@ -308,11 +297,11 @@ pub fn zlibHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resourc
         const input = switch (source_resource.kind) {
             .direct_read => |bytes| bytes,
             .callback_read => try common.materializeSource(.budget, source_resource, &workspace, limits.encoded_bytes),
-            else => return error.Unsupported,
+            else => return error.UnsupportedFailure,
         };
-        if (input.len > limits.encoded_bytes) return error.ResourceLimit;
+        if (input.len > limits.encoded_bytes) return error.ResourceFailure;
         const output_size = try zlib.decodedSize(input, history, plan.provider);
-        if (output_size > limits.decoded_bytes) return error.ResourceLimit;
+        if (output_size > limits.decoded_bytes) return error.ResourceFailure;
         if (sink) |sink_resource| {
             try common.checkWorkspaceOverlap(call, source_resource, sink_resource);
             try common.requireSink(sink_resource, call, output_size);
@@ -326,7 +315,7 @@ pub fn zlibHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resourc
         const output_size = if (sizing == .bounded) blk: {
             const input_len = try common.measureSource(source_resource, limits.decoded_bytes);
             const bound = zlib.encodedSizeBound(input_len, options);
-            if (bound > limits.encoded_bytes) return error.ResourceLimit;
+            if (bound > limits.encoded_bytes) return error.ResourceFailure;
             break :blk bound;
         } else try planCountedEncode(source_resource, limits.decoded_bytes, limits.encoded_bytes, true, zlibEncodeStream, .{ .history = history, .options = options });
         if (sink) |sink_resource| {
@@ -335,16 +324,13 @@ pub fn zlibHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resourc
             bounded_source.init(source_resource, limits.decoded_bytes);
             var bounded_sink = resource.BoundedWriter.init(sink_resource, limits.encoded_bytes);
             zlib.encodeStream(&bounded_source.reader, &bounded_sink.writer, history, options) catch |err| return common.mapSinkError(err, call, sink_resource);
-            if (sizing == .bounded) {
-                response.byte_length = try common.boundedProduced(&bounded_sink, limits.encoded_bytes, output_size);
-                return;
-            }
+            if (try common.respondWrite(response, sizing, &bounded_sink, limits.encoded_bytes, output_size)) return;
             response.byte_length = output_size;
         } else {
             response.byte_length = output_size;
         }
     } else {
-        return error.Unsupported;
+        return error.UnsupportedFailure;
     }
 }
 
@@ -367,12 +353,12 @@ fn parseLz4Options(request: ?*Node, command_mask: u32) Failure!lz4.Options {
 }
 
 pub fn zstd_seekableHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
-    const source_resource = source orelse return error.InvalidCall;
+    const source_resource = source orelse return error.CallFailure;
     try requireReplay(source_resource, sizing, commit, false);
     var options = zstd_seekable.Options{ .provider = plan.provider };
     if (command_mask == vocabulary.command_mask_write or command_mask == vocabulary.command_mask_query) {
         if (try optCast(call.request, "zstd-seekable", "frame_size", u32)) |frame_size| {
-            if (frame_size < zstd_seekable.frame_size_min or frame_size > zstd_seekable.frame_size_max) return error.InvalidCall;
+            if (frame_size < zstd_seekable.frame_size_min or frame_size > zstd_seekable.frame_size_max) return error.CallFailure;
             options.frame_size = frame_size;
         }
     }
@@ -381,10 +367,10 @@ pub fn zstd_seekableHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: 
         if (sink) |sink_resource| try common.checkWorkspaceOverlap(call, source_resource, sink_resource);
         var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
         const input = try common.materializeSource(.budget, source_resource, &workspace, limits.encoded_bytes);
-        if (input.len > limits.encoded_bytes) return error.ResourceLimit;
+        if (input.len > limits.encoded_bytes) return error.ResourceFailure;
         const history = try workspace.take(u8, @as(usize, frame_options.window_size) + zstd.block_size_max);
         const output_size = try zstd_seekable.decodedSize(input, history, options);
-        if (output_size > limits.decoded_bytes) return error.ResourceLimit;
+        if (output_size > limits.decoded_bytes) return error.ResourceFailure;
         if (sink) |sink_resource| {
             try common.requireSink(sink_resource, call, output_size);
             if (sink_resource.kind == .direct_write) {
@@ -408,62 +394,59 @@ pub fn zstd_seekableHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: 
         const entries = try workspace.take(zstd_seekable.FrameEntry, zstd_seekable.frameCountFor(input.len, options));
         const output_size = if (sizing == .bounded) blk: {
             const bound = zstd_seekable.encodedSizeBound(input.len, options);
-            if (bound > limits.encoded_bytes) return error.ResourceLimit;
+            if (bound > limits.encoded_bytes) return error.ResourceFailure;
             break :blk bound;
         } else blk: {
             var counter = measurement.Counter.init(null);
             try zstd_seekable.encodeToWriter(input, &counter.writer, history, workspace_u32, entries, options);
             const exact = try measurement.measuredLength(&counter);
-            if (exact > limits.encoded_bytes) return error.ResourceLimit;
+            if (exact > limits.encoded_bytes) return error.ResourceFailure;
             break :blk exact;
         };
-        if (input.len + output_size > limits.codec_work) return error.ResourceLimit;
+        if (input.len + output_size > limits.codec_work) return error.ResourceFailure;
         if (sink) |sink_resource| {
             try common.requireSink(sink_resource, call, output_size);
             const staging = try workspace.take(u8, output_size);
             const produced = try zstd_seekable.encode(input, staging, history, workspace_u32, entries, options);
-            if (sizing == .bounded) {
-                if (produced > output_size) return error.InternalFailure;
-                try common.commitBytesToSink(sink_resource, call, staging[0..produced]);
-                response.byte_length = produced;
+            if (try common.verifiedCommitLength(sink_resource, call, sizing, staging, output_size, produced)) |produced_length| {
+                response.byte_length = produced_length;
                 return;
             }
-            try common.commitBytesToSink(sink_resource, call, staging);
         }
         response.byte_length = output_size;
     } else {
-        return error.Unsupported;
+        return error.UnsupportedFailure;
     }
 }
 
 pub fn zdictHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
-    const source_resource = source orelse return error.InvalidCall;
+    const source_resource = source orelse return error.CallFailure;
     try requireReplay(source_resource, sizing, commit, false);
     if (command_mask == vocabulary.command_mask_read) {
         if (sink) |sink_resource| try common.checkWorkspaceOverlap(call, source_resource, sink_resource);
         var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
         const input = try common.materializeSource(.require_size, source_resource, &workspace, limits.encoded_bytes);
         const content = zstd.dictionaryContent(input) catch |err| switch (err) {
-            error.InvalidData, error.Unsupported, error.ResourceLimit, error.IoFailure, error.IntegrityFailure => |e| return e,
+            error.DataFailure, error.UnsupportedFailure, error.ResourceFailure, error.IoFailure, error.IntegrityFailure => |e| return e,
         };
-        if (content.len > limits.decoded_bytes) return error.ResourceLimit;
+        if (content.len > limits.decoded_bytes) return error.ResourceFailure;
         if (sink) |sink_resource| {
             try common.checkWorkspaceOverlap(call, source_resource, sink_resource);
-            if (!sink_resource.hasCapability(resource.capability_bit_write)) return error.Unsupported;
+            if (!sink_resource.hasCapability(resource.capability_bit_write)) return error.UnsupportedFailure;
             try common.requireSinkCapacity(sink_resource, call, content.len);
             try common.commitBytesToSink(sink_resource, call, content);
         }
         response.byte_length = content.len;
         return;
     }
-    if (command_mask != vocabulary.command_mask_write and command_mask != vocabulary.command_mask_query) return error.Unsupported;
-    const sample_size = (try optCast(call.request, "zdict", "sample_size", usize)) orelse return error.InvalidCall;
-    if (sample_size == 0) return error.InvalidCall;
+    if (command_mask != vocabulary.command_mask_write and command_mask != vocabulary.command_mask_query) return error.UnsupportedFailure;
+    const sample_size = (try optCast(call.request, "zdict", "sample_size", usize)) orelse return error.CallFailure;
+    if (sample_size == 0) return error.CallFailure;
     var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
     const input = try common.materializeSource(.require_size, source_resource, &workspace, limits.decoded_bytes);
-    if (input.len % sample_size != 0) return error.InvalidCall;
+    if (input.len % sample_size != 0) return error.CallFailure;
     const sample_count = input.len / sample_size;
-    if (sample_count == 0 or sample_count > (1 << 20)) return error.InvalidCall;
+    if (sample_count == 0 or sample_count > (1 << 20)) return error.CallFailure;
     const samples = try workspace.take([]const u8, sample_count);
     for (0..sample_count) |index| {
         samples[index] = input[index * sample_size ..][0..sample_size];
@@ -472,11 +455,11 @@ pub fn zdictHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resour
     const staging = try workspace.take(u8, capacity);
     const train_scratch = try workspace.take(u8, zstd.trainWorkspaceSize());
     const produced = try zstd.trainDictionary(samples, capacity, staging, train_scratch, plan.provider);
-    if (produced > limits.encoded_bytes) return error.ResourceLimit;
-    if (input.len + produced > limits.codec_work) return error.ResourceLimit;
+    if (produced > limits.encoded_bytes) return error.ResourceFailure;
+    if (input.len + produced > limits.codec_work) return error.ResourceFailure;
     if (sink) |sink_resource| {
         try common.checkWorkspaceOverlap(call, source_resource, sink_resource);
-        if (!sink_resource.hasCapability(resource.capability_bit_write)) return error.Unsupported;
+        if (!sink_resource.hasCapability(resource.capability_bit_write)) return error.UnsupportedFailure;
         try common.requireSinkCapacity(sink_resource, call, produced);
         try common.commitBytesToSink(sink_resource, call, staging[0..produced]);
     }
@@ -484,7 +467,7 @@ pub fn zdictHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resour
 }
 
 pub fn zstdHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
-    const source_resource = source orelse return error.InvalidCall;
+    const source_resource = source orelse return error.CallFailure;
     try requireReplay(source_resource, sizing, commit, true);
     const options = blk: {
         var parsed = try parseZstdOptions(call.request, command_mask);
@@ -501,14 +484,14 @@ pub fn zstdHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resourc
         const input = try common.materializeSource(.replay, source_resource, &workspace, limits.encoded_bytes);
         var planned_history: ?[]u8 = null;
         const output_size = zstd.frameContentSize(input, window) catch |err| switch (err) {
-            error.Unsupported => blk: {
+            error.UnsupportedFailure => blk: {
                 const history = try workspace.take(u8, history_base_size);
                 planned_history = history;
                 break :blk try zstd_seam.decodedSize(options.provider, input, history, options);
             },
             else => return err,
         };
-        if (output_size > limits.decoded_bytes) return error.ResourceLimit;
+        if (output_size > limits.decoded_bytes) return error.ResourceFailure;
         if (sink) |sink_resource| {
             try common.requireSink(sink_resource, call, output_size);
             var source_reader = std.Io.Reader.fixed(input);
@@ -553,7 +536,7 @@ pub fn zstdHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resourc
         encode_options.max_decoded_bytes = limits.decoded_bytes;
         const output_size = if (sizing == .bounded) blk: {
             const bound = zstd.encodedSizeBound(input_len, encode_options);
-            if (bound > limits.encoded_bytes) return error.ResourceLimit;
+            if (bound > limits.encoded_bytes) return error.ResourceFailure;
             break :blk bound;
         } else try planCountedEncode(source_resource, limits.decoded_bytes, limits.encoded_bytes, false, zstdEncodeStream, .{ .history = history, .workspace = encoder_workspace, .options = encode_options });
         if (sink) |sink_resource| {
@@ -563,17 +546,14 @@ pub fn zstdHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resourc
             bounded_source.init(source_resource, limits.decoded_bytes);
             var staging_writer = std.Io.Writer.fixed(staging);
             const produced = try zstd.encodeStream(&bounded_source.reader, &staging_writer, history, encoder_workspace, encode_options);
-            if (sizing == .bounded) {
-                if (produced > output_size) return error.InternalFailure;
-                try common.commitBytesToSink(sink_resource, call, staging[0..produced]);
-                response.byte_length = produced;
+            if (try common.verifiedCommitLength(sink_resource, call, sizing, staging, output_size, produced)) |produced_length| {
+                response.byte_length = produced_length;
                 return;
             }
-            try common.commitBytesToSink(sink_resource, call, staging);
         }
         response.byte_length = output_size;
     } else {
-        return error.Unsupported;
+        return error.UnsupportedFailure;
     }
 }
 
@@ -584,19 +564,19 @@ fn parseZstdOptions(request: ?*Node, command_mask: u32) Failure!zstd.Options {
     };
     if (command_mask == vocabulary.command_mask_write or command_mask == vocabulary.command_mask_query) {
         if (try optCast(request, "zstd", "hash_bits", u5)) |hash_bits| {
-            if (hash_bits < 10 or hash_bits > 17) return error.InvalidCall;
+            if (hash_bits < 10 or hash_bits > 17) return error.CallFailure;
             options.hash_bits = hash_bits;
         }
         if (try optCast(request, "zstd", "max_chain", u32)) |max_chain| {
-            if (max_chain == 0) return error.InvalidCall;
+            if (max_chain == 0) return error.CallFailure;
             options.max_chain = max_chain;
         }
         if (try optCast(request, "zstd", "nice_len", u32)) |nice_len| {
-            if (nice_len < 3) return error.InvalidCall;
+            if (nice_len < 3) return error.CallFailure;
             options.nice_len = nice_len;
         }
         if (try optCast(request, "zstd", "search_window", u32)) |search_window| {
-            if (search_window == 0) return error.InvalidCall;
+            if (search_window == 0) return error.CallFailure;
             options.search_window = search_window;
         }
         if (optNode(request, "zstd", "lazy")) |node| options.lazy = node.value_low != 0;
@@ -608,15 +588,15 @@ fn parseZstdOptions(request: ?*Node, command_mask: u32) Failure!zstd.Options {
 }
 
 fn parseZstdWindow(node: ?*Node) Failure!u32 {
-    const n = node orelse return error.InvalidCall;
-    const window = std.math.cast(u32, n.value_low) orelse return error.InvalidCall;
-    if (window < zstd.window_size_min or window > zstd.window_size_max) return error.InvalidCall;
+    const n = node orelse return error.CallFailure;
+    const window = std.math.cast(u32, n.value_low) orelse return error.CallFailure;
+    if (window < zstd.window_size_min or window > zstd.window_size_max) return error.CallFailure;
     return window;
 }
 
 fn parseZstdDictionary(node: ?*Node) Failure!?[]const u8 {
     const n = node orelse return null;
-    if (n.value_low != 0 or n.child != null) return error.InvalidCall;
+    if (n.value_low != 0 or n.child != null) return error.CallFailure;
     return @as(?[]const u8, try resource.checkedConstBytes(n.bytes, n.byte_length));
 }
 
@@ -631,7 +611,7 @@ fn parseBzip2Options(request: ?*Node, command_mask: u32) Failure!bzip2.Options {
     var options: bzip2.Options = .{};
     if (command_mask == vocabulary.command_mask_write or command_mask == vocabulary.command_mask_query) {
         if (try optCast(request, "bzip2", "block_size", u32)) |block_size| {
-            if (block_size < bzip2.block_size_min or block_size > bzip2.block_size_max) return error.InvalidCall;
+            if (block_size < bzip2.block_size_min or block_size > bzip2.block_size_max) return error.CallFailure;
             options.block_size = block_size;
         }
     }
@@ -641,9 +621,9 @@ fn parseBzip2Options(request: ?*Node, command_mask: u32) Failure!bzip2.Options {
 fn parseDictionary(comptime component: []const u8, request: ?*Node, fallback: ?u32) Failure!u32 {
     const dictionary_size = (try optCast(request, component, "dictionary", u32)) orelse {
         if (fallback) |size| return size;
-        return error.InvalidCall;
+        return error.CallFailure;
     };
-    if (dictionary_size < lzma.dictionary_min or dictionary_size > lzma.dictionary_max) return error.InvalidCall;
+    if (dictionary_size < lzma.dictionary_min or dictionary_size > lzma.dictionary_max) return error.CallFailure;
     return dictionary_size;
 }
 
@@ -663,7 +643,7 @@ fn parseLzmaMatchParams(request: ?*Node, command_mask: u32) Failure!LzmaMatchPar
     var params = LzmaMatchParams{};
     if (command_mask != vocabulary.command_mask_write and command_mask != vocabulary.command_mask_query) return params;
     if (try optCast(request, "lzma", "match_finder_depth", u32)) |depth| {
-        if (depth == 0) return error.InvalidCall;
+        if (depth == 0) return error.CallFailure;
         params.match_finder_depth = depth;
     }
     if (optNode(request, "lzma", "lazy")) |node| {
@@ -671,14 +651,14 @@ fn parseLzmaMatchParams(request: ?*Node, command_mask: u32) Failure!LzmaMatchPar
         params.lazy_set = true;
     }
     if (try optCast(request, "lzma", "nice_len", u32)) |nice_len| {
-        if (nice_len < 2 or nice_len > 273) return error.InvalidCall;
+        if (nice_len < 2 or nice_len > 273) return error.CallFailure;
         params.nice_len = nice_len;
     }
     if (optNode(request, "lzma", "match_finder")) |node| {
         params.match_finder = switch (node.value_low) {
             0 => .hash_chain,
             1 => .bt4,
-            else => return error.InvalidCall,
+            else => return error.CallFailure,
         };
     }
     // BT4 defaults to lazy matching unless the caller explicitly opts into greedy.
@@ -726,7 +706,7 @@ pub fn lzma2Hook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resour
 }
 
 fn bufferCodecHook(comptime Codec: type, plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32, decode_workspace: usize, encode_workspace: usize, options: Codec.Options) Failure!void {
-    const source_resource = source orelse return error.InvalidCall;
+    const source_resource = source orelse return error.CallFailure;
     try requireReplay(source_resource, sizing, commit, false);
     if (sink == null) try common.checkSourceWorkspaceOverlap(call, source_resource);
     if (command_mask == vocabulary.command_mask_read) {
@@ -735,18 +715,18 @@ fn bufferCodecHook(comptime Codec: type, plan: *common.ExecutionPlan, source: ?*
         const input = try common.materializeSource(.require_size, source_resource, &workspace, limits.encoded_bytes);
         if (sink) |sink_resource| {
             try common.checkWorkspaceOverlap(call, source_resource, sink_resource);
-            if (!sink_resource.hasCapability(resource.capability_bit_write)) return error.Unsupported;
+            if (!sink_resource.hasCapability(resource.capability_bit_write)) return error.UnsupportedFailure;
             var direct_route = false;
             if (Codec == lz4 and sink_resource.kind == .direct_write) {
                 // One decode into workspace staging sized by the frame's declared
                 // content size: a rejected read leaves the sink untouched, exactly like
                 // the counted route, and the checksum failure still arrives from the leaf.
                 if (try lz4.frameContentSize(input)) |declared| {
-                    const size = std.math.cast(usize, declared) orelse return error.ResourceLimit;
+                    const size = std.math.cast(usize, declared) orelse return error.ResourceFailure;
                     if (size <= limits.decoded_bytes and input.len + size <= limits.codec_work) {
                         const staging = try workspace.take(u8, size);
                         if (codecDecodeDirectInPlace(Codec, input, staging, scratch, options)) |produced| {
-                            if (produced > limits.decoded_bytes) return error.ResourceLimit;
+                            if (produced > limits.decoded_bytes) return error.ResourceFailure;
                             try common.requireSinkCapacity(sink_resource, call, produced);
                             try common.commitBytesToSink(sink_resource, call, staging[0..produced]);
                             response.byte_length = produced;
@@ -754,7 +734,7 @@ fn bufferCodecHook(comptime Codec: type, plan: *common.ExecutionPlan, source: ?*
                         } else |err| switch (err) {
                             // A span overrun means the declared size lied small: the measured
                             // route counts the true size and reports the exact status.
-                            error.InsufficientCapacity => {},
+                            error.CapacityFailure => {},
                             else => return err,
                         }
                     }
@@ -763,17 +743,17 @@ fn bufferCodecHook(comptime Codec: type, plan: *common.ExecutionPlan, source: ?*
             if (!direct_route and sink_resource.kind == .direct_write and try codecKnownOutputSize(Codec, options) == null and (Codec == lzma or Codec == bzip2)) {
                 // No size preflight: the produced length comes back from the codec. lzma2 is excluded because chunk headers give a cheap size and in-place is faster.
                 const output = try common.sinkDirectBuffer(sink_resource, common.sinkCapacity(sink_resource));
-                if (input.len + output.len > limits.codec_work) return error.ResourceLimit;
+                if (input.len + output.len > limits.codec_work) return error.ResourceFailure;
                 if (codecDecodeDirect(Codec, input, output, scratch, options)) |produced| {
-                    if (produced > limits.decoded_bytes) return error.ResourceLimit;
+                    if (produced > limits.decoded_bytes) return error.ResourceFailure;
                     response.byte_length = produced;
                     direct_route = true;
                 } else |err| return err;
             }
             if (!direct_route) {
                 const output_size = if (try codecKnownOutputSize(Codec, options)) |size| size else try codecDecodedSize(Codec, input, scratch, options);
-                if (output_size > limits.decoded_bytes) return error.ResourceLimit;
-                if (input.len + output_size > limits.codec_work) return error.ResourceLimit;
+                if (output_size > limits.decoded_bytes) return error.ResourceFailure;
+                if (input.len + output_size > limits.codec_work) return error.ResourceFailure;
                 try common.requireSinkCapacity(sink_resource, call, output_size);
                 if (sink_resource.kind == .direct_write) {
                     const output = try common.sinkDirectBuffer(sink_resource, output_size);
@@ -788,8 +768,8 @@ fn bufferCodecHook(comptime Codec: type, plan: *common.ExecutionPlan, source: ?*
             }
         } else {
             const output_size = if (try codecKnownOutputSize(Codec, options)) |size| size else try codecDecodedSize(Codec, input, scratch, options);
-            if (output_size > limits.decoded_bytes) return error.ResourceLimit;
-            if (input.len + output_size > limits.codec_work) return error.ResourceLimit;
+            if (output_size > limits.decoded_bytes) return error.ResourceFailure;
+            if (input.len + output_size > limits.codec_work) return error.ResourceFailure;
             response.byte_length = output_size;
         }
     } else if (command_mask == vocabulary.command_mask_write) {
@@ -797,8 +777,8 @@ fn bufferCodecHook(comptime Codec: type, plan: *common.ExecutionPlan, source: ?*
         const scratch = try workspace.take(u8, encode_workspace);
         const input = try common.materializeSource(.require_size, source_resource, &workspace, limits.decoded_bytes);
         const output_size = if (sizing == .bounded) Codec.encodedSizeBound(input.len) else try Codec.requiredSize(input, scratch, options);
-        if (output_size > limits.encoded_bytes) return error.ResourceLimit;
-        if (input.len + output_size > limits.codec_work) return error.ResourceLimit;
+        if (output_size > limits.encoded_bytes) return error.ResourceFailure;
+        if (input.len + output_size > limits.codec_work) return error.ResourceFailure;
         if (sink) |sink_resource| {
             try common.checkWorkspaceOverlap(call, source_resource, sink_resource);
             try common.requireSink(sink_resource, call, output_size);
@@ -813,25 +793,22 @@ fn bufferCodecHook(comptime Codec: type, plan: *common.ExecutionPlan, source: ?*
             } else {
                 const staging = try workspace.take(u8, output_size);
                 const produced = try Codec.encode(input, staging, scratch, options);
-                if (sizing == .bounded) {
-                    if (produced > output_size) return error.InternalFailure;
-                    try common.commitBytesToSink(sink_resource, call, staging[0..produced]);
-                    response.byte_length = produced;
+                if (try common.verifiedCommitLength(sink_resource, call, sizing, staging, output_size, produced)) |produced_length| {
+                    response.byte_length = produced_length;
                     return;
                 }
-                try common.commitBytesToSink(sink_resource, call, staging);
             }
         }
         response.byte_length = output_size;
     } else {
-        return error.Unsupported;
+        return error.UnsupportedFailure;
     }
 }
 
 fn codecKnownOutputSize(comptime Codec: type, options: Codec.Options) Failure!?usize {
     if (!@hasField(Codec.Options, "unpack_size")) return null;
     const size = options.unpack_size orelse return null;
-    return std.math.cast(usize, size) orelse error.ResourceLimit;
+    return std.math.cast(usize, size) orelse error.ResourceFailure;
 }
 
 fn codecDecodedSize(comptime Codec: type, input: []const u8, scratch: []u8, options: Codec.Options) Failure!usize {
@@ -856,17 +833,17 @@ fn codecDecodeDirectInPlace(comptime Codec: type, input: []const u8, output: []u
 }
 
 pub fn lzma_fileHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
-    const source_resource = source orelse return error.InvalidCall;
+    const source_resource = source orelse return error.CallFailure;
     try requireReplay(source_resource, sizing, commit, false);
     if (sink == null) try common.checkSourceWorkspaceOverlap(call, source_resource);
     if (command_mask == vocabulary.command_mask_read) {
         var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
         const input = try common.materializeSource(.require_size, source_resource, &workspace, limits.encoded_bytes);
-        if (input.len < lzma_file.header_size) return error.InvalidData;
+        if (input.len < lzma_file.header_size) return error.DataFailure;
         const options = try lzma_file.decodeOptions(input);
         const scratch = try workspace.take(u8, lzma.decodeWorkspaceSize(options.properties));
-        const output_size = if (options.unpack_size) |size| std.math.cast(usize, size) orelse return error.ResourceLimit else try lzma_file.decodedSize(input, scratch, plan.provider);
-        if (output_size > limits.decoded_bytes) return error.ResourceLimit;
+        const output_size = if (options.unpack_size) |size| std.math.cast(usize, size) orelse return error.ResourceFailure else try lzma_file.decodedSize(input, scratch, plan.provider);
+        if (output_size > limits.decoded_bytes) return error.ResourceFailure;
         if (sink) |sink_resource| {
             try common.checkWorkspaceOverlap(call, source_resource, sink_resource);
             try common.requireSink(sink_resource, call, output_size);
@@ -893,24 +870,21 @@ pub fn lzma_fileHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Re
         const input = try common.materializeSource(.require_size, source_resource, &workspace, limits.decoded_bytes);
         options.unpack_size = input.len;
         const output_size = if (sizing == .bounded) lzma_file.encodedSizeBound(input.len) else try lzma_file.requiredSize(input, scratch, options);
-        if (output_size > limits.encoded_bytes) return error.ResourceLimit;
-        if (input.len + output_size > limits.codec_work) return error.ResourceLimit;
+        if (output_size > limits.encoded_bytes) return error.ResourceFailure;
+        if (input.len + output_size > limits.codec_work) return error.ResourceFailure;
         if (sink) |sink_resource| {
             try common.checkWorkspaceOverlap(call, source_resource, sink_resource);
             try common.requireSink(sink_resource, call, output_size);
             const staging = try workspace.take(u8, output_size);
             const produced = try lzma_file.encode(input, staging, scratch, options);
-            if (sizing == .bounded) {
-                if (produced > output_size) return error.InternalFailure;
-                try common.commitBytesToSink(sink_resource, call, staging[0..produced]);
-                response.byte_length = produced;
+            if (try common.verifiedCommitLength(sink_resource, call, sizing, staging, output_size, produced)) |produced_length| {
+                response.byte_length = produced_length;
                 return;
             }
-            try common.commitBytesToSink(sink_resource, call, staging);
         }
         response.byte_length = output_size;
     } else {
-        return error.Unsupported;
+        return error.UnsupportedFailure;
     }
 }
 
@@ -919,7 +893,7 @@ fn parseLzmaFileDictionary(request: ?*Node) Failure!u32 {
 }
 
 pub fn xzHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
-    const source_resource = source orelse return error.InvalidCall;
+    const source_resource = source orelse return error.CallFailure;
     try requireReplay(source_resource, sizing, commit, true);
     if (sink) |sink_resource| try common.checkWorkspaceOverlap(call, source_resource, sink_resource);
     const dictionary_size = try parseLzmaDictionary(call.request);
@@ -942,7 +916,7 @@ pub fn xzHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource,
             comptime discovery.parameter("delta", "distance").family,
             comptime discovery.parameter("delta", "distance").ordinal,
         )) |node| {
-            if (node.value_low < 1 or node.value_low > 255) return error.InvalidCall;
+            if (node.value_low < 1 or node.value_low > 255) return error.CallFailure;
             delta_distance = @intCast(node.value_low);
         }
     }
@@ -951,15 +925,15 @@ pub fn xzHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource,
         call.request,
         comptime discovery.parameter("xz", "block_size").family,
         comptime discovery.parameter("xz", "block_size").ordinal,
-    ))) orelse return error.InvalidCall;
+    ))) orelse return error.CallFailure;
     if (command_mask == vocabulary.command_mask_read) {
         var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
         const scratch = try workspace.take(u8, xz.decodeWorkspaceSize(dictionary_size));
         const input = try common.materializeSource(.require_size, source_resource, &workspace, limits.encoded_bytes);
-        if (input.len > limits.encoded_bytes) return error.ResourceLimit;
+        if (input.len > limits.encoded_bytes) return error.ResourceFailure;
         const output_size = try xz.decodedSize(input, scratch, plan.provider);
-        if (output_size > limits.decoded_bytes) return error.ResourceLimit;
-        if (input.len + output_size > limits.codec_work) return error.ResourceLimit;
+        if (output_size > limits.decoded_bytes) return error.ResourceFailure;
+        if (input.len + output_size > limits.codec_work) return error.ResourceFailure;
         if (sink) |sink_resource| {
             try common.requireSink(sink_resource, call, output_size);
             const staging = try workspace.take(u8, output_size);
@@ -970,7 +944,7 @@ pub fn xzHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource,
     } else if (command_mask == vocabulary.command_mask_write) {
         var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
         const input = try common.materializeSource(.require_size, source_resource, &workspace, limits.decoded_bytes);
-        if (input.len > limits.decoded_bytes) return error.ResourceLimit;
+        if (input.len > limits.decoded_bytes) return error.ResourceFailure;
         const encode_workspace = if (params.match_finder == .bt4) xz.encodeWorkspaceSizeBt(dictionary_size) else xz.encodeWorkspaceSize(dictionary_size);
         // Beyond the encoder workspace: index records per block, plus the
         // 1:1 filter staging when a filter chain is active.
@@ -988,23 +962,20 @@ pub fn xzHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource,
             .provider = plan.provider,
         };
         const output_size = if (sizing == .bounded) xz.encodedSizeBound(input.len, options.block_size) else try xz.requiredSize(input, scratch, options);
-        if (output_size > limits.encoded_bytes) return error.ResourceLimit;
-        if (input.len + output_size > limits.codec_work) return error.ResourceLimit;
+        if (output_size > limits.encoded_bytes) return error.ResourceFailure;
+        if (input.len + output_size > limits.codec_work) return error.ResourceFailure;
         if (sink) |sink_resource| {
             try common.requireSink(sink_resource, call, output_size);
             const staging = try workspace.take(u8, output_size);
             const produced = try xz.encode(input, staging, scratch, options);
-            if (sizing == .bounded) {
-                if (produced > output_size) return error.InternalFailure;
-                try common.commitBytesToSink(sink_resource, call, staging[0..produced]);
-                response.byte_length = produced;
+            if (try common.verifiedCommitLength(sink_resource, call, sizing, staging, output_size, produced)) |produced_length| {
+                response.byte_length = produced_length;
                 return;
             }
-            try common.commitBytesToSink(sink_resource, call, staging);
         }
         response.byte_length = output_size;
     } else {
-        return error.Unsupported;
+        return error.UnsupportedFailure;
     }
 }
 
@@ -1016,7 +987,7 @@ fn parseXzCheck(node: ?*Node) Failure!xz.CheckType {
         1 => .crc32,
         4 => .crc64,
         0x0A => .sha256,
-        else => error.Unsupported,
+        else => error.UnsupportedFailure,
     };
 }
 
@@ -1034,6 +1005,6 @@ fn parseXzFilters(node: ?*Node) Failure!xz.FilterChoice {
         7 => .sparc,
         8 => .arm64,
         9 => .riscv,
-        else => error.InvalidCall,
+        else => error.CallFailure,
     };
 }

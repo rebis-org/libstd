@@ -71,7 +71,7 @@ const dist_bits = [dc20]u5{
 };
 
 fn decodeDistance(slot: u32, br: *BitReader) Failure!u32 {
-    if (slot >= dc20) return error.InvalidData;
+    if (slot >= dc20) return error.DataFailure;
     var distance: u32 = dist_decode[slot] + 1;
     const table_bits = dist_bits[slot];
     if (table_bits > 0) {
@@ -80,14 +80,17 @@ fn decodeDistance(slot: u32, br: *BitReader) Failure!u32 {
     return distance;
 }
 
-// The predictor adapts every 32 samples by nudging one coefficient toward the bucket with the smallest accumulated difference.
-// The clamp is asymmetric, [-17, 16], because each guard tests `>= -16` before the decrement.
+// The predictor adapts every 32 samples, nudging one coefficient toward
+// the bucket with the smallest accumulated difference.
+// The clamp is asymmetric, [-17, 16], because each guard tests `>= -16`
+// before the decrement.
 const AudioChannel = struct {
     k1: i32 = 0,
     k2: i32 = 0,
     k3: i32 = 0,
     k4: i32 = 0,
     k5: i32 = 0,
+
     d1: i32 = 0,
     d2: i32 = 0,
     d3: i32 = 0,
@@ -96,6 +99,22 @@ const AudioChannel = struct {
     dif: [11]u32 = @splat(0),
     byte_count: u32 = 0,
     last_char: i32 = 0,
+
+    fn adaptGain(self: *@This(), comptime bucket: usize) void {
+        const gain = switch (comptime (bucket + 1) / 2) {
+            1 => &self.k1,
+            2 => &self.k2,
+            3 => &self.k3,
+            4 => &self.k4,
+            5 => &self.k5,
+            else => unreachable,
+        };
+        if (comptime bucket % 2 == 0) {
+            if (gain.* < 16) gain.* += 1;
+        } else {
+            if (gain.* >= -16) gain.* -= 1;
+        }
+    }
 
     // The channel delta is shared across channels, so this pointer carries state between calls.
     fn decode(self: *AudioChannel, channel_delta: *i32, delta_symbol: u32) u8 {
@@ -144,37 +163,9 @@ const AudioChannel = struct {
                 }
                 self.dif[i] = 0;
             }
+            // Odd buckets lean the gain down, even buckets up; fields run k1..k5.
             switch (min_bucket) {
-                1 => if (self.k1 >= -16) {
-                    self.k1 -= 1;
-                },
-                2 => if (self.k1 < 16) {
-                    self.k1 += 1;
-                },
-                3 => if (self.k2 >= -16) {
-                    self.k2 -= 1;
-                },
-                4 => if (self.k2 < 16) {
-                    self.k2 += 1;
-                },
-                5 => if (self.k3 >= -16) {
-                    self.k3 -= 1;
-                },
-                6 => if (self.k3 < 16) {
-                    self.k3 += 1;
-                },
-                7 => if (self.k4 >= -16) {
-                    self.k4 -= 1;
-                },
-                8 => if (self.k4 < 16) {
-                    self.k4 += 1;
-                },
-                9 => if (self.k5 >= -16) {
-                    self.k5 -= 1;
-                },
-                10 => if (self.k5 < 16) {
-                    self.k5 += 1;
-                },
+                inline 1...10 => |bucket| self.adaptGain(bucket),
                 else => {},
             }
         }
@@ -309,7 +300,7 @@ fn readTables(st: *Decoder) Failure!void {
             code_lengths[i] = @intCast((symbol + st.old_table[i]) & 0x0f);
             i += 1;
         } else if (symbol == 16) {
-            if (i == 0) return error.InvalidData;
+            if (i == 0) return error.DataFailure;
             var repeat_count: u32 = 3 + try br.readBits(2);
             while (repeat_count > 0 and i < table_size) : (repeat_count -= 1) {
                 code_lengths[i] = code_lengths[i - 1];
@@ -346,7 +337,7 @@ fn readTables(st: *Decoder) Failure!void {
 
 fn decodeLength(br: *BitReader, length_table: *const DecodeTable) Failure!u32 {
     const slot = try huffman.decodeNumber(br, length_table);
-    if (slot >= rc20) return error.InvalidData;
+    if (slot >= rc20) return error.DataFailure;
 
     const base = length_bases[slot] + length_rep_base;
     const extra = length_extra_bits[slot];
@@ -366,8 +357,8 @@ fn flushDecoded(st: *Decoder, keep: usize) Failure!void {
 
     const count = emit_upto - st.flushed;
     const back = produced - st.flushed;
-    if (back > st.window.buffer.len) return error.InvalidData;
-    if (!st.window.emitTo(out, back, count)) return error.InvalidData;
+    if (back > st.window.buffer.len) return error.DataFailure;
+    if (!st.window.emitTo(out, back, count)) return error.DataFailure;
     st.flushed += count;
 }
 
@@ -399,7 +390,7 @@ fn unpackAudioBlock(st: *Decoder) Failure!void {
         {
             try flushDecoded(st, 0);
         }
-        if (br.remainingBits() < 1) return error.InvalidData;
+        if (br.remainingBits() < 1) return error.DataFailure;
 
         const channel = st.cur_channel;
         const symbol = try huffman.decodeNumber(br, &st.audio_tables[channel]);
@@ -426,7 +417,7 @@ fn unpackLzBlock(st: *Decoder) Failure!void {
         {
             try flushDecoded(st, 0);
         }
-        if (br.remainingBits() < 1) return error.InvalidData;
+        if (br.remainingBits() < 1) return error.DataFailure;
 
         const symbol = try huffman.decodeNumber(br, &st.literal_table);
 
@@ -483,7 +474,7 @@ fn unpackLzBlock(st: *Decoder) Failure!void {
             return;
         } else if (symbol >= 270) {
             const length_slot: u32 = symbol - 270;
-            if (length_slot >= rc20) return error.InvalidData;
+            if (length_slot >= rc20) return error.DataFailure;
 
             var length: u32 = blk: {
                 const base = length_bases[length_slot] + length_match_base;
@@ -511,7 +502,7 @@ fn unpackLzBlock(st: *Decoder) Failure!void {
             st.window.copyMatch(dist, length);
             st.written_size += length;
         } else {
-            return error.InvalidData;
+            return error.DataFailure;
         }
     }
 }
@@ -589,7 +580,7 @@ pub const Session = struct {
         // A trailing match can overshoot the declared size, so measure how far the cursor actually moved.
         const consumed = st.window.write_pos - start_pos;
         if (!st.window.emitTo(out, consumed, out_size)) {
-            return error.InvalidData;
+            return error.DataFailure;
         }
     }
 };

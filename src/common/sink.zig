@@ -1,10 +1,8 @@
 const std = @import("std");
 
-// The circular window can split one logical run into two spans, so sinks
-// must tolerate arbitrary chunking. `write` cannot fail because destinations
-// are pre-sized. BufferSink records overflow rather than truncating: a
-// partial file that still looks like success is the failure mode an
-// integrity layer must not have.
+// Destinations are pre-sized, so `write` cannot fail.
+// BufferSink records overflow: a partial file that still looks like success
+// is the failure an integrity layer must not allow.
 
 pub const Sink = struct {
     ctx: *anyopaque,

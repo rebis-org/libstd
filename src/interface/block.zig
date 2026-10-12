@@ -20,7 +20,7 @@ pub const Block = struct {
     }
 
     pub fn init(storage: []u8) Failure!Block {
-        if (storage.len <= header_len) return error.ResourceLimit;
+        if (storage.len <= header_len) return error.ResourceFailure;
         // Incrementing the stored generation keeps a recycled buffer from reissuing a stale value.
         const generation = loadGeneration(storage) +% 1;
         storeGeneration(storage, generation);

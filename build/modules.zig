@@ -59,8 +59,15 @@ pub const benchmark = Module{
         .{ .name = "run", .module = "run" },
     },
 };
+pub const micro = Module{
+    .name = "micro",
+    .root = "build/micro/main.zig",
+    .imports = &.{
+        .{ .name = "checksum", .module = "checksum" },
+    },
+};
 
-const importable = [_]Module{ seam, checksum, crypto, library, manifest, package, abi_exports, harness, run, oracles, interface, grammar, trap, component, benchmark };
+const importable = [_]Module{ seam, checksum, crypto, library, manifest, package, abi_exports, harness, run, oracles, interface, grammar, trap, component, benchmark, micro };
 
 fn byName(name: []const u8) Module {
     for (importable) |module| {
