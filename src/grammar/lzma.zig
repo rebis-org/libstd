@@ -2,10 +2,11 @@ const std = @import("std");
 
 const bounds = @import("../common/primitive/bounds.zig");
 const failure_prim = @import("../common/primitive/failure.zig");
-const Failure = failure_prim.Failure;
 const io = @import("../common/primitive/io.zig");
 const measurement = @import("../common/primitive/measurement.zig");
 const lzma = @import("../leaf/lzma.zig");
+
+const Failure = failure_prim.Failure;
 
 pub const header_size = 13;
 pub const default_dictionary: u32 = 1 << 20;

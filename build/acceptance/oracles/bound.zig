@@ -3,6 +3,7 @@ const std = @import("std");
 const abi = @import("abi.zig");
 const corpus = @import("corpus.zig");
 const harness = @import("harness.zig");
+
 const Runner = harness.Runner;
 
 const Kind = enum { deflate, gzip, bzip2, lzma, lzma2, xz, zstd };

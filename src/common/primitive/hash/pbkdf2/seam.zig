@@ -1,7 +1,9 @@
 const std = @import("std");
+
 const options = @import("options");
-const onprem = @import("onprem.zig");
 const seam = @import("seam");
+
+const onprem = @import("onprem.zig");
 
 pub const WeakParametersError = error{WeakParameters};
 pub const OutputTooLongError = error{OutputTooLong};

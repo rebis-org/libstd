@@ -1,14 +1,16 @@
-const envelope = @import("../kernel/envelope.zig");
-const EnvelopeId = envelope.Id;
-const contract = @import("interface").contract;
-const vocabulary = @import("../kernel/vocabulary.zig");
-const discovery = @import("../kernel/discovery.zig");
 const components = @import("components");
+const contract = @import("interface").contract;
+
+const discovery = @import("../kernel/discovery.zig");
+const envelope = @import("../kernel/envelope.zig");
+const vocabulary = @import("../kernel/vocabulary.zig");
+
+const EnvelopeId = envelope.Id;
+const CommandPolicy = vocabulary.CommandPolicy;
+const CommitMode = vocabulary.CommitMode;
 const command_mask_query = vocabulary.command_mask_query;
 const command_mask_read = vocabulary.command_mask_read;
 const command_mask_write = vocabulary.command_mask_write;
-const CommandPolicy = vocabulary.CommandPolicy;
-const CommitMode = vocabulary.CommitMode;
 
 // Dispatch answers how a profile runs, not what it is.
 pub fn toContractId(id: EnvelopeId) contract.Id {

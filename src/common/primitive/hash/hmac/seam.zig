@@ -1,9 +1,11 @@
 const std = @import("std");
+
 const options = @import("options");
-const onprem = @import("onprem.zig");
 const seam = @import("seam");
+
 const sha1_onprem = @import("../sha1/onprem.zig");
 const sha256_onprem = @import("../sha256/onprem.zig");
+const onprem = @import("onprem.zig");
 
 fn HmacPair(comptime ShaOnprem: type, comptime ShaOffprem: type) type {
     return struct {

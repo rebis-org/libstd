@@ -1,10 +1,11 @@
 const std = @import("std");
 
+const kernels = @import("../common/kernels.zig");
 const failure_prim = @import("../common/primitive/failure.zig");
-const Failure = failure_prim.Failure;
 const io = @import("../common/primitive/io.zig");
 const measurement = @import("../common/primitive/measurement.zig");
-const kernels = @import("../common/kernels.zig");
+
+const Failure = failure_prim.Failure;
 
 pub const dictionary_min = 1 << 12;
 pub const dictionary_max = 1 << 30; // 1 GiB for 64-bit workspace sizing.

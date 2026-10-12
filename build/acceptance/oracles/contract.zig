@@ -1,7 +1,7 @@
 const std = @import("std");
 
-const contract = @import("interface").contract;
 const kernel = @import("kernel");
+const contract = @import("interface").contract;
 
 // Enumeration must cover class-shaped verbs and omit absent components (miss maps to unsupported).
 const CatalogEntry = struct {

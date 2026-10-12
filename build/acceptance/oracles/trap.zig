@@ -1,9 +1,10 @@
 const std = @import("std");
+
 const interface = @import("interface");
 
-const span = interface.span;
-const lease = interface.lease;
 const block = interface.block;
+const lease = interface.lease;
+const span = interface.span;
 const surface = interface.surface;
 
 // Re-executes per scenario: contract violations trap the process, so driver and scenarios cannot share an address space.

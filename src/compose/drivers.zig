@@ -2,12 +2,16 @@ const std = @import("std");
 
 const checksum = @import("../common/primitive/checksum.zig");
 const failure_prim = @import("../common/primitive/failure.zig");
-const Failure = failure_prim.Failure;
 const measurement = @import("../common/primitive/measurement.zig");
 const gzip = @import("../grammar/gzip.zig");
+// ---- zlib decode session ----
+const zlib = @import("../grammar/zlib.zig");
 const deflate = @import("../leaf/deflate.zig");
+const lz4 = @import("../leaf/lz4.zig");
 const composition = @import("composition.zig");
 const sessions = @import("sessions.zig");
+
+const Failure = failure_prim.Failure;
 const StepResult = sessions.StepResult;
 
 const id1: u8 = 0x1f;
@@ -515,11 +519,6 @@ pub fn deflateDecodeStep(state: *DeflateDecode, input: []const u8, output: []u8,
     result.status = .open;
     return result;
 }
-
-// ---- zlib decode session ----
-
-const zlib = @import("../grammar/zlib.zig");
-const lz4 = @import("../leaf/lz4.zig");
 
 const zlib_cm_deflate: u8 = 8;
 const zlib_cinfo_max: u8 = 7;

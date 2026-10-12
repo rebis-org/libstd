@@ -1,24 +1,24 @@
 const std = @import("std");
+
 const failure = @import("../../common/primitive/failure.zig");
-const Failure = failure.Failure;
-const bits = @import("bits.zig");
-const BitWriter = bits.BitWriter;
 const primitive_huffman = @import("../../common/primitive/huffman.zig");
-const slots = @import("slots.zig");
-const finder_mod = @import("finder.zig");
-const MatchFinder = finder_mod.MatchFinder;
-const LzToken = finder_mod.LzToken;
-const unpack50 = @import("unpack50.zig");
-const filters50 = @import("filters50.zig");
-const facade = @import("../rar.zig");
 const common_sink = @import("../../common/sink.zig");
+const facade = @import("../rar.zig");
+const bits = @import("bits.zig");
+const filters50 = @import("filters50.zig");
+const finder_mod = @import("finder.zig");
+const slots = @import("slots.zig");
+const unpack50 = @import("unpack50.zig");
 
-// Nothing allocates. Staging needs 2x the input plus slack because the worst case is
-// ~8 bits per symbol plus the tables, and matches only shrink it.
-
-const nc: u16 = unpack50.nc;
+const Failure = failure.Failure;
+const BitWriter = bits.BitWriter;
+const LzToken = finder_mod.LzToken;
+const MatchFinder = finder_mod.MatchFinder;
 const dc: u16 = unpack50.dc_rar5;
 const ldc: u16 = unpack50.ldc;
+// Nothing allocates. Staging needs 2x the input plus slack because the worst case is
+// ~8 bits per symbol plus the tables, and matches only shrink it.
+const nc: u16 = unpack50.nc;
 const rc: u16 = unpack50.rc;
 
 const code_length_symbols: u16 = 20;

@@ -6,9 +6,10 @@ const abi = @import("abi.zig");
 const catalog = @import("catalog.zig");
 const corpus = @import("corpus.zig");
 const harness = @import("harness.zig");
-const Runner = harness.Runner;
 const lib = @import("lib.zig");
 const steps = @import("steps.zig");
+
+const Runner = harness.Runner;
 
 var lzma_file_input: [48]u8 = undefined;
 

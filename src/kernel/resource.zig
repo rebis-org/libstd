@@ -1,20 +1,21 @@
 const std = @import("std");
 
+const io = @import("../common/primitive/io.zig");
 const abi = @import("./envelope.zig");
 const vocabulary = @import("./vocabulary.zig");
-pub const Failure = vocabulary.Failure;
-pub const capability_bit_read = vocabulary.resource_capability_bit_read;
-pub const capability_bit_write = vocabulary.resource_capability_bit_write;
-pub const capability_bit_size = vocabulary.resource_capability_bit_size;
-pub const capability_bit_replay = vocabulary.resource_capability_bit_replay;
-pub const capability_bit_seek = vocabulary.resource_capability_bit_seek;
-pub const capability_bit_range = vocabulary.resource_capability_bit_range;
-const io = @import("../common/primitive/io.zig");
-pub const checkedConstBytes = io.checkedConstBytes;
-pub const checkedMutBytes = io.checkedMutBytes;
+pub const Limits = @import("../common/primitive/limits.zig").Limits;
+
 pub const Workspace = io.Workspace;
 pub const WorkspacePlan = io.WorkspacePlan;
-pub const Limits = @import("../common/primitive/limits.zig").Limits;
+pub const checkedConstBytes = io.checkedConstBytes;
+pub const checkedMutBytes = io.checkedMutBytes;
+pub const Failure = vocabulary.Failure;
+pub const capability_bit_range = vocabulary.resource_capability_bit_range;
+pub const capability_bit_read = vocabulary.resource_capability_bit_read;
+pub const capability_bit_replay = vocabulary.resource_capability_bit_replay;
+pub const capability_bit_seek = vocabulary.resource_capability_bit_seek;
+pub const capability_bit_size = vocabulary.resource_capability_bit_size;
+pub const capability_bit_write = vocabulary.resource_capability_bit_write;
 
 pub const Resource = struct {
     call: *abi.Call,

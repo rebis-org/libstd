@@ -2,8 +2,9 @@ const std = @import("std");
 
 const bounds = @import("../common/primitive/bounds.zig");
 const failure_prim = @import("../common/primitive/failure.zig");
-const Failure = failure_prim.Failure;
 const io = @import("../common/primitive/io.zig");
+
+const Failure = failure_prim.Failure;
 
 const block_size: u64 = 512;
 pub const scratch_size: usize = @intCast(block_size);

@@ -1,8 +1,9 @@
 const std = @import("std");
 
 const failure_prim = @import("../../common/primitive/failure.zig");
-const Failure = failure_prim.Failure;
 const measurement = @import("../../common/primitive/measurement.zig");
+
+const Failure = failure_prim.Failure;
 
 pub const order_min = 2;
 pub const order_max = 16;

@@ -3,11 +3,12 @@ const std = @import("std");
 const bounds = @import("../common/primitive/bounds.zig");
 const checksum = @import("../common/primitive/checksum.zig");
 const failure_prim = @import("../common/primitive/failure.zig");
-const Failure = failure_prim.Failure;
 const io = @import("../common/primitive/io.zig");
 const measurement = @import("../common/primitive/measurement.zig");
 const tee = @import("../common/primitive/tee.zig");
 const deflate = @import("../leaf/deflate.zig");
+
+const Failure = failure_prim.Failure;
 pub const deflate_history_size = deflate.history_size;
 
 const Crc32Tee = tee.CountingTee(.{ .crc32 = true });

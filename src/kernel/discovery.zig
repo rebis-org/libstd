@@ -1,6 +1,7 @@
 const std = @import("std");
-const contract = @import("interface").contract;
+
 pub const components = @import("components");
+const contract = @import("interface").contract;
 
 // Table is comptime-small, so linear scan suffices. Hot dispatch lives in the drivers.
 pub fn enumerate() []const contract.Descriptor {

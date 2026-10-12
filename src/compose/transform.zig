@@ -1,21 +1,16 @@
 const std = @import("std");
 
-const node_graph = @import("../kernel/node.zig");
 const measurement = @import("../common/primitive/measurement.zig");
-const resource = @import("../kernel/resource.zig");
-const Resource = resource.Resource;
-const Limits = resource.Limits;
 const gzip = @import("../grammar/gzip.zig");
-const zlib = @import("../grammar/zlib.zig");
-const zstd_seekable = @import("../grammar/zstd_seekable.zig");
 const lzma_file = @import("../grammar/lzma.zig");
 const xz = @import("../grammar/xz.zig");
+const zlib = @import("../grammar/zlib.zig");
+const zstd_seekable = @import("../grammar/zstd_seekable.zig");
 const discovery = @import("../kernel/discovery.zig");
 const abi = @import("../kernel/envelope.zig");
-const Node = abi.Node;
-const Call = abi.Call;
+const node_graph = @import("../kernel/node.zig");
+const resource = @import("../kernel/resource.zig");
 const vocabulary = @import("../kernel/vocabulary.zig");
-const Failure = vocabulary.Failure;
 const bzip2 = @import("../leaf/bzip2.zig");
 const deflate = @import("../leaf/deflate.zig");
 const lz4 = @import("../leaf/lz4.zig");
@@ -24,6 +19,12 @@ const lzma2 = @import("../leaf/lzma2.zig");
 const zstd = @import("../leaf/zstd.zig");
 const common = @import("common.zig");
 const zstd_sizing = @import("sizing.zig");
+
+const Call = abi.Call;
+const Node = abi.Node;
+const Limits = resource.Limits;
+const Resource = resource.Resource;
+const Failure = vocabulary.Failure;
 
 const deflate_options: deflate.Options = .{ .good = 8, .nice = 128, .lazy = 16, .chain = 8 };
 

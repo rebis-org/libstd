@@ -1,9 +1,11 @@
 const std = @import("std");
 
+const options = @import("options");
+
 const abi = @import("abi.zig");
 const corpus = @import("corpus.zig");
 const harness = @import("harness.zig");
-const options = @import("options");
+
 const Runner = harness.Runner;
 
 // Provider-selection coverage: existing scenarios run every call with no

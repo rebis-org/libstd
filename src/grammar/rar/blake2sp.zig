@@ -1,6 +1,7 @@
 const std = @import("std");
-const mem = std.mem;
+
 const math = std.math;
+const mem = std.mem;
 
 // BLAKE2sp is the RAR5 optional file checksum. The stdlib Blake2s exposes no tree
 // parameters, so this implementation follows the spec directly.

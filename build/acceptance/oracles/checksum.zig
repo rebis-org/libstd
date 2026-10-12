@@ -1,5 +1,7 @@
 const std = @import("std");
+
 const checksum = @import("checksum");
+
 const harness = @import("harness.zig");
 
 const seed: u64 = 0x9e3779b97f4a7c15;

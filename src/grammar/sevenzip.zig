@@ -5,11 +5,8 @@ const bounds = @import("../common/primitive/bounds.zig");
 const checksum = @import("../common/primitive/checksum.zig");
 const crypto = @import("../common/primitive/crypto.zig");
 const failure_prim = @import("../common/primitive/failure.zig");
-const Failure = failure_prim.Failure;
 const io = @import("../common/primitive/io.zig");
-const Workspace = io.Workspace;
 const limits_prim = @import("../common/primitive/limits.zig");
-const Limits = limits_prim.Limits;
 const measurement = @import("../common/primitive/measurement.zig");
 const bcj = @import("../leaf/bcj.zig");
 const bcj2 = @import("../leaf/bcj2.zig");
@@ -19,6 +16,10 @@ const delta = @import("../leaf/delta.zig");
 const lzma = @import("../leaf/lzma.zig");
 const lzma2 = @import("../leaf/lzma2.zig");
 const ppmd = @import("../leaf/ppmd.zig");
+
+const Failure = failure_prim.Failure;
+const Workspace = io.Workspace;
+const Limits = limits_prim.Limits;
 
 const signature = [6]u8{ '7', 'z', 0xBC, 0xAF, 0x27, 0x1C };
 const version = [2]u8{ 0, 4 };

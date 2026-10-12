@@ -4,10 +4,11 @@ const abi = @import("abi.zig");
 const corpus = @import("corpus.zig");
 const fixtures = @import("fixtures.zig");
 const harness = @import("harness.zig");
-const Runner = harness.Runner;
-const EntryNodes = harness.ArchiveEntryNodes;
-const entryWithMethod = harness.archiveEntryMethod;
 const lib = @import("lib.zig");
+
+const EntryNodes = harness.ArchiveEntryNodes;
+const Runner = harness.Runner;
+const entryWithMethod = harness.archiveEntryMethod;
 
 const zip_caps: u64 = harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay;
 
