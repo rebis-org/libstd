@@ -1,5 +1,7 @@
 const std = @import("std");
 
+const seam = @import("seam");
+
 // Cyan4973/xxHash.
 
 pub const XxHash32 = struct {
@@ -98,17 +100,5 @@ pub const XxHash32 = struct {
 };
 
 test "xxh32 onprem matches the std oracle" {
-    var rng = std.Random.DefaultPrng.init(0x3232);
-    var size: usize = 0;
-    while (size <= 1024) : (size += 1) {
-        const buf = try std.testing.allocator.alloc(u8, size);
-        defer std.testing.allocator.free(buf);
-        rng.random().bytes(buf);
-        var actual = XxHash32.init(0);
-        actual.update(buf[0 .. size / 2]);
-        actual.update(buf[size / 2 ..]);
-        var expected = std.hash.XxHash32.init(0);
-        expected.update(buf);
-        try std.testing.expectEqual(expected.final(), actual.final());
-    }
+    try seam.expectAgreement(XxHash32.init(0), std.hash.XxHash32.init(0), 0x3232, false, null);
 }

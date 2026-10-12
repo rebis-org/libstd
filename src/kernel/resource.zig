@@ -71,7 +71,7 @@ pub const Resource = struct {
     }
 
     pub fn requireCapability(self: Resource, bit: u32) Failure!void {
-        if (!self.hasCapability(bit)) return error.Unsupported;
+        if (!self.hasCapability(bit)) return error.UnsupportedFailure;
     }
 
     pub fn size(self: *Resource) Failure!usize {
@@ -79,10 +79,10 @@ pub const Resource = struct {
             .direct_read => |bytes| return bytes.len,
             .callback_read => {
                 const result = try self.invoke(vocabulary.ids.callback_size, null, null);
-                if (result.value_high != 0) return error.ResourceLimit;
-                return std.math.cast(usize, result.value_low) orelse error.ResourceLimit;
+                if (result.value_high != 0) return error.ResourceFailure;
+                return std.math.cast(usize, result.value_low) orelse error.ResourceFailure;
             },
-            else => return error.Unsupported,
+            else => return error.UnsupportedFailure,
         }
     }
 
@@ -91,15 +91,6 @@ pub const Resource = struct {
             .direct_read, .direct_write => self.offset = 0,
             .callback_read => _ = try self.invoke(vocabulary.ids.callback_rewind, null, null),
             .callback_write => {},
-        }
-    }
-
-    pub fn seekTo(self: *Resource, position: usize) Failure!void {
-        switch (self.kind) {
-            .direct_read => self.offset = @min(position, self.kind.direct_read.len),
-            .direct_write => self.offset = @min(position, self.kind.direct_write.len),
-            .callback_read => _ = try self.invokeWithValue(vocabulary.ids.callback_seek, null, null, position),
-            .callback_write => return error.Unsupported,
         }
     }
 
@@ -120,7 +111,7 @@ pub const Resource = struct {
                 if (bytes_read > staging.len) return error.IoFailure;
                 return bytes_read;
             },
-            else => return error.Unsupported,
+            else => return error.UnsupportedFailure,
         }
     }
 
@@ -128,7 +119,7 @@ pub const Resource = struct {
         if (chunk.len == 0) return 0;
         switch (self.kind) {
             .direct_write => |destination| {
-                if (self.offset + chunk.len > destination.len) return error.InsufficientCapacity;
+                if (self.offset + chunk.len > destination.len) return error.CapacityFailure;
                 @memcpy(destination[self.offset..][0..chunk.len], chunk);
                 self.offset += chunk.len;
                 return chunk.len;
@@ -138,10 +129,10 @@ pub const Resource = struct {
                 const result = try self.invoke(vocabulary.ids.callback_write, chunk, null);
                 const bytes_written = std.math.cast(usize, result.bytes) orelse return error.IoFailure;
                 if (bytes_written > chunk.len) return error.IoFailure;
-                self.committed = std.math.add(u64, initial, bytes_written) catch return error.ResourceLimit;
+                self.committed = std.math.add(u64, initial, bytes_written) catch return error.ResourceFailure;
                 return bytes_written;
             },
-            else => return error.Unsupported,
+            else => return error.UnsupportedFailure,
         }
     }
 
@@ -164,19 +155,15 @@ pub const Resource = struct {
         if (cursor == staging.len) {
             var extra: [1]u8 = undefined;
             const tail_read = try self.read(&extra);
-            if (tail_read != 0) return error.ResourceLimit;
+            if (tail_read != 0) return error.ResourceFailure;
         }
         return staging[0..cursor];
     }
 
     fn invoke(self: *Resource, verb: abi.Id, request_bytes: ?[]const u8, response_bytes: ?[]u8) Failure!CallbackResult {
-        return self.invokeWithValue(verb, request_bytes, response_bytes, self.token_low);
-    }
-
-    fn invokeWithValue(self: *Resource, verb: abi.Id, request_bytes: ?[]const u8, response_bytes: ?[]u8, value_low: u64) Failure!CallbackResult {
-        const callback = self.call.callback orelse return error.InvalidCall;
+        const callback = self.call.callback orelse return error.CallFailure;
         var request = abi.Node.init();
-        request.value_low = value_low;
+        request.value_low = self.token_low;
         request.value_high = self.token_high;
         if (request_bytes) |bytes| {
             request.bytes = if (bytes.len == 0) null else @constCast(bytes.ptr);
@@ -267,11 +254,17 @@ const writer_vtable = std.Io.Writer.VTable{ .drain = boundedWriterDrain };
 fn boundedWriterDrain(writer: *std.Io.Writer, chunks: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
     const self: *BoundedWriter = @fieldParentPtr("writer", writer);
     var total: usize = 0;
-    for (chunks[0 .. chunks.len - 1]) |part| total += part.len;
-    total += chunks[chunks.len - 1].len * splat;
+    for (chunks[0 .. chunks.len - 1]) |part| {
+        total = std.math.add(usize, total, part.len) catch return error.WriteFailed;
+    }
+    const splatted = std.math.mul(usize, chunks[chunks.len - 1].len, splat) catch return error.WriteFailed;
+    total = std.math.add(usize, total, splatted) catch return error.WriteFailed;
     if (total == 0) return 0;
     if (total > self.limit) return error.WriteFailed;
     var cursor: usize = 0;
+    // The budget is charged on every path, so a short write costs what it wrote
+    // instead of leaving the ceiling untouched for the next drain to spend.
+    defer self.limit -= cursor;
     for (chunks[0 .. chunks.len - 1]) |part| {
         const bytes_written = self.resource.write(part) catch return error.WriteFailed;
         cursor += bytes_written;
@@ -283,7 +276,6 @@ fn boundedWriterDrain(writer: *std.Io.Writer, chunks: []const []const u8, splat:
         cursor += bytes_written;
         if (bytes_written < last.len) return cursor;
     }
-    self.limit -= cursor;
     return cursor;
 }
 

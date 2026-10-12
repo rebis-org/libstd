@@ -227,20 +227,6 @@ const rar_fixture = [_]u8{
 
 const rar_fixture_encryption = [_]u8{ 0x52, 0x61, 0x72, 0x21, 0x1a, 0x07, 0x01, 0x00, 0x78, 0xc8, 0xa9, 0x98, 0x02, 0x04, 0x00 };
 
-const rar_fixture_compressed = [_]u8{
-    0x52, 0x61, 0x72, 0x21, 0x1a, 0x07, 0x01, 0x00, 0xc5, 0x1a, 0x33, 0x32, 0x03, 0x01, 0x00, 0x00, 0x4f,
-    0x99, 0xa4, 0x2f, 0x16, 0x02, 0x02, 0x11, 0x04, 0x11, 0x00, 0x2e, 0xcc, 0x7c, 0x2c, 0x80, 0x01, 0x00,
-    0x08, 0x74, 0x65, 0x73, 0x74, 0x2e, 0x74, 0x78, 0x74, 0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x20, 0x72, 0x61,
-    0x72, 0x35, 0x20, 0x73, 0x74, 0x6f, 0x72, 0x65, 0x64, 0x19, 0xb2, 0x3a, 0x35, 0x03, 0x05, 0x00, 0x00,
-};
-
-const rar_fixture_solid = [_]u8{
-    0x52, 0x61, 0x72, 0x21, 0x1a, 0x07, 0x01, 0x00, 0xc5, 0x1a, 0x33, 0x32, 0x03, 0x01, 0x00, 0x00, 0xcc,
-    0x99, 0x25, 0x35, 0x15, 0x02, 0x02, 0x11, 0x04, 0x11, 0x00, 0x2e, 0xcc, 0x7c, 0x2c, 0x40, 0x00, 0x08,
-    0x74, 0x65, 0x73, 0x74, 0x2e, 0x74, 0x78, 0x74, 0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x20, 0x72, 0x61, 0x72,
-    0x35, 0x20, 0x73, 0x74, 0x6f, 0x72, 0x65, 0x64, 0x19, 0xb2, 0x3a, 0x35, 0x03, 0x05, 0x00, 0x00,
-};
-
 const rar_fixture_service = [_]u8{
     0x52, 0x61, 0x72, 0x21, 0x1a, 0x07, 0x01, 0x00, 0xc5, 0x1a, 0x33, 0x32, 0x03, 0x01, 0x00,
     0x00, 0x55, 0xb1, 0x5e, 0xd3, 0x08, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -400,9 +386,9 @@ fn runRarEncrypted(r: *Runner) anyerror!void {
         const produced = r.response.byte_length;
         if (produced != rar_encrypted_expected.len) return error.RarEncryptedSizeMismatch;
         if (!std.mem.eql(u8, r.output[0..produced], rar_encrypted_expected)) return error.RarEncryptedMismatch;
-        // A wrong password must fail (integrity or invalid data). RAR reads
-        // are tentative-commit, so a late CRC failure may leave decoded
-        // garbage in the sink; only the failure itself is asserted here.
+        // A wrong password must fail (integrity or invalid data).
+        // RAR reads are tentative-commit; a late CRC failure can leave garbage in
+        // the sink, so only the failure is asserted.
         _ = harness.call(r, harness.ids.read, &.{
             harness.archiveOrdinalParam(0),
             harness.sourceSpan(fixture.bytes),
@@ -508,10 +494,9 @@ pub fn runRar(r: *Runner) anyerror!void {
         harness.sinkSpan(r.output),
     }, .{ .ctx = true }, r.output);
     try rarExpectUnsupported(r, &rar_fixture_multi_volume);
-    // Service blocks (QuickOpen) carry no payload we expose. The walk skips
-    // their data and ends cleanly at EOF, so the archive lists zero entries
-    // and any ordinal read is invalid_data, the same observable shape the
-    // reference gives this archive ("0 files").
+    // QuickOpen service blocks carry no payload we expose.
+    // The walk ends cleanly with zero entries and invalid_data on any ordinal
+    // read — the reference's observable shape.
     _ = harness.call(r, harness.ids.query, &.{
         harness.paramTargetCommand(harness.ids.read),
         harness.sourceSpan(&rar_fixture_service),
@@ -572,9 +557,8 @@ fn runRarArchive(r: *Runner) anyerror!void {
     try runArchive(r, harness.ids.rar);
 }
 
-// Every official-fixture decode runs the envelope's CRC check (and BLAKE2sp
-// where the archive carries it), so a clean status at the expected length is
-// already a byte-exactness proof against the producer.
+// Fixture decodes run the envelope's CRC (and BLAKE2sp where present);
+// a clean status at the expected length proves byte-exactness.
 const RarOfficial = struct {
     data: []const u8,
     sizes: []const usize,
@@ -623,66 +607,45 @@ const rarw_password = "PASS";
 
 fn rarwWrite(r: *Runner, entry: harness.Node, archive: []u8, extra: []const harness.Node) !usize {
     var nodes: [14]harness.Node = undefined;
-    var count: usize = 0;
-    nodes[count] = harness.paramTargetCommand(harness.ids.write);
-    count += 1;
-    nodes[count] = harness.scalarNode(harness.ids.source);
-    count += 1;
-    nodes[count] = harness.capabilityParam(arc_caps);
-    count += 1;
-    nodes[count] = harness.sizingModeParam(harness.size_metadata_exact);
-    count += 1;
-    nodes[count] = harness.commitModeParam(harness.commit_confirmed);
-    count += 1;
-    @memcpy(nodes[count..][0..extra.len], extra);
-    count += extra.len;
-    nodes[count] = entry;
-    count += 1;
-    _ = harness.call(r, harness.ids.query, nodes[0..count], .{});
+    var list = harness.NodeList{ .nodes = &nodes };
+    list.push(harness.paramTargetCommand(harness.ids.write));
+    list.push(harness.scalarNode(harness.ids.source));
+    list.push(harness.capabilityParam(arc_caps));
+    list.push(harness.sizingModeParam(harness.size_metadata_exact));
+    list.push(harness.commitModeParam(harness.commit_confirmed));
+    list.pushAll(extra);
+    list.push(entry);
+    _ = harness.call(r, harness.ids.query, list.items(), .{});
     try harness.requireStatus(r, abi.Status.ok);
     const size: usize = @intCast(r.response.byte_length);
-    count = 0;
-    nodes[count] = harness.scalarNode(harness.ids.source);
-    count += 1;
-    nodes[count] = harness.sinkSpan(archive[0..size]);
-    count += 1;
-    nodes[count] = harness.capabilityParam(arc_caps);
-    count += 1;
-    nodes[count] = harness.sizingModeParam(harness.size_metadata_exact);
-    count += 1;
-    nodes[count] = harness.commitModeParam(harness.commit_confirmed);
-    count += 1;
-    @memcpy(nodes[count..][0..extra.len], extra);
-    count += extra.len;
-    nodes[count] = entry;
-    count += 1;
-    _ = harness.call(r, harness.ids.write, nodes[0..count], .{});
+    list.count = 0;
+    list.push(harness.scalarNode(harness.ids.source));
+    list.push(harness.sinkSpan(archive[0..size]));
+    list.push(harness.capabilityParam(arc_caps));
+    list.push(harness.sizingModeParam(harness.size_metadata_exact));
+    list.push(harness.commitModeParam(harness.commit_confirmed));
+    list.pushAll(extra);
+    list.push(entry);
+    _ = harness.call(r, harness.ids.write, list.items(), .{});
     try harness.requireStatus(r, abi.Status.ok);
     return size;
 }
 
 fn rarwReadBack(r: *Runner, archive: []const u8, expected: []const u8, crypto: []const harness.Node) !void {
     var nodes: [8]harness.Node = undefined;
-    var count: usize = 0;
-    nodes[count] = harness.archiveOrdinalParam(0);
-    count += 1;
-    nodes[count] = harness.sourceSpan(archive);
-    count += 1;
-    nodes[count] = harness.sinkSpan(r.output);
-    count += 1;
-    @memcpy(nodes[count..][0..crypto.len], crypto);
-    count += crypto.len;
+    var list = harness.NodeList{ .nodes = &nodes };
+    list.push(harness.archiveOrdinalParam(0));
+    list.push(harness.sourceSpan(archive));
+    list.push(harness.sinkSpan(r.output));
+    list.pushAll(crypto);
     @memset(r.output, 0xa5);
-    _ = harness.call(r, harness.ids.read, nodes[0..count], .{ .ctx = true });
+    _ = harness.call(r, harness.ids.read, list.items(), .{ .ctx = true });
     try harness.requireStatus(r, abi.Status.ok);
     if (r.response.byte_length != expected.len or !std.mem.eql(u8, r.output[0..expected.len], expected)) return error.RarWriteEncryptedMismatch;
 }
 
-// RAR5 creation with -p and -hp: the envelope round-trips both shapes, the
-// wrong password fails with the wrong-password cause and an untouched sink,
-// and -hp hides the entry list without a password. (The official unrar
-// binary validates the byte shapes in the benchmark harness's fixture
-// pipeline; libarchive does not read encrypted RAR.)
+// -hp hides the entry list without a password; unrar validates the byte
+// shapes (libarchive reads no encrypted RAR).
 fn runRarWriteEncrypted(r: *Runner) anyerror!void {
     setupRar(r);
     corpus.fillTiled(r.corpus_index, &rarw_payload);

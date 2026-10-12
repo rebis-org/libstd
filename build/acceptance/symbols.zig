@@ -21,7 +21,7 @@ pub fn assertExports(init: std.process.Init, library: []const u8) !void {
     var count: usize = 0;
     var lines = std.mem.splitScalar(u8, stdout, '\n');
     while (lines.next()) |line| {
-        const index = std.mem.indexOf(u8, line, " T ") orelse continue;
+        const index = std.mem.find(u8, line, " T ") orelse continue;
         const name = std.mem.trim(u8, line[index + 3 ..], " \t\r");
         const known = for (exports, 0..) |expected, i| {
             if (std.mem.eql(u8, name, expected)) {

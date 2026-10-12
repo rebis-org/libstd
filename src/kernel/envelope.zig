@@ -47,19 +47,9 @@ pub const Node = extern struct {
     reserved: [2]u64,
 
     pub fn init() Node {
-        return .{
-            .structure_size = @sizeOf(Node),
-            .flags = 0,
-            .id = .{ .low = 0, .high = 0 },
-            .value_low = 0,
-            .value_high = 0,
-            .bytes = null,
-            .byte_capacity = 0,
-            .byte_length = 0,
-            .child = null,
-            .next = null,
-            .reserved = .{ 0, 0 },
-        };
+        var self = std.mem.zeroes(Node);
+        self.structure_size = @sizeOf(Node);
+        return self;
     }
 
     pub fn isValid(self: *const Node) bool {
@@ -83,19 +73,9 @@ pub const Call = extern struct {
     reserved: [4]u64,
 
     pub fn init() Call {
-        return .{
-            .structure_size = @sizeOf(Call),
-            .flags = 0,
-            .operation = .{ .low = 0, .high = 0 },
-            .request = null,
-            .response = null,
-            .diagnostic = null,
-            .workspace = null,
-            .workspace_capacity = 0,
-            .callback = null,
-            .callback_context = null,
-            .reserved = .{ 0, 0, 0, 0 },
-        };
+        var self = std.mem.zeroes(Call);
+        self.structure_size = @sizeOf(Call);
+        return self;
     }
 
     pub fn isValid(self: *const Call) bool {

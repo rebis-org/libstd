@@ -28,10 +28,10 @@ pub fn decodeWorkspaceSize(max_block: u32) usize {
 }
 
 pub fn decodeWorkspaceSizeFor(input: []const u8) Failure!usize {
-    if (input.len < 4) return error.InvalidData;
-    if (input[0] != 'B' or input[1] != 'Z' or input[2] != 'h') return error.InvalidData;
+    if (input.len < 4) return error.DataFailure;
+    if (input[0] != 'B' or input[1] != 'Z' or input[2] != 'h') return error.DataFailure;
     const digit = input[3];
-    if (digit < '1' or digit > '9') return error.InvalidData;
+    if (digit < '1' or digit > '9') return error.DataFailure;
     const max_block = @as(u32, digit - '0') * 100_000;
     return decodeWorkspaceSize(max_block);
 }
@@ -98,10 +98,10 @@ fn decodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, provide
     // Concatenated streams (cat a.bz2 b.bz2) decode back to back; each outer
     // pass consumes exactly one BZh stream through its EOS magic.
     while (true) {
-        if (cursor.len < 4) return error.InvalidData;
-        if (cursor[0] != 'B' or cursor[1] != 'Z' or cursor[2] != 'h') return error.InvalidData;
+        if (cursor.len < 4) return error.DataFailure;
+        if (cursor[0] != 'B' or cursor[1] != 'Z' or cursor[2] != 'h') return error.DataFailure;
         const block_digit = cursor[3];
-        if (block_digit < '1' or block_digit > '9') return error.InvalidData;
+        if (block_digit < '1' or block_digit > '9') return error.DataFailure;
         const max_block = @as(u32, block_digit - '0') * 100_000;
         var br = BitReader.init(cursor[4..]);
         var combined_crc: u32 = 0;
@@ -112,12 +112,12 @@ fn decodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, provide
                 if (combined_crc != stored_combined) return error.IntegrityFailure;
                 break;
             }
-            if (marker != 0x314159265359) return error.InvalidData;
+            if (marker != 0x314159265359) return error.DataFailure;
             const stored_crc = try br.readU32be();
             const randomised = try br.readBit();
-            if (randomised != 0) return error.Unsupported;
+            if (randomised != 0) return error.UnsupportedFailure;
             const orig_ptr_u = try br.readBits(24);
-            const orig_ptr = std.math.cast(u32, orig_ptr_u) orelse return error.InvalidData;
+            const orig_ptr = std.math.cast(u32, orig_ptr_u) orelse return error.DataFailure;
             const in_use16: u16 = @intCast(try br.readBits(16));
             var seq_to_unseq: [256]u8 = undefined;
             var n_in_use: u32 = 0;
@@ -134,15 +134,15 @@ fn decodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, provide
                     }
                 }
             }
-            if (n_in_use == 0) return error.InvalidData;
+            if (n_in_use == 0) return error.DataFailure;
             const alpha_size = n_in_use + 2;
             const eob = alpha_size - 1;
             const n_groups_u = try br.readBits(3);
-            const n_groups = std.math.cast(u32, n_groups_u) orelse return error.InvalidData;
-            if (n_groups < 2 or n_groups > max_groups) return error.InvalidData;
+            const n_groups = std.math.cast(u32, n_groups_u) orelse return error.DataFailure;
+            if (n_groups < 2 or n_groups > max_groups) return error.DataFailure;
             const n_selectors_u = try br.readBits(15);
-            const n_selectors = std.math.cast(u32, n_selectors_u) orelse return error.InvalidData;
-            if (n_selectors == 0) return error.InvalidData;
+            const n_selectors = std.math.cast(u32, n_selectors_u) orelse return error.DataFailure;
+            if (n_selectors == 0) return error.DataFailure;
             var selectors: [max_selectors]u8 = undefined;
             {
                 var pos: [max_groups]u8 = undefined;
@@ -155,7 +155,7 @@ fn decodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, provide
                         const bit = try br.readBit();
                         if (bit == 0) break;
                         v += 1;
-                        if (v >= n_groups) return error.InvalidData;
+                        if (v >= n_groups) return error.DataFailure;
                     }
                     const selected = pos[v];
                     var j = v;
@@ -164,15 +164,15 @@ fn decodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, provide
                     if (i < max_selectors) selectors[i] = selected;
                 }
             }
-            if (n_selectors > max_selectors) return error.InvalidData;
+            if (n_selectors > max_selectors) return error.DataFailure;
             var lens: [max_groups][max_alpha_size]u8 = undefined;
             var tables: [max_groups]HuffTable = undefined;
             {
                 var t: u32 = 0;
                 while (t < n_groups) : (t += 1) {
                     const curr_u = try br.readBits(5);
-                    var curr = std.math.cast(u32, curr_u) orelse return error.InvalidData;
-                    if (curr < 1 or curr > max_code_len) return error.InvalidData;
+                    var curr = std.math.cast(u32, curr_u) orelse return error.DataFailure;
+                    if (curr < 1 or curr > max_code_len) return error.DataFailure;
                     var sym: u32 = 0;
                     while (sym < alpha_size) : (sym += 1) {
                         while (true) {
@@ -184,7 +184,7 @@ fn decodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, provide
                             } else {
                                 curr -%= 1;
                             }
-                            if (curr < 1 or curr > max_code_len) return error.InvalidData;
+                            if (curr < 1 or curr > max_code_len) return error.DataFailure;
                         }
                         lens[t][sym] = @intCast(curr);
                     }
@@ -206,7 +206,7 @@ fn decodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, provide
             while (true) {
                 if (group_pos == 0) {
                     group_no += 1;
-                    if (group_no >= n_selectors) return error.InvalidData;
+                    if (group_no >= n_selectors) return error.DataFailure;
                     group_pos = group_size;
                 }
                 group_pos -= 1;
@@ -214,17 +214,17 @@ fn decodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, provide
                 const table = &tables[sel];
                 const sym = try decodeHuffman(&br, table);
                 if (sym == 0 or sym == 1) {
-                    if (run_weight >= 2 * 1024 * 1024) return error.InvalidData;
+                    if (run_weight >= 2 * 1024 * 1024) return error.DataFailure;
                     run_accum += (sym + 1) * run_weight;
                     run_weight *= 2;
                     continue;
                 }
                 if (run_accum != -1) {
-                    const copies = std.math.cast(u32, run_accum + 1) orelse return error.InvalidData;
+                    const copies = std.math.cast(u32, run_accum + 1) orelse return error.DataFailure;
                     const byte = seq_to_unseq[mtf[0]];
                     var k: u32 = 0;
                     while (k < copies) : (k += 1) {
-                        if (nblock >= bwt_buffer.len) return error.InvalidData;
+                        if (nblock >= bwt_buffer.len) return error.DataFailure;
                         bwt_buffer[nblock] = byte;
                         nblock += 1;
                     }
@@ -234,11 +234,11 @@ fn decodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, provide
                 if (sym == eob) break;
                 const idx = sym - 1;
                 const uc = mtfMove(&mtf, idx);
-                if (nblock >= bwt_buffer.len) return error.InvalidData;
+                if (nblock >= bwt_buffer.len) return error.DataFailure;
                 bwt_buffer[nblock] = seq_to_unseq[uc];
                 nblock += 1;
             }
-            if (nblock == 0 or orig_ptr >= nblock) return error.InvalidData;
+            if (nblock == 0 or orig_ptr >= nblock) return error.DataFailure;
             var cftab: [256]u32 = undefined;
             @memset(&cftab, 0);
             var i: u32 = 0;
@@ -324,7 +324,7 @@ fn decodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, provide
         }
         // The bit stream ends with zero padding to the next byte boundary;
         // anything nonzero there is corruption.
-        if (br.bits != 0) return error.InvalidData;
+        if (br.bits != 0) return error.DataFailure;
         // Trailing zero bytes are padding (7z pads encrypted pack streams to
         // the 16-byte boundary with zeros); only nonzero tail bytes must form
         // another complete BZh stream.
@@ -336,7 +336,7 @@ fn decodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, provide
 }
 
 fn encodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options: Options) Failure!void {
-    if (options.block_size < block_size_min or options.block_size > block_size_max) return error.InvalidCall;
+    if (options.block_size < block_size_min or options.block_size > block_size_max) return error.CallFailure;
     const max_block = options.block_size;
     var bit_writer = BitWriter.init(writer);
     try bit_writer.writeByte('B');
@@ -402,7 +402,7 @@ fn appendRun(buffer: []u8, len: *usize, byte: u8, count: usize) Failure!void {
     if (count < 4) {
         var i: usize = 0;
         while (i < count) : (i += 1) {
-            if (len.* >= buffer.len) return error.ResourceLimit;
+            if (len.* >= buffer.len) return error.ResourceFailure;
             buffer[len.*] = byte;
             len.* += 1;
         }
@@ -410,11 +410,11 @@ fn appendRun(buffer: []u8, len: *usize, byte: u8, count: usize) Failure!void {
     }
     var i: usize = 0;
     while (i < 4) : (i += 1) {
-        if (len.* >= buffer.len) return error.ResourceLimit;
+        if (len.* >= buffer.len) return error.ResourceFailure;
         buffer[len.*] = byte;
         len.* += 1;
     }
-    if (len.* >= buffer.len) return error.ResourceLimit;
+    if (len.* >= buffer.len) return error.ResourceFailure;
     buffer[len.*] = @intCast(count - 4);
     len.* += 1;
 }
@@ -587,7 +587,7 @@ fn encodeBlock(block: []const u8, block_crc: u32, bit_writer: *BitWriter, worksp
     // Bounds the linear-time SA-IS passes against the caller work budget.
     const log_n = std.math.log2_int_ceil(u32, @as(u32, @intCast(@max(2, nblock))));
     const estimate = @as(u64, nblock) * @as(u64, log_n) * 4;
-    if (estimate > options.max_work) return error.ResourceLimit;
+    if (estimate > options.max_work) return error.ResourceFailure;
     var in_use: [256]bool = @splat(false);
     for (block) |b| in_use[b] = true;
     var unseq_to_seq: [256]u8 = undefined;
@@ -808,7 +808,7 @@ fn buildHuffmanGroups(mtfv: []const u16, n_mtf: usize, alpha_size: u32, group_le
 fn emitRun(wr: *usize, mtfv: []u16, z_pend: *u32) Failure!void {
     z_pend.* -%= 1;
     while (true) {
-        if (mtfv.len - wr.* < 1) return error.ResourceLimit;
+        if (mtfv.len - wr.* < 1) return error.ResourceFailure;
         if (z_pend.* & 1 != 0) {
             mtfv[wr.*] = 1;
         } else {
@@ -998,14 +998,14 @@ const BitReader = struct {
         return .{ .bytes = bytes, .byte_pos = 0, .bits = 0, .bit_count = 0 };
     }
 
-    fn refill(self: *BitReader) error{ InvalidData, ResourceLimit }!void {
-        if (self.byte_pos >= self.bytes.len) return error.InvalidData;
+    fn refill(self: *BitReader) error{ DataFailure, ResourceFailure }!void {
+        if (self.byte_pos >= self.bytes.len) return error.DataFailure;
         self.bits = (self.bits << 8) | self.bytes[self.byte_pos];
         self.byte_pos += 1;
         self.bit_count += 8;
     }
 
-    fn readBit(self: *BitReader) error{ InvalidData, ResourceLimit }!u32 {
+    fn readBit(self: *BitReader) error{ DataFailure, ResourceFailure }!u32 {
         if (self.bit_count == 0) try self.refill();
         self.bit_count -= 1;
         const remaining: u6 = @intCast(self.bit_count);
@@ -1014,7 +1014,7 @@ const BitReader = struct {
         return bit;
     }
 
-    fn readBits(self: *BitReader, n: u6) error{ InvalidData, ResourceLimit }!u64 {
+    fn readBits(self: *BitReader, n: u6) error{ DataFailure, ResourceFailure }!u64 {
         while (self.bit_count < n) try self.refill();
         const shift: u6 = @intCast(self.bit_count - n);
         const value = (self.bits >> shift) & ((@as(u64, 1) << n) - 1);
@@ -1023,7 +1023,7 @@ const BitReader = struct {
         return value;
     }
 
-    fn readU32be(self: *BitReader) error{ InvalidData, ResourceLimit }!u32 {
+    fn readU32be(self: *BitReader) error{ DataFailure, ResourceFailure }!u32 {
         return @intCast(try self.readBits(32));
     }
 };
@@ -1133,11 +1133,11 @@ fn buildHuffTable(lens: []const u8, alpha_size: u32) Failure!HuffTable {
     var sym: u32 = 0;
     while (sym < alpha_size) : (sym += 1) {
         const len = lens[sym];
-        if (len < 1 or len > max_code_len) return error.InvalidData;
+        if (len < 1 or len > max_code_len) return error.DataFailure;
         if (len < table.min_len) table.min_len = len;
         if (len > table.max_len) table.max_len = len;
     }
-    if (table.min_len > table.max_len) return error.InvalidData;
+    if (table.min_len > table.max_len) return error.DataFailure;
     var count: [max_code_len + 2]u32 = undefined;
     @memset(&count, 0);
     sym = 0;
@@ -1154,13 +1154,13 @@ fn buildHuffTable(lens: []const u8, alpha_size: u32) Failure!HuffTable {
         sym = 0;
         while (sym < alpha_size) : (sym += 1) {
             if (lens[sym] == len) {
-                if (pp >= max_alpha_size) return error.InvalidData;
+                if (pp >= max_alpha_size) return error.DataFailure;
                 table.perm[pp] = @intCast(sym);
                 pp += 1;
             }
         }
     }
-    if (pp != alpha_size) return error.InvalidData;
+    if (pp != alpha_size) return error.DataFailure;
     @memset(&table.base, 0);
     sym = 0;
     while (sym < alpha_size) : (sym += 1) {
@@ -1244,31 +1244,31 @@ fn decodeHuffman(br: *BitReader, table: *const HuffTable) Failure!u32 {
         if ((z15 >> @intCast(15 - zn)) <= table.limit[zn]) {
             br.bit_count -= zn;
             const idx = (z15 >> @intCast(15 - zn)) - table.base[zn];
-            if (idx >= max_alpha_size) return error.InvalidData;
+            if (idx >= max_alpha_size) return error.DataFailure;
             return table.perm[idx];
         }
-        if (zn >= table.max_len) return error.InvalidData;
+        if (zn >= table.max_len) return error.DataFailure;
         br.bit_count -= 15;
         var zvec: u32 = z15;
         while (zn < table.max_len and zvec > table.limit[zn]) {
             zn += 1;
             zvec = (zvec << 1) | try br.readBit();
         }
-        if (zvec > table.limit[zn]) return error.InvalidData;
+        if (zvec > table.limit[zn]) return error.DataFailure;
         const idx = zvec - table.base[zn];
-        if (idx >= max_alpha_size) return error.InvalidData;
+        if (idx >= max_alpha_size) return error.DataFailure;
         return table.perm[idx];
     }
     var zn: u6 = @intCast(table.min_len);
     var zvec = try br.readBits(zn);
     while (zvec > table.limit[zn]) {
-        if (zn >= table.max_len) return error.InvalidData;
+        if (zn >= table.max_len) return error.DataFailure;
         zn += 1;
         const bit = try br.readBit();
         zvec = (zvec << 1) | bit;
     }
     const idx = zvec - table.base[zn];
-    if (idx >= max_alpha_size) return error.InvalidData;
+    if (idx >= max_alpha_size) return error.DataFailure;
     return table.perm[idx];
 }
 
@@ -1310,5 +1310,5 @@ test "bzip2 concatenated streams decode in sequence" {
     garbage[len_a + 2] = 'Z';
     const garbage_scratch = try allocator.alloc(u8, try decodeWorkspaceSizeFor(garbage));
     defer allocator.free(garbage_scratch);
-    try std.testing.expectError(error.InvalidData, decode(garbage, output, garbage_scratch, checksum.default_provider));
+    try std.testing.expectError(error.DataFailure, decode(garbage, output, garbage_scratch, checksum.default_provider));
 }

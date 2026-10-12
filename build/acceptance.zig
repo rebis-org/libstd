@@ -2,8 +2,8 @@ const std = @import("std");
 
 const Translator = @import("translate_c").Translator;
 
-const cmd = @import("acceptance/benchmark/command.zig");
 const sevenzip = @import("acceptance/benchmark/ref/sevenzip.zig");
+const reference = @import("acceptance/benchmark/refs.zig");
 const modules = @import("modules.zig");
 const common = @import("platform/common.zig");
 
@@ -84,7 +84,7 @@ fn skipVariantHostLibraries(b: *std.Build, ctx: *const common.Settings) common.H
     return common.addHostLibrariesWithOptions(b, ctx.target, ctx.optimize, ctx.portable, skip_options.createModule(), ctx.sanitize_c);
 }
 
-fn linkOracleRefs(app: AcceptanceApp, refs: cmd.Refs, catalog: std.Build.LazyPath) void {
+fn linkOracleRefs(app: AcceptanceApp, refs: reference.Refs, catalog: std.Build.LazyPath) void {
     inline for ([_][]const u8{ "z", "lzma", "bz2", "archive" }) |name| {
         app.exe.root_module.linkSystemLibrary(name, .{});
     }
@@ -113,7 +113,7 @@ fn addContractCheck(b: *std.Build, interface: *std.Build.Module, components: *st
     return contract_run;
 }
 
-fn linkBenchmarkExe(b: *std.Build, exe: *std.Build.Step.Compile, run: *std.Build.Step.Run, refs: cmd.Refs, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, catalog: std.Build.LazyPath, sdk_usr_lib: ?[]const u8) void {
+fn linkBenchmarkExe(b: *std.Build, exe: *std.Build.Step.Compile, run: *std.Build.Step.Run, refs: reference.Refs, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, catalog: std.Build.LazyPath, sdk_usr_lib: ?[]const u8) void {
     _ = sevenzip.addReference(b, target, optimize, exe);
     refs.link(b, exe.root_module);
     exe.root_module.addCSourceFile(.{ .file = b.path("build/acceptance/benchmark/ref/libzip.c") });
@@ -130,7 +130,7 @@ fn linkBenchmarkExe(b: *std.Build, exe: *std.Build.Step.Compile, run: *std.Build
 fn addOracleApp(
     b: *std.Build,
     ctx: *common.Settings,
-    refs: cmd.Refs,
+    refs: reference.Refs,
     exe_name: []const u8,
     variant_name: []const u8,
     modules_pair: modules.Components,
@@ -166,7 +166,7 @@ fn addAbComparison(b: *std.Build, baseline_exe: *std.Build.Step.Compile, skip_ex
     b.step("oracles_ab", "Compare LZMA encode output between the baseline and skip variants").dependOn(&diff.step);
 }
 
-fn addOracles(b: *std.Build, ctx: *common.Settings, refs: cmd.Refs) void {
+fn addOracles(b: *std.Build, ctx: *common.Settings, refs: reference.Refs) void {
     const modules_pair = modules.componentsWithInterface(b, ctx, ctx.target, ctx.target, ctx.optimize);
     const c_module = translateCModule(b, ctx.target, ctx.optimize);
 
@@ -194,7 +194,7 @@ fn addOracles(b: *std.Build, ctx: *common.Settings, refs: cmd.Refs) void {
     app.run.step.dependOn(&compose_ab_run.step);
 }
 
-fn addOraclesUbsan(b: *std.Build, ctx: *common.Settings, refs: cmd.Refs) void {
+fn addOraclesUbsan(b: *std.Build, ctx: *common.Settings, refs: reference.Refs) void {
     // Zig 0.17 ships no ASan runtime, so UBSan is the only implementable sanitizer step.
     var ubsan_ctx = ctx.*;
     ubsan_ctx.sanitize_c = .full;
@@ -215,7 +215,7 @@ fn addOraclesUbsan(b: *std.Build, ctx: *common.Settings, refs: cmd.Refs) void {
 fn addBenchmarkApp(
     b: *std.Build,
     ctx: *common.Settings,
-    refs: cmd.Refs,
+    refs: reference.Refs,
     exe_name: []const u8,
     host: common.HostLibraries,
     step_name: []const u8,
@@ -239,7 +239,7 @@ fn addBenchmarkApp(
     return app;
 }
 
-fn addBenchmark(b: *std.Build, ctx: *common.Settings, refs: cmd.Refs) void {
+fn addBenchmark(b: *std.Build, ctx: *common.Settings, refs: reference.Refs) void {
     const ref_target = common.refTarget(b, ctx.target);
     // The components target stays on ctx.target while the interface uses ref_target,
     // because the reference binaries need the parity code generation.

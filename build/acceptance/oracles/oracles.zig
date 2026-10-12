@@ -23,8 +23,10 @@ const xz = @import("xz.zig");
 const zip = @import("zip.zig");
 const zstd = @import("zstd.zig");
 
-// Suites derive from the component table: removing a descriptor removes its suite with no central edits.
-// Harness constants duplicate the table for build-side convenience. Descriptors stay authoritative, drift fails the build.
+// Suites derive from the component table; removing a descriptor removes
+// its suite with no central edits.
+// Harness constants duplicate the table for build-side convenience;
+// descriptors stay authoritative, drift fails the build.
 comptime {
     const Pin = struct { component: []const u8, parameter: []const u8, family: u16, ordinal: u32 };
     const pins = [_]Pin{

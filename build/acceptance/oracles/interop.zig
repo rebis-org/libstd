@@ -51,9 +51,9 @@ fn xzRefDecode(input: []const u8, output: []u8) ?usize {
 }
 
 fn zstdParams(_: *harness.Runner, out: *[steps.MaxExtra]harness.Node) usize {
-    out[0] = harness.paramScalar(harness.param_family_zstd, harness.zstd_window, harness.cmd_all, 1 << 22);
-    out[1] = harness.paramScalar(harness.param_family_zstd, harness.zstd_hash_bits, harness.cmd_all, 17);
-    out[2] = harness.paramScalar(harness.param_family_zstd, harness.zstd_double_hash, harness.cmd_all, 1);
+    out[0] = harness.paramScalar(harness.param_family_zstd, harness.zstd_window, harness.cmds, 1 << 22);
+    out[1] = harness.paramScalar(harness.param_family_zstd, harness.zstd_hash_bits, harness.cmds, 17);
+    out[2] = harness.paramScalar(harness.param_family_zstd, harness.zstd_double_hash, harness.cmds, 1);
     return 3;
 }
 

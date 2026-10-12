@@ -25,7 +25,16 @@ const Resource = resource.Resource;
 const Failure = vocabulary.Failure;
 
 fn requireCommit(commit: vocabulary.CommitMode, expected: vocabulary.CommitMode) Failure!void {
-    if (commit != expected) return error.Unsupported;
+    if (commit != expected) return error.UnsupportedFailure;
+}
+
+const ReadHead = struct { sink: *Resource, ordinal: u64 };
+
+// Tentative commit, sink presence, and the entry ordinal resolve identically
+// for every archive read; formats with extra checks run them after this.
+fn readHead(sink: ?*Resource, call: *Call, commit: vocabulary.CommitMode) Failure!ReadHead {
+    try requireTentative(commit);
+    return .{ .sink = sink.?, .ordinal = archiveOrdinal(call.request) };
 }
 
 fn requireTentative(commit: vocabulary.CommitMode) Failure!void {
@@ -50,7 +59,7 @@ fn parseHeaderEncode(request: ?*Node, comptime component: []const u8) Failure!u6
         comptime discovery.parameter(component, "header_encode").family,
         comptime discovery.parameter(component, "header_encode").ordinal,
     ));
-    if (header_encode > 2) return error.InvalidCall;
+    if (header_encode > 2) return error.CallFailure;
     return header_encode;
 }
 
@@ -84,6 +93,13 @@ const CryptoParams = struct {
     password_lifetime: u64 = 0,
 };
 
+// A selector arrives on the wire as a u64, so narrowing it to the field width
+// is a checked conversion: a value the field cannot hold is a malformed
+// request, not a number to wrap.
+fn narrow(comptime T: type, value: u64) Failure!T {
+    return std.math.cast(T, value) orelse error.CallFailure;
+}
+
 fn cryptoPassword(params: ?CryptoParams) ?[]const u8 {
     return if (params) |held| held.password else null;
 }
@@ -100,10 +116,7 @@ fn cryptoLifetime(params: ?CryptoParams) u64 {
     return if (params) |held| held.password_lifetime else 0;
 }
 
-// The crypto selectors are declared by each archive descriptor (zip,
-// sevenzip, and rar each carry family 1, ordinals 1-4) so a host reads them
-// from the invoked profile's own catalog row; the wire values match by
-// convention, and a descriptor missing a row fails at comptime here.
+// Each descriptor owns its crypto selectors; a missing row fails comptime.
 fn parseCryptoParams(comptime component: []const u8, request: ?*Node, failure_cause: *crypto.FailureCause) Failure!?CryptoParams {
     failure_cause.* = .none;
     const profile_node = node_graph.findParameter(request, vocabulary.ids.crypto_profile);
@@ -115,23 +128,29 @@ fn parseCryptoParams(comptime component: []const u8, request: ?*Node, failure_ca
     if (profile_node == null and password_node == null) return null;
     const profile_id = if (profile_node) |node| blk: {
         const value: abi.Id = .{ .low = node.value_low, .high = node.value_high };
-        const descriptor = kernel_catalog.descriptorFor(value) orelse return error.Unsupported;
-        if (descriptor.kind != .profile) return error.InvalidCall;
+        const descriptor = kernel_catalog.descriptorFor(value) orelse return error.UnsupportedFailure;
+        if (descriptor.kind != .profile) return error.CallFailure;
         break :blk value;
-    } else return error.InvalidCall;
-    if (!vocabulary.eql(profile_id, vocabulary.ids.crypto)) return error.InvalidCall;
-    const password_node2 = password_node orelse return error.InvalidCall;
+    } else return error.CallFailure;
+    if (!vocabulary.eql(profile_id, vocabulary.ids.crypto)) return error.CallFailure;
+    const password_node2 = password_node orelse return error.CallFailure;
     const password = try resource.checkedConstBytes(password_node2.bytes, password_node2.byte_length);
-    if (password.len == 0) return error.InvalidCall;
+    if (password.len == 0) return error.CallFailure;
     const algorithm = if (node_graph.findSelector(
         request,
         comptime discovery.parameter(component, "algorithm").family,
         comptime discovery.parameter(component, "algorithm").ordinal,
     )) |node| blk: {
-        const value: u8 = @truncate(node.value_low);
+        // Truncating a wide selector would answer a request for a stronger
+        // algorithm with a weaker one, so an unrepresentable value is refused
+        // alongside an out-of-range one.
+        const value = narrow(u8, node.value_low) catch {
+            failure_cause.* = .unsupported_algorithm;
+            return error.UnsupportedFailure;
+        };
         if (value > 3) {
             failure_cause.* = .unsupported_algorithm;
-            return error.Unsupported;
+            return error.UnsupportedFailure;
         }
         break :blk value;
     } else 3;
@@ -153,7 +172,7 @@ fn parseCryptoParams(comptime component: []const u8, request: ?*Node, failure_ca
 
 pub fn tarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
     _ = sizing;
-    const source_resource = source orelse return error.InvalidCall;
+    const source_resource = source orelse return error.CallFailure;
     var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
     if (command_mask == vocabulary.command_mask_read) {
         if (sink == null) {
@@ -162,13 +181,13 @@ pub fn tarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
             response.byte_length = count;
             return;
         }
-        try requireTentative(commit);
-        const sink_resource = sink.?;
-        const ordinal = archiveOrdinal(call.request);
+        const head = try readHead(sink, call, commit);
+        const sink_resource = head.sink;
+        const ordinal = head.ordinal;
         const archive = try materializeArchive(source_resource, &workspace, limits);
         const entry = try tar_seam.inspectOrdinal(plan.provider, archive, ordinal);
-        const size = std.math.cast(usize, entry.size) orelse return error.ResourceLimit;
-        if (size > limits.decoded_bytes) return error.ResourceLimit;
+        const size = std.math.cast(usize, entry.size) orelse return error.ResourceFailure;
+        if (size > limits.decoded_bytes) return error.ResourceFailure;
         try common.requireSinkCapacity(sink_resource, call, size);
         if (sink_resource.kind == .direct_write) {
             const output = try common.sinkDirectBuffer(sink_resource, size);
@@ -206,13 +225,13 @@ pub fn tarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
             response.byte_length = written;
         }
     } else {
-        return error.Unsupported;
+        return error.UnsupportedFailure;
     }
 }
 
 pub fn zipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
     _ = sizing;
-    const source_resource = source orelse return error.InvalidCall;
+    const source_resource = source orelse return error.CallFailure;
     var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
     var crypto_cause: crypto.FailureCause = .none;
     const crypto_params = parseCryptoParams("zip", call.request, &crypto_cause) catch |err| {
@@ -228,14 +247,14 @@ pub fn zipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
             response.byte_length = count;
             return;
         }
-        try requireTentative(commit);
-        const sink_resource = sink.?;
-        const ordinal = archiveOrdinal(call.request);
+        const head = try readHead(sink, call, commit);
+        const sink_resource = head.sink;
+        const ordinal = head.ordinal;
         const archive = try materializeArchive(source_resource, &workspace, limits);
         const entry = try zip.zipInspectOrdinal(archive, ordinal);
         const history = try workspace.take(u8, if (entry.actual_method == 9) zip.deflate64_decode_history_size else zip.deflate_history_size);
         const size = entry.uncompressed_size;
-        if (size > limits.decoded_bytes) return error.ResourceLimit;
+        if (size > limits.decoded_bytes) return error.ResourceFailure;
         try common.requireSinkCapacity(sink_resource, call, size);
         const decrypt_staging = if (entry.encrypted) try workspace.take(u8, entry.compressed_size) else @as([]u8, &.{});
         const callback_staging = if (sink_resource.kind == .callback_write) try workspace.take(u8, size) else @as([]u8, &.{});
@@ -269,7 +288,7 @@ pub fn zipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
         if (crypto_params) |params| {
             if (params.algorithm > 3) {
                 writeCryptoFailure(call, .unsupported_algorithm);
-                return error.Unsupported;
+                return error.UnsupportedFailure;
             }
         }
         const entries = try collectEntries(zip.Entry, call.request, &workspace, crypto_params, fillZipEntry);
@@ -317,7 +336,7 @@ pub fn zipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
             response.byte_length = written;
         }
     } else {
-        return error.Unsupported;
+        return error.UnsupportedFailure;
     }
 }
 
@@ -328,7 +347,7 @@ pub fn sevenzipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Res
 
 fn sevenZipGeneric(comptime coded: bool, plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
     _ = sizing;
-    const source_resource = source orelse return error.InvalidCall;
+    const source_resource = source orelse return error.CallFailure;
     var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
     var crypto_cause: crypto.FailureCause = .none;
     const crypto_params = parseCryptoParams("sevenzip", call.request, &crypto_cause) catch |err| {
@@ -364,9 +383,9 @@ fn sevenZipGeneric(comptime coded: bool, plan: *common.ExecutionPlan, source: ?*
             writeCryptoFailure(call, crypto_cause);
             return err;
         };
-        if (!coded and entry.method != .copy) return error.Unsupported;
-        const size = std.math.cast(usize, entry.size) orelse return error.ResourceLimit;
-        if (size > limits.decoded_bytes) return error.ResourceLimit;
+        if (!coded and entry.method != .copy) return error.UnsupportedFailure;
+        const size = std.math.cast(usize, entry.size) orelse return error.ResourceFailure;
+        if (size > limits.decoded_bytes) return error.ResourceFailure;
         try common.requireSinkCapacity(sink_resource, call, size);
         const decode_options: seven_zip.SevenZipDecodeOptions = .{
             .password = cryptoPassword(crypto_params),
@@ -426,7 +445,7 @@ fn sevenZipGeneric(comptime coded: bool, plan: *common.ExecutionPlan, source: ?*
             response.byte_length = written;
         }
     } else {
-        return error.Unsupported;
+        return error.UnsupportedFailure;
     }
 }
 
@@ -510,7 +529,7 @@ fn parseSevenZipMethod(node: *Node) Failure!seven_zip.CoderMethod {
         12 => .arm64,
         13 => .riscv,
         14 => .ppmd,
-        else => error.InvalidCall,
+        else => error.CallFailure,
     };
 }
 
@@ -519,8 +538,8 @@ fn parseSevenZipMethod(node: *Node) Failure!seven_zip.CoderMethod {
 const rar_header_scratch_size = 2 * 1024 * 1024 + 16;
 
 pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
-    const source_resource = source orelse return error.InvalidCall;
-    if (sizing != .metadata_exact) return error.Unsupported;
+    const source_resource = source orelse return error.CallFailure;
+    if (sizing != .metadata_exact) return error.UnsupportedFailure;
     var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
     if (command_mask == vocabulary.command_mask_read) {
         var failure_cause: crypto.FailureCause = .none;
@@ -573,15 +592,15 @@ pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
             writeCryptoFailure(call, failure_cause);
             return err;
         };
-        const size = std.math.cast(usize, entry.size) orelse return error.ResourceLimit;
-        if (size > limits.decoded_bytes) return error.ResourceLimit;
+        const size = std.math.cast(usize, entry.size) orelse return error.ResourceFailure;
+        if (size > limits.decoded_bytes) return error.ResourceFailure;
         try common.requireSinkCapacity(sink_resource, call, size);
 
         // The walk resolved the entry's declared needs into RarInfo. Store
         // entries carve nothing. The PPMd heap is whatever workspace remains:
         // the stream names its model size at decode time and is refused
         // cleanly if the pool cannot hold it.
-        const window_len = std.math.cast(usize, entry.window_bytes) orelse return error.ResourceLimit;
+        const window_len = std.math.cast(usize, entry.window_bytes) orelse return error.ResourceFailure;
         var bufs: rar.DecodeBuffers = .{
             .state = &.{},
             .window = &.{},
@@ -643,7 +662,7 @@ pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
             .kdf_rounds_limit = cryptoKdfLimit(crypto_params),
             .failure_cause = &crypto_cause,
         };
-        if (write_options.encrypt_headers and write_options.password.len == 0) return error.InvalidCall;
+        if (write_options.encrypt_headers and write_options.password.len == 0) return error.CallFailure;
         var max_input: usize = 0;
         var packed_total: usize = 0;
         for (entries) |entry| {
@@ -697,15 +716,15 @@ pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
             response.byte_length = written;
         }
     } else {
-        return error.Unsupported;
+        return error.UnsupportedFailure;
     }
 }
 
 fn fillRarEntry(entry: *rar_writer.RarEntry, node: *Node, _: NoCtx) Failure!void {
     const parts = try entryNameData(node.child);
     const method_node = entryMethod(node.child);
-    if (!std.unicode.utf8ValidateSlice(parts.name)) return error.InvalidCall;
-    const method: u8 = if (method_node) |n| @truncate(n.value_low) else 0;
+    if (!std.unicode.utf8ValidateSlice(parts.name)) return error.CallFailure;
+    const method: u8 = if (method_node) |n| try narrow(u8, n.value_low) else 0;
     const mtime = entryMtime(node.child);
     entry.* = .{
         .name = parts.name,
@@ -726,11 +745,11 @@ fn fillTarEntry(entry: *tar.Entry, node: *Node, _: NoCtx) Failure!void {
     const link_name_node = node_graph.findSelector(node.child, comptime discovery.parameter("tar", "entry_link_name").family, comptime discovery.parameter("tar", "entry_link_name").ordinal);
     const uid_node = node_graph.findSelector(node.child, comptime discovery.parameter("tar", "entry_uid").family, comptime discovery.parameter("tar", "entry_uid").ordinal);
     const typeflag: u8 = if (typeflag_node) |n| blk: {
-        break :blk @truncate(n.value_low);
+        break :blk try narrow(u8, n.value_low);
     } else 0;
     const link_name = if (link_name_node) |n| try resource.checkedConstBytes(n.bytes, n.byte_length) else &.{};
     const uid: u32 = if (uid_node) |n| blk: {
-        break :blk @truncate(n.value_low);
+        break :blk try narrow(u32, n.value_low);
     } else 0;
     const mtime = entryMtime(node.child);
     entry.* = .{ .name = parts.name, .data = parts.data, .link_name = link_name, .uid = uid, .modification_time = mtime, .typeflag = typeflag };
@@ -739,7 +758,7 @@ fn fillTarEntry(entry: *tar.Entry, node: *Node, _: NoCtx) Failure!void {
 fn fillZipEntry(entry: *zip.Entry, node: *Node, crypto_params: ?CryptoParams) Failure!void {
     const parts = try entryNameData(node.child);
     const method_node = entryMethod(node.child);
-    const method: u16 = if (method_node) |n| @truncate(n.value_low) else 8;
+    const method: u16 = if (method_node) |n| try narrow(u16, n.value_low) else 8;
     entry.* = .{ .name = parts.name, .data = parts.data, .method = method };
     // A nonzero value writes the streaming shape: zeroed local sizes and
     // a data descriptor after the entry data.

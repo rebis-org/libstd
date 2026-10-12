@@ -1,25 +1,15 @@
 const std = @import("std");
 
 const build_options = @import("options");
-// zstd decode seam, the coarse contract shape: one dispatch per call, never
-// per symbol or block. The comptime flavor (a fixed leaf_impl build)
-// inlines to the arm's own function; the runtime flavor (mergeable) binds
-// the provider tag per call. Fixed builds reject the other tag explicitly
-// instead of serving it silently.
-//
-// The offprem arm records the std incompleteness the caller accepts by
-// choosing it: frame content checksums are not verified and dictionaries
-// are unsupported (see offprem.zig).
+// One dispatch per call, never per symbol or block; the offprem arm's
+// accepted incompleteness is recorded in offprem.zig.
 pub const Provider = @import("seam").Provider;
 
 const offprem = @import("offprem.zig");
 const onprem = @import("onprem.zig");
 
-// Fixed builds reject the other tag explicitly instead of serving it
-// silently; the mergeable build binds the tag per call. One dispatch per
-// call, never per symbol or block.
-fn requireServed(provider: Provider, comptime served: Provider) error{Unsupported}!void {
-    if (provider != served) return error.Unsupported;
+fn requireServed(provider: Provider, comptime served: Provider) error{UnsupportedFailure}!void {
+    if (provider != served) return error.UnsupportedFailure;
 }
 pub fn decodeStream(provider: Provider, input: *std.Io.Reader, output: *std.Io.Writer, history: []u8, options: onprem.Options) onprem.DecodeError!usize {
     return switch (build_options.leaf_impl) {

@@ -23,7 +23,7 @@ pub const Sink = struct {
     offset: usize = 0,
 
     pub fn write(self: *Sink, chunk: []const u8) Failure!void {
-        if (chunk.len > self.bytes.len - self.offset) return error.InsufficientCapacity;
+        if (chunk.len > self.bytes.len - self.offset) return error.CapacityFailure;
         @memcpy(self.bytes[self.offset..][0..chunk.len], chunk);
         self.offset += chunk.len;
     }
@@ -41,9 +41,9 @@ fn Slice(comptime Ptr: type) type {
 }
 
 fn checkedSlice(comptime Ptr: type, pointer: ?Ptr, length: u64) Failure!Slice(Ptr) {
-    const count = std.math.cast(usize, length) orelse return error.ResourceLimit;
+    const count = std.math.cast(usize, length) orelse return error.ResourceFailure;
     if (count == 0) return &.{};
-    const base = pointer orelse return error.InvalidCall;
+    const base = pointer orelse return error.CallFailure;
     // Slicing a comptime-known pointer yields a const slice, so the mutable case casts back onto caller-owned memory.
     const slice = base[0..count];
     if (comptime @typeInfo(Ptr).pointer.attrs.@"const") return slice;
@@ -80,7 +80,7 @@ pub const Workspace = struct {
         if (self.required_tracker) |tracker| {
             if (end > tracker.*) tracker.* = end;
         }
-        if (end > self.bytes.len) return error.InsufficientCapacity;
+        if (end > self.bytes.len) return error.CapacityFailure;
         const output: []T = @alignCast(std.mem.bytesAsSlice(T, self.bytes[aligned..end]));
         self.cursor = end;
         return output;
@@ -112,9 +112,9 @@ const Extent = struct { start: usize, end: usize };
 
 fn extent(base: usize, cursor: usize, comptime T: type, count: usize) Failure!Extent {
     const alignment = @alignOf(T);
-    const address = std.math.add(usize, base, cursor) catch return error.ResourceLimit;
-    if (address > std.math.maxInt(usize) - (alignment - 1)) return error.ResourceLimit;
+    const address = std.math.add(usize, base, cursor) catch return error.ResourceFailure;
+    if (address > std.math.maxInt(usize) - (alignment - 1)) return error.ResourceFailure;
     const start = std.mem.alignForward(usize, address, alignment) - base;
-    const size = std.math.mul(usize, count, @sizeOf(T)) catch return error.ResourceLimit;
-    return .{ .start = start, .end = std.math.add(usize, start, size) catch return error.ResourceLimit };
+    const size = std.math.mul(usize, count, @sizeOf(T)) catch return error.ResourceFailure;
+    return .{ .start = start, .end = std.math.add(usize, start, size) catch return error.ResourceFailure };
 }

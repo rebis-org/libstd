@@ -125,10 +125,10 @@ pub fn makeDecodeTables(code_lengths: []const u8, storage: []u16) Failure!Decode
 }
 
 pub fn decodeNumber(br: *BitReader, table: *const DecodeTable) Failure!u16 {
-    if (!table.valid) return error.InvalidData;
+    if (!table.valid) return error.DataFailure;
 
     const bits_available = br.remainingBits();
-    if (bits_available == 0) return error.InvalidData;
+    if (bits_available == 0) return error.DataFailure;
 
     const peek_count: u5 = if (bits_available >= 16) 16 else @intCast(bits_available);
     const peeked = try br.peekBits(peek_count);
@@ -217,5 +217,5 @@ test "decode number on empty stream fails" {
     var storage: [3]u16 = undefined;
     const table = try makeDecodeTables(&code_lengths, &storage);
     var br = BitReader.init(&[_]u8{});
-    try std.testing.expectError(error.InvalidData, decodeNumber(&br, &table));
+    try std.testing.expectError(error.DataFailure, decodeNumber(&br, &table));
 }

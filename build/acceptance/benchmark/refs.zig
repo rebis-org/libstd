@@ -133,9 +133,9 @@ fn installOut(b: *std.Build, dep: *std.Build.Step, source: []const u8, name: []c
 
 fn gnu(b: *std.Build, cwd: []const u8, argv: []const []const u8, dummy_dir: std.Build.LazyPath) *std.Build.Step.Run {
     // The vendor autotools builds only probe $MAKEINFO/$TEXI2PDF for --version;
-    // the generated scripts answer that and the real work stays disabled. The
-    // paths must be absolute single words: gnulib's get_version splits its
-    // argument unquoted, and recursive makes resolve MAKEINFO from subdirs.
+    // the dummy scripts answer that.
+    // Paths must be absolute single words: gnulib's get_version splits unquoted,
+    // and recursive makes resolve MAKEINFO from subdirs.
     const step = b.addSystemCommand(&.{
         "sh", "-c",
         \\dummy="$(cd "$1" && pwd)"
@@ -161,7 +161,7 @@ fn gnuChain(b: *std.Build, cwd: []const u8, dummy_dir: std.Build.LazyPath, pre: 
     return make_step;
 }
 fn archiveFileName(url: []const u8) []const u8 {
-    return url[std.mem.lastIndexOfScalar(u8, url, '/').? + 1 ..];
+    return url[std.mem.findScalarLast(u8, url, '/').? + 1 ..];
 }
 
 fn addBinaryFetch(b: *std.Build, ctx: *const common.Settings, ref: BinaryRef) *std.Build.Step.Run {
@@ -169,7 +169,7 @@ fn addBinaryFetch(b: *std.Build, ctx: *const common.Settings, ref: BinaryRef) *s
     const fetch_exe = b.addExecutable(.{
         .name = "binary_fetch",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("build/acceptance/benchmark/ref/binary.zig"),
+            .root_source_file = b.path("build/acceptance/benchmark/binary.zig"),
             .target = b.graph.host,
             .optimize = .debug,
             .imports = &.{.{ .name = "run", .module = modules.create(b, modules.run, ctx) }},

@@ -1,7 +1,7 @@
 const std = @import("std");
 
 const render = @import("../../src/kernel/render.zig");
-const cmd = @import("../acceptance/benchmark/command.zig");
+const reference = @import("../acceptance/benchmark/refs.zig");
 const modules = @import("../modules.zig");
 const manifest = @import("manifest.zig");
 
@@ -15,11 +15,10 @@ pub fn refTarget(b: *std.Build, target: std.Build.ResolvedTarget) std.Build.Reso
 // Each descriptor is a file argument, because a directory argument is unfingerprinted.
 pub fn descriptorPaths(b: *std.Build) [][]const u8 {
     var list: std.ArrayList([]const u8) = .empty;
-    // The enumeration itself observes configuration-time state, so declare it:
-    // a new, deleted, renamed, or edited descriptor must invalidate the
-    // configure cache. dependOnDirectoryContents is not recursive, so the
-    // top-level directory catches new subdirectories while each parent
-    // directory catches entry changes one level down.
+    // The enumeration observes configuration-time state; any descriptor change
+    // must invalidate the configure cache.
+    // dependOnDirectoryContents is not recursive: the top-level directory catches
+    // new subdirectories, each parent catches entry changes one level down.
     b.dependOnDirectoryContents(b.path("src"));
     var dir = b.root.openDir(b.graph.io, "src", .{ .iterate = true }) catch @panic("The component scan cannot open src.");
     defer dir.close(b.graph.io);
@@ -30,7 +29,7 @@ pub fn descriptorPaths(b: *std.Build) [][]const u8 {
         const rel = b.allocator.print("src/{s}", .{entry.path}) catch @panic("The component scan is out of memory.");
         list.append(b.allocator, rel) catch @panic("The component scan is out of memory.");
         b.dependOnFileContents(b.path(rel));
-        const parent = rel[0 .. std.mem.lastIndexOfScalar(u8, rel, '/') orelse unreachable];
+        const parent = rel[0..std.mem.findScalarLast(u8, rel, '/').?];
         b.dependOnDirectoryContents(b.path(parent));
     }
     std.mem.sort([]const u8, list.items, {}, struct {
@@ -72,9 +71,9 @@ pub fn putCapability(options: *std.Build.Step.Options, comptime capability: []co
 }
 
 // Every key `@import("options")` resolves anywhere in the tree. A build that
-// compiles the library against a second options module has to declare the whole
-// surface, not the subset that variant happens to vary, so this is the one
-// place the list lives.
+// Every options key resolves somewhere in the tree.
+// A build compiling against a second options module must declare the whole
+// surface, so the list lives here.
 pub fn putUniformOptions(options: *std.Build.Step.Options, impl: Implementation, portable_flag: bool) void {
     options.addOption(bool, "portable", portable_flag);
     options.addOption(Implementation, "primitives_impl", impl);
@@ -89,7 +88,7 @@ pub const Settings = struct {
     version: std.SemanticVersion,
     generated: Generated,
     host: HostLibraries,
-    refs: ?cmd.Refs = null,
+    refs: ?reference.Refs = null,
     archives: ?[]const ProviderArchives = null,
     portable: bool = false,
     options: *std.Build.Module,
@@ -130,11 +129,8 @@ pub fn rootModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std
     return module;
 }
 
-// Attach the library's import closure to the package-manager module created
-// with b.addModule in build.zig, so a dependent build consuming
-// dep.module("libstd") compiles out of the box. In this build the module is
-// inert (nothing imports it); a dependent build compiles only this instance,
-// so the shared source files never sit in two compiled modules at once.
+// A dependent build compiles only this module instance, so the shared sources
+// never sit in two compiled modules at once.
 pub fn attachPackageImports(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, ctx: *const Settings) void {
     module.addImport("options", ctx.options);
     module.addImport("seam", modules.shared(b, modules.seam, target, optimize, ctx));
@@ -237,7 +233,7 @@ pub fn addZipArchive(b: *std.Build, distribution: manifest.Distribution, stage: 
 fn archiveRoot(distribution: manifest.Distribution) []const u8 {
     const entries = distribution.entries;
     const first = entries[0];
-    const slash = std.mem.indexOfScalar(u8, first, '/') orelse return ".";
+    const slash = std.mem.findScalar(u8, first, '/') orelse return ".";
     const prefix = first[0 .. slash + 1];
     for (entries[1..]) |entry| {
         if (!std.mem.startsWith(u8, entry, prefix)) return ".";

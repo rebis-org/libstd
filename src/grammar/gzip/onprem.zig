@@ -49,7 +49,7 @@ pub fn encodedSizeBound(input_len: usize, options: Options) usize {
 }
 
 pub fn decodedSize(input: []const u8, history: []u8, provider: checksum.Provider) Failure!usize {
-    if (history.len < deflate_history_size) return error.InsufficientCapacity;
+    if (history.len < deflate_history_size) return error.CapacityFailure;
     var counter = measurement.Counter.init(null);
     _ = try decode(input, &counter.writer, history, provider);
     return measurement.measuredLength(&counter);
@@ -81,10 +81,10 @@ fn readMember(input: []const u8, at: usize, history: []u8, output: *std.Io.Write
     var tee_writer = Crc32Tee.initWithProvider(output, provider);
     const inflated = inflatePayload(input, data_start, history, &tee_writer.writer, provider) catch |err| return switch (err) {
         error.WriteFailed => error.IoFailure,
-        else => error.InvalidData,
+        else => error.DataFailure,
     };
     const trailer_at = data_start + inflated.consumed;
-    if (input.len - trailer_at < trailer_len) return error.InvalidData;
+    if (input.len - trailer_at < trailer_len) return error.DataFailure;
     const stored_crc = std.mem.readInt(u32, input[trailer_at..][0..4], .little);
     const stored_size = std.mem.readInt(u32, input[trailer_at + 4 ..][0..4], .little);
     if (stored_crc != tee_writer.crc32Value() or stored_size != @as(u32, @truncate(tee_writer.size))) return error.IntegrityFailure;
@@ -100,7 +100,7 @@ fn readMember(input: []const u8, at: usize, history: []u8, output: *std.Io.Write
 // ISIZE only seeds the attempt; commit needs exact count, CRC32, and trailer.
 // Mismatch defers to the two-pass route.
 pub fn decodeSinglePass(input: []const u8, output: []u8, history: []u8, provider: checksum.Provider) Failure!SinglePass {
-    if (history.len < deflate_history_size) return error.InsufficientCapacity;
+    if (history.len < deflate_history_size) return error.CapacityFailure;
     if (input.len >= std.math.maxInt(u32)) return .fallback;
     if (input.len < minimum_member_len) return .fallback;
     const claimed_size = std.mem.readInt(u32, input[input.len - 4 ..][0..4], .little);
@@ -112,7 +112,7 @@ pub fn decodeSinglePass(input: []const u8, output: []u8, history: []u8, provider
 }
 
 pub fn decode(input: []const u8, output: *std.Io.Writer, history: []u8, provider: checksum.Provider) Failure!usize {
-    if (history.len < deflate_history_size) return error.InsufficientCapacity;
+    if (history.len < deflate_history_size) return error.CapacityFailure;
     var total: usize = 0;
     var at: usize = 0;
     while (at < input.len) {
@@ -124,7 +124,7 @@ pub fn decode(input: []const u8, output: *std.Io.Writer, history: []u8, provider
 }
 
 pub fn encodeStream(source: *std.Io.Reader, output: *std.Io.Writer, history: []u8, options: Options) Failure!void {
-    if (history.len < deflate_history_size) return error.InsufficientCapacity;
+    if (history.len < deflate_history_size) return error.CapacityFailure;
     try writeHeader(output, options);
     // Optimal mode carves scratch past deflate_history_size, so the full slice is required.
     var compressor = try deflate.Compress.init(output, history, options.deflate);
@@ -135,12 +135,12 @@ pub fn encodeStream(source: *std.Io.Reader, output: *std.Io.Writer, history: []u
 }
 
 fn parseHeader(input: []const u8, provider: checksum.Provider) Failure!HeaderTail {
-    if (input.len < 10) return error.InvalidData;
+    if (input.len < 10) return error.DataFailure;
     const fixed = input[0..10];
-    if (fixed[0] != magic_1 or fixed[1] != magic_2) return error.InvalidData;
-    if (fixed[2] != cm_deflate) return error.Unsupported;
+    if (fixed[0] != magic_1 or fixed[1] != magic_2) return error.DataFailure;
+    if (fixed[2] != cm_deflate) return error.UnsupportedFailure;
     const flags = fixed[3];
-    if (flags & reserved_flags != 0) return error.InvalidData;
+    if (flags & reserved_flags != 0) return error.DataFailure;
     var hasher = checksum.Crc32.bind(provider);
     hasher.update(fixed);
     var cursor: usize = fixed.len;
@@ -148,29 +148,29 @@ fn parseHeader(input: []const u8, provider: checksum.Provider) Failure!HeaderTai
     var name: []const u8 = &.{};
     var comment: []const u8 = &.{};
     if (flags & flag_extra != 0) {
-        if (input.len - cursor < 2) return error.InvalidData;
+        if (input.len - cursor < 2) return error.DataFailure;
         const remaining: usize = (@as(usize, input[cursor + 1]) << 8) | input[cursor];
         hasher.update(input[cursor..][0..2]);
         cursor += 2;
-        if (input.len - cursor < remaining) return error.InvalidData;
+        if (input.len - cursor < remaining) return error.DataFailure;
         extra = input[cursor .. cursor + remaining];
         hasher.update(extra);
         cursor += remaining;
     }
     if (flags & flag_name != 0) {
-        const end = std.mem.indexOfScalarPos(u8, input, cursor, 0) orelse return error.InvalidData;
+        const end = std.mem.findScalarPos(u8, input, cursor, 0) orelse return error.DataFailure;
         name = input[cursor..end];
         hasher.update(input[cursor .. end + 1]);
         cursor = end + 1;
     }
     if (flags & flag_comment != 0) {
-        const end = std.mem.indexOfScalarPos(u8, input, cursor, 0) orelse return error.InvalidData;
+        const end = std.mem.findScalarPos(u8, input, cursor, 0) orelse return error.DataFailure;
         comment = input[cursor..end];
         hasher.update(input[cursor .. end + 1]);
         cursor = end + 1;
     }
     if (flags & flag_header_crc != 0) {
-        if (input.len - cursor < 2) return error.InvalidData;
+        if (input.len - cursor < 2) return error.DataFailure;
         const stored_crc = (@as(u16, input[cursor + 1]) << 8) | input[cursor];
         if (stored_crc != @as(u16, @truncate(hasher.final()))) return error.IntegrityFailure;
         cursor += 2;
@@ -191,14 +191,14 @@ const Inflated = struct {
 };
 
 fn inflatePayload(input: []const u8, data_start: usize, history: []u8, output: *std.Io.Writer, provider: checksum.Provider) !Inflated {
-    var inflater = deflate_seam.Decode.initSliceBound(provider, input[data_start..], history) catch return error.Unsupported;
+    var inflater = deflate_seam.Decode.initSliceBound(provider, input[data_start..], history) catch return error.UnsupportedFailure;
     const produced = try inflater.readerPtr().streamRemaining(output);
     return .{ .produced = produced, .consumed = (inflater.inputBitsConsumed() + 7) / 8 };
 }
 
 fn writeHeader(writer: *std.Io.Writer, options: Options) Failure!void {
-    if (options.extra.len > std.math.maxInt(u16)) return error.InvalidCall;
-    if (std.mem.indexOfScalar(u8, options.name, 0) != null or std.mem.indexOfScalar(u8, options.comment, 0) != null) return error.InvalidCall;
+    if (options.extra.len > std.math.maxInt(u16)) return error.CallFailure;
+    if (std.mem.findScalar(u8, options.name, 0) != null or std.mem.findScalar(u8, options.comment, 0) != null) return error.CallFailure;
     var flags: u8 = 0;
     if (options.text) flags |= flag_text;
     if (options.header_crc) flags |= flag_header_crc;
@@ -270,23 +270,22 @@ pub const MemberIterator = struct {
 
     pub fn next(self: *MemberIterator) Failure!?MemberInfo {
         if (self.offset >= self.input.len) return null;
-        if (self.input.len - self.offset < minimum_member_len) return error.InvalidData;
+        if (self.input.len - self.offset < minimum_member_len) return error.DataFailure;
         const member = try inspectMember(self.input[self.offset..], self.history, self.provider);
         self.offset = try bounds.addUsize(self.offset, member.total_size);
         return member;
     }
 };
 
-// Enumerates the members of a (possibly concatenated) gzip stream. Each next
-// call parses one member strictly: the deflate payload is decoded and the
-// trailer CRC and ISIZE are verified, so a corrupt member fails at its
-// ordinal rather than silently ending the walk.
+// Enumerates the members of a possibly concatenated gzip stream.
+// Each member is decoded strictly, with the trailer CRC and ISIZE verified,
+// so a corrupt member fails at its ordinal.
 pub fn inspectMembers(input: []const u8, history: []u8, provider: checksum.Provider) MemberIterator {
     return .{ .input = input, .history = history, .provider = provider };
 }
 
 fn inspectMember(input: []const u8, history: []u8, provider: checksum.Provider) Failure!MemberInfo {
-    if (history.len < deflate_history_size) return error.InsufficientCapacity;
+    if (history.len < deflate_history_size) return error.CapacityFailure;
     var counter = measurement.Counter.init(null);
     const member = try readMember(input, 0, history, &counter.writer, provider);
     return .{

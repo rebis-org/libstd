@@ -9,9 +9,9 @@ const steps = @import("steps.zig");
 const Runner = harness.Runner;
 
 fn optimalParams(_: *Runner, out: *[steps.MaxExtra]harness.Node) usize {
-    out[0] = harness.paramScalar(harness.param_family_deflate, harness.deflate_optimal, harness.cmd_all, 1);
-    out[1] = harness.paramScalar(harness.param_family_deflate, harness.deflate_nice, harness.cmd_all, 258);
-    out[2] = harness.paramScalar(harness.param_family_deflate, harness.deflate_chain, harness.cmd_all, 256);
+    out[0] = harness.paramScalar(harness.param_family_deflate, harness.deflate_optimal, harness.cmds, 1);
+    out[1] = harness.paramScalar(harness.param_family_deflate, harness.deflate_nice, harness.cmds, 258);
+    out[2] = harness.paramScalar(harness.param_family_deflate, harness.deflate_chain, harness.cmds, 256);
     return 3;
 }
 

@@ -1,12 +1,5 @@
 const build_options = @import("options");
-// tar grammar seam under grammar_impl, the coarse contract shape: one
-// dispatch per call. The comptime flavor (a fixed grammar_impl build)
-// inlines to the arm's own function; the runtime flavor (mergeable) binds
-// the provider tag per call. Per-verb faithfulness is decided in the
-// offprem file: inspectCount and decodeOrdinal are faithful through
-// std.tar; inspectOrdinal resolves to onprem because std's File carries no
-// mtime/uid/gid/typeflag; encode serves only the subset std.tar.Writer can
-// carry and answers Unsupported otherwise.
+// Per-verb faithfulness lives in the offprem file; one dispatch per call.
 pub const Provider = @import("seam").Provider;
 
 const offprem = @import("offprem.zig");
@@ -24,8 +17,8 @@ pub const default_provider: Provider = switch (build_options.grammar_impl) {
 // Fixed builds reject the other tag explicitly instead of serving it
 // silently; the mergeable build binds the tag per call. One dispatch per
 // call, never per symbol or block.
-fn requireServed(provider: Provider, comptime served: Provider) error{Unsupported}!void {
-    if (provider != served) return error.Unsupported;
+fn requireServed(provider: Provider, comptime served: Provider) error{UnsupportedFailure}!void {
+    if (provider != served) return error.UnsupportedFailure;
 }
 pub fn inspectCount(provider: Provider, archive: []const u8) Failure!u64 {
     return switch (build_options.grammar_impl) {

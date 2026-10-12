@@ -101,7 +101,7 @@ pub fn decodeInPlace(input: []const u8, output: []u8, scratch: []u8, options: Op
 fn decodeStreamImpl(reader: *std.Io.Reader, writer: ?*std.Io.Writer, output: []u8, scratch: []u8, options: Options, in_place: bool) Failure!usize {
     const props = try validateProperties(options.properties);
     const lzma_scratch_size = if (in_place) lzma.decodeInPlaceWorkspaceSize(props) else lzma.decodeWorkspaceSize(props);
-    if (scratch.len < lzma_scratch_size + chunk_max_unpacked) return error.InsufficientCapacity;
+    if (scratch.len < lzma_scratch_size + chunk_max_unpacked) return error.CapacityFailure;
     const lzma_scratch = scratch[0..lzma_scratch_size];
     var copy_staging = scratch[lzma_scratch_size..][0..chunk_max_unpacked];
     const SliceDecoder = lzma.DecoderOf(true);
@@ -119,19 +119,19 @@ fn decodeStreamImpl(reader: *std.Io.Reader, writer: ?*std.Io.Writer, output: []u
             need_properties = true;
             need_dictionary_reset = true;
         } else if (need_dictionary_reset) {
-            return error.InvalidData;
+            return error.DataFailure;
         }
         if (control & 0x80 != 0) {
             const unpack_size = try readLzmaUnpackSize(reader, control);
-            if (unpack_size > chunk_max_unpacked) return error.InvalidData;
+            if (unpack_size > chunk_max_unpacked) return error.DataFailure;
             const pack_size = try readPackSize(reader);
-            if (pack_size < 5 or pack_size > max_pack_size) return error.InvalidData;
+            if (pack_size < 5 or pack_size > max_pack_size) return error.DataFailure;
             if (control >= control_lzma_new_props) {
                 const properties_byte = try io.readByte(reader);
                 const parsed = try lzma.Properties.decode(properties_byte, options.dictionary_size);
                 // LZMA2 permits any valid lc/lp/pb combination per chunk; only
                 // the lc+lp<=4 shape constraint applies (SDK behavior).
-                if (parsed.lc + parsed.lp > 4) return error.Unsupported;
+                if (parsed.lc + parsed.lp > 4) return error.UnsupportedFailure;
                 decoder.setProperties(parsed);
                 need_properties = false;
                 decoder.resetState();
@@ -141,7 +141,7 @@ fn decodeStreamImpl(reader: *std.Io.Reader, writer: ?*std.Io.Writer, output: []u
                     need_dictionary_reset = false;
                 }
             } else {
-                if (need_properties) return error.InvalidData;
+                if (need_properties) return error.DataFailure;
                 if (control >= control_lzma_reset_state) {
                     decoder.resetState();
                     decoder.resetProbabilities();
@@ -158,9 +158,9 @@ fn decodeStreamImpl(reader: *std.Io.Reader, writer: ?*std.Io.Writer, output: []u
             try decoder.resetReaderSlice(chunk_buffer[0..pack_size]);
             try decoder.decodeToOutput(null, unpack_size, false);
         } else {
-            if (control != control_copy_reset_dict and control != control_copy) return error.InvalidData;
+            if (control != control_copy_reset_dict and control != control_copy) return error.DataFailure;
             const unpack_size = try readCopyUnpackSize(reader);
-            if (unpack_size > chunk_max_unpacked) return error.InvalidData;
+            if (unpack_size > chunk_max_unpacked) return error.DataFailure;
             if (need_dictionary_reset) {
                 decoder.resetDictionary();
                 need_dictionary_reset = false;
@@ -181,7 +181,7 @@ fn decodeStreamImpl(reader: *std.Io.Reader, writer: ?*std.Io.Writer, output: []u
 }
 
 fn validateProperties(props: lzma.Properties) Failure!lzma.Properties {
-    if (props.lc + props.lp > 4) return error.Unsupported;
+    if (props.lc + props.lp > 4) return error.UnsupportedFailure;
     return props;
 }
 
@@ -226,40 +226,40 @@ fn scanDecodedSize(input: []const u8) Failure!?usize {
             need_properties = true;
             need_dictionary_reset = true;
         } else if (need_dictionary_reset) {
-            return error.InvalidData;
+            return error.DataFailure;
         }
         if (control & 0x80 != 0) {
-            if (pos + 2 > input.len) return error.InvalidData;
+            if (pos + 2 > input.len) return error.DataFailure;
             const unpack_size = (((@as(usize, control & 0x0F) << 16) | (@as(usize, input[pos]) << 8) | input[pos + 1]) + 1);
             pos += 2;
-            if (pos + 2 > input.len) return error.InvalidData;
+            if (pos + 2 > input.len) return error.DataFailure;
             const pack_size = ((@as(usize, input[pos]) << 8) | input[pos + 1]) + 1;
             pos += 2;
-            if (unpack_size > chunk_max_unpacked or pack_size < 5 or pack_size > max_pack_size) return error.InvalidData;
+            if (unpack_size > chunk_max_unpacked or pack_size < 5 or pack_size > max_pack_size) return error.DataFailure;
             if (control >= control_lzma_new_props) {
-                if (pos >= input.len) return error.InvalidData;
+                if (pos >= input.len) return error.DataFailure;
                 pos += 1;
                 need_properties = false;
                 if (control >= control_lzma_new_props_reset_dict) need_dictionary_reset = false;
             } else {
-                if (need_properties) return error.InvalidData;
+                if (need_properties) return error.DataFailure;
             }
             pos += pack_size;
-            if (pos > input.len) return error.InvalidData;
-            total = std.math.add(usize, total, unpack_size) catch return error.ResourceLimit;
+            if (pos > input.len) return error.DataFailure;
+            total = std.math.add(usize, total, unpack_size) catch return error.ResourceFailure;
         } else {
-            if (control != control_copy_reset_dict and control != control_copy) return error.InvalidData;
-            if (pos + 2 > input.len) return error.InvalidData;
+            if (control != control_copy_reset_dict and control != control_copy) return error.DataFailure;
+            if (pos + 2 > input.len) return error.DataFailure;
             const unpack_size = ((@as(usize, input[pos]) << 8) | input[pos + 1]) + 1;
             pos += 2;
-            if (unpack_size > chunk_max_unpacked) return error.InvalidData;
+            if (unpack_size > chunk_max_unpacked) return error.DataFailure;
             if (need_dictionary_reset) need_dictionary_reset = false;
             pos += unpack_size;
-            if (pos > input.len) return error.InvalidData;
-            total = std.math.add(usize, total, unpack_size) catch return error.ResourceLimit;
+            if (pos > input.len) return error.DataFailure;
+            total = std.math.add(usize, total, unpack_size) catch return error.ResourceFailure;
         }
     }
-    return error.InvalidData;
+    return error.DataFailure;
 }
 
 pub fn requiredSize(input: []const u8, scratch: []u8, options: Options) Failure!usize {
@@ -275,7 +275,7 @@ pub fn encode(input: []const u8, output: []u8, scratch: []u8, options: Options) 
 }
 
 pub fn encodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options: Options) Failure!void {
-    if (input.len > options.max_work) return error.ResourceLimit;
+    if (input.len > options.max_work) return error.ResourceFailure;
     try encodeStreamInner(input, writer, scratch, options);
 }
 
@@ -298,7 +298,7 @@ fn isChunkCompressible(chunk: []const u8, estimate_scratch: []u8, props: lzma.Pr
 fn encodeStreamInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options: Options) Failure!void {
     const props = try validateProperties(options.properties);
     const encoder_scratch_size = if (options.match_finder == .bt4) lzma.encodeWorkspaceSizeBt(props) else lzma.encodeWorkspaceSize(props);
-    if (scratch.len < 2 * encoder_scratch_size) return error.InsufficientCapacity;
+    if (scratch.len < 2 * encoder_scratch_size) return error.CapacityFailure;
     const encoder_scratch = scratch[0..encoder_scratch_size];
     const estimate_scratch = scratch[encoder_scratch_size .. 2 * encoder_scratch_size];
     var model_workspace = try io.Workspace.init(scratch[2 * encoder_scratch_size ..].ptr, scratch[2 * encoder_scratch_size ..].len);

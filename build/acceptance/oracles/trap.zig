@@ -209,10 +209,14 @@ fn substrateImportsFormatLayers(gpa: std.mem.Allocator, io: std.Io) !bool {
         for (roots) |root| {
             var one: [32]u8 = undefined;
             var two: [32]u8 = undefined;
-            const one_up = try std.fmt.bufPrint(&one, "@import(\"{s}\")", .{root});
-            const two_up = try std.fmt.bufPrint(&two, "@import(\"../{s}\")", .{root});
-            if (std.mem.indexOf(u8, bytes, one_up) != null) return true;
-            if (std.mem.indexOf(u8, bytes, two_up) != null) return true;
+            var one_writer: std.Io.Writer = std.Io.Writer.fixed(&one);
+            try one_writer.print("@import(\"{s}\")", .{root});
+            const one_up = one_writer.buffered();
+            var two_writer: std.Io.Writer = std.Io.Writer.fixed(&two);
+            try two_writer.print("@import(\"../{s}\")", .{root});
+            const two_up = two_writer.buffered();
+            if (std.mem.find(u8, bytes, one_up) != null) return true;
+            if (std.mem.find(u8, bytes, two_up) != null) return true;
         }
     }
     return false;

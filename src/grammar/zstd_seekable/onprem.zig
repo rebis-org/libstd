@@ -57,29 +57,29 @@ pub const FrameInfo = struct {
 // The footer magic must be at the end of the input. Each table entry is checked
 // against the frame magic at its compressed offset.
 pub fn inspect(input: []const u8) Failure!FrameInfo {
-    if (input.len < 8 + footer_size) return error.InvalidData;
-    if (std.mem.readInt(u32, input[input.len - 4 ..][0..4], .little) != seekable_magic) return error.InvalidData;
+    if (input.len < 8 + footer_size) return error.DataFailure;
+    if (std.mem.readInt(u32, input[input.len - 4 ..][0..4], .little) != seekable_magic) return error.DataFailure;
     const frame_count = std.mem.readInt(u32, input[input.len - footer_size ..][0..4], .little);
     const descriptor = input[input.len - 5];
-    if (descriptor & 0x7C != 0) return error.Unsupported;
+    if (descriptor & 0x7C != 0) return error.UnsupportedFailure;
     const has_checksums = (descriptor & 0x80) != 0;
     const entry_bytes = @as(usize, frame_count) * (entry_size + @as(usize, if (has_checksums) 4 else 0));
-    if (input.len < 8 + entry_bytes + footer_size) return error.InvalidData;
+    if (input.len < 8 + entry_bytes + footer_size) return error.DataFailure;
     const table_start = input.len - footer_size - entry_bytes;
     const table = input[table_start .. input.len - footer_size];
-    if (std.mem.readInt(u32, input[table_start - 4 ..][0..4], .little) != entry_bytes + footer_size) return error.InvalidData;
-    if (std.mem.readInt(u32, input[table_start - 8 ..][0..4], .little) != skippable_magic) return error.InvalidData;
+    if (std.mem.readInt(u32, input[table_start - 4 ..][0..4], .little) != entry_bytes + footer_size) return error.DataFailure;
+    if (std.mem.readInt(u32, input[table_start - 8 ..][0..4], .little) != skippable_magic) return error.DataFailure;
     var offset: usize = 0;
     for (0..frame_count) |index| {
         const entry = table[index * (entry_size + @as(usize, if (has_checksums) 4 else 0)) ..][0..entry_size];
         const compressed_size = std.mem.readInt(u32, entry[0..4], .little);
-        if (compressed_size == 0) return error.InvalidData;
-        if (offset + compressed_size > table_start - 8) return error.InvalidData;
+        if (compressed_size == 0) return error.DataFailure;
+        if (offset + compressed_size > table_start - 8) return error.DataFailure;
         const magic = std.mem.readInt(u32, input[offset..][0..4], .little);
-        if (magic != frame_magic and !(magic >= 0x184D2A50 and magic <= 0x184D2A5F)) return error.InvalidData;
+        if (magic != frame_magic and !(magic >= 0x184D2A50 and magic <= 0x184D2A5F)) return error.DataFailure;
         offset += compressed_size;
     }
-    if (offset != table_start - 8) return error.InvalidData;
+    if (offset != table_start - 8) return error.DataFailure;
     return .{ .frame_count = frame_count, .has_checksums = has_checksums };
 }
 
@@ -97,24 +97,24 @@ pub fn frameCountFor(input_len: usize, options: Options) usize {
 }
 
 pub fn encodeToWriter(input: []const u8, output: *std.Io.Writer, history: []u8, workspace: []u32, entries: []FrameEntry, options: Options) Failure!void {
-    if (options.frame_size < frame_size_min or options.frame_size > frame_size_max) return error.InvalidCall;
-    if (entries.len < frameCountFor(input.len, options)) return error.InsufficientCapacity;
+    if (options.frame_size < frame_size_min or options.frame_size > frame_size_max) return error.CallFailure;
+    if (entries.len < frameCountFor(input.len, options)) return error.CapacityFailure;
     const frame_options = frameOptions(options);
     const needed_history = @as(usize, frame_options.window_size) + zstd.block_size_max;
-    if (history.len < needed_history) return error.InsufficientCapacity;
-    if (workspace.len < zstd.encoderWorkspaceU32Count(0, options.frame_size, frame_options)) return error.InsufficientCapacity;
+    if (history.len < needed_history) return error.CapacityFailure;
+    if (workspace.len < zstd.encoderWorkspaceU32Count(0, options.frame_size, frame_options)) return error.CapacityFailure;
     var frame_count: usize = 0;
     var offset: usize = 0;
     while (offset < input.len or (input.len == 0 and frame_count == 0)) {
         const chunk_len: usize = if (input.len == 0) 0 else @min(input.len - offset, options.frame_size);
         const chunk = input[offset .. offset + chunk_len];
         const written = zstd.encodeFrame(output, chunk, workspace, frame_options, 0) catch |err| switch (err) {
-            error.InvalidData => return error.InvalidCall,
-            error.ResourceLimit, error.IoFailure => |e| return e,
+            error.DataFailure => return error.CallFailure,
+            error.ResourceFailure, error.IoFailure => |e| return e,
         };
         entries[frame_count] = .{
-            .compressed_size = std.math.cast(u32, written) orelse return error.ResourceLimit,
-            .decompressed_size = std.math.cast(u32, chunk_len) orelse return error.ResourceLimit,
+            .compressed_size = std.math.cast(u32, written) orelse return error.ResourceFailure,
+            .decompressed_size = std.math.cast(u32, chunk_len) orelse return error.ResourceFailure,
         };
         frame_count += 1;
         offset += chunk_len;
@@ -123,12 +123,12 @@ pub fn encodeToWriter(input: []const u8, output: *std.Io.Writer, history: []u8, 
     // The seek table is a skippable frame. Descriptor 0 stores no per-entry checksums.
     const table_len = tableSize(frame_count);
     output.writeInt(u32, skippable_magic, .little) catch return error.IoFailure;
-    output.writeInt(u32, std.math.cast(u32, table_len - 8) orelse return error.ResourceLimit, .little) catch return error.IoFailure;
+    output.writeInt(u32, std.math.cast(u32, table_len - 8) orelse return error.ResourceFailure, .little) catch return error.IoFailure;
     for (entries[0..frame_count]) |entry| {
         output.writeInt(u32, entry.compressed_size, .little) catch return error.IoFailure;
         output.writeInt(u32, entry.decompressed_size, .little) catch return error.IoFailure;
     }
-    output.writeInt(u32, std.math.cast(u32, frame_count) orelse return error.ResourceLimit, .little) catch return error.IoFailure;
+    output.writeInt(u32, std.math.cast(u32, frame_count) orelse return error.ResourceFailure, .little) catch return error.IoFailure;
     output.writeByte(0) catch return error.IoFailure;
     output.writeInt(u32, seekable_magic, .little) catch return error.IoFailure;
 }
@@ -173,5 +173,5 @@ test "zstd seekable round trip restores the original input" {
     try decode(encoded[0..encoded_len], &sink, history, options);
     try std.testing.expectEqualSlices(u8, input, decoded[0..sink.end]);
     // The payload without its table is not a seekable stream.
-    try std.testing.expectError(error.InvalidData, inspect(encoded[0 .. encoded_len - footer_size]));
+    try std.testing.expectError(error.DataFailure, inspect(encoded[0 .. encoded_len - footer_size]));
 }

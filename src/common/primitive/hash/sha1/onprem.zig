@@ -1,5 +1,6 @@
-const builtin = @import("builtin");
 const std = @import("std");
+
+const seam = @import("seam");
 
 const merkle = @import("../merkle.zig");
 
@@ -49,25 +50,5 @@ fn compressSha1(state: *align(16) [5]u32, block: *const [64]u8) void {
 }
 
 test "sha1 onprem matches the std oracle" {
-    var rng = std.Random.DefaultPrng.init(0x5A1);
-    var size: usize = 0;
-    while (size <= 1024) : (size += 1) {
-        const buf = try std.testing.allocator.alloc(u8, size);
-        defer std.testing.allocator.free(buf);
-        rng.random().bytes(buf);
-        var ours = Sha1.init(.{});
-        ours.update(buf[0 .. size / 2]);
-        ours.update(buf[size / 2 ..]);
-        var theirs = std.crypto.hash.Sha1.init(.{});
-        theirs.update(buf);
-        try std.testing.expectEqualSlices(u8, &theirs.finalResult(), &ours.finalResult());
-    }
-    const long = try std.testing.allocator.alloc(u8, 1 << 20);
-    defer std.testing.allocator.free(long);
-    rng.random().bytes(long);
-    var ours = Sha1.init(.{});
-    ours.update(long);
-    var theirs = std.crypto.hash.Sha1.init(.{});
-    theirs.update(long);
-    try std.testing.expectEqualSlices(u8, &theirs.finalResult(), &ours.finalResult());
+    try seam.expectAgreement(Sha1.init(.{}), std.crypto.hash.Sha1.init(.{}), 0x5A1, true, null);
 }

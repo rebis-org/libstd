@@ -8,7 +8,7 @@ const window_mod = @import("window.zig");
 const Failure = failure.Failure;
 
 // Nothing allocates: every table is caller-provided, and token-buffer
-// exhaustion returns InsufficientCapacity so the caller can size the buffer.
+// exhaustion returns CapacityFailure so the caller can size the buffer.
 
 pub const LzToken = union(enum) {
     literal: u8,
@@ -36,9 +36,8 @@ pub const MatchFinder = struct {
     pub const hash3_bits: comptime_int = 18;
     pub const hash3_size: usize = 1 << hash3_bits;
 
-    pub fn windowSizeFor(_: u32) u32 {
-        return 1 << 20; // The window must match the writer's 1 MiB dictionary.
-    }
+    // The window must match the writer's 1 MiB dictionary.
+    pub const dictionary_window: u32 = 1 << 20;
 
     pub fn init(
         hash: []u32,
@@ -307,12 +306,12 @@ pub const MatchFinder = struct {
                     const next_match = self.findBT4Match(bytes, pos + 1, bt_left, bt_right);
                     if (next_match) |nm| {
                         if (nm.length > m.length + 1) {
-                            if (count >= tokens.len) return error.InsufficientCapacity;
+                            if (count >= tokens.len) return error.CapacityFailure;
                             tokens[count] = .{ .literal = bytes[pos] };
                             count += 1;
                             pos += 1;
 
-                            if (count >= tokens.len) return error.InsufficientCapacity;
+                            if (count >= tokens.len) return error.CapacityFailure;
                             tokens[count] = .{ .match = .{ .length = nm.length, .distance = nm.distance } };
                             count += 1;
                             var i: u32 = 1;
@@ -325,7 +324,7 @@ pub const MatchFinder = struct {
                     }
                     // Position pos is already in the tree from findBT4Match, and
                     // pos + 1 from the lazy check above, so the loop starts at 2.
-                    if (count >= tokens.len) return error.InsufficientCapacity;
+                    if (count >= tokens.len) return error.CapacityFailure;
                     tokens[count] = .{ .match = .{ .length = m.length, .distance = m.distance } };
                     count += 1;
                     var i: u32 = 2;
@@ -334,7 +333,7 @@ pub const MatchFinder = struct {
                     }
                     pos += m.length;
                 } else {
-                    if (count >= tokens.len) return error.InsufficientCapacity;
+                    if (count >= tokens.len) return error.CapacityFailure;
                     tokens[count] = .{ .match = .{ .length = m.length, .distance = m.distance } };
                     count += 1;
                     var i: u32 = 1; // Position pos is already in the tree.
@@ -345,7 +344,7 @@ pub const MatchFinder = struct {
                 }
             } else {
                 // Position pos is already in the tree.
-                if (count >= tokens.len) return error.InsufficientCapacity;
+                if (count >= tokens.len) return error.CapacityFailure;
                 tokens[count] = .{ .literal = bytes[pos] };
                 count += 1;
                 pos += 1;

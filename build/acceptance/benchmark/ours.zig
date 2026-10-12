@@ -56,7 +56,7 @@ fn pushNode(buffer: *Buf, node: harness.Node) void {
 
 fn pushParams(buffer: *Buf, row: matrix.Row) void {
     for (row.params) |param| {
-        pushNode(buffer, harness.paramScalar(param.family, param.ordinal, harness.cmd_all, param.value));
+        pushNode(buffer, harness.paramScalar(param.family, param.ordinal, harness.cmds, param.value));
     }
 }
 

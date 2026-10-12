@@ -2,14 +2,14 @@ const std = @import("std");
 
 const package = @import("build.zig.zon");
 
-const units = @import("build/units.zig");
-const common = @import("build/platform/common.zig");
 const modules = @import("build/modules.zig");
-
-const version = std.SemanticVersion.parse(package.version) catch @compileError("version must be semantic");
+const common = @import("build/platform/common.zig");
+const units = @import("build/units.zig");
 
 const Implementation = common.Implementation;
 const capabilities = common.capabilities;
+
+const version = std.SemanticVersion.parse(package.version) catch @compileError("version must be semantic");
 
 fn putCapability(options: *std.Build.Step.Options, comptime capability: []const u8, selected: Implementation, portable_flag: bool) void {
     common.putCapability(options, capability, selected, portable_flag);
@@ -91,4 +91,17 @@ pub fn build(b: *std.Build) void {
         const run_unit = b.addRunArtifact(unit_tests);
         unit_step.dependOn(&run_unit.step);
     }
+    // The micro runner's own invariants (calibration clamp, percentile rank,
+    // allocation counting) ride the unit step next to the library blocks.
+    const micro_tests = b.addTest(.{ .root_module = modules.createFor(b, modules.micro, ctx.target, .debug, &ctx) });
+    unit_step.dependOn(&b.addRunArtifact(micro_tests).step);
+
+    // Leaf-level micro benchmarks through the time-budgeted runner in
+    // build/micro. Defaults to fast because debug numbers carry no evidence.
+    const micro_optimize = b.option(std.lang.Optimize, "micro_optimize", "Optimization mode for zig build micro") orelse .fast;
+    const micro_module = modules.createFor(b, modules.micro, ctx.target, micro_optimize, &ctx);
+    const micro_exe = b.addExecutable(.{ .name = "micro", .root_module = micro_module });
+    const run_micro = b.addRunArtifact(micro_exe);
+    run_micro.addPassthruArgs();
+    b.step("micro", "Run leaf-level micro benchmarks (time budget, p75/p99, allocation counts)").dependOn(&run_micro.step);
 }

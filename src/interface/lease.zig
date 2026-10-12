@@ -26,12 +26,12 @@ pub const Registry = struct {
     }
 
     pub fn lease(self: *Registry, memory: ConstSpan) Failure!Lease {
-        if (memory.len == 0) return error.InvalidCall;
+        if (memory.len == 0) return error.CallFailure;
         for (self.slots[0..self.used]) |slot| {
             if (!slot.live) continue;
-            if (span_module.hasOverlap(@intFromPtr(memory.ptr), memory.len, slot.base, slot.len)) return error.InvalidCall;
+            if (span_module.hasOverlap(@intFromPtr(memory.ptr), memory.len, slot.base, slot.len)) return error.CallFailure;
         }
-        if (self.used == self.slots.len) return error.ResourceLimit;
+        if (self.used == self.slots.len) return error.ResourceFailure;
         const token = self.next_token;
         self.next_token += 1;
         self.slots[self.used] = .{

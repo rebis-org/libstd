@@ -77,41 +77,27 @@ var sz_filter_payload: [600]u8 = undefined;
 
 fn sevenZipWrite(r: *Runner, entries: harness.Node, archive: []u8, crypto_nodes: []const harness.Node) !usize {
     var nodes: [12]harness.Node = undefined;
-    var count: usize = 0;
-    nodes[count] = harness.paramTargetCommand(harness.ids.write);
-    count += 1;
-    nodes[count] = harness.scalarNode(harness.ids.source);
-    count += 1;
-    nodes[count] = harness.capabilityParam(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay);
-    count += 1;
-    nodes[count] = harness.sizingModeParam(harness.size_metadata_exact);
-    count += 1;
-    nodes[count] = harness.commitModeParam(harness.commit_confirmed);
-    count += 1;
-    @memcpy(nodes[count..][0..crypto_nodes.len], crypto_nodes);
-    count += crypto_nodes.len;
-    nodes[count] = entries;
-    count += 1;
-    _ = harness.call(r, harness.ids.query, nodes[0..count], .{});
+    var list = harness.NodeList{ .nodes = &nodes };
+    list.push(harness.paramTargetCommand(harness.ids.write));
+    list.push(harness.scalarNode(harness.ids.source));
+    list.push(harness.capabilityParam(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay));
+    list.push(harness.sizingModeParam(harness.size_metadata_exact));
+    list.push(harness.commitModeParam(harness.commit_confirmed));
+    list.pushAll(crypto_nodes);
+    list.push(entries);
+    _ = harness.call(r, harness.ids.query, list.items(), .{});
     try harness.requireStatus(r, abi.Status.ok);
     if (r.response.byte_length == 0 or r.response.byte_length > archive.len) return error.SevenZipQueryCapacity;
     const size: usize = @intCast(r.response.byte_length);
-    count = 0;
-    nodes[count] = harness.scalarNode(harness.ids.source);
-    count += 1;
-    nodes[count] = harness.sinkSpan(archive[0..size]);
-    count += 1;
-    nodes[count] = harness.capabilityParam(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay);
-    count += 1;
-    nodes[count] = harness.sizingModeParam(harness.size_metadata_exact);
-    count += 1;
-    nodes[count] = harness.commitModeParam(harness.commit_confirmed);
-    count += 1;
-    @memcpy(nodes[count..][0..crypto_nodes.len], crypto_nodes);
-    count += crypto_nodes.len;
-    nodes[count] = entries;
-    count += 1;
-    _ = harness.call(r, harness.ids.write, nodes[0..count], .{});
+    list.count = 0;
+    list.push(harness.scalarNode(harness.ids.source));
+    list.push(harness.sinkSpan(archive[0..size]));
+    list.push(harness.capabilityParam(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay));
+    list.push(harness.sizingModeParam(harness.size_metadata_exact));
+    list.push(harness.commitModeParam(harness.commit_confirmed));
+    list.pushAll(crypto_nodes);
+    list.push(entries);
+    _ = harness.call(r, harness.ids.write, list.items(), .{});
     try harness.requireStatus(r, abi.Status.ok);
     if (r.response.byte_length != size) return error.SevenZipWriteLengthMismatch;
     return size;
@@ -119,16 +105,12 @@ fn sevenZipWrite(r: *Runner, entries: harness.Node, archive: []u8, crypto_nodes:
 
 fn sevenZipRead(r: *Runner, archive: []const u8, ordinal: u64, output: []u8, crypto_nodes: []const harness.Node) !usize {
     var nodes: [7]harness.Node = undefined;
-    var count: usize = 0;
-    nodes[count] = harness.archiveOrdinalParam(ordinal);
-    count += 1;
-    nodes[count] = harness.sourceSpan(archive);
-    count += 1;
-    nodes[count] = harness.sinkSpan(output);
-    count += 1;
-    @memcpy(nodes[count..][0..crypto_nodes.len], crypto_nodes);
-    count += crypto_nodes.len;
-    _ = harness.call(r, harness.ids.read, nodes[0..count], .{ .ctx = true });
+    var list = harness.NodeList{ .nodes = &nodes };
+    list.push(harness.archiveOrdinalParam(ordinal));
+    list.push(harness.sourceSpan(archive));
+    list.push(harness.sinkSpan(output));
+    list.pushAll(crypto_nodes);
+    _ = harness.call(r, harness.ids.read, list.items(), .{ .ctx = true });
     return @intCast(r.response.byte_length);
 }
 
@@ -327,7 +309,9 @@ fn runEncodeAdvanced(r: *Runner) anyerror!void {
     var solid_entries: [3]harness.Node = undefined;
     var name_buffers: [3][16]u8 = undefined;
     for (0..3) |i| {
-        const name = std.fmt.bufPrint(&name_buffers[i], "s{d}.txt", .{i}) catch return error.NameFormat;
+        var name_writer: std.Io.Writer = std.Io.Writer.fixed(&name_buffers[i]);
+        name_writer.print("s{d}.txt", .{i}) catch return error.NameFormat;
+        const name = name_writer.buffered();
         solid_entries[i] = entryWithMethod(&solid_stores[i], name, solids[i], 4);
         if (i > 0) solid_entries[i - 1].next = &solid_entries[i];
     }
@@ -491,10 +475,9 @@ fn runEncrypted(r: *Runner) anyerror!void {
     if (r.response.byte_length != 53) return error.Copy53FixtureMismatch;
 }
 
-// Encoded headers (-mhc compressed, -mhe encrypted): the next header rides in
-// a packed stream, so -mhe inspect needs the password channel and the header
-// bytes are no longer visible in the archive. The fixtures pin the decoder
-// against archives the official 7-Zip CLI produced.
+// Encoded headers ride in a packed stream: -mhe inspect needs the password
+// channel, and the header bytes vanish.
+// Fixtures pin the decoder against official-CLI archives.
 fn runEncodedHeaders(r: *Runner) anyerror!void {
     setup7z(r, harness.ids.sevenzip);
     corpus.fillTiled(r.corpus_index, &sz_enc_data);
@@ -580,7 +563,9 @@ fn runPpmd(r: *Runner) anyerror!void {
     var nodes: [3]harness.Node = undefined;
     var name_buffers: [3][16]u8 = undefined;
     for (0..3) |i| {
-        const name = std.fmt.bufPrint(&name_buffers[i], "p{d}.bin", .{i}) catch return error.NameFormat;
+        var name_writer: std.Io.Writer = std.Io.Writer.fixed(&name_buffers[i]);
+        name_writer.print("p{d}.bin", .{i}) catch return error.NameFormat;
+        const name = name_writer.buffered();
         nodes[i] = entryWithMethod(&stores[i], name, parts[i], 14);
         if (i > 0) nodes[i - 1].next = &nodes[i];
     }
@@ -590,7 +575,9 @@ fn runPpmd(r: *Runner) anyerror!void {
     }
     var expected: [3]lib.ExpectedEntry = undefined;
     for (0..3) |i| {
-        expected[i] = .{ .name = std.fmt.bufPrint(&name_buffers[i], "p{d}.bin", .{i}) catch return error.NameFormat, .data = parts[i] };
+        var expected_name: std.Io.Writer = std.Io.Writer.fixed(&name_buffers[i]);
+        expected_name.print("p{d}.bin", .{i}) catch return error.NameFormat;
+        expected[i] = .{ .name = expected_name.buffered(), .data = parts[i] };
     }
     const oracle = lib.archiveReadMatches(sz_coded_archive[0..archive_size], &expected);
     if (oracle == .mismatch) return error.PpmdSolidOracleRejected;

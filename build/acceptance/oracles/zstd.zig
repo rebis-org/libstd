@@ -9,20 +9,20 @@ const steps = @import("steps.zig");
 const Runner = harness.Runner;
 
 fn baseParams(out: *[steps.MaxExtra]harness.Node) usize {
-    out[0] = harness.paramScalar(harness.param_family_zstd, harness.zstd_window, harness.cmd_all, 1 << 22);
-    out[1] = harness.paramScalar(harness.param_family_zstd, harness.zstd_hash_bits, harness.cmd_all, 17);
+    out[0] = harness.paramScalar(harness.param_family_zstd, harness.zstd_window, harness.cmds, 1 << 22);
+    out[1] = harness.paramScalar(harness.param_family_zstd, harness.zstd_hash_bits, harness.cmds, 17);
     return 2;
 }
 
 fn zstdParams(_: *Runner, out: *[steps.MaxExtra]harness.Node) usize {
     const count = baseParams(out);
-    out[count] = harness.paramScalar(harness.param_family_zstd, harness.zstd_double_hash, harness.cmd_all, 1);
+    out[count] = harness.paramScalar(harness.param_family_zstd, harness.zstd_double_hash, harness.cmds, 1);
     return count + 1;
 }
 
 fn zstdRowParams(_: *Runner, out: *[steps.MaxExtra]harness.Node) usize {
     const count = baseParams(out);
-    out[count] = harness.paramScalar(harness.param_family_zstd, harness.zstd_row_match, harness.cmd_all, 1);
+    out[count] = harness.paramScalar(harness.param_family_zstd, harness.zstd_row_match, harness.cmds, 1);
     return count + 1;
 }
 
@@ -118,7 +118,7 @@ fn runCorrupt(r: *Runner) anyerror!void {
 fn runInvalidWindow(r: *Runner) !void {
     const input = "invalid window";
     const nodes = steps.build(&zstdParams, r, &.{
-        harness.paramScalar(harness.param_family_zstd, harness.zstd_window, harness.cmd_all, 3),
+        harness.paramScalar(harness.param_family_zstd, harness.zstd_window, harness.cmds, 3),
         harness.sourceSpan(input),
         harness.sinkSpan(r.encoded),
     });

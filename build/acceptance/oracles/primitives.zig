@@ -192,7 +192,7 @@ fn runAes() !void {
     const zeros_16: [16]u8 = @splat(0);
     var invalid_out: [16]u8 = undefined;
     if (crypto.winzipCtr(crypto.default_provider, &invalid_key, &invalid_out, &zeros_16)) |_| return error.ExpectedInvalidCall else |err| {
-        try require(err == error.InvalidCall);
+        try require(err == error.CallFailure);
     }
 }
 

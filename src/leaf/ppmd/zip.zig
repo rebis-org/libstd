@@ -80,21 +80,21 @@ pub fn decode(input: []const u8, output: []u8, scratch: []u8, options: Options) 
     var count: usize = 0;
     var finished = false;
     while (count < output.len) {
-        const symbol = model.decodeSymbol(&rc) catch return error.InvalidData;
+        const symbol = model.decodeSymbol(&rc) catch return error.DataFailure;
         if (symbol == -1) {
             finished = true;
             break;
         }
-        if (symbol < 0) return error.InvalidData;
+        if (symbol < 0) return error.DataFailure;
         output[count] = @intCast(symbol);
         count += 1;
     }
     if (!finished) {
-        const symbol = model.decodeSymbol(&rc) catch return error.InvalidData;
-        if (symbol != -1) return error.InvalidData;
+        const symbol = model.decodeSymbol(&rc) catch return error.DataFailure;
+        if (symbol != -1) return error.DataFailure;
     }
-    if (rc.code != 0) return error.InvalidData;
-    if (rc.pos != input.len) return error.InvalidData;
+    if (rc.code != 0) return error.DataFailure;
+    if (rc.pos != input.len) return error.DataFailure;
     return .{ .decoded = count, .consumed = rc.pos };
 }
 
@@ -123,10 +123,10 @@ fn encodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options
 }
 
 fn validateOptions(options: Options) Failure!void {
-    if (options.order < order_min or options.order > order_max) return error.Unsupported;
-    if (options.mem_size < (mem_mb_min << 20) or options.mem_size > (mem_mb_max << 20)) return error.Unsupported;
-    if (options.mem_size & 3 != 0) return error.Unsupported;
-    if (options.restore_method != restore_restart and options.restore_method != restore_cut_off) return error.Unsupported;
+    if (options.order < order_min or options.order > order_max) return error.UnsupportedFailure;
+    if (options.mem_size < (mem_mb_min << 20) or options.mem_size > (mem_mb_max << 20)) return error.UnsupportedFailure;
+    if (options.mem_size & 3 != 0) return error.UnsupportedFailure;
+    if (options.restore_method != restore_restart and options.restore_method != restore_cut_off) return error.UnsupportedFailure;
 }
 
 const RangeDecoder = struct {
@@ -141,7 +141,7 @@ const RangeDecoder = struct {
     }
 
     fn readByte(self: *RangeDecoder) Failure!u8 {
-        if (self.pos >= self.input.len) return error.InvalidData;
+        if (self.pos >= self.input.len) return error.DataFailure;
         const byte = self.input[self.pos];
         self.pos += 1;
         return byte;
@@ -153,7 +153,7 @@ const RangeDecoder = struct {
         while (i < 4) : (i += 1) {
             self.code = (self.code << 8) | try self.readByte();
         }
-        if (self.code >= 0xFFFFFFFF) return error.InvalidData;
+        if (self.code >= 0xFFFFFFFF) return error.DataFailure;
     }
 
     fn normalize(self: *RangeDecoder) Failure!void {
@@ -197,7 +197,7 @@ const RangeEncoder = struct {
     }
 
     fn writeByte(self: *RangeEncoder) Failure!void {
-        self.writer.writeByte(@truncate(self.low >> 24)) catch return error.InsufficientCapacity;
+        self.writer.writeByte(@truncate(self.low >> 24)) catch return error.CapacityFailure;
     }
 
     fn normalize(self: *RangeEncoder) Failure!void {
@@ -291,11 +291,11 @@ const Model = struct {
     init_rl: i32 = 0,
 
     fn prepare(scratch: []u8, mem_size: u32) Failure!*Model {
-        if (scratch.len < decodeWorkspaceSize(mem_size)) return error.InsufficientCapacity;
+        if (scratch.len < decodeWorkspaceSize(mem_size)) return error.CapacityFailure;
         const model_addr = std.mem.alignForward(usize, @intFromPtr(scratch.ptr), @alignOf(Model));
         const model: *Model = @ptrFromInt(model_addr);
         const buf_addr = std.mem.alignForward(usize, model_addr + @sizeOf(Model), 4);
-        if (buf_addr + mem_size + unit_size > @intFromPtr(scratch.ptr) + scratch.len) return error.InsufficientCapacity;
+        if (buf_addr + mem_size + unit_size > @intFromPtr(scratch.ptr) + scratch.len) return error.CapacityFailure;
         model.base = @ptrFromInt(buf_addr);
         model.size = mem_size;
         model.construct();
@@ -1233,7 +1233,7 @@ const Model = struct {
                 i -= 1;
                 if (i == 0) break;
             }
-            if (hi_cnt >= summ_freq) return error.InvalidData;
+            if (hi_cnt >= summ_freq) return error.DataFailure;
             rc.decode(hi_cnt -% count, summ_freq - (hi_cnt -% count));
             @memset(&mask, 0xFF);
             var scan = self.statsOf(min_ctx);
@@ -1314,7 +1314,7 @@ const Model = struct {
                 self.update2();
                 return symbol;
             }
-            if (count >= freq_sum2) return error.InvalidData;
+            if (count >= freq_sum2) return error.DataFailure;
             rc.decode(hi_cnt, freq_sum2 - hi_cnt);
             esc.see.summ = @intCast(esc.see.summ + freq_sum);
             s = self.statsOf(mc);

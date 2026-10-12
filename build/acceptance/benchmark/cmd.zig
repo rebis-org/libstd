@@ -158,7 +158,7 @@ fn argv(
     var n: usize = 0;
     for (spec) |arg| switch (arg) {
         .lit => |s| {
-            put(&result, &n, if (std.mem.indexOfScalar(u8, s, '%')) |i| try env.print("{s}{s}{s}", .{ s[0..i], ext, s[i + 1 ..] }) else s);
+            put(&result, &n, if (std.mem.findScalar(u8, s, '%')) |i| try env.print("{s}{s}{s}", .{ s[0..i], ext, s[i + 1 ..] }) else s);
         },
         .bin => put(&result, &n, bin),
         .input => put(&result, &n, input),

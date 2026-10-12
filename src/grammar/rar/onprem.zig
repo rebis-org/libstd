@@ -146,7 +146,7 @@ fn detectFamily(archive: []const u8, provider: crypto.Provider) Failure!struct {
     // An SFX prefix moves the signature away from offset 0, so the scan looks for it
     // and confirms that a main block follows the match.
     const signature = rar5_signature;
-    if (archive.len < signature.len) return error.InvalidData;
+    if (archive.len < signature.len) return error.DataFailure;
     const limit = @min(archive.len, sfx_scan_limit);
     var offset: usize = 0;
     while (offset <= limit - signature.len) : (offset += 1) {
@@ -156,7 +156,7 @@ fn detectFamily(archive: []const u8, provider: crypto.Provider) Failure!struct {
         const header = parseRar5Block(archive, &cursor, provider) catch continue;
         if (header.header_type == rar5_type_main) return .{ .family = .rar5, .offset = offset };
     }
-    return error.InvalidData;
+    return error.DataFailure;
 }
 
 pub const rar5_signature = [8]u8{ 0x52, 0x61, 0x72, 0x21, 0x1a, 0x07, 0x01, 0x00 };
@@ -187,11 +187,11 @@ pub const Rar5Keys = struct { key: [32]u8, hash_key: [32]u8, pswcheck: [32]u8 };
 // The decryption step that RAR5 needs because its PBKDF2-HMAC-SHA256 covers the
 // first block only; the hash key and the password check continue the same chain 16 times each.
 pub fn rar5Kdf(password: []const u8, salt: *const [16]u8, lg2count: u8, opts: DecodeOptions) Failure!Rar5Keys {
-    if (lg2count > rar5_kdf_lg2_count_max) return error.Unsupported;
+    if (lg2count > rar5_kdf_lg2_count_max) return error.UnsupportedFailure;
     const rounds: u64 = @as(u64, 1) << @intCast(lg2count);
     if (opts.kdf_rounds_limit != 0 and rounds > opts.kdf_rounds_limit) {
         if (opts.failure_cause) |cause| cause.* = .kdf_limit;
-        return error.ResourceLimit;
+        return error.ResourceFailure;
     }
     var salt_block: [20]u8 = undefined;
     @memcpy(salt_block[0..16], salt);
@@ -253,10 +253,10 @@ fn rar4Kdf(password_utf16le: []const u8, salt: ?[]const u8, opts: DecodeOptions)
     const hash_rounds: u32 = 0x40000;
     if (opts.kdf_rounds_limit != 0 and hash_rounds > opts.kdf_rounds_limit) {
         if (opts.failure_cause) |cause| cause.* = .kdf_limit;
-        return error.ResourceLimit;
+        return error.ResourceFailure;
     }
     var raw: [2 * 127 + 8]u8 = undefined;
-    if (password_utf16le.len > raw.len - 8) return error.Unsupported;
+    if (password_utf16le.len > raw.len - 8) return error.UnsupportedFailure;
     @memcpy(raw[0..password_utf16le.len], password_utf16le);
     var raw_len = password_utf16le.len;
     if (salt) |salt_bytes| {
@@ -292,11 +292,17 @@ fn passwordToUtf16Le(password: []const u8, utf16le: []u8) Failure![]u8 {
     var cursor = binary.WriteCursor.init(utf16le);
     var i: usize = 0;
     while (i < password.len) {
-        const len = std.unicode.utf8ByteSequenceLength(password[i]) catch return error.InvalidData;
-        if (i + len > password.len) return error.InvalidData;
-        const code_point = std.unicode.utf8Decode(password[i..][0..len]) catch return error.InvalidData;
+        const len = std.unicode.utf8ByteSequenceLength(password[i]) catch return error.DataFailure;
+        if (i + len > password.len) return error.DataFailure;
+        const code_point: u21 = switch (len) {
+            1 => password[i],
+            2 => std.unicode.utf8Decode2(password[i..][0..2].*) catch return error.DataFailure,
+            3 => std.unicode.utf8Decode3(password[i..][0..3].*) catch return error.DataFailure,
+            4 => std.unicode.utf8Decode4(password[i..][0..4].*) catch return error.DataFailure,
+            else => unreachable,
+        };
         i += len;
-        cursor.writeUtf16Le(code_point) catch return error.ResourceLimit;
+        cursor.writeUtf16Le(code_point) catch return error.ResourceFailure;
     }
     return utf16le[0..cursor.pos];
 }
@@ -337,10 +343,10 @@ fn parseRar5FileBody(cursor: *binary.ReadCursor, flags: u64, extra_size: u64, re
     result.compression = try cursor.readUleb128();
     _ = try cursor.readUleb128(); // Host OS.
     const name_length = try cursor.readUleb128();
-    result.name = try cursor.readSlice(std.math.cast(usize, name_length) orelse return error.ResourceLimit);
+    result.name = try cursor.readSlice(std.math.cast(usize, name_length) orelse return error.ResourceFailure);
     result.is_directory = result.file_flags & rar5_file_directory != 0;
     if (flags & rar5_flag_extra != 0) {
-        const extra_size_usize = std.math.cast(usize, extra_size) orelse return error.ResourceLimit;
+        const extra_size_usize = std.math.cast(usize, extra_size) orelse return error.ResourceFailure;
         var extra_remaining: usize = extra_size_usize;
         while (extra_remaining > 0) {
             const record_start = cursor.pos;
@@ -348,20 +354,20 @@ fn parseRar5FileBody(cursor: *binary.ReadCursor, flags: u64, extra_size: u64, re
             const type_start = cursor.pos;
             const record_type = try cursor.readUleb128();
             const type_size = cursor.pos - type_start;
-            if (record_size < type_size) return error.InvalidData;
-            const record_data_size = std.math.cast(usize, record_size - type_size) orelse return error.ResourceLimit;
+            if (record_size < type_size) return error.DataFailure;
+            const record_data_size = std.math.cast(usize, record_size - type_size) orelse return error.ResourceFailure;
             const header_consumed = cursor.pos - record_start;
             const consumed = try bounds.addUsize(header_consumed, record_data_size);
-            if (consumed > extra_remaining) return error.InvalidData;
+            if (consumed > extra_remaining) return error.DataFailure;
             switch (record_type) {
-                rar5_extra_redir => return error.Unsupported,
+                rar5_extra_redir => return error.UnsupportedFailure,
                 rar5_extra_crypt => {
                     // The record layout: version and flags as vInt, the KDF count in
                     // 1 byte, a 16-byte salt and IV, then the optional password check and checksum.
                     var record_cursor = binary.ReadCursor.init(try cursor.readSlice(record_data_size));
                     const version = try record_cursor.readUleb128();
                     const enc_flags = try record_cursor.readUleb128();
-                    if (version > 0) return error.Unsupported;
+                    if (version > 0) return error.UnsupportedFailure;
                     const lg2count = try record_cursor.readU8();
                     var crypt: Crypt = .{ .rar5 = .{
                         .lg2count = lg2count,
@@ -408,18 +414,18 @@ fn parseRar5Block(archive: []const u8, cursor: *usize, provider: crypto.Provider
     const header_start = cursor.*;
     var size_reader = binary.ReadCursor.init(archive[cursor.*..]);
     const size = try size_reader.readUleb128();
-    if (size == 0 or size > 2 * 1024 * 1024) return error.InvalidData;
+    if (size == 0 or size > 2 * 1024 * 1024) return error.DataFailure;
     const header_body_start = cursor.* + size_reader.pos;
-    const header_body_end = try bounds.addUsize(header_body_start, std.math.cast(usize, size) orelse return error.ResourceLimit);
-    if (header_body_end > archive.len) return error.InvalidData;
+    const header_body_end = try bounds.addUsize(header_body_start, std.math.cast(usize, size) orelse return error.ResourceFailure);
+    if (header_body_end > archive.len) return error.DataFailure;
     const recorded_crc = std.mem.readInt(u32, crc_bytes[0..4], .little);
     const computed_crc = checksum.crc32With(provider, archive[header_start..header_body_end]);
     if (computed_crc != recorded_crc) return error.IntegrityFailure;
     var body_cursor = binary.ReadCursor.init(archive[header_body_start..header_body_end]);
     var block = try finishRar5Block(&body_cursor);
     block.data_offset = header_body_end;
-    const data_end = try bounds.addUsize(header_body_end, std.math.cast(usize, block.data_size) orelse return error.ResourceLimit);
-    if (data_end > archive.len) return error.InvalidData;
+    const data_end = try bounds.addUsize(header_body_end, std.math.cast(usize, block.data_size) orelse return error.ResourceFailure);
+    if (data_end > archive.len) return error.DataFailure;
     cursor.* = data_end;
     return block;
 }
@@ -449,13 +455,13 @@ fn finishRar5Block(body: *binary.ReadCursor) Failure!Rar5Block {
         },
         rar5_type_file, rar5_type_service => {
             if (flags & (rar5_flag_split_before | rar5_flag_split_after | rar5_flag_solid_dep | rar5_flag_child) != 0)
-                return error.Unsupported;
+                return error.UnsupportedFailure;
             try parseRar5FileBody(body, flags, extra_size, &result);
         },
         rar5_type_encryption => {
             const version = try body.readUleb128();
             const enc_flags = try body.readUleb128();
-            if (version > 0) return error.Unsupported;
+            if (version > 0) return error.UnsupportedFailure;
             result.enc_lg2count = try body.readU8();
             @memcpy(&result.enc_salt, try body.readSlice(16));
             if (enc_flags & rar5_crypt_pswcheck != 0) {
@@ -487,27 +493,27 @@ fn parseRar5BlockEncrypted(
     const iv_bytes = try bounds.slice(archive, cursor.*, 16);
     cursor.* = try bounds.addUsize(cursor.*, 16);
     const first = try bounds.slice(archive, cursor.*, 16);
-    if (scratch.len < 16) return error.InsufficientCapacity;
-    crypto.aesCbcDecrypt(provider, keys.key[0..], iv_bytes[0..16].*, scratch[0..16], first) catch return error.InvalidData;
+    if (scratch.len < 16) return error.CapacityFailure;
+    crypto.aesCbcDecrypt(provider, keys.key[0..], iv_bytes[0..16].*, scratch[0..16], first) catch return error.DataFailure;
     const recorded_crc = std.mem.readInt(u32, scratch[0..4], .little);
     var size_cursor = binary.ReadCursor.init(scratch[4..16]);
-    const block_size = size_cursor.readUleb128() catch return error.InvalidData;
+    const block_size = size_cursor.readUleb128() catch return error.DataFailure;
     const size_bytes = size_cursor.pos;
-    const header_size = 4 + size_bytes + (std.math.cast(usize, block_size) orelse return error.ResourceLimit);
+    const header_size = 4 + size_bytes + (std.math.cast(usize, block_size) orelse return error.ResourceFailure);
     const enc_len = std.mem.alignForward(usize, header_size, 16);
-    if (scratch.len < enc_len) return error.InsufficientCapacity;
+    if (scratch.len < enc_len) return error.CapacityFailure;
     if (enc_len > 16) {
         const rest = try bounds.slice(archive, cursor.* + 16, enc_len - 16);
         // The CBC chaining value is the first cipher block.
-        crypto.aesCbcDecrypt(provider, keys.key[0..], first[0..16].*, scratch[16..enc_len], rest) catch return error.InvalidData;
+        crypto.aesCbcDecrypt(provider, keys.key[0..], first[0..16].*, scratch[16..enc_len], rest) catch return error.DataFailure;
     }
     if (checksum.crc32With(provider, scratch[4..header_size]) != recorded_crc) return error.IntegrityFailure;
     var body_cursor = binary.ReadCursor.init(scratch[4 + size_bytes .. header_size]);
     var block = try finishRar5Block(&body_cursor);
     const block_end = try bounds.addUsize(cursor.*, enc_len);
     block.data_offset = block_end;
-    const data_end = try bounds.addUsize(block_end, std.math.cast(usize, block.data_size) orelse return error.ResourceLimit);
-    if (data_end > archive.len) return error.InvalidData;
+    const data_end = try bounds.addUsize(block_end, std.math.cast(usize, block.data_size) orelse return error.ResourceFailure);
+    if (data_end > archive.len) return error.DataFailure;
     cursor.* = data_end;
     return block;
 }
@@ -528,8 +534,8 @@ fn walkRar5(archive: []const u8, offset: usize, opts: DecodeOptions, ctx: anytyp
             rar5_type_encryption => {
                 // The HEAD_CRYPT block precedes the encrypted main header in a -hp
                 // archive, so no seen_main requirement applies here.
-                if (header.enc_lg2count > rar5_kdf_lg2_count_max) return error.Unsupported;
-                const password = opts.password orelse return error.Unsupported;
+                if (header.enc_lg2count > rar5_kdf_lg2_count_max) return error.UnsupportedFailure;
+                const password = opts.password orelse return error.UnsupportedFailure;
                 const keys = try rar5Kdf(password, &header.enc_salt, header.enc_lg2count, opts);
                 if (header.enc_pswcheck) |expected| {
                     if (!crypto.constantTimeEql(&rar5PswCheck(&keys.pswcheck), &expected)) {
@@ -541,24 +547,24 @@ fn walkRar5(archive: []const u8, offset: usize, opts: DecodeOptions, ctx: anytyp
             },
             rar5_type_main => {
                 const flags = header.archive_flags;
-                if (flags & (rar5_archive_volume | rar5_archive_volnum) != 0) return error.Unsupported;
+                if (flags & (rar5_archive_volume | rar5_archive_volnum) != 0) return error.UnsupportedFailure;
                 if (header.flags & (rar5_flag_data | rar5_flag_split_before | rar5_flag_split_after | rar5_flag_solid_dep | rar5_flag_child) != 0)
-                    return error.Unsupported;
+                    return error.UnsupportedFailure;
                 seen_main = true;
             },
             rar5_type_end => {
-                if (!seen_main) return error.InvalidData;
-                if (header.archive_flags & rar5_archive_volume != 0) return error.Unsupported;
+                if (!seen_main) return error.DataFailure;
+                if (header.archive_flags & rar5_archive_volume != 0) return error.UnsupportedFailure;
                 return;
             },
             rar5_type_service => {
-                if (!seen_main) return error.InvalidData;
+                if (!seen_main) return error.DataFailure;
                 // Service blocks, such as QuickOpen, carry no payload for this
                 // facade, so skip their data.
                 continue;
             },
             rar5_type_file => {
-                if (!seen_main) return error.InvalidData;
+                if (!seen_main) return error.DataFailure;
                 var entry: Entry = .{
                     .info = .{
                         .name = header.name,
@@ -581,8 +587,8 @@ fn walkRar5(archive: []const u8, offset: usize, opts: DecodeOptions, ctx: anytyp
                     .crypt = header.crypt,
                 };
                 if (!header.is_directory) {
-                    if (header.file_flags & rar5_file_size_unknown != 0) return error.Unsupported;
-                    if (header.flags & rar5_flag_data == 0) return error.Unsupported;
+                    if (header.file_flags & rar5_file_size_unknown != 0) return error.UnsupportedFailure;
+                    if (header.flags & rar5_flag_data == 0) return error.UnsupportedFailure;
                     const method = (header.compression >> 7) & 0x7;
                     const algo_raw: u8 = @intCast(header.compression & 0x3F);
                     const compat_flag = (header.compression >> 20) & 1 != 0;
@@ -592,18 +598,18 @@ fn walkRar5(archive: []const u8, offset: usize, opts: DecodeOptions, ctx: anytyp
                         // AES block, so data_size can exceed unpacked_size by
                         // up to 15 bytes; plaintext stored must match exactly.
                         if (header.crypt) |c| {
-                            if (c != .rar5) return error.Unsupported;
-                            if (header.data_size < header.unpacked_size or header.data_size > header.unpacked_size + 15) return error.Unsupported;
-                        } else if (header.data_size != header.unpacked_size) return error.Unsupported;
+                            if (c != .rar5) return error.UnsupportedFailure;
+                            if (header.data_size < header.unpacked_size or header.data_size > header.unpacked_size + 15) return error.UnsupportedFailure;
+                        } else if (header.data_size != header.unpacked_size) return error.UnsupportedFailure;
                         entry.method = 0;
                     } else {
-                        if (method > 5) return error.Unsupported;
-                        if (version != 50 and version != 70) return error.Unsupported;
+                        if (method > 5) return error.UnsupportedFailure;
+                        if (version != 50 and version != 70) return error.UnsupportedFailure;
                         const window_bits_field: u6 = @intCast((header.compression >> 10) & (if (version == 70) @as(u64, 0x1F) else 0x0F));
                         // The window that the entry requires. A smaller window silently truncates
                         // history, so a window that does not fit is refused, never clamped.
                         const window_bytes: u64 = (@as(u64, 0x20000) << window_bits_field);
-                        if (window_bits_field > max_rar5_window_bits) return error.ResourceLimit;
+                        if (window_bits_field > max_rar5_window_bits) return error.ResourceFailure;
                         entry.method = @intCast(method);
                         entry.unpack_version = version;
                         entry.dict_bits = windowBitsCeil(window_bytes);
@@ -612,7 +618,7 @@ fn walkRar5(archive: []const u8, offset: usize, opts: DecodeOptions, ctx: anytyp
                     // Integrity coverage is CRC32 or better; a file block that carries neither
                     // (some producers strip both) is refused rather than delivered unverifiable.
                     if (header.file_flags & rar5_file_crc32 == 0 and header.blake2 == null)
-                        return error.Unsupported;
+                        return error.UnsupportedFailure;
                 }
                 entry.info.family = .rar5;
                 entry.info.method = entry.method;
@@ -631,7 +637,7 @@ fn walkRar5(archive: []const u8, offset: usize, opts: DecodeOptions, ctx: anytyp
     }
     // An EOF exactly on a block boundary is a clean end, because UnexpEndArcMsg stays
     // silent there; an older producer omits the end block and a truncation fails above.
-    if (!seen_main) return error.InvalidData;
+    if (!seen_main) return error.DataFailure;
 }
 
 fn windowBitsCeil(window_bytes: u64) u6 {
@@ -681,9 +687,9 @@ const Rar4Header = struct {
 fn parseRar4Header(archive: []const u8, offset: usize, provider: crypto.Provider) Failure!Rar4Header {
     const head = try bounds.slice(archive, offset, 7);
     const head_size = std.mem.readInt(u16, head[5..7], .little);
-    if (head_size < 7) return error.InvalidData;
+    if (head_size < 7) return error.DataFailure;
     const header_end = try bounds.addUsize(offset, head_size);
-    if (header_end > archive.len) return error.InvalidData;
+    if (header_end > archive.len) return error.DataFailure;
     const flags = std.mem.readInt(u16, head[3..5], .little);
     // CRC-32 low 16 bits over bytes [2..head_size], except the marker block (0x72),
     // whose first two bytes are the "Ra" signature and carry no CRC (unrar exempts HEAD3_SIGN).
@@ -726,8 +732,10 @@ const Rar4File = struct {
 const rar4_lhd_salt: u16 = 0x0400;
 
 fn parseRar4File(archive: []const u8, header: Rar4Header) Failure!Rar4File {
-    // In a RAR4 file block the base header ADD_SIZE field is PACK_SIZE and there is no
-    // second packed-size field; reading one shifts every later field by 4 bytes and empties the name.
+    // In RAR4 the base header ADD_SIZE is PACK_SIZE; there is no second
+    // packed-size field.
+    // Reading one anyway shifts every later field by 4 bytes and empties the
+    // name.
     var packed_size: u64 = header.data_size;
     const fields_offset = try bounds.addUsize(header.header_offset, 7 + @as(usize, if (header.flags & rar4_long_block != 0) 4 else 0));
     var cursor = binary.ReadCursor.init(archive[fields_offset..]);
@@ -786,15 +794,15 @@ fn parseRar4HeaderEncrypted(
     scratch: []u8,
 ) Failure!Rar4Header {
     const first = try bounds.slice(archive, offset, 16);
-    if (scratch.len < 16) return error.InsufficientCapacity;
-    crypto.aesCbcDecrypt(provider, hcrypt.keys.key[0..], hcrypt.iv, scratch[0..16], first) catch return error.InvalidData;
+    if (scratch.len < 16) return error.CapacityFailure;
+    crypto.aesCbcDecrypt(provider, hcrypt.keys.key[0..], hcrypt.iv, scratch[0..16], first) catch return error.DataFailure;
     const head_size = std.mem.readInt(u16, scratch[5..7], .little);
-    if (head_size < 7) return error.InvalidData;
+    if (head_size < 7) return error.DataFailure;
     const enc_len = std.mem.alignForward(usize, head_size, 16);
-    if (scratch.len < enc_len) return error.InsufficientCapacity;
+    if (scratch.len < enc_len) return error.CapacityFailure;
     if (enc_len > 16) {
         const rest = try bounds.slice(archive, offset + 16, enc_len - 16);
-        crypto.aesCbcDecrypt(provider, hcrypt.keys.key[0..], first[0..16].*, scratch[16..enc_len], rest) catch return error.InvalidData;
+        crypto.aesCbcDecrypt(provider, hcrypt.keys.key[0..], first[0..16].*, scratch[16..enc_len], rest) catch return error.DataFailure;
     }
     const stored_crc = std.mem.readInt(u16, scratch[0..2], .little);
     const computed_crc: u16 = @truncate(checksum.crc32With(provider, scratch[2..head_size]));
@@ -823,7 +831,7 @@ fn walkRar4(archive: []const u8, opts: DecodeOptions, ctx: anytype, comptime vis
     var ordinal: usize = 0;
     var header_crypt: ?Rar4HeaderCrypt = null;
     while (cursor < archive.len) {
-        if (archive.len - cursor < 7) return error.InvalidData;
+        if (archive.len - cursor < 7) return error.DataFailure;
         var header: Rar4Header = undefined;
         var header_source: []const u8 = archive;
         if (header_crypt) |*crypt| {
@@ -837,9 +845,9 @@ fn walkRar4(archive: []const u8, opts: DecodeOptions, ctx: anytype, comptime vis
             rar4_main => {
                 // The flag 0x0040 is MHD_PROTECT, a recovery record, and not
                 // MHD_PASSWORD, so only the volume flag is refused.
-                if (header.flags & rar4_mhd_volume != 0) return error.Unsupported;
+                if (header.flags & rar4_mhd_volume != 0) return error.UnsupportedFailure;
                 if (header.flags & rar4_mhd_password != 0) {
-                    const password = opts.password orelse return error.Unsupported;
+                    const password = opts.password orelse return error.UnsupportedFailure;
                     const salt = try bounds.slice(archive, cursor + header.head_size, 8);
                     var salt_bytes: [8]u8 = undefined;
                     @memcpy(&salt_bytes, salt);
@@ -854,9 +862,9 @@ fn walkRar4(archive: []const u8, opts: DecodeOptions, ctx: anytype, comptime vis
                 seen_main = true;
             },
             rar4_file => {
-                if (!seen_main) return error.InvalidData;
+                if (!seen_main) return error.DataFailure;
                 if (header.flags & (rar4_lhd_split_before | rar4_lhd_split_after) != 0)
-                    return error.Unsupported;
+                    return error.UnsupportedFailure;
                 const file = try parseRar4File(header_source, header);
                 var entry: Entry = .{
                     .info = .{
@@ -878,16 +886,16 @@ fn walkRar4(archive: []const u8, opts: DecodeOptions, ctx: anytype, comptime vis
                     .blake2 = null,
                     .crypt = if (header.flags & rar4_lhd_password != 0) blk: {
                         // The versions 13, 15, and 20 use the retired proprietary ciphers.
-                        if (file.unpack_version != 29 and file.unpack_version != 36) return error.Unsupported;
-                        const salt = file.salt orelse return error.InvalidData;
+                        if (file.unpack_version != 29 and file.unpack_version != 36) return error.UnsupportedFailure;
+                        const salt = file.salt orelse return error.DataFailure;
                         break :blk Crypt{ .rar4 = .{ .salt = salt } };
                     } else null,
                 };
                 if (!file.is_directory) {
-                    if (file.method > 5) return error.Unsupported;
+                    if (file.method > 5) return error.UnsupportedFailure;
                     if (file.unpack_version != 20 and file.unpack_version != 26 and
                         file.unpack_version != 29 and file.unpack_version != 36)
-                        return error.Unsupported; // Version 15 and unknown future versions.
+                        return error.UnsupportedFailure; // Version 15 and unknown future versions.
                     entry.method = file.method;
                     entry.solid = header.flags & rar4_lhd_solid != 0;
                 }
@@ -904,8 +912,8 @@ fn walkRar4(archive: []const u8, opts: DecodeOptions, ctx: anytype, comptime vis
                 }
                 // The base header holds only the low 32 bits of the packed size, so the walk
                 // advances with the 64-bit value, and the data area is never header-encrypted.
-                const payload_end = try bounds.addUsize(cursor + header.enc_len, std.math.cast(usize, file.packed_size) orelse return error.ResourceLimit);
-                if (payload_end > archive.len) return error.InvalidData;
+                const payload_end = try bounds.addUsize(cursor + header.enc_len, std.math.cast(usize, file.packed_size) orelse return error.ResourceFailure);
+                if (payload_end > archive.len) return error.DataFailure;
                 cursor = payload_end;
                 continue;
             },
@@ -915,20 +923,20 @@ fn walkRar4(archive: []const u8, opts: DecodeOptions, ctx: anytype, comptime vis
                 // their data is skipped, and a protect record is content, not encryption.
             },
         }
-        const data_end = try bounds.addUsize(cursor + header.enc_len, std.math.cast(usize, header.data_size) orelse return error.ResourceLimit);
-        if (data_end > archive.len) return error.InvalidData;
+        const data_end = try bounds.addUsize(cursor + header.enc_len, std.math.cast(usize, header.data_size) orelse return error.ResourceFailure);
+        if (data_end > archive.len) return error.DataFailure;
         cursor = data_end;
     }
     // Same EOF rule as the RAR5 walk: the UnexpEndArcMsg of unrar stays silent at
     // a block boundary, and a RAR 1.5 archive never wrote an end block.
-    if (!seen_main) return error.InvalidData;
+    if (!seen_main) return error.DataFailure;
 }
 
 const CountCtx = struct { count: usize = 0, max_entries: u64 };
 
 fn countVisit(ctx: *CountCtx, entry: Entry) Failure!void {
     if (entry.is_directory) return;
-    if (ctx.count >= ctx.max_entries) return error.ResourceLimit;
+    if (ctx.count >= ctx.max_entries) return error.ResourceFailure;
     ctx.count = try bounds.addUsize(ctx.count, 1);
 }
 
@@ -959,7 +967,7 @@ const FindCtx = struct {
 
 fn findVisit(ctx: *FindCtx, entry: Entry) Failure!void {
     if (entry.is_directory) return;
-    if (ctx.ordinal >= ctx.max_entries) return error.ResourceLimit;
+    if (ctx.ordinal >= ctx.max_entries) return error.ResourceFailure;
     if (ctx.found == null and ctx.ordinal == ctx.target) {
         ctx.found = entry.info;
     }
@@ -970,7 +978,7 @@ pub fn rarInspectOrdinalOpts(archive: []const u8, ordinal: usize, max_entries: u
     var ctx: FindCtx = .{ .target = ordinal, .max_entries = max_entries };
     try walkEntriesOpts(archive, opts, &ctx, findVisit);
     if (ctx.found) |info| return info;
-    return error.InvalidData;
+    return error.DataFailure;
 }
 
 // The largest engine state. The caller carves one buffer this big
@@ -1021,32 +1029,32 @@ fn locateVisit(ctx: *LocateCtx, entry: Entry) Failure!void {
 fn entryPayload(entry: Entry, archive: []const u8, opts: DecodeOptions, bufs: *DecodeBuffers) Failure![]const u8 {
     const payload = try bounds.slice(archive, entry.info.data_offset, entry.info.packed_size);
     const crypt = entry.crypt orelse return payload;
-    const password = opts.password orelse return error.Unsupported;
+    const password = opts.password orelse return error.UnsupportedFailure;
     if (bufs.packed_stage.len < payload.len) return error.InternalFailure;
     switch (crypt) {
         .rar5 => |c| {
             if (opts.password_lifetime != 0 and payload.len > opts.password_lifetime) {
                 if (opts.failure_cause) |cause| cause.* = .password_lifetime;
-                return error.ResourceLimit;
+                return error.ResourceFailure;
             }
             const keys = try rar5Kdf(password, &c.salt, c.lg2count, opts);
             if (c.pswcheck) |expected| {
                 if (!crypto.constantTimeEql(&rar5PswCheck(&keys.pswcheck), &expected)) {
                     if (opts.failure_cause) |cause| cause.* = .wrong_password;
-                    return error.InvalidData;
+                    return error.DataFailure;
                 }
             }
-            crypto.aesCbcDecrypt(opts.provider, keys.key[0..], c.iv, bufs.packed_stage[0..payload.len], payload) catch return error.InvalidData;
+            crypto.aesCbcDecrypt(opts.provider, keys.key[0..], c.iv, bufs.packed_stage[0..payload.len], payload) catch return error.DataFailure;
         },
         .rar4 => |c| {
             if (opts.password_lifetime != 0 and payload.len > opts.password_lifetime) {
                 if (opts.failure_cause) |cause| cause.* = .password_lifetime;
-                return error.ResourceLimit;
+                return error.ResourceFailure;
             }
             var utf16_buffer: [2 * 127]u8 = undefined;
             const utf16 = try passwordToUtf16Le(password, &utf16_buffer);
             const keys = try rar4Kdf(utf16, &c.salt, opts);
-            crypto.aesCbcDecrypt(opts.provider, keys.key[0..], keys.iv, bufs.packed_stage[0..payload.len], payload) catch return error.InvalidData;
+            crypto.aesCbcDecrypt(opts.provider, keys.key[0..], keys.iv, bufs.packed_stage[0..payload.len], payload) catch return error.DataFailure;
         },
     }
     return bufs.packed_stage[0..payload.len];
@@ -1070,10 +1078,10 @@ fn replayVisit(
     if (entry.method == 0) return;
     const payload = try entryPayload(entry, archive, opts, bufs);
     if (entry.info.ordinal == locate.target) {
-        const size = std.math.cast(usize, entry.info.size) orelse return error.ResourceLimit;
+        const size = std.math.cast(usize, entry.info.size) orelse return error.ResourceFailure;
         var bs = sink.BufferSink.init(output[0..size]);
         try session.decodeFile(payload, entry.info.size, entry.solid, bs.sink());
-        if (bs.overflowed) return error.InvalidData;
+        if (bs.overflowed) return error.DataFailure;
     } else {
         var discard = sink.DiscardSink{};
         try session.decodeFile(payload, entry.info.size, entry.solid, discard.sink());
@@ -1089,18 +1097,18 @@ pub fn rarDecodeOrdinal(
 ) Failure!usize {
     var locate: LocateCtx = .{ .target = ordinal };
     try walkEntriesOpts(archive, opts, &locate, locateVisit);
-    const entry = locate.target_entry orelse return error.InvalidData;
-    if (entry.is_directory) return error.InvalidData;
+    const entry = locate.target_entry orelse return error.DataFailure;
+    if (entry.is_directory) return error.DataFailure;
 
-    const size = std.math.cast(usize, entry.info.size) orelse return error.ResourceLimit;
-    if (output.len < size) return error.InsufficientCapacity;
+    const size = std.math.cast(usize, entry.info.size) orelse return error.ResourceFailure;
+    if (output.len < size) return error.CapacityFailure;
 
     if (entry.method == 0) {
         const payload = try entryPayload(entry, archive, opts, bufs);
-        if (payload.len < size) return error.InvalidData;
+        if (payload.len < size) return error.DataFailure;
         @memcpy(output[0..size], payload[0..size]);
     } else {
-        const window_len = std.math.cast(usize, locate.group_max_window) orelse return error.ResourceLimit;
+        const window_len = std.math.cast(usize, locate.group_max_window) orelse return error.ResourceFailure;
         try replayCompressed(archive, opts, &locate, entry, output[0..size], bufs, window_len);
     }
 
@@ -1110,7 +1118,7 @@ pub fn rarDecodeOrdinal(
     if (entry.crypt) |c| {
         switch (c) {
             .rar5 => |r5| if (r5.hashmac) {
-                const password = opts.password orelse return error.Unsupported;
+                const password = opts.password orelse return error.UnsupportedFailure;
                 const keys = try rar5Kdf(password, &r5.salt, r5.lg2count, opts);
                 hash_key = keys.hash_key;
             },
@@ -1190,7 +1198,7 @@ fn replayCompressed(
                     var replay: ReplayCtx(unpack20.Session) = .{ .session = &session, .archive = archive, .locate = locate, .output = output, .opts = opts, .bufs = bufs };
                     try walkEntriesOpts(archive, opts, &replay, replayVisitCtx(unpack20.Session));
                 },
-                else => return error.Unsupported,
+                else => return error.UnsupportedFailure,
             }
         },
     }

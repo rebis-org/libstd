@@ -5,64 +5,26 @@ const seam = @import("seam");
 
 const onprem = @import("onprem.zig");
 
-pub const Offprem = std.hash.Adler32;
 pub const Onprem = onprem.Adler32;
 
-pub const Inner = switch (options.adler32_impl) {
-    .onprem => FixedAdler(.onprem, Onprem),
-    .offprem => FixedAdler(.offprem, Offprem),
-    .mergeable => MergeableAdler(Onprem, Offprem),
+// std.hash.Adler32 exposes its running state instead of an init/final pair.
+
+pub const Offprem = struct {
+    inner: std.hash.Adler32 = .{},
+
+    pub fn init() @This() {
+        return .{};
+    }
+
+    pub fn update(self: *@This(), input: []const u8) void {
+        self.inner.update(input);
+    }
+
+    pub fn final(self: *const @This()) u32 {
+        return self.inner.adler;
+    }
 };
 
-// Both implementations carry the state as `adler`, so the finalizer reads the field directly.
-fn FixedAdler(comptime tag: seam.Provider, comptime Impl: type) type {
-    return struct {
-        inner: Impl = .{},
+pub const Adler32 = seam.Checksum(options.adler32_impl, Onprem, Offprem);
 
-        pub fn init() @This() {
-            return .{};
-        }
-
-        pub fn bind(provider: seam.Provider) @This() {
-            std.debug.assert(provider == tag);
-            return .{};
-        }
-
-        pub fn update(self: *@This(), input: []const u8) void {
-            self.inner.update(input);
-        }
-
-        pub fn final(self: *const @This()) u32 {
-            return self.inner.adler;
-        }
-    };
-}
-
-fn MergeableAdler(comptime On: type, comptime Off: type) type {
-    return struct {
-        state: seam.Pair(On, Off) = .{ .onprem = .{} },
-
-        pub fn init() @This() {
-            return .{};
-        }
-
-        pub fn bind(provider: seam.Provider) @This() {
-            return switch (provider) {
-                .onprem => .{ .state = .{ .onprem = .{} } },
-                .offprem => .{ .state = .{ .offprem = .{} } },
-            };
-        }
-
-        pub fn update(self: *@This(), input: []const u8) void {
-            switch (self.state) {
-                inline else => |*inner| inner.update(input),
-            }
-        }
-
-        pub fn final(self: *const @This()) u32 {
-            switch (self.state) {
-                inline else => |*inner| return inner.adler,
-            }
-        }
-    };
-}
+pub const Inner = Adler32;

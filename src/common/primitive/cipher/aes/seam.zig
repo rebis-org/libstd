@@ -1,16 +1,16 @@
 const std = @import("std");
 
 const options = @import("options");
-const seam = @import("seam");
 
 const onprem = @import("onprem.zig");
 
 // AES-192 stays on-prem because std ships no 192-bit context; either provider
 // tag resolves to the on-prem schedule.
 const std_aes = std.crypto.core.aes;
-// The 192-bit schedule has no std context, so it is the same type under every
-// provider tag; matching the std suite's method names lets one suite-shaped
-// accessor serve all three key sizes.
+// The 192-bit schedule has no std context, so it is the same type under
+// every provider tag.
+// Matching the std suite's method names lets one accessor serve all three
+// key sizes.
 pub const Aes192Hw = onprem.Aes192Hw;
 
 const StdDirection = enum { encrypt, decrypt };

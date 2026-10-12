@@ -4,33 +4,18 @@ const onprem = @import("onprem.zig");
 pub const Failure = @import("../../common/primitive/failure.zig").Failure;
 
 const std_tar = std.tar;
-// Offprem arm of the tar grammar: std.tar used directly, under the
-// caller-freedom rule that the caller's tag choice accepts std's shape.
-// Per-verb faithfulness decides what the arm serves:
-//
-// - inspectCount and decodeOrdinal are faithful through std.tar.Iterator
-//   (pax records are parsed internally), so the arm serves them.
-// - inspectOrdinal is not: std's Iterator.File carries no mtime, uid, gid,
-//   or typeflag, and the ordinal-inspect contract promises all of them.
-//   That verb resolves to onprem in the seam instead of lying about the
-//   metadata.
-// - encode (write) serves only the subset std.tar.Writer can carry
-//   faithfully: names and link targets within the ustar field widths, no
-//   device entries, uid/gid zero, sizes within the ustar octal range.
-//   Anything else answers Unsupported and the caller picks onprem.
-//
-// std.tar.Writer/Iterator read and write through std.Io.Reader/Writer, so
-// the caller's spans wrap directly; no allocator is involved anywhere.
+// std's Iterator.File lacks mtime/uid/gid/typeflag, so inspectOrdinal stays
+// onprem; encode serves only what std.tar.Writer carries faithfully.
 pub const Entry = onprem.Entry;
 pub const EntryInfo = onprem.EntryInfo;
 
 fn mapError(err: anyerror) Failure {
     return switch (err) {
-        error.UnexpectedEndOfStream, error.TarInsufficientBuffer => error.InvalidData,
-        error.NameTooLong => error.Unsupported,
-        error.WriteFailed => error.InsufficientCapacity,
-        error.OctalOverflow => error.Unsupported,
-        else => error.InvalidData,
+        error.UnexpectedEndOfStream, error.TarInsufficientBuffer => error.DataFailure,
+        error.NameTooLong => error.UnsupportedFailure,
+        error.WriteFailed => error.CapacityFailure,
+        error.OctalOverflow => error.UnsupportedFailure,
+        else => error.DataFailure,
     };
 }
 
@@ -39,8 +24,8 @@ fn mapError(err: anyerror) Failure {
 // stack is the documented shape, matching std's own expectation.
 pub fn inspectCount(archive: []const u8) Failure!u64 {
     var reader = std.Io.Reader.fixed(archive);
-    var name_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    var link_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var name_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var link_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     var it = std_tar.Iterator.init(&reader, .{ .file_name_buffer = &name_buffer, .link_name_buffer = &link_buffer });
     var count: u64 = 0;
     while (true) {
@@ -53,23 +38,23 @@ pub fn inspectCount(archive: []const u8) Failure!u64 {
 
 pub fn decodeOrdinal(archive: []const u8, ordinal: u64, output: []u8) Failure!usize {
     var reader = std.Io.Reader.fixed(archive);
-    var name_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    var link_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var name_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var link_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     var it = std_tar.Iterator.init(&reader, .{ .file_name_buffer = &name_buffer, .link_name_buffer = &link_buffer });
     var index: u64 = 0;
     while (true) {
         const maybe = it.next() catch |err| return mapError(err);
         const file = maybe orelse break;
         if (index == ordinal) {
-            const size: usize = std.math.cast(usize, file.size) orelse return error.ResourceLimit;
-            if (output.len < size) return error.InsufficientCapacity;
+            const size: usize = std.math.cast(usize, file.size) orelse return error.ResourceFailure;
+            if (output.len < size) return error.CapacityFailure;
             var sink = std.Io.Writer.fixed(output[0..size]);
             it.streamRemaining(file, &sink) catch |err| return mapError(err);
             return size;
         }
         index += 1;
     }
-    return error.InvalidCall;
+    return error.CallFailure;
 }
 
 // archiveSize runs the same encode into a counting writer; the write arm
@@ -91,15 +76,15 @@ pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Failure!usize
 fn encodeTo(entries: []const Entry, writer: *std.Io.Writer) Failure!void {
     var tar_writer: std_tar.Writer = .{ .underlying_writer = writer };
     for (entries) |entry| {
-        if (entry.uid != 0 or entry.gid != 0) return error.Unsupported;
-        if (entry.name.len > 100) return error.Unsupported;
-        if (entry.link_name.len > 100) return error.Unsupported;
+        if (entry.uid != 0 or entry.gid != 0) return error.UnsupportedFailure;
+        if (entry.name.len > 100) return error.UnsupportedFailure;
+        if (entry.link_name.len > 100) return error.UnsupportedFailure;
         const options: std_tar.Writer.Options = .{ .mode = entry.mode, .mtime = entry.modification_time };
         switch (entry.typeflag) {
             onprem.typeflag_regular => tar_writer.writeFileBytes(entry.name, entry.data, options) catch |err| return mapError(err),
             '5' => tar_writer.writeDir(entry.name, options) catch |err| return mapError(err),
             '2' => tar_writer.writeLink(entry.name, entry.link_name, options) catch |err| return mapError(err),
-            else => return error.Unsupported,
+            else => return error.UnsupportedFailure,
         }
     }
     tar_writer.finishPedantically() catch |err| return mapError(err);

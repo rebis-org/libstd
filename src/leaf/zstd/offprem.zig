@@ -2,28 +2,33 @@ const std = @import("std");
 
 const onprem = @import("onprem.zig");
 
-// Offprem arm of the zstd decode seam: std.compress.zstd (0.17). The
-// caller's tag choice accepts std's incompleteness, recorded here rather
-// than patched over: frame content checksums are not verified (std's
-// verify_checksum panics instead of verifying, so the arm leaves it off),
-// and dictionaries are unsupported. Both resolve like any missing arm: a
-// caller who needs them picks onprem. Window bounds and the caller-owned
-// storage contract hold exactly as the onprem arm enforces them.
+// std's verify_checksum panics instead of verifying, so the arm leaves
+// checksums off; dictionaries are unsupported. Both pick onprem.
 
-// The reader vtable folds every decoder error into ReadFailed; a WriteFailed
-// is the sink rejecting bytes (capacity), not corruption.
+// The reader vtable folds every decoder error into ReadFailed; a WriteFailed is
+// the sink rejecting bytes, which is an I/O fault against the caller's own
+// writer.
 fn mapStreamError(err: std.Io.Reader.StreamError) onprem.DecodeError {
     return switch (err) {
         error.WriteFailed => error.IoFailure,
-        error.ReadFailed, error.EndOfStream => error.InvalidData,
+        error.ReadFailed, error.EndOfStream => error.DataFailure,
+    };
+}
+
+// A fixed writer reports the same WriteFailed when the caller's span fills, and
+// there the cause is capacity, so it answers as a capacity shortfall.
+fn mapFixedStreamError(err: std.Io.Reader.StreamError) onprem.DecodeError {
+    return switch (err) {
+        error.WriteFailed => error.CapacityFailure,
+        error.ReadFailed, error.EndOfStream => error.DataFailure,
     };
 }
 
 fn preflight(options: onprem.Options, history: ?[]u8) onprem.DecodeError!void {
-    if (options.dictionary != null) return error.Unsupported;
-    if (options.window_size < onprem.window_size_min or options.window_size > onprem.window_size_max) return error.Unsupported;
+    if (options.dictionary != null) return error.UnsupportedFailure;
+    if (options.window_size < onprem.window_size_min or options.window_size > onprem.window_size_max) return error.UnsupportedFailure;
     if (history) |buffer| {
-        if (buffer.len < @as(usize, options.window_size) + onprem.block_size_max) return error.Unsupported;
+        if (buffer.len < @as(usize, options.window_size) + onprem.block_size_max) return error.UnsupportedFailure;
     }
 }
 
@@ -37,11 +42,11 @@ pub fn decodeInPlace(input: *std.Io.Reader, output: []u8, options: onprem.Option
     // Same precondition the onprem arm states: the span carries the output
     // plus one block of window slack. std zstd's direct mode drives the
     // window from the writer buffer, so no separate history is passed.
-    if (output.len < @as(usize, options.window_size) + onprem.block_size_max) return error.Unsupported;
+    if (output.len < @as(usize, options.window_size) + onprem.block_size_max) return error.UnsupportedFailure;
     try preflight(options, null);
     var fixed = std.Io.Writer.fixed(output);
     var decoder = std.compress.zstd.Decompress.init(input, &.{}, .{ .window_len = options.window_size });
-    return decoder.reader.streamRemaining(&fixed) catch |err| mapStreamError(err);
+    return decoder.reader.streamRemaining(&fixed) catch |err| mapFixedStreamError(err);
 }
 
 pub fn decodedSize(input: []const u8, history: []u8, options: onprem.Options) onprem.DecodeError!usize {
@@ -57,15 +62,10 @@ test "offprem zstd decodes byte-identical to onprem across shapes" {
     const alloc = std.testing.allocator;
     const measurement = @import("../../common/primitive/measurement.zig");
 
-    var rng: u64 = 0x9e3779b97f4a7c15;
     const input = try alloc.alloc(u8, 300000);
     defer alloc.free(input);
-    for (input) |*b| {
-        rng ^= rng << 13;
-        rng ^= rng >> 7;
-        rng ^= rng << 17;
-        b.* = @truncate(rng >> 32);
-    }
+    var prng = std.Random.DefaultPrng.init(0x9e3779b97f4a7c15);
+    prng.random().bytes(input);
     @memset(input[100000..250000], 0);
 
     const compressed = try alloc.alloc(u8, 320000);

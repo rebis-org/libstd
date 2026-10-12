@@ -140,7 +140,7 @@ const block_writer = struct {
         const plain_len = 4 + size_len + contents.len;
         if (header_keys) |keys| {
             const padded = std.mem.alignForward(usize, plain_len, 16);
-            if (out.len < pos + 16 + padded) return error.InsufficientCapacity;
+            if (out.len < pos + 16 + padded) return error.CapacityFailure;
             var iv: [16]u8 = undefined;
             try crypto.fillRandom(&iv);
             @memcpy(out[pos..][0..16], &iv);
@@ -152,7 +152,7 @@ const block_writer = struct {
             try crypto.aesCbcEncrypt(provider, keys.key[0..], iv, region, region);
             return pos + 16 + padded;
         }
-        if (out.len < pos + plain_len) return error.InsufficientCapacity;
+        if (out.len < pos + plain_len) return error.CapacityFailure;
         std.mem.writeInt(u32, out[pos..][0..4], crc_state.final(), .little);
         var cursor = pos + 4;
         @memcpy(out[cursor..][0..size_len], size_buf[0..size_len]);
@@ -334,7 +334,7 @@ const block_writer = struct {
 
         var cursor = try emitHeader(out, pos, contents[0..c], header_keys, provider);
         if (data_size > 0) {
-            if (out.len < cursor + packed_data.len) return error.InsufficientCapacity;
+            if (out.len < cursor + packed_data.len) return error.CapacityFailure;
             @memcpy(out[cursor..][0..packed_data.len], packed_data);
             cursor += packed_data.len;
         }
@@ -343,13 +343,13 @@ const block_writer = struct {
 };
 
 fn checkWriteEntries(entries: []const RarEntry, options: WriteOptions) Failure!void {
-    if (options.encrypt_headers and options.password.len == 0) return error.InvalidCall;
-    if (options.kdf_lg2_count > 24) return error.InvalidCall;
+    if (options.encrypt_headers and options.password.len == 0) return error.CallFailure;
+    if (options.kdf_lg2_count > 24) return error.CallFailure;
     for (entries) |entry| {
-        if (entry.name.len > 4096) return error.InvalidCall;
-        if (entry.method > 5) return error.InvalidCall;
+        if (entry.name.len > 4096) return error.CallFailure;
+        if (entry.method > 5) return error.CallFailure;
     }
-    if (entries.len > 65535) return error.ResourceLimit;
+    if (entries.len > 65535) return error.ResourceFailure;
 }
 
 // The sizing query and the commit pass each run this, so one encode compresses twice.
@@ -404,7 +404,7 @@ fn packEntries(entries: []const RarEntry, ws: *WriteBuffers, options: WriteOptio
             const padded = std.mem.alignForward(usize, packed_len, crypto.block_length);
             if (ws.packed_buf.len - packed_cursor < padded) return error.InternalFailure;
             @memset(ws.packed_buf[packed_cursor + packed_len .. packed_cursor + padded], 0);
-            crypto.aesCbcEncrypt(crypto.default_provider, keys.key[0..], ws.crypt_ivs[i], ws.packed_buf[packed_cursor .. packed_cursor + padded], ws.packed_buf[packed_cursor .. packed_cursor + padded]) catch return error.InvalidCall;
+            crypto.aesCbcEncrypt(crypto.default_provider, keys.key[0..], ws.crypt_ivs[i], ws.packed_buf[packed_cursor .. packed_cursor + padded], ws.packed_buf[packed_cursor .. packed_cursor + padded]) catch return error.CallFailure;
             packed_len = padded;
         }
         if (ws.packed_sizes.len < entries.len) return error.InternalFailure;
@@ -430,7 +430,7 @@ pub fn rarEncode(entries: []const RarEntry, output: []u8, ws: *WriteBuffers, pro
 
 pub fn rarEncodeEx(entries: []const RarEntry, output: []u8, ws: *WriteBuffers, provider: crypto.Provider, options: WriteOptions) Failure!usize {
     const required = try rarWriteSizeEx(entries, ws, options);
-    if (output.len < required) return error.InsufficientCapacity;
+    if (output.len < required) return error.CapacityFailure;
 
     var header_keys: ?rar.Rar5Keys = null;
     var header_salt: [16]u8 = @splat(0);
@@ -689,7 +689,7 @@ test "created encrypted archives roundtrip through the facade reader" {
         if (options.encrypt_headers) {
             try testing.expectError(error.IntegrityFailure, rar.rarInspectCountOpts(archive, 128, wrong_opts));
         } else {
-            try testing.expectError(error.InvalidData, rar.rarDecodeOrdinal(archive, 0, out1, @constCast(&bufs), wrong_opts));
+            try testing.expectError(error.DataFailure, rar.rarDecodeOrdinal(archive, 0, out1, @constCast(&bufs), wrong_opts));
         }
         try testing.expectEqual(crypto.FailureCause.wrong_password, cause);
     }

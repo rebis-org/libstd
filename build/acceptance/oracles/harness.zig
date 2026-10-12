@@ -12,22 +12,42 @@ pub const Node = abi.Node;
 pub const Status = abi.Status;
 pub const isIdEqual = abi.isIdEqual;
 
+// Node-array construction without hand-counted indices; scenario code reads as
+// the envelope it builds. The count stays visible for arrays a scenario reuses.
+
+pub const NodeList = struct {
+    nodes: []Node,
+    count: usize = 0,
+
+    pub fn push(self: *NodeList, entry: Node) void {
+        self.nodes[self.count] = entry;
+        self.count += 1;
+    }
+
+    pub fn pushAll(self: *NodeList, extra: []const Node) void {
+        @memcpy(self.nodes[self.count..][0..extra.len], extra);
+        self.count += extra.len;
+    }
+
+    pub fn items(self: *const NodeList) []Node {
+        return self.nodes[0..self.count];
+    }
+};
+
 pub const cap_read: u32 = 1 << 0;
 pub const cap_write: u32 = 1 << 1;
 pub const cap_size: u32 = 1 << 2;
 pub const cap_replay: u32 = 1 << 3;
 pub const cap_seek: u32 = 1 << 4;
 pub const cap_range: u32 = 1 << 5;
-pub const plan_unavailable: u64 = 0;
 pub const size_metadata_exact: u64 = 1;
 pub const size_measured: u64 = 2;
-pub const plan_materialization: u64 = 3;
 pub const commit_tentative: u64 = 0;
 pub const commit_confirmed: u64 = 1;
 pub const cmd_query: u32 = 1 << 0;
 pub const cmd_read: u32 = 1 << 1;
 pub const cmd_write: u32 = 1 << 2;
-pub const cmd_all: u32 = cmd_query | cmd_read | cmd_write;
+pub const cmds: u32 = cmd_query | cmd_read | cmd_write;
 pub const cmd_query_write: u32 = cmd_query | cmd_write;
 pub const param_family_protocol: u16 = 0;
 pub const param_family_crypto: u16 = 1;
@@ -293,12 +313,6 @@ pub fn scalarNode(id: Id) Node {
     return result;
 }
 
-pub fn scalarValueNode(id: Id, value: u64) Node {
-    var result = scalarNode(id);
-    result.value_low = value;
-    return result;
-}
-
 pub fn paramProfile(id: Id) Node {
     var result = scalarNode(ids.profile);
     result.value_low = id.low;
@@ -342,23 +356,23 @@ pub fn paramBytesWithAttributes(family: u16, ordinal: u32, attributes: u8, comma
 }
 
 pub fn capabilityParam(value: u64) Node {
-    return paramScalar(param_family_protocol, protocol_resource_capabilities, cmd_all, value);
+    return paramScalar(param_family_protocol, protocol_resource_capabilities, cmds, value);
 }
 
 pub fn sizingModeParam(value: u64) Node {
-    return paramScalar(param_family_protocol, protocol_sizing_mode, cmd_all, value);
+    return paramScalar(param_family_protocol, protocol_sizing_mode, cmds, value);
 }
 
 pub fn commitModeParam(value: u64) Node {
-    return paramScalar(param_family_protocol, protocol_commit_mode, cmd_all, value);
+    return paramScalar(param_family_protocol, protocol_commit_mode, cmds, value);
 }
 
 pub fn providerParam(value: u64) Node {
-    return paramScalar(param_family_protocol, protocol_provider, cmd_all, value);
+    return paramScalar(param_family_protocol, protocol_provider, cmds, value);
 }
 
 pub fn resourceLimitParam(value: u64) Node {
-    return paramScalar(param_family_protocol, protocol_resource_limit, cmd_all, value);
+    return paramScalar(param_family_protocol, protocol_resource_limit, cmds, value);
 }
 
 pub fn bzip2BlockParam(value: u64) Node {
@@ -366,7 +380,7 @@ pub fn bzip2BlockParam(value: u64) Node {
 }
 
 pub fn lzmaDictionaryParam(value: u64) Node {
-    return paramScalar(param_family_lzma, lzma_dictionary, cmd_all, value);
+    return paramScalar(param_family_lzma, lzma_dictionary, cmds, value);
 }
 
 pub fn xzCheckParam(value: u64) Node {
@@ -380,33 +394,33 @@ pub fn xzFiltersParam(value: u64) Node {
 pub const param_family_sevenzip: u16 = 14;
 pub const sevenzip_header_encode: u32 = 1;
 pub fn sevenzipHeaderEncodeParam(value: u64) Node {
-    return paramScalar(param_family_sevenzip, sevenzip_header_encode, cmd_all, value);
+    return paramScalar(param_family_sevenzip, sevenzip_header_encode, cmds, value);
 }
 
 pub fn cryptoPasswordParam(bytes: []const u8) Node {
-    return paramBytes(param_family_crypto, crypto_password, cmd_all, bytes);
+    return paramBytes(param_family_crypto, crypto_password, cmds, bytes);
 }
 
 pub fn cryptoAlgorithmParam(value: u64) Node {
-    return paramScalar(param_family_crypto, crypto_algorithm, cmd_all, value);
+    return paramScalar(param_family_crypto, crypto_algorithm, cmds, value);
 }
 
 pub const zip_data_descriptor: u32 = 5;
 pub const param_family_rar: u16 = 15;
 pub const rar_header_encode: u32 = 1;
 pub fn rarHeaderEncodeParam(value: u64) Node {
-    return paramScalar(param_family_rar, rar_header_encode, cmd_all, value);
+    return paramScalar(param_family_rar, rar_header_encode, cmds, value);
 }
 pub fn zipDataDescriptorParam(value: u64) Node {
-    return paramScalar(param_family_crypto, zip_data_descriptor, cmd_all, value);
+    return paramScalar(param_family_crypto, zip_data_descriptor, cmds, value);
 }
 
 pub fn cryptoKdfLimitParam(value: u64) Node {
-    return paramScalar(param_family_crypto, crypto_kdf_rounds_limit, cmd_all, value);
+    return paramScalar(param_family_crypto, crypto_kdf_rounds_limit, cmds, value);
 }
 
 pub fn cryptoPasswordLifetimeParam(value: u64) Node {
-    return paramScalar(param_family_crypto, crypto_password_lifetime, cmd_all, value);
+    return paramScalar(param_family_crypto, crypto_password_lifetime, cmds, value);
 }
 
 pub fn gzipMtimeParam(value: u64) Node {
@@ -497,8 +511,8 @@ pub fn archiveEntryNode(name_node: *Node, data_node: *Node, name: []const u8, da
     var entry = node(null, 0);
     entry.id = ids.parameter;
     entry.value_high = paramSelector(param_family_archive, archive_entry, 0x17, cmd_query_write);
-    name_node.* = paramBytesWithAttributes(param_family_archive, archive_entry_name, 0x32, cmd_all, name);
-    data_node.* = paramBytes(param_family_archive, archive_entry_data, cmd_all, data);
+    name_node.* = paramBytesWithAttributes(param_family_archive, archive_entry_name, 0x32, cmds, name);
+    data_node.* = paramBytes(param_family_archive, archive_entry_data, cmds, data);
     entry.child = name_node;
     name_node.next = data_node;
     return entry;

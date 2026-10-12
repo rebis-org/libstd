@@ -18,7 +18,7 @@ const Failure = vocabulary.Failure;
 // A sink must accept writes and have the capacity before any byte is
 // produced; every transform and archive hook states this pair first.
 pub fn requireSink(sink: *Resource, call: *Call, required: usize) Failure!void {
-    if (!sink.hasCapability(resource.capability_bit_write)) return error.Unsupported;
+    if (!sink.hasCapability(resource.capability_bit_write)) return error.UnsupportedFailure;
     return requireSinkCapacity(sink, call, required);
 }
 
@@ -26,8 +26,20 @@ pub fn requireSinkCapacity(sink: *Resource, call: *Call, required: usize) Failur
     const capacity = sinkCapacity(sink);
     if (required > capacity) {
         writeCapacityDiagnostic(call, required, capacity);
-        return error.InsufficientCapacity;
+        return error.CapacityFailure;
     }
+}
+
+// Verified commit: a bounded write reports the produced length, and an
+// overrun of the analytic bound is a correctness bug, never a silent truncation.
+pub fn verifiedCommitLength(sink: *Resource, call: *Call, sizing: vocabulary.SizingMode, staged: []const u8, planned: usize, produced: usize) Failure!?usize {
+    if (sizing == .bounded) {
+        if (produced > planned) return error.InternalFailure;
+        try commitBytesToSink(sink, call, staged[0..produced]);
+        return produced;
+    }
+    try commitBytesToSink(sink, call, staged);
+    return null;
 }
 
 pub fn commitBytesToSink(sink: *Resource, call: *Call, chunk: []const u8) Failure!void {
@@ -57,7 +69,7 @@ fn budgetRequest(workspace: *resource.Workspace, limit: u64) usize {
 pub fn materializeSource(comptime sizing: SourceSizing, source: *Resource, workspace: *resource.Workspace, limit: u64) Failure![]const u8 {
     return switch (source.kind) {
         .direct_read => |bytes| {
-            if (bytes.len > limit) return error.ResourceLimit;
+            if (bytes.len > limit) return error.ResourceFailure;
             return bytes;
         },
         .callback_read => materialize_block: {
@@ -69,14 +81,14 @@ pub fn materializeSource(comptime sizing: SourceSizing, source: *Resource, works
                 .require_size => request_block: {
                     try source.requireCapability(resource.capability_bit_size);
                     const total = try source.size();
-                    if (total > limit) return error.ResourceLimit;
-                    break :request_block std.math.cast(usize, total) orelse return error.ResourceLimit;
+                    if (total > limit) return error.ResourceFailure;
+                    break :request_block std.math.cast(usize, total) orelse return error.ResourceFailure;
                 },
                 .size_or_budget => request_block: {
                     if (source.hasCapability(resource.capability_bit_size)) {
                         const total = try source.size();
-                        if (total > limit) return error.ResourceLimit;
-                        break :request_block std.math.cast(usize, total) orelse return error.ResourceLimit;
+                        if (total > limit) return error.ResourceFailure;
+                        break :request_block std.math.cast(usize, total) orelse return error.ResourceFailure;
                     }
                     break :request_block budgetRequest(workspace, limit);
                 },
@@ -87,36 +99,36 @@ pub fn materializeSource(comptime sizing: SourceSizing, source: *Resource, works
                         const bytes_read = try source.read(&buffer);
                         if (bytes_read == 0) break;
                         total += bytes_read;
-                        if (total > limit) return error.ResourceLimit;
+                        if (total > limit) return error.ResourceFailure;
                     }
                     try source.rewind();
-                    break :request_block std.math.cast(usize, total) orelse return error.ResourceLimit;
+                    break :request_block std.math.cast(usize, total) orelse return error.ResourceFailure;
                 },
             };
-            if ((sizing == .budget or sizing == .size_or_budget) and request == 0) return error.InsufficientCapacity;
+            if ((sizing == .budget or sizing == .size_or_budget) and request == 0) return error.CapacityFailure;
             if (sizing == .require_size and request == 0) break :materialize_block &.{};
             const buffer = try workspace.take(u8, request);
             break :materialize_block try source.materialize(buffer);
         },
-        else => return error.Unsupported,
+        else => return error.UnsupportedFailure,
     };
 }
 
 pub fn measureSource(source: *Resource, limit: u64) Failure!usize {
     if (source.hasCapability(resource.capability_bit_size)) {
         const total = try source.size();
-        if (total > limit) return error.ResourceLimit;
-        return std.math.cast(usize, total) orelse error.ResourceLimit;
+        if (total > limit) return error.ResourceFailure;
+        return std.math.cast(usize, total) orelse error.ResourceFailure;
     }
-    if (!source.hasCapability(resource.capability_bit_replay)) return error.Unsupported;
+    if (!source.hasCapability(resource.capability_bit_replay)) return error.UnsupportedFailure;
     var counter = measurement.Counter.init(null);
     var bounded_source: resource.BoundedReader = undefined;
     bounded_source.init(source, limit);
     _ = std.Io.Reader.streamRemaining(&bounded_source.reader, &counter.writer) catch |failure| return mapStreamError(failure);
     try source.rewind();
     const total = counter.written();
-    if (total > limit) return error.ResourceLimit;
-    return std.math.cast(usize, total) orelse error.ResourceLimit;
+    if (total > limit) return error.ResourceFailure;
+    return std.math.cast(usize, total) orelse error.ResourceFailure;
 }
 
 pub fn measureOutputSize(source: *Resource, limits: Limits) Failure!u64 {
@@ -134,21 +146,21 @@ fn mapStreamError(failure: anyerror) Failure {
 
 pub fn planOutputSize(source: *Resource, sizing: vocabulary.SizingMode, limits: Limits, workspace: *resource.Workspace) Failure!usize {
     switch (sizing) {
-        .unavailable => return error.Unsupported,
+        .unavailable => return error.UnsupportedFailure,
         .metadata_exact => {
             try source.requireCapability(resource.capability_bit_size);
             const total = try source.size();
-            if (total > limits.encoded_bytes) return error.ResourceLimit;
-            return std.math.cast(usize, total) orelse error.ResourceLimit;
+            if (total > limits.encoded_bytes) return error.ResourceFailure;
+            return std.math.cast(usize, total) orelse error.ResourceFailure;
         },
         .measured => {
             try source.requireCapability(resource.capability_bit_replay);
             const total = try measureOutputSize(source, limits);
-            return std.math.cast(usize, total) orelse error.ResourceLimit;
+            return std.math.cast(usize, total) orelse error.ResourceFailure;
         },
-        .bounded => return error.Unsupported,
+        .bounded => return error.UnsupportedFailure,
         .materialization => {
-            const budget = std.math.cast(usize, limits.encoded_bytes) orelse return error.ResourceLimit;
+            const budget = std.math.cast(usize, limits.encoded_bytes) orelse return error.ResourceFailure;
             const buffer = try workspace.take(u8, budget);
             const materialized = try source.materialize(buffer);
             return materialized.len;
@@ -201,7 +213,7 @@ pub fn writeDownstreamDiagnostic(call: *Call, status: u32) void {
 }
 
 fn overlapsWorkspace(workspace_ptr: usize, workspace_len: usize, ptr: usize, len: usize) Failure!void {
-    if (try spanOverlap(workspace_ptr, workspace_len, ptr, len)) return error.InvalidCall;
+    if (try spanOverlap(workspace_ptr, workspace_len, ptr, len)) return error.CallFailure;
 }
 
 fn workspaceRange(call: *Call) ?struct { ptr: usize, len: usize } {
@@ -233,13 +245,13 @@ pub fn validateBoundary(call: *Call, plan: *const ExecutionPlan, source_node: ?*
         if (source_node) |node| {
             if ((node.flags & abi.node_flag_callback_resource) == 0 and node.byte_length != 0) {
                 const bytes = try resource.checkedConstBytes(node.bytes, node.byte_length);
-                if (try spanOverlap(workspace_ptr, workspace_len, @intFromPtr(bytes.ptr), bytes.len)) return error.InvalidCall;
+                if (try spanOverlap(workspace_ptr, workspace_len, @intFromPtr(bytes.ptr), bytes.len)) return error.CallFailure;
             }
         }
         if (sink_node) |node| {
             if ((node.flags & abi.node_flag_callback_resource) == 0 and node.byte_capacity != 0) {
                 const bytes = try resource.checkedMutBytes(node.bytes, node.byte_capacity);
-                if (try spanOverlap(workspace_ptr, workspace_len, @intFromPtr(bytes.ptr), bytes.len)) return error.InvalidCall;
+                if (try spanOverlap(workspace_ptr, workspace_len, @intFromPtr(bytes.ptr), bytes.len)) return error.CallFailure;
             }
         }
     }
@@ -248,7 +260,7 @@ pub fn validateBoundary(call: *Call, plan: *const ExecutionPlan, source_node: ?*
             if ((source.flags & abi.node_flag_callback_resource) == 0 and (sink.flags & abi.node_flag_callback_resource) == 0 and source.byte_length != 0 and sink.byte_capacity != 0) {
                 const source_bytes = try resource.checkedConstBytes(source.bytes, source.byte_length);
                 const sink_bytes = try resource.checkedMutBytes(sink.bytes, sink.byte_capacity);
-                if (try spanOverlap(@intFromPtr(source_bytes.ptr), source_bytes.len, @intFromPtr(sink_bytes.ptr), sink_bytes.len)) return error.InvalidCall;
+                if (try spanOverlap(@intFromPtr(source_bytes.ptr), source_bytes.len, @intFromPtr(sink_bytes.ptr), sink_bytes.len)) return error.CallFailure;
             }
         }
     }
@@ -256,8 +268,8 @@ pub fn validateBoundary(call: *Call, plan: *const ExecutionPlan, source_node: ?*
 
 pub fn spanOverlap(first_ptr: usize, first_len: usize, second_ptr: usize, second_len: usize) Failure!bool {
     if (first_len == 0 or second_len == 0) return false;
-    const first_end = std.math.add(usize, first_ptr, first_len) catch return error.ResourceLimit;
-    const second_end = std.math.add(usize, second_ptr, second_len) catch return error.ResourceLimit;
+    const first_end = std.math.add(usize, first_ptr, first_len) catch return error.ResourceFailure;
+    const second_end = std.math.add(usize, second_ptr, second_len) catch return error.ResourceFailure;
     return first_ptr < second_end and second_ptr < first_end;
 }
 
@@ -267,7 +279,7 @@ pub fn checkSourceSinkOverlap(source: *Resource, sink: *Resource) Failure!void {
     const source_len = source.kind.direct_read.len;
     const sink_ptr = @intFromPtr(sink.kind.direct_write.ptr);
     const sink_len = sink.kind.direct_write.len;
-    if (try spanOverlap(source_ptr, source_len, sink_ptr, sink_len)) return error.InvalidCall;
+    if (try spanOverlap(source_ptr, source_len, sink_ptr, sink_len)) return error.CallFailure;
 }
 
 pub fn sinkCapacity(sink: *Resource) usize {
@@ -280,8 +292,8 @@ pub fn sinkCapacity(sink: *Resource) usize {
 
 pub fn sinkDirectBuffer(sink: *Resource, required: usize) Failure![]u8 {
     return switch (sink.kind) {
-        .direct_write => |destination| if (destination.len >= required) destination[0..required] else return error.InsufficientCapacity,
-        else => return error.Unsupported,
+        .direct_write => |destination| if (destination.len >= required) destination[0..required] else return error.CapacityFailure,
+        else => return error.UnsupportedFailure,
     };
 }
 
@@ -291,6 +303,16 @@ pub fn mapSinkError(failure: Failure, call: *Call, sink: *Resource) Failure {
 }
 
 // Bound plan must never truncate. Overrun past it is an internal bug.
+// Bounded writes report produced bytes; the plan stands for measured writes.
+// True means the response is final and the caller returns.
+pub fn respondWrite(response: *Node, sizing: vocabulary.SizingMode, produced: anytype, limit: u64, planned: usize) Failure!bool {
+    if (sizing == .bounded) {
+        response.byte_length = try boundedProduced(produced, limit, planned);
+        return true;
+    }
+    return false;
+}
+
 pub fn boundedProduced(bounded_sink: *resource.BoundedWriter, encoded_limit: u64, planned: usize) Failure!usize {
     const produced = encoded_limit - bounded_sink.limit;
     if (produced > planned) return error.InternalFailure;

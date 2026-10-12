@@ -245,6 +245,18 @@ pub fn adler32(input: []const u8) u32 {
     return adler32With(default_provider, input);
 }
 
+pub fn adler32With(provider: seam.Provider, input: []const u8) u32 {
+    return seal(Adler32, Adler32.bind(provider), input);
+}
+
+pub fn xxh32(input: []const u8) u32 {
+    return xxh32With(default_provider, input);
+}
+
+pub fn xxh32With(provider: seam.Provider, input: []const u8) u32 {
+    return seal(XxHash32, XxHash32.bind(provider, 0), input);
+}
+
 fn TableCrc(comptime T: type, comptime poly: T, comptime reflected: bool) type {
     const bits = @bitSizeOf(T);
     return struct {
@@ -364,18 +376,6 @@ fn TableCrc(comptime T: type, comptime poly: T, comptime reflected: bool) type {
             break :blk t;
         };
     };
-}
-
-pub fn adler32With(provider: seam.Provider, input: []const u8) u32 {
-    return seal(Adler32, Adler32.bind(provider), input);
-}
-
-pub fn xxh32(input: []const u8) u32 {
-    return xxh32With(default_provider, input);
-}
-
-pub fn xxh32With(provider: seam.Provider, input: []const u8) u32 {
-    return seal(XxHash32, XxHash32.bind(provider, 0), input);
 }
 
 test "xxh32 matches the published vectors" {

@@ -112,7 +112,7 @@ pub const Unpacker = struct {
 };
 
 pub fn decodeLengthSlot(br: *BitReader, slot: u32) Failure!u32 {
-    if (slot >= rc) return error.InvalidData;
+    if (slot >= rc) return error.DataFailure;
     const entry = length_table[@intCast(slot)];
     if (entry.extra == 0) return entry.base;
     return entry.base + try br.readBits(entry.extra);
@@ -179,7 +179,7 @@ fn readTables(st: *Unpacker) Failure!void {
     }
 
     var cl_table = try huffman.makeDecodeTables(&cl_lengths, pool[0 * table_pool_words ..][0..table_pool_words]);
-    if (!cl_table.valid) return error.InvalidData;
+    if (!cl_table.valid) return error.DataFailure;
 
     // RAR5 assigns code lengths for the full alphabet directly, with no delta
     // across blocks. Symbols 16 to 19 encode repeat and zero runs.
@@ -196,7 +196,7 @@ fn readTables(st: *Unpacker) Failure!void {
             i += 1;
         } else if (cl_symbol == 16) {
             const repeat_count = 3 + try br.readBits(3);
-            if (i == 0) return error.InvalidData;
+            if (i == 0) return error.DataFailure;
             const prev_len = code_lengths[i - 1];
             var j: u32 = 0;
             while (j < repeat_count and i < total_symbols) : (j += 1) {
@@ -205,7 +205,7 @@ fn readTables(st: *Unpacker) Failure!void {
             }
         } else if (cl_symbol == 17) {
             const repeat_count = 11 + try br.readBits(7);
-            if (i == 0) return error.InvalidData;
+            if (i == 0) return error.DataFailure;
             const prev_len = code_lengths[i - 1];
             var j: u32 = 0;
             while (j < repeat_count and i < total_symbols) : (j += 1) {
@@ -227,7 +227,7 @@ fn readTables(st: *Unpacker) Failure!void {
                 i += 1;
             }
         } else {
-            return error.InvalidData;
+            return error.DataFailure;
         }
     }
 
@@ -252,17 +252,17 @@ fn parseFilterDescriptor(st: *Unpacker) Failure!void {
     const block_start = @as(usize, @intCast(st.window.write_pos)) +% block_start_delta;
 
     const block_length = try filters.readFilterSize(br);
-    if (block_length == 0) return error.InvalidData;
+    if (block_length == 0) return error.DataFailure;
 
     const raw_filter_type: u3 = @intCast(try br.readBits(3));
-    const filter_type = filters.filterTypeFromRaw(raw_filter_type) orelse return error.Unsupported;
+    const filter_type = filters.filterTypeFromRaw(raw_filter_type) orelse return error.UnsupportedFailure;
 
     var channels: u8 = 1;
     if (filter_type == .delta) {
         channels = @intCast((try br.readBits(5)) + 1);
     }
 
-    if (st.pending_count >= st.pending.len) return error.Unsupported;
+    if (st.pending_count >= st.pending.len) return error.UnsupportedFailure;
     st.pending[st.pending_count] = .{
         .filter_type = filter_type,
         .start = block_start,
@@ -295,14 +295,14 @@ fn flushDecoded(st: *Unpacker, limit: u64) Failure!void {
         // Nothing emittable while a filter's region is still decoding. Only a
         // filter larger than the window is fatal, and that is unverifiable rather than damaged.
         if (produced - st.flushed + max_lz_match >= st.window.buffer.len) {
-            return error.Unsupported;
+            return error.UnsupportedFailure;
         }
         return;
     }
 
     const count = emit_upto - st.flushed;
     const back = produced - st.flushed;
-    if (back > st.window.buffer.len) return error.InvalidData;
+    if (back > st.window.buffer.len) return error.DataFailure;
 
     // A filter starting BEFORE the flushed mark lost part of its region to an
     // earlier emit, so a stale assumption here fails as silent wrong output.
@@ -310,7 +310,7 @@ fn flushDecoded(st: *Unpacker, limit: u64) Failure!void {
         if (filter.length == 0) continue;
         const filter_start = filter.start - st.entry_start;
         if (filter_start < st.flushed and filter_start + filter.length > st.flushed) {
-            return error.InvalidData;
+            return error.DataFailure;
         }
     }
 
@@ -340,7 +340,7 @@ fn decodeBlock(st: *Unpacker, unpacked_size: u64) Failure!bool {
     const block_bit_size: u4 = @intCast((flags & 7) + 1);
     // The u8 annotation lets the value reach 4, which the next check rejects.
     const byte_count: u8 = @intCast(((flags >> 3) & 3) + 1);
-    if (byte_count == 4) return error.InvalidData;
+    if (byte_count == 4) return error.DataFailure;
     const is_last_block = (flags & 0x40) != 0;
     const table_present = (flags & 0x80) != 0;
 
@@ -353,12 +353,12 @@ fn decodeBlock(st: *Unpacker, unpacked_size: u64) Failure!bool {
     }
 
     const computed_checksum: u8 = 0x5a ^ flags ^ @as(u8, @truncate(block_size)) ^ @as(u8, @truncate(block_size >> 8)) ^ @as(u8, @truncate(block_size >> 16));
-    if (computed_checksum != saved_checksum) return error.InvalidData;
+    if (computed_checksum != saved_checksum) return error.DataFailure;
 
     const block_start_byte = br.bit_pos / 8;
 
     if (table_present) try readTables(st);
-    if (!st.tables_loaded) return error.InvalidData;
+    if (!st.tables_loaded) return error.DataFailure;
 
     const block_end_byte = block_start_byte + block_size;
 
@@ -385,7 +385,7 @@ fn decodeBlock(st: *Unpacker, unpacked_size: u64) Failure!bool {
         } else if (symbol == 256) {
             try parseFilterDescriptor(st);
         } else if (symbol == 257) {
-            if (st.last_length == 0) return error.InvalidData;
+            if (st.last_length == 0) return error.DataFailure;
             st.window.copyMatch(@intCast(st.prev_distances[0]), @intCast(st.last_length));
             st.written_size += st.last_length;
         } else if (symbol >= 258 and symbol <= 261) {
@@ -544,7 +544,7 @@ test "decodeLengthSlot: direct and extra-bit slots" {
     var br = BitReader.init(&data);
     try std.testing.expectEqual(@as(u32, 2), try decodeLengthSlot(&br, 0));
     try std.testing.expectEqual(@as(u32, 9), try decodeLengthSlot(&br, 7));
-    try std.testing.expectError(error.InvalidData, decodeLengthSlot(&br, 44));
+    try std.testing.expectError(error.DataFailure, decodeLengthSlot(&br, 44));
 }
 
 test "decodeDistance: slot 0 returns 1" {

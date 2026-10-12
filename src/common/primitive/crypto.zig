@@ -21,6 +21,7 @@ pub const Sha256 = sha256_seam.Sha256;
 
 pub const block_length = 16;
 pub const hmac_sha1_length = 20;
+pub const hmac_sha256_length = 32;
 pub const winzip_verify_length = 2;
 pub const winzip_hmac_length = 10;
 pub const seven_zip_key_length = 32;
@@ -35,8 +36,6 @@ pub const FailureCause = enum {
     password_lifetime,
     unsupported_algorithm,
 };
-
-pub const hmac_sha256_length = 32;
 
 pub fn hmacWith(comptime H: type, provider: Provider, out: *[H.mac_length]u8, message: []const u8, key: []const u8) void {
     var hmac = H.bind(provider, key);
@@ -57,7 +56,7 @@ pub fn winzipKeyLength(strength: u8) Failure!usize {
         1 => 16,
         2 => 24,
         3 => 32,
-        else => error.Unsupported,
+        else => error.UnsupportedFailure,
     };
 }
 
@@ -67,10 +66,9 @@ pub fn winzipSaltLength(strength: u8) Failure!usize {
 
 pub const Direction = enum { encrypt, decrypt };
 
-// 128- and 256-bit keys take the suite contexts; 192-bit keys take the
-// on-prem schedule, which std does not provide. The direction is a type
-// parameter rather than a runtime tag, so encrypting through a decrypt
-// context is a compile error instead of an unreachable arm.
+// 192-bit keys take the on-prem schedule, which std does not provide.
+// Direction is a type parameter: encrypting through a decrypt context is a
+// compile error, not an unreachable arm.
 fn BlockCipher(comptime S: type, comptime direction: Direction) type {
     const method = if (direction == .encrypt) "encrypt" else "decrypt";
     return union(enum) {
@@ -92,7 +90,7 @@ fn BlockCipher(comptime S: type, comptime direction: Direction) type {
                     .encrypt => S.Enc256.init(key[0..32].*),
                     .decrypt => S.Dec256.init(key[0..32].*),
                 } },
-                else => error.InvalidCall,
+                else => error.CallFailure,
             };
         }
 
@@ -121,15 +119,29 @@ fn assertFixed(provider: Provider) void {
     std.debug.assert(provider == default_provider);
 }
 
-fn aesBlock(comptime direction: Direction, provider: Provider, key: []const u8, block: [block_length]u8) Failure![block_length]u8 {
-    if (comptime options.aes_impl == .mergeable) {
+// Mergeable builds bind the provider tag per call; fixed builds assert it.
+// Every crypto entry point dispatches through this one shape.
+fn forBothArms(
+    comptime impl_flag: anytype,
+    provider: Provider,
+    comptime with: anytype,
+    comptime fixed: type,
+    comptime onprem: type,
+    comptime offprem: type,
+    args: anytype,
+) @TypeOf(@call(.auto, with, .{fixed} ++ args)) {
+    if (comptime impl_flag == .mergeable) {
         return switch (provider) {
-            .onprem => aesBlockWith(aes_seam.suite_onprem, direction, key, block),
-            .offprem => aesBlockWith(aes_seam.suite_offprem, direction, key, block),
+            .onprem => @call(.auto, with, .{onprem} ++ args),
+            .offprem => @call(.auto, with, .{offprem} ++ args),
         };
     }
     assertFixed(provider);
-    return aesBlockWith(aes_seam.suite, direction, key, block);
+    return @call(.auto, with, .{fixed} ++ args);
+}
+
+fn aesBlock(comptime direction: Direction, provider: Provider, key: []const u8, block: [block_length]u8) Failure![block_length]u8 {
+    return forBothArms(options.aes_impl, provider, aesBlockWith, aes_seam.suite, aes_seam.suite_onprem, aes_seam.suite_offprem, .{ direction, key, block });
 }
 
 pub fn aesEncryptBlock(provider: Provider, key: []const u8, block: [block_length]u8) Failure![block_length]u8 {
@@ -141,7 +153,7 @@ pub fn aesDecryptBlock(provider: Provider, key: []const u8, block: [block_length
 }
 
 fn winzipCtrWith(comptime S: type, key: []const u8, destination: []u8, source: []const u8) Failure!void {
-    if (destination.len < source.len) return error.InvalidCall;
+    if (destination.len < source.len) return error.CallFailure;
     const ctx = try BlockCipher(S, .encrypt).init(key);
     var counter: [block_length]u8 = @splat(0);
     counter[0] = 1;
@@ -175,24 +187,17 @@ fn winzipCtrWith(comptime S: type, key: []const u8, destination: []u8, source: [
             counter[byte_index] +%= 1;
             if (counter[byte_index] != 0) break;
         }
-        if (byte_index == 8) return error.ResourceLimit;
+        if (byte_index == 8) return error.ResourceFailure;
     }
 }
 
 pub fn winzipCtr(provider: Provider, key: []const u8, destination: []u8, source: []const u8) Failure!void {
-    if (comptime options.aes_impl == .mergeable) {
-        return switch (provider) {
-            .onprem => winzipCtrWith(aes_seam.suite_onprem, key, destination, source),
-            .offprem => winzipCtrWith(aes_seam.suite_offprem, key, destination, source),
-        };
-    }
-    assertFixed(provider);
-    return winzipCtrWith(aes_seam.suite, key, destination, source);
+    return forBothArms(options.aes_impl, provider, winzipCtrWith, aes_seam.suite, aes_seam.suite_onprem, aes_seam.suite_offprem, .{ key, destination, source });
 }
 
 // Operates on whole blocks only; the caller supplies the padding.
 fn aesCbcEncryptWith(comptime S: type, key: []const u8, iv: [block_length]u8, destination: []u8, source: []const u8) Failure!void {
-    if (source.len % block_length != 0 or destination.len < source.len) return error.InvalidCall;
+    if (source.len % block_length != 0 or destination.len < source.len) return error.CallFailure;
     const ctx = try BlockCipher(S, .encrypt).init(key);
     var previous = iv;
     var offset: usize = 0;
@@ -205,24 +210,15 @@ fn aesCbcEncryptWith(comptime S: type, key: []const u8, iv: [block_length]u8, de
     return;
 }
 
-fn aesCbc(comptime direction: Direction, provider: Provider, key: []const u8, iv: [block_length]u8, destination: []u8, source: []const u8) Failure!void {
-    if (comptime options.aes_impl == .mergeable) {
-        return switch (provider) {
-            .onprem => switch (direction) {
-                .encrypt => aesCbcEncryptWith(aes_seam.suite_onprem, key, iv, destination, source),
-                .decrypt => aesCbcDecryptWith(aes_seam.suite_onprem, key, iv, destination, source),
-            },
-            .offprem => switch (direction) {
-                .encrypt => aesCbcEncryptWith(aes_seam.suite_offprem, key, iv, destination, source),
-                .decrypt => aesCbcDecryptWith(aes_seam.suite_offprem, key, iv, destination, source),
-            },
-        };
-    }
-    assertFixed(provider);
+fn aesCbcWith(comptime S: type, comptime direction: Direction, key: []const u8, iv: [block_length]u8, destination: []u8, source: []const u8) Failure!void {
     return switch (direction) {
-        .encrypt => aesCbcEncryptWith(aes_seam.suite, key, iv, destination, source),
-        .decrypt => aesCbcDecryptWith(aes_seam.suite, key, iv, destination, source),
+        .encrypt => aesCbcEncryptWith(S, key, iv, destination, source),
+        .decrypt => aesCbcDecryptWith(S, key, iv, destination, source),
     };
+}
+
+fn aesCbc(comptime direction: Direction, provider: Provider, key: []const u8, iv: [block_length]u8, destination: []u8, source: []const u8) Failure!void {
+    return forBothArms(options.aes_impl, provider, aesCbcWith, aes_seam.suite, aes_seam.suite_onprem, aes_seam.suite_offprem, .{ direction, key, iv, destination, source });
 }
 
 pub fn aesCbcEncrypt(provider: Provider, key: []const u8, iv: [block_length]u8, destination: []u8, source: []const u8) Failure!void {
@@ -230,7 +226,7 @@ pub fn aesCbcEncrypt(provider: Provider, key: []const u8, iv: [block_length]u8, 
 }
 
 fn aesCbcDecryptWith(comptime S: type, key: []const u8, iv: [block_length]u8, destination: []u8, source: []const u8) Failure!void {
-    if (source.len % block_length != 0 or destination.len < source.len) return error.InvalidCall;
+    if (source.len % block_length != 0 or destination.len < source.len) return error.CallFailure;
     const ctx = try BlockCipher(S, .decrypt).init(key);
     var previous = iv;
     var offset: usize = 0;
@@ -265,8 +261,8 @@ pub fn aesCbcDecrypt(provider: Provider, key: []const u8, iv: [block_length]u8, 
 }
 
 pub fn winzipDeriveKey(provider: Provider, password: []const u8, salt: []const u8, key_length: usize, out: []u8) Failure!void {
-    const derived_length = std.math.add(usize, 2 * key_length, winzip_verify_length) catch return error.ResourceLimit;
-    if (out.len < derived_length) return error.InvalidCall;
+    const derived_length = std.math.add(usize, 2 * key_length, winzip_verify_length) catch return error.ResourceFailure;
+    if (out.len < derived_length) return error.CallFailure;
     try pbkdf2HmacSha1(provider, out[0..derived_length], password, salt, @intCast(winzip_pbkdf2_rounds));
     return;
 }
@@ -286,14 +282,7 @@ fn sevenZipKdfWith(comptime Sha: type, password_utf16: []const u8, salt: []const
 }
 
 pub fn sevenZipKdf(provider: Provider, password_utf16: []const u8, salt: []const u8, num_cycles_power: u8, out_key: *[seven_zip_key_length]u8) void {
-    if (comptime options.sha256_impl == .mergeable) {
-        return switch (provider) {
-            .onprem => sevenZipKdfWith(sha256_seam.Onprem, password_utf16, salt, num_cycles_power, out_key),
-            .offprem => sevenZipKdfWith(sha256_seam.Offprem, password_utf16, salt, num_cycles_power, out_key),
-        };
-    }
-    assertFixed(provider);
-    return sevenZipKdfWith(sha256_seam.Sha256, password_utf16, salt, num_cycles_power, out_key);
+    return forBothArms(options.sha256_impl, provider, sevenZipKdfWith, sha256_seam.Sha256, sha256_seam.Onprem, sha256_seam.Offprem, .{ password_utf16, salt, num_cycles_power, out_key });
 }
 
 pub fn pbkdf2HmacSha1(provider: Provider, out: []u8, password: []const u8, salt: []const u8, rounds: u32) Failure!void {
@@ -306,8 +295,8 @@ pub fn pbkdf2HmacSha256(provider: Provider, out: []u8, password: []const u8, sal
 
 fn pbkdf2Hmac(comptime PrfOnprem: type, comptime PrfOffprem: type, provider: Provider, out: []u8, password: []const u8, salt: []const u8, rounds: u32) Failure!void {
     pbkdf2_seam.pbkdf2(PrfOnprem, PrfOffprem, provider, out, password, salt, rounds) catch |err| switch (err) {
-        error.WeakParameters => return error.InvalidCall,
-        error.OutputTooLong => return error.ResourceLimit,
+        error.WeakParameters => return error.CallFailure,
+        error.OutputTooLong => return error.ResourceFailure,
     };
 }
 
@@ -340,7 +329,7 @@ pub fn fillRandom(bytes: []u8) Failure!void {
         }
         return;
     }
-    return error.Unsupported;
+    return error.UnsupportedFailure;
 }
 
 // ZipCrypto (PKWARE traditional cipher). No std equivalent exists; the key
