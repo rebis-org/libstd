@@ -1,5 +1,3 @@
-pub const max_distance: u8 = 255;
-
 pub const Direction = enum { encode, decode };
 
 fn apply(code: []u8, distance: u8, comptime dir: Direction) void {

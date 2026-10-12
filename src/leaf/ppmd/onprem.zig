@@ -1,8 +1,8 @@
 const std = @import("std");
 
-const failure_prim = @import("../common/primitive/failure.zig");
-const io = @import("../common/primitive/io.zig");
-const measurement = @import("../common/primitive/measurement.zig");
+const failure_prim = @import("../../common/primitive/failure.zig");
+const io = @import("../../common/primitive/io.zig");
+const measurement = @import("../../common/primitive/measurement.zig");
 
 const Failure = failure_prim.Failure;
 
@@ -64,7 +64,7 @@ pub const encodeWorkspaceSize = decodeWorkspaceSize;
 pub fn requiredSize(input: []const u8, scratch: []u8, options: Options) Failure!usize {
     var counter = measurement.Counter.init(null);
     try encodeToWriter(input, &counter.writer, scratch, options);
-    return std.math.cast(usize, counter.written()) orelse error.ResourceLimit;
+    return measurement.measuredLength(&counter);
 }
 
 pub fn encode(input: []const u8, output: []u8, scratch: []u8, options: Options) Failure!usize {

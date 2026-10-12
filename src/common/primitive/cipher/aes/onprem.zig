@@ -571,7 +571,7 @@ pub const Aes192Hw = struct {
         dst.* = t.toBytes();
     }
 
-    pub fn encryptBlock(self: Aes192Hw, dst: *[block_length]u8, src: *const [block_length]u8) void {
+    pub fn encrypt(self: Aes192Hw, dst: *[block_length]u8, src: *const [block_length]u8) void {
         cryptBlock(self, dst, src, .encrypt);
     }
 
@@ -597,7 +597,7 @@ pub const Aes192Hw = struct {
         dst[48..64].* = b3.toBytes();
     }
 
-    pub fn decryptBlock(self: Aes192Hw, dst: *[block_length]u8, src: *const [block_length]u8) void {
+    pub fn decrypt(self: Aes192Hw, dst: *[block_length]u8, src: *const [block_length]u8) void {
         cryptBlock(self, dst, src, .decrypt);
     }
 
@@ -850,10 +850,10 @@ test "aes onprem matches the std oracle" {
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0x8e, 0xa2, 0xb7, 0xca, 0x51, 0x67, 0x45, 0xbf, 0xea, 0xfc, 0x49, 0x90, 0x4b, 0x49, 0x60, 0x89 }, &out);
 
     const ours192 = Aes192Hw.initEnc(key192);
-    ours192.encryptBlock(&out, &pt);
+    ours192.encrypt(&out, &pt);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0xdd, 0xa9, 0x7c, 0xa4, 0x86, 0x4c, 0xdf, 0xe0, 0x6e, 0xaf, 0x70, 0xa0, 0xec, 0x0d, 0x71, 0x91 }, &out);
     const dec192 = Aes192Hw.initDec(key192);
-    dec192.decryptBlock(&back, &out);
+    dec192.decrypt(&back, &out);
     try std.testing.expectEqualSlices(u8, &pt, &back);
 }
 

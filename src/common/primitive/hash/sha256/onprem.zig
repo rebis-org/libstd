@@ -78,7 +78,6 @@ fn compressScalar(state: *align(16) [8]u32, block: *const [64]u8) void {
     state[7] +%= h;
 }
 
-// sha256h/h2 carry a full round each; su0/su1 build the message schedule.
 fn compressAarch64(state: *align(16) [8]u32, w: *align(16) [64]u32) void {
     const V4u32 = @Vector(4, u32);
     var x: V4u32 = state[0..4].*;

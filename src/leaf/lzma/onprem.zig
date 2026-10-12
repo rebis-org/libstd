@@ -1,9 +1,9 @@
 const std = @import("std");
 
-const kernels = @import("../common/kernels.zig");
-const failure_prim = @import("../common/primitive/failure.zig");
-const io = @import("../common/primitive/io.zig");
-const measurement = @import("../common/primitive/measurement.zig");
+const kernels = @import("../../common/kernels.zig");
+const failure_prim = @import("../../common/primitive/failure.zig");
+const io = @import("../../common/primitive/io.zig");
+const measurement = @import("../../common/primitive/measurement.zig");
 
 const Failure = failure_prim.Failure;
 
@@ -1324,7 +1324,7 @@ pub fn decodeStream(reader: *std.Io.Reader, writer: *std.Io.Writer, scratch: []u
 pub fn requiredSize(input: []const u8, scratch: []u8, options: Options) Failure!usize {
     var counter = measurement.Counter.init(null);
     try encodeInner(input, &counter.writer, scratch, options);
-    return std.math.cast(usize, counter.written()) orelse error.ResourceLimit;
+    return measurement.measuredLength(&counter);
 }
 
 // Greedy live-model pass for the LZMA2 probe. The dictionary clamps to the chunk size so clears scale with the chunk.

@@ -2,11 +2,12 @@ const std = @import("std");
 
 const bounds = @import("../common/primitive/bounds.zig");
 const crypto = @import("../common/primitive/crypto.zig");
-const rar = @import("../grammar/rar.zig");
+const rar = @import("../grammar/rar/onprem.zig");
 const rar_writer = @import("../grammar/rar/writer.zig");
-const seven_zip = @import("../grammar/sevenzip.zig");
-const tar = @import("../grammar/tar.zig");
-const zip = @import("../grammar/zip.zig");
+const seven_zip = @import("../grammar/sevenzip/onprem.zig");
+const tar = @import("../grammar/tar/onprem.zig");
+const tar_seam = @import("../grammar/tar/seam.zig");
+const zip = @import("../grammar/zip/onprem.zig");
 const kernel_catalog = @import("../kernel/catalog.zig");
 const discovery = @import("../kernel/discovery.zig");
 const abi = @import("../kernel/envelope.zig");
@@ -33,11 +34,6 @@ fn requireTentative(commit: vocabulary.CommitMode) Failure!void {
 
 fn requireVerified(commit: vocabulary.CommitMode) Failure!void {
     return requireCommit(commit, .confirmed);
-}
-
-fn requireSink(sink: *Resource, call: *Call, size: usize) Failure!void {
-    if (!sink.hasCapability(resource.capability_bit_write)) return error.Unsupported;
-    try common.requireSinkCapacity(sink, call, size);
 }
 
 fn archiveOrdinal(request: ?*Node) u64 {
@@ -162,7 +158,7 @@ pub fn tarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
     if (command_mask == vocabulary.command_mask_read) {
         if (sink == null) {
             const archive = try materializeArchive(source_resource, &workspace, limits);
-            const count = try tar.inspectCount(archive);
+            const count = try tar_seam.inspectCount(plan.provider, archive);
             response.byte_length = count;
             return;
         }
@@ -170,17 +166,17 @@ pub fn tarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
         const sink_resource = sink.?;
         const ordinal = archiveOrdinal(call.request);
         const archive = try materializeArchive(source_resource, &workspace, limits);
-        const entry = try tar.inspectOrdinal(archive, ordinal);
+        const entry = try tar_seam.inspectOrdinal(plan.provider, archive, ordinal);
         const size = std.math.cast(usize, entry.size) orelse return error.ResourceLimit;
         if (size > limits.decoded_bytes) return error.ResourceLimit;
         try common.requireSinkCapacity(sink_resource, call, size);
         if (sink_resource.kind == .direct_write) {
             const output = try common.sinkDirectBuffer(sink_resource, size);
-            _ = try tar.decodeOrdinal(archive, ordinal, output);
+            _ = try tar_seam.decodeOrdinal(plan.provider, archive, ordinal, output);
         } else {
             if (entry.sparse != null) {
                 const staged = try workspace.take(u8, size);
-                _ = try tar.decodeOrdinal(archive, ordinal, staged);
+                _ = try tar_seam.decodeOrdinal(plan.provider, archive, ordinal, staged);
                 try common.commitBytesToSink(sink_resource, call, staged);
             } else {
                 const data = try bounds.slice(archive, entry.data_offset, entry.size);
@@ -191,7 +187,7 @@ pub fn tarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
     } else if (command_mask == vocabulary.command_mask_write) {
         try requireVerified(commit);
         const entries = try collectEntries(tar.Entry, call.request, &workspace, NoCtx{}, fillTarEntry);
-        const required = try tar.archiveSize(entries);
+        const required = try tar_seam.archiveSize(plan.provider, entries);
         if (sink == null) {
             response.byte_length = required;
             return;
@@ -201,11 +197,11 @@ pub fn tarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
         const scratch = try workspace.take(u8, tar.scratch_size);
         if (sink_resource.kind == .direct_write) {
             const output = try common.sinkDirectBuffer(sink_resource, required);
-            const written = try tar.encode(entries, output, scratch);
+            const written = try tar_seam.encode(plan.provider, entries, output, scratch);
             response.byte_length = written;
         } else {
             const staging = try workspace.take(u8, required);
-            const written = try tar.encode(entries, staging, scratch);
+            const written = try tar_seam.encode(plan.provider, entries, staging, scratch);
             try common.commitBytesToSink(sink_resource, call, staging[0..written]);
             response.byte_length = written;
         }

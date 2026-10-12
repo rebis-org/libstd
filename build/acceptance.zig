@@ -80,7 +80,7 @@ fn makeModule(b: *std.Build, root: []const u8, target: std.Build.ResolvedTarget,
 
 fn skipVariantHostLibraries(b: *std.Build, ctx: *const common.Settings) common.HostLibraries {
     const skip_options = b.addOptions();
-    skip_options.addOption(bool, "portable", ctx.portable);
+    common.putUniformOptions(skip_options, .onprem, ctx.portable);
     return common.addHostLibrariesWithOptions(b, ctx.target, ctx.optimize, ctx.portable, skip_options.createModule(), ctx.sanitize_c);
 }
 

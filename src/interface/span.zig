@@ -4,7 +4,7 @@ pub const Failure = error{ InvalidCall, ResourceLimit, InsufficientCapacity, Inv
 
 pub const Violation = enum { out_of_bounds, use_after_free, lease_violation, overlap };
 
-var empty_storage: [1]u8 = .{0};
+const empty_storage: [1]u8 = .{0};
 
 // Contract violations trap: out-of-provenance access is a bug, never a survivable condition.
 pub fn trap(violation: Violation, context: []const u8) noreturn {
@@ -75,7 +75,9 @@ fn SpanFor(comptime Pointer: type) type {
 
 fn spanFrom(comptime Pointer: type, base: ?Pointer, length: u64) Failure!SpanFor(Pointer) {
     const count = std.math.cast(usize, length) orelse return error.ResourceLimit;
-    if (count == 0) return .{ .ptr = &empty_storage, .len = 0 };
+    // A zero length never dereferences the pointer, so the immutable empty
+    // storage stands in for the null a caller may legitimately pass.
+    if (count == 0) return .{ .ptr = @constCast(&empty_storage), .len = 0 };
     const live = base orelse return error.InvalidCall;
     return .{ .ptr = live, .len = count };
 }

@@ -63,6 +63,26 @@ pub const HostLibraries = struct {
     dynamic_library: *std.Build.Step.Compile,
 };
 
+pub const Implementation = enum { onprem, offprem, mergeable };
+pub const capabilities = .{ "sha256", "sha1", "hmac", "pbkdf2", "adler32", "xxh32", "xxh64", "aes", "crc32", "crc64xz", "bzip2crc32" };
+
+pub fn putCapability(options: *std.Build.Step.Options, comptime capability: []const u8, selected: Implementation, portable_flag: bool) void {
+    options.addOption(Implementation, capability ++ "_impl", selected);
+    options.addOption(bool, capability ++ "_portable", portable_flag);
+}
+
+// Every key `@import("options")` resolves anywhere in the tree. A build that
+// compiles the library against a second options module has to declare the whole
+// surface, not the subset that variant happens to vary, so this is the one
+// place the list lives.
+pub fn putUniformOptions(options: *std.Build.Step.Options, impl: Implementation, portable_flag: bool) void {
+    options.addOption(bool, "portable", portable_flag);
+    options.addOption(Implementation, "primitives_impl", impl);
+    options.addOption(Implementation, "leaf_impl", impl);
+    options.addOption(Implementation, "grammar_impl", impl);
+    inline for (capabilities) |capability| putCapability(options, capability, impl, portable_flag);
+}
+
 pub const Settings = struct {
     target: std.Build.ResolvedTarget,
     optimize: std.lang.Optimize,

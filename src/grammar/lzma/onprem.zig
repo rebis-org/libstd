@@ -1,10 +1,11 @@
 const std = @import("std");
 
-const bounds = @import("../common/primitive/bounds.zig");
-const failure_prim = @import("../common/primitive/failure.zig");
-const io = @import("../common/primitive/io.zig");
-const measurement = @import("../common/primitive/measurement.zig");
-const lzma = @import("../leaf/lzma.zig");
+const bounds = @import("../../common/primitive/bounds.zig");
+const failure_prim = @import("../../common/primitive/failure.zig");
+const io = @import("../../common/primitive/io.zig");
+const measurement = @import("../../common/primitive/measurement.zig");
+const lzma = @import("../../leaf/lzma/onprem.zig");
+const lzma_seam = @import("../../leaf/lzma/seam.zig");
 
 const Failure = failure_prim.Failure;
 
@@ -59,31 +60,31 @@ pub fn encode(input: []const u8, output: []u8, scratch: []u8, options: lzma.Opti
 pub fn requiredSize(input: []const u8, scratch: []u8, options: lzma.Options) Failure!usize {
     var counter = measurement.Counter.init(null);
     try encodeToWriter(input, &counter.writer, scratch, options);
-    return std.math.cast(usize, counter.written()) orelse error.ResourceLimit;
+    return measurement.measuredLength(&counter);
 }
 
 pub fn encodedSizeBound(input_len: usize) usize {
     return lzma.encodedSizeBound(input_len) +| header_size;
 }
 
-pub fn decodedSize(input: []const u8, scratch: []u8) Failure!usize {
+pub fn decodedSize(input: []const u8, scratch: []u8, provider: lzma_seam.Provider) Failure!usize {
     const options = try decodeOptions(input);
-    return lzma.decodedSize(input[header_size..], scratch, options);
+    return lzma_seam.decodedSize(provider, input[header_size..], scratch, options);
 }
 
-pub fn decode(input: []const u8, output: []u8, scratch: []u8) Failure!usize {
+pub fn decode(input: []const u8, output: []u8, scratch: []u8, provider: lzma_seam.Provider) Failure!usize {
     const options = try decodeOptions(input);
-    return lzma.decode(input[header_size..], output, scratch, options);
+    return lzma_seam.decode(provider, input[header_size..], output, scratch, options);
 }
 
-pub fn decodeInPlace(input: []const u8, output: []u8, scratch: []u8) Failure!usize {
+pub fn decodeInPlace(input: []const u8, output: []u8, scratch: []u8, provider: lzma_seam.Provider) Failure!usize {
     const options = try decodeOptions(input);
-    return lzma.decodeInPlace(input[header_size..], output, scratch, options);
+    return lzma_seam.decodeInPlace(provider, input[header_size..], output, scratch, options);
 }
 
-pub fn decodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8) Failure!void {
+pub fn decodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, provider: lzma_seam.Provider) Failure!void {
     const options = try decodeOptions(input);
-    return lzma.decodeToWriter(input[header_size..], writer, scratch, options);
+    return lzma_seam.decodeToWriter(provider, input[header_size..], writer, scratch, options);
 }
 
 test "lzma file container round trip restores the original input" {
@@ -108,7 +109,7 @@ test "lzma file container round trip restores the original input" {
     try std.testing.expect(!header.marker_required);
     const decoded = try std.testing.allocator.alloc(u8, input.len);
     defer std.testing.allocator.free(decoded);
-    const produced = try decode(encoded[0..encoded_len], decoded, scratch);
+    const produced = try decode(encoded[0..encoded_len], decoded, scratch, lzma_seam.default_provider);
     try std.testing.expectEqualSlices(u8, &input, decoded[0..produced]);
 }
 

@@ -1,17 +1,14 @@
 const std = @import("std");
 
-const bounds = @import("../common/primitive/bounds.zig");
-const checksum = @import("../common/primitive/checksum.zig");
-const failure_prim = @import("../common/primitive/failure.zig");
-const measurement = @import("../common/primitive/measurement.zig");
-const zstd = @import("../leaf/zstd.zig");
+const bounds = @import("../../common/primitive/bounds.zig");
+const checksum = @import("../../common/primitive/checksum.zig");
+const failure_prim = @import("../../common/primitive/failure.zig");
+const measurement = @import("../../common/primitive/measurement.zig");
+const zstd = @import("../../leaf/zstd/onprem.zig");
 
 const Failure = failure_prim.Failure;
 pub const frame_size_max: u32 = zstd.encoder_frame_size_max;
 pub const frame_size_min: u32 = zstd.window_size_min;
-
-// Seekable format: independent frames plus a trailing skippable seek table.
-// Frame magic first, footer magic last.
 
 const frame_magic: u32 = 0xFD2FB528;
 const skippable_magic: u32 = 0x184D2A5E;
@@ -90,7 +87,7 @@ pub fn decodedSize(input: []const u8, history: []u8, options: Options) Failure!u
     _ = try inspect(input);
     var counter = measurement.Counter.init(null);
     try decode(input, &counter.writer, history, options);
-    return std.math.cast(usize, counter.written()) orelse error.ResourceLimit;
+    return measurement.measuredLength(&counter);
 }
 
 pub const FrameEntry = struct { compressed_size: u32, decompressed_size: u32 };

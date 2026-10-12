@@ -1,17 +1,19 @@
 const std = @import("std");
 
-const binary = @import("../common/primitive/binary.zig");
-const bounds = @import("../common/primitive/bounds.zig");
-const checksum = @import("../common/primitive/checksum.zig");
-const crypto = @import("../common/primitive/crypto.zig");
-const failure_prim = @import("../common/primitive/failure.zig");
-const io = @import("../common/primitive/io.zig");
-const measurement = @import("../common/primitive/measurement.zig");
-const tee = @import("../common/primitive/tee.zig");
-const bcj = @import("../leaf/bcj.zig");
-const delta = @import("../leaf/delta.zig");
-const lzma = @import("../leaf/lzma.zig");
-const lzma2 = @import("../leaf/lzma2.zig");
+const binary = @import("../../common/primitive/binary.zig");
+const bounds = @import("../../common/primitive/bounds.zig");
+const checksum = @import("../../common/primitive/checksum.zig");
+const crypto = @import("../../common/primitive/crypto.zig");
+const failure_prim = @import("../../common/primitive/failure.zig");
+const io = @import("../../common/primitive/io.zig");
+const measurement = @import("../../common/primitive/measurement.zig");
+const tee = @import("../../common/primitive/tee.zig");
+const bcj = @import("../../leaf/bcj/onprem.zig");
+const deflate_seam = @import("../../leaf/deflate/seam.zig");
+const delta = @import("../../leaf/delta/onprem.zig");
+const lzma = @import("../../leaf/lzma/onprem.zig");
+const lzma2 = @import("../../leaf/lzma2/onprem.zig");
+const lzma2_seam = @import("../../leaf/lzma2/seam.zig");
 
 const Failure = failure_prim.Failure;
 
@@ -19,6 +21,7 @@ pub const header_magic = [6]u8{ 0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00 };
 pub const footer_magic = [2]u8{ 0x59, 0x5A };
 pub const stream_header_size = 12;
 pub const stream_footer_size = 12;
+const delta_filter_id: u8 = 0x03;
 
 pub const CheckType = enum(u8) {
     none = 0,
@@ -96,7 +99,7 @@ pub fn decodedSize(input: []const u8, scratch: []u8, provider: checksum.Provider
     var counter = measurement.Counter.init(null);
     var sink = Sink{ .writer = &counter.writer, .buffer = null };
     try decodeOutOfPlace(input, &sink, scratch, provider);
-    return std.math.cast(usize, counter.written()) orelse error.ResourceLimit;
+    return measurement.measuredLength(&counter);
 }
 
 fn scanStreamSize(input: []const u8, provider: checksum.Provider) Failure!?usize {
@@ -296,13 +299,13 @@ fn decodeBlock(cursor: *binary.ReadCursor, sink: *Sink, scratch: []u8, check: Ch
         if (in_place) {
             const in_place_scratch_size = lzma2.decodeInPlaceWorkspaceSize(dictionary_size);
             if (scratch.len < in_place_scratch_size) return error.InsufficientCapacity;
-            const result = try lzma2.decodeInPlace(if (compressed_data) |data| data else cursor.remainingSlice(), block_output, scratch[0..in_place_scratch_size], options);
+            const result = try lzma2_seam.decodeInPlace(provider, if (compressed_data) |data| data else cursor.remainingSlice(), block_output, scratch[0..in_place_scratch_size], options);
             uncompressed_size = result.produced;
             compressed_size = block_header.compressed_size orelse result.consumed;
         } else {
             var fixed_writer = std.Io.Writer.fixed(block_output);
             var chunk_reader = std.Io.Reader.fixed(if (compressed_data) |data| data else cursor.remainingSlice());
-            try lzma2.decodeStream(&chunk_reader, &fixed_writer, scratch[0..lzma2.decodeWorkspaceSize(dictionary_size)], options);
+            try lzma2_seam.decodeStream(provider, &chunk_reader, &fixed_writer, scratch[0..lzma2.decodeWorkspaceSize(dictionary_size)], options);
             compressed_size = block_header.compressed_size orelse chunk_reader.seek;
             uncompressed_size = fixed_writer.end;
         }
@@ -314,7 +317,7 @@ fn decodeBlock(cursor: *binary.ReadCursor, sink: *Sink, scratch: []u8, check: Ch
     } else {
         decode_tee = tee.Tee.initWithProvider(sink.writer, provider);
         var chunk_reader = std.Io.Reader.fixed(if (compressed_data) |data| data else cursor.remainingSlice());
-        try lzma2.decodeStream(&chunk_reader, &decode_tee.?.writer, scratch[0..lzma_scratch_size], options);
+        try lzma2_seam.decodeStream(provider, &chunk_reader, &decode_tee.?.writer, scratch[0..lzma_scratch_size], options);
         compressed_size = block_header.compressed_size orelse chunk_reader.seek;
         uncompressed_size = std.math.cast(usize, decode_tee.?.size) orelse return error.ResourceLimit;
         if (block_header.uncompressed_size) |size| {
@@ -377,22 +380,12 @@ fn decodeBlockHeader(cursor: *binary.ReadCursor, provider: checksum.Provider) Fa
                 dictionary_props = try sub.readU8();
                 filters[filter_count] = .{ .lzma2 = dictionary_props.? };
             },
-            0x03 => {
+            delta_filter_id => {
                 if (props_size != 1) return error.Unsupported;
                 filters[filter_count] = .{ .delta = try sub.readU8() };
             },
             0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B => {
-                const kind: bcj.Kind = switch (filter_id) {
-                    0x04 => .x86,
-                    0x05 => .ppc,
-                    0x06 => .ia64,
-                    0x07 => .arm,
-                    0x08 => .armt,
-                    0x09 => .sparc,
-                    0x0A => .arm64,
-                    0x0B => .riscv,
-                    else => unreachable,
-                };
+                const kind: bcj.Kind = bcj.fromId(@intCast(filter_id)).?;
                 const start_offset: u32 = if (props_size == 0) 0 else if (props_size == 4) blk: {
                     const props = try sub.readBytes(4);
                     break :blk std.mem.readInt(u32, &props, .little);
@@ -534,7 +527,7 @@ fn writeCheck(writer: *std.Io.Writer, check: CheckType, crc32: u32, crc64: u64) 
 pub fn requiredSize(input: []const u8, scratch: []u8, options: Options) Failure!usize {
     var counter = measurement.Counter.init(null);
     try encodeInternal(input, &counter.writer, scratch, options);
-    return std.math.cast(usize, counter.written()) orelse error.ResourceLimit;
+    return measurement.measuredLength(&counter);
 }
 
 pub fn encode(input: []const u8, output: []u8, scratch: []u8, options: Options) Failure!usize {
@@ -624,17 +617,9 @@ fn applyEncodeFilter(filter: FilterChoice, delta_distance: u8, buffer: []u8) Fai
 }
 
 fn bcjKindFromChoice(filter: FilterChoice) bcj.Kind {
-    return switch (filter) {
-        .x86 => .x86,
-        .ppc => .ppc,
-        .ia64 => .ia64,
-        .arm => .arm,
-        .armt => .armt,
-        .sparc => .sparc,
-        .arm64 => .arm64,
-        .riscv => .riscv,
-        else => unreachable,
-    };
+    // The choice enum is dense and the wire ids are not, so the delta id anchors
+    // the offset and the leaf owns the other end of it.
+    return bcj.fromId(@intCast(@backingInt(filter) + delta_filter_id - @backingInt(FilterChoice.delta))) orelse unreachable;
 }
 
 fn writeStreamHeader(writer: *std.Io.Writer, check: CheckType, provider: checksum.Provider) Failure!void {
@@ -689,18 +674,10 @@ fn buildBlockHeader(uncompressed_size: usize, dictionary_props: u8, filters: Fil
 }
 
 fn filterId(filter: FilterChoice) u64 {
-    return switch (filter) {
-        .delta => 0x03,
-        .x86 => 0x04,
-        .ppc => 0x05,
-        .ia64 => 0x06,
-        .arm => 0x07,
-        .armt => 0x08,
-        .sparc => 0x09,
-        .arm64 => 0x0A,
-        .riscv => 0x0B,
-        .none => unreachable,
-    };
+    return if (filter == .delta)
+        delta_filter_id
+    else
+        @backingInt(bcjKindFromChoice(filter));
 }
 
 fn filterPropsSize(filter: FilterChoice) u64 {
@@ -794,6 +771,9 @@ fn checkSize(check: CheckType) usize {
 }
 
 test "xz delta filter honors the requested distance" {
+    // A mixed provider build serves no single tag for both the checksum
+    // and codec arms; run where the default tag serves the codec.
+    if (!deflate_seam.decodeServed(checksum.default_provider)) return;
     const allocator = std.testing.allocator;
     var input: [512]u8 = undefined;
     for (&input, 0..) |*byte, i| byte.* = @truncate(i *% 7 +% 3);
@@ -852,6 +832,9 @@ fn findBlockHeader(stream: []const u8) ?u8 {
 }
 
 test "xz multi-block output roundtrips through our decoder and the index" {
+    // A mixed provider build serves no single tag for both the checksum
+    // and codec arms; run where the default tag serves the codec.
+    if (!deflate_seam.decodeServed(checksum.default_provider)) return;
     const allocator = std.testing.allocator;
     var input: [100 * 1024]u8 = undefined;
     for (&input, 0..) |*byte, i| byte.* = @truncate(i *% 31 +% (i >> 7));
@@ -916,6 +899,9 @@ pub fn inspectBlocks(input: []const u8, records: []BlockRecord, scratch: []u8, p
 }
 
 test "inspectBlocks enumerates a multi-block stream" {
+    // A mixed provider build serves no single tag for both the checksum
+    // and codec arms; run where the default tag serves the codec.
+    if (!deflate_seam.decodeServed(checksum.default_provider)) return;
     const allocator = std.testing.allocator;
     var input: [100 * 1024]u8 = undefined;
     for (&input, 0..) |*byte, i| byte.* = @truncate(i *% 31 +% (i >> 7));

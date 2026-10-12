@@ -39,7 +39,6 @@ pub fn isServed(provider: Provider) bool {
     };
 }
 
-// Both providers of one capability contract, bound per context at runtime.
 pub fn Pair(comptime On: type, comptime Off: type) type {
     return union(Provider) {
         onprem: On,
@@ -335,70 +334,6 @@ fn MergeableMac(comptime On: type, comptime Off: type) type {
         pub fn finalResult(self: *@This()) [mac_length]u8 {
             switch (self.state) {
                 inline else => |*inner| return inner.finalResult(),
-            }
-        }
-    };
-}
-
-pub fn CipherCtx(comptime mode: Mode, comptime On: type, comptime Off: type) type {
-    return switch (mode) {
-        .onprem => FixedCipherCtx(.onprem, On),
-        .offprem => FixedCipherCtx(.offprem, Off),
-        .mergeable => MergeableCipherCtx(On, Off),
-    };
-}
-
-fn FixedCipherCtx(comptime tag: Provider, comptime Impl: type) type {
-    return struct {
-        inner: Impl,
-
-        pub const Key = hashSeed(Impl);
-
-        pub fn init(key: Key) @This() {
-            return .{ .inner = Impl.init(key) };
-        }
-
-        pub fn bind(provider: Provider, key: Key) @This() {
-            std.debug.assert(provider == tag);
-            return init(key);
-        }
-
-        pub fn encrypt(self: @This(), dst: *[16]u8, src: *const [16]u8) void {
-            self.inner.encrypt(dst, src);
-        }
-
-        pub fn decrypt(self: @This(), dst: *[16]u8, src: *const [16]u8) void {
-            self.inner.decrypt(dst, src);
-        }
-    };
-}
-
-fn MergeableCipherCtx(comptime On: type, comptime Off: type) type {
-    return struct {
-        state: Pair(On, Off),
-
-        pub const Key = hashSeed(On);
-
-        pub fn init(key: Key) @This() {
-            return bind(default_provider, key);
-        }
-
-        pub fn bind(provider: Provider, key: Key) @This() {
-            return switch (provider) {
-                .onprem => .{ .state = .{ .onprem = On.init(key) } },
-                .offprem => .{ .state = .{ .offprem = Off.init(key) } },
-            };
-        }
-
-        pub fn encrypt(self: @This(), dst: *[16]u8, src: *const [16]u8) void {
-            switch (self.state) {
-                inline else => |inner| inner.encrypt(dst, src),
-            }
-        }
-
-        pub fn decrypt(self: @This(), dst: *[16]u8, src: *const [16]u8) void {
-            switch (self.state) {
-                inline else => |inner| inner.decrypt(dst, src),
             }
         }
     };

@@ -65,63 +65,55 @@ pub fn winzipSaltLength(strength: u8) Failure!usize {
     return (try winzipKeyLength(strength)) / 2;
 }
 
+pub const Direction = enum { encrypt, decrypt };
+
 // 128- and 256-bit keys take the suite contexts; 192-bit keys take the
-// on-prem schedule, which std does not provide.
-fn BlockCipher(comptime S: type) type {
+// on-prem schedule, which std does not provide. The direction is a type
+// parameter rather than a runtime tag, so encrypting through a decrypt
+// context is a compile error instead of an unreachable arm.
+fn BlockCipher(comptime S: type, comptime direction: Direction) type {
+    const method = if (direction == .encrypt) "encrypt" else "decrypt";
     return union(enum) {
-        enc128: S.Enc128,
-        dec128: S.Dec128,
-        enc256: S.Enc256,
-        dec256: S.Dec256,
-        hw192_enc: aes_seam.Aes192Hw,
-        hw192_dec: aes_seam.Aes192Hw,
+        bits128: if (direction == .encrypt) S.Enc128 else S.Dec128,
+        bits192: aes_seam.Aes192Hw,
+        bits256: if (direction == .encrypt) S.Enc256 else S.Dec256,
 
-        pub const Direction = enum { encrypt, decrypt };
-
-        fn init(key: []const u8, comptime direction: Direction) Failure!@This() {
-            return switch (direction) {
-                .encrypt => switch (key.len) {
-                    16 => .{ .enc128 = S.Enc128.init(key[0..16].*) },
-                    24 => .{ .hw192_enc = aes_seam.Aes192Hw.initEnc(key[0..24].*) },
-                    32 => .{ .enc256 = S.Enc256.init(key[0..32].*) },
-                    else => error.InvalidCall,
-                },
-                .decrypt => switch (key.len) {
-                    16 => .{ .dec128 = S.Dec128.init(key[0..16].*) },
-                    24 => .{ .hw192_dec = aes_seam.Aes192Hw.initDec(key[0..24].*) },
-                    32 => .{ .dec256 = S.Dec256.init(key[0..32].*) },
-                    else => error.InvalidCall,
-                },
+        fn init(key: []const u8) Failure!@This() {
+            return switch (key.len) {
+                16 => .{ .bits128 = switch (direction) {
+                    .encrypt => S.Enc128.init(key[0..16].*),
+                    .decrypt => S.Dec128.init(key[0..16].*),
+                } },
+                24 => .{ .bits192 = switch (direction) {
+                    .encrypt => aes_seam.Aes192Hw.initEnc(key[0..24].*),
+                    .decrypt => aes_seam.Aes192Hw.initDec(key[0..24].*),
+                } },
+                32 => .{ .bits256 = switch (direction) {
+                    .encrypt => S.Enc256.init(key[0..32].*),
+                    .decrypt => S.Dec256.init(key[0..32].*),
+                } },
+                else => error.InvalidCall,
             };
         }
 
-        fn encryptBlock(self: @This(), dst: *[block_length]u8, src: *const [block_length]u8) void {
+        fn cryptBlock(self: @This(), dst: *[block_length]u8, src: *const [block_length]u8) void {
             switch (self) {
-                .enc128 => |ctx| ctx.encrypt(dst, src),
-                .enc256 => |ctx| ctx.encrypt(dst, src),
-                .hw192_enc => |ctx| ctx.encryptBlock(dst, src),
-                else => unreachable,
+                inline else => |ctx| @call(.auto, @field(@TypeOf(ctx), method), .{ ctx, dst, src }),
             }
         }
 
-        fn decryptBlock(self: @This(), dst: *[block_length]u8, src: *const [block_length]u8) void {
+        fn cryptWide4(self: @This(), dst: *[64]u8, src: *const [64]u8) void {
             switch (self) {
-                .dec128 => |ctx| ctx.decrypt(dst, src),
-                .dec256 => |ctx| ctx.decrypt(dst, src),
-                .hw192_dec => |ctx| ctx.decryptBlock(dst, src),
-                else => unreachable,
+                inline else => |ctx| @call(.auto, @field(@TypeOf(ctx), method ++ "Wide4"), .{ ctx, dst, src }),
             }
         }
     };
 }
 
-fn aesBlockWith(comptime S: type, comptime direction: BlockCipher(S).Direction, key: []const u8, block: [block_length]u8) Failure![block_length]u8 {
-    const ctx = try BlockCipher(S).init(key, direction);
+fn aesBlockWith(comptime S: type, comptime direction: Direction, key: []const u8, block: [block_length]u8) Failure![block_length]u8 {
+    const ctx = try BlockCipher(S, direction).init(key);
     var out: [block_length]u8 = undefined;
-    switch (direction) {
-        .encrypt => ctx.encryptBlock(&out, &block),
-        .decrypt => ctx.decryptBlock(&out, &block),
-    }
+    ctx.cryptBlock(&out, &block);
     return out;
 }
 
@@ -129,7 +121,7 @@ fn assertFixed(provider: Provider) void {
     std.debug.assert(provider == default_provider);
 }
 
-fn aesBlock(comptime direction: BlockCipher(aes_seam.suite_onprem).Direction, provider: Provider, key: []const u8, block: [block_length]u8) Failure![block_length]u8 {
+fn aesBlock(comptime direction: Direction, provider: Provider, key: []const u8, block: [block_length]u8) Failure![block_length]u8 {
     if (comptime options.aes_impl == .mergeable) {
         return switch (provider) {
             .onprem => aesBlockWith(aes_seam.suite_onprem, direction, key, block),
@@ -150,7 +142,7 @@ pub fn aesDecryptBlock(provider: Provider, key: []const u8, block: [block_length
 
 fn winzipCtrWith(comptime S: type, key: []const u8, destination: []u8, source: []const u8) Failure!void {
     if (destination.len < source.len) return error.InvalidCall;
-    const ctx = try BlockCipher(S).init(key, .encrypt);
+    const ctx = try BlockCipher(S, .encrypt).init(key);
     var counter: [block_length]u8 = @splat(0);
     counter[0] = 1;
     var offset: usize = 0;
@@ -164,12 +156,7 @@ fn winzipCtrWith(comptime S: type, key: []const u8, destination: []u8, source: [
                 std.mem.writeInt(u64, counters[j * block_length ..][0..8], lo +% j, .little);
             }
             var keystream: [64]u8 = undefined;
-            switch (ctx) {
-                .enc128 => |c| c.encryptWide4(&keystream, &counters),
-                .enc256 => |c| c.encryptWide4(&keystream, &counters),
-                .hw192_enc => |c| c.encryptWide4(&keystream, &counters),
-                else => unreachable,
-            }
+            ctx.cryptWide4(&keystream, &counters);
             for (0..64) |index| destination[offset + index] = source[offset + index] ^ keystream[index];
             offset += 64;
             lo += 4;
@@ -178,9 +165,11 @@ fn winzipCtrWith(comptime S: type, key: []const u8, destination: []u8, source: [
     }
     while (offset < source.len) : (offset += block_length) {
         var keystream: [block_length]u8 = undefined;
-        ctx.encryptBlock(&keystream, &counter);
+        ctx.cryptBlock(&keystream, &counter);
         const count = @min(block_length, source.len - offset);
         for (0..count) |index| destination[offset + index] = source[offset + index] ^ keystream[index];
+        // The counter is big-endian, so carrying means walking its bytes; a
+        // carry out of the low eight words can never happen inside one stream.
         var byte_index: usize = 0;
         while (byte_index < 8) : (byte_index += 1) {
             counter[byte_index] +%= 1;
@@ -188,7 +177,6 @@ fn winzipCtrWith(comptime S: type, key: []const u8, destination: []u8, source: [
         }
         if (byte_index == 8) return error.ResourceLimit;
     }
-    return;
 }
 
 pub fn winzipCtr(provider: Provider, key: []const u8, destination: []u8, source: []const u8) Failure!void {
@@ -205,19 +193,19 @@ pub fn winzipCtr(provider: Provider, key: []const u8, destination: []u8, source:
 // Operates on whole blocks only; the caller supplies the padding.
 fn aesCbcEncryptWith(comptime S: type, key: []const u8, iv: [block_length]u8, destination: []u8, source: []const u8) Failure!void {
     if (source.len % block_length != 0 or destination.len < source.len) return error.InvalidCall;
-    const ctx = try BlockCipher(S).init(key, .encrypt);
+    const ctx = try BlockCipher(S, .encrypt).init(key);
     var previous = iv;
     var offset: usize = 0;
     while (offset < source.len) : (offset += block_length) {
         var block: [block_length]u8 = undefined;
         for (0..block_length) |index| block[index] = source[offset + index] ^ previous[index];
-        ctx.encryptBlock(destination[offset..][0..block_length], &block);
+        ctx.cryptBlock(destination[offset..][0..block_length], &block);
         @memcpy(&previous, destination[offset..][0..block_length]);
     }
     return;
 }
 
-fn aesCbc(comptime direction: BlockCipher(aes_seam.suite_onprem).Direction, provider: Provider, key: []const u8, iv: [block_length]u8, destination: []u8, source: []const u8) Failure!void {
+fn aesCbc(comptime direction: Direction, provider: Provider, key: []const u8, iv: [block_length]u8, destination: []u8, source: []const u8) Failure!void {
     if (comptime options.aes_impl == .mergeable) {
         return switch (provider) {
             .onprem => switch (direction) {
@@ -243,7 +231,7 @@ pub fn aesCbcEncrypt(provider: Provider, key: []const u8, iv: [block_length]u8, 
 
 fn aesCbcDecryptWith(comptime S: type, key: []const u8, iv: [block_length]u8, destination: []u8, source: []const u8) Failure!void {
     if (source.len % block_length != 0 or destination.len < source.len) return error.InvalidCall;
-    const ctx = try BlockCipher(S).init(key, .decrypt);
+    const ctx = try BlockCipher(S, .decrypt).init(key);
     var previous = iv;
     var offset: usize = 0;
     // Four blocks in parallel hide the aesd latency; ciphertexts are staged
@@ -253,12 +241,7 @@ fn aesCbcDecryptWith(comptime S: type, key: []const u8, iv: [block_length]u8, de
             var cipher: [64]u8 = undefined;
             @memcpy(&cipher, source[offset..][0..64]);
             var raw: [64]u8 = undefined;
-            switch (ctx) {
-                .dec128 => |c| c.decryptWide4(&raw, &cipher),
-                .dec256 => |c| c.decryptWide4(&raw, &cipher),
-                .hw192_dec => |c| c.decryptWide4(&raw, &cipher),
-                else => unreachable,
-            }
+            ctx.cryptWide4(&raw, &cipher);
             for (0..block_length) |index| destination[offset + index] = raw[index] ^ previous[index];
             for (block_length..64) |index| destination[offset + index] = raw[index] ^ cipher[index - block_length];
             @memcpy(&previous, cipher[48..64]);
@@ -270,7 +253,7 @@ fn aesCbcDecryptWith(comptime S: type, key: []const u8, iv: [block_length]u8, de
         // (7z decrypts into the same buffer) keeps the running XOR operand.
         const cipher_block: [block_length]u8 = source[offset..][0..block_length].*;
         var decrypted: [block_length]u8 = undefined;
-        ctx.decryptBlock(&decrypted, &cipher_block);
+        ctx.cryptBlock(&decrypted, &cipher_block);
         for (0..block_length) |index| destination[offset + index] = decrypted[index] ^ previous[index];
         previous = cipher_block;
     }
@@ -404,18 +387,20 @@ pub const ZipCryptoKeys = struct {
         return @truncate(product >> 8);
     }
 
+    // ZipCrypto is its own inverse: one keystream byte per input byte, and the
+    // plaintext advances the key ladder. Only where the plaintext sits
+    // differs between the two directions.
     pub fn encrypt(self: *ZipCryptoKeys, destination: []u8, source: []const u8) void {
-        for (source, 0..) |plain, index| {
-            destination[index] = self.decryptByte() ^ plain;
+        for (source, destination) |plain, *out| {
+            out.* = self.decryptByte() ^ plain;
             self.update(plain);
         }
     }
 
     pub fn decrypt(self: *ZipCryptoKeys, destination: []u8, source: []const u8) void {
-        for (source, 0..) |cipher, index| {
-            const plain = self.decryptByte() ^ cipher;
-            destination[index] = plain;
-            self.update(plain);
+        for (source, destination) |cipher, *out| {
+            out.* = self.decryptByte() ^ cipher;
+            self.update(out.*);
         }
     }
 };
@@ -580,7 +565,7 @@ test "cbc decrypt operates in place" {
     try std.testing.expectEqualSlices(u8, plain, &buf);
 }
 
-test "zipcrypto encrypts then decrypts" {
+test "zipcrypto round trips through its own inverse" {
     var keys = ZipCryptoKeys.init("password");
     const msg = "hello world, zip crypto!";
     var cipher: [msg.len]u8 = undefined;

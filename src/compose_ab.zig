@@ -2,7 +2,7 @@ const std = @import("std");
 
 const drivers = @import("compose/drivers.zig");
 const sessions = @import("compose/sessions.zig");
-const gzip = @import("grammar/gzip.zig");
+const gzip = @import("grammar/gzip/onprem.zig");
 
 // Both paths run the same leaf code, so outputs and step counts must match. Input is
 // non-periodic xorshift because repeating corpora hide composition bugs.

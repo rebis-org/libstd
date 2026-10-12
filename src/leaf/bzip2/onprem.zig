@@ -1,12 +1,10 @@
 const std = @import("std");
 
-const checksum = @import("../common/primitive/checksum.zig");
-const failure_prim = @import("../common/primitive/failure.zig");
-const io = @import("../common/primitive/io.zig");
-const measurement = @import("../common/primitive/measurement.zig");
+const checksum = @import("../../common/primitive/checksum.zig");
+const failure_prim = @import("../../common/primitive/failure.zig");
+const io = @import("../../common/primitive/io.zig");
+const measurement = @import("../../common/primitive/measurement.zig");
 
-pub const DecodeError = Failure;
-pub const EncodeError = Failure;
 const Bzip2Crc32 = checksum.Bzip2Crc32;
 const Failure = failure_prim.Failure;
 

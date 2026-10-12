@@ -1,4 +1,4 @@
-const zstd = @import("../leaf/zstd.zig");
+const zstd = @import("../leaf/zstd/onprem.zig");
 
 // Single-sourced: envelope and bypass paths must agree exactly or framing diverges output.
 
