@@ -1,26 +1,27 @@
 const std = @import("std");
 
-const abi = @import("../kernel/envelope.zig");
-const Id = abi.Id;
-const Node = abi.Node;
-const Call = abi.Call;
-const Status = abi.Status;
-const vocabulary = @import("../kernel/vocabulary.zig");
-const discovery = @import("../kernel/discovery.zig");
-const kernel_catalog = @import("../kernel/catalog.zig");
-const Failure = vocabulary.Failure;
-const node_graph = @import("../kernel/node.zig");
 const bounds = @import("../common/primitive/bounds.zig");
 const crypto = @import("../common/primitive/crypto.zig");
-const resource = @import("../kernel/resource.zig");
-const Resource = resource.Resource;
-const Limits = resource.Limits;
 const rar = @import("../grammar/rar.zig");
 const rar_writer = @import("../grammar/rar/writer.zig");
 const seven_zip = @import("../grammar/sevenzip.zig");
 const tar = @import("../grammar/tar.zig");
 const zip = @import("../grammar/zip.zig");
+const kernel_catalog = @import("../kernel/catalog.zig");
+const discovery = @import("../kernel/discovery.zig");
+const abi = @import("../kernel/envelope.zig");
+const node_graph = @import("../kernel/node.zig");
+const resource = @import("../kernel/resource.zig");
+const vocabulary = @import("../kernel/vocabulary.zig");
 const common = @import("common.zig");
+
+const Call = abi.Call;
+const Id = abi.Id;
+const Node = abi.Node;
+const Status = abi.Status;
+const Limits = resource.Limits;
+const Resource = resource.Resource;
+const Failure = vocabulary.Failure;
 
 fn requireCommit(commit: vocabulary.CommitMode, expected: vocabulary.CommitMode) Failure!void {
     if (commit != expected) return error.Unsupported;
@@ -103,13 +104,17 @@ fn cryptoLifetime(params: ?CryptoParams) u64 {
     return if (params) |held| held.password_lifetime else 0;
 }
 
-fn parseCryptoParams(request: ?*Node, failure_cause: *crypto.FailureCause) Failure!?CryptoParams {
+// The crypto selectors are declared by each archive descriptor (zip,
+// sevenzip, and rar each carry family 1, ordinals 1-4) so a host reads them
+// from the invoked profile's own catalog row; the wire values match by
+// convention, and a descriptor missing a row fails at comptime here.
+fn parseCryptoParams(comptime component: []const u8, request: ?*Node, failure_cause: *crypto.FailureCause) Failure!?CryptoParams {
     failure_cause.* = .none;
     const profile_node = node_graph.findParameter(request, vocabulary.ids.crypto_profile);
     const password_node = node_graph.findSelector(
         request,
-        comptime discovery.parameter("zip", "password").family,
-        comptime discovery.parameter("zip", "password").ordinal,
+        comptime discovery.parameter(component, "password").family,
+        comptime discovery.parameter(component, "password").ordinal,
     );
     if (profile_node == null and password_node == null) return null;
     const profile_id = if (profile_node) |node| blk: {
@@ -124,8 +129,8 @@ fn parseCryptoParams(request: ?*Node, failure_cause: *crypto.FailureCause) Failu
     if (password.len == 0) return error.InvalidCall;
     const algorithm = if (node_graph.findSelector(
         request,
-        comptime discovery.parameter("zip", "algorithm").family,
-        comptime discovery.parameter("zip", "algorithm").ordinal,
+        comptime discovery.parameter(component, "algorithm").family,
+        comptime discovery.parameter(component, "algorithm").ordinal,
     )) |node| blk: {
         const value: u8 = @truncate(node.value_low);
         if (value > 3) {
@@ -139,13 +144,13 @@ fn parseCryptoParams(request: ?*Node, failure_cause: *crypto.FailureCause) Failu
         .algorithm = algorithm,
         .kdf_rounds_limit = node_graph.parseU64(node_graph.findSelector(
             request,
-            comptime discovery.parameter("zip", "kdf_rounds_limit").family,
-            comptime discovery.parameter("zip", "kdf_rounds_limit").ordinal,
+            comptime discovery.parameter(component, "kdf_rounds_limit").family,
+            comptime discovery.parameter(component, "kdf_rounds_limit").ordinal,
         )),
         .password_lifetime = node_graph.parseU64(node_graph.findSelector(
             request,
-            comptime discovery.parameter("zip", "password_lifetime").family,
-            comptime discovery.parameter("zip", "password_lifetime").ordinal,
+            comptime discovery.parameter(component, "password_lifetime").family,
+            comptime discovery.parameter(component, "password_lifetime").ordinal,
         )),
     };
 }
@@ -214,7 +219,7 @@ pub fn zipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
     const source_resource = source orelse return error.InvalidCall;
     var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
     var crypto_cause: crypto.FailureCause = .none;
-    const crypto_params = parseCryptoParams(call.request, &crypto_cause) catch |err| {
+    const crypto_params = parseCryptoParams("zip", call.request, &crypto_cause) catch |err| {
         // A rejection inside the parser (e.g. algorithm > 3) already recorded
         // its cause; surface it before the error unwinds.
         writeCryptoFailure(call, crypto_cause);
@@ -330,7 +335,7 @@ fn sevenZipGeneric(comptime coded: bool, plan: *common.ExecutionPlan, source: ?*
     const source_resource = source orelse return error.InvalidCall;
     var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
     var crypto_cause: crypto.FailureCause = .none;
-    const crypto_params = parseCryptoParams(call.request, &crypto_cause) catch |err| {
+    const crypto_params = parseCryptoParams("sevenzip", call.request, &crypto_cause) catch |err| {
         // A rejection inside the parser (e.g. algorithm > 3) already recorded
         // its cause; surface it before the error unwinds.
         writeCryptoFailure(call, crypto_cause);
@@ -523,7 +528,7 @@ pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
     var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
     if (command_mask == vocabulary.command_mask_read) {
         var failure_cause: crypto.FailureCause = .none;
-        const crypto_params = parseCryptoParams(call.request, &failure_cause) catch |err| {
+        const crypto_params = parseCryptoParams("rar", call.request, &failure_cause) catch |err| {
             writeCryptoFailure(call, failure_cause);
             return err;
         };
@@ -629,7 +634,7 @@ pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
     } else if (command_mask == vocabulary.command_mask_write) {
         try requireVerified(commit);
         var crypto_cause: crypto.FailureCause = .none;
-        const crypto_params = parseCryptoParams(call.request, &crypto_cause) catch |err| {
+        const crypto_params = parseCryptoParams("rar", call.request, &crypto_cause) catch |err| {
             writeCryptoFailure(call, crypto_cause);
             return err;
         };

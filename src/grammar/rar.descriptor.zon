@@ -7,6 +7,10 @@
     .class = "grammar",
     .verbs = .{ "inspect", "decode_ordinal", "encode_ordinal" },
     .parameters = .{
+        .{ .name = "password", .family = 1, .ordinal = 1, .representation = "bytes" },
+        .{ .name = "algorithm", .family = 1, .ordinal = 2, .representation = "scalar_words" },
+        .{ .name = "kdf_rounds_limit", .family = 1, .ordinal = 3, .representation = "scalar_words" },
+        .{ .name = "password_lifetime", .family = 1, .ordinal = 4, .representation = "scalar_words" },
         .{ .name = "header_encode", .family = 15, .ordinal = 1, .representation = "scalar_words" },
     },
     .capabilities = .{ "read", "write", "size", "replay" },
