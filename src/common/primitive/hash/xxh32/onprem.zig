@@ -66,15 +66,23 @@ pub const XxHash32 = struct {
         self.acc4 = round(self.acc4, std.mem.readInt(u32, lanes[12..16], .little));
     }
 
+    // LLVM pattern-matches this to a single ror; std.math.rotl emitted an
+    // out-of-line call per round in the stripe loop.
+    inline fn rotl(x: u32, comptime n: std.math.Log2Int(u32)) u32 {
+        comptime std.debug.assert(n != 0);
+        const m: std.math.Log2Int(u32) = @intCast(@as(u32, 32) - n);
+        return (x << n) | (x >> m);
+    }
+
     fn round(acc: u32, lane: u32) u32 {
-        return std.math.rotl(u32, acc +% lane *% prime_2, @as(u32, 13)) *% prime_1;
+        return rotl(acc +% lane *% prime_2, 13) *% prime_1;
     }
 
     pub fn final(self: *Self) u32 {
         var hash: u32 = undefined;
         if (self.total >= 16) {
-            hash = std.math.rotl(u32, self.acc1, 1) +% std.math.rotl(u32, self.acc2, 7) +%
-                std.math.rotl(u32, self.acc3, 12) +% std.math.rotl(u32, self.acc4, 18);
+            hash = rotl(self.acc1, 1) +% rotl(self.acc2, 7) +%
+                rotl(self.acc3, 12) +% rotl(self.acc4, 18);
         } else {
             hash = self.seed +% prime_5;
         }
@@ -82,12 +90,12 @@ pub const XxHash32 = struct {
         var rest: []const u8 = self.buffer[0..self.buffered];
         while (rest.len >= 4) {
             hash +%= std.mem.readInt(u32, rest[0..4], .little) *% prime_3;
-            hash = std.math.rotl(u32, hash, 17) *% prime_4;
+            hash = rotl(hash, 17) *% prime_4;
             rest = rest[4..];
         }
         while (rest.len != 0) {
             hash +%= @as(u32, rest[0]) *% prime_5;
-            hash = std.math.rotl(u32, hash, 11) *% prime_1;
+            hash = rotl(hash, 11) *% prime_1;
             rest = rest[1..];
         }
         hash ^= hash >> 15;
