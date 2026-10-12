@@ -1,14 +1,16 @@
 const std = @import("std");
+
 const failure = @import("../../common/primitive/failure.zig");
-const Failure = failure.Failure;
-const bits = @import("bits.zig");
-const BitReader = bits.BitReader;
-const huffman = @import("huffman.zig");
-const DecodeTable = huffman.DecodeTable;
-const window_mod = @import("window.zig");
-const Window = window_mod.Window;
 const sink = @import("../../common/sink.zig");
+const bits = @import("bits.zig");
+const huffman = @import("huffman.zig");
+const window_mod = @import("window.zig");
+
+const Failure = failure.Failure;
 const Sink = sink.Sink;
+const BitReader = bits.BitReader;
+const DecodeTable = huffman.DecodeTable;
+const Window = window_mod.Window;
 
 // RAR 2.x (v20/v26) code length tables must stay literal, because no closed form reproduces DBits saturating at 16.
 // Every match pushes its distance at the write cursor, so the old-distance ring must stay circular.

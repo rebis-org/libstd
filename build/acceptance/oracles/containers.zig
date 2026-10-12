@@ -4,8 +4,9 @@ const abi = @import("abi.zig");
 const corpus = @import("corpus.zig");
 const harness = @import("harness.zig");
 const lib = @import("lib.zig");
-const Runner = harness.Runner;
 const steps = @import("steps.zig");
+
+const Runner = harness.Runner;
 
 fn setupContainer(r: *Runner, profile_id: harness.Id) void {
     harness.setup(r, profile_id, harness.mode_stream);

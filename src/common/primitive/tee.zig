@@ -1,7 +1,8 @@
 const std = @import("std");
 
-const checksum = @import("checksum.zig");
 const seam = @import("seam");
+
+const checksum = @import("checksum.zig");
 
 // Selecting kinds through a comptime packed struct means a new checksum adds
 // one field here and one line in `per_kind`, not a new bool parameter at every

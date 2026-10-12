@@ -1,11 +1,14 @@
 const std = @import("std");
 
 const bounds = @import("../common/primitive/bounds.zig");
-const failure_prim = @import("../common/primitive/failure.zig");
-const Failure = failure_prim.Failure;
 const checksum = @import("../common/primitive/checksum.zig");
+const failure_prim = @import("../common/primitive/failure.zig");
 const measurement = @import("../common/primitive/measurement.zig");
 const zstd = @import("../leaf/zstd.zig");
+
+const Failure = failure_prim.Failure;
+pub const frame_size_max: u32 = zstd.encoder_frame_size_max;
+pub const frame_size_min: u32 = zstd.window_size_min;
 
 // Seekable format: independent frames plus a trailing skippable seek table.
 // Frame magic first, footer magic last.
@@ -16,8 +19,6 @@ const seekable_magic: u32 = 0x8F92EAB1;
 const footer_size = 9;
 const entry_size = 8;
 
-pub const frame_size_min: u32 = zstd.window_size_min;
-pub const frame_size_max: u32 = zstd.encoder_frame_size_max;
 pub const frame_size_default: u32 = 1 << 20;
 
 pub const Options = struct {

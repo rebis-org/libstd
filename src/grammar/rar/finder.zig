@@ -1,9 +1,11 @@
 const std = @import("std");
-const failure = @import("../../common/primitive/failure.zig");
-const Failure = failure.Failure;
+
 const kernels = @import("../../common/kernels.zig");
-const window_mod = @import("window.zig");
+const failure = @import("../../common/primitive/failure.zig");
 const common_sink = @import("../../common/sink.zig");
+const window_mod = @import("window.zig");
+
+const Failure = failure.Failure;
 
 // Nothing allocates: every table is caller-provided, and token-buffer
 // exhaustion returns InsufficientCapacity so the caller can size the buffer.

@@ -1,7 +1,9 @@
 const std = @import("std");
-const sink = @import("../../common/sink.zig");
-const Sink = sink.Sink;
+
 const kernels = @import("../../common/kernels.zig");
+const sink = @import("../../common/sink.zig");
+
+const Sink = sink.Sink;
 
 // Distances are validated against total_written, so reset must not re-zero the
 // buffer, because a window-sized memset per entry dwarfs decoding on small files.

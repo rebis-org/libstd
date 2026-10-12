@@ -1,14 +1,15 @@
-const std = @import("std");
 const builtin = @import("builtin");
+const std = @import("std");
 
 const build_options = @import("options");
 
+const kernels = @import("../common/kernels.zig");
 const binary = @import("../common/primitive/binary.zig");
-const ReadCursor = binary.ReadCursor;
 const checksum = @import("../common/primitive/checksum.zig");
 const huffman = @import("../common/primitive/huffman.zig");
 const tee = @import("../common/primitive/tee.zig");
-const kernels = @import("../common/kernels.zig");
+
+const ReadCursor = binary.ReadCursor;
 
 // NEON is baseline on aarch64, so the wide match-copy path needs no extra
 // target feature. Other targets keep the portable word-at-a-time path.

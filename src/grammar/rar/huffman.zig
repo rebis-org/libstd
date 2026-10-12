@@ -1,7 +1,9 @@
 const std = @import("std");
+
 const failure = @import("../../common/primitive/failure.zig");
-const Failure = failure.Failure;
 const bits = @import("bits.zig");
+
+const Failure = failure.Failure;
 const BitReader = bits.BitReader;
 
 // The DecodeLen, DecodePos, and DecodeNum tables accept the over-committed

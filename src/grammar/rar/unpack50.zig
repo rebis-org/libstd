@@ -1,16 +1,18 @@
 const std = @import("std");
+
 const failure = @import("../../common/primitive/failure.zig");
-const Failure = failure.Failure;
-const bits = @import("bits.zig");
-const BitReader = bits.BitReader;
-const huffman = @import("huffman.zig");
-const DecodeTable = huffman.DecodeTable;
-const window_mod = @import("window.zig");
-const Window = window_mod.Window;
-const filters = @import("filters50.zig");
 const sink = @import("../../common/sink.zig");
+const bits = @import("bits.zig");
 const emit = @import("emit.zig");
+const filters = @import("filters50.zig");
+const huffman = @import("huffman.zig");
+const window_mod = @import("window.zig");
+
+const Failure = failure.Failure;
 const Sink = sink.Sink;
+const BitReader = bits.BitReader;
+const DecodeTable = huffman.DecodeTable;
+const Window = window_mod.Window;
 
 // A real entry carries only a handful of filters, so a full pending list means
 // the stream is undecodable, and the parser refuses it instead of guessing.

@@ -1,7 +1,8 @@
-const std = @import("std");
 const builtin = @import("builtin");
+const std = @import("std");
 
 const options = @import("options");
+
 const merkle = @import("../merkle.zig");
 
 // FIPS 180-4.

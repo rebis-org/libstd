@@ -1,19 +1,21 @@
 const std = @import("std");
-const failure = @import("../../common/primitive/failure.zig");
-const Failure = failure.Failure;
+
 const checksum = @import("../../common/primitive/checksum.zig");
-const bits = @import("bits.zig");
-const BitReader = bits.BitReader;
-const huffman = @import("huffman.zig");
-const DecodeTable = huffman.DecodeTable;
-const window_mod = @import("window.zig");
-const Window = window_mod.Window;
-const ppm_mod = @import("ppm.zig");
-const PpmModel = ppm_mod.PpmModel;
-const rarvm = @import("rarvm.zig");
+const failure = @import("../../common/primitive/failure.zig");
 const sink = @import("../../common/sink.zig");
+const bits = @import("bits.zig");
 const emit = @import("emit.zig");
+const huffman = @import("huffman.zig");
+const ppm_mod = @import("ppm.zig");
+const rarvm = @import("rarvm.zig");
+const window_mod = @import("window.zig");
+
+const Failure = failure.Failure;
 const Sink = sink.Sink;
+const BitReader = bits.BitReader;
+const DecodeTable = huffman.DecodeTable;
+const PpmModel = ppm_mod.PpmModel;
+const Window = window_mod.Window;
 
 // RAR3/4 (v29/v36): in a solid archive the window, tables, block mode, PPM
 // model, and filter programs all persist across entries.

@@ -1,11 +1,12 @@
 const std = @import("std");
 
+const kernels = @import("../common/kernels.zig");
 const bounds = @import("../common/primitive/bounds.zig");
 const checksum = @import("../common/primitive/checksum.zig");
 const failure_prim = @import("../common/primitive/failure.zig");
-const Failure = failure_prim.Failure;
-const kernels = @import("../common/kernels.zig");
 const measurement = @import("../common/primitive/measurement.zig");
+
+const Failure = failure_prim.Failure;
 
 // Frame layout follows the "LZ4 Frame Format Description" spec; the block codec
 // mirrors the reference greedy parser in vendor/lz4.

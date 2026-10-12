@@ -3,16 +3,21 @@ const std = @import("std");
 const binary = @import("../common/primitive/binary.zig");
 const bounds = @import("../common/primitive/bounds.zig");
 const checksum = @import("../common/primitive/checksum.zig");
-const failure_prim = @import("../common/primitive/failure.zig");
-const Failure = failure_prim.Failure;
-
-const sink = @import("../common/sink.zig");
 const crypto = @import("../common/primitive/crypto.zig");
+const failure_prim = @import("../common/primitive/failure.zig");
+const sink = @import("../common/sink.zig");
 const blake2sp = @import("rar/blake2sp.zig");
 const filters50 = @import("rar/filters50.zig");
-const unpack50 = @import("rar/unpack50.zig");
-const unpack29 = @import("rar/unpack29.zig");
 const unpack20 = @import("rar/unpack20.zig");
+const unpack29 = @import("rar/unpack29.zig");
+const unpack50 = @import("rar/unpack50.zig");
+
+const Failure = failure_prim.Failure;
+pub const PendingFilter50 = filters50.Filter;
+pub const filter_scratch_extra = filters50.max_filter_block;
+pub const PendingFilter29 = unpack29.PendingFilter;
+pub const max_pending29 = unpack29.max_pending_filters;
+pub const max_pending50 = unpack50.max_pending_filters;
 
 // Every buffer comes from the caller, so the decode path allocates nothing.
 
@@ -133,11 +138,6 @@ pub const table_pool_words = unpack50.table_pool_words * 4;
 // its own (base 0x20000 << dict_bits, 4-bit exponent for v50).
 pub const max_rar4_window: usize = 4 * 1024 * 1024;
 pub const max_rar5_window_bits: u6 = 31; // 0x20000 << 14 is already 2^31, so a wider window does not fit the address space.
-pub const max_pending50 = unpack50.max_pending_filters;
-pub const max_pending29 = unpack29.max_pending_filters;
-pub const PendingFilter50 = filters50.Filter;
-pub const PendingFilter29 = unpack29.PendingFilter;
-pub const filter_scratch_extra = filters50.max_filter_block;
 
 fn detectFamily(archive: []const u8, provider: crypto.Provider) Failure!struct { family: Family, offset: usize } {
     if (archive.len >= rar4_signature.len and

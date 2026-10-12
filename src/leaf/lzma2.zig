@@ -1,10 +1,11 @@
 const std = @import("std");
 
 const failure_prim = @import("../common/primitive/failure.zig");
-const Failure = failure_prim.Failure;
 const io = @import("../common/primitive/io.zig");
 const measurement = @import("../common/primitive/measurement.zig");
 const lzma = @import("lzma.zig");
+
+const Failure = failure_prim.Failure;
 
 pub const chunk_max_unpacked: usize = 1 << 20;
 const chunk_min_unpacked: usize = 4 * 1024;

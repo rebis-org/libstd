@@ -1,11 +1,12 @@
 const std = @import("std");
+
 const options = @import("options");
-const onprem = @import("onprem.zig");
 const seam = @import("seam");
+
+const onprem = @import("onprem.zig");
 
 // AES-192 stays on-prem because std ships no 192-bit context; either provider
 // tag resolves to the on-prem schedule.
-
 const std_aes = std.crypto.core.aes;
 
 const StdDirection = enum { encrypt, decrypt };

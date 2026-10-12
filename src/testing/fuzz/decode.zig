@@ -5,12 +5,7 @@
 // format magics.
 
 const std = @import("std");
-const testing = std.testing;
 
-const bzip2 = @import("../../leaf/bzip2.zig");
-const deflate = @import("../../leaf/deflate.zig");
-const lz4 = @import("../../leaf/lz4.zig");
-const zstd = @import("../../leaf/zstd.zig");
 const checksum = @import("../../common/primitive/checksum.zig");
 const crypto = @import("../../common/primitive/crypto.zig");
 const io = @import("../../common/primitive/io.zig");
@@ -22,6 +17,12 @@ const tar = @import("../../grammar/tar.zig");
 const xz = @import("../../grammar/xz.zig");
 const zip = @import("../../grammar/zip.zig");
 const zlib = @import("../../grammar/zlib.zig");
+const bzip2 = @import("../../leaf/bzip2.zig");
+const deflate = @import("../../leaf/deflate.zig");
+const lz4 = @import("../../leaf/lz4.zig");
+const zstd = @import("../../leaf/zstd.zig");
+
+const testing = std.testing;
 
 const max_input = 16 * 1024;
 const max_output = 64 * 1024;

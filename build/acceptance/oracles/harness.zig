@@ -1,14 +1,16 @@
 const std = @import("std");
+
 const options = @import("options");
 
 const abi = @import("abi.zig");
-pub const Id = abi.Id;
-pub const Node = abi.Node;
+pub const catalog = @import("catalog.zig");
+
 pub const Call = abi.Call;
 pub const Callback = abi.Callback;
+pub const Id = abi.Id;
+pub const Node = abi.Node;
 pub const Status = abi.Status;
 pub const isIdEqual = abi.isIdEqual;
-pub const catalog = @import("catalog.zig");
 
 pub const cap_read: u32 = 1 << 0;
 pub const cap_write: u32 = 1 << 1;

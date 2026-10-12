@@ -1,9 +1,11 @@
 const std = @import("std");
+
 const options = @import("options");
-const onprem = @import("onprem.zig");
 const seam = @import("seam");
 
-pub const Onprem = onprem.XxHash32;
+const onprem = @import("onprem.zig");
+
 pub const Offprem = std.hash.XxHash32;
+pub const Onprem = onprem.XxHash32;
 
 pub const XxHash32 = seam.Hash(options.xxh32_impl, Onprem, Offprem);

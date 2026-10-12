@@ -1,5 +1,6 @@
-const std = @import("std");
 const builtin = @import("builtin");
+const std = @import("std");
+
 const build_options = @import("options");
 
 // NEON is baseline on aarch64, so the wide match-copy path needs no extra

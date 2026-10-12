@@ -1,5 +1,5 @@
-const std = @import("std");
 const builtin = @import("builtin");
+const std = @import("std");
 
 pub const silesia_url = "https://sun.aei.polsl.pl/~sdeor/corpus/silesia.zip";
 pub const silesia_files = [_][]const u8{ "dickens", "mozilla", "mr", "nci", "ooffice", "osdb", "reymont", "samba", "sao", "webster", "xml", "x-ray" };

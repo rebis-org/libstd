@@ -1,7 +1,7 @@
 const std = @import("std");
 
-const common = @import("../../platform/common.zig");
 const modules = @import("../../modules.zig");
+const common = @import("../../platform/common.zig");
 
 pub const Refs = struct {
     sevenzz: *std.Build.Step.InstallFile,

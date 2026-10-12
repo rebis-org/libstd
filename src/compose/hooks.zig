@@ -1,20 +1,22 @@
 const std = @import("std");
 
-const resource = @import("../kernel/resource.zig");
-const Resource = resource.Resource;
-const Limits = resource.Limits;
-const abi = @import("../kernel/envelope.zig");
-const Id = abi.Id;
-const Node = abi.Node;
-const Call = abi.Call;
-const vocabulary = @import("../kernel/vocabulary.zig");
-const Failure = vocabulary.Failure;
-const discovery = @import("../kernel/discovery.zig");
 const components = @import("components");
+
+const discovery = @import("../kernel/discovery.zig");
+const abi = @import("../kernel/envelope.zig");
+const resource = @import("../kernel/resource.zig");
+const vocabulary = @import("../kernel/vocabulary.zig");
 const archive = @import("archive.zig");
 const catalog = @import("catalog.zig");
 const common = @import("common.zig");
 const transform = @import("transform.zig");
+
+const Call = abi.Call;
+const Id = abi.Id;
+const Node = abi.Node;
+const Limits = resource.Limits;
+const Resource = resource.Resource;
+const Failure = vocabulary.Failure;
 
 const ProfileHook = *const fn (plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void;
 

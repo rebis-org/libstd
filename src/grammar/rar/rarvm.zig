@@ -1,9 +1,11 @@
 const std = @import("std");
-const failure = @import("../../common/primitive/failure.zig");
-const Failure = failure.Failure;
-const bits = @import("bits.zig");
-const BitReader = bits.BitReader;
+
 const checksum = @import("../../common/primitive/checksum.zig");
+const failure = @import("../../common/primitive/failure.zig");
+const bits = @import("bits.zig");
+
+const Failure = failure.Failure;
+const BitReader = bits.BitReader;
 
 // Only six standard filter programs exist, so a program matches only when its
 // CRC32 and its length both match. Any other program must stay unverifiable.

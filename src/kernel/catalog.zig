@@ -2,8 +2,9 @@ const std = @import("std");
 
 const discovery = @import("discovery.zig");
 const envelope = @import("envelope.zig");
-const EnvelopeId = envelope.Id;
 const vocabulary = @import("vocabulary.zig");
+
+const EnvelopeId = envelope.Id;
 pub const Descriptor = vocabulary.Descriptor;
 
 pub fn descriptorFor(id: EnvelopeId) ?*const Descriptor {

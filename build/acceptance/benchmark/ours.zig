@@ -1,8 +1,8 @@
 const std = @import("std");
 
+const bypass = @import("bypass");
 const harness = @import("harness");
 
-const bypass = @import("bypass");
 const env_mod = @import("env.zig");
 const matrix = @import("matrix.zig");
 const metric = @import("metric.zig");

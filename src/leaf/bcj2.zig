@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const failure_prim = @import("../common/primitive/failure.zig");
+
 const Failure = failure_prim.Failure;
 
 // BCJ2 (branch/call/jump filter, version 2), method ID 0x03 0x03 0x01 0x1B. The encoder

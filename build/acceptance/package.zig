@@ -1,10 +1,11 @@
 const std = @import("std");
 
 const manifest = @import("manifest");
-const slices = manifest.slices;
 
 const run = @import("run.zig");
 const symbols = @import("symbols.zig");
+
+const slices = manifest.slices;
 
 pub fn main(init: std.process.Init) !void {
     var args = run.Args.init(init.minimal.args);
