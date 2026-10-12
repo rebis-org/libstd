@@ -4,6 +4,7 @@
 const std = @import("std");
 
 const checksum = @import("checksum");
+const crypto = @import("crypto");
 
 const runner = @import("runner.zig");
 
@@ -96,12 +97,19 @@ pub fn main(init: std.process.Init) !void {
     const bzip2_crc32_case: Bzip2Crc32Case = .{ .data = data };
     const xxhash64_case: XxHash64Case = .{ .data = data };
 
+    const xxh32_case: XxHash32Case = .{ .data = data };
+    const sha1_case: Sha1Case = .{ .data = data };
+    const sha256_case: Sha256Case = .{ .data = data };
+
     const cases = .{
         .{ "checksum.adler32", &adler32_case },
         .{ "checksum.crc32", &crc32_case },
         .{ "checksum.xz_crc64", &xz_crc64_case },
         .{ "checksum.bzip2_crc32", &bzip2_crc32_case },
+        .{ "checksum.xxh32", &xxh32_case },
         .{ "checksum.xxh64", &xxhash64_case },
+        .{ "crypto.sha1", &sha1_case },
+        .{ "crypto.sha256", &sha256_case },
     };
     inline for (cases) |case| {
         if (filter == null or std.mem.find(u8, case[0], filter.?) != null) {
@@ -111,6 +119,36 @@ pub fn main(init: std.process.Init) !void {
 
     try bench.run(init.io);
 }
+
+const XxHash32Case = struct {
+    data: []const u8,
+    pub fn run(self: *const @This(), allocator: std.mem.Allocator) void {
+        _ = allocator;
+        var hash = checksum.XxHash32.bind(checksum.default_provider, 0);
+        hash.update(self.data);
+        std.mem.doNotOptimizeAway(hash.final());
+    }
+};
+
+const Sha1Case = struct {
+    data: []const u8,
+    pub fn run(self: *const @This(), allocator: std.mem.Allocator) void {
+        _ = allocator;
+        var hash = crypto.Sha1.bind(crypto.default_provider, .{});
+        hash.update(self.data);
+        std.mem.doNotOptimizeAway(hash.finalResult());
+    }
+};
+
+const Sha256Case = struct {
+    data: []const u8,
+    pub fn run(self: *const @This(), allocator: std.mem.Allocator) void {
+        _ = allocator;
+        var hash = crypto.Sha256.bind(crypto.default_provider, .{});
+        hash.update(self.data);
+        std.mem.doNotOptimizeAway(hash.finalResult());
+    }
+};
 
 test "micro cases stay runnable (smoke)" {
     // Anti-bitrot after TigerBeetle's stdx.benchmark: every case runs in the
@@ -124,10 +162,16 @@ test "micro cases stay runnable (smoke)" {
     const xz_crc64_case: XzCrc64Case = .{ .data = &buf };
     const bzip2_crc32_case: Bzip2Crc32Case = .{ .data = &buf };
     const xxhash64_case: XxHash64Case = .{ .data = &buf };
+    const xxh32_case: XxHash32Case = .{ .data = &buf };
+    const sha1_case: Sha1Case = .{ .data = &buf };
+    const sha256_case: Sha256Case = .{ .data = &buf };
 
     adler32_case.run(std.testing.allocator);
     crc32_case.run(std.testing.allocator);
     xz_crc64_case.run(std.testing.allocator);
     bzip2_crc32_case.run(std.testing.allocator);
+    xxh32_case.run(std.testing.allocator);
     xxhash64_case.run(std.testing.allocator);
+    sha1_case.run(std.testing.allocator);
+    sha256_case.run(std.testing.allocator);
 }
