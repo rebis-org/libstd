@@ -90,7 +90,7 @@ fn requireAppleSlice(init: std.process.Init, archive: []const u8, slice: slices.
     defer std.heap.page_allocator.free(platform_text);
     const minimum_text = try print("minos {s}", .{slice.minimum});
     defer std.heap.page_allocator.free(minimum_text);
-    if (std.mem.indexOf(u8, stdout, platform_text) == null or std.mem.indexOf(u8, stdout, minimum_text) == null) return error.invalid_apple_library;
+    if (std.mem.find(u8, stdout, platform_text) == null or std.mem.find(u8, stdout, minimum_text) == null) return error.invalid_apple_library;
     // App Store validation rejects embedded frameworks whose Info.plist
     // lacks MinimumOSVersion (90530/90360).
     const plist_entry = if (slices.isMacos(slice))
@@ -100,5 +100,5 @@ fn requireAppleSlice(init: std.process.Init, archive: []const u8, slice: slices.
     defer std.heap.page_allocator.free(plist_entry);
     const plist = try extract(init, archive, plist_entry);
     defer std.heap.page_allocator.free(plist);
-    if (std.mem.indexOf(u8, plist, "<key>MinimumOSVersion</key>") == null) return error.missing_minimum_os_version;
+    if (std.mem.find(u8, plist, "<key>MinimumOSVersion</key>") == null) return error.missing_minimum_os_version;
 }

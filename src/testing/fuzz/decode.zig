@@ -1,8 +1,5 @@
-// Decode-surface fuzzing: every decoder must survive arbitrary input without
-// trapping; a data-dependent failure answers through the error set. Each test
-// runs once with default input under `zig build unit` and for real under the
-// toolchain's fuzzer, which coverage-guides the Smith generator past the
-// format magics.
+// Every decoder must survive arbitrary input without trapping;
+// coverage-guided runs live under the toolchain fuzzer.
 
 const std = @import("std");
 

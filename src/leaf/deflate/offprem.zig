@@ -1,11 +1,7 @@
 const std = @import("std");
 
-// Offprem arm of the deflate decode seam: std.compress.flate (0.17) over
-// the raw container, with the caller's history span as the inflate window
-// so the seam keeps the caller-owned storage contract. Decode-only: std's
-// compressor cannot express this leaf's option surface, so encode requests
-// under an offprem tag fail explicit `unsupported` at the call site rather
-// than falling back silently.
+// Decode-only: std's compressor cannot express this leaf's option surface,
+// so an offprem encode tag fails unsupported instead of falling back.
 
 pub const Decompress = struct {
     inner: std.compress.flate.Decompress,
@@ -34,13 +30,13 @@ pub const Decompress = struct {
     // Seam binding points: the tag binds at construction and the decode
     // loop never dispatches. A mismatched tag is unsupported, never a
     // silent fallback. `anytype` keeps the arm free of module imports.
-    pub fn initBound(provider: anytype, input: *std.Io.Reader, history: []u8) error{Unsupported}!@This() {
-        if (provider != .offprem) return error.Unsupported;
+    pub fn initBound(provider: anytype, input: *std.Io.Reader, history: []u8) error{UnsupportedFailure}!@This() {
+        if (provider != .offprem) return error.UnsupportedFailure;
         return init(input, history);
     }
 
-    pub fn initSliceBound(provider: anytype, data: []const u8, history: []u8) error{Unsupported}!@This() {
-        if (provider != .offprem) return error.Unsupported;
+    pub fn initSliceBound(provider: anytype, data: []const u8, history: []u8) error{UnsupportedFailure}!@This() {
+        if (provider != .offprem) return error.UnsupportedFailure;
         return initSlice(data, history);
     }
 
@@ -85,15 +81,10 @@ test "offprem arm decodes byte-identical to onprem across shapes" {
     const onprem = @import("onprem.zig");
     const alloc = std.testing.allocator;
 
-    var rng: u64 = 0x9e3779b97f4a7c15;
     const input = try alloc.alloc(u8, 70000);
     defer alloc.free(input);
-    for (input) |*b| {
-        rng ^= rng << 13;
-        rng ^= rng >> 7;
-        rng ^= rng << 17;
-        b.* = @truncate(rng >> 32);
-    }
+    var prng = std.Random.DefaultPrng.init(0x9e3779b97f4a7c15);
+    prng.random().bytes(input);
     // Zeros beside the random stretch force stored blocks next to dynamic
     // ones; sizes below sweep empty, tails, one window, and multi-block.
     @memset(input[30000..65000], 0);

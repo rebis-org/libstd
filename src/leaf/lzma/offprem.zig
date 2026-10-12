@@ -2,25 +2,18 @@ const std = @import("std");
 
 const failure = @import("../../common/primitive/failure.zig");
 const onprem = @import("onprem.zig");
-pub const Failure = @import("../../common/primitive/failure.zig").Failure;
 
 const std_lzma = std.compress.lzma;
+pub const Failure = failure.Failure;
 pub const Options = onprem.Options;
-// Offprem arm of the lzma decode path: std.compress.lzma.Decompress used
-// directly, the same shape as the zstd arm. The caller's output span
-// receives the decoded stream; std's probability tables and the match
-// window carve from the caller's scratch span through a
-// FixedBufferAllocator (mem limit pins the window at the dictionary size).
-// Where std's growth exceeds the scratch the arm answers
-// `error.InsufficientCapacity` — the accepted incompleteness of choosing
-// std, the same class the zstd arm records for checksums. Decode only:
-// encode resolves to onprem under any tag.
+// std's tables and window carve from the caller's scratch; growth beyond it
+// answers CapacityFailure — the accepted incompleteness of choosing std.
 pub const Properties = onprem.Properties;
 
 fn mapStreamError(err: std.Io.Reader.StreamError) Failure {
     return switch (err) {
-        error.WriteFailed => error.InsufficientCapacity,
-        error.ReadFailed, error.EndOfStream => error.InvalidData,
+        error.ReadFailed, error.EndOfStream => error.DataFailure,
+        else => failure.fromStd(err),
     };
 }
 
@@ -92,15 +85,10 @@ pub fn decodedSize(input: []const u8, scratch: []u8, options: Options) Failure!u
 test "offprem lzma payload decodes byte-identical to onprem" {
     const alloc = std.testing.allocator;
 
-    var rng: u64 = 0x9e3779b97f4a7c15;
     const input = try alloc.alloc(u8, 120000);
     defer alloc.free(input);
-    for (input) |*b| {
-        rng ^= rng << 13;
-        rng ^= rng >> 7;
-        rng ^= rng << 17;
-        b.* = @truncate(rng >> 32);
-    }
+    var prng = std.Random.DefaultPrng.init(0x9e3779b97f4a7c15);
+    prng.random().bytes(input);
     @memset(input[40000..90000], 0);
 
     const compressed = try alloc.alloc(u8, 400000);

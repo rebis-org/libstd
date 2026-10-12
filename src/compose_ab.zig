@@ -71,7 +71,7 @@ fn decodeKernel(allocator: std.mem.Allocator, compressed: []const u8, budgets: s
         if (result.status == .failed) {
             if (expect_budget_failure) {
                 if (result.failure) |failure| {
-                    if (failure == error.ResourceLimit) return null;
+                    if (failure == error.ResourceFailure) return null;
                 }
             }
             return error.UnexpectedFailure;
@@ -147,7 +147,7 @@ pub fn main(init: std.process.Init) !void {
     const after_destroy = session.step(compressed, &.{}, false);
     var destroy_invalid_call = false;
     if (after_destroy.failure) |failure| {
-        destroy_invalid_call = failure == error.InvalidCall;
+        destroy_invalid_call = failure == error.CallFailure;
     }
     check(after_destroy.status == .failed and destroy_invalid_call, "A step after destroy returns invalid_call");
 
@@ -170,7 +170,7 @@ pub fn main(init: std.process.Init) !void {
     const tight_size = try drivers.gzipEncode(tight_two, corpus, &encode_history, drivers.default_encode_options, .measured);
     check(tight_size == two_size, "Measured mode accepts an exact-size sink");
     const undersized = drivers.gzipEncode(one_out[0 .. bound - 1], corpus, &encode_history, drivers.default_encode_options, .bounded);
-    check(undersized == error.InsufficientCapacity, "Bounded mode enforces capacity before encoding");
+    check(undersized == error.CapacityFailure, "Bounded mode enforces capacity before encoding");
     const roundtrip = try decodeKernel(allocator, one_out[0..one_size], .{}, false);
     check(roundtrip != null and std.mem.eql(u8, roundtrip.?.bytes, corpus), "Bounded-mode output decodes through the session");
 

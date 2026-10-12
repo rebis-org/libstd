@@ -36,10 +36,8 @@ pub const apple_slices = [_]AppleSlice{
     } },
 };
 
-// Only iOS, iOS Simulator, macOS, and Mac Catalyst ship. tvOS and visionOS
-// are omitted for now. watchOS is blocked: its device slice needs arm64_32, which Zig
-// 0.17 has no backend for, and aarch64-watchos clamps any floor below 26.0
-// up to minos 26.0, so no v9 slice can pass the package gate.
+// watchOS is blocked: arm64_32 has no 0.17 backend, and aarch64-watchos
+// clamps floors to 26.0, failing the package gate.
 
 pub const framework_bundle = "StdK.framework";
 pub const framework_binary = "StdK";

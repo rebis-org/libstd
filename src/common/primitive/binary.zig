@@ -16,18 +16,18 @@ pub const ReadCursor = struct {
         return self.buffer[self.pos..];
     }
 
-    fn take(self: *ReadCursor, count: usize) error{InvalidData}![]const u8 {
-        if (count > self.buffer.len - self.pos) return error.InvalidData;
+    fn take(self: *ReadCursor, count: usize) error{DataFailure}![]const u8 {
+        if (count > self.buffer.len - self.pos) return error.DataFailure;
         const start = self.pos;
         self.pos += count;
         return self.buffer[start..][0..count];
     }
 
-    pub fn readU8(self: *ReadCursor) error{InvalidData}!u8 {
+    pub fn readU8(self: *ReadCursor) error{DataFailure}!u8 {
         return (try self.take(1))[0];
     }
 
-    pub fn readU32Le(self: *ReadCursor) error{InvalidData}!u32 {
+    pub fn readU32Le(self: *ReadCursor) error{DataFailure}!u32 {
         const raw = try self.readBytes(4);
         return std.mem.readInt(u32, &raw, .little);
     }
@@ -35,30 +35,30 @@ pub const ReadCursor = struct {
     // The shift bound is what terminates a maximally long encoding: a tenth
     // byte would push the value past 64 bits, so it is a resource limit
     // rather than malformed input.
-    pub fn readUleb128(self: *ReadCursor) error{ InvalidData, ResourceLimit }!u64 {
+    pub fn readUleb128(self: *ReadCursor) error{ DataFailure, ResourceFailure }!u64 {
         var decoded: u64 = 0;
         var shift: u6 = 0;
         while (true) {
             const next = try self.readU8();
             const low_bits: u64 = next & 0x7f;
-            if (shift == 63 and low_bits > 1) return error.ResourceLimit;
+            if (shift == 63 and low_bits > 1) return error.ResourceFailure;
             decoded |= low_bits << shift;
             if ((next & 0x80) == 0) return decoded;
-            if (shift >= 57) return error.ResourceLimit;
+            if (shift >= 57) return error.ResourceFailure;
             shift += 7;
         }
     }
 
-    pub fn readSlice(self: *ReadCursor, length: usize) error{InvalidData}![]const u8 {
+    pub fn readSlice(self: *ReadCursor, length: usize) error{DataFailure}![]const u8 {
         return self.take(length);
     }
 
-    pub fn advance(self: *ReadCursor, count: u64) error{ InvalidData, ResourceLimit }!void {
-        const steps = std.math.cast(usize, count) orelse return error.ResourceLimit;
+    pub fn advance(self: *ReadCursor, count: u64) error{ DataFailure, ResourceFailure }!void {
+        const steps = std.math.cast(usize, count) orelse return error.ResourceFailure;
         _ = try self.take(steps);
     }
 
-    pub fn readBytes(self: *ReadCursor, comptime length: u8) error{InvalidData}![length]u8 {
+    pub fn readBytes(self: *ReadCursor, comptime length: u8) error{DataFailure}![length]u8 {
         return (try self.take(length))[0..length].*;
     }
 };
@@ -79,8 +79,8 @@ pub const WriteCursor = struct {
         return self.pos;
     }
 
-    pub fn writeUtf16Le(self: *WriteCursor, code_point: u21) error{InsufficientCapacity}!void {
-        if (self.pos + 2 * utf16LeUnits(code_point) > self.buffer.len) return error.InsufficientCapacity;
+    pub fn writeUtf16Le(self: *WriteCursor, code_point: u21) error{CapacityFailure}!void {
+        if (self.pos + 2 * utf16LeUnits(code_point) > self.buffer.len) return error.CapacityFailure;
         if (code_point < 0x10000) {
             std.mem.writeInt(u16, self.buffer[self.pos..][0..2], @intCast(code_point), .little);
             self.pos += 2;
@@ -92,13 +92,13 @@ pub const WriteCursor = struct {
         }
     }
 
-    pub fn writeU8(self: *WriteCursor, next: u8) error{InsufficientCapacity}!void {
-        if (self.pos >= self.buffer.len) return error.InsufficientCapacity;
+    pub fn writeU8(self: *WriteCursor, next: u8) error{CapacityFailure}!void {
+        if (self.pos >= self.buffer.len) return error.CapacityFailure;
         self.buffer[self.pos] = next;
         self.pos += 1;
     }
 
-    pub fn writeUleb128(self: *WriteCursor, decoded: u64) error{InsufficientCapacity}!void {
+    pub fn writeUleb128(self: *WriteCursor, decoded: u64) error{CapacityFailure}!void {
         var rest = decoded;
         while (true) {
             var next: u8 = @truncate(rest & 0x7f);

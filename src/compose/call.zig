@@ -44,15 +44,15 @@ fn report(call: *Call, failure: Failure) u32 {
 // An unsupported request usually names the id it could not place, and that id
 // is more actionable than the generic diagnostic the status would otherwise carry.
 fn fail(call: *Call, failure: Failure) u32 {
-    if (failure == error.Unsupported) if (unknownRequiredId(call.request)) |id| common.writeDiagnosticId(call, ids.diagnostic_subject, id);
+    if (failure == error.UnsupportedFailure) if (unknownRequiredId(call.request)) |id| common.writeDiagnosticId(call, ids.diagnostic_subject, id);
     return report(call, failure);
 }
 
 pub fn invoke(call: ?*Call) u32 {
     const envelope = call orelse return Status.invalid_call;
-    if (!envelope.isValid()) return if (envelope.structure_size >= @sizeOf(Call)) report(envelope, error.InvalidCall) else Status.invalid_call;
-    const response = envelope.response orelse return report(envelope, error.InvalidCall);
-    if (!response.isValid() or !isZero(response.id)) return report(envelope, error.InvalidCall);
+    if (!envelope.isValid()) return if (envelope.structure_size >= @sizeOf(Call)) report(envelope, error.CallFailure) else Status.invalid_call;
+    const response = envelope.response orelse return report(envelope, error.CallFailure);
+    if (!response.isValid() or !isZero(response.id)) return report(envelope, error.CallFailure);
     if (envelope.diagnostic) |diagnostic| {
         node_graph.validateGraph(diagnostic.child, .out, 0) catch |failure| return mapFailure(failure).status;
     }
@@ -74,24 +74,24 @@ fn writeCatalog(call: *Call, response: *Node) u32 {
         common.writeCapacityDiagnostic(call, catalog_json.len, response.byte_capacity);
         return Status.insufficient_capacity;
     }
-    const output = response.bytes orelse return report(call, error.InvalidCall);
+    const output = response.bytes orelse return report(call, error.CallFailure);
     @memcpy(output[0..catalog_json.len], catalog_json);
     return Status.ok;
 }
 
 fn dispatch(envelope: *Call, response: *Node) Failure!void {
     const command_mask = commandMaskForId(envelope.operation);
-    if (command_mask == 0) return error.Unsupported;
+    if (command_mask == 0) return error.UnsupportedFailure;
     const profile_id = nodeId(try requireParameter(envelope.request, ids.profile));
-    const profile = descriptorFor(profile_id) orelse return error.Unsupported;
-    if (profile.kind != .profile or (profile.command_mask & command_mask) == 0) return error.Unsupported;
-    const tag = compose_catalog.profileTagForId(profile_id) orelse return error.Unsupported;
+    const profile = descriptorFor(profile_id) orelse return error.UnsupportedFailure;
+    if (profile.kind != .profile or (profile.command_mask & command_mask) == 0) return error.UnsupportedFailure;
+    const tag = compose_catalog.profileTagForId(profile_id) orelse return error.UnsupportedFailure;
     const is_query = eql(envelope.operation, ids.query);
     const direction = if (is_query)
         try queryDirection(envelope.request)
     else
         command_mask;
-    const policy = compose_catalog.commandPolicyFor(profile_id, direction) orelse return error.Unsupported;
+    const policy = compose_catalog.commandPolicyFor(profile_id, direction) orelse return error.UnsupportedFailure;
     const sizing = try parseSizingMode(
         protocolParam(envelope.request, vocabulary.protocol_parameter.sizing_mode),
         policy.sizing,
@@ -101,10 +101,10 @@ fn dispatch(envelope: *Call, response: *Node) Failure!void {
         policy.commit,
     );
     // Fixtures run every sizing and commit pairing; released profiles do not.
-    if (tag != .test_echo and tag != .test_read and (sizing != policy.sizing or commit != policy.commit)) return error.Unsupported;
+    if (tag != .test_echo and tag != .test_read and (sizing != policy.sizing or commit != policy.commit)) return error.UnsupportedFailure;
     // size_bound only opts measured writes into bounded sizing. Other targets map to unsupported as parameter misuse.
     const effective_sizing = if (node_graph.findParameter(envelope.request, ids.size_bound) == null) sizing else bounded: {
-        if (policy.sizing != .measured or direction != command_mask_write) return error.Unsupported;
+        if (policy.sizing != .measured or direction != command_mask_write) return error.UnsupportedFailure;
         break :bounded vocabulary.SizingMode.bounded;
     };
     const limits = Limits.fromScalar(node_graph.parseU64(protocolParam(
@@ -136,9 +136,9 @@ fn dispatch(envelope: *Call, response: *Node) Failure!void {
     try common.validateBoundary(envelope, &plan, source_node, sink_node);
     var source = try Resource.sourceFromNode(envelope, source_node, capabilities);
     var sink: ?Resource = if (sink_node) |node| try Resource.sinkFromNode(envelope, node, capabilities) else null;
-    const selected = if (is_query) &source else if (direction == command_mask_read) &source else if (sink) |*sink_resource| sink_resource else return error.InvalidCall;
-    if ((selected.capabilities & policy.capabilities) != policy.capabilities) return error.Unsupported;
-    if (effective_sizing == .unavailable) return error.Unsupported;
+    const selected = if (is_query) &source else if (direction == command_mask_read) &source else if (sink) |*sink_resource| sink_resource else return error.CallFailure;
+    if ((selected.capabilities & policy.capabilities) != policy.capabilities) return error.UnsupportedFailure;
+    if (effective_sizing == .unavailable) return error.UnsupportedFailure;
     // Workspace requirement must be reported on every exit path, success or failure.
     defer if (plan.workspace_required != 0)
         common.writeWorkspaceCapacityDiagnostic(envelope, plan.workspace_required, plan.workspace_available);
@@ -149,7 +149,7 @@ fn dispatch(envelope: *Call, response: *Node) Failure!void {
 // the request before any policy or capability question is asked.
 fn queryDirection(request: ?*Node) Failure!u32 {
     const direction = commandMaskForId(nodeId(try requireParameter(request, ids.target_command)));
-    if (direction != command_mask_read and direction != command_mask_write) return error.InvalidCall;
+    if (direction != command_mask_read and direction != command_mask_write) return error.CallFailure;
     return direction;
 }
 
@@ -171,7 +171,7 @@ fn unknownRequiredIdInGraph(first: ?*Node, depth: u16, remaining: *usize) ?Id {
 }
 
 fn requireParameter(first: ?*Node, id: Id) Failure!*Node {
-    return node_graph.findParameter(first, id) orelse error.InvalidCall;
+    return node_graph.findParameter(first, id) orelse error.CallFailure;
 }
 
 fn nodeId(node: *Node) Id {
@@ -194,7 +194,7 @@ fn parseSizingMode(node: ?*Node, default: vocabulary.SizingMode) Failure!vocabul
         1 => .metadata_exact,
         2 => .measured,
         3 => .materialization,
-        else => error.InvalidCall,
+        else => error.CallFailure,
     };
 }
 
@@ -203,7 +203,7 @@ fn parseCommitMode(node: ?*Node, default: vocabulary.CommitMode) Failure!vocabul
     return switch (present.value_low) {
         0 => .tentative,
         1 => .confirmed,
-        else => error.InvalidCall,
+        else => error.CallFailure,
     };
 }
 
@@ -212,8 +212,8 @@ fn parseProvider(node: ?*Node) Failure!seam.Provider {
     const provider: seam.Provider = switch (present.value_low) {
         0 => .onprem,
         1 => .offprem,
-        else => return error.InvalidCall,
+        else => return error.CallFailure,
     };
-    if (!seam.isServed(provider)) return error.Unsupported;
+    if (!seam.isServed(provider)) return error.UnsupportedFailure;
     return provider;
 }

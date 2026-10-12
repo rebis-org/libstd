@@ -3,7 +3,9 @@ const std = @import("std");
 const missing = "missing";
 
 fn formatCell(buffer: *[16]u8, comptime format: []const u8, value: f64) []const u8 {
-    return std.fmt.bufPrint(buffer, format, .{value}) catch missing;
+    var writer: std.Io.Writer = std.Io.Writer.fixed(buffer);
+    writer.print(format, .{value}) catch return missing;
+    return writer.buffered();
 }
 
 pub fn cell(buffer: *[16]u8, comptime format: []const u8, value: f64, show: bool) []const u8 {

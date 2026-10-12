@@ -161,7 +161,7 @@ fn methodId(method: CoderMethod) []const u8 {
 
 fn methodFromId(id: []const u8) Failure!CoderMethod {
     inline for (method_ids) |row| if (std.mem.eql(u8, id, row.id)) return row.method;
-    return error.Unsupported;
+    return error.UnsupportedFailure;
 }
 
 fn coderAttributeSize(method: CoderMethod) usize {
@@ -196,8 +196,8 @@ const PackedEntry = struct {
 fn packBuffer(comptime codec: type, method: CoderMethod, input: []const u8, unpacked_crc: u32, workspace: *Workspace, limits: Limits, scratch_size: usize, options: codec.Options) Failure!PackedEntry {
     const scratch = try workspace.take(u8, scratch_size);
     const packed_size = try codec.requiredSize(input, scratch, options);
-    if (packed_size > limits.encoded_bytes) return error.ResourceLimit;
-    if (try bounds.addUsize(input.len, packed_size) > limits.codec_work) return error.ResourceLimit;
+    if (packed_size > limits.encoded_bytes) return error.ResourceFailure;
+    if (try bounds.addUsize(input.len, packed_size) > limits.codec_work) return error.ResourceFailure;
     const packed_data = try workspace.take(u8, packed_size);
     _ = try codec.encode(input, packed_data, scratch, options);
     return .{ .method = method, .data = packed_data, .crc = unpacked_crc, .pack_size = packed_size, .unpack_size = input.len };
@@ -205,39 +205,39 @@ fn packBuffer(comptime codec: type, method: CoderMethod, input: []const u8, unpa
 
 fn packEntry(entry: Entry, provider: crypto.Provider, workspace: *Workspace, limits: Limits, failure_cause: *crypto.FailureCause) Failure!PackedEntry {
     if (entry.encrypted) {
-        if (entry.password.len == 0) return error.InvalidCall;
-        if (entry.num_cycles_power > crypto.seven_zip_cycles_max) return error.InvalidCall;
-        if (entry.salt_length > 16) return error.InvalidCall;
+        if (entry.password.len == 0) return error.CallFailure;
+        if (entry.num_cycles_power > crypto.seven_zip_cycles_max) return error.CallFailure;
+        if (entry.salt_length > 16) return error.CallFailure;
         const cycles = if (entry.num_cycles_power == 0) crypto.seven_zip_default_cycles else entry.num_cycles_power;
         const rounds: u64 = @as(u64, 1) << @intCast(cycles);
         if (entry.kdf_rounds_limit != 0 and entry.kdf_rounds_limit < rounds) {
             failure_cause.* = .kdf_limit;
-            return error.ResourceLimit;
+            return error.ResourceFailure;
         }
     }
     const unpacked_crc = checksum.crc32With(provider, entry.data);
     const compressed_entry = switch (entry.method) {
-        .bcj2 => return error.InvalidCall, // Decode-only; creation never emits BCJ2.
+        .bcj2 => return error.CallFailure, // Decode-only; creation never emits BCJ2.
         .copy => blk: {
-            if (entry.filter != null) return error.InvalidCall;
-            if (entry.data.len > limits.encoded_bytes) return error.ResourceLimit;
-            if (entry.data.len > limits.codec_work) return error.ResourceLimit;
+            if (entry.filter != null) return error.CallFailure;
+            if (entry.data.len > limits.encoded_bytes) return error.ResourceFailure;
+            if (entry.data.len > limits.codec_work) return error.ResourceFailure;
             break :blk PackedEntry{ .method = .copy, .data = entry.data, .crc = unpacked_crc, .pack_size = entry.data.len, .unpack_size = entry.data.len };
         },
         .deflate => blk: {
             const measure_history = try workspace.take(u8, deflate.history_size);
             var counter = measurement.Counter.init(null);
-            var measure_compressor = deflate.Compress.init(&counter.writer, measure_history, default_deflate_options) catch return error.InsufficientCapacity;
+            var measure_compressor = deflate.Compress.init(&counter.writer, measure_history, default_deflate_options) catch return error.CapacityFailure;
             var measure_source = std.Io.Reader.fixed(entry.data);
             _ = std.Io.Reader.streamRemaining(&measure_source, &measure_compressor.writer) catch return error.IoFailure;
             measure_compressor.finish() catch return error.IoFailure;
             const packed_size = counter.written();
-            if (packed_size > limits.encoded_bytes) return error.ResourceLimit;
-            if (entry.data.len + packed_size > limits.codec_work) return error.ResourceLimit;
+            if (packed_size > limits.encoded_bytes) return error.ResourceFailure;
+            if (entry.data.len + packed_size > limits.codec_work) return error.ResourceFailure;
             const packed_data = try workspace.take(u8, packed_size);
             const history = try workspace.take(u8, deflate.history_size);
             var fixed_writer = std.Io.Writer.fixed(packed_data);
-            var compressor = deflate.Compress.init(&fixed_writer, history, default_deflate_options) catch return error.InsufficientCapacity;
+            var compressor = deflate.Compress.init(&fixed_writer, history, default_deflate_options) catch return error.CapacityFailure;
             var source = std.Io.Reader.fixed(entry.data);
             _ = std.Io.Reader.streamRemaining(&source, &compressor.writer) catch return error.IoFailure;
             compressor.finish() catch return error.IoFailure;
@@ -274,7 +274,7 @@ fn packEntry(entry: Entry, provider: crypto.Provider, workspace: *Workspace, lim
                         const options: lzma2.Options = .{ .dictionary_size = default_dictionary, .properties = lzma2.defaultProperties(default_dictionary), .max_work = limits.codec_work };
                         break :blk2 try packBuffer(lzma2, .lzma2, filtered, unpacked_crc, workspace, limits, lzma2.encodeWorkspaceSizeBt(default_dictionary), options);
                     },
-                    else => return error.InvalidCall,
+                    else => return error.CallFailure,
                 };
                 packed_entry.filter = explicit;
                 break :blk packed_entry;
@@ -296,7 +296,7 @@ fn packEntry(entry: Entry, provider: crypto.Provider, workspace: *Workspace, lim
     const padded_size = std.mem.alignForward(usize, compressed_entry.data.len, crypto.block_length);
     if (entry.password_lifetime != 0 and padded_size > entry.password_lifetime) {
         failure_cause.* = .password_lifetime;
-        return error.ResourceLimit;
+        return error.ResourceFailure;
     }
     const encrypted_data = try workspace.take(u8, padded_size);
     @memset(encrypted_data[compressed_entry.data.len..], 0);
@@ -313,7 +313,7 @@ fn applyEncodeFilter(method: CoderMethod, data: []u8) Failure!void {
     switch (method) {
         .delta => delta.encode(data, 0),
         .x86, .ppc, .ia64, .arm, .armt, .sparc, .arm64, .riscv => bcj.encode(bcjKindFromMethod(method), 0, data),
-        else => return error.InvalidCall,
+        else => return error.CallFailure,
     }
 }
 
@@ -334,7 +334,7 @@ fn packAllEntries(entries: []const Entry, provider: crypto.Provider, workspace: 
             if (j - i >= 2) {
                 var total: usize = 0;
                 for (entries[i..j]) |entry| total = try bounds.addUsize(total, entry.data.len);
-                if (total > limits.codec_work) return error.ResourceLimit;
+                if (total > limits.codec_work) return error.ResourceFailure;
                 const concat = try workspace.take(u8, total);
                 var offset: usize = 0;
                 for (entries[i..j]) |entry| {
@@ -358,8 +358,8 @@ fn packAllEntries(entries: []const Entry, provider: crypto.Provider, workspace: 
                     },
                     else => unreachable,
                 };
-                if (packed_size > limits.encoded_bytes) return error.ResourceLimit;
-                if (try bounds.addUsize(total, packed_size) > limits.codec_work) return error.ResourceLimit;
+                if (packed_size > limits.encoded_bytes) return error.ResourceFailure;
+                if (try bounds.addUsize(total, packed_size) > limits.codec_work) return error.ResourceFailure;
                 const packed_data = try workspace.take(u8, packed_size);
                 switch (entries[i].method) {
                     .lzma2 => {
@@ -402,19 +402,15 @@ fn requiredSizeFromPacked(entries: []const Entry, packed_entries: []const Packed
     const header_struct_size = try measurement.measuredLength(&counter);
     const packs_and_header = try bounds.addUsize(total_pack_size, header.pack_size);
     const total = try bounds.addUsize(start_header_size, try bounds.addUsize(packs_and_header, header_struct_size));
-    return std.math.cast(usize, total) orelse error.ResourceLimit;
+    return std.math.cast(usize, total) orelse error.ResourceFailure;
 }
 
 pub fn sevenZipPackedSize(entries: []const Entry, packed_entries: []const PackedEntry, workspace: *Workspace, provider: crypto.Provider, limits: Limits, header_options: SevenZipHeaderOptions) Failure!usize {
     return try requiredSizeFromPacked(entries, packed_entries, workspace, provider, limits, header_options);
 }
 
-// Archive-level header policy for the write path: -mhc (compress the header
-// into a packed stream) and -mhe (AES-256-encrypt the header, stored, not
-// compressed). The stored-under-encryption shape matches the reference
-// 7zOut.cpp writer, whose -mhe folder is a single AES coder; an encrypted
-// compressed header (AES+LZMA) is spec-legal and readable here, but the
-// reference reader rejects it, so composition never emits it.
+// The reference reader rejects an encrypted compressed header (AES+LZMA),
+// so composition never emits it even though it is spec-legal.
 pub const SevenZipHeaderOptions = struct {
     compress: bool = false,
     encrypt: bool = false,
@@ -445,13 +441,13 @@ const HeaderEncode = struct {
 };
 
 fn encryptHeaderBytes(cleartext: []const u8, workspace: *Workspace, provider: crypto.Provider, header_options: SevenZipHeaderOptions) Failure!struct { data: []const u8, cycles: u8, iv: [16]u8 } {
-    if (header_options.password.len == 0) return error.InvalidCall;
-    if (header_options.num_cycles_power > crypto.seven_zip_cycles_max) return error.InvalidCall;
+    if (header_options.password.len == 0) return error.CallFailure;
+    if (header_options.num_cycles_power > crypto.seven_zip_cycles_max) return error.CallFailure;
     const cycles = if (header_options.num_cycles_power == 0) crypto.seven_zip_default_cycles else header_options.num_cycles_power;
     const rounds: u64 = @as(u64, 1) << @intCast(cycles);
     if (header_options.kdf_rounds_limit != 0 and header_options.kdf_rounds_limit < rounds) {
         if (header_options.failure_cause) |cause| cause.* = .kdf_limit;
-        return error.ResourceLimit;
+        return error.ResourceFailure;
     }
     const password_utf16 = try passwordToUtf16(header_options.password, workspace);
     var key: [crypto.seven_zip_key_length]u8 = undefined;
@@ -459,7 +455,7 @@ fn encryptHeaderBytes(cleartext: []const u8, workspace: *Workspace, provider: cr
     const padded_size = std.mem.alignForward(usize, cleartext.len, crypto.block_length);
     if (header_options.password_lifetime != 0 and padded_size > header_options.password_lifetime) {
         if (header_options.failure_cause) |cause| cause.* = .password_lifetime;
-        return error.ResourceLimit;
+        return error.ResourceFailure;
     }
     const encrypted_data = try workspace.take(u8, padded_size);
     @memset(encrypted_data[cleartext.len..], 0);
@@ -572,9 +568,10 @@ fn writeNextHeader(writer: *std.Io.Writer, header: *const HeaderEncode, pack_off
         try writeUint64(writer, 0);
     }
     try io.writeBytes(writer, &.{0x0C});
-    // A lone AES coder records the real header size (the padding is stripped
-    // by the reader); an AES coder feeding a compressor records its padded
-    // output, as in the file-data folder convention.
+    // A lone AES coder records the real header size; the reader strips the
+    // padding.
+    // An AES coder feeding a compressor records its padded output, as in
+    // file-data folders.
     if (header.encrypted and header.compressed) try writeUint64(writer, header.pack_size);
     try writeUint64(writer, header.unpack_size);
     try io.writeBytes(writer, &.{0x0A});
@@ -588,7 +585,7 @@ fn writeNextHeader(writer: *std.Io.Writer, header: *const HeaderEncode, pack_off
 
 fn writeArchive(output: []u8, entries: []const Entry, packed_entries: []const PackedEntry, workspace: *Workspace, provider: crypto.Provider, limits: Limits, header_options: SevenZipHeaderOptions) Failure!usize {
     const required = try requiredSizeFromPacked(entries, packed_entries, workspace, provider, limits, header_options);
-    if (output.len < required) return error.InsufficientCapacity;
+    if (output.len < required) return error.CapacityFailure;
     var total_pack_size: usize = 0;
     const plan = try buildFolderPlan(packed_entries, workspace);
     for (plan) |folder| total_pack_size = try bounds.addUsize(total_pack_size, packed_entries[folder.first].data.len);
@@ -632,7 +629,7 @@ pub fn sevenZipInspectOrdinal(archive_bytes: []const u8, workspace: *Workspace, 
 
 pub fn sevenZipInspectOrdinalEx(archive_bytes: []const u8, workspace: *Workspace, limits: Limits, ordinal: u64, options: *const SevenZipLoadOptions) Failure!Info {
     const loaded = try loadArchive(archive_bytes, workspace, limits, options);
-    if (ordinal >= loaded.count) return error.InvalidData;
+    if (ordinal >= loaded.count) return error.DataFailure;
     return loaded.entries[ordinal];
 }
 
@@ -646,78 +643,78 @@ pub fn sevenZipDecodeOrdinal(archive_bytes: []const u8, workspace: *Workspace, l
         .provider = decode_options.provider,
     };
     const loaded = try loadArchive(archive_bytes, workspace, limits, &load_options);
-    if (ordinal >= loaded.count) return error.InvalidData;
+    if (ordinal >= loaded.count) return error.DataFailure;
     const entry = loaded.entries[ordinal];
-    const size = std.math.cast(usize, entry.size) orelse return error.ResourceLimit;
-    if (output.len < size) return error.InsufficientCapacity;
+    const size = std.math.cast(usize, entry.size) orelse return error.ResourceFailure;
+    if (output.len < size) return error.CapacityFailure;
     if (size == 0) return 0;
     var decode_output = output;
     var decode_target_len = size;
     if (entry.folder) |folder| {
         if (folder.num_substreams > 1) {
             const total_size = try folderOutputSize(folder);
-            if (total_size > limits.decoded_bytes) return error.ResourceLimit;
+            if (total_size > limits.decoded_bytes) return error.ResourceFailure;
             decode_output = try workspace.take(u8, total_size);
             decode_target_len = total_size;
         }
     }
-    const pack_size = std.math.cast(usize, entry.pack_size) orelse return error.ResourceLimit;
+    const pack_size = std.math.cast(usize, entry.pack_size) orelse return error.ResourceFailure;
     const packed_data = try workspace.take(u8, pack_size);
     try readAt(loaded.data, entry.data_offset, packed_data);
     const decrypted_packed = try aesDecryptStream(entry.encrypted, entry.aes_num_cycles, entry.aes_salt, entry.aes_iv, packed_data, workspace, &load_options);
     switch (entry.method) {
         .copy => {
-            if (decrypted_packed.len != decode_target_len and !entry.encrypted) return error.InvalidData;
-            if (decrypted_packed.len < decode_target_len) return error.InvalidData;
+            if (decrypted_packed.len != decode_target_len and !entry.encrypted) return error.DataFailure;
+            if (decrypted_packed.len < decode_target_len) return error.DataFailure;
             @memcpy(decode_output[0..decode_target_len], decrypted_packed[0..decode_target_len]);
         },
         .deflate => {
             const history = try workspace.take(u8, deflate.history_size);
             var source_reader = std.Io.Reader.fixed(decrypted_packed);
             var dest_writer = std.Io.Writer.fixed(decode_output);
-            var inflater = deflate_seam.Decode.initBound(decode_options.provider, &source_reader, history) catch return error.Unsupported;
-            _ = inflater.readerPtr().streamRemaining(&dest_writer) catch return error.InvalidData;
-            if (dest_writer.end != decode_target_len) return error.InvalidData;
+            var inflater = deflate_seam.Decode.initBound(decode_options.provider, &source_reader, history) catch return error.UnsupportedFailure;
+            _ = inflater.readerPtr().streamRemaining(&dest_writer) catch return error.DataFailure;
+            if (dest_writer.end != decode_target_len) return error.DataFailure;
         },
         .bzip2 => {
             const scratch_size = try bzip2.decodeWorkspaceSizeFor(decrypted_packed);
             const scratch = try workspace.take(u8, scratch_size);
             const decoded = try bzip2.decode(decrypted_packed, decode_output, scratch, decode_options.provider);
-            if (decoded != decode_target_len) return error.InvalidData;
+            if (decoded != decode_target_len) return error.DataFailure;
         },
         .lzma => {
             const properties = try parseLzmaProperties(entry.attributes);
             const options: lzma.Options = .{ .properties = properties, .unpack_size = decode_target_len, .marker_required = false, .max_work = limits.codec_work };
             const scratch = try workspace.take(u8, lzma.decodeWorkspaceSize(properties));
             const decoded = try lzma_seam.decode(decode_options.provider, decrypted_packed, decode_output, scratch, options);
-            if (decoded != decode_target_len) return error.InvalidData;
+            if (decoded != decode_target_len) return error.DataFailure;
         },
         .lzma2 => {
             const dictionary = lzma2.dictionarySizeFromProperties(try readLzma2Prop(entry.attributes));
-            if (dictionary < lzma.dictionary_min or dictionary > lzma.dictionary_max) return error.Unsupported;
+            if (dictionary < lzma.dictionary_min or dictionary > lzma.dictionary_max) return error.UnsupportedFailure;
             const options: lzma2.Options = .{ .dictionary_size = dictionary, .properties = lzma2.defaultProperties(dictionary), .max_work = limits.codec_work };
             const scratch = try workspace.take(u8, lzma2.decodeWorkspaceSize(dictionary));
             const decoded = try lzma2_seam.decode(decode_options.provider, decrypted_packed, decode_output, scratch, options);
-            if (decoded != decode_target_len) return error.InvalidData;
+            if (decoded != decode_target_len) return error.DataFailure;
         },
         .ppmd => {
             const options = try parsePpmdOptions(entry.attributes, decode_target_len, limits.codec_work);
             const scratch = try workspace.take(u8, ppmd.decodeWorkspaceSize(options.mem_size));
             const decoded = try ppmd.decode(decrypted_packed, decode_output, scratch, options);
-            if (decoded != decode_target_len) return error.InvalidData;
+            if (decoded != decode_target_len) return error.DataFailure;
         },
         .bcj2 => {
-            const folder = entry.folder orelse return error.InvalidData;
+            const folder = entry.folder orelse return error.DataFailure;
             const written = try decodeBcj2Folder(folder, entry.pack_stream_sizes, decrypted_packed, decode_output[0..decode_target_len], workspace, limits, decode_options.provider);
-            if (written != decode_target_len) return error.InvalidData;
+            if (written != decode_target_len) return error.DataFailure;
         },
-        else => return error.Unsupported,
+        else => return error.UnsupportedFailure,
     }
     if (entry.folder) |folder| {
         try applyFolderFilters(folder.coders, decode_output[0..decode_target_len]);
         if (folder.num_substreams > 1) {
-            const offset = std.math.cast(usize, entry.substream_offset) orelse return error.ResourceLimit;
-            if (offset + size > decode_target_len) return error.InvalidData;
+            const offset = std.math.cast(usize, entry.substream_offset) orelse return error.ResourceFailure;
+            if (offset + size > decode_target_len) return error.DataFailure;
             @memcpy(output[0..size], decode_output[offset..][0..size]);
         }
     }
@@ -728,30 +725,30 @@ pub fn sevenZipDecodeOrdinal(archive_bytes: []const u8, workspace: *Workspace, l
 }
 
 fn readLzma2Prop(attributes: []const u8) Failure!u8 {
-    if (attributes.len != 1) return error.InvalidData;
+    if (attributes.len != 1) return error.DataFailure;
     return attributes[0];
 }
 
 // Recombines a BCJ2 folder. Each of the four inputs is a raw packed stream or the decoded
 // output of one of the folder's compressor coders, per `folder.bcj2_sources`.
 fn decodeBcj2Folder(folder: *const Folder, pack_sizes: []const u64, packed_data: []const u8, output: []u8, workspace: *Workspace, limits: Limits, provider: lzma2_seam.Provider) Failure!usize {
-    if (!folder.bcj2 or pack_sizes.len != 4) return error.InvalidData;
+    if (!folder.bcj2 or pack_sizes.len != 4) return error.DataFailure;
     var packed_offset: usize = 0;
     var packed_slices: [4][]const u8 = undefined;
     for (0..4) |k| {
-        const size = std.math.cast(usize, pack_sizes[k]) orelse return error.ResourceLimit;
+        const size = std.math.cast(usize, pack_sizes[k]) orelse return error.ResourceFailure;
         packed_offset = try bounds.addUsize(packed_offset, size);
-        if (packed_offset > packed_data.len) return error.InvalidData;
+        if (packed_offset > packed_data.len) return error.DataFailure;
         packed_slices[k] = packed_data[packed_offset - size .. packed_offset];
     }
     var substreams: [4][]const u8 = undefined;
     for (0..4) |k| {
         const source = folder.bcj2_sources[k];
-        const ordinal = std.math.cast(usize, source.pack_ordinal) orelse return error.ResourceLimit;
-        if (ordinal >= 4) return error.InvalidData;
+        const ordinal = std.math.cast(usize, source.pack_ordinal) orelse return error.ResourceFailure;
+        if (ordinal >= 4) return error.DataFailure;
         const slice = packed_slices[ordinal];
         if (source.producer) |coder_index| {
-            if (coder_index >= folder.coders.len) return error.InvalidData;
+            if (coder_index >= folder.coders.len) return error.DataFailure;
             substreams[k] = try decodeBcj2Substream(folder.coders[coder_index], slice, workspace, limits, provider);
         } else {
             substreams[k] = slice;
@@ -765,21 +762,21 @@ fn decodeBcj2Substream(coder: ParsedCoder, packed_data: []const u8, workspace: *
         .copy => return packed_data,
         .lzma2 => {
             const dictionary = lzma2.dictionarySizeFromProperties(try readLzma2Prop(coder.attributes));
-            if (dictionary < lzma.dictionary_min or dictionary > lzma.dictionary_max) return error.Unsupported;
+            if (dictionary < lzma.dictionary_min or dictionary > lzma.dictionary_max) return error.UnsupportedFailure;
             const options: lzma2.Options = .{ .dictionary_size = dictionary, .properties = lzma2.defaultProperties(dictionary), .max_work = limits.codec_work };
             const scratch = try workspace.take(u8, lzma2.decodeWorkspaceSize(dictionary));
             const decoded_size = try lzma2_seam.decodedSize(provider, packed_data, scratch, options);
-            if (decoded_size > limits.decoded_bytes) return error.ResourceLimit;
+            if (decoded_size > limits.decoded_bytes) return error.ResourceFailure;
             const buffer = try workspace.take(u8, decoded_size);
             const decoded = try lzma2_seam.decode(provider, packed_data, buffer, scratch, options);
             return buffer[0..decoded];
         },
-        else => return error.Unsupported,
+        else => return error.UnsupportedFailure,
     }
 }
 
 fn parsePpmdOptions(attributes: []const u8, unpack_size: usize, codec_work: u64) Failure!ppmd.Options {
-    if (attributes.len != 5) return error.InvalidData;
+    if (attributes.len != 5) return error.DataFailure;
     const mem_field = std.mem.readInt(u32, attributes[1..5], .little);
     const mem_size = mem_field << 8;
     return .{
@@ -791,11 +788,11 @@ fn parsePpmdOptions(attributes: []const u8, unpack_size: usize, codec_work: u64)
 }
 
 fn parseLzmaProperties(attributes: []const u8) Failure!lzma.Properties {
-    if (attributes.len != 5) return error.InvalidData;
+    if (attributes.len != 5) return error.DataFailure;
     const props_byte = attributes[0];
     var dictionary: u32 = 0;
     for (0..4) |i| dictionary |= @as(u32, attributes[1 + i]) << @intCast(8 * i);
-    if (dictionary < lzma.dictionary_min or dictionary > lzma.dictionary_max) return error.Unsupported;
+    if (dictionary < lzma.dictionary_min or dictionary > lzma.dictionary_max) return error.UnsupportedFailure;
     return try lzma.Properties.decode(props_byte, dictionary);
 }
 
@@ -804,7 +801,7 @@ fn applyFolderFilters(coders: []const ParsedCoder, data: []u8) Failure!void {
     var filter_count: usize = 0;
     for (coders) |coder| {
         if (isFilterMethod(coder.method)) {
-            if (filter_count >= filters.len) return error.Unsupported;
+            if (filter_count >= filters.len) return error.UnsupportedFailure;
             filters[filter_count] = coder;
             filter_count += 1;
         }
@@ -812,16 +809,16 @@ fn applyFolderFilters(coders: []const ParsedCoder, data: []u8) Failure!void {
     for (filters[0..filter_count]) |coder| {
         switch (coder.method) {
             .delta => {
-                if (coder.attributes.len != 1) return error.InvalidData;
+                if (coder.attributes.len != 1) return error.DataFailure;
                 delta.decode(data, coder.attributes[0]);
             },
             .x86, .ppc, .ia64, .arm, .armt, .sparc, .arm64, .riscv => {
                 const start_offset: u32 = if (coder.attributes.len == 0) 0 else if (coder.attributes.len == 4)
                     std.mem.readInt(u32, coder.attributes[0..4], .little)
                 else
-                    return error.InvalidData;
+                    return error.DataFailure;
                 const kind = bcjKindFromMethod(coder.method);
-                if (start_offset % bcj.alignment(kind) != 0) return error.InvalidData;
+                if (start_offset % bcj.alignment(kind) != 0) return error.DataFailure;
                 bcj.decode(kind, start_offset, data);
             },
             else => return error.InternalFailure,
@@ -859,9 +856,9 @@ const LoadedArchive = struct {
 };
 
 fn readAt(data: []const u8, offset: u64, buffer: []u8) Failure!void {
-    const start = std.math.cast(usize, offset) orelse return error.InvalidData;
+    const start = std.math.cast(usize, offset) orelse return error.DataFailure;
     const end = try bounds.addUsize(start, buffer.len);
-    if (end > data.len) return error.InvalidData;
+    if (end > data.len) return error.DataFailure;
     @memcpy(buffer, data[start..end]);
 }
 
@@ -879,7 +876,7 @@ const k_header: u8 = 0x01;
 const k_encoded_header: u8 = 0x17;
 
 fn loadArchive(data: []const u8, workspace: *Workspace, limits: Limits, options: *const SevenZipLoadOptions) Failure!LoadedArchive {
-    if (data.len > limits.encoded_bytes) return error.ResourceLimit;
+    if (data.len > limits.encoded_bytes) return error.ResourceFailure;
     var archive: LoadedArchive = .{
         .data = data,
         .count = 0,
@@ -887,17 +884,17 @@ fn loadArchive(data: []const u8, workspace: *Workspace, limits: Limits, options:
     };
     var start_buffer: [start_header_size]u8 = undefined;
     try readAt(data, 0, &start_buffer);
-    if (!std.mem.eql(u8, start_buffer[0..6], &signature)) return error.InvalidData;
-    if (!std.mem.eql(u8, start_buffer[6..8], &version)) return error.Unsupported;
+    if (!std.mem.eql(u8, start_buffer[0..6], &signature)) return error.DataFailure;
+    if (!std.mem.eql(u8, start_buffer[6..8], &version)) return error.UnsupportedFailure;
     const recorded_start_crc = std.mem.readInt(u32, start_buffer[8..12], .little);
     const start_header_crc = checksum.crc32With(options.provider, start_buffer[12..32]);
     if (recorded_start_crc != start_header_crc) return error.IntegrityFailure;
     const next_header_offset = std.mem.readInt(u64, start_buffer[12..20], .little);
     const next_header_size = std.mem.readInt(u64, start_buffer[20..28], .little);
     const recorded_header_crc = std.mem.readInt(u32, start_buffer[28..32], .little);
-    if (next_header_size > limits.metadata_records) return error.ResourceLimit;
+    if (next_header_size > limits.metadata_records) return error.ResourceFailure;
     const header_start = try bounds.addU64(start_header_size, next_header_offset);
-    const header_size_usize = std.math.cast(usize, next_header_size) orelse return error.ResourceLimit;
+    const header_size_usize = std.math.cast(usize, next_header_size) orelse return error.ResourceFailure;
     const header_buffer = try workspace.take(u8, header_size_usize);
     try readAt(archive.data, header_start, header_buffer);
     if (checksum.crc32With(options.provider, header_buffer) != recorded_header_crc) return error.IntegrityFailure;
@@ -907,9 +904,9 @@ fn loadArchive(data: []const u8, workspace: *Workspace, limits: Limits, options:
     if (header_id == k_encoded_header) {
         header_bytes = try decodeEncodedHeader(data, &cursor, workspace, limits, options);
         cursor = binary.ReadCursor.init(header_bytes);
-        if (try cursor.readU8() != k_header) return error.InvalidData;
+        if (try cursor.readU8() != k_header) return error.DataFailure;
     } else if (header_id != k_header) {
-        return error.Unsupported;
+        return error.UnsupportedFailure;
     }
     var streams: ?StreamsInfo = null;
     var files: ?FilesInfo = null;
@@ -920,11 +917,11 @@ fn loadArchive(data: []const u8, workspace: *Workspace, limits: Limits, options:
             0x04 => streams = try parseStreamsInfo(&cursor, workspace, false),
             0x05 => files = try parseFilesInfo(&cursor, workspace),
             0x02 => try skipArchiveProperties(&cursor),
-            else => return error.Unsupported,
+            else => return error.UnsupportedFailure,
         }
     }
-    const si = streams orelse return error.InvalidData;
-    const fi = files orelse return error.InvalidData;
+    const si = streams orelse return error.DataFailure;
+    const fi = files orelse return error.DataFailure;
     archive.entries = try buildEntries(&si, &fi, workspace, limits);
     archive.count = archive.entries.len;
     return archive;
@@ -938,20 +935,20 @@ fn decodeEncodedHeader(archive_data: []const u8, cursor: *binary.ReadCursor, wor
     // StreamsInfo (with its own terminating kEnd, per 7zOut.cpp's encoded
     // header writer) is the whole of the structure: nothing may follow it.
     const si = try parseStreamsInfo(cursor, workspace, true);
-    if (cursor.remaining() != 0) return error.InvalidData;
-    if (si.folders.len != 1) return error.Unsupported;
+    if (cursor.remaining() != 0) return error.DataFailure;
+    if (si.folders.len != 1) return error.UnsupportedFailure;
     const folder = &si.folders[0];
-    if (folder.bcj2) return error.Unsupported;
-    if (folder.num_pack_streams != 1 or si.pack_sizes.len != 1) return error.Unsupported;
+    if (folder.bcj2) return error.UnsupportedFailure;
+    if (folder.num_pack_streams != 1 or si.pack_sizes.len != 1) return error.UnsupportedFailure;
     for (folder.coders) |coder| {
-        if (isFilterMethod(coder.method)) return error.Unsupported;
+        if (isFilterMethod(coder.method)) return error.UnsupportedFailure;
     }
-    const unpack_size = std.math.cast(usize, folder.unpack_size) orelse return error.ResourceLimit;
-    if (unpack_size == 0) return error.InvalidData;
-    if (unpack_size > limits.metadata_records) return error.ResourceLimit;
-    const pack_size = std.math.cast(usize, si.pack_sizes[0]) orelse return error.ResourceLimit;
-    if (pack_size > limits.encoded_bytes) return error.ResourceLimit;
-    const pack_pos = std.math.cast(usize, si.pack_pos) orelse return error.ResourceLimit;
+    const unpack_size = std.math.cast(usize, folder.unpack_size) orelse return error.ResourceFailure;
+    if (unpack_size == 0) return error.DataFailure;
+    if (unpack_size > limits.metadata_records) return error.ResourceFailure;
+    const pack_size = std.math.cast(usize, si.pack_sizes[0]) orelse return error.ResourceFailure;
+    if (pack_size > limits.encoded_bytes) return error.ResourceFailure;
+    const pack_pos = std.math.cast(usize, si.pack_pos) orelse return error.ResourceFailure;
     const packed_data = try workspace.take(u8, pack_size);
     try readAt(archive_data, try bounds.addUsize(start_header_size, pack_pos), packed_data);
     if (si.pack_crcs.len == 1 and si.pack_crcs[0] != 0 and
@@ -980,44 +977,44 @@ fn decodeFolderStream(folder: *const Folder, packed_data: []const u8, output: []
     const decrypted = try aesDecryptFolder(folder, packed_data, workspace, options);
     switch (folder.method) {
         .copy => {
-            if (decrypted.len < output.len) return error.InvalidData;
+            if (decrypted.len < output.len) return error.DataFailure;
             @memcpy(output, decrypted[0..output.len]);
         },
         .deflate => {
             const history = try workspace.take(u8, deflate.history_size);
             var source_reader = std.Io.Reader.fixed(decrypted);
             var dest_writer = std.Io.Writer.fixed(output);
-            var inflater = deflate_seam.Decode.initBound(options.provider, &source_reader, history) catch return error.Unsupported;
-            _ = inflater.readerPtr().streamRemaining(&dest_writer) catch return error.InvalidData;
-            if (dest_writer.end != output.len) return error.InvalidData;
+            var inflater = deflate_seam.Decode.initBound(options.provider, &source_reader, history) catch return error.UnsupportedFailure;
+            _ = inflater.readerPtr().streamRemaining(&dest_writer) catch return error.DataFailure;
+            if (dest_writer.end != output.len) return error.DataFailure;
         },
         .bzip2 => {
             const scratch = try workspace.take(u8, try bzip2.decodeWorkspaceSizeFor(decrypted));
             const decoded = try bzip2.decode(decrypted, output, scratch, options.provider);
-            if (decoded != output.len) return error.InvalidData;
+            if (decoded != output.len) return error.DataFailure;
         },
         .lzma => {
             const properties = try parseLzmaProperties(folder.attributes);
             const lzma_options: lzma.Options = .{ .properties = properties, .unpack_size = output.len, .marker_required = false, .max_work = limits.codec_work };
             const scratch = try workspace.take(u8, lzma.decodeWorkspaceSize(properties));
             const decoded = try lzma_seam.decode(options.provider, decrypted, output, scratch, lzma_options);
-            if (decoded != output.len) return error.InvalidData;
+            if (decoded != output.len) return error.DataFailure;
         },
         .lzma2 => {
             const dictionary = lzma2.dictionarySizeFromProperties(try readLzma2Prop(folder.attributes));
-            if (dictionary < lzma.dictionary_min or dictionary > lzma.dictionary_max) return error.Unsupported;
+            if (dictionary < lzma.dictionary_min or dictionary > lzma.dictionary_max) return error.UnsupportedFailure;
             const lzma2_options: lzma2.Options = .{ .dictionary_size = dictionary, .properties = lzma2.defaultProperties(dictionary), .max_work = limits.codec_work };
             const scratch = try workspace.take(u8, lzma2.decodeWorkspaceSize(dictionary));
             const decoded = try lzma2_seam.decode(options.provider, decrypted, output, scratch, lzma2_options);
-            if (decoded != output.len) return error.InvalidData;
+            if (decoded != output.len) return error.DataFailure;
         },
         .ppmd => {
             const ppmd_options = try parsePpmdOptions(folder.attributes, output.len, limits.codec_work);
             const scratch = try workspace.take(u8, ppmd.decodeWorkspaceSize(ppmd_options.mem_size));
             const decoded = try ppmd.decode(decrypted, output, scratch, ppmd_options);
-            if (decoded != output.len) return error.InvalidData;
+            if (decoded != output.len) return error.DataFailure;
         },
-        else => return error.Unsupported,
+        else => return error.UnsupportedFailure,
     }
 }
 
@@ -1027,15 +1024,15 @@ fn aesDecryptFolder(folder: *const Folder, packed_data: []const u8, workspace: *
 
 fn aesDecryptStream(encrypted: bool, num_cycles: u8, salt: []const u8, iv: [16]u8, packed_data: []const u8, workspace: *Workspace, options: *const SevenZipLoadOptions) Failure![]const u8 {
     if (!encrypted) return packed_data;
-    const password = options.password orelse return error.Unsupported;
+    const password = options.password orelse return error.UnsupportedFailure;
     const rounds: u64 = if (num_cycles == 0x3F) 0 else @as(u64, 1) << @intCast(num_cycles);
     if (options.kdf_rounds_limit != 0 and rounds > options.kdf_rounds_limit) {
         options.failure_cause.* = .kdf_limit;
-        return error.ResourceLimit;
+        return error.ResourceFailure;
     }
     if (options.password_lifetime != 0 and packed_data.len > options.password_lifetime) {
         options.failure_cause.* = .password_lifetime;
-        return error.ResourceLimit;
+        return error.ResourceFailure;
     }
     const password_utf16 = try passwordToUtf16(password, workspace);
     var key: [crypto.seven_zip_key_length]u8 = undefined;
@@ -1130,8 +1127,8 @@ fn parseStreamsInfo(cursor: *binary.ReadCursor, workspace: *Workspace, comptime 
                 has_pack = true;
                 pack_pos = try readUint64(cursor);
                 const num_pack_streams = try readUint64(cursor);
-                if (num_pack_streams == 0) return error.InvalidData;
-                const sizes = try workspace.take(u64, std.math.cast(usize, num_pack_streams) orelse return error.ResourceLimit);
+                if (num_pack_streams == 0) return error.DataFailure;
+                const sizes = try workspace.take(u64, std.math.cast(usize, num_pack_streams) orelse return error.ResourceFailure);
                 while (true) {
                     const pid = try cursor.readU8();
                     if (pid == 0x00) break;
@@ -1140,7 +1137,7 @@ fn parseStreamsInfo(cursor: *binary.ReadCursor, workspace: *Workspace, comptime 
                     } else if (pid == 0x0A) {
                         pack_crcs = try readDigests(cursor, num_pack_streams, workspace);
                     } else {
-                        return error.Unsupported;
+                        return error.UnsupportedFailure;
                     }
                 }
                 pack_sizes = sizes;
@@ -1152,19 +1149,19 @@ fn parseStreamsInfo(cursor: *binary.ReadCursor, workspace: *Workspace, comptime 
             0x08 => {
                 try parseSubStreamsInfo(cursor, workspace, folders);
             },
-            else => return error.Unsupported,
+            else => return error.UnsupportedFailure,
         }
     }
-    if (!has_pack or !has_unpack) return error.InvalidData;
+    if (!has_pack or !has_unpack) return error.DataFailure;
     // Packed streams are per-folder runs, and a BCJ2 folder owns four, so the runs tile the
     // pack size array in folder order.
     var next_pack_index: usize = 0;
     for (folders) |*folder| {
         folder.pack_index = next_pack_index;
-        const run = std.math.cast(usize, folder.num_pack_streams) orelse return error.ResourceLimit;
+        const run = std.math.cast(usize, folder.num_pack_streams) orelse return error.ResourceFailure;
         next_pack_index = try bounds.addUsize(next_pack_index, run);
     }
-    if (next_pack_index != pack_sizes.len) return error.InvalidData;
+    if (next_pack_index != pack_sizes.len) return error.DataFailure;
     return .{
         .pack_pos = pack_pos,
         .pack_sizes = pack_sizes,
@@ -1176,21 +1173,21 @@ fn parseStreamsInfo(cursor: *binary.ReadCursor, workspace: *Workspace, comptime 
 fn parseFolders(cursor: *binary.ReadCursor, workspace: *Workspace, comptime aes_only_folders: bool) Failure![]Folder {
     const folder_id = try cursor.readU8();
     if (folder_id != 0x0B) {
-        return error.InvalidData;
+        return error.DataFailure;
     }
     const num_folders = try readUint64(cursor);
-    const folder_count = std.math.cast(usize, num_folders) orelse return error.ResourceLimit;
+    const folder_count = std.math.cast(usize, num_folders) orelse return error.ResourceFailure;
     const external = try cursor.readU8();
     if (external != 0) {
-        return error.Unsupported;
+        return error.UnsupportedFailure;
     }
     const folders = try workspace.take(Folder, folder_count);
     for (folders) |*folder| {
         const num_coders = try readUint64(cursor);
         // A BCJ2 folder carries four compressor coders and the recombiner, so the bound leaves
         // headroom without going open-ended.
-        if (num_coders < 1 or num_coders > 8) return error.Unsupported;
-        const coder_count = std.math.cast(usize, num_coders) orelse return error.ResourceLimit;
+        if (num_coders < 1 or num_coders > 8) return error.UnsupportedFailure;
+        const coder_count = std.math.cast(usize, num_coders) orelse return error.ResourceFailure;
         const coders = try workspace.take(ParsedCoder, coder_count);
         for (coders) |*coder| {
             coder.* = try parseCoder(cursor, workspace);
@@ -1211,11 +1208,11 @@ fn parseFolders(cursor: *binary.ReadCursor, workspace: *Workspace, comptime aes_
             folder_in_streams = try bounds.addUsize(folder_in_streams, coder.num_in_streams);
             folder_out_streams = try bounds.addUsize(folder_out_streams, coder.num_out_streams);
             if (std.mem.eql(u8, coder.method_id, &method_7z_aes_id)) {
-                if (encrypted) return error.Unsupported;
+                if (encrypted) return error.UnsupportedFailure;
                 encrypted = true;
                 aes = try parse7zAesProps(coder.attributes);
             } else if (coder.method == .bcj2) {
-                if (bcj2_idx != null) return error.Unsupported;
+                if (bcj2_idx != null) return error.UnsupportedFailure;
                 bcj2_idx = i;
             } else if (isFilterMethod(coder.method)) {
                 filter_present = true;
@@ -1227,9 +1224,9 @@ fn parseFolders(cursor: *binary.ReadCursor, workspace: *Workspace, comptime aes_
         // An AES-only folder is the -mhe encoded-header shape (stored header,
         // one AES coder); file-data folders always carry a real data coder.
         if (data_coder_count == 0) {
-            if (!(aes_only_folders and encrypted)) return error.Unsupported;
-        } else if (encrypted and data_coder_count != 1) return error.Unsupported;
-        if (bcj2_idx != null and (encrypted or filter_present)) return error.Unsupported;
+            if (!(aes_only_folders and encrypted)) return error.UnsupportedFailure;
+        } else if (encrypted and data_coder_count != 1) return error.UnsupportedFailure;
+        if (bcj2_idx != null and (encrypted or filter_present)) return error.UnsupportedFailure;
         var method: CoderMethod = .copy;
         var attributes: []const u8 = &.{};
         var num_in_streams: u64 = 1;
@@ -1246,29 +1243,29 @@ fn parseFolders(cursor: *binary.ReadCursor, workspace: *Workspace, comptime aes_
         const bcj2_in_base = if (bcj2_idx) |i| coder_in_base[i] else 0;
         if (num_coders > 1) {
             const num_bonds = num_coders - 1;
-            const bond_count = std.math.cast(usize, num_bonds) orelse return error.ResourceLimit;
+            const bond_count = std.math.cast(usize, num_bonds) orelse return error.ResourceFailure;
             const bond_list = try workspace.take(Bond, bond_count);
             var bond: u64 = 0;
             while (bond < num_bonds) : (bond += 1) {
                 const in_index = try readUint64(cursor);
                 const coder_index = try readUint64(cursor);
-                if (in_index >= folder_in_streams or coder_index >= num_coders) return error.InvalidData;
+                if (in_index >= folder_in_streams or coder_index >= num_coders) return error.DataFailure;
                 // An input stream feeds from exactly one place, so a repeat means a malformed folder.
                 for (bond_list[0..@intCast(bond)]) |existing| {
-                    if (existing.in_index == in_index) return error.InvalidData;
+                    if (existing.in_index == in_index) return error.DataFailure;
                 }
                 bond_list[@intCast(bond)] = .{ .in_index = in_index, .coder_index = coder_index };
             }
             bonds = bond_list;
             const num_packed_streams = folder_in_streams - num_bonds;
-            if (num_packed_streams == 0) return error.InvalidData;
+            if (num_packed_streams == 0) return error.DataFailure;
             if (num_packed_streams != 1) {
-                const packed_count = std.math.cast(usize, num_packed_streams) orelse return error.ResourceLimit;
+                const packed_count = std.math.cast(usize, num_packed_streams) orelse return error.ResourceFailure;
                 const packed_list = try workspace.take(u64, packed_count);
                 var packed_index: u64 = 0;
                 while (packed_index < num_packed_streams) : (packed_index += 1) {
                     const index = try readUint64(cursor);
-                    if (index >= folder_in_streams) return error.InvalidData;
+                    if (index >= folder_in_streams) return error.DataFailure;
                     packed_list[@intCast(packed_index)] = index;
                 }
                 packed_inputs = packed_list;
@@ -1286,7 +1283,7 @@ fn parseFolders(cursor: *binary.ReadCursor, workspace: *Workspace, comptime aes_
                     if (existing.in_index == global_in) producer = @intCast(existing.coder_index);
                 }
                 if (producer) |ci| {
-                    if (coders[ci].num_in_streams != 1 or coders[ci].method == .bcj2) return error.Unsupported;
+                    if (coders[ci].num_in_streams != 1 or coders[ci].method == .bcj2) return error.UnsupportedFailure;
                     bcj2_sources[k] = .{
                         .pack_ordinal = try packedOrdinal(packed_inputs, folder_in_streams - bonds.len, coder_in_base[ci]),
                         .producer = ci,
@@ -1322,9 +1319,9 @@ fn parseFolders(cursor: *binary.ReadCursor, workspace: *Workspace, comptime aes_
         };
     }
     const unpack_id = try cursor.readU8();
-    if (unpack_id != 0x0C) return error.InvalidData;
+    if (unpack_id != 0x0C) return error.DataFailure;
     for (folders) |*folder| {
-        const stream_count = std.math.cast(usize, folder.total_out_streams) orelse return error.ResourceLimit;
+        const stream_count = std.math.cast(usize, folder.total_out_streams) orelse return error.ResourceFailure;
         const arr = try workspace.take(u64, stream_count);
         for (0..stream_count) |index| {
             arr[index] = try readUint64(cursor);
@@ -1343,7 +1340,7 @@ fn parseFolders(cursor: *binary.ReadCursor, workspace: *Workspace, comptime aes_
             for (folders, 0..) |*folder, i| {
                 if (i < digests.len) folder.substream_crcs = digests[i .. i + 1];
             }
-        } else return error.Unsupported;
+        } else return error.UnsupportedFailure;
     }
     return folders;
 }
@@ -1355,10 +1352,10 @@ fn packedOrdinal(packed_inputs: []const u64, num_packed_streams: u64, global_in:
         for (packed_inputs, 0..) |input, ordinal| {
             if (input == global_in) return ordinal;
         }
-        return error.Unsupported;
+        return error.UnsupportedFailure;
     }
     if (num_packed_streams == 1 and global_in == 0) return 0;
-    return error.Unsupported;
+    return error.UnsupportedFailure;
 }
 
 // The global index of the folder output stream no bond consumes, if exactly one exists.
@@ -1397,8 +1394,8 @@ fn parseCoder(cursor: *binary.ReadCursor, workspace: *Workspace) Failure!ParsedC
     const id_size = flags & 0x0F;
     const is_complex = (flags & 0x10) != 0;
     const has_attributes = (flags & 0x20) != 0;
-    if ((flags & 0x40) != 0 or (flags & 0x80) != 0) return error.Unsupported;
-    if (id_size == 0 or id_size > 8) return error.Unsupported;
+    if ((flags & 0x40) != 0 or (flags & 0x80) != 0) return error.UnsupportedFailure;
+    if (id_size == 0 or id_size > 8) return error.UnsupportedFailure;
     const method_id = try cursor.readSlice(id_size);
     const method: CoderMethod = if (std.mem.eql(u8, method_id, &method_7z_aes_id)) .copy else try methodFromId(method_id);
     var num_in_streams: u64 = 1;
@@ -1409,20 +1406,20 @@ fn parseCoder(cursor: *binary.ReadCursor, workspace: *Workspace) Failure!ParsedC
     }
     if (method == .bcj2) {
         // BCJ2 is the one many-to-one coder, with four sub-stream inputs and one output.
-        if (num_in_streams != 4 or num_out_streams != 1) return error.Unsupported;
-    } else if (num_in_streams != 1 or num_out_streams != 1) return error.Unsupported;
+        if (num_in_streams != 4 or num_out_streams != 1) return error.UnsupportedFailure;
+    } else if (num_in_streams != 1 or num_out_streams != 1) return error.UnsupportedFailure;
     const attributes = blk: {
         if (has_attributes) {
             const prop_size = try readUint64(cursor);
-            const prop_count = std.math.cast(usize, prop_size) orelse return error.ResourceLimit;
-            if (prop_size > cursor.remaining()) return error.InvalidData;
+            const prop_count = std.math.cast(usize, prop_size) orelse return error.ResourceFailure;
+            if (prop_size > cursor.remaining()) return error.DataFailure;
             const bytes = try workspace.take(u8, prop_count);
             const start = cursor.pos;
             try cursor.advance(prop_size);
             @memcpy(bytes, cursor.buffer[start..cursor.pos]);
             break :blk bytes;
         } else {
-            if (method == .lzma or method == .lzma2) return error.InvalidData;
+            if (method == .lzma or method == .lzma2) return error.DataFailure;
             break :blk &[_]u8{};
         }
     };
@@ -1436,19 +1433,19 @@ fn parseCoder(cursor: *binary.ReadCursor, workspace: *Workspace) Failure!ParsedC
 }
 
 fn parse7zAesProps(attributes: []const u8) Failure!AesCoderProps {
-    if (attributes.len == 0) return error.InvalidData;
+    if (attributes.len == 0) return error.DataFailure;
     const b0 = attributes[0];
     const num_cycles = b0 & 0x3F;
     if ((b0 & 0xC0) == 0) {
-        if (attributes.len != 1) return error.InvalidData;
+        if (attributes.len != 1) return error.DataFailure;
         return .{ .num_cycles = num_cycles, .salt = &.{}, .iv = @splat(0), .iv_size = 0 };
     }
-    if (attributes.len <= 1) return error.InvalidData;
+    if (attributes.len <= 1) return error.DataFailure;
     const b1 = attributes[1];
     const salt_size = @as(usize, (b0 >> 7) & 1) + (b1 >> 4);
     const iv_size = @as(usize, (b0 >> 6) & 1) + (b1 & 0x0F);
-    if (attributes.len != 2 + salt_size + iv_size) return error.InvalidData;
-    if (num_cycles > crypto.seven_zip_cycles_max and num_cycles != 0x3F) return error.Unsupported;
+    if (attributes.len != 2 + salt_size + iv_size) return error.DataFailure;
+    if (num_cycles > crypto.seven_zip_cycles_max and num_cycles != 0x3F) return error.UnsupportedFailure;
     var iv: [16]u8 = @splat(0);
     @memcpy(iv[0..iv_size], attributes[2 + salt_size ..][0..iv_size]);
     return .{
@@ -1467,7 +1464,7 @@ fn parseSubStreamsInfo(cursor: *binary.ReadCursor, workspace: *Workspace, folder
             0x0D => {
                 for (folders) |*folder| {
                     const count = try readUint64(cursor);
-                    if (count == 0) return error.InvalidData;
+                    if (count == 0) return error.DataFailure;
                     folder.num_substreams = count;
                 }
             },
@@ -1480,14 +1477,14 @@ fn parseSubStreamsInfo(cursor: *binary.ReadCursor, workspace: *Workspace, folder
                 }
                 var index: usize = 0;
                 for (folders) |*folder| {
-                    const count = std.math.cast(usize, folder.num_substreams) orelse return error.ResourceLimit;
+                    const count = std.math.cast(usize, folder.num_substreams) orelse return error.ResourceFailure;
                     // The size list omits each folder's final substream: it is
                     // the folder's unpack total minus the listed sizes.
                     var known: u64 = 0;
                     for (arr[index .. index + count - 1]) |size| {
                         known = try bounds.addU64(known, size);
                     }
-                    if (known > folder.unpack_size) return error.InvalidData;
+                    if (known > folder.unpack_size) return error.DataFailure;
                     arr[index + count - 1] = folder.unpack_size - known;
                     folder.substream_sizes = arr[index .. index + count];
                     index += count;
@@ -1498,14 +1495,14 @@ fn parseSubStreamsInfo(cursor: *binary.ReadCursor, workspace: *Workspace, folder
                 const digests = try readDigests(cursor, total, workspace);
                 var index: usize = 0;
                 for (folders) |*folder| {
-                    const count = std.math.cast(usize, folder.num_substreams) orelse return error.ResourceLimit;
+                    const count = std.math.cast(usize, folder.num_substreams) orelse return error.ResourceFailure;
                     if (index + count <= digests.len) {
                         folder.substream_crcs = digests[index .. index + count];
                     }
                     index += count;
                 }
             },
-            else => return error.Unsupported,
+            else => return error.UnsupportedFailure,
         }
     }
     try finalizeSubstreamSizes(folders);
@@ -1514,7 +1511,7 @@ fn parseSubStreamsInfo(cursor: *binary.ReadCursor, workspace: *Workspace, folder
 fn totalSubstreams(folders: []const Folder) Failure!usize {
     var total: usize = 0;
     for (folders) |folder| {
-        const count = std.math.cast(usize, folder.num_substreams) orelse return error.ResourceLimit;
+        const count = std.math.cast(usize, folder.num_substreams) orelse return error.ResourceFailure;
         total = try bounds.addUsize(total, count);
     }
     return total;
@@ -1523,7 +1520,7 @@ fn totalSubstreams(folders: []const Folder) Failure!usize {
 fn substreamSizeCount(folders: []const Folder) Failure!usize {
     var total: usize = 0;
     for (folders) |folder| {
-        const count = std.math.cast(usize, folder.num_substreams) orelse return error.ResourceLimit;
+        const count = std.math.cast(usize, folder.num_substreams) orelse return error.ResourceFailure;
         if (count > 0) total = try bounds.addUsize(total, count - 1);
     }
     return total;
@@ -1531,24 +1528,24 @@ fn substreamSizeCount(folders: []const Folder) Failure!usize {
 
 fn finalizeSubstreamSizes(folders: []Folder) Failure!void {
     for (folders) |*folder| {
-        const count = std.math.cast(usize, folder.num_substreams) orelse return error.ResourceLimit;
-        if (folder.substream_sizes.len != count) return error.InvalidData;
+        const count = std.math.cast(usize, folder.num_substreams) orelse return error.ResourceFailure;
+        if (folder.substream_sizes.len != count) return error.DataFailure;
         if (count == 1) {
-            if (folder.substream_sizes[0] != folder.unpack_size) return error.InvalidData;
+            if (folder.substream_sizes[0] != folder.unpack_size) return error.DataFailure;
             continue;
         }
         var sum: u64 = 0;
         for (folder.substream_sizes[0 .. count - 1]) |size| {
             sum = try bounds.addU64(sum, size);
         }
-        if (sum > folder.unpack_size) return error.InvalidData;
+        if (sum > folder.unpack_size) return error.DataFailure;
         folder.substream_sizes[count - 1] = folder.unpack_size - sum;
     }
 }
 
 fn parseFilesInfo(cursor: *binary.ReadCursor, workspace: *Workspace) Failure!FilesInfo {
     const num_files = try readUint64(cursor);
-    const count = std.math.cast(usize, num_files) orelse return error.ResourceLimit;
+    const count = std.math.cast(usize, num_files) orelse return error.ResourceFailure;
     const empty_streams = try workspace.take(bool, count);
     const empty_files = try workspace.take(bool, count);
     const names = try workspace.take([]const u8, count);
@@ -1558,7 +1555,7 @@ fn parseFilesInfo(cursor: *binary.ReadCursor, workspace: *Workspace) Failure!Fil
         const id = try cursor.readU8();
         if (id == 0x00) break;
         const prop_size = try readUint64(cursor);
-        if (prop_size > cursor.remaining()) return error.InvalidData;
+        if (prop_size > cursor.remaining()) return error.DataFailure;
         const prop_start = cursor.pos;
         try cursor.advance(prop_size);
         var sub = binary.ReadCursor.init(cursor.buffer[prop_start..cursor.pos]);
@@ -1576,12 +1573,12 @@ fn parseFilesInfo(cursor: *binary.ReadCursor, workspace: *Workspace) Failure!Fil
                 const empty_count = countEmpty(empty_streams);
                 const bits = try readBitVectorRaw(&sub, empty_count, workspace);
                 for (bits) |b| {
-                    if (b) return error.Unsupported;
+                    if (b) return error.UnsupportedFailure;
                 }
             },
             0x11 => {
                 const external = try sub.readU8();
-                if (external != 0) return error.Unsupported;
+                if (external != 0) return error.UnsupportedFailure;
                 for (0..count) |i| {
                     names[i] = try readUtf16Name(&sub, workspace);
                 }
@@ -1589,10 +1586,10 @@ fn parseFilesInfo(cursor: *binary.ReadCursor, workspace: *Workspace) Failure!Fil
             0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x19 => {},
             // kStartPos shifts per-file data offsets; pack offsets here are
             // computed sequentially, so accepting it would mis-locate data.
-            0x18 => return error.Unsupported,
-            else => return error.Unsupported,
+            0x18 => return error.UnsupportedFailure,
+            else => return error.UnsupportedFailure,
         }
-        if (id >= 0x0E and id <= 0x11 and sub.remaining() != 0) return error.InvalidData;
+        if (id >= 0x0E and id <= 0x11 and sub.remaining() != 0) return error.DataFailure;
     }
     return .{
         .empty_streams = empty_streams,
@@ -1606,7 +1603,7 @@ fn skipArchiveProperties(cursor: *binary.ReadCursor) Failure!void {
         const id = try cursor.readU8();
         if (id == 0x00) break;
         const size = try readUint64(cursor);
-        if (size > cursor.remaining()) return error.InvalidData;
+        if (size > cursor.remaining()) return error.DataFailure;
         try cursor.advance(size);
     }
 }
@@ -1636,25 +1633,25 @@ fn buildEntries(si: *const StreamsInfo, fi: *const FilesInfo, workspace: *Worksp
         var entry_pack_stream_sizes: []const u64 = &.{};
         if (!is_empty) {
             while (folder_index < si.folders.len) {
-                const folder_substream_count = std.math.cast(usize, si.folders[folder_index].num_substreams) orelse return error.ResourceLimit;
+                const folder_substream_count = std.math.cast(usize, si.folders[folder_index].num_substreams) orelse return error.ResourceFailure;
                 if (substream_index < folder_substream_count) break;
                 folder_index += 1;
                 substream_index = 0;
                 substream_offset = 0;
             }
-            if (folder_index >= si.folders.len) return error.InvalidData;
+            if (folder_index >= si.folders.len) return error.DataFailure;
             const folder = &si.folders[folder_index];
             entry_folder = folder;
-            if (substream_index >= folder.substream_sizes.len) return error.InvalidData;
+            if (substream_index >= folder.substream_sizes.len) return error.DataFailure;
             size = folder.substream_sizes[substream_index];
-            if (size > limits.decoded_bytes) return error.ResourceLimit;
-            const pack_run = std.math.cast(usize, folder.num_pack_streams) orelse return error.ResourceLimit;
-            if (folder.pack_index + pack_run > si.pack_sizes.len) return error.InvalidData;
+            if (size > limits.decoded_bytes) return error.ResourceFailure;
+            const pack_run = std.math.cast(usize, folder.num_pack_streams) orelse return error.ResourceFailure;
+            if (folder.pack_index + pack_run > si.pack_sizes.len) return error.DataFailure;
             entry_pack_stream_sizes = si.pack_sizes[folder.pack_index..][0..pack_run];
             for (entry_pack_stream_sizes) |stream_size| {
                 pack_size = try bounds.addU64(pack_size, stream_size);
             }
-            if (pack_size > limits.encoded_bytes) return error.ResourceLimit;
+            if (pack_size > limits.encoded_bytes) return error.ResourceFailure;
             data_offset = try bounds.addU64(start_header_size, try folderPackOffset(si, folder_index));
             method = folder.method;
             attributes = folder.attributes;
@@ -1669,7 +1666,7 @@ fn buildEntries(si: *const StreamsInfo, fi: *const FilesInfo, workspace: *Worksp
             }
             substream_index += 1;
             substream_offset = try bounds.addU64(substream_offset, size);
-            const folder_substream_count = std.math.cast(usize, folder.num_substreams) orelse return error.ResourceLimit;
+            const folder_substream_count = std.math.cast(usize, folder.num_substreams) orelse return error.ResourceFailure;
             if (substream_index >= folder_substream_count) {
                 folder_index += 1;
                 substream_index = 0;
@@ -1696,14 +1693,14 @@ fn buildEntries(si: *const StreamsInfo, fi: *const FilesInfo, workspace: *Worksp
             .pack_stream_sizes = entry_pack_stream_sizes,
         };
     }
-    if (folder_index != si.folders.len) return error.InvalidData;
+    if (folder_index != si.folders.len) return error.DataFailure;
     return entries;
 }
 
 fn folderPackOffset(si: *const StreamsInfo, folder_index: usize) Failure!u64 {
     var offset = si.pack_pos;
     for (0..folder_index) |index| {
-        const run = std.math.cast(usize, si.folders[index].num_pack_streams) orelse return error.ResourceLimit;
+        const run = std.math.cast(usize, si.folders[index].num_pack_streams) orelse return error.ResourceFailure;
         for (0..run) |sub| {
             offset = try bounds.addU64(offset, si.pack_sizes[si.folders[index].pack_index + sub]);
         }
@@ -1714,7 +1711,7 @@ fn folderPackOffset(si: *const StreamsInfo, folder_index: usize) Failure!u64 {
 fn folderOutputSize(folder: *const Folder) Failure!usize {
     var total: usize = 0;
     for (folder.substream_sizes) |size| {
-        const part = std.math.cast(usize, size) orelse return error.ResourceLimit;
+        const part = std.math.cast(usize, size) orelse return error.ResourceFailure;
         total = try bounds.addUsize(total, part);
     }
     return total;
@@ -1982,7 +1979,7 @@ fn writeSizedProperty(writer: *std.Io.Writer, workspace: *Workspace, id: u8, ctx
         try ctx.write(writer);
         return;
     }
-    const buffer = try workspace.take(u8, std.math.cast(usize, size) orelse return error.ResourceLimit);
+    const buffer = try workspace.take(u8, std.math.cast(usize, size) orelse return error.ResourceFailure);
     var fixed_writer = std.Io.Writer.fixed(buffer);
     try ctx.write(&fixed_writer);
     try io.writeBytes(writer, &.{id});
@@ -2026,7 +2023,7 @@ fn emptyFileAt(entries: []const Entry, index: usize) bool {
 }
 
 fn readDigests(cursor: *binary.ReadCursor, count: u64, workspace: *Workspace) Failure![]const u32 {
-    const n = std.math.cast(usize, count) orelse return error.ResourceLimit;
+    const n = std.math.cast(usize, count) orelse return error.ResourceFailure;
     const all_defined = try cursor.readU8();
     if (all_defined == 1) {
         const crcs = try workspace.take(u32, n);
@@ -2048,7 +2045,7 @@ fn readDigests(cursor: *binary.ReadCursor, count: u64, workspace: *Workspace) Fa
         }
         return crcs;
     }
-    return error.Unsupported;
+    return error.UnsupportedFailure;
 }
 
 fn readBoolVectorRaw(cursor: *binary.ReadCursor, count: usize, workspace: *Workspace) Failure![]const bool {
@@ -2063,7 +2060,7 @@ fn readBoolVectorRaw(cursor: *binary.ReadCursor, count: usize, workspace: *Works
         @memset(result, true);
         return result;
     }
-    if (all != 1) return error.InvalidData;
+    if (all != 1) return error.DataFailure;
     const bytes_count = (count + 7) / 8;
     const bytes = try cursor.readSlice(bytes_count);
     for (0..count) |i| {
@@ -2076,7 +2073,7 @@ fn readBoolVectorRaw(cursor: *binary.ReadCursor, count: usize, workspace: *Works
 fn readBitVectorRaw(cursor: *binary.ReadCursor, count: usize, workspace: *Workspace) Failure![]const bool {
     if (count == 0) return &.{};
     const bytes_count = (count + 7) / 8;
-    if (cursor.remaining() < bytes_count) return error.InvalidData;
+    if (cursor.remaining() < bytes_count) return error.DataFailure;
     const bytes = try cursor.readSlice(bytes_count);
     const result = try workspace.take(bool, count);
     for (0..count) |i| {
@@ -2102,14 +2099,14 @@ fn emptyIndex(bits: []const bool, target: usize) Failure!usize {
             seen += 1;
         }
     }
-    return error.InvalidData;
+    return error.DataFailure;
 }
 
 fn readUtf16Name(cursor: *binary.ReadCursor, workspace: *Workspace) Failure![]const u8 {
     const start = cursor.pos;
     var byte_len: usize = 0;
     while (true) {
-        if (cursor.remaining() < 2) return error.InvalidData;
+        if (cursor.remaining() < 2) return error.DataFailure;
         const unit = std.mem.readInt(u16, &(try cursor.readBytes(2)), .little);
         byte_len += 2;
         if (unit == 0) break;
@@ -2120,7 +2117,7 @@ fn readUtf16Name(cursor: *binary.ReadCursor, workspace: *Workspace) Failure![]co
 }
 
 fn utf16LeToUtf8(name_utf16: []const u8, workspace: *Workspace) Failure![]const u8 {
-    if (name_utf16.len < 2 or name_utf16.len % 2 != 0) return error.InvalidData;
+    if (name_utf16.len < 2 or name_utf16.len % 2 != 0) return error.DataFailure;
     var utf8_len: usize = 0;
     var i: usize = 0;
     while (i + 2 <= name_utf16.len) : (i += 2) {
@@ -2128,15 +2125,15 @@ fn utf16LeToUtf8(name_utf16: []const u8, workspace: *Workspace) Failure![]const 
         if (unit == 0) break;
         var cp: u21 = unit;
         if (unit >= 0xD800 and unit <= 0xDBFF) {
-            if (i + 4 > name_utf16.len) return error.InvalidData;
+            if (i + 4 > name_utf16.len) return error.DataFailure;
             const low = std.mem.readInt(u16, name_utf16[i + 2 ..][0..2], .little);
-            if (low < 0xDC00 or low > 0xDFFF) return error.InvalidData;
+            if (low < 0xDC00 or low > 0xDFFF) return error.DataFailure;
             cp = 0x10000 + ((@as(u21, unit - 0xD800) << 10) | @as(u21, low - 0xDC00));
             i += 2;
         } else if (unit >= 0xDC00 and unit <= 0xDFFF) {
-            return error.InvalidData;
+            return error.DataFailure;
         }
-        utf8_len += std.unicode.utf8CodepointSequenceLength(cp) catch return error.InvalidData;
+        utf8_len += std.unicode.utf8CodepointSequenceLength(cp) catch return error.DataFailure;
     }
     const result = try workspace.take(u8, utf8_len);
     i = 0;
@@ -2150,14 +2147,14 @@ fn utf16LeToUtf8(name_utf16: []const u8, workspace: *Workspace) Failure![]const 
             cp = 0x10000 + ((@as(u21, unit - 0xD800) << 10) | @as(u21, low - 0xDC00));
             i += 2;
         }
-        offset += std.unicode.utf8Encode(cp, result[offset..]) catch return error.InvalidData;
+        offset += std.unicode.utf8Encode(cp, result[offset..]) catch return error.DataFailure;
     }
     return result;
 }
 
 fn writeUtf16Name(writer: *std.Io.Writer, name: []const u8) Failure!void {
     const stripped = if (name.len > 0 and name[name.len - 1] == '/') name[0 .. name.len - 1] else name;
-    const view = std.unicode.Utf8View.init(stripped) catch return error.InvalidData;
+    const view = std.unicode.Utf8View.init(stripped) catch return error.DataFailure;
     var it = view.iterator();
     while (it.nextCodepoint()) |cp| {
         if (cp < 0x10000) {
@@ -2178,7 +2175,7 @@ fn writeUtf16Name(writer: *std.Io.Writer, name: []const u8) Failure!void {
 }
 
 fn passwordToUtf16(password: []const u8, workspace: *Workspace) Failure![]const u8 {
-    const view = std.unicode.Utf8View.init(password) catch return error.InvalidData;
+    const view = std.unicode.Utf8View.init(password) catch return error.DataFailure;
     var byte_len: usize = 0;
     var it = view.iterator();
     while (it.nextCodepoint()) |cp| byte_len = try bounds.addUsize(byte_len, 2 * binary.utf16LeUnits(cp));
@@ -2328,7 +2325,7 @@ test "sevenzip encrypted roundtrip with salt and custom cycles" {
     cause = .none;
     const refuse_out = try allocator.alloc(u8, data.len);
     defer allocator.free(refuse_out);
-    try testing.expectError(error.ResourceLimit, sevenZipDecodeOrdinal(archive, &refuse_ws, .{}, 0, refuse_out, .{
+    try testing.expectError(error.ResourceFailure, sevenZipDecodeOrdinal(archive, &refuse_ws, .{}, 0, refuse_out, .{
         .password = "pw",
         .kdf_rounds_limit = (1 << 10) - 1,
         .failure_cause = &cause,
@@ -2479,7 +2476,7 @@ test "sevenzip encoded headers roundtrip in both modes" {
         try testing.expectEqualSlices(u8, data, out[0..produced]);
         if (mode.encrypt) {
             var fail_ws = try Workspace.init(backing.ptr, backing.len);
-            try testing.expectError(error.Unsupported, sevenZipInspectCountEx(archive, &fail_ws, .{}, &.{ .failure_cause = &cause }));
+            try testing.expectError(error.UnsupportedFailure, sevenZipInspectCountEx(archive, &fail_ws, .{}, &.{ .failure_cause = &cause }));
             var wrong_ws = try Workspace.init(backing.ptr, backing.len);
             // The wrong password surfaces wherever the garbage stream first
             // fails: the LZMA property byte, the decompressor, or the header
@@ -2669,5 +2666,7 @@ test "sevenzip decodes 7zz AES-256 encrypted archive" {
     var bad_ws = try Workspace.init(backing.ptr, backing.len);
     if (sevenZipDecodeOrdinal(&archive_bytes, &bad_ws, .{}, 0, out, .{ .password = "wrong", .failure_cause = &cause })) |_| {
         try testing.expect(false);
-    } else |_| {}
+    } else |_| {
+        // The wrong password rejects the decode; that is the expected outcome.
+    }
 }

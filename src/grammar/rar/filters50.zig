@@ -41,7 +41,7 @@ pub const max_filter_block: usize = 0x400000;
 const e8_wrap: u32 = 0x1000000;
 
 pub fn applyFilter(data: []u8, filter: Filter, file_offset: u64, scratch: []u8) Failure!void {
-    if (filter.length > data.len) return error.InvalidData;
+    if (filter.length > data.len) return error.DataFailure;
     const region = data[0..filter.length];
     switch (filter.filter_type) {
         .delta => try applyDelta(region, filter.channels, scratch),
@@ -55,7 +55,7 @@ pub fn applyFilter(data: []u8, filter: Filter, file_offset: u64, scratch: []u8) 
 // destination overlap, so the transform writes to the scratch copy.
 fn applyDelta(data: []u8, channels: u8, scratch: []u8) Failure!void {
     if (channels == 0 or data.len == 0) return;
-    if (scratch.len < data.len) return error.InsufficientCapacity;
+    if (scratch.len < data.len) return error.CapacityFailure;
     const channel_count: usize = channels;
     const dst = scratch[0..data.len];
 

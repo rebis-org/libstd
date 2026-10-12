@@ -80,8 +80,10 @@ pub fn readData(br: *BitReader) Failure!u32 {
     }
 }
 
-// A false result means the parameters are out of range, so the caller must report the entry unverifiable.
-// Each filter reads from scratch, because writing over the destination would overwrite unread input.
+// A false result means the parameters are out of range; the caller reports
+// the entry unverifiable.
+// Each filter reads from scratch: writing over the destination would
+// overwrite unread input.
 pub fn applyFilter(
     filter: StandardFilter,
     data: []u8,

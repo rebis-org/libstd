@@ -1,4 +1,3 @@
-const builtin = @import("builtin");
 const std = @import("std");
 
 const build_options = @import("options");
@@ -24,10 +23,10 @@ const start_repeated_offset_2 = 4;
 const start_repeated_offset_3 = 8;
 
 pub const DecodeError = error{
-    InvalidData,
+    DataFailure,
     IntegrityFailure,
-    Unsupported,
-    ResourceLimit,
+    UnsupportedFailure,
+    ResourceFailure,
     IoFailure,
 };
 
@@ -108,17 +107,17 @@ pub fn decodeStream(input: *std.Io.Reader, output: *std.Io.Writer, history: []u8
 }
 
 pub fn decodeInPlace(input: *std.Io.Reader, output: []u8, options: Options) DecodeError!usize {
-    if (options.window_size < window_size_min or options.window_size > window_size_max) return error.Unsupported;
-    if (output.len < @as(usize, options.window_size) + block_size_max) return error.Unsupported;
+    if (options.window_size < window_size_min or options.window_size > window_size_max) return error.UnsupportedFailure;
+    if (output.len < @as(usize, options.window_size) + block_size_max) return error.UnsupportedFailure;
     var discard_buffer: [0]u8 = .{};
     var discarding: std.Io.Writer.Discarding = .init(&discard_buffer);
     return decodeWithOutput(input, &discarding.writer, output, options, true);
 }
 
 fn decodeWithOutput(input: *std.Io.Reader, output: *std.Io.Writer, history: []u8, options: Options, in_place: bool) DecodeError!usize {
-    if (options.window_size < window_size_min or options.window_size > window_size_max) return error.Unsupported;
+    if (options.window_size < window_size_min or options.window_size > window_size_max) return error.UnsupportedFailure;
     const needed_history = @as(usize, options.window_size) + block_size_max;
-    if (history.len < needed_history) return error.Unsupported;
+    if (history.len < needed_history) return error.UnsupportedFailure;
     var limited = LimitedReader.init(input, options.max_encoded_bytes);
     limited.interface.buffer = &limited.buffer;
     // Per-block state below is filled at block scope before any use, so `undefined` is safe.
@@ -166,20 +165,20 @@ fn decodeWithOutput(input: *std.Io.Reader, output: *std.Io.Writer, history: []u8
         };
         if (magic == frame_magic) {
             decoder.decodeFrameBody() catch |err| {
-                if (limited.limit_reached) return error.ResourceLimit;
+                if (limited.limit_reached) return error.ResourceFailure;
                 return err;
             };
         } else if (magic >= skippable_magic_min and magic <= skippable_magic_max) {
             const size = readU32Le(&limited.interface) catch |err| switch (err) {
-                error.EndOfStream => return error.InvalidData,
+                error.EndOfStream => return error.DataFailure,
                 error.ReadFailed => return error.IoFailure,
             };
             try skipBytes(&limited.interface, size);
         } else {
-            return error.InvalidData;
+            return error.DataFailure;
         }
     }
-    return std.math.cast(usize, decoder.total_output) orelse error.ResourceLimit;
+    return std.math.cast(usize, decoder.total_output) orelse error.ResourceFailure;
 }
 
 pub fn frameContentSize(input: []const u8, max_window: u32) DecodeError!usize {
@@ -200,9 +199,9 @@ pub const dictionary_id_min: u32 = 32768;
 pub const dictionary_id_max: u32 = (1 << 31) - 1;
 
 pub const TrainError = error{
-    InvalidCall,
-    InsufficientCapacity,
-    ResourceLimit,
+    CallFailure,
+    CapacityFailure,
+    ResourceFailure,
 };
 
 // Fastcover-style segment selection with deterministic greedy picks.
@@ -226,13 +225,13 @@ fn trainHash(provider: checksum.Provider, bytes: *const [train_d]u8) u32 {
 }
 
 pub fn trainDictionary(samples: []const []const u8, max_size: usize, output: []u8, scratch: []u8, provider: checksum.Provider) TrainError!usize {
-    if (samples.len == 0) return error.InvalidCall;
-    if (max_size < dictionary_header_size + 8) return error.InvalidCall;
+    if (samples.len == 0) return error.CallFailure;
+    if (max_size < dictionary_header_size + 8) return error.CallFailure;
     var total: usize = 0;
-    for (samples) |sample| total = std.math.add(usize, total, sample.len) catch return error.ResourceLimit;
-    if (total == 0) return error.InvalidCall;
-    if (output.len < @min(total, max_size - dictionary_header_size) + dictionary_header_size) return error.InsufficientCapacity;
-    if (scratch.len < trainWorkspaceSize()) return error.InsufficientCapacity;
+    for (samples) |sample| total = std.math.add(usize, total, sample.len) catch return error.ResourceFailure;
+    if (total == 0) return error.CallFailure;
+    if (output.len < @min(total, max_size - dictionary_header_size) + dictionary_header_size) return error.CapacityFailure;
+    if (scratch.len < trainWorkspaceSize()) return error.CapacityFailure;
     const content_cap = @min(total, max_size - dictionary_header_size);
 
     const freqs: []u32 = @alignCast(std.mem.bytesAsSlice(u32, scratch[0 .. train_buckets * @sizeOf(u32)]));
@@ -319,8 +318,9 @@ pub fn trainDictionary(samples: []const []const u8, max_size: usize, output: []u
     output[header_pos + 1] = 0x10;
     header_pos += 2;
     // FSE tables (offsets, match lengths, literal lengths): accuracy log 5,
-    // symbol 0 at 31, symbol 1 as low probability (-1). Bit-exact with the
-    // reference ncount writer: (tableLog-5)<<0, then 62<<(4), flush 11 bits.
+    // symbol 0 at 31, symbol 1 low-probability (-1).
+    // Bit-exact with the reference ncount writer: (tableLog-5)<<0, then
+    // 62<<(4), flush 11 bits.
     const minimal_ncount = [2]u8{ 0xE0, 0x03 };
     for (0..3) |i| {
         output[header_pos + 2 * i] = minimal_ncount[0];
@@ -336,31 +336,31 @@ pub fn trainDictionary(samples: []const []const u8, max_size: usize, output: []u
 }
 
 pub const EncodeError = error{
-    InvalidData,
-    ResourceLimit,
+    DataFailure,
+    ResourceFailure,
     IoFailure,
 };
 
 pub fn encodeStream(input: *std.Io.Reader, output: *std.Io.Writer, history: []u8, workspace: []u32, options: Options) EncodeError!usize {
-    if (options.window_size < window_size_min or options.window_size > window_size_max) return error.InvalidData;
-    if (options.hash_bits < 10 or options.hash_bits > 17) return error.InvalidData;
-    if (options.max_chain == 0) return error.InvalidData;
-    if (options.nice_len < min_match_len) return error.InvalidData;
-    if (options.search_window == 0) return error.InvalidData;
+    if (options.window_size < window_size_min or options.window_size > window_size_max) return error.DataFailure;
+    if (options.hash_bits < 10 or options.hash_bits > 17) return error.DataFailure;
+    if (options.max_chain == 0) return error.DataFailure;
+    if (options.nice_len < min_match_len) return error.DataFailure;
+    if (options.search_window == 0) return error.DataFailure;
     const dictionary = options.dictionary orelse &.{};
     // Preload only the content view, like the decoder; formatted dictionaries
     // carry magic/ID/entropy tables that are not match-finder material.
     const dict_content: []const u8 = if (dictionary.len >= 8 and std.mem.readInt(u32, dictionary[0..4], .little) == dictionary_magic)
-        dictionaryContent(dictionary) catch return error.InvalidData
+        dictionaryContent(dictionary) catch return error.DataFailure
     else
         dictionary;
     const needed_history = @as(usize, options.window_size) + block_size_max + dict_content.len;
-    if (history.len < needed_history) return error.InvalidData;
+    if (history.len < needed_history) return error.DataFailure;
     const frame_cap = if (useFixedTables(options))
         @min(history.len - dict_content.len - block_size_max, encoder_frame_size_max)
     else
         @min(options.window_size, encoder_frame_size_max);
-    if (workspace.len < encoderWorkspaceU32Count(dict_content.len, frame_cap, options)) return error.InvalidData;
+    if (workspace.len < encoderWorkspaceU32Count(dict_content.len, frame_cap, options)) return error.DataFailure;
     var total_encoded: u64 = 0;
     var total_input: u64 = 0;
     var is_empty = true;
@@ -378,9 +378,9 @@ pub fn encodeStream(input: *std.Io.Reader, output: *std.Io.Writer, history: []u8
         const written = try encodeFrame(output, history[0 .. dict_content.len + frame_len], workspace, options, dict_content.len);
         total_encoded = try checkedAdd(total_encoded, written, options.max_encoded_bytes);
     }
-    if (total_input > options.max_decoded_bytes) return error.ResourceLimit;
-    if (total_encoded > options.max_encoded_bytes) return error.ResourceLimit;
-    return std.math.cast(usize, total_encoded) orelse error.ResourceLimit;
+    if (total_input > options.max_decoded_bytes) return error.ResourceFailure;
+    if (total_encoded > options.max_encoded_bytes) return error.ResourceFailure;
+    return std.math.cast(usize, total_encoded) orelse error.ResourceFailure;
 }
 
 fn readFrameInput(input: *std.Io.Reader, buffer: []u8, max_len: usize, max_total: u64, total: *u64) EncodeError!usize {
@@ -396,14 +396,14 @@ fn readFrameInput(input: *std.Io.Reader, buffer: []u8, max_len: usize, max_total
         if (n == 0) break;
         len += n;
     }
-    total.* = std.math.add(u64, total.*, len) catch return error.ResourceLimit;
-    if (total.* > max_total) return error.ResourceLimit;
+    total.* = std.math.add(u64, total.*, len) catch return error.ResourceFailure;
+    if (total.* > max_total) return error.ResourceFailure;
     return len;
 }
 
 fn checkedAdd(a: u64, b: u64, limit: u64) EncodeError!u64 {
-    const sum = std.math.add(u64, a, b) catch return error.ResourceLimit;
-    if (sum > limit) return error.ResourceLimit;
+    const sum = std.math.add(u64, a, b) catch return error.ResourceFailure;
+    if (sum > limit) return error.ResourceFailure;
     return sum;
 }
 
@@ -420,7 +420,7 @@ pub fn encodeFrame(output: *std.Io.Writer, content: []const u8, workspace: []u32
     var hasher = checksum.XxHash64.bind(options.provider, 0);
     try encodeBlocks(&counted.writer, content, content_start, workspace, options, &hasher);
     try writeU32le(&counted.writer, @truncate(hasher.final()));
-    return std.math.cast(usize, counted.written()) orelse error.ResourceLimit;
+    return std.math.cast(usize, counted.written()) orelse error.ResourceFailure;
 }
 
 fn writeFrameHeader(writer: *std.Io.Writer, content_size: usize, window_size: u32, dictionary_id: u32) EncodeError!void {
@@ -480,9 +480,9 @@ fn encodeBlocks(output: *std.Io.Writer, content: []const u8, content_start: usiz
     var literal_table: [1 << 6]FseEntry = undefined;
     var match_table: [1 << 6]FseEntry = undefined;
     var offset_table: [1 << 5]FseEntry = undefined;
-    buildFseEncoderSpread(&default_literal_probs, &literal_table) catch return error.InvalidData;
-    buildFseEncoderSpread(&default_match_probs, &match_table) catch return error.InvalidData;
-    buildFseEncoderSpread(&default_offset_probs, &offset_table) catch return error.InvalidData;
+    buildFseEncoderSpread(&default_literal_probs, &literal_table) catch return error.DataFailure;
+    buildFseEncoderSpread(&default_match_probs, &match_table) catch return error.DataFailure;
+    buildFseEncoderSpread(&default_offset_probs, &offset_table) catch return error.DataFailure;
     const frame_len = content.len - content_start;
     const head = workspace[0..hash_size];
     @memset(head, encoder_no_position);
@@ -491,10 +491,10 @@ fn encodeBlocks(output: *std.Io.Writer, content: []const u8, content_start: usiz
     else
         workspace[hash_size .. hash_size + @max(content.len, dfastShortTableSize(options))];
     if (useDfast(options)) @memset(chain, encoder_no_position);
-    // Seed the finders with the dictionary region so emitted sequences can
-    // address it. The chain path links positions through chain[]; dfast uses
-    // single-candidate long/short tables with no walk, so a plain dual insert
-    // suffices. Row tables are tag-indexed and stay unseeded.
+    // Seeding lets emitted sequences address the dictionary region.
+    // dfast's single-candidate tables take a plain dual insert; the chain path
+    // links positions through chain[].
+    // Row tables are tag-indexed and stay unseeded.
     if (!useRowMatch(options) and content_start > 0) {
         if (useDfast(options)) {
             const long_bits = options.hash_bits;
@@ -1499,7 +1499,7 @@ fn fseEncodeWeightStream(symbols: []const u4, normalized: []const i16, norm_log:
 
 // The encoder's spread table keeps the symbol per position, which the FSE state
 // derivation reads. The decoder builds its packed entry instead.
-fn buildFseEncoderSpread(values: []const i16, entries: []FseEntry) error{InvalidData}!void {
+fn buildFseEncoderSpread(values: []const i16, entries: []FseEntry) error{DataFailure}!void {
     const table_size: u16 = @intCast(entries.len);
     const accuracy_log = std.math.log2_int(u16, table_size);
     const table_mask = entries.len - 1;
@@ -1509,7 +1509,7 @@ fn buildFseEncoderSpread(values: []const i16, entries: []FseEntry) error{Invalid
     // -1 symbols sit at the high end of the table.
     for (values, 0..) |value, symbol| {
         if (value == -1) {
-            if (high_threshold == 0) return error.InvalidData;
+            if (high_threshold == 0) return error.DataFailure;
             high_threshold -= 1;
             entries[high_threshold] = .{
                 .symbol = @intCast(symbol),
@@ -1535,7 +1535,7 @@ fn buildFseEncoderSpread(values: []const i16, entries: []FseEntry) error{Invalid
             }
         }
     }
-    if (position != 0) return error.InvalidData;
+    if (position != 0) return error.DataFailure;
     for (0..entries.len) |index| {
         const symbol = entries[index].symbol;
         const next_state = symbol_next[symbol];
@@ -2336,7 +2336,7 @@ const ReverseBitWriter = struct {
 };
 
 pub fn scanContentSize(input: *std.Io.Reader, max_window: u32) DecodeError!usize {
-    if (max_window < window_size_min or max_window > window_size_max) return error.Unsupported;
+    if (max_window < window_size_min or max_window > window_size_max) return error.UnsupportedFailure;
     var total: u64 = 0;
     while (true) {
         const magic = readU32Le(input) catch |err| switch (err) {
@@ -2346,24 +2346,24 @@ pub fn scanContentSize(input: *std.Io.Reader, max_window: u32) DecodeError!usize
         if (magic != frame_magic) {
             if (magic >= skippable_magic_min and magic <= skippable_magic_max) {
                 const size = readU32Le(input) catch |err| switch (err) {
-                    error.EndOfStream => return error.InvalidData,
+                    error.EndOfStream => return error.DataFailure,
                     error.ReadFailed => return error.IoFailure,
                 };
                 try skipBytes(input, size);
                 continue;
             }
-            return error.InvalidData;
+            return error.DataFailure;
         }
         const header = try decodeFrameHeader(input, max_window);
-        if (!header.has_content_size) return error.Unsupported;
-        total = std.math.add(u64, total, header.content_size) catch return error.ResourceLimit;
+        if (!header.has_content_size) return error.UnsupportedFailure;
+        total = std.math.add(u64, total, header.content_size) catch return error.ResourceFailure;
         while (true) {
             const block_header = try readBlockHeader(input);
-            if (block_header.size > block_size_max) return error.Unsupported;
+            if (block_header.size > block_size_max) return error.UnsupportedFailure;
             switch (block_header.type) {
                 .raw, .compressed => try skipBytes(input, block_header.size),
                 .rle => try skipBytes(input, 1),
-                .reserved => return error.InvalidData,
+                .reserved => return error.DataFailure,
             }
             if (block_header.last) break;
         }
@@ -2371,7 +2371,7 @@ pub fn scanContentSize(input: *std.Io.Reader, max_window: u32) DecodeError!usize
             try skipBytes(input, 4);
         }
     }
-    return std.math.cast(usize, total) orelse error.ResourceLimit;
+    return std.math.cast(usize, total) orelse error.ResourceFailure;
 }
 
 // Backward reader over the literal/sequence streams. Unread bits are always 8 * pos + valid().
@@ -2386,7 +2386,7 @@ const BackwardBitStream = struct {
         var self: BackwardBitStream = .{ .bytes = bytes, .pos = 0, .container = 0, .consumed = 64, .tail_pad = 0 };
         if (bytes.len == 0) return self;
         const last = bytes[bytes.len - 1];
-        if (last == 0) return error.InvalidData;
+        if (last == 0) return error.DataFailure;
         const highbit = std.math.log2_int(u8, last);
         if (bytes.len >= 8) {
             self.container = std.mem.readInt(u64, bytes[bytes.len - 8 ..][0..8], .little);
@@ -2441,7 +2441,7 @@ const BackwardBitStream = struct {
         // unconsumed prefix and the remaining count are invariant: a container that
         // already holds count bits answers without it.
         if (self.valid() < count) self.refill();
-        if (self.remaining() < count) return error.InvalidData;
+        if (self.remaining() < count) return error.DataFailure;
         const value = self.peek(count);
         self.skip(count);
         return value;
@@ -2451,7 +2451,7 @@ const BackwardBitStream = struct {
 // Parses a formatted dictionary and returns its referenceable content.
 // Raw-content dictionaries without magic are their own content.
 pub fn dictionaryContent(dictionary: []const u8) DecodeError![]const u8 {
-    if (dictionary.len < 8) return error.InvalidData;
+    if (dictionary.len < 8) return error.DataFailure;
     if (std.mem.readInt(u32, dictionary[0..4], .little) != dictionary_magic) return dictionary;
     // RFC 8878 permits a zero Dictionary_ID (it means "unspecified"); only
     // the raw-content fast path (magic mismatch) bypasses parsing entirely.
@@ -2514,7 +2514,7 @@ const Decoder = struct {
 
     fn decodeFrameBody(d: *Decoder) DecodeError!void {
         const header = try decodeFrameHeader(d.input, d.window_size);
-        if (header.has_content_size and header.content_size > d.max_decoded) return error.ResourceLimit;
+        if (header.has_content_size and header.content_size > d.max_decoded) return error.ResourceFailure;
         d.content_size = if (header.has_content_size) header.content_size else null;
         d.has_checksum = header.has_checksum;
         d.checksummer = checksum.XxHash64.bind(d.provider, 0);
@@ -2522,7 +2522,7 @@ const Decoder = struct {
         if (d.dictionary) |dictionary| {
             try d.loadDictionary(dictionary, header.dictionary_id);
         } else {
-            if (header.dictionary_id != 0) return error.Unsupported;
+            if (header.dictionary_id != 0) return error.UnsupportedFailure;
             d.repeat_offsets = .{
                 start_repeated_offset_1,
                 start_repeated_offset_2,
@@ -2537,42 +2537,42 @@ const Decoder = struct {
                 try d.slideHistory();
             }
             const block_header = try readBlockHeader(d.input);
-            if (block_header.size > block_size_max) return error.Unsupported;
+            if (block_header.size > block_size_max) return error.UnsupportedFailure;
             const block_output_before = d.history_end;
             switch (block_header.type) {
                 .raw => try d.decodeRawBlock(block_header.size),
                 .rle => try d.decodeRleBlock(block_header.size),
                 .compressed => try d.decodeCompressedBlock(block_header.size),
-                .reserved => return error.InvalidData,
+                .reserved => return error.DataFailure,
             }
             const block_output_after = d.history_end;
             const block_produced = block_output_after - block_output_before;
             d.checksummer.update(d.history[block_output_before..block_output_after]);
-            d.frame_output = std.math.add(u64, d.frame_output, block_produced) catch return error.ResourceLimit;
+            d.frame_output = std.math.add(u64, d.frame_output, block_produced) catch return error.ResourceFailure;
             if (d.content_size) |cs| {
-                if (d.frame_output > cs) return error.InvalidData;
+                if (d.frame_output > cs) return error.DataFailure;
             }
-            if (d.frame_output > d.max_decoded) return error.ResourceLimit;
+            if (d.frame_output > d.max_decoded) return error.ResourceFailure;
             if (block_header.last) break;
         }
         if (d.content_size) |cs| {
-            if (d.frame_output != cs) return error.InvalidData;
+            if (d.frame_output != cs) return error.DataFailure;
         }
         if (d.has_checksum) {
             const stored = try d.readU32Le();
             const actual: u32 = @truncate(d.checksummer.final());
             if (stored != actual) return error.IntegrityFailure;
         }
-        d.total_output = std.math.add(u64, d.total_output, d.frame_output) catch return error.ResourceLimit;
+        d.total_output = std.math.add(u64, d.total_output, d.frame_output) catch return error.ResourceFailure;
         try d.flushHistory();
     }
 
     fn loadDictionary(d: *Decoder, dictionary: []const u8, expected_id: u32) DecodeError!void {
-        if (dictionary.len < 8) return error.InvalidData;
+        if (dictionary.len < 8) return error.DataFailure;
         const magic = std.mem.readInt(u32, dictionary[0..4], .little);
         if (magic != dictionary_magic) {
-            if (expected_id != 0) return error.InvalidData;
-            if (dictionary.len > d.history.len) return error.ResourceLimit;
+            if (expected_id != 0) return error.DataFailure;
+            if (dictionary.len > d.history.len) return error.ResourceFailure;
             @memcpy(d.history[0..dictionary.len], dictionary);
             d.history_end = dictionary.len;
             d.output_base = dictionary.len;
@@ -2586,8 +2586,8 @@ const Decoder = struct {
             return;
         }
         const dictionary_id = std.mem.readInt(u32, dictionary[4..8], .little);
-        if (dictionary_id == 0) return error.InvalidData;
-        if (expected_id != 0 and dictionary_id != expected_id) return error.InvalidData;
+        if (dictionary_id == 0) return error.DataFailure;
+        if (expected_id != 0 and dictionary_id != expected_id) return error.DataFailure;
         var cursor = binary.ReadCursor.init(dictionary[8..]);
         // Nodes filled below before use, so `undefined` is safe.
         d.huffman_tree = .{ .nodes = undefined };
@@ -2614,9 +2614,9 @@ const Decoder = struct {
         const recent_offset_2 = try cursor.readU32Le();
         const recent_offset_3 = try cursor.readU32Le();
         const content = cursor.remainingSlice();
-        if (content.len > d.history.len) return error.ResourceLimit;
-        if (recent_offset_1 == 0 or recent_offset_2 == 0 or recent_offset_3 == 0) return error.InvalidData;
-        if (recent_offset_1 > content.len or recent_offset_2 > content.len or recent_offset_3 > content.len) return error.InvalidData;
+        if (content.len > d.history.len) return error.ResourceFailure;
+        if (recent_offset_1 == 0 or recent_offset_2 == 0 or recent_offset_3 == 0) return error.DataFailure;
+        if (recent_offset_1 > content.len or recent_offset_2 > content.len or recent_offset_3 > content.len) return error.DataFailure;
         @memcpy(d.history[0..content.len], content);
         d.history_end = content.len;
         d.output_base = content.len;
@@ -2625,7 +2625,7 @@ const Decoder = struct {
     }
 
     fn decodeRawBlock(d: *Decoder, size: usize) DecodeError!void {
-        if (d.history_end + size > d.history.len) return error.ResourceLimit;
+        if (d.history_end + size > d.history.len) return error.ResourceFailure;
         var target = std.Io.Writer.fixed(d.history[d.history_end..][0..size]);
         try streamExact(d.input, &target, size);
         d.history_end += size;
@@ -2633,14 +2633,14 @@ const Decoder = struct {
 
     fn decodeRleBlock(d: *Decoder, size: usize) DecodeError!void {
         if (size == 0) return;
-        if (d.history_end + size > d.history.len) return error.ResourceLimit;
+        if (d.history_end + size > d.history.len) return error.ResourceFailure;
         const byte = try d.readU8();
         @memset(d.history[d.history_end..][0..size], byte);
         d.history_end += size;
     }
 
     fn decodeCompressedBlock(d: *Decoder, block_size: usize) DecodeError!void {
-        if (block_size > d.block_buffer.len) return error.Unsupported;
+        if (block_size > d.block_buffer.len) return error.UnsupportedFailure;
         var target = std.Io.Writer.fixed(d.block_buffer[0..block_size]);
         try streamExact(d.input, &target, block_size);
         var cursor = ReadCursor.init(d.block_buffer[0..block_size]);
@@ -2655,7 +2655,7 @@ const Decoder = struct {
                 .one => |stream| stream,
                 .four => |streams| streams[0],
             };
-            if (first.len == 0) return error.InvalidData;
+            if (first.len == 0) return error.DataFailure;
             literal_bits = try BackwardBitStream.init(first);
         }
         const sequences = try decodeSequencesHeader(&cursor);
@@ -2683,14 +2683,14 @@ const Decoder = struct {
         var literal_written: usize = 0;
         var decoded_count: usize = 0;
         const output_limit = d.history.len - d.history_end;
-        if (output_limit < block_size_max) return error.ResourceLimit;
+        if (output_limit < block_size_max) return error.ResourceFailure;
         for (0..sequences.count) |seq_index| {
             const last_sequence = seq_index == sequences.count - 1;
 
             const offset_entry = offset_table[offset_state];
             const match_entry = match_table[match_state];
             const literal_entry = literal_table[literal_state];
-            if (offset_entry.extra_bits == fse_invalid_extra or match_entry.extra_bits == fse_invalid_extra or literal_entry.extra_bits == fse_invalid_extra) return error.InvalidData;
+            if (offset_entry.extra_bits == fse_invalid_extra or match_entry.extra_bits == fse_invalid_extra or literal_entry.extra_bits == fse_invalid_extra) return error.DataFailure;
 
             const offset_extra: u32 = @intCast(try seq_bits.read(@intCast(offset_entry.extra_bits)));
             const offset_value = offset_entry.base_value + offset_extra;
@@ -2702,20 +2702,20 @@ const Decoder = struct {
             const literal_length = literal_entry.base_value + literal_extra;
 
             const offset = computeOffsetValue(offset_value, literal_length, &reps);
-            if (offset == 0) return error.InvalidData;
+            if (offset == 0) return error.DataFailure;
             // The match source loads while the literal run is emitted, so its line
             // starts early. The guard keeps the hint off a corrupt stream's wild offset.
             const write_base = d.history_end + decoded_count;
             if (offset <= write_base) @prefetch(d.history[write_base - offset ..].ptr, .{ .rw = .read, .locality = 3, .cache = .data });
             if (literal_length > 0) {
-                if (literal_written + literal_length > literals.regenerated_size) return error.InvalidData;
-                if (decoded_count + literal_length > block_size_max) return error.InvalidData;
+                if (literal_written + literal_length > literals.regenerated_size) return error.DataFailure;
+                if (decoded_count + literal_length > block_size_max) return error.DataFailure;
                 try d.copyLiteralRun(&literals, &literal_bits, &literal_stream_index, &literal_legacy, d.history[d.history_end + decoded_count ..][0..literal_length], literal_written);
                 literal_written += literal_length;
                 decoded_count += literal_length;
             }
             if (match_length > 0) {
-                if (decoded_count + match_length > block_size_max) return error.InvalidData;
+                if (decoded_count + match_length > block_size_max) return error.DataFailure;
                 try d.copyMatch(offset, match_length, decoded_count);
                 decoded_count += match_length;
             }
@@ -2738,7 +2738,7 @@ const Decoder = struct {
         d.repeat_offsets = reps;
         if (literal_written < literals.regenerated_size) {
             const remaining_literals = literals.regenerated_size - literal_written;
-            if (decoded_count + remaining_literals > block_size_max) return error.InvalidData;
+            if (decoded_count + remaining_literals > block_size_max) return error.DataFailure;
             try d.copyLiteralRun(&literals, &literal_bits, &literal_stream_index, &literal_legacy, d.history[d.history_end + decoded_count ..][0..remaining_literals], literal_written);
             decoded_count += remaining_literals;
         }
@@ -2749,12 +2749,12 @@ const Decoder = struct {
                     d.isLiteralStreamEmpty(&literals)
                 else
                     literal_bits.remaining() == 0 and literal_stream_index + 1 >= literalStreamCount(&literals);
-                if (!is_empty) return error.InvalidData;
+                if (!is_empty) return error.DataFailure;
             },
             .raw, .rle => {},
         }
-        if (seq_bits.remaining() != 0) return error.InvalidData;
-        if (decoded_count > block_size_max) return error.InvalidData;
+        if (seq_bits.remaining() != 0) return error.DataFailure;
+        if (decoded_count > block_size_max) return error.DataFailure;
         d.savePrevTables();
         d.history_end += decoded_count;
     }
@@ -2800,19 +2800,19 @@ const Decoder = struct {
                                     if (stream_index.* + 1 >= streams.len) break;
                                     stream_index.* += 1;
                                     const next = streams[stream_index.*];
-                                    if (next.len == 0) return error.InvalidData;
+                                    if (next.len == 0) return error.DataFailure;
                                     bits.* = try BackwardBitStream.init(next);
                                 },
                             }
                         }
                     }
                     const avail: u4 = @intCast(@min(bits.valid(), max_bits));
-                    if (avail == 0) return error.InvalidData;
+                    if (avail == 0) return error.DataFailure;
                     const index: u16 = @intCast(bits.peek(avail));
                     const entry = tree.lookup_two[index << @intCast(max_bits - avail)];
                     const len1: u8 = @intCast((entry >> 16) & 0x1F);
                     const len2: u8 = @intCast((entry >> 21) & 0x1F);
-                    if (len1 == 0) return error.InvalidData;
+                    if (len1 == 0) return error.DataFailure;
                     if (len1 > avail) {
                         // Split streams continue in the merged-window decoder for exact behavior.
                         if (literals.streams == .four and stream_index.* + 1 < literals.streams.four.len) {
@@ -2826,7 +2826,7 @@ const Decoder = struct {
                             try d.decodeLiterals(literals, dest[emitted..], dest.len - emitted, 0);
                             return;
                         }
-                        return error.InvalidData;
+                        return error.DataFailure;
                     }
                     if (len2 != 0 and len1 + len2 <= avail and emitted + 2 <= dest.len) {
                         // The entry packs both symbols little-endian in its low 16 bits.
@@ -2844,9 +2844,9 @@ const Decoder = struct {
     }
 
     inline fn copyMatch(d: *Decoder, offset: u32, length: usize, decoded_count: usize) DecodeError!void {
-        if (offset == 0) return error.InvalidData;
+        if (offset == 0) return error.DataFailure;
         const write_base = d.history_end + decoded_count;
-        if (offset > write_base) return error.InvalidData;
+        if (offset > write_base) return error.DataFailure;
         const src = write_base - offset;
         const history = d.history;
         if (comptime vector_match_copy) {
@@ -2934,7 +2934,7 @@ const Decoder = struct {
                     .offset => .offset,
                 };
                 const table_size = @as(usize, 1) << accuracy_log;
-                buildFseTable(probs, state.entries[0..table_size], kind) catch return error.InvalidData;
+                buildFseTable(probs, state.entries[0..table_size], kind) catch return error.DataFailure;
                 state.table = .{ .fse = state.entries[0..table_size] };
                 state.accuracy_log = accuracy_log;
             },
@@ -2964,7 +2964,7 @@ const Decoder = struct {
                 state.accuracy_log = @intCast(std.math.log2_int(usize, decoded.table_size));
             },
             .repeat => {
-                if (!d.prev_tables_valid) return error.InvalidData;
+                if (!d.prev_tables_valid) return error.DataFailure;
                 d.applyRepeatTable(choice);
             },
         }
@@ -2987,12 +2987,12 @@ const Decoder = struct {
                     try d.literalRefill(literals);
                     const max_bits = tree.max_bits;
                     const available: u4 = @intCast(@min(d.literal_window_bits, max_bits));
-                    if (available == 0) return error.InvalidData;
+                    if (available == 0) return error.DataFailure;
                     const index: u16 = @intCast(d.literal_window >> @intCast(@as(u7, 64) - available));
                     const index_aligned = index << @intCast(max_bits - available);
                     const entry = tree.lookup[index_aligned];
                     const bits: u4 = @intCast(entry >> 8);
-                    if (bits == 0 or bits > d.literal_window_bits) return error.InvalidData;
+                    if (bits == 0 or bits > d.literal_window_bits) return error.DataFailure;
                     d.literalConsume(bits);
                     dest[emitted] = @intCast(entry & 0xFF);
                     emitted += 1;
@@ -3002,9 +3002,9 @@ const Decoder = struct {
     }
 
     fn literalInitStream(d: *Decoder, stream: []const u8) DecodeError!void {
-        if (stream.len == 0) return error.InvalidData;
+        if (stream.len == 0) return error.DataFailure;
         const last = stream[stream.len - 1];
-        if (last == 0) return error.InvalidData;
+        if (last == 0) return error.DataFailure;
         const highbit = std.math.log2_int(u8, last);
         const k: u6 = @intCast(highbit);
         const new_bits: u64 = last & ((@as(u64, 1) << k) - 1);
@@ -3065,7 +3065,7 @@ const Decoder = struct {
 
     fn readU8(d: *Decoder) DecodeError!u8 {
         return d.input.takeByte() catch |err| switch (err) {
-            error.EndOfStream => error.InvalidData,
+            error.EndOfStream => error.DataFailure,
             error.ReadFailed => error.IoFailure,
         };
     }
@@ -3201,10 +3201,9 @@ fn fseTableOrRle(state: *const FseDecoder, kind: TableKind, storage: *[1]DecodeE
 // user: its symbol is the weight itself.
 const TableKind = enum { literal, match, offset, weight };
 
-// The RLE symbol is a raw byte, so a symbol past the stream's code table marks
-// the entry invalid and the sequence loop rejects it where the old per-symbol
-// bounds checks did. An offset symbol past 31 also removes the shift overflow
-// the old `1 << symbol` form allowed.
+// A symbol past the stream's code table marks the entry invalid; the
+// sequence loop rejects it where per-symbol bounds checks did.
+// An offset symbol past 31 also removes the old `1 << symbol` shift overflow.
 const CodeFields = struct { base: u32, extra: u8 };
 
 fn entryFields(kind: TableKind, symbol: u16) CodeFields {
@@ -3307,18 +3306,18 @@ const ReverseBitReader = struct {
         };
         if (bytes.len == 0) return self;
         while (self.remaining > 0 or self.count > 0) {
-            const bit = self.readBitsAny(u1, 1) catch return error.InvalidData;
-            if (bit.count == 0) return error.InvalidData;
+            const bit = self.readBitsAny(u1, 1) catch return error.DataFailure;
+            if (bit.count == 0) return error.DataFailure;
             if (bit.value != 0) {
                 return self;
             }
         }
-        return error.InvalidData;
+        return error.DataFailure;
     }
 
     fn readBitsNoEof(self: *ReverseBitReader, comptime T: type, count: u16) DecodeError!T {
         const result = try self.readBitsAny(T, count);
-        if (result.count < count) return error.InvalidData;
+        if (result.count < count) return error.DataFailure;
         return result.value;
     }
 
@@ -3351,7 +3350,7 @@ const ReverseBitReader = struct {
     }
 
     fn takeByte(self: *ReverseBitReader) DecodeError!u8 {
-        if (self.remaining == 0) return error.InvalidData;
+        if (self.remaining == 0) return error.DataFailure;
         self.remaining -= 1;
         return self.bytes[self.remaining];
     }
@@ -3379,7 +3378,7 @@ fn lowBitMask(bits: u4) u8 {
 
 fn streamExact(reader: *std.Io.Reader, writer: *std.Io.Writer, count: usize) DecodeError!void {
     reader.streamExact(writer, count) catch |err| switch (err) {
-        error.EndOfStream => return error.InvalidData,
+        error.EndOfStream => return error.DataFailure,
         error.WriteFailed => return error.IoFailure,
         error.ReadFailed => return error.IoFailure,
     };
@@ -3390,7 +3389,7 @@ fn skipBytes(reader: *std.Io.Reader, count: usize) DecodeError!void {
     while (remaining > 0) {
         const step = @min(remaining, 4096);
         const discarded = reader.discard(.limited(step)) catch |err| switch (err) {
-            error.EndOfStream => return error.InvalidData,
+            error.EndOfStream => return error.DataFailure,
             error.ReadFailed => return error.IoFailure,
         };
         remaining -= discarded;
@@ -3404,7 +3403,7 @@ fn decodeFrameHeader(input: *std.Io.Reader, window_limit: u32) DecodeError!Frame
     const single_segment_flag = (descriptor & 0b100000) != 0;
     const reserved_bit = (descriptor & 0b1000) != 0;
     const content_checksum_flag = (descriptor & 0b100) != 0;
-    if (reserved_bit) return error.InvalidData;
+    if (reserved_bit) return error.DataFailure;
     const window_descriptor = if (!single_segment_flag) try readU8(input) else 0;
     var window_size = computeWindowSize(window_descriptor);
     const dictionary_id: u32 = if (dictionary_id_flag == 0) 0 else blk: {
@@ -3414,7 +3413,7 @@ fn decodeFrameHeader(input: *std.Io.Reader, window_limit: u32) DecodeError!Frame
             3 => 4,
             else => unreachable,
         };
-        break :blk std.math.cast(u32, try readVarInt(input, field_size)) orelse return error.ResourceLimit;
+        break :blk std.math.cast(u32, try readVarInt(input, field_size)) orelse return error.ResourceFailure;
     };
     var content_size: u64 = 0;
     var has_content_size = false;
@@ -3430,7 +3429,7 @@ fn decodeFrameHeader(input: *std.Io.Reader, window_limit: u32) DecodeError!Frame
         if (field_size == 2) content_size += 256;
         has_content_size = true;
     }
-    if (window_size > window_limit) return error.Unsupported;
+    if (window_size > window_limit) return error.UnsupportedFailure;
     return .{
         .has_content_size = has_content_size,
         .content_size = content_size,
@@ -3463,7 +3462,7 @@ fn readBlockHeader(input: *std.Io.Reader) DecodeError!BlockHeader {
 
 fn readU8(input: *std.Io.Reader) DecodeError!u8 {
     return input.takeByte() catch |err| switch (err) {
-        error.EndOfStream => error.InvalidData,
+        error.EndOfStream => error.DataFailure,
         error.ReadFailed => error.IoFailure,
     };
 }
@@ -3534,7 +3533,7 @@ fn decodeLiteralsSection(cursor: *ReadCursor, d: *Decoder) DecodeError!LiteralsS
             streams = .{ .one = d.block_buffer[0..1] };
         },
         .compressed, .treeless => {
-            if (block_type == .treeless and d.huffman_tree == null) return error.InvalidData;
+            if (block_type == .treeless and d.huffman_tree == null) return error.DataFailure;
             const huffman_tree_size = if (block_type == .compressed) b: {
                 const before_huffman = cursor.pos;
                 // Nodes filled below before use, so `undefined` is safe.
@@ -3543,7 +3542,7 @@ fn decodeLiteralsSection(cursor: *ReadCursor, d: *Decoder) DecodeError!LiteralsS
                 break :b cursor.pos - before_huffman;
             } else 0;
             const cs = compressed_size.?;
-            if (huffman_tree_size > cs) return error.InvalidData;
+            if (huffman_tree_size > cs) return error.DataFailure;
             const total_streams_size = cs - huffman_tree_size;
             const stream_data = try cursor.readSlice(total_streams_size);
             streams = try splitLiteralStreams(size_format, stream_data);
@@ -3558,7 +3557,7 @@ fn decodeLiteralsSection(cursor: *ReadCursor, d: *Decoder) DecodeError!LiteralsS
 
 fn splitLiteralStreams(size_format: u2, data: []const u8) DecodeError!LiteralsStreams {
     if (size_format == 0) return .{ .one = data };
-    if (data.len < 6) return error.InvalidData;
+    if (data.len < 6) return error.DataFailure;
     const s1 = std.mem.readInt(u16, data[0..2], .little);
     const s2 = std.mem.readInt(u16, data[2..4], .little);
     const s3 = std.mem.readInt(u16, data[4..6], .little);
@@ -3566,7 +3565,7 @@ fn splitLiteralStreams(size_format: u2, data: []const u8) DecodeError!LiteralsSt
     const start2 = start1 + s1;
     const start3 = start2 + s2;
     const start4 = start3 + s3;
-    if (data.len < start4) return error.InvalidData;
+    if (data.len < start4) return error.DataFailure;
     return .{ .four = .{
         data[start1..start2],
         data[start2..start3],
@@ -3586,7 +3585,7 @@ fn decodeHuffmanTree(cursor: *ReadCursor, tree: *HuffmanTree) DecodeError!void {
         const decoded = try decodeFseTable(compressed, 256, 6, &entries, .weight);
         const accuracy_log = std.math.log2_int(usize, decoded.table_size);
         const remaining = compressed[decoded.consumed..];
-        symbol_count = assignHuffmanWeights(remaining, accuracy_log, &entries, &weights) catch return error.InvalidData;
+        symbol_count = assignHuffmanWeights(remaining, accuracy_log, &entries, &weights) catch return error.DataFailure;
     } else {
         const weight_count = header - 127;
         symbol_count = weight_count + 1;
@@ -3616,43 +3615,43 @@ fn assignHuffmanWeights(
     while (i < 254) {
         const even_data = entries[even_state];
         var read_count: u16 = 0;
-        const even_bits = reader.readBitsAny(u32, even_data.bits) catch return error.InvalidData;
+        const even_bits = reader.readBitsAny(u32, even_data.bits) catch return error.DataFailure;
         read_count = even_bits.count;
-        weights[i] = std.math.cast(u4, even_data.base_value) orelse return error.InvalidData;
+        weights[i] = std.math.cast(u4, even_data.base_value) orelse return error.DataFailure;
         i += 1;
         if (read_count < even_data.bits) {
-            weights[i] = std.math.cast(u4, entries[odd_state].base_value) orelse return error.InvalidData;
+            weights[i] = std.math.cast(u4, entries[odd_state].base_value) orelse return error.DataFailure;
             i += 1;
             break;
         }
         even_state = even_data.baseline + even_bits.value;
         const odd_data = entries[odd_state];
-        const odd_bits = reader.readBitsAny(u32, odd_data.bits) catch return error.InvalidData;
+        const odd_bits = reader.readBitsAny(u32, odd_data.bits) catch return error.DataFailure;
         read_count = odd_bits.count;
-        weights[i] = std.math.cast(u4, odd_data.base_value) orelse return error.InvalidData;
+        weights[i] = std.math.cast(u4, odd_data.base_value) orelse return error.DataFailure;
         i += 1;
         if (read_count < odd_data.bits) {
-            if (i == 255) return error.InvalidData;
-            weights[i] = std.math.cast(u4, entries[even_state].base_value) orelse return error.InvalidData;
+            if (i == 255) return error.DataFailure;
+            weights[i] = std.math.cast(u4, entries[even_state].base_value) orelse return error.DataFailure;
             i += 1;
             break;
         }
         odd_state = odd_data.baseline + odd_bits.value;
-    } else return error.InvalidData;
-    if (!reader.isEmpty()) return error.InvalidData;
+    } else return error.DataFailure;
+    if (!reader.isEmpty()) return error.DataFailure;
     return i + 1;
 }
 
-fn buildHuffmanTree(weights: []const u4, symbol_count: usize, tree: *HuffmanTree) error{InvalidData}!void {
+fn buildHuffmanTree(weights: []const u4, symbol_count: usize, tree: *HuffmanTree) error{DataFailure}!void {
     var weight_power_sum: u32 = 0;
     for (weights[0 .. symbol_count - 1]) |value| {
         weight_power_sum += (@as(u16, 1) << @intCast(value)) >> 1;
     }
-    if (weight_power_sum >= 1 << 11) return error.InvalidData;
+    if (weight_power_sum >= 1 << 11) return error.DataFailure;
     const max_bits: u4 = if (weight_power_sum == 0) 1 else @intCast(std.math.log2_int(u32, weight_power_sum) + 1);
     const next_power = @as(u32, 1) << max_bits;
     const last_weight_value = next_power - weight_power_sum;
-    if (last_weight_value == 0) return error.InvalidData;
+    if (last_weight_value == 0) return error.DataFailure;
     const last_weight = std.math.log2_int(u32, last_weight_value) + 1;
     var local_weights: [256]u4 = undefined;
     @memcpy(local_weights[0..symbol_count], weights[0..symbol_count]);
@@ -3746,7 +3745,7 @@ fn decodeSequencesHeader(cursor: *ReadCursor) DecodeError!SequencesHeader {
         count = @as(usize, byte1) + (@as(usize, byte2) << 8) + 0x7F00;
     }
     const modes = try cursor.readU8();
-    if ((modes & 0b11) != 0) return error.InvalidData;
+    if ((modes & 0b11) != 0) return error.DataFailure;
     const match_mode: SequenceMode = @fromBackingInt(@intCast((modes >> 2) & 0b11));
     const offset_mode: SequenceMode = @fromBackingInt(@intCast((modes >> 4) & 0b11));
     const literal_mode: SequenceMode = @fromBackingInt(@intCast((modes >> 6) & 0b11));
@@ -3775,7 +3774,7 @@ const NCountWindow = struct {
 
     fn peek(self: *NCountWindow, n: u5) DecodeError!u32 {
         self.refill();
-        if (self.bit_count < n) return error.InvalidData;
+        if (self.bit_count < n) return error.DataFailure;
         return self.window & ((@as(u32, 1) << n) - 1);
     }
 
@@ -3796,7 +3795,7 @@ fn decodeFseTable(
     var window = NCountWindow{ .bytes = bytes };
     const accuracy_log_biased = try window.peek(4);
     window.consume(4);
-    if (accuracy_log_biased > max_accuracy_log -| 5) return error.InvalidData;
+    if (accuracy_log_biased > max_accuracy_log -| 5) return error.DataFailure;
     const accuracy_log: u4 = @intCast(accuracy_log_biased + 5);
     var norm: [256]i16 = @splat(0);
     var remaining: i32 = (@as(i32, 1) << accuracy_log) + 1;
@@ -3840,15 +3839,15 @@ fn decodeFseTable(
             threshold = @as(i32, 1) << (nb - 1);
         }
     }
-    if (remaining != 1) return error.InvalidData;
-    if (charnum > expected_symbol_count) return error.InvalidData;
-    if (charnum < 2) return error.InvalidData;
+    if (remaining != 1) return error.DataFailure;
+    if (charnum > expected_symbol_count) return error.DataFailure;
+    if (charnum < 2) return error.DataFailure;
     const table_size = @as(usize, 1) << accuracy_log;
-    buildFseTable(norm[0..charnum], entries[0..table_size], kind) catch return error.InvalidData;
+    buildFseTable(norm[0..charnum], entries[0..table_size], kind) catch return error.DataFailure;
     return .{ .table_size = table_size, .consumed = (window.total + 7) / 8 };
 }
 
-fn buildFseTable(values: []const i16, entries: []DecodeEntry, kind: TableKind) error{InvalidData}!void {
+fn buildFseTable(values: []const i16, entries: []DecodeEntry, kind: TableKind) error{DataFailure}!void {
     const table_size: u16 = @intCast(entries.len);
     const accuracy_log = std.math.log2_int(u16, table_size);
     const table_mask = entries.len - 1;
@@ -3861,7 +3860,7 @@ fn buildFseTable(values: []const i16, entries: []DecodeEntry, kind: TableKind) e
     // -1 symbols sit at the high end of the table.
     for (values, 0..) |value, symbol| {
         if (value == -1) {
-            if (high_threshold == 0) return error.InvalidData;
+            if (high_threshold == 0) return error.DataFailure;
             high_threshold -= 1;
             const fields = entryFields(kind, @intCast(symbol));
             entries[high_threshold] = .{
@@ -3897,7 +3896,7 @@ fn buildFseTable(values: []const i16, entries: []DecodeEntry, kind: TableKind) e
             }
         }
     }
-    if (position != 0) return error.InvalidData;
+    if (position != 0) return error.DataFailure;
     for (0..entries.len) |index| {
         const symbol = placed[index];
         const next_state = symbol_next[symbol];
@@ -3979,7 +3978,7 @@ test "zstd dictionary trainer selects deterministic segments" {
     const second_len = try trainDictionary(&samples, second.len, &second, scratch, checksum.default_provider);
     try std.testing.expectEqual(first_len, second_len);
     if (!std.mem.eql(u8, first[0..first_len], second[0..first_len])) {
-        std.debug.print("first length {d} differs at offset {d}: {x} vs {x}\n", .{ first_len, std.mem.indexOfDiff(u8, first[0..first_len], second[0..first_len]).?, first[std.mem.indexOfDiff(u8, first[0..first_len], second[0..first_len]).?], second[std.mem.indexOfDiff(u8, first[0..first_len], second[0..first_len]).?] });
+        std.debug.print("first length {d} differs at offset {d}: {x} vs {x}\n", .{ first_len, std.mem.findDiff(u8, first[0..first_len], second[0..first_len]).?, first[std.mem.findDiff(u8, first[0..first_len], second[0..first_len]).?], second[std.mem.findDiff(u8, first[0..first_len], second[0..first_len]).?] });
     }
     try std.testing.expectEqualSlices(u8, first[0..first_len], second[0..first_len]);
 
@@ -3990,7 +3989,7 @@ test "zstd dictionary trainer selects deterministic segments" {
     while (offset + train_k <= content.len) : (offset += train_k) {
         var found = false;
         for (samples) |sample| {
-            if (std.mem.indexOfPos(u8, sample, 0, content[offset..][0..train_k]) != null) {
+            if (std.mem.findPos(u8, sample, 0, content[offset..][0..train_k]) != null) {
                 found = true;
                 break;
             }
@@ -4104,7 +4103,7 @@ test "zstd encoder seeds dictionary matches and writes dictionary id" {
     // A frame declaring a Dictionary_ID refuses to decode without it.
     var bare_source = std.Io.Reader.fixed(with_dict[0..with_len]);
     var bare_sink = std.Io.Writer.fixed(decoded);
-    try std.testing.expectError(error.Unsupported, decodeStream(&bare_source, &bare_sink, plain_history, .{ .window_size = window }));
+    try std.testing.expectError(error.UnsupportedFailure, decodeStream(&bare_source, &bare_sink, plain_history, .{ .window_size = window }));
 }
 
 test "zstd dictionary content accepts zero dictionary id" {

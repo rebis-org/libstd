@@ -2,19 +2,13 @@ const std = @import("std");
 
 const failure = @import("../../common/primitive/failure.zig");
 const onprem = @import("onprem.zig");
-pub const Failure = @import("../../common/primitive/failure.zig").Failure;
 
 const std_lzma2 = std.compress.lzma2;
+pub const Failure = failure.Failure;
 pub const InPlaceResult = onprem.InPlaceResult;
-// Offprem arm of the lzma2 decode path: std.compress.lzma2.Decode used
-// directly. Decoded bytes land in the caller's output span through
-// `Writer.Allocating.initOwnedSlice`; std's chunk tables and the
-// AccumBuffer history carve from the caller's scratch span through a
-// FixedBufferAllocator. The accepted incompleteness of choosing std,
-// recorded: std lzma2's AccumBuffer grows with the decoded size, so a
-// stream whose decoded size outgrows the scratch answers
-// `error.InsufficientCapacity` — the caller picks onprem for those.
-// Decode only: encode resolves to onprem under any tag.
+// std lzma2's AccumBuffer grows with the decoded size; a stream that
+// outgrows the scratch answers CapacityFailure — the accepted incompleteness.
+// Encode resolves to onprem under any tag.
 pub const Options = onprem.Options;
 
 // The scratch the arm asks for: std's probability tables plus the
@@ -81,15 +75,10 @@ pub fn decodedSize(input: []const u8, scratch: []u8) Failure!usize {
 test "offprem lzma2 decodes byte-identical to onprem" {
     const alloc = std.testing.allocator;
 
-    var rng: u64 = 0x9e3779b97f4a7c15;
     const input = try alloc.alloc(u8, 200000);
     defer alloc.free(input);
-    for (input) |*b| {
-        rng ^= rng << 13;
-        rng ^= rng >> 7;
-        rng ^= rng << 17;
-        b.* = @truncate(rng >> 32);
-    }
+    var prng = std.Random.DefaultPrng.init(0x9e3779b97f4a7c15);
+    prng.random().bytes(input);
     @memset(input[60000..150000], 0);
 
     const compressed = try alloc.alloc(u8, 220000);

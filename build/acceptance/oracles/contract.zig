@@ -2,6 +2,7 @@ const std = @import("std");
 
 const kernel = @import("kernel");
 const contract = @import("interface").contract;
+const surface = @import("interface").surface;
 
 // Enumeration must cover class-shaped verbs and omit absent components (miss maps to unsupported).
 const CatalogEntry = struct {
@@ -86,6 +87,12 @@ pub fn main(init: std.process.Init) !void {
     }
 
     check(kernel.discovery.findByName("absent-component") == null, "absent lookup omitted");
+
+    // The surface crossing reports the boundary's frozen vocabulary, so one
+    // status decoder serves both entry points.
+    check(surface.status_ok == kernel.envelope.Status.ok, "surface ok matches the boundary status");
+    check(surface.status_invalid_call == kernel.envelope.Status.invalid_call, "surface invalid_call matches the boundary status");
+    check(surface.status_resource_limit == kernel.envelope.Status.resource_limit, "surface resource_limit matches the boundary status");
 
     if (failures != 0) std.process.exit(1);
     std.debug.print("contract check: all checks passed\n", .{});

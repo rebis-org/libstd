@@ -70,15 +70,15 @@ pub fn compressBlock(
     ws: Workspaces,
     out: []u8,
 ) Failure!usize {
-    if (input.len == 0) return error.InvalidCall;
+    if (input.len == 0) return error.CallFailure;
 
-    var finder = try MatchFinder.init(ws.hash, ws.hash2, ws.hash3, MatchFinder.windowSizeFor(level), level);
+    var finder = try MatchFinder.init(ws.hash, ws.hash2, ws.hash3, MatchFinder.dictionary_window, level);
     const tokens = try finder.compress(input, ws.tokens, ws.bt_left, ws.bt_right);
 
-    // The decoder adds the distance-dependent bonus back, so an adjusted
-    // length below 2 has no slot. Both passes below demote such matches to
-    // literals; an in-place pre-pass would be unsafe because a demotion can
-    // expand past the not-yet-read tail of the token buffer.
+    // The decoder adds the distance-dependent bonus back, so an adjusted length
+    // below 2 has no slot.
+    // An in-place pre-pass is unsafe: a demotion can expand past the
+    // not-yet-read tail of the token buffer.
     var ld_freq: [nc]u32 = @splat(0);
     var dd_freq: [dc]u32 = @splat(0);
     var ldd_freq: [ldc]u32 = @splat(0);
@@ -173,8 +173,9 @@ pub fn compressBlock(
     var cl_codes: [code_length_symbols]u32 = undefined;
     computeCanonicalCodes(&cl_lengths, &cl_codes);
 
-    // Stage 1 writes the 20 CL lengths in 4 bits each. A 15 escape is followed by
-    // 0 for a real length of 15, or by a zero-run count of value + 2.
+    // Stage 1 writes the 20 CL lengths in 4 bits each.
+    // A 15 escape is followed by 0 for a real length of 15, or by a zero-run
+    // count of value + 2.
     {
         var i: usize = 0;
         while (i < code_length_symbols) {
@@ -395,7 +396,7 @@ fn wrapBlockHeader(block_bytes: []const u8, total_bits: usize, is_last_block: bo
 
     const header_size: usize = 2 + byte_count;
     const total_size = header_size + block_bytes.len;
-    if (out.len < total_size) return error.InsufficientCapacity;
+    if (out.len < total_size) return error.CapacityFailure;
 
     out[0] = flags;
     out[1] = checksum;

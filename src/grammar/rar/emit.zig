@@ -31,19 +31,19 @@ pub fn emitSpan(
         }
     }
     if (!touches) {
-        if (!window.emitTo(out, back, count)) return error.InvalidData;
+        if (!window.emitTo(out, back, count)) return error.DataFailure;
         return;
     }
     if (count > staged_buf.len) return error.InternalFailure;
     const staged = staged_buf[0..count];
     var staged_sink = sink.BufferSink.init(staged);
-    if (!window.emitTo(staged_sink.sink(), back, count)) return error.InvalidData;
-    if (staged_sink.overflowed) return error.InvalidData;
+    if (!window.emitTo(staged_sink.sink(), back, count)) return error.DataFailure;
+    if (staged_sink.overflowed) return error.DataFailure;
     for (pending) |*f| {
         if (f.length == 0) continue;
         const s: usize = @intCast(f.start);
         if (s + f.length <= span_start or s >= span_end) continue;
-        if (s < span_start or s + f.length > span_end) return error.Unsupported;
+        if (s < span_start or s + f.length > span_end) return error.UnsupportedFailure;
         try applyOne(ctx, f, staged[s - span_start ..][0..f.length], transform_scratch);
         f.length = 0;
     }

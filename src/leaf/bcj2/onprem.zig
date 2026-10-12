@@ -14,7 +14,7 @@ const rc_init_bytes = 5; // One discarded byte, then four bytes of initial code.
 const top: u32 = 1 << 24;
 
 pub fn decode(main_stream: []const u8, call_stream: []const u8, jump_stream: []const u8, rc_stream: []const u8, output: []u8) Failure!usize {
-    if (rc_stream.len < rc_init_bytes) return error.InvalidData;
+    if (rc_stream.len < rc_init_bytes) return error.DataFailure;
 
     var probs: [num_probs]u16 = undefined;
     for (&probs) |*prob| prob.* = bit_model_total / 2;
@@ -32,7 +32,7 @@ pub fn decode(main_stream: []const u8, call_stream: []const u8, jump_stream: []c
     while (main_pos < main_stream.len) {
         const byte = main_stream[main_pos];
         main_pos += 1;
-        if (out_pos >= output.len) return error.InsufficientCapacity;
+        if (out_pos >= output.len) return error.CapacityFailure;
         output[out_pos] = byte;
         out_pos += 1;
 
@@ -54,16 +54,16 @@ pub fn decode(main_stream: []const u8, call_stream: []const u8, jump_stream: []c
                 // value subtracts the address of the byte after the operand.
                 var address: u32 = undefined;
                 if (use_call_stream) {
-                    if (call_pos + 4 > call_stream.len) return error.InvalidData;
+                    if (call_pos + 4 > call_stream.len) return error.DataFailure;
                     address = std.mem.readInt(u32, call_stream[call_pos..][0..4], .big);
                     call_pos += 4;
                 } else {
-                    if (jump_pos + 4 > jump_stream.len) return error.InvalidData;
+                    if (jump_pos + 4 > jump_stream.len) return error.DataFailure;
                     address = std.mem.readInt(u32, jump_stream[jump_pos..][0..4], .big);
                     jump_pos += 4;
                 }
                 address -%= @as(u32, @intCast(out_pos + 4));
-                if (out_pos + 4 > output.len) return error.InsufficientCapacity;
+                if (out_pos + 4 > output.len) return error.CapacityFailure;
                 output[out_pos] = @truncate(address);
                 output[out_pos + 1] = @truncate(address >> 8);
                 output[out_pos + 2] = @truncate(address >> 16);
@@ -187,11 +187,11 @@ test "bcj2 truncations are errors" {
     const rc_buf = [_]u8{ 0, 0xFF, 0xFF, 0xFF, 0xFF };
     var out: [16]u8 = undefined;
     // The rc stream is shorter than the five initialization bytes.
-    try std.testing.expectError(error.InvalidData, decode(&main_buf, &.{}, &.{}, rc_buf[0..4], &out));
+    try std.testing.expectError(error.DataFailure, decode(&main_buf, &.{}, &.{}, rc_buf[0..4], &out));
     // A confirmed branch has no 4-byte target in the call stream.
-    try std.testing.expectError(error.InvalidData, decode(&main_buf, &.{}, &.{}, &rc_buf, &out));
+    try std.testing.expectError(error.DataFailure, decode(&main_buf, &.{}, &.{}, &rc_buf, &out));
     // The output holds less than one confirmed branch.
-    try std.testing.expectError(error.InsufficientCapacity, decode(&main_buf, &[_]u8{ 0, 0, 0, 0x10 }, &.{}, &rc_buf, out[0..3]));
+    try std.testing.expectError(error.CapacityFailure, decode(&main_buf, &[_]u8{ 0, 0, 0, 0x10 }, &.{}, &rc_buf, out[0..3]));
 }
 
 test "bcj2 call then jump through one range-code word" {

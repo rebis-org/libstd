@@ -1,5 +1,7 @@
 const std = @import("std");
 
+const seam = @import("seam");
+
 // Cyan4973/xxHash.
 
 pub const XxHash64 = struct {
@@ -111,25 +113,5 @@ pub const XxHash64 = struct {
 };
 
 test "xxh64 onprem matches the std oracle" {
-    var rng = std.Random.DefaultPrng.init(0x6464);
-    var size: usize = 0;
-    while (size <= 1024) : (size += 1) {
-        const buf = try std.testing.allocator.alloc(u8, size);
-        defer std.testing.allocator.free(buf);
-        rng.random().bytes(buf);
-        var actual = XxHash64.init(0);
-        actual.update(buf[0 .. size / 2]);
-        actual.update(buf[size / 2 ..]);
-        var expected = std.hash.XxHash64.init(0);
-        expected.update(buf);
-        try std.testing.expectEqual(expected.final(), actual.final());
-    }
-    const long = try std.testing.allocator.alloc(u8, 1 << 20);
-    defer std.testing.allocator.free(long);
-    rng.random().bytes(long);
-    var actual = XxHash64.init(0);
-    actual.update(long);
-    var expected = std.hash.XxHash64.init(0);
-    expected.update(long);
-    try std.testing.expectEqual(expected.final(), actual.final());
+    try seam.expectAgreement(XxHash64.init(0), std.hash.XxHash64.init(0), 0x6464, false, null);
 }

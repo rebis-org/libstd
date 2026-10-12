@@ -54,7 +54,7 @@ fn runLz4(r: *Runner) anyerror!void {
 }
 
 fn hcParams(_: *Runner, out: *[steps.MaxExtra]harness.Node) usize {
-    out[0] = harness.paramScalar(harness.param_family_lz4, harness.lz4_search_depth, harness.cmd_all, 256);
+    out[0] = harness.paramScalar(harness.param_family_lz4, harness.lz4_search_depth, harness.cmds, 256);
     return 1;
 }
 
@@ -150,8 +150,8 @@ fn runZdict(r: *Runner) anyerror!void {
     var encoded_with_dict: [4096]u8 = undefined;
     _ = harness.call(r, harness.ids.write, &.{
         harness.paramProfile(harness.ids.zstd),
-        harness.paramScalar(harness.param_family_zstd, harness.zstd_window, harness.cmd_all, 1 << 16),
-        harness.paramBytes(harness.param_family_zstd, harness.zstd_dictionary, harness.cmd_all, dictionary),
+        harness.paramScalar(harness.param_family_zstd, harness.zstd_window, harness.cmds, 1 << 16),
+        harness.paramBytes(harness.param_family_zstd, harness.zstd_dictionary, harness.cmds, dictionary),
         harness.sourceSpan(input),
         harness.sinkSpan(&encoded_with_dict),
         harness.capabilityParam(r.caps_io),
@@ -172,8 +172,8 @@ fn runZdict(r: *Runner) anyerror!void {
     var ours_decoded: [2048]u8 = undefined;
     _ = harness.call(r, harness.ids.read, &.{
         harness.paramProfile(harness.ids.zstd),
-        harness.paramScalar(harness.param_family_zstd, harness.zstd_window, harness.cmd_all, 1 << 16),
-        harness.paramBytes(harness.param_family_zstd, harness.zstd_dictionary, harness.cmd_all, dictionary),
+        harness.paramScalar(harness.param_family_zstd, harness.zstd_window, harness.cmds, 1 << 16),
+        harness.paramBytes(harness.param_family_zstd, harness.zstd_dictionary, harness.cmds, dictionary),
         harness.sourceSpan(reference_encoded[0..reference_len]),
         harness.sinkSpan(&ours_decoded),
         harness.capabilityParam(r.caps_io),

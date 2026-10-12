@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const cmd = @import("acceptance/benchmark/command.zig");
+const reference = @import("acceptance/benchmark/refs.zig");
 const modules = @import("modules.zig");
 const common = @import("platform/common.zig");
 
@@ -13,12 +13,12 @@ pub const units = [_]Unit{
 };
 
 pub fn expand(b: *std.Build, ctx: *common.Settings) void {
-    const refs = cmd.add(b, ctx);
+    const refs = reference.add(b, ctx);
     ctx.refs = refs;
     addVendorTests(b, refs, ctx);
 }
 
-fn addVendorTests(b: *std.Build, refs: cmd.Refs, ctx: *common.Settings) void {
+fn addVendorTests(b: *std.Build, refs: reference.Refs, ctx: *common.Settings) void {
     const test_exe = b.addExecutable(.{
         .name = "vendor",
         .root_module = b.createModule(.{

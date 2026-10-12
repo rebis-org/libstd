@@ -74,8 +74,8 @@ pub fn encode(input: []const u8, output: []u8, scratch: []u8, options: Options) 
 }
 
 fn encodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options: Options) Failure!void {
-    const unpack_size = std.math.cast(usize, options.unpack_size) orelse return error.ResourceLimit;
-    if (input.len != unpack_size) return error.InvalidCall;
+    const unpack_size = std.math.cast(usize, options.unpack_size) orelse return error.ResourceFailure;
+    if (input.len != unpack_size) return error.CallFailure;
     try validateOptions(options, unpack_size);
     const model = try Model.prepare(scratch, options.mem_size);
     model.restart(options.order);
@@ -89,13 +89,13 @@ fn encodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, opti
 pub fn decodedSize(input: []const u8, scratch: []u8, options: Options) Failure!usize {
     _ = input;
     _ = scratch;
-    if (options.unpack_size > std.math.maxInt(usize)) return error.ResourceLimit;
-    return std.math.cast(usize, options.unpack_size) orelse error.ResourceLimit;
+    if (options.unpack_size > std.math.maxInt(usize)) return error.ResourceFailure;
+    return std.math.cast(usize, options.unpack_size) orelse error.ResourceFailure;
 }
 
 pub fn decode(input: []const u8, output: []u8, scratch: []u8, options: Options) Failure!usize {
-    const unpack_size = std.math.cast(usize, options.unpack_size) orelse return error.ResourceLimit;
-    if (output.len < unpack_size) return error.InsufficientCapacity;
+    const unpack_size = std.math.cast(usize, options.unpack_size) orelse return error.ResourceFailure;
+    if (output.len < unpack_size) return error.CapacityFailure;
     try validateOptions(options, unpack_size);
     const model = try Model.prepare(scratch, options.mem_size);
     model.restart(options.order);
@@ -104,16 +104,16 @@ pub fn decode(input: []const u8, output: []u8, scratch: []u8, options: Options) 
     var dest = std.Io.Writer.fixed(output);
     var count: usize = 0;
     while (count < unpack_size) : (count += 1) {
-        const symbol = model.decodeSymbol(&range_coder) catch return error.InvalidData;
+        const symbol = model.decodeSymbol(&range_coder) catch return error.DataFailure;
         try io.writeByte(&dest, @intCast(symbol));
     }
-    if (range_coder.code != 0) return error.InvalidData;
+    if (range_coder.code != 0) return error.DataFailure;
     return count;
 }
 
 pub fn decodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options: Options) Failure!void {
-    if (options.unpack_size > std.math.maxInt(usize)) return error.ResourceLimit;
-    const unpack_size = std.math.cast(usize, options.unpack_size) orelse return error.ResourceLimit;
+    if (options.unpack_size > std.math.maxInt(usize)) return error.ResourceFailure;
+    const unpack_size = std.math.cast(usize, options.unpack_size) orelse return error.ResourceFailure;
     try validateOptions(options, unpack_size);
     const model = try Model.prepare(scratch, options.mem_size);
     model.restart(options.order);
@@ -121,17 +121,17 @@ pub fn decodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, 
     try range_coder.initStream();
     var count: usize = 0;
     while (count < unpack_size) : (count += 1) {
-        const symbol = model.decodeSymbol(&range_coder) catch return error.InvalidData;
+        const symbol = model.decodeSymbol(&range_coder) catch return error.DataFailure;
         try io.writeByte(writer, @intCast(symbol));
     }
-    if (range_coder.code != 0) return error.InvalidData;
+    if (range_coder.code != 0) return error.DataFailure;
 }
 
 fn validateOptions(options: Options, unpack_size: usize) Failure!void {
-    if (options.order < order_min or options.order > order_max) return error.Unsupported;
-    if (options.mem_size < mem_min or options.mem_size > mem_max) return error.Unsupported;
-    if (options.mem_size & 3 != 0) return error.Unsupported;
-    if (options.max_work < unpack_size) return error.ResourceLimit;
+    if (options.order < order_min or options.order > order_max) return error.UnsupportedFailure;
+    if (options.mem_size < mem_min or options.mem_size > mem_max) return error.UnsupportedFailure;
+    if (options.mem_size & 3 != 0) return error.UnsupportedFailure;
+    if (options.max_work < unpack_size) return error.ResourceFailure;
 }
 
 const RangeDecoder = struct {
@@ -146,20 +146,20 @@ const RangeDecoder = struct {
     }
 
     fn readByte(self: *RangeDecoder) Failure!u8 {
-        if (self.pos >= self.input.len) return error.InvalidData;
+        if (self.pos >= self.input.len) return error.DataFailure;
         const byte = self.input[self.pos];
         self.pos += 1;
         return byte;
     }
 
     fn initStream(self: *RangeDecoder) Failure!void {
-        if (try self.readByte() != 0) return error.InvalidData;
+        if (try self.readByte() != 0) return error.DataFailure;
         self.code = 0;
         var i: usize = 0;
         while (i < 4) : (i += 1) {
             self.code = (self.code << 8) | try self.readByte();
         }
-        if (self.code >= 0xFFFFFFFF) return error.InvalidData;
+        if (self.code >= 0xFFFFFFFF) return error.DataFailure;
     }
 
     fn normalize(self: *RangeDecoder) Failure!void {
@@ -210,7 +210,7 @@ const RangeEncoder = struct {
         if (@as(u32, @truncate(self.low)) < 0xFF00_0000 or (self.low >> 32) != 0) {
             var temp = self.cache;
             while (true) {
-                self.writer.writeByte(temp +% @as(u8, @truncate(self.low >> 32))) catch return error.InsufficientCapacity;
+                self.writer.writeByte(temp +% @as(u8, @truncate(self.low >> 32))) catch return error.CapacityFailure;
                 temp = 0xFF;
                 self.cache_size -= 1;
                 if (self.cache_size == 0) break;
@@ -281,11 +281,11 @@ const Model = struct {
     init_rl: i32 = 0,
 
     fn prepare(scratch: []u8, mem_size: u32) Failure!*Model {
-        if (scratch.len < decodeWorkspaceSize(mem_size)) return error.InsufficientCapacity;
+        if (scratch.len < decodeWorkspaceSize(mem_size)) return error.CapacityFailure;
         const model_addr = std.mem.alignForward(usize, @intFromPtr(scratch.ptr), @alignOf(Model));
         const model: *Model = @ptrFromInt(model_addr);
         const buf_addr = std.mem.alignForward(usize, model_addr + @sizeOf(Model), 4);
-        if (buf_addr + mem_size + unit_size > @intFromPtr(scratch.ptr) + scratch.len) return error.InsufficientCapacity;
+        if (buf_addr + mem_size + unit_size > @intFromPtr(scratch.ptr) + scratch.len) return error.CapacityFailure;
         model.construct();
         model.base = @ptrFromInt(buf_addr);
         model.size = mem_size;
@@ -947,7 +947,7 @@ const Model = struct {
                 if (i == 1) break;
                 i -= 1;
             }
-            if (count >= min_ctx.summ_freq) return error.InvalidData;
+            if (count >= min_ctx.summ_freq) return error.DataFailure;
             self.hi_bits_flag = self.tables.hb2_flag[self.state(self.found_state).symbol];
             try range_coder.decodeRange(hi_cnt, @as(u32, min_ctx.summ_freq) - hi_cnt);
             @memset(&mask, 0xFF);
@@ -979,7 +979,7 @@ const Model = struct {
             const num_masked: u32 = min_ctx.num_stats;
             while (true) {
                 self.order_fall += 1;
-                if (min_ctx.suffix == 0) return error.InvalidData;
+                if (min_ctx.suffix == 0) return error.DataFailure;
                 self.min_context = min_ctx.suffix;
                 min_ctx = self.ctx(self.min_context);
                 if (min_ctx.num_stats != num_masked) break;
@@ -1017,7 +1017,7 @@ const Model = struct {
                 self.update2();
                 return symbol;
             }
-            if (count >= freq_sum) return error.InvalidData;
+            if (count >= freq_sum) return error.DataFailure;
             try range_coder.decodeRange(hi_cnt, freq_sum - hi_cnt);
             esc.see.summ = @intCast(esc.see.summ + freq_sum);
             while (i != 0) {

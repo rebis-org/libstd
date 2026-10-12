@@ -28,8 +28,8 @@ pub const Budgets = struct {
     max_entries: u64 = std.math.maxInt(u64),
 
     fn charge(current: *u64, ceiling: u64, amount: usize) Failure!void {
-        const next = std.math.add(u64, current.*, amount) catch return error.ResourceLimit;
-        if (next > ceiling) return error.ResourceLimit;
+        const next = std.math.add(u64, current.*, amount) catch return error.ResourceFailure;
+        if (next > ceiling) return error.ResourceFailure;
         current.* = next;
     }
 
@@ -62,7 +62,7 @@ pub const Session = struct {
     failure_detail: u64 = 0,
 
     pub fn step(self: *Session, input: []const u8, output: []u8, end_of_input: bool) StepResult {
-        if (!self.alive) return .{ .status = .failed, .failure = error.InvalidCall };
+        if (!self.alive) return .{ .status = .failed, .failure = error.CallFailure };
         return self.ops.step(self.state, input, output, end_of_input);
     }
 

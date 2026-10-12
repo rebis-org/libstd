@@ -5,11 +5,10 @@ const corpus = @import("corpus.zig");
 const harness = @import("harness.zig");
 const steps = @import("steps.zig");
 
-// The substrate session boundary exercised through its C exports: the same
-// driver code the envelope path uses, reached with caller-owned storage and
-// no envelope. Byte-identity with the kernel-mediated decode plus the
-// lifecycle (idempotent destroy, invalid_call on step-after-destroy) is the
-// contract.
+// Exercises the session boundary through its C exports with caller-owned
+// storage and no envelope.
+// The contract: byte-identity with the kernel-mediated decode, idempotent
+// destroy, invalid_call after destroy.
 
 extern fn stdk_session_storage(component: [*:0]const u8, verb: [*:0]const u8) u64;
 extern fn stdk_session_create(component: [*:0]const u8, verb: [*:0]const u8, storage: ?[*]u8, storage_len: u64) u32;
@@ -85,8 +84,8 @@ fn run(r: *harness.Runner) anyerror!void {
     // removed tar/write pair stays out (retirement is part of the contract).
     const catalog = std.mem.span(stdk_session_catalog());
     if (!std.mem.startsWith(u8, catalog, "v1:")) return error.CatalogVersion;
-    if (std.mem.indexOf(u8, catalog, "gzip/decode") == null) return error.CatalogMissingGzip;
-    if (std.mem.indexOf(u8, catalog, "tar/write") != null) return error.CatalogRetiredPair;
+    if (std.mem.find(u8, catalog, "gzip/decode") == null) return error.CatalogMissingGzip;
+    if (std.mem.find(u8, catalog, "tar/write") != null) return error.CatalogRetiredPair;
 
     // Failure detail: an over-sized step reports the capacity shortfall.
     if (stdk_session_create("gzip", "decode", storage, storage_len) != abi.Status.ok) return error.CreateFailed;
@@ -169,7 +168,7 @@ fn run(r: *harness.Runner) anyerror!void {
     if (out_pos != r.input.len or !std.mem.eql(u8, decoded[0..out_pos], r.input)) return error.DeflateSessionMismatch;
     if (stdk_session_destroy(deflate_storage) != abi.Status.ok) return error.DestroyFailed;
     const catalog_check = std.mem.span(stdk_session_catalog());
-    if (std.mem.indexOf(u8, catalog_check, "deflate/decode") == null) return error.CatalogMissingDeflate;
+    if (std.mem.find(u8, catalog_check, "deflate/decode") == null) return error.CatalogMissingDeflate;
 }
 
 // Encode sessions pump the corpus through in chunks and the envelope reads
@@ -291,7 +290,7 @@ fn runExtended(r: *harness.Runner) anyerror!void {
 
     const catalog = std.mem.span(stdk_session_catalog());
     for ([_][]const u8{ "zlib/decode", "deflate/encode", "gzip/encode", "zlib/encode", "lz4/decode", "lz4/encode" }) |pair| {
-        if (std.mem.indexOf(u8, catalog, pair) == null) return error.CatalogMissingPair;
+        if (std.mem.find(u8, catalog, pair) == null) return error.CatalogMissingPair;
     }
 }
 

@@ -2,6 +2,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 
 const options = @import("options");
+const seam = @import("seam");
 
 const merkle = @import("../merkle.zig");
 
@@ -217,25 +218,5 @@ test "sha256 hw matches the scalar path" {
     }
 }
 test "sha256 onprem matches the std oracle" {
-    var rng = std.Random.DefaultPrng.init(0x5A256);
-    var size: usize = 0;
-    while (size <= 1024) : (size += 1) {
-        const buf = try std.testing.allocator.alloc(u8, size);
-        defer std.testing.allocator.free(buf);
-        rng.random().bytes(buf);
-        var ours = Sha256.init(.{});
-        ours.update(buf[0 .. size / 2]);
-        ours.update(buf[size / 2 ..]);
-        var theirs = std.crypto.hash.sha2.Sha256.init(.{});
-        theirs.update(buf);
-        try std.testing.expectEqualSlices(u8, &theirs.finalResult(), &ours.finalResult());
-    }
-    const long = try std.testing.allocator.alloc(u8, 1 << 20);
-    defer std.testing.allocator.free(long);
-    rng.random().bytes(long);
-    var ours = Sha256.init(.{});
-    ours.update(long);
-    var theirs = std.crypto.hash.sha2.Sha256.init(.{});
-    theirs.update(long);
-    try std.testing.expectEqualSlices(u8, &theirs.finalResult(), &ours.finalResult());
+    try seam.expectAgreement(Sha256.init(.{}), std.crypto.hash.sha2.Sha256.init(.{}), 0x5A256, true, null);
 }

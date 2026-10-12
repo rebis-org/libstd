@@ -2,8 +2,7 @@ const span = @import("span.zig");
 
 const Failure = span.Failure;
 
-// Plain extern structs: no vtable crosses the ABI. Not exported: the ABI gate
-// pins stdk_call as the sole export.
+// Plain extern structs: no vtable crosses the ABI.
 pub const Surface = extern struct {
     ptr: ?[*]u8,
     len: u64,
@@ -14,18 +13,17 @@ pub const ConstSurface = extern struct {
     len: u64,
 };
 
-pub const Status = enum(u32) {
-    ok = 0,
-    invalid_call = 1,
-    resource_limit = 2,
-    _,
-};
+// A crossing that fails reports the boundary's own vocabulary.
+// The interface sits below the kernel owning those values; restating them
+// would drift from the frozen wire numbers.
+pub const status_ok: u32 = 0;
+pub const status_invalid_call: u32 = 1;
+pub const status_resource_limit: u32 = 7;
 
 fn statusFor(failure: Failure) u32 {
     return switch (failure) {
-        error.InvalidCall => @backingInt(Status.invalid_call),
-        error.ResourceLimit => @backingInt(Status.resource_limit),
-        error.InsufficientCapacity, error.InvalidData => @backingInt(Status.invalid_call),
+        error.CallFailure => status_invalid_call,
+        error.ResourceFailure => status_resource_limit,
     };
 }
 
@@ -35,5 +33,5 @@ pub fn copy(sink_surface: Surface, origin_surface: ConstSurface) callconv(.c) u3
     span.requireDisjoint(.{ .ptr = sink.ptr, .len = sink.len }, origin, "surface copy regions overlap.");
     const limit = @min(sink.len, origin.len);
     sink.write(0, origin.read(0, limit));
-    return @backingInt(Status.ok);
+    return status_ok;
 }

@@ -23,10 +23,9 @@ const SessionDef = struct {
     storage: *const fn () usize,
     session: *const fn ([]u8, sessions.Budgets) Failure!Session,
 };
-// The write-side pair (tar/write) was removed from the public boundary: its
-// store-only, fixed-mode framing could not express the tar profile's
-// typeflags, links, modes, or pax long names, and misled hosts away from the
-// envelope path. A full-surface tar write session can re-enter as a v2 pair.
+// tar/write left the boundary: store-only fixed-mode framing cannot express
+// typeflags, links, modes, or pax names.
+// A full tar write can re-enter as a v2 pair.
 const session_defs = [_]SessionDef{
     .{ .component = "gzip", .verb = "decode", .storage = drivers.gzipDecodeStorage, .session = drivers.gzipDecodeSession },
     .{ .component = "deflate", .verb = "decode", .storage = drivers.deflateDecodeStorage, .session = drivers.deflateDecodeSession },
@@ -86,10 +85,9 @@ export fn stdk_session_create(
     return createWithBudgets(component, verb, storage, storage_len, .{});
 }
 
-// Bounded variant of stdk_session_create: per-session ceilings on encoded,
-// decoded, work, and entry bytes. Hosts that run untrusted archives through
-// the stepped boundary pass their zip-bomb limits here instead of policing
-// produced bytes themselves. The unbounded create keeps the old behavior.
+// Per-session ceilings on encoded, decoded, work, and entry bytes.
+// Hosts pass zip-bomb limits here instead of policing produced bytes
+// themselves.
 export fn stdk_session_bounded(
     component: [*:0]const u8,
     verb: [*:0]const u8,
@@ -157,12 +155,8 @@ export fn stdk_session_failure(
     return envelope.Status.ok;
 }
 
-// The session-able (component, verb) pairs as a versioned, comma-separated
-// "component/verb" list, so hosts discover streamable codecs at runtime
-// instead of hardcoding them. The leading "v1:" is the format version and
-// the retirement mechanism: pairs are append-only within a version, and a
-// breaking change (removal or new field shape) bumps the prefix so hosts
-// can gate on it. Ordering matches session_defs and is ABI once released.
+// "v1:" is the version and retirement mechanism: pairs are append-only
+// within a version, and a breaking change bumps the prefix.
 export fn stdk_session_catalog() callconv(.c) [*:0]const u8 {
     return session_catalog_text;
 }
