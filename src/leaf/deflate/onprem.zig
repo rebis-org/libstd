@@ -23,6 +23,10 @@ pub const Strategy = enum(u8) {
     huffman_only,
     // Matches are limited to distance one (run-length encoding).
     rle,
+    // zlib's filtered profile: tuned for mostly-small, weakly-correlated
+    // values, forcing more Huffman coding and less string matching by
+    // clamping the search knobs at init, as zlib's configuration table does.
+    filtered,
 };
 
 pub const Options = struct {
@@ -334,6 +338,15 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
             if (options.lazy > options.nice) return error.CallFailure;
             if (options.chain == 0) return error.CallFailure;
             if (options.optimal and options.strategy != .default) return error.CallFailure;
+            var effective = options;
+            if (options.strategy == .filtered) {
+                // zlib's filtered configuration: good 4, lazy 4, nice 16,
+                // chain 8 — the search gives up sooner so literals dominate.
+                effective.good = @min(options.good, 4);
+                effective.lazy = @min(options.lazy, 4);
+                effective.nice = @min(options.nice, 16);
+                effective.chain = @min(options.chain, 8);
+            }
             var optimal: ?*OptimalScratch = null;
             if (options.optimal) {
                 const base = @intFromPtr(history.ptr) + config.history_size;
@@ -346,7 +359,7 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
             return .{
                 .writer = .{ .buffer = history[0..config.history_size], .vtable = &.{ .drain = drain, .flush = flush, .rebase = writerRebase } },
                 .downstream = downstream,
-                .options = options,
+                .options = effective,
                 .history = history[0..config.history_size],
                 .base = 0,
                 .end = 0,
@@ -1784,5 +1797,29 @@ test "deflate strategies roundtrip and shape blocks" {
         var sink_buf: [8]u8 = undefined;
         var sink = std.Io.Writer.fixed(&sink_buf);
         try std_testing.expectError(error.CallFailure, Compress.init(&sink, &history, .{ .good = 8, .nice = 128, .lazy = 16, .chain = 8, .optimal = true, .strategy = .rle }));
+    }
+
+    // Filtered clamps the search profile and still round-trips: zlib's
+    // filtered data is mostly small values with weak correlation.
+    {
+        var history: [history_size]u8 = undefined;
+        var encoded: [512]u8 = undefined;
+        var w = std.Io.Writer.fixed(&encoded);
+        var c = try Compress.init(&w, &history, .{ .good = 8, .nice = 128, .lazy = 16, .chain = 32, .strategy = .filtered });
+        var payload: [256]u8 = undefined;
+        var state: u32 = 7;
+        for (&payload) |*byte| {
+            state = state *% 1664525 +% 1013904223;
+            byte.* = @truncate(state >> 24 >> @intCast(state & 7));
+        }
+        var reader = std.Io.Reader.fixed(&payload);
+        _ = std.Io.Reader.streamRemaining(&reader, &c.writer) catch return error.CompressStream;
+        try c.finish();
+        var decoded: [payload.len]u8 = undefined;
+        var in = std.Io.Reader.fixed(encoded[0..w.end]);
+        var out = std.Io.Writer.fixed(&decoded);
+        var inflater = Decompress.init(&in, &history);
+        _ = inflater.reader.streamRemaining(&out) catch return error.DecompressStream;
+        try std_testing.expectEqualSlices(u8, &payload, &decoded);
     }
 }
