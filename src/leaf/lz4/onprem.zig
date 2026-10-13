@@ -15,6 +15,9 @@ pub const block_size_max: u32 = 4 * 1024 * 1024;
 pub const block_size_default: u32 = block_size_max;
 
 const magic: u32 = 0x184D2204;
+// The pre-1.8 legacy format: one magic (the low nibble carried a version
+// digit), then dependent raw LZ4 blocks, no header descriptor at all.
+const legacy_magic: u32 = 0x184C2102;
 const version_bits: u8 = 0x40; // LZ4 frame spec fixes the version field at 01.
 const flag_block_independence: u8 = 0x20;
 const flag_block_checksum: u8 = 0x10;
@@ -142,7 +145,12 @@ pub fn decodeInPlace(input: []const u8, output: []u8, scratch: []u8, options: Op
 // measured route, separating a too-small sink from a corrupt stream.
 fn decodeBlocksInto(input: []const u8, output: []u8, options: Options) Failure!usize {
     if (input.len < 7) return error.DataFailure;
-    if (std.mem.readInt(u32, input[0..4], .little) != magic) return error.DataFailure;
+    const magic_value = std.mem.readInt(u32, input[0..4], .little);
+    // The legacy frame format (pre-1.8): fixed magic, then dependent LZ4
+    // blocks with no header fields, checksums, or block-size descriptor.
+    if (magic_value >= legacy_magic and magic_value <= legacy_magic + 7)
+        return decodeLegacyBlocksInto(input, output, options);
+    if (magic_value != magic) return error.DataFailure;
     const flags = input[4];
     if ((flags & 0xC0) != version_bits) return error.UnsupportedFailure;
     const linked = flags & flag_block_independence == 0;
@@ -216,6 +224,32 @@ fn decodeBlocksInto(input: []const u8, output: []u8, options: Options) Failure!u
     if (content_size) |expected| {
         if (expected != total) return error.IntegrityFailure;
     }
+    return total;
+}
+
+// Legacy frames (pre-1.8 interop): dependent raw LZ4 blocks, no BD byte, no
+// checksums, end marked by a zero size. Decode-only, as the modern encoder
+// never produces them.
+fn decodeLegacyBlocksInto(input: []const u8, output: []u8, options: Options) Failure!usize {
+    var offset: usize = 4;
+    var total: usize = 0;
+    while (true) {
+        if (input.len < offset + 4) return error.DataFailure;
+        const block_len: usize = std.mem.readInt(u32, input[offset..][0..4], .little);
+        offset += 4;
+        if (block_len == 0) break;
+        if (input.len < offset + block_len) return error.DataFailure;
+        const block_data = input[offset .. offset + block_len];
+        offset += block_len;
+        const prefix_len = @min(total, window_size);
+        const produced = decompressBlock(block_data, output[total..], output[total - prefix_len .. total]) catch |err| return switch (err) {
+            error.DataFailure => error.DataFailure,
+            error.OutputTooSmall => error.CapacityFailure,
+        };
+        total += produced;
+        if (try bounds.addUsize(input.len, total) > options.max_work) return error.ResourceFailure;
+    }
+    if (offset != input.len) return error.DataFailure;
     return total;
 }
 
