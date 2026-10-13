@@ -1326,16 +1326,20 @@ pub fn DecompressOf(comptime variant: enum { deflate, deflate64 }) type {
             };
         }
 
+        pub fn initSliceInPlace(self: *@This(), data: []const u8, history: []u8) void {
+            self.* = initSlice(data, history);
+        }
+
+        pub fn initSliceBoundInPlace(self: *@This(), provider: anytype, data: []const u8, history: []u8) error{UnsupportedFailure}!void {
+            if (provider != .onprem) return error.UnsupportedFailure;
+            self.initSliceInPlace(data, history);
+        }
+
         // Seam binding points: the tag binds at construction, the decode loop never
         // dispatches; `anytype` avoids module imports.
         pub fn initBound(provider: anytype, input: *std.Io.Reader, history: []u8) error{UnsupportedFailure}!@This() {
             if (provider != .onprem) return error.UnsupportedFailure;
             return init(input, history);
-        }
-
-        pub fn initSliceBound(provider: anytype, data: []const u8, history: []u8) error{UnsupportedFailure}!@This() {
-            if (provider != .onprem) return error.UnsupportedFailure;
-            return initSlice(data, history);
         }
 
         // Resume a fresh member at a byte position the framing read ahead to.
@@ -1345,8 +1349,8 @@ pub fn DecompressOf(comptime variant: enum { deflate, deflate64 }) type {
             self.bit_count = 0;
         }
 
-        // Session-driver surface (src/compose/drivers.zig): framing pokes the
-        // inflater between steps; these cover every poke both arms share.
+        // Session-driver surface: framing pokes the inflater between steps;
+        // these cover every poke both arms share.
         pub fn streamPosition(self: *const @This()) usize {
             return self.input.slice.pos;
         }
@@ -1368,6 +1372,12 @@ pub fn DecompressOf(comptime variant: enum { deflate, deflate64 }) type {
 
         pub fn readerPtr(self: *@This()) *std.Io.Reader {
             return &self.reader;
+        }
+
+        // Reading buffer[seek..end] first would walk seek past flush_to, and the rebase would re-emit it.
+        pub fn streamTo(self: *@This(), writer: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+            const reader = &self.reader;
+            return reader.vtable.stream(reader, writer, limit);
         }
 
         fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {

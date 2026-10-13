@@ -94,6 +94,11 @@ pub const onprem_servable = blk: {
 };
 
 pub const both_servable = offprem_servable and onprem_servable;
+
+// True when the default leaf arm is std, whose flate and lzma2 arms cannot serve the gated scenarios.
+pub const leaf_offprem_default = options.leaf_impl != .onprem;
+// True when the default grammar arm is std, whose tar writer cannot serve the gated scenarios.
+pub const grammar_offprem_default = options.grammar_impl != .onprem;
 pub const crypto_password: u32 = 1;
 pub const crypto_algorithm: u32 = 2;
 pub const crypto_kdf_rounds_limit: u32 = 3;

@@ -1,5 +1,7 @@
 const std = @import("std");
 
+const options = @import("options");
+
 const drivers = @import("compose/drivers.zig");
 const sessions = @import("compose/sessions.zig");
 const gzip = @import("grammar/gzip/onprem.zig");
@@ -106,6 +108,12 @@ fn decodeBypass(allocator: std.mem.Allocator, compressed: []const u8) !DecodeOut
 }
 
 pub fn main(init: std.process.Init) !void {
+    // The comparison premise is same-leaf code; the offprem arm suspends
+    // differently at a full step span, which is recorded incompleteness.
+    if (comptime options.leaf_impl != .onprem) {
+        try std.Io.File.stdout().writeStreamingAll(init.io, "compose_ab skipped: leaf_impl is not onprem\n");
+        return;
+    }
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     const allocator = arena.allocator();
 

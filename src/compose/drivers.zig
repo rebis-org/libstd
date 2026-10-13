@@ -138,13 +138,13 @@ pub fn gzipDecodeInit(storage: []u8, budgets: sessions.Budgets) error{CapacityFa
         .trailer = undefined,
         .budgets = budgets,
     };
-    state.inflater = deflate_seam.Decode.initSliceBound(deflate_seam.default_provider, &.{}, history) catch unreachable;
+    state.inflater.initSliceBoundInPlace(deflate_seam.default_provider, &.{}, history) catch unreachable;
     return state;
 }
 
 // Each member needs a fresh deflate stream resuming at frame_pos, where framing read ahead to.
 fn enterDeflate(state: *GzipDecode) void {
-    state.inflater = deflate_seam.Decode.initSliceBound(deflate_seam.default_provider, state.pending[0..state.pending_len], state.history) catch unreachable;
+    state.inflater.initSliceBoundInPlace(deflate_seam.default_provider, state.pending[0..state.pending_len], state.history) catch unreachable;
     state.inflater.setFramePos(state.frame_pos);
     state.phase = .deflate;
 }
@@ -191,16 +191,18 @@ fn pumpInflated(
 ) ?StepResult {
     var sink = std.Io.Writer.fixed(output[result.produced..]);
     const limit = composition.limitFor(output.len - result.produced);
-    const reader = state.inflater.readerPtr();
-    const emitted = reader.vtable.stream(reader, &sink, limit) catch {
+    // Through the arm, not its reader: only the arm knows its own window bookkeeping.
+    const emitted = state.inflater.streamTo(&sink, limit) catch |err| {
         const partial = sink.end;
         if (partial > 0) {
             result.produced += partial;
-            note(state, output[0..partial]);
+            note(state, output[result.produced - partial ..][0..partial]);
             state.budgets.addDecoded(partial) catch |failure| {
                 return framingFailed(result, input_len, failure);
             };
         }
+        // Both arms report a finished member as end-of-stream; the caller reads atEnd() for the boundary.
+        if (err == error.EndOfStream and state.inflater.atEnd()) return null;
         const starved = state.inflater.streamPosition() == state.pending_len;
         if (!end_of_input and starved) {
             state.inflater.clearFailure();
@@ -471,11 +473,12 @@ pub fn deflateDecodeInit(storage: []u8, budgets: sessions.Budgets) error{Capacit
     const state = carved.state;
     const history = carved.history;
     state.* = .{
-        .inflater = deflate_seam.Decode.initSliceBound(deflate_seam.default_provider, &.{}, history) catch unreachable,
+        .inflater = undefined,
         .history = history,
         .pending = undefined,
         .budgets = budgets,
     };
+    state.inflater.initSliceBoundInPlace(deflate_seam.default_provider, &.{}, history) catch unreachable;
     return state;
 }
 
@@ -492,7 +495,7 @@ pub fn deflateDecodeStep(state: *DeflateDecode, input: []const u8, output: []u8,
         return framingFailed(&result, 0, failure);
     };
     if (!state.started) {
-        state.inflater = deflate_seam.Decode.initSliceBound(deflate_seam.default_provider, state.pending[0..state.pending_len], state.history) catch unreachable;
+        state.inflater.initSliceBoundInPlace(deflate_seam.default_provider, state.pending[0..state.pending_len], state.history) catch unreachable;
         state.started = true;
     }
     if (output.len != 0 and result.produced < output.len) {
@@ -561,7 +564,7 @@ pub fn zlibDecodeInit(storage: []u8, budgets: sessions.Budgets) error{CapacityFa
         .adler = checksum.Adler32.init(),
         .budgets = budgets,
     };
-    state.inflater = deflate_seam.Decode.initSliceBound(deflate_seam.default_provider, &.{}, history) catch unreachable;
+    state.inflater.initSliceBoundInPlace(deflate_seam.default_provider, &.{}, history) catch unreachable;
     return state;
 }
 
@@ -591,7 +594,7 @@ pub fn zlibDecodeStep(state: *ZlibDecode, input: []const u8, output: []u8, end_o
         if ((@as(u32, cmf) * 256 + @as(u32, flg)) % 31 != 0) return framingFailed(&result, input.len, error.DataFailure);
         if (flg & zlib_flag_dictionary != 0) return framingFailed(&result, input.len, error.UnsupportedFailure);
         state.adler = checksum.Adler32.init();
-        state.inflater = deflate_seam.Decode.initSliceBound(deflate_seam.default_provider, state.pending[0..state.pending_len], state.history) catch unreachable;
+        state.inflater.initSliceBoundInPlace(deflate_seam.default_provider, state.pending[0..state.pending_len], state.history) catch unreachable;
         state.inflater.setFramePos(zlib_header_size);
         state.started = true;
     }

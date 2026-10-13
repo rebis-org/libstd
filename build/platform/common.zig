@@ -117,7 +117,7 @@ pub fn addLibrary(
     linkage: std.lang.LinkMode,
     ctx: *const Settings,
 ) *std.Build.Step.Compile {
-    return addLibraryFromModule(b, rootModule(b, target, optimize, ctx), linkage);
+    return addLibraryFromModule(b, target, rootModule(b, target, optimize, ctx), linkage);
 }
 
 pub fn rootModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, ctx: *const Settings) *std.Build.Module {
@@ -139,7 +139,9 @@ pub fn attachPackageImports(b: *std.Build, module: *std.Build.Module, target: st
     module.addImport("interface", modules_pair.interface);
 }
 
-fn addLibraryFromModule(b: *std.Build, module: *std.Build.Module, linkage: std.lang.LinkMode) *std.Build.Step.Compile {
+fn addLibraryFromModule(b: *std.Build, target: std.Build.ResolvedTarget, module: *std.Build.Module, linkage: std.lang.LinkMode) *std.Build.Step.Compile {
+    // The panic handler names std.c, so these archives carry a libc dependency.
+    if (std.zig.target.canBuildLibC(&target.result)) module.linkSystemLibrary("c", .{});
     return b.addLibrary(.{
         .name = "std",
         .root_module = module,
@@ -206,8 +208,8 @@ pub fn addHostLibrariesWithOptions(
 ) HostLibraries {
     var ctx = scanContext(target, optimize, portable, options, sanitize_c);
     const module = rootModule(b, target, optimize, &ctx);
-    const static_library = addLibraryFromModule(b, module, .static);
-    const dynamic_library = addLibraryFromModule(b, module, .dynamic);
+    const static_library = addLibraryFromModule(b, target, module, .static);
+    const dynamic_library = addLibraryFromModule(b, target, module, .dynamic);
     return .{ .static_library = static_library, .dynamic_library = dynamic_library };
 }
 
