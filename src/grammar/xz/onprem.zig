@@ -335,6 +335,9 @@ fn decodeBlock(cursor: *binary.ReadCursor, sink: *Sink, scratch: []u8, check: Ch
     var compressed_size: usize = undefined;
     var uncompressed_size: usize = undefined;
     var decode_tee: ?tee.Tee = null;
+    // Set only by the single-filter SHA-256 streaming branch, compared in
+    // the shared tail once padding positions the cursor on the check.
+    var sha_digest: ?[32]u8 = null;
     if (sink.buffer != null) {
         const block_output = if (block_header.uncompressed_size) |size|
             try sink.blockBuffer(size)
@@ -363,7 +366,8 @@ fn decodeBlock(cursor: *binary.ReadCursor, sink: *Sink, scratch: []u8, check: Ch
         if (check == .sha256 and block_header.filter_count == 1) {
             // Single-filter SHA-256 blocks verify fully on the streaming path:
             // the check covers exactly the bytes observed here, with no filter
-            // between decode and check.
+            // between decode and check. The digest is compared in the shared
+            // tail, after padding advance positions the cursor on the check.
             var sha256 = crypto.Sha256.bind(provider, .{});
             var hash_tee = Sha256Tee.init(sink.writer.?, &sha256);
             try lzma2_seam.decodeStream(provider, &chunk_reader, &hash_tee.writer, scratch[0..lzma_scratch_size], options);
@@ -372,9 +376,7 @@ fn decodeBlock(cursor: *binary.ReadCursor, sink: *Sink, scratch: []u8, check: Ch
             if (block_header.uncompressed_size) |size| {
                 if (uncompressed_size != size) return error.IntegrityFailure;
             }
-            const check_bytes = try cursor.readSlice(checkSize(check));
-            var digest: [32]u8 = sha256.finalResult();
-            if (!std.mem.eql(u8, &digest, check_bytes)) return error.IntegrityFailure;
+            sha_digest = sha256.finalResult();
         } else {
             decode_tee = tee.Tee.initWithProvider(sink.writer, provider);
             try lzma2_seam.decodeStream(provider, &chunk_reader, &decode_tee.?.writer, scratch[0..lzma_scratch_size], options);
@@ -391,18 +393,21 @@ fn decodeBlock(cursor: *binary.ReadCursor, sink: *Sink, scratch: []u8, check: Ch
         const block_output = sink.buffer.?[sink.offset - uncompressed_size ..][0..uncompressed_size];
         const check_bytes = try cursor.readSlice(checkSize(check));
         try verifyFilteredCheck(check, block_output, check_bytes, provider);
-    } else if (decode_tee) |*dt| {
+    } else {
         const check_bytes = try cursor.readSlice(checkSize(check));
-        // Multi-filter streaming blocks cannot be verified without staging:
-        // the check covers filtered bytes this path never materializes, and
-        // staging would defeat the bounded memory the measurement oracle
-        // exists for. Only decodedSize streams; every decode entry point
-        // stages the block and verifies it above.
-        if (block_header.filter_count == 1 and check != .sha256) {
-            try verifyCheck(check, dt.crc32Value(), dt.crc64Value(), check_bytes);
+        if (sha_digest) |digest| {
+            if (!std.mem.eql(u8, &digest, check_bytes)) return error.IntegrityFailure;
+        } else if (decode_tee) |*dt| {
+            // Multi-filter streaming blocks cannot be verified without staging:
+            // the check covers filtered bytes this path never materializes, and
+            // staging would defeat the bounded memory the measurement oracle
+            // exists for. Only decodedSize streams; every decode entry point
+            // stages the block and verifies it above.
+            if (block_header.filter_count == 1 and check != .sha256) {
+                try verifyCheck(check, dt.crc32Value(), dt.crc64Value(), check_bytes);
+            }
         }
     }
-    // The SHA-256 streaming branch consumed and verified its check bytes above.
     const unpadded_size = try bounds.addUsize(block_header.header_size, try bounds.addUsize(compressed_size, checkSize(check)));
     return .{
         .unpadded_size = std.math.cast(u64, unpadded_size) orelse return error.ResourceFailure,
@@ -995,4 +1000,67 @@ test "inspectBlocks enumerates a multi-block stream" {
         total += record.uncompressed_size;
     }
     try std.testing.expectEqual(@as(u64, input.len), total);
+}
+
+test "xz sha256 check roundtrips through decode and the measurement path" {
+    if (!deflate_seam.decodeServed(checksum.default_provider)) return;
+    const allocator = std.testing.allocator;
+    var input: [4096]u8 = undefined;
+    for (&input, 0..) |*byte, i| byte.* = @truncate(i *% 13 +% 7);
+    const dictionary_size: u32 = 1 << 20;
+    const scratch = try allocator.alloc(u8, encodeWorkspaceSizeBt(dictionary_size));
+    defer allocator.free(scratch);
+    const options: Options = .{
+        .dictionary_size = dictionary_size,
+        .check = .sha256,
+        .filters = .none,
+    };
+    const bound = encodedSizeBound(input.len, options.block_size);
+    const encoded = try allocator.alloc(u8, bound);
+    defer allocator.free(encoded);
+    const written = try encode(&input, encoded, scratch, options);
+    const decode_scratch = try allocator.alloc(u8, decodeWorkspaceSize(8 << 20));
+    defer allocator.free(decode_scratch);
+    var output: [input.len]u8 = undefined;
+    const decoded = try decode(encoded[0..written], &output, decode_scratch, checksum.default_provider);
+    try std.testing.expectEqualSlices(u8, &input, output[0..decoded]);
+    const measured = try decodedSize(encoded[0..written], decode_scratch, checksum.default_provider);
+    try std.testing.expectEqual(@as(usize, input.len), measured);
+}
+
+test "xz decodes a liblzma-produced sha256 stream on the measurement path" {
+    const stream = [_]u8{
+    253, 55, 122, 88, 90, 0, 0, 10, 225, 251, 12, 161, 2, 0, 33, 1,
+    0, 0, 0, 0, 55, 39, 151, 214, 224, 15, 255, 1, 4, 93, 0, 8,
+    140, 235, 59, 82, 194, 64, 244, 179, 252, 251, 147, 19, 113, 2, 15, 183,
+    122, 13, 138, 0, 199, 204, 160, 44, 78, 83, 197, 26, 189, 29, 224, 174,
+    115, 183, 68, 17, 184, 77, 127, 252, 92, 161, 47, 118, 133, 84, 83, 113,
+    188, 99, 183, 236, 17, 198, 129, 201, 131, 224, 186, 96, 251, 130, 166, 181,
+    185, 76, 86, 65, 188, 157, 253, 50, 102, 108, 88, 47, 60, 102, 179, 181,
+    49, 207, 243, 83, 46, 201, 248, 121, 164, 155, 29, 208, 206, 89, 133, 188,
+    224, 208, 161, 27, 39, 88, 230, 140, 100, 181, 29, 118, 186, 254, 180, 64,
+    121, 103, 238, 66, 61, 105, 110, 185, 6, 248, 13, 109, 195, 59, 190, 93,
+    94, 7, 240, 199, 89, 129, 133, 65, 99, 87, 237, 48, 210, 162, 8, 76,
+    166, 6, 86, 247, 199, 238, 69, 203, 186, 211, 44, 90, 227, 117, 76, 1,
+    243, 107, 143, 0, 180, 22, 164, 237, 56, 110, 152, 121, 46, 143, 189, 65,
+    49, 113, 124, 83, 21, 239, 116, 201, 12, 121, 246, 198, 61, 194, 124, 201,
+    202, 253, 95, 120, 37, 230, 90, 232, 11, 38, 167, 245, 251, 164, 254, 65,
+    224, 234, 137, 184, 160, 189, 146, 96, 146, 70, 195, 98, 170, 205, 160, 17,
+    49, 243, 162, 154, 80, 50, 251, 183, 177, 101, 169, 7, 16, 12, 64, 20,
+    160, 14, 233, 6, 216, 36, 83, 131, 194, 115, 47, 250, 208, 89, 38, 107,
+    202, 43, 0, 0, 18, 245, 24, 117, 193, 84, 90, 250, 197, 179, 189, 75,
+    63, 213, 19, 26, 158, 217, 245, 15, 242, 72, 184, 75, 1, 152, 109, 9,
+    52, 113, 111, 104, 0, 1, 184, 2, 128, 32, 0, 0, 126, 230, 24, 154,
+    182, 233, 223, 28, 2, 0, 0, 0, 0, 10, 89, 90,
+    };
+    const allocator = std.testing.allocator;
+    const decode_scratch = try allocator.alloc(u8, decodeWorkspaceSize(8 << 20));
+    defer allocator.free(decode_scratch);
+    const measured = try decodedSize(&stream, decode_scratch, checksum.default_provider);
+    var input: [4096]u8 = undefined;
+    for (&input, 0..) |*byte, i| byte.* = @truncate(i *% 31 +% 17);
+    try std.testing.expectEqual(@as(usize, input.len), measured);
+    var output: [input.len]u8 = undefined;
+    const decoded = try decode(&stream, &output, decode_scratch, checksum.default_provider);
+    try std.testing.expectEqualSlices(u8, &input, output[0..decoded]);
 }
