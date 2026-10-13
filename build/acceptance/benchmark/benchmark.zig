@@ -29,11 +29,22 @@ fn ensureCorpus(env: *env_mod.Env) ![]const u8 {
     try std.Io.Dir.cwd().createDirPath(env.io, env_mod.paths.corpus_dir);
     const download = try run.output(env.init, &.{ "curl", "-fsSL", "-o", env_mod.paths.corpus_zip, env_mod.silesia_url });
     env.allocator.free(download);
+    try verifyCorpusZip(env);
     try run.silent(env.init, &.{ "unzip", "-q", "-o", env_mod.paths.corpus_zip, "-d", env_mod.paths.corpus_dir });
     for (env_mod.paths.corpus_candidates) |dir| {
         if (corpusComplete(env, dir)) return dir;
     }
     return error.silesia_corpus_missing;
+}
+
+fn verifyCorpusZip(env: *env_mod.Env) !void {
+    const data = try std.Io.Dir.cwd().readFileAlloc(env.io, env_mod.paths.corpus_zip, env.allocator, .limited(1 << 31));
+    defer env.allocator.free(data);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
+    var expected: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&expected, env_mod.silesia_sha256) catch return error.silesia_digest_invalid;
+    if (!std.mem.eql(u8, &digest, &expected)) return error.silesia_digest_mismatch;
 }
 
 fn produceArchive(env: *env_mod.Env, comptime row: matrix.Row, input_path: []const u8, output_path: []const u8) ![]u8 {

@@ -32,11 +32,11 @@ jobs:
     runs-on: xcode-27
     steps:
       - name: Check out sources
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
       - name: Install the toolchain
-        uses: jdx/mise-action@v5.1.1
+        uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
         with:
           install: true
       - id: keys
@@ -52,14 +52,14 @@ jobs:
             echo "cache=$cache"
           } >> "$GITHUB_OUTPUT"
       - name: Restore the dependency cache
-        uses: actions/cache@v6.1.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ steps.keys.outputs.cache }}
           key: zig-global-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-${{ hashFiles('build.zig.zon', 'pkg/**') }}
           restore-keys: |
             zig-global-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-
       - name: Restore the project cache
-        uses: actions/cache@v6.1.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .zig-cache
           key: zig-project-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-${{ steps.keys.outputs.vendor }}-${{ inputs.impl }}-${{ inputs.portable }}-${{ hashFiles('build.zig', 'build.zig.zon', 'build/**', 'src/**', 'pkg/**') }}
@@ -68,7 +68,7 @@ jobs:
             zig-project-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-${{ steps.keys.outputs.vendor }}-
             zig-project-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-
       - name: Restore the Homebrew cache
-        uses: actions/cache@v6.1.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: inputs.profile == 'build'
         with:
           path: ~/Library/Caches/Homebrew
@@ -76,7 +76,7 @@ jobs:
           restore-keys: |
             brew-${{ runner.os }}-${{ runner.arch }}-
       - name: Restore the benchmark cache
-        uses: actions/cache@v6.1.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: inputs.benchmark
         with:
           path: |
@@ -100,7 +100,7 @@ jobs:
           zig build dist -Doptimize=fast
           zig build package -Doptimize=fast
       - name: Export the archives
-        uses: actions/upload-artifact@v7.0.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: inputs.export
         with:
           name: dist
@@ -120,3 +120,6 @@ jobs:
           esac
           zig build unit -Dprimitives_impl=${{ inputs.impl }} -Dportable=${{ inputs.portable }}
           zig build oracles -Dprimitives_impl=${{ inputs.impl }} -Dportable=${{ inputs.portable }} -Doptimize=safe
+          if [ "${{ inputs.impl }}" = onprem ] && [ "${{ inputs.portable }}" = false ]; then
+            zig build oracles_ubsan
+          fi

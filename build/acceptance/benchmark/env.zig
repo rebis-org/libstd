@@ -2,6 +2,9 @@ const builtin = @import("builtin");
 const std = @import("std");
 
 pub const silesia_url = "https://sun.aei.polsl.pl/~sdeor/corpus/silesia.zip";
+// The corpus zip is pinned by content: a swapped or truncated download must
+// fail before it can skew a benchmark campaign.
+pub const silesia_sha256 = "0626e25f45c0ffb5dc801f13b7c82a3b75743ba07e3a71835a41e3d9f63c77af";
 pub const silesia_files = [_][]const u8{ "dickens", "mozilla", "mr", "nci", "ooffice", "osdb", "reymont", "samba", "sao", "webster", "xml", "x-ray" };
 
 pub const paths = struct {

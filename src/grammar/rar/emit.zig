@@ -8,12 +8,15 @@ const Failure = failure.Failure;
 
 // The window must keep the RAW LZ bytes, because later solid entries match back
 // into earlier window regions, so apply each filter to a staged copy instead.
+// Filter starts are window-absolute; start_base converts them into the
+// span-relative coordinate system the emit ranges use.
 pub fn emitSpan(
     window: *window_mod.Window,
     out: sink.Sink,
     back: usize,
     span_start: usize,
     count: usize,
+    start_base: usize,
     pending: anytype,
     staged_buf: []u8,
     transform_scratch: []u8,
@@ -24,7 +27,7 @@ pub fn emitSpan(
     var touches = false;
     for (pending) |*f| {
         if (f.length == 0) continue;
-        const s: usize = @intCast(f.start);
+        const s: usize = @intCast(f.start - start_base);
         if (s < span_end and s + f.length > span_start) {
             touches = true;
             break;
@@ -41,7 +44,7 @@ pub fn emitSpan(
     if (staged_sink.overflowed) return error.DataFailure;
     for (pending) |*f| {
         if (f.length == 0) continue;
-        const s: usize = @intCast(f.start);
+        const s: usize = @intCast(f.start - start_base);
         if (s + f.length <= span_start or s >= span_end) continue;
         if (s < span_start or s + f.length > span_end) return error.UnsupportedFailure;
         try applyOne(ctx, f, staged[s - span_start ..][0..f.length], transform_scratch);

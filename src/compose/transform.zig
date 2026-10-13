@@ -155,14 +155,14 @@ pub fn gzipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resourc
         if (input.len > limits.encoded_bytes) return error.ResourceFailure;
         if (sink) |sink_resource| {
             if (plan.provider == .onprem and sink_resource.kind == .direct_write and sink_resource.hasCapability(resource.capability_bit_write)) {
-                // Single-pass: fallback recomputes exact size before further writes, so capacity never fails post-write. Carve-out: aborted fast path may leave a tentative prefix.
+                // Single-pass: fallback recomputes exact size before further writes, so capacity never fails post-write. The abandoned fast path's bytes are erased so a failed call leaves no decoded prefix behind.
                 switch (try gzip.decodeSinglePass(input, sink_resource.kind.direct_write, history, plan.provider)) {
                     .decoded => |produced| {
                         if (produced > limits.decoded_bytes) return error.ResourceFailure;
                         response.byte_length = produced;
                         return;
                     },
-                    .fallback => {},
+                    .fallback => |tentative| @memset(sink_resource.kind.direct_write[0..tentative], 0),
                 }
             }
         }
@@ -503,7 +503,12 @@ pub fn zstdHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resourc
                     const output = try common.sinkDirectBuffer(sink_resource, output_size + zstd.block_size_max);
                     var in_place_options = options;
                     in_place_options.max_decoded_bytes = output_size;
-                    _ = try zstd_seam.decodeInPlace(options.provider, &source_reader, output, in_place_options);
+                    _ = zstd_seam.decodeInPlace(options.provider, &source_reader, output, in_place_options) catch |err| {
+                        // A corrupt frame must not leave a tentative prefix and
+                        // working suffix in the caller's buffer.
+                        @memset(output, 0);
+                        return err;
+                    };
                 } else {
                     const staging = try workspace.take(u8, output_size + zstd.block_size_max);
                     var in_place_options = options;

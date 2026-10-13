@@ -224,7 +224,7 @@ fn decodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, provide
                     const byte = seq_to_unseq[mtf[0]];
                     var k: u32 = 0;
                     while (k < copies) : (k += 1) {
-                        if (nblock >= bwt_buffer.len) return error.DataFailure;
+                        if (nblock >= max_block) return error.DataFailure;
                         bwt_buffer[nblock] = byte;
                         nblock += 1;
                     }
@@ -234,7 +234,7 @@ fn decodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, provide
                 if (sym == eob) break;
                 const idx = sym - 1;
                 const uc = mtfMove(&mtf, idx);
-                if (nblock >= bwt_buffer.len) return error.DataFailure;
+                if (nblock >= max_block) return error.DataFailure;
                 bwt_buffer[nblock] = seq_to_unseq[uc];
                 nblock += 1;
             }
@@ -1237,7 +1237,10 @@ fn decodeHuffman(br: *BitReader, table: *const HuffTable) Failure!u32 {
         }
     }
     while (br.bit_count < 15 and br.byte_pos < br.bytes.len) try br.refill();
-    if (br.bit_count >= 15) {
+    // The 15-bit fast path indexes lengths up to 15; tables whose shortest
+    // code is longer (legal: headers accept lengths up to 20) take the exact
+    // walk below, which handles any length.
+    if (br.bit_count >= 15 and table.min_len <= 15) {
         const z15: u32 = @intCast((br.bits >> @intCast(br.bit_count - 15)) & 0x7FFF);
         var zn: u6 = @intCast(table.min_len);
         while (zn < 15 and (z15 >> @intCast(15 - zn)) > table.limit[zn]) zn += 1;

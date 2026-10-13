@@ -123,7 +123,7 @@ pub fn gzipDecodeStorage() usize {
     return stateSize(GzipDecode) + deflate.history_size;
 }
 
-pub fn gzipDecodeInit(storage: []u8, budgets: sessions.Budgets) error{CapacityFailure}!*GzipDecode {
+pub fn gzipDecodeInit(storage: []u8, budgets: sessions.Budgets) error{ CapacityFailure, UnsupportedFailure }!*GzipDecode {
     const carved = try carveHistory(GzipDecode, storage, deflate.history_size);
     const state = carved.state;
     const history = carved.history;
@@ -138,13 +138,13 @@ pub fn gzipDecodeInit(storage: []u8, budgets: sessions.Budgets) error{CapacityFa
         .trailer = undefined,
         .budgets = budgets,
     };
-    state.inflater.initSliceBoundInPlace(deflate_seam.default_provider, &.{}, history) catch unreachable;
+    state.inflater.initSliceBoundInPlace(deflate_seam.default_provider, &.{}, history) catch return error.UnsupportedFailure;
     return state;
 }
 
 // Each member needs a fresh deflate stream resuming at frame_pos, where framing read ahead to.
-fn enterDeflate(state: *GzipDecode) void {
-    state.inflater.initSliceBoundInPlace(deflate_seam.default_provider, state.pending[0..state.pending_len], state.history) catch unreachable;
+fn enterDeflate(state: *GzipDecode) error{UnsupportedFailure}!void {
+    try state.inflater.initSliceBoundInPlace(deflate_seam.default_provider, state.pending[0..state.pending_len], state.history);
     state.inflater.setFramePos(state.frame_pos);
     state.phase = .deflate;
 }
@@ -165,7 +165,7 @@ fn StepOps(comptime Driver: type, comptime step: fn (*Driver, []const u8, []u8, 
 
 const decode_ops = StepOps(GzipDecode, gzipDecodeStep);
 
-pub fn gzipDecodeSession(storage: []u8, budgets: sessions.Budgets) error{CapacityFailure}!sessions.Session {
+pub fn gzipDecodeSession(storage: []u8, budgets: sessions.Budgets) error{ CapacityFailure, UnsupportedFailure }!sessions.Session {
     const state = try gzipDecodeInit(storage, budgets);
     return .{ .state = state, .ops = &decode_ops };
 }
@@ -234,7 +234,7 @@ fn noteDeflateDecoded(state: *DeflateDecode, slice: []const u8) void {
     _ = slice;
 }
 
-fn selectPostHeaderPhase(state: *GzipDecode) void {
+fn selectPostHeaderPhase(state: *GzipDecode) error{UnsupportedFailure}!void {
     const flags = state.fixed[3];
     if (flags & flag_extra != 0) {
         state.phase = .extra_len;
@@ -245,7 +245,7 @@ fn selectPostHeaderPhase(state: *GzipDecode) void {
     } else if (flags & flag_hcrc != 0) {
         state.phase = .hcrc;
     } else {
-        enterDeflate(state);
+        try enterDeflate(state);
     }
 }
 
@@ -282,7 +282,7 @@ pub fn gzipDecodeStep(state: *GzipDecode, input: []const u8, output: []u8, end_o
                         if (fixed[3] & reserved_flags != 0) return framingFailed(&result, state.frame_pos, error.DataFailure);
                         state.member_crc = checksum.Crc32.init();
                         state.member_size = 0;
-                        selectPostHeaderPhase(state);
+                        selectPostHeaderPhase(state) catch |failure| return framingFailed(&result, state.frame_pos, failure);
                     },
                     .extra_len => {
                         const low = state.nextByte() orelse break :framing;
@@ -309,7 +309,7 @@ pub fn gzipDecodeStep(state: *GzipDecode, input: []const u8, output: []u8, end_o
                         } else if (state.fixed[3] & flag_hcrc != 0) {
                             state.phase = .hcrc;
                         } else {
-                            enterDeflate(state);
+                            enterDeflate(state) catch |failure| return framingFailed(&result, state.frame_pos, failure);
                         }
                     },
                     .name, .comment => {
@@ -323,7 +323,7 @@ pub fn gzipDecodeStep(state: *GzipDecode, input: []const u8, output: []u8, end_o
                         } else if (state.fixed[3] & flag_hcrc != 0) {
                             state.phase = .hcrc;
                         } else {
-                            enterDeflate(state);
+                            enterDeflate(state) catch |failure| return framingFailed(&result, state.frame_pos, failure);
                         }
                     },
                     .hcrc => {
@@ -334,7 +334,7 @@ pub fn gzipDecodeStep(state: *GzipDecode, input: []const u8, output: []u8, end_o
                         }
                         const expected = std.mem.readInt(u16, &stored, .little);
                         if (expected != @as(u16, @truncate(state.header_crc.final()))) return framingFailed(&result, state.frame_pos, error.IntegrityFailure);
-                        enterDeflate(state);
+                        enterDeflate(state) catch |failure| return framingFailed(&result, state.frame_pos, failure);
                     },
                     .deflate => break :framing,
                     .trailer => {
@@ -468,7 +468,7 @@ pub fn deflateDecodeStorage() usize {
     return stateSize(DeflateDecode) + deflate.history_size;
 }
 
-pub fn deflateDecodeInit(storage: []u8, budgets: sessions.Budgets) error{CapacityFailure}!*DeflateDecode {
+pub fn deflateDecodeInit(storage: []u8, budgets: sessions.Budgets) error{ CapacityFailure, UnsupportedFailure }!*DeflateDecode {
     const carved = try carveHistory(DeflateDecode, storage, deflate.history_size);
     const state = carved.state;
     const history = carved.history;
@@ -478,13 +478,13 @@ pub fn deflateDecodeInit(storage: []u8, budgets: sessions.Budgets) error{Capacit
         .pending = undefined,
         .budgets = budgets,
     };
-    state.inflater.initSliceBoundInPlace(deflate_seam.default_provider, &.{}, history) catch unreachable;
+    state.inflater.initSliceBoundInPlace(deflate_seam.default_provider, &.{}, history) catch return error.UnsupportedFailure;
     return state;
 }
 
 const deflate_decode_ops = StepOps(DeflateDecode, deflateDecodeStep);
 
-pub fn deflateDecodeSession(storage: []u8, budgets: sessions.Budgets) error{CapacityFailure}!sessions.Session {
+pub fn deflateDecodeSession(storage: []u8, budgets: sessions.Budgets) error{ CapacityFailure, UnsupportedFailure }!sessions.Session {
     const state = try deflateDecodeInit(storage, budgets);
     return .{ .state = state, .ops = &deflate_decode_ops };
 }
@@ -495,7 +495,7 @@ pub fn deflateDecodeStep(state: *DeflateDecode, input: []const u8, output: []u8,
         return framingFailed(&result, 0, failure);
     };
     if (!state.started) {
-        state.inflater.initSliceBoundInPlace(deflate_seam.default_provider, state.pending[0..state.pending_len], state.history) catch unreachable;
+        state.inflater.initSliceBoundInPlace(deflate_seam.default_provider, state.pending[0..state.pending_len], state.history) catch |failure| return framingFailed(&result, 0, failure);
         state.started = true;
     }
     if (output.len != 0 and result.produced < output.len) {
@@ -553,7 +553,7 @@ pub fn zlibDecodeStorage() usize {
     return stateSize(ZlibDecode) + deflate.history_size;
 }
 
-pub fn zlibDecodeInit(storage: []u8, budgets: sessions.Budgets) error{CapacityFailure}!*ZlibDecode {
+pub fn zlibDecodeInit(storage: []u8, budgets: sessions.Budgets) error{ CapacityFailure, UnsupportedFailure }!*ZlibDecode {
     const carved = try carveHistory(ZlibDecode, storage, deflate.history_size);
     const state = carved.state;
     const history = carved.history;
@@ -564,13 +564,13 @@ pub fn zlibDecodeInit(storage: []u8, budgets: sessions.Budgets) error{CapacityFa
         .adler = checksum.Adler32.init(),
         .budgets = budgets,
     };
-    state.inflater.initSliceBoundInPlace(deflate_seam.default_provider, &.{}, history) catch unreachable;
+    state.inflater.initSliceBoundInPlace(deflate_seam.default_provider, &.{}, history) catch return error.UnsupportedFailure;
     return state;
 }
 
 const zlib_decode_ops = StepOps(ZlibDecode, zlibDecodeStep);
 
-pub fn zlibDecodeSession(storage: []u8, budgets: sessions.Budgets) error{CapacityFailure}!sessions.Session {
+pub fn zlibDecodeSession(storage: []u8, budgets: sessions.Budgets) error{ CapacityFailure, UnsupportedFailure }!sessions.Session {
     const state = try zlibDecodeInit(storage, budgets);
     return .{ .state = state, .ops = &zlib_decode_ops };
 }
@@ -594,7 +594,7 @@ pub fn zlibDecodeStep(state: *ZlibDecode, input: []const u8, output: []u8, end_o
         if ((@as(u32, cmf) * 256 + @as(u32, flg)) % 31 != 0) return framingFailed(&result, input.len, error.DataFailure);
         if (flg & zlib_flag_dictionary != 0) return framingFailed(&result, input.len, error.UnsupportedFailure);
         state.adler = checksum.Adler32.init();
-        state.inflater.initSliceBoundInPlace(deflate_seam.default_provider, state.pending[0..state.pending_len], state.history) catch unreachable;
+        state.inflater.initSliceBoundInPlace(deflate_seam.default_provider, state.pending[0..state.pending_len], state.history) catch |failure| return framingFailed(&result, input.len, failure);
         state.inflater.setFramePos(zlib_header_size);
         state.started = true;
     }
@@ -744,7 +744,7 @@ fn deflateEncodeInitImpl(storage: []u8, budgets: sessions.Budgets) error{Capacit
     return state;
 }
 
-fn deflateEncodeSessionImpl(comptime wrap: EncodeWrap, storage: []u8, budgets: sessions.Budgets) error{CapacityFailure}!sessions.Session {
+fn deflateEncodeSessionImpl(comptime wrap: EncodeWrap, storage: []u8, budgets: sessions.Budgets) error{ CapacityFailure, UnsupportedFailure }!sessions.Session {
     const state = try deflateEncodeInitImpl(storage, budgets);
     const ops = comptime deflateEncodeOps(wrap);
     return .{ .state = state, .ops = ops };
@@ -833,7 +833,7 @@ pub fn deflateEncodeStorage() usize {
 pub fn deflateEncodeInit(storage: []u8, budgets: sessions.Budgets) error{CapacityFailure}!*DeflateEncode {
     return deflateEncodeInitImpl(storage, budgets);
 }
-pub fn deflateEncodeSession(storage: []u8, budgets: sessions.Budgets) error{CapacityFailure}!sessions.Session {
+pub fn deflateEncodeSession(storage: []u8, budgets: sessions.Budgets) error{ CapacityFailure, UnsupportedFailure }!sessions.Session {
     return deflateEncodeSessionImpl(.raw, storage, budgets);
 }
 
@@ -843,7 +843,7 @@ pub fn gzipEncodeStorage() usize {
 pub fn gzipEncodeInit(storage: []u8, budgets: sessions.Budgets) error{CapacityFailure}!*DeflateEncode {
     return deflateEncodeInitImpl(storage, budgets);
 }
-pub fn gzipEncodeSession(storage: []u8, budgets: sessions.Budgets) error{CapacityFailure}!sessions.Session {
+pub fn gzipEncodeSession(storage: []u8, budgets: sessions.Budgets) error{ CapacityFailure, UnsupportedFailure }!sessions.Session {
     return deflateEncodeSessionImpl(.gzip, storage, budgets);
 }
 
@@ -853,7 +853,7 @@ pub fn zlibEncodeStorage() usize {
 pub fn zlibEncodeInit(storage: []u8, budgets: sessions.Budgets) error{CapacityFailure}!*DeflateEncode {
     return deflateEncodeInitImpl(storage, budgets);
 }
-pub fn zlibEncodeSession(storage: []u8, budgets: sessions.Budgets) error{CapacityFailure}!sessions.Session {
+pub fn zlibEncodeSession(storage: []u8, budgets: sessions.Budgets) error{ CapacityFailure, UnsupportedFailure }!sessions.Session {
     return deflateEncodeSessionImpl(.zlib, storage, budgets);
 }
 
@@ -921,7 +921,7 @@ pub fn lz4DecodeInit(storage: []u8, budgets: sessions.Budgets) error{CapacityFai
 
 const lz4_decode_ops = StepOps(Lz4Decode, lz4DecodeStep);
 
-pub fn lz4DecodeSession(storage: []u8, budgets: sessions.Budgets) error{CapacityFailure}!sessions.Session {
+pub fn lz4DecodeSession(storage: []u8, budgets: sessions.Budgets) error{ CapacityFailure, UnsupportedFailure }!sessions.Session {
     const state = try lz4DecodeInit(storage, budgets);
     return .{ .state = state, .ops = &lz4_decode_ops };
 }
@@ -1158,7 +1158,7 @@ pub fn lz4EncodeInit(storage: []u8, budgets: sessions.Budgets) error{CapacityFai
 
 const lz4_encode_ops = StepOps(Lz4Encode, lz4EncodeStep);
 
-pub fn lz4EncodeSession(storage: []u8, budgets: sessions.Budgets) error{CapacityFailure}!sessions.Session {
+pub fn lz4EncodeSession(storage: []u8, budgets: sessions.Budgets) error{ CapacityFailure, UnsupportedFailure }!sessions.Session {
     const state = try lz4EncodeInit(storage, budgets);
     return .{ .state = state, .ops = &lz4_encode_ops };
 }

@@ -6,6 +6,11 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+// The envelope status vocabulary subset this bridge needs. Kept as literals so
+// the bridge stays decoupled from the generated header.
+#define STDK_STATUS_OK 0u
+#define STDK_STATUS_INVALID_CALL 1u
+
 extern uint64_t stdk_session_storage(const char* component, const char* verb);
 extern uint32_t stdk_session_bounded(const char* component,
                                      const char* verb,
@@ -38,6 +43,21 @@ static void releaseUtf8(JNIEnv* env, jstring value, const char* chars) {
     if (chars != NULL) {
         (*env)->ReleaseStringUTFChars(env, value, chars);
     }
+}
+
+// Rejects negative lengths and lengths past the real array extent before any
+// pointer is handed to the native engine: a negative jint widens to a huge
+// u64 in the engine and would read or write out of bounds.
+static jint checkedLen(JNIEnv* env, jbyteArray array, jint len, const char* what) {
+    if (len < 0 || (array == NULL && len != 0)) {
+        (*env)->ThrowNew(env, (*env)->FindClass(env, "java/lang/IllegalArgumentException"), what);
+        return -1;
+    }
+    if (array != NULL && len > (*env)->GetArrayLength(env, array)) {
+        (*env)->ThrowNew(env, (*env)->FindClass(env, "java/lang/IllegalArgumentException"), what);
+        return -1;
+    }
+    return len;
 }
 
 JNIEXPORT jlong JNICALL Java_dev_stdk_StdK_sessionStorage(JNIEnv* env, jclass cls, jstring component, jstring verb) {
@@ -100,19 +120,42 @@ JNIEXPORT jlong JNICALL Java_dev_stdk_StdK_sessionCreate(JNIEnv* env,
     return (jlong) storage;
 }
 
-JNIEXPORT jint JNICALL Java_dev_stdk_StdK_sessionStep(JNIEnv* env,
-                                                      jclass cls,
-                                                      jlong session,
-                                                      jbyteArray input,
-                                                      jint input_len,
-                                                      jbyteArray output,
-                                                      jint output_len,
-                                                      jboolean end_of_input,
-                                                      jlongArray counts) {
+JNIEXPORT jint JNICALL Java_dev_stdk_StdK_nativeSessionStep(JNIEnv* env,
+                                                            jclass cls,
+                                                            jlong session,
+                                                            jbyteArray input,
+                                                            jint input_len,
+                                                            jbyteArray output,
+                                                            jint output_len,
+                                                            jboolean end_of_input,
+                                                            jlongArray counts) {
     (void) cls;
+    if (checkedLen(env, input, input_len, "inputLen out of range") < 0) {
+        return STDK_STATUS_INVALID_CALL;
+    }
+    if (checkedLen(env, output, output_len, "outputLen out of range") < 0) {
+        return STDK_STATUS_INVALID_CALL;
+    }
+    // counts must exist and carry consumed, produced, and state.
+    if (counts == NULL || (*env)->GetArrayLength(env, counts) < 3) {
+        (*env)->ThrowNew(env,
+                         (*env)->FindClass(env, "java/lang/IllegalArgumentException"),
+                         "counts must hold 3 elements");
+        return STDK_STATUS_INVALID_CALL;
+    }
     uint8_t* input_ptr = input != NULL ? (uint8_t*) (*env)->GetByteArrayElements(env, input, NULL) : NULL;
     uint8_t* output_ptr = output != NULL ? (uint8_t*) (*env)->GetByteArrayElements(env, output, NULL) : NULL;
     jlong* counts_ptr = (*env)->GetLongArrayElements(env, counts, NULL);
+    if (counts_ptr == NULL) {
+        // JVM out-of-memory while materializing the counts array.
+        if (output_ptr != NULL) {
+            (*env)->ReleaseByteArrayElements(env, output, (jbyte*) output_ptr, JNI_ABORT);
+        }
+        if (input_ptr != NULL) {
+            (*env)->ReleaseByteArrayElements(env, input, (jbyte*) input_ptr, JNI_ABORT);
+        }
+        return STDK_STATUS_INVALID_CALL;
+    }
     int state = 0;
     // JNI jlong and pointer interop is inherently integer-to-pointer.
     void* session_ptr = (void*) session; /* NOLINT(performance-no-int-to-ptr) */
@@ -136,11 +179,17 @@ JNIEXPORT jint JNICALL Java_dev_stdk_StdK_sessionStep(JNIEnv* env,
     return (jint) rc;
 }
 
-JNIEXPORT jint JNICALL Java_dev_stdk_StdK_sessionFailure(JNIEnv* env,
-                                                         jclass cls,
-                                                         jlong session,
-                                                         jlongArray status_and_detail) {
+JNIEXPORT jint JNICALL Java_dev_stdk_StdK_nativeSessionFailure(JNIEnv* env,
+                                                               jclass cls,
+                                                               jlong session,
+                                                               jlongArray status_and_detail) {
     (void) cls;
+    if (status_and_detail == NULL || (*env)->GetArrayLength(env, status_and_detail) < 2) {
+        (*env)->ThrowNew(env,
+                         (*env)->FindClass(env, "java/lang/IllegalArgumentException"),
+                         "statusAndDetail must hold 2 elements");
+        return STDK_STATUS_INVALID_CALL;
+    }
     uint32_t status = 0;
     uint64_t detail = 0;
     // JNI jlong and pointer interop is inherently integer-to-pointer.
@@ -153,7 +202,7 @@ JNIEXPORT jint JNICALL Java_dev_stdk_StdK_sessionFailure(JNIEnv* env,
     return (jint) rc;
 }
 
-JNIEXPORT jint JNICALL Java_dev_stdk_StdK_sessionDestroy(JNIEnv* env, jclass cls, jlong session) {
+JNIEXPORT jint JNICALL Java_dev_stdk_StdK_nativeSessionDestroy(JNIEnv* env, jclass cls, jlong session) {
     (void) env;
     (void) cls;
     // JNI jlong and pointer interop is inherently integer-to-pointer.
@@ -161,7 +210,9 @@ JNIEXPORT jint JNICALL Java_dev_stdk_StdK_sessionDestroy(JNIEnv* env, jclass cls
     return (jint) stdk_session_destroy(session_ptr);
 }
 
-JNIEXPORT void JNICALL Java_dev_stdk_StdK_sessionFree(JNIEnv* env, jclass cls, jlong storage) {
+// Frees storage obtained from sessionCreate. Java must never pass a foreign or
+// already-freed pointer; the class tracks live handles and nulls them on free.
+JNIEXPORT void JNICALL Java_dev_stdk_StdK_nativeSessionFree(JNIEnv* env, jclass cls, jlong storage) {
     (void) env;
     (void) cls;
     // JNI jlong and pointer interop is inherently integer-to-pointer.

@@ -536,6 +536,9 @@ const Reader = struct {
                         entry.prefix = &.{};
                     }
                     if (self.long_link) |link_name| entry.link_name = link_name;
+                    // Decode-side parity with ZIP: refuse traversal, absolute,
+                    // backslash, and embedded-NUL member names.
+                    if (bounds.isAbsoluteOrTraversal(entry.name) or std.mem.findScalar(u8, entry.name, 0) != null) return error.DataFailure;
                     entry.ordinal = self.ordinal;
                     self.ordinal = try bounds.addU64(self.ordinal, 1);
                     self.long_name = null;
@@ -566,6 +569,9 @@ const Reader = struct {
                         entry.prefix = &.{};
                     }
                     if (self.long_link) |link_name| entry.link_name = link_name;
+                    // Decode-side parity with ZIP: refuse traversal, absolute,
+                    // backslash, and embedded-NUL member names.
+                    if (bounds.isAbsoluteOrTraversal(entry.name) or std.mem.findScalar(u8, entry.name, 0) != null) return error.DataFailure;
                     entry.ordinal = self.ordinal;
                     self.ordinal = try bounds.addU64(self.ordinal, 1);
                     try self.advance(advance_size);

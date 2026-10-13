@@ -61,7 +61,10 @@ pub const Entry = struct {
     num_cycles_power: u8 = 0,
     salt: [16]u8 = @splat(0),
     salt_length: u8 = 0,
-    kdf_rounds_limit: u64 = 0,
+    // KDF bomb defense is on by default: the ceiling matches the format maximum
+    // (seven_zip_cycles_max), so raising the parser cap alone cannot reopen it.
+    // Pass std.math.maxInt(u64) to opt back into unbounded rounds.
+    kdf_rounds_limit: u64 = 1 << 24,
     password_lifetime: u64 = 0,
 };
 
@@ -88,7 +91,10 @@ pub const Info = struct {
 
 pub const SevenZipDecodeOptions = struct {
     password: ?[]const u8 = null,
-    kdf_rounds_limit: u64 = 0,
+    // KDF bomb defense is on by default: the ceiling matches the format maximum
+    // (seven_zip_cycles_max), so raising the parser cap alone cannot reopen it.
+    // Pass std.math.maxInt(u64) to opt back into unbounded rounds.
+    kdf_rounds_limit: u64 = 1 << 24,
     password_lifetime: u64 = 0,
     failure_cause: *crypto.FailureCause,
     provider: crypto.Provider = crypto.default_provider,
@@ -418,7 +424,10 @@ pub const SevenZipHeaderOptions = struct {
     // 0 selects the default 2^19 rounds, otherwise the power is written
     // verbatim (1..24), matching the file-data knob.
     num_cycles_power: u8 = 0,
-    kdf_rounds_limit: u64 = 0,
+    // KDF bomb defense is on by default: the ceiling matches the format maximum
+    // (seven_zip_cycles_max), so raising the parser cap alone cannot reopen it.
+    // Pass std.math.maxInt(u64) to opt back into unbounded rounds.
+    kdf_rounds_limit: u64 = 1 << 24,
     password_lifetime: u64 = 0,
     failure_cause: ?*crypto.FailureCause = null,
 };
@@ -866,7 +875,10 @@ fn readAt(data: []const u8, offset: u64, buffer: []u8) Failure!void {
 // password channel serves both file-data and encoded-header decryption.
 pub const SevenZipLoadOptions = struct {
     password: ?[]const u8 = null,
-    kdf_rounds_limit: u64 = 0,
+    // KDF bomb defense is on by default: the ceiling matches the format maximum
+    // (seven_zip_cycles_max), so raising the parser cap alone cannot reopen it.
+    // Pass std.math.maxInt(u64) to opt back into unbounded rounds.
+    kdf_rounds_limit: u64 = 1 << 24,
     password_lifetime: u64 = 0,
     failure_cause: *crypto.FailureCause,
     provider: crypto.Provider = crypto.default_provider,
@@ -958,7 +970,10 @@ fn decodeEncodedHeader(archive_data: []const u8, cursor: *binary.ReadCursor, wor
     }
     const output = try workspace.take(u8, unpack_size);
     decodeFolderStream(folder, packed_data, output, workspace, limits, options) catch |err| {
-        if (folder.encrypted) options.failure_cause.* = .wrong_password;
+        // A decode failure on an encrypted folder usually means a wrong
+        // password, but never overwrite a cause the failure already carries
+        // (kdf_limit, password_lifetime) and never label limit/data refusals.
+        if (folder.encrypted and options.failure_cause.* == .none) options.failure_cause.* = .wrong_password;
         return err;
     };
     if (folder.substream_crcs.len == 1 and folder.substream_crcs[0] != 0 and
@@ -1037,6 +1052,9 @@ fn aesDecryptStream(encrypted: bool, num_cycles: u8, salt: []const u8, iv: [16]u
     const password_utf16 = try passwordToUtf16(password, workspace);
     var key: [crypto.seven_zip_key_length]u8 = undefined;
     if (num_cycles == 0x3F) {
+        // Direct-key mode is bounded by the fixed key-material word; refuse
+        // passwords that would overflow it instead of smashing the stack.
+        if (salt.len + password_utf16.len > 64) return error.UnsupportedFailure;
         var key_material: [64]u8 = @splat(0);
         @memcpy(key_material[0..salt.len], salt);
         @memcpy(key_material[salt.len..][0..password_utf16.len], password_utf16);
@@ -1129,10 +1147,12 @@ fn parseStreamsInfo(cursor: *binary.ReadCursor, workspace: *Workspace, comptime 
                 const num_pack_streams = try readUint64(cursor);
                 if (num_pack_streams == 0) return error.DataFailure;
                 const sizes = try workspace.take(u64, std.math.cast(usize, num_pack_streams) orelse return error.ResourceFailure);
+                var has_sizes = false;
                 while (true) {
                     const pid = try cursor.readU8();
                     if (pid == 0x00) break;
                     if (pid == 0x09) {
+                        has_sizes = true;
                         for (sizes) |*s| s.* = try readUint64(cursor);
                     } else if (pid == 0x0A) {
                         pack_crcs = try readDigests(cursor, num_pack_streams, workspace);
@@ -1140,6 +1160,9 @@ fn parseStreamsInfo(cursor: *binary.ReadCursor, workspace: *Workspace, comptime 
                         return error.UnsupportedFailure;
                     }
                 }
+                // kSize absence reads as zero-length streams, matching p7zip's
+                // value-initialized PackSizes, never recycled workspace bytes.
+                if (!has_sizes) @memset(sizes, 0);
                 pack_sizes = sizes;
             },
             0x07 => {
@@ -1436,6 +1459,9 @@ fn parse7zAesProps(attributes: []const u8) Failure!AesCoderProps {
     if (attributes.len == 0) return error.DataFailure;
     const b0 = attributes[0];
     const num_cycles = b0 & 0x3F;
+    // Both wire shapes share the cost ceiling; a single-byte 0x3E props must
+    // not reach the KDF as an unchecked 2^62 rounds.
+    if (num_cycles > crypto.seven_zip_cycles_max and num_cycles != 0x3F) return error.UnsupportedFailure;
     if ((b0 & 0xC0) == 0) {
         if (attributes.len != 1) return error.DataFailure;
         return .{ .num_cycles = num_cycles, .salt = &.{}, .iv = @splat(0), .iv_size = 0 };
@@ -1445,7 +1471,6 @@ fn parse7zAesProps(attributes: []const u8) Failure!AesCoderProps {
     const salt_size = @as(usize, (b0 >> 7) & 1) + (b1 >> 4);
     const iv_size = @as(usize, (b0 >> 6) & 1) + (b1 & 0x0F);
     if (attributes.len != 2 + salt_size + iv_size) return error.DataFailure;
-    if (num_cycles > crypto.seven_zip_cycles_max and num_cycles != 0x3F) return error.UnsupportedFailure;
     var iv: [16]u8 = @splat(0);
     @memcpy(iv[0..iv_size], attributes[2 + salt_size ..][0..iv_size]);
     return .{
@@ -1551,6 +1576,8 @@ fn parseFilesInfo(cursor: *binary.ReadCursor, workspace: *Workspace) Failure!Fil
     const names = try workspace.take([]const u8, count);
     @memset(empty_streams, false);
     @memset(empty_files, false);
+    // kNames absence must read as "no name", never as recycled workspace bytes.
+    @memset(names, &.{});
     while (cursor.remaining() > 0) {
         const id = try cursor.readU8();
         if (id == 0x00) break;
@@ -1610,6 +1637,7 @@ fn skipArchiveProperties(cursor: *binary.ReadCursor) Failure!void {
 
 fn buildEntries(si: *const StreamsInfo, fi: *const FilesInfo, workspace: *Workspace, limits: Limits) Failure![]const Info {
     const count = fi.names.len;
+    if (@as(u64, count) > limits.entries) return error.ResourceFailure;
     const entries = try workspace.take(Info, count);
     var folder_index: usize = 0;
     var substream_index: usize = 0;
@@ -1674,6 +1702,9 @@ fn buildEntries(si: *const StreamsInfo, fi: *const FilesInfo, workspace: *Worksp
             }
         }
         const name = try utf16LeToUtf8(fi.names[i], workspace);
+        // Decode-side parity with ZIP: refuse traversal, absolute, backslash,
+        // and embedded-NUL names instead of delegating tar-slip checks to consumers.
+        if (bounds.isAbsoluteOrTraversal(name) or std.mem.findScalar(u8, name, 0) != null) return error.DataFailure;
         entries[i] = .{
             .name = name,
             .size = size,

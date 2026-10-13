@@ -92,6 +92,8 @@ pub const DecodeOptions = struct {
     password_lifetime: u64 = 0,
     // Set on a kdf_limit or password_lifetime refusal, like the ZIP/7z paths.
     failure_cause: ?*crypto.FailureCause = null,
+    // Optional single-entry KDF memo shared across passes; see Rar5KdfMemo.
+    kdf_memo: ?*Rar5KdfMemo = null,
     // The primitive provider for KDF and block decryption on this call.
     provider: crypto.Provider = crypto.default_provider,
 };
@@ -184,6 +186,19 @@ const rar5_hash_blake2sp: u64 = 0x00;
 
 pub const Rar5Keys = struct { key: [32]u8, hash_key: [32]u8, pswcheck: [32]u8 };
 
+// A single-entry memo for rar5Kdf. Encrypted archives carry one KDF record per
+// entry, and a walk plus its replay used to pay the derivation twice for the
+// same (password, salt, count); callers running many passes can share one memo
+// to pay it once. The key is a password fingerprint, so a memo never serves a
+// different password.
+pub const Rar5KdfMemo = struct {
+    populated: bool = false,
+    lg2count: u8 = 0,
+    salt: [16]u8 = @splat(0),
+    password_fp: [16]u8 = @splat(0),
+    keys: Rar5Keys = undefined,
+};
+
 // The decryption step that RAR5 needs because its PBKDF2-HMAC-SHA256 covers the
 // first block only; the hash key and the password check continue the same chain 16 times each.
 pub fn rar5Kdf(password: []const u8, salt: *const [16]u8, lg2count: u8, opts: DecodeOptions) Failure!Rar5Keys {
@@ -192,6 +207,20 @@ pub fn rar5Kdf(password: []const u8, salt: *const [16]u8, lg2count: u8, opts: De
     if (opts.kdf_rounds_limit != 0 and rounds > opts.kdf_rounds_limit) {
         if (opts.failure_cause) |cause| cause.* = .kdf_limit;
         return error.ResourceFailure;
+    }
+    var password_fp: [16]u8 = @splat(0);
+    if (opts.kdf_memo != null) {
+        var fp_sha = crypto.Sha256.bind(opts.provider, .{});
+        fp_sha.update(password);
+        const fp_full = fp_sha.finalResult();
+        @memcpy(&password_fp, fp_full[0..16]);
+        if (opts.kdf_memo.?.populated and
+            opts.kdf_memo.?.lg2count == lg2count and
+            std.mem.eql(u8, &opts.kdf_memo.?.salt, salt) and
+            std.mem.eql(u8, &opts.kdf_memo.?.password_fp, &password_fp))
+        {
+            return opts.kdf_memo.?.keys;
+        }
     }
     var salt_block: [20]u8 = undefined;
     @memcpy(salt_block[0..16], salt);
@@ -217,6 +246,13 @@ pub fn rar5Kdf(password: []const u8, salt: *const [16]u8, lg2count: u8, opts: De
         for (&accumulator, u_value) |*byte, other| byte.* ^= other;
     }
     keys.pswcheck = accumulator;
+    if (opts.kdf_memo) |memo| {
+        memo.populated = true;
+        memo.lg2count = lg2count;
+        memo.salt = salt.*;
+        memo.password_fp = password_fp;
+        memo.keys = keys;
+    }
     return keys;
 }
 
@@ -499,11 +535,13 @@ fn parseRar5BlockEncrypted(
     var size_cursor = binary.ReadCursor.init(scratch[4..16]);
     const block_size = size_cursor.readUleb128() catch return error.DataFailure;
     const size_bytes = size_cursor.pos;
-    const header_size = 4 + size_bytes + (std.math.cast(usize, block_size) orelse return error.ResourceFailure);
+    const header_size = try bounds.addUsize(try bounds.addUsize(4, size_bytes), std.math.cast(usize, block_size) orelse return error.ResourceFailure);
+    if (header_size > std.math.maxInt(usize) - 15) return error.ResourceFailure;
     const enc_len = std.mem.alignForward(usize, header_size, 16);
     if (scratch.len < enc_len) return error.CapacityFailure;
     if (enc_len > 16) {
-        const rest = try bounds.slice(archive, cursor.* + 16, enc_len - 16);
+        const rest_start = try bounds.addUsize(cursor.*, 16);
+        const rest = try bounds.slice(archive, rest_start, enc_len - 16);
         // The CBC chaining value is the first cipher block.
         crypto.aesCbcDecrypt(provider, keys.key[0..], first[0..16].*, scratch[16..enc_len], rest) catch return error.DataFailure;
     }
@@ -607,9 +645,10 @@ fn walkRar5(archive: []const u8, offset: usize, opts: DecodeOptions, ctx: anytyp
                         if (version != 50 and version != 70) return error.UnsupportedFailure;
                         const window_bits_field: u6 = @intCast((header.compression >> 10) & (if (version == 70) @as(u64, 0x1F) else 0x0F));
                         // The window that the entry requires. A smaller window silently truncates
-                        // history, so a window that does not fit is refused, never clamped.
+                        // history, so a window that does not fit is refused, never clamped. The
+                        // field is masked above, so v50 tops out at 15 and v70 at 31: exactly
+                        // max_rar5_window_bits, and 0x20000 << 31 still fits u64.
                         const window_bytes: u64 = (@as(u64, 0x20000) << window_bits_field);
-                        if (window_bits_field > max_rar5_window_bits) return error.ResourceFailure;
                         entry.method = @intCast(method);
                         entry.unpack_version = version;
                         entry.dict_bits = windowBitsCeil(window_bytes);
@@ -1095,8 +1134,11 @@ pub fn rarDecodeOrdinal(
     bufs: *DecodeBuffers,
     opts: DecodeOptions,
 ) Failure!usize {
+    var kdf_memo: Rar5KdfMemo = .{};
+    var memo_opts = opts;
+    memo_opts.kdf_memo = &kdf_memo;
     var locate: LocateCtx = .{ .target = ordinal };
-    try walkEntriesOpts(archive, opts, &locate, locateVisit);
+    try walkEntriesOpts(archive, memo_opts, &locate, locateVisit);
     const entry = locate.target_entry orelse return error.DataFailure;
     if (entry.is_directory) return error.DataFailure;
 
@@ -1104,12 +1146,12 @@ pub fn rarDecodeOrdinal(
     if (output.len < size) return error.CapacityFailure;
 
     if (entry.method == 0) {
-        const payload = try entryPayload(entry, archive, opts, bufs);
+        const payload = try entryPayload(entry, archive, memo_opts, bufs);
         if (payload.len < size) return error.DataFailure;
         @memcpy(output[0..size], payload[0..size]);
     } else {
         const window_len = std.math.cast(usize, locate.group_max_window) orelse return error.ResourceFailure;
-        try replayCompressed(archive, opts, &locate, entry, output[0..size], bufs, window_len);
+        try replayCompressed(archive, memo_opts, &locate, entry, output[0..size], bufs, window_len);
     }
 
     // The integrity check covers the CRC32 of the delivered bytes, plus BLAKE2sp when the
@@ -1119,7 +1161,7 @@ pub fn rarDecodeOrdinal(
         switch (c) {
             .rar5 => |r5| if (r5.hashmac) {
                 const password = opts.password orelse return error.UnsupportedFailure;
-                const keys = try rar5Kdf(password, &r5.salt, r5.lg2count, opts);
+                const keys = try rar5Kdf(password, &r5.salt, r5.lg2count, memo_opts);
                 hash_key = keys.hash_key;
             },
             .rar4 => {},
@@ -1128,15 +1170,17 @@ pub fn rarDecodeOrdinal(
     if (entry.info.has_crc) {
         const crc = checksum.crc32With(opts.provider, output[0..size]);
         if (hash_key) |key| {
-            if (rar5CrcMac(opts.provider, crc, &key) != entry.info.crc) return error.IntegrityFailure;
+            const mac = rar5CrcMac(opts.provider, crc, &key);
+            if (!crypto.constantTimeEql(std.mem.asBytes(&mac), std.mem.asBytes(&entry.info.crc))) return error.IntegrityFailure;
         } else if (crc != entry.info.crc) return error.IntegrityFailure;
     }
     if (entry.blake2) |expected| {
         var got: [32]u8 = undefined;
         blake2sp.blake2sp(output[0..size], &got);
         if (hash_key) |key| {
-            if (!std.mem.eql(u8, &expected, &rar5BlakeMac(opts.provider, &got, &key))) return error.IntegrityFailure;
-        } else if (!std.mem.eql(u8, &expected, &got)) return error.IntegrityFailure;
+            const mac = rar5BlakeMac(opts.provider, &got, &key);
+            if (!crypto.constantTimeEql(&expected, &mac)) return error.IntegrityFailure;
+        } else if (!crypto.constantTimeEql(&expected, &got)) return error.IntegrityFailure;
     }
     return size;
 }
