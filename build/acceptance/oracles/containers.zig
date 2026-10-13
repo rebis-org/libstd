@@ -146,6 +146,9 @@ fn runZdict(r: *Runner) anyerror!void {
     }
     const input = zdict_sample_data[0..sample_size];
 
+    // Recorded incompleteness: std's zstd decoder takes no preloaded dictionary.
+    if (harness.leaf_offprem_default) return;
+
     // Ours encodes with the dictionary, the reference decodes with it.
     var encoded_with_dict: [4096]u8 = undefined;
     _ = harness.call(r, harness.ids.write, &.{

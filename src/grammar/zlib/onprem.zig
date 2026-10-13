@@ -63,7 +63,8 @@ pub fn decode(input: []const u8, output: *std.Io.Writer, history: []u8, provider
     if (header.has_dictionary) return error.UnsupportedFailure;
     if (header.window_size > window_size_max) return error.UnsupportedFailure;
     var tee_writer = tee.CountingTee(.{ .adler32 = true }).initWithProvider(output, provider);
-    var inflater = deflate_seam.Decode.initSliceBound(provider, input[header_size..], history) catch return error.UnsupportedFailure;
+    var inflater: deflate_seam.Decode = undefined;
+    inflater.initSliceBoundInPlace(provider, input[header_size..], history) catch return error.UnsupportedFailure;
     const produced = inflater.readerPtr().streamRemaining(&tee_writer.writer) catch |err| {
         return switch (err) {
             error.WriteFailed => error.IoFailure,

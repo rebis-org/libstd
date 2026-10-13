@@ -29,6 +29,19 @@ fn stdProperties(properties: Properties) std_lzma.Decode.Properties {
     return .{ .lc = @intCast(properties.lc), .lp = @intCast(properties.lp), .pb = @intCast(properties.pb) };
 }
 
+// std fuses the stop rule and the length assertion, reporting an early end marker as a size mismatch.
+fn endedShortOfDeclared(decoder: *const std_lzma.Decompress, options: Options) bool {
+    const declared = options.unpack_size orelse return false;
+    const mismatch = decoder.err orelse return false;
+    return mismatch == error.DecompressedSizeMismatch and decoder.buffer.len < declared;
+}
+
+// std flushes the window's tail only on the success path, so a short run leaves it unflushed.
+fn drainShortRun(decoder: *std_lzma.Decompress, writer: *std.Io.Writer) Failure!void {
+    writer.writeAll(decoder.reader.buffer[decoder.reader.seek..decoder.reader.end]) catch return error.CapacityFailure;
+    decoder.buffer.finish(writer) catch return error.CapacityFailure;
+}
+
 // drive decodes the raw LZMA payload (after the 13-byte .lzma header, or an
 // lzma2 chunk body) into output through the caller-provided reader.
 pub fn drive(reader: *std.Io.Reader, output: []u8, scratch: []u8, options: Options) Failure!usize {
@@ -42,7 +55,10 @@ pub fn drive(reader: *std.Io.Reader, output: []u8, scratch: []u8, options: Optio
     var decoder = std_lzma.Decompress.initParams(reader, allocator, &.{}, params, options.properties.dictionary_size) catch |err| return failure.fromStd(err);
     defer decoder.deinit();
     var sink = std.Io.Writer.fixed(output);
-    _ = decoder.reader.streamRemaining(&sink) catch |err| return mapStreamError(err);
+    _ = decoder.reader.streamRemaining(&sink) catch |err| {
+        if (!endedShortOfDeclared(&decoder, options)) return mapStreamError(err);
+        try drainShortRun(&decoder, &sink);
+    };
     return sink.end;
 }
 
@@ -62,7 +78,10 @@ pub fn decodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, 
     var reader = std.Io.Reader.fixed(input);
     var decoder = std_lzma.Decompress.initParams(&reader, allocator, &.{}, params, options.properties.dictionary_size) catch |err| return failure.fromStd(err);
     defer decoder.deinit();
-    _ = decoder.reader.streamRemaining(writer) catch |err| return mapStreamError(err);
+    _ = decoder.reader.streamRemaining(writer) catch |err| {
+        if (!endedShortOfDeclared(&decoder, options)) return mapStreamError(err);
+        try drainShortRun(&decoder, writer);
+    };
 }
 
 pub fn decodedSize(input: []const u8, scratch: []u8, options: Options) Failure!usize {
@@ -78,7 +97,10 @@ pub fn decodedSize(input: []const u8, scratch: []u8, options: Options) Failure!u
     var decoder = std_lzma.Decompress.initParams(&reader, allocator, &.{}, params, options.properties.dictionary_size) catch |err| return failure.fromStd(err);
     defer decoder.deinit();
     var counter = measurement.Counter.init(null);
-    _ = decoder.reader.streamRemaining(&counter.writer) catch |err| return mapStreamError(err);
+    _ = decoder.reader.streamRemaining(&counter.writer) catch |err| {
+        if (!endedShortOfDeclared(&decoder, options)) return mapStreamError(err);
+        try drainShortRun(&decoder, &counter.writer);
+    };
     return counter.written();
 }
 

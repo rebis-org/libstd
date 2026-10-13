@@ -191,7 +191,8 @@ const Inflated = struct {
 };
 
 fn inflatePayload(input: []const u8, data_start: usize, history: []u8, output: *std.Io.Writer, provider: checksum.Provider) !Inflated {
-    var inflater = deflate_seam.Decode.initSliceBound(provider, input[data_start..], history) catch return error.UnsupportedFailure;
+    var inflater: deflate_seam.Decode = undefined;
+    inflater.initSliceBoundInPlace(provider, input[data_start..], history) catch return error.UnsupportedFailure;
     const produced = try inflater.readerPtr().streamRemaining(output);
     return .{ .produced = produced, .consumed = (inflater.inputBitsConsumed() + 7) / 8 };
 }

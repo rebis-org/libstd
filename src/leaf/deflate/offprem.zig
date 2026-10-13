@@ -5,17 +5,26 @@ const std = @import("std");
 
 pub const Decompress = struct {
     inner: std.compress.flate.Decompress,
+    // Owns the fixed reader slice constructions bind std flate to: a
+    // constructor-local reader would dangle the moment init returned.
+    fixed_input: std.Io.Reader,
     slice_bound: bool,
 
     pub fn init(input: *std.Io.Reader, history: []u8) @This() {
         std.debug.assert(history.len >= 10);
-        return .{ .inner = std.compress.flate.Decompress.init(input, .raw, history), .slice_bound = false };
+        return .{ .inner = std.compress.flate.Decompress.init(input, .raw, history), .fixed_input = undefined, .slice_bound = false };
     }
 
-    pub fn initSlice(data: []const u8, history: []u8) @This() {
+    pub fn initSliceInPlace(self: *@This(), data: []const u8, history: []u8) void {
         std.debug.assert(history.len >= 10);
-        var reader: std.Io.Reader = .fixed(data);
-        return .{ .inner = std.compress.flate.Decompress.init(&reader, .raw, history), .slice_bound = true };
+        self.slice_bound = true;
+        self.fixed_input = .fixed(data);
+        self.inner = std.compress.flate.Decompress.init(&self.fixed_input, .raw, history);
+    }
+
+    pub fn initSliceBoundInPlace(self: *@This(), provider: anytype, data: []const u8, history: []u8) error{UnsupportedFailure}!void {
+        if (provider != .offprem) return error.UnsupportedFailure;
+        self.initSliceInPlace(data, history);
     }
 
     // The fixed reader's seek is the consumed byte position; the stream
@@ -35,11 +44,6 @@ pub const Decompress = struct {
         return init(input, history);
     }
 
-    pub fn initSliceBound(provider: anytype, data: []const u8, history: []u8) error{UnsupportedFailure}!@This() {
-        if (provider != .offprem) return error.UnsupportedFailure;
-        return initSlice(data, history);
-    }
-
     // Resume a fresh member at a byte position the framing already read
     // ahead to (session drivers). Both fields are fresh-construction state.
     pub fn setFramePos(self: *@This(), pos: usize) void {
@@ -47,8 +51,8 @@ pub const Decompress = struct {
         self.inner.consumed_bits = 0;
     }
 
-    // Session-driver surface (src/compose/drivers.zig): same pokes the
-    // onprem arm exposes, over the fixed reader std flate keeps its input in.
+    // Session-driver surface: same pokes the onprem arm exposes,
+    // over the fixed reader std flate keeps its input in.
     pub fn streamPosition(self: *const @This()) usize {
         return self.inner.input.seek;
     }
@@ -74,6 +78,20 @@ pub const Decompress = struct {
 
     pub fn readerPtr(self: *@This()) *std.Io.Reader {
         return &self.inner.reader;
+    }
+
+    // std's stream entry ignores the writer and decodes into the history buffer instead.
+    pub fn streamTo(self: *@This(), writer: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const reader = &self.inner.reader;
+        var produced: usize = 0;
+        while (true) {
+            const emitted = reader.stream(writer, limit) catch |err| return err;
+            produced += emitted;
+            if (produced >= @backingInt(limit)) break;
+            // A pull that neither moved nor staged cannot move again.
+            if (emitted == 0 and reader.seek >= reader.end) break;
+        }
+        return produced;
     }
 };
 
@@ -118,7 +136,8 @@ test "offprem arm decodes byte-identical to onprem across shapes" {
         const produced_on = onprem_inflater.readerPtr().streamRemaining(&onprem_counting) catch return error.TestUnexpectedResult;
         const consumed_on = (onprem_inflater.inputBitsConsumed() + 7) / 8;
 
-        var offprem_inflater = Decompress.initSlice(compressed[0..compressed_len], window);
+        var offprem_inflater: Decompress = undefined;
+        offprem_inflater.initSliceInPlace(compressed[0..compressed_len], window);
         var offprem_counting = std.Io.Writer.fixed(offprem_out);
         const produced_off = offprem_inflater.readerPtr().streamRemaining(&offprem_counting) catch return error.TestUnexpectedResult;
         const consumed_off = (offprem_inflater.inputBitsConsumed() + 7) / 8;
