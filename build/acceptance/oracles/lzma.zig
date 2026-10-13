@@ -263,7 +263,7 @@ pub fn runIncompressible(r: *Runner) anyerror!void {
 }
 
 pub fn runMultichunk(r: *Runner) anyerror!void {
-    var input: [(1 << 20) + 1024]u8 = undefined;
+    var input: [(1 << 21) + 1024]u8 = undefined;
     @memset(&input, 'A');
     setupLzma(r, harness.ids.lzma2, 4096);
     r.input = &input;
@@ -271,12 +271,13 @@ pub fn runMultichunk(r: *Runner) anyerror!void {
     try steps.writeSpan(&lzmaParams, r);
     try steps.queryRead(&lzmaParams, r);
     try steps.readSpan(&lzmaParams, r);
-    const raw_unpack: usize = ((@as(usize, r.encoded[0] & 0x0F)) << 16) | (@as(usize, r.encoded[1]) << 8) | r.encoded[2];
+    // Five control bits carry the unpack-size high bits, matching the SDK.
+    const raw_unpack: usize = ((@as(usize, r.encoded[0] & 0x1F)) << 16) | (@as(usize, r.encoded[1]) << 8) | r.encoded[2];
     const first_unpack = raw_unpack + 1;
     const first_pack: usize = ((@as(usize, r.encoded[3]) << 8) | r.encoded[4]) + 1;
     const next_offset = 1 + 4 + 1 + first_pack;
     if ((r.encoded[0] & 0x80) == 0) return error.UnexpectedChunkControl;
-    if (first_unpack != (1 << 20)) return error.UnexpectedFirstChunkSize;
+    if (first_unpack != (1 << 21)) return error.UnexpectedFirstChunkSize;
     if (next_offset >= r.encoded_len - 1) return error.ChunkLayoutMismatch;
     if (next_offset >= r.encoded.len or r.encoded[next_offset] != 0x80) return error.UnexpectedEndMarker;
 }
@@ -1058,7 +1059,7 @@ pub const scenarios = harness.scenarios(
         .{ .name = "lzma2 truncated header", .run = runLzma2TruncatedHeader, .workspace_size = 3670016, .output_size = 16, .encoded_size = 16 },
         .{ .name = "lzma2 corrupt payload", .run = runLzma2CorruptPayload, .workspace_size = 3670016, .output_size = 48, .encoded_size = 512 },
         .{ .name = "lzma2 incompressible", .run = runIncompressible, .workspace_size = 3 * 1024 * 1024, .output_size = 1 << 20, .encoded_size = (1 << 20) + 4096 },
-        .{ .name = "lzma2 multichunk", .run = runMultichunk, .workspace_size = 8 * 1024 * 1024, .output_size = (1 << 20) + 1024, .encoded_size = 65536 },
+        .{ .name = "lzma2 multichunk", .run = runMultichunk, .workspace_size = 8 * 1024 * 1024, .output_size = (1 << 21) + 1024, .encoded_size = 65536 },
         .{ .name = "lzma2 midstream reset", .run = runMidstreamReset, .workspace_size = 3670016, .output_size = 4096, .encoded_size = 1024 },
         .{ .name = "lzma2 mixed chunks", .run = runMixedChunks, .workspace_size = 48 * 1024 * 1024, .output_size = (64 << 10) + (2 << 20), .encoded_size = (1 << 20) + 4096 },
         .{ .name = "lzma2 copy floor", .run = runCopyFloor, .workspace_size = 3 * 1024 * 1024, .output_size = 48 << 10, .encoded_size = (48 << 10) + 2048 },
