@@ -11,6 +11,10 @@ pub const Failure = failure.Failure;
 pub const Options = zstd.Options;
 pub const zstdEncodeHistoryLen = sizing.encodeHistoryLen;
 
+pub fn zstdEncodeBound(input_len: usize, options: Options) usize {
+    return zstd.encodedSizeBound(input_len, options);
+}
+
 // Caller wires spans straight to the leaf, so byte-identity is expected.
 pub fn zstdEncode(input: interface.span.ConstSpan, output: interface.span.Span, history: interface.span.Span, workspace: interface.span.Span, options: Options) Failure!usize {
     const bound = zstd.encodedSizeBound(input.len, options);
