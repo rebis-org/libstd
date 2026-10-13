@@ -5,6 +5,7 @@
     .verbs = .{ "inspect", "decode_ordinal", "decoded_size", "encode_ordinal", "required_size", "encoded_size_bound" },
     .parameters = .{
         .{ .name = "dictionary", .family = 6, .ordinal = 1, .representation = "scalar_words" },
+        .{ .name = "properties", .family = 6, .ordinal = 6, .representation = "scalar_words" },
     },
     .capabilities = .{ "read", "replay" },
     .sizing = "measured",

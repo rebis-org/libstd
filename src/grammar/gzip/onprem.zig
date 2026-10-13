@@ -48,6 +48,29 @@ pub fn encodedSizeBound(input_len: usize, options: Options) usize {
     return deflate.encodedSizeBound(input_len) +| wrapper_size;
 }
 
+pub const StreamInfo = struct {
+    flags: u8,
+    modification_time: u32,
+    extra_flags: u8,
+    operating_system: u8,
+};
+
+// First-member fixed-header fields for the read-side inspect projection,
+// parsed without walking the payload.
+pub fn inspectStream(input: []const u8) Failure!StreamInfo {
+    if (input.len < 10) return error.DataFailure;
+    if (input[0] != magic_1 or input[1] != magic_2) return error.DataFailure;
+    if (input[2] != cm_deflate) return error.UnsupportedFailure;
+    const flags = input[3];
+    if (flags & reserved_flags != 0) return error.DataFailure;
+    return .{
+        .flags = flags,
+        .modification_time = std.mem.readInt(u32, input[4..8], .little),
+        .extra_flags = input[8],
+        .operating_system = input[9],
+    };
+}
+
 pub fn decodedSize(input: []const u8, history: []u8, provider: checksum.Provider) Failure!usize {
     if (history.len < deflate_history_size) return error.CapacityFailure;
     var counter = measurement.Counter.init(null);
