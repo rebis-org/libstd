@@ -522,5 +522,5 @@ pub const scenarios = harness.scenarios("xz", &.{
     .{ .label = "xz roundtrip", .run = runRoundtrip, .workspace_size = 8 * 1024 * 1024, .output_size = 4096, .encoded_size = 16384 },
     .{ .label = "xz filters", .run = runFilters, .workspace_size = 8 * 1024 * 1024, .output_size = 4096, .encoded_size = 16384 },
     .{ .label = "xz optional", .run = runOptional, .workspace_size = 8 * 1024 * 1024, .output_size = 4096, .encoded_size = 16384 },
-    .{ .label = "xz encode advanced", .run = runEncode, .workspace_size = 8 * 1024 * 1024, .output_size = 4096, .encoded_size = 16384 },
+    .{ .label = "xz encode advanced", .run = runEncode, .workspace_size = 12 * 1024 * 1024, .output_size = 4096, .encoded_size = 16384 },
 }, &.{});
