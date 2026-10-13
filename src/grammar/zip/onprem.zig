@@ -195,9 +195,12 @@ pub fn encode(entries: []const Entry, archive_comment: []const u8, output: []u8,
 
 fn validateEntry(entry: Entry) Failure!void {
     if (entry.name.len == 0 or entry.name.len > std.math.maxInt(u16) or entry.extra.len > std.math.maxInt(u16) or entry.comment.len > std.math.maxInt(u16)) return error.CallFailure;
-    // The writable flag set is UTF-8 names (0x0800) and the data-descriptor
-    // marker (0x0008); the descriptor is emitted after the entry data.
-    if (entry.flags & ~@as(u16, 0x0800 | 0x0008) != 0 or (entry.flags & 0x0800 != 0 and !std.unicode.utf8ValidateSlice(entry.name))) return error.UnsupportedFailure;
+    // The writable flag set: UTF-8 names (0x0800), the data-descriptor
+    // marker (0x0008), and the compression-level hint (0x0002, honored as a
+    // hint only — the encoder runs its tuned configuration regardless, and
+    // the LZMA path already forces the bit for interop). Everything else
+    // names a feature the writer does not emit, so it stays rejected.
+    if (entry.flags & ~@as(u16, 0x0800 | 0x0008 | 0x0002) != 0 or (entry.flags & 0x0800 != 0 and !std.unicode.utf8ValidateSlice(entry.name))) return error.UnsupportedFailure;
     try validatePath(entry.name, entry.flags);
     switch (entry.method) {
         0, 8, 9, 12, 14, 93, 95, 98 => {},
