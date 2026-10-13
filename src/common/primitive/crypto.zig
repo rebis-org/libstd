@@ -180,8 +180,9 @@ fn winzipCtrWith(comptime S: type, key: []const u8, destination: []u8, source: [
         ctx.cryptBlock(&keystream, &counter);
         const count = @min(block_length, source.len - offset);
         for (0..count) |index| destination[offset + index] = source[offset + index] ^ keystream[index];
-        // The counter is big-endian, so carrying means walking its bytes; a
-        // carry out of the low eight words can never happen inside one stream.
+        // The counter is little-endian (see the wide4 loop above), so
+        // incrementing walks bytes from index 0; a carry out of the low u64
+        // can never happen inside one stream.
         var byte_index: usize = 0;
         while (byte_index < 8) : (byte_index += 1) {
             counter[byte_index] +%= 1;
@@ -303,7 +304,7 @@ fn pbkdf2Hmac(comptime PrfOnprem: type, comptime PrfOffprem: type, provider: Pro
 pub fn constantTimeEql(first: []const u8, second: []const u8) bool {
     // No early return on length mismatch: timing depends only on the public
     // lengths, never on where the contents first differ.
-    var accumulator: u8 = @truncate(first.len ^ second.len);
+    var accumulator: usize = first.len ^ second.len;
     const common = @min(first.len, second.len);
     for (first[0..common], second[0..common]) |l, r| accumulator |= l ^ r;
     for (first[common..]) |l| accumulator |= l;
@@ -323,7 +324,12 @@ pub fn fillRandom(bytes: []u8) Failure!void {
         var filled: usize = 0;
         while (filled < bytes.len) {
             const count = std.os.linux.getrandom(bytes.ptr + filled, bytes.len - filled, 0);
-            if (@as(isize, @bitCast(count)) < 0) return error.InternalFailure;
+            if (@as(isize, @bitCast(count)) < 0) {
+                // Interrupted syscalls must retry rather than fail the whole
+                // fill; only a real error refuses.
+                if (count == @backingInt(std.posix.E.INTR)) continue;
+                return error.InternalFailure;
+            }
             if (count == 0) return error.InternalFailure;
             filled += count;
         }

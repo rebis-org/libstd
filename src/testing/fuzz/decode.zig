@@ -18,11 +18,14 @@ const bzip2 = @import("../../leaf/bzip2/onprem.zig");
 const deflate = @import("../../leaf/deflate/onprem.zig");
 const lz4 = @import("../../leaf/lz4/onprem.zig");
 const zstd = @import("../../leaf/zstd/onprem.zig");
+const corpus = @import("corpus.zig");
 
 const testing = std.testing;
 
+// Input stays small so structure-aware mutation stays cheap; the output bound
+// sizes only fuzz scratch, and 256 KiB lets wrapped-window shapes form.
 const max_input = 16 * 1024;
-const max_output = 64 * 1024;
+const max_output = 256 * 1024;
 
 fn drive(smith: *testing.Smith, comptime run: fn (data: []const u8) anyerror!void) anyerror!void {
     var input: [max_input]u8 = undefined;
@@ -42,7 +45,7 @@ test "fuzz gzip decode" {
         fn f(_: void, smith: *testing.Smith) anyerror!void {
             try drive(smith, runGzip);
         }
-    }.f, .{ .corpus = &.{} });
+    }.f, .{ .corpus = &.{corpus.gzip_empty[0..]} });
 }
 
 fn runZlib(data: []const u8) anyerror!void {
@@ -57,7 +60,7 @@ test "fuzz zlib decode" {
         fn f(_: void, smith: *testing.Smith) anyerror!void {
             try drive(smith, runZlib);
         }
-    }.f, .{ .corpus = &.{} });
+    }.f, .{ .corpus = &.{corpus.zlib_empty[0..]} });
 }
 
 fn runDeflate(data: []const u8) anyerror!void {
@@ -139,7 +142,9 @@ test "fuzz lzma alone decode" {
 fn runBzip2(data: []const u8) anyerror!void {
     var out: [max_output]u8 = undefined;
     const size = bzip2.decodeWorkspaceSizeFor(data) catch return;
-    const scratch = try testing.allocator.alloc(u8, @min(size, 1 << 20));
+    // The BZh9 workspace is ~4.7 MiB; cap fuzz scratch at 8 MiB so every
+    // block-size digit keeps its deep decode paths reachable.
+    const scratch = try testing.allocator.alloc(u8, @min(size, 8 << 20));
     defer testing.allocator.free(scratch);
     _ = bzip2.decode(data, &out, scratch, checksum.default_provider) catch {};
 }
@@ -186,7 +191,7 @@ test "fuzz zip decode" {
         fn f(_: void, smith: *testing.Smith) anyerror!void {
             try drive(smith, runZip);
         }
-    }.f, .{ .corpus = &.{} });
+    }.f, .{ .corpus = &.{corpus.zip_one_file[0..]} });
 }
 
 fn runRar(data: []const u8) anyerror!void {
@@ -235,5 +240,5 @@ test "fuzz tar decode" {
         fn f(_: void, smith: *testing.Smith) anyerror!void {
             try drive(smith, runTar);
         }
-    }.f, .{ .corpus = &.{} });
+    }.f, .{ .corpus = &.{corpus.tar_one_file[0..]} });
 }

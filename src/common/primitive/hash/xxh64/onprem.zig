@@ -2,6 +2,8 @@ const std = @import("std");
 
 const seam = @import("seam");
 
+const rotate = @import("../rotate.zig");
+
 // Cyan4973/xxHash.
 
 pub const XxHash64 = struct {
@@ -66,16 +68,8 @@ pub const XxHash64 = struct {
         self.acc4 = round(self.acc4, std.mem.readInt(u64, stripe[24..32], .little));
     }
 
-    // LLVM pattern-matches this to a single ror; std.math.rotl emitted an
-    // out-of-line call per round in the stripe loop.
-    inline fn rotl(x: u64, comptime n: std.math.Log2Int(u64)) u64 {
-        comptime std.debug.assert(n != 0);
-        const m: std.math.Log2Int(u64) = @intCast(@as(u32, 64) - n);
-        return (x << n) | (x >> m);
-    }
-
     fn round(acc: u64, lane: u64) u64 {
-        return rotl(acc +% lane *% prime_2, 31) *% prime_1;
+        return rotate.rotl(acc +% lane *% prime_2, 31) *% prime_1;
     }
 
     fn mergeAccumulator(acc: u64, other: u64) u64 {
@@ -84,8 +78,8 @@ pub const XxHash64 = struct {
 
     pub fn final(self: *Self) u64 {
         var hash: u64 = if (self.total >= 32)
-            rotl(self.acc1, 1) +% rotl(self.acc2, 7) +%
-                rotl(self.acc3, 12) +% rotl(self.acc4, 18)
+            rotate.rotl(self.acc1, 1) +% rotate.rotl(self.acc2, 7) +%
+                rotate.rotl(self.acc3, 12) +% rotate.rotl(self.acc4, 18)
         else
             self.seed +% prime_5;
         if (self.total >= 32) {
@@ -98,17 +92,17 @@ pub const XxHash64 = struct {
         var rest: []const u8 = self.buffer[0..self.buffered];
         while (rest.len >= 8) {
             hash ^= round(0, std.mem.readInt(u64, rest[0..8], .little));
-            hash = rotl(hash, 27) *% prime_1 +% prime_4;
+            hash = rotate.rotl(hash, 27) *% prime_1 +% prime_4;
             rest = rest[8..];
         }
         if (rest.len >= 4) {
             hash ^= @as(u64, std.mem.readInt(u32, rest[0..4], .little)) *% prime_1;
-            hash = rotl(hash, 23) *% prime_2 +% prime_3;
+            hash = rotate.rotl(hash, 23) *% prime_2 +% prime_3;
             rest = rest[4..];
         }
         while (rest.len != 0) {
             hash ^= @as(u64, rest[0]) *% prime_5;
-            hash = rotl(hash, 11) *% prime_1;
+            hash = rotate.rotl(hash, 11) *% prime_1;
             rest = rest[1..];
         }
         hash ^= hash >> 33;

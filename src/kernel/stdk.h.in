@@ -50,14 +50,28 @@ struct stdk_call_envelope {
 
 /* Session boundary over caller-owned storage with opaque handles and no
  * allocator, so hosts keep control of every byte. Storage sizing lives in
- * stdk_session_storage because driver state is fixed per pair. The step pump
- * reports consumed and produced counts separately so callers can stream
- * across arbitrary buffer boundaries. Destroy is idempotent so cleanup paths
- * cannot step a dead session. stdk_session_bounded exists so zip-bomb limits
- * are enforced engine-side rather than by host policing. stdk_session_failure
- * reads back the failing status and detail. stdk_session_catalog carries the
- * versioned pair list so hosts discover streamable codecs without hardcoding
- * them.
+ * stdk_session_storage because driver state is fixed per pair; the storage
+ * must be aligned to 8 bytes and remain alive for the session's lifetime.
+ * The step pump reports consumed and produced counts separately so callers
+ * can stream across buffer boundaries, but each step accepts at most
+ * 131064 input bytes (the 128 KiB pending window minus its framing slack);
+ * larger inputs must be split across steps. Input and output ranges must not
+ * overlap each other or the session storage.
+ *
+ * stdk_session_create applies generous default ceilings (16 GiB encoded,
+ * 16 GiB decoded, 4 GiB work, 1 Mi entries) so zip-bomb limits hold engine-
+ * side by default; pass explicit ceilings through stdk_session_bounded, or
+ * std.math.maxInt values to opt back into unbounded streaming.
+ *
+ * A failed create poisons the storage: every later step returns
+ * invalid_call and stdk_session_destroy reports ok. A failed step fails the
+ * session permanently; later steps return invalid_call instead of depending
+ * on driver-specific recovery. Destroy is idempotent and total: live
+ * sessions are destroyed, dead sessions report ok, and storage that was
+ * never successfully created is refused rather than dispatched through
+ * garbage. stdk_session_failure reads back the failing status and detail.
+ * stdk_session_catalog carries the versioned pair list so hosts discover
+ * streamable codecs without hardcoding them.
  */
 uint64_t stdk_session_storage(const char* component, const char* verb);
 uint32_t stdk_session_create(const char* component, const char* verb, void* storage, uint64_t storage_len);

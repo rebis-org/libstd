@@ -10,7 +10,7 @@ pub const block_length = 16;
 
 const Repr = @Vector(2, u64);
 
-const has_arm8 = builtin.target.cpu.arch == .aarch64 and
+const has_arm8 = !options.portable and builtin.target.cpu.arch == .aarch64 and
     builtin.zig_backend != .stage2_c and
     builtin.target.cpu.has(.aarch64, .aes);
 
@@ -126,12 +126,17 @@ const BlockSoft = struct {
     }
 
     pub fn decrypt(block: BlockSoft, inv_round_key: BlockSoft) BlockSoft {
+        // Mirrors the hardware round's net function exactly: InvSubBytes,
+        // InvShiftRows, InvMixColumns, then AddRoundKey. InvMixColumns
+        // commutes with the XOR up to the key transform the inverted
+        // schedule already applies, and this boundary order is what chains
+        // correctly between rounds.
         var bytes = block.toBytes();
+        invSubBytes(&bytes);
+        invShiftRows(&bytes);
         invMixColumnsBytes(&bytes);
         const key_bytes = inv_round_key.toBytes();
         addRoundKey(&bytes, &key_bytes);
-        invShiftRows(&bytes);
-        invSubBytes(&bytes);
         return fromBytes(&bytes);
     }
 

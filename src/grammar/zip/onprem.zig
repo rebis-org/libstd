@@ -5,6 +5,7 @@ const checksum = @import("../../common/primitive/checksum.zig");
 const crypto = @import("../../common/primitive/crypto.zig");
 const failure_prim = @import("../../common/primitive/failure.zig");
 const io = @import("../../common/primitive/io.zig");
+const limits_prim = @import("../../common/primitive/limits.zig");
 const measurement = @import("../../common/primitive/measurement.zig");
 const xz = @import("../../grammar/xz/onprem.zig");
 const bzip2 = @import("../../leaf/bzip2/onprem.zig");
@@ -18,6 +19,7 @@ const zstd = @import("../../leaf/zstd/onprem.zig");
 const winzip_aes_hmac_length = crypto.winzip_hmac_length;
 const winzip_aes_verify_length = crypto.winzip_verify_length;
 const Failure = failure_prim.Failure;
+const Limits = limits_prim.Limits;
 pub const deflate64_decode_history_size = deflate.deflate64_decode_history_size;
 pub const deflate64_history_size = deflate.deflate64_history_size;
 pub const deflate_history_size = deflate.history_size;
@@ -352,6 +354,8 @@ fn writeCentralZip64(sink: *io.Sink, compressed: usize, uncompressed: usize, loc
 
 fn validatePath(name: []const u8, flags: u16) Failure!void {
     if (bounds.isAbsoluteOrTraversal(name) or (name.len >= 2 and std.ascii.isAlphabetic(name[0]) and name[1] == ':')) return error.DataFailure;
+    // An embedded NUL would truncate the name for any C-string consumer.
+    if (std.mem.findScalar(u8, name, 0) != null) return error.DataFailure;
     if (flags & 0x0800 != 0 and !std.unicode.utf8ValidateSlice(name)) return error.DataFailure;
 }
 
@@ -575,7 +579,12 @@ pub const ZipDecodeOptions = struct {
 };
 
 pub fn zipInspectCount(archive: []const u8) Failure!usize {
+    return zipInspectCountEx(archive, .{});
+}
+
+pub fn zipInspectCountEx(archive: []const u8, limits: Limits) Failure!usize {
     const directory = try zipDirectory(archive);
+    if (directory.count > limits.entries) return error.ResourceFailure;
     var cursor = directory.offset;
     var index: usize = 0;
     while (index < directory.count) : (index += 1) _ = try zipNext(archive, directory, &cursor, index);
@@ -584,7 +593,12 @@ pub fn zipInspectCount(archive: []const u8) Failure!usize {
 }
 
 pub fn zipInspectOrdinal(archive: []const u8, ordinal: usize) Failure!Info {
+    return zipInspectOrdinalEx(archive, ordinal, .{});
+}
+
+pub fn zipInspectOrdinalEx(archive: []const u8, ordinal: usize, limits: Limits) Failure!Info {
     const directory = try zipDirectory(archive);
+    if (directory.count > limits.entries) return error.ResourceFailure;
     if (ordinal >= directory.count) return error.DataFailure;
     var cursor = directory.offset;
     var index: usize = 0;
@@ -802,6 +816,9 @@ fn zipZstdWindow(compressed: []const u8) Failure!u32 {
             if (compressed.len < 6) return error.DataFailure;
             const window_descriptor = compressed[5];
             const window_log: u32 = 10 + (window_descriptor >> 3);
+            // RFC 8878 caps windowLog at 31; larger values also exceed the u5
+            // shift range, which is UB in release-fast.
+            if (window_log > 31) return error.DataFailure;
             const window_base: u32 = @as(u32, 1) << @intCast(window_log);
             const window_add = (window_base / 8) * (window_descriptor & 0x07);
             return window_base + window_add;

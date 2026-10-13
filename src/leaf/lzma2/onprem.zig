@@ -7,7 +7,7 @@ const lzma = @import("../lzma/onprem.zig");
 
 const Failure = failure_prim.Failure;
 
-pub const chunk_max_unpacked: usize = 1 << 20;
+pub const chunk_max_unpacked: usize = 1 << 21;
 const chunk_min_unpacked: usize = 4 * 1024;
 
 pub fn defaultProperties(dictionary_size: u32) lzma.Properties {
@@ -172,7 +172,7 @@ fn decodeStreamImpl(reader: *std.Io.Reader, writer: ?*std.Io.Writer, output: []u
                 const copy_read = reader.readVec(&copy_iovecs) catch return error.IoFailure;
                 if (copy_read != batch) return error.IoFailure;
                 if (writer) |sink| try io.writeBytes(sink, copy_staging[0..batch]);
-                for (copy_staging[0..batch]) |byte| decoder.feedByte(byte);
+                for (copy_staging[0..batch]) |byte| try decoder.feedByte(byte);
                 remaining -= batch;
             }
         }
@@ -193,7 +193,9 @@ fn readCopyUnpackSize(reader: *std.Io.Reader) Failure!usize {
 }
 
 fn readLzmaUnpackSize(reader: *std.Io.Reader, control: u8) Failure!usize {
-    const high = @as(usize, control & 0x0F) << 16;
+    // Five control bits carry the size high bits, matching the SDK; four
+    // bits would cap chunks at 1 MiB and reject SDK-produced 1..2 MiB blocks.
+    const high = @as(usize, control & 0x1F) << 16;
     const mid = try io.readByte(reader);
     const low = try io.readByte(reader);
     return (high | (@as(usize, mid) << 8) | low) + 1;
@@ -230,7 +232,7 @@ fn scanDecodedSize(input: []const u8) Failure!?usize {
         }
         if (control & 0x80 != 0) {
             if (pos + 2 > input.len) return error.DataFailure;
-            const unpack_size = (((@as(usize, control & 0x0F) << 16) | (@as(usize, input[pos]) << 8) | input[pos + 1]) + 1);
+            const unpack_size = (((@as(usize, control & 0x1F) << 16) | (@as(usize, input[pos]) << 8) | input[pos + 1]) + 1);
             pos += 2;
             if (pos + 2 > input.len) return error.DataFailure;
             const pack_size = ((@as(usize, input[pos]) << 8) | input[pos + 1]) + 1;
@@ -348,7 +350,7 @@ fn encodeStreamInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, o
                 const raw_pack_size = packed_len - 1;
                 const control_base: u8 = if (is_first_chunk) control_lzma_new_props_reset_dict else if (send_props) control_lzma_new_props else control_lzma;
                 const control: u8 = control_base |
-                    @as(u8, @intCast((raw_unpack_size >> 16) & 0x0F));
+                    @as(u8, @intCast((raw_unpack_size >> 16) & 0x1F));
                 try io.writeByte(writer, control);
                 try io.writeByte(writer, @intCast((raw_unpack_size >> 8) & 0xFF));
                 try io.writeByte(writer, @intCast(raw_unpack_size & 0xFF));
