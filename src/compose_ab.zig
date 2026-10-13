@@ -6,10 +6,19 @@ const drivers = @import("compose/drivers.zig");
 const sessions = @import("compose/sessions.zig");
 const gzip = @import("grammar/gzip/onprem.zig");
 
+// A performance claim is fatal only at three or more runs.
+// Five rounds keeps a single preemption from deciding this one.
+const throughput_rounds: usize = 5;
+
 // Both paths run the same leaf code, so outputs and step counts must match. Input is
 // non-periodic xorshift because repeating corpora hide composition bugs.
 // Rooted at src/: module confinement requires it for mains reaching the whole tree.
 var failures: usize = 0;
+
+fn nowNs(io: std.Io) u64 {
+    const timestamp = std.Io.Clock.Timestamp.now(io, .awake);
+    return @intCast(timestamp.raw.toNanoseconds());
+}
 
 fn check(ok: bool, label: []const u8) void {
     if (ok) {
@@ -120,15 +129,23 @@ pub fn main(init: std.process.Init) !void {
     const corpus = try makeCorpus(allocator, 1 << 20);
     const compressed = try encodeCorpus(allocator, corpus);
 
-    // Same leaf code cannot diverge far, so bypass must stay within 2x of kernel.
-    const kernel_start = std.Io.Clock.Timestamp.now(init.io, .awake).raw.nanoseconds;
+    // The same leaf decodes on both paths, so neither drifts far from the other.
+    // The two decodes the checks need warm both arms; each timed round then
+    // brackets them and keeps the fastest round each.
     const kernel = try decodeKernel(allocator, compressed, .{}, false);
-    const kernel_end = std.Io.Clock.Timestamp.now(init.io, .awake).raw.nanoseconds;
-    const bypass_start = kernel_end;
     const bypass = try decodeBypass(allocator, compressed);
-    const bypass_end = std.Io.Clock.Timestamp.now(init.io, .awake).raw.nanoseconds;
-    const kernel_mibps = @as(f64, @floatFromInt(corpus.len)) / @as(f64, @floatFromInt(kernel_end - kernel_start)) * 1e3;
-    const bypass_mibps = @as(f64, @floatFromInt(corpus.len)) / @as(f64, @floatFromInt(bypass_end - bypass_start)) * 1e3;
+    var kernel_ns: u64 = std.math.maxInt(u64);
+    var bypass_ns: u64 = std.math.maxInt(u64);
+    for (0..throughput_rounds) |_| {
+        const kernel_start = nowNs(init.io);
+        _ = try decodeKernel(allocator, compressed, .{}, false);
+        kernel_ns = @min(kernel_ns, nowNs(init.io) - kernel_start);
+        const bypass_start = nowNs(init.io);
+        _ = try decodeBypass(allocator, compressed);
+        bypass_ns = @min(bypass_ns, nowNs(init.io) - bypass_start);
+    }
+    const kernel_mibps = @as(f64, @floatFromInt(corpus.len)) / @as(f64, @floatFromInt(kernel_ns)) * 1e3;
+    const bypass_mibps = @as(f64, @floatFromInt(corpus.len)) / @as(f64, @floatFromInt(bypass_ns)) * 1e3;
     std.debug.print("Bypass row: kernel {d:.1} MiB/s, bypass {d:.1} MiB/s.\n", .{ kernel_mibps, bypass_mibps });
     check(bypass_mibps >= kernel_mibps * 0.5, "Bypass throughput stays within 2x of the kernel path");
     check(kernel != null and bypass.steps == kernel.?.steps, "Kernel and bypass step counts match");
