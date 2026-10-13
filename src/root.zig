@@ -1,14 +1,9 @@
-const builtin = @import("builtin");
 const std = @import("std");
+
+const diagnostic = @import("interface").diagnostic;
 
 const invoke = @import("compose/call.zig").invoke;
 const Call = @import("kernel/envelope.zig").Call;
-
-// Zig provides no libc for the android and ohos ABIs, so naming std.c fails there.
-const has_libc: bool = switch (builtin.target.abi) {
-    .android, .androideabi, .ohos, .ohoseabi => false,
-    else => true,
-};
 
 // Keep panics off std.debug's default handler: its debug_io instantiates
 // std.Io.Threaded, which fails to compile for the Apple embedded targets.
@@ -17,10 +12,9 @@ const has_libc: bool = switch (builtin.target.abi) {
 pub const panic = std.debug.FullPanic(struct {
     fn panicFn(msg: []const u8, first_trace_addr: ?usize) noreturn {
         _ = first_trace_addr;
-        if (comptime has_libc) {
-            // Raw write keeps std.debug's debug_io, and its std.Io.Threaded, out.
-            _ = std.c.write(2, msg.ptr, msg.len);
-            _ = std.c.write(2, "\n", 1);
+        if (comptime diagnostic.has_libc) {
+            diagnostic.writeStderr(msg);
+            diagnostic.writeStderr("\n");
             std.c.abort();
         }
         // No libc to name: the contract violation still traps, without a message.

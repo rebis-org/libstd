@@ -1,5 +1,7 @@
 const std = @import("std");
 
+const diagnostic = @import("diagnostic.zig");
+
 // The interface module cannot import the primitive failure set, and it never
 // needs to: a span crossing only answers these two. Naming the exact set keeps
 // the substrate vocabulary from becoming a second, divergent one.
@@ -14,7 +16,7 @@ pub fn trap(violation: Violation, context: []const u8) noreturn {
     var message_storage: [128]u8 = undefined;
     var message_writer: std.Io.Writer = std.Io.Writer.fixed(&message_storage);
     const message = if (message_writer.print("interface trap: {s}: {s}\n", .{ @tagName(violation), context })) |_| message_writer.buffered() else |_| "interface trap.\n";
-    std.debug.print("{s}", .{message});
+    diagnostic.writeStderr(message);
     std.posix.raise(std.posix.SIG.TRAP) catch {};
     unreachable;
 }
