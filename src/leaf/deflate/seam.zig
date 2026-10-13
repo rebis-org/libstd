@@ -49,11 +49,17 @@ const Mergeable = union(Provider) {
         };
     }
 
-    pub fn initSliceBound(provider: Provider, data: []const u8, history: []u8) error{UnsupportedFailure}!@This() {
-        return switch (provider) {
-            .onprem => .{ .onprem = onprem.Decompress.initSlice(data, history) },
-            .offprem => .{ .offprem = offprem.Decompress.initSlice(data, history) },
-        };
+    pub fn initSliceBoundInPlace(self: *@This(), provider: Provider, data: []const u8, history: []u8) error{UnsupportedFailure}!void {
+        switch (provider) {
+            .onprem => {
+                self.* = .{ .onprem = undefined };
+                self.onprem.initSliceInPlace(data, history);
+            },
+            .offprem => {
+                self.* = .{ .offprem = undefined };
+                try self.offprem.initSliceBoundInPlace(provider, data, history);
+            },
+        }
     }
 
     pub fn inputBitsConsumed(self: *const @This()) usize {
@@ -103,6 +109,14 @@ const Mergeable = union(Provider) {
         return switch (self.*) {
             .onprem => |*inner| inner.readerPtr(),
             .offprem => |*inner| inner.readerPtr(),
+        };
+    }
+
+    // Each arm owns how its decoded bytes reach a writer, so this dispatches once.
+    pub fn streamTo(self: *@This(), writer: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        return switch (self.*) {
+            .onprem => |*inner| inner.streamTo(writer, limit),
+            .offprem => |*inner| inner.streamTo(writer, limit),
         };
     }
 };

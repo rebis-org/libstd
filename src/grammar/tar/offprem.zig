@@ -81,7 +81,8 @@ fn encodeTo(entries: []const Entry, writer: *std.Io.Writer) Failure!void {
         if (entry.link_name.len > 100) return error.UnsupportedFailure;
         const options: std_tar.Writer.Options = .{ .mode = entry.mode, .mtime = entry.modification_time };
         switch (entry.typeflag) {
-            onprem.typeflag_regular => tar_writer.writeFileBytes(entry.name, entry.data, options) catch |err| return mapError(err),
+            // The boundary sends a bare zero where the onprem arm reads a regular file.
+            0, onprem.typeflag_regular, '7' => tar_writer.writeFileBytes(entry.name, entry.data, options) catch |err| return mapError(err),
             '5' => tar_writer.writeDir(entry.name, options) catch |err| return mapError(err),
             '2' => tar_writer.writeLink(entry.name, entry.link_name, options) catch |err| return mapError(err),
             else => return error.UnsupportedFailure,

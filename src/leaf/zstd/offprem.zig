@@ -15,11 +15,11 @@ fn mapStreamError(err: std.Io.Reader.StreamError) onprem.DecodeError {
     };
 }
 
-// A fixed writer reports the same WriteFailed when the caller's span fills, and
-// there the cause is capacity, so it answers as a capacity shortfall.
+// The caller's span filling reports the same WriteFailed; the onprem arm
+// answers ResourceFailure, and the arms must agree.
 fn mapFixedStreamError(err: std.Io.Reader.StreamError) onprem.DecodeError {
     return switch (err) {
-        error.WriteFailed => error.CapacityFailure,
+        error.WriteFailed => error.ResourceFailure,
         error.ReadFailed, error.EndOfStream => error.DataFailure,
     };
 }
