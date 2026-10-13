@@ -107,6 +107,6 @@ pub const XxHash32 = struct {
     }
 };
 
-test "xxh32 onprem matches the std oracle" {
+test "xxh32 onprem matches the stdlib oracle" {
     try seam.expectAgreement(XxHash32.init(0), std.hash.XxHash32.init(0), 0x3232, false, null);
 }

@@ -6,12 +6,12 @@ const onprem = @import("onprem.zig");
 const std_lzma2 = std.compress.lzma2;
 pub const Failure = failure.Failure;
 pub const InPlaceResult = onprem.InPlaceResult;
-// std lzma2's AccumBuffer grows with the decoded size; a stream that
+// stdlib lzma2's AccumBuffer grows with the decoded size; a stream that
 // outgrows the scratch answers CapacityFailure — the accepted incompleteness.
 // Encode resolves to onprem under any tag.
 pub const Options = onprem.Options;
 
-// The scratch the arm asks for: std's probability tables plus the
+// The scratch the arm asks for: stdlib's probability tables plus the
 // AccumBuffer's start. The buffer grows with the decoded stream until the
 // scratch ends; callers that cannot size for a stream pick onprem.
 pub fn scratchNeed(dictionary_size: u32) usize {
@@ -47,7 +47,7 @@ pub fn decodeInPlace(input: []const u8, output: []u8, scratch: []u8) Failure!InP
 }
 
 // decodeStream stages through the scratch: the caller's writer shape has
-// no std Allocating equivalent. Streams that do not fit the scratch answer
+// no stdlib Allocating equivalent. Streams that do not fit the scratch answer
 // insufficient_capacity.
 pub fn decodeStream(reader: *std.Io.Reader, writer: *std.Io.Writer, scratch: []u8) Failure!void {
     var fba = std.heap.FixedBufferAllocator.init(scratch);

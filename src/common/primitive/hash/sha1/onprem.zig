@@ -49,6 +49,6 @@ fn compressSha1(state: *align(16) [5]u32, block: *const [64]u8) void {
     state[4] +%= e;
 }
 
-test "sha1 onprem matches the std oracle" {
+test "sha1 onprem matches the stdlib oracle" {
     try seam.expectAgreement(Sha1.init(.{}), std.crypto.hash.Sha1.init(.{}), 0x5A1, true, null);
 }
