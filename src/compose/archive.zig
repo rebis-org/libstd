@@ -170,6 +170,15 @@ fn parseCryptoParams(comptime component: []const u8, request: ?*Node, failure_ca
     };
 }
 
+// Structured inspect projection, phase one: the entry_size selector (family
+// 2, ordinal 4) with an explicit ordinal asks for the entry's uncompressed
+// size without decoding its data. Returns null when the selector is absent.
+fn projectedEntrySize(request: ?*Node) Failure!?u64 {
+    if (node_graph.findSelector(request, comptime discovery.parameter("rar", "entry_size").family, comptime discovery.parameter("rar", "entry_size").ordinal) == null) return null;
+    const ordinal_node = node_graph.findSelector(request, comptime discovery.parameter("rar", "ordinal").family, comptime discovery.parameter("rar", "ordinal").ordinal) orelse return error.CallFailure;
+    return node_graph.parseU64(ordinal_node);
+}
+
 pub fn tarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
     _ = sizing;
     const source_resource = source orelse return error.CallFailure;
@@ -177,6 +186,11 @@ pub fn tarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
     if (command_mask == vocabulary.command_mask_read) {
         if (sink == null) {
             const archive = try materializeArchive(source_resource, &workspace, limits);
+            if (try projectedEntrySize(call.request)) |ordinal| {
+                const entry = try tar_seam.inspectOrdinal(plan.provider, archive, ordinal);
+                response.byte_length = entry.size;
+                return;
+            }
             const count = try tar_seam.inspectCount(plan.provider, archive);
             response.byte_length = count;
             return;
@@ -243,6 +257,11 @@ pub fn zipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
     if (command_mask == vocabulary.command_mask_read) {
         if (sink == null) {
             const archive = try materializeArchive(source_resource, &workspace, limits);
+            if (try projectedEntrySize(call.request)) |ordinal| {
+                const entry = try zip.zipInspectOrdinalEx(archive, std.math.cast(usize, ordinal) orelse return error.CallFailure, limits);
+                response.byte_length = entry.uncompressed_size;
+                return;
+            }
             const count = try zip.zipInspectCountEx(archive, limits);
             response.byte_length = count;
             return;
@@ -367,6 +386,14 @@ fn sevenZipGeneric(comptime coded: bool, plan: *common.ExecutionPlan, source: ?*
         if (sink == null) {
             try common.checkSourceWorkspaceOverlap(call, source_resource);
             const archive = try common.materializeSource(.replay, source_resource, &workspace, limits.encoded_bytes);
+            if (try projectedEntrySize(call.request)) |ordinal| {
+                const entry = seven_zip.sevenZipInspectOrdinalEx(archive, &workspace, limits, ordinal, &load_options) catch |err| {
+                    writeCryptoFailure(call, crypto_cause);
+                    return err;
+                };
+                response.byte_length = entry.size;
+                return;
+            }
             const count = seven_zip.sevenZipInspectCountEx(archive, &workspace, limits, &load_options) catch |err| {
                 writeCryptoFailure(call, crypto_cause);
                 return err;
@@ -553,14 +580,23 @@ pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
             const archive = try materializeArchive(source_resource, &workspace, limits);
             // Archives with encrypted headers (-hp) need decrypted-header staging, capped by the archive size.
             const header_scratch = if (decrypting) try workspace.take(u8, @min(@as(usize, rar_header_scratch_size), archive.len + 16)) else try workspace.take(u8, 0);
-            const count = rar.rarInspectCountOpts(archive, limits.entries, .{
+            const inspect_opts: rar.DecodeOptions = .{
                 .password = cryptoPassword(crypto_params),
                 .scratch = header_scratch,
                 .kdf_rounds_limit = cryptoKdfLimit(crypto_params),
                 .password_lifetime = cryptoLifetime(crypto_params),
                 .failure_cause = &failure_cause,
                 .provider = plan.provider,
-            }) catch |err| {
+            };
+            if (try projectedEntrySize(call.request)) |ordinal| {
+                const entry = rar.rarInspectOrdinalOpts(archive, ordinal, limits.entries, inspect_opts) catch |err| {
+                    writeCryptoFailure(call, failure_cause);
+                    return err;
+                };
+                response.byte_length = entry.size;
+                return;
+            }
+            const count = rar.rarInspectCountOpts(archive, limits.entries, inspect_opts) catch |err| {
                 writeCryptoFailure(call, failure_cause);
                 return err;
             };
