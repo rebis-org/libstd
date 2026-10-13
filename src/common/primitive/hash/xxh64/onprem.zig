@@ -120,6 +120,6 @@ pub const XxHash64 = struct {
     }
 };
 
-test "xxh64 onprem matches the std oracle" {
+test "xxh64 onprem matches the stdlib oracle" {
     try seam.expectAgreement(XxHash64.init(0), std.hash.XxHash64.init(0), 0x6464, false, null);
 }

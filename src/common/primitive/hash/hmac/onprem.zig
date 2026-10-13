@@ -53,7 +53,7 @@ pub fn Hmac(comptime H: type) type {
     };
 }
 
-test "hmac onprem matches the std oracle" {
+test "hmac onprem matches the stdlib oracle" {
     const sha256 = @import("../sha256/seam.zig");
     const sha1 = @import("../sha1/seam.zig");
     var rng = std.Random.DefaultPrng.init(0x484D4143);

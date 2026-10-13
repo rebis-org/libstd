@@ -217,6 +217,6 @@ test "sha256 hw matches the scalar path" {
         try checkHwScalar(&rng, Hw, Sw, big);
     }
 }
-test "sha256 onprem matches the std oracle" {
+test "sha256 onprem matches the stdlib oracle" {
     try seam.expectAgreement(Sha256.init(.{}), std.crypto.hash.sha2.Sha256.init(.{}), 0x5A256, true, null);
 }

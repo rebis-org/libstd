@@ -2,7 +2,7 @@ const std = @import("std");
 
 const build_options = @import("options");
 // One dispatch per call, never per chunk or symbol; see offprem.zig for the
-// incompleteness choosing std accepts.
+// incompleteness choosing stdlib accepts.
 pub const Provider = @import("seam").Provider;
 
 const offprem = @import("offprem.zig");

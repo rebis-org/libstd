@@ -4,7 +4,7 @@ const onprem = @import("onprem.zig");
 pub const Failure = @import("../../common/primitive/failure.zig").Failure;
 
 const std_tar = std.tar;
-// std's Iterator.File lacks mtime/uid/gid/typeflag, so inspectOrdinal stays
+// stdlib's Iterator.File lacks mtime/uid/gid/typeflag, so inspectOrdinal stays
 // onprem; encode serves only what std.tar.Writer carries faithfully.
 pub const Entry = onprem.Entry;
 pub const EntryInfo = onprem.EntryInfo;
@@ -21,7 +21,7 @@ fn mapError(err: anyerror) Failure {
 
 // std.tar.Iterator borrows caller-owned name buffers (its Options demand
 // them); the decode surface takes no scratch, so the fs path cap on the
-// stack is the documented shape, matching std's own expectation.
+// stack is the documented shape, matching stdlib's own expectation.
 pub fn inspectCount(archive: []const u8) Failure!u64 {
     var reader = std.Io.Reader.fixed(archive);
     var name_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;

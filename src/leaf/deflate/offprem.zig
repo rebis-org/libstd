@@ -1,11 +1,11 @@
 const std = @import("std");
 
-// Decode-only: std's compressor cannot express this leaf's option surface,
+// Decode-only: stdlib's compressor cannot express this leaf's option surface,
 // so an offprem encode tag fails unsupported instead of falling back.
 
 pub const Decompress = struct {
     inner: std.compress.flate.Decompress,
-    // Owns the fixed reader slice constructions bind std flate to: a
+    // Owns the fixed reader slice constructions bind stdlib flate to: a
     // constructor-local reader would dangle the moment init returned.
     fixed_input: std.Io.Reader,
     slice_bound: bool,
@@ -52,7 +52,7 @@ pub const Decompress = struct {
     }
 
     // Session-driver surface: same pokes the onprem arm exposes,
-    // over the fixed reader std flate keeps its input in.
+    // over the fixed reader stdlib flate keeps its input in.
     pub fn streamPosition(self: *const @This()) usize {
         return self.inner.input.seek;
     }
@@ -80,7 +80,7 @@ pub const Decompress = struct {
         return &self.inner.reader;
     }
 
-    // std's stream entry ignores the writer and decodes into the history buffer instead.
+    // stdlib's stream entry ignores the writer and decodes into the history buffer instead.
     pub fn streamTo(self: *@This(), writer: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
         const reader = &self.inner.reader;
         var produced: usize = 0;
