@@ -39,6 +39,9 @@ pub fn inspect(input: []const u8) Failure!Header {
     const cmf = input[0];
     const flg = input[1];
     if (cmf & 0x0f != cm_deflate) return error.UnsupportedFailure;
+    // CINFO above 7 names a window larger than this decoder supports; refusing
+    // here keeps inspect and decode symmetric instead of diverging downstream.
+    if (cmf >> 4 > cinfo_max) return error.UnsupportedFailure;
     if ((@as(u32, cmf) << 8 | flg) % 31 != 0) return error.DataFailure;
     return .{
         .window_size = @as(u32, 1) << @intCast((cmf >> 4) + 8),

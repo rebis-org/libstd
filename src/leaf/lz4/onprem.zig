@@ -113,7 +113,7 @@ pub fn frameContentSize(input: []const u8) Failure!?u64 {
 
 pub fn decodedSize(input: []const u8, scratch: []u8, options: Options) Failure!usize {
     var counter = measurement.Counter.init(null);
-    return try decodeBlocks(input, &counter.writer, scratch, options.provider);
+    return try decodeBlocks(input, &counter.writer, scratch, options.provider, options.max_work);
 }
 
 pub fn requiredSize(input: []const u8, scratch: []u8, options: Options) Failure!usize {
@@ -194,6 +194,9 @@ fn decodeBlocksInto(input: []const u8, output: []u8, options: Options) Failure!u
             content_hasher.update(block_data);
             total += block_len;
         } else {
+            // The Block_Size field is bounded by Block_MaxSize whether the
+            // block is stored or compressed, as in the reference.
+            if (block_len > max_block) return error.DataFailure;
             const produced = decompressBlock(block_data, output[total..], prefix) catch |err| return switch (err) {
                 error.DataFailure => error.DataFailure,
                 error.OutputTooSmall => error.CapacityFailure,
@@ -201,7 +204,7 @@ fn decodeBlocksInto(input: []const u8, output: []u8, options: Options) Failure!u
             content_hasher.update(output[total .. total + produced]);
             total += produced;
         }
-        if (input.len + total > options.max_work) return error.ResourceFailure;
+        if (try bounds.addUsize(input.len, total) > options.max_work) return error.ResourceFailure;
     }
     if (flags & flag_content_checksum != 0) {
         if (input.len < offset + 4) return error.DataFailure;
@@ -268,10 +271,10 @@ pub fn encodeToWriter(input: []const u8, output: *std.Io.Writer, scratch: []u8, 
 }
 
 pub fn decodeToWriter(input: []const u8, output: *std.Io.Writer, scratch: []u8, options: Options) Failure!void {
-    _ = try decodeBlocks(input, output, scratch, options.provider);
+    _ = try decodeBlocks(input, output, scratch, options.provider, options.max_work);
 }
 
-fn decodeBlocks(input: []const u8, output: *std.Io.Writer, scratch: []u8, provider: checksum.Provider) Failure!usize {
+fn decodeBlocks(input: []const u8, output: *std.Io.Writer, scratch: []u8, provider: checksum.Provider, max_work: u64) Failure!usize {
     if (scratch.len < decodeWorkspaceSize()) return error.CapacityFailure;
     if (input.len < 7) return error.DataFailure;
     if (std.mem.readInt(u32, input[0..4], .little) != magic) return error.DataFailure;
@@ -326,12 +329,16 @@ fn decodeBlocks(input: []const u8, output: *std.Io.Writer, scratch: []u8, provid
                 content_hasher.update(block_data);
                 break :blk block_len;
             }
+            // The Block_Size field is bounded by Block_MaxSize whether the
+            // block is stored or compressed, as in the reference.
+            if (block_len > max_block) return error.DataFailure;
             const decoded = decompressBlock(block_data, block_buffer, history[0..history_len]) catch return error.DataFailure;
             output.writeAll(block_buffer[0..decoded]) catch return error.IoFailure;
             content_hasher.update(block_buffer[0..decoded]);
             break :blk decoded;
         };
         total = try bounds.addUsize(total, produced);
+        if (try bounds.addUsize(input.len, total) > max_work) return error.ResourceFailure;
         if (linked) {
             const produced_bytes = if (is_stored) block_data else block_buffer[0..produced];
             if (produced_bytes.len >= window_size) {

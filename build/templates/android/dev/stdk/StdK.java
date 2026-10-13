@@ -2,7 +2,9 @@ package dev.stdk;
 
 /**
  * Raw JNI bindings for the libstd C session boundary. The native library is {@code libstd.so}
- * inside the AAR, loaded once on class init.
+ * inside the AAR, loaded once on class init. Every entry point validates its arguments before
+ * touching native memory: negative lengths, lengths past the array extent, and undersized count
+ * arrays throw {@link IllegalArgumentException} instead of faulting in JNI.
  */
 public final class StdK {
     public static final int ABI_EPOCH = 8;
@@ -38,8 +40,37 @@ public final class StdK {
             long maxWork,
             long maxEntries);
 
-    // counts carries consumed, produced, and state (0 open, 1 done) in that order.
-    public static native int sessionStep(
+    /**
+     * Runs one step. {@code counts} must hold at least 3 elements and receives consumed, produced,
+     * and state (0 open, 1 done, -1 failed). {@code inputLen} and {@code outputLen} must be
+     * non-negative and no larger than their arrays.
+     */
+    public static int sessionStep(
+            long session,
+            byte[] input,
+            int inputLen,
+            byte[] output,
+            int outputLen,
+            boolean endOfInput,
+            long[] counts) {
+        requireHandle(session, "session");
+        if (inputLen < 0
+                || (input == null && inputLen != 0)
+                || (input != null && inputLen > input.length)) {
+            throw new IllegalArgumentException("inputLen out of range");
+        }
+        if (outputLen < 0
+                || (output == null && outputLen != 0)
+                || (output != null && outputLen > output.length)) {
+            throw new IllegalArgumentException("outputLen out of range");
+        }
+        if (counts == null || counts.length < 3) {
+            throw new IllegalArgumentException("counts must hold 3 elements");
+        }
+        return nativeSessionStep(session, input, inputLen, output, outputLen, endOfInput, counts);
+    }
+
+    private static native int nativeSessionStep(
             long session,
             byte[] input,
             int inputLen,
@@ -48,11 +79,46 @@ public final class StdK {
             boolean endOfInput,
             long[] counts);
 
-    public static native int sessionFailure(long session, long[] statusAndDetail);
+    public static int sessionFailure(long session, long[] statusAndDetail) {
+        requireHandle(session, "session");
+        if (statusAndDetail == null || statusAndDetail.length < 2) {
+            throw new IllegalArgumentException("statusAndDetail must hold 2 elements");
+        }
+        return nativeSessionFailure(session, statusAndDetail);
+    }
 
-    public static native int sessionDestroy(long session);
+    private static native int nativeSessionFailure(long session, long[] statusAndDetail);
 
-    public static native void sessionFree(long storage);
+    /**
+     * Destroys a live session. The handle stays owned by the caller; pair every non-zero handle
+     * from {@link #sessionCreate} with exactly one destroy, then release its storage with {@link
+     * #sessionFree}.
+     */
+    public static int sessionDestroy(long session) {
+        requireHandle(session, "session");
+        return nativeSessionDestroy(session);
+    }
+
+    private static native int nativeSessionDestroy(long session);
+
+    /**
+     * Releases storage previously returned by {@link #sessionCreate}. Passing any pointer not
+     * returned by sessionCreate, or double-freeing, corrupts the heap.
+     */
+    public static void sessionFree(long storage) {
+        if (storage == 0) {
+            return;
+        }
+        nativeSessionFree(storage);
+    }
+
+    private static native void nativeSessionFree(long storage);
 
     public static native String sessionCatalog();
+
+    private static void requireHandle(long handle, String what) {
+        if (handle == 0) {
+            throw new IllegalArgumentException(what + " must be non-zero");
+        }
+    }
 }

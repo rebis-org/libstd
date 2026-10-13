@@ -243,7 +243,7 @@ pub fn zipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
     if (command_mask == vocabulary.command_mask_read) {
         if (sink == null) {
             const archive = try materializeArchive(source_resource, &workspace, limits);
-            const count = try zip.zipInspectCount(archive);
+            const count = try zip.zipInspectCountEx(archive, limits);
             response.byte_length = count;
             return;
         }
@@ -251,7 +251,7 @@ pub fn zipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
         const sink_resource = head.sink;
         const ordinal = head.ordinal;
         const archive = try materializeArchive(source_resource, &workspace, limits);
-        const entry = try zip.zipInspectOrdinal(archive, ordinal);
+        const entry = try zip.zipInspectOrdinalEx(archive, ordinal, limits);
         const history = try workspace.take(u8, if (entry.actual_method == 9) zip.deflate64_decode_history_size else zip.deflate_history_size);
         const size = entry.uncompressed_size;
         if (size > limits.decoded_bytes) return error.ResourceFailure;

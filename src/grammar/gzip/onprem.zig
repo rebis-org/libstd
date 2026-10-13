@@ -57,7 +57,7 @@ pub fn decodedSize(input: []const u8, history: []u8, provider: checksum.Provider
 
 pub const SinglePass = union(enum) {
     decoded: usize,
-    fallback: void,
+    fallback: usize,
 };
 
 const Member = struct {
@@ -98,21 +98,25 @@ fn readMember(input: []const u8, at: usize, history: []u8, output: *std.Io.Write
 }
 
 // ISIZE only seeds the attempt; commit needs exact count, CRC32, and trailer.
-// Mismatch defers to the two-pass route.
+// Mismatch defers to the two-pass route. A fallback carries the byte count
+// already written, so the caller can erase the tentative prefix.
 pub fn decodeSinglePass(input: []const u8, output: []u8, history: []u8, provider: checksum.Provider) Failure!SinglePass {
     if (history.len < deflate_history_size) return error.CapacityFailure;
-    if (input.len >= std.math.maxInt(u32)) return .fallback;
-    if (input.len < minimum_member_len) return .fallback;
+    if (input.len >= std.math.maxInt(u32)) return .{ .fallback = 0 };
+    if (input.len < minimum_member_len) return .{ .fallback = 0 };
     const claimed_size = std.mem.readInt(u32, input[input.len - 4 ..][0..4], .little);
-    if (output.len < claimed_size) return .fallback;
+    if (output.len < claimed_size) return .{ .fallback = 0 };
     var sink_writer = std.Io.Writer.fixed(output);
-    const member = readMember(input, 0, history, &sink_writer, provider) catch return .fallback;
-    if (member.total() != input.len) return .fallback;
+    const member = readMember(input, 0, history, &sink_writer, provider) catch return .{ .fallback = sink_writer.end };
+    if (member.total() != input.len) return .{ .fallback = sink_writer.end };
     return .{ .decoded = member.decoded_size };
 }
 
 pub fn decode(input: []const u8, output: *std.Io.Writer, history: []u8, provider: checksum.Provider) Failure!usize {
     if (history.len < deflate_history_size) return error.CapacityFailure;
+    // An empty byte string is not a gzip stream; accepting it would let
+    // non-archive empty files pass as valid zero-member decodes.
+    if (input.len == 0) return error.DataFailure;
     var total: usize = 0;
     var at: usize = 0;
     while (at < input.len) {

@@ -12,6 +12,8 @@ pub const Limits = struct {
         return .{
             .encoded_bytes = ceiling,
             .decoded_bytes = ceiling,
+            .entries = ceiling,
+            .metadata_records = ceiling,
             .codec_work = ceiling,
         };
     }

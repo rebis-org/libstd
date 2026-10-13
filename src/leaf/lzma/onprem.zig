@@ -26,6 +26,9 @@ pub const Properties = struct {
         const packed_pb_lp = properties_byte / 9;
         const pb: u4 = @intCast(packed_pb_lp / 5);
         const lp: u4 = @intCast(packed_pb_lp % 5);
+        // The SDK constraint, enforced at the leaf so direct leaf users are
+        // covered too: larger lc+lp would overflow the probability tables.
+        if (lc + lp > 4) return error.UnsupportedFailure;
         return .{
             .lc = lc,
             .lp = lp,
@@ -79,6 +82,11 @@ const pos_decoders_count = 1 + num_full_distances - end_pos_model_index;
 const low_coder_count = 1 << num_pos_bits_max;
 const mid_coder_count = 1 << num_pos_bits_max;
 const literal_probs_count = 0x300;
+// Tables are sized for the lc+lp ceiling, not the opening properties:
+// LZMA2 chunks may switch to a larger lc+lp mid-stream, and the decoder
+// reuses the same carve without reallocating (the SDK reallocates; the
+// ceiling shape avoids that entirely while staying within the lc+lp<=4 bound).
+const max_literal_context_count = 1 << 4;
 
 // No copy fallback: 10 bits per byte covers converged cost plus transient wrongness.
 // Constant absorbs the cache byte, the flush, and the end marker.
@@ -158,7 +166,10 @@ const ProbTables = struct {
 };
 
 fn probCount(comptime name: []const u8, properties: Properties) usize {
-    if (std.mem.eql(u8, name, "literal_probs")) return literal_probs_count * properties.literalContextCount();
+    // Only the literal table ever depended on properties, and it now always
+    // carries the lc+lp ceiling so mid-stream property changes stay in bounds.
+    _ = properties;
+    if (std.mem.eql(u8, name, "literal_probs")) return literal_probs_count * max_literal_context_count;
     if (std.mem.eql(u8, name, "is_match")) return is_match_count;
     if (std.mem.eql(u8, name, "is_rep")) return num_states;
     if (std.mem.eql(u8, name, "is_rep_g0")) return num_states;
@@ -652,7 +663,10 @@ pub fn DecoderOf(comptime slice_input: bool) type {
         dictionary_full: bool,
         // A reset cannot rewind in-place output, so it acts as a distance validation floor.
         dictionary_floor: u32,
+        // Position within the stream, mod 2^32 per the format; decoded is the
+        // exact output count so sizes survive 4 GiB without wrap.
         total_pos: u32,
+        decoded: u64,
         range_coder: RC,
         is_match: []Prob,
         is_rep: []Prob,
@@ -703,6 +717,7 @@ pub fn DecoderOf(comptime slice_input: bool) type {
                 .dictionary_full = false,
                 .dictionary_floor = 0,
                 .total_pos = 0,
+                .decoded = 0,
                 .range_coder = undefined,
                 .is_match = undefined,
                 .is_rep = undefined,
@@ -751,6 +766,7 @@ pub fn DecoderOf(comptime slice_input: bool) type {
                 .dictionary_full = false,
                 .dictionary_floor = 0,
                 .total_pos = 0,
+                .decoded = 0,
                 .range_coder = undefined,
                 .is_match = undefined,
                 .is_rep = undefined,
@@ -829,11 +845,17 @@ pub fn DecoderOf(comptime slice_input: bool) type {
             resetTables(self);
         }
 
-        pub fn feedByte(self: *Self, byte: u8) void {
+        pub fn feedByte(self: *Self, byte: u8) Failure!void {
+            // In-place output is the caller's buffer and does not wrap: the
+            // LZMA2 copy-block path can outrun it across chunks, so the
+            // capacity check putByte carries applies here too.
+            if (!self.clear_dictionary and self.dictionary_pos >= self.dictionary.len) return error.CapacityFailure;
             self.dictionary[self.dictionary_pos] = byte;
             self.dictionary_pos += 1;
             self.total_pos +%= 1;
+            self.decoded += 1;
             if (self.dictionary_pos == self.dictionary.len) {
+                // Only the ring buffer wraps; in-place output must not rewind.
                 if (self.clear_dictionary) {
                     self.dictionary_pos = 0;
                     self.dictionary_full = true;
@@ -855,10 +877,9 @@ pub fn DecoderOf(comptime slice_input: bool) type {
                     if (remaining) |*remaining_count| {
                         if (remaining_count.* == 0) {
                             if (!marker_required) {
-                                if (range_coder.isFinishedOk()) {
-                                    try self.finishOutput();
-                                    return;
-                                }
+                                // Size-only commit: the declared unpack size is
+                                // the authority; the coder's finish state adds no
+                                // signal, so both former arms collapsed here.
                                 try self.finishOutput();
                                 return;
                             }
@@ -869,7 +890,13 @@ pub fn DecoderOf(comptime slice_input: bool) type {
                     if (range_coder.decodeBit(&self.is_match[state2]) == 0) {
                         prev_byte = try self.decodeLiteral(&range_coder, prev_byte);
                         self.state = updateStateLiteral(self.state);
-                        if (remaining) |*remaining_count| remaining_count.* -= 1;
+                        if (remaining) |*remaining_count| {
+                            // With a marker required, a literal past the
+                            // declared size is corruption, and decrementing
+                            // past zero would wrap the counter.
+                            if (remaining_count.* == 0) return error.DataFailure;
+                            remaining_count.* -= 1;
+                        }
                         continue;
                     }
                     // Assigned on both match branches, so `undefined` is safe.
@@ -893,6 +920,7 @@ pub fn DecoderOf(comptime slice_input: bool) type {
                         if (range_coder.decodeBit(&self.is_rep_g0[self.state]) == 0) {
                             if (range_coder.decodeBit(&self.is_rep0_long[state2]) == 0) {
                                 self.state = updateStateShortRep(self.state);
+                                if (!self.isDistanceValid(self.rep0)) return error.DataFailure;
                                 const byte = self.getByte(self.rep0 + 1);
                                 try self.putByte(byte);
                                 prev_byte = byte;
@@ -931,6 +959,7 @@ pub fn DecoderOf(comptime slice_input: bool) type {
                         }
                         remaining_count.* -= length;
                     }
+                    if (!self.isDistanceValid(self.rep0)) return error.DataFailure;
                     try self.copyMatch(self.rep0 + 1, length);
                     if (is_error) return error.DataFailure;
                     prev_byte = self.getByte(1);
@@ -941,10 +970,9 @@ pub fn DecoderOf(comptime slice_input: bool) type {
                     if (remaining) |*remaining_count| {
                         if (remaining_count.* == 0) {
                             if (!marker_required) {
-                                if (self.range_coder.isFinishedOk()) {
-                                    try self.finishOutput();
-                                    return;
-                                }
+                                // Size-only commit: the declared unpack size is
+                                // the authority; the coder's finish state adds no
+                                // signal, so both former arms collapsed here.
                                 try self.finishOutput();
                                 return;
                             }
@@ -955,7 +983,13 @@ pub fn DecoderOf(comptime slice_input: bool) type {
                     if (try self.range_coder.decodeBit(&self.is_match[state2]) == 0) {
                         prev_byte = try self.decodeLiteral(&self.range_coder, prev_byte);
                         self.state = updateStateLiteral(self.state);
-                        if (remaining) |*remaining_count| remaining_count.* -= 1;
+                        if (remaining) |*remaining_count| {
+                            // With a marker required, a literal past the
+                            // declared size is corruption, and decrementing
+                            // past zero would wrap the counter.
+                            if (remaining_count.* == 0) return error.DataFailure;
+                            remaining_count.* -= 1;
+                        }
                         continue;
                     }
                     // Assigned on both match branches, so `undefined` is safe.
@@ -979,6 +1013,7 @@ pub fn DecoderOf(comptime slice_input: bool) type {
                         if (try self.range_coder.decodeBit(&self.is_rep_g0[self.state]) == 0) {
                             if (try self.range_coder.decodeBit(&self.is_rep0_long[state2]) == 0) {
                                 self.state = updateStateShortRep(self.state);
+                                if (!self.isDistanceValid(self.rep0)) return error.DataFailure;
                                 const byte = self.getByte(self.rep0 + 1);
                                 try self.putByte(byte);
                                 prev_byte = byte;
@@ -1017,6 +1052,7 @@ pub fn DecoderOf(comptime slice_input: bool) type {
                         }
                         remaining_count.* -= length;
                     }
+                    if (!self.isDistanceValid(self.rep0)) return error.DataFailure;
                     try self.copyMatch(self.rep0 + 1, length);
                     if (is_error) return error.DataFailure;
                     prev_byte = self.getByte(1);
@@ -1031,6 +1067,7 @@ pub fn DecoderOf(comptime slice_input: bool) type {
             var symbol: u32 = 1;
             if (comptime slice_input) {
                 if (self.state >= 7) {
+                    if (!self.isDistanceValid(self.rep0)) return error.DataFailure;
                     var match_byte = self.getByte(self.rep0 + 1);
                     var use_match = true;
                     // Exactly 8 steps: the symbol stays below 0x100 until the last shift.
@@ -1058,6 +1095,7 @@ pub fn DecoderOf(comptime slice_input: bool) type {
                 return byte;
             } else {
                 if (self.state >= 7) {
+                    if (!self.isDistanceValid(self.rep0)) return error.DataFailure;
                     var match_byte = self.getByte(self.rep0 + 1);
                     var use_match = true;
                     inline for (0..8) |_| {
@@ -1150,9 +1188,15 @@ pub fn DecoderOf(comptime slice_input: bool) type {
             self.dictionary[self.dictionary_pos] = byte;
             self.dictionary_pos += 1;
             self.total_pos +%= 1;
+            self.decoded += 1;
             if (self.dictionary_pos == self.dictionary.len) {
-                self.dictionary_pos = 0;
-                self.dictionary_full = true;
+                // Only the ring buffer wraps. In-place output is the caller's
+                // buffer: wrapping would rewind onto decoded bytes and let
+                // distances reach before the buffer, so it must not.
+                if (self.clear_dictionary) {
+                    self.dictionary_pos = 0;
+                    self.dictionary_full = true;
+                }
             }
             if (self.output_buffer) |output| {
                 if (self.output_pos >= output.len) return error.CapacityFailure;
@@ -1186,7 +1230,12 @@ pub fn DecoderOf(comptime slice_input: bool) type {
 
         fn isDistanceValid(self: Self, distance: u32) bool {
             // A 0-based distance reaches distance + 1 bytes back. An in-place match must not cross the reset floor.
-            if (!self.clear_dictionary) return distance < self.dictionary_pos - self.dictionary_floor;
+            if (!self.clear_dictionary) {
+                // Short-circuit before the subtraction: a mid-stream reset can
+                // leave the floor above the position, and the wrapping
+                // subtraction would pass every distance.
+                return self.dictionary_pos > self.dictionary_floor and distance < self.dictionary_pos - self.dictionary_floor;
+            }
             return distance < self.dictionary_pos or self.dictionary_full;
         }
 
@@ -1197,6 +1246,7 @@ pub fn DecoderOf(comptime slice_input: bool) type {
                 kernels.copyMatch(self.dictionary, self.dictionary_pos, distance, length);
                 self.dictionary_pos += length;
                 self.total_pos +%= length;
+                self.decoded += length;
                 return;
             }
             var remaining = length;
@@ -1246,6 +1296,7 @@ pub fn DecoderOf(comptime slice_input: bool) type {
                     self.dictionary_full = true;
                 }
                 self.total_pos +%= @intCast(batch);
+                self.decoded += batch;
                 remaining -= @intCast(batch);
             }
         }
@@ -1285,7 +1336,7 @@ pub fn decode(input: []const u8, output: []u8, scratch: []u8, options: Options) 
     var decoder = try DecoderOf(true).initPropertiesInPlace(options.properties, output, scratch);
     try decoder.resetReaderSlice(input);
     try decoder.decodeToOutput(null, options.unpack_size, options.marker_required);
-    return decoder.total_pos;
+    return std.math.cast(usize, decoder.decoded) orelse return error.ResourceFailure;
 }
 
 pub fn decodeInPlace(input: []const u8, output: []u8, scratch: []u8, options: Options) Failure!usize {
@@ -1295,7 +1346,7 @@ pub fn decodeInPlace(input: []const u8, output: []u8, scratch: []u8, options: Op
     var decoder = try DecoderOf(true).initPropertiesInPlace(options.properties, output, scratch);
     try decoder.resetReaderSlice(input);
     try decoder.decodeToOutput(null, options.unpack_size, options.marker_required);
-    return decoder.total_pos;
+    return std.math.cast(usize, decoder.decoded) orelse return error.ResourceFailure;
 }
 
 pub fn decodedSize(input: []const u8, scratch: []u8, options: Options) Failure!usize {

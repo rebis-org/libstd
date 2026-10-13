@@ -185,6 +185,51 @@ const Sink = struct {
     }
 };
 
+// Measurement-path writer: forwards to the downstream writer and hashes
+// whatever passes through, so single-filter SHA-256 blocks verify on the
+// streaming path instead of skipping their check. The digest state lives
+// behind a pointer to keep this struct's layout writer-friendly.
+const Sha256Tee = struct {
+    writer: std.Io.Writer,
+    downstream: *std.Io.Writer,
+    sha256: *crypto.Sha256,
+    size: u64,
+
+    fn init(downstream: *std.Io.Writer, sha256: *crypto.Sha256) Sha256Tee {
+        return .{
+            .writer = .{ .vtable = &vtable, .buffer = &.{}, .end = 0 },
+            .downstream = downstream,
+            .sha256 = sha256,
+            .size = 0,
+        };
+    }
+
+    fn feed(self: *Sha256Tee, part: []const u8) std.Io.Writer.Error!void {
+        self.downstream.writeAll(part) catch return error.WriteFailed;
+        self.sha256.update(part);
+    }
+
+    fn drain(writer: *std.Io.Writer, chunks: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *Sha256Tee = @fieldParentPtr("writer", writer);
+        if (chunks.len == 0) return 0;
+        var total: usize = 0;
+        for (chunks[0 .. chunks.len - 1]) |part| total += part.len;
+        total += chunks[chunks.len - 1].len * splat;
+        if (total == 0) return 0;
+        for (chunks[0 .. chunks.len - 1]) |part| try self.feed(part);
+        const last = chunks[chunks.len - 1];
+        for (0..splat) |_| try self.feed(last);
+        self.size = std.math.add(u64, self.size, total) catch return error.WriteFailed;
+        return total;
+    }
+
+    const vtable = std.Io.Writer.VTable{
+        .drain = drain,
+        .flush = std.Io.Writer.noopFlush,
+        .rebase = std.Io.Writer.failingRebase,
+    };
+};
+
 fn decodeOutOfPlace(input: []const u8, sink: *Sink, scratch: []u8, provider: checksum.Provider) Failure!void {
     try decodeStreams(input, sink, scratch, false, provider);
 }
@@ -314,24 +359,50 @@ fn decodeBlock(cursor: *binary.ReadCursor, sink: *Sink, scratch: []u8, check: Ch
         applyDecodeFilters(block_header.filters[0..block_header.filter_count], block_output[0..uncompressed_size]);
         sink.commitBlock(uncompressed_size);
     } else {
-        decode_tee = tee.Tee.initWithProvider(sink.writer, provider);
         var chunk_reader = std.Io.Reader.fixed(if (compressed_data) |data| data else cursor.remainingSlice());
-        try lzma2_seam.decodeStream(provider, &chunk_reader, &decode_tee.?.writer, scratch[0..lzma_scratch_size], options);
-        compressed_size = block_header.compressed_size orelse chunk_reader.seek;
-        uncompressed_size = std.math.cast(usize, decode_tee.?.size) orelse return error.ResourceFailure;
-        if (block_header.uncompressed_size) |size| {
-            if (uncompressed_size != size) return error.IntegrityFailure;
+        if (check == .sha256 and block_header.filter_count == 1) {
+            // Single-filter SHA-256 blocks verify fully on the streaming path:
+            // the check covers exactly the bytes observed here, with no filter
+            // between decode and check.
+            var sha256 = crypto.Sha256.bind(provider, .{});
+            var hash_tee = Sha256Tee.init(sink.writer.?, &sha256);
+            try lzma2_seam.decodeStream(provider, &chunk_reader, &hash_tee.writer, scratch[0..lzma_scratch_size], options);
+            compressed_size = block_header.compressed_size orelse chunk_reader.seek;
+            uncompressed_size = std.math.cast(usize, hash_tee.size) orelse return error.ResourceFailure;
+            if (block_header.uncompressed_size) |size| {
+                if (uncompressed_size != size) return error.IntegrityFailure;
+            }
+            const check_bytes = try cursor.readSlice(checkSize(check));
+            var digest: [32]u8 = sha256.finalResult();
+            if (!std.mem.eql(u8, &digest, check_bytes)) return error.IntegrityFailure;
+        } else {
+            decode_tee = tee.Tee.initWithProvider(sink.writer, provider);
+            try lzma2_seam.decodeStream(provider, &chunk_reader, &decode_tee.?.writer, scratch[0..lzma_scratch_size], options);
+            compressed_size = block_header.compressed_size orelse chunk_reader.seek;
+            uncompressed_size = std.math.cast(usize, decode_tee.?.size) orelse return error.ResourceFailure;
+            if (block_header.uncompressed_size) |size| {
+                if (uncompressed_size != size) return error.IntegrityFailure;
+            }
         }
     }
     if (block_header.compressed_size == null) try cursor.advance(compressed_size);
     try cursor.advance(blockPadding(compressed_size));
-    const check_bytes = try cursor.readSlice(checkSize(check));
     if (sink.buffer != null) {
         const block_output = sink.buffer.?[sink.offset - uncompressed_size ..][0..uncompressed_size];
+        const check_bytes = try cursor.readSlice(checkSize(check));
         try verifyFilteredCheck(check, block_output, check_bytes, provider);
-    } else if (block_header.filter_count == 1 and check != .sha256) {
-        try verifyCheck(check, decode_tee.?.crc32Value(), decode_tee.?.crc64Value(), check_bytes);
+    } else if (decode_tee) |*dt| {
+        const check_bytes = try cursor.readSlice(checkSize(check));
+        // Multi-filter streaming blocks cannot be verified without staging:
+        // the check covers filtered bytes this path never materializes, and
+        // staging would defeat the bounded memory the measurement oracle
+        // exists for. Only decodedSize streams; every decode entry point
+        // stages the block and verifies it above.
+        if (block_header.filter_count == 1 and check != .sha256) {
+            try verifyCheck(check, dt.crc32Value(), dt.crc64Value(), check_bytes);
+        }
     }
+    // The SHA-256 streaming branch consumed and verified its check bytes above.
     const unpadded_size = try bounds.addUsize(block_header.header_size, try bounds.addUsize(compressed_size, checkSize(check)));
     return .{
         .unpadded_size = std.math.cast(u64, unpadded_size) orelse return error.ResourceFailure,

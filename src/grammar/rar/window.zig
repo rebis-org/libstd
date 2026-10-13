@@ -58,7 +58,15 @@ pub const Window = struct {
         var remaining = length;
         while (remaining > 0) {
             const seg = @min(remaining, @min(buf_len - dst, buf_len - src));
-            kernels.copyMatch(self.buffer, dst, @intCast(distance), @intCast(seg));
+            if (src > dst) {
+                // The source wrapped past the destination, so the kernel's flat
+                // recomputation (out_off - distance) would underflow. The segment
+                // length is at most distance here, so the logical ranges do not
+                // overlap and a forward copy reads each byte before writing it.
+                std.mem.copyForwards(u8, self.buffer[dst..][0..seg], self.buffer[src..][0..seg]);
+            } else {
+                kernels.copyMatch(self.buffer, dst, @intCast(distance), @intCast(seg));
+            }
             dst = (dst + seg) & self.mask;
             src = (src + seg) & self.mask;
             remaining -= seg;
@@ -130,4 +138,18 @@ test "window emit refuses overwritten history" {
     var out: [8]u8 = undefined;
     var bs = sink.BufferSink.init(&out);
     try std.testing.expect(!win.emitTo(bs.sink(), 8, 8));
+}
+
+test "window copy match crosses the physical wrap" {
+    // 24 bytes into a 16-byte window: write_pos wraps, so a match whose
+    // distance exceeds the masked destination offset takes the forward-copy
+    // path instead of the kernel's flat recomputation (which underflows).
+    // Bytes 16..24 overwrite buffer[0..8], so the raw window reads
+    // QRSTUVWX MNOP before the match runs.
+    var buf: [16]u8 = undefined;
+    var win = Window.init(&buf);
+    for ("ABCDEFGHIJKLMNOPQRSTUVWX") |c| win.putByte(c);
+    win.copyMatch(12, 8);
+    try std.testing.expectEqualSlices(u8, "QRSTUVWXMNOPQRST", &buf);
+    try std.testing.expectEqual(@as(u64, 32), win.total_written);
 }

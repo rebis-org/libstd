@@ -7,6 +7,7 @@ test {
     _ = @import("grammar/rar/writer.zig");
     _ = @import("grammar/zlib/onprem.zig");
     _ = @import("grammar/lzma/onprem.zig");
+    _ = @import("grammar/gzip/onprem.zig");
     _ = @import("grammar/zstd_seekable/onprem.zig");
     _ = @import("grammar/sevenzip/onprem.zig");
     _ = @import("grammar/zip/onprem.zig");
