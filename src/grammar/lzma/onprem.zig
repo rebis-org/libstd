@@ -67,6 +67,14 @@ pub fn encodedSizeBound(input_len: usize) usize {
     return lzma.encodedSizeBound(input_len) +| header_size;
 }
 
+// The lzma-alone properties byte (lc + 9 * lp + 45 * pb) for the read-side
+// inspect projection, parsed without decoding.
+pub fn inspectProperties(input: []const u8) Failure!u8 {
+    if (input.len < header_size) return error.DataFailure;
+    if (input[0] >= 9 * 5 * 5) return error.DataFailure;
+    return input[0];
+}
+
 pub fn decodedSize(input: []const u8, scratch: []u8, provider: lzma_seam.Provider) Failure!usize {
     const options = try decodeOptions(input);
     return lzma_seam.decodedSize(provider, input[header_size..], scratch, options);

@@ -28,6 +28,11 @@ const Limits = resource.Limits;
 const Resource = resource.Resource;
 const Failure = vocabulary.Failure;
 
+// gzip fixed-header flag bits, mirrored from the grammar leaf for the
+// read-side inspect projection.
+const flag_text: u8 = 0x01;
+const flag_header_crc: u8 = 0x02;
+
 const deflate_options: deflate.Options = .{ .good = 8, .nice = 128, .lazy = 16, .chain = 8 };
 
 fn requireReplay(source: *Resource, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, comptime confirmed: bool) Failure!void {
@@ -153,6 +158,31 @@ pub fn gzipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resourc
             else => return error.UnsupportedFailure,
         };
         if (input.len > limits.encoded_bytes) return error.ResourceFailure;
+        if (sink == null) {
+            // Read-side header projection: a family-3 selector asks for the
+            // named field of the first member's fixed header; absent
+            // selectors keep the decoded-size path below.
+            const header_requested = optNode(call.request, "gzip", "modification_time") != null or
+                optNode(call.request, "gzip", "operating_system") != null or
+                optNode(call.request, "gzip", "extra_flags") != null or
+                optNode(call.request, "gzip", "text") != null or
+                optNode(call.request, "gzip", "header_crc") != null;
+            if (header_requested) {
+                const info = try gzip.inspectStream(input);
+                if (optNode(call.request, "gzip", "operating_system") != null) {
+                    response.byte_length = info.operating_system;
+                } else if (optNode(call.request, "gzip", "extra_flags") != null) {
+                    response.byte_length = info.extra_flags;
+                } else if (optNode(call.request, "gzip", "text") != null) {
+                    response.byte_length = info.flags & flag_text;
+                } else if (optNode(call.request, "gzip", "header_crc") != null) {
+                    response.byte_length = info.flags & flag_header_crc;
+                } else {
+                    response.byte_length = info.modification_time;
+                }
+                return;
+            }
+        }
         if (sink) |sink_resource| {
             if (plan.provider == .onprem and sink_resource.kind == .direct_write and sink_resource.hasCapability(resource.capability_bit_write)) {
                 // Single-pass: fallback recomputes exact size before further writes, so capacity never fails post-write. The abandoned fast path's bytes are erased so a failed call leaves no decoded prefix behind.
@@ -845,6 +875,12 @@ pub fn lzma_fileHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Re
         var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
         const input = try common.materializeSource(.require_size, source_resource, &workspace, limits.encoded_bytes);
         if (input.len < lzma_file.header_size) return error.DataFailure;
+        if (sink == null and optNode(call.request, "lzma-file", "properties") != null) {
+            // Read-side header projection: the properties byte of the
+            // lzma-alone header, without decoding.
+            response.byte_length = try lzma_file.inspectProperties(input);
+            return;
+        }
         const options = try lzma_file.decodeOptions(input);
         const scratch = try workspace.take(u8, lzma.decodeWorkspaceSize(options.properties));
         const output_size = if (options.unpack_size) |size| std.math.cast(usize, size) orelse return error.ResourceFailure else try lzma_file.decodedSize(input, scratch, plan.provider);
@@ -936,6 +972,12 @@ pub fn xzHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource,
         const scratch = try workspace.take(u8, xz.decodeWorkspaceSize(dictionary_size));
         const input = try common.materializeSource(.require_size, source_resource, &workspace, limits.encoded_bytes);
         if (input.len > limits.encoded_bytes) return error.ResourceFailure;
+        if (sink == null and optNode(call.request, "xz", "check") != null) {
+            // Read-side header projection: the check selector asks for the
+            // stream's check type id without decoding anything.
+            response.byte_length = try xz.inspectCheck(input, plan.provider);
+            return;
+        }
         const output_size = try xz.decodedSize(input, scratch, plan.provider);
         if (output_size > limits.decoded_bytes) return error.ResourceFailure;
         if (input.len + output_size > limits.codec_work) return error.ResourceFailure;
