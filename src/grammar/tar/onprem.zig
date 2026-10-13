@@ -858,3 +858,24 @@ test "tar pax records roundtrip long names and out of octal fields" {
     const size = try decodeOrdinal(archive[0..written], 0, &out);
     try testing.expectEqualStrings("long payload", out[0..size]);
 }
+
+test "tar pax records keep embedded newlines and equals signs in long names" {
+    // Pax values are length-prefixed on the wire, so a path containing '\n'
+    // or '=' must survive the round trip through the path record untouched.
+    const testing = std.testing;
+    var long_name: [120]u8 = undefined;
+    @memset(&long_name, 'a');
+    long_name[40] = '\n';
+    long_name[80] = '=';
+    const entries = [_]Entry{
+        .{ .name = &long_name, .data = "payload" },
+    };
+    var archive: [8192]u8 = undefined;
+    var scratch: [4096]u8 = undefined;
+    const written = try encode(&entries, &archive, &scratch);
+    const info = try inspectOrdinal(archive[0..written], 0);
+    try testing.expectEqualSlices(u8, &long_name, info.name);
+    var out: [16]u8 = undefined;
+    const size = try decodeOrdinal(archive[0..written], 0, &out);
+    try testing.expectEqualStrings("payload", out[0..size]);
+}
