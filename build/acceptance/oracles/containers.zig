@@ -146,7 +146,7 @@ fn runZdict(r: *Runner) anyerror!void {
     }
     const input = zdict_sample_data[0..sample_size];
 
-    // Recorded incompleteness: std's zstd decoder takes no preloaded dictionary.
+    // Recorded incompleteness: stdlib's zstd decoder takes no preloaded dictionary.
     if (harness.leaf_offprem_default) return;
 
     // Ours encodes with the dictionary, the reference decodes with it.

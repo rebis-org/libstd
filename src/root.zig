@@ -11,8 +11,9 @@ const has_libc: bool = switch (builtin.target.abi) {
 };
 
 // Keep panics off std.debug's default handler: its debug_io instantiates
-// std.Io.Threaded, which does not compile for iOS targets on 0.17.0. The
-// library traps like every other contract violation.
+// std.Io.Threaded, which fails to compile for the Apple embedded targets.
+// Upstream tracked as ziglang/zig#37061, fixed on master but unreleased.
+// The library traps like every other contract violation.
 pub const panic = std.debug.FullPanic(struct {
     fn panicFn(msg: []const u8, first_trace_addr: ?usize) noreturn {
         _ = first_trace_addr;

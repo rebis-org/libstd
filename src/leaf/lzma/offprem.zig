@@ -6,7 +6,7 @@ const onprem = @import("onprem.zig");
 const std_lzma = std.compress.lzma;
 pub const Failure = failure.Failure;
 pub const Options = onprem.Options;
-// std's tables and window carve from the caller's scratch; growth beyond it
+// stdlib's tables and window carve from the caller's scratch; growth beyond it
 // answers CapacityFailure — the accepted incompleteness of choosing std.
 pub const Properties = onprem.Properties;
 
@@ -17,7 +17,7 @@ fn mapStreamError(err: std.Io.Reader.StreamError) Failure {
     };
 }
 
-// The scratch the arm asks for: std's probability tables plus the match
+// The scratch the arm asks for: stdlib's probability tables plus the match
 // window, worst-cased. Callers size with max(onprem need, scratchNeed).
 pub fn scratchNeed(properties: Properties) usize {
     const literal = @as(usize, 0x300) * properties.literalContextCount() * @sizeOf(u16);
@@ -29,14 +29,14 @@ fn stdProperties(properties: Properties) std_lzma.Decode.Properties {
     return .{ .lc = @intCast(properties.lc), .lp = @intCast(properties.lp), .pb = @intCast(properties.pb) };
 }
 
-// std fuses the stop rule and the length assertion, reporting an early end marker as a size mismatch.
+// stdlib fuses the stop rule and the length assertion, reporting an early end marker as a size mismatch.
 fn endedShortOfDeclared(decoder: *const std_lzma.Decompress, options: Options) bool {
     const declared = options.unpack_size orelse return false;
     const mismatch = decoder.err orelse return false;
     return mismatch == error.DecompressedSizeMismatch and decoder.buffer.len < declared;
 }
 
-// std flushes the window's tail only on the success path, so a short run leaves it unflushed.
+// stdlib flushes the window's tail only on the success path, so a short run leaves it unflushed.
 fn drainShortRun(decoder: *std_lzma.Decompress, writer: *std.Io.Writer) Failure!void {
     writer.writeAll(decoder.reader.buffer[decoder.reader.seek..decoder.reader.end]) catch return error.CapacityFailure;
     decoder.buffer.finish(writer) catch return error.CapacityFailure;

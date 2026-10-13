@@ -98,7 +98,7 @@ fn MergeableDigest(comptime On: type, comptime Off: type) type {
             return bind(default_provider, opts);
         }
 
-        // std's Options is a distinct nominal type; both are empty today, so
+        // stdlib's Options is a distinct nominal type; both are empty today, so
         // the offprem arm constructs from defaults.
         pub fn bind(provider: Provider, opts: Options) @This() {
             return switch (provider) {
@@ -340,7 +340,7 @@ fn MergeableMac(comptime On: type, comptime Off: type) type {
 }
 
 // The differential contract the seam stitches together: sweep every input
-// width against the paired std implementation, splitting updates at each size.
+// width against the paired stdlib implementation, splitting updates at each size.
 pub fn expectAgreement(pristine_ours: anytype, pristine_theirs: anytype, seed: u64, comptime digest: bool, comptime theirs_field: ?[]const u8) !void {
     var rng = std.Random.DefaultPrng.init(seed);
     var size: usize = 0;

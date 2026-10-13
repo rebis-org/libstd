@@ -66,7 +66,7 @@ pub fn winzipSaltLength(strength: u8) Failure!usize {
 
 pub const Direction = enum { encrypt, decrypt };
 
-// 192-bit keys take the on-prem schedule, which std does not provide.
+// 192-bit keys take the on-prem schedule, which stdlib does not provide.
 // Direction is a type parameter: encrypting through a decrypt context is a
 // compile error, not an unreachable arm.
 fn BlockCipher(comptime S: type, comptime direction: Direction) type {
@@ -332,7 +332,7 @@ pub fn fillRandom(bytes: []u8) Failure!void {
     return error.UnsupportedFailure;
 }
 
-// ZipCrypto (PKWARE traditional cipher). No std equivalent exists; the key
+// ZipCrypto (PKWARE traditional cipher). No stdlib equivalent exists; the key
 // ladder is CRC-32 based, which is why the table lives here rather than in
 // checksum.zig.
 const zip_crc_table: [256]u32 = blk: {
@@ -616,7 +616,7 @@ test "both providers agree on the mode glue when mergeable" {
     try std.testing.expectEqualSlices(u8, &dk_onprem, &dk_offprem);
     const pt = [16]u8{ 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff };
     const key192 = [24]u8{ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17 };
-    // AES-192 has no std arm, so both tags resolve to the same on-prem schedule.
+    // AES-192 has no stdlib arm, so both tags resolve to the same on-prem schedule.
     const ct192_onprem = try aesEncryptBlock(.onprem, &key192, pt);
     const ct192_offprem = try aesEncryptBlock(.offprem, &key192, pt);
     try std.testing.expectEqualSlices(u8, &ct192_onprem, &ct192_offprem);

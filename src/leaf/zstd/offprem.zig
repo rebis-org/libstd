@@ -2,7 +2,7 @@ const std = @import("std");
 
 const onprem = @import("onprem.zig");
 
-// std's verify_checksum panics instead of verifying, so the arm leaves
+// stdlib's verify_checksum panics instead of verifying, so the arm leaves
 // checksums off; dictionaries are unsupported. Both pick onprem.
 
 // The reader vtable folds every decoder error into ReadFailed; a WriteFailed is
@@ -40,7 +40,7 @@ pub fn decodeStream(input: *std.Io.Reader, output: *std.Io.Writer, history: []u8
 
 pub fn decodeInPlace(input: *std.Io.Reader, output: []u8, options: onprem.Options) onprem.DecodeError!usize {
     // Same precondition the onprem arm states: the span carries the output
-    // plus one block of window slack. std zstd's direct mode drives the
+    // plus one block of window slack. stdlib zstd's direct mode drives the
     // window from the writer buffer, so no separate history is passed.
     if (output.len < @as(usize, options.window_size) + onprem.block_size_max) return error.UnsupportedFailure;
     try preflight(options, null);

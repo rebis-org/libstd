@@ -195,7 +195,7 @@ pub const BoundedReader = struct {
     limit: u64,
     reader: std.Io.Reader,
     // The reader's own fill buffer. The stream vtable stages through a separate
-    // local buffer because std hands it a writer over exactly this memory.
+    // local buffer because stdlib hands it a writer over exactly this memory.
     staging: [4096]u8,
 
     pub fn init(self: *BoundedReader, resource: *Resource, limit: u64) void {
