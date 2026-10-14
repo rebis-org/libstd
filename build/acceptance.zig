@@ -50,6 +50,9 @@ fn addAcceptanceApp(
     const exe = b.addExecutable(.{ .name = name, .root_module = module });
     exe.root_module.linkLibrary(host.dynamic_library);
     const run = b.addRunArtifact(exe);
+    // Forward `--` args so suite and scenario filters reach the app:
+    // `zig build oracles -- --suite zstd` runs one suite instead of all.
+    run.addPassthruArgs();
     b.step(step_name, step_description).dependOn(&run.step);
     return .{ .exe = exe, .run = run };
 }
