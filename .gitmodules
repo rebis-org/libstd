@@ -52,3 +52,18 @@
 [submodule "pkg/arocc"]
 	path = pkg/arocc
 	url = https://codeberg.org/ziglang/arocc.git
+[submodule "vendor/wimlib"]
+	path = vendor/wimlib
+	url = https://github.com/ebiggers/wimlib.git
+[submodule "vendor/xar"]
+	path = vendor/xar
+	url = https://github.com/apple-oss-distributions/xar.git
+[submodule "vendor/dwarfs"]
+	path = vendor/dwarfs
+	url = https://github.com/mhx/dwarfs.git
+[submodule "vendor/squashfs-tools"]
+	path = vendor/squashfs-tools
+	url = https://github.com/plougher/squashfs-tools.git
+[submodule "vendor/libarchive"]
+	path = vendor/libarchive
+	url = https://github.com/libarchive/libarchive.git
