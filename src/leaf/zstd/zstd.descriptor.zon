@@ -14,6 +14,8 @@
         .{ .name = "skip_interior_insert", .family = 4, .ordinal = 8, .representation = "scalar_words" },
         .{ .name = "double_hash", .family = 4, .ordinal = 9, .representation = "scalar_words" },
         .{ .name = "row_match", .family = 4, .ordinal = 10, .representation = "scalar_words" },
+        .{ .name = "strategy", .family = 4, .ordinal = 11, .representation = "scalar_words" },
+        .{ .name = "entropy", .family = 4, .ordinal = 12, .representation = "scalar_words" },
     },
     .capabilities = .{ "read", "replay" },
     .sizing = "measured",
