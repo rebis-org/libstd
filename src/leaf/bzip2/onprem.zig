@@ -1363,3 +1363,34 @@ const randomisation_counts = [512]u32{
     780, 773, 635, 389, 707, 100, 626, 958, 165, 504, 920, 176, 193, 713, 857, 265,
     203, 50,  668, 108, 645, 990, 626, 197, 510, 357, 358, 850, 858, 364, 936, 638,
 };
+
+// Corpus-scale cover for the suffix sort. The default 900k block drives the
+// doubled SA-IS through its recursive path on random data. The planted
+// repeats keep the tie handling honest.
+test "bzip2 full-block encode roundtrips" {
+    const allocator = std.testing.allocator;
+    var input: [1 << 20]u8 = undefined;
+    var state: u64 = 0x9E3779B97F4A7C15;
+    for (&input) |*b| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        b.* = @as(u8, @truncate(state));
+    }
+    for (1..8) |i| {
+        const at = (1 << 17) * i;
+        @memcpy(input[at..][0..4096], input[0..4096]);
+    }
+    const scratch = try allocator.alloc(u8, encodeWorkspaceSize(block_size_max));
+    defer allocator.free(scratch);
+    const encoded = try allocator.alloc(u8, encodedSizeBound(input.len));
+    defer allocator.free(encoded);
+    const encoded_len = try encode(&input, encoded, scratch, .{});
+    const decode_scratch = try allocator.alloc(u8, try decodeWorkspaceSizeFor(encoded[0..encoded_len]));
+    defer allocator.free(decode_scratch);
+    const output = try allocator.alloc(u8, input.len);
+    defer allocator.free(output);
+    const decoded = try decode(encoded[0..encoded_len], output, decode_scratch, checksum.default_provider);
+    try std.testing.expectEqual(input.len, decoded);
+    try std.testing.expectEqualSlices(u8, &input, output);
+}

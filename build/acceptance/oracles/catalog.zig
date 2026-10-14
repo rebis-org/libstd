@@ -24,6 +24,7 @@ pub const Ids = struct {
     deflate: Id,
     gzip: Id,
     zstd: Id,
+    brotli: Id,
     tar: Id,
     zip: Id,
     bzip2: Id,
