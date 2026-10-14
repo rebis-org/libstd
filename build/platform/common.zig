@@ -29,8 +29,13 @@ pub fn descriptorPaths(b: *std.Build) [][]const u8 {
         const rel = b.allocator.print("src/{s}", .{entry.path}) catch @panic("The component scan is out of memory.");
         list.append(b.allocator, rel) catch @panic("The component scan is out of memory.");
         b.dependOnFileContents(b.path(rel));
-        const parent = rel[0..std.mem.findScalarLast(u8, rel, '/').?];
-        b.dependOnDirectoryContents(b.path(parent));
+        // Watch every ancestor, not just the direct parent. A new component
+        // directory two levels down (src/<layer>/<name>/) changes no watched
+        // directory otherwise. The cached configure keeps missing it.
+        var slash = std.mem.findScalar(u8, rel, '/');
+        while (slash) |at| : (slash = std.mem.findScalarPos(u8, rel, at + 1, '/')) {
+            b.dependOnDirectoryContents(b.path(rel[0 .. at + 1]));
+        }
     }
     std.mem.sort([]const u8, list.items, {}, struct {
         fn lessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
