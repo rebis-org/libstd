@@ -27,25 +27,61 @@ pub fn expand(b: *std.Build, ctx: *common.Settings) void {
     };
 }
 
-fn addHeaderProbe(b: *std.Build, zig: []const u8, driver: []const u8, std_flag: []const u8, source: std.Build.LazyPath, header_dir: std.Build.LazyPath) *std.Build.Step.Run {
-    const probe = b.addSystemCommand(&.{ zig, driver, std_flag });
+fn addHeaderProbe(
+    b: *std.Build,
+    abi: *std.Build.Step,
+    probe_tool: *std.Build.Step.Compile,
+    command: []const []const u8,
+    std_flag: []const u8,
+    source: std.Build.LazyPath,
+    header_dir: std.Build.LazyPath,
+) void {
+    const probe = std.Build.Step.Run.create(b, b.fmt("abi {s} {s}", .{ command[command.len - 1], std_flag }));
+    probe.addArtifactArg(probe_tool);
+    probe.addArgs(command);
+    probe.addArg("--");
+    probe.addArg(std_flag);
     probe.addDirectoryArg2(header_dir, .{ .prefix = "-I" });
     probe.addFileArg2(source, .{});
     probe.addArgs(&.{ "-o", if (builtin.target.os.tag == .windows) "NUL" else "/dev/null" });
     probe.step.dependOn(b.getInstallStep());
-    return probe;
+    abi.dependOn(&probe.step);
 }
 
 fn addAbi(b: *std.Build, ctx: *common.Settings) void {
     const zig = b.graph.zig_exe;
     const abi = b.step("abi", "Check the ABI contract of the generated header and library");
-    // No -fsyntax-only mode exists, so objecting to /dev/null proves parsing.
-    inline for (.{
-        .{ "cc", "-std=c23", "build/acceptance/header.c" },
-        .{ "c++", "-std=c++2c", "build/acceptance/header.cpp" },
-    }) |probe_spec| {
-        const probe = addHeaderProbe(b, zig, probe_spec[0], probe_spec[1], b.path(probe_spec[2]), ctx.generated.header_dir);
-        abi.dependOn(&probe.step);
+    const probe_tool = b.addExecutable(.{
+        .name = "abi_probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("build/platform/probe.zig"),
+            .target = b.graph.host,
+        }),
+    });
+    const header_c = b.path("build/acceptance/header.c");
+    const header_cpp = b.path("build/acceptance/header.cpp");
+    const c_stds = .{ "-std=c11", "-std=c17", "-std=c23" };
+    const cxx_stds = .{ "-std=c++20", "-std=c++23", "-std=c++2c" };
+    inline for (c_stds) |std_flag| {
+        addHeaderProbe(b, abi, probe_tool, &.{ zig, "cc" }, std_flag, header_c, ctx.generated.header_dir);
+    }
+    inline for (cxx_stds) |std_flag| {
+        addHeaderProbe(b, abi, probe_tool, &.{ zig, "c++" }, std_flag, header_cpp, ctx.generated.header_dir);
+    }
+    const External = struct { command: []const []const u8, cxx: ?[]const []const u8 };
+    const external = [_]External{
+        .{ .command = &.{ "clang" }, .cxx = &.{ "clang++" } },
+        .{ .command = &.{ "xcrun", "clang" }, .cxx = &.{ "xcrun", "clang++" } },
+        .{ .command = &.{"gcc-16"}, .cxx = &.{"g++-16"} },
+    };
+    inline for (external) |compiler| {
+        inline for (c_stds) |std_flag| addHeaderProbe(b, abi, probe_tool, compiler.command, std_flag, header_c, ctx.generated.header_dir);
+        if (compiler.cxx) |cxx| {
+            inline for (.{ "-std=c++20", "-std=c++23" }) |std_flag| addHeaderProbe(b, abi, probe_tool, cxx, std_flag, header_cpp, ctx.generated.header_dir);
+        }
+    }
+    if (b.graph.environ_map.get("ANDROID_NDK_CLANG")) |ndk| {
+        inline for (c_stds) |std_flag| addHeaderProbe(b, abi, probe_tool, &.{ndk}, std_flag, header_c, ctx.generated.header_dir);
     }
     abi.dependOn(&ctx.host.dynamic_library.step);
     const abi_exports = b.addExecutable(.{
