@@ -12,6 +12,7 @@ const node_graph = @import("../kernel/node.zig");
 const resource = @import("../kernel/resource.zig");
 const vocabulary = @import("../kernel/vocabulary.zig");
 const bzip2 = @import("../leaf/bzip2/onprem.zig");
+const brotli = @import("../leaf/brotli/onprem.zig");
 const deflate = @import("../leaf/deflate/onprem.zig");
 const deflate_seam = @import("../leaf/deflate/seam.zig");
 const lz4 = @import("../leaf/lz4/onprem.zig");
@@ -36,10 +37,19 @@ const flag_header_crc: u8 = 0x02;
 const deflate_options: deflate.Options = .{ .good = 8, .nice = 128, .lazy = 16, .chain = 8 };
 
 fn requireReplay(source: *Resource, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, comptime confirmed: bool) Failure!void {
-    if (sizing != .measured and sizing != .bounded) return error.UnsupportedFailure;
+    if (sizing != .measured and sizing != .bounded) {
+        std.debug.print("BRDBG requireReplay sizing\n", .{});
+        return error.UnsupportedFailure;
+    }
     const expected: vocabulary.CommitMode = if (confirmed) .confirmed else .tentative;
-    if (commit != expected) return error.UnsupportedFailure;
-    if (!source.hasCapability(resource.capability_bit_read) or !source.hasCapability(resource.capability_bit_replay)) return error.UnsupportedFailure;
+    if (commit != expected) {
+        std.debug.print("BRDBG requireReplay commit\n", .{});
+        return error.UnsupportedFailure;
+    }
+    if (!source.hasCapability(resource.capability_bit_read) or !source.hasCapability(resource.capability_bit_replay)) {
+        std.debug.print("BRDBG requireReplay caps\n", .{});
+        return error.UnsupportedFailure;
+    }
 }
 
 fn optNode(request: ?*Node, comptime component: []const u8, comptime name: []const u8) ?*Node {
@@ -648,6 +658,23 @@ pub fn bzip2Hook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resour
     options.max_work = limits.codec_work;
     options.provider = plan.provider;
     return bufferCodecHook(bzip2, plan, source, sink, call, response, sizing, commit, limits, command_mask, bzip2.decodeWorkspaceSize(bzip2.block_size_max), bzip2.encodeWorkspaceSize(options.block_size), options);
+}
+
+pub fn brotliHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
+    const options = try parseBrotliOptions(call.request, command_mask);
+    // The encoder lands with the dictionary support; read serves now.
+    return bufferCodecHook(brotli, plan, source, sink, call, response, sizing, commit, limits, command_mask, brotli.decodeWorkspaceSize(options), 0, options);
+}
+
+fn parseBrotliOptions(request: ?*Node, command_mask: u32) Failure!brotli.Options {
+    var options: brotli.Options = .{};
+    if (command_mask == vocabulary.command_mask_write or command_mask == vocabulary.command_mask_query) {
+        if (try optCast(request, "brotli", "quality", u32)) |quality| {
+            if (quality > 11) return error.CallFailure;
+            options.quality = quality;
+        }
+    }
+    return options;
 }
 
 fn parseBzip2Options(request: ?*Node, command_mask: u32) Failure!bzip2.Options {
