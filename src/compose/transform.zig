@@ -618,6 +618,14 @@ fn parseZstdOptions(request: ?*Node, command_mask: u32) Failure!zstd.Options {
         if (optNode(request, "zstd", "skip_interior_insert")) |node| options.skip_interior_insert = node.value_low != 0;
         if (optNode(request, "zstd", "double_hash")) |node| options.double_hash = node.value_low != 0;
         if (optNode(request, "zstd", "row_match")) |node| options.row_match = node.value_low != 0;
+        if (try optCast(request, "zstd", "strategy", u32)) |strategy| {
+            if (strategy > 3) return error.CallFailure;
+            options.strategy = strategy;
+        }
+        if (try optCast(request, "zstd", "entropy", u32)) |entropy| {
+            if (entropy > 1) return error.CallFailure;
+            options.entropy = entropy;
+        }
     }
     return options;
 }

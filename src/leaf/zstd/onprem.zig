@@ -44,8 +44,31 @@ pub const Options = struct {
     skip_interior_insert: bool = false,
     double_hash: bool = true,
     row_match: bool = false,
+    // Parser tier for the hash-chain path. 0 = chain: the lazy selector
+    // defers one position. 1 = greedy: take the best immediately. 2 = lazy2:
+    // defer up to two positions. The dfast and row finders ignore this.
+    strategy: u32 = 0,
+    // Entropy-table selection: 0 = full cost model (default), 1 = the
+    // vendor's selectEncodingType early-outs (repeat-for-small-blocks).
+    // The early-outs change the encoded bytes; gate is descriptor ordinal 12.
+    entropy: u32 = 0,
     provider: checksum.Provider = checksum.default_provider,
 };
+
+const strategy_greedy: u32 = 1;
+const strategy_lazy2: u32 = 2;
+// The price-DP tier: candidates per position come from the hash chain, the
+// repeat offsets, and a 3-byte side table. A greedy replay over those
+// candidates freezes per-symbol prices. A backward DP picks the cheapest
+// sequence lattice. Emission re-resolves offset values against the real
+// repeat-offset history, so the stream stays self-consistent whatever the
+// DP chose.
+const strategy_dp: u32 = 3;
+const dp_stride = 4;
+const dp_price_shift = 6;
+const dp_head3_bits = 17;
+const dp_seq_overhead = 12 << dp_price_shift;
+const dp_no_price = 24 << dp_price_shift;
 
 const LimitedReader = struct {
     inner: *std.Io.Reader,
@@ -534,11 +557,17 @@ const encoder_no_position = std.math.maxInt(u32);
 const encoder_block_seq_u32s = (encoder_block_size_max * @sizeOf(Sequence) + 3) / 4;
 const encoder_block_lit_u32s = (encoder_block_size_max + 3) / 4;
 const encoder_block_section_u32s = (3 * encoder_block_size_max + 3) / 4;
+// Price-DP scratch, present only when the descriptor sizes the workspace
+// for strategy 3. The pieces: per-position candidate pairs and counts, the
+// DP cost and choice arrays, and the 3-byte side table.
+const encoder_block_dp_u32s = encoder_block_size_max * (2 * dp_stride + 3) + 1 + (1 << dp_head3_bits);
+const encoder_block_prefix_u32s = encoder_block_seq_u32s + encoder_block_lit_u32s + encoder_block_section_u32s;
 const encoder_workspace_u32_count = hash_size + encoder_zip_frame_budget + encoder_block_section_u32s;
 
 pub fn encoderWorkspaceU32Count(dictionary_len: usize, frame_budget: usize, options: Options) usize {
     const chain_size = if (useFixedTables(options)) dfastShortTableSize(options) else @max(dictionary_len + frame_budget, dfastShortTableSize(options));
-    return hash_size + chain_size + encoder_block_seq_u32s + encoder_block_lit_u32s + encoder_block_section_u32s;
+    const dp_size: usize = if (options.strategy == strategy_dp) encoder_block_dp_u32s else 0;
+    return hash_size + chain_size + encoder_block_prefix_u32s + dp_size;
 }
 
 pub const encoder_workspace_size = encoder_workspace_u32_count * @sizeOf(u32);
@@ -551,7 +580,9 @@ fn dfastShortTableSize(options: Options) usize {
 }
 
 pub fn useDfast(options: Options) bool {
-    return options.double_hash and !options.lazy and !options.skip_interior_insert;
+    // The dispatch order runs an explicit strategy before the legacy toggles.
+    // The double-fast tables then serve only the strategy-less default path.
+    return options.double_hash and !options.lazy and !options.skip_interior_insert and options.strategy == 0;
 }
 
 pub fn useRowMatch(options: Options) bool {
@@ -571,19 +602,15 @@ pub fn encodedSizeBound(input_len: usize, options: Options) usize {
     return input_len +| 3 *| (input_len / encoder_block_size_max + frames) +| 18 *| frames +| 8;
 }
 
+// The sequence-execution stage's input record: one emitted sequence. Codes,
+// extra values, and extra bit counts are pure functions of these three
+// words. The offset word is the rep-resolved offset value, so the
+// repeat-offset history stays parse-side. That keeps the record at 12 bytes
+// and the code computation out of the parse hot path.
 const Sequence = struct {
     literal_length: u32,
-    literal_code: u8,
-    literal_extra: u32,
-    literal_extra_bits: u5,
     match_length: u32,
-    match_code: u8,
-    match_extra: u32,
-    match_extra_bits: u5,
-    offset: u32,
-    offset_code: u8,
-    offset_extra: u32,
-    offset_extra_bits: u5,
+    offset_value: u32,
 };
 
 const LengthCode = struct {
@@ -594,25 +621,14 @@ const LengthCode = struct {
 
 fn encodeBlock(output: *std.Io.Writer, content: []const u8, block_start: usize, block_end: usize, head: []u32, chain: []u32, literal_table: []const FseEntry, match_table: []const FseEntry, offset_table: []const FseEntry, is_last: bool, options: Options, block_workspace: []u32, repeat_offsets: *[3]u32, prev: *PrevFseTables) EncodeError!void {
     if (useRowMatch(options)) return encodeBlockRow(output, content, block_start, block_end, head, chain, literal_table, match_table, offset_table, is_last, options, block_workspace, repeat_offsets, prev);
+    // An explicit strategy owns the chain-path parse; the legacy toggles keep
+    // their meaning only when no strategy is selected.
+    if (options.strategy == strategy_greedy) return encodeBlockGreedy(output, content, block_start, block_end, head, chain, literal_table, match_table, offset_table, is_last, options, block_workspace, repeat_offsets, prev);
+    if (options.strategy == strategy_lazy2) return encodeBlockLazy2(output, content, block_start, block_end, head, chain, literal_table, match_table, offset_table, is_last, options, block_workspace, repeat_offsets, prev);
+    if (options.strategy == strategy_dp) return encodeBlockDp(output, content, block_start, block_end, head, chain, literal_table, match_table, offset_table, is_last, options, block_workspace, repeat_offsets, prev);
     if (useDfast(options)) return encodeBlockDfast(output, content, block_start, block_end, head, chain, literal_table, match_table, offset_table, is_last, options, block_workspace, repeat_offsets, prev);
     const src = content[block_start..block_end];
-    if (src.len == 0) {
-        try writeBlockHeader(output, .raw, 0, is_last);
-        return;
-    }
-    const first_byte = src[0];
-    var is_all_same = true;
-    for (src) |b| {
-        if (b != first_byte) {
-            is_all_same = false;
-            break;
-        }
-    }
-    if (is_all_same) {
-        try writeBlockHeader(output, .rle, src.len, is_last);
-        try writeByte(output, first_byte);
-        return;
-    }
+    if (try storeOnlyPrefix(output, src, is_last)) return;
     const seq_data = std.mem.bytesAsSlice(Sequence, std.mem.sliceAsBytes(block_workspace[0..encoder_block_seq_u32s]));
     const literal_buf = std.mem.sliceAsBytes(block_workspace[encoder_block_seq_u32s..][0..encoder_block_lit_u32s])[0..encoder_block_size_max];
     var literal_freq: [256]u32 = undefined;
@@ -637,11 +653,11 @@ fn encodeBlock(output: *std.Io.Writer, content: []const u8, block_start: usize, 
             match_offset = pending_offset;
             has_pending = false;
         } else {
-            const match = findLongestMatch(content, block_start, block_end, pos, head, chain, options);
+            const match = findLongestMatch(content, block_start, block_end, pos, head, chain, options, std.math.maxInt(usize));
             if (options.lazy and match.len < options.nice_len and pos + 1 < src.len) {
                 insertPosition(content, insert_pos, block_end, head, chain, options);
                 insert_pos += 1;
-                const next_match = findLongestMatch(content, block_start, block_end, pos + 1, head, chain, options);
+                const next_match = findLongestMatch(content, block_start, block_end, pos + 1, head, chain, options, std.math.maxInt(usize));
                 if (next_match.len > match.len) {
                     pending_len = next_match.len;
                     pending_offset = next_match.offset;
@@ -662,15 +678,394 @@ fn encodeBlock(output: *std.Io.Writer, content: []const u8, block_start: usize, 
             pos += 1;
         }
     }
-    while (insert_pos < block_end) {
-        insertPosition(content, insert_pos, block_end, head, chain, options);
-        insert_pos += 1;
+    try flushParse(output, content, block_end, src, anchor, insert_pos, head, chain, options, seq_data, seq_count, literal_buf, &literal_count, &literal_freq, literal_table, match_table, offset_table, is_last, block_workspace, prev, options.entropy);
+}
+
+// Every parser tier's prefix: empty blocks are raw, all-same blocks are RLE.
+fn storeOnlyPrefix(output: *std.Io.Writer, src: []const u8, is_last: bool) EncodeError!bool {
+    if (src.len == 0) {
+        try writeBlockHeader(output, .raw, 0, is_last);
+        return true;
+    }
+    const first_byte = src[0];
+    for (src) |b| {
+        if (b != first_byte) return false;
+    }
+    try writeBlockHeader(output, .rle, src.len, is_last);
+    try writeByte(output, first_byte);
+    return true;
+}
+
+// Every parser tier's suffix: insert the remaining positions and flush the
+// tail literals. Hand the parse product to the sequence-execution stage.
+fn flushParse(output: *std.Io.Writer, content: []const u8, block_end: usize, src: []const u8, anchor: usize, insert_pos: usize, head: []u32, chain: []u32, options: Options, seq_data: []Sequence, seq_count: usize, literal_buf: []u8, literal_count: *usize, literal_freq: *[256]u32, literal_table: []const FseEntry, match_table: []const FseEntry, offset_table: []const FseEntry, is_last: bool, block_workspace: []u32, prev: *PrevFseTables, entropy: u32) EncodeError!void {
+    var insert = insert_pos;
+    while (insert < block_end) {
+        insertPosition(content, insert, block_end, head, chain, options);
+        insert += 1;
     }
     const tail = src[anchor..];
-    @memcpy(literal_buf[literal_count..][0..tail.len], tail);
-    literal_count += tail.len;
-    countLiteralFreqs(literal_buf[0..literal_count], &literal_freq);
-    try finishBlock(output, src, literal_buf[0..literal_count], seq_data[0..seq_count], &literal_freq, literal_table, match_table, offset_table, is_last, block_workspace, prev);
+    @memcpy(literal_buf[literal_count.*..][0..tail.len], tail);
+    literal_count.* += tail.len;
+    countLiteralFreqs(literal_buf[0..literal_count.*], literal_freq);
+    try executeSeqData(output, src, literal_buf[0..literal_count.*], seq_data[0..seq_count], literal_freq, literal_table, match_table, offset_table, is_last, block_workspace, prev, entropy);
+}
+
+const Match = struct { len: usize, offset: usize };
+
+// The strategy tiers cap how far one candidate may extend: pathological
+// periodic input otherwise spends a full block scan per position. Longer
+// matches split into multiple sequences at a negligible ratio cost; the
+// legacy chain tier keeps uncapped extensions (byte-stable output).
+const extension_cap = 1 << 12;
+
+// Repeat-offset candidates at a position: the three history entries checked
+// in order, extended forward. Ties and cheap codes make rep hits valuable
+// even when the chain walk would find a longer match later.
+fn findRepMatch(content: []const u8, block_start: usize, block_end: usize, pos: usize, repeat_offsets: *const [3]u32, min_abs: usize) Match {
+    const src_len = block_end - block_start;
+    if (pos + min_take_len > src_len) return .{ .len = 0, .offset = 0 };
+    const cur_abs = block_start + pos;
+    const max_len = @min(src_len - pos, extension_cap);
+    var best = Match{ .len = min_take_len - 1, .offset = 0 };
+    for (repeat_offsets) |off| {
+        if (off != 0 and cur_abs >= off and cur_abs - off >= min_abs and best.len < max_len and content[cur_abs - off + best.len] == content[cur_abs + best.len] and readU32At(content, cur_abs - off) == readU32At(content, cur_abs)) {
+            const len = min_take_len + countMatchLen(content, cur_abs - off + min_take_len, cur_abs + min_take_len, cur_abs + max_len);
+            if (len > best.len) best = .{ .len = len, .offset = off };
+        }
+    }
+    if (best.len < min_take_len) return .{ .len = 0, .offset = 0 };
+    return best;
+}
+
+// The best match at one position: repeat-offset hits first. Ties prefer the
+// rep code, which encodes cheaper. The hash-chain walk follows.
+fn bestMatchAt(content: []const u8, block_start: usize, block_end: usize, pos: usize, head: []u32, chain: []u32, options: Options, repeat_offsets: *const [3]u32) Match {
+    const cur_abs = block_start + pos;
+    const window_limit = @min(options.window_size, options.search_window);
+    const min_abs = cur_abs - @min(cur_abs, window_limit);
+    const rep = findRepMatch(content, block_start, block_end, pos, repeat_offsets, min_abs);
+    const chain_match = findLongestMatch(content, block_start, block_end, pos, head, chain, options, extension_cap);
+    const chain_best = Match{ .len = chain_match.len, .offset = chain_match.offset };
+    if (rep.len >= chain_best.len) return rep;
+    return chain_best;
+}
+
+// The greedy tier: take the best match at each position immediately, no
+// deferral. Cheapest per byte of the chain-based tiers; the row finder and
+// dfast stay separate faster-shallower options.
+fn encodeBlockGreedy(output: *std.Io.Writer, content: []const u8, block_start: usize, block_end: usize, head: []u32, chain: []u32, literal_table: []const FseEntry, match_table: []const FseEntry, offset_table: []const FseEntry, is_last: bool, options: Options, block_workspace: []u32, repeat_offsets: *[3]u32, prev: *PrevFseTables) EncodeError!void {
+    const src = content[block_start..block_end];
+    if (try storeOnlyPrefix(output, src, is_last)) return;
+    const seq_data = std.mem.bytesAsSlice(Sequence, std.mem.sliceAsBytes(block_workspace[0..encoder_block_seq_u32s]));
+    const literal_buf = std.mem.sliceAsBytes(block_workspace[encoder_block_seq_u32s..][0..encoder_block_lit_u32s])[0..encoder_block_size_max];
+    var literal_freq: [256]u32 = undefined;
+    var literal_count: usize = 0;
+    var seq_count: usize = 0;
+    var anchor: usize = 0;
+    var pos: usize = 0;
+    var insert_pos: usize = block_start;
+    while (pos < src.len) {
+        while (insert_pos < block_start + pos) {
+            insertPosition(content, insert_pos, block_end, head, chain, options);
+            insert_pos += 1;
+        }
+        const match = bestMatchAt(content, block_start, block_end, pos, head, chain, options, repeat_offsets);
+        if (match.len >= min_take_len) {
+            appendSequence(seq_data, &seq_count, literal_buf, &literal_count, src, anchor, pos, match.len, @intCast(match.offset), repeat_offsets);
+            pos += match.len;
+            anchor = pos;
+        } else {
+            pos += 1;
+        }
+    }
+    try flushParse(output, content, block_end, src, anchor, insert_pos, head, chain, options, seq_data, seq_count, literal_buf, &literal_count, &literal_freq, literal_table, match_table, offset_table, is_last, block_workspace, prev, options.entropy);
+}
+
+// The lazy2 tier: defer to the next position when it beats the current
+// match. Defer once more when the position after that beats the second.
+// That is the reference lazy2 shape. Each searched position is inserted
+// before its search, so the table never offers a self-match.
+fn encodeBlockLazy2(output: *std.Io.Writer, content: []const u8, block_start: usize, block_end: usize, head: []u32, chain: []u32, literal_table: []const FseEntry, match_table: []const FseEntry, offset_table: []const FseEntry, is_last: bool, options: Options, block_workspace: []u32, repeat_offsets: *[3]u32, prev: *PrevFseTables) EncodeError!void {
+    const src = content[block_start..block_end];
+    if (try storeOnlyPrefix(output, src, is_last)) return;
+    const seq_data = std.mem.bytesAsSlice(Sequence, std.mem.sliceAsBytes(block_workspace[0..encoder_block_seq_u32s]));
+    const literal_buf = std.mem.sliceAsBytes(block_workspace[encoder_block_seq_u32s..][0..encoder_block_lit_u32s])[0..encoder_block_size_max];
+    var literal_freq: [256]u32 = undefined;
+    var literal_count: usize = 0;
+    var seq_count: usize = 0;
+    var anchor: usize = 0;
+    var pos: usize = 0;
+    var insert_pos: usize = block_start;
+    while (pos < src.len) {
+        while (insert_pos < block_start + pos) {
+            insertPosition(content, insert_pos, block_end, head, chain, options);
+            insert_pos += 1;
+        }
+        const first = bestMatchAt(content, block_start, block_end, pos, head, chain, options, repeat_offsets);
+        var match_len = first.len;
+        var match_offset = first.offset;
+        if (first.len < options.nice_len and pos + 1 < src.len) {
+            insertPosition(content, insert_pos, block_end, head, chain, options);
+            insert_pos += 1;
+            const second = bestMatchAt(content, block_start, block_end, pos + 1, head, chain, options, repeat_offsets);
+            if (second.len > first.len) {
+                pos += 1;
+                match_len = second.len;
+                match_offset = second.offset;
+                if (second.len < options.nice_len and pos + 1 < src.len) {
+                    insertPosition(content, insert_pos, block_end, head, chain, options);
+                    insert_pos += 1;
+                    const third = bestMatchAt(content, block_start, block_end, pos + 1, head, chain, options, repeat_offsets);
+                    if (third.len > second.len) {
+                        pos += 1;
+                        match_len = third.len;
+                        match_offset = third.offset;
+                    }
+                }
+            }
+        }
+        if (match_len >= min_take_len) {
+            appendSequence(seq_data, &seq_count, literal_buf, &literal_count, src, anchor, pos, match_len, @intCast(match_offset), repeat_offsets);
+            pos += match_len;
+            anchor = pos;
+        } else {
+            pos += 1;
+        }
+    }
+    try flushParse(output, content, block_end, src, anchor, insert_pos, head, chain, options, seq_data, seq_count, literal_buf, &literal_count, &literal_freq, literal_table, match_table, offset_table, is_last, block_workspace, prev, options.entropy);
+}
+
+// --- The price-DP tier -------------------------------------------------
+
+// Candidate entries live in pairs of u32. Word zero holds the length, with
+// the repeat index (1-3) parked in the top two bits when the hit is a rep.
+// Word one holds the raw offset either way. Emission re-resolves the offset
+// value against the real repeat history.
+fn dpPush(cand: []u32, count: *usize, len: usize, offset: u32, rep_index: u2) bool {
+    if (count.* >= dp_stride) return false;
+    cand[count.* * 2] = @as(u32, @intCast(len)) | (@as(u32, rep_index) << 30);
+    cand[count.* * 2 + 1] = offset;
+    count.* += 1;
+    return true;
+}
+
+inline fn dpHash3(content: []const u8, pos: usize) u32 {
+    const word = @as(u32, content[pos]) | (@as(u32, content[pos + 1]) << 8) | (@as(u32, content[pos + 2]) << 16);
+    var h = word *% 0x9E37_79B1;
+    h ^= h >> 15;
+    return h >> @intCast(32 - dp_head3_bits);
+}
+
+// Whole-bit prices on a fixed-point scale, so the DP compares integers.
+fn dpCodePrice(count: u32, total: u32) u32 {
+    if (count == 0 or total == 0) return dp_no_price;
+    var bits: u32 = 0;
+    while ((@as(u64, count) << @intCast(bits)) < total and bits < 24) bits += 1;
+    return bits << dp_price_shift;
+}
+
+fn dpSequencePrice(len: usize, entry0: u32, raw_offset: u32, match_price: []const u32, offset_price: []const u32) u32 {
+    const match_code = matchLengthCode(@intCast(len));
+    var price = match_price[match_code.code] + (@as(u32, match_code.bits) << dp_price_shift) + dp_seq_overhead;
+    const rep_index: u32 = entry0 >> 30;
+    if (rep_index != 0) {
+        price += offset_price[rep_index];
+    } else {
+        const offset_value = raw_offset + 3;
+        const offset_code = std.math.log2_int(u32, offset_value);
+        price += offset_price[offset_code] + (@as(u32, @intCast(offset_code)) << dp_price_shift);
+    }
+    return price;
+}
+
+// Collect the candidates at one position. Sources: the three repeat hits
+// (priced from the replay's history), the improving hash-chain walk, and
+// the nearest 3-byte side hit. `cand` holds dp_stride pairs; the caller
+// inserts the position afterwards.
+fn dpCollect(content: []const u8, block_start: usize, block_end: usize, pos: usize, head: []u32, chain: []u32, options: Options, replay_reps: *const [3]u32, head3: []u32, cand: []u32) usize {
+    var count: usize = 0;
+    const src_len = block_end - block_start;
+    const pos_abs = block_start + pos;
+    const window_limit = @min(options.window_size, options.search_window);
+    const min_abs = pos_abs - @min(pos_abs, window_limit);
+    if (pos + 3 <= src_len) {
+        const h3 = dpHash3(content, pos_abs);
+        const prev3 = head3[h3];
+        head3[h3] = @intCast(pos_abs);
+        if (prev3 != encoder_no_position and prev3 >= min_abs and prev3 < pos_abs) {
+            const side_end = @min(block_end, pos_abs + extension_cap);
+            const len3 = 3 + countMatchLen(content, prev3 + 3, pos_abs + 3, side_end);
+            _ = dpPush(cand, &count, len3, @intCast(pos_abs - prev3), 0);
+        }
+    }
+    if (pos + min_take_len > src_len) return count;
+    // Repeat hits first: ties prefer them later, and each is a distinct
+    // offset value with its own code. The decisive-byte guard retires a rep
+    // that cannot beat the running best. A shorter rep in that shadow is
+    // priced out anyway.
+    var best_len: usize = 0;
+    const max_len = @min(src_len - pos, extension_cap);
+    inline for (0..3) |rep_index| {
+        const off = replay_reps[rep_index];
+        if (off != 0 and pos_abs >= off and pos_abs - off >= min_abs and best_len < max_len and content[pos_abs - off + best_len] == content[pos_abs + best_len] and readU32At(content, pos_abs - off) == readU32At(content, pos_abs)) {
+            const len = min_take_len + countMatchLen(content, pos_abs - off + min_take_len, pos_abs + min_take_len, block_end);
+            best_len = @max(best_len, len);
+            _ = dpPush(cand, &count, len, off, @intCast(rep_index + 1));
+        }
+    }
+    const mask = (@as(u32, 1) << options.hash_bits) - 1;
+    var candidate = head[hash4(content, pos_abs, mask)];
+    var steps: usize = 0;
+    while (candidate != encoder_no_position and candidate >= min_abs and candidate < pos_abs and steps < options.max_chain) : (steps += 1) {
+        if (best_len < max_len and content[candidate + best_len] == content[pos_abs + best_len] and readU32At(content, candidate) == readU32At(content, pos_abs)) {
+            const len = kernels.matchLen8(content, candidate, pos_abs, max_len);
+            if (len > best_len) {
+                best_len = len;
+                if (!dpPush(cand, &count, len, @intCast(pos_abs - candidate), 0)) break;
+                if (len >= options.nice_len) break;
+            }
+        }
+        candidate = chain[candidate];
+    }
+    return count;
+}
+
+fn encodeBlockDp(output: *std.Io.Writer, content: []const u8, block_start: usize, block_end: usize, head: []u32, chain: []u32, literal_table: []const FseEntry, match_table: []const FseEntry, offset_table: []const FseEntry, is_last: bool, options: Options, block_workspace: []u32, repeat_offsets: *[3]u32, prev: *PrevFseTables) EncodeError!void {
+    const src = content[block_start..block_end];
+    if (try storeOnlyPrefix(output, src, is_last)) return;
+    const seq_data = std.mem.bytesAsSlice(Sequence, std.mem.sliceAsBytes(block_workspace[0..encoder_block_seq_u32s]));
+    const literal_buf = std.mem.sliceAsBytes(block_workspace[encoder_block_seq_u32s..][0..encoder_block_lit_u32s])[0..encoder_block_size_max];
+    const dp = block_workspace[encoder_block_prefix_u32s..][0..encoder_block_dp_u32s];
+    const pair_words = encoder_block_size_max * dp_stride * 2;
+    const cand_base: usize = 0;
+    const counts_base = pair_words;
+    const cost_base = counts_base + encoder_block_size_max;
+    const choice_base = cost_base + encoder_block_size_max + 1;
+    const head3_base = choice_base + encoder_block_size_max;
+    const head3 = dp[head3_base..][0 .. 1 << dp_head3_bits];
+    const span = src.len;
+
+    var literal_count: usize = 0;
+    var seq_count: usize = 0;
+    var literal_freq: [256]u32 = @splat(0);
+    var lit_total: u32 = 0;
+    var match_freq: [256]u32 = @splat(0);
+    var match_total: u32 = 0;
+    var offset_freq: [64]u32 = @splat(0);
+    var offset_total: u32 = 0;
+    // A baseline so a three-byte match at a rep code has a finite price
+    // before the replay emits one.
+    match_freq[1] = 1;
+    match_total = 1;
+
+    @memset(head3, encoder_no_position);
+    // Candidate pass. The greedy replay over the collected candidates drives
+    // the repeat history for later rep hits. It also sets the symbol
+    // frequencies for the frozen prices. Every position is inserted for
+    // later walks.
+    var replay_reps = repeat_offsets.*;
+    var replay_pos: usize = 0;
+    var replay_anchor: usize = 0;
+    for (0..span) |pos| {
+        const cand = dp[cand_base + pos * dp_stride * 2 ..][0 .. dp_stride * 2];
+        const count = dpCollect(content, block_start, block_end, pos, head, chain, options, &replay_reps, head3, cand);
+        dp[counts_base + pos] = @intCast(count);
+        insertPosition(content, block_start + pos, block_end, head, chain, options);
+        if (pos != replay_pos) continue;
+        var best_len: usize = 0;
+        var best_index: usize = 0;
+        for (cand[0 .. count * 2], 0..) |word0, ci| {
+            const len: usize = @intCast(word0 & 0x3FFFFFFF);
+            if (len > best_len) {
+                best_len = len;
+                best_index = ci / 2;
+            }
+        }
+        if (best_len >= min_take_len) {
+            const run = src[replay_anchor..pos];
+            for (run) |b| literal_freq[b] += 1;
+            lit_total += @intCast(run.len);
+            const raw_offset = cand[best_index * 2 + 1];
+            const offset_value = resolveOffsetValue(raw_offset, @intCast(run.len), &replay_reps);
+            offset_freq[std.math.log2_int(u32, offset_value)] += 1;
+            offset_total += 1;
+            const match_code = matchLengthCode(@intCast(best_len));
+            match_freq[match_code.code] += 1;
+            match_total += 1;
+            replay_pos = pos + best_len;
+            replay_anchor = replay_pos;
+        } else {
+            literal_freq[src[pos]] += 1;
+            lit_total += 1;
+            replay_anchor = pos + 1;
+            replay_pos = pos + 1;
+        }
+    }
+    if (replay_anchor < span) {
+        for (src[replay_anchor..span]) |b| literal_freq[b] += 1;
+        lit_total += @intCast(span - replay_anchor);
+    }
+
+    var lit_price: [256]u32 = undefined;
+    for (0..256) |s| lit_price[s] = dpCodePrice(literal_freq[s], lit_total);
+    var match_price: [256]u32 = undefined;
+    for (0..256) |s| match_price[s] = dpCodePrice(match_freq[s], match_total);
+    var offset_price: [64]u32 = undefined;
+    for (0..64) |s| offset_price[s] = dpCodePrice(offset_freq[s], offset_total);
+
+    // Backward DP over frozen prices. Choosing a match skips its interior,
+    // so literals between matches accrue one position at a time.
+    dp[cost_base + span] = 0;
+    var i: usize = span;
+    while (i > 0) {
+        i -= 1;
+        var best_price = lit_price[src[i]] + dp[cost_base + i + 1];
+        var best_choice: u32 = 0;
+        const count: usize = @intCast(dp[counts_base + i]);
+        if (count != 0) {
+            const cand = dp[cand_base + i * dp_stride * 2 ..][0 .. dp_stride * 2];
+            for (0..count) |ci| {
+                const cand_len: usize = @intCast(cand[ci * 2] & 0x3FFFFFFF);
+                // A slot's price is constant across its lengths, so only the
+                // first length of each slot needs trying. The suffix cost
+                // decides which slot wins.
+                var slot_len: usize = match_length_code_table[0][0];
+                while (slot_len <= cand_len) {
+                    const slot_code = matchLengthCode(@intCast(slot_len));
+                    const price = dpSequencePrice(slot_len, cand[ci * 2], cand[ci * 2 + 1], &match_price, &offset_price) + dp[cost_base + i + slot_len];
+                    if (price < best_price) {
+                        best_price = price;
+                        best_choice = (@as(u32, @intCast(slot_len)) << 4) | @as(u32, @intCast(ci + 1));
+                    }
+                    if (slot_code.code + 1 >= match_length_code_table.len) break;
+                    slot_len = match_length_code_table[slot_code.code + 1][0];
+                }
+            }
+        }
+        dp[cost_base + i] = best_price;
+        dp[choice_base + i] = best_choice;
+    }
+
+    // Emission: replay the choices, re-resolving offset values against the
+    // real repeat history so the stream stays decoder-exact.
+    var pos: usize = 0;
+    var anchor: usize = 0;
+    while (pos < span) {
+        const choice = dp[choice_base + pos];
+        if (choice == 0) {
+            pos += 1;
+            continue;
+        }
+        const len: usize = @intCast(choice >> 4);
+        const ci: usize = @intCast(choice & 0xF);
+        const cand = dp[cand_base + pos * dp_stride * 2 ..][0 .. dp_stride * 2];
+        const raw_offset = cand[ci * 2 - 2 + 1];
+        appendSequence(seq_data, &seq_count, literal_buf, &literal_count, src, anchor, pos, len, raw_offset, repeat_offsets);
+        pos += len;
+        anchor = pos;
+    }
+    try flushParse(output, content, block_end, src, anchor, block_start + span, head, chain, options, seq_data, seq_count, literal_buf, &literal_count, &literal_freq, literal_table, match_table, offset_table, is_last, block_workspace, prev, options.entropy);
 }
 
 fn countLiteralFreqs(literals: []const u8, freq: *[256]u32) void {
@@ -698,27 +1093,18 @@ fn appendSequence(seq_data: []Sequence, seq_count: *usize, literal_buf: []u8, li
     }
     literal_count.* += literal_run.len;
     const literal_len: u32 = @intCast(literal_end - literal_start);
-    const literal_code = literalLengthCode(literal_len);
-    const match_code = matchLengthCode(@intCast(match_len));
-    const offset_code = offsetCode(offset, literal_len, repeat_offsets);
     seq_data[seq_count.*] = .{
         .literal_length = literal_len,
-        .literal_code = literal_code.code,
-        .literal_extra = literal_code.extra,
-        .literal_extra_bits = literal_code.bits,
         .match_length = @intCast(match_len),
-        .match_code = match_code.code,
-        .match_extra = match_code.extra,
-        .match_extra_bits = match_code.bits,
-        .offset = offset,
-        .offset_code = offset_code.code,
-        .offset_extra = offset_code.extra,
-        .offset_extra_bits = offset_code.bits,
+        .offset_value = resolveOffsetValue(offset, literal_len, repeat_offsets),
     };
     seq_count.* += 1;
 }
 
-fn finishBlock(output: *std.Io.Writer, src: []const u8, literal_buf: []const u8, seq_data: []const Sequence, literal_freq: *[256]u32, literal_table: []const FseEntry, match_table: []const FseEntry, offset_table: []const FseEntry, is_last: bool, block_workspace: []u32, prev: *PrevFseTables) EncodeError!void {
+// The sequence-execution stage: turns the parse product (literal buffer
+// plus Sequence list) into one block bitstream. Raw wins when the
+// compressed sections cannot beat it. Every parser tier ends here.
+fn executeSeqData(output: *std.Io.Writer, src: []const u8, literal_buf: []const u8, seq_data: []const Sequence, literal_freq: *[256]u32, literal_table: []const FseEntry, match_table: []const FseEntry, offset_table: []const FseEntry, is_last: bool, block_workspace: []u32, prev: *PrevFseTables, entropy: u32) EncodeError!void {
     const literal_count = literal_buf.len;
     const seq_count = seq_data.len;
     const raw_size = 3 + src.len;
@@ -742,7 +1128,7 @@ fn finishBlock(output: *std.Io.Writer, src: []const u8, literal_buf: []const u8,
     }
     const literal_ok = compressed_literal_ok or raw_literal_ok;
     const prev_saved = prev.*;
-    const seq_ok = buildSequenceSection(seq_data[0..seq_count], literal_table, match_table, offset_table, prev, seq_section_buf, &seq_section);
+    const seq_ok = buildSequenceSection(seq_data[0..seq_count], literal_table, match_table, offset_table, prev, entropy, seq_section_buf, &seq_section);
     const compressed_size = if (literal_ok and seq_ok) 3 + literal_section.len + seq_section.len else raw_size;
     const compressed_wins = literal_ok and seq_ok and compressed_size < raw_size;
     if (!compressed_wins) prev.* = prev_saved;
@@ -901,7 +1287,7 @@ fn encodeBlockDfast(output: *std.Io.Writer, content: []const u8, block_start: us
     @memcpy(literal_buf[literal_count..][0..tail.len], tail);
     literal_count += tail.len;
     countLiteralFreqs(literal_buf[0..literal_count], &literal_freq);
-    try finishBlock(output, src, literal_buf[0..literal_count], seq_data[0..seq_count], &literal_freq, literal_table, match_table, offset_table, is_last, block_workspace, prev);
+    try executeSeqData(output, src, literal_buf[0..literal_count], seq_data[0..seq_count], &literal_freq, literal_table, match_table, offset_table, is_last, block_workspace, prev, options.entropy);
 }
 
 // Row finder: 5-byte hash selects a row, 16-bit tag prefilters. Scalar computes the identical
@@ -1091,7 +1477,7 @@ fn encodeBlockRow(output: *std.Io.Writer, content: []const u8, block_start: usiz
     @memcpy(literal_buf[literal_count..][0..tail.len], tail);
     literal_count += tail.len;
     countLiteralFreqs(literal_buf[0..literal_count], &literal_freq);
-    try finishBlock(output, src, literal_buf[0..literal_count], seq_data[0..seq_count], &literal_freq, literal_table, match_table, offset_table, is_last, block_workspace, prev);
+    try executeSeqData(output, src, literal_buf[0..literal_count], seq_data[0..seq_count], &literal_freq, literal_table, match_table, offset_table, is_last, block_workspace, prev, options.entropy);
 }
 
 inline fn readU32At(content: []const u8, pos: usize) u32 {
@@ -1134,13 +1520,14 @@ fn insertPosition(content: []const u8, pos: usize, block_end: usize, head: []u32
     head[h] = @intCast(pos);
 }
 
-fn findLongestMatch(content: []const u8, block_start: usize, block_end: usize, pos: usize, head: []u32, chain: []u32, options: Options) struct { len: usize, offset: usize } {
+fn findLongestMatch(content: []const u8, block_start: usize, block_end: usize, pos: usize, head: []u32, chain: []u32, options: Options, cap: usize) struct { len: usize, offset: usize } {
     const src_len = block_end - block_start;
     if (pos + min_take_len > src_len) return .{ .len = 0, .offset = 0 };
     const cur_abs = block_start + pos;
     const window_limit = @min(options.window_size, options.search_window);
     const limit = @min(cur_abs, window_limit);
     const min_abs = cur_abs - limit;
+    const cap_len = @min(src_len - pos, cap);
     const mask = (@as(u32, 1) << options.hash_bits) - 1;
     const h = hash4(content, cur_abs, mask);
     var best_len: usize = min_take_len - 1;
@@ -1148,11 +1535,13 @@ fn findLongestMatch(content: []const u8, block_start: usize, block_end: usize, p
     var candidate = head[h];
     var steps: usize = 0;
     const cur_word = readU32At(content, cur_abs);
-    while (candidate != encoder_no_position and candidate >= min_abs and steps < options.max_chain) : (steps += 1) {
+    while (candidate != encoder_no_position and candidate >= min_abs and candidate < cur_abs and steps < options.max_chain) : (steps += 1) {
         if (candidate < cur_abs) {
-            const max_len = src_len - pos;
-            if (readU32At(content, candidate) == cur_word) {
-                const len = kernels.matchLen8(content, candidate, cur_abs, max_len);
+            // The decisive-byte guard skips candidates that cannot improve:
+            // when best_len already reaches the block end, one comparison
+            // retires every later candidate on periodic input.
+            if (best_len < cap_len and content[candidate + best_len] == content[cur_abs + best_len] and readU32At(content, candidate) == cur_word) {
+                const len = kernels.matchLen8(content, candidate, cur_abs, cap_len);
                 if (len > best_len) {
                     best_len = len;
                     best_offset = cur_abs - candidate;
@@ -1201,7 +1590,10 @@ fn matchLengthCode(length: u32) LengthCode {
     return .{ .code = @intCast(lo), .extra = length - base, .bits = bits };
 }
 
-fn offsetCode(offset: u32, literal_length: u32, reps: *[3]u32) LengthCode {
+// Resolves a raw match offset against the repeat-offset history, updating
+// the history exactly as the decoder will. The returned value is what the
+// bitstream carries: 1-3 for repeat codes, offset + 3 otherwise.
+fn resolveOffsetValue(offset: u32, literal_length: u32, reps: *[3]u32) u32 {
     const no_literals = literal_length == 0;
     const offset_value: u32 = if (!no_literals and offset == reps[0]) 1 else if (offset == reps[1]) @as(u32, 2) - @intFromBool(no_literals) else if (offset == reps[2]) @as(u32, 3) - @intFromBool(no_literals) else if (no_literals and offset == reps[0] - 1) 3 else offset + 3;
     switch (offset_value) {
@@ -1224,6 +1616,10 @@ fn offsetCode(offset: u32, literal_length: u32, reps: *[3]u32) LengthCode {
         },
         else => updateRepeatOffsets(offset, reps),
     }
+    return offset_value;
+}
+
+fn offsetCodeFromValue(offset_value: u32) LengthCode {
     const code = std.math.log2_int(u32, offset_value);
     const extra = offset_value - (@as(u32, 1) << code);
     return .{ .code = @intCast(code), .extra = extra, .bits = @intCast(code) };
@@ -1667,7 +2063,7 @@ fn writeCompressedLiteralHeader(out: []u8, regen: usize, compressed: usize) void
     }
 }
 
-fn buildSequenceSection(seqs: []const Sequence, literal_table: []const FseEntry, match_table: []const FseEntry, offset_table: []const FseEntry, prev: *PrevFseTables, out: []u8, section: *[]const u8) bool {
+fn buildSequenceSection(seqs: []const Sequence, literal_table: []const FseEntry, match_table: []const FseEntry, offset_table: []const FseEntry, prev: *PrevFseTables, entropy: u32, out: []u8, section: *[]const u8) bool {
     const n = seqs.len;
     if (n == 0) {
         if (out.len < 1) return false;
@@ -1682,12 +2078,15 @@ fn buildSequenceSection(seqs: []const Sequence, literal_table: []const FseEntry,
     var match_freq: [256]u32 = @splat(0);
     var offset_freq: [256]u32 = @splat(0);
     for (seqs, 0..) |seq, i| {
-        lit_symbols[i] = seq.literal_code;
-        match_symbols[i] = seq.match_code;
-        offset_symbols[i] = seq.offset_code;
-        lit_freq[seq.literal_code] += 1;
-        match_freq[seq.match_code] += 1;
-        offset_freq[seq.offset_code] += 1;
+        const lit_code = literalLengthCode(seq.literal_length).code;
+        const match_code = matchLengthCode(seq.match_length).code;
+        const offset_code = offsetCodeFromValue(seq.offset_value).code;
+        lit_symbols[i] = lit_code;
+        match_symbols[i] = match_code;
+        offset_symbols[i] = offset_code;
+        lit_freq[lit_code] += 1;
+        match_freq[match_code] += 1;
+        offset_freq[offset_code] += 1;
     }
     var lit_values: [encoder_block_size_max]u16 = undefined;
     var lit_counts: [encoder_block_size_max]u8 = undefined;
@@ -1701,9 +2100,9 @@ fn buildSequenceSection(seqs: []const Sequence, literal_table: []const FseEntry,
     var lit_ncount: [256]u8 = undefined;
     var match_ncount: [256]u8 = undefined;
     var offset_ncount: [256]u8 = undefined;
-    const lit_plan = planMode(n, &lit_symbols, &lit_freq, 36, 9, literal_table, if (prev.literal_valid) prev.literal[0 .. @as(usize, 1) << prev.literal_log] else null, prev.literal_log, &lit_values, &lit_counts, &lit_table_buf, &lit_ncount);
-    const match_plan = planMode(n, &match_symbols, &match_freq, 53, 9, match_table, if (prev.match_valid) prev.match[0 .. @as(usize, 1) << prev.match_log] else null, prev.match_log, &match_values, &match_counts, &match_table_buf, &match_ncount);
-    const offset_plan = planMode(n, &offset_symbols, &offset_freq, 32, 8, offset_table, if (prev.offset_valid) prev.offset[0 .. @as(usize, 1) << prev.offset_log] else null, prev.offset_log, &offset_values, &offset_counts, &offset_table_buf, &offset_ncount);
+    const lit_plan = planMode(n, &lit_symbols, &lit_freq, 36, 9, literal_table, if (prev.literal_valid) prev.literal[0 .. @as(usize, 1) << prev.literal_log] else null, prev.literal_log, &lit_values, &lit_counts, &lit_table_buf, &lit_ncount, entropy);
+    const match_plan = planMode(n, &match_symbols, &match_freq, 53, 9, match_table, if (prev.match_valid) prev.match[0 .. @as(usize, 1) << prev.match_log] else null, prev.match_log, &match_values, &match_counts, &match_table_buf, &match_ncount, entropy);
+    const offset_plan = planMode(n, &offset_symbols, &offset_freq, 32, 8, offset_table, if (prev.offset_valid) prev.offset[0 .. @as(usize, 1) << prev.offset_log] else null, prev.offset_log, &offset_values, &offset_counts, &offset_table_buf, &offset_ncount, entropy);
     if (!lit_plan.valid or !match_plan.valid or !offset_plan.valid) return false;
     prev.literal_valid = lit_plan.kind == .fse or lit_plan.kind == .predefined or lit_plan.kind == .repeat;
     prev.match_valid = match_plan.kind == .fse or match_plan.kind == .predefined or match_plan.kind == .repeat;
@@ -1768,9 +2167,12 @@ fn buildSequenceSection(seqs: []const Sequence, literal_table: []const FseEntry,
             if (match_plan.kind != .rle) bit_writer.writeBits(match_values[j], @intCast(match_counts[j])) catch return false;
             if (lit_plan.kind != .rle) bit_writer.writeBits(lit_values[j], @intCast(lit_counts[j])) catch return false;
         }
-        bit_writer.writeBits(seqs[j].literal_extra, seqs[j].literal_extra_bits) catch return false;
-        bit_writer.writeBits(seqs[j].match_extra, seqs[j].match_extra_bits) catch return false;
-        bit_writer.writeBits(seqs[j].offset_extra, seqs[j].offset_extra_bits) catch return false;
+        const lit_code = literalLengthCode(seqs[j].literal_length);
+        const match_code = matchLengthCode(seqs[j].match_length);
+        const offset_code = offsetCodeFromValue(seqs[j].offset_value);
+        bit_writer.writeBits(lit_code.extra, lit_code.bits) catch return false;
+        bit_writer.writeBits(match_code.extra, match_code.bits) catch return false;
+        bit_writer.writeBits(offset_code.extra, offset_code.bits) catch return false;
     }
     if (match_plan.kind != .rle) bit_writer.writeBits(match_plan.initial, match_plan.accuracy_log) catch return false;
     if (offset_plan.kind != .rle) bit_writer.writeBits(offset_plan.initial, offset_plan.accuracy_log) catch return false;
@@ -1828,7 +2230,7 @@ const ModePlan = struct {
     ncount: []const u8 = &.{},
 };
 
-fn planMode(n: usize, symbols: []const u8, freq: *const [256]u32, symbol_count: usize, max_log: u5, default_table: []const FseEntry, prev_table: ?[]const FseEntry, prev_log: u5, values: []u16, counts: []u8, table_buf: []FseEntry, ncount_buf: []u8) ModePlan {
+fn planMode(n: usize, symbols: []const u8, freq: *const [256]u32, symbol_count: usize, max_log: u5, default_table: []const FseEntry, prev_table: ?[]const FseEntry, prev_log: u5, values: []u16, counts: []u8, table_buf: []FseEntry, ncount_buf: []u8, entropy: u32) ModePlan {
     var distinct: usize = 0;
     for (freq[0..symbol_count]) |f| {
         if (f > 0) distinct += 1;
@@ -1845,6 +2247,21 @@ fn planMode(n: usize, symbols: []const u8, freq: *const [256]u32, symbol_count: 
             best = .{ .kind = .repeat, .accuracy_log = prev_log, .table = table };
             best_bits = bits;
         }
+    }
+    // The vendor's selectEncodingType early-out: on small blocks the fresh
+    // table's description cost dominates. Keep the previous table without
+    // pricing the alternatives. Byte-changing; behind the entropy selector.
+    if (entropy == 1 and best.valid and n < 32) {
+        // Written behind the valid flag, so `undefined` is safe.
+        var initial: usize = undefined;
+        var bits: u64 = undefined;
+        if (evalFseTable(best.table, symbols, n, values, counts, &initial, &bits)) {
+            best.values = values;
+            best.counts = counts;
+            best.initial = initial;
+            return best;
+        }
+        return .{ .kind = .predefined, .valid = false, .accuracy_log = 5 };
     }
     const default_log: u5 = @intCast(std.math.log2_int(usize, default_table.len));
     const default_bits = estimateFseBits(default_table, freq, symbol_count, default_log);
@@ -4119,4 +4536,119 @@ test "zstd dictionary content accepts zero dictionary id" {
     std.mem.writeInt(u32, dict_buffer[4..8], 0, .little);
     const content = try dictionaryContent(dict_buffer[0..dict_len]);
     try std.testing.expect(content.len > 0);
+}
+
+// The strategy selector must actually reach the parser tiers. The crafted
+// input: an immediate 16-byte match at offset 100 blocks a 24-byte match
+// one position later. Lazy2 defers. The DP takes the global view; the chain
+// and greedy tiers take the first match.
+test "zstd strategy tiers engage and decode" {
+    const allocator = std.testing.allocator;
+    var input: [1024]u8 = undefined;
+    var state: u64 = 0x243F6A8885A308D3;
+    for (&input) |*b| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        b.* = @as(u8, @truncate(state)) & 7;
+    }
+    @memcpy(input[100..116], input[0..16]);
+    @memcpy(input[101..125], input[41..65]);
+    input[116] ^= 0xFF;
+    input[56] ^= 0xFF;
+    input[125] ^= 0xFF;
+    input[65] ^= 0xFF;
+
+    const window: u32 = 1 << 16;
+    const base: Options = .{ .window_size = window, .hash_bits = 12, .max_chain = 16, .nice_len = 32, .search_window = 4096, .double_hash = false };
+    const history = try allocator.alloc(u8, @as(usize, window) + block_size_max);
+    defer allocator.free(history);
+    const dp_options: Options = .{ .window_size = window, .hash_bits = 12, .max_chain = 16, .nice_len = 32, .search_window = 4096, .double_hash = false, .strategy = strategy_dp };
+    const workspace = try allocator.alloc(u32, encoderWorkspaceU32Count(0, window, dp_options));
+    defer allocator.free(workspace);
+    const bound = encodedSizeBound(input.len, base) + 64;
+    const out_chain = try allocator.alloc(u8, bound);
+    defer allocator.free(out_chain);
+    const out_lazy2 = try allocator.alloc(u8, bound);
+    defer allocator.free(out_lazy2);
+    const out_dp = try allocator.alloc(u8, bound);
+    defer allocator.free(out_dp);
+
+    var source = std.Io.Reader.fixed(&input);
+    var sink = std.Io.Writer.fixed(out_chain);
+    const chain_len = try encodeStream(&source, &sink, history, workspace, base);
+    var source2 = std.Io.Reader.fixed(&input);
+    var sink2 = std.Io.Writer.fixed(out_lazy2);
+    const lazy2_len = try encodeStream(&source2, &sink2, history, workspace, .{ .window_size = window, .hash_bits = 12, .max_chain = 16, .nice_len = 32, .search_window = 4096, .double_hash = false, .strategy = strategy_lazy2 });
+    var source3 = std.Io.Reader.fixed(&input);
+    var sink3 = std.Io.Writer.fixed(out_dp);
+    const dp_len = try encodeStream(&source3, &sink3, history, workspace, .{ .window_size = window, .hash_bits = 12, .max_chain = 16, .nice_len = 32, .search_window = 4096, .strategy = strategy_dp });
+
+    // Deferral changes the parse; the DP changes it again. The DP must not
+    // lose to the immediate take on the crafted decision point.
+    try std.testing.expect(lazy2_len != chain_len or !std.mem.eql(u8, out_lazy2[0..lazy2_len], out_chain[0..chain_len]));
+    try std.testing.expect(dp_len != chain_len or !std.mem.eql(u8, out_dp[0..dp_len], out_chain[0..chain_len]));
+    try std.testing.expect(dp_len <= chain_len);
+
+    const decoded = try allocator.alloc(u8, input.len);
+    defer allocator.free(decoded);
+    for ([_][]const u8{ out_chain[0..chain_len], out_lazy2[0..lazy2_len], out_dp[0..dp_len] }) |encoded| {
+        var encoded_source = std.Io.Reader.fixed(encoded);
+        var decoded_sink = std.Io.Writer.fixed(decoded);
+        _ = try decodeStream(&encoded_source, &decoded_sink, history, .{ .window_size = window });
+        try std.testing.expectEqualSlices(u8, &input, decoded);
+    }
+}
+
+
+// The entropy early-out needs a multi-block frame. The later block must
+// carry fewer than 32 sequences while a previous table exists. Block one
+// establishes the tables from dense matches; block two is random (no
+// matches). The unconditional repeat then diverges from the cost model.
+test "zstd entropy early-outs engage" {
+    const allocator = std.testing.allocator;
+    var input: [(128 + 64) * 1024]u8 = undefined;
+    var state: u64 = 0xB5297A4D3F84D5B5;
+    for (input[0 .. 128 * 1024]) |*b| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        b.* = @as(u8, @truncate(state)) & 3;
+    }
+    for (input[128 * 1024 ..]) |*b| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        b.* = @as(u8, @truncate(state));
+    }
+    // Sparse structure: sixteen 64-byte repeats leave the second block with
+    // sixteen sequences, under the early-out's 32-sequence threshold.
+    for (0..16) |i| {
+        const at = 128 * 1024 + i * 4096;
+        @memcpy(input[at..][0..64], input[0..64]);
+    }
+    const window: u32 = 1 << 22;
+    const base: Options = .{ .window_size = window, .hash_bits = 17, .double_hash = false };
+    const early: Options = .{ .window_size = window, .hash_bits = 17, .double_hash = false, .entropy = 1 };
+    const workspace = try allocator.alloc(u32, encoderWorkspaceU32Count(0, window, early));
+    defer allocator.free(workspace);
+    const history = try allocator.alloc(u8, @as(usize, window) + block_size_max);
+    defer allocator.free(history);
+    const out_base = try allocator.alloc(u8, encodedSizeBound(input.len, base) + 64);
+    defer allocator.free(out_base);
+    const out_early = try allocator.alloc(u8, encodedSizeBound(input.len, early) + 64);
+    defer allocator.free(out_early);
+    var s1 = std.Io.Reader.fixed(&input);
+    var w1 = std.Io.Writer.fixed(out_base);
+    const base_len = try encodeStream(&s1, &w1, history, workspace, base);
+    var s2 = std.Io.Reader.fixed(&input);
+    var w2 = std.Io.Writer.fixed(out_early);
+    const early_len = try encodeStream(&s2, &w2, history, workspace, early);
+    try std.testing.expect(base_len != early_len or !std.mem.eql(u8, out_base[0..base_len], out_early[0..early_len]));
+    const decoded = try allocator.alloc(u8, input.len);
+    defer allocator.free(decoded);
+    var s3 = std.Io.Reader.fixed(out_early[0..early_len]);
+    var w3 = std.Io.Writer.fixed(decoded);
+    _ = try decodeStream(&s3, &w3, history, .{ .window_size = window });
+    try std.testing.expectEqualSlices(u8, &input, decoded);
 }
