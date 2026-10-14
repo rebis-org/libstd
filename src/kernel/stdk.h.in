@@ -7,43 +7,43 @@ extern "C" {
 #endif
 @STDK_STATUS@
 typedef struct stdk_id {
-    uint64_t low;
-    uint64_t high;
+	uint64_t low;
+	uint64_t high;
 } stdk_id;
 typedef struct stdk_node stdk_node;
 typedef struct stdk_call_envelope stdk_call_envelope;
-typedef uint32_t (*stdk_callback)(stdk_call_envelope* call);
+typedef uint32_t (*stdk_callback)(stdk_call_envelope *call);
 struct stdk_node {
-    uint32_t structure_size;
-    uint32_t flags;
-    stdk_id id;
-    uint64_t value_low;
-    uint64_t value_high;
-    uint8_t* bytes;
-    uint64_t byte_capacity;
-    uint64_t byte_length;
-    stdk_node* child;
-    stdk_node* next;
-    uint64_t reserved[2];
+	uint32_t structure_size;
+	uint32_t flags;
+	stdk_id id;
+	uint64_t value_low;
+	uint64_t value_high;
+	uint8_t *bytes;
+	uint64_t byte_capacity;
+	uint64_t byte_length;
+	stdk_node *child;
+	stdk_node *next;
+	uint64_t reserved[2];
 };
 struct stdk_call_envelope {
-    uint32_t structure_size;
-    uint32_t flags;
-    stdk_id operation;
-    stdk_node* request;
-    stdk_node* response;
-    stdk_node* diagnostic;
-    uint8_t* workspace;
-    uint64_t workspace_capacity;
-    stdk_callback callback;
-    void* callback_context;
-    uint64_t reserved[4];
+	uint32_t structure_size;
+	uint32_t flags;
+	stdk_id operation;
+	stdk_node *request;
+	stdk_node *response;
+	stdk_node *diagnostic;
+	uint8_t *workspace;
+	uint64_t workspace_capacity;
+	stdk_callback callback;
+	void *callback_context;
+	uint64_t reserved[4];
 };
 @STDK_LAYOUT@
 #ifdef __cplusplus
-    #define STDK_STATIC_ASSERT(condition, message) static_assert(condition, message)
+#define STDK_STATIC_ASSERT(condition, message) static_assert(condition, message)
 #else
-    #define STDK_STATIC_ASSERT(condition, message) _Static_assert(condition, message)
+#define STDK_STATIC_ASSERT(condition, message) _Static_assert(condition, message)
 #endif
 @STDK_ASSERT@
 @STDK_CALL@
@@ -73,13 +73,21 @@ struct stdk_call_envelope {
  * stdk_session_catalog carries the versioned pair list so hosts discover
  * streamable codecs without hardcoding them.
  */
-uint64_t stdk_session_storage(const char* component, const char* verb);
-uint32_t stdk_session_create(const char* component, const char* verb, void* storage, uint64_t storage_len);
-uint32_t stdk_session_bounded(const char* component, const char* verb, void* storage, uint64_t storage_len, uint64_t max_encoded, uint64_t max_decoded, uint64_t max_work, uint64_t max_entries);
-uint32_t stdk_session_step(void* session, const uint8_t* input, uint64_t input_len, uint8_t* output, uint64_t output_len, int end_of_input, uint64_t counts_out[2], int* state_out);
-uint32_t stdk_session_failure(void* session, uint32_t* status_out, uint64_t* detail_out);
-const char* stdk_session_catalog(void);
-uint32_t stdk_session_destroy(void* session);
+uint64_t stdk_session_storage(const char *component, const char *verb);
+uint32_t stdk_session_create(const char *component, const char *verb,
+			     void *storage, uint64_t storage_len);
+uint32_t stdk_session_bounded(const char *component, const char *verb,
+			      void *storage, uint64_t storage_len,
+			      uint64_t max_encoded, uint64_t max_decoded,
+			      uint64_t max_work, uint64_t max_entries);
+uint32_t stdk_session_step(void *session, const uint8_t *input,
+			   uint64_t input_len, uint8_t *output,
+			   uint64_t output_len, int end_of_input,
+			   uint64_t counts_out[2], int *state_out);
+uint32_t stdk_session_failure(void *session, uint32_t *status_out,
+			      uint64_t *detail_out);
+const char *stdk_session_catalog(void);
+uint32_t stdk_session_destroy(void *session);
 #ifdef __cplusplus
 }
 #endif
