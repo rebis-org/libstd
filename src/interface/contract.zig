@@ -4,7 +4,7 @@ pub const Id = struct {
     high: u64,
 };
 
-pub const Class = enum { slice, streaming, grammar, filter };
+pub const Class = enum { slice, streaming, grammar, volume, filter };
 
 pub const Verb = enum {
     required_size,
@@ -35,6 +35,11 @@ pub fn verbsFor(class: Class) []const Verb {
             .encoded_size_bound,
         },
         .grammar => &.{
+            .inspect,
+            .decode_ordinal,
+            .encode_ordinal,
+        },
+        .volume => &.{
             .inspect,
             .decode_ordinal,
             .encode_ordinal,
