@@ -14,6 +14,8 @@ test {
     _ = @import("grammar/cpio/offprem.zig");
     _ = @import("grammar/cpio/onprem.zig");
     _ = @import("grammar/tar/onprem.zig");
+    _ = @import("grammar/xar/offprem.zig");
+    _ = @import("grammar/xar/onprem.zig");
     _ = @import("grammar/xz/onprem.zig");
     _ = @import("leaf/lz4/onprem.zig");
     _ = @import("leaf/zstd/onprem.zig");

@@ -221,6 +221,28 @@ pub fn runCpio(r: *Runner) anyerror!void {
     try runArchive(r, harness.ids.cpio);
 }
 
+pub fn runXar(r: *Runner) anyerror!void {
+    try runArchive(r, harness.ids.xar);
+}
+
+fn runXarForeign(comptime format: lib.ArchiveFormat) fn (*Runner) anyerror!void {
+    return struct {
+        fn run(r: *Runner) anyerror!void {
+            setupArchive(r, harness.ids.xar);
+            const expected = [_]lib.WriteEntry{
+                .{ .name = "m1.txt", .data = &arc_state.data1, .filetype = 0o100000 },
+                .{ .name = "m2.txt", .data = &arc_state.data2, .filetype = 0o100000 },
+            };
+            const foreign = lib.archiveWrite(format, &expected) orelse return error.ReferenceToolUnavailable;
+            const read_expected = [_]lib.ExpectedEntry{
+                .{ .name = "m1.txt", .data = &arc_state.data1 },
+                .{ .name = "m2.txt", .data = &arc_state.data2 },
+            };
+            try arcReadForeign(r, foreign, &read_expected);
+        }
+    }.run;
+}
+
 fn runCpioForeign(comptime format: lib.ArchiveFormat) fn (*Runner) anyerror!void {
     return struct {
         fn run(r: *Runner) anyerror!void {
@@ -729,6 +751,8 @@ pub const scenarios = harness.scenarios("archive", &.{
     .{ .label = "archive cpio", .run = runCpio, .workspace_size = 65536, .output_size = 512, .encoded_size = 4096 },
     .{ .label = "archive cpio foreign newc", .run = runCpioForeign(.cpio_newc), .workspace_size = 65536, .output_size = 512, .encoded_size = 4096 },
     .{ .label = "archive cpio foreign odc", .run = runCpioForeign(.cpio_odc), .workspace_size = 65536, .output_size = 512, .encoded_size = 4096 },
+    .{ .label = "archive xar", .run = runXar, .workspace_size = 3 * 1024 * 1024, .output_size = 512, .encoded_size = 4096 },
+    .{ .label = "archive xar foreign", .run = runXarForeign(.xar), .workspace_size = 3 * 1024 * 1024, .output_size = 512, .encoded_size = 4096 },
     .{ .label = "archive zip", .run = runZip, .workspace_size = 65536 + 4096, .output_size = 512, .encoded_size = 4096 },
     .{ .label = "archive rar", .run = runRarArchive, .workspace_size = 12 * 1024 * 1024, .output_size = 512, .encoded_size = 4096 },
 }, &.{
