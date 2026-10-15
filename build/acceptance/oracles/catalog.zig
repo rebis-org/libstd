@@ -31,6 +31,7 @@ pub const Ids = struct {
     wim: Id,
     squashfs: Id,
     iso: Id,
+    dwarfs: Id,
     zip: Id,
     bzip2: Id,
     lzma: Id,

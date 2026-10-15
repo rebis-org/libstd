@@ -27,6 +27,8 @@ test {
     _ = @import("grammar/tar/offprem.zig");
     _ = @import("testing/fuzz/decode.zig");
     _ = @import("leaf/lzo/onprem.zig");
+    _ = @import("volume/dwarfs/offprem.zig");
+    _ = @import("volume/dwarfs/onprem.zig");
     _ = @import("volume/iso/offprem.zig");
     _ = @import("volume/iso/onprem.zig");
     _ = @import("volume/squashfs/offprem.zig");
