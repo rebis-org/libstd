@@ -233,10 +233,7 @@ const HufTable = struct {
             const n = self.count[len];
             if (code -% first < n) {
                 const idx = index + (code - first);
-                if (idx >= self.symbols.len) {
-                    std.debug.print("WALK OOB len {d} code {d} first {d} index {d} n {d} symlen {d}\n", .{ len, code, first, index, n, self.symbols.len });
-                    return error.DataFailure;
-                }
+                if (idx >= self.symbols.len) return error.DataFailure;
                 return self.symbols[idx];
             }
             index += n;
