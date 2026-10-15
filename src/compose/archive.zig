@@ -9,6 +9,8 @@ const cpio = @import("../grammar/cpio/onprem.zig");
 const cpio_seam = @import("../grammar/cpio/seam.zig");
 const tar = @import("../grammar/tar/onprem.zig");
 const tar_seam = @import("../grammar/tar/seam.zig");
+const squashfs = @import("../volume/squashfs/onprem.zig");
+const squashfs_seam = @import("../volume/squashfs/seam.zig");
 const wim = @import("../grammar/wim/onprem.zig");
 const wim_seam = @import("../grammar/wim/seam.zig");
 const xar = @import("../grammar/xar/onprem.zig");
@@ -323,6 +325,72 @@ pub fn xarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
 fn fillWimEntry(entry: *wim.Entry, node: *Node, _: NoCtx) Failure!void {
     const parts = try entryNameData(node.child);
     entry.* = .{ .name = parts.name, .data = parts.data };
+}
+
+fn fillSquashfsEntry(entry: *squashfs.Entry, node: *Node, _: NoCtx) Failure!void {
+    const parts = try entryNameData(node.child);
+    entry.* = .{ .name = parts.name, .data = parts.data };
+}
+
+pub fn squashfsHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
+    _ = sizing;
+    const source_resource = source orelse return error.CallFailure;
+    var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
+    if (command_mask == vocabulary.command_mask_read) {
+        if (sink == null) {
+            const archive = try materializeArchive(source_resource, &workspace, limits);
+            const scratch = try workspace.take(u8, squashfs_seam.scratch_size);
+            if (try projectedEntrySize(call.request)) |ordinal| {
+                const entry = try squashfs_seam.inspectOrdinal(plan.provider, archive, ordinal, scratch);
+                response.byte_length = entry.size;
+                return;
+            }
+            const count = try squashfs_seam.inspectCount(plan.provider, archive, scratch);
+            response.byte_length = count;
+            return;
+        }
+        const head = try readHead(sink, call, commit);
+        const sink_resource = head.sink;
+        const ordinal = head.ordinal;
+        const archive = try materializeArchive(source_resource, &workspace, limits);
+        const scratch = try workspace.take(u8, squashfs_seam.scratch_size);
+        const entry = try squashfs_seam.inspectOrdinal(plan.provider, archive, ordinal, scratch);
+        const size = std.math.cast(usize, entry.size) orelse return error.ResourceFailure;
+        if (size > limits.decoded_bytes) return error.ResourceFailure;
+        try common.requireSinkCapacity(sink_resource, call, size);
+        if (sink_resource.kind == .direct_write) {
+            const output = try common.sinkDirectBuffer(sink_resource, size);
+            _ = try squashfs_seam.decodeOrdinal(plan.provider, archive, ordinal, output, scratch);
+        } else {
+            const staged = try workspace.take(u8, size);
+            _ = try squashfs_seam.decodeOrdinal(plan.provider, archive, ordinal, staged, scratch);
+            try common.commitBytesToSink(sink_resource, call, staged);
+        }
+        response.byte_length = size;
+    } else if (command_mask == vocabulary.command_mask_write) {
+        try requireVerified(commit);
+        const entries = try collectEntries(squashfs.Entry, call.request, &workspace, NoCtx{}, fillSquashfsEntry);
+        const required = try squashfs_seam.archiveSize(plan.provider, entries);
+        if (sink == null) {
+            response.byte_length = required;
+            return;
+        }
+        const sink_resource = sink.?;
+        try common.requireSinkCapacity(sink_resource, call, required);
+        const scratch = try workspace.take(u8, squashfs_seam.scratch_size);
+        if (sink_resource.kind == .direct_write) {
+            const output = try common.sinkDirectBuffer(sink_resource, required);
+            const written = try squashfs_seam.encode(plan.provider, entries, output, scratch);
+            response.byte_length = written;
+        } else {
+            const staging = try workspace.take(u8, required);
+            const written = try squashfs_seam.encode(plan.provider, entries, staging, scratch);
+            try common.commitBytesToSink(sink_resource, call, staging[0..written]);
+            response.byte_length = written;
+        }
+    } else {
+        return error.UnsupportedFailure;
+    }
 }
 
 pub fn wimHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
