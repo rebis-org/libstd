@@ -127,43 +127,65 @@ fn parseRecord(dir: []const u8, at: usize) Failure!?Record {
 
 const Target = union(enum) {
     count,
-    resolve: struct { ordinal: u64, info: *EntryInfo, output: ?[]u8 },
+    resolve: struct { ordinal: u64, info: *EntryInfo, output: ?[]u8, found: *bool = undefined },
 };
 
+const WalkState = struct { ordinal: u64 = 0 };
+
 fn walkRoot(archive: []const u8, desc: Descriptor, target: Target) Failure!u64 {
-    const dir = try bounds.slice(archive, std.math.mul(u64, desc.root_extent, sector_size) catch return error.DataFailure, desc.root_size);
+    var state = WalkState{};
+    var found = false;
+    const resolved = switch (target) {
+        .count => target,
+        .resolve => |res| Target{ .resolve = .{ .ordinal = res.ordinal, .info = res.info, .output = res.output, .found = &found } },
+    };
+    try walkIsoDir(archive, desc.root_extent, desc.root_size, resolved, &state);
+    return switch (target) {
+        .count => state.ordinal,
+        .resolve => if (found) state.ordinal else error.DataFailure,
+    };
+}
+
+fn walkIsoDir(archive: []const u8, extent: u32, size: u32, target: Target, state: *WalkState) Failure!void {
+    const dir = try bounds.slice(archive, std.math.mul(u64, extent, sector_size) catch return error.DataFailure, size);
     const dot = (try parseRecord(dir, 0)) orelse return error.DataFailure;
     if (!dot.is_dot) return error.DataFailure;
     const dotdot = (try parseRecord(dir, dot.skip)) orelse return error.DataFailure;
     if (!dotdot.is_dotdot) return error.DataFailure;
     var pos: usize = dot.skip + dotdot.skip;
-    var ordinal: u64 = 0;
+    const found_ptr = switch (target) {
+        .resolve => |res| res.found,
+        .count => null,
+    };
     while (pos < dir.len) {
+        if (found_ptr) |fp| {
+            if (fp.*) return;
+        }
         const rec = (try parseRecord(dir, pos)) orelse break;
         pos += rec.skip;
         if (rec.is_dot or rec.is_dotdot) continue;
-        if (rec.flags & flag_directory != 0) return error.UnsupportedFailure;
+        if (rec.flags & flag_directory != 0) {
+            try walkIsoDir(archive, rec.extent, rec.size, target, state);
+            continue;
+        }
         switch (target) {
             .count => {},
             .resolve => |res| {
-                if (ordinal == res.ordinal) {
+                if (state.ordinal == res.ordinal) {
                     res.info.size = rec.size;
-                    res.info.ordinal = ordinal;
+                    res.info.ordinal = state.ordinal;
                     if (res.output) |out| {
                         if (out.len < rec.size) return error.CapacityFailure;
                         const data = try bounds.slice(archive, std.math.mul(u64, rec.extent, sector_size) catch return error.DataFailure, rec.size);
                         @memcpy(out[0..rec.size], data);
                     }
-                    return ordinal;
+                    res.found.* = true;
+                    return;
                 }
             },
         }
-        ordinal += 1;
+        state.ordinal += 1;
     }
-    return switch (target) {
-        .count => ordinal,
-        .resolve => error.DataFailure,
-    };
 }
 
 pub fn inspectCount(archive: []const u8, scratch: []u8) Failure!u64 {
@@ -185,18 +207,162 @@ pub fn decodeOrdinal(archive: []const u8, ordinal: u64, output: []u8, scratch: [
     return @intCast(info.size);
 }
 
-const Layout = struct {
-    total: u64,
-    count: usize,
-    sorted: [max_entries]u16,
-    file_lba: [max_entries]u32,
-    dir_size: usize,
+const IsoNode = struct {
+    kind: enum { dir, file },
+    name: []const u8,
+    parent: u32,
+    data: []const u8 = &.{},
+    first_child: u32 = 0,
+    child_count: u32 = 0,
 };
+
+const max_tree_nodes = 128;
+
+const IsoPlan = struct {
+    nodes: []IsoNode,
+    dir_order: []u32,
+    file_order: []u32,
+    kids: []u32,
+    dir_content: []u32,
+    dir_lba_of: []u32,
+    file_lba_of: []u32,
+    path_table_size: u32,
+    total: u64,
+};
+
+fn isoFindOrCreateDir(nodes: *std.ArrayList(IsoNode), alloc: std.mem.Allocator, parent: u32, name: []const u8) Failure!u32 {
+    for (nodes.items, 0..) |node, i| {
+        if (node.kind == .dir and node.parent == parent and std.mem.eql(u8, node.name, name)) return @intCast(i);
+    }
+    const idx: u32 = @intCast(nodes.items.len);
+    nodes.append(alloc, .{ .kind = .dir, .name = name, .parent = parent }) catch return error.ResourceFailure;
+    nodes.items[parent].child_count += 1;
+    return idx;
+}
+
+fn buildIsoPlan(entries: []const Entry, alloc: std.mem.Allocator) Failure!IsoPlan {
+    if (entries.len == 0 or entries.len > max_entries) return error.UnsupportedFailure;
+    var nodes: std.ArrayList(IsoNode) = .empty;
+    nodes.append(alloc, .{ .kind = .dir, .name = "", .parent = 0 }) catch return error.ResourceFailure;
+    for (entries) |entry| {
+        try validateName(entry.name);
+        if (entry.data.len > std.math.maxInt(u32)) return error.UnsupportedFailure;
+        var parent: u32 = 0;
+        var it = std.mem.splitScalar(u8, entry.name, '/');
+        var comp = it.next().?;
+        while (it.next()) |next| {
+            parent = try isoFindOrCreateDir(&nodes, alloc, parent, comp);
+            comp = next;
+        }
+        nodes.append(alloc, .{ .kind = .file, .name = comp, .parent = parent, .data = entry.data }) catch return error.ResourceFailure;
+        nodes.items[parent].child_count += 1;
+    }
+    if (nodes.items.len > max_tree_nodes) return error.UnsupportedFailure;
+
+    const counts = alloc.alloc(u32, nodes.items.len) catch return error.ResourceFailure;
+    @memset(counts, 0);
+    for (nodes.items, 0..) |node, i| {
+        if (i != 0) counts[node.parent] += 1;
+    }
+    const starts = alloc.alloc(u32, nodes.items.len) catch return error.ResourceFailure;
+    var acc: u32 = 0;
+    for (counts, 0..) |c, i| {
+        starts[i] = acc;
+        acc += c;
+    }
+    const kids = alloc.alloc(u32, acc) catch return error.ResourceFailure;
+    const fill = alloc.alloc(u32, nodes.items.len) catch return error.ResourceFailure;
+    @memcpy(fill, starts);
+    for (nodes.items, 0..) |node, i| {
+        if (i == 0) continue;
+        kids[fill[node.parent]] = @intCast(i);
+        fill[node.parent] += 1;
+    }
+    for (nodes.items, 0..) |*node, i| {
+        node.first_child = starts[i];
+        const slice = kids[node.first_child .. node.first_child + counts[i]];
+        std.mem.sort(u32, slice, &nodes, struct {
+            fn less(ns: *std.ArrayList(IsoNode), a: u32, b: u32) bool {
+                return std.mem.order(u8, ns.items[a].name, ns.items[b].name) == .lt;
+            }
+        }.less);
+    }
+
+    var dir_order: std.ArrayList(u32) = .empty;
+    var file_order: std.ArrayList(u32) = .empty;
+    try isoDfs(&nodes, kids, 0, &dir_order, &file_order, alloc);
+
+    const dir_content = alloc.alloc(u32, dir_order.items.len) catch return error.ResourceFailure;
+    for (dir_order.items, 0..) |ni, di| {
+        const node = &nodes.items[ni];
+        var size: u32 = 33 + 1; // dot-dot record
+        size += if (di == 0) 33 + 1 + rr_size_dot_sua else 33 + 1;
+        for (kids[node.first_child .. node.first_child + node.child_count]) |ci| {
+            size += @intCast(dirRecordSize(nodes.items[ci].name.len, true));
+        }
+        if (size > sector_size) return error.UnsupportedFailure;
+        dir_content[di] = size;
+    }
+
+    const dir_lba_of = alloc.alloc(u32, dir_order.items.len) catch return error.ResourceFailure;
+    for (dir_order.items, 0..) |_, di| {
+        dir_lba_of[di] = dir_lba + @as(u32, @intCast(di));
+    }
+    const file_lba_of = alloc.alloc(u32, file_order.items.len) catch return error.ResourceFailure;
+    var lba: u32 = dir_lba + @as(u32, @intCast(dir_order.items.len));
+    for (file_order.items, 0..) |ni, fi| {
+        file_lba_of[fi] = lba;
+        lba += @intCast((nodes.items[ni].data.len + sector_size - 1) / sector_size);
+    }
+
+    var path_table_size: u32 = 0;
+    for (dir_order.items) |ni| {
+        const len: u32 = if (nodes.items[ni].name.len == 0) 1 else @intCast(nodes.items[ni].name.len);
+        path_table_size += 8 + len + (len & 1);
+    }
+
+    return .{
+        .nodes = nodes.items,
+        .dir_order = dir_order.items,
+        .file_order = file_order.items,
+        .kids = kids,
+        .dir_content = dir_content,
+        .dir_lba_of = dir_lba_of,
+        .file_lba_of = file_lba_of,
+        .path_table_size = path_table_size,
+        // libarchive's bid reads the reserved area plus eight descriptor sectors.
+        // Shorter images never reach the parser; pad to 32 sectors.
+        .total = @as(u64, @max(lba, 32)) * sector_size,
+    };
+}
+
+fn isoDfs(nodes: *std.ArrayList(IsoNode), kids: []const u32, dir_index: u32, dir_order: *std.ArrayList(u32), file_order: *std.ArrayList(u32), alloc: std.mem.Allocator) Failure!void {
+    dir_order.append(alloc, dir_index) catch return error.ResourceFailure;
+    const start = nodes.items[dir_index].first_child;
+    const end = start + nodes.items[dir_index].child_count;
+    for (kids[start..end]) |ci| {
+        if (nodes.items[ci].kind == .dir) {
+            try isoDfs(nodes, kids, ci, dir_order, file_order, alloc);
+        } else {
+            file_order.append(alloc, ci) catch return error.ResourceFailure;
+        }
+    }
+}
+
+pub fn archiveSize(entries: []const Entry) Failure!u64 {
+    var stack: [32 * 1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&stack);
+    const plan = try buildIsoPlan(entries, fba.allocator());
+    return plan.total;
+}
 
 fn validateName(name: []const u8) Failure!void {
     if (name.len == 0 or name.len > 250) return error.CallFailure;
-    if (std.mem.findScalar(u8, name, '/') != null) return error.CallFailure;
-    if (std.mem.findScalar(u8, name, ';') != null) return error.CallFailure;
+    var it = std.mem.splitScalar(u8, name, '/');
+    while (it.next()) |part| {
+        if (part.len == 0) return error.CallFailure;
+        if (std.mem.findScalar(u8, part, ';') != null) return error.CallFailure;
+    }
 }
 
 // The interchange name carries the ";1" version suffix.
@@ -219,50 +385,6 @@ fn dirRecordSize(name_len: usize, has_nm: bool) usize {
     return size;
 }
 
-fn layoutEntries(entries: []const Entry) Failure!Layout {
-    if (entries.len == 0 or entries.len > max_entries) return error.UnsupportedFailure;
-    var lay: Layout = undefined;
-    lay.count = entries.len;
-    for (0..entries.len) |rank| {
-        try validateName(entries[rank].name);
-        if (entries[rank].data.len > std.math.maxInt(u32)) return error.UnsupportedFailure;
-        var best: ?usize = null;
-        for (entries, 0..) |entry, i| {
-            var taken = false;
-            for (lay.sorted[0..rank]) |used| taken = taken or used == i;
-            if (taken) continue;
-            if (best == null or std.mem.order(u8, entry.name, entries[best.?].name) == .lt) best = i;
-        }
-        lay.sorted[rank] = @intCast(best.?);
-    }
-    for (0..entries.len - 1) |rank| {
-        if (std.mem.eql(u8, entries[lay.sorted[rank]].name, entries[lay.sorted[rank + 1]].name)) return error.CallFailure;
-    }
-    var dir_size: usize = 0;
-    dir_size += 33 + 1 + rr_size_dot_sua;
-    dir_size += 33 + 1;
-    for (0..entries.len) |rank| {
-        dir_size += dirRecordSize(entries[lay.sorted[rank]].name.len, true);
-    }
-    if (dir_size > sector_size) return error.UnsupportedFailure;
-    lay.dir_size = dir_size;
-    var lba: u32 = file_start_lba;
-    for (0..entries.len) |rank| {
-        lay.file_lba[rank] = lba;
-        const bytes = entries[lay.sorted[rank]].data.len;
-        lba += @intCast((bytes + sector_size - 1) / sector_size);
-    }
-    // libarchive's bid reads the reserved area plus eight descriptor sectors.
-    // Shorter images never reach the parser; pad to 32 sectors.
-    lay.total = @as(u64, @max(lba, 32)) * sector_size;
-    return lay;
-}
-
-pub fn archiveSize(entries: []const Entry) Failure!u64 {
-    const lay = try layoutEntries(entries);
-    return lay.total;
-}
-
 fn writeU16Both(out: []u8, value: u16) void {
     std.mem.writeInt(u16, out[0..2], value, .little);
     std.mem.writeInt(u16, out[2..4], value, .big);
@@ -273,10 +395,8 @@ fn writeU32Both(out: []u8, value: u32) void {
     std.mem.writeInt(u32, out[4..8], value, .big);
 }
 
-const stamp = "2026010100000000";
-
 fn writeTimestamp(out: []u8) void {
-    @memcpy(out[0..16], stamp);
+    @memcpy(out[0..16], "2026010100000000");
     out[16] = 0;
 }
 
@@ -284,7 +404,7 @@ fn writeFixedText(out: []u8) void {
     @memset(out, ' ');
 }
 
-fn writePvd(out: []u8, lay: *const Layout) void {
+fn writePvd(out: []u8, plan: *const IsoPlan) void {
     @memset(out, 0);
     out[0] = descriptor_primary;
     @memcpy(out[1..6], volume_descriptor_magic);
@@ -292,17 +412,17 @@ fn writePvd(out: []u8, lay: *const Layout) void {
     writeFixedText(out[8..40]);
     writeFixedText(out[40..72]);
     @memcpy(out[40..48], "LIBSTD10");
-    const total_sectors: u32 = @intCast(lay.total / sector_size);
+    const total_sectors: u32 = @intCast(plan.total / sector_size);
     writeU32Both(out[80..88], total_sectors);
     writeU16Both(out[120..124], 1);
     writeU16Both(out[124..128], 1);
     writeU16Both(out[128..132], @intCast(sector_size));
-    writeU32Both(out[132..140], 10);
+    writeU32Both(out[132..140], plan.path_table_size);
     std.mem.writeInt(u32, out[140..144], path_table_lba, .little);
     std.mem.writeInt(u32, out[144..148], 0, .little);
     std.mem.writeInt(u32, out[148..152], path_table_lba + 1, .big);
     std.mem.writeInt(u32, out[152..156], 0, .big);
-    writeBaseRecord(out[156..190], dir_lba, @intCast(lay.dir_size), true, 1, 0);
+    writeBaseRecord(out[156..190], dir_lba, plan.dir_content[0], true, 1, 0);
     writeFixedText(out[190..318]);
     writeFixedText(out[318..446]);
     writeFixedText(out[446..574]);
@@ -333,19 +453,37 @@ fn writeBaseRecord(out: []u8, extent: u32, size: u32, directory: bool, name_len:
     out[33] = name_byte;
 }
 
-// One root path table entry: one-byte identifier, padded to even length.
-fn writePathTable(sector: []u8, big_endian: bool) void {
+// One path table entry per directory, parent before child in DFS order.
+fn writePathTable(sector: []u8, plan: *const IsoPlan, big_endian: bool) void {
     @memset(sector, 0);
-    sector[0] = 1;
-    sector[1] = 0;
-    if (big_endian) {
-        std.mem.writeInt(u32, sector[2..6], dir_lba, .big);
-        std.mem.writeInt(u16, sector[6..8], 1, .big);
-    } else {
-        std.mem.writeInt(u32, sector[2..6], dir_lba, .little);
-        std.mem.writeInt(u16, sector[6..8], 1, .little);
+    var pos: usize = 0;
+    for (plan.dir_order, 0..) |ni, di| {
+        const node = &plan.nodes[ni];
+        const parent_rank: u32 = if (di == 0) 1 else parentRank(plan, node.parent);
+        const name_len: u8 = if (node.name.len == 0) 1 else @intCast(node.name.len);
+        sector[pos] = name_len;
+        sector[pos + 1] = 0;
+        if (big_endian) {
+            std.mem.writeInt(u32, sector[pos + 2 ..][0..4], plan.dir_lba_of[di], .big);
+            std.mem.writeInt(u16, sector[pos + 6 ..][0..2], @intCast(parent_rank), .big);
+        } else {
+            std.mem.writeInt(u32, sector[pos + 2 ..][0..4], plan.dir_lba_of[di], .little);
+            std.mem.writeInt(u16, sector[pos + 6 ..][0..2], @intCast(parent_rank), .little);
+        }
+        if (node.name.len == 0) {
+            sector[pos + 8] = 0;
+        } else {
+            @memcpy(sector[pos + 8 ..][0..node.name.len], node.name);
+        }
+        pos += 8 + @as(usize, name_len) + (name_len & 1);
     }
-    sector[8] = 0;
+}
+
+fn parentRank(plan: *const IsoPlan, parent_node: u32) u32 {
+    for (plan.dir_order, 0..) |ni, di| {
+        if (ni == parent_node) return @intCast(di + 1);
+    }
+    unreachable;
 }
 
 const rr_size_sp: usize = 7;
@@ -380,12 +518,12 @@ fn writeRrEr(out: []u8) usize {
     return rr_size_er;
 }
 
-fn writeRrPx(out: []u8, serial: u32) usize {
+fn writeRrPx(out: []u8, mode: u32, serial: u32) usize {
     out[0] = 'P';
     out[1] = 'X';
     out[2] = rr_size_px;
     out[3] = 1;
-    writeU32Both(out[4..12], 0o100644);
+    writeU32Both(out[4..12], mode);
     writeU32Both(out[12..20], 1);
     writeU32Both(out[20..28], 0);
     writeU32Both(out[28..36], 0);
@@ -422,19 +560,14 @@ fn writeDirRecord(
     var sua: [320]u8 = undefined;
     var sua_len: usize = 0;
     // A PX mode there would override the directory mode and hide every child.
-    // The dot record carries only SUSP and ER.
-
-    // The dot-dot record carries nothing.
-
-    // The dot-dot record carries nothing.
-    if (directory and stored_name_len == 1 and stored_name[0] == 0) {
+    // The root dot record alone carries SUSP and ER.
+    if (directory and stored_name_len == 1 and stored_name[0] == 0 and serial == 0) {
         sua_len += writeRrSp(&sua);
         sua_len += writeRrEr(sua[sua_len..]);
-    } else if (!(directory and stored_name_len == 1 and stored_name[0] == 1)) {
-        sua_len += writeRrPx(sua[sua_len..], serial);
+    } else if (!(directory and stored_name_len == 1 and (stored_name[0] == 0 or stored_name[0] == 1))) {
+        sua_len += writeRrPx(sua[sua_len..], if (directory) 0o40755 else 0o100644, serial);
         if (rr_name) |name| sua_len += writeRrNm(sua[sua_len..], name);
     }
-    // Directory records are even length; zero-pad an odd system-use area.
     if (sua_len & 1 != 0) {
         sua[sua_len] = 0;
         sua_len += 1;
@@ -458,38 +591,91 @@ fn writeDirRecord(
 
 pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Failure!usize {
     _ = scratch;
-    const lay = try layoutEntries(entries);
-    if (output.len < lay.total) return error.CapacityFailure;
-    @memset(output[0..lay.total], 0);
-    writePvd(output[16 * sector_size ..][0..sector_size], &lay);
+    var stack: [32 * 1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&stack);
+    const plan = try buildIsoPlan(entries, fba.allocator());
+    if (output.len < plan.total) return error.CapacityFailure;
+    @memset(output[0..plan.total], 0);
+    writePvd(output[16 * sector_size ..][0..sector_size], &plan);
     const vdst = output[17 * sector_size ..][0..sector_size];
     @memset(vdst, 0);
     vdst[0] = descriptor_terminator;
     @memcpy(vdst[1..6], volume_descriptor_magic);
     vdst[6] = 1;
-    writePathTable(output[18 * sector_size ..][0..sector_size], false);
-    writePathTable(output[19 * sector_size ..][0..sector_size], true);
-    var dir: [sector_size]u8 = undefined;
-    @memset(&dir, 0);
-    var pos: usize = 0;
-    try writeDirRecord(&dir, &pos, dir_lba, @intCast(lay.dir_size), true, "\x00", 1, null, 1);
-    try writeDirRecord(&dir, &pos, dir_lba, @intCast(lay.dir_size), true, "\x01", 1, null, 1);
-    for (0..lay.count) |rank| {
-        const entry = entries[lay.sorted[rank]];
-        var stored: [252]u8 = undefined;
-        if (entry.name.len + 2 > stored.len) return error.UnsupportedFailure;
-        @memcpy(stored[0..entry.name.len], entry.name);
-        stored[entry.name.len] = ';';
-        stored[entry.name.len + 1] = '1';
-        try writeDirRecord(&dir, &pos, lay.file_lba[rank], @intCast(entry.data.len), false, stored[0 .. entry.name.len + 2], @intCast(entry.name.len + 2), entry.name, @intCast(rank + 2));
+    writePathTable(output[18 * sector_size ..][0..sector_size], &plan, false);
+    writePathTable(output[19 * sector_size ..][0..sector_size], &plan, true);
+    // One sector per directory, in path-table order. PX serials must be
+    // unique per file or Rock Ridge readers collapse them into hardlinks.
+    var serial: u32 = 2;
+    for (plan.dir_order, 0..) |ni, di| {
+        const node = &plan.nodes[ni];
+        var dir: [sector_size]u8 = undefined;
+        @memset(&dir, 0);
+        var pos: usize = 0;
+        const parent_rank: u32 = if (di == 0) 1 else parentRank(&plan, node.parent);
+        const parent_lba: u32 = plan.dir_lba_of[parent_rank - 1];
+        try writeDirRecord(&dir, &pos, plan.dir_lba_of[di], plan.dir_content[di], true, "\x00", 1, null, if (di == 0) 0 else 1);
+        try writeDirRecord(&dir, &pos, parent_lba, plan.dir_content[parent_rank - 1], true, "\x01", 1, null, if (di == 0) 0 else 1);
+        for (plan.kids[node.first_child .. node.first_child + node.child_count]) |ci| {
+            const child = &plan.nodes[ci];
+            var stored: [252]u8 = undefined;
+            if (child.name.len + 2 > stored.len) return error.UnsupportedFailure;
+            @memcpy(stored[0..child.name.len], child.name);
+            stored[child.name.len] = ';';
+            stored[child.name.len + 1] = '1';
+            if (child.kind == .dir) {
+                const child_rank = childRank(&plan, ci);
+                try writeDirRecord(&dir, &pos, plan.dir_lba_of[child_rank], plan.dir_content[child_rank], true, stored[0 .. child.name.len + 2], @intCast(child.name.len + 2), child.name, serial);
+                serial += 1;
+            } else {
+                const file_rank = fileRank(&plan, ci);
+                try writeDirRecord(&dir, &pos, plan.file_lba_of[file_rank], @intCast(child.data.len), false, stored[0 .. child.name.len + 2], @intCast(child.name.len + 2), child.name, serial);
+                serial += 1;
+            }
+        }
+        @memcpy(output[std.math.mul(u64, plan.dir_lba_of[di], sector_size) catch return error.DataFailure ..][0..sector_size], &dir);
     }
-    @memcpy(output[20 * sector_size ..][0..sector_size], &dir);
-    for (0..lay.count) |rank| {
-        const entry = entries[lay.sorted[rank]];
-        const at = std.math.mul(u64, lay.file_lba[rank], sector_size) catch return error.DataFailure;
-        @memcpy(output[at .. at + entry.data.len], entry.data);
+    for (plan.file_order, 0..) |ni, fi| {
+        const node = &plan.nodes[ni];
+        const at = std.math.mul(u64, plan.file_lba_of[fi], sector_size) catch return error.DataFailure;
+        @memcpy(output[at .. at + node.data.len], node.data);
     }
-    return @intCast(lay.total);
+    return @intCast(plan.total);
+}
+
+fn childRank(plan: *const IsoPlan, node_index: u32) usize {
+    for (plan.dir_order, 0..) |ni, di| {
+        if (ni == node_index) return di;
+    }
+    unreachable;
+}
+
+fn fileRank(plan: *const IsoPlan, node_index: u32) usize {
+    for (plan.file_order, 0..) |ni, fi| {
+        if (ni == node_index) return fi;
+    }
+    unreachable;
+}
+
+test "iso write roundtrips nested directories" {
+    const testing = std.testing;
+    const entries = [_]Entry{
+        .{ .name = "a/b/deep.txt", .data = "nested payload" },
+        .{ .name = "a/sib.txt", .data = "sibling" },
+        .{ .name = "top.txt", .data = "root file" },
+    };
+    var archive: [64 * sector_size]u8 = undefined;
+    var scratch: [scratch_size]u8 = undefined;
+    const written = try encode(&entries, &archive, &scratch);
+    try testing.expectEqual(written, try archiveSize(&entries));
+    try testing.expectEqual(@as(u64, 3), try inspectCount(archive[0..written], &scratch));
+    var out: [16]u8 = undefined;
+    const n0 = try decodeOrdinal(archive[0..written], 0, &out, &scratch);
+    try testing.expectEqualSlices(u8, "nested payload", out[0..n0]);
+    const n1 = try decodeOrdinal(archive[0..written], 1, &out, &scratch);
+    try testing.expectEqualSlices(u8, "sibling", out[0..n1]);
+    const n2 = try decodeOrdinal(archive[0..written], 2, &out, &scratch);
+    try testing.expectEqualSlices(u8, "root file", out[0..n2]);
 }
 
 test "iso prefers a joliet supplementary descriptor" {
