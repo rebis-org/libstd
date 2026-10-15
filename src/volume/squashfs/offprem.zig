@@ -18,7 +18,7 @@ pub fn decodeOrdinal(_: []const u8, _: u64, _: []u8, _: []u8) Failure!usize {
     return error.UnsupportedFailure;
 }
 
-pub fn archiveSize(_: []const Entry) Failure!u64 {
+pub fn archiveSize(_: []const Entry, _: []u8) Failure!u64 {
     return error.UnsupportedFailure;
 }
 

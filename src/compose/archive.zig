@@ -506,14 +506,14 @@ pub fn squashfsHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Res
     } else if (command_mask == vocabulary.command_mask_write) {
         try requireVerified(commit);
         const entries = try collectEntries(squashfs.Entry, call.request, &workspace, NoCtx{}, fillSquashfsEntry);
-        const required = try squashfs_seam.archiveSize(plan.provider, entries);
+        const scratch = try workspace.take(u8, squashfs_seam.scratch_size);
+        const required = try squashfs_seam.archiveSize(plan.provider, entries, scratch);
         if (sink == null) {
             response.byte_length = required;
             return;
         }
         const sink_resource = sink.?;
         try common.requireSinkCapacity(sink_resource, call, required);
-        const scratch = try workspace.take(u8, squashfs_seam.scratch_size);
         if (sink_resource.kind == .direct_write) {
             const output = try common.sinkDirectBuffer(sink_resource, required);
             const written = try squashfs_seam.encode(plan.provider, entries, output, scratch);
