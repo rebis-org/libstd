@@ -60,7 +60,7 @@ const RawDescriptor = struct {
     benchmark: ?RawBenchmark = null,
 };
 
-const known_classes = [_][]const u8{ "slice", "streaming", "grammar", "filter" };
+const known_classes = [_][]const u8{ "slice", "streaming", "grammar", "volume", "filter" };
 const known_verbs = [_][]const u8{
     "required_size", "decoded_size",  "encoded_size_bound", "encode",         "decode",
     "encode_stream", "decode_stream", "inspect",            "decode_ordinal", "encode_ordinal",
