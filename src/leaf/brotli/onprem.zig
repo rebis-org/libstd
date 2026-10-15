@@ -870,7 +870,10 @@ fn decodeMetaBlock(
             ring[1] = ring[0];
             ring[0] = distance;
         }
-        if (pos + copy_len > mlen) return error.DataFailure;
+        if (pos + copy_len > mlen) {
+            std.debug.print("COPYFAIL pos={d} copy={d} mlen={d} produced={d}\n", .{ pos, copy_len, mlen, produced.* });
+            return error.DataFailure;
+        }
         if (produced.* + copy_len > output.len) return error.CapacityFailure;
         kernels.copyMatch(output, produced.*, distance, @intCast(copy_len));
         produced.* += copy_len;
@@ -1464,13 +1467,14 @@ fn encodeMetaBlock(bw: *BitWriter, src: []const u8, is_last: bool, ring: *[4]u32
     try bw.writeBit(@intFromBool(is_last));
     if (is_last) {
         try bw.writeBit(0); // ISLASTEMPTY: the block carries data.
-    } else {
-        try bw.writeBit(0); // ISUNCOMPRESSED: the block is compressed.
     }
     const mlen_minus1: u64 = src.len - 1;
     const nibbles: u5 = if (mlen_minus1 <= 0xFFFF) 4 else if (mlen_minus1 <= 0xFFFFF) 5 else 6;
     try bw.writeBits(@intCast(nibbles - 4), 2);
     try bw.writeBits(@intCast(mlen_minus1), @intCast(nibbles * 4));
+    if (!is_last) {
+        try bw.writeBit(0); // ISUNCOMPRESSED: the block is compressed.
+    }
     // NBLTYPESL, NBLTYPESI, NBLTYPESD (each value 1: one 0 bit).
     try bw.writeBit(0);
     try bw.writeBit(0);
@@ -1567,6 +1571,38 @@ test "brotli decode rejects oversubscribed cl codes" {
         const output = try allocator.alloc(u8, 16);
         defer allocator.free(output);
         try std.testing.expectEqual(0, try decode(&.{0x06}, output, scratch, .{}));
+    }
+}
+
+
+test "brotli encode roundtrips multi-block" {
+    const allocator = std.testing.allocator;
+    const sizes = [_]usize{ (1 << 20) + 1, (1 << 20) + 2, (1 << 20) + 3, (1 << 20) + 4, (1 << 20) + 8, (1 << 20) + 64, (1 << 20) + 1024 };
+    for (sizes) |size| {
+        const big = try allocator.alloc(u8, size);
+        defer allocator.free(big);
+        var state: u64 = 0x243F6A8885A308D3;
+        for (big) |*b| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            b.* = @as(u8, @truncate(state)) & 7;
+        }
+        var i: usize = 1;
+        while ((i << 16) + 4096 <= big.len) : (i += 1) {
+            @memcpy(big[(1 << 16) * i ..][0..4096], big[0..4096]);
+        }
+        const scratch = try allocator.alloc(u8, encode_workspace_size + decode_workspace_size);
+        defer allocator.free(scratch);
+        const bound = encodedSizeBound(big.len);
+        const encoded = try allocator.alloc(u8, bound);
+        defer allocator.free(encoded);
+        const enc_len = try encode(big, encoded, scratch[0..encode_workspace_size], .{});
+        const output = try allocator.alloc(u8, big.len + 16);
+        defer allocator.free(output);
+        const n = try decode(encoded[0..enc_len], output, scratch[encode_workspace_size..], .{});
+        try std.testing.expectEqual(big.len, n);
+        try std.testing.expectEqualSlices(u8, big, output[0..n]);
     }
 }
 
