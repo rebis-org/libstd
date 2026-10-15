@@ -393,6 +393,40 @@ pub fn runIso(r: *Runner) anyerror!void {
     _ = std.Io.Dir.cwd().deleteFile(oracle_io, image_path) catch {};
 }
 
+pub fn runDwarfs(r: *Runner) anyerror!void {
+    try runArchive(r, harness.ids.dwarfs);
+    const oracle_io = harness.oracle_io;
+    // dwarfsck must accept our image; then dwarfsextract must round-trip it.
+    const ck = squashfs_bin_dir ++ "/dwarfsck";
+    std.Io.Dir.cwd().access(oracle_io, ck, .{}) catch return error.ReferenceToolUnavailable;
+    const image_path = try std.fmt.allocPrint(r.gpa, "zig-out/oracles/dwarfs-ours-{d}.dwarfs", .{r.corpus_index});
+    defer r.gpa.free(image_path);
+    try std.Io.Dir.cwd().writeFile(oracle_io, .{ .sub_path = image_path, .data = arc_state.archive[0..arc_state.archive_size] });
+    var child = try std.process.spawn(oracle_io, .{ .argv = &.{ ck, image_path } });
+    var term = try child.wait(oracle_io);
+    if (term != .exited or term.exited != 0) return error.ReferenceToolCheckFailed;
+    const ex = squashfs_bin_dir ++ "/dwarfsextract";
+    std.Io.Dir.cwd().access(oracle_io, ex, .{}) catch return error.ReferenceToolUnavailable;
+    const out_path = try std.fmt.allocPrint(r.gpa, "zig-out/oracles/dwarfs-out-{d}", .{r.corpus_index});
+    defer r.gpa.free(out_path);
+    try std.Io.Dir.cwd().createDirPath(oracle_io, out_path);
+    child = try std.process.spawn(oracle_io, .{ .argv = &.{ ex, "-i", image_path, "-o", out_path } });
+    term = try child.wait(oracle_io);
+    if (term != .exited or term.exited != 0) return error.ReferenceToolExtractFailed;
+    const got_path1 = try std.fmt.allocPrint(r.gpa, "{s}/m1.txt", .{out_path});
+    defer r.gpa.free(got_path1);
+    const got1 = try std.Io.Dir.cwd().readFileAlloc(oracle_io, got_path1, r.gpa, .limited(1 << 20));
+    defer r.gpa.free(got1);
+    if (!std.mem.eql(u8, got1, &arc_state.data1)) return error.DwarfsExtractMismatch;
+    const got_path2 = try std.fmt.allocPrint(r.gpa, "{s}/m2.txt", .{out_path});
+    defer r.gpa.free(got_path2);
+    const got2 = try std.Io.Dir.cwd().readFileAlloc(oracle_io, got_path2, r.gpa, .limited(1 << 20));
+    defer r.gpa.free(got2);
+    if (!std.mem.eql(u8, got2, &arc_state.data2)) return error.DwarfsExtractMismatch;
+    _ = std.Io.Dir.cwd().deleteTree(oracle_io, out_path) catch {};
+    _ = std.Io.Dir.cwd().deleteFile(oracle_io, image_path) catch {};
+}
+
 fn runDwarfsForeign(r: *Runner) anyerror!void {
     setupArchive(r, harness.ids.dwarfs);
     const bin = squashfs_bin_dir ++ "/mkdwarfs";
@@ -1066,6 +1100,7 @@ pub const scenarios = harness.scenarios("archive", &.{
     .{ .label = "archive wim foreign lzms", .run = runWimForeignLzms, .workspace_size = 256 * 1024, .output_size = 512, .encoded_size = 4096 },
     .{ .label = "archive iso", .run = runIso, .workspace_size = 256 * 1024, .output_size = 512, .encoded_size = 65536 },
     .{ .label = "archive iso foreign", .run = runIsoForeign, .workspace_size = 256 * 1024, .output_size = 512, .encoded_size = 65536 },
+    .{ .label = "archive dwarfs", .run = runDwarfs, .workspace_size = 8 * 1024 * 1024, .output_size = 512, .encoded_size = 65536 },
     .{ .label = "archive dwarfs foreign", .run = runDwarfsForeign, .workspace_size = 4 * 1024 * 1024, .output_size = 512, .encoded_size = 65536 },
     .{ .label = "archive squashfs", .run = runSquashfs, .workspace_size = 8 * 1024 * 1024, .output_size = 512, .encoded_size = 4096 },
     .{ .label = "archive squashfs foreign", .run = runSquashfsForeign, .workspace_size = 8 * 1024 * 1024, .output_size = 512, .encoded_size = 4096 },

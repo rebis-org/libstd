@@ -11,7 +11,7 @@
         .{ .name = "entry", .family = 2, .ordinal = 5, .representation = "node_chain" },
         .{ .name = "entry_data", .family = 2, .ordinal = 6, .representation = "bytes" },
     },
-    .capabilities = .{ "read", "size", "replay" },
+    .capabilities = .{ "read", "write", "size", "replay" },
     .sizing = "metadata_exact",
     .commit = "tentative",
     .limits = .{ .window = 0, .block = 0, .history = 0 },

@@ -562,16 +562,332 @@ pub fn decodeOrdinal(archive: []const u8, ordinal: u64, output: []u8, scratch: [
     return @intCast(info.size);
 }
 
-pub fn archiveSize(entries: []const Entry) Failure!u64 {
-    _ = entries;
-    return error.UnsupportedFailure;
+// The write path emits the same v2 section chain mkdwarfs produces for the
+// flat shape: BLOCK, METADATA_V2_SCHEMA, METADATA_V2, SECTION_INDEX.
+// Payloads stay uncompressed; total data is capped for the slice.
+
+const write_block_size: u32 = 16 * 1024 * 1024;
+const write_data_cap: usize = 512 * 1024;
+const section_type_index: u16 = 9;
+const section_offset_mask: u64 = (1 << 48) - 1;
+const root_bytes: usize = 101;
+const root_bits: usize = 802;
+
+const wl_u32: i16 = 0;
+const wl_u64: i16 = 1;
+const wl_bool: i16 = 2;
+const wl_vec_u32: i16 = 3;
+const wl_chunk: i16 = 4;
+const wl_vec_chunk: i16 = 5;
+const wl_directory: i16 = 6;
+const wl_vec_dir: i16 = 7;
+const wl_inode: i16 = 8;
+const wl_vec_inode: i16 = 9;
+const wl_dirent: i16 = 10;
+const wl_vec_dirent: i16 = 11;
+const wl_opt_dirent: i16 = 12;
+const wl_fstring: i16 = 13;
+const wl_names: i16 = 14;
+const wl_opt_names: i16 = 15;
+const wl_root: i16 = 16;
+
+const WField = struct { id: i16, layout: i16, offset: i16 };
+const WLayout = struct {
+    size: u32,
+    bits: u16,
+    fields: []const WField,
+};
+
+// Offsets are bit positions; the schema encodes them negative.
+const wlayouts = [_]WLayout{
+    .{ .size = 0, .bits = 32, .fields = &.{} },
+    .{ .size = 0, .bits = 64, .fields = &.{} },
+    .{ .size = 0, .bits = 1, .fields = &.{} },
+    .{ .size = 0, .bits = 64, .fields = &.{ .{ .id = 2, .layout = wl_u32, .offset = 0 }, .{ .id = 1, .layout = wl_u32, .offset = -32 }, .{ .id = 3, .layout = wl_u32, .offset = 0 } } },
+    .{ .size = 0, .bits = 96, .fields = &.{ .{ .id = 1, .layout = wl_u32, .offset = 0 }, .{ .id = 2, .layout = wl_u32, .offset = -32 }, .{ .id = 3, .layout = wl_u32, .offset = -64 } } },
+    .{ .size = 0, .bits = 64, .fields = &.{ .{ .id = 2, .layout = wl_u32, .offset = 0 }, .{ .id = 1, .layout = wl_u32, .offset = -32 }, .{ .id = 3, .layout = wl_chunk, .offset = 0 } } },
+    .{ .size = 0, .bits = 96, .fields = &.{ .{ .id = 1, .layout = wl_u32, .offset = 0 }, .{ .id = 2, .layout = wl_u32, .offset = -32 }, .{ .id = 3, .layout = wl_u32, .offset = -64 } } },
+    .{ .size = 0, .bits = 64, .fields = &.{ .{ .id = 2, .layout = wl_u32, .offset = 0 }, .{ .id = 1, .layout = wl_u32, .offset = -32 }, .{ .id = 3, .layout = wl_directory, .offset = 0 } } },
+    .{ .size = 0, .bits = 192, .fields = &.{ .{ .id = 1, .layout = wl_u32, .offset = 0 }, .{ .id = 2, .layout = wl_u32, .offset = -32 }, .{ .id = 3, .layout = wl_u32, .offset = -64 }, .{ .id = 4, .layout = wl_u32, .offset = -96 }, .{ .id = 5, .layout = wl_u32, .offset = -128 }, .{ .id = 14, .layout = wl_u32, .offset = -160 } } },
+    .{ .size = 0, .bits = 64, .fields = &.{ .{ .id = 2, .layout = wl_u32, .offset = 0 }, .{ .id = 1, .layout = wl_u32, .offset = -32 }, .{ .id = 3, .layout = wl_inode, .offset = 0 } } },
+    .{ .size = 0, .bits = 64, .fields = &.{ .{ .id = 1, .layout = wl_u32, .offset = 0 }, .{ .id = 2, .layout = wl_u32, .offset = -32 } } },
+    .{ .size = 0, .bits = 64, .fields = &.{ .{ .id = 2, .layout = wl_u32, .offset = 0 }, .{ .id = 1, .layout = wl_u32, .offset = -32 }, .{ .id = 3, .layout = wl_dirent, .offset = 0 } } },
+    .{ .size = 0, .bits = 65, .fields = &.{ .{ .id = 1, .layout = wl_bool, .offset = 0 }, .{ .id = 2, .layout = wl_vec_dirent, .offset = -1 } } },
+    .{ .size = 0, .bits = 64, .fields = &.{ .{ .id = 1, .layout = wl_u32, .offset = 0 }, .{ .id = 2, .layout = wl_u32, .offset = -32 } } },
+    .{ .size = 0, .bits = 128, .fields = &.{ .{ .id = 1, .layout = wl_fstring, .offset = 0 }, .{ .id = 3, .layout = wl_vec_u32, .offset = -64 } } },
+    .{ .size = 0, .bits = 129, .fields = &.{ .{ .id = 1, .layout = wl_bool, .offset = 0 }, .{ .id = 2, .layout = wl_names, .offset = -1 } } },
+    .{ .size = 101, .bits = 802, .fields = &.{ .{ .id = 1, .layout = wl_vec_chunk, .offset = 0 }, .{ .id = 2, .layout = wl_vec_dir, .offset = -64 }, .{ .id = 3, .layout = wl_vec_inode, .offset = -128 }, .{ .id = 4, .layout = wl_vec_u32, .offset = -192 }, .{ .id = 7, .layout = wl_vec_u32, .offset = -256 }, .{ .id = 8, .layout = wl_vec_u32, .offset = -320 }, .{ .id = 9, .layout = wl_vec_u32, .offset = -384 }, .{ .id = 12, .layout = wl_u64, .offset = -448 }, .{ .id = 15, .layout = wl_u32, .offset = -512 }, .{ .id = 16, .layout = wl_u64, .offset = -544 }, .{ .id = 19, .layout = wl_opt_dirent, .offset = -608 }, .{ .id = 24, .layout = wl_opt_names, .offset = -673 } } },
+};
+
+// LSB-first bit writer over the frozen blob.
+const BitWriter = struct {
+    bytes: []u8,
+    bit: usize = 0,
+
+    fn write(b: *BitWriter, value: u64, width: u16) void {
+        var i: u16 = 0;
+        while (i < width) : (i += 1) {
+            const at = b.bit + i;
+            if ((value >> @intCast(i)) & 1 != 0) {
+                b.bytes[at >> 3] |= @as(u8, 1) << @intCast(at & 7);
+            }
+        }
+        b.bit += width;
+    }
+};
+
+fn sectionHeader(out: *[section_header_size]u8, number: u32, stype: u16, payload: []const u8) void {
+    @memset(out, 0);
+    @memcpy(out[0..6], section_magic);
+    out[6] = 2;
+    out[7] = 5;
+    std.mem.writeInt(u32, out[48..52], number, .little);
+    std.mem.writeInt(u16, out[52..54], stype, .little);
+    std.mem.writeInt(u16, out[54..56], compression_none, .little);
+    std.mem.writeInt(u64, out[56..64], payload.len, .little);
+    // xxh3 covers the header from the number field through the payload.
+    var xxh = std.hash.XxHash3.init(0);
+    xxh.update(out[48..64]);
+    xxh.update(payload);
+    std.mem.writeInt(u64, out[40..48], xxh.final(), .little);
+    // sha2-512/256 covers the header from the xxh3 field through the payload.
+    var sha = std.crypto.hash.sha2.Sha512_256.init(.{});
+    sha.update(out[40..64]);
+    sha.update(payload);
+    var digest: [32]u8 = undefined;
+    sha.final(&digest);
+    @memcpy(out[8..40], &digest);
+}
+
+fn writeSchema(out: *std.ArrayList(u8), alloc0: std.mem.Allocator) Failure!void {
+    const w = struct {
+        fn byte(list: *std.ArrayList(u8), a: std.mem.Allocator, b: u8) Failure!void {
+            list.append(a, b) catch return error.ResourceFailure;
+        }
+        fn varint(list: *std.ArrayList(u8), a: std.mem.Allocator, v0: u64) Failure!void {
+            var v = v0;
+            while (v >= 0x80) {
+                try byte(list, a, @as(u8, @truncate(v)) | 0x80);
+                v >>= 7;
+            }
+            try byte(list, a, @intCast(v));
+        }
+        fn zz(list: *std.ArrayList(u8), a: std.mem.Allocator, v: i64) Failure!void {
+            try varint(list, a, @as(u64, @bitCast((v << 1) ^ (v >> 63))));
+        }
+    };
+    // Field 1: relaxTypeChecks = true.
+    try w.byte(out, alloc0, (1 << 4) | 1);
+    // Field 2: layouts map<i16, Layout>.
+    try w.byte(out, alloc0, (1 << 4) | 11);
+    try w.varint(out, alloc0, wlayouts.len);
+    try w.byte(out, alloc0, 0x4c);
+    for (wlayouts, 0..) |lay, lid| {
+        try w.zz(out, alloc0, @as(i64, @intCast(lid)));
+        var last: i16 = 0;
+        try w.byte(out, alloc0, (1 << 4) | 5);
+        try w.zz(out, alloc0, lay.size);
+        last = 1;
+        try w.byte(out, alloc0, @as(u8, @intCast((2 - last) << 4)) | 4);
+        try w.zz(out, alloc0, lay.bits);
+        last = 2;
+        try w.byte(out, alloc0, @as(u8, @intCast((3 - last) << 4)) | 11);
+        try w.varint(out, alloc0, lay.fields.len);
+        if (lay.fields.len > 0) try w.byte(out, alloc0, 0x4c);
+        for (lay.fields) |f| {
+            try w.zz(out, alloc0, f.id);
+            try w.byte(out, alloc0, (1 << 4) | 4);
+            try w.zz(out, alloc0, f.layout);
+            try w.byte(out, alloc0, (1 << 4) | 4);
+            try w.zz(out, alloc0, f.offset);
+            try w.byte(out, alloc0, 0);
+        }
+        last = 3;
+        try w.byte(out, alloc0, @as(u8, @intCast((4 - last) << 4)) | 8);
+        try w.varint(out, alloc0, 0);
+        try w.byte(out, alloc0, 0);
+    }
+    // Field 3: rootLayout i16, field 4: fileVersion i32 = 1.
+    try w.byte(out, alloc0, (1 << 4) | 4);
+    try w.zz(out, alloc0, wl_root);
+    try w.byte(out, alloc0, (1 << 4) | 5);
+    try w.zz(out, alloc0, 1);
+    try w.byte(out, alloc0, 0);
 }
 
 pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Failure!usize {
-    _ = entries;
-    _ = output;
-    _ = scratch;
-    return error.UnsupportedFailure;
+    if (entries.len == 0 or entries.len > 4096) return error.UnsupportedFailure;
+    var fba = std.heap.FixedBufferAllocator.init(scratch);
+    const alloc = fba.allocator();
+
+    // BLOCK payload and the flat metadata vectors.
+    var block_data: std.ArrayList(u8) = .empty;
+    var chunks: std.ArrayList(u8) = .empty;
+    var chunk_table: std.ArrayList(u32) = .empty;
+    var inodes: std.ArrayList(u32) = .empty;
+    var dir_entries: std.ArrayList(u32) = .empty;
+    var names: std.ArrayList(u8) = .empty;
+    var names_index: std.ArrayList(u32) = .empty;
+
+    chunk_table.append(alloc, 0) catch return error.ResourceFailure;
+    inodes.appendSlice(alloc, &.{ 0, 0, 0, 0, 0, 0 }) catch return error.ResourceFailure;
+    dir_entries.appendSlice(alloc, &.{ 0, 0 }) catch return error.ResourceFailure;
+    var chunk_off: u32 = 0;
+    var name_off: u32 = 0;
+    for (entries, 0..) |entry, i| {
+        if (entry.data.len > write_block_size) return error.UnsupportedFailure;
+        if (block_data.items.len + entry.data.len > write_data_cap) return error.UnsupportedFailure;
+        block_data.appendSlice(alloc, entry.data) catch return error.ResourceFailure;
+        for ([_]u32{ 0, chunk_off, @intCast(entry.data.len) }) |v| {
+            var raw: [4]u8 = undefined;
+            std.mem.writeInt(u32, &raw, v, .little);
+            chunks.appendSlice(alloc, &raw) catch return error.ResourceFailure;
+        }
+        chunk_off = std.math.add(u32, chunk_off, @intCast(entry.data.len)) catch return error.UnsupportedFailure;
+        chunk_table.append(alloc, @intCast(i + 1)) catch return error.ResourceFailure;
+        // inode: name slot, mode index 1, ino, owner, group, nlink.
+        inodes.appendSlice(alloc, &.{ @intCast(i + 1), 1, 0, 0, 0, 0 }) catch return error.ResourceFailure;
+        // directory entry: name slot i, inode number i+1.
+        dir_entries.appendSlice(alloc, &.{ @intCast(i), @intCast(i + 1) }) catch return error.ResourceFailure;
+        names_index.append(alloc, name_off) catch return error.ResourceFailure;
+        name_off = std.math.add(u32, name_off, @intCast(entry.name.len)) catch return error.UnsupportedFailure;
+        names.appendSlice(alloc, entry.name) catch return error.ResourceFailure;
+    }
+    names_index.append(alloc, name_off) catch return error.ResourceFailure;
+    const total_size: u64 = block_data.items.len;
+    if (total_size > write_block_size) return error.UnsupportedFailure;
+
+    const directories = [_]u32{ 0, 1, 0, 0, @intCast(entries.len + 1), 0 };
+    const modes = [_]u32{ 0o40755, 0o100644 };
+    const single_uid = [_]u32{0};
+    const single_gid = [_]u32{0};
+
+    // Segments land after the root struct, byte aligned.
+    const chunks_at = root_bytes;
+    const chunk_table_at = chunks_at + chunks.items.len;
+    const directories_at = chunk_table_at + 4 * chunk_table.items.len;
+    const inodes_at = directories_at + 4 * directories.len;
+    const modes_at = inodes_at + 4 * inodes.items.len;
+    const uids_at = modes_at + 4 * modes.len;
+    const gids_at = uids_at + 4;
+    const dir_entries_at = gids_at + 4;
+    const names_at = dir_entries_at + 4 * dir_entries.items.len;
+    const names_index_at = names_at + names.items.len;
+    const blob_len = names_index_at + 4 * names_index.items.len;
+
+    var blob_bytes = std.ArrayList(u8).empty;
+    blob_bytes.resize(alloc, blob_len) catch return error.ResourceFailure;
+    @memset(blob_bytes.items, 0);
+    @memcpy(blob_bytes.items[chunks_at..][0..chunks.items.len], chunks.items);
+    for (chunk_table.items, 0..) |v, i| {
+        std.mem.writeInt(u32, blob_bytes.items[chunk_table_at + 4 * i ..][0..4], v, .little);
+    }
+    for (directories, 0..) |v, i| {
+        std.mem.writeInt(u32, blob_bytes.items[directories_at + 4 * i ..][0..4], v, .little);
+    }
+    for (inodes.items, 0..) |v, i| {
+        std.mem.writeInt(u32, blob_bytes.items[inodes_at + 4 * i ..][0..4], v, .little);
+    }
+    for (modes, 0..) |v, i| {
+        std.mem.writeInt(u32, blob_bytes.items[modes_at + 4 * i ..][0..4], v, .little);
+    }
+    std.mem.writeInt(u32, blob_bytes.items[uids_at..][0..4], single_uid[0], .little);
+    std.mem.writeInt(u32, blob_bytes.items[gids_at..][0..4], single_gid[0], .little);
+    for (dir_entries.items, 0..) |v, i| {
+        std.mem.writeInt(u32, blob_bytes.items[dir_entries_at + 4 * i ..][0..4], v, .little);
+    }
+    @memcpy(blob_bytes.items[names_at..][0..names.items.len], names.items);
+    for (names_index.items, 0..) |v, i| {
+        std.mem.writeInt(u32, blob_bytes.items[names_index_at + 4 * i ..][0..4], v, .little);
+    }
+
+    // Root struct fields in ascending id order.
+    var bw = BitWriter{ .bytes = blob_bytes.items };
+    bw.write(@intCast(chunks.items.len / 12), 32);
+    bw.write(chunks_at, 32);
+    bw.write(2, 32);
+    bw.write(directories_at, 32);
+    bw.write(@intCast(inodes.items.len / 6), 32);
+    bw.write(inodes_at, 32);
+    bw.write(@intCast(chunk_table.items.len), 32);
+    bw.write(chunk_table_at, 32);
+    bw.write(1, 32);
+    bw.write(uids_at, 32);
+    bw.write(1, 32);
+    bw.write(gids_at, 32);
+    bw.write(@intCast(modes.len), 32);
+    bw.write(modes_at, 32);
+    bw.write(0, 64); // timestamp_base
+    bw.write(write_block_size, 32); // block_size
+    bw.write(total_size, 64); // total_fs_size
+    bw.write(1, 1); // dir_entries present
+    bw.write(@intCast(dir_entries.items.len / 2), 32);
+    bw.write(dir_entries_at, 32);
+    bw.write(1, 1); // names present
+    bw.write(names_at, 32);
+    bw.write(names.items.len, 32);
+    bw.write(@intCast(names_index.items.len), 32);
+    bw.write(names_index_at, 32);
+    if (bw.bit != root_bits) return error.DataFailure;
+
+    var schema_bytes: std.ArrayList(u8) = .empty;
+    try writeSchema(&schema_bytes, alloc);
+
+    // Section chain: BLOCK, SCHEMA, METADATA_V2, SECTION_INDEX.
+    const block_at: u64 = 0;
+    const schema_at = block_at + section_header_size + block_data.items.len;
+    const metadata_at = schema_at + section_header_size + schema_bytes.items.len;
+    const index_at = metadata_at + section_header_size + blob_bytes.items.len;
+    const index_count = 4;
+
+    var sink: std.ArrayList(u8) = .empty;
+    var head: [section_header_size]u8 = undefined;
+    sectionHeader(&head, 0, section_type_block, block_data.items);
+    sink.appendSlice(alloc, &head) catch return error.ResourceFailure;
+    sink.appendSlice(alloc, block_data.items) catch return error.ResourceFailure;
+    sectionHeader(&head, 1, section_type_schema, schema_bytes.items);
+    sink.appendSlice(alloc, &head) catch return error.ResourceFailure;
+    sink.appendSlice(alloc, schema_bytes.items) catch return error.ResourceFailure;
+    sectionHeader(&head, 2, section_type_metadata, blob_bytes.items);
+    sink.appendSlice(alloc, &head) catch return error.ResourceFailure;
+    sink.appendSlice(alloc, blob_bytes.items) catch return error.ResourceFailure;
+    const kinds = [_]u16{ section_type_block, section_type_schema, section_type_metadata, section_type_index };
+    const offs = [_]u64{ block_at, schema_at, metadata_at, index_at };
+    for (0..index_count) |i| {
+        var raw: [8]u8 = undefined;
+        std.mem.writeInt(u64, &raw, (@as(u64, kinds[i]) << 48) | (offs[i] & section_offset_mask), .little);
+        sink.appendSlice(alloc, &raw) catch return error.ResourceFailure;
+    }
+    const index_len = 8 * index_count;
+    sectionHeader(&head, 3, section_type_index, sink.items[sink.items.len - index_len ..]);
+    sink.insertSlice(alloc, sink.items.len - index_len, &head) catch return error.ResourceFailure;
+    var tail: [8]u8 = undefined;
+    std.mem.writeInt(u64, &tail, (@as(u64, section_type_index) << 48) | (index_at & section_offset_mask), .little);
+    sink.appendSlice(alloc, &tail) catch return error.ResourceFailure;
+
+    if (output.len < sink.items.len) return error.CapacityFailure;
+    @memcpy(output[0..sink.items.len], sink.items);
+    return sink.items.len;
+}
+
+// The generated schema is data-independent; its size is measured into a
+// stack buffer. Every other length follows from the entry table.
+pub fn archiveSize(entries: []const Entry) Failure!u64 {
+    if (entries.len == 0 or entries.len > 4096) return error.UnsupportedFailure;
+    var schema_buf: [2048]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&schema_buf);
+    var schema_bytes: std.ArrayList(u8) = .empty;
+    try writeSchema(&schema_bytes, fba.allocator());
+    const n: u64 = entries.len;
+    var names_len: u64 = 0;
+    var data_len: u64 = 0;
+    for (entries) |entry| {
+        names_len = try bounds.addU64(names_len, entry.name.len);
+        data_len = try bounds.addU64(data_len, entry.data.len);
+    }
+    if (data_len > write_data_cap) return error.UnsupportedFailure;
+    const blob_len: u64 = root_bytes + 12 * n + 4 * (n + 1) + 24 + 24 * (n + 1) + 8 + 8 + 8 * (n + 1) + names_len + 4 * (n + 1);
+    return 4 * section_header_size + data_len + schema_bytes.items.len + blob_len + 8 * 4 + 8;
 }
 
 const mkdwarfs_fixture = [_]u8{
@@ -660,5 +976,22 @@ test "dwarfs reads a mkdwarfs image" {
     const n = try decodeOrdinal(&mkdwarfs_fixture, 0, &out, &scratch);
     try testing.expectEqualSlices(u8, "ABCABCABCABC", out[0..n]);
     const n1 = try decodeOrdinal(&mkdwarfs_fixture, 1, &out, &scratch);
+    try testing.expectEqualSlices(u8, "hello dwarfs\n", out[0..n1]);
+}
+
+test "dwarfs write roundtrips and mirrors the fixture shape" {
+    const testing = std.testing;
+    const entries = [_]Entry{
+        .{ .name = "data.bin", .data = "ABCABCABCABC" },
+        .{ .name = "hello.txt", .data = "hello dwarfs\n" },
+    };
+    var archive: [4096]u8 = undefined;
+    var scratch: [scratch_size]u8 = undefined;
+    const written = try encode(&entries, &archive, &scratch);
+    try testing.expectEqual(@as(u64, 2), try inspectCount(archive[0..written], &scratch));
+    var out: [16]u8 = undefined;
+    const n = try decodeOrdinal(archive[0..written], 0, &out, &scratch);
+    try testing.expectEqualSlices(u8, "ABCABCABCABC", out[0..n]);
+    const n1 = try decodeOrdinal(archive[0..written], 1, &out, &scratch);
     try testing.expectEqualSlices(u8, "hello dwarfs\n", out[0..n1]);
 }
