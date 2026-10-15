@@ -70,19 +70,19 @@ pub fn decodeOrdinal(provider: Provider, archive: []const u8, ordinal: u64, outp
     };
 }
 
-pub fn archiveSize(provider: Provider, entries: []const Entry) Failure!u64 {
+pub fn archiveSize(provider: Provider, entries: []const Entry, scratch: []u8) Failure!u64 {
     return switch (build_options.grammar_impl) {
         .onprem => blk: {
             try requireServed(provider, .onprem);
-            break :blk onprem.archiveSize(entries);
+            break :blk onprem.archiveSize(entries, scratch);
         },
         .offprem => blk: {
             try requireServed(provider, .offprem);
-            break :blk offprem.archiveSize(entries);
+            break :blk offprem.archiveSize(entries, scratch);
         },
         .mergeable => switch (provider) {
-            .onprem => onprem.archiveSize(entries),
-            .offprem => offprem.archiveSize(entries),
+            .onprem => onprem.archiveSize(entries, scratch),
+            .offprem => offprem.archiveSize(entries, scratch),
         },
     };
 }
