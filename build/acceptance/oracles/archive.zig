@@ -360,6 +360,47 @@ fn runWimForeign(r: *Runner) anyerror!void {
 
 const squashfs_bin_dir = "zig-out/benchmark/bin";
 
+fn runIsoTree(r: *Runner) anyerror!void {
+    setupArchive(r, harness.ids.iso);
+    // Park the second entry under a subdirectory for this scenario only.
+    const saved_entry2 = arc_state.entry2;
+    const saved_name2 = arc_state.name2;
+    arc_state.name2 = undefined;
+    arc_state.entry2 = harness.archiveEntryNode(&arc_state.name2, &arc_state.data_node2, "sub/m2.txt", &arc_state.data2);
+    arc_state.entry1.next = &arc_state.entry2;
+    defer {
+        arc_state.entry2 = saved_entry2;
+        arc_state.name2 = saved_name2;
+        arc_state.entry1.next = &arc_state.entry2;
+    }
+    try arcQueryWrite(r);
+    try arcWrite(r);
+    try arcQueryRead(r);
+    try arcReadOrdinal(r, 0, &arc_state.data1);
+    try arcReadOrdinal(r, 1, &arc_state.data2);
+    // bsdtar must reconstruct the subdirectory from our image.
+    const bin = "/usr/bin/bsdtar";
+    std.Io.Dir.cwd().access(harness.oracle_io, bin, .{}) catch return error.ReferenceToolUnavailable;
+    const oracle_io = harness.oracle_io;
+    const image_path = try std.fmt.allocPrint(r.gpa, "zig-out/oracles/iso-tree-{d}.iso", .{r.corpus_index});
+    defer r.gpa.free(image_path);
+    try std.Io.Dir.cwd().writeFile(oracle_io, .{ .sub_path = image_path, .data = arc_state.archive[0..arc_state.archive_size] });
+    const out_path = try std.fmt.allocPrint(r.gpa, "zig-out/oracles/iso-tree-out-{d}", .{r.corpus_index});
+    defer r.gpa.free(out_path);
+    _ = std.Io.Dir.cwd().deleteTree(oracle_io, out_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(oracle_io, out_path);
+    var child = try std.process.spawn(oracle_io, .{ .argv = &.{ bin, "-xf", image_path, "-C", out_path } });
+    const term = try child.wait(oracle_io);
+    if (term != .exited or term.exited != 0) return error.ReferenceToolExtractFailed;
+    const got_path2 = try std.fmt.allocPrint(r.gpa, "{s}/sub/m2.txt", .{out_path});
+    defer r.gpa.free(got_path2);
+    const got2 = try std.Io.Dir.cwd().readFileAlloc(oracle_io, got_path2, r.gpa, .limited(1 << 20));
+    defer r.gpa.free(got2);
+    if (!std.mem.eql(u8, got2, &arc_state.data2)) return error.IsoExtractMismatch;
+    _ = std.Io.Dir.cwd().deleteTree(oracle_io, out_path) catch {};
+    _ = std.Io.Dir.cwd().deleteFile(oracle_io, image_path) catch {};
+}
+
 pub fn runIso(r: *Runner) anyerror!void {
     arc_state.corrupt_offset = 16 * 2048;
     // Volume formats list a synthetic dot entry first.
@@ -1187,6 +1228,7 @@ pub const scenarios = harness.scenarios("archive", &.{
     .{ .label = "archive wim foreign lzx", .run = runWimForeignLzx, .workspace_size = 256 * 1024, .output_size = 512, .encoded_size = 4096 },
     .{ .label = "archive wim foreign lzms", .run = runWimForeignLzms, .workspace_size = 256 * 1024, .output_size = 512, .encoded_size = 4096 },
     .{ .label = "archive iso", .run = runIso, .workspace_size = 256 * 1024, .output_size = 512, .encoded_size = 65536 },
+    .{ .label = "archive iso tree", .run = runIsoTree, .workspace_size = 256 * 1024, .output_size = 512, .encoded_size = 65536 },
     .{ .label = "archive iso foreign", .run = runIsoForeign, .workspace_size = 256 * 1024, .output_size = 512, .encoded_size = 65536 },
     .{ .label = "archive dwarfs", .run = runDwarfs, .workspace_size = 8 * 1024 * 1024, .output_size = 512, .encoded_size = 65536 },
     .{ .label = "archive dwarfs tree", .run = runDwarfsTree, .workspace_size = 8 * 1024 * 1024, .output_size = 512, .encoded_size = 65536 },
