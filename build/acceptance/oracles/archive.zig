@@ -272,9 +272,8 @@ const squashfs_bin_dir = "zig-out/benchmark/bin";
 
 pub fn runIso(r: *Runner) anyerror!void {
     arc_state.corrupt_offset = 16 * 2048;
-    // Volume formats list a synthetic dot entry first, so the generic
-    // libarchive name-order check cannot apply; runIso verifies the
-    // extraction against bsdtar instead.
+    // Volume formats list a synthetic dot entry first.
+    // The generic name-order check cannot apply; runIso verifies via bsdtar.
     try runArchiveChecked(r, harness.ids.iso, false);
     arc_state.corrupt_offset = 0;
     // Reference extraction: bsdtar must read our encoded image back.
@@ -361,7 +360,19 @@ pub fn runSquashfs(r: *Runner) anyerror!void {
     _ = std.Io.Dir.cwd().deleteFile(oracle_io, image_path) catch {};
 }
 
+fn runSquashfsForeignComp(comptime compressor: []const u8, comptime extra_args: []const []const u8) fn (*Runner) anyerror!void {
+    return struct {
+        fn run(r: *Runner) anyerror!void {
+            try runSquashfsForeignWith(r, compressor, extra_args);
+        }
+    }.run;
+}
+
 fn runSquashfsForeign(r: *Runner) anyerror!void {
+    return runSquashfsForeignWith(r, "gzip", &.{});
+}
+
+fn runSquashfsForeignWith(r: *Runner, compressor: []const u8, extra_args: []const []const u8) anyerror!void {
     setupArchive(r, harness.ids.squashfs);
     const bin = squashfs_bin_dir ++ "/mksquashfs";
     std.Io.Dir.cwd().access(harness.oracle_io, bin, .{}) catch return error.ReferenceToolUnavailable;
@@ -377,7 +388,16 @@ fn runSquashfsForeign(r: *Runner) anyerror!void {
     try std.Io.Dir.cwd().writeFile(oracle_io, .{ .sub_path = file2, .data = &arc_state.data2 });
     const image_path = try std.fmt.allocPrint(r.gpa, "zig-out/oracles/squashfs-foreign-{d}.sqfs", .{r.corpus_index});
     defer r.gpa.free(image_path);
-    var child = try std.process.spawn(oracle_io, .{ .argv = &.{ bin, dir_path, image_path, "-noappend" } });
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(r.gpa);
+    try argv.append(r.gpa, bin);
+    try argv.append(r.gpa, dir_path);
+    try argv.append(r.gpa, image_path);
+    try argv.append(r.gpa, "-noappend");
+    try argv.append(r.gpa, "-comp");
+    try argv.append(r.gpa, compressor);
+    for (extra_args) |arg| try argv.append(r.gpa, arg);
+    var child = try std.process.spawn(oracle_io, .{ .argv = argv.items });
     const term = try child.wait(oracle_io);
     if (term != .exited or term.exited != 0) return error.ReferenceToolCaptureFailed;
     const foreign = try std.Io.Dir.cwd().readFileAlloc(oracle_io, image_path, r.gpa, .limited(8 << 20));
@@ -923,8 +943,13 @@ pub const scenarios = harness.scenarios("archive", &.{
     .{ .label = "archive wim foreign", .run = runWimForeign, .workspace_size = 128 * 1024, .output_size = 512, .encoded_size = 4096 },
     .{ .label = "archive iso", .run = runIso, .workspace_size = 256 * 1024, .output_size = 512, .encoded_size = 65536 },
     .{ .label = "archive iso foreign", .run = runIsoForeign, .workspace_size = 256 * 1024, .output_size = 512, .encoded_size = 65536 },
-    .{ .label = "archive squashfs", .run = runSquashfs, .workspace_size = 256 * 1024, .output_size = 512, .encoded_size = 4096 },
-    .{ .label = "archive squashfs foreign", .run = runSquashfsForeign, .workspace_size = 256 * 1024, .output_size = 512, .encoded_size = 4096 },
+    .{ .label = "archive squashfs", .run = runSquashfs, .workspace_size = 4 * 1024 * 1024, .output_size = 512, .encoded_size = 4096 },
+    .{ .label = "archive squashfs foreign", .run = runSquashfsForeign, .workspace_size = 4 * 1024 * 1024, .output_size = 512, .encoded_size = 4096 },
+    .{ .label = "archive squashfs foreign xz", .run = runSquashfsForeignComp("xz", &.{}), .workspace_size = 4 * 1024 * 1024, .output_size = 512, .encoded_size = 4096 },
+    .{ .label = "archive squashfs foreign lzma", .run = runSquashfsForeignComp("lzma", &.{}), .workspace_size = 4 * 1024 * 1024, .output_size = 512, .encoded_size = 4096 },
+    .{ .label = "archive squashfs foreign lzo", .run = runSquashfsForeignComp("lzo", &.{}), .workspace_size = 4 * 1024 * 1024, .output_size = 512, .encoded_size = 4096 },
+    .{ .label = "archive squashfs foreign lz4", .run = runSquashfsForeignComp("lz4", &.{}), .workspace_size = 4 * 1024 * 1024, .output_size = 512, .encoded_size = 4096 },
+    .{ .label = "archive squashfs foreign zstd", .run = runSquashfsForeignComp("zstd", &.{}), .workspace_size = 4 * 1024 * 1024, .output_size = 512, .encoded_size = 4096 },
     .{ .label = "archive zip", .run = runZip, .workspace_size = 65536 + 4096, .output_size = 512, .encoded_size = 4096 },
     .{ .label = "archive rar", .run = runRarArchive, .workspace_size = 12 * 1024 * 1024, .output_size = 512, .encoded_size = 4096 },
 }, &.{

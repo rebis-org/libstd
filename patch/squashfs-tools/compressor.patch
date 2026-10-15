@@ -1,0 +1,13 @@
+diff --git i/squashfs-tools/compressor.c w/squashfs-tools/compressor.c
+index 436787a..039a747 100644
+--- i/squashfs-tools/compressor.c
++++ w/squashfs-tools/compressor.c
+@@ -58,7 +58,7 @@ extern struct compressor lz4_comp_ops;
+ #endif
+ 
+ #ifndef XZ_SUPPORT
+-COMPRESSOR_DEF(XZ_COMPRESSION, xz);
++COMPRESSOR_DEF(xz, XZ_COMPRESSION);
+ #else
+ extern struct compressor xz_comp_ops;
+ #endif

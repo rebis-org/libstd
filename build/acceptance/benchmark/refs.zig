@@ -354,8 +354,8 @@ fn addFastLzma2(b: *std.Build) struct { lib: std.Build.LazyPath, test_run: *std.
 }
 
 fn addWimlib(b: *std.Build, dummy_dir: std.Build.LazyPath) *std.Build.Step.InstallFile {
-    // The CLI is the WIM oracle: wimlib is the format's reference
-    // implementation. autoreconf needs the Homebrew libtool name.
+    // The CLI is the oracle; wimlib is the format's reference implementation.
+    // autoreconf needs the Homebrew libtool name.
     const make_wimlib = gnuChain(b, "vendor/wimlib", dummy_dir, null,
         &.{"sh", "-c", "export LIBTOOLIZE=glibtoolize; exec autoreconf -i"},
         &.{"sh", "-c", "exec ./configure --without-fuse --without-ntfs-3g --disable-shared"},
@@ -365,14 +365,19 @@ fn addWimlib(b: *std.Build, dummy_dir: std.Build.LazyPath) *std.Build.Step.Insta
 }
 
 fn addSquashfsTools(b: *std.Build) struct { mksquashfs: *std.Build.Step.InstallFile, unsquashfs: *std.Build.Step.InstallFile } {
-    // The squashfs-tools pair is the format's reference implementation.
-    // XZ stays enabled only to keep the vendored compressor.c stub (a
-    // swapped-argument COMPRESSOR_DEF at line 61) out of the build; LZO,
-    // LZ4, and ZSTD are off and their stub branches are correct.
+    // Reference implementation with every compressor built in.
+    // The vendored compressor.c line 61 stub swaps COMPRESSOR_DEF arguments.
+
+    // The patch carries the fix; reset-then-apply keeps reruns idempotent.
+    const apply_patch = b.addSystemCommand(&.{
+        "sh", "-c",
+        "git -C vendor/squashfs-tools checkout -- squashfs-tools/compressor.c && git -C vendor/squashfs-tools apply ../../patch/squashfs-tools/compressor.patch",
+    });
     const make_tools = make(b, "vendor/squashfs-tools/squashfs-tools", &.{
         "sh", "-c",
-        "make clean >/dev/null 2>&1; exec make -j4 XZ_SUPPORT=1 LZO_SUPPORT= LZ4_SUPPORT= ZSTD_SUPPORT= EXTRA_CFLAGS=-I/opt/homebrew/include EXTRA_LDFLAGS=-L/opt/homebrew/lib mksquashfs unsquashfs",
+        "make clean >/dev/null 2>&1; exec make -j4 XZ_SUPPORT=1 LZO_SUPPORT=1 LZ4_SUPPORT=1 ZSTD_SUPPORT=1 LZMA_XZ_SUPPORT=1 EXTRA_CFLAGS=-I/opt/homebrew/include EXTRA_LDFLAGS=-L/opt/homebrew/lib mksquashfs unsquashfs",
     });
+    make_tools.step.dependOn(&apply_patch.step);
     return .{
         .mksquashfs = installOut(b, &make_tools.step, "vendor/squashfs-tools/squashfs-tools/mksquashfs", "mksquashfs"),
         .unsquashfs = installOut(b, &make_tools.step, "vendor/squashfs-tools/squashfs-tools/unsquashfs", "unsquashfs"),
@@ -380,11 +385,12 @@ fn addSquashfsTools(b: *std.Build) struct { mksquashfs: *std.Build.Step.InstallF
 }
 
 fn addDwarfsTools(b: *std.Build) struct { mkdwarfs: *std.Build.Step.InstallFile, dwarfsck: *std.Build.Step.InstallFile, dwarfsextract: *std.Build.Step.InstallFile } {
-    // The dwarfs triple is the format's reference implementation. The build
-    // needs Homebrew boost, utf8cpp, nlohmann-json and fmt, a keg-only
-    // libarchive on PKG_CONFIG_PATH, a range-v3 newer than 0.12.0 for the
-    // Xcode 27 libc++ (0.12.0's meta.hpp collides), and Howard Hinnant's
-    // date.h for std::chrono::from_stream, which Apple libc++ lacks.
+    // Homebrew supplies boost, utf8cpp, nlohmann-json, and fmt.
+    // Keg-only libarchive needs PKG_CONFIG_PATH.
+
+    // range-v3 must postdate 0.12.0.
+    // Its meta.hpp collides with Xcode 27 libc++.
+    // date.h covers the missing from_stream.
     var cfg = std.ArrayList([]const u8).empty;
     cfg.appendSlice(b.allocator, &.{
         "-DCMAKE_BUILD_TYPE=Release",

@@ -1,6 +1,5 @@
-// Unit-test entry for the grammar layer, wired into `zig build unit`. The
-// module root has to sit at src/ so the grammar's `../common` imports stay
-// inside the module path.
+// Unit-test entry for every implementation above the kernel.
+// The src/ root keeps `../common` imports inside the module path.
 test {
     _ = @import("grammar/rar/onprem.zig");
     // Writer tests cover create→inspect→decode round trips the facade alone never runs.
@@ -27,4 +26,9 @@ test {
     _ = @import("leaf/lzma2/offprem.zig");
     _ = @import("grammar/tar/offprem.zig");
     _ = @import("testing/fuzz/decode.zig");
+    _ = @import("leaf/lzo/onprem.zig");
+    _ = @import("volume/iso/offprem.zig");
+    _ = @import("volume/iso/onprem.zig");
+    _ = @import("volume/squashfs/offprem.zig");
+    _ = @import("volume/squashfs/onprem.zig");
 }
