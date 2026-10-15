@@ -4,6 +4,45 @@ const failure_prim = @import("../../common/primitive/failure.zig");
 
 const Failure = failure_prim.Failure;
 
+pub const Options = struct {};
+
+// The format carries no size header: counting passes stage through the
+// scratch, capped at one MiB.
+pub const measured_staging: usize = 1 << 20;
+
+pub fn decodeWorkspaceSize() usize {
+    return 0;
+}
+
+pub fn encodeWorkspaceSize() usize {
+    return encode_workspace_size;
+}
+
+pub fn encodedSizeBound(input_len: usize) usize {
+    // All-literal worst case: one control byte per 18 bytes, then the
+    // zero-run extensions and the end marker.
+    return input_len + input_len / 18 + 64;
+}
+
+pub fn requiredSize(input: []const u8, scratch: []u8, options: Options) Failure!usize {
+    _ = options;
+    return encodeCounting(input, scratch);
+}
+
+// Decoded size is a pure token walk: match lengths ride in the tokens, so
+// no output buffer is needed.
+pub fn decodedSize(input: []const u8, scratch: []u8, options: Options) Failure!usize {
+    _ = scratch;
+    _ = options;
+    return countDecoded(input);
+}
+
+pub fn decodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options: Options) Failure!void {
+    _ = options;
+    const produced = try decodeInPlace(input, scratch, &.{}, .{});
+    writer.writeAll(scratch[0..produced]) catch return error.IoFailure;
+}
+
 // LZO1X decompression, ported from the reference decoder in vendor/lzo.
 
 // Match classes span small offsets to 0x4000 plus the M4 bias.
@@ -32,20 +71,24 @@ fn readExtended(input: []const u8, ip: *usize, base: usize) Failure!usize {
     }
 }
 
-fn copyLiterals(input: []const u8, output: []u8, ip: *usize, op: *usize, len: usize) Failure!void {
+fn copyLiterals(input: []const u8, output: []u8, ip: *usize, op: *usize, len: usize, count_only: bool) Failure!void {
     if (len > input.len - ip.*) return error.DataFailure;
-    if (len > output.len - op.*) return error.CapacityFailure;
-    @memcpy(output[op.* .. op.* + len], input[ip.* .. ip.* + len]);
+    if (!count_only) {
+        if (len > output.len - op.*) return error.CapacityFailure;
+        @memcpy(output[op.* .. op.* + len], input[ip.* .. ip.* + len]);
+    }
     ip.* += len;
     op.* += len;
 }
 
 // Byte-granular history copy: LZO matches may overlap the output cursor.
-fn copyMatch(output: []u8, op: *usize, m_pos: usize, len: usize) Failure!void {
-    if (len > output.len - op.*) return error.CapacityFailure;
-    var i: usize = 0;
-    while (i < len) : (i += 1) {
-        output[op.* + i] = output[m_pos + i];
+fn copyMatch(output: []u8, op: *usize, m_pos: usize, len: usize, count_only: bool) Failure!void {
+    if (!count_only) {
+        if (len > output.len - op.*) return error.CapacityFailure;
+        var i: usize = 0;
+        while (i < len) : (i += 1) {
+            output[op.* + i] = output[m_pos + i];
+        }
     }
     op.* += len;
 }
@@ -54,20 +97,36 @@ const Phase = enum { literal, match };
 
 // Small token after literals: three-byte M1 match.
 // Returns the next match token; zero reopens the literal phase.
-fn m1AfterLiteral(input: []const u8, output: []u8, ip: *usize, op: *usize, t: usize) Failure!usize {
+fn m1AfterLiteral(input: []const u8, output: []u8, ip: *usize, op: *usize, t: usize, count_only: bool) Failure!usize {
     const b = try takeToken(input, ip);
     const back = (1 + m2_max_offset) + (t >> 2) + (@as(usize, b) << 2);
     if (back > op.*) return error.DataFailure;
-    try copyMatch(output, op, op.* - back, 3);
+    try copyMatch(output, op, op.* - back, 3, count_only);
     if (ip.* < 2) return error.DataFailure;
     var bridge: usize = input[ip.* - 2] & 3;
     if (bridge == 0) return 0;
-    try copyLiterals(input, output, ip, op, bridge);
+    try copyLiterals(input, output, ip, op, bridge, count_only);
     bridge = try takeToken(input, ip);
     return bridge;
 }
 
-pub fn decodeInPlace(input: []const u8, output: []u8) Failure!usize {
+pub fn decode(input: []const u8, output: []u8, scratch: []u8, options: Options) Failure!usize {
+    _ = scratch;
+    _ = options;
+    return decodeInPlace(input, output, &.{}, .{});
+}
+
+pub fn decodeInPlace(input: []const u8, output: []u8, scratch: []u8, options: Options) Failure!usize {
+    _ = scratch;
+    _ = options;
+    return decodeInner(input, output, false);
+}
+
+pub fn countDecoded(input: []const u8) Failure!usize {
+    return decodeInner(input, &.{}, true);
+}
+
+fn decodeInner(input: []const u8, output: []u8, count_only: bool) Failure!usize {
     if (input.len == 0) return error.DataFailure;
     var ip: usize = 0;
     var op: usize = 0;
@@ -77,10 +136,10 @@ pub fn decodeInPlace(input: []const u8, output: []u8) Failure!usize {
     // A first token above 17 opens a literal run without the usual length encoding.
     if (t > 17) {
         t -= 17;
-        try copyLiterals(input, output, &ip, &op, t);
+        try copyLiterals(input, output, &ip, &op, t, count_only);
         t = try takeToken(input, &ip);
         if (t < 16) {
-            t = try m1AfterLiteral(input, output, &ip, &op, t);
+            t = try m1AfterLiteral(input, output, &ip, &op, t, count_only);
             if (t == 0) {
                 t = try takeToken(input, &ip);
                 phase = .literal;
@@ -97,10 +156,10 @@ pub fn decodeInPlace(input: []const u8, output: []u8) Failure!usize {
             if (t < 16) {
                 var len = t;
                 if (len == 0) len = try readExtended(input, &ip, 15);
-                try copyLiterals(input, output, &ip, &op, len + 3);
+                try copyLiterals(input, output, &ip, &op, len + 3, count_only);
                 t = try takeToken(input, &ip);
                 if (t < 16) {
-                    t = try m1AfterLiteral(input, output, &ip, &op, t);
+                    t = try m1AfterLiteral(input, output, &ip, &op, t, count_only);
                     if (t == 0) {
                         t = try takeToken(input, &ip);
                         continue;
@@ -118,7 +177,7 @@ pub fn decodeInPlace(input: []const u8, output: []u8) Failure!usize {
             const back = 1 + ((t >> 2) & 7) + (@as(usize, b) << 3);
             if (back > op) return error.DataFailure;
             const len = (t >> 5) + 1;
-            try copyMatch(output, &op, op - back, len);
+            try copyMatch(output, &op, op - back, len, count_only);
             t = if (ip >= 2) input[ip - 2] & 3 else return error.DataFailure;
         } else if (t >= 32) {
             // M3: fourteen-bit offset in the following two bytes.
@@ -128,7 +187,7 @@ pub fn decodeInPlace(input: []const u8, output: []u8) Failure!usize {
             const off = (@as(usize, input[ip] >> 2) + (@as(usize, input[ip + 1]) << 6)) + 1;
             ip += 2;
             if (off > op) return error.DataFailure;
-            try copyMatch(output, &op, op - off, len + 2);
+            try copyMatch(output, &op, op - off, len + 2, count_only);
             t = input[ip - 2] & 3;
         } else if (t >= 16) {
             // M4 widens the offset by 8 KiB via the third token bit.
@@ -145,14 +204,14 @@ pub fn decodeInPlace(input: []const u8, output: []u8) Failure!usize {
             }
             const back = wide + off + m4_bias;
             if (back > op) return error.DataFailure;
-            try copyMatch(output, &op, op - back, len + 2);
+            try copyMatch(output, &op, op - back, len + 2, count_only);
             t = input[ip - 2] & 3;
         } else {
             // M1 inside the chain: a two-byte copy with a short offset.
             const b = try takeToken(input, &ip);
             const back = 1 + (t >> 2) + (@as(usize, b) << 2);
             if (back > op) return error.DataFailure;
-            try copyMatch(output, &op, op - back, 2);
+            try copyMatch(output, &op, op - back, 2, count_only);
             t = if (ip >= 2) input[ip - 2] & 3 else return error.DataFailure;
         }
         if (t == 0) {
@@ -160,7 +219,7 @@ pub fn decodeInPlace(input: []const u8, output: []u8) Failure!usize {
             phase = .literal;
             continue;
         }
-        try copyLiterals(input, output, &ip, &op, t);
+        try copyLiterals(input, output, &ip, &op, t, count_only);
         t = try takeToken(input, &ip);
     }
 }
@@ -181,11 +240,12 @@ test "lzo1x decompresses reference fixtures" {
     var out: [128]u8 = undefined;
     for ([_][]const u8{ &fixture0_comp, &fixture1_comp, &fixture2_comp }, [_][]const u8{ &fixture0_plain, &fixture1_plain, &fixture2_plain }) |comp, plain| {
         @memset(&out, 0);
-        const n = try decodeInPlace(comp, &out);
+        const n = try decodeInPlace(comp, &out, &.{}, .{});
         try testing.expectEqual(plain.len, n);
         try testing.expectEqualSlices(u8, plain, out[0..n]);
     }
 }
+
 
 
 
@@ -194,6 +254,8 @@ test "lzo1x decompresses reference fixtures" {
 // offset dictionary. Matches encode as M2 short forms, M3 within 0x4000,
 // or M4 with the 0x4000 bias. Chunks cap at 49152 bytes so every offset
 // stays encodable.
+
+
 
 const m2_max_len: usize = 8;
 const m3_max_offset: usize = 0x4000;
@@ -218,11 +280,13 @@ const Encoder = struct {
     dict: []u16,
     out: []u8,
     op: usize = 0,
-    pending: usize = 0,
+    count_only: bool = false,
 
     fn emitByte(e: *Encoder, b: u8) Failure!void {
-        if (e.op >= e.out.len) return error.CapacityFailure;
-        e.out[e.op] = b;
+        if (!e.count_only) {
+            if (e.op >= e.out.len) return error.CapacityFailure;
+            e.out[e.op] = b;
+        }
         e.op += 1;
     }
 
@@ -231,7 +295,7 @@ const Encoder = struct {
         if (t == 0) return;
         if (t <= 3) {
             if (e.op < 2) return error.DataFailure;
-            e.out[e.op - 2] |= @intCast(t);
+            if (!e.count_only) e.out[e.op - 2] |= @intCast(t);
         } else if (t <= 18) {
             try e.emitByte(@intCast(t - 3));
         } else {
@@ -243,8 +307,10 @@ const Encoder = struct {
             }
             try e.emitByte(@intCast(tt));
         }
-        if (e.op + t > e.out.len) return error.CapacityFailure;
-        @memcpy(e.out[e.op .. e.op + t], input[start .. start + t]);
+        if (!e.count_only) {
+            if (e.op + t > e.out.len) return error.CapacityFailure;
+            @memcpy(e.out[e.op .. e.op + t], input[start .. start + t]);
+        }
         e.op += t;
     }
 
@@ -322,17 +388,32 @@ fn compressChunk(e: *Encoder, input: []const u8, start: usize, len: usize, carry
     return in_end - (ii - ti);
 }
 
-pub fn encode(input: []const u8, output: []u8, workspace: []u8) Failure!usize {
-    if (workspace.len < encode_workspace_size) return error.CapacityFailure;
+fn encodeCounting(input: []const u8, scratch: []u8) Failure!usize {
+    if (scratch.len < encode_workspace_size) return error.CapacityFailure;
     var e = Encoder{
-        .dict = @alignCast(std.mem.bytesAsSlice(u16, workspace[0..encode_workspace_size])),
+        .dict = @alignCast(std.mem.bytesAsSlice(u16, scratch[0..encode_workspace_size])),
+        .out = &.{},
+        .count_only = true,
+    };
+    return encodeInner(&e, input);
+}
+
+pub fn encode(input: []const u8, output: []u8, scratch: []u8, options: Options) Failure!usize {
+    _ = options;
+    if (scratch.len < encode_workspace_size) return error.CapacityFailure;
+    var e = Encoder{
+        .dict = @alignCast(std.mem.bytesAsSlice(u16, scratch[0..encode_workspace_size])),
         .out = output,
     };
+    return encodeInner(&e, input);
+}
+
+fn encodeInner(e: *Encoder, input: []const u8) Failure!usize {
     var at: usize = 0;
     var t: usize = 0;
     while (input.len - at > 20) {
         const len = @min(chunk_max, input.len - at);
-        t = try compressChunk(&e, input, at, len, t);
+        t = try compressChunk(e, input, at, len, t);
         at += len;
     }
     t += input.len - at;
@@ -342,7 +423,7 @@ pub fn encode(input: []const u8, output: []u8, workspace: []u8) Failure!usize {
             try e.emitByte(@intCast(17 + t));
         } else if (t <= 3) {
             if (e.op < 2) return error.DataFailure;
-            e.out[e.op - 2] |= @intCast(t);
+            if (!e.count_only) e.out[e.op - 2] |= @intCast(t);
         } else if (t <= 18) {
             try e.emitByte(@intCast(t - 3));
         } else {
@@ -354,8 +435,10 @@ pub fn encode(input: []const u8, output: []u8, workspace: []u8) Failure!usize {
             }
             try e.emitByte(@intCast(tt));
         }
-        if (e.op + t > e.out.len) return error.CapacityFailure;
-        @memcpy(e.out[e.op .. e.op + t], input[ii .. ii + t]);
+        if (!e.count_only) {
+            if (e.op + t > e.out.len) return error.CapacityFailure;
+            @memcpy(e.out[e.op .. e.op + t], input[ii .. ii + t]);
+        }
         e.op += t;
     }
     try e.emitByte(m4_marker | 1);
@@ -369,11 +452,13 @@ test "lzo1x roundtrips reference fixtures" {
     var workspace: [encode_workspace_size]u8 = undefined;
     for ([_][]const u8{ &fixture0_plain, &fixture1_plain, &fixture2_plain }) |plain| {
         var comp: [512]u8 = undefined;
-        const n = try encode(plain, &comp, &workspace);
+        const n = try encode(plain, &comp, &workspace, .{});
         var back: [128]u8 = undefined;
-        const m = try decodeInPlace(comp[0..n], &back);
+        const m = try decode(comp[0..n], &back, &.{}, .{});
         try testing.expectEqual(plain.len, m);
         try testing.expectEqualSlices(u8, plain, back[0..m]);
+        try testing.expectEqual(m, try countDecoded(comp[0..n]));
     }
 }
+
 

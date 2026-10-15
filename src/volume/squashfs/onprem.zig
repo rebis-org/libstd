@@ -159,7 +159,7 @@ fn inflateBlock(compression: u16, payload: []const u8, out: []u8, history: []u8,
     switch (compression) {
         compression_gzip => return inflateZlib(payload, out, history),
         compression_lzma => return lzma_grammar.decodeInPlace(payload, out, aux orelse return error.CapacityFailure, lzma_seam.default_provider),
-        compression_lzo => return lzo_leaf.decodeInPlace(payload, out),
+        compression_lzo => return lzo_leaf.decodeInPlace(payload, out, &.{}, .{}),
         compression_xz => return xz_grammar.decode(payload, out, aux orelse return error.CapacityFailure, checksum.default_provider),
         compression_lz4 => {
             return lz4_leaf.decompressBlock(payload, out, &.{}) catch |err| return switch (err) {
