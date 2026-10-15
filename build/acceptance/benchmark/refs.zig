@@ -23,6 +23,7 @@ pub const Refs = struct {
     libzip_build: *std.Build.Step.Run,
     unrar_cmd: *std.Build.Step.InstallFile,
     brotli_cmd: *std.Build.Step.InstallFile,
+    wimlib_cmd: *std.Build.Step.InstallFile,
     libunrar_lib: std.Build.LazyPath,
     fast_lzma2_lib: std.Build.LazyPath,
     fast_lzma2_test: *std.Build.Step.Run,
@@ -56,6 +57,7 @@ pub const Refs = struct {
         step.dependOn(&self.ziptool_cmd.step);
         step.dependOn(&self.unrar_cmd.step);
         step.dependOn(&self.brotli_cmd.step);
+        step.dependOn(&self.wimlib_cmd.step);
         step.dependOn(&self.fast_lzma2_test.step);
         step.dependOn(&self.libzip_build.step);
     }
@@ -341,6 +343,17 @@ fn addFastLzma2(b: *std.Build) struct { lib: std.Build.LazyPath, test_run: *std.
     return .{ .lib = lib, .test_run = make_test };
 }
 
+fn addWimlib(b: *std.Build, dummy_dir: std.Build.LazyPath) *std.Build.Step.InstallFile {
+    // The CLI is the WIM oracle: wimlib is the format's reference
+    // implementation. autoreconf needs the Homebrew libtool name.
+    const make_wimlib = gnuChain(b, "vendor/wimlib", dummy_dir, null,
+        &.{"sh", "-c", "export LIBTOOLIZE=glibtoolize; exec autoreconf -i"},
+        &.{"sh", "-c", "exec ./configure --without-fuse --without-ntfs-3g --disable-shared"},
+        &.{"sh", "-c", "make clean >/dev/null 2>&1; exec make -j4 wimlib-imagex"},
+    );
+    return installOut(b, &make_wimlib.step, "vendor/wimlib/.libs/wimlib-imagex", "wimlib-imagex");
+}
+
 fn addBrotli(b: *std.Build) *std.Build.Step.InstallFile {
     const brotli = cmake(b, "vendor/brotli", "zig-out/benchmark/build/brotli", &.{
         "-DBUILD_SHARED_LIBS=OFF",
@@ -367,6 +380,7 @@ pub fn add(b: *std.Build, ctx: *const common.Settings) Refs {
     const lz4 = addLz4(b);
     const bin_refs = addBinaryRefs(b, ctx);
     const brotli_cmd = addBrotli(b);
+    const wimlib_cmd = addWimlib(b, dummy_dir);
 
     return .{
         .sevenzz = seven.sevenzz,
@@ -388,6 +402,7 @@ pub fn add(b: *std.Build, ctx: *const common.Settings) Refs {
         .libzip_build = libzip.build,
         .unrar_cmd = unrar.cmd,
         .brotli_cmd = brotli_cmd,
+        .wimlib_cmd = wimlib_cmd,
         .libunrar_lib = unrar.lib,
         .fast_lzma2_lib = fast_lzma2.lib,
         .fast_lzma2_test = fast_lzma2.test_run,
