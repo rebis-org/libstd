@@ -64,16 +64,31 @@ const NameParts = struct {
     uses_long_name: bool,
 };
 
+const Format = enum { posix, gnu };
+
 pub fn archiveSize(entries: []const Entry) Failure!u64 {
+    return archiveSizeWith(.posix, entries);
+}
+
+pub fn archiveSizeGnu(entries: []const Entry) Failure!u64 {
+    return archiveSizeWith(.gnu, entries);
+}
+
+fn archiveSizeWith(comptime format: Format, entries: []const Entry) Failure!u64 {
     var total: u64 = 1024;
     for (entries) |entry| {
         const parts = try tarNameParts(entry.name);
         if (std.mem.findScalar(u8, entry.link_name, 0) != null) return error.CallFailure;
         if ((entry.typeflag == '1' or entry.typeflag == '2') and entry.link_name.len == 0) return error.CallFailure;
         const data_size = try tarDataSize(entry.typeflag, entry.data);
-        var pax_buffer: [512]u8 = undefined;
-        const pax_len = try writePaxRecords(entry, data_size, parts.uses_long_name, &pax_buffer);
-        if (pax_len > 0) total = try bounds.addU64(total, try bounds.addU64(block_size, try tarAligned(pax_len)));
+        if (format == .posix) {
+            var pax_buffer: [512]u8 = undefined;
+            const pax_len = try writePaxRecords(entry, data_size, parts.uses_long_name, &pax_buffer);
+            if (pax_len > 0) total = try bounds.addU64(total, try bounds.addU64(block_size, try tarAligned(pax_len)));
+        } else {
+            if (entry.name.len > 100) total = try bounds.addU64(total, try bounds.addU64(block_size, try tarAligned(@as(u64, entry.name.len) + 1)));
+            if (entry.link_name.len > 100) total = try bounds.addU64(total, try bounds.addU64(block_size, try tarAligned(@as(u64, entry.link_name.len) + 1)));
+        }
         total = try bounds.addU64(total, block_size);
         total = try bounds.addU64(total, try tarAligned(data_size));
     }
@@ -81,7 +96,17 @@ pub fn archiveSize(entries: []const Entry) Failure!u64 {
 }
 
 pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Failure!usize {
-    const required = try archiveSize(entries);
+    return encodeWith(.posix, entries, output, scratch);
+}
+
+// GNU variant: the "ustar  \0" magic and 'L'/'K' long-name entries
+// instead of pax records.
+pub fn encodeGnu(entries: []const Entry, output: []u8, scratch: []u8) Failure!usize {
+    return encodeWith(.gnu, entries, output, scratch);
+}
+
+fn encodeWith(comptime format: Format, entries: []const Entry, output: []u8, scratch: []u8) Failure!usize {
+    const required = try archiveSizeWith(format, entries);
     if (output.len < required) return error.CapacityFailure;
     if (scratch.len < scratch_size) return error.CapacityFailure;
     var sink = io.Sink{ .bytes = output };
@@ -90,14 +115,32 @@ pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Failure!usize
         if (std.mem.findScalar(u8, entry.link_name, 0) != null) return error.CallFailure;
         if ((entry.typeflag == '1' or entry.typeflag == '2') and entry.link_name.len == 0) return error.CallFailure;
         const data_size = try tarDataSize(entry.typeflag, entry.data);
-        var pax_buffer: [512]u8 = undefined;
-        const pax_len = try writePaxRecords(entry, data_size, parts.uses_long_name, &pax_buffer);
-        if (pax_len > 0) {
-            try tarWriteHeader(&sink, scratch, "././@PaxHeader", &.{}, &.{}, 0o644, 0, 0, 0, typeflag_pax, pax_len, 0, 0);
-            try sink.write(pax_buffer[0..pax_len]);
-            try tarWritePadding(&sink, scratch, pax_len);
+        if (format == .posix) {
+            var pax_buffer: [512]u8 = undefined;
+            const pax_len = try writePaxRecords(entry, data_size, parts.uses_long_name, &pax_buffer);
+            if (pax_len > 0) {
+                try tarWriteHeader(&sink, scratch, "././@PaxHeader", &.{}, &.{}, 0o644, 0, 0, 0, typeflag_pax, pax_len, 0, 0);
+                try sink.write(pax_buffer[0..pax_len]);
+                try tarWritePadding(&sink, scratch, pax_len);
+            }
+            try tarWriteHeader(&sink, scratch, parts.name, parts.prefix, if (entry.link_name.len > 100) &.{} else entry.link_name, entry.mode, entry.uid, entry.gid, entry.modification_time, entry.typeflag, data_size, entry.devmajor, entry.devminor);
+        } else {
+            if (entry.name.len > 100) {
+                const long_size: u64 = @as(u64, entry.name.len) + 1;
+                try tarWriteHeaderGnu(&sink, scratch, "././@LongLink", &.{}, 0o644, 0, 0, 0, typeflag_gnu_long_name, long_size, 0, 0);
+                try sink.write(entry.name);
+                try sink.write("\x00");
+                try tarWritePadding(&sink, scratch, long_size);
+            }
+            if (entry.link_name.len > 100) {
+                const long_size: u64 = @as(u64, entry.link_name.len) + 1;
+                try tarWriteHeaderGnu(&sink, scratch, "././@LongLink", &.{}, 0o644, 0, 0, 0, typeflag_gnu_long_link, long_size, 0, 0);
+                try sink.write(entry.link_name);
+                try sink.write("\x00");
+                try tarWritePadding(&sink, scratch, long_size);
+            }
+            try tarWriteHeaderGnu(&sink, scratch, parts.name, if (entry.link_name.len > 100) &.{} else entry.link_name, entry.mode, entry.uid, entry.gid, entry.modification_time, entry.typeflag, data_size, entry.devmajor, entry.devminor);
         }
-        try tarWriteHeader(&sink, scratch, parts.name, parts.prefix, if (entry.link_name.len > 100) &.{} else entry.link_name, entry.mode, entry.uid, entry.gid, entry.modification_time, entry.typeflag, data_size, entry.devmajor, entry.devminor);
         try sink.write(entry.data);
         try tarWritePadding(&sink, scratch, data_size);
     }
@@ -367,6 +410,36 @@ fn tarWriteHeader(sink: *io.Sink, scratch: []u8, name: []const u8, prefix: []con
     try sink.write(block);
 }
 
+// GNU headers carry the OLDGNU magic and no prefix field.
+fn tarWriteHeaderGnu(sink: *io.Sink, scratch: []u8, name: []const u8, link_name: []const u8, mode: u32, uid: u32, gid: u32, modification_time: u64, typeflag: u8, size: u64, devmajor: u32, devminor: u32) Failure!void {
+    if (scratch.len < scratch_size) return error.CapacityFailure;
+    const block = scratch[0..scratch_size];
+    @memset(block, 0);
+    tarWriteField(block[0..100], name);
+    tarWriteNumber(block[100..108], mode);
+    tarWriteNumber(block[108..116], uid);
+    tarWriteNumber(block[116..124], gid);
+    tarWriteNumber(block[124..136], size);
+    tarWriteNumber(block[136..148], modification_time);
+    block[156] = typeflag;
+    tarWriteField(block[157..257], link_name);
+    tarWriteField(block[257..265], "ustar  ");
+    if (typeflag == '3' or typeflag == '4') {
+        tarWriteNumber(block[329..337], devmajor);
+        tarWriteNumber(block[337..345], devminor);
+    }
+    var checksum = tarChecksum(block);
+    var index: usize = 154;
+    while (index > 148) {
+        index -= 1;
+        block[index] = '0' + @as(u8, @truncate(checksum & 7));
+        checksum >>= 3;
+    }
+    block[154] = 0;
+    block[155] = ' ';
+    try sink.write(block);
+}
+
 fn tarWritePadding(sink: *io.Sink, scratch: []u8, size: u64) Failure!void {
     const padding = (block_size - size % block_size) % block_size;
     if (padding != 0) {
@@ -409,9 +482,12 @@ const Reader = struct {
         if (recorded_checksum != tarChecksum(header)) return error.IntegrityFailure;
         const size = try tarNumber(header[124..136]);
         const data_offset = try bounds.addU64(self.offset, block_size);
+        // The prefix and device fields are ustar extensions; V7 headers
+        // carry unrelated data there.
+        const ustar = std.mem.eql(u8, header[257..262], "ustar");
         return .{
             .name = tarField(header[0..100]),
-            .prefix = tarField(header[345..500]),
+            .prefix = if (ustar) tarField(header[345..500]) else &.{},
             .link_name = tarField(header[157..257]),
             .mode = std.math.cast(u32, try tarNumber(header[100..108])) orelse return error.DataFailure,
             .uid = std.math.cast(u32, try tarNumber(header[108..116])) orelse return error.DataFailure,
@@ -419,8 +495,8 @@ const Reader = struct {
             .size = size,
             .modification_time = try tarNumber(header[136..148]),
             .typeflag = header[156],
-            .devmajor = std.math.cast(u32, try tarNumber(header[329..337])) orelse return error.DataFailure,
-            .devminor = std.math.cast(u32, try tarNumber(header[337..345])) orelse return error.DataFailure,
+            .devmajor = if (ustar) std.math.cast(u32, try tarNumber(header[329..337])) orelse return error.DataFailure else 0,
+            .devminor = if (ustar) std.math.cast(u32, try tarNumber(header[337..345])) orelse return error.DataFailure else 0,
             .ordinal = 0,
             .header_offset = self.offset,
             .data_offset = data_offset,
@@ -817,6 +893,72 @@ fn tarApplyPax(entry: *EntryInfo, attributes: Pax) Failure!void {
     if (attributes.gid) |gid| entry.gid = gid;
     if (attributes.size) |size| entry.size = size;
     if (attributes.modification_time) |modification_time| entry.modification_time = modification_time;
+}
+
+test "tar gnu format roundtrips long names through LongLink entries" {
+    const testing = std.testing;
+    var long_name: [140]u8 = undefined;
+    @memset(&long_name, 'x');
+    @memcpy(long_name[0..14], "gnu-long-name-");
+    @memcpy(long_name[136..140], ".txt");
+    const entries = [_]Entry{
+        .{ .name = &long_name, .data = "gnu payload" },
+        .{ .name = "plain.txt", .data = "plain payload" },
+    };
+    var archive: [8192]u8 = undefined;
+    var scratch: [4096]u8 = undefined;
+    const written = try encodeGnu(&entries, &archive, &scratch);
+    // The GNU magic sits in the version bytes too.
+    try testing.expectEqualSlices(u8, "ustar  \x00", archive[257..265]);
+    const info = try inspectOrdinal(archive[0..written], 0);
+    try testing.expectEqualSlices(u8, &long_name, info.name);
+    var out: [16]u8 = undefined;
+    const size = try decodeOrdinal(archive[0..written], 0, &out);
+    try testing.expectEqualSlices(u8, "gnu payload", out[0..size]);
+    const second = try inspectOrdinal(archive[0..written], 1);
+    try testing.expectEqualSlices(u8, "plain.txt", second.name);
+}
+
+test "tar reads V7 headers without the ustar magic" {
+    // V7 predates the magic, the prefix, and the device fields.
+    // Those bytes carry unrelated data that must not be parsed.
+    const testing = std.testing;
+    var block: [512]u8 = @splat(0);
+    const name = "v7file.txt";
+    @memcpy(block[0..name.len], name);
+    tarWriteNumber(block[100..108], 0o644);
+    tarWriteNumber(block[108..116], 7);
+    tarWriteNumber(block[116..124], 8);
+    tarWriteNumber(block[124..136], 6);
+    tarWriteNumber(block[136..148], 9);
+    block[157] = 0;
+    block[156] = 0;
+    // Deliberately hostile prefix and device fields for a V7 reader.
+    @memcpy(block[345..350], "9zzzz");
+    @memcpy(block[329..334], "8yyyy");
+    var checksum: u64 = 8 * ' ';
+    for (block, 0..) |byte, index| {
+        if (index < 148 or index >= 156) checksum += byte;
+    }
+    var index: usize = 154;
+    while (index > 148) {
+        index -= 1;
+        block[index] = '0' + @as(u8, @truncate(checksum & 7));
+        checksum >>= 3;
+    }
+    block[154] = 0;
+    block[155] = ' ';
+    var archive: [1024]u8 = @splat(0);
+    @memcpy(archive[0..512], &block);
+    @memcpy(archive[512..518], "v7data");
+    const info = try inspectOrdinal(&archive, 0);
+    try testing.expectEqualSlices(u8, name, info.name);
+    try testing.expectEqualSlices(u8, "", info.prefix);
+    try testing.expectEqual(@as(u64, 6), info.size);
+    try testing.expectEqual(@as(u32, 0), info.devmajor);
+    var out: [8]u8 = undefined;
+    const size = try decodeOrdinal(&archive, 0, &out);
+    try testing.expectEqualSlices(u8, "v7data", out[0..size]);
 }
 
 test "tar device entries roundtrip devmajor and devminor" {
