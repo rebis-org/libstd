@@ -451,7 +451,6 @@ fn walkInodeDir(archive: []const u8, super: Super, scratch: *Scratch, ref: u64, 
                     .resolve => |res| {
                         if (state.ordinal == res.ordinal) {
                             const inode = try readInode(archive, super, child_ref, scratch);
-                            std.debug.print("MATCH ordinal={d} ref={d} size={d}\n", .{ state.ordinal, child_ref, inode.file_size });
                             res.info.size = inode.file_size;
                             res.info.ordinal = state.ordinal;
                             if (res.output) |out| {
