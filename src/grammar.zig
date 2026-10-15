@@ -11,6 +11,8 @@ test {
     _ = @import("grammar/zstd_seekable/onprem.zig");
     _ = @import("grammar/sevenzip/onprem.zig");
     _ = @import("grammar/zip/onprem.zig");
+    _ = @import("grammar/cpio/offprem.zig");
+    _ = @import("grammar/cpio/onprem.zig");
     _ = @import("grammar/tar/onprem.zig");
     _ = @import("grammar/xz/onprem.zig");
     _ = @import("leaf/lz4/onprem.zig");

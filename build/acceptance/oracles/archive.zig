@@ -217,6 +217,43 @@ pub fn runZip(r: *Runner) anyerror!void {
     try runArchive(r, harness.ids.zip);
 }
 
+pub fn runCpio(r: *Runner) anyerror!void {
+    try runArchive(r, harness.ids.cpio);
+}
+
+fn runCpioForeign(comptime format: lib.ArchiveFormat) fn (*Runner) anyerror!void {
+    return struct {
+        fn run(r: *Runner) anyerror!void {
+            setupArchive(r, harness.ids.cpio);
+            const expected = [_]lib.WriteEntry{
+                .{ .name = "m1.txt", .data = &arc_state.data1, .filetype = 0o100000 },
+                .{ .name = "m2.txt", .data = &arc_state.data2, .filetype = 0o100000 },
+            };
+            const foreign = lib.archiveWrite(format, &expected) orelse return error.ReferenceToolUnavailable;
+            const read_expected = [_]lib.ExpectedEntry{
+                .{ .name = "m1.txt", .data = &arc_state.data1 },
+                .{ .name = "m2.txt", .data = &arc_state.data2 },
+            };
+            try arcReadForeign(r, foreign, &read_expected);
+        }
+    }.run;
+}
+
+fn arcReadForeign(r: *Runner, archive: []const u8, entries: []const lib.ExpectedEntry) !void {
+    for (entries, 0..) |expected, ordinal| {
+        _ = harness.call(r, harness.ids.read, &.{
+            harness.archiveOrdinalParam(ordinal),
+            harness.sourceSpan(archive),
+            harness.sinkSpan(r.output),
+        }, .{ .ctx = true });
+        try harness.requireStatus(r, abi.Status.ok);
+        const data = expected.data orelse continue;
+        if (r.response.byte_length != data.len or !std.mem.eql(u8, r.output[0..data.len], data)) {
+            return error.ArchiveForeignOrdinalMismatch;
+        }
+    }
+}
+
 const rar_fixture = [_]u8{
     0x52, 0x61, 0x72, 0x21, 0x1a, 0x07, 0x01, 0x00, 0x33, 0x92, 0xb5, 0xe5, 0x0a, 0x01, 0x05, 0x06, 0x00, 0x05, 0x01,
     0x01, 0x80, 0x80, 0x00, 0x98, 0x1b, 0x21, 0x04, 0x26, 0x02, 0x03, 0x0b, 0x91, 0x00, 0x04, 0x91, 0x00, 0xa4, 0x83,
@@ -689,6 +726,9 @@ fn runRarWriteEncrypted(r: *Runner) anyerror!void {
 pub const scenarios = harness.scenarios("archive", &.{
     .{ .label = "archive rar write encrypted", .run = runRarWriteEncrypted, .workspace_size = 48 * 1024 * 1024, .output_size = 1024, .encoded_size = 16384 },
     .{ .label = "archive tar", .run = runTar, .workspace_size = 65536, .output_size = 512, .encoded_size = 4096 },
+    .{ .label = "archive cpio", .run = runCpio, .workspace_size = 65536, .output_size = 512, .encoded_size = 4096 },
+    .{ .label = "archive cpio foreign newc", .run = runCpioForeign(.cpio_newc), .workspace_size = 65536, .output_size = 512, .encoded_size = 4096 },
+    .{ .label = "archive cpio foreign odc", .run = runCpioForeign(.cpio_odc), .workspace_size = 65536, .output_size = 512, .encoded_size = 4096 },
     .{ .label = "archive zip", .run = runZip, .workspace_size = 65536 + 4096, .output_size = 512, .encoded_size = 4096 },
     .{ .label = "archive rar", .run = runRarArchive, .workspace_size = 12 * 1024 * 1024, .output_size = 512, .encoded_size = 4096 },
 }, &.{
