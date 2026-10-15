@@ -61,26 +61,110 @@ pub fn decodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, 
     writer.writeAll(staging[0..produced]) catch return error.IoFailure;
 }
 
-pub fn requiredSize(input: []const u8, scratch: []u8, options: Options) DecodeError!usize {
-    // Bounded-sizing query: count via the staged decode. Streams whose
-    // output exceeds the staging answer ResourceFailure; sizing is
-    // "measured", so the default query path does not call this.
-    _ = try alignedWorkspace(scratch);
-    const staging = scratch[scratch.len - writer_staging_size ..][0..writer_staging_size];
-    return decode(input, staging, scratch, options);
+pub fn requiredSize(input: []const u8, scratch: []u8, options: Options) EncodeError!usize {
+    // Measured-sizing query for the write path: encode once into a
+    // counting bit writer and report the byte count.
+    return encodeCountedSize(input, scratch, options);
 }
 
 pub fn decodeWorkspaceSize(_: Options) usize {
     return decode_workspace_size;
 }
 
-pub fn encodeWorkspaceSize(_: Options) usize {
-    return 0;
+fn hash4At(src: []const u8, pos: usize) usize {
+    const w = std.mem.readInt(u32, src[pos..][0..4], .little);
+    return (w *% 0x9E37_79B1) >> (32 - 17);
 }
 
-pub fn encode(_: []const u8, _: []u8, _: []u8, _: Options) EncodeError!usize {
-    // The encoder lands in a follow-up iteration.
-    return error.UnsupportedFailure;
+fn parseCommands(src: []const u8, commands: []Command, head: []u32, ring: *[4]u32) usize {
+    @memset(head, 0);
+    var count: usize = 0;
+    var pos: usize = 0;
+    var anchor: usize = 0;
+    while (pos + 4 <= src.len) {
+        const h = hash4At(src, pos);
+        const cand_plus1 = head[h];
+        head[h] = @intCast(pos + 1);
+        if (cand_plus1 != 0) {
+            const cand: usize = cand_plus1 - 1;
+            const dist = pos - cand;
+            if (dist <= (1 << 22) - 16) {
+                const len = kernels.matchLen8(src, cand, pos, src.len - pos);
+                if (len >= 4) {
+                    const ins = src[anchor..pos];
+                    var cmd: Command = .{
+                        .icode = 0,
+                        .ins_extra = 0,
+                        .ins_bits = 0,
+                        .copy_extra = 0,
+                        .copy_bits = 0,
+                        .dcode = 0xFFFF,
+                        .dextra = 0,
+                        .d_bits = 0,
+                        .lit_start = @intCast(anchor),
+                        .ins_len = @intCast(ins.len),
+                    };
+                    const ins_code = insertCode(ins.len);
+                    const copy_code = copyCode(len);
+                    // The implicit distance-0 form exists only for icodes
+                    // below 128 (insert codes 0..7). A ring[0] hit with a
+                    // longer insert still writes a distance symbol: code 0
+                    // repeats ring[0] and skips the ring push on both sides.
+                    const implicit = dist == ring[0] and ins_code < 8;
+                    cmd.icode = icodeFor(ins.len, len, implicit);
+                    cmd.ins_extra = @intCast(ins.len - insert_base[ins_code]);
+                    cmd.ins_bits = insert_extra[ins_code];
+                    cmd.copy_extra = @intCast(len - copy_base[copy_code]);
+                    cmd.copy_bits = copy_extra[copy_code];
+                    if (implicit) {
+                        // dcode stays 0xFFFF: no distance symbol.
+                    } else if (dist == ring[0]) {
+                        cmd.dcode = 0;
+                    } else {
+                        if (trySpecialDistance(@intCast(dist), ring)) |dc| {
+                            cmd.dcode = dc;
+                        } else {
+                            const nd = normalDistance(@intCast(dist));
+                            cmd.dcode = nd.dcode;
+                            cmd.dextra = nd.extra;
+                            cmd.d_bits = nd.bits;
+                        }
+                        ring[3] = ring[2];
+                        ring[2] = ring[1];
+                        ring[1] = ring[0];
+                        ring[0] = @intCast(dist);
+                    }
+                    commands[count] = cmd;
+                    count += 1;
+                    pos += len;
+                    anchor = pos;
+                    continue;
+                }
+            }
+        }
+        pos += 1;
+    }
+    // Trailing literals: a final command whose ignored copy ends the block.
+    if (anchor < src.len or count == 0) {
+        const ins = src[anchor..src.len];
+        const ins_code = insertCode(ins.len);
+        var cmd: Command = .{
+            .icode = 0,
+            .ins_extra = @intCast(ins.len - insert_base[ins_code]),
+            .ins_bits = insert_extra[ins_code],
+            .copy_extra = 0,
+            .copy_bits = 0,
+            .dcode = 0xFFFF,
+            .dextra = 0,
+            .d_bits = 0,
+            .lit_start = @intCast(anchor),
+            .ins_len = @intCast(ins.len),
+        };
+        cmd.icode = icodeFor(ins.len, 2, true);
+        commands[count] = cmd;
+        count += 1;
+    }
+    return count;
 }
 
 const max_alphabet = 704; // distance alphabet: 16 + 120 + (48 << 3)
@@ -209,7 +293,11 @@ fn buildCodeLengthCode(br: *BitReader, hskip: u32) DecodeError!HufTable {
             len = if (try br.readBit() == 0) 1 else 5;
         }
         lengths[sym] = len;
-        if (len != 0) space -= @as(u32, 32) >> @intCast(len);
+        if (len != 0) {
+            const weight = @as(u32, 32) >> @intCast(len);
+            if (space < weight) return error.DataFailure;
+            space -= weight;
+        }
     }
     if (space != 0) return error.DataFailure;
     // Build the temporary table on the stack: alphabet 18 fits easily.
@@ -533,7 +621,9 @@ fn readContextMap(br: *BitReader, sc: *Scratch, size: usize, num_trees: u32, map
 
 // ------------------------------------------------------------- meta-block
 
-const distance_ring_init = [4]u32{ 16, 15, 11, 4 };
+// RFC 4: the last distance starts at 4, the second-to-last at 11, the
+// third-to-last at 15, the fourth-to-last at 16.
+const distance_ring_init = [4]u32{ 4, 11, 15, 16 };
 
 fn decodeMetaBlock(
     br: *BitReader,
@@ -746,7 +836,7 @@ fn decodeMetaBlock(
             const tree_idx = sc.cmapd[4 * @as(usize, dist.cur_type) + dcid];
             const dcode = try dist_trees[tree_idx].decode(br);
             if (dcode < 16) {
-                const slot = [16]u8{ 0, 1, 2, 3, 0, 0, 1, 1, 2, 2, 3, 3, 3, 3, 3, 3 };
+                const slot = [16]u8{ 0, 1, 2, 3, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1 };
                 const off = [16]i8{ 0, 0, 0, 0, -1, 1, -2, 2, -3, 3, -1, 1, -2, 2, -3, 3 };
                 const idx = slot[dcode];
                 const v = @as(i64, ring[idx]) + off[dcode];
@@ -893,16 +983,9 @@ test "brotli decodes reference vectors" {
     @memcpy(concat[0..text_br.len], &text_br);
     @memcpy(concat[text_br.len..], &empty_br);
     try checkVector(allocator, &concat, &text);
-    // The repetitive q5 vector exercises a 704-symbol complex tree
-    // description that misaligns this decoder. The standalone and
-    // concatenated forms are held to the same status.
-    {
-        const rep_out = try allocator.alloc(u8, rep.len);
-        defer allocator.free(rep_out);
-        const rep_scratch = try allocator.alloc(u8, decode_workspace_size);
-        defer allocator.free(rep_scratch);
-        try std.testing.expectError(error.DataFailure, decode(&rep_br, rep_out, rep_scratch, .{}));
-    }
+    // The repetitive q5 vector exercises a 704-symbol complex tree and
+    // static-dictionary references.
+    try checkVector(allocator, &rep_br, rep);
 }
 
 fn checkVector(allocator: std.mem.Allocator, encoded: []const u8, expected: []const u8) !void {
@@ -1095,4 +1178,442 @@ fn copyDictionaryWord(
         p1.* = output[produced.* - 1];
     }
     return total;
+}
+
+// ---------------------------------------------------------------- encode
+
+// The encoder is quality-1 fidelity: greedy head-only hash matches of four
+// or more bytes, one block type per category, LSB6 literal contexts, frozen
+// Huffman tables from real frequencies, and distance codes that prefer the
+// special symbols and the implicit distance-0 form. Complex prefix codes
+// transmit every length directly (no 16/17 run-length coding; only the
+// required trailing-zero omission), which is larger but always valid.
+
+const huffman = @import("../../common/primitive/huffman.zig");
+
+const encode_mb_cap = 1 << 20;
+
+const BitWriter = struct {
+    out: []u8,
+    pos: usize = 0,
+    mask: u8 = 0,
+    count_only: bool = false,
+
+    fn writeBit(self: *BitWriter, bit: u32) EncodeError!void {
+        if (self.mask == 0) {
+            if (!self.count_only) {
+                if (self.pos >= self.out.len) return error.CapacityFailure;
+                self.out[self.pos] = 0;
+            }
+            self.mask = 1;
+        }
+        if (bit != 0 and !self.count_only) self.out[self.pos] |= self.mask;
+        self.mask <<= 1;
+        if (self.mask == 0) self.pos += 1;
+    }
+
+    fn writeBits(self: *BitWriter, value: u32, n: u5) EncodeError!void {
+        var i: u5 = 0;
+        while (i < n) : (i += 1) {
+            try self.writeBit((value >> i) & 1);
+        }
+    }
+
+    fn alignToByte(self: *BitWriter) void {
+        if (self.mask != 0) {
+            self.mask = 0;
+            self.pos += 1;
+        }
+    }
+
+    fn finish(self: *BitWriter) usize {
+        self.alignToByte();
+        return self.pos;
+    }
+};
+
+const Command = struct {
+    icode: u16,
+    ins_extra: u32,
+    ins_bits: u8,
+    copy_extra: u32,
+    copy_bits: u8,
+    dcode: u16, // 0xFFFF = implicit distance 0 (no distance symbol emitted)
+    dextra: u32,
+    d_bits: u8,
+    lit_start: u32,
+    ins_len: u32,
+};
+
+fn icodeFor(ins_len: usize, copy_len: usize, implicit: bool) u16 {
+    const ins_code: u32 = lengthToCode(@intCast(ins_len), &insert_base);
+    const copy_code: u32 = lengthToCode(@intCast(copy_len), &copy_base);
+    if (implicit and ins_code < 8) {
+        if (copy_code < 8) return @intCast(ins_code * 8 + copy_code);
+        if (copy_code < 16) return @intCast(64 + ins_code * 8 + (copy_code - 8));
+    }
+    var cell: u32 = undefined;
+    if (copy_code < 8) {
+        cell = if (ins_code < 8) 128 else if (ins_code < 16) 256 else 448;
+    } else if (copy_code < 16) {
+        cell = if (ins_code < 8) 192 else if (ins_code < 16) 320 else 576;
+    } else {
+        cell = if (ins_code < 8) 384 else if (ins_code < 16) 512 else 640;
+    }
+    return @intCast(cell + (ins_code & 7) * 8 + (copy_code & 7));
+}
+
+fn lengthToCode(len: u32, base: []const u32) u32 {
+    var code: u32 = @intCast(base.len - 1);
+    while (code > 0) : (code -= 1) {
+        if (len >= base[code]) break;
+    }
+    return code;
+}
+
+fn insertCode(len: usize) u32 {
+    return lengthToCode(@intCast(len), &insert_base);
+}
+fn copyCode(len: usize) u32 {
+    return lengthToCode(@intCast(len), &copy_base);
+}
+
+// Inverse distance encoding for NPOSTFIX=0, NDIRECT=0: returns the distance
+// code and extra value/bits, or a special code 0..15 when the distance
+// matches the ring (handled by the caller via `ring_dcode`).
+fn normalDistance(distance: u32) struct { dcode: u16, extra: u32, bits: u8 } {
+    const d = distance;
+    var n: u5 = 1;
+    while (d >= ((@as(u32, 4) << n) - 3)) n += 1;
+    const parity: u32 = if (d < ((@as(u32, 3) << n) - 3)) 0 else 1;
+    const offset = ((@as(u32, 2) + parity) << n) - 4;
+    return .{ .dcode = @intCast(16 + 2 * (@as(u32, n) - 1) + parity), .extra = d - offset - 1, .bits = n };
+}
+
+fn trySpecialDistance(distance: u32, ring: *const [4]u32) ?u16 {
+    const map = [16]u8{ 0, 1, 2, 3, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1 };
+    const off = [16]i8{ 0, 0, 0, 0, -1, 1, -2, 2, -3, 3, -1, 1, -2, 2, -3, 3 };
+    for (0..16) |dc| {
+        if (@as(i64, ring[map[dc]]) + off[dc] == distance) return @intCast(dc);
+    }
+    return null;
+}
+
+const encode_head_words = 1 << 17;
+const encode_command_cap = encode_mb_cap / 4 + 64;
+pub const encode_workspace_size: usize = encode_head_words * 4 + encode_command_cap * @sizeOf(Command) + 4096 + 16;
+
+pub fn encodeWorkspaceSize(_: Options) usize {
+    return encode_workspace_size;
+}
+
+const code_order = [18]u8{ 1, 2, 3, 4, 0, 5, 17, 6, 16, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+
+fn writeCodeLengthLen(bw: *BitWriter, len: u8) EncodeError!void {
+    switch (len) {
+        0 => try bw.writeBits(0b00, 2),
+        1 => try bw.writeBits(0b0111, 4),
+        2 => try bw.writeBits(0b011, 3),
+        3 => try bw.writeBits(0b10, 2),
+        4 => try bw.writeBits(0b01, 2),
+        5 => try bw.writeBits(0b1111, 4),
+        else => unreachable,
+    }
+}
+
+// Canonical codes: symbols sorted by (length, symbol); codes assigned in
+// order within each length.
+fn canonicalCodes(lens: []const u8, codes: []u16) void {
+    var count: [16]u32 = @splat(0);
+    for (lens) |l| count[l] += 1;
+    count[0] = 0;
+    var next_code: [16]u32 = undefined;
+    var code: u32 = 0;
+    for (1..16) |l| {
+        code = (code + count[l - 1]) << 1;
+        next_code[l] = code;
+    }
+    for (lens, 0..) |l, s| {
+        if (l != 0) {
+            codes[s] = @intCast(next_code[l]);
+            next_code[l] += 1;
+        }
+    }
+}
+
+fn writeSymbol(bw: *BitWriter, code: u16, len: u8) EncodeError!void {
+    var i: u8 = 0;
+    while (i < len) : (i += 1) {
+        try bw.writeBit((code >> @intCast(len - 1 - i)) & 1);
+    }
+}
+
+// Emits one prefix code description for the given lengths. Returns true
+// when the described code decodes to its single symbol with zero bits
+// (NSYM 0 or 1); the caller then skips the symbol write in the command
+// loop. Codes with at most four symbols use the simple form, whose length
+// shapes are fixed by the format (2 x 1; 1,2,2; 2,2,2,2 or 1,2,3,3), so the
+// lengths are forced over the most frequent symbols. Longer codes use the
+// complex form with every length transmitted directly (no 16/17
+// run-length coding); only the required trailing-zero omission applies.
+fn writePrefixCode(bw: *BitWriter, lens: []u8, alphabet: usize) EncodeError!bool {
+    var freq_rank: [704]u16 = undefined;
+    var nused: usize = 0;
+    for (lens[0..alphabet], 0..) |l, sym| {
+        if (l != 0) {
+            freq_rank[nused] = @intCast(sym);
+            nused += 1;
+        }
+    }
+    if (nused == 0) {
+        try bw.writeBits(1, 2);
+        try bw.writeBits(0, 2);
+        const abits: u5 = @intCast(std.math.log2_int(usize, std.math.ceilPowerOfTwoAssert(usize, alphabet)));
+        try bw.writeBits(0, abits);
+        return true;
+    }
+    if (nused <= 4) {
+        // Sort used symbols by ascending length then symbol; the simple
+        // forms assign lengths by declared position, so the desired shape
+        // is produced by emitting in (length, symbol) order.
+        var order: [4]u16 = undefined;
+        var oi: usize = 0;
+        for (1..16) |l| {
+            for (lens[0..alphabet], 0..) |ll, sym| {
+                if (ll == l and oi < nused) {
+                    order[oi] = @intCast(sym);
+                    oi += 1;
+                }
+            }
+        }
+        // Force the format's fixed shapes over this order.
+        const shape: []const u8 = switch (nused) {
+            1 => &.{1},
+            2 => &.{ 1, 1 },
+            3 => &.{ 1, 2, 2 },
+            4 => &.{ 2, 2, 2, 2 },
+            else => unreachable,
+        };
+        const all2 = nused == 4 and lens[order[0]] == 2 and lens[order[1]] == 2 and lens[order[2]] == 2 and lens[order[3]] == 2;
+        const use_shape: []const u8 = if (nused == 4 and !all2) &.{ 1, 2, 3, 3 } else shape;
+        for (order[0..nused], 0..) |sym, i| lens[sym] = use_shape[i];
+        try bw.writeBits(1, 2);
+        try bw.writeBits(@intCast(nused - 1), 2);
+        const abits: u5 = @intCast(std.math.log2_int(usize, std.math.ceilPowerOfTwoAssert(usize, alphabet)));
+        for (order[0..nused]) |sym| try bw.writeBits(sym, abits);
+        if (nused == 4) try bw.writeBit(@intFromBool(!all2));
+        return nused == 1;
+    }
+    // Complex form.
+    if (lens[alphabet - 1] == lens[0]) {
+        // Every symbol used at one length: the cl code below would hold a
+        // single symbol and fail the Kraft check. One symbol moves one
+        // level up and two move one level down; the sum stays exact.
+        const l0 = lens[0];
+        const all_equal = for (lens[0..alphabet]) |l| {
+            if (l != l0) break false;
+        } else true;
+        if (all_equal) {
+            lens[0] = l0 - 1;
+            lens[1] = l0 + 1;
+            lens[2] = l0 + 1;
+        }
+    }
+    var cl_freq: [18]u32 = @splat(0);
+    for (lens[0..alphabet]) |l| cl_freq[l] += 1;
+    var cl_lens: [18]u8 = undefined;
+    huffman.limitedLengths(cl_freq[0..18], cl_lens[0..18], 5);
+    var cl_codes: [18]u16 = undefined;
+    canonicalCodes(cl_lens[0..18], cl_codes[0..18]);
+    try bw.writeBits(0, 2); // HSKIP 0
+    var last_order: usize = 17;
+    while (last_order > 0 and cl_lens[code_order[last_order]] == 0) last_order -= 1;
+    for (0..last_order + 1) |i| try writeCodeLengthLen(bw, cl_lens[code_order[i]]);
+    var last_sym = alphabet - 1;
+    while (last_sym > 0 and lens[last_sym] == 0) last_sym -= 1;
+    for (0..last_sym + 1) |sym| try writeSymbol(bw, cl_codes[lens[sym]], cl_lens[lens[sym]]);
+    return false;
+}
+
+fn encodeMetaBlock(bw: *BitWriter, src: []const u8, is_last: bool, ring: *[4]u32, workspace: []u8) EncodeError!void {
+    const head = std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(workspace[0 .. encode_head_words * 4])));
+    const commands = std.mem.bytesAsSlice(Command, @as([]align(4) u8, @alignCast(workspace[encode_head_words * 4 ..][0 .. encode_command_cap * @sizeOf(Command)])));
+    const cmd_count = parseCommands(src, commands, head, ring);
+
+    var lit_lens: [256]u8 = undefined;
+    var icode_lens: [704]u8 = undefined;
+    var dcode_lens: [64]u8 = undefined;
+    var lit_freq: [256]u32 = @splat(0);
+    var icode_freq: [704]u32 = @splat(0);
+    var dcode_freq: [64]u32 = @splat(0);
+    for (commands[0..cmd_count]) |cmd| {
+        icode_freq[cmd.icode] += 1;
+        if (cmd.dcode != 0xFFFF) dcode_freq[cmd.dcode] += 1;
+        const lits = src[cmd.lit_start..][0..cmd.ins_len];
+        for (lits) |b| lit_freq[b] += 1;
+    }
+    huffman.limitedLengths(lit_freq[0..256], lit_lens[0..256], 15);
+    huffman.limitedLengths(icode_freq[0..704], icode_lens[0..704], 15);
+    huffman.limitedLengths(dcode_freq[0..64], dcode_lens[0..64], 15);
+    var lit_codes: [256]u16 = undefined;
+    var icode_codes: [704]u16 = undefined;
+    var dcode_codes: [64]u16 = undefined;
+
+    // Meta-block header (RFC 9.2): ISLAST, MNIBBLES, MLEN-1, then
+    // NBLTYPES = 1 for all three categories (single 0 bit each), NPOSTFIX
+    // and NDIRECT (zero), one LSB6 context mode, NTREES = 1 for literals
+    // and distances (single 0 bit each), then the three prefix codes.
+    try bw.writeBit(@intFromBool(is_last));
+    if (is_last) {
+        try bw.writeBit(0); // ISLASTEMPTY: the block carries data.
+    } else {
+        try bw.writeBit(0); // ISUNCOMPRESSED: the block is compressed.
+    }
+    const mlen_minus1: u64 = src.len - 1;
+    const nibbles: u5 = if (mlen_minus1 <= 0xFFFF) 4 else if (mlen_minus1 <= 0xFFFFF) 5 else 6;
+    try bw.writeBits(@intCast(nibbles - 4), 2);
+    try bw.writeBits(@intCast(mlen_minus1), @intCast(nibbles * 4));
+    // NBLTYPESL, NBLTYPESI, NBLTYPESD (each value 1: one 0 bit).
+    try bw.writeBit(0);
+    try bw.writeBit(0);
+    try bw.writeBit(0);
+    try bw.writeBits(0, 2); // NPOSTFIX
+    try bw.writeBits(0, 4); // NDIRECT
+    try bw.writeBits(0, 2); // context mode LSB6 for the single literal type
+    try bw.writeBit(0); // NTREESL = 1
+    try bw.writeBit(0); // NTREESD = 1
+    const lit_single = try writePrefixCode(bw, lit_lens[0..256], 256);
+    const icode_single = try writePrefixCode(bw, icode_lens[0..704], 704);
+    const dcode_single = try writePrefixCode(bw, dcode_lens[0..64], 64);
+    // The writer fixes the final lengths (simple shapes, Kraft guard), so
+    // the canonical codes for the symbol bits come after it.
+    canonicalCodes(lit_lens[0..256], lit_codes[0..256]);
+    canonicalCodes(icode_lens[0..704], icode_codes[0..704]);
+    canonicalCodes(dcode_lens[0..64], dcode_codes[0..64]);
+
+    for (commands[0..cmd_count]) |cmd| {
+        if (!icode_single) try writeSymbol(bw, icode_codes[cmd.icode], icode_lens[cmd.icode]);
+        try bw.writeBits(cmd.ins_extra, @as(u5, @intCast(cmd.ins_bits)));
+        try bw.writeBits(cmd.copy_extra, @as(u5, @intCast(cmd.copy_bits)));
+        const lits = src[cmd.lit_start..][0..cmd.ins_len];
+        for (lits) |b| {
+            if (!lit_single) try writeSymbol(bw, lit_codes[b], lit_lens[b]);
+        }
+        if (cmd.dcode != 0xFFFF) {
+            if (!dcode_single) try writeSymbol(bw, dcode_codes[cmd.dcode], dcode_lens[cmd.dcode]);
+            try bw.writeBits(cmd.dextra, @as(u5, @intCast(cmd.d_bits)));
+        }
+    }
+}
+
+fn encodeBits(input: []const u8, bw: *BitWriter, ws: []u8) EncodeError!void {
+    try bw.writeBits(0b1011, 4); // WBITS 22
+    var ring = distance_ring_init;
+    if (input.len == 0) {
+        try bw.writeBit(1); // ISLAST
+        try bw.writeBit(1); // ISLASTEMPTY
+        return;
+    }
+    var offset: usize = 0;
+    while (offset < input.len) {
+        const chunk = @min(encode_mb_cap, input.len - offset);
+        const is_last = offset + chunk == input.len;
+        try encodeMetaBlock(bw, input[offset..][0..chunk], is_last, &ring, ws);
+        offset += chunk;
+    }
+}
+
+fn encodeWorkspace(scratch: []u8) EncodeError![]u8 {
+    const off = std.mem.alignForward(usize, @intFromPtr(scratch.ptr), 16) - @intFromPtr(scratch.ptr);
+    if (scratch.len < off + (encode_workspace_size - 16)) return error.ResourceFailure;
+    return scratch[off..];
+}
+
+pub fn encode(input: []const u8, output: []u8, scratch: []u8, options: Options) EncodeError!usize {
+    _ = options;
+    const ws = try encodeWorkspace(scratch);
+    var bw = BitWriter{ .out = output };
+    try encodeBits(input, &bw, ws);
+    return bw.finish();
+}
+
+pub fn encodeCountedSize(input: []const u8, scratch: []u8, options: Options) EncodeError!usize {
+    _ = options;
+    const ws = try encodeWorkspace(scratch);
+    var bw = BitWriter{ .out = &.{}, .count_only = true };
+    try encodeBits(input, &bw, ws);
+    return bw.finish();
+}
+
+// The encoder is new; the hermetic gate is a full round trip through this
+// decoder, and the envelope scenario adds the reference decode.
+test "brotli decode rejects oversubscribed cl codes" {
+    // Adversarial prefixes once overflowed the Kraft accumulator instead
+    // of answering DataFailure.
+    const allocator = std.testing.allocator;
+    const inputs = [_][]const u8{
+        "Squdgy fez, blank jimp crwth vox!",
+        "I have a friend who is always full",
+    };
+    for (inputs) |input| {
+        const scratch = try allocator.alloc(u8, decode_workspace_size);
+        defer allocator.free(scratch);
+        const output = try allocator.alloc(u8, 4096);
+        defer allocator.free(output);
+        try std.testing.expectError(error.DataFailure, decode(input, output, scratch, .{}));
+    }
+    // 0x06 is a valid empty stream (WBITS 16, ISLAST, ISLASTEMPTY).
+    {
+        const scratch = try allocator.alloc(u8, decode_workspace_size);
+        defer allocator.free(scratch);
+        const output = try allocator.alloc(u8, 16);
+        defer allocator.free(output);
+        try std.testing.expectEqual(0, try decode(&.{0x06}, output, scratch, .{}));
+    }
+}
+
+test "brotli encode roundtrips" {
+    const allocator = std.testing.allocator;
+    const cases = [_][]const u8{
+        "",
+        "a",
+        "hello world, hello world, hello world!",
+        "abcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabc",
+    };
+    for (cases) |input| {
+        const scratch = try allocator.alloc(u8, encode_workspace_size + decode_workspace_size);
+        defer allocator.free(scratch);
+        const bound = encodedSizeBound(input.len);
+        const encoded = try allocator.alloc(u8, bound);
+        defer allocator.free(encoded);
+        const enc_len = try encode(input, encoded, scratch[0..encode_workspace_size], .{});
+        const output = try allocator.alloc(u8, input.len + 16);
+        defer allocator.free(output);
+        const n = try decode(encoded[0..enc_len], output, scratch[encode_workspace_size..], .{});
+        try std.testing.expectEqual(input.len, n);
+        try std.testing.expectEqualSlices(u8, input, output[0..n]);
+    }
+    // A larger mixed input crosses command and multi-byte extras.
+    var big: [1 << 17]u8 = undefined;
+    var state: u64 = 0x243F6A8885A308D3;
+    for (&big) |*b| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        b.* = @as(u8, @truncate(state)) & 7;
+    }
+    for (1..8) |i| {
+        @memcpy(big[(1 << 14) * i ..][0..4096], big[0..4096]);
+    }
+    const scratch = try allocator.alloc(u8, encode_workspace_size + decode_workspace_size);
+    defer allocator.free(scratch);
+    const bound = encodedSizeBound(big.len);
+    const encoded = try allocator.alloc(u8, bound);
+    defer allocator.free(encoded);
+    const enc_len = try encode(&big, encoded, scratch[0..encode_workspace_size], .{});
+    const output = try allocator.alloc(u8, big.len + 16);
+    defer allocator.free(output);
+    const n = try decode(encoded[0..enc_len], output, scratch[encode_workspace_size..], .{});
+    try std.testing.expectEqual(big.len, n);
+    try std.testing.expectEqualSlices(u8, &big, output[0..n]);
 }

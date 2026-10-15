@@ -1,7 +1,7 @@
 // Deflate tops out at 288 symbols; the RAR5 writer reaches 306.
 const std = @import("std");
 
-const max_alphabet = 512;
+const max_alphabet = 704; // brotli command alphabet; rar uses 512, deflate/zstd 288
 const max_nodes = 2 * max_alphabet;
 const max_code_len = 15;
 
