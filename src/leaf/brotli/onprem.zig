@@ -266,7 +266,7 @@ const Scratch = struct {
     }
 };
 
-fn buildCodeLengthCode(br: *BitReader, hskip: u32) DecodeError!HufTable {
+fn buildCodeLengthCode(br: *BitReader, hskip: u32, sc: *Scratch) DecodeError!*HufTable {
     // RFC 3.5: the 18 code-length symbols arrive in a fixed order. The
     // order table and the 2..4-bit prefix code come from the spec.
     var lengths: [18]u8 = @splat(0);
@@ -300,18 +300,18 @@ fn buildCodeLengthCode(br: *BitReader, hskip: u32) DecodeError!HufTable {
         }
     }
     if (space != 0) return error.DataFailure;
-    // Build the temporary table on the stack: alphabet 18 fits easily.
-    var table: HufTable = .{};
-    var syms: [18]u16 = undefined;
-    table.symbols = syms[0..18];
+    // Scratch-owned: the table outlives this frame through the symbol
+    // decode below.
+    const tree = try sc.allocTree(18);
+    const table = tree.table;
     for (lengths) |l| table.count[l] += 1;
     table.count[0] = 0;
     var offset: [16]u32 = undefined;
     offset[1] = 0;
     for (1..15) |l| offset[l + 1] = offset[l] + table.count[l];
-    for (lengths, 0..) |l, s| {
+    for (lengths, 0..) |l, sym| {
         if (l != 0) {
-            syms[offset[l]] = @intCast(s);
+            tree.symbols[offset[l]] = @intCast(sym);
             offset[l] += 1;
         }
     }
@@ -375,7 +375,7 @@ fn readPrefixCode(br: *BitReader, sc: *Scratch, alphabet: usize) DecodeError!*Hu
         return tree.table;
     }
     // Complex prefix code (RFC 3.5); the 2 bits just read are the HSKIP.
-    var clcode = try buildCodeLengthCode(br, hskip_bits);
+    const clcode = try buildCodeLengthCode(br, hskip_bits, sc);
     var lengths = try sc.allocTree(alphabet);
     var symbol_count: usize = 0;
     var prev_len: u8 = 8;
@@ -620,6 +620,7 @@ fn readContextMap(br: *BitReader, sc: *Scratch, size: usize, num_trees: u32, map
 }
 
 // ------------------------------------------------------------- meta-block
+
 
 // RFC 4: the last distance starts at 4, the second-to-last at 11, the
 // third-to-last at 15, the fourth-to-last at 16.
