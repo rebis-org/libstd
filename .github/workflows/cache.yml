@@ -118,6 +118,7 @@ jobs:
             onprem|offprem|mergeable) ;;
             *) echo "unknown primitive implementation" >&2; exit 1 ;;
           esac
+          zig build corpus
           zig build unit -Dprimitives_impl=${{ inputs.impl }} -Dportable=${{ inputs.portable }}
           zig build oracles -Dprimitives_impl=${{ inputs.impl }} -Dportable=${{ inputs.portable }} -Doptimize=safe
           if [ "${{ inputs.impl }}" = onprem ] && [ "${{ inputs.portable }}" = false ]; then
