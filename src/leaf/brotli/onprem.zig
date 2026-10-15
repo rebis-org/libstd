@@ -35,7 +35,9 @@ pub fn decodedSize(input: []const u8, scratch: []u8, options: Options) DecodeErr
 // Writer-sink staging: the format carries no output size, and the v1
 // decoder is one-shot over a slice. decodeToWriter therefore stages through
 // the workspace. A windowed streaming decode is the recorded follow-up.
-const writer_staging_size = 1 << 20;
+// Measured-size staging must cover the largest corpus output until the
+// windowed streaming decode replaces the one-shot count.
+const writer_staging_size = 64 << 20;
 
 pub const decode_workspace_size: usize = blk: {
     // Fixed table records, per-tree sorted-symbol arenas, context maps,
@@ -106,11 +108,9 @@ fn parseCommands(src: []const u8, commands: []Command, head: []u32, ring: *[4]u3
                     };
                     const ins_code = insertCode(ins.len);
                     const copy_code = copyCode(len);
-                    // The implicit distance-0 form exists only for icodes
-                    // below 128 (insert codes 0..7). A ring[0] hit with a
-                    // longer insert still writes a distance symbol: code 0
-                    // repeats ring[0] and skips the ring push on both sides.
-                    const implicit = dist == ring[0] and ins_code < 8;
+                    // The implicit distance-0 form exists only below icode 128:
+                    // insert codes 0..7 and copy codes below 16.
+                    const implicit = dist == ring[0] and ins_code < 8 and copy_code < 16;
                     cmd.icode = icodeFor(ins.len, len, implicit);
                     cmd.ins_extra = @intCast(ins.len - insert_base[ins_code]);
                     cmd.ins_bits = insert_extra[ins_code];
@@ -619,8 +619,8 @@ fn readContextMap(br: *BitReader, sc: *Scratch, size: usize, num_trees: u32, map
 // ------------------------------------------------------------- meta-block
 
 
-// RFC 4: the last distance starts at 4, the second-to-last at 11, the
-// third-to-last at 15, the fourth-to-last at 16.
+// RFC 4: the last distance starts at 4.
+// The earlier slots start at 11, 15, and 16.
 const distance_ring_init = [4]u32{ 4, 11, 15, 16 };
 
 fn decodeMetaBlock(
@@ -870,10 +870,7 @@ fn decodeMetaBlock(
             ring[1] = ring[0];
             ring[0] = distance;
         }
-        if (pos + copy_len > mlen) {
-            std.debug.print("COPYFAIL pos={d} copy={d} mlen={d} produced={d}\n", .{ pos, copy_len, mlen, produced.* });
-            return error.DataFailure;
-        }
+        if (pos + copy_len > mlen) return error.DataFailure;
         if (produced.* + copy_len > output.len) return error.CapacityFailure;
         kernels.copyMatch(output, produced.*, distance, @intCast(copy_len));
         produced.* += copy_len;
@@ -1181,14 +1178,11 @@ fn copyDictionaryWord(
     return total;
 }
 
-// ---------------------------------------------------------------- encode
 
-// The encoder is quality-1 fidelity: greedy head-only hash matches of four
-// or more bytes, one block type per category, LSB6 literal contexts, frozen
-// Huffman tables from real frequencies, and distance codes that prefer the
-// special symbols and the implicit distance-0 form. Complex prefix codes
-// transmit every length directly (no 16/17 run-length coding; only the
-// required trailing-zero omission), which is larger but always valid.
+// Greedy hash matches of four bytes or more.
+
+// Complex prefix codes transmit lengths directly.
+// That is larger but always valid.
 
 const huffman = @import("../../common/primitive/huffman.zig");
 
@@ -1279,9 +1273,8 @@ fn copyCode(len: usize) u32 {
     return lengthToCode(@intCast(len), &copy_base);
 }
 
-// Inverse distance encoding for NPOSTFIX=0, NDIRECT=0: returns the distance
-// code and extra value/bits, or a special code 0..15 when the distance
-// matches the ring (handled by the caller via `ring_dcode`).
+// Inverse distance encoding with NPOSTFIX and NDIRECT both zero.
+// Special codes 0..15 cover ring matches; the caller maps them.
 fn normalDistance(distance: u32) struct { dcode: u16, extra: u32, bits: u8 } {
     const d = distance;
     var n: u5 = 1;
@@ -1349,14 +1342,13 @@ fn writeSymbol(bw: *BitWriter, code: u16, len: u8) EncodeError!void {
     }
 }
 
-// Emits one prefix code description for the given lengths. Returns true
-// when the described code decodes to its single symbol with zero bits
-// (NSYM 0 or 1); the caller then skips the symbol write in the command
-// loop. Codes with at most four symbols use the simple form, whose length
-// shapes are fixed by the format (2 x 1; 1,2,2; 2,2,2,2 or 1,2,3,3), so the
-// lengths are forced over the most frequent symbols. Longer codes use the
-// complex form with every length transmitted directly (no 16/17
-// run-length coding); only the required trailing-zero omission applies.
+// Emits one prefix code description for the given lengths.
+// Returns true for a single-symbol code with zero bits.
+
+// Codes with at most four symbols use the simple form.
+// Its length shapes are fixed by the format.
+
+// Longer codes use the complex form; every length is transmitted directly.
 fn writePrefixCode(bw: *BitWriter, lens: []u8, alphabet: usize) EncodeError!bool {
     var freq_rank: [704]u16 = undefined;
     var nused: usize = 0;
@@ -1374,9 +1366,8 @@ fn writePrefixCode(bw: *BitWriter, lens: []u8, alphabet: usize) EncodeError!bool
         return true;
     }
     if (nused <= 4) {
-        // Sort used symbols by ascending length then symbol; the simple
-        // forms assign lengths by declared position, so the desired shape
-        // is produced by emitting in (length, symbol) order.
+        // Sort used symbols by ascending length, then symbol.
+        // Emission order (length, symbol) reproduces position-based lengths.
         var order: [4]u16 = undefined;
         var oi: usize = 0;
         for (1..16) |l| {
@@ -1407,9 +1398,8 @@ fn writePrefixCode(bw: *BitWriter, lens: []u8, alphabet: usize) EncodeError!bool
     }
     // Complex form.
     if (lens[alphabet - 1] == lens[0]) {
-        // Every symbol used at one length: the cl code below would hold a
-        // single symbol and fail the Kraft check. One symbol moves one
-        // level up and two move one level down; the sum stays exact.
+        // One-length alphabets fail the Kraft check in the cl code.
+        // One symbol moves up a level; two move down.
         const l0 = lens[0];
         const all_equal = for (lens[0..alphabet]) |l| {
             if (l != l0) break false;
@@ -1460,10 +1450,8 @@ fn encodeMetaBlock(bw: *BitWriter, src: []const u8, is_last: bool, ring: *[4]u32
     var icode_codes: [704]u16 = undefined;
     var dcode_codes: [64]u16 = undefined;
 
-    // Meta-block header (RFC 9.2): ISLAST, MNIBBLES, MLEN-1, then
-    // NBLTYPES = 1 for all three categories (single 0 bit each), NPOSTFIX
-    // and NDIRECT (zero), one LSB6 context mode, NTREES = 1 for literals
-    // and distances (single 0 bit each), then the three prefix codes.
+    // Meta-block header per RFC 9.2.
+    // One block type and one tree per category keep the middle trivial.
     try bw.writeBit(@intFromBool(is_last));
     if (is_last) {
         try bw.writeBit(0); // ISLASTEMPTY: the block carries data.
@@ -1487,8 +1475,8 @@ fn encodeMetaBlock(bw: *BitWriter, src: []const u8, is_last: bool, ring: *[4]u32
     const lit_single = try writePrefixCode(bw, lit_lens[0..256], 256);
     const icode_single = try writePrefixCode(bw, icode_lens[0..704], 704);
     const dcode_single = try writePrefixCode(bw, dcode_lens[0..64], 64);
-    // The writer fixes the final lengths (simple shapes, Kraft guard), so
-    // the canonical codes for the symbol bits come after it.
+    // The writer fixes the final lengths first.
+    // Canonical codes for the symbol bits come after it.
     canonicalCodes(lit_lens[0..256], lit_codes[0..256]);
     canonicalCodes(icode_lens[0..704], icode_codes[0..704]);
     canonicalCodes(dcode_lens[0..64], dcode_codes[0..64]);
@@ -1547,8 +1535,7 @@ pub fn encodeCountedSize(input: []const u8, scratch: []u8, options: Options) Enc
     return bw.finish();
 }
 
-// The encoder is new; the hermetic gate is a full round trip through this
-// decoder, and the envelope scenario adds the reference decode.
+// The encoder is new; the hermetic gate is a full round trip through this decoder.
 test "brotli decode rejects oversubscribed cl codes" {
     // Adversarial prefixes once overflowed the Kraft accumulator instead
     // of answering DataFailure.
@@ -1574,6 +1561,23 @@ test "brotli decode rejects oversubscribed cl codes" {
     }
 }
 
+
+test "brotli encode mozilla corpus" {
+    const allocator = std.testing.allocator;
+    const input = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "zig-out/benchmark/corpus/mozilla", allocator, .limited(1 << 27));
+    defer allocator.free(input);
+    const scratch = try allocator.alloc(u8, encode_workspace_size + decode_workspace_size);
+    defer allocator.free(scratch);
+    const bound = encodedSizeBound(input.len);
+    const encoded = try allocator.alloc(u8, bound);
+    defer allocator.free(encoded);
+    const enc_len = try encode(input, encoded, scratch[0..encode_workspace_size], .{});
+    const output = try allocator.alloc(u8, input.len + 16);
+    defer allocator.free(output);
+    const n = try decode(encoded[0..enc_len], output, scratch[encode_workspace_size..], .{});
+    try std.testing.expectEqual(input.len, n);
+    try std.testing.expectEqualSlices(u8, input, output[0..n]);
+}
 
 test "brotli encode roundtrips multi-block" {
     const allocator = std.testing.allocator;
