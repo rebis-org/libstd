@@ -16,6 +16,7 @@ const brotli = @import("../leaf/brotli/onprem.zig");
 const deflate = @import("../leaf/deflate/onprem.zig");
 const deflate_seam = @import("../leaf/deflate/seam.zig");
 const lz4 = @import("../leaf/lz4/onprem.zig");
+const lzo = @import("../leaf/lzo/onprem.zig");
 const lzma = @import("../leaf/lzma/onprem.zig");
 const lzma2 = @import("../leaf/lzma2/onprem.zig");
 const zstd = @import("../leaf/zstd/onprem.zig");
@@ -372,6 +373,10 @@ pub fn zlibHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resourc
     } else {
         return error.UnsupportedFailure;
     }
+}
+
+pub fn lzoHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
+    return bufferCodecHook(lzo, plan, source, sink, call, response, sizing, commit, limits, command_mask, lzo.decodeWorkspaceSize(), lzo.encodeWorkspaceSize(), .{});
 }
 
 pub fn lz4Hook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
