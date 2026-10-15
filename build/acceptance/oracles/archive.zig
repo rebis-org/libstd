@@ -11,7 +11,8 @@ const Runner = harness.Runner;
 const arc_caps: u64 = harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay;
 
 const ArcFixture = struct {
-    archive: [4096]u8,
+    archive: [65536]u8,
+    corrupt_offset: usize = 0,
     archive_size: usize = 0,
     data1: [32]u8,
     data2: [445]u8,
@@ -164,14 +165,14 @@ fn arcCapacity(r: *Runner) !void {
 }
 
 fn arcCorrupt(r: *Runner) !void {
-    arc_state.archive[0] ^= 0xff;
+    arc_state.archive[arc_state.corrupt_offset] ^= 0xff;
     const nodes = &.{
         harness.sourceSpan(arc_state.archive[0..arc_state.archive_size]),
         harness.sinkSpan(r.output),
     };
     @memset(r.output, 0xa5);
     _ = harness.call(r, harness.ids.read, nodes, .{ .ctx = true });
-    arc_state.archive[0] ^= 0xff;
+    arc_state.archive[arc_state.corrupt_offset] ^= 0xff;
     if (r.status == abi.Status.ok or !harness.allBytesEqual(r.output, 0xa5)) return error.CorruptArchiveChangedOutput;
 }
 
@@ -193,7 +194,7 @@ fn arcForeign(r: *Runner) !void {
     if (result == .mismatch) return error.ReferenceToolRejectedOutput;
 }
 
-fn runArchive(r: *Runner, profile_id: harness.Id) anyerror!void {
+fn runArchiveChecked(r: *Runner, profile_id: harness.Id, check_foreign: bool) anyerror!void {
     setupArchive(r, profile_id);
     try arcQueryWrite(r);
     try arcWrite(r);
@@ -206,7 +207,11 @@ fn runArchive(r: *Runner, profile_id: harness.Id) anyerror!void {
     try arcCapacity(r);
     try arcCorrupt(r);
     try arcLimit(r);
-    try arcForeign(r);
+    if (check_foreign) try arcForeign(r);
+}
+
+fn runArchive(r: *Runner, profile_id: harness.Id) anyerror!void {
+    return runArchiveChecked(r, profile_id, true);
 }
 
 pub fn runTar(r: *Runner) anyerror!void {
@@ -264,6 +269,69 @@ fn runWimForeign(r: *Runner) anyerror!void {
 }
 
 const squashfs_bin_dir = "zig-out/benchmark/bin";
+
+pub fn runIso(r: *Runner) anyerror!void {
+    arc_state.corrupt_offset = 16 * 2048;
+    // Volume formats list a synthetic dot entry first, so the generic
+    // libarchive name-order check cannot apply; runIso verifies the
+    // extraction against bsdtar instead.
+    try runArchiveChecked(r, harness.ids.iso, false);
+    arc_state.corrupt_offset = 0;
+    // Reference extraction: bsdtar must read our encoded image back.
+    const bin = "/usr/bin/bsdtar";
+    std.Io.Dir.cwd().access(harness.oracle_io, bin, .{}) catch return error.ReferenceToolUnavailable;
+    const oracle_io = harness.oracle_io;
+    const image_path = try std.fmt.allocPrint(r.gpa, "zig-out/oracles/iso-ours-{d}.iso", .{r.corpus_index});
+    defer r.gpa.free(image_path);
+    try std.Io.Dir.cwd().writeFile(oracle_io, .{ .sub_path = image_path, .data = arc_state.archive[0..arc_state.archive_size] });
+    const out_path = try std.fmt.allocPrint(r.gpa, "zig-out/oracles/iso-out-{d}", .{r.corpus_index});
+    defer r.gpa.free(out_path);
+    try std.Io.Dir.cwd().createDirPath(oracle_io, out_path);
+    var child = try std.process.spawn(oracle_io, .{ .argv = &.{ bin, "-xf", image_path, "-C", out_path } });
+    const term = try child.wait(oracle_io);
+    if (term != .exited or term.exited != 0) return error.ReferenceToolExtractFailed;
+    const got_path1 = try std.fmt.allocPrint(r.gpa, "{s}/m1.txt", .{out_path});
+    defer r.gpa.free(got_path1);
+    const got1 = try std.Io.Dir.cwd().readFileAlloc(oracle_io, got_path1, r.gpa, .limited(1 << 20));
+    defer r.gpa.free(got1);
+    if (!std.mem.eql(u8, got1, &arc_state.data1)) return error.IsoExtractMismatch;
+    const got_path2 = try std.fmt.allocPrint(r.gpa, "{s}/m2.txt", .{out_path});
+    defer r.gpa.free(got_path2);
+    const got2 = try std.Io.Dir.cwd().readFileAlloc(oracle_io, got_path2, r.gpa, .limited(1 << 20));
+    defer r.gpa.free(got2);
+    if (!std.mem.eql(u8, got2, &arc_state.data2)) return error.IsoExtractMismatch;
+    _ = std.Io.Dir.cwd().deleteTree(oracle_io, out_path) catch {};
+    _ = std.Io.Dir.cwd().deleteFile(oracle_io, image_path) catch {};
+}
+
+fn runIsoForeign(r: *Runner) anyerror!void {
+    setupArchive(r, harness.ids.iso);
+    // hdiutil makehybrid is the local Rock Ridge/Joliet writer reference.
+    const oracle_io = harness.oracle_io;
+    const dir_path = try std.fmt.allocPrint(r.gpa, "zig-out/oracles/iso-src-{d}", .{r.corpus_index});
+    defer r.gpa.free(dir_path);
+    try std.Io.Dir.cwd().createDirPath(oracle_io, dir_path);
+    const file1 = try std.fmt.allocPrint(r.gpa, "{s}/m1.txt", .{dir_path});
+    defer r.gpa.free(file1);
+    try std.Io.Dir.cwd().writeFile(oracle_io, .{ .sub_path = file1, .data = &arc_state.data1 });
+    const file2 = try std.fmt.allocPrint(r.gpa, "{s}/m2.txt", .{dir_path});
+    defer r.gpa.free(file2);
+    try std.Io.Dir.cwd().writeFile(oracle_io, .{ .sub_path = file2, .data = &arc_state.data2 });
+    const image_path = try std.fmt.allocPrint(r.gpa, "zig-out/oracles/iso-foreign-{d}.iso", .{r.corpus_index});
+    defer r.gpa.free(image_path);
+    var child = try std.process.spawn(oracle_io, .{ .argv = &.{ "hdiutil", "makehybrid", "-iso", "-o", image_path, dir_path } });
+    const term = try child.wait(oracle_io);
+    if (term != .exited or term.exited != 0) return error.ReferenceToolCaptureFailed;
+    const foreign = try std.Io.Dir.cwd().readFileAlloc(oracle_io, image_path, r.gpa, .limited(8 << 20));
+    defer r.gpa.free(foreign);
+    const read_expected = [_]lib.ExpectedEntry{
+        .{ .name = "m1.txt", .data = &arc_state.data1 },
+        .{ .name = "m2.txt", .data = &arc_state.data2 },
+    };
+    try arcReadForeign(r, foreign, &read_expected);
+    _ = std.Io.Dir.cwd().deleteTree(oracle_io, dir_path) catch {};
+    _ = std.Io.Dir.cwd().deleteFile(oracle_io, image_path) catch {};
+}
 
 pub fn runSquashfs(r: *Runner) anyerror!void {
     try runArchive(r, harness.ids.squashfs);
@@ -853,6 +921,8 @@ pub const scenarios = harness.scenarios("archive", &.{
     .{ .label = "archive xar foreign", .run = runXarForeign(.xar), .workspace_size = 3 * 1024 * 1024, .output_size = 512, .encoded_size = 4096 },
     .{ .label = "archive wim", .run = runWim, .workspace_size = 128 * 1024, .output_size = 512, .encoded_size = 4096 },
     .{ .label = "archive wim foreign", .run = runWimForeign, .workspace_size = 128 * 1024, .output_size = 512, .encoded_size = 4096 },
+    .{ .label = "archive iso", .run = runIso, .workspace_size = 256 * 1024, .output_size = 512, .encoded_size = 65536 },
+    .{ .label = "archive iso foreign", .run = runIsoForeign, .workspace_size = 256 * 1024, .output_size = 512, .encoded_size = 65536 },
     .{ .label = "archive squashfs", .run = runSquashfs, .workspace_size = 256 * 1024, .output_size = 512, .encoded_size = 4096 },
     .{ .label = "archive squashfs foreign", .run = runSquashfsForeign, .workspace_size = 256 * 1024, .output_size = 512, .encoded_size = 4096 },
     .{ .label = "archive zip", .run = runZip, .workspace_size = 65536 + 4096, .output_size = 512, .encoded_size = 4096 },

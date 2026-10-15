@@ -193,6 +193,7 @@ pub const Single = struct {
 };
 
 pub fn scenarios(comptime suite: []const u8, comptime specs: []const Spec, comptime singles: []const Single) [specs.len * 4 + singles.len]Scenario {
+    @setEvalBranchQuota(100_000);
     var list: [specs.len * 4 + singles.len]Scenario = undefined;
     var index: usize = 0;
     for (specs) |spec| {

@@ -26,6 +26,9 @@ pub const Refs = struct {
     wimlib_cmd: *std.Build.Step.InstallFile,
     mksquashfs_cmd: *std.Build.Step.InstallFile,
     unsquashfs_cmd: *std.Build.Step.InstallFile,
+    mkdwarfs_cmd: *std.Build.Step.InstallFile,
+    dwarfsck_cmd: *std.Build.Step.InstallFile,
+    dwarfsextract_cmd: *std.Build.Step.InstallFile,
     libunrar_lib: std.Build.LazyPath,
     fast_lzma2_lib: std.Build.LazyPath,
     fast_lzma2_test: *std.Build.Step.Run,
@@ -62,6 +65,9 @@ pub const Refs = struct {
         step.dependOn(&self.wimlib_cmd.step);
         step.dependOn(&self.mksquashfs_cmd.step);
         step.dependOn(&self.unsquashfs_cmd.step);
+        step.dependOn(&self.mkdwarfs_cmd.step);
+        step.dependOn(&self.dwarfsck_cmd.step);
+        step.dependOn(&self.dwarfsextract_cmd.step);
         step.dependOn(&self.fast_lzma2_test.step);
         step.dependOn(&self.libzip_build.step);
     }
@@ -373,6 +379,38 @@ fn addSquashfsTools(b: *std.Build) struct { mksquashfs: *std.Build.Step.InstallF
     };
 }
 
+fn addDwarfsTools(b: *std.Build) struct { mkdwarfs: *std.Build.Step.InstallFile, dwarfsck: *std.Build.Step.InstallFile, dwarfsextract: *std.Build.Step.InstallFile } {
+    // The dwarfs triple is the format's reference implementation. The build
+    // needs Homebrew boost, utf8cpp, nlohmann-json and fmt, a keg-only
+    // libarchive on PKG_CONFIG_PATH, a range-v3 newer than 0.12.0 for the
+    // Xcode 27 libc++ (0.12.0's meta.hpp collides), and Howard Hinnant's
+    // date.h for std::chrono::from_stream, which Apple libc++ lacks.
+    var cfg = std.ArrayList([]const u8).empty;
+    cfg.appendSlice(b.allocator, &.{
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DNIXPKGS_DWARFS_VERSION_OVERRIDE=v0.11.3",
+        "-DWITH_FUSE_DRIVER=OFF",
+        "-DWITH_TESTS=OFF",
+        "-DWITH_BENCHMARKS=OFF",
+        "-DWITH_MAN_PAGES=OFF",
+        "-DWITH_MAN_OPTION=OFF",
+        "-DWITH_DESKTOP_INTEGRATION=OFF",
+        "-DENABLE_STACKTRACE=OFF",
+        "-DTRY_ENABLE_FLAC=OFF",
+        "-DFETCHCONTENT_SOURCE_DIR_RANGE-V3=/tmp/range-v3",
+        "-DCMAKE_CXX_FLAGS=-I/tmp/date_include",
+    }) catch @panic("oom");
+    const env = b.addSystemCommand(&.{ "sh", "-c", "export PKG_CONFIG_PATH=/opt/homebrew/opt/libarchive/lib/pkgconfig:$PKG_CONFIG_PATH; shift; exec cmake -S vendor/dwarfs -B zig-out/benchmark/build/dwarfs \"$@\"", "sh" });
+    env.addArgs(cfg.items);
+    const build = b.addSystemCommand(&.{ "sh", "-c", "export PKG_CONFIG_PATH=/opt/homebrew/opt/libarchive/lib/pkgconfig:$PKG_CONFIG_PATH; exec cmake --build zig-out/benchmark/build/dwarfs -j4 --target mkdwarfs dwarfsck dwarfsextract", "sh" });
+    build.step.dependOn(&env.step);
+    return .{
+        .mkdwarfs = installOut(b, &build.step, "zig-out/benchmark/build/dwarfs/mkdwarfs", "mkdwarfs"),
+        .dwarfsck = installOut(b, &build.step, "zig-out/benchmark/build/dwarfs/dwarfsck", "dwarfsck"),
+        .dwarfsextract = installOut(b, &build.step, "zig-out/benchmark/build/dwarfs/dwarfsextract", "dwarfsextract"),
+    };
+}
+
 fn addBrotli(b: *std.Build) *std.Build.Step.InstallFile {
     const brotli = cmake(b, "vendor/brotli", "zig-out/benchmark/build/brotli", &.{
         "-DBUILD_SHARED_LIBS=OFF",
@@ -401,6 +439,7 @@ pub fn add(b: *std.Build, ctx: *const common.Settings) Refs {
     const brotli_cmd = addBrotli(b);
     const wimlib_cmd = addWimlib(b, dummy_dir);
     const squashfs_tools = addSquashfsTools(b);
+    const dwarfs_tools = addDwarfsTools(b);
 
     return .{
         .sevenzz = seven.sevenzz,
@@ -425,6 +464,9 @@ pub fn add(b: *std.Build, ctx: *const common.Settings) Refs {
         .wimlib_cmd = wimlib_cmd,
         .mksquashfs_cmd = squashfs_tools.mksquashfs,
         .unsquashfs_cmd = squashfs_tools.unsquashfs,
+        .mkdwarfs_cmd = dwarfs_tools.mkdwarfs,
+        .dwarfsck_cmd = dwarfs_tools.dwarfsck,
+        .dwarfsextract_cmd = dwarfs_tools.dwarfsextract,
         .libunrar_lib = unrar.lib,
         .fast_lzma2_lib = fast_lzma2.lib,
         .fast_lzma2_test = fast_lzma2.test_run,
