@@ -486,6 +486,48 @@ fn runIsoForeign(r: *Runner) anyerror!void {
     _ = std.Io.Dir.cwd().deleteFile(oracle_io, image_path) catch {};
 }
 
+fn runSquashfsTree(r: *Runner) anyerror!void {
+    setupArchive(r, harness.ids.squashfs);
+    // Park the second entry under a subdirectory for this scenario only.
+    const saved_entry2 = arc_state.entry2;
+    const saved_name2 = arc_state.name2;
+    arc_state.name2 = undefined;
+    arc_state.entry2 = harness.archiveEntryNode(&arc_state.name2, &arc_state.data_node2, "sub/m2.txt", &arc_state.data2);
+    arc_state.entry1.next = &arc_state.entry2;
+    defer {
+        arc_state.entry2 = saved_entry2;
+        arc_state.name2 = saved_name2;
+        arc_state.entry1.next = &arc_state.entry2;
+    }
+    // The same write/read checks as runArchive, without its second
+    // setupArchive, which would rebuild the entries flat again.
+    try arcQueryWrite(r);
+    try arcWrite(r);
+    try arcQueryRead(r);
+    try arcReadOrdinal(r, 0, &arc_state.data1);
+    try arcReadOrdinal(r, 1, &arc_state.data2);
+    // unsquashfs must reconstruct the subdirectory.
+    const bin = squashfs_bin_dir ++ "/unsquashfs";
+    std.Io.Dir.cwd().access(harness.oracle_io, bin, .{}) catch return error.ReferenceToolUnavailable;
+    const oracle_io = harness.oracle_io;
+    const image_path = try std.fmt.allocPrint(r.gpa, "zig-out/oracles/squashfs-tree-{d}.sqfs", .{r.corpus_index});
+    defer r.gpa.free(image_path);
+    try std.Io.Dir.cwd().writeFile(oracle_io, .{ .sub_path = image_path, .data = arc_state.archive[0..arc_state.archive_size] });
+    const out_path = try std.fmt.allocPrint(r.gpa, "zig-out/oracles/squashfs-tree-out-{d}", .{r.corpus_index});
+    defer r.gpa.free(out_path);
+    _ = std.Io.Dir.cwd().deleteTree(oracle_io, out_path) catch {};
+    var child = try std.process.spawn(oracle_io, .{ .argv = &.{ bin, "-d", out_path, image_path } });
+    const term = try child.wait(oracle_io);
+    if (term != .exited or term.exited != 0) return error.ReferenceToolExtractFailed;
+    const got_path2 = try std.fmt.allocPrint(r.gpa, "{s}/sub/m2.txt", .{out_path});
+    defer r.gpa.free(got_path2);
+    const got2 = try std.Io.Dir.cwd().readFileAlloc(oracle_io, got_path2, r.gpa, .limited(1 << 20));
+    defer r.gpa.free(got2);
+    if (!std.mem.eql(u8, got2, &arc_state.data2)) return error.SquashfsExtractMismatch;
+    _ = std.Io.Dir.cwd().deleteTree(oracle_io, out_path) catch {};
+    _ = std.Io.Dir.cwd().deleteFile(oracle_io, image_path) catch {};
+}
+
 pub fn runSquashfs(r: *Runner) anyerror!void {
     try runArchive(r, harness.ids.squashfs);
     // Reference extraction: unsquashfs must read our encoded image back.
@@ -1103,6 +1145,7 @@ pub const scenarios = harness.scenarios("archive", &.{
     .{ .label = "archive dwarfs", .run = runDwarfs, .workspace_size = 8 * 1024 * 1024, .output_size = 512, .encoded_size = 65536 },
     .{ .label = "archive dwarfs foreign", .run = runDwarfsForeign, .workspace_size = 4 * 1024 * 1024, .output_size = 512, .encoded_size = 65536 },
     .{ .label = "archive squashfs", .run = runSquashfs, .workspace_size = 8 * 1024 * 1024, .output_size = 512, .encoded_size = 4096 },
+    .{ .label = "archive squashfs tree", .run = runSquashfsTree, .workspace_size = 8 * 1024 * 1024, .output_size = 512, .encoded_size = 4096 },
     .{ .label = "archive squashfs foreign", .run = runSquashfsForeign, .workspace_size = 8 * 1024 * 1024, .output_size = 512, .encoded_size = 4096 },
     .{ .label = "archive squashfs foreign xz", .run = runSquashfsForeignComp("xz", &.{}), .workspace_size = 8 * 1024 * 1024, .output_size = 512, .encoded_size = 4096 },
     .{ .label = "archive squashfs foreign lzma", .run = runSquashfsForeignComp("lzma", &.{}), .workspace_size = 8 * 1024 * 1024, .output_size = 512, .encoded_size = 4096 },
