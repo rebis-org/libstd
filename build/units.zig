@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const acceptance = @import("acceptance.zig");
+const bench_env = @import("acceptance/benchmark/env.zig");
 const checks = @import("checks.zig");
 const dist = @import("dist.zig");
 const common = @import("platform/common.zig");
@@ -35,6 +36,7 @@ comptime {
 }
 
 pub fn expand(b: *std.Build, ctx: *common.Settings) void {
+    addCorpusStep(b);
     inline for (registry_fields.field_names) |name| {
         @field(registry, name).expand(b, ctx);
     }
@@ -87,4 +89,33 @@ pub fn addListingStep(b: *std.Build) *std.Build.Step {
     const step = b.step("units", "List the registered build units");
     step.dependOn(&run.step);
     return step;
+}
+
+// CI suite jobs restore no benchmark cache, so the Silesia corpus the
+// brotli round-trip needs must be materialized on demand. The download is
+// pinned by content exactly as the benchmark harness pins it.
+fn addCorpusStep(b: *std.Build) void {
+    const at_root = bench_env.paths.corpus_dir ++ "/mozilla";
+    const in_folder = bench_env.paths.corpus_dir ++ "/silesia/mozilla";
+    const script = b.fmt(
+        \\if [ ! -f {s} ] && [ ! -f {s} ]; then
+        \\  mkdir -p {s} &&
+        \\  curl -fsSL -o {s} {s} &&
+        \\  echo "{s}  {s}" | shasum -a 256 -c - &&
+        \\  unzip -q -o {s} -d {s}
+        \\fi
+    , .{
+        at_root,
+        in_folder,
+        bench_env.paths.corpus_dir,
+        bench_env.paths.corpus_zip,
+        bench_env.silesia_url,
+        bench_env.silesia_sha256,
+        bench_env.paths.corpus_zip,
+        bench_env.paths.corpus_zip,
+        bench_env.paths.corpus_dir,
+    });
+    const run = std.Build.Step.Run.create(b, "corpus download");
+    run.addArgs(&.{ "sh", "-c", script });
+    b.step("corpus", "Materialize the Silesia benchmark corpus").dependOn(&run.step);
 }
