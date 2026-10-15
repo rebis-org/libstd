@@ -85,7 +85,7 @@ pub fn build(b: *std.Build) void {
     // and primitive layer. System-level interop and contract pins stay in
     // the oracle suite.
     const unit_step = b.step("unit", "Run unit-level test blocks");
-    inline for (&.{ modules.interface, modules.checksum, modules.grammar, modules.volume }) |spec| {
+    inline for (&.{ modules.interface, modules.checksum, modules.implementations }) |spec| {
         const test_module = modules.createFor(b, spec, ctx.target, ctx.optimize, &ctx);
         const unit_tests = b.addTest(.{ .root_module = test_module });
         const run_unit = b.addRunArtifact(unit_tests);

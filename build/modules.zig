@@ -42,8 +42,7 @@ pub const oracles = Module{
     },
 };
 pub const interface = Module{ .name = "interface", .root = "src/interface/root.zig" };
-pub const grammar = Module{ .name = "grammar", .root = "src/grammar.zig", .imports = &.{.{ .name = "seam", .module = "seam" }}, .crc_kernel = true };
-pub const volume = Module{ .name = "volume", .root = "src/volume.zig", .imports = &.{.{ .name = "seam", .module = "seam" }}, .crc_kernel = true };
+pub const implementations = Module{ .name = "implementations", .root = "src/implementations.zig", .imports = &.{.{ .name = "seam", .module = "seam" }}, .crc_kernel = true };
 pub const trap = Module{
     .name = "trap",
     .root = "build/acceptance/oracles/trap.zig",
@@ -69,7 +68,7 @@ pub const micro = Module{
     },
 };
 
-const importable = [_]Module{ seam, checksum, crypto, library, manifest, package, abi_exports, harness, run, oracles, interface, grammar, volume, trap, component, benchmark, micro };
+const importable = [_]Module{ seam, checksum, crypto, library, manifest, package, abi_exports, harness, run, oracles, interface, implementations, trap, component, benchmark, micro };
 
 fn byName(name: []const u8) Module {
     for (importable) |module| {

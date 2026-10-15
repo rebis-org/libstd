@@ -4,19 +4,32 @@ const bounds = @import("../../common/primitive/bounds.zig");
 const failure_prim = @import("../../common/primitive/failure.zig");
 
 const deflate = @import("../../leaf/deflate/onprem.zig");
+const lz4_leaf = @import("../../leaf/lz4/onprem.zig");
+const lzo_leaf = @import("../../leaf/lzo/onprem.zig");
+const zstd_leaf = @import("../../leaf/zstd/onprem.zig");
+const xz_grammar = @import("../../grammar/xz/onprem.zig");
+const lzma_grammar = @import("../../grammar/lzma/onprem.zig");
+const lzma_seam = @import("../../leaf/lzma/seam.zig");
+const checksum = @import("../../common/primitive/checksum.zig");
 
 const Failure = failure_prim.Failure;
 
-// Squashfs 4.0 slice in the flat-file shape: one root directory holding
-// regular files. Read covers store and gzip (zlib-wrapped deflate) data and
-// metadata blocks, tail-end fragments, and the dir/reg/lreg inode headers.
-// Write emits the mksquashfs -noI -noD -noF -no-fragments shape: every
-// metadata block and data block stored uncompressed. The remaining
-// compressors (xz, lzma, lzo, lz4, zstd) and compressed writes land in
-// follow-up slices; they fail explicitly here, never silently.
-// Layout follows the on-disk headers in squashfs_fs.h from squashfs-tools.
+// Squashfs 4.0 slice: one root directory of regular files.
+// Read covers every compressor for data and metadata alike.
 
-pub const scratch_size: usize = 2 * metadata_size + frag_buffer_size + deflate.history_size;
+// Dictionaries are capped at one MiB; larger ones fail explicitly.
+
+// Write emits the mksquashfs -noI -noD -noF -no-fragments shape.
+// Layout follows squashfs_fs.h.
+
+const xz_dictionary_cap: u32 = 1 << 20;
+pub const scratch_size: usize = 2 * metadata_size + frag_buffer_size + deflate.history_size + xz_grammar.decodeWorkspaceSize(xz_dictionary_cap);
+
+const compression_lzma: u16 = 2;
+const compression_lzo: u16 = 3;
+const compression_xz: u16 = 4;
+const compression_lz4: u16 = 5;
+const compression_zstd: u16 = 6;
 
 const magic: u32 = 0x7371_7368;
 const major_version: u16 = 4;
@@ -80,6 +93,7 @@ const Scratch = struct {
     dir: []u8,
     frag: []u8,
     history: []u8,
+    aux: []u8,
 
     fn carve(scratch: []u8) Failure!Scratch {
         if (scratch.len < scratch_size) return error.CapacityFailure;
@@ -88,6 +102,7 @@ const Scratch = struct {
             .dir = scratch[metadata_size .. 2 * metadata_size],
             .frag = scratch[2 * metadata_size ..][0..frag_buffer_size],
             .history = scratch[2 * metadata_size + frag_buffer_size ..][0..deflate.history_size],
+            .aux = scratch[2 * metadata_size + frag_buffer_size + deflate.history_size ..],
         };
     }
 };
@@ -122,10 +137,9 @@ const MetaBlock = struct {
     disk_size: u64,
 };
 
-// One metadata block at an absolute disk position: a 2-byte header whose
-// bit 15 set means the payload is stored raw, then the payload. Compressed
-// payloads inflate into `out` and must land at or under the 8 KiB block cap.
-fn inflateMeta(compression: u16, archive: []const u8, at: u64, out: []u8, history: []u8) Failure!MetaBlock {
+// Bit 15 set means the metadata payload is stored raw.
+// Compressed payloads must fit the 8 KiB block cap.
+fn inflateMeta(compression: u16, archive: []const u8, at: u64, out: []u8, history: []u8, aux: []u8) Failure!MetaBlock {
     const head = try bounds.slice(archive, at, 2);
     const header = std.mem.readInt(u16, head[0..2], .little);
     const size: usize = header & ~flag_uncompressed_metadata;
@@ -135,11 +149,32 @@ fn inflateMeta(compression: u16, archive: []const u8, at: u64, out: []u8, histor
         @memcpy(out[0..size], payload);
         return .{ .len = size, .disk_size = 2 + size };
     }
-    const len = switch (compression) {
-        compression_gzip => try inflateZlib(payload, out, history),
-        else => return error.UnsupportedFailure,
-    };
+    const len = try inflateBlock(compression, payload, out, history, aux);
     return .{ .len = len, .disk_size = 2 + size };
+}
+
+// One compressed payload lands in an exact-size output slice.
+// `aux` carries dictionary-sized workspaces and zstd's rolling history.
+fn inflateBlock(compression: u16, payload: []const u8, out: []u8, history: []u8, aux: ?[]u8) Failure!usize {
+    switch (compression) {
+        compression_gzip => return inflateZlib(payload, out, history),
+        compression_lzma => return lzma_grammar.decodeInPlace(payload, out, aux orelse return error.CapacityFailure, lzma_seam.default_provider),
+        compression_lzo => return lzo_leaf.decodeInPlace(payload, out),
+        compression_xz => return xz_grammar.decode(payload, out, aux orelse return error.CapacityFailure, checksum.default_provider),
+        compression_lz4 => {
+            return lz4_leaf.decompressBlock(payload, out, &.{}) catch |err| return switch (err) {
+                error.DataFailure => error.DataFailure,
+                error.OutputTooSmall => error.CapacityFailure,
+            };
+        },
+        compression_zstd => {
+            const workspace = aux orelse return error.CapacityFailure;
+            var reader = std.Io.Reader.fixed(payload);
+            var writer = std.Io.Writer.fixed(out);
+            return zstd_leaf.decodeStream(&reader, &writer, workspace, .{ .window_size = xz_dictionary_cap }) catch return error.DataFailure;
+        },
+        else => return error.UnsupportedFailure,
+    }
 }
 
 fn inflateZlib(payload: []const u8, out: []u8, history: []u8) Failure!usize {
@@ -155,12 +190,17 @@ fn inflateZlib(payload: []const u8, out: []u8, history: []u8) Failure!usize {
     return fixed.end;
 }
 
-fn inflateData(compression: u16, payload: []const u8, out: []u8, history: []u8) Failure!void {
+fn inflateData(compression: u16, payload: []const u8, out: []u8, history: []u8, aux: ?[]u8) Failure!void {
     switch (compression) {
         compression_gzip => {
             if (try inflateZlib(payload, out, history) != out.len) return error.DataFailure;
         },
-        else => return error.UnsupportedFailure,
+        compression_zstd => {
+            _ = try inflateBlock(compression, payload, out, history, aux);
+        },
+        else => {
+            if (try inflateBlock(compression, payload, out, history, aux) != out.len) return error.DataFailure;
+        },
     }
 }
 
@@ -188,7 +228,7 @@ fn readInode(archive: []const u8, super: Super, ref: u64, scratch: *Scratch) Fai
     const off: usize = @intCast(ref & 0xffff);
     if (rel > super.bytes_used) return error.DataFailure;
     const at = try bounds.addU64(super.inode_table_start, rel);
-    const block = try inflateMeta(super.compression, archive, at, scratch.meta, scratch.history);
+    const block = try inflateMeta(super.compression, archive, at, scratch.meta, scratch.history, scratch.aux);
     if (off >= block.len) return error.DataFailure;
     const raw = scratch.meta[off..block.len];
     if (raw.len < 16) return error.DataFailure;
@@ -250,7 +290,7 @@ fn readFragmentEntry(archive: []const u8, super: Super, index: u32, scratch: *Sc
     const table = try bounds.slice(archive, super.fragment_table_start, index_bytes);
     const slot = std.math.mul(u64, index, 16) catch return error.DataFailure;
     const block_ptr = std.mem.readInt(u64, table[(slot / metadata_size) * 8 ..][0..8], .little);
-    const block = try inflateMeta(super.compression, archive, block_ptr, scratch.frag[0..metadata_size], scratch.history);
+    const block = try inflateMeta(super.compression, archive, block_ptr, scratch.frag[0..metadata_size], scratch.history, scratch.aux);
     const off: usize = @intCast(slot % metadata_size);
     if (off + 16 > block.len) return error.DataFailure;
     return .{
@@ -264,11 +304,12 @@ const MetaStream = struct {
     compression: u16,
     disk: u64,
     buf: []u8,
+    aux: []u8,
     len: usize = 0,
     pos: usize = 0,
 
     fn refill(self: *MetaStream, history: []u8) Failure!void {
-        const block = try inflateMeta(self.compression, self.archive, self.disk, self.buf, history);
+        const block = try inflateMeta(self.compression, self.archive, self.disk, self.buf, history, self.aux);
         self.disk = try bounds.addU64(self.disk, block.disk_size);
         self.len = block.len;
         self.pos = 0;
@@ -309,6 +350,7 @@ fn walkDir(archive: []const u8, super: Super, scratch: *Scratch, target: DirTarg
         .compression = super.compression,
         .disk = try bounds.addU64(super.dir_table_start, root.dir_start),
         .buf = scratch.dir,
+        .aux = scratch.aux,
     };
     try stream.skip(root.dir_offset, scratch.history);
     var remaining: u64 = root.dir_file_size - 3;
@@ -385,7 +427,7 @@ fn readFile(archive: []const u8, super: Super, inode: Inode, output: []u8, scrat
                 if (c_byte != take) return error.DataFailure;
                 @memcpy(output[written..][0..take_usize], payload);
             } else {
-                try inflateData(super.compression, payload, output[written..][0..take_usize], scratch.history);
+                try inflateData(super.compression, payload, output[written..][0..take_usize], scratch.history, scratch.aux);
             }
             data_pos = try bounds.addU64(data_pos, c_byte);
         }
@@ -404,10 +446,7 @@ fn readFile(archive: []const u8, super: Super, inode: Inode, output: []u8, scrat
                 @memcpy(output[written..][0..@intCast(frag_bytes)], payload[off..][0..@intCast(frag_bytes)]);
             } else {
                 if (super.block_size > scratch.frag.len) return error.UnsupportedFailure;
-                const produced = switch (super.compression) {
-                    compression_gzip => try inflateZlib(payload, scratch.frag[0..super.block_size], scratch.history),
-                    else => return error.UnsupportedFailure,
-                };
+                const produced = try inflateBlock(super.compression, payload, scratch.frag[0..super.block_size], scratch.history, scratch.aux);
                 const off: usize = @intCast(inode.frag_offset);
                 if (off + frag_bytes > produced) return error.DataFailure;
                 @memcpy(output[written..][0..@intCast(frag_bytes)], scratch.frag[off..][0..@intCast(frag_bytes)]);
@@ -539,8 +578,8 @@ fn layoutEntries(entries: []const Entry) Failure!Layout {
     }
     lay.root_dir_size = dirPayloadSize(entries, &lay, entries.len);
     const dir_payload = lay.root_dir_size;
-    // The basic dir inode carries the directory size in a u16 field,
-    // including the 3 bytes the reader subtracts for the synthetic dots.
+    // The dir inode's size field is u16.
+    // The count includes the 3 bytes readers subtract for the synthetic dots.
     if (dir_payload + 3 > std.math.maxInt(u16)) return error.UnsupportedFailure;
     const dir_blocks = (dir_payload + metadata_size - 1) / metadata_size;
     lay.dir_table_total = dir_payload + 2 * @as(u64, @intCast(dir_blocks));
@@ -685,9 +724,8 @@ fn writeDirTable(sink: *Sink, entries: []const Entry, lay: *const Layout) Failur
 }
 
 fn writeIdTable(sink: *Sink) Failure!void {
-    // unsquashfs checks bytes_used - id_table_start == index_bytes, so the
-    // id pairs metadata block comes first and the index array last, the
-    // mksquashfs order.
+    // unsquashfs checks bytes_used - id_table_start == index_bytes.
+    // The id block comes first; the index last.
     const block_start: u64 = @intCast(sink.pos);
     var head: [2]u8 = undefined;
     std.mem.writeInt(u16, &head, flag_uncompressed_metadata | 8, .little);
@@ -767,3 +805,4 @@ test "squashfs reads mksquashfs gzip image" {
     const n = try decodeOrdinal(&mksquashfs_fixture, 1, &out, &scratch);
     try testing.expectEqual(@as(usize, 445), n);
 }
+
