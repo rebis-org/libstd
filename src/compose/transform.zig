@@ -663,7 +663,7 @@ pub fn bzip2Hook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resour
 pub fn brotliHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
     const options = try parseBrotliOptions(call.request, command_mask);
     // The encoder lands with the dictionary support; read serves now.
-    return bufferCodecHook(brotli, plan, source, sink, call, response, sizing, commit, limits, command_mask, brotli.decodeWorkspaceSize(options), 0, options);
+    return bufferCodecHook(brotli, plan, source, sink, call, response, sizing, commit, limits, command_mask, brotli.decodeWorkspaceSize(options), brotli.encodeWorkspaceSize(options), options);
 }
 
 fn parseBrotliOptions(request: ?*Node, command_mask: u32) Failure!brotli.Options {
