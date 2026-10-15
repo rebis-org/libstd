@@ -20,6 +20,7 @@ extern int archive_write_set_format_zip(archive *a);
 extern int archive_write_set_format_pax_restricted(archive *a);
 extern int archive_write_set_format_cpio_newc(archive *a);
 extern int archive_write_set_format_cpio_odc(archive *a);
+extern int archive_write_set_format_xar(archive *a);
 extern int archive_write_set_format_option(archive *a, const char *module,
 					   const char *option,
 					   const char *value);
