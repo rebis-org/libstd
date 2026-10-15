@@ -281,7 +281,7 @@ pub fn writeTempFile(bytes: []const u8, extension: []const u8) ![:0]u8 {
     }
 }
 
-pub const ArchiveFormat = enum { tar, zip, seven_zip };
+pub const ArchiveFormat = enum { tar, zip, seven_zip, cpio_newc, cpio_odc };
 
 pub const WriteEntry = struct {
     name: []const u8,
@@ -379,6 +379,8 @@ pub fn archiveWrite(format: ArchiveFormat, entries: []const WriteEntry) ?[]u8 {
         .tar => "tar",
         .zip => "zip",
         .seven_zip => "7z",
+        .cpio_newc => "cpio",
+        .cpio_odc => "odc",
     };
     const path = writeTempFile("", extension) catch return null;
     defer {
@@ -391,6 +393,8 @@ pub fn archiveWrite(format: ArchiveFormat, entries: []const WriteEntry) ?[]u8 {
         .tar => c.archive_write_set_format_pax_restricted(writer),
         .zip => c.archive_write_set_format_zip(writer),
         .seven_zip => c.archive_write_set_format_7zip(writer),
+        .cpio_newc => c.archive_write_set_format_cpio_newc(writer),
+        .cpio_odc => c.archive_write_set_format_cpio_odc(writer),
     };
     if (set_result != c.ARCHIVE_OK) return null;
     if (format == .seven_zip) {
