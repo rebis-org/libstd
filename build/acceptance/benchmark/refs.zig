@@ -24,6 +24,8 @@ pub const Refs = struct {
     unrar_cmd: *std.Build.Step.InstallFile,
     brotli_cmd: *std.Build.Step.InstallFile,
     wimlib_cmd: *std.Build.Step.InstallFile,
+    mksquashfs_cmd: *std.Build.Step.InstallFile,
+    unsquashfs_cmd: *std.Build.Step.InstallFile,
     libunrar_lib: std.Build.LazyPath,
     fast_lzma2_lib: std.Build.LazyPath,
     fast_lzma2_test: *std.Build.Step.Run,
@@ -58,6 +60,8 @@ pub const Refs = struct {
         step.dependOn(&self.unrar_cmd.step);
         step.dependOn(&self.brotli_cmd.step);
         step.dependOn(&self.wimlib_cmd.step);
+        step.dependOn(&self.mksquashfs_cmd.step);
+        step.dependOn(&self.unsquashfs_cmd.step);
         step.dependOn(&self.fast_lzma2_test.step);
         step.dependOn(&self.libzip_build.step);
     }
@@ -351,7 +355,22 @@ fn addWimlib(b: *std.Build, dummy_dir: std.Build.LazyPath) *std.Build.Step.Insta
         &.{"sh", "-c", "exec ./configure --without-fuse --without-ntfs-3g --disable-shared"},
         &.{"sh", "-c", "make clean >/dev/null 2>&1; exec make -j4 wimlib-imagex"},
     );
-    return installOut(b, &make_wimlib.step, "vendor/wimlib/.libs/wimlib-imagex", "wimlib-imagex");
+    return installOut(b, &make_wimlib.step, "vendor/wimlib/wimlib-imagex", "wimlib-imagex");
+}
+
+fn addSquashfsTools(b: *std.Build) struct { mksquashfs: *std.Build.Step.InstallFile, unsquashfs: *std.Build.Step.InstallFile } {
+    // The squashfs-tools pair is the format's reference implementation.
+    // XZ stays enabled only to keep the vendored compressor.c stub (a
+    // swapped-argument COMPRESSOR_DEF at line 61) out of the build; LZO,
+    // LZ4, and ZSTD are off and their stub branches are correct.
+    const make_tools = make(b, "vendor/squashfs-tools/squashfs-tools", &.{
+        "sh", "-c",
+        "make clean >/dev/null 2>&1; exec make -j4 XZ_SUPPORT=1 LZO_SUPPORT= LZ4_SUPPORT= ZSTD_SUPPORT= EXTRA_CFLAGS=-I/opt/homebrew/include EXTRA_LDFLAGS=-L/opt/homebrew/lib mksquashfs unsquashfs",
+    });
+    return .{
+        .mksquashfs = installOut(b, &make_tools.step, "vendor/squashfs-tools/squashfs-tools/mksquashfs", "mksquashfs"),
+        .unsquashfs = installOut(b, &make_tools.step, "vendor/squashfs-tools/squashfs-tools/unsquashfs", "unsquashfs"),
+    };
 }
 
 fn addBrotli(b: *std.Build) *std.Build.Step.InstallFile {
@@ -381,6 +400,7 @@ pub fn add(b: *std.Build, ctx: *const common.Settings) Refs {
     const bin_refs = addBinaryRefs(b, ctx);
     const brotli_cmd = addBrotli(b);
     const wimlib_cmd = addWimlib(b, dummy_dir);
+    const squashfs_tools = addSquashfsTools(b);
 
     return .{
         .sevenzz = seven.sevenzz,
@@ -403,6 +423,8 @@ pub fn add(b: *std.Build, ctx: *const common.Settings) Refs {
         .unrar_cmd = unrar.cmd,
         .brotli_cmd = brotli_cmd,
         .wimlib_cmd = wimlib_cmd,
+        .mksquashfs_cmd = squashfs_tools.mksquashfs,
+        .unsquashfs_cmd = squashfs_tools.unsquashfs,
         .libunrar_lib = unrar.lib,
         .fast_lzma2_lib = fast_lzma2.lib,
         .fast_lzma2_test = fast_lzma2.test_run,

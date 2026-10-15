@@ -29,6 +29,7 @@ pub const Ids = struct {
     cpio: Id,
     xar: Id,
     wim: Id,
+    squashfs: Id,
     zip: Id,
     bzip2: Id,
     lzma: Id,

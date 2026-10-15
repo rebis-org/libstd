@@ -1,0 +1,29 @@
+.{
+    .id = .{ .low = "0x6e6b82f092180601", .high = "0xa7a351053e708601" },
+    .name = "squashfs",
+    .class = "volume",
+    .verbs = .{ "inspect", "decode_ordinal", "encode_ordinal" },
+    .parameters = .{
+        .{ .name = "ordinal", .family = 2, .ordinal = 1, .representation = "scalar_words" },
+        .{ .name = "entry_count", .family = 2, .ordinal = 2, .representation = "scalar_words" },
+        .{ .name = "entry_name", .family = 2, .ordinal = 3, .representation = "bytes" },
+        .{ .name = "entry_size", .family = 2, .ordinal = 4, .representation = "scalar_words" },
+        .{ .name = "entry", .family = 2, .ordinal = 5, .representation = "node_chain" },
+        .{ .name = "entry_data", .family = 2, .ordinal = 6, .representation = "bytes" },
+    },
+    .capabilities = .{ "read", "write", "size", "replay" },
+    .sizing = "metadata_exact",
+    .commit = "tentative",
+    .limits = .{ .window = 0, .block = 0, .history = 0 },
+    .benchmark = .{
+        .row = "squashfs",
+        .params = "store",
+        .kind = "squashfs",
+        .ext = "sqfs",
+        .archive = true,
+        .ref_params = "store",
+        .tunings = .{
+            .{},
+        },
+    },
+}
