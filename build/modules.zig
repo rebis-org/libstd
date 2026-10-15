@@ -42,7 +42,7 @@ pub const oracles = Module{
     },
 };
 pub const interface = Module{ .name = "interface", .root = "src/interface/root.zig" };
-pub const implementations = Module{ .name = "implementations", .root = "src/implementations.zig", .imports = &.{.{ .name = "seam", .module = "seam" }}, .crc_kernel = true };
+pub const implementations = Module{ .name = "implementations", .root = "src/impls.zig", .imports = &.{.{ .name = "seam", .module = "seam" }}, .crc_kernel = true };
 pub const trap = Module{
     .name = "trap",
     .root = "build/acceptance/oracles/trap.zig",
