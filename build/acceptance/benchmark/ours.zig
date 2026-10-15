@@ -45,6 +45,7 @@ fn profileOf(kind: matrix.Kind) harness.Id {
         .brotli => harness.ids.brotli,
         .squashfs => harness.ids.squashfs,
         .iso => harness.ids.iso,
+        .dwarfs => harness.ids.dwarfs,
     };
 }
 

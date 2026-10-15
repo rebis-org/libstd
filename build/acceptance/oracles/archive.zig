@@ -303,6 +303,36 @@ pub fn runIso(r: *Runner) anyerror!void {
     _ = std.Io.Dir.cwd().deleteFile(oracle_io, image_path) catch {};
 }
 
+fn runDwarfsForeign(r: *Runner) anyerror!void {
+    setupArchive(r, harness.ids.dwarfs);
+    const bin = squashfs_bin_dir ++ "/mkdwarfs";
+    std.Io.Dir.cwd().access(harness.oracle_io, bin, .{}) catch return error.ReferenceToolUnavailable;
+    const oracle_io = harness.oracle_io;
+    const dir_path = try std.fmt.allocPrint(r.gpa, "zig-out/oracles/dwarfs-src-{d}", .{r.corpus_index});
+    defer r.gpa.free(dir_path);
+    try std.Io.Dir.cwd().createDirPath(oracle_io, dir_path);
+    const file1 = try std.fmt.allocPrint(r.gpa, "{s}/m1.txt", .{dir_path});
+    defer r.gpa.free(file1);
+    try std.Io.Dir.cwd().writeFile(oracle_io, .{ .sub_path = file1, .data = &arc_state.data1 });
+    const file2 = try std.fmt.allocPrint(r.gpa, "{s}/m2.txt", .{dir_path});
+    defer r.gpa.free(file2);
+    try std.Io.Dir.cwd().writeFile(oracle_io, .{ .sub_path = file2, .data = &arc_state.data2 });
+    const image_path = try std.fmt.allocPrint(r.gpa, "zig-out/oracles/dwarfs-foreign-{d}.dwarfs", .{r.corpus_index});
+    defer r.gpa.free(image_path);
+    var child = try std.process.spawn(oracle_io, .{ .argv = &.{ bin, "-i", dir_path, "-o", image_path, "--force", "--no-progress" } });
+    const term = try child.wait(oracle_io);
+    if (term != .exited or term.exited != 0) return error.ReferenceToolCaptureFailed;
+    const foreign = try std.Io.Dir.cwd().readFileAlloc(oracle_io, image_path, r.gpa, .limited(8 << 20));
+    defer r.gpa.free(foreign);
+    const read_expected = [_]lib.ExpectedEntry{
+        .{ .name = "m1.txt", .data = &arc_state.data1 },
+        .{ .name = "m2.txt", .data = &arc_state.data2 },
+    };
+    try arcReadForeign(r, foreign, &read_expected);
+    _ = std.Io.Dir.cwd().deleteTree(oracle_io, dir_path) catch {};
+    _ = std.Io.Dir.cwd().deleteFile(oracle_io, image_path) catch {};
+}
+
 fn runIsoForeign(r: *Runner) anyerror!void {
     setupArchive(r, harness.ids.iso);
     // hdiutil makehybrid is the local Rock Ridge/Joliet writer reference.
@@ -943,6 +973,7 @@ pub const scenarios = harness.scenarios("archive", &.{
     .{ .label = "archive wim foreign", .run = runWimForeign, .workspace_size = 128 * 1024, .output_size = 512, .encoded_size = 4096 },
     .{ .label = "archive iso", .run = runIso, .workspace_size = 256 * 1024, .output_size = 512, .encoded_size = 65536 },
     .{ .label = "archive iso foreign", .run = runIsoForeign, .workspace_size = 256 * 1024, .output_size = 512, .encoded_size = 65536 },
+    .{ .label = "archive dwarfs foreign", .run = runDwarfsForeign, .workspace_size = 4 * 1024 * 1024, .output_size = 512, .encoded_size = 65536 },
     .{ .label = "archive squashfs", .run = runSquashfs, .workspace_size = 4 * 1024 * 1024, .output_size = 512, .encoded_size = 4096 },
     .{ .label = "archive squashfs foreign", .run = runSquashfsForeign, .workspace_size = 4 * 1024 * 1024, .output_size = 512, .encoded_size = 4096 },
     .{ .label = "archive squashfs foreign xz", .run = runSquashfsForeignComp("xz", &.{}), .workspace_size = 4 * 1024 * 1024, .output_size = 512, .encoded_size = 4096 },
