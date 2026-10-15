@@ -68,21 +68,6 @@ fn addAbi(b: *std.Build, ctx: *common.Settings) void {
     inline for (cxx_stds) |std_flag| {
         addHeaderProbe(b, abi, probe_tool, &.{ zig, "c++" }, std_flag, header_cpp, ctx.generated.header_dir);
     }
-    const External = struct { command: []const []const u8, cxx: ?[]const []const u8 };
-    const external = [_]External{
-        .{ .command = &.{ "clang" }, .cxx = &.{ "clang++" } },
-        .{ .command = &.{ "xcrun", "clang" }, .cxx = &.{ "xcrun", "clang++" } },
-        .{ .command = &.{"gcc-16"}, .cxx = &.{"g++-16"} },
-    };
-    inline for (external) |compiler| {
-        inline for (c_stds) |std_flag| addHeaderProbe(b, abi, probe_tool, compiler.command, std_flag, header_c, ctx.generated.header_dir);
-        if (compiler.cxx) |cxx| {
-            inline for (.{ "-std=c++20", "-std=c++23" }) |std_flag| addHeaderProbe(b, abi, probe_tool, cxx, std_flag, header_cpp, ctx.generated.header_dir);
-        }
-    }
-    if (b.graph.environ_map.get("ANDROID_NDK_CLANG")) |ndk| {
-        inline for (c_stds) |std_flag| addHeaderProbe(b, abi, probe_tool, &.{ndk}, std_flag, header_c, ctx.generated.header_dir);
-    }
     abi.dependOn(&ctx.host.dynamic_library.step);
     const abi_exports = b.addExecutable(.{
         .name = "abi_exports",
