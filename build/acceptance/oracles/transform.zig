@@ -36,8 +36,8 @@ pub fn runDeflate(r: *Runner) anyerror!void {
 
 pub fn runBrotli(r: *Runner) anyerror!void {
     setupProfile(r, harness.ids.brotli);
-    // 0x06 is a valid empty stream (WBITS 16, ISLAST, ISLASTEMPTY); the
-    // reject probe needs a byte with nonzero fill bits.
+    // 0x06 is a valid empty stream (WBITS 16, ISLAST, ISLASTEMPTY).
+    // The reject probe needs nonzero fill bits.
     r.invalid = &.{0x0e};
     try steps.roundtrip(&steps.noParams, r);
 }
@@ -371,8 +371,8 @@ pub const scenarios = harness.scenarios("transform", &.{
     .{ .label = "gzip optimal", .run = runGzipOptimal, .workspace_size = 2 * 1024 * 1024, .output_size = 64 * 1024, .encoded_size = 64 * 1024 + 4096 },
     .{ .label = "bzip2 roundtrip", .run = runBzip2Roundtrip, .workspace_size = 32 * 1024 * 1024, .output_size = 256, .encoded_size = 256 },
     .{ .label = "bzip2 extras", .run = runBzip2Extras, .workspace_size = 32 * 1024 * 1024, .output_size = 256, .encoded_size = 256 },
-    .{ .label = "brotli roundtrip", .run = runBrotli, .workspace_size = 32 * 1024 * 1024, .output_size = 256, .encoded_size = 256 },
-    .{ .label = "brotli reference decode", .run = runBrotliReference, .workspace_size = 8 * 1024 * 1024, .output_size = 4096, .encoded_size = 4096 },
+    .{ .label = "brotli roundtrip", .run = runBrotli, .workspace_size = 160 * 1024 * 1024, .output_size = 256, .encoded_size = 256 },
+    .{ .label = "brotli reference decode", .run = runBrotliReference, .workspace_size = 160 * 1024 * 1024, .output_size = 4096, .encoded_size = 4096 },
     .{ .label = "gzip extras", .run = runGzipExtras, .workspace_size = 65536 + 4096, .output_size = 256, .encoded_size = 256 },
     .{ .label = "gzip large", .run = runGzipLarge, .workspace_size = 65536 + 4096, .output_size = 64 * 1024, .encoded_size = 64 * 1024 + 4096 },
     .{ .label = "gzip oracle", .run = runGzipOracleFixture, .workspace_size = 65536 + 4096, .output_size = 64 * 1024, .encoded_size = 64 * 1024 + 4096 },
