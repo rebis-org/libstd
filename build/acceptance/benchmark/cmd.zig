@@ -90,6 +90,11 @@ const cmds = struct {
         .encode = .{ .out = .stdout, .args = encode_qc },
         .decode = .{ .out = .stdout, .args = decode_qdc },
     };
+    const brotli = Cmd{
+        .exe = "brotli",
+        .encode = .{ .out = .stdout, .args = &.{ .bin, .extra, .{ .lit = "-c" }, .input } },
+        .decode = .{ .out = .stdout, .args = &.{ .bin, .{ .lit = "-d" }, .{ .lit = "-c" }, .archive } },
+    };
 };
 
 pub fn get(comptime id: matrix.Cmd) Cmd {
@@ -104,6 +109,7 @@ pub fn get(comptime id: matrix.Cmd) Cmd {
         .unrar => cmds.unrar,
         .lzma => cmds.lzma,
         .lz4 => cmds.lz4,
+        .brotli => cmds.brotli,
     };
 }
 

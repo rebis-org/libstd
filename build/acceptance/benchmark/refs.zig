@@ -22,6 +22,7 @@ pub const Refs = struct {
     libzip_configure: *std.Build.Step.Run,
     libzip_build: *std.Build.Step.Run,
     unrar_cmd: *std.Build.Step.InstallFile,
+    brotli_cmd: *std.Build.Step.InstallFile,
     libunrar_lib: std.Build.LazyPath,
     fast_lzma2_lib: std.Build.LazyPath,
     fast_lzma2_test: *std.Build.Step.Run,
@@ -54,6 +55,7 @@ pub const Refs = struct {
         step.dependOn(&self.tar_cmd.step);
         step.dependOn(&self.ziptool_cmd.step);
         step.dependOn(&self.unrar_cmd.step);
+        step.dependOn(&self.brotli_cmd.step);
         step.dependOn(&self.fast_lzma2_test.step);
         step.dependOn(&self.libzip_build.step);
     }
@@ -339,6 +341,14 @@ fn addFastLzma2(b: *std.Build) struct { lib: std.Build.LazyPath, test_run: *std.
     return .{ .lib = lib, .test_run = make_test };
 }
 
+fn addBrotli(b: *std.Build) *std.Build.Step.InstallFile {
+    const brotli = cmake(b, "vendor/brotli", "zig-out/benchmark/build/brotli", &.{
+        "-DBUILD_SHARED_LIBS=OFF",
+        "-DBROTLI_DISABLE_TESTS=ON",
+    });
+    return installOut(b, &brotli.build.step, "zig-out/benchmark/build/brotli/brotli", "brotli");
+}
+
 fn addLz4(b: *std.Build) MakePair {
     return addMakePair(b, "vendor/lz4", "lz4-release", "vendor/lz4/programs/lz4", "lz4", "lib-release", "vendor/lz4/lib/liblz4.a", "liblz4.a");
 }
@@ -356,6 +366,7 @@ pub fn add(b: *std.Build, ctx: *const common.Settings) Refs {
     const fast_lzma2 = addFastLzma2(b);
     const lz4 = addLz4(b);
     const bin_refs = addBinaryRefs(b, ctx);
+    const brotli_cmd = addBrotli(b);
 
     return .{
         .sevenzz = seven.sevenzz,
@@ -376,6 +387,7 @@ pub fn add(b: *std.Build, ctx: *const common.Settings) Refs {
         .libzip_configure = libzip.configure,
         .libzip_build = libzip.build,
         .unrar_cmd = unrar.cmd,
+        .brotli_cmd = brotli_cmd,
         .libunrar_lib = unrar.lib,
         .fast_lzma2_lib = fast_lzma2.lib,
         .fast_lzma2_test = fast_lzma2.test_run,

@@ -16,11 +16,16 @@
         .kind = "brotli",
         .ext = "br",
         .cmd = "brotli",
-        .lib = "brotli",
         .archive = false,
         .ref_params = "brotli -q 5",
         .tunings = .{
-            .{},
+            .{
+                .params = .{
+                    .{ .family = 4, .ordinal = 1, .value = 5 },
+                },
+                .ref_params = "brotli -q 5",
+                .cmd_args = .{"--quality=5"},
+            },
         },
     },
 }
