@@ -490,10 +490,15 @@ fn decodeMetadata(meta_raw: []const u8, schema: Schema, arena: std.mem.Allocator
 
 const Target = union(enum) {
     count,
-    resolve: struct { ordinal: u64, info: *EntryInfo, output: ?[]u8 },
+    resolve: struct { ordinal: u64, info: *EntryInfo, output: ?[]u8, found: *bool = undefined },
 };
 
 fn runTarget(archive: []const u8, scratch: []u8, target: Target) Failure!u64 {
+    var found = false;
+    const resolved = switch (target) {
+        .count => target,
+        .resolve => |res| Target{ .resolve = .{ .ordinal = res.ordinal, .info = res.info, .output = res.output, .found = &found } },
+    };
     if (scratch.len < scratch_size) return error.CapacityFailure;
     var fba = std.heap.FixedBufferAllocator.init(scratch);
     const arena = fba.allocator();
@@ -505,13 +510,37 @@ fn runTarget(archive: []const u8, scratch: []u8, target: Target) Failure!u64 {
     if (md.block_size == 0 or md.names_index.len == 0) return error.DataFailure;
     const blocks = try sectionPayload(archive, sections.blocks_at, sections.blocks_len, sections.blocks_compression, arena);
     if (md.directories.len < 2) return error.DataFailure;
-    const file_off: u32 = @intCast(md.directories.len - 1);
-    var ordinal: u64 = 0;
-    var e: usize = md.directories[0];
-    const end: usize = md.directories[1];
-    if (end < e or end > md.dir_entries.len) return error.DataFailure;
+    const dir_count = md.directories.len - 1;
+    const file_off: u32 = @intCast(dir_count);
+    var state = WalkState{};
+    try walkDwarfsDir(md, blocks, 0, file_off, resolved, &state);
+    return switch (target) {
+        .count => state.ordinal,
+        .resolve => if (found) state.ordinal else error.DataFailure,
+    };
+}
+
+const WalkState = struct { ordinal: u64 = 0 };
+
+fn walkDwarfsDir(md: Metadata, blocks: []const u8, dir_index: usize, file_off: u32, target: Target, state: *WalkState) Failure!void {
+    const start = md.directories[dir_index];
+    const end = md.directories[dir_index + 1];
+    if (end < start or end > md.dir_entries.len) return error.DataFailure;
+    const found_ptr = switch (target) {
+        .resolve => |res| res.found,
+        .count => null,
+    };
+    var e = start;
     while (e < end) : (e += 1) {
+        if (found_ptr) |fp| {
+            if (fp.*) return;
+        }
         const entry = md.dir_entries[e];
+        if (entry.inode_num < file_off) {
+            if (entry.inode_num >= file_off) return error.DataFailure;
+            try walkDwarfsDir(md, blocks, entry.inode_num, file_off, target, state);
+            continue;
+        }
         if (entry.inode_num >= md.inodes.len) return error.DataFailure;
         const mode_index = md.inodes[entry.inode_num];
         if (mode_index >= md.modes.len) return error.DataFailure;
@@ -526,24 +555,21 @@ fn runTarget(archive: []const u8, scratch: []u8, target: Target) Failure!u64 {
         switch (target) {
             .count => {},
             .resolve => |res| {
-                if (ordinal == res.ordinal) {
+                if (state.ordinal == res.ordinal) {
                     res.info.size = chunk.size;
-                    res.info.ordinal = ordinal;
+                    res.info.ordinal = state.ordinal;
                     if (res.output) |out| {
                         if (out.len < chunk.size) return error.CapacityFailure;
                         const data = try bounds.slice(blocks, chunk.offset, chunk.size);
                         @memcpy(out[0..chunk.size], data);
                     }
-                    return ordinal;
+                    res.found.* = true;
+                    return;
                 }
             },
         }
-        ordinal += 1;
+        state.ordinal += 1;
     }
-    return switch (target) {
-        .count => ordinal,
-        .resolve => error.DataFailure,
-    };
 }
 
 pub fn inspectCount(archive: []const u8, scratch: []u8) Failure!u64 {
@@ -715,58 +741,186 @@ fn writeSchema(out: *std.ArrayList(u8), alloc0: std.mem.Allocator) Failure!void 
     try w.byte(out, alloc0, 0);
 }
 
+const DwNode = struct {
+    kind: enum { dir, file },
+    name: []const u8,
+    parent: u32,
+    data: []const u8 = &.{},
+    number: u32 = 0,
+    first_child: u32 = 0,
+    child_count: u32 = 0,
+};
+
+const max_tree_nodes = 512;
+
+fn dwFindOrCreateDir(nodes: *std.ArrayList(DwNode), alloc: std.mem.Allocator, parent: u32, name: []const u8) Failure!u32 {
+    for (nodes.items, 0..) |node, i| {
+        if (node.kind == .dir and node.parent == parent and std.mem.eql(u8, node.name, name)) return @intCast(i);
+    }
+    const idx: u32 = @intCast(nodes.items.len);
+    nodes.append(alloc, .{ .kind = .dir, .name = name, .parent = parent }) catch return error.ResourceFailure;
+    nodes.items[parent].child_count += 1;
+    return idx;
+}
+
+fn dwValidate(name: []const u8) Failure!void {
+    if (name.len == 0 or name.len > 512) return error.CallFailure;
+    var it = std.mem.splitScalar(u8, name, '/');
+    while (it.next()) |part| {
+        if (part.len == 0 or part.len > 256) return error.CallFailure;
+        if (std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return error.CallFailure;
+    }
+}
+
 pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Failure!usize {
+    _ = scratch;
     if (entries.len == 0 or entries.len > 4096) return error.UnsupportedFailure;
-    var fba = std.heap.FixedBufferAllocator.init(scratch);
+    var stack: [64 * 1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&stack);
     const alloc = fba.allocator();
 
-    // BLOCK payload and the flat metadata vectors.
-    var block_data: std.ArrayList(u8) = .empty;
+    // Tree build: nodes[0] is the root directory.
+    var nodes: std.ArrayList(DwNode) = .empty;
+    nodes.append(alloc, .{ .kind = .dir, .name = "", .parent = 0 }) catch return error.ResourceFailure;
+    for (entries) |entry| {
+        try dwValidate(entry.name);
+        if (entry.data.len > write_block_size) return error.UnsupportedFailure;
+        var parent: u32 = 0;
+        var it = std.mem.splitScalar(u8, entry.name, '/');
+        var comp = it.next().?;
+        while (it.next()) |next| {
+            parent = try dwFindOrCreateDir(&nodes, alloc, parent, comp);
+            comp = next;
+        }
+        nodes.append(alloc, .{ .kind = .file, .name = comp, .parent = parent, .data = entry.data }) catch return error.ResourceFailure;
+        nodes.items[parent].child_count += 1;
+    }
+    if (nodes.items.len > max_tree_nodes) return error.UnsupportedFailure;
+
+    // Per-directory child lists, sorted by name.
+    const counts = alloc.alloc(u32, nodes.items.len) catch return error.ResourceFailure;
+    @memset(counts, 0);
+    for (nodes.items, 0..) |node, i| {
+        if (i != 0) counts[node.parent] += 1;
+    }
+    const starts = alloc.alloc(u32, nodes.items.len) catch return error.ResourceFailure;
+    var acc: u32 = 0;
+    for (counts, 0..) |c, i| {
+        starts[i] = acc;
+        acc += c;
+    }
+    const kids = alloc.alloc(u32, acc) catch return error.ResourceFailure;
+    const fill = alloc.alloc(u32, nodes.items.len) catch return error.ResourceFailure;
+    @memcpy(fill, starts);
+    for (nodes.items, 0..) |node, i| {
+        if (i == 0) continue;
+        kids[fill[node.parent]] = @intCast(i);
+        fill[node.parent] += 1;
+    }
+    for (nodes.items, 0..) |*node, i| {
+        node.first_child = starts[i];
+        const slice = kids[node.first_child .. node.first_child + counts[i]];
+        std.mem.sort(u32, slice, &nodes, struct {
+            fn less(ns: *std.ArrayList(DwNode), a: u32, b: u32) bool {
+                return std.mem.order(u8, ns.items[a].name, ns.items[b].name) == .lt;
+            }
+        }.less);
+    }
+
+    // Number directories first (dwarfs numbers directories before files),
+    // each group in DFS order.
+    var dir_order: std.ArrayList(u32) = .empty;
+    var file_order: std.ArrayList(u32) = .empty;
+    try dwDfs(&nodes, kids, 0, &dir_order, &file_order, alloc);
+    for (dir_order.items, 0..) |ni, i| {
+        nodes.items[ni].number = @intCast(i);
+    }
+    const dir_count: u32 = @intCast(dir_order.items.len);
+    for (file_order.items, 0..) |ni, i| {
+        nodes.items[ni].number = dir_count + @as(u32, @intCast(i));
+    }
+
+    // Metadata vectors.
     var chunks: std.ArrayList(u8) = .empty;
     var chunk_table: std.ArrayList(u32) = .empty;
     var inodes: std.ArrayList(u32) = .empty;
+    var directories: std.ArrayList(u32) = .empty;
     var dir_entries: std.ArrayList(u32) = .empty;
     var names: std.ArrayList(u8) = .empty;
     var names_index: std.ArrayList(u32) = .empty;
 
-    chunk_table.append(alloc, 0) catch return error.ResourceFailure;
-    inodes.appendSlice(alloc, &.{ 0, 0, 0, 0, 0, 0 }) catch return error.ResourceFailure;
-    dir_entries.appendSlice(alloc, &.{ 0, 0 }) catch return error.ResourceFailure;
+    var total_size: u64 = 0;
     var chunk_off: u32 = 0;
-    var name_off: u32 = 0;
-    for (entries, 0..) |entry, i| {
-        if (entry.data.len > write_block_size) return error.UnsupportedFailure;
-        if (block_data.items.len + entry.data.len > write_data_cap) return error.UnsupportedFailure;
-        block_data.appendSlice(alloc, entry.data) catch return error.ResourceFailure;
-        for ([_]u32{ 0, chunk_off, @intCast(entry.data.len) }) |v| {
+    chunk_table.append(alloc, 0) catch return error.ResourceFailure;
+    for (file_order.items) |ni| {
+        const node = &nodes.items[ni];
+        for ([_]u32{ 0, chunk_off, @intCast(node.data.len) }) |v| {
             var raw: [4]u8 = undefined;
             std.mem.writeInt(u32, &raw, v, .little);
             chunks.appendSlice(alloc, &raw) catch return error.ResourceFailure;
         }
-        chunk_off = std.math.add(u32, chunk_off, @intCast(entry.data.len)) catch return error.UnsupportedFailure;
-        chunk_table.append(alloc, @intCast(i + 1)) catch return error.ResourceFailure;
-        // inode: name slot, mode index 1, ino, owner, group, nlink.
-        inodes.appendSlice(alloc, &.{ @intCast(i + 1), 1, 0, 0, 0, 0 }) catch return error.ResourceFailure;
-        // directory entry: name slot i, inode number i+1.
-        dir_entries.appendSlice(alloc, &.{ @intCast(i), @intCast(i + 1) }) catch return error.ResourceFailure;
-        names_index.append(alloc, name_off) catch return error.ResourceFailure;
-        name_off = std.math.add(u32, name_off, @intCast(entry.name.len)) catch return error.UnsupportedFailure;
-        names.appendSlice(alloc, entry.name) catch return error.ResourceFailure;
+        chunk_off = std.math.add(u32, chunk_off, @intCast(node.data.len)) catch return error.UnsupportedFailure;
+        chunk_table.append(alloc, node.number - dir_count + 1) catch return error.ResourceFailure;
+        total_size += node.data.len;
     }
+    if (total_size > write_data_cap) return error.UnsupportedFailure;
+    // Inodes: directories first, then files, each in DFS order.
+    for (dir_order.items) |_| {
+        for ([_]u32{ 0, 0, 0, 0, 0, 0 }) |v| {
+            inodes.append(alloc, v) catch return error.ResourceFailure;
+        }
+    }
+    for (file_order.items) |_| {
+        for ([_]u32{ 0, 1, 0, 0, 0, 0 }) |v| {
+            inodes.append(alloc, v) catch return error.ResourceFailure;
+        }
+    }
+    // Directory records plus a sentinel; entry zero is the root self
+    // record. Children records are emitted directory by directory in
+    // dir_order, so every record index is computable up front.
+    dir_entries.appendSlice(alloc, &.{ 0, 0 }) catch return error.ResourceFailure;
+    const first_entry_of = alloc.alloc(u32, dir_order.items.len) catch return error.ResourceFailure;
+    const record_of = alloc.alloc(u32, nodes.items.len) catch return error.ResourceFailure;
+    record_of[0] = 0; // the root's own record is entry zero
+    var rec_acc: u32 = 1;
+    for (dir_order.items, 0..) |ni, di| {
+        first_entry_of[di] = rec_acc;
+        rec_acc += nodes.items[ni].child_count;
+    }
+    for (dir_order.items, 0..) |ni, di| {
+        const node = &nodes.items[ni];
+        for (kids[node.first_child .. node.first_child + node.child_count], 0..) |ci, k| {
+            record_of[ci] = first_entry_of[di] + @as(u32, @intCast(k));
+        }
+    }
+    names_index.append(alloc, 0) catch return error.ResourceFailure;
+    var name_off: u32 = 0;
+    for (dir_order.items, 0..) |ni, di| {
+        const node = &nodes.items[ni];
+        const self_entry: u32 = if (di == 0) 0 else record_of[ni];
+        const parent_entry: u32 = if (di == 0) 0 else record_of[node.parent];
+        directories.appendSlice(alloc, &.{ parent_entry, first_entry_of[di], self_entry }) catch return error.ResourceFailure;
+        const s = node.first_child;
+        const e = s + node.child_count;
+        for (kids[s..e]) |ci| {
+            const child = &nodes.items[ci];
+            const record_index: u32 = record_of[ci];
+            dir_entries.appendSlice(alloc, &.{ record_index, child.number }) catch return error.ResourceFailure;
+            names_index.append(alloc, name_off) catch return error.ResourceFailure;
+            name_off = std.math.add(u32, name_off, @intCast(child.name.len)) catch return error.UnsupportedFailure;
+            names.appendSlice(alloc, child.name) catch return error.ResourceFailure;
+        }
+    }
+    // Sentinel directory closes the last directory's entry range.
+    directories.appendSlice(alloc, &.{ 0, @intCast(dir_entries.items.len / 2), 0 }) catch return error.ResourceFailure;
     names_index.append(alloc, name_off) catch return error.ResourceFailure;
-    const total_size: u64 = block_data.items.len;
-    if (total_size > write_block_size) return error.UnsupportedFailure;
-
-    const directories = [_]u32{ 0, 1, 0, 0, @intCast(entries.len + 1), 0 };
+    _ = &name_off;
     const modes = [_]u32{ 0o40755, 0o100644 };
-    const single_uid = [_]u32{0};
-    const single_gid = [_]u32{0};
 
-    // Segments land after the root struct, byte aligned.
     const chunks_at = root_bytes;
     const chunk_table_at = chunks_at + chunks.items.len;
     const directories_at = chunk_table_at + 4 * chunk_table.items.len;
-    const inodes_at = directories_at + 4 * directories.len;
+    const inodes_at = directories_at + 4 * directories.items.len;
     const modes_at = inodes_at + 4 * inodes.items.len;
     const uids_at = modes_at + 4 * modes.len;
     const gids_at = uids_at + 4;
@@ -775,14 +929,14 @@ pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Failure!usize
     const names_index_at = names_at + names.items.len;
     const blob_len = names_index_at + 4 * names_index.items.len;
 
-    var blob_bytes = std.ArrayList(u8).empty;
+    var blob_bytes: std.ArrayList(u8) = .empty;
     blob_bytes.resize(alloc, blob_len) catch return error.ResourceFailure;
     @memset(blob_bytes.items, 0);
     @memcpy(blob_bytes.items[chunks_at..][0..chunks.items.len], chunks.items);
     for (chunk_table.items, 0..) |v, i| {
         std.mem.writeInt(u32, blob_bytes.items[chunk_table_at + 4 * i ..][0..4], v, .little);
     }
-    for (directories, 0..) |v, i| {
+    for (directories.items, 0..) |v, i| {
         std.mem.writeInt(u32, blob_bytes.items[directories_at + 4 * i ..][0..4], v, .little);
     }
     for (inodes.items, 0..) |v, i| {
@@ -791,8 +945,8 @@ pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Failure!usize
     for (modes, 0..) |v, i| {
         std.mem.writeInt(u32, blob_bytes.items[modes_at + 4 * i ..][0..4], v, .little);
     }
-    std.mem.writeInt(u32, blob_bytes.items[uids_at..][0..4], single_uid[0], .little);
-    std.mem.writeInt(u32, blob_bytes.items[gids_at..][0..4], single_gid[0], .little);
+    std.mem.writeInt(u32, blob_bytes.items[uids_at..][0..4], 0, .little);
+    std.mem.writeInt(u32, blob_bytes.items[gids_at..][0..4], 0, .little);
     for (dir_entries.items, 0..) |v, i| {
         std.mem.writeInt(u32, blob_bytes.items[dir_entries_at + 4 * i ..][0..4], v, .little);
     }
@@ -801,13 +955,12 @@ pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Failure!usize
         std.mem.writeInt(u32, blob_bytes.items[names_index_at + 4 * i ..][0..4], v, .little);
     }
 
-    // Root struct fields in ascending id order.
     var bw = BitWriter{ .bytes = blob_bytes.items };
     bw.write(@intCast(chunks.items.len / 12), 32);
     bw.write(chunks_at, 32);
-    bw.write(2, 32);
+    bw.write(@intCast(dir_order.items.len + 1), 32);
     bw.write(directories_at, 32);
-    bw.write(@intCast(inodes.items.len / 6), 32);
+    bw.write(@intCast(dir_count + file_order.items.len), 32);
     bw.write(inodes_at, 32);
     bw.write(@intCast(chunk_table.items.len), 32);
     bw.write(chunk_table_at, 32);
@@ -830,10 +983,14 @@ pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Failure!usize
     bw.write(names_index_at, 32);
     if (bw.bit != root_bits) return error.DataFailure;
 
+    var block_data: std.ArrayList(u8) = .empty;
+    for (file_order.items) |ni| {
+        block_data.appendSlice(alloc, nodes.items[ni].data) catch return error.ResourceFailure;
+    }
+
     var schema_bytes: std.ArrayList(u8) = .empty;
     try writeSchema(&schema_bytes, alloc);
 
-    // Section chain: BLOCK, SCHEMA, METADATA_V2, SECTION_INDEX.
     const block_at: u64 = 0;
     const schema_at = block_at + section_header_size + block_data.items.len;
     const metadata_at = schema_at + section_header_size + schema_bytes.items.len;
@@ -870,23 +1027,62 @@ pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Failure!usize
     return sink.items.len;
 }
 
-// The generated schema is data-independent; its size is measured into a
-// stack buffer. Every other length follows from the entry table.
+fn dwDfs(nodes: *std.ArrayList(DwNode), kids: []const u32, dir_index: u32, dir_order: *std.ArrayList(u32), file_order: *std.ArrayList(u32), alloc: std.mem.Allocator) Failure!void {
+    dir_order.append(alloc, dir_index) catch return error.ResourceFailure;
+    const start = nodes.items[dir_index].first_child;
+    const end = start + nodes.items[dir_index].child_count;
+    for (kids[start..end]) |ci| {
+        if (nodes.items[ci].kind == .dir) {
+            try dwDfs(nodes, kids, ci, dir_order, file_order, alloc);
+        } else {
+            file_order.append(alloc, ci) catch return error.ResourceFailure;
+        }
+    }
+}
+
+// Sizes follow from the entry table via a stack-built tree. The schema is
+// data-independent and measured into a stack buffer.
 pub fn archiveSize(entries: []const Entry) Failure!u64 {
     if (entries.len == 0 or entries.len > 4096) return error.UnsupportedFailure;
-    var schema_buf: [2048]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&schema_buf);
-    var schema_bytes: std.ArrayList(u8) = .empty;
-    try writeSchema(&schema_bytes, fba.allocator());
-    const n: u64 = entries.len;
+    var stack: [64 * 1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&stack);
+    const alloc = fba.allocator();
+    var nodes: std.ArrayList(DwNode) = .empty;
+    nodes.append(alloc, .{ .kind = .dir, .name = "", .parent = 0 }) catch return error.ResourceFailure;
+    for (entries) |entry| {
+        try dwValidate(entry.name);
+        if (entry.data.len > write_block_size) return error.UnsupportedFailure;
+        var parent: u32 = 0;
+        var it = std.mem.splitScalar(u8, entry.name, '/');
+        var comp = it.next().?;
+        while (it.next()) |next| {
+            parent = try dwFindOrCreateDir(&nodes, alloc, parent, comp);
+            comp = next;
+        }
+        nodes.append(alloc, .{ .kind = .file, .name = comp, .parent = parent, .data = entry.data }) catch return error.ResourceFailure;
+        nodes.items[parent].child_count += 1;
+    }
+    if (nodes.items.len > max_tree_nodes) return error.UnsupportedFailure;
+    var dirs: u64 = 0;
+    var files: u64 = 0;
     var names_len: u64 = 0;
     var data_len: u64 = 0;
-    for (entries) |entry| {
-        names_len = try bounds.addU64(names_len, entry.name.len);
-        data_len = try bounds.addU64(data_len, entry.data.len);
+    for (nodes.items) |node| {
+        names_len = try bounds.addU64(names_len, node.name.len);
+        if (node.kind == .dir) {
+            dirs += 1;
+        } else {
+            files += 1;
+            data_len = try bounds.addU64(data_len, node.data.len);
+        }
     }
     if (data_len > write_data_cap) return error.UnsupportedFailure;
-    const blob_len: u64 = root_bytes + 12 * n + 4 * (n + 1) + 24 + 24 * (n + 1) + 8 + 8 + 8 * (n + 1) + names_len + 4 * (n + 1);
+    const records: u64 = files + dirs; // root self + every child record
+    var schema_buf: [2048]u8 = undefined;
+    var sfba = std.heap.FixedBufferAllocator.init(&schema_buf);
+    var schema_bytes: std.ArrayList(u8) = .empty;
+    try writeSchema(&schema_bytes, sfba.allocator());
+    const blob_len: u64 = root_bytes + 12 * files + 4 * (files + 1) + 12 * (dirs + 1) + 24 * (dirs + files) + 8 + 4 + 4 + 8 * records + names_len + 4 * (records + 1);
     return 4 * section_header_size + data_len + schema_bytes.items.len + blob_len + 8 * 4 + 8;
 }
 
@@ -994,4 +1190,25 @@ test "dwarfs write roundtrips and mirrors the fixture shape" {
     try testing.expectEqualSlices(u8, "ABCABCABCABC", out[0..n]);
     const n1 = try decodeOrdinal(archive[0..written], 1, &out, &scratch);
     try testing.expectEqualSlices(u8, "hello dwarfs\n", out[0..n1]);
+}
+
+test "dwarfs write roundtrips nested directories" {
+    const testing = std.testing;
+    const entries = [_]Entry{
+        .{ .name = "a/b/deep.txt", .data = "nested payload" },
+        .{ .name = "a/sib.txt", .data = "sibling" },
+        .{ .name = "top.txt", .data = "root file" },
+    };
+    var archive: [8192]u8 = undefined;
+    var scratch: [scratch_size]u8 = undefined;
+    const written = try encode(&entries, &archive, &scratch);
+    try testing.expectEqual(written, try archiveSize(&entries));
+    try testing.expectEqual(@as(u64, 3), try inspectCount(archive[0..written], &scratch));
+    var out: [16]u8 = undefined;
+    const n0 = try decodeOrdinal(archive[0..written], 0, &out, &scratch);
+    try testing.expectEqualSlices(u8, "nested payload", out[0..n0]);
+    const n1 = try decodeOrdinal(archive[0..written], 1, &out, &scratch);
+    try testing.expectEqualSlices(u8, "sibling", out[0..n1]);
+    const n2 = try decodeOrdinal(archive[0..written], 2, &out, &scratch);
+    try testing.expectEqualSlices(u8, "root file", out[0..n2]);
 }
