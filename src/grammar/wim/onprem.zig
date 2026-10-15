@@ -5,6 +5,7 @@ const failure_prim = @import("../../common/primitive/failure.zig");
 
 const xpress = @import("xpress.zig");
 const lzx = @import("lzx.zig");
+const lzms = @import("lzms.zig");
 const io = @import("../../common/primitive/io.zig");
 
 const Failure = failure_prim.Failure;
@@ -18,7 +19,7 @@ pub const scratch_size: usize = 64 * 1024;
 
 const wim_magic: u64 = 0x0000_004D_4957_534D; // "MSWIM\0\0\0" little-endian.
 const wim_version: u32 = 0x10D00;
-const chunk_size: u32 = 0x8000;
+const wim_version_solid: u32 = 0x0E00;
 const header_disk_size = 208;
 const dentry_disk_size = 102;
 const stream_disk_size = 40;
@@ -319,7 +320,7 @@ pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Failure!usize
 }
 
 
-const Codec = enum { store, xpress, lzx, unsupported };
+const Codec = enum { store, xpress, lzx, lzms, unsupported };
 
 fn headerCodec(archive: []const u8) Failure!Codec {
     if (archive.len < 20) return error.DataFailure;
@@ -327,12 +328,14 @@ fn headerCodec(archive: []const u8) Failure!Codec {
     if (flags & flag_compression == 0) return .store;
     if (flags & (flag_compress_xpress | flag_compress_xpress_2) != 0) return .xpress;
     if (flags & flag_compress_lzx != 0) return .lzx;
+    if (flags & flag_compress_lzms != 0) return .lzms;
     return .unsupported;
 }
 
 // A compressed resource is a chunk table of u32 offsets, one fewer than
 // the chunk count. Entries are relative to the first chunk's byte; every
-// chunk but the last decodes to exactly 32 KiB.
+// chunk but the last decodes to exactly chunk_size. The chunk size comes
+// from the WIM header; LZMS resources use a larger one.
 fn readResource(archive: []const u8, res: Reshdr, codec: Codec, out: []u8) Failure!void {
     if (res.flags & reshdr_flag_compressed == 0) {
         const data = try bounds.slice(archive, res.offset, res.size_in_wim);
@@ -340,9 +343,11 @@ fn readResource(archive: []const u8, res: Reshdr, codec: Codec, out: []u8) Failu
         @memcpy(out, data);
         return;
     }
+    const chunk_len = std.mem.readInt(u32, archive[20..24], .little);
+    if (chunk_len == 0 or chunk_len > (1 << 21)) return error.DataFailure;
     const uncompressed = std.math.cast(usize, res.uncompressed_size) orelse return error.ResourceFailure;
     if (out.len < uncompressed) return error.CapacityFailure;
-    const num_chunks = (uncompressed + chunk_size - 1) / chunk_size;
+    const num_chunks = (uncompressed + chunk_len - 1) / chunk_len;
     if (num_chunks == 0) return error.DataFailure;
     const table_entries = num_chunks - 1;
     // The on-disk area begins at res.offset directly; the 24-byte reshdr is
@@ -354,11 +359,12 @@ fn readResource(archive: []const u8, res: Reshdr, codec: Codec, out: []u8) Failu
         const start_off: u64 = if (i == 0) 0 else std.mem.readInt(u32, table[(i - 1) * 4 ..][0..4], .little);
         const end_off: u64 = if (i == num_chunks - 1) area_len else std.mem.readInt(u32, table[i * 4 ..][0..4], .little);
         if (end_off < start_off or end_off > area_len) return error.DataFailure;
-        const take = @min(chunk_size, uncompressed - i * chunk_size);
+        const take = @min(chunk_len, uncompressed - i * chunk_len);
         const payload = try bounds.slice(archive, try bounds.addU64(area, start_off), end_off - start_off);
         switch (codec) {
-            .xpress => try xpress.xpressDecode(payload, out[i * chunk_size ..][0..take]),
-            .lzx => try lzx.lzxDecode(payload, out[i * chunk_size ..][0..take]),
+            .xpress => try xpress.xpressDecode(payload, out[i * chunk_len ..][0..take]),
+            .lzx => try lzx.lzxDecode(payload, out[i * chunk_len ..][0..take]),
+            .lzms => try lzms.lzmsDecode(payload, out[i * chunk_len ..][0..take]),
             else => return error.UnsupportedFailure,
         }
     }
@@ -378,7 +384,9 @@ const Parsed = struct {
 fn parse(archive: []const u8, scratch: []u8) Failure!Parsed {
     if (archive.len < header_disk_size) return error.DataFailure;
     if (std.mem.readInt(u64, archive[0..8], .little) != wim_magic) return error.DataFailure;
-    if (std.mem.readInt(u32, archive[12..16], .little) != wim_version) return error.DataFailure;
+    // wimlib stamps LZMS captures with the solid variant 0xE00.
+    const version = std.mem.readInt(u32, archive[12..16], .little);
+    if (version != wim_version and version != wim_version_solid) return error.DataFailure;
     const codec = try headerCodec(archive);
     const blobs_hdr = try readReshdr(archive, 48);
     if (blobs_hdr.flags & reshdr_flag_compressed != 0) return error.UnsupportedFailure;
@@ -612,5 +620,7 @@ test "wim store roundtrips flat files" {
     const n = try decodeOrdinal(archive[0..written], 1, &out, &scratch);
     try testing.expectEqualSlices(u8, "payload", out[0..n]);
 }
+
+
 
 

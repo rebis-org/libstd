@@ -114,15 +114,17 @@ pub fn Code(comptime max_len: usize, comptime num_symbols: usize) type {
             return self;
         }
 
-        pub fn read(self: *const Self, bits: *Bits) Failure!u16 {
+        // Any bit reader with ensure/peek/pop methods is accepted; this
+        // covers both the forwards WIM bitstream and the LZMS backwards one.
+        pub fn read(self: *const Self, reader: anytype) Failure!u16 {
             var c: u32 = 0;
             var len: usize = 0;
             while (true) {
                 len += 1;
                 if (len > max_len) return error.DataFailure;
-                bits.ensure(1);
-                c = (c << 1) | bits.peek(1);
-                bits.pop(1);
+                reader.ensure(1);
+                c = (c << 1) | @as(u32, @intCast(reader.peek(1)));
+                reader.pop(1);
                 const count = self.counts[len];
                 if (c >= self.first_code[len] and c - self.first_code[len] < count) {
                     return self.sorted[self.base[len] + @as(u16, @intCast(c - self.first_code[len]))];
