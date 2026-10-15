@@ -4,6 +4,7 @@ const bounds = @import("../../common/primitive/bounds.zig");
 const failure_prim = @import("../../common/primitive/failure.zig");
 
 const xpress = @import("xpress.zig");
+const lzx = @import("lzx.zig");
 const io = @import("../../common/primitive/io.zig");
 
 const Failure = failure_prim.Failure;
@@ -318,13 +319,14 @@ pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Failure!usize
 }
 
 
-const Codec = enum { store, xpress, unsupported };
+const Codec = enum { store, xpress, lzx, unsupported };
 
 fn headerCodec(archive: []const u8) Failure!Codec {
     if (archive.len < 20) return error.DataFailure;
     const flags = std.mem.readInt(u32, archive[16..20], .little);
     if (flags & flag_compression == 0) return .store;
     if (flags & (flag_compress_xpress | flag_compress_xpress_2) != 0) return .xpress;
+    if (flags & flag_compress_lzx != 0) return .lzx;
     return .unsupported;
 }
 
@@ -356,6 +358,7 @@ fn readResource(archive: []const u8, res: Reshdr, codec: Codec, out: []u8) Failu
         const payload = try bounds.slice(archive, try bounds.addU64(area, start_off), end_off - start_off);
         switch (codec) {
             .xpress => try xpress.xpressDecode(payload, out[i * chunk_size ..][0..take]),
+            .lzx => try lzx.lzxDecode(payload, out[i * chunk_size ..][0..take]),
             else => return error.UnsupportedFailure,
         }
     }
@@ -609,3 +612,5 @@ test "wim store roundtrips flat files" {
     const n = try decodeOrdinal(archive[0..written], 1, &out, &scratch);
     try testing.expectEqualSlices(u8, "payload", out[0..n]);
 }
+
+
