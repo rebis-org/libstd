@@ -1,22 +1,22 @@
 const std = @import("std");
 
 const bounds = @import("../../common/primitive/bounds.zig");
-const failure_prim = @import("../../common/primitive/failure.zig");
+const exception_prim = @import("../../common/primitive/exception.zig");
 const io = @import("../../common/primitive/io.zig");
 const measurement = @import("../../common/primitive/measurement.zig");
 const lzma = @import("../../leaf/lzma/onprem.zig");
 const lzma_seam = @import("../../leaf/lzma/seam.zig");
 
-const Failure = failure_prim.Failure;
+const Exception = exception_prim.Exception;
 
 pub const header_size = 13;
 pub const default_dictionary: u32 = 1 << 20;
 
-pub fn decodeOptions(input: []const u8) Failure!lzma.Options {
+pub fn decodeOptions(input: []const u8) Exception!lzma.Options {
     const header = try bounds.slice(input, 0, header_size);
     var dictionary_size = std.mem.readInt(u32, header[1..5], .little);
     if (dictionary_size < lzma.dictionary_min) dictionary_size = lzma.dictionary_min;
-    if (dictionary_size > lzma.dictionary_max) return error.UnsupportedFailure;
+    if (dictionary_size > lzma.dictionary_max) return error.UnsupportedException;
     const unpack_size = std.mem.readInt(u64, header[5..13], .little);
     // The lzma alone format marks an unknown size with the maximum u64 value, which requires the end marker.
     const marker_required = unpack_size == std.math.maxInt(u64);
@@ -29,8 +29,8 @@ pub fn decodeOptions(input: []const u8) Failure!lzma.Options {
 
 // A declared size accompanies a markerless stream. A caller that sizes later
 // passes unpack_size = null and gets the end marker.
-pub fn encodeOptions(dictionary: u32) Failure!lzma.Options {
-    if (dictionary < lzma.dictionary_min or dictionary > lzma.dictionary_max) return error.CallFailure;
+pub fn encodeOptions(dictionary: u32) Exception!lzma.Options {
+    if (dictionary < lzma.dictionary_min or dictionary > lzma.dictionary_max) return error.CallException;
     return .{
         .properties = .{ .lc = 3, .lp = 0, .pb = 2, .dictionary_size = dictionary },
         .unpack_size = null,
@@ -38,7 +38,7 @@ pub fn encodeOptions(dictionary: u32) Failure!lzma.Options {
     };
 }
 
-pub fn encodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options: lzma.Options) Failure!void {
+pub fn encodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options: lzma.Options) Exception!void {
     var header: [header_size]u8 = undefined;
     header[0] = options.properties.encode();
     std.mem.writeInt(u32, header[1..5], options.properties.dictionary_size, .little);
@@ -51,13 +51,13 @@ pub fn encodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, 
     try lzma.encodeToWriter(input, writer, scratch, options);
 }
 
-pub fn encode(input: []const u8, output: []u8, scratch: []u8, options: lzma.Options) Failure!usize {
+pub fn encode(input: []const u8, output: []u8, scratch: []u8, options: lzma.Options) Exception!usize {
     var writer = std.Io.Writer.fixed(output);
     try encodeToWriter(input, &writer, scratch, options);
     return writer.end;
 }
 
-pub fn requiredSize(input: []const u8, scratch: []u8, options: lzma.Options) Failure!usize {
+pub fn requiredSize(input: []const u8, scratch: []u8, options: lzma.Options) Exception!usize {
     var counter = measurement.Counter.init(null);
     try encodeToWriter(input, &counter.writer, scratch, options);
     return measurement.measuredLength(&counter);
@@ -69,28 +69,28 @@ pub fn encodedSizeBound(input_len: usize) usize {
 
 // The lzma-alone properties byte (lc + 9 * lp + 45 * pb) for the read-side
 // inspect projection, parsed without decoding.
-pub fn inspectProperties(input: []const u8) Failure!u8 {
-    if (input.len < header_size) return error.DataFailure;
-    if (input[0] >= 9 * 5 * 5) return error.DataFailure;
+pub fn inspectProperties(input: []const u8) Exception!u8 {
+    if (input.len < header_size) return error.DataException;
+    if (input[0] >= 9 * 5 * 5) return error.DataException;
     return input[0];
 }
 
-pub fn decodedSize(input: []const u8, scratch: []u8, provider: lzma_seam.Provider) Failure!usize {
+pub fn decodedSize(input: []const u8, scratch: []u8, provider: lzma_seam.Provider) Exception!usize {
     const options = try decodeOptions(input);
     return lzma_seam.decodedSize(provider, input[header_size..], scratch, options);
 }
 
-pub fn decode(input: []const u8, output: []u8, scratch: []u8, provider: lzma_seam.Provider) Failure!usize {
+pub fn decode(input: []const u8, output: []u8, scratch: []u8, provider: lzma_seam.Provider) Exception!usize {
     const options = try decodeOptions(input);
     return lzma_seam.decode(provider, input[header_size..], output, scratch, options);
 }
 
-pub fn decodeInPlace(input: []const u8, output: []u8, scratch: []u8, provider: lzma_seam.Provider) Failure!usize {
+pub fn decodeInPlace(input: []const u8, output: []u8, scratch: []u8, provider: lzma_seam.Provider) Exception!usize {
     const options = try decodeOptions(input);
     return lzma_seam.decodeInPlace(provider, input[header_size..], output, scratch, options);
 }
 
-pub fn decodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, provider: lzma_seam.Provider) Failure!void {
+pub fn decodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, provider: lzma_seam.Provider) Exception!void {
     const options = try decodeOptions(input);
     return lzma_seam.decodeToWriter(provider, input[header_size..], writer, scratch, options);
 }
@@ -130,7 +130,7 @@ pub const HeaderInfo = struct {
 };
 
 // Parses the 13-byte lzma-alone header without touching the payload.
-pub fn inspect(input: []const u8) Failure!HeaderInfo {
+pub fn inspect(input: []const u8) Exception!HeaderInfo {
     const options = try decodeOptions(input);
     return .{
         .properties = options.properties,

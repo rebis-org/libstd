@@ -1,14 +1,16 @@
 // Brotli compressed data format (RFC 7932), algorithm-level port with the
-// RFC sections cited inline. The static dictionary and the encoder land in
-// follow-up iterations; dictionary references answer UnsupportedFailure.
+// RFC sections cited inline.
 
 const std = @import("std");
 
 const kernels = @import("../../common/kernels.zig");
+// Complex prefix codes transmit lengths directly.
+// That is larger but always valid.
+const huffman = @import("../../common/primitive/huffman.zig");
 const dictionary = @import("dictionary.zig");
 
-pub const DecodeError = error{ UnsupportedFailure, DataFailure, ResourceFailure, CapacityFailure, InternalFailure, IoFailure };
-pub const EncodeError = error{ UnsupportedFailure, DataFailure, ResourceFailure, CapacityFailure, InternalFailure };
+pub const DecodeError = error{ UnsupportedException, DataException, ResourceException, CapacityException, InternalException, IoException };
+pub const EncodeError = error{ UnsupportedException, DataException, ResourceException, CapacityException, InternalException };
 
 pub const Options = struct {
     quality: u32 = 5,
@@ -25,7 +27,7 @@ pub fn encodedSizeBound(input_len: usize) usize {
 pub fn decodedSize(input: []const u8, scratch: []u8, options: Options) DecodeError!usize {
     // No size field exists in the format, so the measured route decodes
     // into the writer staging and counts. Outputs beyond the staging
-    // answer ResourceFailure; the windowed streaming decode is the
+    // answer ResourceException; the windowed streaming decode is the
     // recorded follow-up.
     _ = try alignedWorkspace(scratch);
     const staging = scratch[scratch.len - writer_staging_size ..][0..writer_staging_size];
@@ -40,32 +42,32 @@ pub fn decodedSize(input: []const u8, scratch: []u8, options: Options) DecodeErr
 const writer_staging_size = 64 << 20;
 
 pub const decode_workspace_size: usize = blk: {
-    // Fixed table records, per-tree sorted-symbol arenas, context maps,
-    // writer staging, and alignment slack. See Scratch below.
     const tables = max_trees * @sizeOf(HufTable);
     const symbols = max_trees * max_alphabet * @sizeOf(u16);
     const maps = 64 * 256 + 4 * 256;
     break :blk tables + symbols + maps + writer_staging_size + 4096 + 16;
 };
 
+fn alignedSlice(scratch_buffer: []u8, comptime size: usize) error{ResourceException}![]u8 {
+    const off = std.mem.alignForward(usize, @intFromPtr(scratch_buffer.ptr), 16) - @intFromPtr(scratch_buffer.ptr);
+    if (scratch_buffer.len < off + (size - 16)) return error.ResourceException;
+    return scratch_buffer[off..];
+}
+
 fn alignedWorkspace(scratch_buffer: []u8) DecodeError!struct { buf: []u8 } {
     // The adapter hands over a []u8 from a sequentially-taken workspace;
     // the table records need natural alignment, so start past the padding.
-    const off = std.mem.alignForward(usize, @intFromPtr(scratch_buffer.ptr), 16) - @intFromPtr(scratch_buffer.ptr);
-    if (scratch_buffer.len < off + (decode_workspace_size - 16)) return error.ResourceFailure;
-    return .{ .buf = scratch_buffer[off..] };
+    return .{ .buf = try alignedSlice(scratch_buffer, decode_workspace_size) };
 }
 
 pub fn decodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options: Options) DecodeError!void {
     _ = try alignedWorkspace(scratch);
     const staging = scratch[scratch.len - writer_staging_size ..][0..writer_staging_size];
     const produced = try decode(input, staging, scratch, options);
-    writer.writeAll(staging[0..produced]) catch return error.IoFailure;
+    writer.writeAll(staging[0..produced]) catch return error.IoException;
 }
 
 pub fn requiredSize(input: []const u8, scratch: []u8, options: Options) EncodeError!usize {
-    // Measured-sizing query for the write path: encode once into a
-    // counting bit writer and report the byte count.
     return encodeCountedSize(input, scratch, options);
 }
 
@@ -106,8 +108,8 @@ fn parseCommands(src: []const u8, commands: []Command, head: []u32, ring: *[4]u3
                         .lit_start = @intCast(anchor),
                         .ins_len = @intCast(ins.len),
                     };
-                    const ins_code = insertCode(ins.len);
-                    const copy_code = copyCode(len);
+                    const ins_code = lengthToCode(@intCast(ins.len), &insert_base);
+                    const copy_code = lengthToCode(@intCast(len), &copy_base);
                     // The implicit distance-0 form exists only below icode 128:
                     // insert codes 0..7 and copy codes below 16.
                     const implicit = dist == ring[0] and ins_code < 8 and copy_code < 16;
@@ -116,23 +118,24 @@ fn parseCommands(src: []const u8, commands: []Command, head: []u32, ring: *[4]u3
                     cmd.ins_bits = insert_extra[ins_code];
                     cmd.copy_extra = @intCast(len - copy_base[copy_code]);
                     cmd.copy_bits = copy_extra[copy_code];
-                    if (implicit) {
-                        // dcode stays 0xFFFF: no distance symbol.
-                    } else if (dist == ring[0]) {
-                        cmd.dcode = 0;
-                    } else {
-                        if (trySpecialDistance(@intCast(dist), ring)) |dc| {
-                            cmd.dcode = dc;
+                    // Implicit distances ride the icode; only explicit ones need a dcode.
+                    if (!implicit) {
+                        if (dist == ring[0]) {
+                            cmd.dcode = 0;
                         } else {
-                            const nd = normalDistance(@intCast(dist));
-                            cmd.dcode = nd.dcode;
-                            cmd.dextra = nd.extra;
-                            cmd.d_bits = nd.bits;
+                            if (trySpecialDistance(@intCast(dist), ring)) |dc| {
+                                cmd.dcode = dc;
+                            } else {
+                                const nd = normalDistance(@intCast(dist));
+                                cmd.dcode = nd.dcode;
+                                cmd.dextra = nd.extra;
+                                cmd.d_bits = nd.bits;
+                            }
+                            ring[3] = ring[2];
+                            ring[2] = ring[1];
+                            ring[1] = ring[0];
+                            ring[0] = @intCast(dist);
                         }
-                        ring[3] = ring[2];
-                        ring[2] = ring[1];
-                        ring[1] = ring[0];
-                        ring[0] = @intCast(dist);
                     }
                     commands[count] = cmd;
                     count += 1;
@@ -147,7 +150,7 @@ fn parseCommands(src: []const u8, commands: []Command, head: []u32, ring: *[4]u3
     // Trailing literals: a final command whose ignored copy ends the block.
     if (anchor < src.len or count == 0) {
         const ins = src[anchor..src.len];
-        const ins_code = insertCode(ins.len);
+        const ins_code = lengthToCode(@intCast(ins.len), &insert_base);
         var cmd: Command = .{
             .icode = 0,
             .ins_extra = @intCast(ins.len - insert_base[ins_code]),
@@ -167,7 +170,9 @@ fn parseCommands(src: []const u8, commands: []Command, head: []u32, ring: *[4]u3
     return count;
 }
 
-const max_alphabet = 704; // distance alphabet: 16 + 120 + (48 << 3)
+const max_alphabet = 704; // insert-and-copy alphabet
+const ring_slot = [16]u8{ 0, 1, 2, 3, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1 };
+const ring_off = [16]i8{ 0, 0, 0, 0, -1, 1, -2, 2, -3, 3, -1, 1, -2, 2, -3, 3 };
 const max_trees = 256 * 3 + 16;
 
 // ---------------------------------------------------------------- bit io
@@ -179,7 +184,7 @@ const BitReader = struct {
 
     fn readBit(self: *BitReader) DecodeError!u32 {
         if (self.mask == 0) {
-            if (self.pos >= self.data.len) return error.DataFailure;
+            if (self.pos >= self.data.len) return error.DataException;
             self.mask = 1;
         }
         const bit = (self.data[self.pos] & self.mask) != 0;
@@ -202,7 +207,7 @@ const BitReader = struct {
     fn alignToByte(self: *BitReader) DecodeError!void {
         if (self.mask != 0) {
             while (self.mask != 0) : (self.mask <<= 1) {
-                if ((self.data[self.pos] & self.mask) != 0) return error.DataFailure;
+                if ((self.data[self.pos] & self.mask) != 0) return error.DataException;
             }
             self.pos += 1;
         }
@@ -215,8 +220,7 @@ const BitReader = struct {
 
 // ---------------------------------------------------------------- huffman
 
-// Canonical prefix code (RFC 3.2/3.5), decoded bit-by-bit; the per-tree
-// memory is a counts vector plus the symbols sorted by (code length, symbol).
+// Canonical prefix code (RFC 3.2/3.5), decoded bit-by-bit.
 const HufTable = struct {
     count: [16]u32 = @splat(0),
     symbols: []u16 = &.{},
@@ -233,14 +237,14 @@ const HufTable = struct {
             const n = self.count[len];
             if (code -% first < n) {
                 const idx = index + (code - first);
-                if (idx >= self.symbols.len) return error.DataFailure;
+                if (idx >= self.symbols.len) return error.DataException;
                 return self.symbols[idx];
             }
             index += n;
             first = (first + n) << 1;
             code <<= 1;
         }
-        return error.DataFailure;
+        return error.DataException;
     }
 };
 
@@ -252,8 +256,8 @@ const Scratch = struct {
     cmapd: []u8,
 
     fn allocTree(self: *Scratch, alphabet: usize) DecodeError!struct { table: *HufTable, symbols: []u16 } {
-        if (alphabet > max_alphabet) return error.DataFailure;
-        if (self.trees_used >= self.tables.len) return error.ResourceFailure;
+        if (alphabet > max_alphabet) return error.DataException;
+        if (self.trees_used >= self.tables.len) return error.ResourceException;
         const t = &self.tables[self.trees_used];
         const base = self.trees_used * max_alphabet;
         self.trees_used += 1;
@@ -263,6 +267,13 @@ const Scratch = struct {
     }
 };
 
+fn canonicalOffsets(counts: [16]u32) [16]u32 {
+    var offset: [16]u32 = undefined;
+    offset[1] = 0;
+    for (1..15) |l| offset[l + 1] = offset[l] + counts[l];
+    return offset;
+}
+
 fn buildCodeLengthCode(br: *BitReader, hskip: u32, sc: *Scratch) DecodeError!*HufTable {
     // RFC 3.5: the 18 code-length symbols arrive in a fixed order. The
     // order table and the 2..4-bit prefix code come from the spec.
@@ -270,7 +281,7 @@ fn buildCodeLengthCode(br: *BitReader, hskip: u32, sc: *Scratch) DecodeError!*Hu
     const order = [18]u8{ 1, 2, 3, 4, 0, 5, 17, 6, 16, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
     // HSKIP arrived with the 2-bit simple/complex selector; value 1 means a
     // simple code and never reaches here (RFC 3.4/3.5).
-    if (hskip == 1) return error.DataFailure;
+    if (hskip == 1) return error.DataException;
     var i: usize = @intCast(hskip);
     var space: u32 = 32;
     while (i < 18 and space > 0) : (i += 1) {
@@ -292,20 +303,16 @@ fn buildCodeLengthCode(br: *BitReader, hskip: u32, sc: *Scratch) DecodeError!*Hu
         lengths[sym] = len;
         if (len != 0) {
             const weight = @as(u32, 32) >> @intCast(len);
-            if (space < weight) return error.DataFailure;
+            if (space < weight) return error.DataException;
             space -= weight;
         }
     }
-    if (space != 0) return error.DataFailure;
-    // Scratch-owned: the table outlives this frame through the symbol
-    // decode below.
+    if (space != 0) return error.DataException;
     const tree = try sc.allocTree(18);
     const table = tree.table;
     for (lengths) |l| table.count[l] += 1;
     table.count[0] = 0;
-    var offset: [16]u32 = undefined;
-    offset[1] = 0;
-    for (1..15) |l| offset[l + 1] = offset[l] + table.count[l];
+    var offset = canonicalOffsets(table.count);
     for (lengths, 0..) |l, sym| {
         if (l != 0) {
             tree.symbols[offset[l]] = @intCast(sym);
@@ -326,8 +333,8 @@ fn readPrefixCode(br: *BitReader, sc: *Scratch, alphabet: usize) DecodeError!*Hu
         var last: [4]u16 = undefined;
         for (0..nsym) |i| {
             const sym = try br.readBits(abits);
-            if (sym >= alphabet) return error.DataFailure;
-            for (last[0..i]) |p| if (p == sym) return error.DataFailure;
+            if (sym >= alphabet) return error.DataException;
+            for (last[0..i]) |p| if (p == sym) return error.DataException;
             last[i] = @intCast(sym);
             tree.table.symbols[i] = @intCast(sym);
         }
@@ -352,15 +359,13 @@ fn readPrefixCode(br: *BitReader, sc: *Scratch, alphabet: usize) DecodeError!*Hu
                     lens = .{ 1, 2, 3, 3 };
                 }
             },
-            else => return error.DataFailure,
+            else => return error.DataException,
         }
         for (0..nsym) |i| tree.table.count[lens[i]] += 1;
         // For NSYM > 1 the symbols must be re-sorted per length for the
         // canonical decode walk: bit-walk order is (len, symbol).
         if (nsym > 1) {
-            var offset: [16]u32 = undefined;
-            offset[1] = 0;
-            for (1..15) |l| offset[l + 1] = offset[l] + tree.table.count[l];
+            var offset = canonicalOffsets(tree.table.count);
             var saved: [4]u16 = undefined;
             @memcpy(saved[0..nsym], tree.table.symbols[0..nsym]);
             for (0..nsym) |i| {
@@ -407,10 +412,10 @@ fn readPrefixCode(br: *BitReader, sc: *Scratch, alphabet: usize) DecodeError!*Hu
             if (repeat > 0) repeat = (repeat - 2) << extra_bits;
             repeat += 3 + extra;
             const delta = repeat - old_repeat;
-            if (symbol_count + delta > alphabet) return error.DataFailure;
+            if (symbol_count + delta > alphabet) return error.DataException;
             if (new_len != 0) {
                 const per = @as(u32, 32768) >> @as(u5, @intCast(new_len));
-                if (per * delta > space) return error.DataFailure;
+                if (per * delta > space) return error.DataException;
                 for (0..delta) |_| {
                     lengths.table.symbols[symbol_count] = @intCast(new_len);
                     symbol_count += 1;
@@ -420,15 +425,14 @@ fn readPrefixCode(br: *BitReader, sc: *Scratch, alphabet: usize) DecodeError!*Hu
                 @memset(lengths.table.symbols[symbol_count..][0..delta], 0);
                 symbol_count += delta;
             }
-        } else return error.DataFailure;
+        } else return error.DataException;
     }
-    if (space != 0 or symbol_count > alphabet) return error.DataFailure;
+    if (space != 0 or symbol_count > alphabet) return error.DataException;
     const total = symbol_count;
-    // Rebuild as a canonical decode table from the lengths.
     var counts: [16]u32 = @splat(0);
     for (lengths.table.symbols[0..total]) |l| counts[l] += 1;
     const nonzero = counts[1] + counts[2] + counts[3] + counts[4] + counts[5] + counts[6] + counts[7] + counts[8] + counts[9] + counts[10] + counts[11] + counts[12] + counts[13] + counts[14] + counts[15];
-    if (nonzero == 0) return error.DataFailure;
+    if (nonzero == 0) return error.DataException;
     if (nonzero == 1) {
         for (lengths.table.symbols[0..total], 0..) |l, s| {
             if (l != 0) {
@@ -438,9 +442,7 @@ fn readPrefixCode(br: *BitReader, sc: *Scratch, alphabet: usize) DecodeError!*Hu
         }
         unreachable;
     }
-    var offset: [16]u32 = undefined;
-    offset[1] = 0;
-    for (1..15) |l| offset[l + 1] = offset[l] + counts[l];
+    var offset = canonicalOffsets(counts);
     var len_copy: [max_alphabet]u16 = undefined;
     @memcpy(len_copy[0..total], lengths.table.symbols[0..total]);
     for (len_copy[0..total], 0..) |l, s| {
@@ -452,7 +454,6 @@ fn readPrefixCode(br: *BitReader, sc: *Scratch, alphabet: usize) DecodeError!*Hu
     lengths.table.count = counts;
     return lengths.table;
 }
-
 
 // ---------------------------------------------------------------- tables
 
@@ -533,6 +534,16 @@ fn literalContext(mode: u8, p1: u8, p2: u8) usize {
 }
 
 // RFC 9.2: NBLTYPES / NTREES variable-length code.
+fn trackContext(p1: *u8, p2: *u8, output: []const u8, last: usize, n: usize) void {
+    if (n >= 2) {
+        p2.* = output[last - 1];
+        p1.* = output[last];
+    } else if (n == 1) {
+        p2.* = p1.*;
+        p1.* = output[last];
+    }
+}
+
 fn readBlockCount(br: *BitReader) DecodeError!u32 {
     if (try br.readBit() == 0) return 1;
     const n = try br.readBits(3);
@@ -550,7 +561,7 @@ const BlockCategory = struct {
     count: u32 = 0,
 
     fn readType(self: *BlockCategory, br: *BitReader) DecodeError!void {
-        const tree = self.type_tree orelse return error.DataFailure;
+        const tree = self.type_tree orelse return error.DataException;
         const sym = try tree.decode(br);
         if (sym == 0) {
             const swap = self.cur_type;
@@ -563,14 +574,14 @@ const BlockCategory = struct {
         } else {
             self.prev_type = self.cur_type;
             self.cur_type = @as(u32, sym) - 2;
-            if (self.cur_type >= self.num_types) return error.DataFailure;
+            if (self.cur_type >= self.num_types) return error.DataException;
         }
     }
 
     fn readCount(self: *BlockCategory, br: *BitReader) DecodeError!void {
-        const tree = self.count_tree orelse return error.DataFailure;
+        const tree = self.count_tree orelse return error.DataException;
         const sym = try tree.decode(br);
-        if (sym >= 26) return error.DataFailure;
+        if (sym >= 26) return error.DataException;
         self.count = block_count_base[sym] + (try br.readBits(block_count_extra[sym]));
     }
 };
@@ -591,12 +602,12 @@ fn readContextMap(br: *BitReader, sc: *Scratch, size: usize, num_trees: u32, map
             i += 1;
         } else if (sym <= rlemax) {
             const rep = (@as(u32, 1) << @intCast(sym)) + (try br.readBits(@intCast(sym)));
-            if (i + rep > size) return error.DataFailure;
+            if (i + rep > size) return error.DataException;
             @memset(map[i .. i + rep], 0);
             i += rep;
         } else {
             const v = sym - rlemax;
-            if (v >= num_trees) return error.DataFailure;
+            if (v >= num_trees) return error.DataException;
             map[i] = @intCast(v);
             i += 1;
         }
@@ -617,7 +628,6 @@ fn readContextMap(br: *BitReader, sc: *Scratch, size: usize, num_trees: u32, map
 }
 
 // ------------------------------------------------------------- meta-block
-
 
 // RFC 4: the last distance starts at 4.
 // The earlier slots start at 11, 15, and 16.
@@ -646,18 +656,17 @@ fn decodeMetaBlock(
     }
     const mnib_code = try br.readBits(2);
     if (mnib_code == 3) {
-        // Metadata meta-block (RFC 9.2): reserved bit, skip length, then
-        // byte alignment and raw skip bytes.
-        if (try br.readBit() != 0) return error.DataFailure;
+        // Metadata meta-block (RFC 9.2).
+        if (try br.readBit() != 0) return error.DataException;
         const mskipbytes = try br.readBits(2);
         var skiplen: usize = 0;
         if (mskipbytes > 0) {
             const v = try br.readBits(@intCast(mskipbytes * 8));
             skiplen = @intCast(v + 1);
-            if (mskipbytes > 1 and (v & 0xFF) == 0 and mskipbytes == ((v >> 8) + 1)) return error.DataFailure;
+            if (mskipbytes > 1 and (v & 0xFF) == 0 and mskipbytes == ((v >> 8) + 1)) return error.DataException;
         }
         try br.alignToByte();
-        if (br.pos + skiplen > br.data.len) return error.DataFailure;
+        if (br.pos + skiplen > br.data.len) return error.DataException;
         br.pos += skiplen;
         is_last.* = false;
         return;
@@ -666,23 +675,17 @@ fn decodeMetaBlock(
     const mlen: usize = @as(usize, try br.readBits(nibbles * 4)) + 1;
     if (nibbles > 4 and ((mlen - 1) >> @intCast((nibbles - 1) * 4)) == 0) {
         // A zero top nibble for a length encoded in more than 16 bits.
-        return error.DataFailure;
+        return error.DataException;
     }
     if (!is_last.*) {
         if ((try br.readBit()) != 0) {
             // Uncompressed meta-block: MLEN literal bytes after alignment.
             try br.alignToByte();
-            if (br.pos + mlen > br.data.len) return error.DataFailure;
-            if (produced.* + mlen > output.len) return error.CapacityFailure;
+            if (br.pos + mlen > br.data.len) return error.DataException;
+            if (produced.* + mlen > output.len) return error.CapacityException;
             @memcpy(output[produced.*..][0..mlen], br.data[br.pos..][0..mlen]);
             br.pos += mlen;
-            if (mlen >= 2) {
-                p2.* = output[produced.* + mlen - 2];
-                p1.* = output[produced.* + mlen - 1];
-            } else if (mlen == 1) {
-                p2.* = p1.*;
-                p1.* = output[produced.*];
-            }
+            trackContext(p1, p2, output, produced.* + mlen - 1, mlen);
             produced.* += mlen;
             return;
         }
@@ -739,7 +742,7 @@ fn decodeMetaBlock(
             ins.count -= 1;
         }
         const icode = try ins_trees[ins.cur_type].decode(br);
-        if (icode >= 704) return error.DataFailure;
+        if (icode >= 704) return error.DataException;
         // RFC 5 cell lookup.
         var ins_base_code: u32 = 0;
         var copy_base_code: u32 = 0;
@@ -786,15 +789,14 @@ fn decodeMetaBlock(
                 ins_base_code = 16;
                 copy_base_code = 16;
             },
-            else => return error.DataFailure,
+            else => return error.DataException,
         }
         const ins_code: usize = @intCast(ins_base_code + ((cell >> 3) & 7));
         const copy_code: usize = @intCast(copy_base_code + (cell & 7));
         const ins_len: usize = @intCast(insert_base[ins_code] + (try br.readBits(insert_extra[ins_code])));
         const copy_len: usize = @intCast(copy_base[copy_code] + (try br.readBits(copy_extra[copy_code])));
 
-        // Insert literals.
-        if (pos + ins_len > mlen) return error.DataFailure;
+        if (pos + ins_len > mlen) return error.DataException;
         for (0..ins_len) |_| {
             if (lit.num_types >= 2) {
                 if (lit.count == 0) {
@@ -806,7 +808,7 @@ fn decodeMetaBlock(
             const cid = literalContext(context_modes[lit.cur_type], p1.*, p2.*);
             const tree_idx = sc.cmapl[64 * @as(usize, lit.cur_type) + cid];
             const byte: u8 = @intCast(try lit_trees[tree_idx].decode(br));
-            if (produced.* >= output.len) return error.CapacityFailure;
+            if (produced.* >= output.len) return error.CapacityException;
             output[produced.*] = byte;
             produced.* += 1;
             p2.* = p1.*;
@@ -834,11 +836,9 @@ fn decodeMetaBlock(
             const tree_idx = sc.cmapd[4 * @as(usize, dist.cur_type) + dcid];
             const dcode = try dist_trees[tree_idx].decode(br);
             if (dcode < 16) {
-                const slot = [16]u8{ 0, 1, 2, 3, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1 };
-                const off = [16]i8{ 0, 0, 0, 0, -1, 1, -2, 2, -3, 3, -1, 1, -2, 2, -3, 3 };
-                const idx = slot[dcode];
-                const v = @as(i64, ring[idx]) + off[dcode];
-                if (v <= 0) return error.DataFailure;
+                const idx = ring_slot[dcode];
+                const v = @as(i64, ring[idx]) + ring_off[dcode];
+                if (v <= 0) return error.DataException;
                 distance = @intCast(v);
                 push_ring = dcode != 0;
             } else if (dcode < 16 + ndirect) {
@@ -858,9 +858,9 @@ fn decodeMetaBlock(
         const max_backward = @min(window_size, produced.* - stream_base);
         if (distance > max_backward) {
             // RFC 8: a static dictionary reference.
-            if (implicit_dist0) return error.DataFailure;
+            if (implicit_dist0) return error.DataException;
             const dict_len = try copyDictionaryWord(output, produced, copy_len, distance, max_backward, p1, p2);
-            if (pos + dict_len > mlen) return error.DataFailure;
+            if (pos + dict_len > mlen) return error.DataException;
             pos += dict_len;
             continue;
         }
@@ -870,17 +870,11 @@ fn decodeMetaBlock(
             ring[1] = ring[0];
             ring[0] = distance;
         }
-        if (pos + copy_len > mlen) return error.DataFailure;
-        if (produced.* + copy_len > output.len) return error.CapacityFailure;
+        if (pos + copy_len > mlen) return error.DataException;
+        if (produced.* + copy_len > output.len) return error.CapacityException;
         kernels.copyMatch(output, produced.*, distance, @intCast(copy_len));
         produced.* += copy_len;
-        if (copy_len >= 2) {
-            p2.* = output[produced.* - 2];
-            p1.* = output[produced.* - 1];
-        } else if (copy_len == 1) {
-            p2.* = p1.*;
-            p1.* = output[produced.* - 1];
-        }
+        trackContext(p1, p2, output, produced.* - 1, copy_len);
         pos += copy_len;
     }
 }
@@ -939,7 +933,7 @@ pub fn decode(input: []const u8, output: []u8, scratch_buffer: []u8, options: Op
                 break;
             }
             if (is_last) break;
-            if (produced > options.max_decoded_bytes) return error.ResourceFailure;
+            if (produced > options.max_decoded_bytes) return error.ResourceException;
         }
         // The last meta-block may end mid-byte; the fill must be zero and
         // a concatenated stream starts at the next byte boundary.
@@ -975,8 +969,7 @@ test "brotli decodes reference vectors" {
     try checkVector(allocator, &random_br, &random);
 
     // Concatenated streams: two dictionary-free streams decode in sequence
-    // with per-stream history; a dictionary-referencing second stream
-    // answers UnsupportedFailure like its standalone form.
+    // with per-stream history.
     var concat: [text_br.len + empty_br.len]u8 = undefined;
     @memcpy(concat[0..text_br.len], &text_br);
     @memcpy(concat[text_br.len..], &empty_br);
@@ -1102,9 +1095,7 @@ fn poolString(offset: usize) []const u8 {
     return dictionary.prefix_suffix[start..end];
 }
 
-// Applies a dictionary word transform and copies the result to the output.
-// Returns the RESULTING word length: RFC 9.3 counts the transformed length
-// against MLEN, not the command's copy length.
+// RFC 9.3 counts the transformed length against MLEN, not the copy length.
 fn copyDictionaryWord(
     output: []u8,
     produced: *usize,
@@ -1114,16 +1105,15 @@ fn copyDictionaryWord(
     p1: *u8,
     p2: *u8,
 ) DecodeError!usize {
-    const length = copy_len;
-    if (length < dictionary.min_word_length or length > dictionary.max_word_length) return error.DataFailure;
+    if (copy_len < dictionary.min_word_length or copy_len > dictionary.max_word_length) return error.DataException;
     const word_id: u64 = @as(u64, distance) - max_backward - 1;
-    const nd: u6 = @intCast(dictionary.ndbits[length]);
+    const nd: u6 = @intCast(dictionary.ndbits[copy_len]);
     const nwords: u64 = @as(u64, 1) << nd;
     const index = word_id % nwords;
     const transform_id = word_id / nwords;
-    if (transform_id >= dictionary.transform_count) return error.DataFailure;
-    const base_off: usize = dictionary.doffset[length] + @as(usize, @intCast(index)) * length;
-    const word = dictionary.data[base_off..][0..length];
+    if (transform_id >= dictionary.transform_count) return error.DataException;
+    const base_off: usize = dictionary.doffset[copy_len] + @as(usize, @intCast(index)) * copy_len;
+    const word = dictionary.data[base_off..][0..copy_len];
 
     var buf: [64]u8 = undefined;
     var total: usize = 0;
@@ -1155,36 +1145,22 @@ fn copyDictionaryWord(
             const k: usize = op - 11;
             word_part = if (word.len < k) word[0..0] else word[0 .. word.len - k];
         },
-        else => return error.DataFailure,
+        else => return error.DataException,
     }
     @memcpy(buf[total..][0..word_part.len], word_part);
     total += word_part.len;
 
     const suffix = poolString(dictionary.transforms[t + 2]);
-    if (total + suffix.len > buf.len) return error.InternalFailure;
+    if (total + suffix.len > buf.len) return error.InternalException;
     @memcpy(buf[total..][0..suffix.len], suffix);
     total += suffix.len;
 
-    if (produced.* + total > output.len) return error.CapacityFailure;
+    if (produced.* + total > output.len) return error.CapacityException;
     @memcpy(output[produced.*..][0..total], buf[0..total]);
     produced.* += total;
-    if (total >= 2) {
-        p2.* = output[produced.* - 2];
-        p1.* = output[produced.* - 1];
-    } else if (total == 1) {
-        p2.* = p1.*;
-        p1.* = output[produced.* - 1];
-    }
+    trackContext(p1, p2, output, produced.* - 1, total);
     return total;
 }
-
-
-// Greedy hash matches of four bytes or more.
-
-// Complex prefix codes transmit lengths directly.
-// That is larger but always valid.
-
-const huffman = @import("../../common/primitive/huffman.zig");
 
 const encode_mb_cap = 1 << 20;
 
@@ -1197,7 +1173,7 @@ const BitWriter = struct {
     fn writeBit(self: *BitWriter, bit: u32) EncodeError!void {
         if (self.mask == 0) {
             if (!self.count_only) {
-                if (self.pos >= self.out.len) return error.CapacityFailure;
+                if (self.pos >= self.out.len) return error.CapacityException;
                 self.out[self.pos] = 0;
             }
             self.mask = 1;
@@ -1266,13 +1242,6 @@ fn lengthToCode(len: u32, base: []const u32) u32 {
     return code;
 }
 
-fn insertCode(len: usize) u32 {
-    return lengthToCode(@intCast(len), &insert_base);
-}
-fn copyCode(len: usize) u32 {
-    return lengthToCode(@intCast(len), &copy_base);
-}
-
 // Inverse distance encoding with NPOSTFIX and NDIRECT both zero.
 // Special codes 0..15 cover ring matches; the caller maps them.
 fn normalDistance(distance: u32) struct { dcode: u16, extra: u32, bits: u8 } {
@@ -1285,10 +1254,8 @@ fn normalDistance(distance: u32) struct { dcode: u16, extra: u32, bits: u8 } {
 }
 
 fn trySpecialDistance(distance: u32, ring: *const [4]u32) ?u16 {
-    const map = [16]u8{ 0, 1, 2, 3, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1 };
-    const off = [16]i8{ 0, 0, 0, 0, -1, 1, -2, 2, -3, 3, -1, 1, -2, 2, -3, 3 };
     for (0..16) |dc| {
-        if (@as(i64, ring[map[dc]]) + off[dc] == distance) return @intCast(dc);
+        if (@as(i64, ring[ring_slot[dc]]) + ring_off[dc] == distance) return @intCast(dc);
     }
     return null;
 }
@@ -1342,7 +1309,6 @@ fn writeSymbol(bw: *BitWriter, code: u16, len: u8) EncodeError!void {
     }
 }
 
-// Emits one prefix code description for the given lengths.
 // Returns true for a single-symbol code with zero bits.
 
 // Codes with at most four symbols use the simple form.
@@ -1350,11 +1316,9 @@ fn writeSymbol(bw: *BitWriter, code: u16, len: u8) EncodeError!void {
 
 // Longer codes use the complex form; every length is transmitted directly.
 fn writePrefixCode(bw: *BitWriter, lens: []u8, alphabet: usize) EncodeError!bool {
-    var freq_rank: [704]u16 = undefined;
     var nused: usize = 0;
-    for (lens[0..alphabet], 0..) |l, sym| {
+    for (lens[0..alphabet]) |l| {
         if (l != 0) {
-            freq_rank[nused] = @intCast(sym);
             nused += 1;
         }
     }
@@ -1366,7 +1330,6 @@ fn writePrefixCode(bw: *BitWriter, lens: []u8, alphabet: usize) EncodeError!bool
         return true;
     }
     if (nused <= 4) {
-        // Sort used symbols by ascending length, then symbol.
         // Emission order (length, symbol) reproduces position-based lengths.
         var order: [4]u16 = undefined;
         var oi: usize = 0;
@@ -1514,9 +1477,7 @@ fn encodeBits(input: []const u8, bw: *BitWriter, ws: []u8) EncodeError!void {
 }
 
 fn encodeWorkspace(scratch: []u8) EncodeError![]u8 {
-    const off = std.mem.alignForward(usize, @intFromPtr(scratch.ptr), 16) - @intFromPtr(scratch.ptr);
-    if (scratch.len < off + (encode_workspace_size - 16)) return error.ResourceFailure;
-    return scratch[off..];
+    return alignedSlice(scratch, encode_workspace_size);
 }
 
 pub fn encode(input: []const u8, output: []u8, scratch: []u8, options: Options) EncodeError!usize {
@@ -1538,7 +1499,7 @@ pub fn encodeCountedSize(input: []const u8, scratch: []u8, options: Options) Enc
 // The encoder is new; the hermetic gate is a full round trip through this decoder.
 test "brotli decode rejects oversubscribed cl codes" {
     // Adversarial prefixes once overflowed the Kraft accumulator instead
-    // of answering DataFailure.
+    // of answering DataException.
     const allocator = std.testing.allocator;
     const inputs = [_][]const u8{
         "Squdgy fez, blank jimp crwth vox!",
@@ -1549,7 +1510,7 @@ test "brotli decode rejects oversubscribed cl codes" {
         defer allocator.free(scratch);
         const output = try allocator.alloc(u8, 4096);
         defer allocator.free(output);
-        try std.testing.expectError(error.DataFailure, decode(input, output, scratch, .{}));
+        try std.testing.expectError(error.DataException, decode(input, output, scratch, .{}));
     }
     // 0x06 is a valid empty stream (WBITS 16, ISLAST, ISLASTEMPTY).
     {
@@ -1560,7 +1521,6 @@ test "brotli decode rejects oversubscribed cl codes" {
         try std.testing.expectEqual(0, try decode(&.{0x06}, output, scratch, .{}));
     }
 }
-
 
 test "brotli encode mozilla corpus" {
     const allocator = std.testing.allocator;

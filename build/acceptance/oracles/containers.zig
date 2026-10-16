@@ -53,7 +53,7 @@ fn runLz4(r: *Runner) anyerror!void {
     }, .{ .ctx = true }, abi.Status.integrity_failure, r.output);
 }
 
-fn hcParams(_: *Runner, out: *[steps.MaxExtra]harness.Node) usize {
+fn hcParams(_: *Runner, out: *[steps.max_extra]harness.Node) usize {
     out[0] = harness.paramScalar(harness.param_family_lz4, harness.lz4_search_depth, harness.cmds, 256);
     return 1;
 }

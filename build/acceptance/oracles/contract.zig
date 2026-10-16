@@ -18,9 +18,9 @@ var failures: usize = 0;
 
 fn check(ok_condition: bool, label: []const u8) void {
     if (ok_condition) {
-        std.debug.print("ok {s}\n", .{label});
+        std.debug.print("ok {s}.\n", .{label});
     } else {
-        std.debug.print("FAIL {s}\n", .{label});
+        std.debug.print("fail {s}.\n", .{label});
         failures += 1;
     }
 }
@@ -31,7 +31,7 @@ pub fn main(init: std.process.Init) !void {
 
     var args = std.process.Args.Iterator.init(init.minimal.args);
     _ = args.next();
-    const catalog_path = args.next() orelse return error.MissingArgument;
+    const catalog_path = args.next() orelse return error.missing_argument;
     const text = try std.Io.Dir.cwd().readFileAlloc(init.io, catalog_path, allocator, .limited(1 << 24));
     const catalog = try std.json.parseFromSliceLeaky(Catalog, allocator, text, .{ .ignore_unknown_fields = true });
 
@@ -47,7 +47,6 @@ pub fn main(init: std.process.Init) !void {
         .{ .profile = "lzma_file", .component = "lzma-file" },
         .{ .profile = "lzma2", .component = "lzma2" },
         .{ .profile = "xz", .component = "xz" },
-        .{ .profile = "sevenzip", .component = "sevenzip" },
         .{ .profile = "rar", .component = "rar" },
         .{ .profile = "zlib", .component = "zlib" },
         .{ .profile = "lz4", .component = "lz4" },
@@ -95,5 +94,5 @@ pub fn main(init: std.process.Init) !void {
     check(surface.status_resource_limit == kernel.envelope.Status.resource_limit, "surface resource_limit matches the boundary status");
 
     if (failures != 0) std.process.exit(1);
-    std.debug.print("contract check: all checks passed\n", .{});
+    std.debug.print("contract check: all checks passed.\n", .{});
 }

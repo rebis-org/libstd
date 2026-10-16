@@ -1,10 +1,10 @@
 const std = @import("std");
 
-const failure_prim = @import("../../common/primitive/failure.zig");
+const exception_prim = @import("../../common/primitive/exception.zig");
 const io = @import("../../common/primitive/io.zig");
 const measurement = @import("../../common/primitive/measurement.zig");
 
-const Failure = failure_prim.Failure;
+const Exception = exception_prim.Exception;
 
 pub const order_min = 2;
 pub const order_max = 64;
@@ -61,21 +61,21 @@ pub fn decodeWorkspaceSize(mem_size: u32) usize {
 
 pub const encodeWorkspaceSize = decodeWorkspaceSize;
 
-pub fn requiredSize(input: []const u8, scratch: []u8, options: Options) Failure!usize {
+pub fn requiredSize(input: []const u8, scratch: []u8, options: Options) Exception!usize {
     var counter = measurement.Counter.init(null);
     try encodeToWriter(input, &counter.writer, scratch, options);
     return measurement.measuredLength(&counter);
 }
 
-pub fn encode(input: []const u8, output: []u8, scratch: []u8, options: Options) Failure!usize {
+pub fn encode(input: []const u8, output: []u8, scratch: []u8, options: Options) Exception!usize {
     var writer = std.Io.Writer.fixed(output);
     try encodeToWriter(input, &writer, scratch, options);
     return writer.end;
 }
 
-fn encodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options: Options) Failure!void {
-    const unpack_size = std.math.cast(usize, options.unpack_size) orelse return error.ResourceFailure;
-    if (input.len != unpack_size) return error.CallFailure;
+fn encodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options: Options) Exception!void {
+    const unpack_size = std.math.cast(usize, options.unpack_size) orelse return error.ResourceException;
+    if (input.len != unpack_size) return error.CallException;
     try validateOptions(options, unpack_size);
     const model = try Model.prepare(scratch, options.mem_size);
     model.restart(options.order);
@@ -86,16 +86,16 @@ fn encodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, opti
     try range_coder.flush();
 }
 
-pub fn decodedSize(input: []const u8, scratch: []u8, options: Options) Failure!usize {
+pub fn decodedSize(input: []const u8, scratch: []u8, options: Options) Exception!usize {
     _ = input;
     _ = scratch;
-    if (options.unpack_size > std.math.maxInt(usize)) return error.ResourceFailure;
-    return std.math.cast(usize, options.unpack_size) orelse error.ResourceFailure;
+    if (options.unpack_size > std.math.maxInt(usize)) return error.ResourceException;
+    return std.math.cast(usize, options.unpack_size) orelse error.ResourceException;
 }
 
-pub fn decode(input: []const u8, output: []u8, scratch: []u8, options: Options) Failure!usize {
-    const unpack_size = std.math.cast(usize, options.unpack_size) orelse return error.ResourceFailure;
-    if (output.len < unpack_size) return error.CapacityFailure;
+pub fn decode(input: []const u8, output: []u8, scratch: []u8, options: Options) Exception!usize {
+    const unpack_size = std.math.cast(usize, options.unpack_size) orelse return error.ResourceException;
+    if (output.len < unpack_size) return error.CapacityException;
     try validateOptions(options, unpack_size);
     const model = try Model.prepare(scratch, options.mem_size);
     model.restart(options.order);
@@ -104,16 +104,16 @@ pub fn decode(input: []const u8, output: []u8, scratch: []u8, options: Options) 
     var dest = std.Io.Writer.fixed(output);
     var count: usize = 0;
     while (count < unpack_size) : (count += 1) {
-        const symbol = model.decodeSymbol(&range_coder) catch return error.DataFailure;
+        const symbol = model.decodeSymbol(&range_coder) catch return error.DataException;
         try io.writeByte(&dest, @intCast(symbol));
     }
-    if (range_coder.code != 0) return error.DataFailure;
+    if (range_coder.code != 0) return error.DataException;
     return count;
 }
 
-pub fn decodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options: Options) Failure!void {
-    if (options.unpack_size > std.math.maxInt(usize)) return error.ResourceFailure;
-    const unpack_size = std.math.cast(usize, options.unpack_size) orelse return error.ResourceFailure;
+pub fn decodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options: Options) Exception!void {
+    if (options.unpack_size > std.math.maxInt(usize)) return error.ResourceException;
+    const unpack_size = std.math.cast(usize, options.unpack_size) orelse return error.ResourceException;
     try validateOptions(options, unpack_size);
     const model = try Model.prepare(scratch, options.mem_size);
     model.restart(options.order);
@@ -121,17 +121,17 @@ pub fn decodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, 
     try range_coder.initStream();
     var count: usize = 0;
     while (count < unpack_size) : (count += 1) {
-        const symbol = model.decodeSymbol(&range_coder) catch return error.DataFailure;
+        const symbol = model.decodeSymbol(&range_coder) catch return error.DataException;
         try io.writeByte(writer, @intCast(symbol));
     }
-    if (range_coder.code != 0) return error.DataFailure;
+    if (range_coder.code != 0) return error.DataException;
 }
 
-fn validateOptions(options: Options, unpack_size: usize) Failure!void {
-    if (options.order < order_min or options.order > order_max) return error.UnsupportedFailure;
-    if (options.mem_size < mem_min or options.mem_size > mem_max) return error.UnsupportedFailure;
-    if (options.mem_size & 3 != 0) return error.UnsupportedFailure;
-    if (options.max_work < unpack_size) return error.ResourceFailure;
+fn validateOptions(options: Options, unpack_size: usize) Exception!void {
+    if (options.order < order_min or options.order > order_max) return error.UnsupportedException;
+    if (options.mem_size < mem_min or options.mem_size > mem_max) return error.UnsupportedException;
+    if (options.mem_size & 3 != 0) return error.UnsupportedException;
+    if (options.max_work < unpack_size) return error.ResourceException;
 }
 
 const RangeDecoder = struct {
@@ -145,24 +145,24 @@ const RangeDecoder = struct {
         return .{ .input = input, .pos = 0, .code = 0, .range = 0xFFFFFFFF, .low = 0 };
     }
 
-    fn readByte(self: *RangeDecoder) Failure!u8 {
-        if (self.pos >= self.input.len) return error.DataFailure;
+    fn readByte(self: *RangeDecoder) Exception!u8 {
+        if (self.pos >= self.input.len) return error.DataException;
         const byte = self.input[self.pos];
         self.pos += 1;
         return byte;
     }
 
-    fn initStream(self: *RangeDecoder) Failure!void {
-        if (try self.readByte() != 0) return error.DataFailure;
+    fn initStream(self: *RangeDecoder) Exception!void {
+        if (try self.readByte() != 0) return error.DataException;
         self.code = 0;
         var i: usize = 0;
         while (i < 4) : (i += 1) {
             self.code = (self.code << 8) | try self.readByte();
         }
-        if (self.code >= 0xFFFFFFFF) return error.DataFailure;
+        if (self.code >= 0xFFFFFFFF) return error.DataException;
     }
 
-    fn normalize(self: *RangeDecoder) Failure!void {
+    fn normalize(self: *RangeDecoder) Exception!void {
         while ((self.low ^ (self.low +% self.range)) < top_value) {
             self.code = (self.code << 8) | try self.readByte();
             self.range <<= 8;
@@ -170,18 +170,18 @@ const RangeDecoder = struct {
         }
     }
 
-    fn getThreshold(self: *RangeDecoder, total: u32) Failure!u32 {
+    fn getThreshold(self: *RangeDecoder, total: u32) Exception!u32 {
         self.range = self.range / total;
         return (self.code -% self.low) / self.range;
     }
 
-    fn decodeRange(self: *RangeDecoder, start: u32, size: u32) Failure!void {
+    fn decodeRange(self: *RangeDecoder, start: u32, size: u32) Exception!void {
         self.code -%= start *% self.range;
         self.range *%= size;
         try self.normalize();
     }
 
-    fn decodeBit(self: *RangeDecoder, size0: u32) Failure!u32 {
+    fn decodeBit(self: *RangeDecoder, size0: u32) Exception!u32 {
         const new_bound = (self.range >> bin_shift) * size0;
         if (self.code < new_bound) {
             self.range = new_bound;
@@ -206,11 +206,11 @@ const RangeEncoder = struct {
         return .{ .writer = writer, .low = 0, .range = 0xFFFFFFFF, .cache = 0, .cache_size = 1 };
     }
 
-    fn shiftLow(self: *RangeEncoder) Failure!void {
+    fn shiftLow(self: *RangeEncoder) Exception!void {
         if (@as(u32, @truncate(self.low)) < 0xFF00_0000 or (self.low >> 32) != 0) {
             var temp = self.cache;
             while (true) {
-                self.writer.writeByte(temp +% @as(u8, @truncate(self.low >> 32))) catch return error.CapacityFailure;
+                self.writer.writeByte(temp +% @as(u8, @truncate(self.low >> 32))) catch return error.CapacityException;
                 temp = 0xFF;
                 self.cache_size -= 1;
                 if (self.cache_size == 0) break;
@@ -221,7 +221,7 @@ const RangeEncoder = struct {
         self.low = @as(u32, @truncate(self.low)) << 8;
     }
 
-    fn normalize(self: *RangeEncoder) Failure!void {
+    fn normalize(self: *RangeEncoder) Exception!void {
         if (self.range < top_value) {
             self.range <<= 8;
             try self.shiftLow();
@@ -237,12 +237,12 @@ const RangeEncoder = struct {
         self.range *%= size;
     }
 
-    fn encodeFinal(self: *RangeEncoder, start: u32, size: u32) Failure!void {
+    fn encodeFinal(self: *RangeEncoder, start: u32, size: u32) Exception!void {
         self.encode(start, size);
         try self.normalize();
     }
 
-    fn flush(self: *RangeEncoder) Failure!void {
+    fn flush(self: *RangeEncoder) Exception!void {
         var i: usize = 0;
         while (i < 5) : (i += 1) try self.shiftLow();
     }
@@ -280,12 +280,12 @@ const Model = struct {
     run_length: i32 = 0,
     init_rl: i32 = 0,
 
-    fn prepare(scratch: []u8, mem_size: u32) Failure!*Model {
-        if (scratch.len < decodeWorkspaceSize(mem_size)) return error.CapacityFailure;
+    fn prepare(scratch: []u8, mem_size: u32) Exception!*Model {
+        if (scratch.len < decodeWorkspaceSize(mem_size)) return error.CapacityException;
         const model_addr = std.mem.alignForward(usize, @intFromPtr(scratch.ptr), @alignOf(Model));
         const model: *Model = @ptrFromInt(model_addr);
         const buf_addr = std.mem.alignForward(usize, model_addr + @sizeOf(Model), 4);
-        if (buf_addr + mem_size + unit_size > @intFromPtr(scratch.ptr) + scratch.len) return error.CapacityFailure;
+        if (buf_addr + mem_size + unit_size > @intFromPtr(scratch.ptr) + scratch.len) return error.CapacityException;
         model.construct();
         model.base = @ptrFromInt(buf_addr);
         model.size = mem_size;
@@ -918,7 +918,7 @@ const Model = struct {
         }
     }
 
-    fn decodeSymbol(self: *Model, range_coder: *RangeDecoder) Failure!u32 {
+    fn decodeSymbol(self: *Model, range_coder: *RangeDecoder) Exception!u32 {
         var mask: [256]u8 = undefined;
         var min_ctx = self.ctx(self.min_context);
         if (min_ctx.num_stats != 1) {
@@ -947,7 +947,7 @@ const Model = struct {
                 if (i == 1) break;
                 i -= 1;
             }
-            if (count >= min_ctx.summ_freq) return error.DataFailure;
+            if (count >= min_ctx.summ_freq) return error.DataException;
             self.hi_bits_flag = self.tables.hb2_flag[self.state(self.found_state).symbol];
             try range_coder.decodeRange(hi_cnt, @as(u32, min_ctx.summ_freq) - hi_cnt);
             @memset(&mask, 0xFF);
@@ -979,7 +979,7 @@ const Model = struct {
             const num_masked: u32 = min_ctx.num_stats;
             while (true) {
                 self.order_fall += 1;
-                if (min_ctx.suffix == 0) return error.DataFailure;
+                if (min_ctx.suffix == 0) return error.DataException;
                 self.min_context = min_ctx.suffix;
                 min_ctx = self.ctx(self.min_context);
                 if (min_ctx.num_stats != num_masked) break;
@@ -1017,7 +1017,7 @@ const Model = struct {
                 self.update2();
                 return symbol;
             }
-            if (count >= freq_sum) return error.DataFailure;
+            if (count >= freq_sum) return error.DataException;
             try range_coder.decodeRange(hi_cnt, freq_sum - hi_cnt);
             esc.see.summ = @intCast(esc.see.summ + freq_sum);
             while (i != 0) {
@@ -1027,7 +1027,7 @@ const Model = struct {
         }
     }
 
-    fn encodeSymbol(self: *Model, range_coder: *RangeEncoder, symbol: i32) Failure!void {
+    fn encodeSymbol(self: *Model, range_coder: *RangeEncoder, symbol: i32) Exception!void {
         var mask: [256]u8 = undefined;
         const min_ctx = self.ctx(self.min_context);
         if (min_ctx.num_stats != 1) {

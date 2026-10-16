@@ -21,9 +21,9 @@ pub const crypto = Module{ .name = "crypto", .root = "src/common/primitive/crypt
 pub const library = Module{ .name = "library", .root = "src/root.zig", .imports = &.{.{ .name = "seam", .module = "seam" }}, .crc_kernel = true };
 // Package-manager entry: the same import closure as the
 // library module, rooted at the package door instead of the boundary file.
-pub const pkg = Module{ .name = "libstd", .root = "main.zig", .imports = &.{.{ .name = "seam", .module = "seam" }}, .crc_kernel = true };
+pub const package_entry = Module{ .name = "libstd", .root = "main.zig", .imports = &.{.{ .name = "seam", .module = "seam" }}, .crc_kernel = true };
 pub const manifest = Module{ .name = "manifest", .root = "build/platform/manifest.zig" };
-pub const package = Module{
+pub const package_check = Module{
     .name = "package",
     .root = "build/acceptance/package.zig",
     .imports = &.{
@@ -68,17 +68,17 @@ pub const micro = Module{
     },
 };
 
-const importable = [_]Module{ seam, checksum, crypto, library, manifest, package, abi_exports, harness, run, oracles, interface, implementations, trap, component, benchmark, micro };
+const importable = [_]Module{ seam, checksum, crypto, library, manifest, package_check, abi_exports, harness, run, oracles, interface, implementations, trap, component, benchmark, micro };
 
-fn byName(name: []const u8) Module {
+fn moduleForName(name: []const u8) Module {
     for (importable) |module| {
         if (std.mem.eql(u8, module.name, name)) return module;
     }
     @compileError("unknown module: " ++ name ++ ".");
 }
 
-pub fn create(b: *std.Build, comptime spec: Module, ctx: *const common.Settings) *std.Build.Module {
-    return createFor(b, spec, b.graph.host, .debug, ctx);
+pub fn create(b: *std.Build, comptime module_spec: Module, ctx: *const common.Settings) *std.Build.Module {
+    return createFor(b, module_spec, b.graph.host, .debug, ctx);
 }
 
 pub const Components = struct {
@@ -127,66 +127,53 @@ pub fn withKernelFeatures(target: std.Build.ResolvedTarget) std.Build.ResolvedTa
 
 pub fn createFor(
     b: *std.Build,
-    comptime spec: Module,
+    comptime module_spec: Module,
     target: std.Build.ResolvedTarget,
     optimize: std.lang.Optimize,
     ctx: *const common.Settings,
 ) *std.Build.Module {
     const module = b.createModule(.{
-        .root_source_file = b.path(spec.root),
-        .target = kernelAdjustedTarget(spec, target, ctx.portable),
+        .root_source_file = b.path(module_spec.root),
+        .target = kernelAdjustedTarget(module_spec, target, ctx.portable),
         .optimize = optimize,
     });
-    if (ctx.sanitize_c) |sc| module.sanitize_c = sc;
+    if (ctx.sanitize_c) |sanitize| module.sanitize_c = sanitize;
     module.addImport("options", ctx.options);
-    inline for (spec.imports) |import| {
-        module.addImport(import.name, shared(b, byName(import.module), target, optimize, ctx));
+    inline for (module_spec.imports) |import| {
+        module.addImport(import.name, createShared(b, moduleForName(import.module), target, optimize, ctx));
     }
     return module;
 }
 
-// crc_kernel specs ask for the hardware feature set the optimized paths are
-// built against; portable builds and other architectures stay on the
-// unadjusted target so the software arms remain the only paths.
-pub fn kernelAdjustedTarget(comptime spec: Module, target: std.Build.ResolvedTarget, portable: bool) std.Build.ResolvedTarget {
-    if (!portable and spec.crc_kernel and (target.result.cpu.arch == .aarch64 or target.result.cpu.arch == .x86_64)) {
+// crc_kernel specs ask for the hardware feature set the optimized paths need.
+// Portable builds stay on the unadjusted target with software arms only.
+pub fn kernelAdjustedTarget(comptime module_spec: Module, target: std.Build.ResolvedTarget, portable: bool) std.Build.ResolvedTarget {
+    if (!portable and module_spec.crc_kernel and (target.result.cpu.arch == .aarch64 or target.result.cpu.arch == .x86_64)) {
         return withKernelFeatures(target);
     }
     return target;
 }
 
-// Single-instance import for callers outside this file (the package-manager
-// module in build.zig); see createShared for the dedupe rule.
-pub fn shared(
-    b: *std.Build,
-    comptime spec: Module,
-    target: std.Build.ResolvedTarget,
-    optimize: std.lang.Optimize,
-    ctx: *const common.Settings,
-) *std.Build.Module {
-    return createShared(b, spec, target, optimize, ctx);
-}
-
-// Imported modules must be single instances per (name, target, optimize): the
-// compiler rejects a file rooted in two instances of one module.
+// Imported modules stay single instances per (name, target, optimize).
+// The compiler rejects a file rooted in two instances of one module.
 var shared_modules: ?std.StringHashMap(*std.Build.Module) = null;
 
-fn createShared(
+pub fn createShared(
     b: *std.Build,
-    comptime spec: Module,
+    comptime module_spec: Module,
     target: std.Build.ResolvedTarget,
     optimize: std.lang.Optimize,
     ctx: *const common.Settings,
 ) *std.Build.Module {
     if (shared_modules == null) shared_modules = std.StringHashMap(*std.Build.Module).init(b.allocator);
     const key = b.allocator.print("{s}|{s}|{s}|{d}", .{
-        spec.name,
-        target.result.zigTriple(b.allocator) catch @panic("The shared module key cannot allocate the target triple."),
+        module_spec.name,
+        target.result.zigTriple(b.allocator) catch @panic("the shared module key cannot allocate the target triple."),
         @tagName(optimize),
         @intFromPtr(ctx.options),
-    }) catch @panic("The shared module key is out of memory.");
+    }) catch @panic("the shared module key is out of memory.");
     if (shared_modules.?.get(key)) |module| return module;
-    const module = createFor(b, spec, target, optimize, ctx);
-    shared_modules.?.put(key, module) catch @panic("The shared module registry is out of memory.");
+    const module = createFor(b, module_spec, target, optimize, ctx);
+    shared_modules.?.put(key, module) catch @panic("the shared module registry is out of memory.");
     return module;
 }

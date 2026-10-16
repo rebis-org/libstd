@@ -1,9 +1,10 @@
 const std = @import("std");
 
 const bounds = @import("../../common/primitive/bounds.zig");
-const failure_prim = @import("../../common/primitive/failure.zig");
+const exception_prim = @import("../../common/primitive/exception.zig");
+const io = @import("../../common/primitive/io.zig");
 
-const Failure = failure_prim.Failure;
+const Exception = exception_prim.Exception;
 
 pub const scratch_size: usize = 256;
 
@@ -52,36 +53,37 @@ fn nameZ(entry: Entry) usize {
     return entry.name.len + 1;
 }
 
-pub fn archiveSize(entries: []const Entry) Failure!u64 {
+pub fn archiveSize(entries: []const Entry) Exception!u64 {
     return archiveSizeWith(.newc, entries);
 }
 
-pub fn archiveSizeOdc(entries: []const Entry) Failure!u64 {
+pub fn archiveSizeOdc(entries: []const Entry) Exception!u64 {
     return archiveSizeWith(.odc, entries);
 }
 
-fn archiveSizeWith(comptime format: Format, entries: []const Entry) Failure!u64 {
+fn archiveSizeWith(comptime format: Format, entries: []const Entry) Exception!u64 {
     var total: u64 = 0;
     for (entries) |entry| {
         try validateEntry(entry);
         const header_size: u64 = switch (format) {
             .newc, .crc => 110,
             .odc => 76,
-            else => return error.UnsupportedFailure,
+            else => return error.UnsupportedException,
         };
         total = try bounds.addU64(total, header_size);
-        total = try bounds.addU64(total, switch (format) {
-            .newc, .crc => alignUp(nameZ(entry), 4),
+        const name_padded = switch (format) {
+            .newc, .crc => try alignUp(nameZ(entry), 4),
             .odc => nameZ(entry),
             else => unreachable,
-        });
-        total = try bounds.addU64(total, switch (format) {
-            .newc, .crc => alignUp(entry.data.len, 4),
+        };
+        total = try bounds.addU64(total, name_padded);
+        const data_padded = switch (format) {
+            .newc, .crc => try alignUp(entry.data.len, 4),
             .odc => entry.data.len,
             else => unreachable,
-        });
+        };
+        total = try bounds.addU64(total, data_padded);
     }
-    // The trailer entry and the block padding behind it.
     total = try bounds.addU64(total, switch (format) {
         .newc, .crc => 112,
         .odc => 78,
@@ -91,27 +93,27 @@ fn archiveSizeWith(comptime format: Format, entries: []const Entry) Failure!u64 
     return total;
 }
 
-fn alignUp(value: usize, alignment: usize) u64 {
+fn alignUp(value: u64, alignment: u64) Exception!u64 {
     const rem = value % alignment;
-    return if (rem == 0) value else value + (alignment - rem);
+    return if (rem == 0) value else bounds.addU64(value, alignment - rem);
 }
 
-fn validateEntry(entry: Entry) Failure!void {
-    if (entry.name.len == 0 or entry.name.len > 0xFFFF) return error.CallFailure;
-    if (std.mem.eql(u8, entry.name, trailer_name)) return error.CallFailure;
-    if (bounds.isAbsoluteOrTraversal(entry.name) or std.mem.findScalar(u8, entry.name, 0) != null) return error.CallFailure;
+fn validateEntry(entry: Entry) Exception!void {
+    if (entry.name.len == 0 or entry.name.len > 0xFFFF) return error.CallException;
+    if (std.mem.eql(u8, entry.name, trailer_name)) return error.CallException;
+    if (bounds.isAbsoluteOrTraversal(entry.name) or std.mem.findScalar(u8, entry.name, 0) != null) return error.CallException;
 }
 
-pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Failure!usize {
+pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Exception!usize {
     return encodeWith(.newc, entries, output, scratch);
 }
 
-pub fn encodeOdc(entries: []const Entry, output: []u8, scratch: []u8) Failure!usize {
+pub fn encodeOdc(entries: []const Entry, output: []u8, scratch: []u8) Exception!usize {
     return encodeWith(.odc, entries, output, scratch);
 }
 
-fn encodeWith(comptime format: Format, entries: []const Entry, output: []u8, scratch: []u8) Failure!usize {
-    if (scratch.len < scratch_size) return error.CapacityFailure;
+fn encodeWith(comptime format: Format, entries: []const Entry, output: []u8, scratch: []u8) Exception!usize {
+    if (scratch.len < scratch_size) return error.CapacityException;
     var sink = io.Sink{ .bytes = output };
     for (entries, 0..) |entry, index| {
         try validateEntry(entry);
@@ -119,7 +121,7 @@ fn encodeWith(comptime format: Format, entries: []const Entry, output: []u8, scr
         switch (format) {
             .newc => try writeNewcHeader(&sink, entry, ino, "070701", 0),
             .odc => try writeOdcHeader(&sink, entry, ino),
-            else => return error.UnsupportedFailure,
+            else => return error.UnsupportedException,
         }
         try sink.write(entry.name);
         try sink.write("\x00");
@@ -127,7 +129,7 @@ fn encodeWith(comptime format: Format, entries: []const Entry, output: []u8, scr
         try sink.write(entry.data);
         if (format != .odc) try writePad(&sink, sink.offset, 4);
     }
-    // Trailer: zero sizes, then pad the archive to a 512 multiple for newc.
+    // Newc archives close on a 512 multiple.
     switch (format) {
         .newc => {
             const zero = Entry{ .name = trailer_name, .data = &.{} };
@@ -143,19 +145,19 @@ fn encodeWith(comptime format: Format, entries: []const Entry, output: []u8, scr
             try sink.write(trailer_name);
             try sink.write("\x00");
         },
-        else => return error.UnsupportedFailure,
+        else => return error.UnsupportedException,
     }
     return sink.offset;
 }
 
-fn writePad(sink: *io.Sink, offset: u64, alignment: u64) Failure!void {
+fn writePad(sink: *io.Sink, offset: u64, alignment: u64) Exception!void {
     const rem = offset % alignment;
     if (rem == 0) return;
     const zeros: [512]u8 = @splat(0);
-    sink.write(zeros[0 .. alignment - rem]) catch return error.CapacityFailure;
+    sink.write(zeros[0 .. alignment - rem]) catch return error.CapacityException;
 }
 
-fn writeHex8(sink: *io.Sink, value: u64) Failure!void {
+fn writeHex8(sink: *io.Sink, value: u64) Exception!void {
     var buf: [8]u8 = undefined;
     const digits = "0123456789abcdef";
     var v = value;
@@ -165,10 +167,10 @@ fn writeHex8(sink: *io.Sink, value: u64) Failure!void {
         buf[i] = digits[v & 0xF];
         v >>= 4;
     }
-    sink.write(&buf) catch return error.CapacityFailure;
+    sink.write(&buf) catch return error.CapacityException;
 }
 
-fn writeOctal(sink: *io.Sink, width: usize, value: u64) Failure!void {
+fn writeOctal(sink: *io.Sink, width: usize, value: u64) Exception!void {
     var buf: [11]u8 = @splat(0);
     var v = value;
     var i: usize = width;
@@ -177,12 +179,12 @@ fn writeOctal(sink: *io.Sink, width: usize, value: u64) Failure!void {
         buf[i] = '0' + @as(u8, @truncate(v & 7));
         v >>= 3;
     }
-    if (v != 0) return error.UnsupportedFailure;
-    sink.write(buf[0..width]) catch return error.CapacityFailure;
+    if (v != 0) return error.UnsupportedException;
+    sink.write(buf[0..width]) catch return error.CapacityException;
 }
 
-fn writeNewcHeader(sink: *io.Sink, entry: Entry, ino: u32, comptime magic: []const u8, check: u32) Failure!void {
-    sink.write(magic) catch return error.CapacityFailure;
+fn writeNewcHeader(sink: *io.Sink, entry: Entry, ino: u32, comptime magic: []const u8, check: u32) Exception!void {
+    sink.write(magic) catch return error.CapacityException;
     try writeHex8(sink, ino);
     try writeHex8(sink, entryMode(entry));
     try writeHex8(sink, entry.uid);
@@ -198,8 +200,8 @@ fn writeNewcHeader(sink: *io.Sink, entry: Entry, ino: u32, comptime magic: []con
     try writeHex8(sink, check);
 }
 
-fn writeOdcHeader(sink: *io.Sink, entry: Entry, ino: u32) Failure!void {
-    sink.write("070707") catch return error.CapacityFailure;
+fn writeOdcHeader(sink: *io.Sink, entry: Entry, ino: u32) Exception!void {
+    sink.write("070707") catch return error.CapacityException;
     try writeOctal(sink, 6, 0);
     try writeOctal(sink, 6, ino);
     try writeOctal(sink, 6, entryMode(entry));
@@ -212,32 +214,36 @@ fn writeOdcHeader(sink: *io.Sink, entry: Entry, ino: u32) Failure!void {
     try writeOctal(sink, 11, entry.data.len);
 }
 
-
-fn parseOctal(field: []const u8) Failure!u64 {
-    if (field.len == 0) return error.DataFailure;
+fn parseDigits(field: []const u8, comptime base: u64, to_digit: *const fn (u8) Exception!u64) Exception!u64 {
+    if (field.len == 0) return error.DataException;
     var value: u64 = 0;
     for (field) |byte| {
-        if (byte < '0' or byte > '7') return error.DataFailure;
-        value = std.math.mul(u64, value, 8) catch return error.DataFailure;
-        value = std.math.add(u64, value, byte - '0') catch return error.DataFailure;
+        value = std.math.mul(u64, value, base) catch return error.DataException;
+        value = std.math.add(u64, value, try to_digit(byte)) catch return error.DataException;
     }
     return value;
 }
 
-fn parseHex(field: []const u8) Failure!u64 {
-    if (field.len == 0) return error.DataFailure;
-    var value: u64 = 0;
-    for (field) |byte| {
-        const digit: u64 = switch (byte) {
-            '0'...'9' => byte - '0',
-            'a'...'f' => byte - 'a' + 10,
-            'A'...'F' => byte - 'A' + 10,
-            else => return error.DataFailure,
-        };
-        value = std.math.mul(u64, value, 16) catch return error.DataFailure;
-        value = std.math.add(u64, value, digit) catch return error.DataFailure;
-    }
-    return value;
+fn octDigit(byte: u8) Exception!u64 {
+    if (byte < '0' or byte > '7') return error.DataException;
+    return byte - '0';
+}
+
+fn hexDigit(byte: u8) Exception!u64 {
+    return switch (byte) {
+        '0'...'9' => byte - '0',
+        'a'...'f' => byte - 'a' + 10,
+        'A'...'F' => byte - 'A' + 10,
+        else => return error.DataException,
+    };
+}
+
+fn parseOctal(field: []const u8) Exception!u64 {
+    return parseDigits(field, 8, octDigit);
+}
+
+fn parseHex(field: []const u8) Exception!u64 {
+    return parseDigits(field, 16, hexDigit);
 }
 
 fn readU16(data: []const u8, offset: usize, big: bool) u32 {
@@ -255,10 +261,10 @@ const Reader = struct {
     offset: u64 = 0,
     ordinal: u64 = 0,
 
-    fn parseHeader(self: *Reader) Failure!?EntryInfo {
+    fn parseHeader(self: *Reader) Exception!?EntryInfo {
         if (self.offset >= self.archive.len) return null;
         const rest = self.archive[@intCast(self.offset)..];
-        if (rest.len < 2) return error.DataFailure;
+        if (rest.len < 2) return error.DataException;
         var info: EntryInfo = undefined;
         info.header_offset = self.offset;
         var namesize: u64 = 0;
@@ -266,7 +272,7 @@ const Reader = struct {
         var name_align: u64 = 2;
         var data_align: u64 = 2;
         if (rest.len >= 6 and std.mem.eql(u8, rest[0..6], "070707")) {
-            if (rest.len < 76) return error.DataFailure;
+            if (rest.len < 76) return error.DataException;
             info.format = .odc;
             info.mode = @intCast(try parseOctal(rest[18..24]));
             // PWB archives leave inode bits in the type field.
@@ -285,7 +291,7 @@ const Reader = struct {
             data_align = 1;
             self.offset = try bounds.addU64(self.offset, 76);
         } else if (rest.len >= 6 and (std.mem.eql(u8, rest[0..6], "070701") or std.mem.eql(u8, rest[0..6], "070702"))) {
-            if (rest.len < 110) return error.DataFailure;
+            if (rest.len < 110) return error.DataException;
             info.format = if (rest[5] == '2') .crc else .newc;
             info.ino = @intCast(try parseHex(rest[6..14]));
             info.mode = @intCast(try parseHex(rest[14..22]));
@@ -305,13 +311,13 @@ const Reader = struct {
                 const data = try bounds.slice(self.archive, self.offset, data_size);
                 var sum: u64 = 0;
                 for (data) |byte| sum += byte;
-                if ((sum & 0xFFFFFFFF) != check) return error.DataFailure;
+                if ((sum & 0xFFFFFFFF) != check) return error.DataException;
             }
         } else {
             const le = readU16(rest, 0, false);
             const be = readU16(rest, 0, true);
-            const big = if (be == 0o070707) true else if (le == 0o070707) false else return error.DataFailure;
-            if (rest.len < 26) return error.DataFailure;
+            const big = if (be == 0o070707) true else if (le == 0o070707) false else return error.DataException;
+            if (rest.len < 26) return error.DataException;
             info.format = if (big) .bin_be else .bin_le;
             info.ino = readU16(rest, 4, big);
             info.mode = readU16(rest, 6, big) & 0o67777;
@@ -326,35 +332,27 @@ const Reader = struct {
             data_size = readU32(rest, 22, big);
             self.offset = try bounds.addU64(self.offset, 26);
         }
-        if (namesize == 0) return error.DataFailure;
-        const name_end = try bounds.addU64(self.offset, namesize - 1);
-        const name_padded = try alignForward(name_end, name_align);
-        const data_start = try alignForward(self.offset + namesize, name_align);
+        if (namesize == 0) return error.DataException;
+        const data_start = try alignUp(try bounds.addU64(self.offset, namesize), name_align);
         const name = try bounds.slice(self.archive, self.offset, namesize - 1);
-        if (std.mem.findScalar(u8, name, 0) != null) return error.DataFailure;
+        if (std.mem.findScalar(u8, name, 0) != null) return error.DataException;
         info.name = name;
         info.size = data_size;
         info.data_offset = data_start;
-        const data_end = try alignForward(try bounds.addU64(data_start, data_size), data_align);
-        if (data_end > self.archive.len) return error.DataFailure;
+        const data_end = try alignUp(try bounds.addU64(data_start, data_size), data_align);
+        if (data_end > self.archive.len) return error.DataException;
         info.ordinal = self.ordinal;
         self.ordinal = try bounds.addU64(self.ordinal, 1);
         self.offset = data_end;
-        _ = name_padded;
         if (std.mem.eql(u8, name, trailer_name)) {
-            if (data_size != 0) return error.DataFailure;
+            if (data_size != 0) return error.DataException;
             return null;
         }
         return info;
     }
-
-    fn alignForward(value: u64, alignment: u64) Failure!u64 {
-        const rem = value % alignment;
-        return if (rem == 0) value else bounds.addU64(value, alignment - rem);
-    }
 };
 
-pub fn inspectCount(archive: []const u8) Failure!u64 {
+pub fn inspectCount(archive: []const u8) Exception!u64 {
     var reader = Reader{ .archive = archive };
     var count: u64 = 0;
     while (try reader.parseHeader()) |info| {
@@ -364,24 +362,22 @@ pub fn inspectCount(archive: []const u8) Failure!u64 {
     return count;
 }
 
-pub fn inspectOrdinal(archive: []const u8, ordinal: u64) Failure!EntryInfo {
+pub fn inspectOrdinal(archive: []const u8, ordinal: u64) Exception!EntryInfo {
     var reader = Reader{ .archive = archive };
     while (try reader.parseHeader()) |info| {
         if (info.ordinal == ordinal) return info;
     }
-    return error.DataFailure;
+    return error.DataException;
 }
 
-pub fn decodeOrdinal(archive: []const u8, ordinal: u64, output: []u8) Failure!usize {
+pub fn decodeOrdinal(archive: []const u8, ordinal: u64, output: []u8) Exception!usize {
     const info = try inspectOrdinal(archive, ordinal);
-    const size = std.math.cast(usize, info.size) orelse return error.ResourceFailure;
-    if (output.len < size) return error.CapacityFailure;
+    const size = std.math.cast(usize, info.size) orelse return error.ResourceException;
+    if (output.len < size) return error.CapacityException;
     const data = try bounds.slice(archive, info.data_offset, info.size);
     @memcpy(output[0..size], data);
     return size;
 }
-
-const io = @import("../../common/primitive/io.zig");
 
 test "cpio newc roundtrips entries and metadata" {
     const testing = std.testing;

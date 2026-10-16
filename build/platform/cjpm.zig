@@ -11,24 +11,25 @@ pub fn addArchive(
     distribution: manifest.Distribution,
 ) std.Build.LazyPath {
     const stage = b.addWriteFiles();
-    _ = stage.add("stdk/cjpm.toml", tomlText(b, ctx));
+    _ = stage.add("stdk/cjpm.toml", tomlManifest(b, ctx));
     _ = stage.addCopyFile(b.path("build/templates/cjpm/stdk.cj"), "stdk/src/stdk.cj");
     common.stageHeaderCatalog(stage, ctx, distribution);
     for (slices.ohos_abis) |abi| {
-        const resolved = b.resolveTargetQuery(.{
+        const target = b.resolveTargetQuery(.{
             .cpu_arch = abi.arch,
             .os_tag = .linux,
             .abi = .ohos,
         });
-        const static_library = common.addLibrary(b, resolved, ctx.optimize, .static, ctx);
-        const dynamic_library = common.addLibrary(b, resolved, ctx.optimize, .dynamic, ctx);
-        _ = stage.addCopyFile(static_library.getEmittedBin(), b.fmt("stdk/libs/{s}/libstd.a", .{abi.triple}));
-        _ = stage.addCopyFile(dynamic_library.getEmittedBin(), b.fmt("stdk/libs/{s}/libstd.so", .{abi.triple}));
+        inline for ([_]std.lang.LinkMode{ .static, .dynamic }) |linkage| {
+            const library = common.addLibrary(b, target, ctx.optimize, linkage, ctx);
+            const extension = if (linkage == .static) "a" else "so";
+            _ = stage.addCopyFile(library.getEmittedBin(), b.fmt("stdk/libs/{s}/libstd.{s}", .{ abi.triple, extension }));
+        }
     }
     return common.addZipArchive(b, distribution, stage);
 }
 
-fn tomlText(b: *std.Build, ctx: *const common.Settings) []const u8 {
+fn tomlManifest(b: *std.Build, ctx: *const common.Settings) []const u8 {
     var text: std.ArrayList(u8) = .empty;
     text.appendSlice(b.allocator, b.fmt(
         \\[package]

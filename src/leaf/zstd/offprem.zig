@@ -10,25 +10,25 @@ const onprem = @import("onprem.zig");
 // writer.
 fn mapStreamError(err: std.Io.Reader.StreamError) onprem.DecodeError {
     return switch (err) {
-        error.WriteFailed => error.IoFailure,
-        error.ReadFailed, error.EndOfStream => error.DataFailure,
+        error.WriteFailed => error.IoException,
+        error.ReadFailed, error.EndOfStream => error.DataException,
     };
 }
 
 // The caller's span filling reports the same WriteFailed; the onprem arm
-// answers ResourceFailure, and the arms must agree.
+// answers ResourceException, and the arms must agree.
 fn mapFixedStreamError(err: std.Io.Reader.StreamError) onprem.DecodeError {
     return switch (err) {
-        error.WriteFailed => error.ResourceFailure,
-        error.ReadFailed, error.EndOfStream => error.DataFailure,
+        error.WriteFailed => error.ResourceException,
+        error.ReadFailed, error.EndOfStream => error.DataException,
     };
 }
 
 fn preflight(options: onprem.Options, history: ?[]u8) onprem.DecodeError!void {
-    if (options.dictionary != null) return error.UnsupportedFailure;
-    if (options.window_size < onprem.window_size_min or options.window_size > onprem.window_size_max) return error.UnsupportedFailure;
+    if (options.dictionary != null) return error.UnsupportedException;
+    if (options.window_size < onprem.window_size_min or options.window_size > onprem.window_size_max) return error.UnsupportedException;
     if (history) |buffer| {
-        if (buffer.len < @as(usize, options.window_size) + onprem.block_size_max) return error.UnsupportedFailure;
+        if (buffer.len < @as(usize, options.window_size) + onprem.block_size_max) return error.UnsupportedException;
     }
 }
 
@@ -42,7 +42,7 @@ pub fn decodeInPlace(input: *std.Io.Reader, output: []u8, options: onprem.Option
     // Same precondition the onprem arm states: the span carries the output
     // plus one block of window slack. stdlib zstd's direct mode drives the
     // window from the writer buffer, so no separate history is passed.
-    if (output.len < @as(usize, options.window_size) + onprem.block_size_max) return error.UnsupportedFailure;
+    if (output.len < @as(usize, options.window_size) + onprem.block_size_max) return error.UnsupportedException;
     try preflight(options, null);
     var fixed = std.Io.Writer.fixed(output);
     var decoder = std.compress.zstd.Decompress.init(input, &.{}, .{ .window_len = options.window_size });

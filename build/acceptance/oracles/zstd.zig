@@ -1,7 +1,8 @@
 const std = @import("std");
 
-const abi = @import("abi.zig");
 const ab_variant = @import("ab_variant");
+
+const abi = @import("abi.zig");
 const corpus = @import("corpus.zig");
 const harness = @import("harness.zig");
 const lib = @import("lib.zig");
@@ -9,19 +10,19 @@ const steps = @import("steps.zig");
 
 const Runner = harness.Runner;
 
-fn baseParams(out: *[steps.MaxExtra]harness.Node) usize {
+fn baseParams(out: *[steps.max_extra]harness.Node) usize {
     out[0] = harness.paramScalar(harness.param_family_zstd, harness.zstd_window, harness.cmds, 1 << 22);
     out[1] = harness.paramScalar(harness.param_family_zstd, harness.zstd_hash_bits, harness.cmds, 17);
     return 2;
 }
 
-fn zstdParams(_: *Runner, out: *[steps.MaxExtra]harness.Node) usize {
+fn zstdParams(_: *Runner, out: *[steps.max_extra]harness.Node) usize {
     const count = baseParams(out);
     out[count] = harness.paramScalar(harness.param_family_zstd, harness.zstd_double_hash, harness.cmds, 1);
     return count + 1;
 }
 
-fn zstdRowParams(_: *Runner, out: *[steps.MaxExtra]harness.Node) usize {
+fn zstdRowParams(_: *Runner, out: *[steps.max_extra]harness.Node) usize {
     const count = baseParams(out);
     out[count] = harness.paramScalar(harness.param_family_zstd, harness.zstd_row_match, harness.cmds, 1);
     return count + 1;
@@ -57,7 +58,7 @@ fn abEncodeAndWrite(r: *Runner, comptime params: steps.Params, input: []const u8
     });
 }
 
-fn zstdFastParams(_: *Runner, out: *[steps.MaxExtra]harness.Node) usize {
+fn zstdFastParams(_: *Runner, out: *[steps.max_extra]harness.Node) usize {
     // The true chain parser: dfast stays off (double_hash = 0). The tier
     // dump then reflects the hash-chain walk, not the double-fast shortcut.
     const count = baseParams(out);
@@ -65,25 +66,25 @@ fn zstdFastParams(_: *Runner, out: *[steps.MaxExtra]harness.Node) usize {
     return count + 1;
 }
 
-fn zstdGreedyParams(_: *Runner, out: *[steps.MaxExtra]harness.Node) usize {
+fn zstdGreedyParams(_: *Runner, out: *[steps.max_extra]harness.Node) usize {
     const count = baseParams(out);
     out[count] = harness.paramScalar(harness.param_family_zstd, harness.zstd_strategy, harness.cmds, 1);
     return count + 1;
 }
 
-fn zstdLazy2Params(_: *Runner, out: *[steps.MaxExtra]harness.Node) usize {
+fn zstdLazy2Params(_: *Runner, out: *[steps.max_extra]harness.Node) usize {
     const count = baseParams(out);
     out[count] = harness.paramScalar(harness.param_family_zstd, harness.zstd_strategy, harness.cmds, 2);
     return count + 1;
 }
 
-fn zstdEntropyParams(_: *Runner, out: *[steps.MaxExtra]harness.Node) usize {
+fn zstdEntropyParams(_: *Runner, out: *[steps.max_extra]harness.Node) usize {
     const count = baseParams(out);
     out[count] = harness.paramScalar(harness.param_family_zstd, harness.zstd_entropy, harness.cmds, 1);
     return count + 1;
 }
 
-fn zstdDpParams(_: *Runner, out: *[steps.MaxExtra]harness.Node) usize {
+fn zstdDpParams(_: *Runner, out: *[steps.max_extra]harness.Node) usize {
     const count = baseParams(out);
     out[count] = harness.paramScalar(harness.param_family_zstd, harness.zstd_strategy, harness.cmds, 3);
     return count + 1;
@@ -193,7 +194,9 @@ fn runZstdAbDumps(r: *Runner) !void {
         try abEncodeAndWrite(r, zstdDpParams, nci_slice, "dp_nci.bin");
         try abEncodeAndWrite(r, zstdEntropyParams, nci_slice, "entropy_nci.bin");
         try abEncodeAndWrite(r, zstdEntropyParams, copying, "entropy_text.bin");
-    } else |_| {}
+    } else |_| {
+        // Missing corpus input skips the dumps; the suite still checks the tables.
+    }
 }
 
 fn setupProfile(r: *Runner) void {

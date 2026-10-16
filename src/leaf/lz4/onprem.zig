@@ -3,10 +3,10 @@ const std = @import("std");
 const kernels = @import("../../common/kernels.zig");
 const bounds = @import("../../common/primitive/bounds.zig");
 const checksum = @import("../../common/primitive/checksum.zig");
-const failure_prim = @import("../../common/primitive/failure.zig");
+const exception_prim = @import("../../common/primitive/exception.zig");
 const measurement = @import("../../common/primitive/measurement.zig");
 
-const Failure = failure_prim.Failure;
+const Exception = exception_prim.Exception;
 
 // Frame layout follows the "LZ4 Frame Format Description" spec; the block codec
 // mirrors the reference greedy parser in vendor/lz4.
@@ -72,13 +72,13 @@ fn writeLengthExtension(output: []u8, op: *usize, length: usize) void {
     op.* += 1;
 }
 
-fn blockSizeCode(block_size: u32) Failure!u8 {
+fn blockSizeCode(block_size: u32) Exception!u8 {
     return switch (block_size) {
         64 * 1024 => 4,
         256 * 1024 => 5,
         1024 * 1024 => 6,
         4 * 1024 * 1024 => 7,
-        else => error.CallFailure,
+        else => error.CallException,
     };
 }
 
@@ -105,63 +105,63 @@ fn blockCompressBound(block_len: usize) usize {
     return block_len + block_len / 255 + 16;
 }
 
-pub fn frameContentSize(input: []const u8) Failure!?u64 {
-    if (input.len < 7) return error.DataFailure;
-    if (std.mem.readInt(u32, input[0..4], .little) != magic) return error.DataFailure;
+pub fn frameContentSize(input: []const u8) Exception!?u64 {
+    if (input.len < 7) return error.DataException;
+    if (std.mem.readInt(u32, input[0..4], .little) != magic) return error.DataException;
     const flags = input[4];
     if (flags & flag_content_size == 0) return null;
-    if (input.len < 14) return error.DataFailure;
+    if (input.len < 14) return error.DataException;
     return std.mem.readInt(u64, input[6..14], .little);
 }
 
-pub fn decodedSize(input: []const u8, scratch: []u8, options: Options) Failure!usize {
+pub fn decodedSize(input: []const u8, scratch: []u8, options: Options) Exception!usize {
     var counter = measurement.Counter.init(null);
     return try decodeBlocks(input, &counter.writer, scratch, options.provider, options.max_work);
 }
 
-pub fn requiredSize(input: []const u8, scratch: []u8, options: Options) Failure!usize {
+pub fn requiredSize(input: []const u8, scratch: []u8, options: Options) Exception!usize {
     // Exact encoded size: one counting encode pass, mirroring the measured policy.
     var counter = measurement.Counter.init(null);
     try encodeToWriter(input, &counter.writer, scratch, options);
     return measurement.measuredLength(&counter);
 }
 
-pub fn encode(input: []const u8, output: []u8, scratch: []u8, options: Options) Failure!usize {
+pub fn encode(input: []const u8, output: []u8, scratch: []u8, options: Options) Exception!usize {
     var fixed = std.Io.Writer.fixed(output);
     try encodeToWriter(input, &fixed, scratch, options);
     return fixed.end;
 }
 
-pub fn decode(input: []const u8, output: []u8, scratch: []u8, options: Options) Failure!usize {
+pub fn decode(input: []const u8, output: []u8, scratch: []u8, options: Options) Exception!usize {
     _ = scratch;
     return decodeBlocksInto(input, output, options);
 }
 
-pub fn decodeInPlace(input: []const u8, output: []u8, scratch: []u8, options: Options) Failure!usize {
+pub fn decodeInPlace(input: []const u8, output: []u8, scratch: []u8, options: Options) Exception!usize {
     return decode(input, output, scratch, options);
 }
 
 // A span overrun answers insufficient_capacity: the adapter re-runs the
 // measured route, separating a too-small sink from a corrupt stream.
-fn decodeBlocksInto(input: []const u8, output: []u8, options: Options) Failure!usize {
-    if (input.len < 7) return error.DataFailure;
+fn decodeBlocksInto(input: []const u8, output: []u8, options: Options) Exception!usize {
+    if (input.len < 7) return error.DataException;
     const magic_value = std.mem.readInt(u32, input[0..4], .little);
     // The legacy frame format (pre-1.8): fixed magic, then dependent LZ4
     // blocks with no header fields, checksums, or block-size descriptor.
     if (magic_value >= legacy_magic and magic_value <= legacy_magic + 7)
         return decodeLegacyBlocksInto(input, output, options);
-    if (magic_value != magic) return error.DataFailure;
+    if (magic_value != magic) return error.DataException;
     const flags = input[4];
-    if ((flags & 0xC0) != version_bits) return error.UnsupportedFailure;
+    if ((flags & 0xC0) != version_bits) return error.UnsupportedException;
     const linked = flags & flag_block_independence == 0;
     const block_size_byte = input[5];
     const block_code = (block_size_byte >> 4) & 0x07;
-    if (block_code < 4 or block_code > 7) return error.DataFailure;
+    if (block_code < 4 or block_code > 7) return error.DataException;
     const max_block: usize = @as(usize, 65536) << @intCast(2 * (@as(usize, block_code) - 4));
     var offset: usize = 6;
     var content_size: ?u64 = null;
     if (flags & flag_content_size != 0) {
-        if (input.len < offset + 8) return error.DataFailure;
+        if (input.len < offset + 8) return error.DataException;
         content_size = std.mem.readInt(u64, input[offset..][0..8], .little);
         offset += 8;
     }
@@ -169,60 +169,60 @@ fn decodeBlocksInto(input: []const u8, output: []u8, options: Options) Failure!u
     // reference; without it, matches reaching before the frame start still
     // fail as invalid data below.
     if (flags & flag_dict_id != 0) offset += 4;
-    if (input.len <= offset) return error.DataFailure;
+    if (input.len <= offset) return error.DataException;
     // Header_Checksum: the high byte of xxh32 over FLG..end-of-header.
     const stored_header_sum = input[offset];
-    if (stored_header_sum != @as(u8, @truncate(checksum.xxh32With(options.provider, input[4..offset]) >> 8))) return error.IntegrityFailure;
+    if (stored_header_sum != @as(u8, @truncate(checksum.xxh32With(options.provider, input[4..offset]) >> 8))) return error.IntegrityException;
     offset += 1;
     var content_hasher = checksum.XxHash32.bind(options.provider, 0);
     var total: usize = 0;
     while (true) {
-        if (input.len < offset + 4) return error.DataFailure;
+        if (input.len < offset + 4) return error.DataException;
         const block_size_field = std.mem.readInt(u32, input[offset..][0..4], .little);
         offset += 4;
         if (block_size_field == 0) break;
         const is_stored = (block_size_field & uncompressed_block) != 0;
         const block_len: usize = @intCast(block_size_field & ~uncompressed_block);
-        if (input.len < offset + block_len) return error.DataFailure;
+        if (input.len < offset + block_len) return error.DataException;
         const block_data = input[offset .. offset + block_len];
         offset += block_len;
         if (flags & flag_block_checksum != 0) {
-            if (input.len < offset + 4) return error.DataFailure;
+            if (input.len < offset + 4) return error.DataException;
             const stored_sum = std.mem.readInt(u32, input[offset..][0..4], .little);
-            if (stored_sum != checksum.xxh32With(options.provider, block_data)) return error.IntegrityFailure;
+            if (stored_sum != checksum.xxh32With(options.provider, block_data)) return error.IntegrityException;
             offset += 4;
         }
         const room = output.len - total;
         const prefix_len = if (linked) @min(total, window_size) else 0;
         const prefix = output[total - prefix_len .. total];
         if (is_stored) {
-            if (block_len > max_block) return error.DataFailure;
-            if (block_len > room) return error.CapacityFailure;
+            if (block_len > max_block) return error.DataException;
+            if (block_len > room) return error.CapacityException;
             @memcpy(output[total..][0..block_len], block_data);
             content_hasher.update(block_data);
             total += block_len;
         } else {
             // The Block_Size field is bounded by Block_MaxSize whether the
             // block is stored or compressed, as in the reference.
-            if (block_len > max_block) return error.DataFailure;
+            if (block_len > max_block) return error.DataException;
             const produced = decompressBlock(block_data, output[total..], prefix) catch |err| return switch (err) {
-                error.DataFailure => error.DataFailure,
-                error.OutputTooSmall => error.CapacityFailure,
+                error.DataException => error.DataException,
+                error.OutputTooSmall => error.CapacityException,
             };
             content_hasher.update(output[total .. total + produced]);
             total += produced;
         }
-        if (try bounds.addUsize(input.len, total) > options.max_work) return error.ResourceFailure;
+        if (try bounds.addUsize(input.len, total) > options.max_work) return error.ResourceException;
     }
     if (flags & flag_content_checksum != 0) {
-        if (input.len < offset + 4) return error.DataFailure;
+        if (input.len < offset + 4) return error.DataException;
         const stored_sum = std.mem.readInt(u32, input[offset..][0..4], .little);
-        if (stored_sum != content_hasher.final()) return error.IntegrityFailure;
+        if (stored_sum != content_hasher.final()) return error.IntegrityException;
         offset += 4;
     }
-    if (offset != input.len) return error.DataFailure;
+    if (offset != input.len) return error.DataException;
     if (content_size) |expected| {
-        if (expected != total) return error.IntegrityFailure;
+        if (expected != total) return error.IntegrityException;
     }
     return total;
 }
@@ -230,49 +230,49 @@ fn decodeBlocksInto(input: []const u8, output: []u8, options: Options) Failure!u
 // Legacy frames (pre-1.8 interop): dependent raw LZ4 blocks, no BD byte, no
 // checksums, end marked by a zero size. Decode-only, as the modern encoder
 // never produces them.
-fn decodeLegacyBlocksInto(input: []const u8, output: []u8, options: Options) Failure!usize {
+fn decodeLegacyBlocksInto(input: []const u8, output: []u8, options: Options) Exception!usize {
     var offset: usize = 4;
     var total: usize = 0;
     while (true) {
-        if (input.len < offset + 4) return error.DataFailure;
+        if (input.len < offset + 4) return error.DataException;
         const block_len: usize = std.mem.readInt(u32, input[offset..][0..4], .little);
         offset += 4;
         if (block_len == 0) break;
-        if (input.len < offset + block_len) return error.DataFailure;
+        if (input.len < offset + block_len) return error.DataException;
         const block_data = input[offset .. offset + block_len];
         offset += block_len;
         const prefix_len = @min(total, window_size);
         const produced = decompressBlock(block_data, output[total..], output[total - prefix_len .. total]) catch |err| return switch (err) {
-            error.DataFailure => error.DataFailure,
-            error.OutputTooSmall => error.CapacityFailure,
+            error.DataException => error.DataException,
+            error.OutputTooSmall => error.CapacityException,
         };
         total += produced;
-        if (try bounds.addUsize(input.len, total) > options.max_work) return error.ResourceFailure;
+        if (try bounds.addUsize(input.len, total) > options.max_work) return error.ResourceException;
     }
-    if (offset != input.len) return error.DataFailure;
+    if (offset != input.len) return error.DataException;
     return total;
 }
 
-pub fn encodeToWriter(input: []const u8, output: *std.Io.Writer, scratch: []u8, options: Options) Failure!void {
-    if (scratch.len < encodeWorkspaceSize()) return error.CapacityFailure;
+pub fn encodeToWriter(input: []const u8, output: *std.Io.Writer, scratch: []u8, options: Options) Exception!void {
+    if (scratch.len < encodeWorkspaceSize()) return error.CapacityException;
     const block_size_byte = try blockSizeCode(options.block_size) << 4;
     var acceleration = options.acceleration;
     if (acceleration < 1) acceleration = 1;
-    output.writeInt(u32, magic, .little) catch return error.IoFailure;
+    output.writeInt(u32, magic, .little) catch return error.IoException;
     var flags: u8 = version_bits | flag_block_independence;
     if (options.block_checksum) flags |= flag_block_checksum;
     flags |= flag_content_size;
     if (options.content_checksum) flags |= flag_content_checksum;
     var header_hasher = checksum.XxHash32.bind(options.provider, 0);
-    output.writeByte(flags) catch return error.IoFailure;
+    output.writeByte(flags) catch return error.IoException;
     header_hasher.update(&.{flags});
-    output.writeByte(block_size_byte) catch return error.IoFailure;
+    output.writeByte(block_size_byte) catch return error.IoException;
     header_hasher.update(&.{block_size_byte});
     var size_bytes: [8]u8 = undefined;
     std.mem.writeInt(u64, &size_bytes, input.len, .little);
-    output.writeAll(&size_bytes) catch return error.IoFailure;
+    output.writeAll(&size_bytes) catch return error.IoException;
     header_hasher.update(&size_bytes);
-    output.writeByte(@truncate(header_hasher.final() >> 8)) catch return error.IoFailure;
+    output.writeByte(@truncate(header_hasher.final() >> 8)) catch return error.IoException;
     const hash_table: []u32 = @alignCast(std.mem.bytesAsSlice(u32, scratch[0 .. hash_size * @sizeOf(u32)]));
     const hc_tables: []u32 = @alignCast(std.mem.bytesAsSlice(u32, scratch[hash_size * @sizeOf(u32) .. (hash_size + 2 * hc_hash_size) * @sizeOf(u32)]));
     const block_buffer = scratch[(hash_size + 2 * hc_hash_size) * @sizeOf(u32) ..];
@@ -285,44 +285,44 @@ pub fn encodeToWriter(input: []const u8, output: *std.Io.Writer, scratch: []u8, 
         else
             compressBlockHc(block, block_buffer, hc_tables[0..hc_hash_size], hc_tables[hc_hash_size..], options.search_depth);
         if (compressed_len >= block_len) {
-            output.writeInt(u32, uncompressed_block | (std.math.cast(u32, block_len) orelse return error.ResourceFailure), .little) catch return error.IoFailure;
-            output.writeAll(block) catch return error.IoFailure;
-            if (options.block_checksum) output.writeInt(u32, checksum.xxh32With(options.provider, block), .little) catch return error.IoFailure;
+            output.writeInt(u32, uncompressed_block | (std.math.cast(u32, block_len) orelse return error.ResourceException), .little) catch return error.IoException;
+            output.writeAll(block) catch return error.IoException;
+            if (options.block_checksum) output.writeInt(u32, checksum.xxh32With(options.provider, block), .little) catch return error.IoException;
         } else {
-            output.writeInt(u32, std.math.cast(u32, compressed_len) orelse return error.ResourceFailure, .little) catch return error.IoFailure;
-            output.writeAll(block_buffer[0..compressed_len]) catch return error.IoFailure;
-            if (options.block_checksum) output.writeInt(u32, checksum.xxh32With(options.provider, block_buffer[0..compressed_len]), .little) catch return error.IoFailure;
+            output.writeInt(u32, std.math.cast(u32, compressed_len) orelse return error.ResourceException, .little) catch return error.IoException;
+            output.writeAll(block_buffer[0..compressed_len]) catch return error.IoException;
+            if (options.block_checksum) output.writeInt(u32, checksum.xxh32With(options.provider, block_buffer[0..compressed_len]), .little) catch return error.IoException;
         }
         offset += block_len;
     }
     if (input.len == 0) {
         // One empty block (single zero token) keeps the block stream well-formed.
-        output.writeInt(u32, 1, .little) catch return error.IoFailure;
-        output.writeByte(0) catch return error.IoFailure;
+        output.writeInt(u32, 1, .little) catch return error.IoException;
+        output.writeByte(0) catch return error.IoException;
     }
-    output.writeInt(u32, 0, .little) catch return error.IoFailure;
-    if (options.content_checksum) output.writeInt(u32, checksum.xxh32With(options.provider, input), .little) catch return error.IoFailure;
+    output.writeInt(u32, 0, .little) catch return error.IoException;
+    if (options.content_checksum) output.writeInt(u32, checksum.xxh32With(options.provider, input), .little) catch return error.IoException;
 }
 
-pub fn decodeToWriter(input: []const u8, output: *std.Io.Writer, scratch: []u8, options: Options) Failure!void {
+pub fn decodeToWriter(input: []const u8, output: *std.Io.Writer, scratch: []u8, options: Options) Exception!void {
     _ = try decodeBlocks(input, output, scratch, options.provider, options.max_work);
 }
 
-fn decodeBlocks(input: []const u8, output: *std.Io.Writer, scratch: []u8, provider: checksum.Provider, max_work: u64) Failure!usize {
-    if (scratch.len < decodeWorkspaceSize()) return error.CapacityFailure;
-    if (input.len < 7) return error.DataFailure;
-    if (std.mem.readInt(u32, input[0..4], .little) != magic) return error.DataFailure;
+fn decodeBlocks(input: []const u8, output: *std.Io.Writer, scratch: []u8, provider: checksum.Provider, max_work: u64) Exception!usize {
+    if (scratch.len < decodeWorkspaceSize()) return error.CapacityException;
+    if (input.len < 7) return error.DataException;
+    if (std.mem.readInt(u32, input[0..4], .little) != magic) return error.DataException;
     const flags = input[4];
-    if ((flags & 0xC0) != version_bits) return error.UnsupportedFailure;
+    if ((flags & 0xC0) != version_bits) return error.UnsupportedException;
     const linked = flags & flag_block_independence == 0;
     const block_size_byte = input[5];
     const block_code = (block_size_byte >> 4) & 0x07;
-    if (block_code < 4 or block_code > 7) return error.DataFailure;
+    if (block_code < 4 or block_code > 7) return error.DataException;
     const max_block: usize = @as(usize, 65536) << @intCast(2 * (@as(usize, block_code) - 4));
     var offset: usize = 6;
     var content_size: ?u64 = null;
     if (flags & flag_content_size != 0) {
-        if (input.len < offset + 8) return error.DataFailure;
+        if (input.len < offset + 8) return error.DataException;
         content_size = std.mem.readInt(u64, input[offset..][0..8], .little);
         offset += 8;
     }
@@ -330,10 +330,10 @@ fn decodeBlocks(input: []const u8, output: *std.Io.Writer, scratch: []u8, provid
     // reference; without it, matches reaching before the frame start still
     // fail as invalid data in the block decode.
     if (flags & flag_dict_id != 0) offset += 4;
-    if (input.len <= offset) return error.DataFailure;
+    if (input.len <= offset) return error.DataException;
     // Header_Checksum: the high byte of xxh32 over FLG..end-of-header.
     const stored_header_sum = input[offset];
-    if (stored_header_sum != @as(u8, @truncate(checksum.xxh32With(provider, input[4..offset]) >> 8))) return error.IntegrityFailure;
+    if (stored_header_sum != @as(u8, @truncate(checksum.xxh32With(provider, input[4..offset]) >> 8))) return error.IntegrityException;
     offset += 1;
     var content_hasher = checksum.XxHash32.bind(provider, 0);
     const block_buffer = scratch[0..max_block];
@@ -341,38 +341,38 @@ fn decodeBlocks(input: []const u8, output: *std.Io.Writer, scratch: []u8, provid
     var history_len: usize = 0;
     var total: usize = 0;
     while (true) {
-        if (input.len < offset + 4) return error.DataFailure;
+        if (input.len < offset + 4) return error.DataException;
         const block_size_field = std.mem.readInt(u32, input[offset..][0..4], .little);
         offset += 4;
         if (block_size_field == 0) break;
         const is_stored = (block_size_field & uncompressed_block) != 0;
         const block_len: usize = @intCast(block_size_field & ~uncompressed_block);
-        if (input.len < offset + block_len) return error.DataFailure;
+        if (input.len < offset + block_len) return error.DataException;
         const block_data = input[offset .. offset + block_len];
         offset += block_len;
         if (flags & flag_block_checksum != 0) {
-            if (input.len < offset + 4) return error.DataFailure;
+            if (input.len < offset + 4) return error.DataException;
             const stored_sum = std.mem.readInt(u32, input[offset..][0..4], .little);
-            if (stored_sum != checksum.xxh32With(provider, block_data)) return error.IntegrityFailure;
+            if (stored_sum != checksum.xxh32With(provider, block_data)) return error.IntegrityException;
             offset += 4;
         }
         const produced: usize = blk: {
             if (is_stored) {
-                if (block_len > max_block) return error.DataFailure;
-                output.writeAll(block_data) catch return error.IoFailure;
+                if (block_len > max_block) return error.DataException;
+                output.writeAll(block_data) catch return error.IoException;
                 content_hasher.update(block_data);
                 break :blk block_len;
             }
             // The Block_Size field is bounded by Block_MaxSize whether the
             // block is stored or compressed, as in the reference.
-            if (block_len > max_block) return error.DataFailure;
-            const decoded = decompressBlock(block_data, block_buffer, history[0..history_len]) catch return error.DataFailure;
-            output.writeAll(block_buffer[0..decoded]) catch return error.IoFailure;
+            if (block_len > max_block) return error.DataException;
+            const decoded = decompressBlock(block_data, block_buffer, history[0..history_len]) catch return error.DataException;
+            output.writeAll(block_buffer[0..decoded]) catch return error.IoException;
             content_hasher.update(block_buffer[0..decoded]);
             break :blk decoded;
         };
         total = try bounds.addUsize(total, produced);
-        if (try bounds.addUsize(input.len, total) > max_work) return error.ResourceFailure;
+        if (try bounds.addUsize(input.len, total) > max_work) return error.ResourceException;
         if (linked) {
             const produced_bytes = if (is_stored) block_data else block_buffer[0..produced];
             if (produced_bytes.len >= window_size) {
@@ -387,14 +387,14 @@ fn decodeBlocks(input: []const u8, output: *std.Io.Writer, scratch: []u8, provid
         }
     }
     if (flags & flag_content_checksum != 0) {
-        if (input.len < offset + 4) return error.DataFailure;
+        if (input.len < offset + 4) return error.DataException;
         const stored_sum = std.mem.readInt(u32, input[offset..][0..4], .little);
-        if (stored_sum != content_hasher.final()) return error.IntegrityFailure;
+        if (stored_sum != content_hasher.final()) return error.IntegrityException;
         offset += 4;
     }
-    if (offset != input.len) return error.DataFailure;
+    if (offset != input.len) return error.DataException;
     if (content_size) |expected| {
-        if (expected != total) return error.IntegrityFailure;
+        if (expected != total) return error.IntegrityException;
     }
     return total;
 }
@@ -612,25 +612,25 @@ fn emitLastLiterals(literals: []const u8, output: []u8, op_start: usize) usize {
 // frame); matches may reach into it when the frame links blocks.
 // Exposed for the session boundary's stepped decode: decodes one block with
 // `prefix` as up-to-64 KiB of linked-block history.
-pub fn decompressBlock(input: []const u8, output: []u8, prefix: []const u8) error{ DataFailure, OutputTooSmall }!usize {
+pub fn decompressBlock(input: []const u8, output: []u8, prefix: []const u8) error{ DataException, OutputTooSmall }!usize {
     var ip: usize = 0;
     var op: usize = 0;
     while (true) {
-        if (ip >= input.len) return error.DataFailure;
+        if (ip >= input.len) return error.DataException;
         const token = input[ip];
         ip += 1;
         var lit_len: usize = token >> 4;
         if (lit_len == lit_len_mask) {
             while (true) {
-                if (ip >= input.len) return error.DataFailure;
+                if (ip >= input.len) return error.DataException;
                 const value = input[ip];
                 ip += 1;
-                if (value != 255 and lit_len > std.math.maxInt(usize) - 510) return error.DataFailure;
+                if (value != 255 and lit_len > std.math.maxInt(usize) - 510) return error.DataException;
                 lit_len += value;
                 if (value != 255) break;
             }
         }
-        if (input.len - ip < lit_len) return error.DataFailure;
+        if (input.len - ip < lit_len) return error.DataException;
         if (output.len - op < lit_len) return error.OutputTooSmall;
         if (lit_len <= 16 and input.len - ip >= 16 and output.len - op >= 16) {
             // Short literal runs dominate, so the reference copies 16 bytes unconditionally
@@ -642,28 +642,28 @@ pub fn decompressBlock(input: []const u8, output: []u8, prefix: []const u8) erro
         op += lit_len;
         ip += lit_len;
         if (ip == input.len) break;
-        if (input.len - ip < 2) return error.DataFailure;
+        if (input.len - ip < 2) return error.DataException;
         const offset = std.mem.readInt(u16, input[ip..][0..2], .little);
         ip += 2;
         var match_len: usize = (token & 0x0f) + min_match;
         if ((token & 0x0f) == match_len_mask) {
             while (true) {
-                if (ip >= input.len) return error.DataFailure;
+                if (ip >= input.len) return error.DataException;
                 const value = input[ip];
                 ip += 1;
-                if (value != 255 and match_len > std.math.maxInt(usize) - 510) return error.DataFailure;
+                if (value != 255 and match_len > std.math.maxInt(usize) - 510) return error.DataException;
                 match_len += value;
                 if (value != 255) break;
             }
         }
         if (output.len - op < match_len) return error.OutputTooSmall;
-        if (offset == 0) return error.DataFailure;
+        if (offset == 0) return error.DataException;
         if (offset <= op) {
-            kernels.copyMatch(output, op, offset, std.math.cast(u32, match_len) orelse return error.DataFailure);
+            kernels.copyMatch(output, op, offset, std.math.cast(u32, match_len) orelse return error.DataException);
         } else {
             // The match reaches before this block into the linked history.
             const reach = offset - op;
-            if (reach > prefix.len) return error.DataFailure;
+            if (reach > prefix.len) return error.DataException;
             var src_pos: usize = prefix.len - reach;
             var remaining = match_len;
             var dst = op;
@@ -747,7 +747,7 @@ test "lz4 corrupt blocks rejected" {
     const input = "abcabcabcabcabcabcabcabcabcabc";
     const encoded_len = try encode(input, &encoded, scratch, .{});
     var output: [64]u8 = undefined;
-    try std.testing.expectError(error.DataFailure, decode(encoded[0 .. encoded_len - 3], &output, scratch, .{}));
+    try std.testing.expectError(error.DataException, decode(encoded[0 .. encoded_len - 3], &output, scratch, .{}));
     encoded[19] ^= 0xff;
     const result = decode(encoded[0..encoded_len], &output, scratch, .{});
     if (result) |produced| {
@@ -755,7 +755,7 @@ test "lz4 corrupt blocks rejected" {
     } else |err| {
         // A corrupted block either fails its input-side checks or overruns the span,
         // which the leaf reports as insufficient_capacity and the adapter resolves.
-        try std.testing.expect(err == error.DataFailure or err == error.IntegrityFailure or err == error.CapacityFailure);
+        try std.testing.expect(err == error.DataException or err == error.IntegrityException or err == error.CapacityException);
     }
 }
 
@@ -842,13 +842,13 @@ test "lz4 frame verifies content size and header checksum" {
     var bad_size = try allocator.dupe(u8, encoded[0..encoded_len]);
     defer allocator.free(bad_size);
     bad_size[6] ^= 0x01;
-    try std.testing.expectError(error.IntegrityFailure, decode(bad_size, output, decode_scratch, .{}));
+    try std.testing.expectError(error.IntegrityException, decode(bad_size, output, decode_scratch, .{}));
 
     // Corrupting the Header_Checksum byte itself must fail too.
     var bad_sum = try allocator.dupe(u8, encoded[0..encoded_len]);
     defer allocator.free(bad_sum);
     bad_sum[14] ^= 0xFF;
-    try std.testing.expectError(error.IntegrityFailure, decode(bad_sum, output, decode_scratch, .{}));
+    try std.testing.expectError(error.IntegrityException, decode(bad_sum, output, decode_scratch, .{}));
 }
 
 test "lz4 dependent blocks reach into the previous block" {
@@ -899,7 +899,7 @@ test "lz4 dependent blocks reach into the previous block" {
     var bad = frame;
     const block1_at = 4 + 1 + 1 + 8 + 1 + 4 + 64 + 4;
     bad[block1_at + 5] = 200; // offset 200 > 4 + 64 of available history
-    try std.testing.expectError(error.DataFailure, decode(bad[0..len], &output, decode_scratch, .{}));
+    try std.testing.expectError(error.DataException, decode(bad[0..len], &output, decode_scratch, .{}));
 }
 
 test "lz4 dictionary id flag parses and skips" {
@@ -936,5 +936,5 @@ test "lz4 dictionary id flag parses and skips" {
     // The dictionary ID participates in the header checksum.
     var bad = frame;
     bad[4 + 1 + 1 + 8] ^= 0x01;
-    try std.testing.expectError(error.IntegrityFailure, decode(bad[0..len], &output, decode_scratch, .{}));
+    try std.testing.expectError(error.IntegrityException, decode(bad[0..len], &output, decode_scratch, .{}));
 }

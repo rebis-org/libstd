@@ -1,7 +1,7 @@
 const std = @import("std");
 
 const onprem = @import("onprem.zig");
-pub const Failure = @import("../../common/primitive/failure.zig").Failure;
+pub const Exception = @import("../../common/primitive/exception.zig").Exception;
 
 const std_tar = std.tar;
 // stdlib's Iterator.File lacks mtime/uid/gid/typeflag, so inspectOrdinal stays
@@ -9,20 +9,20 @@ const std_tar = std.tar;
 pub const Entry = onprem.Entry;
 pub const EntryInfo = onprem.EntryInfo;
 
-fn mapError(err: anyerror) Failure {
+fn mapError(err: anyerror) Exception {
     return switch (err) {
-        error.UnexpectedEndOfStream, error.TarInsufficientBuffer => error.DataFailure,
-        error.NameTooLong => error.UnsupportedFailure,
-        error.WriteFailed => error.CapacityFailure,
-        error.OctalOverflow => error.UnsupportedFailure,
-        else => error.DataFailure,
+        error.UnexpectedEndOfStream, error.TarInsufficientBuffer => error.DataException,
+        error.NameTooLong => error.UnsupportedException,
+        error.WriteFailed => error.CapacityException,
+        error.OctalOverflow => error.UnsupportedException,
+        else => error.DataException,
     };
 }
 
 // std.tar.Iterator borrows caller-owned name buffers (its Options demand
 // them); the decode surface takes no scratch, so the fs path cap on the
 // stack is the documented shape, matching stdlib's own expectation.
-pub fn inspectCount(archive: []const u8) Failure!u64 {
+pub fn inspectCount(archive: []const u8) Exception!u64 {
     var reader = std.Io.Reader.fixed(archive);
     var name_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     var link_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
@@ -36,7 +36,7 @@ pub fn inspectCount(archive: []const u8) Failure!u64 {
     return count;
 }
 
-pub fn decodeOrdinal(archive: []const u8, ordinal: u64, output: []u8) Failure!usize {
+pub fn decodeOrdinal(archive: []const u8, ordinal: u64, output: []u8) Exception!usize {
     var reader = std.Io.Reader.fixed(archive);
     var name_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     var link_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
@@ -46,46 +46,46 @@ pub fn decodeOrdinal(archive: []const u8, ordinal: u64, output: []u8) Failure!us
         const maybe = it.next() catch |err| return mapError(err);
         const file = maybe orelse break;
         if (index == ordinal) {
-            const size: usize = std.math.cast(usize, file.size) orelse return error.ResourceFailure;
-            if (output.len < size) return error.CapacityFailure;
+            const size: usize = std.math.cast(usize, file.size) orelse return error.ResourceException;
+            if (output.len < size) return error.CapacityException;
             var sink = std.Io.Writer.fixed(output[0..size]);
             it.streamRemaining(file, &sink) catch |err| return mapError(err);
             return size;
         }
         index += 1;
     }
-    return error.CallFailure;
+    return error.CallException;
 }
 
 // archiveSize runs the same encode into a counting writer; the write arm
 // only serves shapes it can carry, so the count matches what encode emits.
-pub fn archiveSize(entries: []const Entry) Failure!u64 {
+pub fn archiveSize(entries: []const Entry) Exception!u64 {
     const measurement = @import("../../common/primitive/measurement.zig");
     var counter = measurement.Counter.init(null);
     try encodeTo(entries, &counter.writer);
     return counter.written();
 }
 
-pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Failure!usize {
+pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Exception!usize {
     _ = scratch;
     var sink = std.Io.Writer.fixed(output);
     try encodeTo(entries, &sink);
     return sink.end;
 }
 
-fn encodeTo(entries: []const Entry, writer: *std.Io.Writer) Failure!void {
+fn encodeTo(entries: []const Entry, writer: *std.Io.Writer) Exception!void {
     var tar_writer: std_tar.Writer = .{ .underlying_writer = writer };
     for (entries) |entry| {
-        if (entry.uid != 0 or entry.gid != 0) return error.UnsupportedFailure;
-        if (entry.name.len > 100) return error.UnsupportedFailure;
-        if (entry.link_name.len > 100) return error.UnsupportedFailure;
+        if (entry.uid != 0 or entry.gid != 0) return error.UnsupportedException;
+        if (entry.name.len > 100) return error.UnsupportedException;
+        if (entry.link_name.len > 100) return error.UnsupportedException;
         const options: std_tar.Writer.Options = .{ .mode = entry.mode, .mtime = entry.modification_time };
         switch (entry.typeflag) {
             // The boundary sends a bare zero where the onprem arm reads a regular file.
             0, onprem.typeflag_regular, '7' => tar_writer.writeFileBytes(entry.name, entry.data, options) catch |err| return mapError(err),
             '5' => tar_writer.writeDir(entry.name, options) catch |err| return mapError(err),
             '2' => tar_writer.writeLink(entry.name, entry.link_name, options) catch |err| return mapError(err),
-            else => return error.UnsupportedFailure,
+            else => return error.UnsupportedException,
         }
     }
     tar_writer.finishPedantically() catch |err| return mapError(err);

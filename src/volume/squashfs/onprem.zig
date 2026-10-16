@@ -1,27 +1,27 @@
 const std = @import("std");
 
 const bounds = @import("../../common/primitive/bounds.zig");
-const failure_prim = @import("../../common/primitive/failure.zig");
-
+const checksum = @import("../../common/primitive/checksum.zig");
+const exception_prim = @import("../../common/primitive/exception.zig");
+const tree_order = @import("../../common/primitive/order.zig");
+const lzma_grammar = @import("../../grammar/lzma/onprem.zig");
+const xz_grammar = @import("../../grammar/xz/onprem.zig");
 const deflate = @import("../../leaf/deflate/onprem.zig");
 const lz4_leaf = @import("../../leaf/lz4/onprem.zig");
+const lzma_seam = @import("../../leaf/lzma/seam.zig");
 const lzo_leaf = @import("../../leaf/lzo/onprem.zig");
 const zstd_leaf = @import("../../leaf/zstd/onprem.zig");
-const xz_grammar = @import("../../grammar/xz/onprem.zig");
-const lzma_grammar = @import("../../grammar/lzma/onprem.zig");
-const lzma_seam = @import("../../leaf/lzma/seam.zig");
-const checksum = @import("../../common/primitive/checksum.zig");
 
-const Failure = failure_prim.Failure;
+const Exception = exception_prim.Exception;
 
 // Squashfs 4.0 slice: one root directory of regular files.
 // Read covers every compressor for data and metadata alike.
 
 // Dictionaries are capped at one MiB; larger ones fail explicitly.
 
-// Write emits the mksquashfs -comp zstd -no-fragments shape: data blocks and
-// metadata blocks are zstd frames, stored verbatim when compression expands
-// them. Layout follows squashfs_fs.h.
+// Write emits the mksquashfs -comp zstd -no-fragments shape.
+// Metadata blocks are zstd frames, stored verbatim on expand.
+// Layout follows squashfs_fs.h.
 
 const xz_dictionary_cap: u32 = 1 << 20;
 
@@ -52,21 +52,19 @@ const inode_type_dir: u16 = 1;
 const inode_type_reg: u16 = 2;
 const inode_type_lreg: u16 = 9;
 
-const flag_noi: u16 = 1 << 0;
-const flag_nod: u16 = 1 << 1;
-const flag_nof: u16 = 1 << 3;
 const flag_no_frag: u16 = 1 << 4;
 const flag_no_xattr: u16 = 1 << 9;
 const flag_noid: u16 = 1 << 11;
-// Compressed write keeps fragments, xattrs, and id tables disabled, matching
-// the slice shape. Only the metadata and data compression flags drop out.
+// Compressed write keeps fragments, xattrs, and id tables disabled,
+// matching the slice shape.
 const write_flags: u16 = flag_no_frag | flag_no_xattr | flag_noid;
 
-// Read carving stays at the front of scratch; the zstd encoder workspace and
-// write staging live behind it. The workspace bound covers the hash and
-// double-fast tables at the default options plus block slack.
-// Frames use the reader's one-MiB window so write and read agree on scratch.
-const zstd_options: zstd_leaf.Options = .{ .window_size = 1 << 20 };
+// Read carving stays at the front of scratch; the zstd encoder workspace
+// and write staging live behind it. The workspace bound covers the hash
+// and double-fast tables plus block slack. Frames use the reader's
+// one-MiB window so write and read agree on scratch.
+const zstd_window: u32 = 1 << 20;
+const zstd_options: zstd_leaf.Options = .{ .window_size = zstd_window };
 const max_data_blocks: usize = 4096;
 const meta_staging_size: usize = 48 * 1024;
 const block_staging_size: usize = block_size_default + 64;
@@ -110,8 +108,8 @@ const Scratch = struct {
     history: []u8,
     aux: []u8,
 
-    fn carve(scratch: []u8) Failure!Scratch {
-        if (scratch.len < scratch_size) return error.CapacityFailure;
+    fn carve(scratch: []u8) Exception!Scratch {
+        if (scratch.len < scratch_size) return error.CapacityException;
         return .{
             .meta = scratch[0..metadata_size],
             .dir = scratch[metadata_size .. 2 * metadata_size],
@@ -122,18 +120,18 @@ const Scratch = struct {
     }
 };
 
-fn parseSuper(archive: []const u8) Failure!Super {
-    if (archive.len < super_disk_size) return error.DataFailure;
-    if (std.mem.readInt(u32, archive[0..4], .little) != magic) return error.DataFailure;
+fn parseSuper(archive: []const u8) Exception!Super {
+    if (archive.len < super_disk_size) return error.DataException;
+    if (std.mem.readInt(u32, archive[0..4], .little) != magic) return error.DataException;
     const major = std.mem.readInt(u16, archive[28..30], .little);
     const minor = std.mem.readInt(u16, archive[30..32], .little);
     const block_log = std.mem.readInt(u16, archive[22..24], .little);
     const block_size = std.mem.readInt(u32, archive[12..16], .little);
-    if (major != major_version or minor != 0) return error.UnsupportedFailure;
-    if (block_log < block_log_min or block_log > block_log_max) return error.DataFailure;
-    if (@as(u64, 1) << @intCast(block_log) != block_size) return error.DataFailure;
+    if (major != major_version or minor != 0) return error.UnsupportedException;
+    if (block_log < block_log_min or block_log > block_log_max) return error.DataException;
+    if (@as(u64, 1) << @intCast(block_log) != block_size) return error.DataException;
     const bytes_used = std.mem.readInt(u64, archive[40..48], .little);
-    if (bytes_used > archive.len) return error.DataFailure;
+    if (bytes_used > archive.len) return error.DataException;
     return .{
         .inode_count = std.mem.readInt(u32, archive[4..8], .little),
         .block_size = block_size,
@@ -154,13 +152,13 @@ const MetaBlock = struct {
 
 // Bit 15 set means the metadata payload is stored raw.
 // Compressed payloads must fit the 8 KiB block cap.
-fn inflateMeta(compression: u16, archive: []const u8, at: u64, out: []u8, history: []u8, aux: []u8) Failure!MetaBlock {
+fn inflateMeta(compression: u16, archive: []const u8, at: u64, out: []u8, history: []u8, aux: []u8) Exception!MetaBlock {
     const head = try bounds.slice(archive, at, 2);
     const header = std.mem.readInt(u16, head[0..2], .little);
     const size: usize = header & ~flag_uncompressed_metadata;
     const payload = try bounds.slice(archive, try bounds.addU64(at, 2), size);
     if (header & flag_uncompressed_metadata != 0) {
-        if (size > out.len) return error.DataFailure;
+        if (size > out.len) return error.DataException;
         @memcpy(out[0..size], payload);
         return .{ .len = size, .disk_size = 2 + size };
     }
@@ -168,53 +166,49 @@ fn inflateMeta(compression: u16, archive: []const u8, at: u64, out: []u8, histor
     return .{ .len = len, .disk_size = 2 + size };
 }
 
-// One compressed payload lands in an exact-size output slice.
 // `aux` carries dictionary-sized workspaces and zstd's rolling history.
-fn inflateBlock(compression: u16, payload: []const u8, out: []u8, history: []u8, aux: ?[]u8) Failure!usize {
+fn inflateBlock(compression: u16, payload: []const u8, out: []u8, history: []u8, aux: ?[]u8) Exception!usize {
     switch (compression) {
         compression_gzip => return inflateZlib(payload, out, history),
-        compression_lzma => return lzma_grammar.decodeInPlace(payload, out, aux orelse return error.CapacityFailure, lzma_seam.default_provider),
+        compression_lzma => return lzma_grammar.decodeInPlace(payload, out, aux orelse return error.CapacityException, lzma_seam.default_provider),
         compression_lzo => return lzo_leaf.decodeInPlace(payload, out, &.{}, .{}),
-        compression_xz => return xz_grammar.decode(payload, out, aux orelse return error.CapacityFailure, checksum.default_provider),
+        compression_xz => return xz_grammar.decode(payload, out, aux orelse return error.CapacityException, checksum.default_provider),
         compression_lz4 => {
             return lz4_leaf.decompressBlock(payload, out, &.{}) catch |err| return switch (err) {
-                error.DataFailure => error.DataFailure,
-                error.OutputTooSmall => error.CapacityFailure,
+                error.DataException => error.DataException,
+                error.OutputTooSmall => error.CapacityException,
             };
         },
         compression_zstd => {
-            const workspace = aux orelse return error.CapacityFailure;
+            const workspace = aux orelse return error.CapacityException;
             var reader = std.Io.Reader.fixed(payload);
             var writer = std.Io.Writer.fixed(out);
-            return zstd_leaf.decodeStream(&reader, &writer, workspace, .{ .window_size = xz_dictionary_cap }) catch return error.DataFailure;
+            return zstd_leaf.decodeStream(&reader, &writer, workspace, .{ .window_size = zstd_window }) catch return error.DataException;
         },
-        else => return error.UnsupportedFailure,
+        else => return error.UnsupportedException,
     }
 }
 
-fn inflateZlib(payload: []const u8, out: []u8, history: []u8) Failure!usize {
-    if (payload.len < 2 + 4 + 1) return error.DataFailure;
+fn inflateZlib(payload: []const u8, out: []u8, history: []u8) Exception!usize {
+    if (payload.len < 2 + 4 + 1) return error.DataException;
     const cmf = payload[0];
     const flg = payload[1];
-    if (cmf & 0x0f != 8) return error.UnsupportedFailure;
-    if ((@as(u32, cmf) << 8 | flg) % 31 != 0) return error.DataFailure;
-    if (flg & 0x20 != 0) return error.UnsupportedFailure;
+    if (cmf & 0x0f != 8) return error.UnsupportedException;
+    if ((@as(u32, cmf) << 8 | flg) % 31 != 0) return error.DataException;
+    if (flg & 0x20 != 0) return error.UnsupportedException;
     var fixed = std.Io.Writer.fixed(out);
     var inflater = deflate.Decompress.initSlice(payload[2..], history);
-    _ = inflater.reader.streamRemaining(&fixed) catch return error.DataFailure;
+    _ = inflater.reader.streamRemaining(&fixed) catch return error.DataException;
     return fixed.end;
 }
 
-fn inflateData(compression: u16, payload: []const u8, out: []u8, history: []u8, aux: ?[]u8) Failure!void {
+fn inflateData(compression: u16, payload: []const u8, out: []u8, history: []u8, aux: ?[]u8) Exception!void {
     switch (compression) {
-        compression_gzip => {
-            if (try inflateZlib(payload, out, history) != out.len) return error.DataFailure;
-        },
         compression_zstd => {
             _ = try inflateBlock(compression, payload, out, history, aux);
         },
         else => {
-            if (try inflateBlock(compression, payload, out, history, aux) != out.len) return error.DataFailure;
+            if (try inflateBlock(compression, payload, out, history, aux) != out.len) return error.DataException;
         },
     }
 }
@@ -230,28 +224,28 @@ const Inode = struct {
     dir_file_size: u32 = 0,
 };
 
-fn fullBlockCount(file_size: u64, block_size: u32, fragment: u32) Failure!usize {
+fn fullBlockCount(file_size: u64, block_size: u32, fragment: u32) Exception!usize {
     if (fragment != invalid_fragment) {
-        return std.math.cast(usize, file_size / block_size) orelse return error.DataFailure;
+        return std.math.cast(usize, file_size / block_size) orelse return error.DataException;
     }
     if (file_size == 0) return 0;
-    return std.math.cast(usize, (file_size + block_size - 1) / block_size) orelse return error.DataFailure;
+    return std.math.cast(usize, (file_size + block_size - 1) / block_size) orelse return error.DataException;
 }
 
-fn readInode(archive: []const u8, super: Super, ref: u64, scratch: *Scratch) Failure!Inode {
+fn readInode(archive: []const u8, super: Super, ref: u64, scratch: *Scratch) Exception!Inode {
     const rel = ref >> 16;
     const off: usize = @intCast(ref & 0xffff);
-    if (rel > super.bytes_used) return error.DataFailure;
+    if (rel > super.bytes_used) return error.DataException;
     const at = try bounds.addU64(super.inode_table_start, rel);
     const block = try inflateMeta(super.compression, archive, at, scratch.meta, scratch.history, scratch.aux);
-    if (off >= block.len) return error.DataFailure;
+    if (off >= block.len) return error.DataException;
     const raw = scratch.meta[off..block.len];
-    if (raw.len < 16) return error.DataFailure;
+    if (raw.len < 16) return error.DataException;
     const inode_number = std.mem.readInt(u32, raw[12..16], .little);
-    if (inode_number == 0 or inode_number > super.inode_count) return error.DataFailure;
+    if (inode_number == 0 or inode_number > super.inode_count) return error.DataException;
     switch (std.mem.readInt(u16, raw[0..2], .little)) {
         inode_type_dir => {
-            if (raw.len < 32) return error.DataFailure;
+            if (raw.len < 32) return error.DataException;
             return .{
                 .file_size = 0,
                 .start_block = 0,
@@ -261,11 +255,11 @@ fn readInode(archive: []const u8, super: Super, ref: u64, scratch: *Scratch) Fai
             };
         },
         inode_type_reg => {
-            if (raw.len < 32) return error.DataFailure;
+            if (raw.len < 32) return error.DataException;
             const file_size = std.mem.readInt(u32, raw[28..32], .little);
             const fragment = std.mem.readInt(u32, raw[20..24], .little);
             const list_len = try fullBlockCount(file_size, super.block_size, fragment);
-            if (raw.len < 32 + 4 * list_len) return error.DataFailure;
+            if (raw.len < 32 + 4 * list_len) return error.DataException;
             return .{
                 .file_size = file_size,
                 .start_block = std.mem.readInt(u32, raw[16..20], .little),
@@ -275,11 +269,11 @@ fn readInode(archive: []const u8, super: Super, ref: u64, scratch: *Scratch) Fai
             };
         },
         inode_type_lreg => {
-            if (raw.len < 56) return error.DataFailure;
+            if (raw.len < 56) return error.DataException;
             const file_size = std.mem.readInt(u64, raw[24..32], .little);
             const fragment = std.mem.readInt(u32, raw[44..48], .little);
             const list_len = try fullBlockCount(file_size, super.block_size, fragment);
-            if (raw.len < 56 + 4 * list_len) return error.DataFailure;
+            if (raw.len < 56 + 4 * list_len) return error.DataException;
             return .{
                 .file_size = file_size,
                 .start_block = std.mem.readInt(u64, raw[16..24], .little),
@@ -288,7 +282,7 @@ fn readInode(archive: []const u8, super: Super, ref: u64, scratch: *Scratch) Fai
                 .block_list = raw[56 .. 56 + 4 * list_len],
             };
         },
-        else => return error.UnsupportedFailure,
+        else => return error.UnsupportedException,
     }
 }
 
@@ -297,17 +291,17 @@ const FragmentEntry = struct {
     size: u32,
 };
 
-fn readFragmentEntry(archive: []const u8, super: Super, index: u32, scratch: *Scratch) Failure!FragmentEntry {
-    if (super.fragments == 0 or index >= super.fragments) return error.DataFailure;
-    const table_bytes = std.math.mul(u64, super.fragments, 16) catch return error.DataFailure;
+fn readFragmentEntry(archive: []const u8, super: Super, index: u32, scratch: *Scratch) Exception!FragmentEntry {
+    if (super.fragments == 0 or index >= super.fragments) return error.DataException;
+    const table_bytes = std.math.mul(u64, super.fragments, 16) catch return error.DataException;
     const indexes = table_bytes / metadata_size + 1;
-    const index_bytes = std.math.mul(u64, indexes, 8) catch return error.ResourceFailure;
+    const index_bytes = std.math.mul(u64, indexes, 8) catch return error.ResourceException;
     const table = try bounds.slice(archive, super.fragment_table_start, index_bytes);
-    const slot = std.math.mul(u64, index, 16) catch return error.DataFailure;
+    const slot = std.math.mul(u64, index, 16) catch return error.DataException;
     const block_ptr = std.mem.readInt(u64, table[(slot / metadata_size) * 8 ..][0..8], .little);
     const block = try inflateMeta(super.compression, archive, block_ptr, scratch.frag[0..metadata_size], scratch.history, scratch.aux);
     const off: usize = @intCast(slot % metadata_size);
-    if (off + 16 > block.len) return error.DataFailure;
+    if (off + 16 > block.len) return error.DataException;
     return .{
         .start_block = std.mem.readInt(u64, scratch.frag[off..][0..8], .little),
         .size = std.mem.readInt(u32, scratch.frag[off + 8 ..][0..4], .little),
@@ -323,14 +317,14 @@ const MetaStream = struct {
     len: usize = 0,
     pos: usize = 0,
 
-    fn refill(self: *MetaStream, history: []u8) Failure!void {
+    fn refill(self: *MetaStream, history: []u8) Exception!void {
         const block = try inflateMeta(self.compression, self.archive, self.disk, self.buf, history, self.aux);
         self.disk = try bounds.addU64(self.disk, block.disk_size);
         self.len = block.len;
         self.pos = 0;
     }
 
-    fn read(self: *MetaStream, dest: []u8, history: []u8) Failure!void {
+    fn read(self: *MetaStream, dest: []u8, history: []u8) Exception!void {
         var filled: usize = 0;
         while (filled < dest.len) {
             if (self.pos == self.len) try self.refill(history);
@@ -341,7 +335,7 @@ const MetaStream = struct {
         }
     }
 
-    fn skip(self: *MetaStream, count: usize, history: []u8) Failure!void {
+    fn skip(self: *MetaStream, count: usize, history: []u8) Exception!void {
         var left = count;
         while (left > 0) {
             if (self.pos == self.len) try self.refill(history);
@@ -361,7 +355,7 @@ const WalkState = struct {
     ordinal: u64 = 0,
 };
 
-fn walkDir(archive: []const u8, super: Super, scratch: *Scratch, target: DirTarget) Failure!u64 {
+fn walkDir(archive: []const u8, super: Super, scratch: *Scratch, target: DirTarget) Exception!u64 {
     var state = WalkState{};
     var found = false;
     const resolved = switch (target) {
@@ -371,15 +365,15 @@ fn walkDir(archive: []const u8, super: Super, scratch: *Scratch, target: DirTarg
     try walkInodeDir(archive, super, scratch, super.root_ref, resolved, &state);
     return switch (target) {
         .count => state.ordinal,
-        .resolve => if (found) state.ordinal else error.DataFailure,
+        .resolve => if (found) state.ordinal else error.DataException,
     };
 }
 
-fn walkInodeDir(archive: []const u8, super: Super, scratch: *Scratch, ref: u64, target: DirTarget, state: *WalkState) Failure!void {
+fn walkInodeDir(archive: []const u8, super: Super, scratch: *Scratch, ref: u64, target: DirTarget, state: *WalkState) Exception!void {
     const dir_inode = try readInode(archive, super, ref, scratch);
-    if (dir_inode.dir_file_size < 3) return error.DataFailure;
+    if (dir_inode.dir_file_size < 3) return error.DataException;
     const content_len = dir_inode.dir_file_size - 3;
-    if (content_len > scratch.frag.len) return error.ResourceFailure;
+    if (content_len > scratch.frag.len) return error.ResourceException;
     var stream = MetaStream{
         .archive = archive,
         .compression = super.compression,
@@ -403,7 +397,7 @@ fn walkInodeDir(archive: []const u8, super: Super, scratch: *Scratch, ref: u64, 
     var name_len: usize = 0;
     while (remaining > 0) {
         if (entries_in_header == 0) {
-            if (remaining < 12) return error.DataFailure;
+            if (remaining < 12) return error.DataException;
             var head: [12]u8 = undefined;
             @memcpy(&head, scratch.frag[cursor..][0..12]);
             cursor += 12;
@@ -411,24 +405,24 @@ fn walkInodeDir(archive: []const u8, super: Super, scratch: *Scratch, ref: u64, 
             entries_in_header = std.mem.readInt(u32, head[0..4], .little) + 1;
             header_block = std.mem.readInt(u32, head[4..8], .little);
             prev_inode = std.mem.readInt(u32, head[8..12], .little);
-            if (entries_in_header > max_entries) return error.DataFailure;
+            if (entries_in_header > max_entries) return error.DataException;
         }
-        if (remaining < 8) return error.DataFailure;
+        if (remaining < 8) return error.DataException;
         var ent: [8]u8 = undefined;
         @memcpy(&ent, scratch.frag[cursor..][0..8]);
         cursor += 8;
         remaining -= 8;
         name_len = std.mem.readInt(u16, ent[6..8], .little) + 1;
-        if (name_len > 256 or remaining < name_len) return error.DataFailure;
+        if (name_len > 256 or remaining < name_len) return error.DataException;
         cursor += name_len;
         remaining -= name_len;
         const delta = std.mem.readInt(i16, ent[2..4], .little);
         const next_inode = @as(i64, prev_inode) + delta;
-        if (next_inode < 1 or next_inode > std.math.maxInt(u32)) return error.DataFailure;
+        if (next_inode < 1 or next_inode > std.math.maxInt(u32)) return error.DataException;
         prev_inode = @intCast(next_inode);
         const off_in_block = std.mem.readInt(u16, ent[0..2], .little);
-        if (off_in_block >= metadata_size) return error.DataFailure;
-        if (count >= max_entries) return error.DataFailure;
+        if (off_in_block >= metadata_size) return error.DataException;
+        if (count >= max_entries) return error.DataException;
         refs[count] = (header_block << 16) | @as(u64, off_in_block);
         types[count] = std.mem.readInt(u16, ent[4..6], .little);
         count += 1;
@@ -454,7 +448,7 @@ fn walkInodeDir(archive: []const u8, super: Super, scratch: *Scratch, ref: u64, 
                             res.info.size = inode.file_size;
                             res.info.ordinal = state.ordinal;
                             if (res.output) |out| {
-                                if (out.len < inode.file_size) return error.CapacityFailure;
+                                if (out.len < inode.file_size) return error.CapacityException;
                                 try readFile(archive, super, inode, out[0..@intCast(inode.file_size)], scratch);
                             }
                             res.found.* = true;
@@ -464,12 +458,12 @@ fn walkInodeDir(archive: []const u8, super: Super, scratch: *Scratch, ref: u64, 
                 }
                 state.ordinal += 1;
             },
-            else => return error.UnsupportedFailure,
+            else => return error.UnsupportedException,
         }
     }
 }
 
-fn readFile(archive: []const u8, super: Super, inode: Inode, output: []u8, scratch: *Scratch) Failure!void {
+fn readFile(archive: []const u8, super: Super, inode: Inode, output: []u8, scratch: *Scratch) Exception!void {
     var written: u64 = 0;
     var data_pos = inode.start_block;
     for (0..inode.block_list.len / 4) |i| {
@@ -482,7 +476,7 @@ fn readFile(archive: []const u8, super: Super, inode: Inode, output: []u8, scrat
             const c_byte = head & data_size_mask;
             const payload = try bounds.slice(archive, data_pos, c_byte);
             if (head & data_uncompressed_bit != 0) {
-                if (c_byte != take) return error.DataFailure;
+                if (c_byte != take) return error.DataException;
                 @memcpy(output[written..][0..take_usize], payload);
             } else {
                 try inflateData(super.compression, payload, output[written..][0..take_usize], scratch.history, scratch.aux);
@@ -494,55 +488,55 @@ fn readFile(archive: []const u8, super: Super, inode: Inode, output: []u8, scrat
     if (inode.fragment != invalid_fragment) {
         const frag_bytes = inode.file_size - written;
         if (frag_bytes > 0) {
-            if (inode.frag_offset > scratch.frag.len) return error.DataFailure;
+            if (inode.frag_offset > scratch.frag.len) return error.DataException;
             const entry = try readFragmentEntry(archive, super, inode.fragment, scratch);
             const c_byte = entry.size & data_size_mask;
             const payload = try bounds.slice(archive, entry.start_block, c_byte);
             if (entry.size & data_uncompressed_bit != 0) {
                 const off: usize = @intCast(inode.frag_offset);
-                if (off + frag_bytes > c_byte) return error.DataFailure;
+                if (off + frag_bytes > c_byte) return error.DataException;
                 @memcpy(output[written..][0..@intCast(frag_bytes)], payload[off..][0..@intCast(frag_bytes)]);
             } else {
-                if (super.block_size > scratch.frag.len) return error.UnsupportedFailure;
+                if (super.block_size > scratch.frag.len) return error.UnsupportedException;
                 const produced = try inflateBlock(super.compression, payload, scratch.frag[0..super.block_size], scratch.history, scratch.aux);
                 const off: usize = @intCast(inode.frag_offset);
-                if (off + frag_bytes > produced) return error.DataFailure;
+                if (off + frag_bytes > produced) return error.DataException;
                 @memcpy(output[written..][0..@intCast(frag_bytes)], scratch.frag[off..][0..@intCast(frag_bytes)]);
             }
             written += frag_bytes;
         }
     }
-    if (written != output.len) return error.DataFailure;
+    if (written != output.len) return error.DataException;
 }
 
-pub fn inspectCount(archive: []const u8, scratch: []u8) Failure!u64 {
+fn walkChosen(archive: []const u8, scratch: []u8, target: DirTarget) Exception!u64 {
     var carved = try Scratch.carve(scratch);
     const super = try parseSuper(archive);
-    return walkDir(archive, super, &carved, .count);
+    return walkDir(archive, super, &carved, target);
 }
 
-pub fn inspectOrdinal(archive: []const u8, ordinal: u64, scratch: []u8) Failure!EntryInfo {
-    var carved = try Scratch.carve(scratch);
-    const super = try parseSuper(archive);
+pub fn inspectCount(archive: []const u8, scratch: []u8) Exception!u64 {
+    return walkChosen(archive, scratch, .count);
+}
+
+pub fn inspectOrdinal(archive: []const u8, ordinal: u64, scratch: []u8) Exception!EntryInfo {
     var info: EntryInfo = undefined;
-    _ = try walkDir(archive, super, &carved, .{ .resolve = .{ .ordinal = ordinal, .info = &info, .output = null } });
+    _ = try walkChosen(archive, scratch, .{ .resolve = .{ .ordinal = ordinal, .info = &info, .output = null } });
     return info;
 }
 
-pub fn decodeOrdinal(archive: []const u8, ordinal: u64, output: []u8, scratch: []u8) Failure!usize {
-    var carved = try Scratch.carve(scratch);
-    const super = try parseSuper(archive);
+pub fn decodeOrdinal(archive: []const u8, ordinal: u64, output: []u8, scratch: []u8) Exception!usize {
     var info: EntryInfo = undefined;
-    _ = try walkDir(archive, super, &carved, .{ .resolve = .{ .ordinal = ordinal, .info = &info, .output = output } });
+    _ = try walkChosen(archive, scratch, .{ .resolve = .{ .ordinal = ordinal, .info = &info, .output = output } });
     return @intCast(info.size);
 }
 
-fn validateName(name: []const u8) Failure!void {
-    if (name.len == 0 or name.len > 512) return error.CallFailure;
+fn validateName(name: []const u8) Exception!void {
+    if (name.len == 0 or name.len > 512) return error.CallException;
     var it = std.mem.splitScalar(u8, name, '/');
     while (it.next()) |part| {
-        if (part.len == 0 or part.len > 256) return error.CallFailure;
-        if (std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return error.CallFailure;
+        if (part.len == 0 or part.len > 256) return error.CallException;
+        if (std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return error.CallException;
     }
 }
 
@@ -582,8 +576,8 @@ const Sink = struct {
     bytes: []u8,
     pos: usize = 0,
 
-    fn write(self: *Sink, data: []const u8) Failure!void {
-        if (self.pos + data.len > self.bytes.len) return error.CapacityFailure;
+    fn write(self: *Sink, data: []const u8) Exception!void {
+        if (self.pos + data.len > self.bytes.len) return error.CapacityException;
         @memcpy(self.bytes[self.pos .. self.pos + data.len], data);
         self.pos += data.len;
     }
@@ -599,66 +593,84 @@ fn spanCount(spans: []const Span) usize {
     return spans.len;
 }
 
-// Write staging carved from scratch behind the read carving. The encoder
-// workspace alignment is resolved dynamically against the scratch pointer.
+// Write staging carved from scratch behind the read carving;
+// alignment resolves dynamically.
 const WriteWs = struct {
     stage: []u8,
     meta: []u8,
     block_head_pad: []u8,
     ws: []u32,
 
-    fn carve(scratch: []u8) Failure!WriteWs {
-        if (scratch.len < scratch_size) return error.CapacityFailure;
+    fn carve(scratch: []u8) Exception!WriteWs {
+        if (scratch.len < scratch_size) return error.CapacityException;
         const tail = scratch[read_scratch_size..];
         var at: usize = 0;
         const stage = tail[at..][0..block_staging_size];
         at += block_staging_size;
         const meta = tail[at..][0..meta_staging_size];
         at += meta_staging_size;
-        const block_pad = tail[at..][0..max_data_blocks * 4];
+        const block_pad = tail[at..][0 .. max_data_blocks * 4];
         at += max_data_blocks * 4;
-        if (tail.len - at < zstd_workspace_extra) return error.ResourceFailure;
+        if (tail.len - at < zstd_workspace_extra) return error.ResourceException;
         const base = tail[at..][0..zstd_workspace_extra];
         const pad = (4 - (@intFromPtr(base.ptr) & 3)) & 3;
-        if (base.len < pad) return error.ResourceFailure;
+        if (base.len < pad) return error.ResourceException;
         const region = base[pad..];
         const ws_u32s = zstd_leaf.encoderWorkspaceU32Count(0, block_size_default, zstd_options);
-        if (region.len < ws_u32s * 4) return error.ResourceFailure;
+        if (region.len < ws_u32s * 4) return error.ResourceException;
         const ws: []u32 = @alignCast(std.mem.bytesAsSlice(u32, region[0 .. ws_u32s * 4]));
         return .{ .stage = stage, .meta = meta, .block_head_pad = block_pad, .ws = ws };
     }
 };
 
-fn zstdCompress(ws: []u32, stage: []u8, block: []const u8) Failure!usize {
+fn zstdCompress(ws: []u32, stage: []u8, block: []const u8) Exception!usize {
     var sink = std.Io.Writer.fixed(stage);
-    return zstd_leaf.encodeFrame(&sink, block, ws, zstd_options, 0) catch return error.DataFailure;
+    return zstd_leaf.encodeFrame(&sink, block, ws, zstd_options, 0) catch return error.DataException;
+}
+
+const BlockFrame = struct { head: u32, bytes: []const u8, disk: u64 };
+
+fn blockFrame(ws: *WriteWs, block: []const u8) Exception!BlockFrame {
+    const compressed = try zstdCompress(ws.ws, ws.stage, block);
+    if (compressed < block.len) return .{ .head = @intCast(compressed), .bytes = ws.stage[0..compressed], .disk = compressed };
+    return .{ .head = @as(u32, @intCast(block.len)) | data_uncompressed_bit, .bytes = block, .disk = block.len };
+}
+
+const MetaSpan = union(enum) { compressed: []const u8, raw: []const u8 };
+
+fn metaSpan(ws: []u32, stage: []u8, block: []const u8) Exception!MetaSpan {
+    const compressed = try zstdCompress(ws, stage, block);
+    if (compressed < block.len) return .{ .compressed = stage[0..compressed] };
+    return .{ .raw = block };
 }
 
 // Measures one metadata span; blocks that expand are stored raw per the
 // format. The header size field carries the full byte count, unlike data blocks.
-fn metaSpanDisk(ws: []u32, stage: []u8, block: []const u8) Failure!u64 {
-    const compressed = try zstdCompress(ws, stage, block);
-    if (compressed < block.len) return 2 + compressed;
-    return 2 + block.len;
+fn metaSpanDisk(ws: []u32, stage: []u8, block: []const u8) Exception!u64 {
+    return switch (try metaSpan(ws, stage, block)) {
+        .compressed => |c| 2 + c.len,
+        .raw => |r| 2 + r.len,
+    };
 }
 
-// Emits a measured span: compressed frame, or raw with the uncompressed flag.
-fn emitMetaSpan(sink: *Sink, ws: []u32, stage: []u8, block: []const u8) Failure!void {
-    const compressed = try zstdCompress(ws, stage, block);
-    if (compressed < block.len) {
-        var head: [2]u8 = undefined;
-        std.mem.writeInt(u16, &head, @intCast(compressed), .little);
-        try sink.write(&head);
-        try sink.write(stage[0..compressed]);
-        return;
+fn emitMetaSpan(sink: *Sink, ws: []u32, stage: []u8, block: []const u8) Exception!void {
+    switch (try metaSpan(ws, stage, block)) {
+        .compressed => |c| {
+            var head: [2]u8 = undefined;
+            std.mem.writeInt(u16, &head, @intCast(c.len), .little);
+            try sink.write(&head);
+            try sink.write(c);
+        },
+        .raw => |r| {
+            var head: [2]u8 = undefined;
+            std.mem.writeInt(u16, &head, flag_uncompressed_metadata | @as(u16, @intCast(r.len)), .little);
+            try sink.write(&head);
+            try sink.write(r);
+        },
     }
-    var head: [2]u8 = undefined;
-    std.mem.writeInt(u16, &head, flag_uncompressed_metadata | @as(u16, @intCast(block.len)), .little);
-    try sink.write(&head);
-    try sink.write(block);
 }
 
-fn writeSuper(sink: *Sink, plan: *const Plan) Failure!void {
+fn writeSuper(sink: *Sink, plan: *const Plan) Exception!void {
     var raw: [super_disk_size]u8 = @splat(0);
     const id_start = plan.total - 8;
     std.mem.writeInt(u32, raw[0..4], magic, .little);
@@ -685,9 +697,8 @@ fn nodeInodeSize(node: *const Node) usize {
     return if (node.kind == .dir) 32 else 32 + 4 * @as(usize, node.blocks);
 }
 
-// Inode table bytes in DFS order; spans mark 8 KiB blocks. Directory
-// inodes embed their dir_start/dir_size.
-fn buildInodeTableRaw(plan: *const Plan, buf: []u8, spans: []Span) Failure!usize {
+// Directory inodes embed their dir_start/dir_size.
+fn buildInodeTableRaw(plan: *const Plan, buf: []u8, spans: []Span) Exception!usize {
     var used: usize = 0;
     var span_start: usize = 0;
     for (plan.order) |ni| {
@@ -697,7 +708,7 @@ fn buildInodeTableRaw(plan: *const Plan, buf: []u8, spans: []Span) Failure!usize
             spans[spanCount(spans)] = .{ .start = @intCast(span_start), .len = @intCast(used - span_start) };
             span_start = used;
         }
-        if (used + inode_size > buf.len) return error.ResourceFailure;
+        if (used + inode_size > buf.len) return error.ResourceException;
         var raw: [32]u8 = @splat(0);
         std.mem.writeInt(u16, raw[4..6], uid_index, .little);
         std.mem.writeInt(u16, raw[6..8], guid_index, .little);
@@ -742,10 +753,9 @@ fn fileBlockBase(plan: *const Plan, node_index: u32) usize {
     return base;
 }
 
-// Emits one directory per span-boundary-aligned block group. Every
-// directory starts a fresh 8 KiB block. dir_offset stays zero; dir_start
-// sums the compressed sizes of preceding blocks.
-fn buildDirTableRaw(plan: *Plan, ws: *WriteWs, buf: []u8, spans: []Span) Failure!usize {
+// Every directory starts a fresh 8 KiB block. dir_offset stays zero;
+// dir_start sums preceding compressed sizes.
+fn buildDirTableRaw(plan: *Plan, ws: *WriteWs, buf: []u8, spans: []Span) Exception!usize {
     var used: usize = 0;
     var span_start: usize = 0;
     var dir_start: u32 = 0;
@@ -756,14 +766,14 @@ fn buildDirTableRaw(plan: *Plan, ws: *WriteWs, buf: []u8, spans: []Span) Failure
         if (used > span_start) {
             spans[spanCount(spans)] = .{ .start = @intCast(span_start), .len = @intCast(used - span_start) };
             const span_disk = try metaSpanDisk(ws.ws, ws.stage, buf[span_start..used]);
-            dir_start = std.math.cast(u32, dir_start + span_disk) orelse return error.DataFailure;
+            dir_start = std.math.cast(u32, dir_start + span_disk) orelse return error.DataException;
             span_start = used;
         }
         node.dir_start = dir_start;
         const start = plan.kids[node.first_child .. node.first_child + node.child_count];
         const dir_size = dirPayloadSizeFor(plan, start);
         node.dir_size = dir_size;
-        if (dir_size + 3 > std.math.maxInt(u16)) return error.UnsupportedFailure;
+        if (dir_size + 3 > std.math.maxInt(u16)) return error.UnsupportedException;
         var chunk: u32 = 0;
         var prev_block: ?u64 = null;
         var prev_inode: i64 = 0;
@@ -772,7 +782,7 @@ fn buildDirTableRaw(plan: *Plan, ws: *WriteWs, buf: []u8, spans: []Span) Failure
             const rank = orderRank(plan, child_idx);
             const rel = plan.inode_block_rel[rank];
             if (chunk == 0 or chunk == max_entries or prev_block != rel) {
-                if (used + 12 > buf.len or used + 12 > metadata_size) return error.ResourceFailure;
+                if (used + 12 > buf.len or used + 12 > metadata_size) return error.ResourceException;
                 var run: u32 = 0;
                 var scan = ci;
                 while (scan < start.len and run < max_entries and plan.inode_block_rel[orderRank(plan, start[scan])] == rel) {
@@ -790,11 +800,11 @@ fn buildDirTableRaw(plan: *Plan, ws: *WriteWs, buf: []u8, spans: []Span) Failure
                 chunk = 0;
             }
             const need = 8 + child.name.len;
-            if (used + need > buf.len or used + need > metadata_size) return error.UnsupportedFailure;
+            if (used + need > buf.len or used + need > metadata_size) return error.UnsupportedException;
             var ent: [8]u8 = undefined;
             std.mem.writeInt(u16, ent[0..2], plan.inode_block_off[rank], .little);
             const delta: i64 = @as(i64, child.number) - prev_inode;
-            if (delta < std.math.minInt(i16) or delta > std.math.maxInt(i16)) return error.UnsupportedFailure;
+            if (delta < std.math.minInt(i16) or delta > std.math.maxInt(i16)) return error.UnsupportedException;
             std.mem.writeInt(i16, ent[2..4], @intCast(delta), .little);
             std.mem.writeInt(u16, ent[4..6], if (child.kind == .dir) inode_type_dir else inode_type_reg, .little);
             std.mem.writeInt(u16, ent[6..8], @intCast(child.name.len - 1), .little);
@@ -829,13 +839,10 @@ fn dirPayloadSizeFor(plan: *const Plan, start: []const u32) u32 {
 }
 
 fn orderRank(plan: *const Plan, node_index: u32) usize {
-    for (plan.order, 0..) |ni, rank| {
-        if (ni == node_index) return rank;
-    }
-    unreachable;
+    return orderRankSlice(plan.order, node_index);
 }
 
-fn writeIdTable(sink: *Sink) Failure!void {
+fn writeIdTable(sink: *Sink) Exception!void {
     // unsquashfs checks bytes_used - id_table_start == index_bytes.
     // The id block comes first; the index last.
     const block_start: u64 = @intCast(sink.pos);
@@ -849,13 +856,13 @@ fn writeIdTable(sink: *Sink) Failure!void {
     try sink.write(&index);
 }
 
-fn buildPlan(entries: []const Entry, ws: *WriteWs, alloc: std.mem.Allocator) Failure!Plan {
-    // Tree build: nodes[0] is the root directory.
+fn buildPlan(entries: []const Entry, ws: *WriteWs, alloc: std.mem.Allocator) Exception!Plan {
+    // Tree build: nodes[0] roots the directory tree.
     var nodes: std.ArrayList(Node) = .empty;
-    nodes.append(alloc, .{ .kind = .dir, .name = "", .parent = 0 }) catch return error.ResourceFailure;
+    nodes.append(alloc, .{ .kind = .dir, .name = "", .parent = 0 }) catch return error.ResourceException;
     for (entries) |entry| {
         try validateName(entry.name);
-        if (entry.data.len > std.math.maxInt(u32)) return error.UnsupportedFailure;
+        if (entry.data.len > std.math.maxInt(u32)) return error.UnsupportedException;
         var parent: u32 = 0;
         var it = std.mem.splitScalar(u8, entry.name, '/');
         var comp = it.next().?;
@@ -863,26 +870,26 @@ fn buildPlan(entries: []const Entry, ws: *WriteWs, alloc: std.mem.Allocator) Fai
             parent = try findOrCreateDir(&nodes, alloc, parent, comp);
             comp = next;
         }
-        nodes.append(alloc, .{ .kind = .file, .name = comp, .parent = parent, .data = entry.data }) catch return error.ResourceFailure;
+        nodes.append(alloc, .{ .kind = .file, .name = comp, .parent = parent, .data = entry.data }) catch return error.ResourceException;
         nodes.items[parent].child_count += 1;
     }
-    if (nodes.items.len > max_nodes) return error.UnsupportedFailure;
+    if (nodes.items.len > max_nodes) return error.UnsupportedException;
 
-    // Per-directory child index lists, sorted by name.
-    var counts = alloc.alloc(u32, nodes.items.len) catch return error.ResourceFailure;
+    // Per-directory child lists in name order.
+    var counts = alloc.alloc(u32, nodes.items.len) catch return error.ResourceException;
     @memset(counts, 0);
     for (nodes.items, 0..) |node, i| {
         if (i == 0) continue;
         counts[node.parent] += 1;
     }
-    var starts = alloc.alloc(u32, nodes.items.len) catch return error.ResourceFailure;
+    var starts = alloc.alloc(u32, nodes.items.len) catch return error.ResourceException;
     var acc: u32 = 0;
     for (counts, 0..) |c, i| {
         starts[i] = acc;
         acc += c;
     }
-    var kids = alloc.alloc(u32, acc) catch return error.ResourceFailure;
-    var fill = alloc.alloc(u32, nodes.items.len) catch return error.ResourceFailure;
+    var kids = alloc.alloc(u32, acc) catch return error.ResourceException;
+    var fill = alloc.alloc(u32, nodes.items.len) catch return error.ResourceException;
     @memcpy(fill, starts);
     for (nodes.items, 0..) |node, i| {
         if (i == 0) continue;
@@ -899,10 +906,9 @@ fn buildPlan(entries: []const Entry, ws: *WriteWs, alloc: std.mem.Allocator) Fai
         }.less);
     }
 
-    // DFS pre-order: inode numbers and the inode table sequence.
+    // Inode numbers follow DFS pre-order, one-based.
     var order: std.ArrayList(u32) = .empty;
-    var subdir_acc: std.ArrayList(u32) = .empty;
-    try dfsNumber(&nodes, kids, 0, &order, &subdir_acc, alloc);
+    try tree_order.orderTree(Node, &nodes, kids, 0, &order, null, alloc);
     for (nodes.items) |*node| {
         node.number = 0;
     }
@@ -910,8 +916,7 @@ fn buildPlan(entries: []const Entry, ws: *WriteWs, alloc: std.mem.Allocator) Fai
         nodes.items[ni].number = @intCast(rank + 1);
     }
 
-    // Data block pass: files in table order.
-    var block_head = alloc.alloc(u32, totalFileBlocks(nodes.items)) catch return error.ResourceFailure;
+    var block_head = alloc.alloc(u32, totalFileBlocks(nodes.items)) catch return error.ResourceException;
     var data_total: u64 = 0;
     var k: usize = 0;
     for (order.items) |ni| {
@@ -923,22 +928,16 @@ fn buildPlan(entries: []const Entry, ws: *WriteWs, alloc: std.mem.Allocator) Fai
         for (0..node.blocks) |_| {
             const take: usize = @intCast(@min(@as(u64, block_size_default), node.data.len - data_off));
             const block = node.data[@intCast(data_off)..][0..take];
-            const compressed = try zstdCompress(ws.ws, ws.stage, block);
-            if (compressed < take) {
-                block_head[k] = @intCast(compressed);
-                data_total = try bounds.addU64(data_total, compressed);
-            } else {
-                block_head[k] = @as(u32, @intCast(take)) | data_uncompressed_bit;
-                data_total = try bounds.addU64(data_total, take);
-            }
+            const frame = try blockFrame(ws, block);
+            block_head[k] = frame.head;
+            data_total = try bounds.addU64(data_total, frame.disk);
             k += 1;
             data_off = try bounds.addU64(data_off, take);
         }
     }
 
-    // Inode table rel/off accumulation in table order.
-    var rel = alloc.alloc(u64, order.items.len) catch return error.ResourceFailure;
-    var ioff = alloc.alloc(u16, order.items.len) catch return error.ResourceFailure;
+    var rel = alloc.alloc(u64, order.items.len) catch return error.ResourceException;
+    var ioff = alloc.alloc(u16, order.items.len) catch return error.ResourceException;
     var block_rel: u64 = 0;
     var used: u64 = 0;
     for (order.items) |ni| {
@@ -952,7 +951,7 @@ fn buildPlan(entries: []const Entry, ws: *WriteWs, alloc: std.mem.Allocator) Fai
         used += size;
     }
 
-    // Directory raw table; compression measure gives each dir its dir_start.
+    // Compression measure assigns each dir its dir_start.
     const dir_buf = ws.meta[0 .. ws.meta.len / 2];
     const inode_buf = ws.meta[ws.meta.len / 2 ..];
     var plan = Plan{
@@ -963,7 +962,7 @@ fn buildPlan(entries: []const Entry, ws: *WriteWs, alloc: std.mem.Allocator) Fai
         .inode_block_off = ioff,
         .block_head = block_head,
         .dir_raw = dir_buf,
-        .dir_spans = alloc.alloc(Span, 16) catch return error.ResourceFailure,
+        .dir_spans = alloc.alloc(Span, 16) catch return error.ResourceException,
         .data_total = data_total,
         .inode_table_total = 0,
         .dir_table_total = 0,
@@ -977,7 +976,7 @@ fn buildPlan(entries: []const Entry, ws: *WriteWs, alloc: std.mem.Allocator) Fai
     }
     plan.dir_table_total = dir_table_total;
 
-    var inode_spans = alloc.alloc(Span, 16) catch return error.ResourceFailure;
+    var inode_spans = alloc.alloc(Span, 16) catch return error.ResourceException;
     @memset(inode_spans, .{ .start = 0, .len = 0 });
     _ = try buildInodeTableRaw(&plan, inode_buf, inode_spans);
     var inode_table_total: u64 = 0;
@@ -1004,33 +1003,16 @@ fn totalFileBlocks(nodes: []const Node) usize {
     return n;
 }
 
-fn findOrCreateDir(nodes: *std.ArrayList(Node), alloc: std.mem.Allocator, parent: u32, name: []const u8) Failure!u32 {
+fn findOrCreateDir(nodes: *std.ArrayList(Node), alloc: std.mem.Allocator, parent: u32, name: []const u8) Exception!u32 {
     for (nodes.items, 0..) |node, i| {
         if (node.kind == .dir and node.parent == parent and std.mem.eql(u8, node.name, name)) return @intCast(i);
     }
     const idx: u32 = @intCast(nodes.items.len);
-    nodes.append(alloc, .{ .kind = .dir, .name = name, .parent = parent }) catch return error.ResourceFailure;
+    nodes.append(alloc, .{ .kind = .dir, .name = name, .parent = parent }) catch return error.ResourceException;
     nodes.items[parent].child_count += 1;
     return idx;
 }
 
-fn dfsNumber(nodes: *std.ArrayList(Node), kids: []u32, dir_index: u32, order: *std.ArrayList(u32), subdir_acc: *std.ArrayList(u32), alloc: std.mem.Allocator) Failure!void {
-    order.append(alloc, dir_index) catch return error.ResourceFailure;
-    const start = nodes.items[dir_index].first_child;
-    const end = start + nodes.items[dir_index].child_count;
-    var subdirs: u32 = 0;
-    for (kids[start..end]) |child_idx| {
-        if (nodes.items[child_idx].kind == .dir) subdirs += 1;
-    }
-    nodes.items[dir_index].subdir_count = subdirs;
-    for (kids[start..end]) |child_idx| {
-        if (nodes.items[child_idx].kind == .dir) {
-            try dfsNumber(nodes, kids, child_idx, order, subdir_acc, alloc);
-        } else {
-            order.append(alloc, child_idx) catch return error.ResourceFailure;
-        }
-    }
-}
 test "squashfs zstd write roundtrips flat files" {
     const testing = std.testing;
     const entries = [_]Entry{
@@ -1078,7 +1060,7 @@ const mksquashfs_fixture = [_]u8{
     0x00, 0x00, 0x00, 0x19, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 };
 
-pub fn archiveSize(entries: []const Entry, scratch: []u8) Failure!u64 {
+pub fn archiveSize(entries: []const Entry, scratch: []u8) Exception!u64 {
     var ws = try WriteWs.carve(scratch);
     // The plan allocator borrows the read carving; encode never reads.
     var fba = std.heap.FixedBufferAllocator.init(scratch[0..read_scratch_size]);
@@ -1086,16 +1068,15 @@ pub fn archiveSize(entries: []const Entry, scratch: []u8) Failure!u64 {
     return plan.total;
 }
 
-pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Failure!usize {
+pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Exception!usize {
     var ws = try WriteWs.carve(scratch);
     // The plan allocator borrows the read carving; encode never reads.
     var fba = std.heap.FixedBufferAllocator.init(scratch[0..read_scratch_size]);
     const alloc = fba.allocator();
     const plan = try buildPlan(entries, &ws, alloc);
-    if (output.len < plan.total) return error.CapacityFailure;
+    if (output.len < plan.total) return error.CapacityException;
     var sink = Sink{ .bytes = output };
     try writeSuper(&sink, &plan);
-    // Data blocks: recompressed, sizes already measured by the plan.
     for (plan.order) |ni| {
         const node = &plan.nodes[ni];
         if (node.kind != .file) continue;
@@ -1103,16 +1084,10 @@ pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Failure!usize
         for (0..node.blocks) |_| {
             const take: usize = @intCast(@min(@as(u64, block_size_default), node.data.len - data_off));
             const block = node.data[@intCast(data_off)..][0..take];
-            const compressed = try zstdCompress(ws.ws, ws.stage, block);
-            if (compressed < take) {
-                try sink.write(ws.stage[0..compressed]);
-            } else {
-                try sink.write(block);
-            }
+            try sink.write((try blockFrame(&ws, block)).bytes);
             data_off = try bounds.addU64(data_off, take);
         }
     }
-    // Inode table spans were built into the back half of the staging buffer.
     const inode_buf = ws.meta[ws.meta.len / 2 ..];
     var inode_spans: [16]Span = @splat(.{ .start = 0, .len = 0 });
     _ = try buildInodeTableRaw(@constCast(&plan), inode_buf, &inode_spans);
@@ -1123,10 +1098,9 @@ pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Failure!usize
         try emitMetaSpan(&sink, ws.ws, ws.stage, plan.dir_raw[span.start..][0..span.len]);
     }
     try writeIdTable(&sink);
-    if (sink.pos != plan.total) return error.DataFailure;
+    if (sink.pos != plan.total) return error.DataException;
     return sink.pos;
 }
-
 
 test "squashfs zstd write roundtrips nested directories" {
     const testing = std.testing;

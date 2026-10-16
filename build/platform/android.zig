@@ -10,8 +10,8 @@ fn versionCode(version: std.SemanticVersion) u32 {
     return @intCast(version.major * 1_000_000 + version.minor * 1_000 + version.patch);
 }
 
-// The JNI bridge builds into the Android libraries only, never the host
-// library, so the C ABI export surface stays the enumerated set.
+// The bridge links into Android libraries only.
+// Keeps the host export surface to the enumerated set.
 fn addClassesJar(b: *std.Build) std.Build.LazyPath {
     const compile = b.addSystemCommand(&.{
         "sh", "-c",
@@ -29,7 +29,7 @@ fn addClassesJar(b: *std.Build) std.Build.LazyPath {
 
 fn addJniBridge(b: *std.Build, library: *std.Build.Step.Compile) void {
     const java_home = b.graph.environ_map.get("JAVA_HOME") orelse
-        @panic("The Android archive needs JAVA_HOME to find jni.h.");
+        @panic("the Android archive needs JAVA_HOME to find jni.h.");
     const jni_platform = switch (b.graph.host.result.os.tag) {
         .macos => "darwin",
         .linux => "linux",

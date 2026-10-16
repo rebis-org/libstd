@@ -1,7 +1,7 @@
 const std = @import("std");
 
 const checksum = @import("../common/primitive/checksum.zig");
-const failure_prim = @import("../common/primitive/failure.zig");
+const exception_prim = @import("../common/primitive/exception.zig");
 const measurement = @import("../common/primitive/measurement.zig");
 const gzip = @import("../grammar/gzip/onprem.zig");
 const zlib = @import("../grammar/zlib/onprem.zig");
@@ -11,7 +11,7 @@ const lz4 = @import("../leaf/lz4/onprem.zig");
 const composition = @import("composition.zig");
 const sessions = @import("sessions.zig");
 
-const Failure = failure_prim.Failure;
+const Exception = exception_prim.Exception;
 const StepResult = sessions.StepResult;
 
 const id1: u8 = 0x1f;
@@ -59,7 +59,7 @@ pub const GzipDecode = struct {
     }
 
     // The leftover snapshot records its length before this step appends, so consumed reporting covers only this step's bytes.
-    fn restage(self: *GzipDecode, input: []const u8, result: *StepResult) Failure!void {
+    fn restage(self: *GzipDecode, input: []const u8, result: *StepResult) Exception!void {
         const consumed = self.inflater.streamPosition();
         const floor = if (self.phase == .deflate) consumed else self.frame_pos;
         try compactPending(self.pending[0..], &self.pending_len, floor);
@@ -81,19 +81,19 @@ pub const GzipDecode = struct {
     }
 };
 
-fn compactPending(pending: []u8, pending_len: *usize, floor: usize) Failure!void {
-    if (floor > pending_len.*) return error.InternalFailure;
+fn compactPending(pending: []u8, pending_len: *usize, floor: usize) Exception!void {
+    if (floor > pending_len.*) return error.InternalException;
     if (floor > 0) {
         @memmove(pending[0 .. pending_len.* - floor], pending[floor..pending_len.*]);
         pending_len.* -= floor;
     }
 }
 
-fn appendStaged(pending: []u8, pending_len: *usize, leftover: *usize, input: []const u8, result: *StepResult) Failure!void {
+fn appendStaged(pending: []u8, pending_len: *usize, leftover: *usize, input: []const u8, result: *StepResult) Exception!void {
     leftover.* = pending_len.*;
     if (input.len > pending.len - pending_len.*) {
         result.required_capacity = input.len - (pending.len - pending_len.*);
-        return error.CapacityFailure;
+        return error.CapacityException;
     }
     @memcpy(pending[pending_len.*..][0..input.len], input);
     pending_len.* += input.len;
@@ -103,16 +103,16 @@ fn stateSize(comptime T: type) usize {
     return std.mem.alignForward(usize, @sizeOf(T), 16);
 }
 
-fn carveHistory(comptime T: type, storage: []u8, comptime history_len: usize) error{CapacityFailure}!struct { state: *T, history: []u8 } {
+fn carveHistory(comptime T: type, storage: []u8, comptime history_len: usize) error{CapacityException}!struct { state: *T, history: []u8 } {
     const size = stateSize(T);
-    if (storage.len < size + history_len) return error.CapacityFailure;
+    if (storage.len < size + history_len) return error.CapacityException;
     return .{
         .state = @ptrCast(@alignCast(storage.ptr)),
         .history = storage[size..][0..history_len],
     };
 }
 
-fn restageInflated(inflater: *deflate_seam.Decode, pending: []u8, pending_len: *usize, leftover: *usize, input: []const u8, result: *StepResult) Failure!void {
+fn restageInflated(inflater: *deflate_seam.Decode, pending: []u8, pending_len: *usize, leftover: *usize, input: []const u8, result: *StepResult) Exception!void {
     const consumed = inflater.streamPosition();
     try compactPending(pending, pending_len, consumed);
     try appendStaged(pending, pending_len, leftover, input, result);
@@ -123,7 +123,7 @@ pub fn gzipDecodeStorage() usize {
     return stateSize(GzipDecode) + deflate.history_size;
 }
 
-pub fn gzipDecodeInit(storage: []u8, budgets: sessions.Budgets) error{ CapacityFailure, UnsupportedFailure }!*GzipDecode {
+pub fn gzipDecodeInit(storage: []u8, budgets: sessions.Budgets) error{ CapacityException, UnsupportedException }!*GzipDecode {
     const carved = try carveHistory(GzipDecode, storage, deflate.history_size);
     const state = carved.state;
     const history = carved.history;
@@ -138,12 +138,12 @@ pub fn gzipDecodeInit(storage: []u8, budgets: sessions.Budgets) error{ CapacityF
         .trailer = undefined,
         .budgets = budgets,
     };
-    state.inflater.initSliceBoundInPlace(deflate_seam.default_provider, &.{}, history) catch return error.UnsupportedFailure;
+    state.inflater.initSliceBoundInPlace(deflate_seam.default_provider, &.{}, history) catch return error.UnsupportedException;
     return state;
 }
 
 // Each member needs a fresh deflate stream resuming at frame_pos, where framing read ahead to.
-fn enterDeflate(state: *GzipDecode) error{UnsupportedFailure}!void {
+fn enterDeflate(state: *GzipDecode) error{UnsupportedException}!void {
     try state.inflater.initSliceBoundInPlace(deflate_seam.default_provider, state.pending[0..state.pending_len], state.history);
     state.inflater.setFramePos(state.frame_pos);
     state.phase = .deflate;
@@ -165,15 +165,15 @@ fn StepOps(comptime Driver: type, comptime step: fn (*Driver, []const u8, []u8, 
 
 const decode_ops = StepOps(GzipDecode, gzipDecodeStep);
 
-pub fn gzipDecodeSession(storage: []u8, budgets: sessions.Budgets) error{ CapacityFailure, UnsupportedFailure }!sessions.Session {
+pub fn gzipDecodeSession(storage: []u8, budgets: sessions.Budgets) error{ CapacityException, UnsupportedException }!sessions.Session {
     const state = try gzipDecodeInit(storage, budgets);
     return .{ .state = state, .ops = &decode_ops };
 }
 
-fn framingFailed(result: *StepResult, consumed: usize, failure: Failure) StepResult {
+fn framingFailed(result: *StepResult, consumed: usize, exception: Exception) StepResult {
     result.consumed = consumed;
     result.status = .failed;
-    result.failure = failure;
+    result.exception = exception;
     return result.*;
 }
 
@@ -197,8 +197,8 @@ fn pumpInflated(
         if (partial > 0) {
             result.produced += partial;
             note(state, output[result.produced - partial ..][0..partial]);
-            state.budgets.addDecoded(partial) catch |failure| {
-                return framingFailed(result, input_len, failure);
+            state.budgets.addDecoded(partial) catch |exception| {
+                return framingFailed(result, input_len, exception);
             };
         }
         // Both arms report a finished member as end-of-stream; the caller reads atEnd() for the boundary.
@@ -210,12 +210,12 @@ fn pumpInflated(
             result.status = .open;
             return result.*;
         }
-        return framingFailed(result, input_len, error.DataFailure);
+        return framingFailed(result, input_len, error.DataException);
     };
     result.produced += emitted;
     note(state, output[result.produced - emitted ..][0..emitted]);
-    state.budgets.addDecoded(emitted) catch |failure| {
-        return framingFailed(result, input_len, failure);
+    state.budgets.addDecoded(emitted) catch |exception| {
+        return framingFailed(result, input_len, exception);
     };
     return null;
 }
@@ -234,7 +234,7 @@ fn noteDeflateDecoded(state: *DeflateDecode, slice: []const u8) void {
     _ = slice;
 }
 
-fn selectPostHeaderPhase(state: *GzipDecode) error{UnsupportedFailure}!void {
+fn selectPostHeaderPhase(state: *GzipDecode) error{UnsupportedException}!void {
     const flags = state.fixed[3];
     if (flags & flag_extra != 0) {
         state.phase = .extra_len;
@@ -251,8 +251,8 @@ fn selectPostHeaderPhase(state: *GzipDecode) error{UnsupportedFailure}!void {
 
 pub fn gzipDecodeStep(state: *GzipDecode, input: []const u8, output: []u8, end_of_input: bool) StepResult {
     var result = StepResult{};
-    state.restage(input, &result) catch |failure| {
-        return framingFailed(&result, 0, failure);
+    state.restage(input, &result) catch |exception| {
+        return framingFailed(&result, 0, exception);
     };
 
     // Trailer is read in the same step as end-of-stream so consumed accounting covers the whole member.
@@ -277,12 +277,12 @@ pub fn gzipDecodeStep(state: *GzipDecode, input: []const u8, output: []u8, end_o
                             state.fixed_len += 1;
                         }
                         const fixed = &state.fixed;
-                        if (fixed[0] != id1 or fixed[1] != id2) return framingFailed(&result, state.frame_pos, error.DataFailure);
-                        if (fixed[2] != method_deflate) return framingFailed(&result, state.frame_pos, error.UnsupportedFailure);
-                        if (fixed[3] & reserved_flags != 0) return framingFailed(&result, state.frame_pos, error.DataFailure);
+                        if (fixed[0] != id1 or fixed[1] != id2) return framingFailed(&result, state.frame_pos, error.DataException);
+                        if (fixed[2] != method_deflate) return framingFailed(&result, state.frame_pos, error.UnsupportedException);
+                        if (fixed[3] & reserved_flags != 0) return framingFailed(&result, state.frame_pos, error.DataException);
                         state.member_crc = checksum.Crc32.init();
                         state.member_size = 0;
-                        selectPostHeaderPhase(state) catch |failure| return framingFailed(&result, state.frame_pos, failure);
+                        selectPostHeaderPhase(state) catch |exception| return framingFailed(&result, state.frame_pos, exception);
                     },
                     .extra_len => {
                         const low = state.nextByte() orelse break :framing;
@@ -309,7 +309,7 @@ pub fn gzipDecodeStep(state: *GzipDecode, input: []const u8, output: []u8, end_o
                         } else if (state.fixed[3] & flag_hcrc != 0) {
                             state.phase = .hcrc;
                         } else {
-                            enterDeflate(state) catch |failure| return framingFailed(&result, state.frame_pos, failure);
+                            enterDeflate(state) catch |exception| return framingFailed(&result, state.frame_pos, exception);
                         }
                     },
                     .name, .comment => {
@@ -323,7 +323,7 @@ pub fn gzipDecodeStep(state: *GzipDecode, input: []const u8, output: []u8, end_o
                         } else if (state.fixed[3] & flag_hcrc != 0) {
                             state.phase = .hcrc;
                         } else {
-                            enterDeflate(state) catch |failure| return framingFailed(&result, state.frame_pos, failure);
+                            enterDeflate(state) catch |exception| return framingFailed(&result, state.frame_pos, exception);
                         }
                     },
                     .hcrc => {
@@ -333,8 +333,8 @@ pub fn gzipDecodeStep(state: *GzipDecode, input: []const u8, output: []u8, end_o
                             slot.* = byte;
                         }
                         const expected = std.mem.readInt(u16, &stored, .little);
-                        if (expected != @as(u16, @truncate(state.header_crc.final()))) return framingFailed(&result, state.frame_pos, error.IntegrityFailure);
-                        enterDeflate(state) catch |failure| return framingFailed(&result, state.frame_pos, failure);
+                        if (expected != @as(u16, @truncate(state.header_crc.final()))) return framingFailed(&result, state.frame_pos, error.IntegrityException);
+                        enterDeflate(state) catch |exception| return framingFailed(&result, state.frame_pos, exception);
                     },
                     .deflate => break :framing,
                     .trailer => {
@@ -345,8 +345,8 @@ pub fn gzipDecodeStep(state: *GzipDecode, input: []const u8, output: []u8, end_o
                         }
                         const stored_crc = std.mem.readInt(u32, state.trailer[0..4], .little);
                         const stored_size = std.mem.readInt(u32, state.trailer[4..8], .little);
-                        if (stored_crc != state.member_crc.final()) return framingFailed(&result, state.frame_pos, error.IntegrityFailure);
-                        if (stored_size != @as(u32, @truncate(state.member_size))) return framingFailed(&result, state.frame_pos, error.IntegrityFailure);
+                        if (stored_crc != state.member_crc.final()) return framingFailed(&result, state.frame_pos, error.IntegrityException);
+                        if (stored_size != @as(u32, @truncate(state.member_size))) return framingFailed(&result, state.frame_pos, error.IntegrityException);
                         state.phase = .idle;
                     },
                 }
@@ -369,7 +369,7 @@ pub fn gzipDecodeStep(state: *GzipDecode, input: []const u8, output: []u8, end_o
                     result.status = .open;
                 }
             } else if (end_of_input) {
-                return framingFailed(&result, state.frame_pos, error.DataFailure);
+                return framingFailed(&result, state.frame_pos, error.DataException);
             } else {
                 result.status = .open;
             }
@@ -420,28 +420,28 @@ pub fn gzipEncodedSizeBound(input_len: usize) usize {
     return gzip.encodedSizeBound(input_len, default_encode_options);
 }
 
-pub fn gzipEncode(output: []u8, input: []const u8, history: []u8, options: gzip.Options, sizing: GzipEncodeSizing) Failure!usize {
-    if (history.len < gzip.deflate_history_size) return error.CapacityFailure;
+pub fn gzipEncode(output: []u8, input: []const u8, history: []u8, options: gzip.Options, sizing: GzipEncodeSizing) Exception!usize {
+    if (history.len < gzip.deflate_history_size) return error.CapacityException;
     switch (sizing) {
         .bounded => {
             const bound = gzip.encodedSizeBound(input.len, options);
-            if (output.len < bound) return error.CapacityFailure;
+            if (output.len < bound) return error.CapacityException;
             var source = std.Io.Reader.fixed(input);
             var sink = std.Io.Writer.fixed(output);
-            gzip.encodeStream(&source, &sink, history, options) catch return error.IoFailure;
+            gzip.encodeStream(&source, &sink, history, options) catch return error.IoException;
             return sink.end;
         },
         .measured => {
             var counter = measurement.Counter.init(null);
             {
                 var source = std.Io.Reader.fixed(input);
-                gzip.encodeStream(&source, &counter.writer, history, options) catch return error.IoFailure;
+                gzip.encodeStream(&source, &counter.writer, history, options) catch return error.IoException;
             }
             const exact = try measurement.measuredLength(&counter);
-            if (output.len < exact) return error.CapacityFailure;
+            if (output.len < exact) return error.CapacityException;
             var source = std.Io.Reader.fixed(input);
             var sink = std.Io.Writer.fixed(output);
-            gzip.encodeStream(&source, &sink, history, options) catch return error.IoFailure;
+            gzip.encodeStream(&source, &sink, history, options) catch return error.IoException;
             return sink.end;
         },
     }
@@ -459,7 +459,7 @@ pub const DeflateDecode = struct {
     stream_end: usize = 0,
     budgets: sessions.Budgets,
 
-    fn restage(self: *DeflateDecode, input: []const u8, result: *StepResult) Failure!void {
+    fn restage(self: *DeflateDecode, input: []const u8, result: *StepResult) Exception!void {
         return restageInflated(&self.inflater, self.pending[0..], &self.pending_len, &self.leftover, input, result);
     }
 };
@@ -468,7 +468,7 @@ pub fn deflateDecodeStorage() usize {
     return stateSize(DeflateDecode) + deflate.history_size;
 }
 
-pub fn deflateDecodeInit(storage: []u8, budgets: sessions.Budgets) error{ CapacityFailure, UnsupportedFailure }!*DeflateDecode {
+pub fn deflateDecodeInit(storage: []u8, budgets: sessions.Budgets) error{ CapacityException, UnsupportedException }!*DeflateDecode {
     const carved = try carveHistory(DeflateDecode, storage, deflate.history_size);
     const state = carved.state;
     const history = carved.history;
@@ -478,24 +478,24 @@ pub fn deflateDecodeInit(storage: []u8, budgets: sessions.Budgets) error{ Capaci
         .pending = undefined,
         .budgets = budgets,
     };
-    state.inflater.initSliceBoundInPlace(deflate_seam.default_provider, &.{}, history) catch return error.UnsupportedFailure;
+    state.inflater.initSliceBoundInPlace(deflate_seam.default_provider, &.{}, history) catch return error.UnsupportedException;
     return state;
 }
 
 const deflate_decode_ops = StepOps(DeflateDecode, deflateDecodeStep);
 
-pub fn deflateDecodeSession(storage: []u8, budgets: sessions.Budgets) error{ CapacityFailure, UnsupportedFailure }!sessions.Session {
+pub fn deflateDecodeSession(storage: []u8, budgets: sessions.Budgets) error{ CapacityException, UnsupportedException }!sessions.Session {
     const state = try deflateDecodeInit(storage, budgets);
     return .{ .state = state, .ops = &deflate_decode_ops };
 }
 
 pub fn deflateDecodeStep(state: *DeflateDecode, input: []const u8, output: []u8, end_of_input: bool) StepResult {
     var result = StepResult{};
-    state.restage(input, &result) catch |failure| {
-        return framingFailed(&result, 0, failure);
+    state.restage(input, &result) catch |exception| {
+        return framingFailed(&result, 0, exception);
     };
     if (!state.started) {
-        state.inflater.initSliceBoundInPlace(deflate_seam.default_provider, state.pending[0..state.pending_len], state.history) catch |failure| return framingFailed(&result, 0, failure);
+        state.inflater.initSliceBoundInPlace(deflate_seam.default_provider, state.pending[0..state.pending_len], state.history) catch |exception| return framingFailed(&result, 0, exception);
         state.started = true;
     }
     if (output.len != 0 and result.produced < output.len) {
@@ -513,7 +513,7 @@ pub fn deflateDecodeStep(state: *DeflateDecode, input: []const u8, output: []u8,
         const consumed_bits = state.inflater.inputBitsConsumed();
         state.stream_end = (consumed_bits + 7) / 8;
         if (state.stream_end != state.pending_len) {
-            return framingFailed(&result, input.len, error.DataFailure);
+            return framingFailed(&result, input.len, error.DataException);
         }
         result.consumed = input.len;
         result.status = .done;
@@ -521,7 +521,7 @@ pub fn deflateDecodeStep(state: *DeflateDecode, input: []const u8, output: []u8,
     }
     result.consumed = input.len;
     if (end_of_input and state.inflater.streamPosition() == state.pending_len) {
-        return framingFailed(&result, input.len, error.DataFailure);
+        return framingFailed(&result, input.len, error.DataException);
     }
     result.status = .open;
     return result;
@@ -544,7 +544,7 @@ pub const ZlibDecode = struct {
     leftover: usize = 0,
     budgets: sessions.Budgets,
 
-    fn restage(self: *ZlibDecode, input: []const u8, result: *StepResult) Failure!void {
+    fn restage(self: *ZlibDecode, input: []const u8, result: *StepResult) Exception!void {
         return restageInflated(&self.inflater, self.pending[0..], &self.pending_len, &self.leftover, input, result);
     }
 };
@@ -553,7 +553,7 @@ pub fn zlibDecodeStorage() usize {
     return stateSize(ZlibDecode) + deflate.history_size;
 }
 
-pub fn zlibDecodeInit(storage: []u8, budgets: sessions.Budgets) error{ CapacityFailure, UnsupportedFailure }!*ZlibDecode {
+pub fn zlibDecodeInit(storage: []u8, budgets: sessions.Budgets) error{ CapacityException, UnsupportedException }!*ZlibDecode {
     const carved = try carveHistory(ZlibDecode, storage, deflate.history_size);
     const state = carved.state;
     const history = carved.history;
@@ -564,37 +564,37 @@ pub fn zlibDecodeInit(storage: []u8, budgets: sessions.Budgets) error{ CapacityF
         .adler = checksum.Adler32.init(),
         .budgets = budgets,
     };
-    state.inflater.initSliceBoundInPlace(deflate_seam.default_provider, &.{}, history) catch return error.UnsupportedFailure;
+    state.inflater.initSliceBoundInPlace(deflate_seam.default_provider, &.{}, history) catch return error.UnsupportedException;
     return state;
 }
 
 const zlib_decode_ops = StepOps(ZlibDecode, zlibDecodeStep);
 
-pub fn zlibDecodeSession(storage: []u8, budgets: sessions.Budgets) error{ CapacityFailure, UnsupportedFailure }!sessions.Session {
+pub fn zlibDecodeSession(storage: []u8, budgets: sessions.Budgets) error{ CapacityException, UnsupportedException }!sessions.Session {
     const state = try zlibDecodeInit(storage, budgets);
     return .{ .state = state, .ops = &zlib_decode_ops };
 }
 
 pub fn zlibDecodeStep(state: *ZlibDecode, input: []const u8, output: []u8, end_of_input: bool) StepResult {
     var result = StepResult{};
-    state.restage(input, &result) catch |failure| {
-        return framingFailed(&result, 0, failure);
+    state.restage(input, &result) catch |exception| {
+        return framingFailed(&result, 0, exception);
     };
     if (!state.started) {
         if (state.pending_len < zlib_header_size) {
-            if (end_of_input) return framingFailed(&result, input.len, error.DataFailure);
+            if (end_of_input) return framingFailed(&result, input.len, error.DataException);
             result.consumed = input.len;
             result.status = .open;
             return result;
         }
         const cmf = state.pending[0];
         const flg = state.pending[1];
-        if (cmf & 0x0F != zlib_cm_deflate) return framingFailed(&result, input.len, error.UnsupportedFailure);
-        if ((cmf >> 4) > zlib_cinfo_max) return framingFailed(&result, input.len, error.UnsupportedFailure);
-        if ((@as(u32, cmf) * 256 + @as(u32, flg)) % 31 != 0) return framingFailed(&result, input.len, error.DataFailure);
-        if (flg & zlib_flag_dictionary != 0) return framingFailed(&result, input.len, error.UnsupportedFailure);
+        if (cmf & 0x0F != zlib_cm_deflate) return framingFailed(&result, input.len, error.UnsupportedException);
+        if ((cmf >> 4) > zlib_cinfo_max) return framingFailed(&result, input.len, error.UnsupportedException);
+        if ((@as(u32, cmf) * 256 + @as(u32, flg)) % 31 != 0) return framingFailed(&result, input.len, error.DataException);
+        if (flg & zlib_flag_dictionary != 0) return framingFailed(&result, input.len, error.UnsupportedException);
         state.adler = checksum.Adler32.init();
-        state.inflater.initSliceBoundInPlace(deflate_seam.default_provider, state.pending[0..state.pending_len], state.history) catch |failure| return framingFailed(&result, input.len, failure);
+        state.inflater.initSliceBoundInPlace(deflate_seam.default_provider, state.pending[0..state.pending_len], state.history) catch |exception| return framingFailed(&result, input.len, exception);
         state.inflater.setFramePos(zlib_header_size);
         state.started = true;
     }
@@ -611,22 +611,22 @@ pub fn zlibDecodeStep(state: *ZlibDecode, input: []const u8, output: []u8, end_o
         state.stream_end = (consumed_bits + 7) / 8;
         const trailer_pos = state.stream_end;
         if (state.pending_len - trailer_pos < zlib_trailer_size) {
-            if (end_of_input) return framingFailed(&result, input.len, error.DataFailure);
+            if (end_of_input) return framingFailed(&result, input.len, error.DataException);
             result.consumed = input.len;
             result.status = .open;
             return result;
         }
         const stored_adler = std.mem.readInt(u32, state.pending[trailer_pos..][0..4], .big);
-        if (stored_adler != state.adler.final()) return framingFailed(&result, input.len, error.IntegrityFailure);
+        if (stored_adler != state.adler.final()) return framingFailed(&result, input.len, error.IntegrityException);
         const total = trailer_pos + zlib_trailer_size;
-        if (total != state.pending_len) return framingFailed(&result, input.len, error.DataFailure);
+        if (total != state.pending_len) return framingFailed(&result, input.len, error.DataException);
         result.consumed = input.len;
         result.status = .done;
         return result;
     }
     result.consumed = input.len;
     if (end_of_input and state.inflater.streamPosition() == state.pending_len) {
-        return framingFailed(&result, input.len, error.DataFailure);
+        return framingFailed(&result, input.len, error.DataException);
     }
     result.status = .open;
     return result;
@@ -676,18 +676,18 @@ const DeflateEncode = struct {
     }
 };
 
-fn writePrologue(comptime wrap: EncodeWrap, state: *DeflateEncode) Failure!void {
+fn writePrologue(comptime wrap: EncodeWrap, state: *DeflateEncode) Exception!void {
     switch (wrap) {
         .raw => {},
         .gzip => {
-            if (state.room() < 10) return error.CapacityFailure;
+            if (state.room() < 10) return error.CapacityException;
             const header = [10]u8{ 0x1F, 0x8B, 8, 0, 0, 0, 0, 0, 0, 255 };
             @memcpy(state.pending[state.pending_len..][0..10], &header);
             state.pending_len += 10;
             state.hasher = checksum.Crc32.init();
         },
         .zlib => {
-            if (state.room() < 2) return error.CapacityFailure;
+            if (state.room() < 2) return error.CapacityException;
             // cinfo 7 (32 KiB window) with a valid fcheck: 0x78 0x9C.
             const header = [2]u8{ 0x78, 0x9C };
             @memcpy(state.pending[state.pending_len..][0..2], &header);
@@ -698,11 +698,11 @@ fn writePrologue(comptime wrap: EncodeWrap, state: *DeflateEncode) Failure!void 
     state.header_written = true;
 }
 
-fn writeEpilogue(comptime wrap: EncodeWrap, state: *DeflateEncode) Failure!void {
+fn writeEpilogue(comptime wrap: EncodeWrap, state: *DeflateEncode) Exception!void {
     switch (wrap) {
         .raw => {},
         .gzip => {
-            if (state.room() < 8) return error.CapacityFailure;
+            if (state.room() < 8) return error.CapacityException;
             var trailer: [8]u8 = undefined;
             std.mem.writeInt(u32, trailer[0..4], state.hasher.final(), .little);
             std.mem.writeInt(u32, trailer[4..8], @truncate(state.size), .little);
@@ -710,7 +710,7 @@ fn writeEpilogue(comptime wrap: EncodeWrap, state: *DeflateEncode) Failure!void 
             state.pending_len += 8;
         },
         .zlib => {
-            if (state.room() < 4) return error.CapacityFailure;
+            if (state.room() < 4) return error.CapacityException;
             var trailer: [4]u8 = undefined;
             std.mem.writeInt(u32, &trailer, state.adler.final(), .big);
             @memcpy(state.pending[state.pending_len..][0..4], &trailer);
@@ -726,7 +726,7 @@ fn deflateEncodeStorageImpl(wrap: EncodeWrap) usize {
     return stateSize(DeflateEncode) + deflate.history_size;
 }
 
-fn deflateEncodeInitImpl(storage: []u8, budgets: sessions.Budgets) error{CapacityFailure}!*DeflateEncode {
+fn deflateEncodeInitImpl(storage: []u8, budgets: sessions.Budgets) error{CapacityException}!*DeflateEncode {
     const carved = try carveHistory(DeflateEncode, storage, deflate.history_size);
     const state = carved.state;
     const history = carved.history;
@@ -740,11 +740,11 @@ fn deflateEncodeInitImpl(storage: []u8, budgets: sessions.Budgets) error{Capacit
         .budgets = budgets,
     };
     state.downstream = std.Io.Writer.fixed(&state.pending);
-    state.compressor = deflate.Compress.init(&state.downstream, history, deflate_encode_options) catch return error.CapacityFailure;
+    state.compressor = deflate.Compress.init(&state.downstream, history, deflate_encode_options) catch return error.CapacityException;
     return state;
 }
 
-fn deflateEncodeSessionImpl(comptime wrap: EncodeWrap, storage: []u8, budgets: sessions.Budgets) error{ CapacityFailure, UnsupportedFailure }!sessions.Session {
+fn deflateEncodeSessionImpl(comptime wrap: EncodeWrap, storage: []u8, budgets: sessions.Budgets) error{ CapacityException, UnsupportedException }!sessions.Session {
     const state = try deflateEncodeInitImpl(storage, budgets);
     const ops = comptime deflateEncodeOps(wrap);
     return .{ .state = state, .ops = ops };
@@ -764,8 +764,8 @@ fn deflateEncodeStep(comptime wrap: EncodeWrap, state: *DeflateEncode, input: []
     var result = StepResult{};
     state.drain(output, &result);
     if (!state.header_written) {
-        writePrologue(wrap, state) catch |failure| {
-            return encodeFailed(&result, failure);
+        writePrologue(wrap, state) catch |exception| {
+            return encodeFailed(&result, exception);
         };
         state.drain(output, &result);
     }
@@ -776,12 +776,12 @@ fn deflateEncodeStep(comptime wrap: EncodeWrap, state: *DeflateEncode, input: []
             const needed = deflate.encodedSizeBound(input.len);
             if (state.room() < needed) {
                 result.required_capacity = needed - state.room();
-                return encodeFailed(&result, error.CapacityFailure);
+                return encodeFailed(&result, error.CapacityException);
             }
             state.downstream.end = state.pending_len;
             state.downstream.buffer = state.pending[0..];
             state.compressor.writer.writeAll(input) catch {
-                return encodeFailed(&result, error.InternalFailure);
+                return encodeFailed(&result, error.InternalException);
             };
             state.pending_len = state.downstream.end;
             switch (wrap) {
@@ -789,24 +789,24 @@ fn deflateEncodeStep(comptime wrap: EncodeWrap, state: *DeflateEncode, input: []
                 .gzip => state.hasher.update(input),
                 .zlib => state.adler.update(input),
             }
-            state.size = std.math.add(u64, state.size, input.len) catch return encodeFailed(&result, error.ResourceFailure);
-            state.budgets.addDecoded(input.len) catch |failure| return encodeFailed(&result, failure);
+            state.size = std.math.add(u64, state.size, input.len) catch return encodeFailed(&result, error.ResourceException);
+            state.budgets.addDecoded(input.len) catch |exception| return encodeFailed(&result, exception);
             result.consumed = input.len;
         } else {
             // The mirror case on the decode side is an error, so dropping input
             // handed in after the final block must be one too.
-            return encodeFailed(&result, error.CallFailure);
+            return encodeFailed(&result, error.CallException);
         }
     }
     if (end_of_input and !state.finished) {
         state.downstream.end = state.pending_len;
         state.downstream.buffer = state.pending[0..];
         state.compressor.finish() catch {
-            return encodeFailed(&result, error.InternalFailure);
+            return encodeFailed(&result, error.InternalException);
         };
         state.pending_len = state.downstream.end;
-        writeEpilogue(wrap, state) catch |failure| {
-            return encodeFailed(&result, failure);
+        writeEpilogue(wrap, state) catch |exception| {
+            return encodeFailed(&result, exception);
         };
         state.finished = true;
     }
@@ -819,9 +819,9 @@ fn deflateEncodeStep(comptime wrap: EncodeWrap, state: *DeflateEncode, input: []
     return result;
 }
 
-fn encodeFailed(result: *StepResult, failure: Failure) StepResult {
+fn encodeFailed(result: *StepResult, exception: Exception) StepResult {
     result.status = .failed;
-    result.failure = failure;
+    result.exception = exception;
     return result.*;
 }
 
@@ -830,30 +830,30 @@ fn encodeFailed(result: *StepResult, failure: Failure) StepResult {
 pub fn deflateEncodeStorage() usize {
     return deflateEncodeStorageImpl(.raw);
 }
-pub fn deflateEncodeInit(storage: []u8, budgets: sessions.Budgets) error{CapacityFailure}!*DeflateEncode {
+pub fn deflateEncodeInit(storage: []u8, budgets: sessions.Budgets) error{CapacityException}!*DeflateEncode {
     return deflateEncodeInitImpl(storage, budgets);
 }
-pub fn deflateEncodeSession(storage: []u8, budgets: sessions.Budgets) error{ CapacityFailure, UnsupportedFailure }!sessions.Session {
+pub fn deflateEncodeSession(storage: []u8, budgets: sessions.Budgets) error{ CapacityException, UnsupportedException }!sessions.Session {
     return deflateEncodeSessionImpl(.raw, storage, budgets);
 }
 
 pub fn gzipEncodeStorage() usize {
     return deflateEncodeStorageImpl(.gzip);
 }
-pub fn gzipEncodeInit(storage: []u8, budgets: sessions.Budgets) error{CapacityFailure}!*DeflateEncode {
+pub fn gzipEncodeInit(storage: []u8, budgets: sessions.Budgets) error{CapacityException}!*DeflateEncode {
     return deflateEncodeInitImpl(storage, budgets);
 }
-pub fn gzipEncodeSession(storage: []u8, budgets: sessions.Budgets) error{ CapacityFailure, UnsupportedFailure }!sessions.Session {
+pub fn gzipEncodeSession(storage: []u8, budgets: sessions.Budgets) error{ CapacityException, UnsupportedException }!sessions.Session {
     return deflateEncodeSessionImpl(.gzip, storage, budgets);
 }
 
 pub fn zlibEncodeStorage() usize {
     return deflateEncodeStorageImpl(.zlib);
 }
-pub fn zlibEncodeInit(storage: []u8, budgets: sessions.Budgets) error{CapacityFailure}!*DeflateEncode {
+pub fn zlibEncodeInit(storage: []u8, budgets: sessions.Budgets) error{CapacityException}!*DeflateEncode {
     return deflateEncodeInitImpl(storage, budgets);
 }
-pub fn zlibEncodeSession(storage: []u8, budgets: sessions.Budgets) error{ CapacityFailure, UnsupportedFailure }!sessions.Session {
+pub fn zlibEncodeSession(storage: []u8, budgets: sessions.Budgets) error{ CapacityException, UnsupportedException }!sessions.Session {
     return deflateEncodeSessionImpl(.zlib, storage, budgets);
 }
 
@@ -895,7 +895,7 @@ pub const Lz4Decode = struct {
     leftover: usize = 0,
     budgets: sessions.Budgets,
 
-    fn restage(self: *Lz4Decode, input: []const u8, result: *StepResult) Failure!void {
+    fn restage(self: *Lz4Decode, input: []const u8, result: *StepResult) Exception!void {
         try compactPending(self.pending[0..], &self.pending_len, self.pending_read);
         self.pending_read = 0;
         try appendStaged(self.pending[0..], &self.pending_len, &self.leftover, input, result);
@@ -906,9 +906,9 @@ pub fn lz4DecodeStorage() usize {
     return stateSize(Lz4Decode) + lz4.block_size_max + lz4_window_len;
 }
 
-pub fn lz4DecodeInit(storage: []u8, budgets: sessions.Budgets) error{CapacityFailure}!*Lz4Decode {
+pub fn lz4DecodeInit(storage: []u8, budgets: sessions.Budgets) error{CapacityException}!*Lz4Decode {
     const state_size = stateSize(Lz4Decode);
-    if (storage.len < state_size + lz4.block_size_max + lz4_window_len) return error.CapacityFailure;
+    if (storage.len < state_size + lz4.block_size_max + lz4_window_len) return error.CapacityException;
     const state: *Lz4Decode = @ptrCast(@alignCast(storage.ptr));
     state.* = .{
         .staging = storage[state_size..][0..lz4.block_size_max],
@@ -921,7 +921,7 @@ pub fn lz4DecodeInit(storage: []u8, budgets: sessions.Budgets) error{CapacityFai
 
 const lz4_decode_ops = StepOps(Lz4Decode, lz4DecodeStep);
 
-pub fn lz4DecodeSession(storage: []u8, budgets: sessions.Budgets) error{ CapacityFailure, UnsupportedFailure }!sessions.Session {
+pub fn lz4DecodeSession(storage: []u8, budgets: sessions.Budgets) error{ CapacityException, UnsupportedException }!sessions.Session {
     const state = try lz4DecodeInit(storage, budgets);
     return .{ .state = state, .ops = &lz4_decode_ops };
 }
@@ -932,8 +932,8 @@ fn lz4Available(state: *Lz4Decode) []const u8 {
 
 pub fn lz4DecodeStep(state: *Lz4Decode, input: []const u8, output: []u8, end_of_input: bool) StepResult {
     var result = StepResult{};
-    state.restage(input, &result) catch |failure| {
-        return framingFailed(&result, 0, failure);
+    state.restage(input, &result) catch |exception| {
+        return framingFailed(&result, 0, exception);
     };
     var stalled = false;
     while (!stalled) {
@@ -941,20 +941,20 @@ pub fn lz4DecodeStep(state: *Lz4Decode, input: []const u8, output: []u8, end_of_
             .header => {
                 const avail = lz4Available(state);
                 if (avail.len < 7) {
-                    if (end_of_input) return framingFailed(&result, input.len, error.DataFailure);
+                    if (end_of_input) return framingFailed(&result, input.len, error.DataException);
                     stalled = true;
                     continue;
                 }
-                if (std.mem.readInt(u32, avail[0..4], .little) != lz4_magic_value) return framingFailed(&result, input.len, error.DataFailure);
+                if (std.mem.readInt(u32, avail[0..4], .little) != lz4_magic_value) return framingFailed(&result, input.len, error.DataException);
                 state.flags = avail[4];
-                if ((state.flags & 0xC0) != 0x40) return framingFailed(&result, input.len, error.UnsupportedFailure);
+                if ((state.flags & 0xC0) != 0x40) return framingFailed(&result, input.len, error.UnsupportedException);
                 const block_code = (avail[5] >> 4) & 0x07;
-                if (block_code < 4 or block_code > 7) return framingFailed(&result, input.len, error.DataFailure);
+                if (block_code < 4 or block_code > 7) return framingFailed(&result, input.len, error.DataException);
                 state.max_block = @as(usize, 65536) << @intCast(2 * (@as(usize, block_code) - 4));
                 var offset: usize = 6;
                 if (state.flags & 0x08 != 0) {
                     if (avail.len < 14) {
-                        if (end_of_input) return framingFailed(&result, input.len, error.DataFailure);
+                        if (end_of_input) return framingFailed(&result, input.len, error.DataException);
                         stalled = true;
                         continue;
                     }
@@ -963,20 +963,20 @@ pub fn lz4DecodeStep(state: *Lz4Decode, input: []const u8, output: []u8, end_of_
                 }
                 if (state.flags & 0x01 != 0) {
                     if (avail.len < offset + 4) {
-                        if (end_of_input) return framingFailed(&result, input.len, error.DataFailure);
+                        if (end_of_input) return framingFailed(&result, input.len, error.DataException);
                         stalled = true;
                         continue;
                     }
                     offset += 4;
                 }
                 if (avail.len < offset + 1) {
-                    if (end_of_input) return framingFailed(&result, input.len, error.DataFailure);
+                    if (end_of_input) return framingFailed(&result, input.len, error.DataException);
                     stalled = true;
                     continue;
                 }
                 const stored_sum = avail[offset];
                 const computed: u8 = @truncate(checksum.xxh32With(checksum.default_provider, avail[4..offset]) >> 8);
-                if (stored_sum != computed) return framingFailed(&result, input.len, error.IntegrityFailure);
+                if (stored_sum != computed) return framingFailed(&result, input.len, error.IntegrityException);
                 state.pending_read += offset + 1;
                 state.content_hasher = checksum.XxHash32.init(0);
                 state.phase = .block_size;
@@ -984,7 +984,7 @@ pub fn lz4DecodeStep(state: *Lz4Decode, input: []const u8, output: []u8, end_of_
             .block_size => {
                 const avail = lz4Available(state);
                 if (avail.len < 4) {
-                    if (end_of_input) return framingFailed(&result, input.len, error.DataFailure);
+                    if (end_of_input) return framingFailed(&result, input.len, error.DataException);
                     stalled = true;
                     continue;
                 }
@@ -996,13 +996,13 @@ pub fn lz4DecodeStep(state: *Lz4Decode, input: []const u8, output: []u8, end_of_
                 }
                 state.block_is_stored = (field & 0x80000000) != 0;
                 state.block_remaining = @intCast(field & ~@as(u32, 0x80000000));
-                if (state.block_remaining > state.max_block) return framingFailed(&result, input.len, error.DataFailure);
+                if (state.block_remaining > state.max_block) return framingFailed(&result, input.len, error.DataException);
                 state.phase = .block_data;
             },
             .block_data => {
                 const avail = lz4Available(state);
                 if (avail.len < state.block_remaining) {
-                    if (end_of_input) return framingFailed(&result, input.len, error.DataFailure);
+                    if (end_of_input) return framingFailed(&result, input.len, error.DataException);
                     stalled = true;
                     continue;
                 }
@@ -1016,13 +1016,13 @@ pub fn lz4DecodeStep(state: *Lz4Decode, input: []const u8, output: []u8, end_of_
                     break :blk block_data.len;
                 } else lz4.decompressBlock(block_data, state.staging, state.window[0..state.window_len]) catch |err| {
                     return framingFailed(&result, input.len, switch (err) {
-                        error.DataFailure => error.DataFailure,
-                        error.OutputTooSmall => error.InternalFailure,
+                        error.DataException => error.DataException,
+                        error.OutputTooSmall => error.InternalException,
                     });
                 };
                 state.content_hasher.update(state.staging[0..produced]);
-                state.total = std.math.add(usize, state.total, produced) catch return framingFailed(&result, input.len, error.ResourceFailure);
-                state.budgets.addDecoded(produced) catch |failure| return framingFailed(&result, input.len, failure);
+                state.total = std.math.add(usize, state.total, produced) catch return framingFailed(&result, input.len, error.ResourceException);
+                state.budgets.addDecoded(produced) catch |exception| return framingFailed(&result, input.len, exception);
                 // Linked frames read the last 64 KiB of history.
                 if (state.flags & 0x20 == 0) {
                     const produced_bytes = state.staging[0..produced];
@@ -1057,39 +1057,39 @@ pub fn lz4DecodeStep(state: *Lz4Decode, input: []const u8, output: []u8, end_of_
             .block_checksum => {
                 const avail = lz4Available(state);
                 if (avail.len < 4) {
-                    if (end_of_input) return framingFailed(&result, input.len, error.DataFailure);
+                    if (end_of_input) return framingFailed(&result, input.len, error.DataException);
                     stalled = true;
                     continue;
                 }
                 const stored_sum = std.mem.readInt(u32, avail[0..4], .little);
-                if (stored_sum != state.block_checksum) return framingFailed(&result, input.len, error.IntegrityFailure);
+                if (stored_sum != state.block_checksum) return framingFailed(&result, input.len, error.IntegrityException);
                 state.pending_read += 4;
                 state.phase = .block_size;
             },
             .content_checksum => {
                 if (state.flags & 0x04 == 0) {
                     if (state.content_size) |expected| {
-                        if (expected != state.total) return framingFailed(&result, input.len, error.IntegrityFailure);
+                        if (expected != state.total) return framingFailed(&result, input.len, error.IntegrityException);
                     }
                     state.phase = .done;
                     continue;
                 }
                 const avail = lz4Available(state);
                 if (avail.len < 4) {
-                    if (end_of_input) return framingFailed(&result, input.len, error.DataFailure);
+                    if (end_of_input) return framingFailed(&result, input.len, error.DataException);
                     stalled = true;
                     continue;
                 }
                 const stored_sum = std.mem.readInt(u32, avail[0..4], .little);
-                if (stored_sum != state.content_hasher.final()) return framingFailed(&result, input.len, error.IntegrityFailure);
+                if (stored_sum != state.content_hasher.final()) return framingFailed(&result, input.len, error.IntegrityException);
                 state.pending_read += 4;
                 if (state.content_size) |expected| {
-                    if (expected != state.total) return framingFailed(&result, input.len, error.IntegrityFailure);
+                    if (expected != state.total) return framingFailed(&result, input.len, error.IntegrityException);
                 }
                 state.phase = .done;
             },
             .done => {
-                if (state.pending_read != state.pending_len) return framingFailed(&result, input.len, error.DataFailure);
+                if (state.pending_read != state.pending_len) return framingFailed(&result, input.len, error.DataException);
                 result.consumed = input.len;
                 result.status = .done;
                 return result;
@@ -1098,7 +1098,7 @@ pub fn lz4DecodeStep(state: *Lz4Decode, input: []const u8, output: []u8, end_of_
     }
     result.consumed = input.len;
     if (end_of_input and state.phase != .done) {
-        return framingFailed(&result, input.len, error.DataFailure);
+        return framingFailed(&result, input.len, error.DataException);
     }
     result.status = .open;
     return result;
@@ -1129,9 +1129,9 @@ pub fn lz4EncodeStorage() usize {
     return state_size + lz4.encodeWorkspaceSize();
 }
 
-pub fn lz4EncodeInit(storage: []u8, budgets: sessions.Budgets) error{CapacityFailure}!*Lz4Encode {
+pub fn lz4EncodeInit(storage: []u8, budgets: sessions.Budgets) error{CapacityException}!*Lz4Encode {
     const state_size = stateSize(Lz4Encode);
-    if (storage.len < state_size + lz4.encodeWorkspaceSize()) return error.CapacityFailure;
+    if (storage.len < state_size + lz4.encodeWorkspaceSize()) return error.CapacityException;
     const state: *Lz4Encode = @ptrCast(@alignCast(storage.ptr));
     const workspace = storage[state_size..][0..lz4.encodeWorkspaceSize()];
     state.* = .{
@@ -1144,21 +1144,21 @@ pub fn lz4EncodeInit(storage: []u8, budgets: sessions.Budgets) error{CapacityFai
     // omitted (a stream's total is not knowable at the first step), content
     // checksum on.
     var fixed = std.Io.Writer.fixed(state.pending[0..]);
-    fixed.writeInt(u32, lz4_magic_value, .little) catch return error.CapacityFailure;
+    fixed.writeInt(u32, lz4_magic_value, .little) catch return error.CapacityException;
     const flags: u8 = 0x40 | 0x20 | 0x04;
-    fixed.writeByte(flags) catch return error.CapacityFailure;
-    fixed.writeByte(7 << 4) catch return error.CapacityFailure;
+    fixed.writeByte(flags) catch return error.CapacityException;
+    fixed.writeByte(7 << 4) catch return error.CapacityException;
     state.content_hasher = checksum.XxHash32.init(0);
     var crc_state = checksum.XxHash32.init(0);
     crc_state.update(&.{ flags, 7 << 4 });
-    fixed.writeByte(@truncate(crc_state.final() >> 8)) catch return error.CapacityFailure;
+    fixed.writeByte(@truncate(crc_state.final() >> 8)) catch return error.CapacityException;
     state.pending_len = fixed.end;
     return state;
 }
 
 const lz4_encode_ops = StepOps(Lz4Encode, lz4EncodeStep);
 
-pub fn lz4EncodeSession(storage: []u8, budgets: sessions.Budgets) error{ CapacityFailure, UnsupportedFailure }!sessions.Session {
+pub fn lz4EncodeSession(storage: []u8, budgets: sessions.Budgets) error{ CapacityException, UnsupportedException }!sessions.Session {
     const state = try lz4EncodeInit(storage, budgets);
     return .{ .state = state, .ops = &lz4_encode_ops };
 }
@@ -1177,7 +1177,7 @@ pub fn lz4EncodeStep(state: *Lz4Encode, input: []const u8, output: []u8, end_of_
             if (state.room() < bound + 8) {
                 if (result.consumed == 0 and result.produced == 0) {
                     result.required_capacity = bound + 8 - state.room();
-                    return encodeFailed(&result, error.CapacityFailure);
+                    return encodeFailed(&result, error.CapacityException);
                 }
                 break;
             }
@@ -1186,15 +1186,15 @@ pub fn lz4EncodeStep(state: *Lz4Encode, input: []const u8, output: []u8, end_of_
             const is_stored = compressed_len >= take;
             var fixed = std.Io.Writer.fixed(state.pending[state.pending_len..]);
             if (is_stored) {
-                fixed.writeInt(u32, 0x80000000 | @as(u32, @intCast(take)), .little) catch return encodeFailed(&result, error.InternalFailure);
-                fixed.writeAll(chunk) catch return encodeFailed(&result, error.InternalFailure);
+                fixed.writeInt(u32, 0x80000000 | @as(u32, @intCast(take)), .little) catch return encodeFailed(&result, error.InternalException);
+                fixed.writeAll(chunk) catch return encodeFailed(&result, error.InternalException);
             } else {
-                fixed.writeInt(u32, @as(u32, @intCast(compressed_len)), .little) catch return encodeFailed(&result, error.InternalFailure);
-                fixed.writeAll(compressed) catch return encodeFailed(&result, error.InternalFailure);
+                fixed.writeInt(u32, @as(u32, @intCast(compressed_len)), .little) catch return encodeFailed(&result, error.InternalException);
+                fixed.writeAll(compressed) catch return encodeFailed(&result, error.InternalException);
             }
             state.pending_len += fixed.end;
             state.content_hasher.update(chunk);
-            state.budgets.addDecoded(take) catch |failure| return encodeFailed(&result, failure);
+            state.budgets.addDecoded(take) catch |exception| return encodeFailed(&result, exception);
             result.consumed += take;
             rest = rest[take..];
         }
@@ -1202,11 +1202,11 @@ pub fn lz4EncodeStep(state: *Lz4Encode, input: []const u8, output: []u8, end_of_
     if (end_of_input and !state.finished) {
         if (state.room() < 8) {
             result.required_capacity = 8 - state.room();
-            return encodeFailed(&result, error.CapacityFailure);
+            return encodeFailed(&result, error.CapacityException);
         }
         var fixed = std.Io.Writer.fixed(state.pending[state.pending_len..]);
-        fixed.writeInt(u32, 0, .little) catch return encodeFailed(&result, error.InternalFailure);
-        fixed.writeInt(u32, state.content_hasher.final(), .little) catch return encodeFailed(&result, error.InternalFailure);
+        fixed.writeInt(u32, 0, .little) catch return encodeFailed(&result, error.InternalException);
+        fixed.writeInt(u32, state.content_hasher.final(), .little) catch return encodeFailed(&result, error.InternalException);
         state.pending_len += fixed.end;
         state.finished = true;
     }

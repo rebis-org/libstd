@@ -15,7 +15,7 @@ pub const XxHash32 = xxh32_seam.XxHash32;
 pub const XxHash64 = xxh64_seam.XxHash64;
 
 // Zig inline asm cannot name the 32-bit register views, so the crc32 instructions bind
-// fixed X registers. The fold mirrors the vendor ip7z/7zip arm64 loop.
+// fixed X registers. The fold mirrors the vendor vendor/7zip arm64 loop.
 
 const crc32_hw = builtin.target.cpu.arch == .aarch64 and !options.crc32_portable;
 const has_crc32_kernel = crc32_hw and builtin.target.cpu.has(.aarch64, .crc);

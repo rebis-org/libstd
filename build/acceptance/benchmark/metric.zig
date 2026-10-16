@@ -28,18 +28,18 @@ pub const Totals = struct {
     }
 };
 
-pub const header = "type\tparams\tformat\tours_ratio\tours_c_mibps\tours_d_mibps\tcmd_ratio\tcmd_c_mibps\tcmd_d_mibps\tlib_ratio\tlib_c_mibps\tlib_d_mibps\tbin_ratio\tbin_c_mibps\tbin_d_mibps\tcoverage\n";
+pub const metric_header = "type\tparams\tformat\tours_ratio\tours_c_mibps\tours_d_mibps\tcmd_ratio\tcmd_c_mibps\tcmd_d_mibps\tlib_ratio\tlib_c_mibps\tlib_d_mibps\tbin_ratio\tbin_c_mibps\tbin_d_mibps\tcoverage\n";
 
 fn medianOfSorted(comptime T: type, sorted: []const T) T {
     const mid = sorted.len / 2;
     if (sorted.len % 2 == 1) return sorted[mid];
-    const a = sorted[mid - 1];
-    const b = sorted[mid];
-    return @intFromFloat((@as(f64, @floatFromInt(a)) + @as(f64, @floatFromInt(b))) / 2.0);
+    const lower = sorted[mid - 1];
+    const upper = sorted[mid];
+    return @intFromFloat((@as(f64, @floatFromInt(lower)) + @as(f64, @floatFromInt(upper))) / 2.0);
 }
 
 fn medianValue(comptime T: type, allocator: std.mem.Allocator, values: []const T) !T {
-    if (values.len == 0) return 0;
+    std.debug.assert(values.len > 0);
     var sorted = try allocator.alloc(T, values.len);
     defer allocator.free(sorted);
     @memcpy(sorted, values);
@@ -93,26 +93,26 @@ pub fn medianTotals(allocator: std.mem.Allocator, runs: []const Totals, skip: us
     return result;
 }
 
-pub fn mibps(bytes: usize, ns: u64) f64 {
+pub fn throughputMibps(bytes: usize, ns: u64) f64 {
     if (ns == 0) return 0;
     return @as(f64, @floatFromInt(bytes)) * 1_000_000_000.0 / (@as(f64, @floatFromInt(ns)) * 1048576.0);
 }
 
-pub fn ratio(bytes: usize, encoded: usize) f64 {
+pub fn compressionRatio(bytes: usize, encoded: usize) f64 {
     if (encoded == 0) return 0;
     return @as(f64, @floatFromInt(bytes)) / @as(f64, @floatFromInt(encoded));
 }
 
-pub fn decodeOk(len: usize, expected: []const u8, decoded: []u8) bool {
+pub fn isDecodeOk(len: usize, expected: []const u8, decoded: []u8) bool {
     return len == expected.len and std.mem.eql(u8, decoded[0..expected.len], expected);
 }
 
 fn cellRatio(buffer: *[16]u8, totals: Totals, side: Side, show: bool) []const u8 {
-    return tsv.cell(buffer, "{d:.3}", ratio(totals.input_bytes, totals.encoded[@backingInt(side)]), show);
+    return tsv.formattedCell(buffer, "{d:.3}", compressionRatio(totals.input_bytes, totals.encoded[@backingInt(side)]), show);
 }
 
 fn cellMibps(buffer: *[16]u8, bytes: usize, ns: u64, show: bool) []const u8 {
-    return tsv.cell(buffer, "{d:.1}", mibps(bytes, ns), show);
+    return tsv.formattedCell(buffer, "{d:.1}", throughputMibps(bytes, ns), show);
 }
 
 const missing_labels = [_][]const u8{ "cmd missing", "lib missing", "bin missing" };
@@ -132,7 +132,7 @@ fn coverage(allocator: std.mem.Allocator, totals: Totals, available: [4]bool) ![
     return "ok";
 }
 
-pub fn emitMetricRow(report: *std.ArrayList(u8), allocator: std.mem.Allocator, candidate: matrix.Row, totals: Totals, available: [4]bool) !void {
+pub fn emitMetricRow(report: *std.ArrayList(u8), allocator: std.mem.Allocator, candidate: matrix.BenchmarkRow, totals: Totals, available: [4]bool) !void {
     const show = !candidate.decode_only;
     const coverage_text = try coverage(allocator, totals, available);
     var cells: [12][16]u8 = undefined;

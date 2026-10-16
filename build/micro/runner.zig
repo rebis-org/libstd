@@ -1,6 +1,3 @@
-//! Time-budgeted runner borrowing four hendriknielaender/zBench designs (MIT): budget
-//! calibration, percentiles, allocation counts, opt-in shuffling. Own code.
-
 const std = @import("std");
 
 const shuffling = @import("shuffling.zig");
@@ -42,6 +39,11 @@ pub const CountingAllocator = struct {
         return .{ .count = self.count, .live_bytes = self.live, .peak_bytes = self.peak };
     }
 
+    fn recordLive(self: *CountingAllocator, new_live: usize) void {
+        self.live = new_live;
+        if (self.live > self.peak) self.peak = self.live;
+    }
+
     const vtable: std.mem.Allocator.VTable = .{
         .alloc = allocFn,
         .resize = resizeFn,
@@ -53,24 +55,21 @@ pub const CountingAllocator = struct {
         const self: *CountingAllocator = @ptrCast(@alignCast(self_ptr));
         const ptr = std.mem.Allocator.rawAlloc(self.underlying, len, alignment, ret_addr) orelse return null;
         self.count += 1;
-        self.live += len;
-        if (self.live > self.peak) self.peak = self.live;
+        self.recordLive(self.live + len);
         return ptr;
     }
 
     fn resizeFn(self_ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
         const self: *CountingAllocator = @ptrCast(@alignCast(self_ptr));
         if (!std.mem.Allocator.rawResize(self.underlying, memory, alignment, new_len, ret_addr)) return false;
-        self.live = self.live - memory.len + new_len;
-        if (self.live > self.peak) self.peak = self.live;
+        self.recordLive(self.live - memory.len + new_len);
         return true;
     }
 
     fn remapFn(self_ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
         const self: *CountingAllocator = @ptrCast(@alignCast(self_ptr));
         const ptr = std.mem.Allocator.rawRemap(self.underlying, memory, alignment, new_len, ret_addr) orelse return null;
-        self.live = self.live - memory.len + new_len;
-        if (self.live > self.peak) self.peak = self.live;
+        self.recordLive(self.live - memory.len + new_len);
         return ptr;
     }
 
@@ -81,17 +80,17 @@ pub const CountingAllocator = struct {
     }
 };
 
-const Erased = struct {
-    ctx: *anyopaque,
-    invoke: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) void,
+const Thunk = struct {
+    context: *anyopaque,
+    invoke: *const fn (context: *anyopaque, allocator: std.mem.Allocator) void,
 };
 
-pub const Definition = struct {
+pub const Case = struct {
     name: []const u8,
-    erased: Erased,
+    erased: Thunk,
 };
 
-const Result = struct {
+const Readings = struct {
     runs: usize,
     timings: []u64,
     allocations: []AllocReading,
@@ -100,14 +99,14 @@ const Result = struct {
 pub const Benchmark = struct {
     allocator: std.mem.Allocator,
     config: Config,
-    defs: std.ArrayList(Definition) = .empty,
+    entries: std.ArrayList(Case) = .empty,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) Benchmark {
         return .{ .allocator = allocator, .config = config };
     }
 
     pub fn deinit(self: *Benchmark) void {
-        self.defs.deinit(self.allocator);
+        self.entries.deinit(self.allocator);
     }
 
     pub fn add(self: *Benchmark, name: []const u8, comptime func: *const fn (std.mem.Allocator) void) !void {
@@ -116,11 +115,10 @@ pub const Benchmark = struct {
                 func(allocator);
             }
         };
-        try self.defs.append(self.allocator, .{ .name = name, .erased = .{ .ctx = undefined, .invoke = S.invoke } });
+        try self.entries.append(self.allocator, .{ .name = name, .erased = .{ .context = undefined, .invoke = S.invoke } });
     }
 
-    // instance must be a pointer to a struct declaring
-    // `pub fn run(self: @TypeOf(instance), allocator: std.mem.Allocator) void`.
+    // One path serves function and method cases, so runOne stays monomorphic.
     pub fn addParam(self: *Benchmark, name: []const u8, instance: anytype) !void {
         const P = @TypeOf(instance);
         const T = switch (@typeInfo(P)) {
@@ -129,37 +127,37 @@ pub const Benchmark = struct {
         };
         const run_fn: fn (P, std.mem.Allocator) void = T.run;
         const S = struct {
-            fn invoke(ctx: *anyopaque, allocator: std.mem.Allocator) void {
-                const ptr: P = @ptrCast(@alignCast(ctx));
+            fn invoke(context: *anyopaque, allocator: std.mem.Allocator) void {
+                const ptr: P = @ptrCast(@alignCast(context));
                 run_fn(ptr, allocator);
             }
         };
-        try self.defs.append(self.allocator, .{ .name = name, .erased = .{ .ctx = @constCast(@as(*const anyopaque, instance)), .invoke = S.invoke } });
+        try self.entries.append(self.allocator, .{ .name = name, .erased = .{ .context = @constCast(@as(*const anyopaque, instance)), .invoke = S.invoke } });
     }
 
     pub fn run(self: *Benchmark, io: std.Io) !void {
         var out: std.Io.Writer.Allocating = .init(self.allocator);
         defer out.deinit();
-        const w = &out.writer;
+        const writer = &out.writer;
 
         var max_name_len: usize = "benchmark".len;
-        for (self.defs.items) |def| max_name_len = @max(max_name_len, def.name.len);
+        for (self.entries.items) |entry| max_name_len = @max(max_name_len, entry.name.len);
 
-        try w.print("micro: budget={d}ms max_iterations={d} allocator={s}\n", .{
+        try writer.print("micro: budget={d}ms max_iterations={d} allocator={s}\n", .{
             self.config.time_budget_ns / std.time.ns_per_ms,
             self.config.max_iterations,
             if (self.config.shuffle) "shuffling" else "counting",
         });
-        try printName(w, "benchmark", max_name_len);
-        try w.print(" {s:>8} {s:>12} {s:>12} {s:>12} {s:>12} {s:>12} {s:>12} {s:>8} {s:>10}\n", .{
+        try printName(writer, "benchmark", max_name_len);
+        try writer.print(" {s:>8} {s:>12} {s:>12} {s:>12} {s:>12} {s:>12} {s:>12} {s:>8} {s:>10}\n", .{
             "runs", "avg ns", "sd ns", "min ns", "max ns", "p75 ns", "p99 ns", "allocs", "peak B",
         });
 
-        for (self.defs.items) |*def| {
-            const result = try self.runOne(io, def);
+        for (self.entries.items) |*entry| {
+            const result = try self.runOne(io, entry);
             defer self.allocator.free(result.timings);
             defer self.allocator.free(result.allocations);
-            try printRow(w, max_name_len, def.name, result);
+            try printRow(writer, max_name_len, entry.name, result);
         }
 
         var list = out.toArrayList();
@@ -167,39 +165,39 @@ pub const Benchmark = struct {
         try std.Io.File.stdout().writeStreamingAll(io, list.items);
     }
 
-    fn runOne(self: *Benchmark, io: std.Io, def: *const Definition) !Result {
+    fn runOne(self: *Benchmark, io: std.Io, entry: *const Case) !Readings {
         var counting = CountingAllocator.init(self.allocator);
         var shuffler: ?shuffling.ShufflingAllocator = if (self.config.shuffle)
             shuffling.ShufflingAllocator.init(counting.allocator(), self.config.shuffle_seed)
         else
             null;
-        defer if (shuffler) |*s| s.deinit();
-        const bench_alloc = if (shuffler) |*s| s.allocator() else counting.allocator();
+        defer if (shuffler) |*pool| pool.deinit();
+        const bench_alloc = if (shuffler) |*pool| pool.allocator() else counting.allocator();
 
-        // Calibration: single iterations until the budget is spent, then the
-        // iteration count that a budget's worth of wall time should hold.
+        // Calibration spends the budget on single iterations.
+        // Scales the count to fill a budget's worth of wall time.
         var loops: u64 = 0;
         var elapsed: u64 = 0;
         while (elapsed < self.config.time_budget_ns and loops < self.config.max_iterations) {
             const start = nowNs(io);
-            def.erased.invoke(def.erased.ctx, bench_alloc);
+            entry.erased.invoke(entry.erased.context, bench_alloc);
             elapsed += nowNs(io) - start;
             loops += 1;
         }
-        const n = calibrationN(loops, elapsed, self.config.time_budget_ns, self.config.max_iterations);
+        const run_count = calibrationN(loops, elapsed, self.config.time_budget_ns, self.config.max_iterations);
 
-        const timings = try self.allocator.alloc(u64, n);
+        const timings = try self.allocator.alloc(u64, run_count);
         errdefer self.allocator.free(timings);
-        const allocations = try self.allocator.alloc(AllocReading, n);
+        const allocations = try self.allocator.alloc(AllocReading, run_count);
         errdefer self.allocator.free(allocations);
-        for (0..n) |i| {
+        for (0..run_count) |i| {
             counting.reset();
             const start = nowNs(io);
-            def.erased.invoke(def.erased.ctx, bench_alloc);
+            entry.erased.invoke(entry.erased.context, bench_alloc);
             timings[i] = nowNs(io) - start;
             allocations[i] = counting.reading();
         }
-        return .{ .runs = n, .timings = timings, .allocations = allocations };
+        return .{ .runs = run_count, .timings = timings, .allocations = allocations };
     }
 };
 
@@ -223,39 +221,40 @@ fn percentile(sorted: []const u64, p: f64) u64 {
     return sorted[@min(index, sorted.len) - 1];
 }
 
-fn printName(w: *std.Io.Writer, name: []const u8, width: usize) !void {
-    var buf: [64]u8 = undefined;
-    const len = @min(name.len, buf.len);
-    @memcpy(buf[0..len], name[0..len]);
-    const pad = @min(width, buf.len);
-    if (pad > len) @memset(buf[len..pad], ' ');
-    try w.writeAll(buf[0..@max(pad, len)]);
+fn printName(writer: *std.Io.Writer, name: []const u8, width: usize) !void {
+    var scratch: [64]u8 = undefined;
+    const len = @min(name.len, scratch.len);
+    @memcpy(scratch[0..len], name[0..len]);
+    const pad = @min(width, scratch.len);
+    if (pad > len) @memset(scratch[len..pad], ' ');
+    try writer.writeAll(scratch[0..@max(pad, len)]);
 }
 
-fn printRow(w: *std.Io.Writer, max_name_len: usize, name: []const u8, result: Result) !void {
+fn printRow(writer: *std.Io.Writer, max_name_len: usize, name: []const u8, result: Readings) !void {
+    // Sorts in place because the slice dies with the row.
     const sorted = result.timings;
     std.sort.pdq(u64, sorted, {}, std.sort.asc(u64));
 
     var sum: u128 = 0;
-    for (result.timings) |t| sum += t;
+    for (result.timings) |timing| sum += timing;
     const mean: u64 = @intCast(sum / result.runs);
-    var sq: u128 = 0;
-    for (result.timings) |t| {
-        const d: i128 = @as(i128, t) - @as(i128, mean);
-        sq += @intCast(d * d);
+    var squared: u128 = 0;
+    for (result.timings) |timing| {
+        const delta: i128 = @as(i128, timing) - @as(i128, mean);
+        squared += @intCast(delta * delta);
     }
-    const sd: u64 = @intFromFloat(@sqrt(@as(f64, @floatFromInt(sq / result.runs))));
+    const sd: u64 = @intFromFloat(@sqrt(@as(f64, @floatFromInt(squared / result.runs))));
 
     var alloc_count: usize = 0;
     var peak: usize = 0;
-    for (result.allocations) |a| {
-        alloc_count += a.count;
-        if (a.peak_bytes > peak) peak = a.peak_bytes;
+    for (result.allocations) |reading| {
+        alloc_count += reading.count;
+        if (reading.peak_bytes > peak) peak = reading.peak_bytes;
     }
     const alloc_avg = @as(f64, @floatFromInt(alloc_count)) / @as(f64, @floatFromInt(result.runs));
 
-    try printName(w, name, max_name_len);
-    try w.print(" {d:>8} {d:>12} {d:>12} {d:>12} {d:>12} {d:>12} {d:>12} {d:>8.2} {d:>10}\n", .{
+    try printName(writer, name, max_name_len);
+    try writer.print(" {d:>8} {d:>12} {d:>12} {d:>12} {d:>12} {d:>12} {d:>12} {d:>8.2} {d:>10}\n", .{
         result.runs,
         mean,
         sd,

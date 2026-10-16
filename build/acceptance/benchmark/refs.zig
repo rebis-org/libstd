@@ -222,7 +222,7 @@ fn addBinaryRefs(b: *std.Build, ctx: *const common.Settings) struct { sevenzz: *
 }
 
 fn addSevenZz(b: *std.Build) struct { sevenzz: *std.Build.Step.InstallFile, lzma: *std.Build.Step.InstallFile } {
-    // ip7z/7zip 26.03 trips clang/LLVM 22's lifetime-safety suggestions under the
+    // vendor/7zip 26.03 trips clang/LLVM 22's lifetime-safety suggestions under the
     // makefile's -Weverything -Werror: the intra-TU one on MyStpCpy and, on newer
     // clang builds, the cross-TU one on IntToString.h. The makefile composes flags
     // from CFLAGS_WARN_WALL, so both warnings are disabled there.
@@ -356,10 +356,14 @@ fn addFastLzma2(b: *std.Build) struct { lib: std.Build.LazyPath, test_run: *std.
 fn addWimlib(b: *std.Build, dummy_dir: std.Build.LazyPath) *std.Build.Step.InstallFile {
     // The CLI is the oracle; wimlib is the format's reference implementation.
     // autoreconf needs the Homebrew libtool name.
-    const make_wimlib = gnuChain(b, "vendor/wimlib", dummy_dir, null,
-        &.{"sh", "-c", "export LIBTOOLIZE=glibtoolize; exec autoreconf -i"},
-        &.{"sh", "-c", "exec ./configure --without-fuse --without-ntfs-3g --disable-shared"},
-        &.{"sh", "-c", "make clean >/dev/null 2>&1; exec make -j4 wimlib-imagex"},
+    const make_wimlib = gnuChain(
+        b,
+        "vendor/wimlib",
+        dummy_dir,
+        null,
+        &.{ "sh", "-c", "export LIBTOOLIZE=glibtoolize; exec autoreconf -i" },
+        &.{ "sh", "-c", "exec ./configure --without-fuse --without-ntfs-3g --disable-shared" },
+        &.{ "sh", "-c", "make clean >/dev/null 2>&1; exec make -j4 wimlib-imagex" },
     );
     return installOut(b, &make_wimlib.step, "vendor/wimlib/wimlib-imagex", "wimlib-imagex");
 }
@@ -370,11 +374,11 @@ fn addSquashfsTools(b: *std.Build) struct { mksquashfs: *std.Build.Step.InstallF
 
     // The patch carries the fix; reset-then-apply keeps reruns idempotent.
     const apply_patch = b.addSystemCommand(&.{
-        "sh", "-c",
+        "sh",                                                                                                                                                     "-c",
         "git -C vendor/squashfs-tools checkout -- squashfs-tools/compressor.c && git -C vendor/squashfs-tools apply ../../patch/squashfs-tools/compressor.patch",
     });
     const make_tools = make(b, "vendor/squashfs-tools/squashfs-tools", &.{
-        "sh", "-c",
+        "sh",                                                                                                                                                                                                               "-c",
         "make clean >/dev/null 2>&1; exec make -j4 XZ_SUPPORT=1 LZO_SUPPORT=1 LZ4_SUPPORT=1 ZSTD_SUPPORT=1 LZMA_XZ_SUPPORT=1 EXTRA_CFLAGS=-I/opt/homebrew/include EXTRA_LDFLAGS=-L/opt/homebrew/lib mksquashfs unsquashfs",
     });
     make_tools.step.dependOn(&apply_patch.step);

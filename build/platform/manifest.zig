@@ -1,6 +1,18 @@
 const std = @import("std");
 
-pub const slices = @import("slices.zig");
+const slices = @import("slices.zig");
+
+pub const AndroidAbi = slices.AndroidAbi;
+pub const AppleArch = slices.AppleArch;
+pub const AppleSlice = slices.AppleSlice;
+pub const OhosAbi = slices.OhosAbi;
+pub const android_abis = slices.android_abis;
+pub const apple_slices = slices.apple_slices;
+pub const framework_binary = slices.framework_binary;
+pub const framework_bundle = slices.framework_bundle;
+pub const isMacos = slices.isMacos;
+pub const libraryEntry = slices.libraryEntry;
+pub const ohos_abis = slices.ohos_abis;
 
 pub const Distribution = struct {
     id: []const u8,
@@ -13,6 +25,9 @@ pub const Distribution = struct {
 };
 
 pub const providers = [_][]const u8{ "onprem", "offprem", "mergeable" };
+
+const apple_entries_per_slice = 5;
+const cjpm_entries_per_abi = 2;
 
 const host_entries = hostEntries();
 const android_entries = androidEntries();
@@ -87,7 +102,7 @@ fn androidEntries() []const []const u8 {
 }
 
 fn appleEntries() []const []const u8 {
-    const count = 2 + 5 * slices.apple_slices.len;
+    const count = 2 + apple_entries_per_slice * slices.apple_slices.len;
     const entries: [count][]const u8 = blk: {
         var tmp: [count][]const u8 = undefined;
         tmp[0] = "StdK.xcframework/Info.plist";
@@ -95,11 +110,11 @@ fn appleEntries() []const []const u8 {
         inline for (slices.apple_slices, 0..) |slice, index| {
             const root = std.fmt.comptimePrint("StdK.xcframework/{s}/{s}", .{ slice.id, slices.framework_bundle });
             const prefix = if (slices.isMacos(slice)) "Versions/A/" else "";
-            tmp[2 + 5 * index] = root ++ "/" ++ prefix ++ slices.framework_binary;
-            tmp[2 + 5 * index + 1] = root ++ "/" ++ prefix ++ "Headers/stdk.h";
-            tmp[2 + 5 * index + 2] = root ++ "/" ++ prefix ++ "Headers/module.modulemap";
-            tmp[2 + 5 * index + 3] = root ++ "/" ++ prefix ++ "Modules/module.modulemap";
-            tmp[2 + 5 * index + 4] = if (slices.isMacos(slice)) root ++ "/Versions/A/Resources/Info.plist" else root ++ "/Info.plist";
+            tmp[2 + apple_entries_per_slice * index] = root ++ "/" ++ prefix ++ slices.framework_binary;
+            tmp[2 + apple_entries_per_slice * index + 1] = root ++ "/" ++ prefix ++ "Headers/stdk.h";
+            tmp[2 + apple_entries_per_slice * index + 2] = root ++ "/" ++ prefix ++ "Headers/module.modulemap";
+            tmp[2 + apple_entries_per_slice * index + 3] = root ++ "/" ++ prefix ++ "Modules/module.modulemap";
+            tmp[2 + apple_entries_per_slice * index + 4] = if (slices.isMacos(slice)) root ++ "/Versions/A/Resources/Info.plist" else root ++ "/Info.plist";
         }
         break :blk tmp;
     };
@@ -107,7 +122,7 @@ fn appleEntries() []const []const u8 {
 }
 
 fn cjpmEntries() []const []const u8 {
-    const count = 4 + 2 * slices.ohos_abis.len;
+    const count = 4 + cjpm_entries_per_abi * slices.ohos_abis.len;
     const entries: [count][]const u8 = blk: {
         var tmp: [count][]const u8 = undefined;
         tmp[0] = "stdk/cjpm.toml";
@@ -115,8 +130,8 @@ fn cjpmEntries() []const []const u8 {
         tmp[2] = "stdk/libs/include/stdk.h";
         tmp[3] = "stdk/stdk.catalog.json";
         inline for (slices.ohos_abis, 0..) |abi, index| {
-            tmp[4 + 2 * index] = std.fmt.comptimePrint("stdk/libs/{s}/libstd.a", .{abi.triple});
-            tmp[4 + 2 * index + 1] = std.fmt.comptimePrint("stdk/libs/{s}/libstd.so", .{abi.triple});
+            tmp[4 + cjpm_entries_per_abi * index] = std.fmt.comptimePrint("stdk/libs/{s}/libstd.a", .{abi.triple});
+            tmp[4 + cjpm_entries_per_abi * index + 1] = std.fmt.comptimePrint("stdk/libs/{s}/libstd.so", .{abi.triple});
         }
         break :blk tmp;
     };

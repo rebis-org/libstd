@@ -1,12 +1,12 @@
 const std = @import("std");
 
-const failure = @import("../../common/primitive/failure.zig");
+const exception = @import("../../common/primitive/exception.zig");
 const sink = @import("../../common/sink.zig");
 const bits = @import("bits.zig");
 const huffman = @import("huffman.zig");
 const window_mod = @import("window.zig");
 
-const Failure = failure.Failure;
+const Exception = exception.Exception;
 const Sink = sink.Sink;
 const BitReader = bits.BitReader;
 const DecodeTable = huffman.DecodeTable;
@@ -70,8 +70,8 @@ const dist_bits = [dc20]u5{
     16, 16, 16, 16, 16, 16, 16, 16,
 };
 
-fn decodeDistance(slot: u32, br: *BitReader) Failure!u32 {
-    if (slot >= dc20) return error.DataFailure;
+fn decodeDistance(slot: u32, br: *BitReader) Exception!u32 {
+    if (slot >= dc20) return error.DataException;
     var distance: u32 = dist_decode[slot] + 1;
     const table_bits = dist_bits[slot];
     if (table_bits > 0) {
@@ -210,8 +210,8 @@ pub const Decoder = struct {
         st: *Decoder,
         window_buffer: []u8,
         table_pool: []u16,
-    ) Failure!void {
-        if (table_pool.len < table_pool_words) return error.InternalFailure;
+    ) Exception!void {
+        if (table_pool.len < table_pool_words) return error.InternalException;
         st.* = .{
             .br = undefined,
             .window = Window.init(window_buffer),
@@ -261,7 +261,7 @@ fn tablePoolSlice(st: *Decoder, index: usize, comptime size: usize) []u16 {
     return st.table_pool[offset..][0..size];
 }
 
-fn readTables(st: *Decoder) Failure!void {
+fn readTables(st: *Decoder) Exception!void {
     const br = &st.br;
 
     // V20 reads tables without byte alignment, because aligning discards up to 7 bits.
@@ -300,7 +300,7 @@ fn readTables(st: *Decoder) Failure!void {
             code_lengths[i] = @intCast((symbol + st.old_table[i]) & 0x0f);
             i += 1;
         } else if (symbol == 16) {
-            if (i == 0) return error.DataFailure;
+            if (i == 0) return error.DataException;
             var repeat_count: u32 = 3 + try br.readBits(2);
             while (repeat_count > 0 and i < table_size) : (repeat_count -= 1) {
                 code_lengths[i] = code_lengths[i - 1];
@@ -335,9 +335,9 @@ fn readTables(st: *Decoder) Failure!void {
     st.tables_loaded = true;
 }
 
-fn decodeLength(br: *BitReader, length_table: *const DecodeTable) Failure!u32 {
+fn decodeLength(br: *BitReader, length_table: *const DecodeTable) Exception!u32 {
     const slot = try huffman.decodeNumber(br, length_table);
-    if (slot >= rc20) return error.DataFailure;
+    if (slot >= rc20) return error.DataException;
 
     const base = length_bases[slot] + length_rep_base;
     const extra = length_extra_bits[slot];
@@ -349,7 +349,7 @@ fn decodeLength(br: *BitReader, length_table: *const DecodeTable) Failure!u32 {
 
 // V20 has no VM filters and its multimedia mode decodes inline, so nothing reaches backwards and no reserve is held back.
 // Decoded bytes must be emitted before the circular window overwrites them.
-fn flushDecoded(st: *Decoder, keep: usize) Failure!void {
+fn flushDecoded(st: *Decoder, keep: usize) Exception!void {
     const out = st.stream_out orelse return;
     const produced = st.window.write_pos - st.entry_start;
     const emit_upto = @min(produced -| keep, st.unpacked_size);
@@ -357,8 +357,8 @@ fn flushDecoded(st: *Decoder, keep: usize) Failure!void {
 
     const count = emit_upto - st.flushed;
     const back = produced - st.flushed;
-    if (back > st.window.buffer.len) return error.DataFailure;
-    if (!st.window.emitTo(out, back, count)) return error.DataFailure;
+    if (back > st.window.buffer.len) return error.DataException;
+    if (!st.window.emitTo(out, back, count)) return error.DataException;
     st.flushed += count;
 }
 
@@ -367,7 +367,7 @@ fn flushThreshold(st: *const Decoder) usize {
     return st.window.buffer.len / 2;
 }
 
-fn unpackLoop(st: *Decoder) Failure!void {
+fn unpackLoop(st: *Decoder) Exception!void {
     while (st.written_size < st.unpacked_size) {
         if (!st.tables_loaded) {
             try readTables(st);
@@ -381,7 +381,7 @@ fn unpackLoop(st: *Decoder) Failure!void {
     }
 }
 
-fn unpackAudioBlock(st: *Decoder) Failure!void {
+fn unpackAudioBlock(st: *Decoder) Exception!void {
     const br = &st.br;
 
     while (st.written_size < st.unpacked_size) {
@@ -390,7 +390,7 @@ fn unpackAudioBlock(st: *Decoder) Failure!void {
         {
             try flushDecoded(st, 0);
         }
-        if (br.remainingBits() < 1) return error.DataFailure;
+        if (br.remainingBits() < 1) return error.DataException;
 
         const channel = st.cur_channel;
         const symbol = try huffman.decodeNumber(br, &st.audio_tables[channel]);
@@ -408,7 +408,7 @@ fn unpackAudioBlock(st: *Decoder) Failure!void {
     }
 }
 
-fn unpackLzBlock(st: *Decoder) Failure!void {
+fn unpackLzBlock(st: *Decoder) Exception!void {
     const br = &st.br;
 
     while (st.written_size < st.unpacked_size) {
@@ -417,7 +417,7 @@ fn unpackLzBlock(st: *Decoder) Failure!void {
         {
             try flushDecoded(st, 0);
         }
-        if (br.remainingBits() < 1) return error.DataFailure;
+        if (br.remainingBits() < 1) return error.DataException;
 
         const symbol = try huffman.decodeNumber(br, &st.literal_table);
 
@@ -474,7 +474,7 @@ fn unpackLzBlock(st: *Decoder) Failure!void {
             return;
         } else if (symbol >= 270) {
             const length_slot: u32 = symbol - 270;
-            if (length_slot >= rc20) return error.DataFailure;
+            if (length_slot >= rc20) return error.DataException;
 
             var length: u32 = blk: {
                 const base = length_bases[length_slot] + length_match_base;
@@ -502,7 +502,7 @@ fn unpackLzBlock(st: *Decoder) Failure!void {
             st.window.copyMatch(dist, length);
             st.written_size += length;
         } else {
-            return error.DataFailure;
+            return error.DataException;
         }
     }
 }
@@ -514,7 +514,7 @@ pub const Session = struct {
         st: *Decoder,
         window_buffer: []u8,
         table_pool: []u16,
-    ) Failure!Session {
+    ) Exception!Session {
         try Decoder.init(st, window_buffer, table_pool);
         return .{ .state = st };
     }
@@ -545,7 +545,7 @@ pub const Session = struct {
         unpacked_size: u64,
         solid: bool,
         out: Sink,
-    ) Failure!void {
+    ) Exception!void {
         const st = self.state;
 
         if (!solid) self.resetForNewStream();
@@ -580,7 +580,7 @@ pub const Session = struct {
         // A trailing match can overshoot the declared size, so measure how far the cursor actually moved.
         const consumed = st.window.write_pos - start_pos;
         if (!st.window.emitTo(out, consumed, out_size)) {
-            return error.DataFailure;
+            return error.DataException;
         }
     }
 };

@@ -15,12 +15,12 @@ const Id = abi.Id;
 const Node = abi.Node;
 const Limits = resource.Limits;
 const Resource = resource.Resource;
-const Failure = vocabulary.Failure;
+const Exception = vocabulary.Exception;
 
-const ProfileHook = *const fn (plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void;
+const ProfileHook = *const fn (plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void;
 
 // Convention dispatch: the hook for a tag lives as `<tag>Hook`.
-fn unsupportedHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
+fn unsupportedHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
     _ = plan;
     _ = source;
     _ = sink;
@@ -30,7 +30,7 @@ fn unsupportedHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Reso
     _ = commit;
     _ = limits;
     _ = command_mask;
-    return error.UnsupportedFailure;
+    return error.UnsupportedException;
 }
 
 const handler_map = blk: {
@@ -55,8 +55,8 @@ const handler_map = blk: {
     break :blk std.StaticStringMap(ProfileHook).initComptime(entries);
 };
 
-pub fn dispatchToProfileHook(profile_id: Id, plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
-    const tag = catalog.profileTagForId(profile_id) orelse return error.UnsupportedFailure;
-    const hook = handler_map.get(@tagName(tag)) orelse return error.UnsupportedFailure;
+pub fn dispatchToProfileHook(profile_id: Id, plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
+    const tag = catalog.profileTagForId(profile_id) orelse return error.UnsupportedException;
+    const hook = handler_map.get(@tagName(tag)) orelse return error.UnsupportedException;
     return hook(plan, source, sink, call, response, sizing, commit, limits, command_mask);
 }

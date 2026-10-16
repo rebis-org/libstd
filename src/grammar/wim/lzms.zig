@@ -1,17 +1,14 @@
 const std = @import("std");
 
-const failure_prim = @import("../../common/primitive/failure.zig");
-
+const exception_prim = @import("../../common/primitive/exception.zig");
 const bits = @import("bits.zig");
 
-const Failure = failure_prim.Failure;
+const Exception = exception_prim.Exception;
 
-// WIM LZMS resource codec, ported from wimlib's decompressor
-// (src/lzms_decompress.c). Item types are disambiguated by an adaptive
-// binary range coder reading forwards. Literals, lengths, and offset slots
-// come from adaptive canonical Huffman codes read backwards from the chunk
-// end. Codes are rebuilt on fixed symbol budgets with halved frequencies.
-// The tie-breaking must match wimlib's tree construction leaf-first rule.
+// WIM LZMS codec, ported from wimlib src/lzms_decompress.c.
+// Range coder reads forwards; Huffman codes read backwards.
+// Codes rebuild on fixed budgets with halved frequencies.
+// Ties break leaf-first, matching wimlib's tree construction.
 
 const num_literal_syms: usize = 256;
 const num_length_syms: usize = 54;
@@ -94,8 +91,8 @@ const RangeDecoder = struct {
     next: usize,
     data: []const u8,
 
-    fn init(data: []const u8) Failure!RangeDecoder {
-        if (data.len < 4) return error.DataFailure;
+    fn init(data: []const u8) Exception!RangeDecoder {
+        if (data.len < 4) return error.DataException;
         const hi: u32 = std.mem.readInt(u16, data[0..2], .little);
         const lo: u32 = std.mem.readInt(u16, data[2..4], .little);
         return .{
@@ -147,15 +144,12 @@ const BackBits = struct {
     pub fn ensure(self: *BackBits, num_bits: u7) void {
         if (self.bitsleft >= num_bits) return;
         const avail: u7 = 64 - self.bitsleft;
-        if (self.next != 0) {
-            self.next -= 2;
-            const word: u64 = std.mem.readInt(u16, self.data[self.next..][0..2], .little);
-            self.bitbuf |= word << @intCast(avail - 16);
-        }
-        if (self.next != 0) {
-            self.next -= 2;
-            const word: u64 = std.mem.readInt(u16, self.data[self.next..][0..2], .little);
-            self.bitbuf |= word << @intCast(avail - 32);
+        for ([_]u7{ 16, 32 }) |shift| {
+            if (self.next != 0) {
+                self.next -= 2;
+                const word: u64 = std.mem.readInt(u16, self.data[self.next..][0..2], .little);
+                self.bitbuf |= word << @intCast(avail - shift);
+            }
         }
         self.bitsleft += 32;
     }
@@ -178,7 +172,6 @@ const BackBits = struct {
     }
 };
 
-// Adaptive canonical Huffman code over a fixed symbol budget.
 const AdaptiveCode = struct {
     num_syms: usize,
     until_rebuild: u32,
@@ -205,7 +198,7 @@ const AdaptiveCode = struct {
         for (self.freqs) |*f| f.* = (f.* >> 1) + 1;
     }
 
-    fn readSym(self: *AdaptiveCode, stream: *BackBits) Failure!u16 {
+    fn readSym(self: *AdaptiveCode, stream: *BackBits) Exception!u16 {
         const sym = try self.code.read(stream);
         self.freqs[sym] += 1;
         self.until_rebuild -= 1;
@@ -217,9 +210,16 @@ const AdaptiveCode = struct {
     }
 };
 
-// Builds the canonical code lengths wimlib's LZMS codec requires: classic
-// Huffman tree construction with ties broken toward leaves, then canonical
-// length assignment in (frequency, symbol) order.
+fn readMatchLen(length: *AdaptiveCode, stream: *BackBits) Exception!u32 {
+    const slot: usize = try length.readSym(stream);
+    var match_len: u32 = length_slot_base[slot];
+    const extra = extra_length_bits[slot];
+    if (extra != 0) match_len += @as(u32, @intCast(stream.read(@intCast(extra))));
+    return match_len;
+}
+
+// Ties break toward leaves, then canonical lengths assign in
+// (frequency, symbol) order.
 fn makeCanonicalCode(freqs: []const u32, lens: []u8) void {
     var sorted: [max_num_syms]u32 = undefined;
     var used: usize = 0;
@@ -339,9 +339,9 @@ fn numOffsetSlots(uncompressed_size: usize) usize {
     return 1 + getSlot(@intCast(uncompressed_size - 1), &offset_slot_base);
 }
 
-// x86 CALL-target retranslation; see wimlib's lzms_x86_filter. The usages
-// table is stack-resident, mirroring wimlib's per-resource temporary. The
-// first byte is never examined, and scanning stops 16 bytes before the end.
+// x86 CALL-target retranslation; see wimlib's lzms_x86_filter.
+// The usages table is stack-resident, mirroring wimlib's per-resource
+// temporary.
 fn x86Filter(data: []u8, last_target_usages: *[65536]i32) void {
     const size: usize = data.len;
     if (size <= 17) return;
@@ -411,8 +411,8 @@ fn translateIfNeeded(data: []u8, pos: usize, last_x86_pos: *i32, last_target_usa
     return target + 4;
 }
 
-pub fn lzmsDecode(input: []const u8, output: []u8) Failure!void {
-    if (input.len & 1 != 0 or input.len < 4) return error.DataFailure;
+pub fn lzmsDecode(input: []const u8, output: []u8) Exception!void {
+    if (input.len & 1 != 0 or input.len < 4) return error.DataException;
     var range = try RangeDecoder.init(input);
     var stream = BackBits.init(input);
     var probs: Probabilities = undefined;
@@ -455,7 +455,6 @@ pub fn lzmsDecode(input: []const u8, output: []u8) Failure!void {
             continue;
         }
         if (range.decodeBit(&match_state, num_match_probs, &probs.match) == 0) {
-            // LZ match.
             var offset: u32 = undefined;
             if (range.decodeBit(&lz_state, num_lz_probs, &probs.lz) == 0) {
                 const slot: usize = try lz_offset.readSym(&stream);
@@ -482,13 +481,10 @@ pub fn lzmsDecode(input: []const u8, output: []u8) Failure!void {
             recent_lz[0] = offset;
             prev_item_type = 1;
 
-            const slot: usize = try length.readSym(&stream);
-            var match_len: u32 = length_slot_base[slot];
-            const extra = extra_length_bits[slot];
-            if (extra != 0) match_len += @as(u32, @intCast(stream.read(@intCast(extra))));
+            const match_len = try readMatchLen(&length, &stream);
             const off: usize = @intCast(offset);
-            if (off > op or off == 0) return error.DataFailure;
-            if (match_len > output.len - op) return error.CapacityFailure;
+            if (off > op or off == 0) return error.DataException;
+            if (match_len > output.len - op) return error.CapacityException;
             var i: usize = 0;
             while (i < match_len) : (i += 1) {
                 output[op + i] = output[op - off + i];
@@ -496,7 +492,6 @@ pub fn lzmsDecode(input: []const u8, output: []u8) Failure!void {
             op += match_len;
             continue;
         }
-        // Delta match.
         var power: u32 = undefined;
         var raw_offset: u32 = undefined;
         if (range.decodeBit(&delta_state, num_delta_probs, &probs.delta) == 0) {
@@ -531,17 +526,14 @@ pub fn lzmsDecode(input: []const u8, output: []u8) Failure!void {
         recent_delta[0] = (@as(u64, power) << 32) | raw_offset;
         prev_item_type = 2;
 
-        const slot: usize = try length.readSym(&stream);
-        var match_len: u32 = length_slot_base[slot];
-        const extra = extra_length_bits[slot];
-        if (extra != 0) match_len += @as(u32, @intCast(stream.read(@intCast(extra))));
+        const match_len = try readMatchLen(&length, &stream);
 
         const span: u32 = @as(u32, 1) << @intCast(power);
-        const offset = std.math.mul(u32, raw_offset, span) catch return error.DataFailure;
-        if ((std.math.add(u32, offset, span) catch return error.DataFailure) < offset) return error.DataFailure;
+        const offset = std.math.mul(u32, raw_offset, span) catch return error.DataException;
+        _ = std.math.add(u32, offset, span) catch return error.DataException;
         const total: u64 = @as(u64, offset) + span;
-        if (total > op) return error.DataFailure;
-        if (match_len > output.len - op) return error.CapacityFailure;
+        if (total > op) return error.DataException;
+        if (match_len > output.len - op) return error.CapacityException;
         const matchptr: usize = op - @as(usize, @intCast(offset));
         var i: usize = 0;
         while (i < match_len) : (i += 1) {
@@ -658,15 +650,15 @@ pub const offset_slot_base = [801]u32{
 };
 
 pub const extra_offset_bits = [799]u8{
-    0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 2, 2, 2, 2, 2, 2,
-    2, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4,
-    4, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
-    5, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
-    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
-    7, 7, 7, 7, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
-    8, 8, 8, 8, 8, 8, 8, 8, 9, 9, 9, 9, 9, 9, 9, 9,
-    9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
-    9, 9, 9, 9, 9, 9, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10,
+    0,  0,  0,  0,  0,  0,  0,  0,  2,  2,  2,  2,  2,  2,  2,  2,
+    2,  3,  3,  3,  3,  3,  3,  3,  4,  4,  4,  4,  4,  4,  4,  4,
+    4,  4,  5,  5,  5,  5,  5,  5,  5,  5,  5,  5,  5,  5,  5,  5,
+    5,  6,  6,  6,  6,  6,  6,  6,  6,  6,  6,  6,  6,  6,  6,  6,
+    7,  7,  7,  7,  7,  7,  7,  7,  7,  7,  7,  7,  7,  7,  7,  7,
+    7,  7,  7,  7,  8,  8,  8,  8,  8,  8,  8,  8,  8,  8,  8,  8,
+    8,  8,  8,  8,  8,  8,  8,  8,  9,  9,  9,  9,  9,  9,  9,  9,
+    9,  9,  9,  9,  9,  9,  9,  9,  9,  9,  9,  9,  9,  9,  9,  9,
+    9,  9,  9,  9,  9,  9,  10, 10, 10, 10, 10, 10, 10, 10, 10, 10,
     10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10,
     10, 10, 10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11, 11, 11, 11,
     11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11,
@@ -721,8 +713,8 @@ pub const length_slot_base = [56]u32{
 };
 
 pub const extra_length_bits = [54]u8{
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2,
-    2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 4, 5, 5, 6,
+    0, 0, 0, 0,  0,  0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0,  0,  0,  0, 0, 0, 0, 1, 1, 1, 1, 2, 2,
+    2, 2, 2, 2,  3,  3,  3, 3, 4, 4, 4, 4, 4, 5, 5, 6,
     7, 8, 9, 10, 16, 30,
 };

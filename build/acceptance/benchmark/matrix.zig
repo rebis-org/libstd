@@ -3,26 +3,26 @@ const std = @import("std");
 // Rows derive from descriptors, so removing one removes its rows with no central edits.
 const generated = @import("components");
 
-// Kind uses the released profile stem (seven_zip); Cmd mirrors the
+// Format uses the released profile stem (seven_zip); Cmd mirrors the
 // reference binary name (7zz); Lib mirrors the bridge module name.
 
-pub const Kind = enum { gzip, bzip2, lzma, lzma2, lzma_file, xz, zstd, tar, zip, seven_zip, rar, zlib, lz4, brotli, squashfs, iso, dwarfs, lzo };
+pub const Format = enum { gzip, bzip2, lzma, lzma2, lzma_file, xz, zstd, tar, zip, seven_zip, rar, zlib, lz4, brotli, squashfs, iso, dwarfs, lzo };
 pub const Cmd = enum { sevenzz, zstd, xz, bzip2, gzip, tar, ziptool, unrar, lzma, lz4, brotli };
 pub const Lib = enum { sevenzip, zstd, bzip2, xz, lzma7z, libzip, unrar, fast_lzma2, zlib, lz4 };
 
-pub const Param = struct { family: u16, ordinal: u32, value: u64 };
+pub const Parameter = struct { family: u16, ordinal: u32, value: u64 };
 pub const Tuning = struct {
     name: []const u8,
-    params: []const Param,
+    params: []const Parameter,
     ref_params: []const u8 = "",
     cmd_args: []const []const u8 = &.{},
     lib_level: ?i32 = null,
     bypass: bool = false,
 };
 
-pub const Base = struct {
+pub const RowBase = struct {
     name: []const u8,
-    kind: Kind,
+    kind: Format,
     ext: []const u8,
     cmd: ?Cmd = null,
     lib: ?Lib = null,
@@ -36,26 +36,26 @@ pub const Base = struct {
     ref_params: []const u8 = "",
 };
 
-fn enumFor(comptime T: type, comptime what: []const u8, comptime name: []const u8) T {
+fn enumFromName(comptime T: type, comptime what: []const u8, comptime name: []const u8) T {
     return std.meta.stringToEnum(T, name) orelse @compileError("unknown benchmark " ++ what ++ ": " ++ name ++ ".");
 }
 
-fn kindFor(comptime name: []const u8) Kind {
+fn formatForProfile(comptime name: []const u8) Format {
     if (std.mem.eql(u8, name, "7z")) return .seven_zip;
-    return enumFor(Kind, "kind", name);
+    return enumFromName(Format, "kind", name);
 }
 
 const derived_bases = blk: {
     @setEvalBranchQuota(100_000);
-    var list: []const Base = &.{};
+    var list: []const RowBase = &.{};
     for (generated.benchmarks) |benchmark| {
         const tuning_list: []const Tuning = blk2: {
             var tunings: []const Tuning = &.{};
             for (benchmark.tunings) |raw_tuning| {
-                const param_list: []const Param = blk3: {
-                    var params: []const Param = &.{};
+                const param_list: []const Parameter = blk3: {
+                    var params: []const Parameter = &.{};
                     for (raw_tuning.params) |param| {
-                        params = params ++ &[_]Param{.{ .family = param.family, .ordinal = param.ordinal, .value = param.value }};
+                        params = params ++ &[_]Parameter{.{ .family = param.family, .ordinal = param.ordinal, .value = param.value }};
                     }
                     break :blk3 params;
                 };
@@ -63,16 +63,16 @@ const derived_bases = blk: {
             }
             break :blk2 tunings;
         };
-        list = list ++ &[_]Base{.{ .name = benchmark.row, .kind = kindFor(benchmark.kind), .ext = benchmark.ext, .cmd = if (benchmark.cmd) |value| enumFor(Cmd, "cmd", value) else null, .lib = if (benchmark.lib) |value| enumFor(Lib, "lib", value) else null, .bin = if (benchmark.bin) |value| enumFor(Cmd, "cmd", value) else null, .fmt = benchmark.fmt, .store = benchmark.store, .archive = benchmark.archive, .method = benchmark.method, .decode_only = benchmark.decode_only, .ref_params = benchmark.ref_params, .tunings = tuning_list }};
+        list = list ++ &[_]RowBase{.{ .name = benchmark.row, .kind = formatForProfile(benchmark.kind), .ext = benchmark.ext, .cmd = if (benchmark.cmd) |value| enumFromName(Cmd, "cmd", value) else null, .lib = if (benchmark.lib) |value| enumFromName(Lib, "lib", value) else null, .bin = if (benchmark.bin) |value| enumFromName(Cmd, "cmd", value) else null, .fmt = benchmark.fmt, .store = benchmark.store, .archive = benchmark.archive, .method = benchmark.method, .decode_only = benchmark.decode_only, .ref_params = benchmark.ref_params, .tunings = tuning_list }};
     }
     break :blk list;
 };
 
 pub const bases = derived_bases;
 
-pub const Row = struct {
+pub const BenchmarkRow = struct {
     name: []const u8,
-    kind: Kind,
+    kind: Format,
     ext: []const u8,
     cmd: ?Cmd,
     bin: ?Cmd,
@@ -82,7 +82,7 @@ pub const Row = struct {
     archive: bool,
     method: bool,
     decode_only: bool,
-    params: []const Param,
+    params: []const Parameter,
     ref_params: []const u8,
     row_type: []const u8,
     cmd_args: []const []const u8,
@@ -98,7 +98,7 @@ const row_count = blk: {
 
 const row_array = blk: {
     @setEvalBranchQuota(100_000);
-    var list: [row_count]Row = undefined;
+    var list: [row_count]BenchmarkRow = undefined;
     var index: usize = 0;
     for (bases) |base| {
         for (base.tunings) |tuning| {
@@ -135,4 +135,4 @@ const row_array = blk: {
     break :blk list;
 };
 
-pub const rows: []const Row = &row_array;
+pub const rows: []const BenchmarkRow = &row_array;

@@ -4,16 +4,13 @@ const std = @import("std");
 const modules = @import("modules.zig");
 const common = @import("platform/common.zig");
 
-pub const Unit = struct {
-    name: []const u8,
-    kind: Kind,
-};
+pub const Kind = enum { abi, libraries, render, package };
 
-pub const Kind = enum { abi, exe, render, package };
+pub const Unit = common.KindedUnit(Kind);
 
 pub const units = [_]Unit{
     .{ .name = "abi", .kind = .abi },
-    .{ .name = "exe", .kind = .exe },
+    .{ .name = "exe", .kind = .libraries },
     .{ .name = "render", .kind = .render },
     .{ .name = "package", .kind = .package },
 };
@@ -21,7 +18,7 @@ pub const units = [_]Unit{
 pub fn expand(b: *std.Build, ctx: *common.Settings) void {
     inline for (units) |unit| switch (unit.kind) {
         .abi => addAbi(b, ctx),
-        .exe => addExe(b, ctx),
+        .libraries => addExe(b, ctx),
         .render => addRender(b, ctx),
         .package => addPackage(b, ctx),
     };
@@ -32,15 +29,15 @@ fn addHeaderProbe(
     abi: *std.Build.Step,
     probe_tool: *std.Build.Step.Compile,
     command: []const []const u8,
-    std_flag: []const u8,
+    language_flag: []const u8,
     source: std.Build.LazyPath,
     header_dir: std.Build.LazyPath,
 ) void {
-    const probe = std.Build.Step.Run.create(b, b.fmt("abi {s} {s}", .{ command[command.len - 1], std_flag }));
+    const probe = std.Build.Step.Run.create(b, b.fmt("abi {s} {s}", .{ command[command.len - 1], language_flag }));
     probe.addArtifactArg(probe_tool);
     probe.addArgs(command);
     probe.addArg("--");
-    probe.addArg(std_flag);
+    probe.addArg(language_flag);
     probe.addDirectoryArg2(header_dir, .{ .prefix = "-I" });
     probe.addFileArg2(source, .{});
     probe.addArgs(&.{ "-o", if (builtin.target.os.tag == .windows) "NUL" else "/dev/null" });
@@ -60,13 +57,14 @@ fn addAbi(b: *std.Build, ctx: *common.Settings) void {
     });
     const header_c = b.path("build/acceptance/header.c");
     const header_cpp = b.path("build/acceptance/header.cpp");
-    const c_stds = .{ "-std=c11", "-std=c17", "-std=c23" };
-    const cxx_stds = .{ "-std=c++20", "-std=c++23", "-std=c++2c" };
-    inline for (c_stds) |std_flag| {
-        addHeaderProbe(b, abi, probe_tool, &.{ zig, "cc" }, std_flag, header_c, ctx.generated.header_dir);
-    }
-    inline for (cxx_stds) |std_flag| {
-        addHeaderProbe(b, abi, probe_tool, &.{ zig, "c++" }, std_flag, header_cpp, ctx.generated.header_dir);
+    const probes = .{
+        .{ &.{ zig, "cc" }, &.{ "-std=c11", "-std=c17", "-std=c23" }, header_c },
+        .{ &.{ zig, "c++" }, &.{ "-std=c++20", "-std=c++23", "-std=c++2c" }, header_cpp },
+    };
+    inline for (probes) |probe| {
+        inline for (probe[1]) |language_flag| {
+            addHeaderProbe(b, abi, probe_tool, probe[0], language_flag, probe[2], ctx.generated.header_dir);
+        }
     }
     abi.dependOn(&ctx.host.dynamic_library.step);
     const abi_exports = b.addExecutable(.{
@@ -92,8 +90,8 @@ fn addRender(b: *std.Build, ctx: *common.Settings) void {
 }
 
 fn addPackage(b: *std.Build, ctx: *common.Settings) void {
-    const archives = ctx.archives orelse @panic("The distribution units must expand before the checks units.");
-    const package_exe = b.addExecutable(.{ .name = "package", .root_module = modules.create(b, modules.package, ctx) });
+    const archives = ctx.archives orelse @panic("the distribution units must expand before the checks units.");
+    const package_exe = b.addExecutable(.{ .name = "package", .root_module = modules.create(b, modules.package_check, ctx) });
     const package_run = b.addRunArtifact(package_exe);
     for (archives) |provider| {
         inline for (@typeInfo(common.ProviderArchives).@"struct".field_names) |field_name| {

@@ -20,21 +20,21 @@ pub fn descriptorPaths(b: *std.Build) [][]const u8 {
     // dependOnDirectoryContents is not recursive: the top-level directory catches
     // new subdirectories, each parent catches entry changes one level down.
     b.dependOnDirectoryContents(b.path("src"));
-    var dir = b.root.openDir(b.graph.io, "src", .{ .iterate = true }) catch @panic("The component scan cannot open src.");
+    var dir = b.root.openDir(b.graph.io, "src", .{ .iterate = true }) catch @panic("the component scan cannot open src.");
     defer dir.close(b.graph.io);
-    var walker = dir.walk(b.allocator) catch @panic("The component scan cannot start a walk of src.");
-    while (walker.next(b.graph.io) catch @panic("The component scan cannot continue the walk of src.")) |entry| {
+    var walker = dir.walk(b.allocator) catch @panic("the component scan cannot start a walk of src.");
+    while (walker.next(b.graph.io) catch @panic("the component scan cannot continue the walk of src.")) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.path, ".descriptor.zon")) continue;
-        const rel = b.allocator.print("src/{s}", .{entry.path}) catch @panic("The component scan is out of memory.");
-        list.append(b.allocator, rel) catch @panic("The component scan is out of memory.");
-        b.dependOnFileContents(b.path(rel));
+        const rel_path = b.allocator.print("src/{s}", .{entry.path}) catch @panic("the component scan is out of memory.");
+        list.append(b.allocator, rel_path) catch @panic("the component scan is out of memory.");
+        b.dependOnFileContents(b.path(rel_path));
         // Watch every ancestor, not just the direct parent. A new component
         // directory two levels down (src/<layer>/<name>/) changes no watched
         // directory otherwise. The cached configure keeps missing it.
-        var slash = std.mem.findScalar(u8, rel, '/');
-        while (slash) |at| : (slash = std.mem.findScalarPos(u8, rel, at + 1, '/')) {
-            b.dependOnDirectoryContents(b.path(rel[0 .. at + 1]));
+        var slash_at = std.mem.findScalar(u8, rel_path, '/');
+        while (slash_at) |at| : (slash_at = std.mem.findScalarPos(u8, rel_path, at + 1, '/')) {
+            b.dependOnDirectoryContents(b.path(rel_path[0 .. at + 1]));
         }
     }
     std.mem.sort([]const u8, list.items, {}, struct {
@@ -70,12 +70,22 @@ pub const HostLibraries = struct {
 pub const Implementation = enum { onprem, offprem, mergeable };
 pub const capabilities = .{ "sha256", "sha1", "hmac", "pbkdf2", "adler32", "xxh32", "xxh64", "aes", "crc32", "crc64xz", "bzip2crc32" };
 
+pub fn KindedUnit(comptime Kind: type) type {
+    return struct {
+        name: []const u8,
+        kind: Kind,
+    };
+}
+
+pub const SingleUnit = struct {
+    name: []const u8,
+};
+
 pub fn putCapability(options: *std.Build.Step.Options, comptime capability: []const u8, selected: Implementation, portable_flag: bool) void {
     options.addOption(Implementation, capability ++ "_impl", selected);
     options.addOption(bool, capability ++ "_portable", portable_flag);
 }
 
-// Every key `@import("options")` resolves anywhere in the tree. A build that
 // Every options key resolves somewhere in the tree.
 // A build compiling against a second options module must declare the whole
 // surface, so the list lives here.
@@ -138,7 +148,7 @@ pub fn rootModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std
 // never sit in two compiled modules at once.
 pub fn attachPackageImports(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, ctx: *const Settings) void {
     module.addImport("options", ctx.options);
-    module.addImport("seam", modules.shared(b, modules.seam, target, optimize, ctx));
+    module.addImport("seam", modules.createShared(b, modules.seam, target, optimize, ctx));
     const modules_pair = modules.componentsWithInterface(b, ctx, target, target, optimize);
     module.addImport("components", modules_pair.components);
     module.addImport("interface", modules_pair.interface);

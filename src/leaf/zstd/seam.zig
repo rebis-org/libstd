@@ -8,8 +8,8 @@ pub const Provider = @import("seam").Provider;
 const offprem = @import("offprem.zig");
 const onprem = @import("onprem.zig");
 
-fn requireServed(provider: Provider, comptime served: Provider) error{UnsupportedFailure}!void {
-    if (provider != served) return error.UnsupportedFailure;
+fn requireServed(provider: Provider, comptime served: Provider) error{UnsupportedException}!void {
+    if (provider != served) return error.UnsupportedException;
 }
 pub fn decodeStream(provider: Provider, input: *std.Io.Reader, output: *std.Io.Writer, history: []u8, options: onprem.Options) onprem.DecodeError!usize {
     return switch (build_options.leaf_impl) {

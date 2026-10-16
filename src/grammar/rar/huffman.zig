@@ -1,9 +1,9 @@
 const std = @import("std");
 
-const failure = @import("../../common/primitive/failure.zig");
+const exception = @import("../../common/primitive/exception.zig");
 const bits = @import("bits.zig");
 
-const Failure = failure.Failure;
+const Exception = exception.Exception;
 const BitReader = bits.BitReader;
 
 // The DecodeLen, DecodePos, and DecodeNum tables accept the over-committed
@@ -30,7 +30,7 @@ pub const DecodeTable = struct {
 
 // With `escapes` (v29), a length of 15 is an ESCAPE and the next 4 bits give a
 // zero-run count, where 0 means the length is 15 and an overrun truncates.
-pub fn readCodeLengthTable(br: *BitReader, count: usize, comptime escapes: bool, storage: []u16) Failure!DecodeTable {
+pub fn readCodeLengthTable(br: *BitReader, count: usize, comptime escapes: bool, storage: []u16) Exception!DecodeTable {
     var lengths: [64]u8 = @splat(0);
     var i: usize = 0;
     while (i < count) {
@@ -58,7 +58,7 @@ pub fn readCodeLengthTable(br: *BitReader, count: usize, comptime escapes: bool,
 }
 
 // The table is bounded by storage.len, so every present symbol must fit.
-pub fn makeDecodeTables(code_lengths: []const u8, storage: []u16) Failure!DecodeTable {
+pub fn makeDecodeTables(code_lengths: []const u8, storage: []u16) Exception!DecodeTable {
     var table = DecodeTable{};
     table.max_num = @intCast(code_lengths.len);
 
@@ -79,7 +79,7 @@ pub fn makeDecodeTables(code_lengths: []const u8, storage: []u16) Failure!Decode
     table.decode_pos[max_code_length + 1] = total_symbols;
 
     if (total_symbols == 0) return table; // A zero count leaves the table invalid.
-    if (total_symbols > storage.len) return error.InternalFailure;
+    if (total_symbols > storage.len) return error.InternalException;
 
     table.decode_num = storage[0..total_symbols];
     var tmp_pos: [max_code_length + 2]u32 = undefined;
@@ -124,11 +124,11 @@ pub fn makeDecodeTables(code_lengths: []const u8, storage: []u16) Failure!Decode
     return table;
 }
 
-pub fn decodeNumber(br: *BitReader, table: *const DecodeTable) Failure!u16 {
-    if (!table.valid) return error.DataFailure;
+pub fn decodeNumber(br: *BitReader, table: *const DecodeTable) Exception!u16 {
+    if (!table.valid) return error.DataException;
 
     const bits_available = br.remainingBits();
-    if (bits_available == 0) return error.DataFailure;
+    if (bits_available == 0) return error.DataException;
 
     const peek_count: u5 = if (bits_available >= 16) 16 else @intCast(bits_available);
     const peeked = try br.peekBits(peek_count);
@@ -217,5 +217,5 @@ test "decode number on empty stream fails" {
     var storage: [3]u16 = undefined;
     const table = try makeDecodeTables(&code_lengths, &storage);
     var br = BitReader.init(&[_]u8{});
-    try std.testing.expectError(error.DataFailure, decodeNumber(&br, &table));
+    try std.testing.expectError(error.DataException, decodeNumber(&br, &table));
 }

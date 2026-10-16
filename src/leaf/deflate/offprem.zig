@@ -22,8 +22,8 @@ pub const Decompress = struct {
         self.inner = std.compress.flate.Decompress.init(&self.fixed_input, .raw, history);
     }
 
-    pub fn initSliceBoundInPlace(self: *@This(), provider: anytype, data: []const u8, history: []u8) error{UnsupportedFailure}!void {
-        if (provider != .offprem) return error.UnsupportedFailure;
+    pub fn initSliceBoundInPlace(self: *@This(), provider: anytype, data: []const u8, history: []u8) error{UnsupportedException}!void {
+        if (provider != .offprem) return error.UnsupportedException;
         self.initSliceInPlace(data, history);
     }
 
@@ -39,8 +39,8 @@ pub const Decompress = struct {
     // Seam binding points: the tag binds at construction and the decode
     // loop never dispatches. A mismatched tag is unsupported, never a
     // silent fallback. `anytype` keeps the arm free of module imports.
-    pub fn initBound(provider: anytype, input: *std.Io.Reader, history: []u8) error{UnsupportedFailure}!@This() {
-        if (provider != .offprem) return error.UnsupportedFailure;
+    pub fn initBound(provider: anytype, input: *std.Io.Reader, history: []u8) error{UnsupportedException}!@This() {
+        if (provider != .offprem) return error.UnsupportedException;
         return init(input, history);
     }
 

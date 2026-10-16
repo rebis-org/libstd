@@ -6,21 +6,22 @@
 #include <stdio.h>
 #include <string.h>
 
-// NOLINTNEXTLINE(performance-enum-size)
+/* NOLINTNEXTLINE(performance-enum-size) */
 enum {
 	REF_OK = 0,
 	REF_FAIL = 1,
 	REF_OVERFLOW = 2,
 };
 
-typedef struct {
+struct ref_sink {
 	unsigned char *output;
 	size_t capacity;
 	size_t length;
 	int overflow;
-} ref_sink;
+};
 
-static inline int ref_sink_write(ref_sink *sink, const void *data, size_t size)
+static inline int ref_sink_write(struct ref_sink *sink, const void *data,
+				 size_t size)
 {
 	if (sink->overflow != 0) {
 		return REF_OVERFLOW;
@@ -40,7 +41,7 @@ static inline int ref_sink_write(ref_sink *sink, const void *data, size_t size)
 static inline int ref_emit(const void *data, size_t size, unsigned char *output,
 			   size_t capacity, size_t *output_size)
 {
-	ref_sink sink = { output, capacity, 0, 0 };
+	struct ref_sink sink = { output, capacity, 0, 0 };
 	const int status = ref_sink_write(&sink, data, size);
 	*output_size = status == REF_OVERFLOW ? size : sink.length;
 	return status;

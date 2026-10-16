@@ -1,25 +1,25 @@
 const std = @import("std");
 
-const failure = @import("failure.zig");
+const exception = @import("exception.zig");
 
-const Failure = failure.Failure;
+const Exception = exception.Exception;
 
-fn add(comptime T: type, augend: T, addend: T) Failure!T {
-    return std.math.add(T, augend, addend) catch error.ResourceFailure;
+fn add(comptime T: type, augend: T, addend: T) Exception!T {
+    return std.math.add(T, augend, addend) catch error.ResourceException;
 }
 
-pub fn addUsize(left: usize, right: usize) Failure!usize {
+pub fn addUsize(left: usize, right: usize) Exception!usize {
     return add(usize, left, right);
 }
 
-pub fn addU64(left: u64, right: u64) Failure!u64 {
+pub fn addU64(left: u64, right: u64) Exception!u64 {
     return add(u64, left, right);
 }
 
-pub fn slice(bytes: []const u8, offset: u64, length: u64) Failure![]const u8 {
-    const start = std.math.cast(usize, offset) orelse return error.ResourceFailure;
-    const count = std.math.cast(usize, length) orelse return error.ResourceFailure;
-    if (start > bytes.len or count > bytes.len - start) return error.DataFailure;
+pub fn slice(bytes: []const u8, offset: u64, length: u64) Exception![]const u8 {
+    const start = std.math.cast(usize, offset) orelse return error.ResourceException;
+    const count = std.math.cast(usize, length) orelse return error.ResourceException;
+    if (start > bytes.len or count > bytes.len - start) return error.DataException;
     return bytes[start..][0..count];
 }
 

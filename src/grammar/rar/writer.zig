@@ -3,12 +3,12 @@ const std = @import("std");
 const bounds = @import("../../common/primitive/bounds.zig");
 const checksum = @import("../../common/primitive/checksum.zig");
 const crypto = @import("../../common/primitive/crypto.zig");
-const failure = @import("../../common/primitive/failure.zig");
+const exception = @import("../../common/primitive/exception.zig");
 const finder = @import("finder.zig");
 const rar = @import("onprem.zig");
 const pack50 = @import("pack50.zig");
 
-const Failure = failure.Failure;
+const Exception = exception.Exception;
 pub const LzToken = finder.LzToken;
 pub const pack50Sizes = pack50.workspacesFor;
 
@@ -130,7 +130,7 @@ const block_writer = struct {
     // header: CRC32 over [size_vint .. End], little-endian, then the bytes.
     // With header encryption, the CRC+size+body run is AES-256-CBC encrypted
     // behind a per-block random IV, zero-padded to the 16-byte block.
-    fn emitHeader(out: []u8, pos: usize, contents: []const u8, header_keys: ?*const rar.Rar5Keys, provider: crypto.Provider) Failure!usize {
+    fn emitHeader(out: []u8, pos: usize, contents: []const u8, header_keys: ?*const rar.Rar5Keys, provider: crypto.Provider) Exception!usize {
         var size_buf: [10]u8 = undefined;
         const size_len = writeVint(contents.len, &size_buf);
         // The CRC range must match the reader, which checksums from the size field through the body end.
@@ -140,7 +140,7 @@ const block_writer = struct {
         const plain_len = 4 + size_len + contents.len;
         if (header_keys) |keys| {
             const padded = std.mem.alignForward(usize, plain_len, 16);
-            if (out.len < pos + 16 + padded) return error.CapacityFailure;
+            if (out.len < pos + 16 + padded) return error.CapacityException;
             var iv: [16]u8 = undefined;
             try crypto.fillRandom(&iv);
             @memcpy(out[pos..][0..16], &iv);
@@ -152,7 +152,7 @@ const block_writer = struct {
             try crypto.aesCbcEncrypt(provider, keys.key[0..], iv, region, region);
             return pos + 16 + padded;
         }
-        if (out.len < pos + plain_len) return error.CapacityFailure;
+        if (out.len < pos + plain_len) return error.CapacityException;
         std.mem.writeInt(u32, out[pos..][0..4], crc_state.final(), .little);
         var cursor = pos + 4;
         @memcpy(out[cursor..][0..size_len], size_buf[0..size_len]);
@@ -168,7 +168,7 @@ const block_writer = struct {
         return 16 + std.mem.alignForward(usize, plain, 16);
     }
 
-    fn writeMainBlock(out: []u8, pos: usize, header_keys: ?*const rar.Rar5Keys, provider: crypto.Provider) Failure!usize {
+    fn writeMainBlock(out: []u8, pos: usize, header_keys: ?*const rar.Rar5Keys, provider: crypto.Provider) Exception!usize {
         var contents: [8]u8 = undefined;
         var c: usize = 0;
         c += writeVint(rar.rar5_type_main, contents[c..]);
@@ -186,7 +186,7 @@ const block_writer = struct {
         return 4 + 1 + contents;
     }
 
-    fn writeEncryptionBlock(out: []u8, pos: usize, lg2count: u8, salt: *const [16]u8, pswcheck: *const [8]u8, check_csum: *const [4]u8, provider: crypto.Provider) Failure!usize {
+    fn writeEncryptionBlock(out: []u8, pos: usize, lg2count: u8, salt: *const [16]u8, pswcheck: *const [8]u8, check_csum: *const [4]u8, provider: crypto.Provider) Exception!usize {
         var contents: [40]u8 = undefined;
         var c: usize = 0;
         c += writeVint(rar.rar5_type_encryption, contents[c..]);
@@ -211,7 +211,7 @@ const block_writer = struct {
         return 16 + std.mem.alignForward(usize, plain, 16);
     }
 
-    fn writeEndBlock(out: []u8, pos: usize, header_keys: ?*const rar.Rar5Keys, provider: crypto.Provider) Failure!usize {
+    fn writeEndBlock(out: []u8, pos: usize, header_keys: ?*const rar.Rar5Keys, provider: crypto.Provider) Exception!usize {
         var contents: [8]u8 = undefined;
         var c: usize = 0;
         c += writeVint(rar.rar5_type_end, contents[c..]);
@@ -266,7 +266,7 @@ const block_writer = struct {
         entry_index: usize,
         ws: *WriteBuffers,
         provider: crypto.Provider,
-    ) Failure!usize {
+    ) Exception!usize {
         const data_encrypted = options.password.len != 0 and !entry.is_directory;
         var file_flags: u64 = rar.rar5_file_mtime;
         if (entry.is_directory) {
@@ -334,7 +334,7 @@ const block_writer = struct {
 
         var cursor = try emitHeader(out, pos, contents[0..c], header_keys, provider);
         if (data_size > 0) {
-            if (out.len < cursor + packed_data.len) return error.CapacityFailure;
+            if (out.len < cursor + packed_data.len) return error.CapacityException;
             @memcpy(out[cursor..][0..packed_data.len], packed_data);
             cursor += packed_data.len;
         }
@@ -342,18 +342,18 @@ const block_writer = struct {
     }
 };
 
-fn checkWriteEntries(entries: []const RarEntry, options: WriteOptions) Failure!void {
-    if (options.encrypt_headers and options.password.len == 0) return error.CallFailure;
-    if (options.kdf_lg2_count > 24) return error.CallFailure;
+fn checkWriteEntries(entries: []const RarEntry, options: WriteOptions) Exception!void {
+    if (options.encrypt_headers and options.password.len == 0) return error.CallException;
+    if (options.kdf_lg2_count > 24) return error.CallException;
     for (entries) |entry| {
-        if (entry.name.len > 4096) return error.CallFailure;
-        if (entry.method > 5) return error.CallFailure;
+        if (entry.name.len > 4096) return error.CallException;
+        if (entry.method > 5) return error.CallException;
     }
-    if (entries.len > 65535) return error.ResourceFailure;
+    if (entries.len > 65535) return error.ResourceException;
 }
 
 // The sizing query and the commit pass each run this, so one encode compresses twice.
-fn packEntries(entries: []const RarEntry, ws: *WriteBuffers, options: WriteOptions) Failure!usize {
+fn packEntries(entries: []const RarEntry, ws: *WriteBuffers, options: WriteOptions) Exception!usize {
     const data_encryption = options.password.len != 0;
     var total: usize = undefined;
     if (options.encrypt_headers) {
@@ -368,18 +368,18 @@ fn packEntries(entries: []const RarEntry, ws: *WriteBuffers, options: WriteOptio
         var packed_len: usize = if (entry.is_directory or entry.data.len == 0 or entry.method == 0) blk: {
             // The encode pass reads every entry back from the packed region, so a stored
             // entry must lay its raw bytes there.
-            if (ws.packed_buf.len - packed_cursor < entry.data.len) return error.InternalFailure;
+            if (ws.packed_buf.len - packed_cursor < entry.data.len) return error.InternalException;
             @memcpy(ws.packed_buf[packed_cursor .. packed_cursor + entry.data.len], entry.data);
             break :blk entry.data.len;
         } else blk: {
             const bound = packedBoundEx(entry, data_encryption and !entry.is_directory);
-            if (ws.packed_buf.len - packed_cursor < bound) return error.InternalFailure;
+            if (ws.packed_buf.len - packed_cursor < bound) return error.InternalException;
             const slice = ws.packed_buf[packed_cursor .. packed_cursor + bound];
             const sizes = pack50.workspacesFor(entry.data.len);
             if (ws.hash.len < sizes.hash_words or ws.hash2.len < sizes.hash2_words or
                 ws.hash3.len < sizes.hash3_words or ws.bt_left.len < sizes.bt_words or
                 ws.bt_right.len < sizes.bt_words or ws.tokens.len < sizes.token_count or
-                ws.staging.len < sizes.staging_bytes) return error.InternalFailure;
+                ws.staging.len < sizes.staging_bytes) return error.InternalException;
             const written = try pack50.compressBlock(entry.data, @intCast(entry.method), true, .{
                 .hash = ws.hash,
                 .hash2 = ws.hash2,
@@ -392,7 +392,7 @@ fn packEntries(entries: []const RarEntry, ws: *WriteBuffers, options: WriteOptio
             break :blk written;
         };
         if (data_encryption and !entry.is_directory) {
-            if (ws.crypt_salts.len < entries.len or ws.crypt_ivs.len < entries.len) return error.InternalFailure;
+            if (ws.crypt_salts.len < entries.len or ws.crypt_ivs.len < entries.len) return error.InternalException;
             try crypto.fillRandom(&ws.crypt_salts[i]);
             try crypto.fillRandom(&ws.crypt_ivs[i]);
             const decode_opts: rar.DecodeOptions = .{
@@ -402,12 +402,12 @@ fn packEntries(entries: []const RarEntry, ws: *WriteBuffers, options: WriteOptio
             };
             const keys = try rar.rar5Kdf(options.password, &ws.crypt_salts[i], options.kdf_lg2_count, decode_opts);
             const padded = std.mem.alignForward(usize, packed_len, crypto.block_length);
-            if (ws.packed_buf.len - packed_cursor < padded) return error.InternalFailure;
+            if (ws.packed_buf.len - packed_cursor < padded) return error.InternalException;
             @memset(ws.packed_buf[packed_cursor + packed_len .. packed_cursor + padded], 0);
-            crypto.aesCbcEncrypt(crypto.default_provider, keys.key[0..], ws.crypt_ivs[i], ws.packed_buf[packed_cursor .. packed_cursor + padded], ws.packed_buf[packed_cursor .. packed_cursor + padded]) catch return error.CallFailure;
+            crypto.aesCbcEncrypt(crypto.default_provider, keys.key[0..], ws.crypt_ivs[i], ws.packed_buf[packed_cursor .. packed_cursor + padded], ws.packed_buf[packed_cursor .. packed_cursor + padded]) catch return error.CallException;
             packed_len = padded;
         }
-        if (ws.packed_sizes.len < entries.len) return error.InternalFailure;
+        if (ws.packed_sizes.len < entries.len) return error.InternalException;
         ws.packed_sizes[i] = packed_len;
         packed_cursor = try bounds.addUsize(packed_cursor, packed_len);
         total = try bounds.addUsize(total, block_writer.fileBlockSize(entry, packed_len, options));
@@ -415,22 +415,22 @@ fn packEntries(entries: []const RarEntry, ws: *WriteBuffers, options: WriteOptio
     return total;
 }
 
-pub fn rarWriteSize(entries: []const RarEntry, ws: *WriteBuffers) Failure!usize {
+pub fn rarWriteSize(entries: []const RarEntry, ws: *WriteBuffers) Exception!usize {
     return rarWriteSizeEx(entries, ws, .{});
 }
 
-pub fn rarWriteSizeEx(entries: []const RarEntry, ws: *WriteBuffers, options: WriteOptions) Failure!usize {
+pub fn rarWriteSizeEx(entries: []const RarEntry, ws: *WriteBuffers, options: WriteOptions) Exception!usize {
     try checkWriteEntries(entries, options);
     return packEntries(entries, ws, options);
 }
 
-pub fn rarEncode(entries: []const RarEntry, output: []u8, ws: *WriteBuffers, provider: crypto.Provider) Failure!usize {
+pub fn rarEncode(entries: []const RarEntry, output: []u8, ws: *WriteBuffers, provider: crypto.Provider) Exception!usize {
     return rarEncodeEx(entries, output, ws, provider, .{});
 }
 
-pub fn rarEncodeEx(entries: []const RarEntry, output: []u8, ws: *WriteBuffers, provider: crypto.Provider, options: WriteOptions) Failure!usize {
+pub fn rarEncodeEx(entries: []const RarEntry, output: []u8, ws: *WriteBuffers, provider: crypto.Provider, options: WriteOptions) Exception!usize {
     const required = try rarWriteSizeEx(entries, ws, options);
-    if (output.len < required) return error.CapacityFailure;
+    if (output.len < required) return error.CapacityException;
 
     var header_keys: ?rar.Rar5Keys = null;
     var header_salt: [16]u8 = @splat(0);
@@ -687,9 +687,9 @@ test "created encrypted archives roundtrip through the facade reader" {
             .failure_cause = &cause,
         };
         if (options.encrypt_headers) {
-            try testing.expectError(error.IntegrityFailure, rar.rarInspectCountOpts(archive, 128, wrong_opts));
+            try testing.expectError(error.IntegrityException, rar.rarInspectCountOpts(archive, 128, wrong_opts));
         } else {
-            try testing.expectError(error.DataFailure, rar.rarDecodeOrdinal(archive, 0, out1, @constCast(&bufs), wrong_opts));
+            try testing.expectError(error.DataException, rar.rarDecodeOrdinal(archive, 0, out1, @constCast(&bufs), wrong_opts));
         }
         try testing.expectEqual(crypto.FailureCause.wrong_password, cause);
     }

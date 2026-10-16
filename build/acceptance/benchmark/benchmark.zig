@@ -25,7 +25,7 @@ fn ensureCorpus(env: *env_mod.Env) ![]const u8 {
     for (env_mod.paths.corpus_candidates) |dir| {
         if (corpusComplete(env, dir)) return dir;
     }
-    std.debug.print("silesia corpus is missing. downloading \"{s}\".\n", .{env_mod.silesia_url});
+    std.debug.print("silesia corpus is missing. fetch \"{s}\".\n", .{env_mod.silesia_url});
     try std.Io.Dir.cwd().createDirPath(env.io, env_mod.paths.corpus_dir);
     const download = try run.output(env.init, &.{ "curl", "-fsSL", "-o", env_mod.paths.corpus_zip, env_mod.silesia_url });
     env.allocator.free(download);
@@ -47,9 +47,9 @@ fn verifyCorpusZip(env: *env_mod.Env) !void {
     if (!std.mem.eql(u8, &digest, &expected)) return error.silesia_digest_mismatch;
 }
 
-fn produceArchive(env: *env_mod.Env, comptime row: matrix.Row, input_path: []const u8, output_path: []const u8) ![]u8 {
+fn produceArchive(env: *env_mod.Env, comptime row: matrix.BenchmarkRow, input_path: []const u8, output_path: []const u8) ![]u8 {
     if (row.kind == .lzma_file) {
-        const lzma_cmd = comptime cmd.get(.lzma);
+        const lzma_cmd = comptime cmd.getCommand(.lzma);
         const bin = try env.makePath("{s}/{s}", .{ env_mod.paths.cmd, lzma_cmd.exe });
         defer env.allocator.free(bin);
         _ = try cmd.encode(env, lzma_cmd, bin, input_path, output_path, "lzma", false, &.{});
@@ -57,10 +57,10 @@ fn produceArchive(env: *env_mod.Env, comptime row: matrix.Row, input_path: []con
     }
     const rar_bin = try env.makePath("{s}/rar", .{env_mod.paths.bins});
     defer env.allocator.free(rar_bin);
-    const pwd_stdout = try run.output(env.init, &.{"pwd"});
-    defer env.allocator.free(pwd_stdout);
-    const pwd = std.mem.trim(u8, pwd_stdout, " \n\r");
-    const rar_abs = try env.makePath("{s}/{s}", .{ pwd, rar_bin });
+    const workdir_stdout = try run.output(env.init, &.{"pwd"});
+    defer env.allocator.free(workdir_stdout);
+    const workdir = std.mem.trim(u8, workdir_stdout, " \n\r");
+    const rar_abs = try env.makePath("{s}/{s}", .{ workdir, rar_bin });
     defer env.allocator.free(rar_abs);
     const stdout = try run.outputCwd(env.init, env_mod.paths.work, &.{ rar_abs, "a", "-qo-", "-m0", "-idq", "out.rar", "input.bin" });
     env.allocator.free(stdout);
@@ -72,24 +72,20 @@ fn isSelected(row_name: []const u8, filter: ?[]const u8) bool {
     return std.mem.eql(u8, row_name, wanted);
 }
 
-fn writeReport(env: *env_mod.Env, path: []const u8, report: []const u8) !void {
-    try env.writeFile(path, report);
-}
-
-fn availability(env: *env_mod.Env, comptime row: matrix.Row) [4]bool {
+fn availability(env: *env_mod.Env, comptime row: matrix.BenchmarkRow) [4]bool {
     // Bypass rows print missing: references ran on the kernel-mediated row.
     return .{
         true,
-        !row.bypass and if (row.cmd) |id| env.existsPath("{s}/{s}", .{ env_mod.paths.cmd, cmd.get(id).exe }) else false,
+        !row.bypass and if (row.cmd) |id| env.existsPath("{s}/{s}", .{ env_mod.paths.cmd, cmd.getCommand(id).exe }) else false,
         !row.bypass and row.lib != null,
-        !row.bypass and if (row.bin) |id| env.existsPath("{s}/{s}", .{ env_mod.paths.bins, cmd.get(id).exe }) else false,
+        !row.bypass and if (row.bin) |id| env.existsPath("{s}/{s}", .{ env_mod.paths.bins, cmd.getCommand(id).exe }) else false,
     };
 }
 
-fn measureRow(env: *env_mod.Env, comptime row: matrix.Row, workspace: []u8) !metric.Totals {
-    const cmd_bin: ?[]u8 = if (row.cmd) |id| try env.makePath("{s}/{s}", .{ env_mod.paths.cmd, cmd.get(id).exe }) else null;
+fn measureRow(env: *env_mod.Env, comptime row: matrix.BenchmarkRow, workspace: []u8) !metric.Totals {
+    const cmd_bin: ?[]u8 = if (row.cmd) |id| try env.makePath("{s}/{s}", .{ env_mod.paths.cmd, cmd.getCommand(id).exe }) else null;
     defer if (cmd_bin) |p| env.allocator.free(p);
-    const bin_bin: ?[]u8 = if (row.bin) |id| try env.makePath("{s}/{s}", .{ env_mod.paths.bins, cmd.get(id).exe }) else null;
+    const bin_bin: ?[]u8 = if (row.bin) |id| try env.makePath("{s}/{s}", .{ env_mod.paths.bins, cmd.getCommand(id).exe }) else null;
     defer if (bin_bin) |p| env.allocator.free(p);
     var totals = metric.Totals{};
     for (env_mod.silesia_files[0..env.limit]) |name| {
@@ -119,7 +115,7 @@ fn measureRow(env: *env_mod.Env, comptime row: matrix.Row, workspace: []u8) !met
             defer env.allocator.free(archive);
             totals.add(.ours, ours.decodeOnly(env, row, archive, input, decoded, workspace));
             if (row.cmd) |id| totals.add(.cmd, cmd.decodeMeasure(env, id, cmd_bin.?, output_path, input));
-            if (row.lib != null) totals.add(.lib, lib.decodeOnly(env, lib.refOf(row), archive, input, decoded));
+            if (row.lib != null) totals.add(.lib, lib.decodeOnly(env, lib.referenceOfRow(row), archive, input, decoded));
             if (row.bin) |id| totals.add(.bin, cmd.decodeMeasure(env, id, bin_bin.?, output_path, input));
         } else {
             const ours_result = ours.transform(env, row, input, encoded, decoded, workspace);
@@ -140,7 +136,7 @@ fn measureRow(env: *env_mod.Env, comptime row: matrix.Row, workspace: []u8) !met
                     console_ns = m.encode_ns;
                 }
                 if (row.lib != null) {
-                    var ref = lib.refOf(row);
+                    var ref = lib.referenceOfRow(row);
                     if (row.lib.? == .lzma7z) ref.console = .{ .path = output_path, .encode_ns = console_ns };
                     totals.add(.lib, lib.measure(env, ref, input, encoded, decoded));
                 }
@@ -185,7 +181,7 @@ pub fn main(init: std.process.Init) !void {
     const runs = env_mod.parseRuns(init.environ_map.get("STDK_BENCH_RUNS"));
     const skip_warmup: usize = if (runs > 1) 1 else 0;
 
-    const gate_cfg = env_mod.gate(init.environ_map);
+    const gate_cfg = env_mod.gateConfig(init.environ_map);
     const file_filtered = env.file != null or env.limit != env_mod.silesia_files.len;
     const gate_fatal = gate_cfg.fatal and runs >= 3 and env.row == null and !file_filtered;
     if (gate_cfg.enabled) {
@@ -203,7 +199,7 @@ pub fn main(init: std.process.Init) !void {
     while (run_index < runs) : (run_index += 1) {
         var run_report = std.ArrayList(u8).empty;
         defer run_report.deinit(env.allocator);
-        try run_report.appendSlice(env.allocator, metric.header);
+        try run_report.appendSlice(env.allocator, metric.metric_header);
         inline for (matrix.rows, 0..) |row, idx| {
             if (isSelected(row.name, env.row)) {
                 if (run_index == 0) std.debug.print("benchmark {s} ...\n", .{row.name});
@@ -214,13 +210,13 @@ pub fn main(init: std.process.Init) !void {
         }
         const run_path = try env.allocator.print("zig-out/benchmark/report_{d}.txt", .{run_index});
         defer env.allocator.free(run_path);
-        try writeReport(&env, run_path, run_report.items);
+        try env.writeFile(run_path, run_report.items);
     }
 
     var report = std.ArrayList(u8).empty;
     defer report.deinit(env.allocator);
-    try report.appendSlice(env.allocator, metric.header);
-    var results = std.ArrayList(gate.Result).empty;
+    try report.appendSlice(env.allocator, metric.metric_header);
+    var results = std.ArrayList(gate.GateResult).empty;
     defer results.deinit(env.allocator);
     inline for (matrix.rows, 0..) |row, idx| {
         if (isSelected(row.name, env.row)) {
@@ -237,13 +233,13 @@ pub fn main(init: std.process.Init) !void {
     else
         null;
     defer if (row_report) |path| env.allocator.free(path);
-    try writeReport(&env, row_report orelse env_mod.paths.report, report.items);
+    try env.writeFile(row_report orelse env_mod.paths.report, report.items);
 
     if (gate_cfg.enabled) {
-        gate.sort(results.items);
+        gate.sortByWorstGap(results.items);
         var gate_report = std.ArrayList(u8).empty;
         defer gate_report.deinit(env.allocator);
-        try gate_report.appendSlice(env.allocator, gate.header);
+        try gate_report.appendSlice(env.allocator, gate.gate_header);
         for (results.items) |result| try gate.emitGateRow(&gate_report, env.allocator, result);
         const row_gate: ?[]u8 = if (env.row) |filter|
             try env.allocator.print("zig-out/benchmark/gate_{s}.txt", .{filter})
@@ -251,7 +247,7 @@ pub fn main(init: std.process.Init) !void {
             null;
         defer if (row_gate) |path| env.allocator.free(path);
         const gate_path = row_gate orelse env_mod.paths.gate;
-        try writeReport(&env, gate_path, gate_report.items);
+        try env.writeFile(gate_path, gate_report.items);
         const summary = gate.summarize(results.items);
         std.debug.print("gate: {d} pass, {d} fail, {d} noisy, {d} unmeasurable, {d} unhealthy -> {s}\n", .{ summary.pass, summary.fail, summary.noisy, summary.unmeasurable, summary.unhealthy, gate_path });
         if (results.items.len > 0) {

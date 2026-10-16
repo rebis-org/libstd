@@ -43,9 +43,8 @@ pub const framework_bundle = "StdK.framework";
 pub const framework_binary = "StdK";
 pub const framework_install_name = "@rpath/StdK.framework/StdK";
 
-// Every Apple slice ships as a framework bundle: App Store validation rejects
-// loose dylibs inside an iOS/tvOS/Catalyst app bundle, and create-xcframework
-// refuses an XCFramework that mixes frameworks with bare libraries.
+// Every Apple slice ships as a framework bundle.
+// App Store validation rejects loose dylibs inside app bundles.
 pub fn isMacos(slice: AppleSlice) bool {
     return std.mem.eql(u8, slice.platform, "MACOS");
 }

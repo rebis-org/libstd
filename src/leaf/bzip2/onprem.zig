@@ -1,12 +1,12 @@
 const std = @import("std");
 
 const checksum = @import("../../common/primitive/checksum.zig");
-const failure_prim = @import("../../common/primitive/failure.zig");
+const exception_prim = @import("../../common/primitive/exception.zig");
 const io = @import("../../common/primitive/io.zig");
 const measurement = @import("../../common/primitive/measurement.zig");
 
 const Bzip2Crc32 = checksum.Bzip2Crc32;
-const Failure = failure_prim.Failure;
+const Exception = exception_prim.Exception;
 
 pub const block_size_min = 100_000;
 pub const block_size_max = 900_000;
@@ -27,11 +27,11 @@ pub fn decodeWorkspaceSize(max_block: u32) usize {
     return plan.required();
 }
 
-pub fn decodeWorkspaceSizeFor(input: []const u8) Failure!usize {
-    if (input.len < 4) return error.DataFailure;
-    if (input[0] != 'B' or input[1] != 'Z' or input[2] != 'h') return error.DataFailure;
+pub fn decodeWorkspaceSizeFor(input: []const u8) Exception!usize {
+    if (input.len < 4) return error.DataException;
+    if (input[0] != 'B' or input[1] != 'Z' or input[2] != 'h') return error.DataException;
     const digit = input[3];
-    if (digit < '1' or digit > '9') return error.DataFailure;
+    if (digit < '1' or digit > '9') return error.DataException;
     const max_block = @as(u32, digit - '0') * 100_000;
     return decodeWorkspaceSize(max_block);
 }
@@ -59,29 +59,29 @@ const group_size = 50;
 const max_alpha_size = 258;
 const max_code_len = 20;
 const max_selectors = 32768;
-pub fn decodedSize(input: []const u8, scratch: []u8, provider: checksum.Provider) Failure!usize {
+pub fn decodedSize(input: []const u8, scratch: []u8, provider: checksum.Provider) Exception!usize {
     var counter = measurement.Counter.init(null);
     try decodeInner(input, &counter.writer, scratch, provider);
     return @intCast(counter.written());
 }
 
-pub fn decode(input: []const u8, output: []u8, scratch: []u8, provider: checksum.Provider) Failure!usize {
+pub fn decode(input: []const u8, output: []u8, scratch: []u8, provider: checksum.Provider) Exception!usize {
     var fixed_writer = std.Io.Writer.fixed(output);
     try decodeInner(input, &fixed_writer, scratch, provider);
     return fixed_writer.end;
 }
 
-pub fn decodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, provider: checksum.Provider) Failure!void {
+pub fn decodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, provider: checksum.Provider) Exception!void {
     try decodeInner(input, writer, scratch, provider);
 }
 
-pub fn requiredSize(input: []const u8, scratch: []u8, options: Options) Failure!usize {
+pub fn requiredSize(input: []const u8, scratch: []u8, options: Options) Exception!usize {
     var counter = measurement.Counter.init(null);
     try encodeInner(input, &counter.writer, scratch, options);
     return @intCast(counter.written());
 }
 
-pub fn encode(input: []const u8, output: []u8, scratch: []u8, options: Options) Failure!usize {
+pub fn encode(input: []const u8, output: []u8, scratch: []u8, options: Options) Exception!usize {
     var fixed_writer = std.Io.Writer.fixed(output);
     try encodeInner(input, &fixed_writer, scratch, options);
     return fixed_writer.end;
@@ -93,15 +93,15 @@ pub fn encodedSizeBound(input_len: usize) usize {
     return (input_len *| 13) / 4 +| 16384;
 }
 
-fn decodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, provider: checksum.Provider) Failure!void {
+fn decodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, provider: checksum.Provider) Exception!void {
     var cursor: []const u8 = input;
     // Concatenated streams (cat a.bz2 b.bz2) decode back to back; each outer
     // pass consumes exactly one BZh stream through its EOS magic.
     while (true) {
-        if (cursor.len < 4) return error.DataFailure;
-        if (cursor[0] != 'B' or cursor[1] != 'Z' or cursor[2] != 'h') return error.DataFailure;
+        if (cursor.len < 4) return error.DataException;
+        if (cursor[0] != 'B' or cursor[1] != 'Z' or cursor[2] != 'h') return error.DataException;
         const block_digit = cursor[3];
-        if (block_digit < '1' or block_digit > '9') return error.DataFailure;
+        if (block_digit < '1' or block_digit > '9') return error.DataException;
         const max_block = @as(u32, block_digit - '0') * 100_000;
         var br = BitReader.init(cursor[4..]);
         var combined_crc: u32 = 0;
@@ -109,14 +109,14 @@ fn decodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, provide
             const marker = try br.readBits(48);
             if (marker == 0x177245385090) {
                 const stored_combined = try br.readU32be();
-                if (combined_crc != stored_combined) return error.IntegrityFailure;
+                if (combined_crc != stored_combined) return error.IntegrityException;
                 break;
             }
-            if (marker != 0x314159265359) return error.DataFailure;
+            if (marker != 0x314159265359) return error.DataException;
             const stored_crc = try br.readU32be();
             const randomised = (try br.readBit()) != 0;
             const orig_ptr_u = try br.readBits(24);
-            const orig_ptr = std.math.cast(u32, orig_ptr_u) orelse return error.DataFailure;
+            const orig_ptr = std.math.cast(u32, orig_ptr_u) orelse return error.DataException;
             const in_use16: u16 = @intCast(try br.readBits(16));
             var seq_to_unseq: [256]u8 = undefined;
             var n_in_use: u32 = 0;
@@ -133,15 +133,15 @@ fn decodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, provide
                     }
                 }
             }
-            if (n_in_use == 0) return error.DataFailure;
+            if (n_in_use == 0) return error.DataException;
             const alpha_size = n_in_use + 2;
             const eob = alpha_size - 1;
             const n_groups_u = try br.readBits(3);
-            const n_groups = std.math.cast(u32, n_groups_u) orelse return error.DataFailure;
-            if (n_groups < 2 or n_groups > max_groups) return error.DataFailure;
+            const n_groups = std.math.cast(u32, n_groups_u) orelse return error.DataException;
+            if (n_groups < 2 or n_groups > max_groups) return error.DataException;
             const n_selectors_u = try br.readBits(15);
-            const n_selectors = std.math.cast(u32, n_selectors_u) orelse return error.DataFailure;
-            if (n_selectors == 0) return error.DataFailure;
+            const n_selectors = std.math.cast(u32, n_selectors_u) orelse return error.DataException;
+            if (n_selectors == 0) return error.DataException;
             var selectors: [max_selectors]u8 = undefined;
             {
                 var pos: [max_groups]u8 = undefined;
@@ -154,7 +154,7 @@ fn decodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, provide
                         const bit = try br.readBit();
                         if (bit == 0) break;
                         v += 1;
-                        if (v >= n_groups) return error.DataFailure;
+                        if (v >= n_groups) return error.DataException;
                     }
                     const selected = pos[v];
                     var j = v;
@@ -163,15 +163,15 @@ fn decodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, provide
                     if (i < max_selectors) selectors[i] = selected;
                 }
             }
-            if (n_selectors > max_selectors) return error.DataFailure;
+            if (n_selectors > max_selectors) return error.DataException;
             var lens: [max_groups][max_alpha_size]u8 = undefined;
             var tables: [max_groups]HuffTable = undefined;
             {
                 var t: u32 = 0;
                 while (t < n_groups) : (t += 1) {
                     const curr_u = try br.readBits(5);
-                    var curr = std.math.cast(u32, curr_u) orelse return error.DataFailure;
-                    if (curr < 1 or curr > max_code_len) return error.DataFailure;
+                    var curr = std.math.cast(u32, curr_u) orelse return error.DataException;
+                    if (curr < 1 or curr > max_code_len) return error.DataException;
                     var sym: u32 = 0;
                     while (sym < alpha_size) : (sym += 1) {
                         while (true) {
@@ -183,7 +183,7 @@ fn decodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, provide
                             } else {
                                 curr -%= 1;
                             }
-                            if (curr < 1 or curr > max_code_len) return error.DataFailure;
+                            if (curr < 1 or curr > max_code_len) return error.DataException;
                         }
                         lens[t][sym] = @intCast(curr);
                     }
@@ -205,7 +205,7 @@ fn decodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, provide
             while (true) {
                 if (group_pos == 0) {
                     group_no += 1;
-                    if (group_no >= n_selectors) return error.DataFailure;
+                    if (group_no >= n_selectors) return error.DataException;
                     group_pos = group_size;
                 }
                 group_pos -= 1;
@@ -213,17 +213,17 @@ fn decodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, provide
                 const table = &tables[sel];
                 const sym = try decodeHuffman(&br, table);
                 if (sym == 0 or sym == 1) {
-                    if (run_weight >= 2 * 1024 * 1024) return error.DataFailure;
+                    if (run_weight >= 2 * 1024 * 1024) return error.DataException;
                     run_accum += (sym + 1) * run_weight;
                     run_weight *= 2;
                     continue;
                 }
                 if (run_accum != -1) {
-                    const copies = std.math.cast(u32, run_accum + 1) orelse return error.DataFailure;
+                    const copies = std.math.cast(u32, run_accum + 1) orelse return error.DataException;
                     const byte = seq_to_unseq[mtf[0]];
                     var k: u32 = 0;
                     while (k < copies) : (k += 1) {
-                        if (nblock >= max_block) return error.DataFailure;
+                        if (nblock >= max_block) return error.DataException;
                         bwt_buffer[nblock] = byte;
                         nblock += 1;
                     }
@@ -233,11 +233,11 @@ fn decodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, provide
                 if (sym == eob) break;
                 const idx = sym - 1;
                 const uc = mtfMove(&mtf, idx);
-                if (nblock >= max_block) return error.DataFailure;
+                if (nblock >= max_block) return error.DataException;
                 bwt_buffer[nblock] = seq_to_unseq[uc];
                 nblock += 1;
             }
-            if (nblock == 0 or orig_ptr >= nblock) return error.DataFailure;
+            if (nblock == 0 or orig_ptr >= nblock) return error.DataException;
             var cftab: [256]u32 = undefined;
             @memset(&cftab, 0);
             var i: u32 = 0;
@@ -329,14 +329,14 @@ fn decodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, provide
                 block_crc.update(out_buf[0..out_len]);
             }
             if (block_crc.final() != stored_crc) {
-                return error.IntegrityFailure;
+                return error.IntegrityException;
             }
             combined_crc = (combined_crc << 1) | (combined_crc >> 31);
             combined_crc ^= stored_crc;
         }
         // The bit stream ends with zero padding to the next byte boundary;
         // anything nonzero there is corruption.
-        if (br.bits != 0) return error.DataFailure;
+        if (br.bits != 0) return error.DataException;
         // Trailing zero bytes are padding (7z pads encrypted pack streams to
         // the 16-byte boundary with zeros); only nonzero tail bytes must form
         // another complete BZh stream.
@@ -347,8 +347,8 @@ fn decodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, provide
     }
 }
 
-fn encodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options: Options) Failure!void {
-    if (options.block_size < block_size_min or options.block_size > block_size_max) return error.CallFailure;
+fn encodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options: Options) Exception!void {
+    if (options.block_size < block_size_min or options.block_size > block_size_max) return error.CallException;
     const max_block = options.block_size;
     var bit_writer = BitWriter.init(writer);
     try bit_writer.writeByte('B');
@@ -402,19 +402,19 @@ fn encodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options
         try encodeBlock(rle_buffer[0..rle_len], block_crc.final(), &bit_writer, &workspace, options);
         combined_crc = (combined_crc << 1) | (combined_crc >> 31);
         combined_crc ^= block_crc.final();
-        if (!full and offset < input.len) return error.InternalFailure;
+        if (!full and offset < input.len) return error.InternalException;
     }
     for (eos_magic) |b| try bit_writer.writeByte(b);
     try bit_writer.writeU32be(combined_crc);
     try bit_writer.flush();
 }
 
-fn appendRun(buffer: []u8, len: *usize, byte: u8, count: usize) Failure!void {
+fn appendRun(buffer: []u8, len: *usize, byte: u8, count: usize) Exception!void {
     if (count == 0) return;
     if (count < 4) {
         var i: usize = 0;
         while (i < count) : (i += 1) {
-            if (len.* >= buffer.len) return error.ResourceFailure;
+            if (len.* >= buffer.len) return error.ResourceException;
             buffer[len.*] = byte;
             len.* += 1;
         }
@@ -422,11 +422,11 @@ fn appendRun(buffer: []u8, len: *usize, byte: u8, count: usize) Failure!void {
     }
     var i: usize = 0;
     while (i < 4) : (i += 1) {
-        if (len.* >= buffer.len) return error.ResourceFailure;
+        if (len.* >= buffer.len) return error.ResourceException;
         buffer[len.*] = byte;
         len.* += 1;
     }
-    if (len.* >= buffer.len) return error.ResourceFailure;
+    if (len.* >= buffer.len) return error.ResourceException;
     buffer[len.*] = @intCast(count - 4);
     len.* += 1;
 }
@@ -593,13 +593,13 @@ fn sais(comptime T: type, text: []const T, sa: []u32, alphabet: u32, types: []u8
     saisInduce(T, text, sa, alphabet, types, hist, bptr);
 }
 
-fn encodeBlock(block: []const u8, block_crc: u32, bit_writer: *BitWriter, workspace: *io.Workspace, options: Options) Failure!void {
+fn encodeBlock(block: []const u8, block_crc: u32, bit_writer: *BitWriter, workspace: *io.Workspace, options: Options) Exception!void {
     const nblock = block.len;
     if (nblock == 0) return;
     // Bounds the linear-time SA-IS passes against the caller work budget.
     const log_n = std.math.log2_int_ceil(u32, @as(u32, @intCast(@max(2, nblock))));
     const estimate = @as(u64, nblock) * @as(u64, log_n) * 4;
-    if (estimate > options.max_work) return error.ResourceFailure;
+    if (estimate > options.max_work) return error.ResourceException;
     var in_use: [256]bool = @splat(false);
     for (block) |b| in_use[b] = true;
     var unseq_to_seq: [256]u8 = undefined;
@@ -611,7 +611,7 @@ fn encodeBlock(block: []const u8, block_crc: u32, bit_writer: *BitWriter, worksp
             n_in_use += 1;
         }
     }
-    if (n_in_use == 0) return error.InternalFailure;
+    if (n_in_use == 0) return error.InternalException;
     const alpha_size = n_in_use + 2;
     const eob = alpha_size - 1;
     // Doubled block plus sentinel makes sub-nblock suffixes exactly the rotations. L is tie-order independent.
@@ -644,7 +644,7 @@ fn encodeBlock(block: []const u8, block_crc: u32, bit_writer: *BitWriter, worksp
         l[out_rank] = block[prev];
         out_rank += 1;
     }
-    if (!found_orig or out_rank != nblock) return error.InternalFailure;
+    if (!found_orig or out_rank != nblock) return error.InternalException;
     const mtfv = try workspace.take(u16, workspace.remaining() / @sizeOf(u16));
     var mtf: [256]u8 = undefined;
     {
@@ -817,10 +817,10 @@ fn buildHuffmanGroups(mtfv: []const u16, n_mtf: usize, alpha_size: u32, group_le
     }
 }
 
-fn emitRun(wr: *usize, mtfv: []u16, z_pend: *u32) Failure!void {
+fn emitRun(wr: *usize, mtfv: []u16, z_pend: *u32) Exception!void {
     z_pend.* -%= 1;
     while (true) {
-        if (mtfv.len - wr.* < 1) return error.ResourceFailure;
+        if (mtfv.len - wr.* < 1) return error.ResourceException;
         if (z_pend.* & 1 != 0) {
             mtfv[wr.*] = 1;
         } else {
@@ -937,7 +937,7 @@ fn downHeap(heap: *[max_alpha_size + 2]u32, weight: *const [max_alpha_size * 2]u
     heap[zz] = tmp;
 }
 
-fn writeHuffmanTable(bit_writer: *BitWriter, lens: []const u8, alpha_size: u32) Failure!void {
+fn writeHuffmanTable(bit_writer: *BitWriter, lens: []const u8, alpha_size: u32) Exception!void {
     var curr: i32 = lens[0];
     try bit_writer.writeBits(5, @intCast(curr));
     var sym: u32 = 0;
@@ -1010,14 +1010,14 @@ const BitReader = struct {
         return .{ .bytes = bytes, .byte_pos = 0, .bits = 0, .bit_count = 0 };
     }
 
-    fn refill(self: *BitReader) error{ DataFailure, ResourceFailure }!void {
-        if (self.byte_pos >= self.bytes.len) return error.DataFailure;
+    fn refill(self: *BitReader) error{ DataException, ResourceException }!void {
+        if (self.byte_pos >= self.bytes.len) return error.DataException;
         self.bits = (self.bits << 8) | self.bytes[self.byte_pos];
         self.byte_pos += 1;
         self.bit_count += 8;
     }
 
-    fn readBit(self: *BitReader) error{ DataFailure, ResourceFailure }!u32 {
+    fn readBit(self: *BitReader) error{ DataException, ResourceException }!u32 {
         if (self.bit_count == 0) try self.refill();
         self.bit_count -= 1;
         const remaining: u6 = @intCast(self.bit_count);
@@ -1026,7 +1026,7 @@ const BitReader = struct {
         return bit;
     }
 
-    fn readBits(self: *BitReader, n: u6) error{ DataFailure, ResourceFailure }!u64 {
+    fn readBits(self: *BitReader, n: u6) error{ DataException, ResourceException }!u64 {
         while (self.bit_count < n) try self.refill();
         const shift: u6 = @intCast(self.bit_count - n);
         const value = (self.bits >> shift) & ((@as(u64, 1) << n) - 1);
@@ -1035,7 +1035,7 @@ const BitReader = struct {
         return value;
     }
 
-    fn readU32be(self: *BitReader) error{ DataFailure, ResourceFailure }!u32 {
+    fn readU32be(self: *BitReader) error{ DataException, ResourceException }!u32 {
         return @intCast(try self.readBits(32));
     }
 };
@@ -1055,7 +1055,7 @@ const BitWriter = struct {
         return .{ .writer = writer, .buffer = 0, .bits = 0, .pending = undefined };
     }
 
-    fn emit(self: *BitWriter, byte: u8) Failure!void {
+    fn emit(self: *BitWriter, byte: u8) Exception!void {
         self.pending[self.pending_len] = byte;
         self.pending_len += 1;
         if (self.pending_len == self.pending.len) {
@@ -1064,22 +1064,22 @@ const BitWriter = struct {
         }
     }
 
-    fn writeByte(self: *BitWriter, byte: u8) Failure!void {
+    fn writeByte(self: *BitWriter, byte: u8) Exception!void {
         try self.writeBits(8, byte);
     }
 
-    fn writeU32be(self: *BitWriter, value: u32) Failure!void {
+    fn writeU32be(self: *BitWriter, value: u32) Exception!void {
         try self.writeBits(8, value >> 24);
         try self.writeBits(8, value >> 16);
         try self.writeBits(8, value >> 8);
         try self.writeBits(8, value);
     }
 
-    fn writeBit(self: *BitWriter, bit: u32) Failure!void {
+    fn writeBit(self: *BitWriter, bit: u32) Exception!void {
         try self.writeBits(1, bit);
     }
 
-    fn writeBits(self: *BitWriter, n: u6, value: u64) Failure!void {
+    fn writeBits(self: *BitWriter, n: u6, value: u64) Exception!void {
         // Callers write at most 24 bits, so the container never fills in one call and
         // the drain below leaves fewer than 8 bits behind.
         self.buffer = (self.buffer << @intCast(n)) | (value & ((@as(u64, 1) << n) - 1));
@@ -1097,7 +1097,7 @@ const BitWriter = struct {
         self.buffer &= (@as(u64, 1) << @intCast(self.bits)) - 1;
     }
 
-    fn flush(self: *BitWriter) Failure!void {
+    fn flush(self: *BitWriter) Exception!void {
         // Batched calls leave up to 31 bits behind, so the tail drains whole bytes
         // first and the final partial byte shifts the remainder to the top.
         while (self.bits >= 8) {
@@ -1134,7 +1134,7 @@ const HuffTable = struct {
     root: [huff_root_size]u16,
 };
 
-fn buildHuffTable(lens: []const u8, alpha_size: u32) Failure!HuffTable {
+fn buildHuffTable(lens: []const u8, alpha_size: u32) Exception!HuffTable {
     // Tables filled below before any decode, so `undefined` is safe.
     var table: HuffTable = undefined;
     @memset(&table.limit, 0);
@@ -1145,11 +1145,11 @@ fn buildHuffTable(lens: []const u8, alpha_size: u32) Failure!HuffTable {
     var sym: u32 = 0;
     while (sym < alpha_size) : (sym += 1) {
         const len = lens[sym];
-        if (len < 1 or len > max_code_len) return error.DataFailure;
+        if (len < 1 or len > max_code_len) return error.DataException;
         if (len < table.min_len) table.min_len = len;
         if (len > table.max_len) table.max_len = len;
     }
-    if (table.min_len > table.max_len) return error.DataFailure;
+    if (table.min_len > table.max_len) return error.DataException;
     var count: [max_code_len + 2]u32 = undefined;
     @memset(&count, 0);
     sym = 0;
@@ -1166,13 +1166,13 @@ fn buildHuffTable(lens: []const u8, alpha_size: u32) Failure!HuffTable {
         sym = 0;
         while (sym < alpha_size) : (sym += 1) {
             if (lens[sym] == len) {
-                if (pp >= max_alpha_size) return error.DataFailure;
+                if (pp >= max_alpha_size) return error.DataException;
                 table.perm[pp] = @intCast(sym);
                 pp += 1;
             }
         }
     }
-    if (pp != alpha_size) return error.DataFailure;
+    if (pp != alpha_size) return error.DataException;
     @memset(&table.base, 0);
     sym = 0;
     while (sym < alpha_size) : (sym += 1) {
@@ -1235,7 +1235,7 @@ fn buildHuffTable(lens: []const u8, alpha_size: u32) Failure!HuffTable {
     return table;
 }
 
-fn decodeHuffman(br: *BitReader, table: *const HuffTable) Failure!u32 {
+fn decodeHuffman(br: *BitReader, table: *const HuffTable) Exception!u32 {
     // Root lookup first: one table load resolves every code up to root bits,
     // which is the overwhelmingly common shape. Longer codes and the exact
     // legacy error behavior fall through to the limit/base walk below.
@@ -1259,31 +1259,31 @@ fn decodeHuffman(br: *BitReader, table: *const HuffTable) Failure!u32 {
         if ((z15 >> @intCast(15 - zn)) <= table.limit[zn]) {
             br.bit_count -= zn;
             const idx = (z15 >> @intCast(15 - zn)) - table.base[zn];
-            if (idx >= max_alpha_size) return error.DataFailure;
+            if (idx >= max_alpha_size) return error.DataException;
             return table.perm[idx];
         }
-        if (zn >= table.max_len) return error.DataFailure;
+        if (zn >= table.max_len) return error.DataException;
         br.bit_count -= 15;
         var zvec: u32 = z15;
         while (zn < table.max_len and zvec > table.limit[zn]) {
             zn += 1;
             zvec = (zvec << 1) | try br.readBit();
         }
-        if (zvec > table.limit[zn]) return error.DataFailure;
+        if (zvec > table.limit[zn]) return error.DataException;
         const idx = zvec - table.base[zn];
-        if (idx >= max_alpha_size) return error.DataFailure;
+        if (idx >= max_alpha_size) return error.DataException;
         return table.perm[idx];
     }
     var zn: u6 = @intCast(table.min_len);
     var zvec = try br.readBits(zn);
     while (zvec > table.limit[zn]) {
-        if (zn >= table.max_len) return error.DataFailure;
+        if (zn >= table.max_len) return error.DataException;
         zn += 1;
         const bit = try br.readBit();
         zvec = (zvec << 1) | bit;
     }
     const idx = zvec - table.base[zn];
-    if (idx >= max_alpha_size) return error.DataFailure;
+    if (idx >= max_alpha_size) return error.DataException;
     return table.perm[idx];
 }
 
@@ -1325,7 +1325,7 @@ test "bzip2 concatenated streams decode in sequence" {
     garbage[len_a + 2] = 'Z';
     const garbage_scratch = try allocator.alloc(u8, try decodeWorkspaceSizeFor(garbage));
     defer allocator.free(garbage_scratch);
-    try std.testing.expectError(error.DataFailure, decode(garbage, output, garbage_scratch, checksum.default_provider));
+    try std.testing.expectError(error.DataException, decode(garbage, output, garbage_scratch, checksum.default_provider));
 }
 // The libbzip2 randomisation schedule (vendor/bzip2/randtable.c),
 // applied per inverse-BWT byte to blocks the encoder flagged randomised.

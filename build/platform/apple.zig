@@ -9,16 +9,16 @@ pub fn addArchive(b: *std.Build, ctx: *const common.Settings, distribution: mani
     _ = headers.addCopyFile(ctx.generated.header, "stdk.h");
     _ = headers.addCopyFile(ctx.generated.framework_module_map, "module.modulemap");
     const plist = b.addWriteFiles();
-    const create = b.addSystemCommand(&.{ "xcodebuild", "-create-xcframework" });
+    const xcframework = b.addSystemCommand(&.{ "xcodebuild", "-create-xcframework" });
     for (slices.apple_slices) |slice| {
         // App Store validation requires MinimumOSVersion on every embedded
         // framework. It follows the slice's own deployment floor.
         const plist_file = plist.add(b.fmt("Info-{s}.plist", .{slice.id}), b.fmt(framework_plist, .{ slices.framework_binary, ctx.version.major, ctx.version.minor, ctx.version.patch, ctx.version.major, ctx.version.minor, ctx.version.patch, slice.minimum }));
-        create.addArg("-framework");
-        create.addDirectoryArg(wrapFramework(b, buildSlice(b, ctx, slice), headers.getDirectory(), plist_file, slices.isMacos(slice)));
+        xcframework.addArg("-framework");
+        xcframework.addDirectoryArg(wrapFramework(b, buildSlice(b, ctx, slice), headers.getDirectory(), plist_file, slices.isMacos(slice)));
     }
-    create.addArg("-output");
-    const framework = create.addOutputDirectoryArg("StdK.xcframework");
+    xcframework.addArg("-output");
+    const framework = xcframework.addOutputDirectoryArg("StdK.xcframework");
     // WriteFile staging resolves symlinks away. The versioned macOS framework
     // keeps its bundle root as symlinks, so stage and zip in one shell step.
     const archive = b.addSystemCommand(&.{
@@ -41,7 +41,7 @@ pub fn addArchive(b: *std.Build, ctx: *const common.Settings, distribution: mani
 }
 
 fn buildSlice(b: *std.Build, ctx: *const common.Settings, slice: slices.AppleSlice) std.Build.LazyPath {
-    if (slice.arches.len > 4) @panic("An Apple slice carries at most four architectures.");
+    if (slice.arches.len > 4) @panic("an Apple slice carries at most four architectures.");
     const base = slice.library[0 .. slice.library.len - ".dylib".len];
     // Final leaf name, not a per-arch path: every slice shares one
     // bundle-relative LC_ID_DYLIB for @rpath resolution.
@@ -49,7 +49,7 @@ fn buildSlice(b: *std.Build, ctx: *const common.Settings, slice: slices.AppleSli
     if (slice.arches.len == 1) return buildArch(b, ctx, base, install_name, slice.arches[0]);
     var libraries: [4]std.Build.LazyPath = undefined;
     for (slice.arches, 0..) |arch, index| libraries[index] = buildArch(b, ctx, b.fmt("{s}_{s}", .{ base, archName(arch.arch) }), install_name, arch);
-    return universal(b, base, libraries[0..slice.arches.len]);
+    return lipoCombine(b, base, libraries[0..slice.arches.len]);
 }
 
 fn buildArch(b: *std.Build, ctx: *const common.Settings, name: []const u8, install_name: []const u8, arch: slices.AppleArch) std.Build.LazyPath {
@@ -63,13 +63,13 @@ fn buildArch(b: *std.Build, ctx: *const common.Settings, name: []const u8, insta
         .name = b.fmt("std-{s}", .{name}),
         .root_module = common.rootModule(b, target, .fast, ctx),
     });
-    const link = b.addSystemCommand(&.{ "xcrun", "--sdk", arch.sdk, "clang", "-target", arch.triple, "-dynamiclib" });
-    link.addFileArg2(object.getEmittedBin(), .{});
-    link.addArgs(&.{ "-install_name", install_name, "-o" });
-    return link.addOutputFileArg(b.fmt("{s}.dylib", .{name}));
+    const link_dylib = b.addSystemCommand(&.{ "xcrun", "--sdk", arch.sdk, "clang", "-target", arch.triple, "-dynamiclib" });
+    link_dylib.addFileArg2(object.getEmittedBin(), .{});
+    link_dylib.addArgs(&.{ "-install_name", install_name, "-o" });
+    return link_dylib.addOutputFileArg(b.fmt("{s}.dylib", .{name}));
 }
 
-fn universal(b: *std.Build, output_name: []const u8, libraries: []const std.Build.LazyPath) std.Build.LazyPath {
+fn lipoCombine(b: *std.Build, output_name: []const u8, libraries: []const std.Build.LazyPath) std.Build.LazyPath {
     const lipo = b.addSystemCommand(&.{ "lipo", "-create" });
     for (libraries) |library| lipo.addFileArg2(library, .{});
     lipo.addArg("-output");
@@ -91,8 +91,8 @@ fn archName(arch: std.Target.Cpu.Arch) []const u8 {
     };
 }
 
-// codesign seals the tree it signs, so the bundle is assembled and signed in
-// one step: Zig steps cannot declare an input that a command mutates in place.
+// Codesign seals the tree it signs.
+// Assembles and signs in one step because steps cannot mutate inputs in place.
 fn wrapFramework(b: *std.Build, library: std.Build.LazyPath, headers: std.Build.LazyPath, plist: std.Build.LazyPath, versioned: bool) std.Build.LazyPath {
     const command = b.addSystemCommand(&.{
         "sh", "-c",

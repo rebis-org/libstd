@@ -2,7 +2,7 @@ const std = @import("std");
 
 const span = @import("span.zig");
 
-const Failure = span.Failure;
+const Exception = span.Exception;
 const Span = span.Span;
 
 pub const Block = struct {
@@ -19,8 +19,8 @@ pub const Block = struct {
         std.mem.writeInt(u64, storage[0..header_len], generation, .little);
     }
 
-    pub fn init(storage: []u8) Failure!Block {
-        if (storage.len <= header_len) return error.ResourceFailure;
+    pub fn init(storage: []u8) Exception!Block {
+        if (storage.len <= header_len) return error.ResourceException;
         // Incrementing the stored generation keeps a recycled buffer from reissuing a stale value.
         const generation = loadGeneration(storage) +% 1;
         storeGeneration(storage, generation);

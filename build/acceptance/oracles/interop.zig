@@ -8,17 +8,13 @@ const steps = @import("steps.zig");
 
 // Pins agreement per corpus file both ways: ours decodes under the reference and vice versa.
 
-const RefCodec = struct {
+const ReferenceCodec = struct {
     encode: *const fn (input: []const u8, output: []u8) ?usize,
     decode: *const fn (input: []const u8, output: []u8) ?usize,
 };
 
 extern fn ZSTD_decompress(dst: [*]u8, dstCapacity: usize, src: [*]const u8, compressedSize: usize) usize;
 extern fn ZSTD_isError(code: usize) c_uint;
-
-fn zstdRefEncode(input: []const u8, output: []u8) ?usize {
-    return lib.zstdCompress(input, output);
-}
 
 fn zstdRefDecode(input: []const u8, output: []u8) ?usize {
     const len = ZSTD_decompress(output.ptr, output.len, input.ptr, input.len);
@@ -30,44 +26,24 @@ fn xzRefEncode(input: []const u8, output: []u8) ?usize {
     return lib.xzEncode(input, output, 1, null, null, 1 << 20); // 1 is LZMA_CHECK_CRC32.
 }
 
-fn gzipRefEncode(input: []const u8, output: []u8) ?usize {
-    return lib.gzipCompress(input, output);
-}
-
-fn gzipRefDecode(input: []const u8, output: []u8) ?usize {
-    return lib.gzipDecompress(input, output);
-}
-
-fn bzip2RefEncode(input: []const u8, output: []u8) ?usize {
-    return lib.bzip2Compress(input, output);
-}
-
-fn bzip2RefDecode(input: []const u8, output: []u8) ?usize {
-    return lib.bzip2Decompress(input, output);
-}
-
-fn xzRefDecode(input: []const u8, output: []u8) ?usize {
-    return lib.lzmaBufferDecode(input, output);
-}
-
-fn zstdParams(_: *harness.Runner, out: *[steps.MaxExtra]harness.Node) usize {
+fn zstdParams(_: *harness.Runner, out: *[steps.max_extra]harness.Node) usize {
     out[0] = harness.paramScalar(harness.param_family_zstd, harness.zstd_window, harness.cmds, 1 << 22);
     out[1] = harness.paramScalar(harness.param_family_zstd, harness.zstd_hash_bits, harness.cmds, 17);
     out[2] = harness.paramScalar(harness.param_family_zstd, harness.zstd_double_hash, harness.cmds, 1);
     return 3;
 }
 
-fn xzParams(r: *harness.Runner, out: *[steps.MaxExtra]harness.Node) usize {
+fn xzParams(r: *harness.Runner, out: *[steps.max_extra]harness.Node) usize {
     out[0] = harness.lzmaDictionaryParam(r.lzma_dictionary);
     return 1;
 }
 
-fn cross(
+fn checkBidirectional(
     profile: harness.Id,
     mode: harness.Mode,
     comptime params: steps.Params,
     r: *harness.Runner,
-    reference: RefCodec,
+    reference: ReferenceCodec,
 ) anyerror!void {
     harness.setup(r, profile, mode);
     corpus.fillTiled(r.corpus_index, r.corpus_buffer[0..]);
@@ -101,11 +77,11 @@ fn cross(
 }
 
 fn run(r: *harness.Runner) anyerror!void {
-    try cross(harness.ids.zstd, harness.mode_xz, &zstdParams, r, .{ .encode = &zstdRefEncode, .decode = &zstdRefDecode });
-    try cross(harness.ids.gzip, harness.mode_stream, &steps.noParams, r, .{ .encode = &gzipRefEncode, .decode = &gzipRefDecode });
-    try cross(harness.ids.bzip2, harness.mode_stream, &steps.noParams, r, .{ .encode = &bzip2RefEncode, .decode = &bzip2RefDecode });
+    try checkBidirectional(harness.ids.zstd, harness.mode_xz, &zstdParams, r, .{ .encode = &lib.zstdCompress, .decode = &zstdRefDecode });
+    try checkBidirectional(harness.ids.gzip, harness.mode_stream, &steps.noParams, r, .{ .encode = &lib.gzipCompress, .decode = &lib.gzipDecompress });
+    try checkBidirectional(harness.ids.bzip2, harness.mode_stream, &steps.noParams, r, .{ .encode = &lib.bzip2Compress, .decode = &lib.bzip2Decompress });
     r.lzma_dictionary = 1 << 20; // match xzRefEncode's dictionary
-    try cross(harness.ids.xz, harness.mode_xz, &xzParams, r, .{ .encode = &xzRefEncode, .decode = &xzRefDecode });
+    try checkBidirectional(harness.ids.xz, harness.mode_xz, &xzParams, r, .{ .encode = &xzRefEncode, .decode = &lib.lzmaBufferDecode });
 }
 
 pub const scenarios = harness.scenarios("interop", &.{

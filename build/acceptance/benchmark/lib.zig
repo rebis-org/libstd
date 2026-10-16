@@ -34,7 +34,7 @@ extern fn LZ4F_decompress(ctx: usize, dst: [*]u8, dst_size: *usize, src: [*]cons
 
 pub const Console = struct { path: []const u8, encode_ns: u64 };
 
-pub const Ref = struct {
+pub const Reference = struct {
     kind: matrix.Lib,
     fmt: u8 = 0,
     store: bool = false,
@@ -42,20 +42,20 @@ pub const Ref = struct {
     level: i32 = 0,
 };
 
-const Enc = struct { len: usize, ns: ?u64 = null };
+const EncodeResult = struct { len: usize, ns: ?u64 = null };
 
-const Spec = struct {
-    encode: ?*const fn (env: *env_mod.Env, ref: Ref, input: []const u8, output: []u8) anyerror!Enc = null,
-    decode: ?*const fn (env: *env_mod.Env, ref: Ref, data: []const u8, output: []u8) anyerror!usize = null,
+const ReferenceSpec = struct {
+    encode: ?*const fn (env: *env_mod.Env, ref: Reference, input: []const u8, output: []u8) anyerror!EncodeResult = null,
+    decode: ?*const fn (env: *env_mod.Env, ref: Reference, data: []const u8, output: []u8) anyerror!usize = null,
 };
 
 const sevenzip = struct {
-    fn encode(_: *env_mod.Env, ref: Ref, input: []const u8, output: []u8) anyerror!Enc {
+    fn encode(_: *env_mod.Env, ref: Reference, input: []const u8, output: []u8) anyerror!EncodeResult {
         var len: usize = 0;
         if (ref_archive_create(ref.fmt, input.ptr, input.len, "input.bin", @intFromBool(ref.store), output.ptr, output.len, &len) != 0) return error.encode_failed;
         return .{ .len = len };
     }
-    fn decode(_: *env_mod.Env, ref: Ref, data: []const u8, output: []u8) anyerror!usize {
+    fn decode(_: *env_mod.Env, ref: Reference, data: []const u8, output: []u8) anyerror!usize {
         var len: usize = 0;
         if (ref_archive_extract(ref.fmt, data.ptr, data.len, output.ptr, output.len, &len) != 0) return error.decode_failed;
         return len;
@@ -63,7 +63,7 @@ const sevenzip = struct {
 };
 
 const lzma7z = struct {
-    fn encode(env: *env_mod.Env, ref: Ref, input: []const u8, output: []u8) anyerror!Enc {
+    fn encode(env: *env_mod.Env, ref: Reference, input: []const u8, output: []u8) anyerror!EncodeResult {
         var len: usize = 0;
         if (ref_archive_create(0x0a, input.ptr, input.len, "input.bin", 0, output.ptr, output.len, &len) != 0 or len == 0 or len > output.len) {
             const console = ref.console orelse return error.no_console_archive;
@@ -75,7 +75,7 @@ const lzma7z = struct {
         }
         return .{ .len = len };
     }
-    fn decode(_: *env_mod.Env, _: Ref, data: []const u8, output: []u8) anyerror!usize {
+    fn decode(_: *env_mod.Env, _: Reference, data: []const u8, output: []u8) anyerror!usize {
         var len: usize = 0;
         if (ref_archive_extract(0x0a, data.ptr, data.len, output.ptr, output.len, &len) != 0) return error.decode_failed;
         return len;
@@ -83,12 +83,12 @@ const lzma7z = struct {
 };
 
 const zstd = struct {
-    fn encode(_: *env_mod.Env, ref: Ref, input: []const u8, output: []u8) anyerror!Enc {
+    fn encode(_: *env_mod.Env, ref: Reference, input: []const u8, output: []u8) anyerror!EncodeResult {
         const len = ZSTD_compress(output.ptr, output.len, input.ptr, input.len, @intCast(ref.level));
         if (ZSTD_isError(len) != 0) return error.encode_failed;
         return .{ .len = len };
     }
-    fn decode(_: *env_mod.Env, _: Ref, data: []const u8, output: []u8) anyerror!usize {
+    fn decode(_: *env_mod.Env, _: Reference, data: []const u8, output: []u8) anyerror!usize {
         const len = ZSTD_decompress(output.ptr, output.len, data.ptr, data.len);
         if (ZSTD_isError(len) != 0) return error.decode_failed;
         return len;
@@ -96,12 +96,12 @@ const zstd = struct {
 };
 
 const bzip2 = struct {
-    fn encode(_: *env_mod.Env, ref: Ref, input: []const u8, output: []u8) anyerror!Enc {
+    fn encode(_: *env_mod.Env, ref: Reference, input: []const u8, output: []u8) anyerror!EncodeResult {
         var len: u32 = @intCast(output.len);
         if (BZ2_bzBuffToBuffCompress(output.ptr, &len, input.ptr, @intCast(input.len), @intCast(ref.level), 0, 30) != 0) return error.encode_failed;
         return .{ .len = len };
     }
-    fn decode(_: *env_mod.Env, _: Ref, data: []const u8, output: []u8) anyerror!usize {
+    fn decode(_: *env_mod.Env, _: Reference, data: []const u8, output: []u8) anyerror!usize {
         var len: u32 = @intCast(output.len);
         if (BZ2_bzBuffToBuffDecompress(output.ptr, &len, data.ptr, @intCast(data.len), 0, 0) != 0) return error.decode_failed;
         return len;
@@ -109,12 +109,12 @@ const bzip2 = struct {
 };
 
 const xz = struct {
-    fn encode(_: *env_mod.Env, ref: Ref, input: []const u8, output: []u8) anyerror!Enc {
+    fn encode(_: *env_mod.Env, ref: Reference, input: []const u8, output: []u8) anyerror!EncodeResult {
         var pos: usize = 0;
         if (lzma_easy_buffer_encode(@intCast(ref.level), 4, null, input.ptr, input.len, output.ptr, &pos, output.len) != 0) return error.encode_failed;
         return .{ .len = pos };
     }
-    fn decode(_: *env_mod.Env, _: Ref, data: []const u8, output: []u8) anyerror!usize {
+    fn decode(_: *env_mod.Env, _: Reference, data: []const u8, output: []u8) anyerror!usize {
         var in_pos: usize = 0;
         var pos: usize = 0;
         var memlimit: u64 = 1 << 30;
@@ -124,12 +124,12 @@ const xz = struct {
 };
 
 const fast_lzma2 = struct {
-    fn encode(_: *env_mod.Env, ref: Ref, input: []const u8, output: []u8) anyerror!Enc {
+    fn encode(_: *env_mod.Env, ref: Reference, input: []const u8, output: []u8) anyerror!EncodeResult {
         const len = FL2_compress(output.ptr, output.len, input.ptr, input.len, @intCast(ref.level));
         if (FL2_isError(len) != 0) return error.encode_failed;
         return .{ .len = len };
     }
-    fn decode(_: *env_mod.Env, _: Ref, data: []const u8, output: []u8) anyerror!usize {
+    fn decode(_: *env_mod.Env, _: Reference, data: []const u8, output: []u8) anyerror!usize {
         const len = FL2_decompress(output.ptr, output.len, data.ptr, data.len);
         if (FL2_isError(len) != 0) return error.decode_failed;
         return len;
@@ -137,12 +137,12 @@ const fast_lzma2 = struct {
 };
 
 const zlib = struct {
-    fn encode(_: *env_mod.Env, ref: Ref, input: []const u8, output: []u8) anyerror!Enc {
+    fn encode(_: *env_mod.Env, ref: Reference, input: []const u8, output: []u8) anyerror!EncodeResult {
         var len: usize = output.len;
         if (compress2(output.ptr, &len, input.ptr, input.len, @intCast(ref.level)) != 0) return error.encode_failed;
         return .{ .len = len };
     }
-    fn decode(_: *env_mod.Env, _: Ref, data: []const u8, output: []u8) anyerror!usize {
+    fn decode(_: *env_mod.Env, _: Reference, data: []const u8, output: []u8) anyerror!usize {
         var len: usize = output.len;
         if (uncompress(output.ptr, &len, data.ptr, data.len) != 0) return error.decode_failed;
         return len;
@@ -150,14 +150,14 @@ const zlib = struct {
 };
 
 const lz4 = struct {
-    fn encode(_: *env_mod.Env, _: Ref, input: []const u8, output: []u8) anyerror!Enc {
+    fn encode(_: *env_mod.Env, _: Reference, input: []const u8, output: []u8) anyerror!EncodeResult {
         const bound = LZ4F_compressFrameBound(input.len, null);
         if (bound > output.len) return error.out_too_small;
         const len = LZ4F_compressFrame(output.ptr, output.len, input.ptr, input.len, null);
         if (LZ4F_isError(len) != 0) return error.encode_failed;
         return .{ .len = len };
     }
-    fn decode(_: *env_mod.Env, _: Ref, data: []const u8, output: []u8) anyerror!usize {
+    fn decode(_: *env_mod.Env, _: Reference, data: []const u8, output: []u8) anyerror!usize {
         var ctx: usize = 0;
         if (LZ4F_isError(LZ4F_createDecompressionContext(&ctx, 100)) != 0) return error.decode_failed;
         defer _ = LZ4F_freeDecompressionContext(ctx);
@@ -170,14 +170,14 @@ const lz4 = struct {
 };
 
 const libzip = struct {
-    fn encode(env: *env_mod.Env, ref: Ref, input: []const u8, output: []u8) anyerror!Enc {
+    fn encode(env: *env_mod.Env, ref: Reference, input: []const u8, output: []u8) anyerror!EncodeResult {
         const temp = try env.makePathZ("{s}/ref-libzip.zip", .{env_mod.paths.work});
         defer env.allocator.free(temp);
         var len: usize = 0;
         if (ref_zip_create(input.ptr, input.len, "input.bin", @intFromBool(ref.store), temp.ptr, output.ptr, output.len, &len) != 0) return error.encode_failed;
         return .{ .len = len };
     }
-    fn decode(_: *env_mod.Env, _: Ref, data: []const u8, output: []u8) anyerror!usize {
+    fn decode(_: *env_mod.Env, _: Reference, data: []const u8, output: []u8) anyerror!usize {
         var len: usize = 0;
         if (ref_zip_extract(data.ptr, data.len, output.ptr, output.len, &len) != 0) return error.decode_failed;
         return len;
@@ -185,7 +185,7 @@ const libzip = struct {
 };
 
 const unrar = struct {
-    fn decode(env: *env_mod.Env, _: Ref, data: []const u8, output: []u8) anyerror!usize {
+    fn decode(env: *env_mod.Env, _: Reference, data: []const u8, output: []u8) anyerror!usize {
         const temp = try env.makePathZ("{s}/ref-unrar.temp", .{env_mod.paths.work});
         defer env.allocator.free(temp);
         const destination = try env.makePathZ("{s}", .{env_mod.paths.work});
@@ -196,7 +196,7 @@ const unrar = struct {
     }
 };
 
-fn get(kind: matrix.Lib) Spec {
+fn specOf(kind: matrix.Lib) ReferenceSpec {
     return switch (kind) {
         .sevenzip => .{ .encode = sevenzip.encode, .decode = sevenzip.decode },
         .zstd => .{ .encode = zstd.encode, .decode = zstd.decode },
@@ -211,7 +211,7 @@ fn get(kind: matrix.Lib) Spec {
     };
 }
 
-pub fn refOf(row: matrix.Row) Ref {
+pub fn referenceOfRow(row: matrix.BenchmarkRow) Reference {
     const level: i32 = row.lib_level orelse switch (row.lib.?) {
         .zstd => 3,
         .bzip2 => 9,
@@ -222,38 +222,38 @@ pub fn refOf(row: matrix.Row) Ref {
     return .{ .kind = row.lib.?, .fmt = row.fmt, .store = row.store, .level = level };
 }
 
-fn timedDecode(env: *env_mod.Env, f: *const fn (env: *env_mod.Env, ref: Ref, data: []const u8, output: []u8) anyerror!usize, ref: Ref, data: []const u8, expected: []const u8, decoded: []u8, m: *metric.Metric) void {
-    const t1 = env.now();
-    const len = f(env, ref, data, decoded) catch {
-        m.decode_ns = env.now() - t1;
+fn timedDecode(env: *env_mod.Env, decode_fn: *const fn (env: *env_mod.Env, ref: Reference, data: []const u8, output: []u8) anyerror!usize, ref: Reference, data: []const u8, expected: []const u8, decoded: []u8, m: *metric.Metric) void {
+    const t1 = env.nowNs();
+    const len = decode_fn(env, ref, data, decoded) catch {
+        m.decode_ns = env.nowNs() - t1;
         return;
     };
-    m.decode_ns = env.now() - t1;
-    m.ok = metric.decodeOk(len, expected, decoded);
+    m.decode_ns = env.nowNs() - t1;
+    m.ok = metric.isDecodeOk(len, expected, decoded);
 }
 
-pub fn measure(env: *env_mod.Env, ref: Ref, input: []const u8, encoded: []u8, decoded: []u8) metric.Metric {
+pub fn measure(env: *env_mod.Env, ref: Reference, input: []const u8, encoded: []u8, decoded: []u8) metric.Metric {
     var m = metric.Metric{};
-    const spec = get(ref.kind);
-    if (spec.encode) |f| {
-        const t0 = env.now();
-        const enc = f(env, ref, input, encoded) catch {
-            m.encode_ns = env.now() - t0;
+    const spec = specOf(ref.kind);
+    if (spec.encode) |encode_fn| {
+        const t0 = env.nowNs();
+        const enc = encode_fn(env, ref, input, encoded) catch {
+            m.encode_ns = env.nowNs() - t0;
             return m;
         };
-        m.encode_ns = enc.ns orelse env.now() - t0;
+        m.encode_ns = enc.ns orelse env.nowNs() - t0;
         m.encoded = enc.len;
         if (enc.len == 0 or enc.len > encoded.len) return m;
     }
-    if (spec.decode) |f| {
-        timedDecode(env, f, ref, encoded[0..m.encoded], input, decoded, &m);
+    if (spec.decode) |decode_fn| {
+        timedDecode(env, decode_fn, ref, encoded[0..m.encoded], input, decoded, &m);
     }
     return m;
 }
 
-pub fn decodeOnly(env: *env_mod.Env, ref: Ref, archive: []const u8, expected: []const u8, decoded: []u8) metric.Metric {
+pub fn decodeOnly(env: *env_mod.Env, ref: Reference, archive: []const u8, expected: []const u8, decoded: []u8) metric.Metric {
     var m = metric.Metric{};
-    const f = get(ref.kind).decode orelse return m;
-    timedDecode(env, f, ref, archive, expected, decoded, &m);
+    const decode_fn = specOf(ref.kind).decode orelse return m;
+    timedDecode(env, decode_fn, ref, archive, expected, decoded, &m);
     return m;
 }

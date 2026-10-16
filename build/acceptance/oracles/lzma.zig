@@ -13,7 +13,7 @@ const Runner = harness.Runner;
 
 var lzma_file_input: [48]u8 = undefined;
 
-fn lzmaParams(r: *Runner, out: *[steps.MaxExtra]harness.Node) usize {
+fn lzmaParams(r: *Runner, out: *[steps.max_extra]harness.Node) usize {
     out[0] = harness.lzmaDictionaryParam(r.lzma_dictionary);
     var count: usize = 1;
     if (r.lzma_match_finder) |value| {
@@ -817,40 +817,40 @@ fn scanSize(input: []const u8) !?usize {
             need_properties = true;
             need_dictionary_reset = true;
         } else if (need_dictionary_reset) {
-            return error.DataFailure;
+            return error.DataException;
         }
         if (control & 0x80 != 0) {
-            if (pos + 2 > input.len) return error.DataFailure;
+            if (pos + 2 > input.len) return error.DataException;
             const unpack_size = (((@as(usize, control & 0x0F) << 16) | (@as(usize, input[pos]) << 8) | input[pos + 1]) + 1);
             pos += 2;
-            if (pos + 2 > input.len) return error.DataFailure;
+            if (pos + 2 > input.len) return error.DataException;
             const pack_size = ((@as(usize, input[pos]) << 8) | input[pos + 1]) + 1;
             pos += 2;
-            if (unpack_size > chunk_max_unpacked_local or pack_size < 5 or pack_size > max_pack_size) return error.DataFailure;
+            if (unpack_size > chunk_max_unpacked_local or pack_size < 5 or pack_size > max_pack_size) return error.DataException;
             if (control >= control_lzma_new_props) {
-                if (pos >= input.len) return error.DataFailure;
+                if (pos >= input.len) return error.DataException;
                 pos += 1;
                 need_properties = false;
                 if (control >= control_lzma_new_props_reset_dic) need_dictionary_reset = false;
             } else {
-                if (need_properties) return error.DataFailure;
+                if (need_properties) return error.DataException;
             }
             pos += pack_size;
-            if (pos > input.len) return error.DataFailure;
-            total = std.math.add(usize, total, unpack_size) catch return error.ResourceFailure;
+            if (pos > input.len) return error.DataException;
+            total = std.math.add(usize, total, unpack_size) catch return error.ResourceException;
         } else {
-            if (control != control_copy_reset_dic and control != control_copy) return error.DataFailure;
-            if (pos + 2 > input.len) return error.DataFailure;
+            if (control != control_copy_reset_dic and control != control_copy) return error.DataException;
+            if (pos + 2 > input.len) return error.DataException;
             const unpack_size = ((@as(usize, input[pos]) << 8) | input[pos + 1]) + 1;
             pos += 2;
-            if (unpack_size > chunk_max_unpacked_local) return error.DataFailure;
+            if (unpack_size > chunk_max_unpacked_local) return error.DataException;
             if (need_dictionary_reset) need_dictionary_reset = false;
             pos += unpack_size;
-            if (pos > input.len) return error.DataFailure;
-            total = std.math.add(usize, total, unpack_size) catch return error.ResourceFailure;
+            if (pos > input.len) return error.DataException;
+            total = std.math.add(usize, total, unpack_size) catch return error.ResourceException;
         }
     }
-    return error.DataFailure;
+    return error.DataException;
 }
 
 pub fn runScanTiming(r: *Runner) !void {

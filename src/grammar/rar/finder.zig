@@ -1,14 +1,14 @@
 const std = @import("std");
 
 const kernels = @import("../../common/kernels.zig");
-const failure = @import("../../common/primitive/failure.zig");
+const exception = @import("../../common/primitive/exception.zig");
 const common_sink = @import("../../common/sink.zig");
 const window_mod = @import("window.zig");
 
-const Failure = failure.Failure;
+const Exception = exception.Exception;
 
 // Nothing allocates: every table is caller-provided, and token-buffer
-// exhaustion returns CapacityFailure so the caller can size the buffer.
+// exhaustion returns CapacityException so the caller can size the buffer.
 
 pub const LzToken = union(enum) {
     literal: u8,
@@ -45,9 +45,9 @@ pub const MatchFinder = struct {
         hash3: []u32,
         window_size: u32,
         level: u3,
-    ) Failure!MatchFinder {
+    ) Exception!MatchFinder {
         if (hash.len < hash_size or hash2.len < hash2_size or hash3.len < hash3_size)
-            return error.InternalFailure;
+            return error.InternalException;
         @memset(hash, 0);
         @memset(hash2, 0);
         @memset(hash3, 0);
@@ -289,8 +289,8 @@ pub const MatchFinder = struct {
         tokens: []LzToken,
         bt_left: []u32,
         bt_right: []u32,
-    ) Failure![]LzToken {
-        if (bt_left.len < bytes.len or bt_right.len < bytes.len) return error.InternalFailure;
+    ) Exception![]LzToken {
+        if (bt_left.len < bytes.len or bt_right.len < bytes.len) return error.InternalException;
         @memset(bt_left, 0);
         @memset(bt_right, 0);
 
@@ -306,12 +306,12 @@ pub const MatchFinder = struct {
                     const next_match = self.findBT4Match(bytes, pos + 1, bt_left, bt_right);
                     if (next_match) |nm| {
                         if (nm.length > m.length + 1) {
-                            if (count >= tokens.len) return error.CapacityFailure;
+                            if (count >= tokens.len) return error.CapacityException;
                             tokens[count] = .{ .literal = bytes[pos] };
                             count += 1;
                             pos += 1;
 
-                            if (count >= tokens.len) return error.CapacityFailure;
+                            if (count >= tokens.len) return error.CapacityException;
                             tokens[count] = .{ .match = .{ .length = nm.length, .distance = nm.distance } };
                             count += 1;
                             var i: u32 = 1;
@@ -324,7 +324,7 @@ pub const MatchFinder = struct {
                     }
                     // Position pos is already in the tree from findBT4Match, and
                     // pos + 1 from the lazy check above, so the loop starts at 2.
-                    if (count >= tokens.len) return error.CapacityFailure;
+                    if (count >= tokens.len) return error.CapacityException;
                     tokens[count] = .{ .match = .{ .length = m.length, .distance = m.distance } };
                     count += 1;
                     var i: u32 = 2;
@@ -333,7 +333,7 @@ pub const MatchFinder = struct {
                     }
                     pos += m.length;
                 } else {
-                    if (count >= tokens.len) return error.CapacityFailure;
+                    if (count >= tokens.len) return error.CapacityException;
                     tokens[count] = .{ .match = .{ .length = m.length, .distance = m.distance } };
                     count += 1;
                     var i: u32 = 1; // Position pos is already in the tree.
@@ -344,7 +344,7 @@ pub const MatchFinder = struct {
                 }
             } else {
                 // Position pos is already in the tree.
-                if (count >= tokens.len) return error.CapacityFailure;
+                if (count >= tokens.len) return error.CapacityException;
                 tokens[count] = .{ .literal = bytes[pos] };
                 count += 1;
                 pos += 1;

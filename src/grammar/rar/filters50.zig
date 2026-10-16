@@ -1,9 +1,9 @@
 const std = @import("std");
 
-const failure = @import("../../common/primitive/failure.zig");
+const exception = @import("../../common/primitive/exception.zig");
 const bits = @import("bits.zig");
 
-const Failure = failure.Failure;
+const Exception = exception.Exception;
 const BitReader = bits.BitReader;
 
 // The E8 and Arm transforms relocate against true file positions, so
@@ -40,8 +40,8 @@ pub const max_filter_block: usize = 0x400000;
 // (E8_WRAP), not the file size, and the wrap constant is not the file offset.
 const e8_wrap: u32 = 0x1000000;
 
-pub fn applyFilter(data: []u8, filter: Filter, file_offset: u64, scratch: []u8) Failure!void {
-    if (filter.length > data.len) return error.DataFailure;
+pub fn applyFilter(data: []u8, filter: Filter, file_offset: u64, scratch: []u8) Exception!void {
+    if (filter.length > data.len) return error.DataException;
     const region = data[0..filter.length];
     switch (filter.filter_type) {
         .delta => try applyDelta(region, filter.channels, scratch),
@@ -53,9 +53,9 @@ pub fn applyFilter(data: []u8, filter: Filter, file_offset: u64, scratch: []u8) 
 
 // A channel-sequential delta inverts to a per-channel prefix sum. Source and
 // destination overlap, so the transform writes to the scratch copy.
-fn applyDelta(data: []u8, channels: u8, scratch: []u8) Failure!void {
+fn applyDelta(data: []u8, channels: u8, scratch: []u8) Exception!void {
     if (channels == 0 or data.len == 0) return;
-    if (scratch.len < data.len) return error.CapacityFailure;
+    if (scratch.len < data.len) return error.CapacityException;
     const channel_count: usize = channels;
     const dst = scratch[0..data.len];
 
@@ -121,7 +121,7 @@ pub fn applyArm(data: []u8, file_offset: u64) void {
 
 // The wire size field (ReadFilterData) uses a 2-bit prefix for a byte count of
 // 1 to 4, then assembles the value little-endian.
-pub fn readFilterSize(br: *BitReader) Failure!usize {
+pub fn readFilterSize(br: *BitReader) Exception!usize {
     const byte_count: u3 = @intCast((try br.readBits(2)) + 1);
     var size: usize = 0;
     var i: u3 = 0;
