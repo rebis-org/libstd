@@ -347,6 +347,9 @@ fn riscvDecode(code_bytes: []u8, start_offset: u32) void {
         var inst: u32 = code_bytes[index];
         if (inst == 0xEF) {
             const b1 = code_bytes[index + 1];
+            // The encoder skips these JAL forms; decoding must skip the same
+            // shapes or it converts bytes the encode pass left untouched.
+            if ((b1 & 0x0D) != 0) continue;
             const b2 = code_bytes[index + 2];
             const b3 = code_bytes[index + 3];
             const pc = start_offset +% @as(u32, @truncate(index));
@@ -416,4 +419,31 @@ fn write32le(bytes: *[4]u8, value: u32) void {
 
 fn write32be(bytes: *[4]u8, value: u32) void {
     std.mem.writeInt(u32, bytes, value, .big);
+}
+
+test "riscv decode skips the jal forms the encoder skips" {
+    // A skipped-form JAL (b1 & 0x0D != 0) must survive the round trip
+    // unchanged; converting it would desync the reference interop.
+    var data = [_]u8{ 0xEF, 0x0D, 0x22, 0x11, 0xEF, 0x00, 0x00, 0x00 };
+    const saved = data;
+    encode(.riscv, 0, &data);
+    decode(.riscv, 0, &data);
+    try std.testing.expectEqualSlices(u8, &saved, &data);
+}
+
+test "bcj filters round-trip at aligned offsets" {
+    var rng = std.Random.DefaultPrng.init(0xB0);
+    const random = rng.random();
+    var data: [8192]u8 = undefined;
+    random.bytes(&data);
+    for (0..400) |i| {
+        data[i * 20] = if (i % 2 == 0) 0xE8 else 0xE9;
+        data[i * 20 + 4] = if (i % 3 == 0) 0x00 else 0x41;
+    }
+    inline for (.{ .x86, .ppc, .ia64, .arm, .armt, .sparc, .arm64, .riscv }) |kind| {
+        var copy = data;
+        encode(kind, 0, &copy);
+        decode(kind, 0, &copy);
+        try std.testing.expectEqualSlices(u8, &data, &copy);
+    }
 }
