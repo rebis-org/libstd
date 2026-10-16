@@ -44,7 +44,10 @@ fn mapException(err: anyerror) Exception {
 fn alignWorkspace(workspace: interface.span.Span) Exception![]u32 {
     const base = @intFromPtr(workspace.ptr);
     const aligned = std.mem.alignForward(usize, base, @alignOf(u32));
-    const bytes = workspace.bytes()[(aligned - base)..];
+    const gap = aligned - base;
+    // A workspace smaller than the alignment padding cannot hold one word.
+    if (workspace.len < gap + @sizeOf(u32)) return error.CapacityException;
+    const bytes = workspace.bytes()[gap..];
     const trimmed: []align(4) u8 = @alignCast(bytes[0 .. bytes.len - bytes.len % @sizeOf(u32)]);
     return std.mem.bytesAsSlice(u32, trimmed);
 }
