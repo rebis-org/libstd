@@ -1054,8 +1054,11 @@ pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
         // The walk resolved the entry's declared needs into RarInfo. Store
         // entries carve nothing. The PPMd heap is whatever workspace remains:
         // the stream names its model size at decode time and is refused
-        // cleanly if the pool cannot hold it.
+        // cleanly if the pool cannot hold it. A staged (callback) sink takes
+        // its output staging BEFORE the heap grab, or the heap would consume
+        // the space staging needs.
         const window_len = std.math.cast(usize, entry.window_bytes) orelse return error.ResourceException;
+        const staged_output = if (sink_resource.kind == .callback_write) try workspace.take(u8, size) else @as([]u8, &.{});
         var bufs: rar.DecodeBuffers = .{
             .state = &.{},
             .window = &.{},
@@ -1093,12 +1096,11 @@ pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
                 return err;
             };
         } else {
-            const staging = try workspace.take(u8, size);
-            _ = rar.rarDecodeOrdinal(archive, ordinal, staging, &bufs, decode_opts) catch |err| {
+            _ = rar.rarDecodeOrdinal(archive, ordinal, staged_output, &bufs, decode_opts) catch |err| {
                 writeCryptoFailure(call, failure_cause);
                 return err;
             };
-            try common.commitBytesToSink(sink_resource, call, staging);
+            try common.commitBytesToSink(sink_resource, call, staged_output);
         }
         response.byte_length = size;
     } else if (command_mask == vocabulary.command_mask_write) {
