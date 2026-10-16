@@ -18,6 +18,7 @@ test {
     _ = @import("grammar/xar/offprem.zig");
     _ = @import("grammar/xar/onprem.zig");
     _ = @import("grammar/xz/onprem.zig");
+    _ = @import("leaf/bcj/onprem.zig");
     _ = @import("leaf/lz4/onprem.zig");
     _ = @import("leaf/zstd/onprem.zig");
     _ = @import("leaf/brotli/onprem.zig");
@@ -34,3 +35,4 @@ test {
     _ = @import("volume/squashfs/offprem.zig");
     _ = @import("volume/squashfs/onprem.zig");
 }
+
