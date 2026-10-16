@@ -203,14 +203,9 @@ fn inflateZlib(payload: []const u8, out: []u8, history: []u8) Exception!usize {
 }
 
 fn inflateData(compression: u16, payload: []const u8, out: []u8, history: []u8, aux: ?[]u8) Exception!void {
-    switch (compression) {
-        compression_zstd => {
-            _ = try inflateBlock(compression, payload, out, history, aux);
-        },
-        else => {
-            if (try inflateBlock(compression, payload, out, history, aux) != out.len) return error.DataException;
-        },
-    }
+    // Every compressor must fill the destination exactly: a short frame is
+    // corruption, not a license to leave stale bytes in the block buffer.
+    if (try inflateBlock(compression, payload, out, history, aux) != out.len) return error.DataException;
 }
 
 const Inode = struct {
@@ -228,8 +223,8 @@ fn fullBlockCount(file_size: u64, block_size: u32, fragment: u32) Exception!usiz
     if (fragment != invalid_fragment) {
         return std.math.cast(usize, file_size / block_size) orelse return error.DataException;
     }
-    if (file_size == 0) return 0;
-    return std.math.cast(usize, (file_size + block_size - 1) / block_size) orelse return error.DataException;
+    const blocks = file_size / block_size + @intFromBool(file_size % block_size != 0);
+    return std.math.cast(usize, blocks) orelse return error.DataException;
 }
 
 fn readInode(archive: []const u8, super: Super, ref: u64, scratch: *Scratch) Exception!Inode {
