@@ -105,7 +105,11 @@ fn x86Code(code_bytes: []u8, start_offset: u32, comptime direction: Direction) v
                 const bit = mask_to_bit_number[prev_mask >> 1];
                 ms_byte = @truncate(dest >> @as(u5, @intCast(24 - bit * 8)));
                 if (!test86MsByte(ms_byte)) break;
-                src = dest ^ ((@as(u32, 1) << @as(u5, @intCast(32 - bit * 8))) -% 1);
+                // bit == 0 restores no byte: the mask is zero and src keeps
+                // dest, matching the reference's shift-count-modulo behavior
+                // without a u5 cast of 32.
+                const restore_mask: u32 = if (bit == 0) 0 else (@as(u32, 1) << @as(u5, @intCast(32 - bit * 8))) -% 1;
+                src = dest ^ restore_mask;
             }
             code_bytes[buffer_pos + 4] = @truncate(~((dest >> 24 & 1) -% 1));
             code_bytes[buffer_pos + 3] = @truncate(dest >> 16);
