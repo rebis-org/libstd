@@ -20,6 +20,7 @@ const abi = @import("../kernel/envelope.zig");
 const node_graph = @import("../kernel/node.zig");
 const resource = @import("../kernel/resource.zig");
 const vocabulary = @import("../kernel/vocabulary.zig");
+const apfs_seam = @import("../volume/apfs/seam.zig");
 const dwarfs = @import("../volume/dwarfs/onprem.zig");
 const dwarfs_seam = @import("../volume/dwarfs/seam.zig");
 const iso = @import("../volume/iso/onprem.zig");
@@ -402,6 +403,47 @@ pub fn dwarfsHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resou
             try common.commitBytesToSink(sink_resource, call, staging[0..written]);
             response.byte_length = written;
         }
+    } else {
+        return error.UnsupportedException;
+    }
+}
+
+// APFS is read-only: inspect and decode_ordinal, no encode path.
+pub fn apfsHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
+    _ = sizing;
+    const source_resource = source orelse return error.CallException;
+    var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
+    if (command_mask == vocabulary.command_mask_read) {
+        if (sink == null) {
+            const archive = try materializeArchive(source_resource, &workspace, limits);
+            const scratch = try workspace.take(u8, apfs_seam.scratch_size);
+            if (try projectedEntrySize(call.request)) |ordinal| {
+                const entry = try apfs_seam.inspectOrdinal(plan.provider, archive, ordinal, scratch);
+                response.byte_length = entry.size;
+                return;
+            }
+            const count = try apfs_seam.inspectCount(plan.provider, archive, scratch);
+            response.byte_length = count;
+            return;
+        }
+        const head = try readHead(sink, call, commit);
+        const sink_resource = head.sink;
+        const ordinal = head.ordinal;
+        const archive = try materializeArchive(source_resource, &workspace, limits);
+        const scratch = try workspace.take(u8, apfs_seam.scratch_size);
+        const entry = try apfs_seam.inspectOrdinal(plan.provider, archive, ordinal, scratch);
+        const size = std.math.cast(usize, entry.size) orelse return error.ResourceException;
+        if (size > limits.decoded_bytes) return error.ResourceException;
+        try common.requireSinkCapacity(sink_resource, call, size);
+        if (sink_resource.kind == .direct_write) {
+            const output = try common.sinkDirectBuffer(sink_resource, size);
+            _ = try apfs_seam.decodeOrdinal(plan.provider, archive, ordinal, output, scratch);
+        } else {
+            const staged = try workspace.take(u8, size);
+            _ = try apfs_seam.decodeOrdinal(plan.provider, archive, ordinal, staged, scratch);
+            try common.commitBytesToSink(sink_resource, call, staged);
+        }
+        response.byte_length = size;
     } else {
         return error.UnsupportedException;
     }

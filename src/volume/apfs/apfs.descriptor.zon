@@ -1,0 +1,18 @@
+.{
+    .id = .{ .low = "0x6636364e3f700e86", .high = "0x5a9fd7a6347b51d3" },
+    .name = "apfs",
+    .class = "volume",
+    .verbs = .{ "inspect", "decode_ordinal" },
+    .parameters = .{
+        .{ .name = "ordinal", .family = 2, .ordinal = 1, .representation = "scalar_words" },
+        .{ .name = "entry_count", .family = 2, .ordinal = 2, .representation = "scalar_words" },
+        .{ .name = "entry_name", .family = 2, .ordinal = 3, .representation = "bytes" },
+        .{ .name = "entry_size", .family = 2, .ordinal = 4, .representation = "scalar_words" },
+        .{ .name = "entry", .family = 2, .ordinal = 5, .representation = "node_chain" },
+        .{ .name = "entry_data", .family = 2, .ordinal = 6, .representation = "bytes" },
+    },
+    .capabilities = .{ "read", "size" },
+    .sizing = "metadata_exact",
+    .commit = "tentative",
+    .limits = .{ .window = 0, .block = 0, .history = 0 },
+}
