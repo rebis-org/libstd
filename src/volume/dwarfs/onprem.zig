@@ -11,7 +11,7 @@ const Exception = exception_prim.Exception;
 // DwarFS v2 slice: one root directory of regular files.
 // Fidelity target is mkdwarfs output, verified with dwarfsck.
 
-pub const scratch_size: usize = 1 * 1024 * 1024;
+pub const scratch_size: usize = 2 * 1024 * 1024;
 
 const section_type_block: u16 = 0;
 const section_type_schema: u16 = 7;
@@ -766,10 +766,10 @@ fn dwValidate(name: []const u8) Exception!void {
 }
 
 pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Exception!usize {
-    _ = scratch;
+    // Caller scratch backs the whole build; the scratch_size constant
+    // covers the declared entry and data caps.
     if (entries.len == 0 or entries.len > 4096) return error.UnsupportedException;
-    var stack: [64 * 1024]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&stack);
+    var fba = std.heap.FixedBufferAllocator.init(scratch);
     const alloc = fba.allocator();
 
     // Tree build: nodes[0] roots the directory tree.
