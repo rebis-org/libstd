@@ -501,7 +501,7 @@ fn runTarget(archive: []const u8, scratch: []u8, target: Target) Exception!u64 {
     const dir_count = md.directories.len - 1;
     const file_off: u32 = @intCast(dir_count);
     var state = WalkState{};
-    try walkDwarfsDir(md, blocks, 0, file_off, resolved, &state);
+    try walkDwarfsDir(md, blocks, 0, file_off, resolved, &state, 0);
     return switch (target) {
         .count => state.ordinal,
         .resolve => if (found) state.ordinal else error.DataException,
@@ -510,7 +510,8 @@ fn runTarget(archive: []const u8, scratch: []u8, target: Target) Exception!u64 {
 
 const WalkState = struct { ordinal: u64 = 0 };
 
-fn walkDwarfsDir(md: Metadata, blocks: []const u8, dir_index: usize, file_off: u32, target: Target, state: *WalkState) Exception!void {
+fn walkDwarfsDir(md: Metadata, blocks: []const u8, dir_index: usize, file_off: u32, target: Target, state: *WalkState, depth: u32) Exception!void {
+    if (depth > max_dir_depth) return error.DataException;
     const start = md.directories[dir_index];
     const end = md.directories[dir_index + 1];
     if (end < start or end > md.dir_entries.len) return error.DataException;
@@ -526,7 +527,7 @@ fn walkDwarfsDir(md: Metadata, blocks: []const u8, dir_index: usize, file_off: u
         const entry = md.dir_entries[e];
         if (entry.inode_num < file_off) {
             if (@as(u64, entry.inode_num) + 1 >= md.directories.len) return error.DataException;
-            try walkDwarfsDir(md, blocks, entry.inode_num, file_off, target, state);
+            try walkDwarfsDir(md, blocks, entry.inode_num, file_off, target, state, depth + 1);
             continue;
         }
         if (entry.inode_num >= md.inodes.len) return error.DataException;
@@ -580,6 +581,7 @@ pub fn decodeOrdinal(archive: []const u8, ordinal: u64, output: []u8, scratch: [
 // Payloads stay uncompressed; total data is capped.
 
 const write_block_size: u32 = 16 * 1024 * 1024;
+const max_dir_depth: u32 = 64;
 const write_data_cap: usize = 512 * 1024;
 const section_type_index: u16 = 9;
 const section_offset_mask: u64 = (1 << 48) - 1;
