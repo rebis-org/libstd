@@ -12,7 +12,7 @@ const Exception = exception_prim.Exception;
 // Rock Ridge entries are ignored; layout is unchanged.
 // Write emits a 1999-layout descriptor with Rock Ridge NM/PX.
 
-pub const scratch_size: usize = 4096;
+pub const scratch_size: usize = 64 * 1024;
 
 const sector_size: usize = 2048;
 const max_dir_depth: u32 = 64;
@@ -576,9 +576,9 @@ fn writeDirRecord(
 }
 
 pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Exception!usize {
-    _ = scratch;
-    var stack: [32 * 1024]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&stack);
+    // The plan lives in caller scratch; archiveSize accepts exactly the
+    // sets this budget holds.
+    var fba = std.heap.FixedBufferAllocator.init(scratch);
     const plan = try buildIsoPlan(entries, fba.allocator());
     if (output.len < plan.total) return error.CapacityException;
     @memset(output[0..plan.total], 0);
