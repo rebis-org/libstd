@@ -220,6 +220,7 @@ const Inode = struct {
 };
 
 fn fullBlockCount(file_size: u64, block_size: u32, fragment: u32) Exception!usize {
+    // Overflow-safe ceil division: a hostile length must not wrap the count.
     if (fragment != invalid_fragment) {
         return std.math.cast(usize, file_size / block_size) orelse return error.DataException;
     }
@@ -588,6 +589,12 @@ fn spanCount(spans: []const Span) usize {
     return spans.len;
 }
 
+fn pushSpan(spans: []Span, start: usize, len: usize) Exception!void {
+    const n = spanCount(spans);
+    if (n >= spans.len) return error.ResourceException;
+    spans[n] = .{ .start = @intCast(start), .len = @intCast(len) };
+}
+
 // Write staging carved from scratch behind the read carving;
 // alignment resolves dynamically.
 const WriteWs = struct {
@@ -700,7 +707,7 @@ fn buildInodeTableRaw(plan: *const Plan, buf: []u8, spans: []Span) Exception!usi
         const node = &plan.nodes[ni];
         const inode_size = nodeInodeSize(node);
         if (used > 0 and used + inode_size > metadata_size) {
-            spans[spanCount(spans)] = .{ .start = @intCast(span_start), .len = @intCast(used - span_start) };
+            try pushSpan(spans, span_start, used - span_start);
             span_start = used;
         }
         if (used + inode_size > buf.len) return error.ResourceException;
@@ -748,6 +755,26 @@ fn fileBlockBase(plan: *const Plan, node_index: u32) usize {
     return base;
 }
 
+// Inodes are addressed by disk offset, so a span that compresses advances
+// the next span by its compressed size, not its raw length. Recompute rel
+// from the measured layout once the raw table exists.
+fn recomputeInodeDiskRels(plan: *Plan, spans: []const Span, buf: []const u8, ws: *WriteWs) Exception!void {
+    const count = spanCount(spans);
+    var span_i: usize = 0;
+    var span_end_raw: usize = if (count > 0) spans[0].len else 0;
+    var span_base: u64 = 0;
+    for (plan.order) |ni| {
+        const rank = orderRank(plan, ni);
+        const off = plan.inode_block_off[rank];
+        while (span_i + 1 < count and off >= span_end_raw) {
+            span_base = try bounds.addU64(span_base, 2 + try metaSpanDisk(ws.ws, ws.stage, buf[spans[span_i].start..][0..spans[span_i].len]));
+            span_i += 1;
+            span_end_raw = try bounds.addUsize(span_end_raw, spans[span_i].len);
+        }
+        plan.inode_block_rel[rank] = span_base;
+    }
+}
+
 // Every directory starts a fresh 8 KiB block. dir_offset stays zero;
 // dir_start sums preceding compressed sizes.
 fn buildDirTableRaw(plan: *Plan, ws: *WriteWs, buf: []u8, spans: []Span) Exception!usize {
@@ -759,7 +786,7 @@ fn buildDirTableRaw(plan: *Plan, ws: *WriteWs, buf: []u8, spans: []Span) Excepti
         if (node.kind != .dir) continue;
         // Flush before each directory so it starts at a block boundary.
         if (used > span_start) {
-            spans[spanCount(spans)] = .{ .start = @intCast(span_start), .len = @intCast(used - span_start) };
+            try pushSpan(spans, span_start, used - span_start);
             const span_disk = try metaSpanDisk(ws.ws, ws.stage, buf[span_start..used]);
             dir_start = std.math.cast(u32, dir_start + span_disk) orelse return error.DataException;
             span_start = used;
@@ -777,7 +804,7 @@ fn buildDirTableRaw(plan: *Plan, ws: *WriteWs, buf: []u8, spans: []Span) Excepti
             const rank = orderRank(plan, child_idx);
             const rel = plan.inode_block_rel[rank];
             if (chunk == 0 or chunk == max_entries or prev_block != rel) {
-                if (used + 12 > buf.len or used + 12 > metadata_size) return error.ResourceException;
+                if (used + 12 > buf.len or used - span_start + 12 > metadata_size) return error.ResourceException;
                 var run: u32 = 0;
                 var scan = ci;
                 while (scan < start.len and run < max_entries and plan.inode_block_rel[orderRank(plan, start[scan])] == rel) {
@@ -795,7 +822,7 @@ fn buildDirTableRaw(plan: *Plan, ws: *WriteWs, buf: []u8, spans: []Span) Excepti
                 chunk = 0;
             }
             const need = 8 + child.name.len;
-            if (used + need > buf.len or used + need > metadata_size) return error.UnsupportedException;
+            if (used + need > buf.len or used - span_start + need > metadata_size) return error.UnsupportedException;
             var ent: [8]u8 = undefined;
             std.mem.writeInt(u16, ent[0..2], plan.inode_block_off[rank], .little);
             const delta: i64 = @as(i64, child.number) - prev_inode;
@@ -811,7 +838,7 @@ fn buildDirTableRaw(plan: *Plan, ws: *WriteWs, buf: []u8, spans: []Span) Excepti
         }
     }
     if (used > span_start) {
-        spans[spanCount(spans)] = .{ .start = @intCast(span_start), .len = @intCast(used - span_start) };
+        try pushSpan(spans, span_start, used - span_start);
     }
     return used;
 }
@@ -1068,7 +1095,7 @@ pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Exception!usi
     // The plan allocator borrows the read carving; encode never reads.
     var fba = std.heap.FixedBufferAllocator.init(scratch[0..read_scratch_size]);
     const alloc = fba.allocator();
-    const plan = try buildPlan(entries, &ws, alloc);
+    var plan = try buildPlan(entries, &ws, alloc);
     if (output.len < plan.total) return error.CapacityException;
     var sink = Sink{ .bytes = output };
     try writeSuper(&sink, &plan);
@@ -1085,7 +1112,12 @@ pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Exception!usi
     }
     const inode_buf = ws.meta[ws.meta.len / 2 ..];
     var inode_spans: [16]Span = @splat(.{ .start = 0, .len = 0 });
-    _ = try buildInodeTableRaw(@constCast(&plan), inode_buf, &inode_spans);
+    _ = try buildInodeTableRaw(&plan, inode_buf, &inode_spans);
+    // Directory entries embed rel, so the table must be rebuilt once rel
+    // reflects the compressed on-disk layout.
+    try recomputeInodeDiskRels(&plan, &inode_spans, inode_buf, &ws);
+    @memset(plan.dir_spans, .{ .start = 0, .len = 0 });
+    _ = try buildDirTableRaw(&plan, &ws, plan.dir_raw, plan.dir_spans);
     for (inode_spans[0..spanCount(&inode_spans)]) |span| {
         try emitMetaSpan(&sink, ws.ws, ws.stage, inode_buf[span.start..][0..span.len]);
     }
