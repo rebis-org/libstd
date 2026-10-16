@@ -894,9 +894,14 @@ fn dpCollect(content: []const u8, block_start: usize, block_end: usize, pos: usi
         const prev3 = head3[h3];
         head3[h3] = @intCast(pos_abs);
         if (prev3 != encoder_no_position and prev3 >= min_abs and prev3 < pos_abs) {
-            const side_end = @min(block_end, pos_abs + extension_cap);
-            const len3 = 3 + countMatchLen(content, prev3 + 3, pos_abs + 3, side_end);
-            _ = dpPush(cand, &count, len3, @intCast(pos_abs - prev3), 0);
+            // The hash only narrows the search: the three bytes must match
+            // before the candidate is priced, or a collision emits a match
+            // that the stream cannot replay.
+            if (std.mem.eql(u8, content[pos_abs..][0..3], content[prev3..][0..3])) {
+                const side_end = @min(block_end, pos_abs + extension_cap);
+                const len3 = 3 + countMatchLen(content, prev3 + 3, pos_abs + 3, side_end);
+                _ = dpPush(cand, &count, len3, @intCast(pos_abs - prev3), 0);
+            }
         }
     }
     if (pos + min_take_len > src_len) return count;
@@ -4650,4 +4655,35 @@ test "zstd entropy early-outs engage" {
     var w3 = std.Io.Writer.fixed(decoded);
     _ = try decodeStream(&s3, &w3, history, .{ .window_size = window });
     try std.testing.expectEqualSlices(u8, &input, decoded);
+}
+
+test "zstd price-DP tier roundtrips at full block scale" {
+    const allocator = std.testing.allocator;
+    var rng = std.Random.DefaultPrng.init(0xD03);
+    const random = rng.random();
+    // Mixed runs and random islands: the DP parse diverges from the greedy
+    // replay, so the literal table must be rebuilt from the emitted buffer.
+    const input = try allocator.alloc(u8, 2 * encoder_block_size_max + 17);
+    defer allocator.free(input);
+    for (input, 0..) |*b, i| b.* = if (i % 5 < 3) @as(u8, @truncate(i >> 8)) else random.int(u8);
+
+    const window: u32 = 1 << 20;
+    const dp_options: Options = .{ .window_size = window, .max_chain = 16, .strategy = strategy_dp };
+    const history = try allocator.alloc(u8, @as(usize, window) + block_size_max);
+    defer allocator.free(history);
+    const workspace = try allocator.alloc(u32, encoderWorkspaceU32Count(0, @min(history.len - block_size_max, encoder_frame_size_max), dp_options));
+    defer allocator.free(workspace);
+    const bound = encodedSizeBound(input.len, dp_options) + 64;
+    const encoded = try allocator.alloc(u8, bound);
+    defer allocator.free(encoded);
+    var source = std.Io.Reader.fixed(input);
+    var sink = std.Io.Writer.fixed(encoded);
+    const encoded_len = try encodeStream(&source, &sink, history, workspace, dp_options);
+
+    const decoded = try allocator.alloc(u8, input.len);
+    defer allocator.free(decoded);
+    var decode_source = std.Io.Reader.fixed(encoded[0..encoded_len]);
+    var decode_sink = std.Io.Writer.fixed(decoded);
+    _ = try decodeStream(&decode_source, &decode_sink, history, .{ .window_size = window });
+    try std.testing.expectEqualSlices(u8, input, decoded);
 }
