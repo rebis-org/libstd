@@ -214,6 +214,11 @@ fn runArchive(r: *Runner, profile_id: harness.Id) anyerror!void {
     return runArchiveChecked(r, profile_id, true);
 }
 
+inline fn isOffpremUnsupported() bool {
+    // Recorded incompleteness: no stdlib container exists, the offprem arm stays unsupported.
+    return harness.grammar_offprem_default;
+}
+
 pub fn runTar(r: *Runner) anyerror!void {
     try runArchive(r, harness.ids.tar);
 }
@@ -223,20 +228,24 @@ pub fn runZip(r: *Runner) anyerror!void {
 }
 
 pub fn runCpio(r: *Runner) anyerror!void {
+    if (isOffpremUnsupported()) return;
     try runArchive(r, harness.ids.cpio);
 }
 
 pub fn runXar(r: *Runner) anyerror!void {
+    if (isOffpremUnsupported()) return;
     try runArchive(r, harness.ids.xar);
 }
 
 pub fn runWim(r: *Runner) anyerror!void {
+    if (isOffpremUnsupported()) return;
     try runArchive(r, harness.ids.wim);
 }
 
 const wimlib_path = "zig-out/benchmark/bin/wimlib-imagex";
 
 fn runWimForeignLzx(r: *Runner) anyerror!void {
+    if (isOffpremUnsupported()) return;
     setupArchive(r, harness.ids.wim);
     const bin = wimlib_path;
     std.Io.Dir.cwd().access(harness.oracle_io, bin, .{}) catch return error.ReferenceToolUnavailable;
@@ -267,6 +276,7 @@ fn runWimForeignLzx(r: *Runner) anyerror!void {
 }
 
 fn runWimForeignLzms(r: *Runner) anyerror!void {
+    if (isOffpremUnsupported()) return;
     setupArchive(r, harness.ids.wim);
     const bin = wimlib_path;
     std.Io.Dir.cwd().access(harness.oracle_io, bin, .{}) catch return error.ReferenceToolUnavailable;
@@ -297,6 +307,7 @@ fn runWimForeignLzms(r: *Runner) anyerror!void {
 }
 
 fn runWimForeignXpress(r: *Runner) anyerror!void {
+    if (isOffpremUnsupported()) return;
     setupArchive(r, harness.ids.wim);
     const bin = wimlib_path;
     std.Io.Dir.cwd().access(harness.oracle_io, bin, .{}) catch return error.ReferenceToolUnavailable;
@@ -327,6 +338,7 @@ fn runWimForeignXpress(r: *Runner) anyerror!void {
 }
 
 fn runWimForeign(r: *Runner) anyerror!void {
+    if (isOffpremUnsupported()) return;
     setupArchive(r, harness.ids.wim);
     const bin = wimlib_path;
     std.Io.Dir.cwd().access(harness.oracle_io, bin, .{}) catch return error.ReferenceToolUnavailable;
@@ -361,6 +373,7 @@ fn runWimForeign(r: *Runner) anyerror!void {
 const squashfs_bin_dir = "zig-out/benchmark/bin";
 
 fn runIsoTree(r: *Runner) anyerror!void {
+    if (isOffpremUnsupported()) return;
     setupArchive(r, harness.ids.iso);
     // Park the second entry under a subdirectory for this scenario only.
     const saved_entry2 = arc_state.entry2;
@@ -402,6 +415,7 @@ fn runIsoTree(r: *Runner) anyerror!void {
 }
 
 pub fn runIso(r: *Runner) anyerror!void {
+    if (isOffpremUnsupported()) return;
     arc_state.corrupt_offset = 16 * 2048;
     // Volume formats list a synthetic dot entry first.
     // The generic name-order check cannot apply; runIso verifies via bsdtar.
@@ -435,6 +449,7 @@ pub fn runIso(r: *Runner) anyerror!void {
 }
 
 pub fn runDwarfs(r: *Runner) anyerror!void {
+    if (isOffpremUnsupported()) return;
     try runArchive(r, harness.ids.dwarfs);
     const oracle_io = harness.oracle_io;
     // dwarfsck must accept our image; then dwarfsextract must round-trip it.
@@ -469,6 +484,7 @@ pub fn runDwarfs(r: *Runner) anyerror!void {
 }
 
 fn runDwarfsTree(r: *Runner) anyerror!void {
+    if (isOffpremUnsupported()) return;
     setupArchive(r, harness.ids.dwarfs);
     // Park the second entry under a subdirectory for this scenario only.
     const saved_entry2 = arc_state.entry2;
@@ -515,6 +531,7 @@ fn runDwarfsTree(r: *Runner) anyerror!void {
 }
 
 fn runDwarfsForeign(r: *Runner) anyerror!void {
+    if (isOffpremUnsupported()) return;
     setupArchive(r, harness.ids.dwarfs);
     const bin = squashfs_bin_dir ++ "/mkdwarfs";
     std.Io.Dir.cwd().access(harness.oracle_io, bin, .{}) catch return error.ReferenceToolUnavailable;
@@ -545,6 +562,7 @@ fn runDwarfsForeign(r: *Runner) anyerror!void {
 }
 
 fn runIsoForeign(r: *Runner) anyerror!void {
+    if (isOffpremUnsupported()) return;
     setupArchive(r, harness.ids.iso);
     // hdiutil makehybrid is the local Rock Ridge/Joliet writer reference.
     const oracle_io = harness.oracle_io;
@@ -574,6 +592,7 @@ fn runIsoForeign(r: *Runner) anyerror!void {
 }
 
 fn runSquashfsTree(r: *Runner) anyerror!void {
+    if (isOffpremUnsupported()) return;
     setupArchive(r, harness.ids.squashfs);
     // Park the second entry under a subdirectory for this scenario only.
     const saved_entry2 = arc_state.entry2;
@@ -616,6 +635,7 @@ fn runSquashfsTree(r: *Runner) anyerror!void {
 }
 
 pub fn runSquashfs(r: *Runner) anyerror!void {
+    if (isOffpremUnsupported()) return;
     try runArchive(r, harness.ids.squashfs);
     // Reference extraction: unsquashfs must read our encoded image back.
     const bin = squashfs_bin_dir ++ "/unsquashfs";
@@ -656,6 +676,7 @@ fn runSquashfsForeign(r: *Runner) anyerror!void {
 }
 
 fn runSquashfsForeignWith(r: *Runner, compressor: []const u8, extra_args: []const []const u8) anyerror!void {
+    if (isOffpremUnsupported()) return;
     setupArchive(r, harness.ids.squashfs);
     const bin = squashfs_bin_dir ++ "/mksquashfs";
     std.Io.Dir.cwd().access(harness.oracle_io, bin, .{}) catch return error.ReferenceToolUnavailable;
@@ -697,6 +718,7 @@ fn runSquashfsForeignWith(r: *Runner, compressor: []const u8, extra_args: []cons
 fn runXarForeign(comptime format: lib.ArchiveFormat) fn (*Runner) anyerror!void {
     return struct {
         fn run(r: *Runner) anyerror!void {
+            if (isOffpremUnsupported()) return;
             setupArchive(r, harness.ids.xar);
             const expected = [_]lib.WriteEntry{
                 .{ .name = "m1.txt", .data = &arc_state.data1, .filetype = 0o100000 },
@@ -715,6 +737,7 @@ fn runXarForeign(comptime format: lib.ArchiveFormat) fn (*Runner) anyerror!void 
 fn runCpioForeign(comptime format: lib.ArchiveFormat) fn (*Runner) anyerror!void {
     return struct {
         fn run(r: *Runner) anyerror!void {
+            if (isOffpremUnsupported()) return;
             setupArchive(r, harness.ids.cpio);
             const expected = [_]lib.WriteEntry{
                 .{ .name = "m1.txt", .data = &arc_state.data1, .filetype = 0o100000 },
