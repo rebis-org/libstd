@@ -900,18 +900,30 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
             const stored_bits = 3 + (8 - (c.bit_count + 3) % 8) % 8 + 32 + 8 * span;
             // Strategy overrides: stored emits verbatim blocks; fixed bars
             // dynamic Huffman codes (stored still wins when smaller).
+            // Stored LEN is a 16-bit field. Deflate spans stay under the cap,
+            // but deflate64 spans can reach the window size, so a long span
+            // emits as consecutive stored blocks with the final flag on the
+            // last; single-chunk output is byte-identical to the one-block form.
             if (c.options.strategy == .stored or (stored_bits < fixed_bits and stored_bits < dynamic_bits)) {
-                try c.writeBits(@intFromBool(final), 1);
-                try c.writeBits(0, 2);
-                const pad: u6 = @intCast((8 - c.bit_count % 8) % 8);
-                try c.writeBits(0, pad);
-                try c.writeBits(@intCast(span), 16);
-                try c.writeBits(~@as(u32, @intCast(span)) & 0xFFFF, 16);
-                try c.flushStaging();
-                c.downstream.writeAll(c.history[c.block_start..c.finalized]) catch {
-                    c.failed = true;
-                    return error.WriteFailed;
-                };
+                var stored_off = c.block_start;
+                const stored_end = c.finalized;
+                while (true) {
+                    const chunk = @min(stored_end - stored_off, 65535);
+                    const is_last = stored_off + chunk == stored_end;
+                    try c.writeBits(@intFromBool(final and is_last), 1);
+                    try c.writeBits(0, 2);
+                    const pad: u6 = @intCast((8 - c.bit_count % 8) % 8);
+                    try c.writeBits(0, pad);
+                    try c.writeBits(@intCast(chunk), 16);
+                    try c.writeBits(~@as(u32, @intCast(chunk)) & 0xFFFF, 16);
+                    try c.flushStaging();
+                    c.downstream.writeAll(c.history[stored_off..][0..chunk]) catch {
+                        c.failed = true;
+                        return error.WriteFailed;
+                    };
+                    stored_off += chunk;
+                    if (is_last) break;
+                }
             } else if (c.options.strategy == .fixed or fixed_bits <= dynamic_bits) {
                 try c.writeBits(@intFromBool(final), 1);
                 try c.writeBits(1, 2);
