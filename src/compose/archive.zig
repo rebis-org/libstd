@@ -2,19 +2,13 @@ const std = @import("std");
 
 const bounds = @import("../common/primitive/bounds.zig");
 const crypto = @import("../common/primitive/crypto.zig");
+const cpio = @import("../grammar/cpio/onprem.zig");
+const cpio_seam = @import("../grammar/cpio/seam.zig");
 const rar = @import("../grammar/rar/onprem.zig");
 const rar_writer = @import("../grammar/rar/writer.zig");
 const seven_zip = @import("../grammar/sevenzip/onprem.zig");
-const cpio = @import("../grammar/cpio/onprem.zig");
-const cpio_seam = @import("../grammar/cpio/seam.zig");
 const tar = @import("../grammar/tar/onprem.zig");
 const tar_seam = @import("../grammar/tar/seam.zig");
-const dwarfs = @import("../volume/dwarfs/onprem.zig");
-const dwarfs_seam = @import("../volume/dwarfs/seam.zig");
-const iso = @import("../volume/iso/onprem.zig");
-const iso_seam = @import("../volume/iso/seam.zig");
-const squashfs = @import("../volume/squashfs/onprem.zig");
-const squashfs_seam = @import("../volume/squashfs/seam.zig");
 const wim = @import("../grammar/wim/onprem.zig");
 const wim_seam = @import("../grammar/wim/seam.zig");
 const xar = @import("../grammar/xar/onprem.zig");
@@ -26,6 +20,12 @@ const abi = @import("../kernel/envelope.zig");
 const node_graph = @import("../kernel/node.zig");
 const resource = @import("../kernel/resource.zig");
 const vocabulary = @import("../kernel/vocabulary.zig");
+const dwarfs = @import("../volume/dwarfs/onprem.zig");
+const dwarfs_seam = @import("../volume/dwarfs/seam.zig");
+const iso = @import("../volume/iso/onprem.zig");
+const iso_seam = @import("../volume/iso/seam.zig");
+const squashfs = @import("../volume/squashfs/onprem.zig");
+const squashfs_seam = @import("../volume/squashfs/seam.zig");
 const common = @import("common.zig");
 
 const Call = abi.Call;
@@ -34,26 +34,26 @@ const Node = abi.Node;
 const Status = abi.Status;
 const Limits = resource.Limits;
 const Resource = resource.Resource;
-const Failure = vocabulary.Failure;
+const Exception = vocabulary.Exception;
 
-fn requireCommit(commit: vocabulary.CommitMode, expected: vocabulary.CommitMode) Failure!void {
-    if (commit != expected) return error.UnsupportedFailure;
+fn requireCommit(commit: vocabulary.CommitMode, expected: vocabulary.CommitMode) Exception!void {
+    if (commit != expected) return error.UnsupportedException;
 }
 
 const ReadHead = struct { sink: *Resource, ordinal: u64 };
 
 // Tentative commit, sink presence, and the entry ordinal resolve identically
 // for every archive read; formats with extra checks run them after this.
-fn readHead(sink: ?*Resource, call: *Call, commit: vocabulary.CommitMode) Failure!ReadHead {
+fn readHead(sink: ?*Resource, call: *Call, commit: vocabulary.CommitMode) Exception!ReadHead {
     try requireTentative(commit);
     return .{ .sink = sink.?, .ordinal = archiveOrdinal(call.request) };
 }
 
-fn requireTentative(commit: vocabulary.CommitMode) Failure!void {
+fn requireTentative(commit: vocabulary.CommitMode) Exception!void {
     return requireCommit(commit, .tentative);
 }
 
-fn requireVerified(commit: vocabulary.CommitMode) Failure!void {
+fn requireVerified(commit: vocabulary.CommitMode) Exception!void {
     return requireCommit(commit, .confirmed);
 }
 
@@ -65,13 +65,13 @@ fn archiveOrdinal(request: ?*Node) u64 {
     ));
 }
 
-fn parseHeaderEncode(request: ?*Node, comptime component: []const u8) Failure!u64 {
+fn parseHeaderEncode(request: ?*Node, comptime component: []const u8) Exception!u64 {
     const header_encode = node_graph.parseU64(node_graph.findSelector(
         request,
         comptime discovery.parameter(component, "header_encode").family,
         comptime discovery.parameter(component, "header_encode").ordinal,
     ));
-    if (header_encode > 2) return error.CallFailure;
+    if (header_encode > 2) return error.CallException;
     return header_encode;
 }
 
@@ -83,7 +83,7 @@ fn entryMtime(child: ?*Node) u64 {
     return node_graph.parseU64(node_graph.findSelector(child, comptime discovery.parameter("tar", "entry_mtime").family, comptime discovery.parameter("tar", "entry_mtime").ordinal));
 }
 
-fn materializeArchive(source: *Resource, workspace: *resource.Workspace, limits: Limits) Failure![]const u8 {
+fn materializeArchive(source: *Resource, workspace: *resource.Workspace, limits: Limits) Exception![]const u8 {
     return common.materializeSource(.size_or_budget, source, workspace, limits.encoded_bytes);
 }
 
@@ -108,8 +108,8 @@ const CryptoParams = struct {
 // A selector arrives on the wire as a u64, so narrowing it to the field width
 // is a checked conversion: a value the field cannot hold is a malformed
 // request, not a number to wrap.
-fn narrow(comptime T: type, value: u64) Failure!T {
-    return std.math.cast(T, value) orelse error.CallFailure;
+fn narrow(comptime T: type, value: u64) Exception!T {
+    return std.math.cast(T, value) orelse error.CallException;
 }
 
 fn cryptoPassword(params: ?CryptoParams) ?[]const u8 {
@@ -129,7 +129,7 @@ fn cryptoLifetime(params: ?CryptoParams) u64 {
 }
 
 // Each descriptor owns its crypto selectors; a missing row fails comptime.
-fn parseCryptoParams(comptime component: []const u8, request: ?*Node, failure_cause: *crypto.FailureCause) Failure!?CryptoParams {
+fn parseCryptoParams(comptime component: []const u8, request: ?*Node, failure_cause: *crypto.FailureCause) Exception!?CryptoParams {
     failure_cause.* = .none;
     const profile_node = node_graph.findParameter(request, vocabulary.ids.crypto_profile);
     const password_node = node_graph.findSelector(
@@ -140,14 +140,14 @@ fn parseCryptoParams(comptime component: []const u8, request: ?*Node, failure_ca
     if (profile_node == null and password_node == null) return null;
     const profile_id = if (profile_node) |node| blk: {
         const value: abi.Id = .{ .low = node.value_low, .high = node.value_high };
-        const descriptor = kernel_catalog.descriptorFor(value) orelse return error.UnsupportedFailure;
-        if (descriptor.kind != .profile) return error.CallFailure;
+        const descriptor = kernel_catalog.descriptorFor(value) orelse return error.UnsupportedException;
+        if (descriptor.kind != .profile) return error.CallException;
         break :blk value;
-    } else return error.CallFailure;
-    if (!vocabulary.eql(profile_id, vocabulary.ids.crypto)) return error.CallFailure;
-    const password_node2 = password_node orelse return error.CallFailure;
+    } else return error.CallException;
+    if (!vocabulary.eql(profile_id, vocabulary.ids.crypto)) return error.CallException;
+    const password_node2 = password_node orelse return error.CallException;
     const password = try resource.checkedConstBytes(password_node2.bytes, password_node2.byte_length);
-    if (password.len == 0) return error.CallFailure;
+    if (password.len == 0) return error.CallException;
     const algorithm = if (node_graph.findSelector(
         request,
         comptime discovery.parameter(component, "algorithm").family,
@@ -158,11 +158,11 @@ fn parseCryptoParams(comptime component: []const u8, request: ?*Node, failure_ca
         // alongside an out-of-range one.
         const value = narrow(u8, node.value_low) catch {
             failure_cause.* = .unsupported_algorithm;
-            return error.UnsupportedFailure;
+            return error.UnsupportedException;
         };
         if (value > 3) {
             failure_cause.* = .unsupported_algorithm;
-            return error.UnsupportedFailure;
+            return error.UnsupportedException;
         }
         break :blk value;
     } else 3;
@@ -185,15 +185,15 @@ fn parseCryptoParams(comptime component: []const u8, request: ?*Node, failure_ca
 // Structured inspect projection, phase one: the entry_size selector (family
 // 2, ordinal 4) with an explicit ordinal asks for the entry's uncompressed
 // size without decoding its data. Returns null when the selector is absent.
-fn projectedEntrySize(request: ?*Node) Failure!?u64 {
+fn projectedEntrySize(request: ?*Node) Exception!?u64 {
     if (node_graph.findSelector(request, comptime discovery.parameter("rar", "entry_size").family, comptime discovery.parameter("rar", "entry_size").ordinal) == null) return null;
-    const ordinal_node = node_graph.findSelector(request, comptime discovery.parameter("rar", "ordinal").family, comptime discovery.parameter("rar", "ordinal").ordinal) orelse return error.CallFailure;
+    const ordinal_node = node_graph.findSelector(request, comptime discovery.parameter("rar", "ordinal").family, comptime discovery.parameter("rar", "ordinal").ordinal) orelse return error.CallException;
     return node_graph.parseU64(ordinal_node);
 }
 
-pub fn tarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
+pub fn tarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
     _ = sizing;
-    const source_resource = source orelse return error.CallFailure;
+    const source_resource = source orelse return error.CallException;
     var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
     if (command_mask == vocabulary.command_mask_read) {
         if (sink == null) {
@@ -212,8 +212,8 @@ pub fn tarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
         const ordinal = head.ordinal;
         const archive = try materializeArchive(source_resource, &workspace, limits);
         const entry = try tar_seam.inspectOrdinal(plan.provider, archive, ordinal);
-        const size = std.math.cast(usize, entry.size) orelse return error.ResourceFailure;
-        if (size > limits.decoded_bytes) return error.ResourceFailure;
+        const size = std.math.cast(usize, entry.size) orelse return error.ResourceException;
+        if (size > limits.decoded_bytes) return error.ResourceException;
         try common.requireSinkCapacity(sink_resource, call, size);
         if (sink_resource.kind == .direct_write) {
             const output = try common.sinkDirectBuffer(sink_resource, size);
@@ -251,11 +251,11 @@ pub fn tarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
             response.byte_length = written;
         }
     } else {
-        return error.UnsupportedFailure;
+        return error.UnsupportedException;
     }
 }
 
-fn fillXarEntry(entry: *xar.Entry, node: *Node, _: NoCtx) Failure!void {
+fn fillXarEntry(entry: *xar.Entry, node: *Node, _: NoCtx) Exception!void {
     const parts = try entryNameData(node.child);
     const uid: u32 = if (cpioSelector("entry_uid", node.child)) |n| blk: {
         break :blk try narrow(u32, n.value_low);
@@ -264,9 +264,9 @@ fn fillXarEntry(entry: *xar.Entry, node: *Node, _: NoCtx) Failure!void {
     entry.* = .{ .name = parts.name, .data = parts.data, .uid = uid, .modification_time = mtime };
 }
 
-pub fn xarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
+pub fn xarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
     _ = sizing;
-    const source_resource = source orelse return error.CallFailure;
+    const source_resource = source orelse return error.CallException;
     var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
     if (command_mask == vocabulary.command_mask_read) {
         if (sink == null) {
@@ -287,8 +287,8 @@ pub fn xarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
         const archive = try materializeArchive(source_resource, &workspace, limits);
         const scratch = try workspace.take(u8, xar_seam.scratch_size);
         const entry = try xar_seam.inspectOrdinal(plan.provider, archive, ordinal, scratch);
-        const size = std.math.cast(usize, entry.size) orelse return error.ResourceFailure;
-        if (size > limits.decoded_bytes) return error.ResourceFailure;
+        const size = std.math.cast(usize, entry.size) orelse return error.ResourceException;
+        if (size > limits.decoded_bytes) return error.ResourceException;
         try common.requireSinkCapacity(sink_resource, call, size);
         const decode_scratch = try workspace.take(u8, xar_seam.scratch_size);
         if (sink_resource.kind == .direct_write) {
@@ -322,33 +322,33 @@ pub fn xarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
             response.byte_length = written;
         }
     } else {
-        return error.UnsupportedFailure;
+        return error.UnsupportedException;
     }
 }
 
-fn fillWimEntry(entry: *wim.Entry, node: *Node, _: NoCtx) Failure!void {
+fn fillWimEntry(entry: *wim.Entry, node: *Node, _: NoCtx) Exception!void {
     const parts = try entryNameData(node.child);
     entry.* = .{ .name = parts.name, .data = parts.data };
 }
 
-fn fillSquashfsEntry(entry: *squashfs.Entry, node: *Node, _: NoCtx) Failure!void {
+fn fillSquashfsEntry(entry: *squashfs.Entry, node: *Node, _: NoCtx) Exception!void {
     const parts = try entryNameData(node.child);
     entry.* = .{ .name = parts.name, .data = parts.data };
 }
 
-fn fillDwarfsEntry(entry: *dwarfs.Entry, node: *Node, _: NoCtx) Failure!void {
+fn fillDwarfsEntry(entry: *dwarfs.Entry, node: *Node, _: NoCtx) Exception!void {
     const parts = try entryNameData(node.child);
     entry.* = .{ .name = parts.name, .data = parts.data };
 }
 
-fn fillIsoEntry(entry: *iso.Entry, node: *Node, _: NoCtx) Failure!void {
+fn fillIsoEntry(entry: *iso.Entry, node: *Node, _: NoCtx) Exception!void {
     const parts = try entryNameData(node.child);
     entry.* = .{ .name = parts.name, .data = parts.data };
 }
 
-pub fn dwarfsHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
+pub fn dwarfsHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
     _ = sizing;
-    const source_resource = source orelse return error.CallFailure;
+    const source_resource = source orelse return error.CallException;
     var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
     if (command_mask == vocabulary.command_mask_read) {
         if (sink == null) {
@@ -369,8 +369,8 @@ pub fn dwarfsHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resou
         const archive = try materializeArchive(source_resource, &workspace, limits);
         const scratch = try workspace.take(u8, dwarfs_seam.scratch_size);
         const entry = try dwarfs_seam.inspectOrdinal(plan.provider, archive, ordinal, scratch);
-        const size = std.math.cast(usize, entry.size) orelse return error.ResourceFailure;
-        if (size > limits.decoded_bytes) return error.ResourceFailure;
+        const size = std.math.cast(usize, entry.size) orelse return error.ResourceException;
+        if (size > limits.decoded_bytes) return error.ResourceException;
         try common.requireSinkCapacity(sink_resource, call, size);
         if (sink_resource.kind == .direct_write) {
             const output = try common.sinkDirectBuffer(sink_resource, size);
@@ -403,13 +403,13 @@ pub fn dwarfsHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resou
             response.byte_length = written;
         }
     } else {
-        return error.UnsupportedFailure;
+        return error.UnsupportedException;
     }
 }
 
-pub fn isoHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
+pub fn isoHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
     _ = sizing;
-    const source_resource = source orelse return error.CallFailure;
+    const source_resource = source orelse return error.CallException;
     var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
     if (command_mask == vocabulary.command_mask_read) {
         if (sink == null) {
@@ -430,8 +430,8 @@ pub fn isoHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
         const archive = try materializeArchive(source_resource, &workspace, limits);
         const scratch = try workspace.take(u8, iso_seam.scratch_size);
         const entry = try iso_seam.inspectOrdinal(plan.provider, archive, ordinal, scratch);
-        const size = std.math.cast(usize, entry.size) orelse return error.ResourceFailure;
-        if (size > limits.decoded_bytes) return error.ResourceFailure;
+        const size = std.math.cast(usize, entry.size) orelse return error.ResourceException;
+        if (size > limits.decoded_bytes) return error.ResourceException;
         try common.requireSinkCapacity(sink_resource, call, size);
         if (sink_resource.kind == .direct_write) {
             const output = try common.sinkDirectBuffer(sink_resource, size);
@@ -464,13 +464,13 @@ pub fn isoHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
             response.byte_length = written;
         }
     } else {
-        return error.UnsupportedFailure;
+        return error.UnsupportedException;
     }
 }
 
-pub fn squashfsHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
+pub fn squashfsHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
     _ = sizing;
-    const source_resource = source orelse return error.CallFailure;
+    const source_resource = source orelse return error.CallException;
     var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
     if (command_mask == vocabulary.command_mask_read) {
         if (sink == null) {
@@ -491,8 +491,8 @@ pub fn squashfsHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Res
         const archive = try materializeArchive(source_resource, &workspace, limits);
         const scratch = try workspace.take(u8, squashfs_seam.scratch_size);
         const entry = try squashfs_seam.inspectOrdinal(plan.provider, archive, ordinal, scratch);
-        const size = std.math.cast(usize, entry.size) orelse return error.ResourceFailure;
-        if (size > limits.decoded_bytes) return error.ResourceFailure;
+        const size = std.math.cast(usize, entry.size) orelse return error.ResourceException;
+        if (size > limits.decoded_bytes) return error.ResourceException;
         try common.requireSinkCapacity(sink_resource, call, size);
         if (sink_resource.kind == .direct_write) {
             const output = try common.sinkDirectBuffer(sink_resource, size);
@@ -525,13 +525,13 @@ pub fn squashfsHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Res
             response.byte_length = written;
         }
     } else {
-        return error.UnsupportedFailure;
+        return error.UnsupportedException;
     }
 }
 
-pub fn wimHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
+pub fn wimHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
     _ = sizing;
-    const source_resource = source orelse return error.CallFailure;
+    const source_resource = source orelse return error.CallException;
     var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
     if (command_mask == vocabulary.command_mask_read) {
         if (sink == null) {
@@ -552,8 +552,8 @@ pub fn wimHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
         const archive = try materializeArchive(source_resource, &workspace, limits);
         const scratch = try workspace.take(u8, wim_seam.scratch_size);
         const entry = try wim_seam.inspectOrdinal(plan.provider, archive, ordinal, scratch);
-        const size = std.math.cast(usize, entry.size) orelse return error.ResourceFailure;
-        if (size > limits.decoded_bytes) return error.ResourceFailure;
+        const size = std.math.cast(usize, entry.size) orelse return error.ResourceException;
+        if (size > limits.decoded_bytes) return error.ResourceException;
         try common.requireSinkCapacity(sink_resource, call, size);
         if (sink_resource.kind == .direct_write) {
             const output = try common.sinkDirectBuffer(sink_resource, size);
@@ -586,7 +586,7 @@ pub fn wimHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
             response.byte_length = written;
         }
     } else {
-        return error.UnsupportedFailure;
+        return error.UnsupportedException;
     }
 }
 
@@ -594,7 +594,7 @@ fn cpioSelector(comptime name: []const u8, child: ?*Node) ?*Node {
     return node_graph.findSelector(child, comptime discovery.parameter("cpio", name).family, comptime discovery.parameter("cpio", name).ordinal);
 }
 
-fn fillCpioEntry(entry: *cpio.Entry, node: *Node, _: NoCtx) Failure!void {
+fn fillCpioEntry(entry: *cpio.Entry, node: *Node, _: NoCtx) Exception!void {
     const parts = try entryNameData(node.child);
     const uid: u32 = if (cpioSelector("entry_uid", node.child)) |n| blk: {
         break :blk try narrow(u32, n.value_low);
@@ -603,9 +603,9 @@ fn fillCpioEntry(entry: *cpio.Entry, node: *Node, _: NoCtx) Failure!void {
     entry.* = .{ .name = parts.name, .data = parts.data, .uid = uid, .modification_time = mtime };
 }
 
-pub fn cpioHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
+pub fn cpioHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
     _ = sizing;
-    const source_resource = source orelse return error.CallFailure;
+    const source_resource = source orelse return error.CallException;
     var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
     if (command_mask == vocabulary.command_mask_read) {
         if (sink == null) {
@@ -624,8 +624,8 @@ pub fn cpioHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resourc
         const ordinal = head.ordinal;
         const archive = try materializeArchive(source_resource, &workspace, limits);
         const entry = try cpio_seam.inspectOrdinal(plan.provider, archive, ordinal);
-        const size = std.math.cast(usize, entry.size) orelse return error.ResourceFailure;
-        if (size > limits.decoded_bytes) return error.ResourceFailure;
+        const size = std.math.cast(usize, entry.size) orelse return error.ResourceException;
+        if (size > limits.decoded_bytes) return error.ResourceException;
         try common.requireSinkCapacity(sink_resource, call, size);
         if (sink_resource.kind == .direct_write) {
             const output = try common.sinkDirectBuffer(sink_resource, size);
@@ -658,13 +658,13 @@ pub fn cpioHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resourc
             response.byte_length = written;
         }
     } else {
-        return error.UnsupportedFailure;
+        return error.UnsupportedException;
     }
 }
 
-pub fn zipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
+pub fn zipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
     _ = sizing;
-    const source_resource = source orelse return error.CallFailure;
+    const source_resource = source orelse return error.CallException;
     var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
     var crypto_cause: crypto.FailureCause = .none;
     const crypto_params = parseCryptoParams("zip", call.request, &crypto_cause) catch |err| {
@@ -677,7 +677,7 @@ pub fn zipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
         if (sink == null) {
             const archive = try materializeArchive(source_resource, &workspace, limits);
             if (try projectedEntrySize(call.request)) |ordinal| {
-                const entry = try zip.zipInspectOrdinalEx(archive, std.math.cast(usize, ordinal) orelse return error.CallFailure, limits);
+                const entry = try zip.zipInspectOrdinalEx(archive, std.math.cast(usize, ordinal) orelse return error.CallException, limits);
                 response.byte_length = entry.uncompressed_size;
                 return;
             }
@@ -692,7 +692,7 @@ pub fn zipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
         const entry = try zip.zipInspectOrdinalEx(archive, ordinal, limits);
         const history = try workspace.take(u8, if (entry.actual_method == 9) zip.deflate64_decode_history_size else zip.deflate_history_size);
         const size = entry.uncompressed_size;
-        if (size > limits.decoded_bytes) return error.ResourceFailure;
+        if (size > limits.decoded_bytes) return error.ResourceException;
         try common.requireSinkCapacity(sink_resource, call, size);
         const decrypt_staging = if (entry.encrypted) try workspace.take(u8, entry.compressed_size) else @as([]u8, &.{});
         const callback_staging = if (sink_resource.kind == .callback_write) try workspace.take(u8, size) else @as([]u8, &.{});
@@ -726,7 +726,7 @@ pub fn zipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
         if (crypto_params) |params| {
             if (params.algorithm > 3) {
                 writeCryptoFailure(call, .unsupported_algorithm);
-                return error.UnsupportedFailure;
+                return error.UnsupportedException;
             }
         }
         const entries = try collectEntries(zip.Entry, call.request, &workspace, crypto_params, fillZipEntry);
@@ -774,18 +774,18 @@ pub fn zipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
             response.byte_length = written;
         }
     } else {
-        return error.UnsupportedFailure;
+        return error.UnsupportedException;
     }
 }
 
-pub fn sevenzipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
+pub fn sevenzipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
     // Single sevenzip profile unions decoded/coded sides: reads accept every method, writes pack. Queries follow their target.
     return sevenZipGeneric(true, plan, source, sink, call, response, sizing, commit, limits, command_mask);
 }
 
-fn sevenZipGeneric(comptime coded: bool, plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
+fn sevenZipGeneric(comptime coded: bool, plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
     _ = sizing;
-    const source_resource = source orelse return error.CallFailure;
+    const source_resource = source orelse return error.CallException;
     var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
     var crypto_cause: crypto.FailureCause = .none;
     const crypto_params = parseCryptoParams("sevenzip", call.request, &crypto_cause) catch |err| {
@@ -829,9 +829,9 @@ fn sevenZipGeneric(comptime coded: bool, plan: *common.ExecutionPlan, source: ?*
             writeCryptoFailure(call, crypto_cause);
             return err;
         };
-        if (!coded and entry.method != .copy) return error.UnsupportedFailure;
-        const size = std.math.cast(usize, entry.size) orelse return error.ResourceFailure;
-        if (size > limits.decoded_bytes) return error.ResourceFailure;
+        if (!coded and entry.method != .copy) return error.UnsupportedException;
+        const size = std.math.cast(usize, entry.size) orelse return error.ResourceException;
+        if (size > limits.decoded_bytes) return error.ResourceException;
         try common.requireSinkCapacity(sink_resource, call, size);
         const decode_options: seven_zip.SevenZipDecodeOptions = .{
             .password = cryptoPassword(crypto_params),
@@ -891,7 +891,7 @@ fn sevenZipGeneric(comptime coded: bool, plan: *common.ExecutionPlan, source: ?*
             response.byte_length = written;
         }
     } else {
-        return error.UnsupportedFailure;
+        return error.UnsupportedException;
     }
 }
 
@@ -911,7 +911,7 @@ fn isArchiveEntry(node: *abi.Node) bool {
     return sel.family == entry.family and sel.ordinal == entry.ordinal;
 }
 
-fn entryNameData(child: ?*Node) Failure!struct { name: []const u8, data: []const u8 } {
+fn entryNameData(child: ?*Node) Exception!struct { name: []const u8, data: []const u8 } {
     const name_node = node_graph.findSelector(child, comptime discovery.parameter("tar", "entry_name").family, comptime discovery.parameter("tar", "entry_name").ordinal);
     const data_node = node_graph.findSelector(child, comptime discovery.parameter("tar", "entry_data").family, comptime discovery.parameter("tar", "entry_data").ordinal);
     return .{
@@ -922,7 +922,7 @@ fn entryNameData(child: ?*Node) Failure!struct { name: []const u8, data: []const
 
 const NoCtx = struct {};
 
-fn collectEntries(comptime E: type, request: ?*Node, workspace: *resource.Workspace, ctx: anytype, comptime fill: anytype) Failure![]const E {
+fn collectEntries(comptime E: type, request: ?*Node, workspace: *resource.Workspace, ctx: anytype, comptime fill: anytype) Exception![]const E {
     var entries = try workspace.take(E, entryCount(request));
     var index: usize = 0;
     var cursor = request;
@@ -940,7 +940,7 @@ const SevenZipFillCtx = struct {
     crypto: ?CryptoParams,
 };
 
-fn fillSevenZipEntry(entry: *seven_zip.Entry, node: *Node, ctx: SevenZipFillCtx) Failure!void {
+fn fillSevenZipEntry(entry: *seven_zip.Entry, node: *Node, ctx: SevenZipFillCtx) Exception!void {
     const parts = try entryNameData(node.child);
     const method_node = if (ctx.allow_method) entryMethod(node.child) else null;
     const filter_node = if (ctx.allow_method)
@@ -958,7 +958,7 @@ fn fillSevenZipEntry(entry: *seven_zip.Entry, node: *Node, ctx: SevenZipFillCtx)
     }
 }
 
-fn parseSevenZipMethod(node: *Node) Failure!seven_zip.CoderMethod {
+fn parseSevenZipMethod(node: *Node) Exception!seven_zip.CoderMethod {
     return switch (node.value_low) {
         0 => .copy,
         1 => .deflate,
@@ -975,7 +975,7 @@ fn parseSevenZipMethod(node: *Node) Failure!seven_zip.CoderMethod {
         12 => .arm64,
         13 => .riscv,
         14 => .ppmd,
-        else => error.CallFailure,
+        else => error.CallException,
     };
 }
 
@@ -983,9 +983,9 @@ fn parseSevenZipMethod(node: *Node) Failure!seven_zip.CoderMethod {
 // header at 2 MiB, RAR4 headers are u16-sized aligned to the 16-byte block.
 const rar_header_scratch_size = 2 * 1024 * 1024 + 16;
 
-pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Failure!void {
-    const source_resource = source orelse return error.CallFailure;
-    if (sizing != .metadata_exact) return error.UnsupportedFailure;
+pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
+    const source_resource = source orelse return error.CallException;
+    if (sizing != .metadata_exact) return error.UnsupportedException;
     var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
     if (command_mask == vocabulary.command_mask_read) {
         var failure_cause: crypto.FailureCause = .none;
@@ -1047,15 +1047,15 @@ pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
             writeCryptoFailure(call, failure_cause);
             return err;
         };
-        const size = std.math.cast(usize, entry.size) orelse return error.ResourceFailure;
-        if (size > limits.decoded_bytes) return error.ResourceFailure;
+        const size = std.math.cast(usize, entry.size) orelse return error.ResourceException;
+        if (size > limits.decoded_bytes) return error.ResourceException;
         try common.requireSinkCapacity(sink_resource, call, size);
 
         // The walk resolved the entry's declared needs into RarInfo. Store
         // entries carve nothing. The PPMd heap is whatever workspace remains:
         // the stream names its model size at decode time and is refused
         // cleanly if the pool cannot hold it.
-        const window_len = std.math.cast(usize, entry.window_bytes) orelse return error.ResourceFailure;
+        const window_len = std.math.cast(usize, entry.window_bytes) orelse return error.ResourceException;
         var bufs: rar.DecodeBuffers = .{
             .state = &.{},
             .window = &.{},
@@ -1117,7 +1117,7 @@ pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
             .kdf_rounds_limit = cryptoKdfLimit(crypto_params),
             .failure_cause = &crypto_cause,
         };
-        if (write_options.encrypt_headers and write_options.password.len == 0) return error.CallFailure;
+        if (write_options.encrypt_headers and write_options.password.len == 0) return error.CallException;
         var max_input: usize = 0;
         var packed_total: usize = 0;
         for (entries) |entry| {
@@ -1171,14 +1171,14 @@ pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
             response.byte_length = written;
         }
     } else {
-        return error.UnsupportedFailure;
+        return error.UnsupportedException;
     }
 }
 
-fn fillRarEntry(entry: *rar_writer.RarEntry, node: *Node, _: NoCtx) Failure!void {
+fn fillRarEntry(entry: *rar_writer.RarEntry, node: *Node, _: NoCtx) Exception!void {
     const parts = try entryNameData(node.child);
     const method_node = entryMethod(node.child);
-    if (!std.unicode.utf8ValidateSlice(parts.name)) return error.CallFailure;
+    if (!std.unicode.utf8ValidateSlice(parts.name)) return error.CallException;
     const method: u8 = if (method_node) |n| try narrow(u8, n.value_low) else 0;
     const mtime = entryMtime(node.child);
     entry.* = .{
@@ -1189,12 +1189,12 @@ fn fillRarEntry(entry: *rar_writer.RarEntry, node: *Node, _: NoCtx) Failure!void
     };
 }
 
-fn archiveComment(request: ?*Node) Failure![]const u8 {
+fn archiveComment(request: ?*Node) Exception![]const u8 {
     const node = node_graph.findSelector(request, comptime discovery.parameter("tar", "comment").family, comptime discovery.parameter("tar", "comment").ordinal);
     return if (node) |n| try resource.checkedConstBytes(n.bytes, n.byte_length) else &.{};
 }
 
-fn fillTarEntry(entry: *tar.Entry, node: *Node, _: NoCtx) Failure!void {
+fn fillTarEntry(entry: *tar.Entry, node: *Node, _: NoCtx) Exception!void {
     const parts = try entryNameData(node.child);
     const typeflag_node = node_graph.findSelector(node.child, comptime discovery.parameter("tar", "entry_typeflag").family, comptime discovery.parameter("tar", "entry_typeflag").ordinal);
     const link_name_node = node_graph.findSelector(node.child, comptime discovery.parameter("tar", "entry_link_name").family, comptime discovery.parameter("tar", "entry_link_name").ordinal);
@@ -1210,7 +1210,7 @@ fn fillTarEntry(entry: *tar.Entry, node: *Node, _: NoCtx) Failure!void {
     entry.* = .{ .name = parts.name, .data = parts.data, .link_name = link_name, .uid = uid, .modification_time = mtime, .typeflag = typeflag };
 }
 
-fn fillZipEntry(entry: *zip.Entry, node: *Node, crypto_params: ?CryptoParams) Failure!void {
+fn fillZipEntry(entry: *zip.Entry, node: *Node, crypto_params: ?CryptoParams) Exception!void {
     const parts = try entryNameData(node.child);
     const method_node = entryMethod(node.child);
     const method: u16 = if (method_node) |n| try narrow(u16, n.value_low) else 8;

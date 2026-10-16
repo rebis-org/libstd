@@ -1,10 +1,10 @@
 const std = @import("std");
 
 const bounds = @import("../../common/primitive/bounds.zig");
-const failure_prim = @import("../../common/primitive/failure.zig");
+const exception_prim = @import("../../common/primitive/exception.zig");
 const io = @import("../../common/primitive/io.zig");
 
-const Failure = failure_prim.Failure;
+const Exception = exception_prim.Exception;
 
 const block_size: u64 = 512;
 pub const scratch_size: usize = @intCast(block_size);
@@ -66,20 +66,20 @@ const NameParts = struct {
 
 const Format = enum { posix, gnu };
 
-pub fn archiveSize(entries: []const Entry) Failure!u64 {
+pub fn archiveSize(entries: []const Entry) Exception!u64 {
     return archiveSizeWith(.posix, entries);
 }
 
-pub fn archiveSizeGnu(entries: []const Entry) Failure!u64 {
+pub fn archiveSizeGnu(entries: []const Entry) Exception!u64 {
     return archiveSizeWith(.gnu, entries);
 }
 
-fn archiveSizeWith(comptime format: Format, entries: []const Entry) Failure!u64 {
+fn archiveSizeWith(comptime format: Format, entries: []const Entry) Exception!u64 {
     var total: u64 = 1024;
     for (entries) |entry| {
         const parts = try tarNameParts(entry.name);
-        if (std.mem.findScalar(u8, entry.link_name, 0) != null) return error.CallFailure;
-        if ((entry.typeflag == '1' or entry.typeflag == '2') and entry.link_name.len == 0) return error.CallFailure;
+        if (std.mem.findScalar(u8, entry.link_name, 0) != null) return error.CallException;
+        if ((entry.typeflag == '1' or entry.typeflag == '2') and entry.link_name.len == 0) return error.CallException;
         const data_size = try tarDataSize(entry.typeflag, entry.data);
         if (format == .posix) {
             var pax_buffer: [512]u8 = undefined;
@@ -95,25 +95,25 @@ fn archiveSizeWith(comptime format: Format, entries: []const Entry) Failure!u64 
     return total;
 }
 
-pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Failure!usize {
+pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Exception!usize {
     return encodeWith(.posix, entries, output, scratch);
 }
 
 // GNU variant: the "ustar  \0" magic and 'L'/'K' long-name entries
 // instead of pax records.
-pub fn encodeGnu(entries: []const Entry, output: []u8, scratch: []u8) Failure!usize {
+pub fn encodeGnu(entries: []const Entry, output: []u8, scratch: []u8) Exception!usize {
     return encodeWith(.gnu, entries, output, scratch);
 }
 
-fn encodeWith(comptime format: Format, entries: []const Entry, output: []u8, scratch: []u8) Failure!usize {
+fn encodeWith(comptime format: Format, entries: []const Entry, output: []u8, scratch: []u8) Exception!usize {
     const required = try archiveSizeWith(format, entries);
-    if (output.len < required) return error.CapacityFailure;
-    if (scratch.len < scratch_size) return error.CapacityFailure;
+    if (output.len < required) return error.CapacityException;
+    if (scratch.len < scratch_size) return error.CapacityException;
     var sink = io.Sink{ .bytes = output };
     for (entries) |entry| {
         const parts = try tarNameParts(entry.name);
-        if (std.mem.findScalar(u8, entry.link_name, 0) != null) return error.CallFailure;
-        if ((entry.typeflag == '1' or entry.typeflag == '2') and entry.link_name.len == 0) return error.CallFailure;
+        if (std.mem.findScalar(u8, entry.link_name, 0) != null) return error.CallException;
+        if ((entry.typeflag == '1' or entry.typeflag == '2') and entry.link_name.len == 0) return error.CallException;
         const data_size = try tarDataSize(entry.typeflag, entry.data);
         if (format == .posix) {
             var pax_buffer: [512]u8 = undefined;
@@ -150,7 +150,7 @@ fn encodeWith(comptime format: Format, entries: []const Entry, output: []u8, scr
     return sink.offset;
 }
 
-fn writePaxRecords(entry: Entry, data_size: u64, uses_long_name: bool, buffer: []u8) Failure!usize {
+fn writePaxRecords(entry: Entry, data_size: u64, uses_long_name: bool, buffer: []u8) Exception!usize {
     var written: usize = 0;
     if (uses_long_name) written = try paxRecord(buffer, "path", entry.name);
     if (entry.link_name.len > 100) {
@@ -189,11 +189,11 @@ fn paxPrefixLen(content_len: usize) usize {
     return len_count;
 }
 
-fn paxRecord(buffer: []u8, key: []const u8, payload: []const u8) Failure!usize {
+fn paxRecord(buffer: []u8, key: []const u8, payload: []const u8) Exception!usize {
     const content_len = key.len + 1 + payload.len + 1;
     const len_count = paxPrefixLen(content_len);
     const total = len_count + 1 + content_len;
-    if (total > buffer.len) return error.CallFailure;
+    if (total > buffer.len) return error.CallException;
     var m = total;
     var len_index = len_count;
     while (true) {
@@ -216,7 +216,7 @@ fn paxRecord(buffer: []u8, key: []const u8, payload: []const u8) Failure!usize {
     return pos;
 }
 
-fn paxNumberRecord(buffer: []u8, key: []const u8, value: u64) Failure!usize {
+fn paxNumberRecord(buffer: []u8, key: []const u8, value: u64) Exception!usize {
     var digits: [32]u8 = undefined;
     var n = value;
     var digit_count: usize = 0;
@@ -235,33 +235,33 @@ fn paxNumberRecord(buffer: []u8, key: []const u8, value: u64) Failure!usize {
     return paxRecord(buffer, key, digits[0..digit_count]);
 }
 
-pub fn inspectCount(archive: []const u8) Failure!u64 {
+pub fn inspectCount(archive: []const u8) Exception!u64 {
     var reader = Reader{ .archive = archive };
     var count: u64 = 0;
     while (try reader.next()) |_| count = try bounds.addU64(count, 1);
     return count;
 }
 
-pub fn inspectOrdinal(archive: []const u8, ordinal: u64) Failure!EntryInfo {
+pub fn inspectOrdinal(archive: []const u8, ordinal: u64) Exception!EntryInfo {
     var reader = Reader{ .archive = archive };
     while (try reader.next()) |entry| {
         if (entry.ordinal == ordinal) return entry;
     }
-    return error.DataFailure;
+    return error.DataException;
 }
 
-pub fn decodeOrdinal(archive: []const u8, ordinal: u64, output: []u8) Failure!usize {
+pub fn decodeOrdinal(archive: []const u8, ordinal: u64, output: []u8) Exception!usize {
     const entry = try inspectOrdinal(archive, ordinal);
-    const size = std.math.cast(usize, entry.size) orelse return error.ResourceFailure;
-    if (output.len < size) return error.CapacityFailure;
+    const size = std.math.cast(usize, entry.size) orelse return error.ResourceException;
+    if (output.len < size) return error.CapacityException;
     if (entry.sparse) |sparse| {
         if (size == 0) return 0;
         @memset(output[0..size], 0);
         var stream_offset: u64 = 0;
         for (sparse.segments[0..sparse.segment_count]) |segment| {
-            const start = std.math.cast(usize, segment.offset) orelse return error.DataFailure;
-            const count = std.math.cast(usize, segment.num_bytes) orelse return error.DataFailure;
-            if (start > size or count > size - start) return error.DataFailure;
+            const start = std.math.cast(usize, segment.offset) orelse return error.DataException;
+            const count = std.math.cast(usize, segment.num_bytes) orelse return error.DataException;
+            if (start > size or count > size - start) return error.DataException;
             const chunk = try bounds.slice(archive, try bounds.addU64(entry.data_offset, stream_offset), count);
             @memcpy(output[start..][0..count], chunk);
             stream_offset = try bounds.addU64(stream_offset, segment.num_bytes);
@@ -277,7 +277,7 @@ fn isZeroBlock(block: []const u8) bool {
     return std.mem.allEqual(u8, block, 0);
 }
 
-fn tarAligned(size: u64) Failure!u64 {
+fn tarAligned(size: u64) Exception!u64 {
     const remainder = size % block_size;
     return if (remainder == 0) size else bounds.addU64(size, block_size - remainder);
 }
@@ -286,14 +286,14 @@ fn tarField(field: []const u8) []const u8 {
     return field[0 .. std.mem.findScalar(u8, field, 0) orelse field.len];
 }
 
-fn tarNumber(field: []const u8) Failure!u64 {
-    if (field.len == 0) return error.DataFailure;
+fn tarNumber(field: []const u8) Exception!u64 {
+    if (field.len == 0) return error.DataException;
     if (field[0] & 0x80 != 0) {
-        if (field[0] & 0x40 != 0) return error.DataFailure;
+        if (field[0] & 0x40 != 0) return error.DataException;
         var value: u64 = field[0] & 0x7f;
         for (field[1..]) |byte| {
-            value = std.math.mul(u64, value, 256) catch return error.DataFailure;
-            value = std.math.add(u64, value, byte) catch return error.DataFailure;
+            value = std.math.mul(u64, value, 256) catch return error.DataException;
+            value = std.math.add(u64, value, byte) catch return error.DataException;
         }
         return value;
     }
@@ -303,12 +303,12 @@ fn tarNumber(field: []const u8) Failure!u64 {
     var value: u64 = 0;
     var index = start;
     while (index < field.len and field[index] >= '0' and field[index] <= '7') : (index += 1) {
-        value = std.math.mul(u64, value, 8) catch return error.DataFailure;
-        value = std.math.add(u64, value, field[index] - '0') catch return error.DataFailure;
+        value = std.math.mul(u64, value, 8) catch return error.DataException;
+        value = std.math.add(u64, value, field[index] - '0') catch return error.DataException;
     }
-    if (index == start) return error.DataFailure;
+    if (index == start) return error.DataException;
     while (index < field.len) : (index += 1) {
-        if (field[index] != 0 and field[index] != ' ') return error.DataFailure;
+        if (field[index] != 0 and field[index] != ' ') return error.DataException;
     }
     return value;
 }
@@ -347,17 +347,17 @@ fn tarChecksum(block: []const u8) u64 {
     return sum;
 }
 
-fn tarValidName(name: []const u8) Failure!void {
-    if (bounds.isAbsoluteOrTraversal(name) or std.mem.findScalar(u8, name, 0) != null) return error.CallFailure;
+fn tarValidName(name: []const u8) Exception!void {
+    if (bounds.isAbsoluteOrTraversal(name) or std.mem.findScalar(u8, name, 0) != null) return error.CallException;
     const trimmed = if (name[name.len - 1] == '/') name[0 .. name.len - 1] else name;
-    if (trimmed.len == 0) return error.CallFailure;
+    if (trimmed.len == 0) return error.CallException;
     var components = std.mem.splitScalar(u8, trimmed, '/');
     while (components.next()) |component| {
-        if (component.len == 0 or std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, "..")) return error.CallFailure;
+        if (component.len == 0 or std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, "..")) return error.CallException;
     }
 }
 
-fn tarNameParts(name: []const u8) Failure!NameParts {
+fn tarNameParts(name: []const u8) Exception!NameParts {
     try tarValidName(name);
     if (name.len <= 100) return .{ .name = name, .prefix = &.{}, .uses_long_name = false };
     var index = name.len;
@@ -371,16 +371,16 @@ fn tarNameParts(name: []const u8) Failure!NameParts {
     return .{ .name = "././@LongLink", .prefix = &.{}, .uses_long_name = true };
 }
 
-fn tarDataSize(typeflag: u8, data: []const u8) Failure!u64 {
+fn tarDataSize(typeflag: u8, data: []const u8) Exception!u64 {
     return switch (typeflag) {
         0, typeflag_regular, '7' => data.len,
-        '1', '2', '3', '4', '5', '6' => if (data.len == 0) 0 else error.CallFailure,
-        else => error.CallFailure,
+        '1', '2', '3', '4', '5', '6' => if (data.len == 0) 0 else error.CallException,
+        else => error.CallException,
     };
 }
 
-fn tarWriteHeader(sink: *io.Sink, scratch: []u8, name: []const u8, prefix: []const u8, link_name: []const u8, mode: u32, uid: u32, gid: u32, modification_time: u64, typeflag: u8, size: u64, devmajor: u32, devminor: u32) Failure!void {
-    if (scratch.len < scratch_size) return error.CapacityFailure;
+fn tarWriteHeader(sink: *io.Sink, scratch: []u8, name: []const u8, prefix: []const u8, link_name: []const u8, mode: u32, uid: u32, gid: u32, modification_time: u64, typeflag: u8, size: u64, devmajor: u32, devminor: u32) Exception!void {
+    if (scratch.len < scratch_size) return error.CapacityException;
     const block = scratch[0..scratch_size];
     @memset(block, 0);
     tarWriteField(block[0..100], name);
@@ -411,8 +411,8 @@ fn tarWriteHeader(sink: *io.Sink, scratch: []u8, name: []const u8, prefix: []con
 }
 
 // GNU headers carry the OLDGNU magic and no prefix field.
-fn tarWriteHeaderGnu(sink: *io.Sink, scratch: []u8, name: []const u8, link_name: []const u8, mode: u32, uid: u32, gid: u32, modification_time: u64, typeflag: u8, size: u64, devmajor: u32, devminor: u32) Failure!void {
-    if (scratch.len < scratch_size) return error.CapacityFailure;
+fn tarWriteHeaderGnu(sink: *io.Sink, scratch: []u8, name: []const u8, link_name: []const u8, mode: u32, uid: u32, gid: u32, modification_time: u64, typeflag: u8, size: u64, devmajor: u32, devminor: u32) Exception!void {
+    if (scratch.len < scratch_size) return error.CapacityException;
     const block = scratch[0..scratch_size];
     @memset(block, 0);
     tarWriteField(block[0..100], name);
@@ -440,10 +440,10 @@ fn tarWriteHeaderGnu(sink: *io.Sink, scratch: []u8, name: []const u8, link_name:
     try sink.write(block);
 }
 
-fn tarWritePadding(sink: *io.Sink, scratch: []u8, size: u64) Failure!void {
+fn tarWritePadding(sink: *io.Sink, scratch: []u8, size: u64) Exception!void {
     const padding = (block_size - size % block_size) % block_size;
     if (padding != 0) {
-        if (scratch.len < scratch_size) return error.CapacityFailure;
+        if (scratch.len < scratch_size) return error.CapacityException;
         @memset(scratch[0..scratch_size], 0);
         try sink.write(scratch[0..@intCast(padding)]);
     }
@@ -476,10 +476,10 @@ const Reader = struct {
     global_pax: Pax = .{},
     local_pax: Pax = .{},
 
-    fn readHeader(self: *Reader) Failure!EntryInfo {
+    fn readHeader(self: *Reader) Exception!EntryInfo {
         const header = try bounds.slice(self.archive, self.offset, block_size);
         const recorded_checksum = try tarNumber(header[148..156]);
-        if (recorded_checksum != tarChecksum(header)) return error.IntegrityFailure;
+        if (recorded_checksum != tarChecksum(header)) return error.IntegrityException;
         const size = try tarNumber(header[124..136]);
         const data_offset = try bounds.addU64(self.offset, block_size);
         // The prefix and device fields are ustar extensions; V7 headers
@@ -489,26 +489,26 @@ const Reader = struct {
             .name = tarField(header[0..100]),
             .prefix = if (ustar) tarField(header[345..500]) else &.{},
             .link_name = tarField(header[157..257]),
-            .mode = std.math.cast(u32, try tarNumber(header[100..108])) orelse return error.DataFailure,
-            .uid = std.math.cast(u32, try tarNumber(header[108..116])) orelse return error.DataFailure,
-            .gid = std.math.cast(u32, try tarNumber(header[116..124])) orelse return error.DataFailure,
+            .mode = std.math.cast(u32, try tarNumber(header[100..108])) orelse return error.DataException,
+            .uid = std.math.cast(u32, try tarNumber(header[108..116])) orelse return error.DataException,
+            .gid = std.math.cast(u32, try tarNumber(header[116..124])) orelse return error.DataException,
             .size = size,
             .modification_time = try tarNumber(header[136..148]),
             .typeflag = header[156],
-            .devmajor = if (ustar) std.math.cast(u32, try tarNumber(header[329..337])) orelse return error.DataFailure else 0,
-            .devminor = if (ustar) std.math.cast(u32, try tarNumber(header[337..345])) orelse return error.DataFailure else 0,
+            .devmajor = if (ustar) std.math.cast(u32, try tarNumber(header[329..337])) orelse return error.DataException else 0,
+            .devminor = if (ustar) std.math.cast(u32, try tarNumber(header[337..345])) orelse return error.DataException else 0,
             .ordinal = 0,
             .header_offset = self.offset,
             .data_offset = data_offset,
         };
     }
 
-    fn advance(self: *Reader, size: u64) Failure!void {
+    fn advance(self: *Reader, size: u64) Exception!void {
         self.offset = try bounds.addU64(try bounds.addU64(self.offset, block_size), try tarAligned(size));
-        if (self.offset > self.archive.len) return error.DataFailure;
+        if (self.offset > self.archive.len) return error.DataException;
     }
 
-    fn parseOldGnuSparse(self: *Reader, entry: *EntryInfo) Failure!SparseInfo {
+    fn parseOldGnuSparse(self: *Reader, entry: *EntryInfo) Exception!SparseInfo {
         var info = SparseInfo{ .realsize = 0, .segment_count = 0, .segments = undefined };
         const header = try bounds.slice(self.archive, entry.header_offset, block_size);
         info.realsize = try tarNumber(header[483..495]);
@@ -524,7 +524,7 @@ const Reader = struct {
             extension_blocks += 1;
             extension_offset = try bounds.addU64(extension_offset, block_size);
         }
-        if (chunk_sum != entry.size) return error.DataFailure;
+        if (chunk_sum != entry.size) return error.DataException;
         if (info.realsize == 0) {
             for (info.segments[0..info.segment_count]) |segment| {
                 info.realsize = @max(info.realsize, try bounds.addU64(segment.offset, segment.num_bytes));
@@ -533,15 +533,15 @@ const Reader = struct {
         try validateSparseInfo(info);
         entry.data_offset = try bounds.addU64(entry.header_offset, (extension_blocks + 1) * block_size);
         self.offset = try bounds.addU64(entry.data_offset, try tarAligned(entry.size));
-        if (self.offset > self.archive.len) return error.DataFailure;
+        if (self.offset > self.archive.len) return error.DataException;
         return info;
     }
 
-    fn sparseFromPax(self: *Reader, entry: *EntryInfo, pax: Pax) Failure!?SparseInfo {
+    fn sparseFromPax(self: *Reader, entry: *EntryInfo, pax: Pax) Exception!?SparseInfo {
         if (pax.sparse_major == null and pax.sparse_size == null and pax.sparse_realsize == null and pax.sparse_map == null and pax.sparse_pax == null) return null;
         // Every branch assigns info wholesale before any field is read, so undefined init is safe.
         var info: SparseInfo = undefined;
-        const realsize = pax.sparse_realsize orelse pax.sparse_size orelse return error.DataFailure;
+        const realsize = pax.sparse_realsize orelse pax.sparse_size orelse return error.DataException;
         if (pax.sparse_map) |map| {
             info = try parseSparseMapString(map, realsize);
         } else if (pax.sparse_pax) |pax_data| {
@@ -550,18 +550,18 @@ const Reader = struct {
             info = .{ .realsize = realsize, .segment_count = 0, .segments = undefined };
         }
         if (pax.sparse_major) |major| {
-            if (major != 1) return error.UnsupportedFailure;
-            const minor = pax.sparse_minor orelse return error.DataFailure;
-            if (minor != 0) return error.UnsupportedFailure;
+            if (major != 1) return error.UnsupportedException;
+            const minor = pax.sparse_minor orelse return error.DataException;
+            if (minor != 0) return error.UnsupportedException;
             const map_start = entry.data_offset;
             const map_bytes = try readSparseMapData(self.archive, map_start, &info);
             const map_padded = try tarAligned(map_bytes);
             entry.data_offset = try bounds.addU64(entry.data_offset, map_padded);
-            if (entry.size < map_padded) return error.DataFailure;
+            if (entry.size < map_padded) return error.DataException;
             entry.size -= map_padded;
         }
         if (pax.sparse_numblocks) |count| {
-            if (count != info.segment_count) return error.DataFailure;
+            if (count != info.segment_count) return error.DataException;
         }
         try validateSparseInfo(info);
         if (pax.sparse_name) |name| {
@@ -572,12 +572,12 @@ const Reader = struct {
         return info;
     }
 
-    fn next(self: *Reader) Failure!?EntryInfo {
+    fn next(self: *Reader) Exception!?EntryInfo {
         while (self.offset < self.archive.len) {
             const block = try bounds.slice(self.archive, self.offset, block_size);
             if (isZeroBlock(block)) {
                 const remaining = try bounds.slice(self.archive, self.offset, self.archive.len - @as(usize, @intCast(self.offset)));
-                if (remaining.len < 1024 or !isZeroBlock(remaining)) return error.DataFailure;
+                if (remaining.len < 1024 or !isZeroBlock(remaining)) return error.DataException;
                 return null;
             }
             var entry = try self.readHeader();
@@ -585,17 +585,17 @@ const Reader = struct {
             const data = try bounds.slice(self.archive, entry.data_offset, physical_size);
             switch (entry.typeflag) {
                 typeflag_gnu_long_name => {
-                    if (self.long_name != null) return error.DataFailure;
+                    if (self.long_name != null) return error.DataException;
                     self.long_name = tarField(data);
                     try self.advance(physical_size);
                 },
                 typeflag_gnu_long_link => {
-                    if (self.long_link != null) return error.DataFailure;
+                    if (self.long_link != null) return error.DataException;
                     self.long_link = tarField(data);
                     try self.advance(physical_size);
                 },
                 typeflag_pax => {
-                    if (!tarPaxEmpty(self.local_pax)) return error.DataFailure;
+                    if (!tarPaxEmpty(self.local_pax)) return error.DataException;
                     self.local_pax = try tarParsePax(data);
                     try self.advance(physical_size);
                 },
@@ -614,7 +614,7 @@ const Reader = struct {
                     if (self.long_link) |link_name| entry.link_name = link_name;
                     // Decode-side parity with ZIP: refuse traversal, absolute,
                     // backslash, and embedded-NUL member names.
-                    if (bounds.isAbsoluteOrTraversal(entry.name) or std.mem.findScalar(u8, entry.name, 0) != null) return error.DataFailure;
+                    if (bounds.isAbsoluteOrTraversal(entry.name) or std.mem.findScalar(u8, entry.name, 0) != null) return error.DataException;
                     entry.ordinal = self.ordinal;
                     self.ordinal = try bounds.addU64(self.ordinal, 1);
                     self.long_name = null;
@@ -647,7 +647,7 @@ const Reader = struct {
                     if (self.long_link) |link_name| entry.link_name = link_name;
                     // Decode-side parity with ZIP: refuse traversal, absolute,
                     // backslash, and embedded-NUL member names.
-                    if (bounds.isAbsoluteOrTraversal(entry.name) or std.mem.findScalar(u8, entry.name, 0) != null) return error.DataFailure;
+                    if (bounds.isAbsoluteOrTraversal(entry.name) or std.mem.findScalar(u8, entry.name, 0) != null) return error.DataException;
                     entry.ordinal = self.ordinal;
                     self.ordinal = try bounds.addU64(self.ordinal, 1);
                     try self.advance(advance_size);
@@ -658,11 +658,11 @@ const Reader = struct {
                 },
             }
         }
-        return error.DataFailure;
+        return error.DataException;
     }
 };
 
-fn parseSparseEntries(info: *SparseInfo, chunk_sum: *u64, bytes: []const u8, count: usize) Failure!void {
+fn parseSparseEntries(info: *SparseInfo, chunk_sum: *u64, bytes: []const u8, count: usize) Exception!void {
     var index: usize = 0;
     while (index < count) : (index += 1) {
         const entry_bytes = bytes[index * 24 ..][0..24];
@@ -673,25 +673,25 @@ fn parseSparseEntries(info: *SparseInfo, chunk_sum: *u64, bytes: []const u8, cou
     }
 }
 
-fn addSparseSegment(info: *SparseInfo, chunk_sum: *u64, offset: u64, num_bytes: u64) Failure!void {
-    if (num_bytes == 0) return error.DataFailure;
-    if (info.segment_count >= max_sparse_segments) return error.UnsupportedFailure;
+fn addSparseSegment(info: *SparseInfo, chunk_sum: *u64, offset: u64, num_bytes: u64) Exception!void {
+    if (num_bytes == 0) return error.DataException;
+    if (info.segment_count >= max_sparse_segments) return error.UnsupportedException;
     info.segments[info.segment_count] = .{ .offset = offset, .num_bytes = num_bytes };
     info.segment_count += 1;
     chunk_sum.* = try bounds.addU64(chunk_sum.*, num_bytes);
 }
 
-fn validateSparseInfo(info: SparseInfo) Failure!void {
+fn validateSparseInfo(info: SparseInfo) Exception!void {
     var previous_end: u64 = 0;
     for (info.segments[0..info.segment_count]) |segment| {
-        if (segment.num_bytes == 0 or segment.offset < previous_end) return error.DataFailure;
+        if (segment.num_bytes == 0 or segment.offset < previous_end) return error.DataException;
         const end = try bounds.addU64(segment.offset, segment.num_bytes);
-        if (end > info.realsize) return error.DataFailure;
+        if (end > info.realsize) return error.DataException;
         previous_end = end;
     }
 }
 
-fn parseSparseMapString(map: []const u8, realsize: u64) Failure!SparseInfo {
+fn parseSparseMapString(map: []const u8, realsize: u64) Exception!SparseInfo {
     var info = SparseInfo{ .realsize = realsize, .segment_count = 0, .segments = undefined };
     var chunk_sum: u64 = 0;
     var pending_offset: ?u64 = null;
@@ -705,11 +705,11 @@ fn parseSparseMapString(map: []const u8, realsize: u64) Failure!SparseInfo {
             pending_offset = value;
         }
     }
-    if (pending_offset != null) return error.DataFailure;
+    if (pending_offset != null) return error.DataException;
     return info;
 }
 
-fn parseSparsePaxPairs(data: []const u8, realsize: u64) Failure!SparseInfo {
+fn parseSparsePaxPairs(data: []const u8, realsize: u64) Exception!SparseInfo {
     var info = SparseInfo{ .realsize = realsize, .segment_count = 0, .segments = undefined };
     var chunk_sum: u64 = 0;
     var offset: usize = 0;
@@ -717,34 +717,34 @@ fn parseSparsePaxPairs(data: []const u8, realsize: u64) Failure!SparseInfo {
     while (offset < data.len) {
         const length_start = offset;
         while (offset < data.len and data[offset] >= '0' and data[offset] <= '9') : (offset += 1) {}
-        if (offset == length_start or offset == data.len or data[offset] != ' ') return error.DataFailure;
+        if (offset == length_start or offset == data.len or data[offset] != ' ') return error.DataException;
         const record_length = try tarDecimal(data[length_start..offset]);
-        const length = std.math.cast(usize, record_length) orelse return error.ResourceFailure;
-        if (length > data.len - length_start or length <= offset - length_start + 2) return error.DataFailure;
+        const length = std.math.cast(usize, record_length) orelse return error.ResourceException;
+        if (length > data.len - length_start or length <= offset - length_start + 2) return error.DataException;
         const record = data[length_start .. length_start + length];
-        if (record[record.len - 1] != '\n') return error.DataFailure;
+        if (record[record.len - 1] != '\n') return error.DataException;
         const assignment = record[offset - length_start + 1 .. record.len - 1];
-        const equals = std.mem.findScalar(u8, assignment, '=') orelse return error.DataFailure;
+        const equals = std.mem.findScalar(u8, assignment, '=') orelse return error.DataException;
         const key = assignment[0..equals];
         const value = assignment[equals + 1 ..];
         if (std.mem.eql(u8, key, "GNU.sparse.offset")) {
-            if (pending_offset != null) return error.DataFailure;
+            if (pending_offset != null) return error.DataException;
             pending_offset = try tarDecimal(value);
         } else if (std.mem.eql(u8, key, "GNU.sparse.numbytes")) {
-            const segment_offset = pending_offset orelse return error.DataFailure;
+            const segment_offset = pending_offset orelse return error.DataException;
             try addSparseSegment(&info, &chunk_sum, segment_offset, try tarDecimal(value));
             pending_offset = null;
         }
         offset = length_start + length;
     }
-    if (pending_offset != null) return error.DataFailure;
+    if (pending_offset != null) return error.DataException;
     return info;
 }
 
-fn readSparseMapData(archive: []const u8, start: u64, info: *SparseInfo) Failure!u64 {
+fn readSparseMapData(archive: []const u8, start: u64, info: *SparseInfo) Exception!u64 {
     var offset = start;
     const count = try readSparseLine(archive, &offset);
-    if (count > max_sparse_segments) return error.UnsupportedFailure;
+    if (count > max_sparse_segments) return error.UnsupportedException;
     var chunk_sum: u64 = 0;
     var index: u64 = 0;
     while (index < count) : (index += 1) {
@@ -752,32 +752,32 @@ fn readSparseMapData(archive: []const u8, start: u64, info: *SparseInfo) Failure
         const num_bytes = try readSparseLine(archive, &offset);
         try addSparseSegment(info, &chunk_sum, segment_offset, num_bytes);
     }
-    if (count != info.segment_count) return error.DataFailure;
+    if (count != info.segment_count) return error.DataException;
     return offset - start;
 }
 
-fn readSparseLine(archive: []const u8, offset: *u64) Failure!u64 {
+fn readSparseLine(archive: []const u8, offset: *u64) Exception!u64 {
     var value: u64 = 0;
     var digits: usize = 0;
     while (true) {
-        if (offset.* >= archive.len) return error.DataFailure;
+        if (offset.* >= archive.len) return error.DataException;
         const byte = archive[@intCast(offset.*)];
         offset.* += 1;
         if (byte == '\n') {
-            if (digits == 0) return error.DataFailure;
+            if (digits == 0) return error.DataException;
             return value;
         }
-        if (byte < '0' or byte > '9') return error.DataFailure;
+        if (byte < '0' or byte > '9') return error.DataException;
         digits += 1;
-        value = std.math.mul(u64, value, 10) catch return error.DataFailure;
-        value = std.math.add(u64, value, byte - '0') catch return error.DataFailure;
+        value = std.math.mul(u64, value, 10) catch return error.DataException;
+        value = std.math.add(u64, value, byte - '0') catch return error.DataException;
     }
 }
 
-fn tarValidateType(typeflag: u8) Failure!void {
+fn tarValidateType(typeflag: u8) Exception!void {
     switch (typeflag) {
         0, typeflag_regular, '1', '2', '3', '4', '5', '6', '7' => {},
-        else => return error.UnsupportedFailure,
+        else => return error.UnsupportedException,
     }
 }
 
@@ -803,75 +803,75 @@ fn tarMergePax(target: *Pax, updates: Pax) void {
     if (updates.sparse_pax) |value| target.sparse_pax = value;
 }
 
-fn tarDecimal(value: []const u8) Failure!u64 {
-    if (value.len == 0) return error.DataFailure;
+fn tarDecimal(value: []const u8) Exception!u64 {
+    if (value.len == 0) return error.DataException;
     var result: u64 = 0;
     for (value) |byte| {
-        if (byte < '0' or byte > '9') return error.DataFailure;
-        result = std.math.mul(u64, result, 10) catch return error.DataFailure;
-        result = std.math.add(u64, result, byte - '0') catch return error.DataFailure;
+        if (byte < '0' or byte > '9') return error.DataException;
+        result = std.math.mul(u64, result, 10) catch return error.DataException;
+        result = std.math.add(u64, result, byte - '0') catch return error.DataException;
     }
     return result;
 }
 
-fn tarParsePax(data: []const u8) Failure!Pax {
+fn tarParsePax(data: []const u8) Exception!Pax {
     var attributes: Pax = .{};
     var offset: usize = 0;
     while (offset < data.len) {
         const length_start = offset;
         while (offset < data.len and data[offset] >= '0' and data[offset] <= '9') : (offset += 1) {}
-        if (offset == length_start or offset == data.len or data[offset] != ' ') return error.DataFailure;
+        if (offset == length_start or offset == data.len or data[offset] != ' ') return error.DataException;
         const record_length = try tarDecimal(data[length_start..offset]);
-        const length = std.math.cast(usize, record_length) orelse return error.ResourceFailure;
-        if (length > data.len - length_start or length <= offset - length_start + 2) return error.DataFailure;
+        const length = std.math.cast(usize, record_length) orelse return error.ResourceException;
+        if (length > data.len - length_start or length <= offset - length_start + 2) return error.DataException;
         const record = data[length_start .. length_start + length];
-        if (record[record.len - 1] != '\n') return error.DataFailure;
+        if (record[record.len - 1] != '\n') return error.DataException;
         const assignment = record[offset - length_start + 1 .. record.len - 1];
-        const equals = std.mem.findScalar(u8, assignment, '=') orelse return error.DataFailure;
+        const equals = std.mem.findScalar(u8, assignment, '=') orelse return error.DataException;
         const key = assignment[0..equals];
         const value = assignment[equals + 1 ..];
         if (std.mem.eql(u8, key, "path")) {
-            if (attributes.path != null) return error.DataFailure;
+            if (attributes.path != null) return error.DataException;
             attributes.path = value;
         } else if (std.mem.eql(u8, key, "linkpath")) {
-            if (attributes.link_name != null) return error.DataFailure;
+            if (attributes.link_name != null) return error.DataException;
             attributes.link_name = value;
         } else if (std.mem.eql(u8, key, "size")) {
-            if (attributes.size != null) return error.DataFailure;
+            if (attributes.size != null) return error.DataException;
             attributes.size = try tarDecimal(value);
         } else if (std.mem.eql(u8, key, "uid")) {
-            if (attributes.uid != null) return error.DataFailure;
-            attributes.uid = std.math.cast(u32, try tarDecimal(value)) orelse return error.DataFailure;
+            if (attributes.uid != null) return error.DataException;
+            attributes.uid = std.math.cast(u32, try tarDecimal(value)) orelse return error.DataException;
         } else if (std.mem.eql(u8, key, "gid")) {
-            if (attributes.gid != null) return error.DataFailure;
-            attributes.gid = std.math.cast(u32, try tarDecimal(value)) orelse return error.DataFailure;
+            if (attributes.gid != null) return error.DataException;
+            attributes.gid = std.math.cast(u32, try tarDecimal(value)) orelse return error.DataException;
         } else if (std.mem.eql(u8, key, "mode")) {
-            if (attributes.mode != null) return error.DataFailure;
-            attributes.mode = std.math.cast(u32, try tarDecimal(value)) orelse return error.DataFailure;
+            if (attributes.mode != null) return error.DataException;
+            attributes.mode = std.math.cast(u32, try tarDecimal(value)) orelse return error.DataException;
         } else if (std.mem.eql(u8, key, "mtime")) {
-            if (attributes.modification_time != null) return error.DataFailure;
+            if (attributes.modification_time != null) return error.DataException;
             const seconds_end = std.mem.findScalar(u8, value, '.') orelse value.len;
             attributes.modification_time = try tarDecimal(value[0..seconds_end]);
         } else if (std.mem.eql(u8, key, "GNU.sparse.major")) {
-            if (attributes.sparse_major != null) return error.DataFailure;
+            if (attributes.sparse_major != null) return error.DataException;
             attributes.sparse_major = try tarDecimal(value);
         } else if (std.mem.eql(u8, key, "GNU.sparse.minor")) {
-            if (attributes.sparse_minor != null) return error.DataFailure;
+            if (attributes.sparse_minor != null) return error.DataException;
             attributes.sparse_minor = try tarDecimal(value);
         } else if (std.mem.eql(u8, key, "GNU.sparse.name")) {
-            if (attributes.sparse_name != null) return error.DataFailure;
+            if (attributes.sparse_name != null) return error.DataException;
             attributes.sparse_name = value;
         } else if (std.mem.eql(u8, key, "GNU.sparse.size")) {
-            if (attributes.sparse_size != null) return error.DataFailure;
+            if (attributes.sparse_size != null) return error.DataException;
             attributes.sparse_size = try tarDecimal(value);
         } else if (std.mem.eql(u8, key, "GNU.sparse.realsize")) {
-            if (attributes.sparse_realsize != null) return error.DataFailure;
+            if (attributes.sparse_realsize != null) return error.DataException;
             attributes.sparse_realsize = try tarDecimal(value);
         } else if (std.mem.eql(u8, key, "GNU.sparse.numblocks")) {
-            if (attributes.sparse_numblocks != null) return error.DataFailure;
+            if (attributes.sparse_numblocks != null) return error.DataException;
             attributes.sparse_numblocks = try tarDecimal(value);
         } else if (std.mem.eql(u8, key, "GNU.sparse.map")) {
-            if (attributes.sparse_map != null) return error.DataFailure;
+            if (attributes.sparse_map != null) return error.DataException;
             attributes.sparse_map = value;
         } else if (std.mem.startsWith(u8, key, "GNU.sparse.offset") or std.mem.startsWith(u8, key, "GNU.sparse.numbytes")) {
             if (attributes.sparse_pax == null) attributes.sparse_pax = data;
@@ -881,9 +881,9 @@ fn tarParsePax(data: []const u8) Failure!Pax {
     return attributes;
 }
 
-fn tarApplyPax(entry: *EntryInfo, attributes: Pax) Failure!void {
+fn tarApplyPax(entry: *EntryInfo, attributes: Pax) Exception!void {
     if (attributes.path) |path| {
-        if (path.len == 0 or std.mem.findScalar(u8, path, 0) != null) return error.DataFailure;
+        if (path.len == 0 or std.mem.findScalar(u8, path, 0) != null) return error.DataException;
         entry.name = path;
         entry.prefix = &.{};
     }

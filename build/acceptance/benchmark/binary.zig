@@ -2,7 +2,7 @@ const std = @import("std");
 
 const run = @import("run");
 
-fn hexValue(character: u8) ?u8 {
+fn hexValueForNibble(character: u8) ?u8 {
     return switch (character) {
         '0'...'9' => character - '0',
         'a'...'f' => character - 'a' + 10,
@@ -11,27 +11,27 @@ fn hexValue(character: u8) ?u8 {
     };
 }
 
-fn parseHex(hex: []const u8, out: []u8) !void {
-    if (hex.len != out.len * 2) return error.bad_sha256_length;
-    for (out, 0..) |*byte, index| {
-        const high = hexValue(hex[index * 2]) orelse return error.bad_sha256_hex;
-        const low = hexValue(hex[index * 2 + 1]) orelse return error.bad_sha256_hex;
+fn parseHex(hex: []const u8, digest_out: []u8) !void {
+    if (hex.len != digest_out.len * 2) return error.bad_sha256_length;
+    for (digest_out, 0..) |*byte, index| {
+        const high = hexValueForNibble(hex[index * 2]) orelse return error.bad_sha256_hex;
+        const low = hexValueForNibble(hex[index * 2 + 1]) orelse return error.bad_sha256_hex;
         byte.* = (high << 4) | low;
     }
 }
 
-fn sha256File(io: std.Io, path: []const u8) ![32]u8 {
-    const data = try std.Io.Dir.cwd().readFileAlloc(io, path, std.heap.page_allocator, .limited(1 << 31));
+fn sha256File(io: std.Io, archive_path: []const u8) ![32]u8 {
+    const data = try std.Io.Dir.cwd().readFileAlloc(io, archive_path, std.heap.page_allocator, .limited(1 << 31));
     defer std.heap.page_allocator.free(data);
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
     return digest;
 }
 
-fn download(io: std.Io, url: []const u8, path: []const u8) !void {
+fn download(io: std.Io, url: []const u8, archive_path: []const u8) !void {
     var client: std.http.Client = .{ .allocator = std.heap.page_allocator, .io = io };
     defer client.deinit();
-    var file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+    var file = try std.Io.Dir.cwd().createFile(io, archive_path, .{ .truncate = true });
     defer file.close(io);
     var buffer: [64 * 1024]u8 = undefined;
     var writer = std.Io.File.writer(file, io, &buffer);
@@ -134,11 +134,11 @@ pub fn main(init: std.process.Init) !void {
         // A cache miss leaves confirmed false and falls through to the download.
     }
     if (!confirmed) {
-        std.debug.print("downloading {s}\n", .{url});
+        std.debug.print("downloading {s}.\n", .{url});
         try download(io, url, archive_path);
         const digest = try sha256File(io, archive_path);
         if (!std.mem.eql(u8, &digest, &expected)) {
-            std.debug.print("sha-256 mismatch for {s}\n", .{url});
+            std.debug.print("sha-256 mismatch for {s}.\n", .{url});
             return error.sha256_mismatch;
         }
     }

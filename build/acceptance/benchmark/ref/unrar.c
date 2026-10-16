@@ -1,24 +1,24 @@
 #include <stddef.h>
 #include <string.h>
 
-// NOLINTNEXTLINE(bugprone-reserved-identifier,cert-dcl37-c,cert-dcl51-cpp)
+/* NOLINTNEXTLINE(bugprone-reserved-identifier,cert-dcl37-c,cert-dcl51-cpp) */
 #define _UNIX
 #include "dll.hpp"
 
 #include "ref.h"
 
-// NOLINTBEGIN
+/* NOLINTBEGIN */
 static int CALLBACK unrar_callback(UINT msg, LPARAM user, LPARAM p1, LPARAM p2)
 {
 	if (msg != UCM_PROCESSDATA) {
 		return 0;
 	}
-	ref_sink *sink = (ref_sink *)user;
+	struct ref_sink *sink = (struct ref_sink *)user;
 	return ref_sink_write(sink, (const void *)p1, (size_t)p2) == REF_OK ?
 		       0 :
 		       -1;
 }
-// NOLINTEND
+/* NOLINTEND */
 
 int ref_unrar_extract(const unsigned char *data, size_t size,
 		      const char *temp_path, const char *destination_dir,
@@ -41,7 +41,7 @@ int ref_unrar_extract(const unsigned char *data, size_t size,
 		remove(temp_path);
 		return REF_FAIL;
 	}
-	ref_sink sink = { output, capacity, 0, 0 };
+	struct ref_sink sink = { output, capacity, 0, 0 };
 	RARSetCallback(handle, unrar_callback, (LPARAM)&sink);
 
 	int result = ERAR_SUCCESS;

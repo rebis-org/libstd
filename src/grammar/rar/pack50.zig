@@ -1,16 +1,15 @@
 const std = @import("std");
 
-const failure = @import("../../common/primitive/failure.zig");
+const exception = @import("../../common/primitive/exception.zig");
 const primitive_huffman = @import("../../common/primitive/huffman.zig");
 const common_sink = @import("../../common/sink.zig");
 const bits = @import("bits.zig");
 const filters50 = @import("filters50.zig");
 const finder_mod = @import("finder.zig");
-const facade = @import("onprem.zig");
 const slots = @import("slots.zig");
 const unpack50 = @import("unpack50.zig");
 
-const Failure = failure.Failure;
+const Exception = exception.Exception;
 const BitWriter = bits.BitWriter;
 const LzToken = finder_mod.LzToken;
 const MatchFinder = finder_mod.MatchFinder;
@@ -69,8 +68,8 @@ pub fn compressBlock(
     is_last_block: bool,
     ws: Workspaces,
     out: []u8,
-) Failure!usize {
-    if (input.len == 0) return error.CallFailure;
+) Exception!usize {
+    if (input.len == 0) return error.CallException;
 
     var finder = try MatchFinder.init(ws.hash, ws.hash2, ws.hash3, MatchFinder.dictionary_window, level);
     const tokens = try finder.compress(input, ws.tokens, ws.bt_left, ws.bt_right);
@@ -155,7 +154,7 @@ pub fn compressBlock(
     computeCanonicalCodes(&ldd_lengths, &ldd_codes);
     computeCanonicalCodes(&rd_lengths, &rd_codes);
 
-    if (ws.staging.len < input.len * max_expansion + output_slack) return error.InternalFailure;
+    if (ws.staging.len < input.len * max_expansion + output_slack) return error.InternalException;
     var bw = BitWriter.init(ws.staging);
 
     var cl_symbols: [total_symbols * 2]CLSymbol = undefined;
@@ -379,7 +378,7 @@ fn encodeCLSymbols(
 
 // Block header layout: a flags byte (valid-bits count, size width, last-block,
 // table-present), the 0x5a XOR checksum, and the block size.
-fn wrapBlockHeader(block_bytes: []const u8, total_bits: usize, is_last_block: bool, out: []u8) Failure!usize {
+fn wrapBlockHeader(block_bytes: []const u8, total_bits: usize, is_last_block: bool, out: []u8) Exception!usize {
     const block_size: u32 = @intCast(block_bytes.len);
     const last_byte_bits: u8 = @intCast(if (total_bits % 8 == 0) 8 else total_bits % 8);
     const byte_count: u8 = if (block_size <= 0xFF) 1 else if (block_size <= 0xFFFF) 2 else 3;
@@ -396,7 +395,7 @@ fn wrapBlockHeader(block_bytes: []const u8, total_bits: usize, is_last_block: bo
 
     const header_size: usize = 2 + byte_count;
     const total_size = header_size + block_bytes.len;
-    if (out.len < total_size) return error.CapacityFailure;
+    if (out.len < total_size) return error.CapacityException;
 
     out[0] = flags;
     out[1] = checksum;
@@ -470,7 +469,7 @@ test "compress block round-trips through the unpack50 decoder" {
     var pending: [unpack50.max_pending_filters]filters50.Filter = undefined;
     const filter_scratch = try std.heap.page_allocator.alloc(
         u8,
-        window_buf.len + facade.filter_scratch_extra,
+        window_buf.len + filters50.max_filter_block,
     );
     defer std.heap.page_allocator.free(filter_scratch);
     var st: unpack50.Unpacker = undefined;

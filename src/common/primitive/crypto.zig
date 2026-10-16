@@ -8,7 +8,7 @@ const hmac_seam = @import("hash/hmac/seam.zig");
 const pbkdf2_seam = @import("hash/pbkdf2/seam.zig");
 const sha1_seam = @import("hash/sha1/seam.zig");
 const sha256_seam = @import("hash/sha256/seam.zig");
-const Failure = @import("failure.zig").Failure;
+const Exception = @import("exception.zig").Exception;
 
 pub const Provider = seam.Provider;
 pub const default_provider = seam.default_provider;
@@ -51,16 +51,16 @@ pub fn hmacSha256(provider: Provider, out: *[hmac_sha256_length]u8, message: []c
     hmacWith(HmacSha256, provider, out, message, key);
 }
 
-pub fn winzipKeyLength(strength: u8) Failure!usize {
+pub fn winzipKeyLength(strength: u8) Exception!usize {
     return switch (strength) {
         1 => 16,
         2 => 24,
         3 => 32,
-        else => error.UnsupportedFailure,
+        else => error.UnsupportedException,
     };
 }
 
-pub fn winzipSaltLength(strength: u8) Failure!usize {
+pub fn winzipSaltLength(strength: u8) Exception!usize {
     return (try winzipKeyLength(strength)) / 2;
 }
 
@@ -76,7 +76,7 @@ fn BlockCipher(comptime S: type, comptime direction: Direction) type {
         bits192: aes_seam.Aes192Hw,
         bits256: if (direction == .encrypt) S.Enc256 else S.Dec256,
 
-        fn init(key: []const u8) Failure!@This() {
+        fn init(key: []const u8) Exception!@This() {
             return switch (key.len) {
                 16 => .{ .bits128 = switch (direction) {
                     .encrypt => S.Enc128.init(key[0..16].*),
@@ -90,7 +90,7 @@ fn BlockCipher(comptime S: type, comptime direction: Direction) type {
                     .encrypt => S.Enc256.init(key[0..32].*),
                     .decrypt => S.Dec256.init(key[0..32].*),
                 } },
-                else => error.CallFailure,
+                else => error.CallException,
             };
         }
 
@@ -108,7 +108,7 @@ fn BlockCipher(comptime S: type, comptime direction: Direction) type {
     };
 }
 
-fn aesBlockWith(comptime S: type, comptime direction: Direction, key: []const u8, block: [block_length]u8) Failure![block_length]u8 {
+fn aesBlockWith(comptime S: type, comptime direction: Direction, key: []const u8, block: [block_length]u8) Exception![block_length]u8 {
     const ctx = try BlockCipher(S, direction).init(key);
     var out: [block_length]u8 = undefined;
     ctx.cryptBlock(&out, &block);
@@ -140,20 +140,20 @@ fn forBothArms(
     return @call(.auto, with, .{fixed} ++ args);
 }
 
-fn aesBlock(comptime direction: Direction, provider: Provider, key: []const u8, block: [block_length]u8) Failure![block_length]u8 {
+fn aesBlock(comptime direction: Direction, provider: Provider, key: []const u8, block: [block_length]u8) Exception![block_length]u8 {
     return forBothArms(options.aes_impl, provider, aesBlockWith, aes_seam.suite, aes_seam.suite_onprem, aes_seam.suite_offprem, .{ direction, key, block });
 }
 
-pub fn aesEncryptBlock(provider: Provider, key: []const u8, block: [block_length]u8) Failure![block_length]u8 {
+pub fn aesEncryptBlock(provider: Provider, key: []const u8, block: [block_length]u8) Exception![block_length]u8 {
     return aesBlock(.encrypt, provider, key, block);
 }
 
-pub fn aesDecryptBlock(provider: Provider, key: []const u8, block: [block_length]u8) Failure![block_length]u8 {
+pub fn aesDecryptBlock(provider: Provider, key: []const u8, block: [block_length]u8) Exception![block_length]u8 {
     return aesBlock(.decrypt, provider, key, block);
 }
 
-fn winzipCtrWith(comptime S: type, key: []const u8, destination: []u8, source: []const u8) Failure!void {
-    if (destination.len < source.len) return error.CallFailure;
+fn winzipCtrWith(comptime S: type, key: []const u8, destination: []u8, source: []const u8) Exception!void {
+    if (destination.len < source.len) return error.CallException;
     const ctx = try BlockCipher(S, .encrypt).init(key);
     var counter: [block_length]u8 = @splat(0);
     counter[0] = 1;
@@ -188,17 +188,17 @@ fn winzipCtrWith(comptime S: type, key: []const u8, destination: []u8, source: [
             counter[byte_index] +%= 1;
             if (counter[byte_index] != 0) break;
         }
-        if (byte_index == 8) return error.ResourceFailure;
+        if (byte_index == 8) return error.ResourceException;
     }
 }
 
-pub fn winzipCtr(provider: Provider, key: []const u8, destination: []u8, source: []const u8) Failure!void {
+pub fn winzipCtr(provider: Provider, key: []const u8, destination: []u8, source: []const u8) Exception!void {
     return forBothArms(options.aes_impl, provider, winzipCtrWith, aes_seam.suite, aes_seam.suite_onprem, aes_seam.suite_offprem, .{ key, destination, source });
 }
 
 // Operates on whole blocks only; the caller supplies the padding.
-fn aesCbcEncryptWith(comptime S: type, key: []const u8, iv: [block_length]u8, destination: []u8, source: []const u8) Failure!void {
-    if (source.len % block_length != 0 or destination.len < source.len) return error.CallFailure;
+fn aesCbcEncryptWith(comptime S: type, key: []const u8, iv: [block_length]u8, destination: []u8, source: []const u8) Exception!void {
+    if (source.len % block_length != 0 or destination.len < source.len) return error.CallException;
     const ctx = try BlockCipher(S, .encrypt).init(key);
     var previous = iv;
     var offset: usize = 0;
@@ -211,23 +211,23 @@ fn aesCbcEncryptWith(comptime S: type, key: []const u8, iv: [block_length]u8, de
     return;
 }
 
-fn aesCbcWith(comptime S: type, comptime direction: Direction, key: []const u8, iv: [block_length]u8, destination: []u8, source: []const u8) Failure!void {
+fn aesCbcWith(comptime S: type, comptime direction: Direction, key: []const u8, iv: [block_length]u8, destination: []u8, source: []const u8) Exception!void {
     return switch (direction) {
         .encrypt => aesCbcEncryptWith(S, key, iv, destination, source),
         .decrypt => aesCbcDecryptWith(S, key, iv, destination, source),
     };
 }
 
-fn aesCbc(comptime direction: Direction, provider: Provider, key: []const u8, iv: [block_length]u8, destination: []u8, source: []const u8) Failure!void {
+fn aesCbc(comptime direction: Direction, provider: Provider, key: []const u8, iv: [block_length]u8, destination: []u8, source: []const u8) Exception!void {
     return forBothArms(options.aes_impl, provider, aesCbcWith, aes_seam.suite, aes_seam.suite_onprem, aes_seam.suite_offprem, .{ direction, key, iv, destination, source });
 }
 
-pub fn aesCbcEncrypt(provider: Provider, key: []const u8, iv: [block_length]u8, destination: []u8, source: []const u8) Failure!void {
+pub fn aesCbcEncrypt(provider: Provider, key: []const u8, iv: [block_length]u8, destination: []u8, source: []const u8) Exception!void {
     return aesCbc(.encrypt, provider, key, iv, destination, source);
 }
 
-fn aesCbcDecryptWith(comptime S: type, key: []const u8, iv: [block_length]u8, destination: []u8, source: []const u8) Failure!void {
-    if (source.len % block_length != 0 or destination.len < source.len) return error.CallFailure;
+fn aesCbcDecryptWith(comptime S: type, key: []const u8, iv: [block_length]u8, destination: []u8, source: []const u8) Exception!void {
+    if (source.len % block_length != 0 or destination.len < source.len) return error.CallException;
     const ctx = try BlockCipher(S, .decrypt).init(key);
     var previous = iv;
     var offset: usize = 0;
@@ -257,13 +257,13 @@ fn aesCbcDecryptWith(comptime S: type, key: []const u8, iv: [block_length]u8, de
     return;
 }
 
-pub fn aesCbcDecrypt(provider: Provider, key: []const u8, iv: [block_length]u8, destination: []u8, source: []const u8) Failure!void {
+pub fn aesCbcDecrypt(provider: Provider, key: []const u8, iv: [block_length]u8, destination: []u8, source: []const u8) Exception!void {
     return aesCbc(.decrypt, provider, key, iv, destination, source);
 }
 
-pub fn winzipDeriveKey(provider: Provider, password: []const u8, salt: []const u8, key_length: usize, out: []u8) Failure!void {
-    const derived_length = std.math.add(usize, 2 * key_length, winzip_verify_length) catch return error.ResourceFailure;
-    if (out.len < derived_length) return error.CallFailure;
+pub fn winzipDeriveKey(provider: Provider, password: []const u8, salt: []const u8, key_length: usize, out: []u8) Exception!void {
+    const derived_length = std.math.add(usize, 2 * key_length, winzip_verify_length) catch return error.ResourceException;
+    if (out.len < derived_length) return error.CallException;
     try pbkdf2HmacSha1(provider, out[0..derived_length], password, salt, @intCast(winzip_pbkdf2_rounds));
     return;
 }
@@ -286,18 +286,18 @@ pub fn sevenZipKdf(provider: Provider, password_utf16: []const u8, salt: []const
     return forBothArms(options.sha256_impl, provider, sevenZipKdfWith, sha256_seam.Sha256, sha256_seam.Onprem, sha256_seam.Offprem, .{ password_utf16, salt, num_cycles_power, out_key });
 }
 
-pub fn pbkdf2HmacSha1(provider: Provider, out: []u8, password: []const u8, salt: []const u8, rounds: u32) Failure!void {
+pub fn pbkdf2HmacSha1(provider: Provider, out: []u8, password: []const u8, salt: []const u8, rounds: u32) Exception!void {
     return pbkdf2Hmac(hmac_seam.HmacSha1Onprem, hmac_seam.HmacSha1Offprem, provider, out, password, salt, rounds);
 }
 
-pub fn pbkdf2HmacSha256(provider: Provider, out: []u8, password: []const u8, salt: []const u8, rounds: u32) Failure!void {
+pub fn pbkdf2HmacSha256(provider: Provider, out: []u8, password: []const u8, salt: []const u8, rounds: u32) Exception!void {
     return pbkdf2Hmac(hmac_seam.HmacSha256Onprem, hmac_seam.HmacSha256Offprem, provider, out, password, salt, rounds);
 }
 
-fn pbkdf2Hmac(comptime PrfOnprem: type, comptime PrfOffprem: type, provider: Provider, out: []u8, password: []const u8, salt: []const u8, rounds: u32) Failure!void {
+fn pbkdf2Hmac(comptime PrfOnprem: type, comptime PrfOffprem: type, provider: Provider, out: []u8, password: []const u8, salt: []const u8, rounds: u32) Exception!void {
     pbkdf2_seam.pbkdf2(PrfOnprem, PrfOffprem, provider, out, password, salt, rounds) catch |err| switch (err) {
-        error.WeakParameters => return error.CallFailure,
-        error.OutputTooLong => return error.ResourceFailure,
+        error.WeakParameters => return error.CallException,
+        error.OutputTooLong => return error.ResourceException,
     };
 }
 
@@ -315,7 +315,7 @@ pub fn constantTimeEql(first: []const u8, second: []const u8) bool {
 // Fails loudly instead of degrading to predictable material: a caller that
 // cannot obtain randomness must not produce salts or IVs derived from the
 // password and entry contents.
-pub fn fillRandom(bytes: []u8) Failure!void {
+pub fn fillRandom(bytes: []u8) Exception!void {
     if (comptime @hasDecl(std.posix.system, "arc4random_buf")) {
         std.posix.system.arc4random_buf(bytes.ptr, bytes.len);
         return;
@@ -328,14 +328,14 @@ pub fn fillRandom(bytes: []u8) Failure!void {
                 // Interrupted syscalls must retry rather than fail the whole
                 // fill; only a real error refuses.
                 if (count == @backingInt(std.posix.E.INTR)) continue;
-                return error.InternalFailure;
+                return error.InternalException;
             }
-            if (count == 0) return error.InternalFailure;
+            if (count == 0) return error.InternalException;
             filled += count;
         }
         return;
     }
-    return error.UnsupportedFailure;
+    return error.UnsupportedException;
 }
 
 // ZipCrypto (PKWARE traditional cipher). No stdlib equivalent exists; the key
@@ -402,7 +402,7 @@ pub const ZipCryptoKeys = struct {
 
 // Known-answer vectors pin the glue: FIPS 197, NIST SP 800-38A, RFC 2202,
 // RFC 4231, RFC 6070, the scrypt draft, NIST SHA-256, and the 7z KDF layout
-// from ip7z/7zip. Each capability's onprem file carries its own
+// from vendor/7zip. Each capability's onprem file carries its own
 // differential test against std.
 
 test "mergeable digest binds both providers to the same contract" {

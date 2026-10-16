@@ -1,7 +1,7 @@
 const span_module = @import("span.zig");
 
 const ConstSpan = span_module.ConstSpan;
-const Failure = span_module.Failure;
+const Exception = span_module.Exception;
 const Span = span_module.Span;
 
 // Caller frees are unobservable, so memory is leased per session.
@@ -25,13 +25,13 @@ pub const Registry = struct {
         return .{ .slots = storage };
     }
 
-    pub fn lease(self: *Registry, memory: ConstSpan) Failure!Lease {
-        if (memory.len == 0) return error.CallFailure;
+    pub fn lease(self: *Registry, memory: ConstSpan) Exception!Lease {
+        if (memory.len == 0) return error.CallException;
         for (self.slots[0..self.used]) |slot| {
             if (!slot.live) continue;
-            if (span_module.hasOverlap(@intFromPtr(memory.ptr), memory.len, slot.base, slot.len)) return error.CallFailure;
+            if (span_module.hasOverlap(@intFromPtr(memory.ptr), memory.len, slot.base, slot.len)) return error.CallException;
         }
-        if (self.used == self.slots.len) return error.ResourceFailure;
+        if (self.used == self.slots.len) return error.ResourceException;
         const token = self.next_token;
         self.next_token += 1;
         self.slots[self.used] = .{

@@ -2,11 +2,11 @@ const std = @import("std");
 
 const bounds = @import("../../common/primitive/bounds.zig");
 const checksum = @import("../../common/primitive/checksum.zig");
-const failure_prim = @import("../../common/primitive/failure.zig");
+const exception_prim = @import("../../common/primitive/exception.zig");
 const measurement = @import("../../common/primitive/measurement.zig");
 const zstd = @import("../../leaf/zstd/onprem.zig");
 
-const Failure = failure_prim.Failure;
+const Exception = exception_prim.Exception;
 pub const frame_size_max: u32 = zstd.encoder_frame_size_max;
 pub const frame_size_min: u32 = zstd.window_size_min;
 
@@ -56,34 +56,34 @@ pub const FrameInfo = struct {
 
 // The footer magic must be at the end of the input. Each table entry is checked
 // against the frame magic at its compressed offset.
-pub fn inspect(input: []const u8) Failure!FrameInfo {
-    if (input.len < 8 + footer_size) return error.DataFailure;
-    if (std.mem.readInt(u32, input[input.len - 4 ..][0..4], .little) != seekable_magic) return error.DataFailure;
+pub fn inspect(input: []const u8) Exception!FrameInfo {
+    if (input.len < 8 + footer_size) return error.DataException;
+    if (std.mem.readInt(u32, input[input.len - 4 ..][0..4], .little) != seekable_magic) return error.DataException;
     const frame_count = std.mem.readInt(u32, input[input.len - footer_size ..][0..4], .little);
     const descriptor = input[input.len - 5];
-    if (descriptor & 0x7C != 0) return error.UnsupportedFailure;
+    if (descriptor & 0x7C != 0) return error.UnsupportedException;
     const has_checksums = (descriptor & 0x80) != 0;
     const entry_bytes = @as(usize, frame_count) * (entry_size + @as(usize, if (has_checksums) 4 else 0));
-    if (input.len < 8 + entry_bytes + footer_size) return error.DataFailure;
+    if (input.len < 8 + entry_bytes + footer_size) return error.DataException;
     const table_start = input.len - footer_size - entry_bytes;
     const table = input[table_start .. input.len - footer_size];
-    if (std.mem.readInt(u32, input[table_start - 4 ..][0..4], .little) != entry_bytes + footer_size) return error.DataFailure;
-    if (std.mem.readInt(u32, input[table_start - 8 ..][0..4], .little) != skippable_magic) return error.DataFailure;
+    if (std.mem.readInt(u32, input[table_start - 4 ..][0..4], .little) != entry_bytes + footer_size) return error.DataException;
+    if (std.mem.readInt(u32, input[table_start - 8 ..][0..4], .little) != skippable_magic) return error.DataException;
     var offset: usize = 0;
     for (0..frame_count) |index| {
         const entry = table[index * (entry_size + @as(usize, if (has_checksums) 4 else 0)) ..][0..entry_size];
         const compressed_size = std.mem.readInt(u32, entry[0..4], .little);
-        if (compressed_size == 0) return error.DataFailure;
-        if (offset + compressed_size > table_start - 8) return error.DataFailure;
+        if (compressed_size == 0) return error.DataException;
+        if (offset + compressed_size > table_start - 8) return error.DataException;
         const magic = std.mem.readInt(u32, input[offset..][0..4], .little);
-        if (magic != frame_magic and !(magic >= 0x184D2A50 and magic <= 0x184D2A5F)) return error.DataFailure;
+        if (magic != frame_magic and !(magic >= 0x184D2A50 and magic <= 0x184D2A5F)) return error.DataException;
         offset += compressed_size;
     }
-    if (offset != table_start - 8) return error.DataFailure;
+    if (offset != table_start - 8) return error.DataException;
     return .{ .frame_count = frame_count, .has_checksums = has_checksums };
 }
 
-pub fn decodedSize(input: []const u8, history: []u8, options: Options) Failure!usize {
+pub fn decodedSize(input: []const u8, history: []u8, options: Options) Exception!usize {
     _ = try inspect(input);
     var counter = measurement.Counter.init(null);
     try decode(input, &counter.writer, history, options);
@@ -96,25 +96,25 @@ pub fn frameCountFor(input_len: usize, options: Options) usize {
     return input_len / options.frame_size + 1;
 }
 
-pub fn encodeToWriter(input: []const u8, output: *std.Io.Writer, history: []u8, workspace: []u32, entries: []FrameEntry, options: Options) Failure!void {
-    if (options.frame_size < frame_size_min or options.frame_size > frame_size_max) return error.CallFailure;
-    if (entries.len < frameCountFor(input.len, options)) return error.CapacityFailure;
+pub fn encodeToWriter(input: []const u8, output: *std.Io.Writer, history: []u8, workspace: []u32, entries: []FrameEntry, options: Options) Exception!void {
+    if (options.frame_size < frame_size_min or options.frame_size > frame_size_max) return error.CallException;
+    if (entries.len < frameCountFor(input.len, options)) return error.CapacityException;
     const frame_options = frameOptions(options);
     const needed_history = @as(usize, frame_options.window_size) + zstd.block_size_max;
-    if (history.len < needed_history) return error.CapacityFailure;
-    if (workspace.len < zstd.encoderWorkspaceU32Count(0, options.frame_size, frame_options)) return error.CapacityFailure;
+    if (history.len < needed_history) return error.CapacityException;
+    if (workspace.len < zstd.encoderWorkspaceU32Count(0, options.frame_size, frame_options)) return error.CapacityException;
     var frame_count: usize = 0;
     var offset: usize = 0;
     while (offset < input.len or (input.len == 0 and frame_count == 0)) {
         const chunk_len: usize = if (input.len == 0) 0 else @min(input.len - offset, options.frame_size);
         const chunk = input[offset .. offset + chunk_len];
         const written = zstd.encodeFrame(output, chunk, workspace, frame_options, 0) catch |err| switch (err) {
-            error.DataFailure => return error.CallFailure,
-            error.ResourceFailure, error.IoFailure => |e| return e,
+            error.DataException => return error.CallException,
+            error.ResourceException, error.IoException => |e| return e,
         };
         entries[frame_count] = .{
-            .compressed_size = std.math.cast(u32, written) orelse return error.ResourceFailure,
-            .decompressed_size = std.math.cast(u32, chunk_len) orelse return error.ResourceFailure,
+            .compressed_size = std.math.cast(u32, written) orelse return error.ResourceException,
+            .decompressed_size = std.math.cast(u32, chunk_len) orelse return error.ResourceException,
         };
         frame_count += 1;
         offset += chunk_len;
@@ -122,24 +122,24 @@ pub fn encodeToWriter(input: []const u8, output: *std.Io.Writer, history: []u8, 
     }
     // The seek table is a skippable frame. Descriptor 0 stores no per-entry checksums.
     const table_len = tableSize(frame_count);
-    output.writeInt(u32, skippable_magic, .little) catch return error.IoFailure;
-    output.writeInt(u32, std.math.cast(u32, table_len - 8) orelse return error.ResourceFailure, .little) catch return error.IoFailure;
+    output.writeInt(u32, skippable_magic, .little) catch return error.IoException;
+    output.writeInt(u32, std.math.cast(u32, table_len - 8) orelse return error.ResourceException, .little) catch return error.IoException;
     for (entries[0..frame_count]) |entry| {
-        output.writeInt(u32, entry.compressed_size, .little) catch return error.IoFailure;
-        output.writeInt(u32, entry.decompressed_size, .little) catch return error.IoFailure;
+        output.writeInt(u32, entry.compressed_size, .little) catch return error.IoException;
+        output.writeInt(u32, entry.decompressed_size, .little) catch return error.IoException;
     }
-    output.writeInt(u32, std.math.cast(u32, frame_count) orelse return error.ResourceFailure, .little) catch return error.IoFailure;
-    output.writeByte(0) catch return error.IoFailure;
-    output.writeInt(u32, seekable_magic, .little) catch return error.IoFailure;
+    output.writeInt(u32, std.math.cast(u32, frame_count) orelse return error.ResourceException, .little) catch return error.IoException;
+    output.writeByte(0) catch return error.IoException;
+    output.writeInt(u32, seekable_magic, .little) catch return error.IoException;
 }
 
-pub fn encode(input: []const u8, output: []u8, history: []u8, workspace: []u32, entries: []FrameEntry, options: Options) Failure!usize {
+pub fn encode(input: []const u8, output: []u8, history: []u8, workspace: []u32, entries: []FrameEntry, options: Options) Exception!usize {
     var writer = std.Io.Writer.fixed(output);
     try encodeToWriter(input, &writer, history, workspace, entries, options);
     return writer.end;
 }
 
-pub fn decode(input: []const u8, output: *std.Io.Writer, history: []u8, options: Options) Failure!void {
+pub fn decode(input: []const u8, output: *std.Io.Writer, history: []u8, options: Options) Exception!void {
     _ = try inspect(input);
     const frame_options = frameOptions(options);
     var source = std.Io.Reader.fixed(input);
@@ -173,5 +173,5 @@ test "zstd seekable round trip restores the original input" {
     try decode(encoded[0..encoded_len], &sink, history, options);
     try std.testing.expectEqualSlices(u8, input, decoded[0..sink.end]);
     // The payload without its table is not a seekable stream.
-    try std.testing.expectError(error.DataFailure, inspect(encoded[0 .. encoded_len - footer_size]));
+    try std.testing.expectError(error.DataException, inspect(encoded[0 .. encoded_len - footer_size]));
 }

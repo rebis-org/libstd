@@ -4,12 +4,10 @@ const reference = @import("acceptance/benchmark/refs.zig");
 const modules = @import("modules.zig");
 const common = @import("platform/common.zig");
 
-pub const Unit = struct {
-    name: []const u8,
-};
+pub const Unit = common.SingleUnit;
 
 pub const units = [_]Unit{
-    .{ .name = "vendor" },
+    .{ .name = "references" },
 };
 
 pub fn expand(b: *std.Build, ctx: *common.Settings) void {
@@ -19,7 +17,7 @@ pub fn expand(b: *std.Build, ctx: *common.Settings) void {
 }
 
 fn addVendorTests(b: *std.Build, refs: reference.Refs, ctx: *common.Settings) void {
-    const test_exe = b.addExecutable(.{
+    const vendor_suite = b.addExecutable(.{
         .name = "vendor",
         .root_module = b.createModule(.{
             .root_source_file = b.path("build/acceptance/tests/vendor.zig"),
@@ -28,7 +26,7 @@ fn addVendorTests(b: *std.Build, refs: reference.Refs, ctx: *common.Settings) vo
             .imports = &.{.{ .name = "run", .module = modules.create(b, modules.run, ctx) }},
         }),
     });
-    const run = b.addRunArtifact(test_exe);
-    refs.dependOnTools(&run.step);
-    b.step("test", "Build and run each vendored test and fuzz suite").dependOn(&run.step);
+    const vendor_run = b.addRunArtifact(vendor_suite);
+    refs.dependOnTools(&vendor_run.step);
+    b.step("test", "Build and run each vendored test and fuzz suite").dependOn(&vendor_run.step);
 }

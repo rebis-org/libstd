@@ -1,8 +1,8 @@
 const std = @import("std");
 
-const failure = @import("../../common/primitive/failure.zig");
+const exception = @import("../../common/primitive/exception.zig");
 
-const Failure = failure.Failure;
+const Exception = exception.Exception;
 
 // RAR packs codes MSB-first within each byte. V29 uses zero padding because its
 // end-of-block marker peeks 16 bits to reach the final 1 to 2 bits.
@@ -62,10 +62,10 @@ pub const BitReader = struct {
         }
     }
 
-    pub fn readBits(self: *BitReader, bit_count: u5) Failure!u32 {
+    pub fn readBits(self: *BitReader, bit_count: u5) Exception!u32 {
         const count: u7 = bit_count;
         if (count == 0) return 0;
-        if (self.bit_pos + @as(usize, count) > self.bitLimit()) return error.DataFailure;
+        if (self.bit_pos + @as(usize, count) > self.bitLimit()) return error.DataException;
         if (count > self.pending_bit_count) self.refill();
         const shift: u6 = @intCast(64 - count);
         const result: u32 = @intCast(self.pending_bits >> shift);
@@ -77,14 +77,14 @@ pub const BitReader = struct {
         return result;
     }
 
-    pub fn readBit(self: *BitReader) Failure!u1 {
+    pub fn readBit(self: *BitReader) Exception!u1 {
         return @intCast(try self.readBits(1));
     }
 
-    pub fn peekBits(self: *BitReader, bit_count: u5) Failure!u32 {
+    pub fn peekBits(self: *BitReader, bit_count: u5) Exception!u32 {
         const count: u7 = bit_count;
         if (count == 0) return 0;
-        if (self.bit_pos + @as(usize, count) > self.bitLimit()) return error.DataFailure;
+        if (self.bit_pos + @as(usize, count) > self.bitLimit()) return error.DataException;
         if (count > self.pending_bit_count) self.refill();
         const shift: u6 = @intCast(64 - count);
         return @intCast(self.pending_bits >> shift);
@@ -147,7 +147,7 @@ pub const BitWriter = struct {
         };
     }
 
-    pub fn writeBits(self: *BitWriter, bit_value: u32, bit_count: u5) Failure!void {
+    pub fn writeBits(self: *BitWriter, bit_value: u32, bit_count: u5) Exception!void {
         const count: u7 = bit_count;
         if (count == 0) return;
         const value_mask: u32 = (@as(u32, 1) << bit_count) - 1;
@@ -159,11 +159,11 @@ pub const BitWriter = struct {
         try self.flushBytes();
     }
 
-    pub fn writeBit(self: *BitWriter, bit: u1) Failure!void {
+    pub fn writeBit(self: *BitWriter, bit: u1) Exception!void {
         try self.writeBits(bit, 1);
     }
 
-    fn flushBytes(self: *BitWriter) Failure!void {
+    fn flushBytes(self: *BitWriter) Exception!void {
         if (self.pending_bit_count >= 8) {
             const bytes_to_flush: u7 = self.pending_bit_count >> 3;
             if (bytes_to_flush > 0 and self.byte_pos + 8 <= self.output.len) {
@@ -178,7 +178,7 @@ pub const BitWriter = struct {
                 self.pending_bit_count -= @as(u7, bytes_to_flush) * 8;
             } else {
                 while (self.pending_bit_count >= 8) {
-                    if (self.byte_pos >= self.output.len) return error.CapacityFailure;
+                    if (self.byte_pos >= self.output.len) return error.CapacityException;
                     self.output[self.byte_pos] = @intCast(self.pending_bits >> 56);
                     self.byte_pos += 1;
                     self.pending_bits <<= 8;
@@ -188,9 +188,9 @@ pub const BitWriter = struct {
         }
     }
 
-    pub fn flush(self: *BitWriter) Failure!usize {
+    pub fn flush(self: *BitWriter) Exception!usize {
         if (self.pending_bit_count > 0) {
-            if (self.byte_pos >= self.output.len) return error.CapacityFailure;
+            if (self.byte_pos >= self.output.len) return error.CapacityException;
             self.output[self.byte_pos] = @intCast(self.pending_bits >> 56);
             self.byte_pos += 1;
             self.pending_bits = 0;
@@ -215,7 +215,7 @@ test "bit reader fails past the end unless padded" {
     const data = [_]u8{0xFF};
     var br = BitReader.init(&data);
     _ = try br.readBits(8);
-    try std.testing.expectError(error.DataFailure, br.readBit());
+    try std.testing.expectError(error.DataException, br.readBit());
 
     var padded = BitReader.initPadded(&data, 2);
     try std.testing.expectEqual(@as(u32, 0xFF00), try padded.peekBits(16));
@@ -224,7 +224,7 @@ test "bit reader fails past the end unless padded" {
     _ = try padded.readBits(8);
     _ = try padded.readBits(8);
     try std.testing.expect(padded.hasOverrun());
-    try std.testing.expectError(error.DataFailure, padded.readBit());
+    try std.testing.expectError(error.DataException, padded.readBit());
 }
 
 test "bit writer round-trips through the reader" {
@@ -244,5 +244,5 @@ test "bit writer refuses a full buffer" {
     var buf: [1]u8 = undefined;
     var bw = BitWriter.init(&buf);
     // The capacity error surfaces in writeBits, because that is where the flush runs.
-    try std.testing.expectError(error.CapacityFailure, bw.writeBits(0xFFFF, 16));
+    try std.testing.expectError(error.CapacityException, bw.writeBits(0xFFFF, 16));
 }

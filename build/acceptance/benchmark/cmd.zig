@@ -6,7 +6,7 @@ const env_mod = @import("env.zig");
 const matrix = @import("matrix.zig");
 const metric = @import("metric.zig");
 
-const Arg = union(enum) {
+const CommandArg = union(enum) {
     lit: []const u8,
     bin,
     input,
@@ -20,84 +20,84 @@ const Arg = union(enum) {
     outfile,
 };
 
-const Spec = struct {
-    out: Out,
-    args: []const Arg,
-    store: []const Arg = &.{},
-    lzma: []const Arg = &.{},
+const CommandSpec = struct {
+    output: Output,
+    args: []const CommandArg,
+    store: []const CommandArg = &.{},
+    lzma: []const CommandArg = &.{},
 
-    const Out = enum { stdout, file };
+    const Output = enum { stdout, file };
 };
 
 pub const Cmd = struct {
     exe: []const u8,
-    encode: ?Spec = null,
-    decode: ?Spec = null,
+    encode: ?CommandSpec = null,
+    decode: ?CommandSpec = null,
 };
 
-const encode_qc: []const Arg = &.{ .bin, .{ .lit = "-q" }, .{ .lit = "-c" }, .extra, .input };
-const decode_qdc: []const Arg = &.{ .bin, .{ .lit = "-q" }, .{ .lit = "-dc" }, .archive };
-const encode_c: []const Arg = &.{ .bin, .{ .lit = "-c" }, .extra, .input };
-const decode_dc: []const Arg = &.{ .bin, .{ .lit = "-dc" }, .archive };
+const encode_qc: []const CommandArg = &.{ .bin, .{ .lit = "-q" }, .{ .lit = "-c" }, .extra, .input };
+const decode_qdc: []const CommandArg = &.{ .bin, .{ .lit = "-q" }, .{ .lit = "-dc" }, .archive };
+const encode_c: []const CommandArg = &.{ .bin, .{ .lit = "-c" }, .extra, .input };
+const decode_dc: []const CommandArg = &.{ .bin, .{ .lit = "-dc" }, .archive };
 
 const cmds = struct {
     const sevenzz = Cmd{
         .exe = "7zz",
-        .encode = .{ .out = .file, .args = &.{ .bin, .{ .lit = "a" }, .{ .lit = "-y" }, .{ .lit = "-bso0" }, .{ .lit = "-bsp0" }, .store, .{ .lit = "-t%" }, .output, .input }, .store = &.{.{ .lit = "-mx=0" }} },
-        .decode = .{ .out = .stdout, .args = &.{ .bin, .{ .lit = "x" }, .{ .lit = "-so" }, .{ .lit = "-y" }, .{ .lit = "-bso0" }, .{ .lit = "-bsp0" }, .archive } },
+        .encode = .{ .output = .file, .args = &.{ .bin, .{ .lit = "a" }, .{ .lit = "-y" }, .{ .lit = "-bso0" }, .{ .lit = "-bsp0" }, .store, .{ .lit = "-t%" }, .output, .input }, .store = &.{.{ .lit = "-mx=0" }} },
+        .decode = .{ .output = .stdout, .args = &.{ .bin, .{ .lit = "x" }, .{ .lit = "-so" }, .{ .lit = "-y" }, .{ .lit = "-bso0" }, .{ .lit = "-bsp0" }, .archive } },
     };
     const zstd = Cmd{
         .exe = "zstd",
-        .encode = .{ .out = .stdout, .args = encode_qc },
-        .decode = .{ .out = .stdout, .args = decode_qdc },
+        .encode = .{ .output = .stdout, .args = encode_qc },
+        .decode = .{ .output = .stdout, .args = decode_qdc },
     };
     const xz = Cmd{
         .exe = "xz",
-        .encode = .{ .out = .stdout, .args = &.{ .bin, .{ .lit = "-q" }, .lzma, .{ .lit = "-c" }, .extra, .input }, .lzma = &.{.{ .lit = "--format=lzma" }} },
-        .decode = .{ .out = .stdout, .args = decode_qdc },
+        .encode = .{ .output = .stdout, .args = &.{ .bin, .{ .lit = "-q" }, .lzma, .{ .lit = "-c" }, .extra, .input }, .lzma = &.{.{ .lit = "--format=lzma" }} },
+        .decode = .{ .output = .stdout, .args = decode_qdc },
     };
     const bzip2 = Cmd{
         .exe = "bzip2",
-        .encode = .{ .out = .stdout, .args = encode_c },
-        .decode = .{ .out = .stdout, .args = decode_dc },
+        .encode = .{ .output = .stdout, .args = encode_c },
+        .decode = .{ .output = .stdout, .args = decode_dc },
     };
     const gzip = Cmd{
         .exe = "gzip",
-        .encode = .{ .out = .stdout, .args = encode_c },
-        .decode = .{ .out = .stdout, .args = decode_dc },
+        .encode = .{ .output = .stdout, .args = encode_c },
+        .decode = .{ .output = .stdout, .args = decode_dc },
     };
     const tar = Cmd{
         .exe = "tar",
-        .encode = .{ .out = .file, .args = &.{ .bin, .{ .lit = "-cf" }, .output, .{ .lit = "-C" }, .work, .{ .lit = "input.bin" } } },
-        .decode = .{ .out = .stdout, .args = &.{ .bin, .{ .lit = "-xOf" }, .archive, .{ .lit = "input.bin" } } },
+        .encode = .{ .output = .file, .args = &.{ .bin, .{ .lit = "-cf" }, .output, .{ .lit = "-C" }, .work, .{ .lit = "input.bin" } } },
+        .decode = .{ .output = .stdout, .args = &.{ .bin, .{ .lit = "-xOf" }, .archive, .{ .lit = "input.bin" } } },
     };
     const ziptool = Cmd{
         .exe = "ziptool",
-        .encode = .{ .out = .file, .args = &.{ .bin, .{ .lit = "-n" }, .output, .{ .lit = "add_file" }, .{ .lit = "input.bin" }, .input, .{ .lit = "0" }, .size, .store }, .store = &.{ .{ .lit = "set_file_compression" }, .{ .lit = "0" }, .{ .lit = "store" }, .{ .lit = "0" } } },
-        .decode = .{ .out = .stdout, .args = &.{ .bin, .archive, .{ .lit = "cat" }, .{ .lit = "0" } } },
+        .encode = .{ .output = .file, .args = &.{ .bin, .{ .lit = "-n" }, .output, .{ .lit = "add_file" }, .{ .lit = "input.bin" }, .input, .{ .lit = "0" }, .size, .store }, .store = &.{ .{ .lit = "set_file_compression" }, .{ .lit = "0" }, .{ .lit = "store" }, .{ .lit = "0" } } },
+        .decode = .{ .output = .stdout, .args = &.{ .bin, .archive, .{ .lit = "cat" }, .{ .lit = "0" } } },
     };
     const unrar = Cmd{
         .exe = "unrar",
-        .decode = .{ .out = .stdout, .args = &.{ .bin, .{ .lit = "p" }, .{ .lit = "-inul" }, .archive } },
+        .decode = .{ .output = .stdout, .args = &.{ .bin, .{ .lit = "p" }, .{ .lit = "-inul" }, .archive } },
     };
     const lzma = Cmd{
         .exe = "lzma",
-        .encode = .{ .out = .file, .args = &.{ .bin, .{ .lit = "e" }, .input, .output, .extra } },
-        .decode = .{ .out = .file, .args = &.{ .bin, .{ .lit = "d" }, .archive, .outfile } },
+        .encode = .{ .output = .file, .args = &.{ .bin, .{ .lit = "e" }, .input, .output, .extra } },
+        .decode = .{ .output = .file, .args = &.{ .bin, .{ .lit = "d" }, .archive, .outfile } },
     };
     const lz4 = Cmd{
         .exe = "lz4",
-        .encode = .{ .out = .stdout, .args = encode_qc },
-        .decode = .{ .out = .stdout, .args = decode_qdc },
+        .encode = .{ .output = .stdout, .args = encode_qc },
+        .decode = .{ .output = .stdout, .args = decode_qdc },
     };
     const brotli = Cmd{
         .exe = "brotli",
-        .encode = .{ .out = .stdout, .args = &.{ .bin, .extra, .{ .lit = "-c" }, .input } },
-        .decode = .{ .out = .stdout, .args = &.{ .bin, .{ .lit = "-d" }, .{ .lit = "-c" }, .archive } },
+        .encode = .{ .output = .stdout, .args = &.{ .bin, .extra, .{ .lit = "-c" }, .input } },
+        .decode = .{ .output = .stdout, .args = &.{ .bin, .{ .lit = "-d" }, .{ .lit = "-c" }, .archive } },
     };
 };
 
-pub fn get(comptime id: matrix.Cmd) Cmd {
+pub fn getCommand(comptime id: matrix.Cmd) Cmd {
     return switch (id) {
         .sevenzz => cmds.sevenzz,
         .zstd => cmds.zstd,
@@ -113,7 +113,7 @@ pub fn get(comptime id: matrix.Cmd) Cmd {
     };
 }
 
-fn buildLen(comptime spec: []const Arg, comptime store: []const Arg, comptime lzma: []const Arg, extra: usize) usize {
+fn buildLen(comptime spec: []const CommandArg, comptime store: []const CommandArg, comptime lzma: []const CommandArg, extra: usize) usize {
     var n: usize = 0;
     for (spec) |arg| n += switch (arg) {
         .store => store.len,
@@ -129,28 +129,28 @@ const max_args = blk: {
     var n: usize = 0;
     const cmd_info = @typeInfo(matrix.Cmd).@"enum";
     for (cmd_info.field_names, cmd_info.field_values) |_, field_value| {
-        const cmd = get(@fromBackingInt(@intCast(field_value)));
+        const cmd = getCommand(@fromBackingInt(@intCast(field_value)));
         if (cmd.encode) |spec| n = @max(n, buildLen(spec.args, spec.store, spec.lzma, 0));
         if (cmd.decode) |spec| n = @max(n, buildLen(spec.args, spec.store, spec.lzma, 0));
     }
     break :blk n + max_extra_args;
 };
 
-const Argv = struct {
+const ArgList = struct {
     items: [max_args][]const u8,
     len: usize = 0,
 };
 
-fn put(result: *Argv, n: *usize, item: []const u8) void {
+fn appendArg(result: *ArgList, n: *usize, item: []const u8) void {
     result.items[n.*] = item;
     n.* += 1;
 }
 
-fn argv(
+fn buildArgv(
     env: *env_mod.Env,
-    comptime spec: []const Arg,
-    comptime store: []const Arg,
-    comptime lzma: []const Arg,
+    comptime spec: []const CommandArg,
+    comptime store: []const CommandArg,
+    comptime lzma: []const CommandArg,
     extra: []const []const u8,
     bin: []const u8,
     input: []const u8,
@@ -158,29 +158,29 @@ fn argv(
     archive: []const u8,
     ext: []const u8,
     store_on: bool,
-) !Argv {
+) !ArgList {
     _ = env.arena.reset(.retain_capacity);
-    var result = Argv{ .items = undefined };
+    var result = ArgList{ .items = undefined };
     var n: usize = 0;
     for (spec) |arg| switch (arg) {
         .lit => |s| {
-            put(&result, &n, if (std.mem.findScalar(u8, s, '%')) |i| try env.print("{s}{s}{s}", .{ s[0..i], ext, s[i + 1 ..] }) else s);
+            appendArg(&result, &n, if (std.mem.findScalar(u8, s, '%')) |i| try env.format("{s}{s}{s}", .{ s[0..i], ext, s[i + 1 ..] }) else s);
         },
-        .bin => put(&result, &n, bin),
-        .input => put(&result, &n, input),
-        .output => put(&result, &n, output),
-        .archive => put(&result, &n, archive),
-        .work => put(&result, &n, env_mod.paths.work),
-        .outfile => put(&result, &n, env_mod.paths.out_bin),
-        .size => put(&result, &n, try env.print("{d}", .{try env.size(input)})),
+        .bin => appendArg(&result, &n, bin),
+        .input => appendArg(&result, &n, input),
+        .output => appendArg(&result, &n, output),
+        .archive => appendArg(&result, &n, archive),
+        .work => appendArg(&result, &n, env_mod.paths.work),
+        .outfile => appendArg(&result, &n, env_mod.paths.out_bin),
+        .size => appendArg(&result, &n, try env.format("{d}", .{try env.fileSize(input)})),
         .store => if (store_on) inline for (store) |s| {
-            put(&result, &n, s.lit);
+            appendArg(&result, &n, s.lit);
         },
         .lzma => if (std.mem.eql(u8, ext, "lzma")) inline for (lzma) |s| {
-            put(&result, &n, s.lit);
+            appendArg(&result, &n, s.lit);
         },
         .extra => for (extra) |s| {
-            put(&result, &n, s);
+            appendArg(&result, &n, s);
         },
     };
     result.len = n;
@@ -189,18 +189,18 @@ fn argv(
 
 pub fn encode(env: *env_mod.Env, comptime cmd: Cmd, bin: []const u8, input: []const u8, output: []const u8, ext: []const u8, store: bool, extra: []const []const u8) !usize {
     const spec = cmd.encode orelse return error.unsupported;
-    const args = try argv(env, spec.args, spec.store, spec.lzma, extra, bin, input, output, "", ext, store);
+    const args = try buildArgv(env, spec.args, spec.store, spec.lzma, extra, bin, input, output, "", ext, store);
     const stdout = try run.output(env.init, args.items[0..args.len]);
     defer env.allocator.free(stdout);
-    if (spec.out == .stdout) try env.writeFile(output, stdout);
-    return env.size(output);
+    if (spec.output == .stdout) try env.writeFile(output, stdout);
+    return env.fileSize(output);
 }
 
 pub fn decode(env: *env_mod.Env, comptime cmd: Cmd, bin: []const u8, archive: []const u8) ![]u8 {
     const spec = cmd.decode orelse return error.unsupported;
-    const args = try argv(env, spec.args, &.{}, &.{}, &.{}, bin, "", "", archive, "", false);
+    const args = try buildArgv(env, spec.args, &.{}, &.{}, &.{}, bin, "", "", archive, "", false);
     const stdout = try run.output(env.init, args.items[0..args.len]);
-    if (spec.out == .stdout) return stdout;
+    if (spec.output == .stdout) return stdout;
     env.allocator.free(stdout);
     const data = try env.readFile(env_mod.paths.out_bin, 1 << 31);
     env.delete(env_mod.paths.out_bin);
@@ -209,31 +209,31 @@ pub fn decode(env: *env_mod.Env, comptime cmd: Cmd, bin: []const u8, archive: []
 
 fn timedDecode(env: *env_mod.Env, comptime cmd: Cmd, started: u64, bin: []const u8, archive: []const u8, input: []const u8, m: *metric.Metric) void {
     const bytes = decode(env, cmd, bin, archive) catch {
-        m.decode_ns = env.now() - started;
+        m.decode_ns = env.nowNs() - started;
         return;
     };
     defer env.allocator.free(bytes);
-    m.decode_ns = env.now() - started;
-    m.ok = metric.decodeOk(bytes.len, input, bytes);
+    m.decode_ns = env.nowNs() - started;
+    m.ok = metric.isDecodeOk(bytes.len, input, bytes);
 }
 
 pub fn measure(env: *env_mod.Env, comptime id: matrix.Cmd, bin: []const u8, input_path: []const u8, output_path: []const u8, ext: []const u8, store: bool, extra: []const []const u8, input: []const u8) metric.Metric {
     var m = metric.Metric{};
-    const cmd = comptime get(id);
-    const t0 = env.now();
+    const cmd = comptime getCommand(id);
+    const t0 = env.nowNs();
     const encoded = encode(env, cmd, bin, input_path, output_path, ext, store, extra) catch {
-        m.encode_ns = env.now() - t0;
+        m.encode_ns = env.nowNs() - t0;
         return m;
     };
-    m.encode_ns = env.now() - t0;
+    m.encode_ns = env.nowNs() - t0;
     m.encoded = encoded;
-    timedDecode(env, cmd, env.now(), bin, output_path, input, &m);
+    timedDecode(env, cmd, env.nowNs(), bin, output_path, input, &m);
     return m;
 }
 
 pub fn decodeMeasure(env: *env_mod.Env, comptime id: matrix.Cmd, bin: []const u8, archive_path: []const u8, input: []const u8) metric.Metric {
     var m = metric.Metric{};
-    const cmd = comptime get(id);
-    timedDecode(env, cmd, env.now(), bin, archive_path, input, &m);
+    const cmd = comptime getCommand(id);
+    timedDecode(env, cmd, env.nowNs(), bin, archive_path, input, &m);
     return m;
 }

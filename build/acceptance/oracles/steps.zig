@@ -6,8 +6,8 @@ const lib = @import("lib.zig");
 
 const Runner = harness.Runner;
 
-pub const MaxExtra = 4;
-pub const Params = *const fn (r: *Runner, out: *[MaxExtra]harness.Node) usize;
+pub const max_extra = 4;
+pub const Params = *const fn (r: *Runner, out: *[max_extra]harness.Node) usize;
 
 pub const Nodes = struct {
     items: [16]harness.Node = @splat(harness.Node.init()),
@@ -15,7 +15,7 @@ pub const Nodes = struct {
 };
 
 pub fn build(comptime extra: Params, r: *Runner, base: []const harness.Node) Nodes {
-    var buf: [MaxExtra]harness.Node = @splat(harness.Node.init());
+    var buf: [max_extra]harness.Node = @splat(harness.Node.init());
     const extra_count = extra(r, &buf);
     var result = Nodes{};
     @memcpy(result.items[0..extra_count], buf[0..extra_count]);
@@ -132,7 +132,7 @@ pub fn truncateReject(comptime extra: Params, r: *Runner) !void {
     try harness.reject(r, harness.ids.read, nodes.items[0..nodes.len], .{ .ctx = true }, r.invalid_status, r.output);
 }
 
-pub fn noParams(_: *Runner, _: *[MaxExtra]harness.Node) usize {
+pub fn noParams(_: *Runner, _: *[max_extra]harness.Node) usize {
     return 0;
 }
 

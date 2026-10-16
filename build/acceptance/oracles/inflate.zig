@@ -28,12 +28,12 @@ fn readGzipCallbackSink(r: *harness.Runner, encoded: []const u8, out: []u8) u32 
 
 fn compareReads(status_a: u32, status_b: u32, a: []u8, b: []u8, len_a: usize, len_b: usize) !void {
     if (status_a != status_b) {
-        std.debug.print("Status mismatch: {d} vs {d}.\n", .{ status_a, status_b });
+        std.debug.print("status mismatch: {d} vs {d}.\n", .{ status_a, status_b });
         return error.StatusMismatch;
     }
     const compare_len = if (status_a == abi.Status.ok) a.len else @min(len_a, len_b);
     if (!std.mem.eql(u8, a[0..compare_len], b[0..compare_len])) {
-        std.debug.print("Output mismatch at status {d}.\n", .{status_a});
+        std.debug.print("output mismatch at status {d}.\n", .{status_a});
         return error.OutputMismatch;
     }
 }

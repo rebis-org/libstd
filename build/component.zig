@@ -1,31 +1,31 @@
 const std = @import("std");
 
 // Emits a comptime table, so a component change touches only its own files.
-const RawParameter = struct {
+const ZonParameter = struct {
     name: []const u8,
     family: u16,
     ordinal: u8,
     representation: []const u8,
 };
 
-const RawLimits = struct {
+const ZonLimits = struct {
     window: u64 = 0,
     block: u64 = 0,
     history: u64 = 0,
 };
 
-const RawParam = struct { family: u16, ordinal: u32, value: u64 };
+const ZonTuningParam = struct { family: u16, ordinal: u32, value: u64 };
 
-const RawTuning = struct {
+const ZonTuning = struct {
     name: []const u8 = "",
-    params: []const RawParam = &.{},
+    params: []const ZonTuningParam = &.{},
     ref_params: []const u8 = "",
     cmd_args: []const []const u8 = &.{},
     lib_level: ?i32 = null,
     bypass: bool = false,
 };
 
-const RawBenchmark = struct {
+const ZonBenchmark = struct {
     row: []const u8,
     params: []const u8 = "",
     kind: []const u8,
@@ -39,31 +39,39 @@ const RawBenchmark = struct {
     method: bool = false,
     decode_only: bool = false,
     ref_params: []const u8 = "",
-    tunings: []const RawTuning = &.{},
+    tunings: []const ZonTuning = &.{},
 };
 
-const RawId = struct {
+const ZonId = struct {
     low: []const u8,
     high: []const u8,
 };
 
-const RawDescriptor = struct {
-    id: RawId,
+const ZonDescriptor = struct {
+    id: ZonId,
     name: []const u8,
     class: []const u8,
     verbs: []const []const u8,
-    parameters: []const RawParameter = &.{},
+    parameters: []const ZonParameter = &.{},
     capabilities: []const []const u8 = &.{},
     sizing: []const u8 = "unavailable",
     commit: []const u8 = "tentative",
-    limits: RawLimits = .{},
-    benchmark: ?RawBenchmark = null,
+    limits: ZonLimits = .{},
+    benchmark: ?ZonBenchmark = null,
 };
 
 const known_classes = [_][]const u8{ "slice", "streaming", "grammar", "volume", "filter" };
 const known_verbs = [_][]const u8{
-    "required_size", "decoded_size",  "encoded_size_bound", "encode",         "decode",
-    "encode_stream", "decode_stream", "inspect",            "decode_ordinal", "encode_ordinal",
+    "required_size",
+    "decoded_size",
+    "encoded_size_bound",
+    "encode",
+    "decode",
+    "encode_stream",
+    "decode_stream",
+    "inspect",
+    "decode_ordinal",
+    "encode_ordinal",
 };
 const known_representations = [_][]const u8{ "scalar_words", "bytes", "node_chain", "none" };
 const known_capabilities = [_][]const u8{ "read", "write", "size", "replay", "seek", "range" };
@@ -77,13 +85,13 @@ const decode_verbs = [_][]const u8{ "decode", "decode_stream", "decode_ordinal" 
 const encode_verbs = [_][]const u8{ "encode", "encode_stream", "encode_ordinal" };
 
 fn commandBitForVerb(verb: []const u8) ?u32 {
-    if (has(&sizing_verbs, verb)) return 1;
-    if (has(&decode_verbs, verb)) return 2;
-    if (has(&encode_verbs, verb)) return 4;
+    if (containsString(&sizing_verbs, verb)) return 1;
+    if (containsString(&decode_verbs, verb)) return 2;
+    if (containsString(&encode_verbs, verb)) return 4;
     return null;
 }
 
-fn has(haystack: []const []const u8, needle: []const u8) bool {
+fn containsString(haystack: []const []const u8, needle: []const u8) bool {
     for (haystack) |item| if (std.mem.eql(u8, item, needle)) return true;
     return false;
 }
@@ -98,16 +106,16 @@ fn isSafeText(text: []const u8) bool {
 fn isSafeTag(text: []const u8) bool {
     if (text.len == 0) return false;
     for (text, 0..) |character, index| {
-        const word = character == '_' or character == '-' or
+        const is_word_char = character == '_' or character == '-' or
             (character >= 'a' and character <= 'z') or
             (character >= 'A' and character <= 'Z') or
             (index != 0 and character >= '0' and character <= '9');
-        if (!word) return false;
+        if (!is_word_char) return false;
     }
     return true;
 }
 
-fn quote(allocator: std.mem.Allocator, inner: []const u8) ![]const u8 {
+fn quoteZonString(allocator: std.mem.Allocator, inner: []const u8) ![]const u8 {
     return allocator.print("\"{s}\"", .{inner});
 }
 
@@ -118,17 +126,17 @@ pub fn main(init: std.process.Init) !void {
     var args = std.process.Args.Iterator.init(init.minimal.args);
     _ = args.next();
     // Each descriptor is a file argument, because a directory argument is unfingerprinted.
-    var descriptors: std.ArrayList(RawDescriptor) = .empty;
-    var output_path: ?[]const u8 = null;
+    var descriptors: std.ArrayList(ZonDescriptor) = .empty;
+    var output_override: ?[]const u8 = null;
     while (args.next()) |arg| {
         if (!std.mem.endsWith(u8, arg, ".descriptor.zon")) {
-            output_path = arg;
+            output_override = arg;
             break;
         }
         const text = try std.Io.Dir.cwd().readFileAlloc(init.io, arg, allocator, .limited(1 << 20));
         const source = try allocator.dupeSentinel(u8, text, 0);
         var diagnostics: std.zon.parse.Diagnostics = undefined;
-        const parsed = std.zon.parse.fromSlice(RawDescriptor, .{
+        const parsed = std.zon.parse.fromSlice(ZonDescriptor, .{
             .gpa = std.heap.page_allocator,
             .arena = allocator,
             .source = source,
@@ -139,24 +147,24 @@ pub fn main(init: std.process.Init) !void {
         };
         try descriptors.append(allocator, parsed);
     }
-    const resolved_output_path = output_path orelse return error.missing_argument;
+    const output_path = output_override orelse return error.missing_argument;
 
-    std.mem.sort(RawDescriptor, descriptors.items, {}, struct {
-        fn lessThan(_: void, left: RawDescriptor, right: RawDescriptor) bool {
+    std.mem.sort(ZonDescriptor, descriptors.items, {}, struct {
+        fn lessThan(_: void, left: ZonDescriptor, right: ZonDescriptor) bool {
             return std.mem.order(u8, left.name, right.name) == .lt;
         }
     }.lessThan);
 
     for (descriptors.items) |descriptor| {
-        if (!has(&known_classes, descriptor.class)) return error.unknown_class;
-        for (descriptor.verbs) |verb| if (!has(&known_verbs, verb)) return error.unknown_verb;
+        if (!containsString(&known_classes, descriptor.class)) return error.unknown_class;
+        for (descriptor.verbs) |verb| if (!containsString(&known_verbs, verb)) return error.unknown_verb;
         for (descriptor.parameters) |parameter| {
-            if (!has(&known_representations, parameter.representation)) return error.unknown_representation;
+            if (!containsString(&known_representations, parameter.representation)) return error.unknown_representation;
             if (!isSafeText(parameter.name)) return error.unsafe_text;
         }
-        for (descriptor.capabilities) |capability| if (!has(&known_capabilities, capability)) return error.unknown_capability;
-        if (!has(&known_sizing, descriptor.sizing)) return error.unknown_sizing;
-        if (!has(&known_commit, descriptor.commit)) return error.unknown_commit;
+        for (descriptor.capabilities) |capability| if (!containsString(&known_capabilities, capability)) return error.unknown_capability;
+        if (!containsString(&known_sizing, descriptor.sizing)) return error.unknown_sizing;
+        if (!containsString(&known_commit, descriptor.commit)) return error.unknown_commit;
         if (!isSafeText(descriptor.name) or !isSafeTag(descriptor.name)) return error.unsafe_text;
         if (!isSafeText(descriptor.id.low) or !isSafeText(descriptor.id.high)) return error.unsafe_text;
         if (descriptor.benchmark) |benchmark| {
@@ -222,9 +230,9 @@ pub fn main(init: std.process.Init) !void {
             benchmark.params,
             benchmark.kind,
             benchmark.ext,
-            if (benchmark.cmd) |value| try quote(allocator, value) else "null",
-            if (benchmark.lib) |value| try quote(allocator, value) else "null",
-            if (benchmark.bin) |value| try quote(allocator, value) else "null",
+            if (benchmark.cmd) |value| try quoteZonString(allocator, value) else "null",
+            if (benchmark.lib) |value| try quoteZonString(allocator, value) else "null",
+            if (benchmark.bin) |value| try quoteZonString(allocator, value) else "null",
             benchmark.fmt,
             benchmark.store,
             benchmark.archive,
@@ -250,7 +258,7 @@ pub fn main(init: std.process.Init) !void {
     try output.appendSlice(allocator, "};\n");
     try emitTagTable(allocator, &output, descriptors.items);
 
-    try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = resolved_output_path, .data = output.items });
+    try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = output_path, .data = output.items });
 }
 
 // The table derives every other identity from the descriptor, so a component is one
@@ -263,14 +271,16 @@ fn profileTag(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
     return tagged;
 }
 
-fn emitTagTable(allocator: std.mem.Allocator, output: *std.ArrayList(u8), descriptors: []const RawDescriptor) !void {
+fn emitTagTable(allocator: std.mem.Allocator, output: *std.ArrayList(u8), descriptors: []const ZonDescriptor) !void {
+    const tags = try allocator.alloc([]const u8, descriptors.len);
+    for (descriptors, 0..) |descriptor, index| tags[index] = try profileTag(allocator, descriptor.name);
     try output.appendSlice(allocator, "\npub const ProfileTag = enum {\n");
-    for (descriptors) |descriptor| {
-        try output.print(allocator, "    {s},\n", .{try profileTag(allocator, descriptor.name)});
+    for (tags) |tag| {
+        try output.print(allocator, "    {s},\n", .{tag});
     }
     try output.appendSlice(allocator, "};\n\npub fn tagForName(name: []const u8) ?ProfileTag {\n");
-    for (descriptors) |descriptor| {
-        try output.print(allocator, "    if (std.mem.eql(u8, name, \"{s}\")) return .{s};\n", .{ descriptor.name, try profileTag(allocator, descriptor.name) });
+    for (descriptors, 0..) |descriptor, index| {
+        try output.print(allocator, "    if (std.mem.eql(u8, name, \"{s}\")) return .{s};\n", .{ descriptor.name, tags[index] });
     }
     try output.appendSlice(allocator, "    return null;\n}\n");
 }

@@ -1,19 +1,19 @@
 const std = @import("std");
 
-const failure = @import("../../common/primitive/failure.zig");
+const exception = @import("../../common/primitive/exception.zig");
 const onprem = @import("onprem.zig");
 
 const std_lzma = std.compress.lzma;
-pub const Failure = failure.Failure;
+pub const Exception = exception.Exception;
 pub const Options = onprem.Options;
 // stdlib's tables and window carve from the caller's scratch; growth beyond it
-// answers CapacityFailure — the accepted incompleteness of choosing std.
+// answers CapacityException — the accepted incompleteness of choosing std.
 pub const Properties = onprem.Properties;
 
-fn mapStreamError(err: std.Io.Reader.StreamError) Failure {
+fn mapStreamError(err: std.Io.Reader.StreamError) Exception {
     return switch (err) {
-        error.ReadFailed, error.EndOfStream => error.DataFailure,
-        else => failure.fromStd(err),
+        error.ReadFailed, error.EndOfStream => error.DataException,
+        else => exception.fromStd(err),
     };
 }
 
@@ -37,14 +37,14 @@ fn endedShortOfDeclared(decoder: *const std_lzma.Decompress, options: Options) b
 }
 
 // stdlib flushes the window's tail only on the success path, so a short run leaves it unflushed.
-fn drainShortRun(decoder: *std_lzma.Decompress, writer: *std.Io.Writer) Failure!void {
-    writer.writeAll(decoder.reader.buffer[decoder.reader.seek..decoder.reader.end]) catch return error.CapacityFailure;
-    decoder.buffer.finish(writer) catch return error.CapacityFailure;
+fn drainShortRun(decoder: *std_lzma.Decompress, writer: *std.Io.Writer) Exception!void {
+    writer.writeAll(decoder.reader.buffer[decoder.reader.seek..decoder.reader.end]) catch return error.CapacityException;
+    decoder.buffer.finish(writer) catch return error.CapacityException;
 }
 
 // drive decodes the raw LZMA payload (after the 13-byte .lzma header, or an
 // lzma2 chunk body) into output through the caller-provided reader.
-pub fn drive(reader: *std.Io.Reader, output: []u8, scratch: []u8, options: Options) Failure!usize {
+pub fn drive(reader: *std.Io.Reader, output: []u8, scratch: []u8, options: Options) Exception!usize {
     var fba = std.heap.FixedBufferAllocator.init(scratch);
     const allocator = fba.allocator();
     const params: std_lzma.Decode.Params = .{
@@ -52,7 +52,7 @@ pub fn drive(reader: *std.Io.Reader, output: []u8, scratch: []u8, options: Optio
         .dict_size = options.properties.dictionary_size,
         .unpacked_size = options.unpack_size,
     };
-    var decoder = std_lzma.Decompress.initParams(reader, allocator, &.{}, params, options.properties.dictionary_size) catch |err| return failure.fromStd(err);
+    var decoder = std_lzma.Decompress.initParams(reader, allocator, &.{}, params, options.properties.dictionary_size) catch |err| return exception.fromStd(err);
     defer decoder.deinit();
     var sink = std.Io.Writer.fixed(output);
     _ = decoder.reader.streamRemaining(&sink) catch |err| {
@@ -62,12 +62,12 @@ pub fn drive(reader: *std.Io.Reader, output: []u8, scratch: []u8, options: Optio
     return sink.end;
 }
 
-pub fn decode(input: []const u8, output: []u8, scratch: []u8, options: Options) Failure!usize {
+pub fn decode(input: []const u8, output: []u8, scratch: []u8, options: Options) Exception!usize {
     var reader = std.Io.Reader.fixed(input);
     return drive(&reader, output, scratch, options);
 }
 
-pub fn decodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options: Options) Failure!void {
+pub fn decodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options: Options) Exception!void {
     var fba = std.heap.FixedBufferAllocator.init(scratch);
     const allocator = fba.allocator();
     const params: std_lzma.Decode.Params = .{
@@ -76,7 +76,7 @@ pub fn decodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, 
         .unpacked_size = options.unpack_size,
     };
     var reader = std.Io.Reader.fixed(input);
-    var decoder = std_lzma.Decompress.initParams(&reader, allocator, &.{}, params, options.properties.dictionary_size) catch |err| return failure.fromStd(err);
+    var decoder = std_lzma.Decompress.initParams(&reader, allocator, &.{}, params, options.properties.dictionary_size) catch |err| return exception.fromStd(err);
     defer decoder.deinit();
     _ = decoder.reader.streamRemaining(writer) catch |err| {
         if (!endedShortOfDeclared(&decoder, options)) return mapStreamError(err);
@@ -84,7 +84,7 @@ pub fn decodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, 
     };
 }
 
-pub fn decodedSize(input: []const u8, scratch: []u8, options: Options) Failure!usize {
+pub fn decodedSize(input: []const u8, scratch: []u8, options: Options) Exception!usize {
     const measurement = @import("../../common/primitive/measurement.zig");
     var fba = std.heap.FixedBufferAllocator.init(scratch);
     const allocator = fba.allocator();
@@ -94,7 +94,7 @@ pub fn decodedSize(input: []const u8, scratch: []u8, options: Options) Failure!u
         .unpacked_size = options.unpack_size,
     };
     var reader = std.Io.Reader.fixed(input);
-    var decoder = std_lzma.Decompress.initParams(&reader, allocator, &.{}, params, options.properties.dictionary_size) catch |err| return failure.fromStd(err);
+    var decoder = std_lzma.Decompress.initParams(&reader, allocator, &.{}, params, options.properties.dictionary_size) catch |err| return exception.fromStd(err);
     defer decoder.deinit();
     var counter = measurement.Counter.init(null);
     _ = decoder.reader.streamRemaining(&counter.writer) catch |err| {

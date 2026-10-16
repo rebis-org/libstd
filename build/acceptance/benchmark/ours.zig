@@ -9,7 +9,7 @@ const metric = @import("metric.zig");
 
 const ours_caps: u64 = harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay;
 
-const Buf = struct {
+const Buffer = struct {
     // Worst case is 12 nodes on the bound-query shape, hence 16 slots.
     nodes: [16]harness.Node,
     len: usize = 0,
@@ -17,17 +17,17 @@ const Buf = struct {
 };
 
 // Filled by the query and entry builders before either is read.
-fn freshBuf() Buf {
+fn freshBuffer() Buffer {
     return .{ .nodes = undefined, .entry = undefined };
 }
 
-const Invoke = struct {
+const Invocation = struct {
     status: u32,
     len: usize,
     ns: u64,
 };
 
-fn profileOf(kind: matrix.Kind) harness.Id {
+fn profileOf(kind: matrix.Format) harness.Id {
     return switch (kind) {
         .gzip => harness.ids.gzip,
         .bzip2 => harness.ids.bzip2,
@@ -50,22 +50,22 @@ fn profileOf(kind: matrix.Kind) harness.Id {
     };
 }
 
-fn isConfirmed(kind: matrix.Kind) bool {
+fn isConfirmed(kind: matrix.Format) bool {
     return kind == .xz or kind == .zstd;
 }
 
-fn pushNode(buffer: *Buf, node: harness.Node) void {
+fn pushNode(buffer: *Buffer, node: harness.Node) void {
     buffer.nodes[buffer.len] = node;
     buffer.len += 1;
 }
 
-fn pushParams(buffer: *Buf, row: matrix.Row) void {
+fn pushParams(buffer: *Buffer, row: matrix.BenchmarkRow) void {
     for (row.params) |param| {
         pushNode(buffer, harness.paramScalar(param.family, param.ordinal, harness.cmds, param.value));
     }
 }
 
-fn buildQuery(buffer: *Buf, write: bool, row: matrix.Row, source: []const u8, sink: []u8, bound: bool) void {
+fn buildQuery(buffer: *Buffer, write: bool, row: matrix.BenchmarkRow, source: []const u8, sink: []u8, bound: bool) void {
     buffer.len = 0;
     pushNode(buffer, harness.paramProfile(profileOf(row.kind)));
     pushNode(buffer, if (row.archive and write) harness.scalarNode(harness.ids.source) else harness.sourceSpan(source));
@@ -88,15 +88,15 @@ fn buildQuery(buffer: *Buf, write: bool, row: matrix.Row, source: []const u8, si
     }
 }
 
-fn invokeKernel(env: *env_mod.Env, buffer: *Buf, write: bool, workspace: []u8) Invoke {
+fn invokeKernel(env: *env_mod.Env, buffer: *Buffer, write: bool, workspace: []u8) Invocation {
     harness.linkNodes(buffer.nodes[0..buffer.len]);
     var response = harness.Node.init();
-    const t0 = env.now();
+    const t0 = env.nowNs();
     const status = harness.invoke(if (write) harness.ids.write else harness.ids.read, &buffer.nodes[0], &response, workspace.ptr, workspace.len, null, null, null);
-    return .{ .status = status, .len = @intCast(response.byte_length), .ns = env.now() - t0 };
+    return .{ .status = status, .len = @intCast(response.byte_length), .ns = env.nowNs() - t0 };
 }
 
-fn decodeVerify(env: *env_mod.Env, buffer: *Buf, row: matrix.Row, archive: []const u8, expected: []const u8, decoded: []u8, workspace: []u8) metric.Metric {
+fn decodeVerify(env: *env_mod.Env, buffer: *Buffer, row: matrix.BenchmarkRow, archive: []const u8, expected: []const u8, decoded: []u8, workspace: []u8) metric.Metric {
     buildQuery(buffer, false, row, archive, decoded, false);
     const result = invokeKernel(env, buffer, false, workspace);
     if (result.status != 0) {
@@ -104,13 +104,13 @@ fn decodeVerify(env: *env_mod.Env, buffer: *Buf, row: matrix.Row, archive: []con
     }
     return .{
         .decode_ns = result.ns,
-        .ok = result.status == 0 and metric.decodeOk(result.len, expected, decoded),
+        .ok = result.status == 0 and metric.isDecodeOk(result.len, expected, decoded),
     };
 }
 
-pub fn transform(env: *env_mod.Env, row: matrix.Row, input: []const u8, encoded: []u8, decoded: []u8, workspace: []u8) metric.Metric {
+pub fn transform(env: *env_mod.Env, row: matrix.BenchmarkRow, input: []const u8, encoded: []u8, decoded: []u8, workspace: []u8) metric.Metric {
     if (row.bypass) return bypassTransform(env, row, input, encoded, decoded, workspace);
-    var buffer = freshBuf();
+    var buffer = freshBuffer();
     buildQuery(&buffer, true, row, input, encoded, env.bounded);
     const write_result = invokeKernel(env, &buffer, true, workspace);
     if (write_result.status != 0 or write_result.len == 0 or write_result.len > encoded.len) {
@@ -122,20 +122,20 @@ pub fn transform(env: *env_mod.Env, row: matrix.Row, input: []const u8, encoded:
 }
 
 // Bypass row caller-wires the zstd leaf with no kernel in the loop. The untimed kernel transform proves byte-identity.
-fn castOr(comptime T: type, value: u64, fallback: T) T {
+fn castOrFallback(comptime T: type, value: u64, fallback: T) T {
     return std.math.cast(T, value) orelse fallback;
 }
 
-fn bypassOptions(row: matrix.Row) bypass.Options {
+fn optionsForBypass(row: matrix.BenchmarkRow) bypass.Options {
     var options: bypass.Options = .{ .window_size = 1 << 21 };
     for (row.params) |param| {
         switch (param.ordinal) {
-            1 => options.window_size = castOr(u32, param.value, options.window_size),
+            1 => options.window_size = castOrFallback(u32, param.value, options.window_size),
             2 => {},
-            3 => options.hash_bits = castOr(u5, param.value, options.hash_bits),
-            4 => options.max_chain = castOr(u32, param.value, options.max_chain),
-            5 => options.nice_len = castOr(u32, param.value, options.nice_len),
-            6 => options.search_window = castOr(u32, param.value, options.search_window),
+            3 => options.hash_bits = castOrFallback(u5, param.value, options.hash_bits),
+            4 => options.max_chain = castOrFallback(u32, param.value, options.max_chain),
+            5 => options.nice_len = castOrFallback(u32, param.value, options.nice_len),
+            6 => options.search_window = castOrFallback(u32, param.value, options.search_window),
             7 => options.lazy = param.value != 0,
             8 => options.skip_interior_insert = param.value != 0,
             9 => options.double_hash = param.value != 0,
@@ -146,8 +146,8 @@ fn bypassOptions(row: matrix.Row) bypass.Options {
     return options;
 }
 
-fn bypassTransform(env: *env_mod.Env, row: matrix.Row, input: []const u8, encoded: []u8, decoded: []u8, workspace: []u8) metric.Metric {
-    const options = bypassOptions(row);
+fn bypassTransform(env: *env_mod.Env, row: matrix.BenchmarkRow, input: []const u8, encoded: []u8, decoded: []u8, workspace: []u8) metric.Metric {
+    const options = optionsForBypass(row);
     // Decode needs no more than the encode history: size once, reuse for both.
     const history_len = bypass.zstdEncodeHistoryLen(input.len, 0, options);
 
@@ -167,17 +167,17 @@ fn bypassTransform(env: *env_mod.Env, row: matrix.Row, input: []const u8, encode
     const history = env.allocator.alloc(u8, history_len) catch return .{ .ok = false };
     defer env.allocator.free(history);
 
-    const t0 = env.now();
+    const t0 = env.nowNs();
     const encoded_size = bypass.zstdEncode(.{ .ptr = input.ptr, .len = input.len }, .{ .ptr = encoded.ptr, .len = encoded.len }, .{ .ptr = history.ptr, .len = history.len }, .{ .ptr = workspace.ptr, .len = workspace.len }, options) catch |err| {
         std.debug.print("bypass {s}: encode failed: {s}\n", .{ row.name, @errorName(err) });
         return .{ .ok = false };
     };
-    const t1 = env.now();
+    const t1 = env.nowNs();
     const decoded_size = bypass.zstdDecodeStream(.{ .ptr = encoded.ptr, .len = encoded_size }, .{ .ptr = decoded.ptr, .len = decoded.len }, .{ .ptr = history.ptr, .len = history.len }, options) catch |err| {
         std.debug.print("bypass {s}: decode failed: {s}\n", .{ row.name, @errorName(err) });
         return .{ .encode_ns = t1 - t0, .encoded = encoded_size, .ok = false };
     };
-    const t2 = env.now();
+    const t2 = env.nowNs();
 
     const identical = encoded_size == kernel.encoded and
         std.mem.eql(u8, encoded[0..encoded_size], kernel_encoded[0..kernel.encoded]) and
@@ -188,8 +188,8 @@ fn bypassTransform(env: *env_mod.Env, row: matrix.Row, input: []const u8, encode
 }
 
 // Buffer carries the analytic bound: the bzip2 bound alone exceeds the 1.5x heuristic.
-pub fn encodedBound(row: matrix.Row, input: []const u8, workspace: []u8) !usize {
-    var buffer = freshBuf();
+pub fn encodedBound(row: matrix.BenchmarkRow, input: []const u8, workspace: []u8) !usize {
+    var buffer = freshBuffer();
     buffer.len = 0;
     pushNode(&buffer, harness.paramProfile(profileOf(row.kind)));
     pushNode(&buffer, harness.paramTargetCommand(harness.ids.write));
@@ -206,7 +206,7 @@ pub fn encodedBound(row: matrix.Row, input: []const u8, workspace: []u8) !usize 
     return @intCast(response.byte_length);
 }
 
-pub fn decodeOnly(env: *env_mod.Env, row: matrix.Row, archive: []const u8, expected: []const u8, decoded: []u8, workspace: []u8) metric.Metric {
-    var buffer = freshBuf();
+pub fn decodeOnly(env: *env_mod.Env, row: matrix.BenchmarkRow, archive: []const u8, expected: []const u8, decoded: []u8, workspace: []u8) metric.Metric {
+    var buffer = freshBuffer();
     return decodeVerify(env, &buffer, row, archive, expected, decoded, workspace);
 }

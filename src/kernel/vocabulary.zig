@@ -1,11 +1,11 @@
 const contract = @import("interface").contract;
 
-const failure = @import("../common/primitive/failure.zig");
+const exception = @import("../common/primitive/exception.zig");
 const envelope = @import("envelope.zig");
 
 pub const CommitMode = contract.CommitMode;
 pub const SizingMode = contract.SizingMode;
-pub const Failure = failure.Failure;
+pub const Exception = exception.Exception;
 const Id = envelope.Id;
 const Status = envelope.Status;
 
@@ -124,7 +124,7 @@ pub fn commandMaskForId(id: Id) u32 {
 }
 
 pub const ErrorMap = struct {
-    failure: Failure,
+    exception: Exception,
     name: []const u8,
     status: u32,
     diagnostic: Id,
@@ -239,14 +239,14 @@ pub const ids = struct {
 };
 
 pub const error_map = [_]ErrorMap{
-    .{ .failure = error.CallFailure, .name = "invalid_call", .status = Status.invalid_call, .diagnostic = ids.invalid_call },
-    .{ .failure = error.UnsupportedFailure, .name = "unsupported", .status = Status.unsupported, .diagnostic = ids.unsupported },
-    .{ .failure = error.InternalFailure, .name = "internal_failure", .status = Status.internal_failure, .diagnostic = ids.internal_failure },
-    .{ .failure = error.ResourceFailure, .name = "resource_limit", .status = Status.resource_limit, .diagnostic = ids.diagnostic_resource_limit },
-    .{ .failure = error.CapacityFailure, .name = "insufficient_capacity", .status = Status.insufficient_capacity, .diagnostic = ids.insufficient_capacity },
-    .{ .failure = error.DataFailure, .name = "invalid_data", .status = Status.invalid_data, .diagnostic = ids.invalid_data },
-    .{ .failure = error.IntegrityFailure, .name = "integrity_failure", .status = Status.integrity_failure, .diagnostic = ids.integrity_failure },
-    .{ .failure = error.IoFailure, .name = "io_failure", .status = Status.io_failure, .diagnostic = ids.io_failure },
+    .{ .exception = error.CallException, .name = "invalid_call", .status = Status.invalid_call, .diagnostic = ids.invalid_call },
+    .{ .exception = error.UnsupportedException, .name = "unsupported", .status = Status.unsupported, .diagnostic = ids.unsupported },
+    .{ .exception = error.InternalException, .name = "internal_failure", .status = Status.internal_failure, .diagnostic = ids.internal_failure },
+    .{ .exception = error.ResourceException, .name = "resource_limit", .status = Status.resource_limit, .diagnostic = ids.diagnostic_resource_limit },
+    .{ .exception = error.CapacityException, .name = "insufficient_capacity", .status = Status.insufficient_capacity, .diagnostic = ids.insufficient_capacity },
+    .{ .exception = error.DataException, .name = "invalid_data", .status = Status.invalid_data, .diagnostic = ids.invalid_data },
+    .{ .exception = error.IntegrityException, .name = "integrity_failure", .status = Status.integrity_failure, .diagnostic = ids.integrity_failure },
+    .{ .exception = error.IoException, .name = "io_failure", .status = Status.io_failure, .diagnostic = ids.io_failure },
 };
 
 pub fn eql(left: Id, right: Id) bool {

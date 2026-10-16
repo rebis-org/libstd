@@ -8,17 +8,17 @@ pub const Provider = @import("seam").Provider;
 const offprem = @import("offprem.zig");
 const onprem = @import("onprem.zig");
 
-pub const Failure = offprem.Failure;
+pub const Exception = offprem.Exception;
 
 pub const default_provider: Provider = switch (build_options.leaf_impl) {
     .onprem, .mergeable => .onprem,
     .offprem => .offprem,
 };
 
-fn requireServed(provider: Provider, comptime served: Provider) error{UnsupportedFailure}!void {
-    if (provider != served) return error.UnsupportedFailure;
+fn requireServed(provider: Provider, comptime served: Provider) error{UnsupportedException}!void {
+    if (provider != served) return error.UnsupportedException;
 }
-pub fn decode(provider: Provider, input: []const u8, output: []u8, scratch: []u8, options: onprem.Options) Failure!usize {
+pub fn decode(provider: Provider, input: []const u8, output: []u8, scratch: []u8, options: onprem.Options) Exception!usize {
     return switch (build_options.leaf_impl) {
         .onprem => blk: {
             try requireServed(provider, .onprem);
@@ -34,7 +34,7 @@ pub fn decode(provider: Provider, input: []const u8, output: []u8, scratch: []u8
         },
     };
 }
-pub fn decodeInPlace(provider: Provider, input: []const u8, output: []u8, scratch: []u8, options: onprem.Options) Failure!usize {
+pub fn decodeInPlace(provider: Provider, input: []const u8, output: []u8, scratch: []u8, options: onprem.Options) Exception!usize {
     return switch (build_options.leaf_impl) {
         .onprem => blk: {
             try requireServed(provider, .onprem);
@@ -50,7 +50,7 @@ pub fn decodeInPlace(provider: Provider, input: []const u8, output: []u8, scratc
         },
     };
 }
-pub fn decodedSize(provider: Provider, input: []const u8, scratch: []u8, options: onprem.Options) Failure!usize {
+pub fn decodedSize(provider: Provider, input: []const u8, scratch: []u8, options: onprem.Options) Exception!usize {
     return switch (build_options.leaf_impl) {
         .onprem => blk: {
             try requireServed(provider, .onprem);
@@ -66,7 +66,7 @@ pub fn decodedSize(provider: Provider, input: []const u8, scratch: []u8, options
         },
     };
 }
-pub fn decodeToWriter(provider: Provider, input: []const u8, writer: *std.Io.Writer, scratch: []u8, options: onprem.Options) Failure!void {
+pub fn decodeToWriter(provider: Provider, input: []const u8, writer: *std.Io.Writer, scratch: []u8, options: onprem.Options) Exception!void {
     return switch (build_options.leaf_impl) {
         .onprem => blk: {
             try requireServed(provider, .onprem);

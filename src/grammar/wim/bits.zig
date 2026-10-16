@@ -1,13 +1,13 @@
 const std = @import("std");
 
-const failure_prim = @import("../../common/primitive/failure.zig");
+const exception_prim = @import("../../common/primitive/exception.zig");
 
-const Failure = failure_prim.Failure;
+const Exception = exception_prim.Exception;
 
 // Bit-level port of wimlib's input_bitstream, shared by the WIM codecs.
-// Little-endian 16-bit words are drained high byte first, most-significant
-// bit first. Interleaved extra bytes read at the raw byte cursor, not the
-// bit buffer. Overrun reads yield zeroes, matching wimlib's contract.
+// Words drain high byte first, most-significant bit first.
+// Interleaved bytes read at the raw cursor.
+// Overrun reads yield zeroes, matching wimlib's contract.
 
 pub const Bits = struct {
     data: []const u8,
@@ -63,14 +63,13 @@ pub const Bits = struct {
         return v;
     }
 
-    // Drops buffered bits so reads resume at the raw byte cursor.
     pub fn dropToCursor(b: *Bits) void {
         b.bitsleft = 0;
         b.bitbuf = 0;
     }
 
-    pub fn readBytes(b: *Bits, dst: []u8) Failure!void {
-        if (b.data.len - b.next < dst.len) return error.DataFailure;
+    pub fn readBytes(b: *Bits, dst: []u8) Exception!void {
+        if (b.data.len - b.next < dst.len) return error.DataException;
         @memcpy(dst, b.data[b.next .. b.next + dst.len]);
         b.next += dst.len;
     }
@@ -87,12 +86,12 @@ pub fn Code(comptime max_len: usize, comptime num_symbols: usize) type {
 
         const Self = @This();
 
-        pub fn init(lens: []const u8) Failure!Self {
-            if (lens.len > num_symbols) return error.DataFailure;
+        pub fn init(lens: []const u8) Exception!Self {
+            if (lens.len > num_symbols) return error.DataException;
             var self: Self = undefined;
             self.counts = @splat(0);
             for (lens) |l| {
-                if (l > max_len) return error.DataFailure;
+                if (l > max_len) return error.DataException;
                 self.counts[l] += 1;
             }
             self.counts[0] = 0;
@@ -116,12 +115,12 @@ pub fn Code(comptime max_len: usize, comptime num_symbols: usize) type {
 
         // Any bit reader with ensure/peek/pop methods is accepted; this
         // covers both the forwards WIM bitstream and the LZMS backwards one.
-        pub fn read(self: *const Self, reader: anytype) Failure!u16 {
+        pub fn read(self: *const Self, reader: anytype) Exception!u16 {
             var c: u32 = 0;
             var len: usize = 0;
             while (true) {
                 len += 1;
-                if (len > max_len) return error.DataFailure;
+                if (len > max_len) return error.DataException;
                 reader.ensure(1);
                 c = (c << 1) | @as(u32, @intCast(reader.peek(1)));
                 reader.pop(1);

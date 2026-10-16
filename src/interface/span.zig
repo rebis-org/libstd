@@ -2,16 +2,16 @@ const std = @import("std");
 
 const diagnostic = @import("diagnostic.zig");
 
-// The interface module cannot import the primitive failure set, and it never
+// The interface module cannot import the primitive exception set, and it never
 // needs to: a span crossing only answers these two. Naming the exact set keeps
 // the substrate vocabulary from becoming a second, divergent one.
-pub const Failure = error{ CallFailure, ResourceFailure };
+pub const Exception = error{ CallException, ResourceException };
 
 pub const Violation = enum { out_of_bounds, use_after_free, lease_violation, overlap };
 
 const empty_storage: [1]u8 = .{0};
 
-// Contract violations trap: out-of-provenance access is a bug, never a survivable condition.
+// Contract violations trap: out-of-provenance access is a defect, never a survivable condition.
 pub fn trap(violation: Violation, context: []const u8) noreturn {
     var message_storage: [128]u8 = undefined;
     var message_writer: std.Io.Writer = std.Io.Writer.fixed(&message_storage);
@@ -64,20 +64,20 @@ fn SpanFor(comptime Pointer: type) type {
 pub const Span = SpanFor([*]u8);
 pub const ConstSpan = SpanFor([*]const u8);
 
-fn spanFrom(comptime Pointer: type, base: ?Pointer, length: u64) Failure!SpanFor(Pointer) {
-    const count = std.math.cast(usize, length) orelse return error.ResourceFailure;
+fn spanFrom(comptime Pointer: type, base: ?Pointer, length: u64) Exception!SpanFor(Pointer) {
+    const count = std.math.cast(usize, length) orelse return error.ResourceException;
     // A zero length never dereferences the pointer, so the immutable empty
     // storage stands in for the null a caller may legitimately pass.
     if (count == 0) return .{ .ptr = @constCast(&empty_storage), .len = 0 };
-    const live = base orelse return error.CallFailure;
+    const live = base orelse return error.CallException;
     return .{ .ptr = live, .len = count };
 }
 
-pub fn mutSpan(pointer: ?[*]u8, length: u64) Failure!Span {
+pub fn mutSpan(pointer: ?[*]u8, length: u64) Exception!Span {
     return spanFrom([*]u8, pointer, length);
 }
 
-pub fn constSpan(pointer: ?[*]const u8, length: u64) Failure!ConstSpan {
+pub fn constSpan(pointer: ?[*]const u8, length: u64) Exception!ConstSpan {
     return spanFrom([*]const u8, pointer, length);
 }
 

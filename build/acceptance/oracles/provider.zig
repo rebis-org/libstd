@@ -42,7 +42,7 @@ fn roundtripWithProvider(r: *Runner, profile_id: harness.Id, mode: harness.Mode,
     }
     _ = harness.call(r, harness.ids.read, read_list.items(), .{ .ctx = true });
     if (r.status != abi.Status.ok) {
-        std.debug.print("provider roundtrip read failed: status {d} provider {?d}\n", .{ r.status, provider });
+        std.debug.print("provider roundtrip read failed: status {d} provider {?d}.\n", .{ r.status, provider });
         return error.ProviderRoundtripReadFailed;
     }
     if (r.response.byte_length != provider_input.len) return error.ProviderRoundtripLengthMismatch;

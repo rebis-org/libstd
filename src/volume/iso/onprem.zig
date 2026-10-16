@@ -1,9 +1,10 @@
 const std = @import("std");
 
 const bounds = @import("../../common/primitive/bounds.zig");
-const failure_prim = @import("../../common/primitive/failure.zig");
+const exception_prim = @import("../../common/primitive/exception.zig");
+const tree_order = @import("../../common/primitive/order.zig");
 
-const Failure = failure_prim.Failure;
+const Exception = exception_prim.Exception;
 
 // ISO 9660 slice: one root directory of regular files.
 // Read prefers a Joliet supplementary descriptor.
@@ -29,7 +30,6 @@ const joliet_escape_3 = [3]u8{ '%', '/', 'E' };
 const max_entries = 256;
 const path_table_lba: u32 = 18;
 const dir_lba: u32 = 20;
-const file_start_lba: u32 = 21;
 
 pub const Entry = struct {
     name: []const u8,
@@ -48,37 +48,37 @@ const Descriptor = struct {
     joliet: bool,
 };
 
-fn bothEndianU32(raw: []const u8) Failure!u32 {
+fn bothEndianU32(raw: []const u8) Exception!u32 {
     const le = std.mem.readInt(u32, raw[0..4], .little);
     const be = std.mem.readInt(u32, raw[4..8], .big);
-    if (le != be) return error.DataFailure;
+    if (le != be) return error.DataException;
     return le;
 }
 
-fn bothEndianU16(raw: []const u8) Failure!u16 {
+fn bothEndianU16(raw: []const u8) Exception!u16 {
     const le = std.mem.readInt(u16, raw[0..2], .little);
     const be = std.mem.readInt(u16, raw[2..4], .big);
-    if (le != be) return error.DataFailure;
+    if (le != be) return error.DataException;
     return le;
 }
 
-fn findDescriptor(archive: []const u8, want: u8) Failure!?Descriptor {
+fn findDescriptor(archive: []const u8, want: u8) Exception!?Descriptor {
     var sector: u64 = pvd_sector;
     while (true) {
-        const base = std.math.mul(u64, sector, sector_size) catch return error.DataFailure;
+        const base = std.math.mul(u64, sector, sector_size) catch return error.DataException;
         const sec = try bounds.slice(archive, base, sector_size);
         const dtype = sec[0];
-        if (!std.mem.eql(u8, sec[1..6], volume_descriptor_magic)) return error.DataFailure;
+        if (!std.mem.eql(u8, sec[1..6], volume_descriptor_magic)) return error.DataException;
         if (dtype == descriptor_terminator) return null;
         if (dtype == want) {
             const block_size = try bothEndianU16(sec[128..132]);
-            if (block_size != sector_size) return error.UnsupportedFailure;
+            if (block_size != sector_size) return error.UnsupportedException;
             const escape = sec[88..120];
             const joliet = std.mem.eql(u8, escape[0..3], &joliet_escape_1) or
                 std.mem.eql(u8, escape[0..3], &joliet_escape_2) or
                 std.mem.eql(u8, escape[0..3], &joliet_escape_3);
             const root = sec[156..190];
-            if (root[0] == 0) return error.DataFailure;
+            if (root[0] == 0) return error.DataException;
             return .{
                 .block_size = block_size,
                 .root_extent = try bothEndianU32(root[2..10]),
@@ -87,15 +87,15 @@ fn findDescriptor(archive: []const u8, want: u8) Failure!?Descriptor {
             };
         }
         sector += 1;
-        if (sector > pvd_sector + 16) return error.DataFailure;
+        if (sector > pvd_sector + 16) return error.DataException;
     }
 }
 
-fn chosenDescriptor(archive: []const u8) Failure!Descriptor {
+fn chosenDescriptor(archive: []const u8) Exception!Descriptor {
     if (try findDescriptor(archive, descriptor_supplementary)) |svd| {
         if (svd.joliet) return svd;
     }
-    return (try findDescriptor(archive, descriptor_primary)) orelse error.DataFailure;
+    return (try findDescriptor(archive, descriptor_primary)) orelse error.DataException;
 }
 
 const Record = struct {
@@ -107,14 +107,14 @@ const Record = struct {
     is_dotdot: bool,
 };
 
-fn parseRecord(dir: []const u8, at: usize) Failure!?Record {
+fn parseRecord(dir: []const u8, at: usize) Exception!?Record {
     if (at >= dir.len) return null;
     const len = dir[at];
     if (len == 0) return null;
-    if (at + len > dir.len or len < 33 + 1) return error.DataFailure;
+    if (at + len > dir.len or len < 33 + 1) return error.DataException;
     const raw = dir[at .. at + len];
     const name_len = raw[32];
-    if (33 + name_len > len) return error.DataFailure;
+    if (33 + name_len > len) return error.DataException;
     return .{
         .extent = try bothEndianU32(raw[2..10]),
         .size = try bothEndianU32(raw[10..18]),
@@ -132,7 +132,7 @@ const Target = union(enum) {
 
 const WalkState = struct { ordinal: u64 = 0 };
 
-fn walkRoot(archive: []const u8, desc: Descriptor, target: Target) Failure!u64 {
+fn walkRoot(archive: []const u8, desc: Descriptor, target: Target) Exception!u64 {
     var state = WalkState{};
     var found = false;
     const resolved = switch (target) {
@@ -142,16 +142,16 @@ fn walkRoot(archive: []const u8, desc: Descriptor, target: Target) Failure!u64 {
     try walkIsoDir(archive, desc.root_extent, desc.root_size, resolved, &state);
     return switch (target) {
         .count => state.ordinal,
-        .resolve => if (found) state.ordinal else error.DataFailure,
+        .resolve => if (found) state.ordinal else error.DataException,
     };
 }
 
-fn walkIsoDir(archive: []const u8, extent: u32, size: u32, target: Target, state: *WalkState) Failure!void {
-    const dir = try bounds.slice(archive, std.math.mul(u64, extent, sector_size) catch return error.DataFailure, size);
-    const dot = (try parseRecord(dir, 0)) orelse return error.DataFailure;
-    if (!dot.is_dot) return error.DataFailure;
-    const dotdot = (try parseRecord(dir, dot.skip)) orelse return error.DataFailure;
-    if (!dotdot.is_dotdot) return error.DataFailure;
+fn walkIsoDir(archive: []const u8, extent: u32, size: u32, target: Target, state: *WalkState) Exception!void {
+    const dir = try bounds.slice(archive, std.math.mul(u64, extent, sector_size) catch return error.DataException, size);
+    const dot = (try parseRecord(dir, 0)) orelse return error.DataException;
+    if (!dot.is_dot) return error.DataException;
+    const dotdot = (try parseRecord(dir, dot.skip)) orelse return error.DataException;
+    if (!dotdot.is_dotdot) return error.DataException;
     var pos: usize = dot.skip + dotdot.skip;
     const found_ptr = switch (target) {
         .resolve => |res| res.found,
@@ -175,8 +175,8 @@ fn walkIsoDir(archive: []const u8, extent: u32, size: u32, target: Target, state
                     res.info.size = rec.size;
                     res.info.ordinal = state.ordinal;
                     if (res.output) |out| {
-                        if (out.len < rec.size) return error.CapacityFailure;
-                        const data = try bounds.slice(archive, std.math.mul(u64, rec.extent, sector_size) catch return error.DataFailure, rec.size);
+                        if (out.len < rec.size) return error.CapacityException;
+                        const data = try bounds.slice(archive, std.math.mul(u64, rec.extent, sector_size) catch return error.DataException, rec.size);
                         @memcpy(out[0..rec.size], data);
                     }
                     res.found.* = true;
@@ -188,22 +188,26 @@ fn walkIsoDir(archive: []const u8, extent: u32, size: u32, target: Target, state
     }
 }
 
-pub fn inspectCount(archive: []const u8, scratch: []u8) Failure!u64 {
-    _ = scratch;
-    return walkRoot(archive, try chosenDescriptor(archive), .count);
+fn walkChosen(archive: []const u8, target: Target) Exception!u64 {
+    return walkRoot(archive, try chosenDescriptor(archive), target);
 }
 
-pub fn inspectOrdinal(archive: []const u8, ordinal: u64, scratch: []u8) Failure!EntryInfo {
+pub fn inspectCount(archive: []const u8, scratch: []u8) Exception!u64 {
+    _ = scratch;
+    return walkChosen(archive, .count);
+}
+
+pub fn inspectOrdinal(archive: []const u8, ordinal: u64, scratch: []u8) Exception!EntryInfo {
     _ = scratch;
     var info: EntryInfo = undefined;
-    _ = try walkRoot(archive, try chosenDescriptor(archive), .{ .resolve = .{ .ordinal = ordinal, .info = &info, .output = null } });
+    _ = try walkChosen(archive, .{ .resolve = .{ .ordinal = ordinal, .info = &info, .output = null } });
     return info;
 }
 
-pub fn decodeOrdinal(archive: []const u8, ordinal: u64, output: []u8, scratch: []u8) Failure!usize {
+pub fn decodeOrdinal(archive: []const u8, ordinal: u64, output: []u8, scratch: []u8) Exception!usize {
     _ = scratch;
     var info: EntryInfo = undefined;
-    _ = try walkRoot(archive, try chosenDescriptor(archive), .{ .resolve = .{ .ordinal = ordinal, .info = &info, .output = output } });
+    _ = try walkChosen(archive, .{ .resolve = .{ .ordinal = ordinal, .info = &info, .output = output } });
     return @intCast(info.size);
 }
 
@@ -230,23 +234,23 @@ const IsoPlan = struct {
     total: u64,
 };
 
-fn isoFindOrCreateDir(nodes: *std.ArrayList(IsoNode), alloc: std.mem.Allocator, parent: u32, name: []const u8) Failure!u32 {
+fn isoFindOrCreateDir(nodes: *std.ArrayList(IsoNode), alloc: std.mem.Allocator, parent: u32, name: []const u8) Exception!u32 {
     for (nodes.items, 0..) |node, i| {
         if (node.kind == .dir and node.parent == parent and std.mem.eql(u8, node.name, name)) return @intCast(i);
     }
     const idx: u32 = @intCast(nodes.items.len);
-    nodes.append(alloc, .{ .kind = .dir, .name = name, .parent = parent }) catch return error.ResourceFailure;
+    nodes.append(alloc, .{ .kind = .dir, .name = name, .parent = parent }) catch return error.ResourceException;
     nodes.items[parent].child_count += 1;
     return idx;
 }
 
-fn buildIsoPlan(entries: []const Entry, alloc: std.mem.Allocator) Failure!IsoPlan {
-    if (entries.len == 0 or entries.len > max_entries) return error.UnsupportedFailure;
+fn buildIsoPlan(entries: []const Entry, alloc: std.mem.Allocator) Exception!IsoPlan {
+    if (entries.len == 0 or entries.len > max_entries) return error.UnsupportedException;
     var nodes: std.ArrayList(IsoNode) = .empty;
-    nodes.append(alloc, .{ .kind = .dir, .name = "", .parent = 0 }) catch return error.ResourceFailure;
+    nodes.append(alloc, .{ .kind = .dir, .name = "", .parent = 0 }) catch return error.ResourceException;
     for (entries) |entry| {
         try validateName(entry.name);
-        if (entry.data.len > std.math.maxInt(u32)) return error.UnsupportedFailure;
+        if (entry.data.len > std.math.maxInt(u32)) return error.UnsupportedException;
         var parent: u32 = 0;
         var it = std.mem.splitScalar(u8, entry.name, '/');
         var comp = it.next().?;
@@ -254,24 +258,24 @@ fn buildIsoPlan(entries: []const Entry, alloc: std.mem.Allocator) Failure!IsoPla
             parent = try isoFindOrCreateDir(&nodes, alloc, parent, comp);
             comp = next;
         }
-        nodes.append(alloc, .{ .kind = .file, .name = comp, .parent = parent, .data = entry.data }) catch return error.ResourceFailure;
+        nodes.append(alloc, .{ .kind = .file, .name = comp, .parent = parent, .data = entry.data }) catch return error.ResourceException;
         nodes.items[parent].child_count += 1;
     }
-    if (nodes.items.len > max_tree_nodes) return error.UnsupportedFailure;
+    if (nodes.items.len > max_tree_nodes) return error.UnsupportedException;
 
-    const counts = alloc.alloc(u32, nodes.items.len) catch return error.ResourceFailure;
+    const counts = alloc.alloc(u32, nodes.items.len) catch return error.ResourceException;
     @memset(counts, 0);
     for (nodes.items, 0..) |node, i| {
         if (i != 0) counts[node.parent] += 1;
     }
-    const starts = alloc.alloc(u32, nodes.items.len) catch return error.ResourceFailure;
+    const starts = alloc.alloc(u32, nodes.items.len) catch return error.ResourceException;
     var acc: u32 = 0;
     for (counts, 0..) |c, i| {
         starts[i] = acc;
         acc += c;
     }
-    const kids = alloc.alloc(u32, acc) catch return error.ResourceFailure;
-    const fill = alloc.alloc(u32, nodes.items.len) catch return error.ResourceFailure;
+    const kids = alloc.alloc(u32, acc) catch return error.ResourceException;
+    const fill = alloc.alloc(u32, nodes.items.len) catch return error.ResourceException;
     @memcpy(fill, starts);
     for (nodes.items, 0..) |node, i| {
         if (i == 0) continue;
@@ -290,25 +294,25 @@ fn buildIsoPlan(entries: []const Entry, alloc: std.mem.Allocator) Failure!IsoPla
 
     var dir_order: std.ArrayList(u32) = .empty;
     var file_order: std.ArrayList(u32) = .empty;
-    try isoDfs(&nodes, kids, 0, &dir_order, &file_order, alloc);
+    try tree_order.orderTree(IsoNode, &nodes, kids, 0, &dir_order, &file_order, alloc);
 
-    const dir_content = alloc.alloc(u32, dir_order.items.len) catch return error.ResourceFailure;
+    const dir_content = alloc.alloc(u32, dir_order.items.len) catch return error.ResourceException;
     for (dir_order.items, 0..) |ni, di| {
         const node = &nodes.items[ni];
-        var size: u32 = 33 + 1; // dot-dot record
-        size += if (di == 0) 33 + 1 + rr_size_dot_sua else 33 + 1;
+        var size: u32 = 33 + 1; // dot record
+        size += if (di == 0) 33 + 1 + rr_size_dot_sua else 33 + 1; // dotdot record
         for (kids[node.first_child .. node.first_child + node.child_count]) |ci| {
             size += @intCast(dirRecordSize(nodes.items[ci].name.len, true));
         }
-        if (size > sector_size) return error.UnsupportedFailure;
+        if (size > sector_size) return error.UnsupportedException;
         dir_content[di] = size;
     }
 
-    const dir_lba_of = alloc.alloc(u32, dir_order.items.len) catch return error.ResourceFailure;
+    const dir_lba_of = alloc.alloc(u32, dir_order.items.len) catch return error.ResourceException;
     for (dir_order.items, 0..) |_, di| {
         dir_lba_of[di] = dir_lba + @as(u32, @intCast(di));
     }
-    const file_lba_of = alloc.alloc(u32, file_order.items.len) catch return error.ResourceFailure;
+    const file_lba_of = alloc.alloc(u32, file_order.items.len) catch return error.ResourceException;
     var lba: u32 = dir_lba + @as(u32, @intCast(dir_order.items.len));
     for (file_order.items, 0..) |ni, fi| {
         file_lba_of[fi] = lba;
@@ -336,32 +340,19 @@ fn buildIsoPlan(entries: []const Entry, alloc: std.mem.Allocator) Failure!IsoPla
     };
 }
 
-fn isoDfs(nodes: *std.ArrayList(IsoNode), kids: []const u32, dir_index: u32, dir_order: *std.ArrayList(u32), file_order: *std.ArrayList(u32), alloc: std.mem.Allocator) Failure!void {
-    dir_order.append(alloc, dir_index) catch return error.ResourceFailure;
-    const start = nodes.items[dir_index].first_child;
-    const end = start + nodes.items[dir_index].child_count;
-    for (kids[start..end]) |ci| {
-        if (nodes.items[ci].kind == .dir) {
-            try isoDfs(nodes, kids, ci, dir_order, file_order, alloc);
-        } else {
-            file_order.append(alloc, ci) catch return error.ResourceFailure;
-        }
-    }
-}
-
-pub fn archiveSize(entries: []const Entry) Failure!u64 {
+pub fn archiveSize(entries: []const Entry) Exception!u64 {
     var stack: [32 * 1024]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&stack);
     const plan = try buildIsoPlan(entries, fba.allocator());
     return plan.total;
 }
 
-fn validateName(name: []const u8) Failure!void {
-    if (name.len == 0 or name.len > 250) return error.CallFailure;
+fn validateName(name: []const u8) Exception!void {
+    if (name.len == 0 or name.len > 250) return error.CallException;
     var it = std.mem.splitScalar(u8, name, '/');
     while (it.next()) |part| {
-        if (part.len == 0) return error.CallFailure;
-        if (std.mem.findScalar(u8, part, ';') != null) return error.CallFailure;
+        if (part.len == 0) return error.CallException;
+        if (std.mem.findScalar(u8, part, ';') != null) return error.CallException;
     }
 }
 
@@ -423,17 +414,12 @@ fn writePvd(out: []u8, plan: *const IsoPlan) void {
     std.mem.writeInt(u32, out[148..152], path_table_lba + 1, .big);
     std.mem.writeInt(u32, out[152..156], 0, .big);
     writeBaseRecord(out[156..190], dir_lba, plan.dir_content[0], true, 1, 0);
-    writeFixedText(out[190..318]);
-    writeFixedText(out[318..446]);
-    writeFixedText(out[446..574]);
-    writeFixedText(out[574..702]);
-    writeFixedText(out[702..739]);
-    writeFixedText(out[739..776]);
-    writeFixedText(out[776..813]);
-    writeTimestamp(out[813..830]);
-    writeTimestamp(out[830..847]);
-    writeTimestamp(out[847..864]);
-    writeTimestamp(out[864..881]);
+    for ([_][2]usize{ .{ 190, 318 }, .{ 318, 446 }, .{ 446, 574 }, .{ 574, 702 }, .{ 702, 739 }, .{ 739, 776 }, .{ 776, 813 } }) |r| {
+        writeFixedText(out[r[0]..r[1]]);
+    }
+    for ([_][2]usize{ .{ 813, 830 }, .{ 830, 847 }, .{ 847, 864 }, .{ 864, 881 } }) |r| {
+        writeTimestamp(out[r[0]..r[1]]);
+    }
     out[881] = 1;
 }
 
@@ -479,11 +465,13 @@ fn writePathTable(sector: []u8, plan: *const IsoPlan, big_endian: bool) void {
     }
 }
 
-fn parentRank(plan: *const IsoPlan, parent_node: u32) u32 {
-    for (plan.dir_order, 0..) |ni, di| {
-        if (ni == parent_node) return @intCast(di + 1);
-    }
+fn rankOf(order: []const u32, node: u32) usize {
+    for (order, 0..) |ni, i| if (ni == node) return i;
     unreachable;
+}
+
+fn parentRank(plan: *const IsoPlan, parent_node: u32) u32 {
+    return @intCast(rankOf(plan.dir_order, parent_node) + 1);
 }
 
 const rr_size_sp: usize = 7;
@@ -494,11 +482,15 @@ const rr_er_payload = "IEEE_P1282" ++
 const rr_size_er: usize = 4 + 4 + rr_er_payload.len;
 const rr_size_dot_sua: usize = rr_size_sp + rr_size_er;
 
-fn writeRrSp(out: []u8) usize {
-    out[0] = 'S';
-    out[1] = 'P';
-    out[2] = rr_size_sp;
+fn rrHead(out: []u8, a: u8, b: u8, len: usize) void {
+    out[0] = a;
+    out[1] = b;
+    out[2] = @intCast(len);
     out[3] = 1;
+}
+
+fn writeRrSp(out: []u8) usize {
+    rrHead(out, 'S', 'P', rr_size_sp);
     out[4] = 0xbe;
     out[5] = 0xef;
     out[6] = 0;
@@ -506,10 +498,7 @@ fn writeRrSp(out: []u8) usize {
 }
 
 fn writeRrEr(out: []u8) usize {
-    out[0] = 'E';
-    out[1] = 'R';
-    out[2] = rr_size_er;
-    out[3] = 1;
+    rrHead(out, 'E', 'R', rr_size_er);
     out[4] = 10;
     out[5] = 73;
     out[6] = @intCast(rr_er_payload.len - 73 - 10);
@@ -519,10 +508,7 @@ fn writeRrEr(out: []u8) usize {
 }
 
 fn writeRrPx(out: []u8, mode: u32, serial: u32) usize {
-    out[0] = 'P';
-    out[1] = 'X';
-    out[2] = rr_size_px;
-    out[3] = 1;
+    rrHead(out, 'P', 'X', rr_size_px);
     writeU32Both(out[4..12], mode);
     writeU32Both(out[12..20], 1);
     writeU32Both(out[20..28], 0);
@@ -532,15 +518,11 @@ fn writeRrPx(out: []u8, mode: u32, serial: u32) usize {
 }
 
 fn writeRrNm(out: []u8, name: []const u8) usize {
-    const total = 4 + 1 + name.len;
-    const len = total + (total & 1);
-    out[0] = 'N';
-    out[1] = 'M';
-    out[2] = @intCast(len);
-    out[3] = 1;
+    const len = rrSizeNm(name.len);
+    rrHead(out, 'N', 'M', len);
     out[4] = 0;
     @memcpy(out[5 .. 5 + name.len], name);
-    if (total & 1 != 0) out[total] = 0;
+    if (len != 5 + name.len) out[5 + name.len] = 0;
     return len;
 }
 
@@ -556,7 +538,7 @@ fn writeDirRecord(
     stored_name_len: u8,
     rr_name: ?[]const u8,
     serial: u32,
-) Failure!void {
+) Exception!void {
     var sua: [320]u8 = undefined;
     var sua_len: usize = 0;
     // A PX mode there would override the directory mode and hide every child.
@@ -574,7 +556,7 @@ fn writeDirRecord(
     }
     const pad: usize = if (stored_name_len & 1 == 0) 1 else 0;
     const record_len = 33 + stored_name_len + pad + sua_len;
-    if (record_len > 255) return error.UnsupportedFailure;
+    if (record_len > 255) return error.UnsupportedException;
     const at = pos.*;
     writeBaseRecord(block[at .. at + 34], extent, size, directory, stored_name_len, stored_name[0]);
     block[at] = @intCast(record_len);
@@ -589,12 +571,12 @@ fn writeDirRecord(
     pos.* = at + record_len;
 }
 
-pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Failure!usize {
+pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Exception!usize {
     _ = scratch;
     var stack: [32 * 1024]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&stack);
     const plan = try buildIsoPlan(entries, fba.allocator());
-    if (output.len < plan.total) return error.CapacityFailure;
+    if (output.len < plan.total) return error.CapacityException;
     @memset(output[0..plan.total], 0);
     writePvd(output[16 * sector_size ..][0..sector_size], &plan);
     const vdst = output[17 * sector_size ..][0..sector_size];
@@ -604,8 +586,7 @@ pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Failure!usize
     vdst[6] = 1;
     writePathTable(output[18 * sector_size ..][0..sector_size], &plan, false);
     writePathTable(output[19 * sector_size ..][0..sector_size], &plan, true);
-    // One sector per directory, in path-table order. PX serials must be
-    // unique per file or Rock Ridge readers collapse them into hardlinks.
+    // PX serials must be unique per file or Rock Ridge readers collapse them into hardlinks.
     var serial: u32 = 2;
     for (plan.dir_order, 0..) |ni, di| {
         const node = &plan.nodes[ni];
@@ -619,7 +600,7 @@ pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Failure!usize
         for (plan.kids[node.first_child .. node.first_child + node.child_count]) |ci| {
             const child = &plan.nodes[ci];
             var stored: [252]u8 = undefined;
-            if (child.name.len + 2 > stored.len) return error.UnsupportedFailure;
+            if (child.name.len + 2 > stored.len) return error.UnsupportedException;
             @memcpy(stored[0..child.name.len], child.name);
             stored[child.name.len] = ';';
             stored[child.name.len + 1] = '1';
@@ -633,28 +614,22 @@ pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Failure!usize
                 serial += 1;
             }
         }
-        @memcpy(output[std.math.mul(u64, plan.dir_lba_of[di], sector_size) catch return error.DataFailure ..][0..sector_size], &dir);
+        @memcpy(output[std.math.mul(u64, plan.dir_lba_of[di], sector_size) catch return error.DataException ..][0..sector_size], &dir);
     }
     for (plan.file_order, 0..) |ni, fi| {
         const node = &plan.nodes[ni];
-        const at = std.math.mul(u64, plan.file_lba_of[fi], sector_size) catch return error.DataFailure;
+        const at = std.math.mul(u64, plan.file_lba_of[fi], sector_size) catch return error.DataException;
         @memcpy(output[at .. at + node.data.len], node.data);
     }
     return @intCast(plan.total);
 }
 
 fn childRank(plan: *const IsoPlan, node_index: u32) usize {
-    for (plan.dir_order, 0..) |ni, di| {
-        if (ni == node_index) return di;
-    }
-    unreachable;
+    return rankOf(plan.dir_order, node_index);
 }
 
 fn fileRank(plan: *const IsoPlan, node_index: u32) usize {
-    for (plan.file_order, 0..) |ni, fi| {
-        if (ni == node_index) return fi;
-    }
-    unreachable;
+    return rankOf(plan.file_order, node_index);
 }
 
 test "iso write roundtrips nested directories" {
@@ -687,8 +662,6 @@ test "iso prefers a joliet supplementary descriptor" {
     var archive: [32 * sector_size]u8 = undefined;
     var scratch: [scratch_size]u8 = undefined;
     const written = try encode(&entries, &archive, &scratch);
-    // Hand-built Joliet fixture: an SVD with the escape sequence.
-    // It shares the primary descriptor's directory tree.
     const svd = archive[17 * sector_size ..][0..sector_size];
     @memcpy(svd[0..], archive[16 * sector_size ..][0..sector_size]);
     svd[0] = descriptor_supplementary;

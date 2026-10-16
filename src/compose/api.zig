@@ -4,7 +4,7 @@ const envelope = @import("../kernel/envelope.zig");
 const vocabulary = @import("../kernel/vocabulary.zig");
 const drivers = @import("drivers.zig");
 const sessions = @import("sessions.zig");
-const Failure = @import("../common/primitive/failure.zig").Failure;
+const Exception = @import("../common/primitive/exception.zig").Exception;
 
 // Caller-owned storage: the handle IS the storage pointer, so no allocator, registry, or global state and sessions stay isolated.
 // Destroy clears the cookie so post-destroy steps fail deterministically. No span constructor because it would be a no-op.
@@ -24,8 +24,8 @@ const default_max_decoded: u64 = 16 << 30;
 const default_max_work: u64 = 4 << 30;
 const default_max_entries: u64 = 1 << 20;
 
-fn failureStatus(failure: Failure) u32 {
-    inline for (vocabulary.error_map) |entry| if (failure == entry.failure) return entry.status;
+fn exceptionStatus(exception: Exception) u32 {
+    inline for (vocabulary.error_map) |entry| if (exception == entry.exception) return entry.status;
     return envelope.Status.internal_failure;
 }
 
@@ -35,7 +35,7 @@ const SessionDef = struct {
     component: [:0]const u8,
     verb: [:0]const u8,
     storage: *const fn () usize,
-    session: *const fn ([]u8, sessions.Budgets) Failure!Session,
+    session: *const fn ([]u8, sessions.Budgets) Exception!Session,
 };
 // tar/write left the boundary: store-only fixed-mode framing cannot express
 // typeflags, links, modes, or pax names.
@@ -111,9 +111,9 @@ fn createWithBudgets(
         return envelope.Status.insufficient_capacity;
     }
     const state_storage = bytes[driverStateOffset() .. std.math.cast(usize, storage_len) orelse return envelope.Status.insufficient_capacity];
-    const session = session_defs[index].session(state_storage, budgets) catch |failure| {
+    const session = session_defs[index].session(state_storage, budgets) catch |exception| {
         markDead(bytes, storage_len);
-        return failureStatus(failure);
+        return exceptionStatus(exception);
     };
     std.mem.bytesAsValue(Session, bytes[0..@sizeOf(Session)]).* = session;
     const live = std.mem.bytesAsValue(Session, bytes[0..@sizeOf(Session)]);
@@ -162,6 +162,7 @@ fn driverStateOffset() usize {
 }
 
 // u128 arithmetic keeps the end computation overflow-free for hostile lengths.
+// The C boundary reports no failure, so the check stays infallible.
 fn rangesOverlap(a: ?[*]const u8, a_len: u64, b: ?[*]const u8, b_len: u64) bool {
     const a_start = if (a) |ptr| @as(u128, @intFromPtr(ptr)) else return false;
     const b_start = if (b) |ptr| @as(u128, @intFromPtr(ptr)) else return false;
@@ -201,9 +202,9 @@ export fn stdk_session_step(
     };
     if (result.status == .failed) {
         session.failed = true;
-        session.failure_status = failureStatus(result.failure orelse error.InternalFailure);
+        session.failure_status = exceptionStatus(result.exception orelse error.InternalException);
         session.failure_detail = result.required_capacity;
-        return failureStatus(result.failure orelse error.InternalFailure);
+        return exceptionStatus(result.exception orelse error.InternalException);
     }
     return envelope.Status.ok;
 }

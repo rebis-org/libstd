@@ -1,13 +1,12 @@
-// JNI bridge for the dev.stdk.StdK bindings. Kept out of the host library so
-// the C ABI export surface stays exactly the enumerated set. The session
-// handle is the caller-owned storage pointer, so this bridge owns the malloc
-// behind it and releases it through sessionFree after destroy.
+/* JNI bridge for the dev.stdk.StdK bindings. */
+/* Kept out of the host library so the export surface stays enumerated. */
+/* The session handle is caller-owned storage; the bridge frees it on destroy. */
 #include <jni.h>
 #include <stdint.h>
 #include <stdlib.h>
 
-// The envelope status vocabulary subset this bridge needs. Kept as literals so
-// the bridge stays decoupled from the generated header.
+/* The envelope status vocabulary subset this bridge needs. Kept as literals so */
+/* the bridge stays decoupled from the generated header. */
 #define STDK_STATUS_OK 0u
 #define STDK_STATUS_INVALID_CALL 1u
 
@@ -25,11 +24,11 @@ extern uint32_t stdk_session_failure(void *session, uint32_t *status,
 extern const char *stdk_session_catalog(void);
 extern uint32_t stdk_session_destroy(void *session);
 
-// The string materialization pairs collapse into one helper so the release
-// path cannot drift from the acquire path.
+/* The string materialization pairs collapse into one helper so the release */
+/* path cannot drift from the acquire path. */
 static const char *acquireUtf8(JNIEnv *env, jstring value)
 {
-	// GetStringUTFChars returns NULL on JVM out-of-memory.
+	/* GetStringUTFChars returns NULL on JVM out-of-memory. */
 	return value == NULL ? NULL :
 			       (*env)->GetStringUTFChars(env, value, NULL);
 }
@@ -40,27 +39,27 @@ static void releaseUtf8(JNIEnv *env, jstring value, const char *chars)
 		(*env)->ReleaseStringUTFChars(env, value, chars);
 	}
 }
+/* Throws IllegalArgumentException with the given message. */
+static void throwIllegalArg(JNIEnv *env, const char *message)
+{
+	(*env)->ThrowNew(
+		env,
+		(*env)->FindClass(env, "java/lang/IllegalArgumentException"),
+		message);
+}
 
-// Rejects negative lengths and lengths past the real array extent before any
-// pointer is handed to the native engine: a negative jint widens to a huge
-// u64 in the engine and would read or write out of bounds.
+/* Rejects negative lengths and lengths past the real array extent before any */
+/* pointer is handed to the native engine: a negative jint widens to a huge */
+/* u64 in the engine and would read or write out of bounds. */
 static jint checkedLen(JNIEnv *env, jbyteArray array, jint len,
 		       const char *what)
 {
 	if (len < 0 || (array == NULL && len != 0)) {
-		(*env)->ThrowNew(
-			env,
-			(*env)->FindClass(env,
-					  "java/lang/IllegalArgumentException"),
-			what);
+		throwIllegalArg(env, what);
 		return -1;
 	}
 	if (array != NULL && len > (*env)->GetArrayLength(env, array)) {
-		(*env)->ThrowNew(
-			env,
-			(*env)->FindClass(env,
-					  "java/lang/IllegalArgumentException"),
-			what);
+		throwIllegalArg(env, what);
 		return -1;
 	}
 	return len;
@@ -137,13 +136,9 @@ JNIEXPORT jint JNICALL Java_dev_stdk_StdK_nativeSessionStep(
 	if (checkedLen(env, output, output_len, "outputLen out of range") < 0) {
 		return STDK_STATUS_INVALID_CALL;
 	}
-	// Counts must exist and carry consumed, produced, and state.
+	/* Counts must exist and carry consumed, produced, and state. */
 	if (counts == NULL || (*env)->GetArrayLength(env, counts) < 3) {
-		(*env)->ThrowNew(
-			env,
-			(*env)->FindClass(env,
-					  "java/lang/IllegalArgumentException"),
-			"counts must hold 3 elements");
+		throwIllegalArg(env, "counts must hold 3 elements");
 		return STDK_STATUS_INVALID_CALL;
 	}
 	uint8_t *input_ptr = input != NULL ?
@@ -156,7 +151,7 @@ JNIEXPORT jint JNICALL Java_dev_stdk_StdK_nativeSessionStep(
 				      NULL;
 	jlong *counts_ptr = (*env)->GetLongArrayElements(env, counts, NULL);
 	if (counts_ptr == NULL) {
-		// JVM out-of-memory while materializing the counts array.
+		/* JVM out-of-memory while materializing the counts array. */
 		if (output_ptr != NULL) {
 			(*env)->ReleaseByteArrayElements(
 				env, output, (jbyte *)output_ptr, JNI_ABORT);
@@ -168,7 +163,7 @@ JNIEXPORT jint JNICALL Java_dev_stdk_StdK_nativeSessionStep(
 		return STDK_STATUS_INVALID_CALL;
 	}
 	int state = 0;
-	// JNI jlong and pointer interop is inherently integer-to-pointer.
+	/* JNI jlong and pointer interop is inherently integer-to-pointer. */
 	void *session_ptr =
 		(void *)session; /* NOLINT(performance-no-int-to-ptr) */
 	uint32_t rc = stdk_session_step(session_ptr, input_ptr,
@@ -196,16 +191,12 @@ JNIEXPORT jint JNICALL Java_dev_stdk_StdK_nativeSessionFailure(
 	(void)cls;
 	if (status_and_detail == NULL ||
 	    (*env)->GetArrayLength(env, status_and_detail) < 2) {
-		(*env)->ThrowNew(
-			env,
-			(*env)->FindClass(env,
-					  "java/lang/IllegalArgumentException"),
-			"statusAndDetail must hold 2 elements");
+		throwIllegalArg(env, "statusAndDetail must hold 2 elements");
 		return STDK_STATUS_INVALID_CALL;
 	}
 	uint32_t status = 0;
 	uint64_t detail = 0;
-	// JNI jlong and pointer interop is inherently integer-to-pointer.
+	/* JNI jlong and pointer interop is inherently integer-to-pointer. */
 	void *session_ptr =
 		(void *)session; /* NOLINT(performance-no-int-to-ptr) */
 	uint32_t rc = stdk_session_failure(session_ptr, &status, &detail);
@@ -222,21 +213,21 @@ JNIEXPORT jint JNICALL Java_dev_stdk_StdK_nativeSessionDestroy(JNIEnv *env,
 {
 	(void)env;
 	(void)cls;
-	// JNI jlong and pointer interop is inherently integer-to-pointer.
+	/* JNI jlong and pointer interop is inherently integer-to-pointer. */
 	void *session_ptr =
 		(void *)session; /* NOLINT(performance-no-int-to-ptr) */
 	return (jint)stdk_session_destroy(session_ptr);
 }
 
-// Frees storage obtained from sessionCreate. Java must never pass a foreign or
-// already-freed pointer; the class tracks live handles and nulls them on free.
+/* Frees storage obtained from sessionCreate. Java must never pass a foreign or */
+/* already-freed pointer; the class tracks live handles and nulls them on free. */
 JNIEXPORT void JNICALL Java_dev_stdk_StdK_nativeSessionFree(JNIEnv *env,
 							    jclass cls,
 							    jlong storage)
 {
 	(void)env;
 	(void)cls;
-	// JNI jlong and pointer interop is inherently integer-to-pointer.
+	/* JNI jlong and pointer interop is inherently integer-to-pointer. */
 	void *storage_ptr =
 		(void *)storage; /* NOLINT(performance-no-int-to-ptr) */
 	free(storage_ptr);

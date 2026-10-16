@@ -66,7 +66,7 @@ fn FixedDigest(comptime tag: Provider, comptime Impl: type) type {
             return .{ .inner = Impl.init(opts) };
         }
 
-        // The boundary validated the tag; a mismatch is a caller bug.
+        // The boundary validated the tag; a mismatch is a caller defect.
         pub fn bind(provider: Provider, opts: Options) @This() {
             std.debug.assert(provider == tag);
             return init(opts);
@@ -336,6 +336,36 @@ fn MergeableMac(comptime On: type, comptime Off: type) type {
                 inline else => |*inner| return inner.finalResult(),
             }
         }
+    };
+}
+
+// Fixed builds reject the foreign tag; mergeable binds per call.
+pub fn requireServed(provider: Provider, comptime allowed: Provider) error{UnsupportedException}!void {
+    if (provider != allowed) return error.UnsupportedException;
+}
+
+pub fn defaultProvider(comptime impl: anytype) Provider {
+    return switch (impl) {
+        .onprem, .mergeable => .onprem,
+        .offprem => .offprem,
+    };
+}
+
+pub fn dispatchOnprem(comptime impl: anytype, provider: Provider, comptime on: anytype, args: anytype) @typeInfo(@TypeOf(on)).@"fn".return_type.? {
+    // No stdlib container exists; the offprem arm stays explicit UnsupportedException.
+    return switch (impl) {
+        .onprem => blk: {
+            try requireServed(provider, .onprem);
+            break :blk @call(.auto, on, args);
+        },
+        .offprem => blk: {
+            try requireServed(provider, .offprem);
+            break :blk error.UnsupportedException;
+        },
+        .mergeable => switch (provider) {
+            .onprem => @call(.auto, on, args),
+            .offprem => error.UnsupportedException,
+        },
     };
 }
 

@@ -17,6 +17,7 @@ const zlib = @import("../../grammar/zlib/onprem.zig");
 const bzip2 = @import("../../leaf/bzip2/onprem.zig");
 const deflate = @import("../../leaf/deflate/onprem.zig");
 const lz4 = @import("../../leaf/lz4/onprem.zig");
+const lzma_seam = @import("../../leaf/lzma/seam.zig");
 const zstd = @import("../../leaf/zstd/onprem.zig");
 const corpus = @import("corpus.zig");
 
@@ -128,7 +129,7 @@ test "fuzz xz decode" {
 fn runLzmaAlone(data: []const u8) anyerror!void {
     var scratch: [4096]u8 = undefined;
     var out: [max_output]u8 = undefined;
-    _ = lzma_alone.decode(data, &out, &scratch, @import("../../leaf/lzma/seam.zig").default_provider) catch {};
+    _ = lzma_alone.decode(data, &out, &scratch, lzma_seam.default_provider) catch {};
 }
 
 test "fuzz lzma alone decode" {

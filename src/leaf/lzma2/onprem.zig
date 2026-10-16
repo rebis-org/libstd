@@ -1,11 +1,11 @@
 const std = @import("std");
 
-const failure_prim = @import("../../common/primitive/failure.zig");
+const exception_prim = @import("../../common/primitive/exception.zig");
 const io = @import("../../common/primitive/io.zig");
 const measurement = @import("../../common/primitive/measurement.zig");
 const lzma = @import("../lzma/onprem.zig");
 
-const Failure = failure_prim.Failure;
+const Exception = exception_prim.Exception;
 
 pub const chunk_max_unpacked: usize = 1 << 21;
 const chunk_min_unpacked: usize = 4 * 1024;
@@ -74,34 +74,34 @@ pub fn encodedSizeBound(input_len: usize) usize {
     return input_len +| (input_len / 4) +| 72 *| chunks +| 8;
 }
 
-pub fn decode(input: []const u8, output: []u8, scratch: []u8, options: Options) Failure!usize {
+pub fn decode(input: []const u8, output: []u8, scratch: []u8, options: Options) Exception!usize {
     var source = std.Io.Reader.fixed(input);
     var dest = std.Io.Writer.fixed(output);
     try decodeStream(&source, &dest, scratch, options);
     return dest.end;
 }
 
-pub fn decodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options: Options) Failure!void {
+pub fn decodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options: Options) Exception!void {
     var source = std.Io.Reader.fixed(input);
     _ = try decodeStreamImpl(&source, writer, &.{}, scratch, options, false);
 }
 
-pub fn decodeStream(reader: *std.Io.Reader, writer: *std.Io.Writer, scratch: []u8, options: Options) Failure!void {
+pub fn decodeStream(reader: *std.Io.Reader, writer: *std.Io.Writer, scratch: []u8, options: Options) Exception!void {
     _ = try decodeStreamImpl(reader, writer, &.{}, scratch, options, false);
 }
 
 pub const InPlaceResult = struct { produced: usize, consumed: usize };
 
-pub fn decodeInPlace(input: []const u8, output: []u8, scratch: []u8, options: Options) Failure!InPlaceResult {
+pub fn decodeInPlace(input: []const u8, output: []u8, scratch: []u8, options: Options) Exception!InPlaceResult {
     var source = std.Io.Reader.fixed(input);
     const produced = try decodeStreamImpl(&source, null, output, scratch, options, true);
     return .{ .produced = produced, .consumed = source.seek };
 }
 
-fn decodeStreamImpl(reader: *std.Io.Reader, writer: ?*std.Io.Writer, output: []u8, scratch: []u8, options: Options, in_place: bool) Failure!usize {
+fn decodeStreamImpl(reader: *std.Io.Reader, writer: ?*std.Io.Writer, output: []u8, scratch: []u8, options: Options, in_place: bool) Exception!usize {
     const props = try validateProperties(options.properties);
     const lzma_scratch_size = if (in_place) lzma.decodeInPlaceWorkspaceSize(props) else lzma.decodeWorkspaceSize(props);
-    if (scratch.len < lzma_scratch_size + chunk_max_unpacked) return error.CapacityFailure;
+    if (scratch.len < lzma_scratch_size + chunk_max_unpacked) return error.CapacityException;
     const lzma_scratch = scratch[0..lzma_scratch_size];
     var copy_staging = scratch[lzma_scratch_size..][0..chunk_max_unpacked];
     const SliceDecoder = lzma.DecoderOf(true);
@@ -119,19 +119,19 @@ fn decodeStreamImpl(reader: *std.Io.Reader, writer: ?*std.Io.Writer, output: []u
             need_properties = true;
             need_dictionary_reset = true;
         } else if (need_dictionary_reset) {
-            return error.DataFailure;
+            return error.DataException;
         }
         if (control & 0x80 != 0) {
             const unpack_size = try readLzmaUnpackSize(reader, control);
-            if (unpack_size > chunk_max_unpacked) return error.DataFailure;
+            if (unpack_size > chunk_max_unpacked) return error.DataException;
             const pack_size = try readPackSize(reader);
-            if (pack_size < 5 or pack_size > max_pack_size) return error.DataFailure;
+            if (pack_size < 5 or pack_size > max_pack_size) return error.DataException;
             if (control >= control_lzma_new_props) {
                 const properties_byte = try io.readByte(reader);
                 const parsed = try lzma.Properties.decode(properties_byte, options.dictionary_size);
                 // LZMA2 permits any valid lc/lp/pb combination per chunk; only
                 // the lc+lp<=4 shape constraint applies (SDK behavior).
-                if (parsed.lc + parsed.lp > 4) return error.UnsupportedFailure;
+                if (parsed.lc + parsed.lp > 4) return error.UnsupportedException;
                 decoder.setProperties(parsed);
                 need_properties = false;
                 decoder.resetState();
@@ -141,7 +141,7 @@ fn decodeStreamImpl(reader: *std.Io.Reader, writer: ?*std.Io.Writer, output: []u
                     need_dictionary_reset = false;
                 }
             } else {
-                if (need_properties) return error.DataFailure;
+                if (need_properties) return error.DataException;
                 if (control >= control_lzma_reset_state) {
                     decoder.resetState();
                     decoder.resetProbabilities();
@@ -153,14 +153,14 @@ fn decodeStreamImpl(reader: *std.Io.Reader, writer: ?*std.Io.Writer, output: []u
             }
             var chunk_buffer: [max_pack_size]u8 = undefined;
             var pack_iovecs = [_][]u8{chunk_buffer[0..pack_size]};
-            const pack_read = reader.readVec(&pack_iovecs) catch return error.IoFailure;
-            if (pack_read != pack_size) return error.IoFailure;
+            const pack_read = reader.readVec(&pack_iovecs) catch return error.IoException;
+            if (pack_read != pack_size) return error.IoException;
             try decoder.resetReaderSlice(chunk_buffer[0..pack_size]);
             try decoder.decodeToOutput(null, unpack_size, false);
         } else {
-            if (control != control_copy_reset_dict and control != control_copy) return error.DataFailure;
+            if (control != control_copy_reset_dict and control != control_copy) return error.DataException;
             const unpack_size = try readCopyUnpackSize(reader);
-            if (unpack_size > chunk_max_unpacked) return error.DataFailure;
+            if (unpack_size > chunk_max_unpacked) return error.DataException;
             if (need_dictionary_reset) {
                 decoder.resetDictionary();
                 need_dictionary_reset = false;
@@ -169,8 +169,8 @@ fn decodeStreamImpl(reader: *std.Io.Reader, writer: ?*std.Io.Writer, output: []u
             while (remaining > 0) {
                 const batch = @min(remaining, copy_staging.len);
                 var copy_iovecs = [_][]u8{copy_staging[0..batch]};
-                const copy_read = reader.readVec(&copy_iovecs) catch return error.IoFailure;
-                if (copy_read != batch) return error.IoFailure;
+                const copy_read = reader.readVec(&copy_iovecs) catch return error.IoException;
+                if (copy_read != batch) return error.IoException;
                 if (writer) |sink| try io.writeBytes(sink, copy_staging[0..batch]);
                 for (copy_staging[0..batch]) |byte| try decoder.feedByte(byte);
                 remaining -= batch;
@@ -180,19 +180,19 @@ fn decodeStreamImpl(reader: *std.Io.Reader, writer: ?*std.Io.Writer, output: []u
     return decoder.total_pos;
 }
 
-fn validateProperties(props: lzma.Properties) Failure!lzma.Properties {
-    if (props.lc + props.lp > 4) return error.UnsupportedFailure;
+fn validateProperties(props: lzma.Properties) Exception!lzma.Properties {
+    if (props.lc + props.lp > 4) return error.UnsupportedException;
     return props;
 }
 
-fn readCopyUnpackSize(reader: *std.Io.Reader) Failure!usize {
+fn readCopyUnpackSize(reader: *std.Io.Reader) Exception!usize {
     const high = try io.readByte(reader);
     const low = try io.readByte(reader);
     const stored_size = (@as(usize, high) << 8) | low;
     return stored_size + 1;
 }
 
-fn readLzmaUnpackSize(reader: *std.Io.Reader, control: u8) Failure!usize {
+fn readLzmaUnpackSize(reader: *std.Io.Reader, control: u8) Exception!usize {
     // Five control bits carry the size high bits, matching the SDK; four
     // bits would cap chunks at 1 MiB and reject SDK-produced 1..2 MiB blocks.
     const high = @as(usize, control & 0x1F) << 16;
@@ -201,13 +201,13 @@ fn readLzmaUnpackSize(reader: *std.Io.Reader, control: u8) Failure!usize {
     return (high | (@as(usize, mid) << 8) | low) + 1;
 }
 
-fn readPackSize(reader: *std.Io.Reader) Failure!usize {
+fn readPackSize(reader: *std.Io.Reader) Exception!usize {
     const high = try io.readByte(reader);
     const low = try io.readByte(reader);
     return ((@as(usize, high) << 8) | low) + 1;
 }
 
-pub fn decodedSize(input: []const u8, scratch: []u8, options: Options) Failure!usize {
+pub fn decodedSize(input: []const u8, scratch: []u8, options: Options) Exception!usize {
     if (try scanDecodedSize(input)) |size| return size;
     var source = std.Io.Reader.fixed(input);
     var counter = measurement.Counter.init(null);
@@ -215,7 +215,7 @@ pub fn decodedSize(input: []const u8, scratch: []u8, options: Options) Failure!u
     return measurement.measuredLength(&counter);
 }
 
-fn scanDecodedSize(input: []const u8) Failure!?usize {
+fn scanDecodedSize(input: []const u8) Exception!?usize {
     var pos: usize = 0;
     var total: usize = 0;
     var need_properties = true;
@@ -228,56 +228,56 @@ fn scanDecodedSize(input: []const u8) Failure!?usize {
             need_properties = true;
             need_dictionary_reset = true;
         } else if (need_dictionary_reset) {
-            return error.DataFailure;
+            return error.DataException;
         }
         if (control & 0x80 != 0) {
-            if (pos + 2 > input.len) return error.DataFailure;
+            if (pos + 2 > input.len) return error.DataException;
             const unpack_size = (((@as(usize, control & 0x1F) << 16) | (@as(usize, input[pos]) << 8) | input[pos + 1]) + 1);
             pos += 2;
-            if (pos + 2 > input.len) return error.DataFailure;
+            if (pos + 2 > input.len) return error.DataException;
             const pack_size = ((@as(usize, input[pos]) << 8) | input[pos + 1]) + 1;
             pos += 2;
-            if (unpack_size > chunk_max_unpacked or pack_size < 5 or pack_size > max_pack_size) return error.DataFailure;
+            if (unpack_size > chunk_max_unpacked or pack_size < 5 or pack_size > max_pack_size) return error.DataException;
             if (control >= control_lzma_new_props) {
-                if (pos >= input.len) return error.DataFailure;
+                if (pos >= input.len) return error.DataException;
                 pos += 1;
                 need_properties = false;
                 if (control >= control_lzma_new_props_reset_dict) need_dictionary_reset = false;
             } else {
-                if (need_properties) return error.DataFailure;
+                if (need_properties) return error.DataException;
             }
             pos += pack_size;
-            if (pos > input.len) return error.DataFailure;
-            total = std.math.add(usize, total, unpack_size) catch return error.ResourceFailure;
+            if (pos > input.len) return error.DataException;
+            total = std.math.add(usize, total, unpack_size) catch return error.ResourceException;
         } else {
-            if (control != control_copy_reset_dict and control != control_copy) return error.DataFailure;
-            if (pos + 2 > input.len) return error.DataFailure;
+            if (control != control_copy_reset_dict and control != control_copy) return error.DataException;
+            if (pos + 2 > input.len) return error.DataException;
             const unpack_size = ((@as(usize, input[pos]) << 8) | input[pos + 1]) + 1;
             pos += 2;
-            if (unpack_size > chunk_max_unpacked) return error.DataFailure;
+            if (unpack_size > chunk_max_unpacked) return error.DataException;
             if (need_dictionary_reset) need_dictionary_reset = false;
             pos += unpack_size;
-            if (pos > input.len) return error.DataFailure;
-            total = std.math.add(usize, total, unpack_size) catch return error.ResourceFailure;
+            if (pos > input.len) return error.DataException;
+            total = std.math.add(usize, total, unpack_size) catch return error.ResourceException;
         }
     }
-    return error.DataFailure;
+    return error.DataException;
 }
 
-pub fn requiredSize(input: []const u8, scratch: []u8, options: Options) Failure!usize {
+pub fn requiredSize(input: []const u8, scratch: []u8, options: Options) Exception!usize {
     var counter = measurement.Counter.init(null);
     try encodeStreamInner(input, &counter.writer, scratch, options);
     return measurement.measuredLength(&counter);
 }
 
-pub fn encode(input: []const u8, output: []u8, scratch: []u8, options: Options) Failure!usize {
+pub fn encode(input: []const u8, output: []u8, scratch: []u8, options: Options) Exception!usize {
     var dest = std.Io.Writer.fixed(output);
     try encodeStreamInner(input, &dest, scratch, options);
     return dest.end;
 }
 
-pub fn encodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options: Options) Failure!void {
-    if (input.len > options.max_work) return error.ResourceFailure;
+pub fn encodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options: Options) Exception!void {
+    if (input.len > options.max_work) return error.ResourceException;
     try encodeStreamInner(input, writer, scratch, options);
 }
 
@@ -297,10 +297,10 @@ fn isChunkCompressible(chunk: []const u8, estimate_scratch: []u8, props: lzma.Pr
     return estimate <= max_pack_size and estimate < chunk.len;
 }
 
-fn encodeStreamInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options: Options) Failure!void {
+fn encodeStreamInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options: Options) Exception!void {
     const props = try validateProperties(options.properties);
     const encoder_scratch_size = if (options.match_finder == .bt4) lzma.encodeWorkspaceSizeBt(props) else lzma.encodeWorkspaceSize(props);
-    if (scratch.len < 2 * encoder_scratch_size) return error.CapacityFailure;
+    if (scratch.len < 2 * encoder_scratch_size) return error.CapacityException;
     const encoder_scratch = scratch[0..encoder_scratch_size];
     const estimate_scratch = scratch[encoder_scratch_size .. 2 * encoder_scratch_size];
     var model_workspace = try io.Workspace.init(scratch[2 * encoder_scratch_size ..].ptr, scratch[2 * encoder_scratch_size ..].len);
@@ -379,7 +379,7 @@ fn encodeStreamInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, o
     try io.writeByte(writer, control_end);
 }
 
-fn writeCopyChunk(writer: *std.Io.Writer, chunk: []const u8, reset_dictionary: bool) Failure!void {
+fn writeCopyChunk(writer: *std.Io.Writer, chunk: []const u8, reset_dictionary: bool) Exception!void {
     const control: u8 = if (reset_dictionary) control_copy_reset_dict else control_copy;
     var copy_offset: usize = 0;
     while (copy_offset < chunk.len) {

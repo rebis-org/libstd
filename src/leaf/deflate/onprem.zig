@@ -3,11 +3,11 @@ const std = @import("std");
 const build_options = @import("options");
 
 const kernels = @import("../../common/kernels.zig");
-const failure_prim = @import("../../common/primitive/failure.zig");
+const exception_prim = @import("../../common/primitive/exception.zig");
 const huffman = @import("../../common/primitive/huffman.zig");
 
 const use_vector_match_copy = kernels.vector_match_copy;
-const Failure = failure_prim.Failure;
+const Exception = exception_prim.Exception;
 
 pub const history_size = 2 * window_size;
 pub const measurement_buffer_size = 64;
@@ -184,7 +184,7 @@ fn Tree(comptime max_root_bits: u5, comptime max_sub: usize) type {
     };
 }
 
-fn buildTree(lengths: []const u8, tree: anytype, comptime max_root_bits: u5, allow_single: bool, allow_empty: bool) error{DataFailure}!void {
+fn buildTree(lengths: []const u8, tree: anytype, comptime max_root_bits: u5, allow_single: bool, allow_empty: bool) error{DataException}!void {
     tree.empty = false;
     tree.root_bits = 0;
     tree.sub_len = 0;
@@ -192,7 +192,7 @@ fn buildTree(lengths: []const u8, tree: anytype, comptime max_root_bits: u5, all
 
     var counts: [max_code_bits + 1]u16 = @splat(0);
     for (lengths) |length| {
-        if (length > max_code_bits) return error.DataFailure;
+        if (length > max_code_bits) return error.DataException;
         counts[length] += 1;
     }
     counts[0] = 0;
@@ -202,17 +202,17 @@ fn buildTree(lengths: []const u8, tree: anytype, comptime max_root_bits: u5, all
         if (counts[bits] != 0) tree.max_len = @intCast(bits);
     }
     if (total == 0) {
-        if (!allow_empty) return error.DataFailure;
+        if (!allow_empty) return error.DataException;
         tree.empty = true;
         return;
     }
     var left: i32 = 1;
     for (1..max_code_bits + 1) |bits| {
         left = (left << 1) - counts[bits];
-        if (left < 0) return error.DataFailure;
+        if (left < 0) return error.DataException;
     }
     // A lone one-bit code is the only incomplete tree the format permits.
-    if (left > 0 and !(allow_single and tree.max_len == 1)) return error.DataFailure;
+    if (left > 0 and !(allow_single and tree.max_len == 1)) return error.DataException;
 
     const root_bits: u5 = @min(tree.max_len, max_root_bits);
     const root_size = @as(usize, 1) << root_bits;
@@ -249,7 +249,7 @@ fn buildTree(lengths: []const u8, tree: anytype, comptime max_root_bits: u5, all
             sub_offset[prefix] = 0;
         }
     }
-    if (sub_len > tree.sub.len) return error.DataFailure;
+    if (sub_len > tree.sub.len) return error.DataException;
     tree.sub_len = sub_len;
 
     // Only the live span needs clearing. Complete trees tile every slot.
@@ -331,13 +331,13 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
         optimal: ?*OptimalScratch,
         opt_pending_len: usize,
 
-        pub fn init(downstream: *std.Io.Writer, history: []u8, options: Options) error{ CallFailure, CapacityFailure }!@This() {
-            if (history.len < config.history_size) return error.CapacityFailure;
-            if (options.good < min_match or options.good > config.max_match) return error.CallFailure;
-            if (options.nice < min_match or options.nice > config.max_match) return error.CallFailure;
-            if (options.lazy > options.nice) return error.CallFailure;
-            if (options.chain == 0) return error.CallFailure;
-            if (options.optimal and options.strategy != .default) return error.CallFailure;
+        pub fn init(downstream: *std.Io.Writer, history: []u8, options: Options) error{ CallException, CapacityException }!@This() {
+            if (history.len < config.history_size) return error.CapacityException;
+            if (options.good < min_match or options.good > config.max_match) return error.CallException;
+            if (options.nice < min_match or options.nice > config.max_match) return error.CallException;
+            if (options.lazy > options.nice) return error.CallException;
+            if (options.chain == 0) return error.CallException;
+            if (options.optimal and options.strategy != .default) return error.CallException;
             var effective = options;
             if (options.strategy == .filtered) {
                 // zlib's filtered configuration: good 4, lazy 4, nice 16,
@@ -352,7 +352,7 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
                 const base = @intFromPtr(history.ptr) + config.history_size;
                 const aligned = std.mem.alignForward(usize, base, @alignOf(OptimalScratch));
                 const start = aligned - @intFromPtr(history.ptr);
-                if (history.len < start + @sizeOf(OptimalScratch)) return error.CapacityFailure;
+                if (history.len < start + @sizeOf(OptimalScratch)) return error.CapacityException;
                 optimal = @ptrFromInt(aligned);
             }
             // Encoder state below is filled by the block loop before any read.
@@ -992,19 +992,19 @@ pub const Compress = CompressOf(.deflate);
 // The one feed loop every gzip and zlib frame encodes through: the source is
 // batched into chunks so the compressor and the frame's checksum each see a
 // whole chunk, and the fed byte count comes back for the frame trailer.
-pub fn feed(comptime Checksum: type, source: *std.Io.Reader, compressor: *Compress, checksum: *Checksum) Failure!u64 {
+pub fn feed(comptime Checksum: type, source: *std.Io.Reader, compressor: *Compress, checksum: *Checksum) Exception!u64 {
     var buffer: [4096]u8 = undefined;
     var total: u64 = 0;
     while (true) {
         var staging = std.Io.Writer.fixed(&buffer);
         const count = source.stream(&staging, std.Io.Limit.limited(buffer.len)) catch |err| {
             if (err == error.EndOfStream) break;
-            return error.IoFailure;
+            return error.IoException;
         };
         if (count == 0) break;
         checksum.update(buffer[0..count]);
-        total = std.math.add(u64, total, count) catch return error.ResourceFailure;
-        compressor.writer.writeAll(buffer[0..count]) catch return error.IoFailure;
+        total = std.math.add(u64, total, count) catch return error.ResourceException;
+        compressor.writer.writeAll(buffer[0..count]) catch return error.IoException;
     }
     return total;
 }
@@ -1105,7 +1105,7 @@ const SliceBits = struct {
         b.refill(max_code_bits);
         // Zero-padded tail is exact via tiled tables. Fail only past real buffered bits.
         const entry = tree.root[@intCast(b.bits & ((@as(u64, 1) << @intCast(root_bits)) - 1))];
-        if (entry == 0) return error.DataFailure;
+        if (entry == 0) return error.DataException;
         const len: u7 = @intCast(entry & 0xFF);
         if (len != 0) {
             if (len > b.bit_count) return error.Truncated;
@@ -1254,7 +1254,7 @@ fn runLengthEncode(lengths: []const u8, symbols: []u8, values: []u8, cl_freq: *[
     return count;
 }
 
-const InflateError = error{ DataFailure, Truncated, ReadFailed };
+const InflateError = error{ DataException, Truncated, ReadFailed };
 
 pub fn DecompressOf(comptime variant: enum { deflate, deflate64 }) type {
     return struct {
@@ -1343,15 +1343,15 @@ pub fn DecompressOf(comptime variant: enum { deflate, deflate64 }) type {
             self.* = initSlice(data, history);
         }
 
-        pub fn initSliceBoundInPlace(self: *@This(), provider: anytype, data: []const u8, history: []u8) error{UnsupportedFailure}!void {
-            if (provider != .onprem) return error.UnsupportedFailure;
+        pub fn initSliceBoundInPlace(self: *@This(), provider: anytype, data: []const u8, history: []u8) error{UnsupportedException}!void {
+            if (provider != .onprem) return error.UnsupportedException;
             self.initSliceInPlace(data, history);
         }
 
         // Seam binding points: the tag binds at construction, the decode loop never
         // dispatches; `anytype` avoids module imports.
-        pub fn initBound(provider: anytype, input: *std.Io.Reader, history: []u8) error{UnsupportedFailure}!@This() {
-            if (provider != .onprem) return error.UnsupportedFailure;
+        pub fn initBound(provider: anytype, input: *std.Io.Reader, history: []u8) error{UnsupportedException}!@This() {
+            if (provider != .onprem) return error.UnsupportedException;
             return init(input, history);
         }
 
@@ -1437,9 +1437,9 @@ pub fn DecompressOf(comptime variant: enum { deflate, deflate64 }) type {
         fn discard(r: *std.Io.Reader, limit: std.Io.Limit) std.Io.Reader.Error!usize {
             var sink_buffer: [0]u8 = .{};
             var discarding: std.Io.Writer.Discarding = .init(&sink_buffer);
-            return stream(r, &discarding.writer, limit) catch |failure| switch (failure) {
+            return stream(r, &discarding.writer, limit) catch |exception| switch (exception) {
                 error.WriteFailed => unreachable,
-                else => |other_failure| return other_failure,
+                else => |other_exception| return other_exception,
             };
         }
 
@@ -1471,7 +1471,7 @@ pub fn DecompressOf(comptime variant: enum { deflate, deflate64 }) type {
                     _ = try d.take(pad);
                     const len = try d.take(16);
                     const nlen = try d.take(16);
-                    if (len + nlen != 0xFFFF) return error.DataFailure;
+                    if (len + nlen != 0xFFFF) return error.DataException;
                     d.stored_remaining = @intCast(len);
                     d.state = .stored_copy;
                 },
@@ -1481,15 +1481,15 @@ pub fn DecompressOf(comptime variant: enum { deflate, deflate64 }) type {
                     d.state = .data;
                 },
                 2 => d.state = .tables,
-                else => return error.DataFailure,
+                else => return error.DataException,
             }
         }
 
         fn readTables(d: *@This()) InflateError!void {
             const hlit = (try d.take(5)) + 257;
-            if (hlit > 286) return error.DataFailure;
+            if (hlit > 286) return error.DataException;
             const hdist = (try d.take(5)) + 1;
-            if (hdist > config.hdist_max) return error.DataFailure;
+            if (hdist > config.hdist_max) return error.DataException;
             const hclen = (try d.take(4)) + 4;
             var cl_lengths: [cl_alphabet]u8 = @splat(0);
             for (0..hclen) |i| cl_lengths[codegen_order[i]] = @intCast(try d.take(3));
@@ -1512,8 +1512,8 @@ pub fn DecompressOf(comptime variant: enum { deflate, deflate64 }) type {
                     17 => 3 + (try d.take(3)),
                     else => 11 + (try d.take(7)),
                 };
-                if (symbol == 16 and i == 0) return error.DataFailure;
-                if (i + repeat > total) return error.DataFailure;
+                if (symbol == 16 and i == 0) return error.DataException;
+                if (i + repeat > total) return error.DataException;
                 const fill: u8 = if (symbol == 16) lengths[i - 1] else 0;
                 for (0..repeat) |_| {
                     lengths[i] = fill;
@@ -1542,13 +1542,13 @@ pub fn DecompressOf(comptime variant: enum { deflate, deflate64 }) type {
                     d.state = if (d.final) .end else .header;
                     return;
                 }
-                if (symbol > 285) return error.DataFailure;
+                if (symbol > 285) return error.DataException;
                 const li = symbol - 257;
                 const length = config.length_base[li] + try d.take(config.length_extra[li]);
                 const dsym = try d.decode(distance_tree);
-                if (dsym > config.dist_max) return error.DataFailure;
+                if (dsym > config.dist_max) return error.DataException;
                 const distance = config.dist_base[dsym] + try d.take(config.dist_extra[dsym]);
-                if (distance > r.end) return error.DataFailure;
+                if (distance > r.end) return error.DataException;
                 r.end = copyMatchBuf(r.buffer, r.end, distance, length);
             }
         }
@@ -1556,7 +1556,7 @@ pub fn DecompressOf(comptime variant: enum { deflate, deflate64 }) type {
         // Locals keep per-symbol work in registers. Phase writes back on exit.
         fn decodeDataSlice(d: *@This(), lit: anytype, distance_tree: anytype) InflateError!void {
             const r = &d.reader;
-            if (lit.empty) return error.DataFailure;
+            if (lit.empty) return error.DataException;
             var slice_bits: SliceBits = .{ .bytes = d.input.slice.data, .pos = d.input.slice.pos, .bits = d.bits, .bit_count = d.bit_count };
             var end = r.end;
             const buf = r.buffer;
@@ -1579,15 +1579,15 @@ pub fn DecompressOf(comptime variant: enum { deflate, deflate64 }) type {
                     d.state = if (d.final) .end else .header;
                     return;
                 }
-                if (symbol > 285) return error.DataFailure;
+                if (symbol > 285) return error.DataException;
                 const length_entry = config.length_packed[symbol - 257];
                 const length = (length_entry & 0xFFFF) + try slice_bits.take(@intCast(length_entry >> 16));
-                if (distance_tree.empty) return error.DataFailure;
+                if (distance_tree.empty) return error.DataException;
                 const dsym = try slice_bits.decode(distance_tree, distance_root_bits);
-                if (dsym > config.dist_max) return error.DataFailure;
+                if (dsym > config.dist_max) return error.DataException;
                 const distance_entry = config.dist_packed[dsym];
                 const distance = (distance_entry & 0xFFFF) + try slice_bits.take(@intCast(distance_entry >> 16));
-                if (distance > end) return error.DataFailure;
+                if (distance > end) return error.DataException;
                 end = copyMatchBuf(buf, end, distance, length);
             }
         }
@@ -1681,13 +1681,13 @@ pub fn DecompressOf(comptime variant: enum { deflate, deflate64 }) type {
         }
 
         inline fn decode(d: *@This(), tree: anytype) InflateError!u16 {
-            if (tree.empty) return error.DataFailure;
+            if (tree.empty) return error.DataException;
             // One refill covers the longest code in the common case.
             try d.refill(max_code_bits);
             const root_bits = tree.root_bits;
             // Zero-padded tail is exact via tiled tables. Fail only past real buffered bits.
             const entry = tree.root[@intCast(d.bits & ((@as(u64, 1) << @intCast(root_bits)) - 1))];
-            if (entry == 0) return error.DataFailure;
+            if (entry == 0) return error.DataException;
             const len: u7 = @intCast(entry & 0xFF);
             if (len != 0) {
                 if (len > d.bit_count) return error.Truncated;
@@ -1712,7 +1712,7 @@ pub const Decompress64 = DecompressOf(.deflate64);
 const fixed_lit_tree = buildTreeValue(10, 9216, &fixed_lit_lengths, false, false) catch @compileError("the fixed huffman literal table failed to build.");
 const fixed_dist_tree = buildTreeValue(8, 4096, &fixed_dist_lengths, false, false) catch @compileError("the fixed huffman distance table failed to build.");
 
-fn buildTreeValue(comptime max_root_bits: u5, comptime max_sub: usize, lengths: []const u8, allow_single: bool, allow_empty: bool) error{DataFailure}!Tree(max_root_bits, max_sub) {
+fn buildTreeValue(comptime max_root_bits: u5, comptime max_sub: usize, lengths: []const u8, allow_single: bool, allow_empty: bool) error{DataException}!Tree(max_root_bits, max_sub) {
     @setEvalBranchQuota(1_000_000);
     // Filled before the caller reads it, so `undefined` is safe.
     var tree: Tree(max_root_bits, max_sub) = undefined;
@@ -1796,7 +1796,7 @@ test "deflate strategies roundtrip and shape blocks" {
         var history: [history_size + optimal_workspace_size]u8 = undefined;
         var sink_buf: [8]u8 = undefined;
         var sink = std.Io.Writer.fixed(&sink_buf);
-        try std_testing.expectError(error.CallFailure, Compress.init(&sink, &history, .{ .good = 8, .nice = 128, .lazy = 16, .chain = 8, .optimal = true, .strategy = .rle }));
+        try std_testing.expectError(error.CallException, Compress.init(&sink, &history, .{ .good = 8, .nice = 128, .lazy = 16, .chain = 8, .optimal = true, .strategy = .rle }));
     }
 
     // Filtered clamps the search profile and still round-trips: zlib's

@@ -1,17 +1,14 @@
 const std = @import("std");
 
-const failure_prim = @import("../../common/primitive/failure.zig");
-
+const exception_prim = @import("../../common/primitive/exception.zig");
 const bits = @import("bits.zig");
 
-const Failure = failure_prim.Failure;
+const Exception = exception_prim.Exception;
 
-// WIM LZX resource codec, ported from wimlib's decompressor
-// (src/lzx_decompress.c). Blocks carry a precode-encoded canonical Huffman
-// lens for the main and length codes, optionally with an aligned-offset code.
-// Match state persists across blocks of one resource: the three recent
-// offsets and the delta-coded lens. Decoded data passes through the E8
-// CALL-target filter with the WIM magic file size.
+// WIM LZX codec, ported from wimlib src/lzx_decompress.c.
+// Blocks carry precode-encoded lens for the main and length codes.
+// Three recent offsets and delta-coded lens persist across blocks.
+// Decoded data passes through the E8 CALL-target filter.
 
 const num_chars: usize = 256;
 const min_match_len: usize = 2;
@@ -40,7 +37,7 @@ const block_verbatim: u32 = 1;
 const block_aligned: u32 = 2;
 const block_uncompressed: u32 = 3;
 
-// First match offset of each offset slot; slots 0-1 map to repeat offsets.
+// First match offset of each offset slot; slots 0-2 map to repeat offsets.
 const offset_slot_base = [max_offset_slots + 1]i32{
     -2,      -1,      0,       1,       2,
     4,       6,       10,      14,      22,
@@ -73,8 +70,8 @@ const LenCode = bits.Code(max_len_codeword_len, num_len_syms + len_overrun);
 const PreCode = bits.Code(max_pre_codeword_len, precode_num_symbols);
 const AlignedCode = bits.Code(max_aligned_codeword_len, aligned_num_symbols);
 
-fn windowOrder(out_len: usize) Failure!u5 {
-    if (out_len == 0 or out_len > (1 << 21)) return error.DataFailure;
+fn windowOrder(out_len: usize) Exception!u5 {
+    if (out_len == 0 or out_len > (1 << 21)) return error.DataException;
     var order: u5 = 15;
     while (@as(usize, 1) << order < out_len) order += 1;
     return order;
@@ -87,7 +84,6 @@ fn numMainSymbols(order: u5) usize {
     return num_chars + slot * num_len_headers;
 }
 
-// Applies one delta step of the lens RLE coding, wrapping below zero.
 fn deltaLen(prev: u8, presym: u16) u8 {
     var len: i16 = @as(i16, prev) - @as(i16, @intCast(presym));
     if (len < 0) len += 17;
@@ -97,7 +93,7 @@ fn deltaLen(prev: u8, presym: u16) u8 {
 // Reads one precode-encoded run of codeword lens; the precode itself is sent
 // as 20 explicit 4-bit lengths. Runs may write up to len_overrun slots past
 // num_lens, so the backing array must carry that slack, as wimlib's does.
-fn readCodewordLens(stream: *bits.Bits, lens: []u8, num_lens: usize, pre_lens: *[precode_num_symbols]u8) Failure!void {
+fn readCodewordLens(stream: *bits.Bits, lens: []u8, num_lens: usize, pre_lens: *[precode_num_symbols]u8) Exception!void {
     for (0..precode_num_symbols) |i| {
         pre_lens[i] = @intCast(stream.readBits(precode_element_size));
     }
@@ -121,7 +117,7 @@ fn readCodewordLens(stream: *bits.Bits, lens: []u8, num_lens: usize, pre_lens: *
         } else {
             run_len = 4 + stream.readBits(1);
             const next = try pre.read(stream);
-            if (next > 17) return error.DataFailure;
+            if (next > 17) return error.DataException;
             len = deltaLen(lens[pos], next);
         }
         for (0..run_len) |i| {
@@ -152,7 +148,7 @@ fn e8Postprocess(data: []u8) void {
     }
 }
 
-pub fn lzxDecode(input: []const u8, output: []u8) Failure!void {
+pub fn lzxDecode(input: []const u8, output: []u8) Exception!void {
     const order = try windowOrder(output.len);
     const num_main_syms = numMainSymbols(order);
     var main_lens: [max_main_num_symbols + len_overrun]u8 = @splat(0);
@@ -179,7 +175,7 @@ pub fn lzxDecode(input: []const u8, output: []u8) Failure!void {
                 block_size = (block_size << 8) | stream.readBits(8);
             }
         }
-        if (block_size < 1 or block_size > output.len - op) return error.DataFailure;
+        if (block_size < 1 or block_size > output.len - op) return error.DataException;
 
         switch (block_type) {
             block_uncompressed => {
@@ -188,7 +184,7 @@ pub fn lzxDecode(input: []const u8, output: []u8) Failure!void {
                 recent[0] = stream.readU32();
                 recent[1] = stream.readU32();
                 recent[2] = stream.readU32();
-                if (recent[0] == 0 or recent[1] == 0 or recent[2] == 0) return error.DataFailure;
+                if (recent[0] == 0 or recent[1] == 0 or recent[2] == 0) return error.DataException;
                 try stream.readBytes(output[op..][0..block_size]);
                 if (block_size & 1 != 0) _ = stream.readByte();
                 may_have_e8_byte = true;
@@ -244,8 +240,8 @@ pub fn lzxDecode(input: []const u8, output: []u8) Failure!void {
                     }
                     recent[0] = offset;
                     const off: usize = @intCast(offset);
-                    if (off > op or off == 0) return error.DataFailure;
-                    if (length > block_end - op) return error.DataFailure;
+                    if (off > op or off == 0) return error.DataException;
+                    if (length > block_end - op) return error.DataException;
                     var i: usize = 0;
                     while (i < length) : (i += 1) {
                         output[op + i] = output[op - off + i];
@@ -253,7 +249,7 @@ pub fn lzxDecode(input: []const u8, output: []u8) Failure!void {
                     op += length;
                 }
             },
-            else => return error.DataFailure,
+            else => return error.DataException,
         }
     }
     if (may_have_e8_byte) e8Postprocess(output);

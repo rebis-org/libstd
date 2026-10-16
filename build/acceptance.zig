@@ -7,12 +7,9 @@ const reference = @import("acceptance/benchmark/refs.zig");
 const modules = @import("modules.zig");
 const common = @import("platform/common.zig");
 
-pub const Unit = struct {
-    name: []const u8,
-    kind: Kind,
-};
-
 pub const Kind = enum { oracles, benchmark };
+
+pub const Unit = common.KindedUnit(Kind);
 
 pub const units = [_]Unit{
     .{ .name = "oracles", .kind = .oracles },
@@ -20,7 +17,7 @@ pub const units = [_]Unit{
 };
 
 pub fn expand(b: *std.Build, ctx: *common.Settings) void {
-    const refs = ctx.refs orelse @panic("The vendor units must expand before the acceptance units.");
+    const refs = ctx.refs orelse @panic("the vendor units must expand before the acceptance units.");
     inline for (units) |unit| switch (unit.kind) {
         .oracles => addOracles(b, ctx, refs),
         .benchmark => addBenchmark(b, ctx, refs),
@@ -75,9 +72,9 @@ fn abVariantModule(b: *std.Build, name: []const u8) *std.Build.Module {
     return variant.createModule();
 }
 
-fn makeModule(b: *std.Build, root: []const u8, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, sanitize_c: ?std.zig.SanitizeC) *std.Build.Module {
+fn checkedModule(b: *std.Build, root: []const u8, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, sanitize_c: ?std.zig.SanitizeC) *std.Build.Module {
     const module = b.createModule(.{ .root_source_file = b.path(root), .target = target, .optimize = optimize });
-    if (sanitize_c) |sc| module.sanitize_c = sc;
+    if (sanitize_c) |sanitize| module.sanitize_c = sanitize;
     return module;
 }
 
@@ -104,10 +101,10 @@ fn addTrapRun(b: *std.Build, ctx: *const common.Settings, target: std.Build.Reso
 }
 
 fn addContractCheck(b: *std.Build, interface: *std.Build.Module, components: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, sanitize_c: ?std.zig.SanitizeC, exe_name: []const u8, catalog: std.Build.LazyPath) *std.Build.Step.Run {
-    const kernel_module = makeModule(b, "src/kernel/root.zig", target, optimize, sanitize_c);
+    const kernel_module = checkedModule(b, "src/kernel/root.zig", target, optimize, sanitize_c);
     kernel_module.addImport("interface", interface);
     kernel_module.addImport("components", components);
-    const contract_module = makeModule(b, "build/acceptance/oracles/contract.zig", target, optimize, sanitize_c);
+    const contract_module = checkedModule(b, "build/acceptance/oracles/contract.zig", target, optimize, sanitize_c);
     contract_module.addImport("interface", interface);
     contract_module.addImport("kernel", kernel_module);
     const contract_exe = b.addExecutable(.{ .name = exe_name, .root_module = contract_module });
@@ -178,6 +175,11 @@ fn addOracles(b: *std.Build, ctx: *common.Settings, refs: reference.Refs) void {
     const skip_host = skipVariantHostLibraries(b, ctx);
     const skip_app = addOracleApp(b, ctx, refs, "oracles_skip", "skip", modules_pair, c_module, skip_host, "oracles_skip", "Run the oracle suite against the encode A/B variant slot");
 
+    // Foreign scenarios shell out to the reference CLIs at run time, so the
+    // oracles step installs them even when the benchmark never runs.
+    refs.dependOnTools(&app.run.step);
+    refs.dependOnTools(&skip_app.run.step);
+
     addAbComparison(b, app.exe, skip_app.exe, ctx.generated.catalog);
 
     // Each scenario runs in its own process: a contract violation traps, so the
@@ -207,6 +209,7 @@ fn addOraclesUbsan(b: *std.Build, ctx: *common.Settings, refs: reference.Refs) v
     const c_module = translateCModule(b, ctx.target, ctx.optimize);
 
     const app = addOracleApp(b, &ubsan_ctx, refs, "oracles_ubsan", "baseline", modules_pair, c_module, ubsan_ctx.host, "oracles_ubsan", "Run the oracle suite with UBSan");
+    refs.dependOnTools(&app.run.step);
     app.run.step.dependOn(&addTrapRun(b, &ubsan_ctx, ctx.target, ctx.optimize, "oracles_trap_ubsan").step);
     app.run.step.dependOn(&addContractCheck(b, modules_pair.interface, modules_pair.components, ctx.target, ctx.optimize, .full, "contract_check_ubsan", ctx.generated.catalog).step);
 
@@ -262,7 +265,7 @@ fn addBenchmark(b: *std.Build, ctx: *common.Settings, refs: reference.Refs) void
     // The SDK path exists only for a Darwin target, and the expansion runs for every -Dtarget.
     const macos_sdk_usr_lib: ?[]const u8 = if (ref_target.result.os.tag.isDarwin())
         macosSdkUsrLib(b, ctx) orelse
-            @panic("The benchmark build needs the macOS SDK. Run xcode-select to select an Xcode install.")
+            @panic("the benchmark build needs the macOS SDK. Run xcode-select to select an Xcode install.")
     else
         null;
     _ = addBenchmarkApp(b, ctx, refs, "benchmark", ctx.host, "benchmark", "Run the Silesia codec benchmark against reference implementations and write the report", ref_target, bench_components_module, bypass_module, macos_sdk_usr_lib, ctx.generated.catalog);

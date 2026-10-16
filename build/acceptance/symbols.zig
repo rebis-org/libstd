@@ -23,13 +23,13 @@ pub fn assertExports(init: std.process.Init, library: []const u8) !void {
     while (lines.next()) |line| {
         const index = std.mem.find(u8, line, " T ") orelse continue;
         const name = std.mem.trim(u8, line[index + 3 ..], " \t\r");
-        const known = for (exports, 0..) |expected, i| {
+        const is_known = for (exports, 0..) |expected, export_index| {
             if (std.mem.eql(u8, name, expected)) {
-                found[i] = true;
+                found[export_index] = true;
                 break true;
             }
         } else false;
-        if (!known) return error.unexpected_export;
+        if (!is_known) return error.unexpected_export;
         count += 1;
     }
     if (count != exports.len) return error.missing_export;

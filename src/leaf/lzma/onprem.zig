@@ -1,11 +1,11 @@
 const std = @import("std");
 
 const kernels = @import("../../common/kernels.zig");
-const failure_prim = @import("../../common/primitive/failure.zig");
+const exception_prim = @import("../../common/primitive/exception.zig");
 const io = @import("../../common/primitive/io.zig");
 const measurement = @import("../../common/primitive/measurement.zig");
 
-const Failure = failure_prim.Failure;
+const Exception = exception_prim.Exception;
 
 pub const dictionary_min = 1 << 12;
 pub const dictionary_max = 1 << 30; // 1 GiB for 64-bit workspace sizing.
@@ -20,15 +20,15 @@ pub const Properties = struct {
         return @intCast((@as(u32, self.pb) * 5 + self.lp) * 9 + self.lc);
     }
 
-    pub fn decode(properties_byte: u8, dictionary_size: u32) Failure!Properties {
-        if (properties_byte >= 9 * 5 * 5) return error.DataFailure;
+    pub fn decode(properties_byte: u8, dictionary_size: u32) Exception!Properties {
+        if (properties_byte >= 9 * 5 * 5) return error.DataException;
         const lc: u4 = @intCast(properties_byte % 9);
         const packed_pb_lp = properties_byte / 9;
         const pb: u4 = @intCast(packed_pb_lp / 5);
         const lp: u4 = @intCast(packed_pb_lp % 5);
         // The SDK constraint, enforced at the leaf so direct leaf users are
         // covered too: larger lc+lp would overflow the probability tables.
-        if (lc + lp > 4) return error.UnsupportedFailure;
+        if (lc + lp > 4) return error.UnsupportedException;
         return .{
             .lc = lc,
             .lp = lp,
@@ -202,13 +202,13 @@ pub fn modelSize(properties: Properties) usize {
     return modelProbCount(properties) * @sizeOf(Prob);
 }
 
-fn takeTables(self: anytype, workspace: *io.Workspace, properties: Properties) Failure!void {
+fn takeTables(self: anytype, workspace: *io.Workspace, properties: Properties) Exception!void {
     inline for (@typeInfo(ProbTables).@"struct".field_names) |name| {
         @field(self, name) = try workspace.take(Prob, probCount(name, properties));
     }
 }
 
-fn planTables(plan: *io.WorkspacePlan, properties: Properties) Failure!void {
+fn planTables(plan: *io.WorkspacePlan, properties: Properties) Exception!void {
     inline for (@typeInfo(ProbTables).@"struct".field_names) |name| {
         try plan.take(Prob, probCount(name, properties));
     }
@@ -282,7 +282,7 @@ fn encodeWorkspaceSizeFor(properties: Properties, use_bt: bool) usize {
 }
 
 const RangeDecoder = struct {
-    const Error = Failure;
+    const Error = Exception;
 
     input: Input,
     range: u32,
@@ -294,7 +294,7 @@ const RangeDecoder = struct {
         slice: struct { data: []const u8, position: usize },
     };
 
-    fn init(reader: *std.Io.Reader) Failure!RangeDecoder {
+    fn init(reader: *std.Io.Reader) Exception!RangeDecoder {
         var self = RangeDecoder{
             .input = .{ .reader = reader },
             .range = 0xFFFFFFFF,
@@ -302,7 +302,7 @@ const RangeDecoder = struct {
             .corrupted = false,
         };
         const first = try self.readByte();
-        if (first != 0) return error.DataFailure;
+        if (first != 0) return error.DataException;
         for (0..4) |_| {
             self.code = (self.code << 8) | try self.readByte();
         }
@@ -310,7 +310,7 @@ const RangeDecoder = struct {
         return self;
     }
 
-    fn initSlice(data: []const u8) Failure!RangeDecoder {
+    fn initSlice(data: []const u8) Exception!RangeDecoder {
         var self = RangeDecoder{
             .input = .{ .slice = .{ .data = data, .position = 0 } },
             .range = 0xFFFFFFFF,
@@ -318,7 +318,7 @@ const RangeDecoder = struct {
             .corrupted = false,
         };
         const first = try self.readByte();
-        if (first != 0) return error.DataFailure;
+        if (first != 0) return error.DataException;
         for (0..4) |_| {
             self.code = (self.code << 8) | try self.readByte();
         }
@@ -331,7 +331,7 @@ const RangeDecoder = struct {
             .reader => |reader| io.readByte(reader),
             .slice => |*input_state| read_byte: {
                 if (input_state.position >= input_state.data.len) {
-                    return error.DataFailure;
+                    return error.DataException;
                 }
                 const byte = input_state.data[input_state.position];
                 input_state.position += 1;
@@ -407,7 +407,7 @@ const RangeDecoderFast = struct {
     code: u32,
     corrupted: bool,
 
-    fn initSlice(data: []const u8) Failure!RangeDecoderFast {
+    fn initSlice(data: []const u8) Exception!RangeDecoderFast {
         var self = RangeDecoderFast{
             .input = .{ .data = data, .position = 0 },
             .range = 0xFFFFFFFF,
@@ -415,7 +415,7 @@ const RangeDecoderFast = struct {
             .corrupted = false,
         };
         const first = self.readByte();
-        if (first != 0) return error.DataFailure;
+        if (first != 0) return error.DataException;
         for (0..4) |_| {
             self.code = (self.code << 8) | self.readByte();
         }
@@ -509,7 +509,7 @@ pub const RangeEncoder = struct {
         };
     }
 
-    fn shiftLow(self: *RangeEncoder) Failure!void {
+    fn shiftLow(self: *RangeEncoder) Exception!void {
         const low32: u32 = @intCast(self.low & 0xFFFFFFFF);
         const high: u32 = @intCast(self.low >> 32);
         self.low = @as(u64, std.math.shl(u32, low32, 8));
@@ -528,14 +528,14 @@ pub const RangeEncoder = struct {
         }
     }
 
-    fn normalize(self: *RangeEncoder) Failure!void {
+    fn normalize(self: *RangeEncoder) Exception!void {
         if (self.range < top_value) {
             self.range <<= 8;
             try self.shiftLow();
         }
     }
 
-    fn encodeBit(self: *RangeEncoder, prob: *Prob, symbol: u1) Failure!void {
+    fn encodeBit(self: *RangeEncoder, prob: *Prob, symbol: u1) Exception!void {
         const probability: u32 = prob.*;
         const bound = (self.range >> prob_total_bits) * probability;
         updateProb(prob, symbol);
@@ -548,7 +548,7 @@ pub const RangeEncoder = struct {
         try self.normalize();
     }
 
-    fn encodeDirectBits(self: *RangeEncoder, value: u32, num_bits: u5) Failure!void {
+    fn encodeDirectBits(self: *RangeEncoder, value: u32, num_bits: u5) Exception!void {
         var remaining = num_bits;
         while (remaining > 0) : (remaining -= 1) {
             self.range >>= 1;
@@ -559,7 +559,7 @@ pub const RangeEncoder = struct {
         }
     }
 
-    pub fn finish(self: *RangeEncoder) Failure!void {
+    pub fn finish(self: *RangeEncoder) Exception!void {
         var i: u32 = 0;
         while (i < 5) : (i += 1) {
             try self.shiftLow();
@@ -579,18 +579,18 @@ inline fn updateProb(prob: *Prob, symbol: u1) void {
 const PriceCounter = struct {
     price: u64 = 0,
 
-    inline fn encodeBit(self: *PriceCounter, prob: *Prob, symbol: u1) Failure!void {
+    inline fn encodeBit(self: *PriceCounter, prob: *Prob, symbol: u1) Exception!void {
         self.price += Encoder.priceBit(prob.*, symbol);
         updateProb(prob, symbol);
     }
 
-    inline fn encodeDirectBits(self: *PriceCounter, value: u32, num_bits: u5) Failure!void {
+    inline fn encodeDirectBits(self: *PriceCounter, value: u32, num_bits: u5) Exception!void {
         _ = value;
         self.price += @as(u64, num_bits) << price_scale_shift;
     }
 };
 
-inline fn bitTreeDecode(range_coder: anytype, probs: []Prob, comptime num_bits: u5) Failure!u32 {
+inline fn bitTreeDecode(range_coder: anytype, probs: []Prob, comptime num_bits: u5) Exception!u32 {
     var node: u32 = 1;
     inline for (0..num_bits) |_| {
         const bit = try range_coder.decodeBit(&probs[node]);
@@ -599,7 +599,7 @@ inline fn bitTreeDecode(range_coder: anytype, probs: []Prob, comptime num_bits: 
     return node - (@as(u32, 1) << num_bits);
 }
 
-inline fn bitTreeReverseDecode(range_coder: anytype, probs: []Prob, num_bits: u5) Failure!u32 {
+inline fn bitTreeReverseDecode(range_coder: anytype, probs: []Prob, num_bits: u5) Exception!u32 {
     var node: u32 = 1;
     var symbol: u32 = 0;
     var i: u32 = 0;
@@ -632,7 +632,7 @@ inline fn bitTreeReverseDecodeFast(range_coder: *RangeDecoderFast, probs: []Prob
     return symbol;
 }
 
-fn bitTreeEncode(range_coder: anytype, probs: []Prob, num_bits: u5, symbol: u32) Failure!void {
+fn bitTreeEncode(range_coder: anytype, probs: []Prob, num_bits: u5, symbol: u32) Exception!void {
     var node: u32 = 1;
     var i = num_bits;
     while (i > 0) : (i -= 1) {
@@ -642,7 +642,7 @@ fn bitTreeEncode(range_coder: anytype, probs: []Prob, num_bits: u5, symbol: u32)
     }
 }
 
-fn bitTreeReverseEncode(range_coder: anytype, probs: []Prob, num_bits: u5, symbol: u32) Failure!void {
+fn bitTreeReverseEncode(range_coder: anytype, probs: []Prob, num_bits: u5, symbol: u32) Exception!void {
     var node: u32 = 1;
     var i: u32 = 0;
     while (i < num_bits) : (i += 1) {
@@ -706,7 +706,7 @@ pub fn DecoderOf(comptime slice_input: bool) type {
             self.properties = properties;
         }
 
-        pub fn initProperties(properties: Properties, scratch: []u8) Failure!Self {
+        pub fn initProperties(properties: Properties, scratch: []u8) Exception!Self {
             var workspace = try io.Workspace.init(scratch.ptr, scratch.len);
             const dictionary = try workspace.take(u8, properties.dictionary_size);
             // Tables assigned and filled before the decoder runs, so `undefined` is safe.
@@ -756,7 +756,7 @@ pub fn DecoderOf(comptime slice_input: bool) type {
             return self;
         }
 
-        pub fn initPropertiesInPlace(properties: Properties, output: []u8, scratch: []u8) Failure!Self {
+        pub fn initPropertiesInPlace(properties: Properties, output: []u8, scratch: []u8) Exception!Self {
             var workspace = try io.Workspace.init(scratch.ptr, scratch.len);
             // Tables assigned and filled before the decoder runs, so `undefined` is safe.
             var self = Self{
@@ -805,20 +805,20 @@ pub fn DecoderOf(comptime slice_input: bool) type {
             return self;
         }
 
-        pub fn init(properties: Properties, reader: *std.Io.Reader, scratch: []u8) Failure!Self {
+        pub fn init(properties: Properties, reader: *std.Io.Reader, scratch: []u8) Exception!Self {
             var self = try initProperties(properties, scratch);
             try self.resetReader(reader);
             return self;
         }
 
-        pub fn resetReader(self: *Self, reader: *std.Io.Reader) Failure!void {
+        pub fn resetReader(self: *Self, reader: *std.Io.Reader) Exception!void {
             if (comptime slice_input) {
-                return error.UnsupportedFailure;
+                return error.UnsupportedException;
             }
             self.range_coder = try RC.init(reader);
         }
 
-        pub fn resetReaderSlice(self: *Self, data: []const u8) Failure!void {
+        pub fn resetReaderSlice(self: *Self, data: []const u8) Exception!void {
             self.range_coder = try RC.initSlice(data);
         }
 
@@ -845,11 +845,11 @@ pub fn DecoderOf(comptime slice_input: bool) type {
             resetTables(self);
         }
 
-        pub fn feedByte(self: *Self, byte: u8) Failure!void {
+        pub fn feedByte(self: *Self, byte: u8) Exception!void {
             // In-place output is the caller's buffer and does not wrap: the
             // LZMA2 copy-block path can outrun it across chunks, so the
             // capacity check putByte carries applies here too.
-            if (!self.clear_dictionary and self.dictionary_pos >= self.dictionary.len) return error.CapacityFailure;
+            if (!self.clear_dictionary and self.dictionary_pos >= self.dictionary.len) return error.CapacityException;
             self.dictionary[self.dictionary_pos] = byte;
             self.dictionary_pos += 1;
             self.total_pos +%= 1;
@@ -863,7 +863,7 @@ pub fn DecoderOf(comptime slice_input: bool) type {
             }
         }
 
-        pub fn decodeToOutput(self: *Self, output: ?[]u8, unpack_size: ?u64, marker_required: bool) Failure!void {
+        pub fn decodeToOutput(self: *Self, output: ?[]u8, unpack_size: ?u64, marker_required: bool) Exception!void {
             self.output_buffer = output;
             self.output_pos = 0;
             var remaining: ?u64 = unpack_size;
@@ -873,7 +873,7 @@ pub fn DecoderOf(comptime slice_input: bool) type {
                 defer self.range_coder = range_coder;
                 var prev_byte: u32 = if (self.dictionary_pos == 0 and !self.dictionary_full) 0 else self.getByte(1);
                 while (true) {
-                    if (range_coder.corrupted) return error.DataFailure;
+                    if (range_coder.corrupted) return error.DataException;
                     if (remaining) |*remaining_count| {
                         if (remaining_count.* == 0) {
                             if (!marker_required) {
@@ -894,7 +894,7 @@ pub fn DecoderOf(comptime slice_input: bool) type {
                             // With a marker required, a literal past the
                             // declared size is corruption, and decrementing
                             // past zero would wrap the counter.
-                            if (remaining_count.* == 0) return error.DataFailure;
+                            if (remaining_count.* == 0) return error.DataException;
                             remaining_count.* -= 1;
                         }
                         continue;
@@ -909,18 +909,18 @@ pub fn DecoderOf(comptime slice_input: bool) type {
                         length = try self.decodeLength(&range_coder, position_state, false);
                         self.rep0 = try self.decodeDistance(&range_coder, length);
                         if (self.rep0 == 0xFFFFFFFF) {
-                            if (!range_coder.isFinishedOk()) return error.DataFailure;
-                            if (marker_required and remaining != null and remaining.? != 0) return error.DataFailure;
+                            if (!range_coder.isFinishedOk()) return error.DataException;
+                            if (marker_required and remaining != null and remaining.? != 0) return error.DataException;
                             try self.finishOutput();
                             return;
                         }
-                        if (self.rep0 >= self.properties.dictionary_size or !self.isDistanceValid(self.rep0)) return error.DataFailure;
+                        if (self.rep0 >= self.properties.dictionary_size or !self.isDistanceValid(self.rep0)) return error.DataException;
                     } else {
-                        if (self.dictionary_pos == 0 and !self.dictionary_full) return error.DataFailure;
+                        if (self.dictionary_pos == 0 and !self.dictionary_full) return error.DataException;
                         if (range_coder.decodeBit(&self.is_rep_g0[self.state]) == 0) {
                             if (range_coder.decodeBit(&self.is_rep0_long[state2]) == 0) {
                                 self.state = updateStateShortRep(self.state);
-                                if (!self.isDistanceValid(self.rep0)) return error.DataFailure;
+                                if (!self.isDistanceValid(self.rep0)) return error.DataException;
                                 const byte = self.getByte(self.rep0 + 1);
                                 try self.putByte(byte);
                                 prev_byte = byte;
@@ -959,9 +959,9 @@ pub fn DecoderOf(comptime slice_input: bool) type {
                         }
                         remaining_count.* -= length;
                     }
-                    if (!self.isDistanceValid(self.rep0)) return error.DataFailure;
+                    if (!self.isDistanceValid(self.rep0)) return error.DataException;
                     try self.copyMatch(self.rep0 + 1, length);
-                    if (is_error) return error.DataFailure;
+                    if (is_error) return error.DataException;
                     prev_byte = self.getByte(1);
                 }
             } else {
@@ -987,7 +987,7 @@ pub fn DecoderOf(comptime slice_input: bool) type {
                             // With a marker required, a literal past the
                             // declared size is corruption, and decrementing
                             // past zero would wrap the counter.
-                            if (remaining_count.* == 0) return error.DataFailure;
+                            if (remaining_count.* == 0) return error.DataException;
                             remaining_count.* -= 1;
                         }
                         continue;
@@ -1002,18 +1002,18 @@ pub fn DecoderOf(comptime slice_input: bool) type {
                         length = try self.decodeLength(&self.range_coder, position_state, false);
                         self.rep0 = try self.decodeDistance(&self.range_coder, length);
                         if (self.rep0 == 0xFFFFFFFF) {
-                            if (!self.range_coder.isFinishedOk()) return error.DataFailure;
-                            if (marker_required and remaining != null and remaining.? != 0) return error.DataFailure;
+                            if (!self.range_coder.isFinishedOk()) return error.DataException;
+                            if (marker_required and remaining != null and remaining.? != 0) return error.DataException;
                             try self.finishOutput();
                             return;
                         }
-                        if (self.rep0 >= self.properties.dictionary_size or !self.isDistanceValid(self.rep0)) return error.DataFailure;
+                        if (self.rep0 >= self.properties.dictionary_size or !self.isDistanceValid(self.rep0)) return error.DataException;
                     } else {
-                        if (self.dictionary_pos == 0 and !self.dictionary_full) return error.DataFailure;
+                        if (self.dictionary_pos == 0 and !self.dictionary_full) return error.DataException;
                         if (try self.range_coder.decodeBit(&self.is_rep_g0[self.state]) == 0) {
                             if (try self.range_coder.decodeBit(&self.is_rep0_long[state2]) == 0) {
                                 self.state = updateStateShortRep(self.state);
-                                if (!self.isDistanceValid(self.rep0)) return error.DataFailure;
+                                if (!self.isDistanceValid(self.rep0)) return error.DataException;
                                 const byte = self.getByte(self.rep0 + 1);
                                 try self.putByte(byte);
                                 prev_byte = byte;
@@ -1052,22 +1052,22 @@ pub fn DecoderOf(comptime slice_input: bool) type {
                         }
                         remaining_count.* -= length;
                     }
-                    if (!self.isDistanceValid(self.rep0)) return error.DataFailure;
+                    if (!self.isDistanceValid(self.rep0)) return error.DataException;
                     try self.copyMatch(self.rep0 + 1, length);
-                    if (is_error) return error.DataFailure;
+                    if (is_error) return error.DataException;
                     prev_byte = self.getByte(1);
                 }
             }
         }
 
-        fn decodeLiteral(self: *Self, range_coder: *RC, prev_byte: u32) Failure!u8 {
+        fn decodeLiteral(self: *Self, range_coder: *RC, prev_byte: u32) Exception!u8 {
             const lit_state = ((self.total_pos & ((@as(u32, 1) << @intCast(self.properties.lp)) - 1)) << @intCast(self.properties.lc)) +
                 (prev_byte >> @intCast(8 - self.properties.lc));
             const probs = self.literal_probs[lit_state * literal_probs_count ..][0..literal_probs_count];
             var symbol: u32 = 1;
             if (comptime slice_input) {
                 if (self.state >= 7) {
-                    if (!self.isDistanceValid(self.rep0)) return error.DataFailure;
+                    if (!self.isDistanceValid(self.rep0)) return error.DataException;
                     var match_byte = self.getByte(self.rep0 + 1);
                     var use_match = true;
                     // Exactly 8 steps: the symbol stays below 0x100 until the last shift.
@@ -1089,13 +1089,13 @@ pub fn DecoderOf(comptime slice_input: bool) type {
                         symbol = (symbol << 1) | bit;
                     }
                 }
-                if (range_coder.corrupted) return error.DataFailure;
+                if (range_coder.corrupted) return error.DataException;
                 const byte: u8 = @intCast(symbol - 0x100);
                 try self.putByte(byte);
                 return byte;
             } else {
                 if (self.state >= 7) {
-                    if (!self.isDistanceValid(self.rep0)) return error.DataFailure;
+                    if (!self.isDistanceValid(self.rep0)) return error.DataException;
                     var match_byte = self.getByte(self.rep0 + 1);
                     var use_match = true;
                     inline for (0..8) |_| {
@@ -1122,7 +1122,7 @@ pub fn DecoderOf(comptime slice_input: bool) type {
             }
         }
 
-        fn decodeLength(self: *Self, range_coder: *RC, position_state: u32, comptime is_rep: bool) Failure!u32 {
+        fn decodeLength(self: *Self, range_coder: *RC, position_state: u32, comptime is_rep: bool) Exception!u32 {
             const choice = if (is_rep) &self.rep_len_choice[0] else &self.len_choice[0];
             const choice2 = if (is_rep) &self.rep_len_choice[1] else &self.len_choice[1];
             const low = if (is_rep) self.rep_len_low else self.len_low;
@@ -1131,16 +1131,16 @@ pub fn DecoderOf(comptime slice_input: bool) type {
             if (comptime slice_input) {
                 if (range_coder.decodeBit(choice) == 0) {
                     const length = bitTreeDecodeFast(range_coder, low[position_state * (1 << 3) ..][0..(1 << 3)], 3);
-                    if (range_coder.corrupted) return error.DataFailure;
+                    if (range_coder.corrupted) return error.DataException;
                     return length;
                 }
                 if (range_coder.decodeBit(choice2) == 0) {
                     const length = 8 + bitTreeDecodeFast(range_coder, mid[position_state * (1 << 3) ..][0..(1 << 3)], 3);
-                    if (range_coder.corrupted) return error.DataFailure;
+                    if (range_coder.corrupted) return error.DataException;
                     return length;
                 }
                 const length = 16 + bitTreeDecodeFast(range_coder, high, 8);
-                if (range_coder.corrupted) return error.DataFailure;
+                if (range_coder.corrupted) return error.DataException;
                 return length;
             }
             if (try range_coder.decodeBit(choice) == 0) {
@@ -1152,12 +1152,12 @@ pub fn DecoderOf(comptime slice_input: bool) type {
             return 16 + try bitTreeDecode(range_coder, high, 8);
         }
 
-        fn decodeDistance(self: *Self, range_coder: *RC, length: u32) Failure!u32 {
+        fn decodeDistance(self: *Self, range_coder: *RC, length: u32) Exception!u32 {
             var length_state = length;
             if (length_state > num_len_to_pos_states - 1) length_state = num_len_to_pos_states - 1;
             if (comptime slice_input) {
                 const pos_slot = bitTreeDecodeFast(range_coder, self.pos_slot_decoders[length_state * (1 << 6) ..][0..(1 << 6)], 6);
-                if (range_coder.corrupted) return error.DataFailure;
+                if (range_coder.corrupted) return error.DataException;
                 if (pos_slot < 4) return pos_slot;
                 const num_direct_bits = (pos_slot >> 1) - 1;
                 var distance: u32 = (@as(u32, 2) | (pos_slot & 1)) << @intCast(num_direct_bits);
@@ -1167,7 +1167,7 @@ pub fn DecoderOf(comptime slice_input: bool) type {
                     distance += (range_coder.decodeDirectBits(@intCast(num_direct_bits - num_align_bits))) << num_align_bits;
                     distance += bitTreeReverseDecodeFast(range_coder, self.align_decoder, num_align_bits);
                 }
-                if (range_coder.corrupted) return error.DataFailure;
+                if (range_coder.corrupted) return error.DataException;
                 return distance;
             }
             const pos_slot = try bitTreeDecode(range_coder, self.pos_slot_decoders[length_state * (1 << 6) ..][0..(1 << 6)], 6);
@@ -1183,8 +1183,8 @@ pub fn DecoderOf(comptime slice_input: bool) type {
             return distance;
         }
 
-        fn putByte(self: *Self, byte: u8) Failure!void {
-            if (!self.clear_dictionary and self.dictionary_pos >= self.dictionary.len) return error.CapacityFailure;
+        fn putByte(self: *Self, byte: u8) Exception!void {
+            if (!self.clear_dictionary and self.dictionary_pos >= self.dictionary.len) return error.CapacityException;
             self.dictionary[self.dictionary_pos] = byte;
             self.dictionary_pos += 1;
             self.total_pos +%= 1;
@@ -1199,7 +1199,7 @@ pub fn DecoderOf(comptime slice_input: bool) type {
                 }
             }
             if (self.output_buffer) |output| {
-                if (self.output_pos >= output.len) return error.CapacityFailure;
+                if (self.output_pos >= output.len) return error.CapacityException;
                 output[self.output_pos] = byte;
                 self.output_pos += 1;
             } else if (self.output_writer) |writer| {
@@ -1212,12 +1212,12 @@ pub fn DecoderOf(comptime slice_input: bool) type {
             }
         }
 
-        fn flushOutput(self: *Self, writer: *std.Io.Writer) Failure!void {
+        fn flushOutput(self: *Self, writer: *std.Io.Writer) Exception!void {
             try io.writeBytes(writer, self.staging_buffer[0..self.staging_length]);
             self.staging_length = 0;
         }
 
-        fn finishOutput(self: *Self) Failure!void {
+        fn finishOutput(self: *Self) Exception!void {
             if (self.output_writer) |writer| {
                 if (self.staging_length > 0) try self.flushOutput(writer);
             }
@@ -1239,10 +1239,10 @@ pub fn DecoderOf(comptime slice_input: bool) type {
             return distance < self.dictionary_pos or self.dictionary_full;
         }
 
-        fn copyMatch(self: *Self, distance: u32, length: u32) Failure!void {
+        fn copyMatch(self: *Self, distance: u32, length: u32) Exception!void {
             // A linear dictionary keeps the source contiguous and before the destination, so one forward copy covers it.
             if (!self.clear_dictionary) {
-                if (self.dictionary_pos + length > self.dictionary.len) return error.CapacityFailure;
+                if (self.dictionary_pos + length > self.dictionary.len) return error.CapacityException;
                 kernels.copyMatch(self.dictionary, self.dictionary_pos, distance, length);
                 self.dictionary_pos += length;
                 self.total_pos +%= length;
@@ -1251,7 +1251,7 @@ pub fn DecoderOf(comptime slice_input: bool) type {
             }
             var remaining = length;
             while (remaining > 0) {
-                if (self.dictionary_pos >= self.dictionary.len) return error.CapacityFailure;
+                if (self.dictionary_pos >= self.dictionary.len) return error.CapacityException;
                 const source = if (distance <= self.dictionary_pos)
                     self.dictionary_pos - distance
                 else
@@ -1260,7 +1260,7 @@ pub fn DecoderOf(comptime slice_input: bool) type {
                 if (source > self.dictionary_pos) batch = @min(batch, self.dictionary.len - source);
                 if (self.output_buffer) |output| {
                     batch = @min(batch, output.len - self.output_pos);
-                    if (batch == 0) return error.CapacityFailure;
+                    if (batch == 0) return error.CapacityException;
                 }
                 if (source < self.dictionary_pos) {
                     var covered: usize = distance;
@@ -1328,51 +1328,51 @@ fn initProbs(probs: []Prob) void {
     for (probs) |*prob_entry| prob_entry.* = prob_init;
 }
 
-pub fn decode(input: []const u8, output: []u8, scratch: []u8, options: Options) Failure!usize {
+pub fn decode(input: []const u8, output: []u8, scratch: []u8, options: Options) Exception!usize {
     const needed = decodeWorkspaceSize(options.properties);
-    if (scratch.len < needed) return error.CapacityFailure;
-    if (input.len + output.len > options.max_work) return error.ResourceFailure;
+    if (scratch.len < needed) return error.CapacityException;
+    if (input.len + output.len > options.max_work) return error.ResourceException;
     // Output doubles as dictionary window, avoiding a separate copy.
     var decoder = try DecoderOf(true).initPropertiesInPlace(options.properties, output, scratch);
     try decoder.resetReaderSlice(input);
     try decoder.decodeToOutput(null, options.unpack_size, options.marker_required);
-    return std.math.cast(usize, decoder.decoded) orelse return error.ResourceFailure;
+    return std.math.cast(usize, decoder.decoded) orelse return error.ResourceException;
 }
 
-pub fn decodeInPlace(input: []const u8, output: []u8, scratch: []u8, options: Options) Failure!usize {
+pub fn decodeInPlace(input: []const u8, output: []u8, scratch: []u8, options: Options) Exception!usize {
     const needed = decodeInPlaceWorkspaceSize(options.properties);
-    if (scratch.len < needed) return error.CapacityFailure;
-    if (input.len + output.len > options.max_work) return error.ResourceFailure;
+    if (scratch.len < needed) return error.CapacityException;
+    if (input.len + output.len > options.max_work) return error.ResourceException;
     var decoder = try DecoderOf(true).initPropertiesInPlace(options.properties, output, scratch);
     try decoder.resetReaderSlice(input);
     try decoder.decodeToOutput(null, options.unpack_size, options.marker_required);
-    return std.math.cast(usize, decoder.decoded) orelse return error.ResourceFailure;
+    return std.math.cast(usize, decoder.decoded) orelse return error.ResourceException;
 }
 
-pub fn decodedSize(input: []const u8, scratch: []u8, options: Options) Failure!usize {
+pub fn decodedSize(input: []const u8, scratch: []u8, options: Options) Exception!usize {
     const needed = decodeWorkspaceSize(options.properties);
-    if (scratch.len < needed) return error.CapacityFailure;
-    if (input.len > options.max_work) return error.ResourceFailure;
+    if (scratch.len < needed) return error.CapacityException;
+    if (input.len > options.max_work) return error.ResourceException;
     var decoder = try DecoderOf(true).initProperties(options.properties, scratch);
     try decoder.resetReaderSlice(input);
     try decoder.decodeToOutput(null, options.unpack_size, options.marker_required);
     return decoder.output_pos;
 }
 
-pub fn decodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options: Options) Failure!void {
+pub fn decodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options: Options) Exception!void {
     var source = std.Io.Reader.fixed(input);
     try decodeStream(&source, writer, scratch, options);
 }
 
-pub fn decodeStream(reader: *std.Io.Reader, writer: *std.Io.Writer, scratch: []u8, options: Options) Failure!void {
+pub fn decodeStream(reader: *std.Io.Reader, writer: *std.Io.Writer, scratch: []u8, options: Options) Exception!void {
     const needed = decodeWorkspaceSize(options.properties);
-    if (scratch.len < needed) return error.CapacityFailure;
+    if (scratch.len < needed) return error.CapacityException;
     var decoder = try Decoder.init(options.properties, reader, scratch);
     decoder.output_writer = writer;
     try decoder.decodeToOutput(null, options.unpack_size, options.marker_required);
 }
 
-pub fn requiredSize(input: []const u8, scratch: []u8, options: Options) Failure!usize {
+pub fn requiredSize(input: []const u8, scratch: []u8, options: Options) Exception!usize {
     var counter = measurement.Counter.init(null);
     try encodeInner(input, &counter.writer, scratch, options);
     return measurement.measuredLength(&counter);
@@ -1380,7 +1380,7 @@ pub fn requiredSize(input: []const u8, scratch: []u8, options: Options) Failure!
 
 // Greedy live-model pass for the LZMA2 probe. The dictionary clamps to the chunk size so clears scale with the chunk.
 // Calibration is documented at the lzma2 probe.
-pub fn estimatedSize(input: []const u8, scratch: []u8, options: Options) Failure!usize {
+pub fn estimatedSize(input: []const u8, scratch: []u8, options: Options) Exception!usize {
     var properties = options.properties;
     if (input.len < properties.dictionary_size) {
         var clamp: u32 = dictionary_min;
@@ -1388,26 +1388,26 @@ pub fn estimatedSize(input: []const u8, scratch: []u8, options: Options) Failure
         if (clamp < properties.dictionary_size) properties.dictionary_size = clamp;
     }
     const needed = if (options.match_finder == .bt4) encodeWorkspaceSizeBt(properties) else encodeWorkspaceSize(properties);
-    if (scratch.len < needed) return error.CapacityFailure;
+    if (scratch.len < needed) return error.CapacityException;
     var probe_options = options;
     probe_options.properties = properties;
     var drain = std.Io.Writer.fixed(&.{});
     var encoder = try Encoder.init(properties, &drain, scratch, probe_options);
     const price = try encoder.estimateInput(input);
-    const payload = std.math.cast(usize, (price + (1 << 13) - 1) >> 13) orelse return error.ResourceFailure;
+    const payload = std.math.cast(usize, (price + (1 << 13) - 1) >> 13) orelse return error.ResourceException;
     // 5 flush bytes plus the cache byte.
     return payload + 6;
 }
 
-pub fn encode(input: []const u8, output: []u8, scratch: []u8, options: Options) Failure!usize {
-    if (input.len + output.len > options.max_work) return error.ResourceFailure;
+pub fn encode(input: []const u8, output: []u8, scratch: []u8, options: Options) Exception!usize {
+    if (input.len + output.len > options.max_work) return error.ResourceException;
     var dest = std.Io.Writer.fixed(output);
     try encodeInner(input, &dest, scratch, options);
     return dest.end;
 }
 
-pub fn encodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options: Options) Failure!void {
-    if (input.len > options.max_work) return error.ResourceFailure;
+pub fn encodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options: Options) Exception!void {
+    if (input.len > options.max_work) return error.ResourceException;
     try encodeInner(input, writer, scratch, options);
 }
 
@@ -1459,7 +1459,7 @@ pub const Encoder = struct {
     prices: *PriceTables,
     literal_prices: []u32,
 
-    pub fn init(properties: Properties, writer: *std.Io.Writer, scratch: []u8, options: Options) Failure!Encoder {
+    pub fn init(properties: Properties, writer: *std.Io.Writer, scratch: []u8, options: Options) Exception!Encoder {
         var workspace = try io.Workspace.init(scratch.ptr, scratch.len);
         const dictionary = try workspace.take(u8, properties.dictionary_size);
         const chain = try workspace.take(u32, matchFinderChainSize(properties.dictionary_size));
@@ -1681,7 +1681,7 @@ pub const Encoder = struct {
             self.prices.align_prices[distance & (align_size - 1)];
     }
 
-    pub fn encodeInput(self: *Encoder, input: []const u8, marker_required: bool) Failure!void {
+    pub fn encodeInput(self: *Encoder, input: []const u8, marker_required: bool) Exception!void {
         self.input = input;
         self.input_base = self.total_pos;
         var position: usize = 0;
@@ -1871,7 +1871,7 @@ pub const Encoder = struct {
         ptr1.* = 0;
     }
 
-    fn estimateInput(self: *Encoder, input: []const u8) Failure!u64 {
+    fn estimateInput(self: *Encoder, input: []const u8) Exception!u64 {
         self.input = input;
         self.input_base = self.total_pos;
         var price_counter = PriceCounter{};
@@ -2100,7 +2100,7 @@ pub const Encoder = struct {
         return decision_count;
     }
 
-    fn encodeWindow(self: *Encoder, window_start: usize, decision_count: usize) Failure!void {
+    fn encodeWindow(self: *Encoder, window_start: usize, decision_count: usize) Exception!void {
         const pb_mask = (@as(u32, 1) << @intCast(self.properties.pb)) - 1;
         var pending_decisions = decision_count;
         var position = window_start;
@@ -2181,7 +2181,7 @@ pub const Encoder = struct {
         }
     }
 
-    fn encodeLiteral(self: *Encoder, range_coder: anytype, byte: u8) Failure!void {
+    fn encodeLiteral(self: *Encoder, range_coder: anytype, byte: u8) Exception!void {
         const prev_byte: u32 = if (self.dictionary_pos == 0 and !self.dictionary_full) 0 else self.getByte(1);
         const lit_state = ((self.total_pos & ((@as(u32, 1) << @intCast(self.properties.lp)) - 1)) << @intCast(self.properties.lc)) +
             (prev_byte >> @intCast(8 - self.properties.lc));
@@ -2208,7 +2208,7 @@ pub const Encoder = struct {
         }
     }
 
-    fn encodeLength(self: *Encoder, range_coder: anytype, position_state: u32, length: u32) Failure!void {
+    fn encodeLength(self: *Encoder, range_coder: anytype, position_state: u32, length: u32) Exception!void {
         if (length < 8) {
             try range_coder.encodeBit(&self.len_choice[0], 0);
             try bitTreeEncode(range_coder, self.len_low[position_state * (1 << 3) ..][0..(1 << 3)], 3, length);
@@ -2223,7 +2223,7 @@ pub const Encoder = struct {
         }
     }
 
-    fn encodeRepLength(self: *Encoder, range_coder: anytype, position_state: u32, length: u32) Failure!void {
+    fn encodeRepLength(self: *Encoder, range_coder: anytype, position_state: u32, length: u32) Exception!void {
         if (length < 8) {
             try range_coder.encodeBit(&self.rep_len_choice[0], 0);
             try bitTreeEncode(range_coder, self.rep_len_low[position_state * (1 << 3) ..][0..(1 << 3)], 3, length);
@@ -2238,7 +2238,7 @@ pub const Encoder = struct {
         }
     }
 
-    fn encodeDistance(self: *Encoder, range_coder: anytype, raw_length: u32, distance: u32) Failure!void {
+    fn encodeDistance(self: *Encoder, range_coder: anytype, raw_length: u32, distance: u32) Exception!void {
         const pos_slot = encodePosSlot(distance);
         var length_state = raw_length;
         if (length_state > num_len_to_pos_states - 1) length_state = num_len_to_pos_states - 1;
@@ -2255,7 +2255,7 @@ pub const Encoder = struct {
         }
     }
 
-    fn encodeEndMarker(self: *Encoder, range_coder: anytype) Failure!void {
+    fn encodeEndMarker(self: *Encoder, range_coder: anytype) Exception!void {
         const pos_slot: u32 = 63;
         const length_state: u32 = 0;
         try bitTreeEncode(range_coder, self.pos_slot_decoders[length_state * (1 << 6) ..][0..(1 << 6)], 6, pos_slot);
@@ -2574,9 +2574,9 @@ pub const Encoder = struct {
     }
 };
 
-fn encodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options: Options) Failure!void {
+fn encodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options: Options) Exception!void {
     const needed = if (options.match_finder == .bt4) encodeWorkspaceSizeBt(options.properties) else encodeWorkspaceSize(options.properties);
-    if (scratch.len < needed) return error.CapacityFailure;
+    if (scratch.len < needed) return error.CapacityException;
     var encoder = try Encoder.init(options.properties, writer, scratch, options);
     try encoder.encodeInput(input, options.marker_required);
 }

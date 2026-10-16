@@ -42,14 +42,14 @@ const Mergeable = union(Provider) {
     onprem: onprem.Decompress,
     offprem: offprem.Decompress,
 
-    pub fn initBound(provider: Provider, input: *std.Io.Reader, history: []u8) error{UnsupportedFailure}!@This() {
+    pub fn initBound(provider: Provider, input: *std.Io.Reader, history: []u8) error{UnsupportedException}!@This() {
         return switch (provider) {
             .onprem => .{ .onprem = onprem.Decompress.init(input, history) },
             .offprem => .{ .offprem = offprem.Decompress.init(input, history) },
         };
     }
 
-    pub fn initSliceBoundInPlace(self: *@This(), provider: Provider, data: []const u8, history: []u8) error{UnsupportedFailure}!void {
+    pub fn initSliceBoundInPlace(self: *@This(), provider: Provider, data: []const u8, history: []u8) error{UnsupportedException}!void {
         switch (provider) {
             .onprem => {
                 self.* = .{ .onprem = undefined };

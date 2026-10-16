@@ -1,10 +1,10 @@
 const std = @import("std");
 
 const checksum = @import("../../common/primitive/checksum.zig");
-const failure = @import("../../common/primitive/failure.zig");
+const exception = @import("../../common/primitive/exception.zig");
 const bits = @import("bits.zig");
 
-const Failure = failure.Failure;
+const Exception = exception.Exception;
 const BitReader = bits.BitReader;
 
 // Only six standard filter programs exist, so a program matches only when its
@@ -48,7 +48,7 @@ pub fn identifyFilter(provider: checksum.Provider, code: []const u8) StandardFil
 
 // A variable-width integer uses the top two bits to select the width. The
 // 0x4000 width has a sub-case that sign-extends a small negative value.
-pub fn readData(br: *BitReader) Failure!u32 {
+pub fn readData(br: *BitReader) Exception!u32 {
     const head_bits = try br.peekBits(16);
     switch (head_bits & 0xc000) {
         0 => {

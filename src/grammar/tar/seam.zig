@@ -5,7 +5,7 @@ pub const Provider = @import("seam").Provider;
 const offprem = @import("offprem.zig");
 const onprem = @import("onprem.zig");
 
-pub const Failure = offprem.Failure;
+pub const Exception = offprem.Exception;
 pub const Entry = onprem.Entry;
 pub const EntryInfo = onprem.EntryInfo;
 
@@ -17,10 +17,10 @@ pub const default_provider: Provider = switch (build_options.grammar_impl) {
 // Fixed builds reject the other tag explicitly instead of serving it
 // silently; the mergeable build binds the tag per call. One dispatch per
 // call, never per symbol or block.
-fn requireServed(provider: Provider, comptime served: Provider) error{UnsupportedFailure}!void {
-    if (provider != served) return error.UnsupportedFailure;
+fn requireServed(provider: Provider, comptime served: Provider) error{UnsupportedException}!void {
+    if (provider != served) return error.UnsupportedException;
 }
-pub fn inspectCount(provider: Provider, archive: []const u8) Failure!u64 {
+pub fn inspectCount(provider: Provider, archive: []const u8) Exception!u64 {
     return switch (build_options.grammar_impl) {
         .onprem => blk: {
             try requireServed(provider, .onprem);
@@ -36,7 +36,7 @@ pub fn inspectCount(provider: Provider, archive: []const u8) Failure!u64 {
         },
     };
 }
-pub fn decodeOrdinal(provider: Provider, archive: []const u8, ordinal: u64, output: []u8) Failure!usize {
+pub fn decodeOrdinal(provider: Provider, archive: []const u8, ordinal: u64, output: []u8) Exception!usize {
     return switch (build_options.grammar_impl) {
         .onprem => blk: {
             try requireServed(provider, .onprem);
@@ -52,7 +52,7 @@ pub fn decodeOrdinal(provider: Provider, archive: []const u8, ordinal: u64, outp
         },
     };
 }
-pub fn archiveSize(provider: Provider, entries: []const Entry) Failure!u64 {
+pub fn archiveSize(provider: Provider, entries: []const Entry) Exception!u64 {
     return switch (build_options.grammar_impl) {
         .onprem => blk: {
             try requireServed(provider, .onprem);
@@ -68,7 +68,7 @@ pub fn archiveSize(provider: Provider, entries: []const Entry) Failure!u64 {
         },
     };
 }
-pub fn encode(provider: Provider, entries: []const Entry, output: []u8, scratch: []u8) Failure!usize {
+pub fn encode(provider: Provider, entries: []const Entry, output: []u8, scratch: []u8) Exception!usize {
     return switch (build_options.grammar_impl) {
         .onprem => blk: {
             try requireServed(provider, .onprem);
@@ -85,7 +85,7 @@ pub fn encode(provider: Provider, entries: []const Entry, output: []u8, scratch:
     };
 }
 
-pub fn inspectOrdinal(provider: Provider, archive: []const u8, ordinal: u64) Failure!EntryInfo {
+pub fn inspectOrdinal(provider: Provider, archive: []const u8, ordinal: u64) Exception!EntryInfo {
     // std.tar.Iterator.File carries no mtime/uid/gid/typeflag, so ordinal
     // inspect resolves to onprem under every build to keep the metadata
     // contract (see offprem.zig).

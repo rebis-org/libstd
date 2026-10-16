@@ -4,7 +4,7 @@ const binary = @import("../../common/primitive/binary.zig");
 const bounds = @import("../../common/primitive/bounds.zig");
 const checksum = @import("../../common/primitive/checksum.zig");
 const crypto = @import("../../common/primitive/crypto.zig");
-const failure_prim = @import("../../common/primitive/failure.zig");
+const exception_prim = @import("../../common/primitive/exception.zig");
 const io = @import("../../common/primitive/io.zig");
 const limits_prim = @import("../../common/primitive/limits.zig");
 const measurement = @import("../../common/primitive/measurement.zig");
@@ -20,7 +20,7 @@ const lzma2 = @import("../../leaf/lzma2/onprem.zig");
 const lzma2_seam = @import("../../leaf/lzma2/seam.zig");
 const ppmd = @import("../../leaf/ppmd/onprem.zig");
 
-const Failure = failure_prim.Failure;
+const Exception = exception_prim.Exception;
 const Workspace = io.Workspace;
 const Limits = limits_prim.Limits;
 
@@ -165,9 +165,9 @@ fn methodId(method: CoderMethod) []const u8 {
     unreachable;
 }
 
-fn methodFromId(id: []const u8) Failure!CoderMethod {
+fn methodFromId(id: []const u8) Exception!CoderMethod {
     inline for (method_ids) |row| if (std.mem.eql(u8, id, row.id)) return row.method;
-    return error.UnsupportedFailure;
+    return error.UnsupportedException;
 }
 
 fn coderAttributeSize(method: CoderMethod) usize {
@@ -199,54 +199,54 @@ const PackedEntry = struct {
     unpack_size: usize = 0,
 };
 
-fn packBuffer(comptime codec: type, method: CoderMethod, input: []const u8, unpacked_crc: u32, workspace: *Workspace, limits: Limits, scratch_size: usize, options: codec.Options) Failure!PackedEntry {
+fn packBuffer(comptime codec: type, method: CoderMethod, input: []const u8, unpacked_crc: u32, workspace: *Workspace, limits: Limits, scratch_size: usize, options: codec.Options) Exception!PackedEntry {
     const scratch = try workspace.take(u8, scratch_size);
     const packed_size = try codec.requiredSize(input, scratch, options);
-    if (packed_size > limits.encoded_bytes) return error.ResourceFailure;
-    if (try bounds.addUsize(input.len, packed_size) > limits.codec_work) return error.ResourceFailure;
+    if (packed_size > limits.encoded_bytes) return error.ResourceException;
+    if (try bounds.addUsize(input.len, packed_size) > limits.codec_work) return error.ResourceException;
     const packed_data = try workspace.take(u8, packed_size);
     _ = try codec.encode(input, packed_data, scratch, options);
     return .{ .method = method, .data = packed_data, .crc = unpacked_crc, .pack_size = packed_size, .unpack_size = input.len };
 }
 
-fn packEntry(entry: Entry, provider: crypto.Provider, workspace: *Workspace, limits: Limits, failure_cause: *crypto.FailureCause) Failure!PackedEntry {
+fn packEntry(entry: Entry, provider: crypto.Provider, workspace: *Workspace, limits: Limits, failure_cause: *crypto.FailureCause) Exception!PackedEntry {
     if (entry.encrypted) {
-        if (entry.password.len == 0) return error.CallFailure;
-        if (entry.num_cycles_power > crypto.seven_zip_cycles_max) return error.CallFailure;
-        if (entry.salt_length > 16) return error.CallFailure;
+        if (entry.password.len == 0) return error.CallException;
+        if (entry.num_cycles_power > crypto.seven_zip_cycles_max) return error.CallException;
+        if (entry.salt_length > 16) return error.CallException;
         const cycles = if (entry.num_cycles_power == 0) crypto.seven_zip_default_cycles else entry.num_cycles_power;
         const rounds: u64 = @as(u64, 1) << @intCast(cycles);
         if (entry.kdf_rounds_limit != 0 and entry.kdf_rounds_limit < rounds) {
             failure_cause.* = .kdf_limit;
-            return error.ResourceFailure;
+            return error.ResourceException;
         }
     }
     const unpacked_crc = checksum.crc32With(provider, entry.data);
     const compressed_entry = switch (entry.method) {
-        .bcj2 => return error.CallFailure, // Decode-only; creation never emits BCJ2.
+        .bcj2 => return error.CallException, // Decode-only; creation never emits BCJ2.
         .copy => blk: {
-            if (entry.filter != null) return error.CallFailure;
-            if (entry.data.len > limits.encoded_bytes) return error.ResourceFailure;
-            if (entry.data.len > limits.codec_work) return error.ResourceFailure;
+            if (entry.filter != null) return error.CallException;
+            if (entry.data.len > limits.encoded_bytes) return error.ResourceException;
+            if (entry.data.len > limits.codec_work) return error.ResourceException;
             break :blk PackedEntry{ .method = .copy, .data = entry.data, .crc = unpacked_crc, .pack_size = entry.data.len, .unpack_size = entry.data.len };
         },
         .deflate => blk: {
             const measure_history = try workspace.take(u8, deflate.history_size);
             var counter = measurement.Counter.init(null);
-            var measure_compressor = deflate.Compress.init(&counter.writer, measure_history, default_deflate_options) catch return error.CapacityFailure;
+            var measure_compressor = deflate.Compress.init(&counter.writer, measure_history, default_deflate_options) catch return error.CapacityException;
             var measure_source = std.Io.Reader.fixed(entry.data);
-            _ = std.Io.Reader.streamRemaining(&measure_source, &measure_compressor.writer) catch return error.IoFailure;
-            measure_compressor.finish() catch return error.IoFailure;
+            _ = std.Io.Reader.streamRemaining(&measure_source, &measure_compressor.writer) catch return error.IoException;
+            measure_compressor.finish() catch return error.IoException;
             const packed_size = counter.written();
-            if (packed_size > limits.encoded_bytes) return error.ResourceFailure;
-            if (entry.data.len + packed_size > limits.codec_work) return error.ResourceFailure;
+            if (packed_size > limits.encoded_bytes) return error.ResourceException;
+            if (entry.data.len + packed_size > limits.codec_work) return error.ResourceException;
             const packed_data = try workspace.take(u8, packed_size);
             const history = try workspace.take(u8, deflate.history_size);
             var fixed_writer = std.Io.Writer.fixed(packed_data);
-            var compressor = deflate.Compress.init(&fixed_writer, history, default_deflate_options) catch return error.CapacityFailure;
+            var compressor = deflate.Compress.init(&fixed_writer, history, default_deflate_options) catch return error.CapacityException;
             var source = std.Io.Reader.fixed(entry.data);
-            _ = std.Io.Reader.streamRemaining(&source, &compressor.writer) catch return error.IoFailure;
-            compressor.finish() catch return error.IoFailure;
+            _ = std.Io.Reader.streamRemaining(&source, &compressor.writer) catch return error.IoException;
+            compressor.finish() catch return error.IoException;
             break :blk PackedEntry{ .method = .deflate, .data = packed_data, .crc = unpacked_crc, .pack_size = packed_size, .unpack_size = entry.data.len };
         },
         .bzip2 => try packBuffer(bzip2, .bzip2, entry.data, unpacked_crc, workspace, limits, bzip2.encodeWorkspaceSize(default_bzip2_block), .{ .block_size = default_bzip2_block }),
@@ -280,7 +280,7 @@ fn packEntry(entry: Entry, provider: crypto.Provider, workspace: *Workspace, lim
                         const options: lzma2.Options = .{ .dictionary_size = default_dictionary, .properties = lzma2.defaultProperties(default_dictionary), .max_work = limits.codec_work };
                         break :blk2 try packBuffer(lzma2, .lzma2, filtered, unpacked_crc, workspace, limits, lzma2.encodeWorkspaceSizeBt(default_dictionary), options);
                     },
-                    else => return error.CallFailure,
+                    else => return error.CallException,
                 };
                 packed_entry.filter = explicit;
                 break :blk packed_entry;
@@ -302,7 +302,7 @@ fn packEntry(entry: Entry, provider: crypto.Provider, workspace: *Workspace, lim
     const padded_size = std.mem.alignForward(usize, compressed_entry.data.len, crypto.block_length);
     if (entry.password_lifetime != 0 and padded_size > entry.password_lifetime) {
         failure_cause.* = .password_lifetime;
-        return error.ResourceFailure;
+        return error.ResourceException;
     }
     const encrypted_data = try workspace.take(u8, padded_size);
     @memset(encrypted_data[compressed_entry.data.len..], 0);
@@ -315,15 +315,15 @@ fn packEntry(entry: Entry, provider: crypto.Provider, workspace: *Workspace, lim
     return .{ .method = compressed_entry.method, .data = encrypted_data, .crc = compressed_entry.crc, .encrypted = true, .filter = compressed_entry.filter, .iv = iv, .salt = entry.salt, .salt_length = entry.salt_length, .num_cycles_power = cycles, .pack_size = compressed_entry.pack_size, .unpack_size = compressed_entry.unpack_size };
 }
 
-fn applyEncodeFilter(method: CoderMethod, data: []u8) Failure!void {
+fn applyEncodeFilter(method: CoderMethod, data: []u8) Exception!void {
     switch (method) {
         .delta => delta.encode(data, 0),
         .x86, .ppc, .ia64, .arm, .armt, .sparc, .arm64, .riscv => bcj.encode(bcjKindFromMethod(method), 0, data),
-        else => return error.CallFailure,
+        else => return error.CallException,
     }
 }
 
-fn packAllEntries(entries: []const Entry, provider: crypto.Provider, workspace: *Workspace, limits: Limits, failure_cause: *crypto.FailureCause) Failure![]const PackedEntry {
+fn packAllEntries(entries: []const Entry, provider: crypto.Provider, workspace: *Workspace, limits: Limits, failure_cause: *crypto.FailureCause) Exception![]const PackedEntry {
     const packed_entries = try workspace.take(PackedEntry, nonEmptyCount(entries));
     var index: usize = 0;
     var i: usize = 0;
@@ -333,14 +333,14 @@ fn packAllEntries(entries: []const Entry, provider: crypto.Provider, workspace: 
             continue;
         }
         // One folder and one continuous codec stream per run, so coder state
-        // carries across the substreams as in ip7z/7zip's solid folders.
+        // carries across the substreams as in vendor/7zip's solid folders.
         if ((entries[i].method == .lzma2 or entries[i].method == .ppmd) and !entries[i].encrypted) {
             var j = i + 1;
             while (j < entries.len and !isEmptyEntry(entries[j]) and entries[j].method == entries[i].method and !entries[j].encrypted and entries[j].filter == entries[i].filter) j += 1;
             if (j - i >= 2) {
                 var total: usize = 0;
                 for (entries[i..j]) |entry| total = try bounds.addUsize(total, entry.data.len);
-                if (total > limits.codec_work) return error.ResourceFailure;
+                if (total > limits.codec_work) return error.ResourceException;
                 const concat = try workspace.take(u8, total);
                 var offset: usize = 0;
                 for (entries[i..j]) |entry| {
@@ -364,8 +364,8 @@ fn packAllEntries(entries: []const Entry, provider: crypto.Provider, workspace: 
                     },
                     else => unreachable,
                 };
-                if (packed_size > limits.encoded_bytes) return error.ResourceFailure;
-                if (try bounds.addUsize(total, packed_size) > limits.codec_work) return error.ResourceFailure;
+                if (packed_size > limits.encoded_bytes) return error.ResourceException;
+                if (try bounds.addUsize(total, packed_size) > limits.codec_work) return error.ResourceException;
                 const packed_data = try workspace.take(u8, packed_size);
                 switch (entries[i].method) {
                     .lzma2 => {
@@ -393,12 +393,12 @@ fn packAllEntries(entries: []const Entry, provider: crypto.Provider, workspace: 
     return packed_entries[0..index];
 }
 
-pub fn sevenZipPack(entries: []const Entry, provider: crypto.Provider, workspace: *Workspace, limits: Limits, failure_cause: *crypto.FailureCause) Failure![]const PackedEntry {
+pub fn sevenZipPack(entries: []const Entry, provider: crypto.Provider, workspace: *Workspace, limits: Limits, failure_cause: *crypto.FailureCause) Exception![]const PackedEntry {
     failure_cause.* = .none;
     return try packAllEntries(entries, provider, workspace, limits, failure_cause);
 }
 
-fn requiredSizeFromPacked(entries: []const Entry, packed_entries: []const PackedEntry, workspace: *Workspace, provider: crypto.Provider, limits: Limits, header_options: SevenZipHeaderOptions) Failure!usize {
+fn requiredSizeFromPacked(entries: []const Entry, packed_entries: []const PackedEntry, workspace: *Workspace, provider: crypto.Provider, limits: Limits, header_options: SevenZipHeaderOptions) Exception!usize {
     var total_pack_size: usize = 0;
     const plan = try buildFolderPlan(packed_entries, workspace);
     for (plan) |folder| total_pack_size = try bounds.addUsize(total_pack_size, packed_entries[folder.first].data.len);
@@ -408,10 +408,10 @@ fn requiredSizeFromPacked(entries: []const Entry, packed_entries: []const Packed
     const header_struct_size = try measurement.measuredLength(&counter);
     const packs_and_header = try bounds.addUsize(total_pack_size, header.pack_size);
     const total = try bounds.addUsize(start_header_size, try bounds.addUsize(packs_and_header, header_struct_size));
-    return std.math.cast(usize, total) orelse error.ResourceFailure;
+    return std.math.cast(usize, total) orelse error.ResourceException;
 }
 
-pub fn sevenZipPackedSize(entries: []const Entry, packed_entries: []const PackedEntry, workspace: *Workspace, provider: crypto.Provider, limits: Limits, header_options: SevenZipHeaderOptions) Failure!usize {
+pub fn sevenZipPackedSize(entries: []const Entry, packed_entries: []const PackedEntry, workspace: *Workspace, provider: crypto.Provider, limits: Limits, header_options: SevenZipHeaderOptions) Exception!usize {
     return try requiredSizeFromPacked(entries, packed_entries, workspace, provider, limits, header_options);
 }
 
@@ -449,14 +449,14 @@ const HeaderEncode = struct {
     encoded: bool = false,
 };
 
-fn encryptHeaderBytes(cleartext: []const u8, workspace: *Workspace, provider: crypto.Provider, header_options: SevenZipHeaderOptions) Failure!struct { data: []const u8, cycles: u8, iv: [16]u8 } {
-    if (header_options.password.len == 0) return error.CallFailure;
-    if (header_options.num_cycles_power > crypto.seven_zip_cycles_max) return error.CallFailure;
+fn encryptHeaderBytes(cleartext: []const u8, workspace: *Workspace, provider: crypto.Provider, header_options: SevenZipHeaderOptions) Exception!struct { data: []const u8, cycles: u8, iv: [16]u8 } {
+    if (header_options.password.len == 0) return error.CallException;
+    if (header_options.num_cycles_power > crypto.seven_zip_cycles_max) return error.CallException;
     const cycles = if (header_options.num_cycles_power == 0) crypto.seven_zip_default_cycles else header_options.num_cycles_power;
     const rounds: u64 = @as(u64, 1) << @intCast(cycles);
     if (header_options.kdf_rounds_limit != 0 and header_options.kdf_rounds_limit < rounds) {
         if (header_options.failure_cause) |cause| cause.* = .kdf_limit;
-        return error.ResourceFailure;
+        return error.ResourceException;
     }
     const password_utf16 = try passwordToUtf16(header_options.password, workspace);
     var key: [crypto.seven_zip_key_length]u8 = undefined;
@@ -464,7 +464,7 @@ fn encryptHeaderBytes(cleartext: []const u8, workspace: *Workspace, provider: cr
     const padded_size = std.mem.alignForward(usize, cleartext.len, crypto.block_length);
     if (header_options.password_lifetime != 0 and padded_size > header_options.password_lifetime) {
         if (header_options.failure_cause) |cause| cause.* = .password_lifetime;
-        return error.ResourceFailure;
+        return error.ResourceException;
     }
     const encrypted_data = try workspace.take(u8, padded_size);
     @memset(encrypted_data[cleartext.len..], 0);
@@ -475,7 +475,7 @@ fn encryptHeaderBytes(cleartext: []const u8, workspace: *Workspace, provider: cr
     return .{ .data = encrypted_data, .cycles = cycles, .iv = iv };
 }
 
-fn encodeHeaderBytes(entries: []const Entry, packed_entries: []const PackedEntry, workspace: *Workspace, provider: crypto.Provider, limits: Limits, header_options: SevenZipHeaderOptions) Failure!HeaderEncode {
+fn encodeHeaderBytes(entries: []const Entry, packed_entries: []const PackedEntry, workspace: *Workspace, provider: crypto.Provider, limits: Limits, header_options: SevenZipHeaderOptions) Exception!HeaderEncode {
     var counter = measurement.Counter.init(null);
     try writeHeader(&counter.writer, entries, packed_entries, workspace);
     const header_size = try measurement.measuredLength(&counter);
@@ -538,7 +538,7 @@ fn encodeHeaderBytes(entries: []const Entry, packed_entries: []const PackedEntry
 // Writes the next-header bytes: the raw header, or the kEncodedHeader
 // structure naming `pack_offset` (the header stream's position after the
 // start header, past the data pack streams).
-fn writeNextHeader(writer: *std.Io.Writer, header: *const HeaderEncode, pack_offset: u64) Failure!void {
+fn writeNextHeader(writer: *std.Io.Writer, header: *const HeaderEncode, pack_offset: u64) Exception!void {
     if (!header.encoded) {
         try io.writeBytes(writer, header.stored);
         return;
@@ -592,9 +592,9 @@ fn writeNextHeader(writer: *std.Io.Writer, header: *const HeaderEncode, pack_off
     try io.writeBytes(writer, &.{0x00});
 }
 
-fn writeArchive(output: []u8, entries: []const Entry, packed_entries: []const PackedEntry, workspace: *Workspace, provider: crypto.Provider, limits: Limits, header_options: SevenZipHeaderOptions) Failure!usize {
+fn writeArchive(output: []u8, entries: []const Entry, packed_entries: []const PackedEntry, workspace: *Workspace, provider: crypto.Provider, limits: Limits, header_options: SevenZipHeaderOptions) Exception!usize {
     const required = try requiredSizeFromPacked(entries, packed_entries, workspace, provider, limits, header_options);
-    if (output.len < required) return error.CapacityFailure;
+    if (output.len < required) return error.CapacityException;
     var total_pack_size: usize = 0;
     const plan = try buildFolderPlan(packed_entries, workspace);
     for (plan) |folder| total_pack_size = try bounds.addUsize(total_pack_size, packed_entries[folder.first].data.len);
@@ -621,28 +621,28 @@ fn writeArchive(output: []u8, entries: []const Entry, packed_entries: []const Pa
     return required;
 }
 
-pub fn sevenZipWritePacked(entries: []const Entry, packed_entries: []const PackedEntry, output: []u8, workspace: *Workspace, provider: crypto.Provider, limits: Limits, header_options: SevenZipHeaderOptions) Failure!usize {
+pub fn sevenZipWritePacked(entries: []const Entry, packed_entries: []const PackedEntry, output: []u8, workspace: *Workspace, provider: crypto.Provider, limits: Limits, header_options: SevenZipHeaderOptions) Exception!usize {
     return try writeArchive(output, entries, packed_entries, workspace, provider, limits, header_options);
 }
 
-pub fn sevenZipInspectCountEx(archive_bytes: []const u8, workspace: *Workspace, limits: Limits, options: *const SevenZipLoadOptions) Failure!u64 {
+pub fn sevenZipInspectCountEx(archive_bytes: []const u8, workspace: *Workspace, limits: Limits, options: *const SevenZipLoadOptions) Exception!u64 {
     const loaded = try loadArchive(archive_bytes, workspace, limits, options);
     return loaded.count;
 }
 
-pub fn sevenZipInspectOrdinal(archive_bytes: []const u8, workspace: *Workspace, limits: Limits, ordinal: u64, provider: crypto.Provider) Failure!Info {
+pub fn sevenZipInspectOrdinal(archive_bytes: []const u8, workspace: *Workspace, limits: Limits, ordinal: u64, provider: crypto.Provider) Exception!Info {
     var cause: crypto.FailureCause = .none;
     const options: SevenZipLoadOptions = .{ .failure_cause = &cause, .provider = provider };
     return try sevenZipInspectOrdinalEx(archive_bytes, workspace, limits, ordinal, &options);
 }
 
-pub fn sevenZipInspectOrdinalEx(archive_bytes: []const u8, workspace: *Workspace, limits: Limits, ordinal: u64, options: *const SevenZipLoadOptions) Failure!Info {
+pub fn sevenZipInspectOrdinalEx(archive_bytes: []const u8, workspace: *Workspace, limits: Limits, ordinal: u64, options: *const SevenZipLoadOptions) Exception!Info {
     const loaded = try loadArchive(archive_bytes, workspace, limits, options);
-    if (ordinal >= loaded.count) return error.DataFailure;
+    if (ordinal >= loaded.count) return error.DataException;
     return loaded.entries[ordinal];
 }
 
-pub fn sevenZipDecodeOrdinal(archive_bytes: []const u8, workspace: *Workspace, limits: Limits, ordinal: u64, output: []u8, decode_options: SevenZipDecodeOptions) Failure!usize {
+pub fn sevenZipDecodeOrdinal(archive_bytes: []const u8, workspace: *Workspace, limits: Limits, ordinal: u64, output: []u8, decode_options: SevenZipDecodeOptions) Exception!usize {
     decode_options.failure_cause.* = .none;
     const load_options: SevenZipLoadOptions = .{
         .password = decode_options.password,
@@ -652,112 +652,112 @@ pub fn sevenZipDecodeOrdinal(archive_bytes: []const u8, workspace: *Workspace, l
         .provider = decode_options.provider,
     };
     const loaded = try loadArchive(archive_bytes, workspace, limits, &load_options);
-    if (ordinal >= loaded.count) return error.DataFailure;
+    if (ordinal >= loaded.count) return error.DataException;
     const entry = loaded.entries[ordinal];
-    const size = std.math.cast(usize, entry.size) orelse return error.ResourceFailure;
-    if (output.len < size) return error.CapacityFailure;
+    const size = std.math.cast(usize, entry.size) orelse return error.ResourceException;
+    if (output.len < size) return error.CapacityException;
     if (size == 0) return 0;
     var decode_output = output;
     var decode_target_len = size;
     if (entry.folder) |folder| {
         if (folder.num_substreams > 1) {
             const total_size = try folderOutputSize(folder);
-            if (total_size > limits.decoded_bytes) return error.ResourceFailure;
+            if (total_size > limits.decoded_bytes) return error.ResourceException;
             decode_output = try workspace.take(u8, total_size);
             decode_target_len = total_size;
         }
     }
-    const pack_size = std.math.cast(usize, entry.pack_size) orelse return error.ResourceFailure;
+    const pack_size = std.math.cast(usize, entry.pack_size) orelse return error.ResourceException;
     const packed_data = try workspace.take(u8, pack_size);
     try readAt(loaded.data, entry.data_offset, packed_data);
     const decrypted_packed = try aesDecryptStream(entry.encrypted, entry.aes_num_cycles, entry.aes_salt, entry.aes_iv, packed_data, workspace, &load_options);
     switch (entry.method) {
         .copy => {
-            if (decrypted_packed.len != decode_target_len and !entry.encrypted) return error.DataFailure;
-            if (decrypted_packed.len < decode_target_len) return error.DataFailure;
+            if (decrypted_packed.len != decode_target_len and !entry.encrypted) return error.DataException;
+            if (decrypted_packed.len < decode_target_len) return error.DataException;
             @memcpy(decode_output[0..decode_target_len], decrypted_packed[0..decode_target_len]);
         },
         .deflate => {
             const history = try workspace.take(u8, deflate.history_size);
             var source_reader = std.Io.Reader.fixed(decrypted_packed);
             var dest_writer = std.Io.Writer.fixed(decode_output);
-            var inflater = deflate_seam.Decode.initBound(decode_options.provider, &source_reader, history) catch return error.UnsupportedFailure;
-            _ = inflater.readerPtr().streamRemaining(&dest_writer) catch return error.DataFailure;
-            if (dest_writer.end != decode_target_len) return error.DataFailure;
+            var inflater = deflate_seam.Decode.initBound(decode_options.provider, &source_reader, history) catch return error.UnsupportedException;
+            _ = inflater.readerPtr().streamRemaining(&dest_writer) catch return error.DataException;
+            if (dest_writer.end != decode_target_len) return error.DataException;
         },
         .bzip2 => {
             const scratch_size = try bzip2.decodeWorkspaceSizeFor(decrypted_packed);
             const scratch = try workspace.take(u8, scratch_size);
             const decoded = try bzip2.decode(decrypted_packed, decode_output, scratch, decode_options.provider);
-            if (decoded != decode_target_len) return error.DataFailure;
+            if (decoded != decode_target_len) return error.DataException;
         },
         .lzma => {
             const properties = try parseLzmaProperties(entry.attributes);
             const options: lzma.Options = .{ .properties = properties, .unpack_size = decode_target_len, .marker_required = false, .max_work = limits.codec_work };
             const scratch = try workspace.take(u8, lzma.decodeWorkspaceSize(properties));
             const decoded = try lzma_seam.decode(decode_options.provider, decrypted_packed, decode_output, scratch, options);
-            if (decoded != decode_target_len) return error.DataFailure;
+            if (decoded != decode_target_len) return error.DataException;
         },
         .lzma2 => {
             const dictionary = lzma2.dictionarySizeFromProperties(try readLzma2Prop(entry.attributes));
-            if (dictionary < lzma.dictionary_min or dictionary > lzma.dictionary_max) return error.UnsupportedFailure;
+            if (dictionary < lzma.dictionary_min or dictionary > lzma.dictionary_max) return error.UnsupportedException;
             const options: lzma2.Options = .{ .dictionary_size = dictionary, .properties = lzma2.defaultProperties(dictionary), .max_work = limits.codec_work };
             const scratch = try workspace.take(u8, lzma2.decodeWorkspaceSize(dictionary));
             const decoded = try lzma2_seam.decode(decode_options.provider, decrypted_packed, decode_output, scratch, options);
-            if (decoded != decode_target_len) return error.DataFailure;
+            if (decoded != decode_target_len) return error.DataException;
         },
         .ppmd => {
             const options = try parsePpmdOptions(entry.attributes, decode_target_len, limits.codec_work);
             const scratch = try workspace.take(u8, ppmd.decodeWorkspaceSize(options.mem_size));
             const decoded = try ppmd.decode(decrypted_packed, decode_output, scratch, options);
-            if (decoded != decode_target_len) return error.DataFailure;
+            if (decoded != decode_target_len) return error.DataException;
         },
         .bcj2 => {
-            const folder = entry.folder orelse return error.DataFailure;
+            const folder = entry.folder orelse return error.DataException;
             const written = try decodeBcj2Folder(folder, entry.pack_stream_sizes, decrypted_packed, decode_output[0..decode_target_len], workspace, limits, decode_options.provider);
-            if (written != decode_target_len) return error.DataFailure;
+            if (written != decode_target_len) return error.DataException;
         },
-        else => return error.UnsupportedFailure,
+        else => return error.UnsupportedException,
     }
     if (entry.folder) |folder| {
         try applyFolderFilters(folder.coders, decode_output[0..decode_target_len]);
         if (folder.num_substreams > 1) {
-            const offset = std.math.cast(usize, entry.substream_offset) orelse return error.ResourceFailure;
-            if (offset + size > decode_target_len) return error.DataFailure;
+            const offset = std.math.cast(usize, entry.substream_offset) orelse return error.ResourceException;
+            if (offset + size > decode_target_len) return error.DataException;
             @memcpy(output[0..size], decode_output[offset..][0..size]);
         }
     }
     if (entry.crc) |expected| {
-        if (checksum.crc32With(decode_options.provider, output[0..size]) != expected) return error.IntegrityFailure;
+        if (checksum.crc32With(decode_options.provider, output[0..size]) != expected) return error.IntegrityException;
     }
     return size;
 }
 
-fn readLzma2Prop(attributes: []const u8) Failure!u8 {
-    if (attributes.len != 1) return error.DataFailure;
+fn readLzma2Prop(attributes: []const u8) Exception!u8 {
+    if (attributes.len != 1) return error.DataException;
     return attributes[0];
 }
 
 // Recombines a BCJ2 folder. Each of the four inputs is a raw packed stream or the decoded
 // output of one of the folder's compressor coders, per `folder.bcj2_sources`.
-fn decodeBcj2Folder(folder: *const Folder, pack_sizes: []const u64, packed_data: []const u8, output: []u8, workspace: *Workspace, limits: Limits, provider: lzma2_seam.Provider) Failure!usize {
-    if (!folder.bcj2 or pack_sizes.len != 4) return error.DataFailure;
+fn decodeBcj2Folder(folder: *const Folder, pack_sizes: []const u64, packed_data: []const u8, output: []u8, workspace: *Workspace, limits: Limits, provider: lzma2_seam.Provider) Exception!usize {
+    if (!folder.bcj2 or pack_sizes.len != 4) return error.DataException;
     var packed_offset: usize = 0;
     var packed_slices: [4][]const u8 = undefined;
     for (0..4) |k| {
-        const size = std.math.cast(usize, pack_sizes[k]) orelse return error.ResourceFailure;
+        const size = std.math.cast(usize, pack_sizes[k]) orelse return error.ResourceException;
         packed_offset = try bounds.addUsize(packed_offset, size);
-        if (packed_offset > packed_data.len) return error.DataFailure;
+        if (packed_offset > packed_data.len) return error.DataException;
         packed_slices[k] = packed_data[packed_offset - size .. packed_offset];
     }
     var substreams: [4][]const u8 = undefined;
     for (0..4) |k| {
         const source = folder.bcj2_sources[k];
-        const ordinal = std.math.cast(usize, source.pack_ordinal) orelse return error.ResourceFailure;
-        if (ordinal >= 4) return error.DataFailure;
+        const ordinal = std.math.cast(usize, source.pack_ordinal) orelse return error.ResourceException;
+        if (ordinal >= 4) return error.DataException;
         const slice = packed_slices[ordinal];
         if (source.producer) |coder_index| {
-            if (coder_index >= folder.coders.len) return error.DataFailure;
+            if (coder_index >= folder.coders.len) return error.DataException;
             substreams[k] = try decodeBcj2Substream(folder.coders[coder_index], slice, workspace, limits, provider);
         } else {
             substreams[k] = slice;
@@ -766,26 +766,26 @@ fn decodeBcj2Folder(folder: *const Folder, pack_sizes: []const u64, packed_data:
     return bcj2.decode(substreams[0], substreams[1], substreams[2], substreams[3], output);
 }
 
-fn decodeBcj2Substream(coder: ParsedCoder, packed_data: []const u8, workspace: *Workspace, limits: Limits, provider: lzma2_seam.Provider) Failure![]const u8 {
+fn decodeBcj2Substream(coder: ParsedCoder, packed_data: []const u8, workspace: *Workspace, limits: Limits, provider: lzma2_seam.Provider) Exception![]const u8 {
     switch (coder.method) {
         .copy => return packed_data,
         .lzma2 => {
             const dictionary = lzma2.dictionarySizeFromProperties(try readLzma2Prop(coder.attributes));
-            if (dictionary < lzma.dictionary_min or dictionary > lzma.dictionary_max) return error.UnsupportedFailure;
+            if (dictionary < lzma.dictionary_min or dictionary > lzma.dictionary_max) return error.UnsupportedException;
             const options: lzma2.Options = .{ .dictionary_size = dictionary, .properties = lzma2.defaultProperties(dictionary), .max_work = limits.codec_work };
             const scratch = try workspace.take(u8, lzma2.decodeWorkspaceSize(dictionary));
             const decoded_size = try lzma2_seam.decodedSize(provider, packed_data, scratch, options);
-            if (decoded_size > limits.decoded_bytes) return error.ResourceFailure;
+            if (decoded_size > limits.decoded_bytes) return error.ResourceException;
             const buffer = try workspace.take(u8, decoded_size);
             const decoded = try lzma2_seam.decode(provider, packed_data, buffer, scratch, options);
             return buffer[0..decoded];
         },
-        else => return error.UnsupportedFailure,
+        else => return error.UnsupportedException,
     }
 }
 
-fn parsePpmdOptions(attributes: []const u8, unpack_size: usize, codec_work: u64) Failure!ppmd.Options {
-    if (attributes.len != 5) return error.DataFailure;
+fn parsePpmdOptions(attributes: []const u8, unpack_size: usize, codec_work: u64) Exception!ppmd.Options {
+    if (attributes.len != 5) return error.DataException;
     const mem_field = std.mem.readInt(u32, attributes[1..5], .little);
     const mem_size = mem_field << 8;
     return .{
@@ -796,21 +796,21 @@ fn parsePpmdOptions(attributes: []const u8, unpack_size: usize, codec_work: u64)
     };
 }
 
-fn parseLzmaProperties(attributes: []const u8) Failure!lzma.Properties {
-    if (attributes.len != 5) return error.DataFailure;
+fn parseLzmaProperties(attributes: []const u8) Exception!lzma.Properties {
+    if (attributes.len != 5) return error.DataException;
     const props_byte = attributes[0];
     var dictionary: u32 = 0;
     for (0..4) |i| dictionary |= @as(u32, attributes[1 + i]) << @intCast(8 * i);
-    if (dictionary < lzma.dictionary_min or dictionary > lzma.dictionary_max) return error.UnsupportedFailure;
+    if (dictionary < lzma.dictionary_min or dictionary > lzma.dictionary_max) return error.UnsupportedException;
     return try lzma.Properties.decode(props_byte, dictionary);
 }
 
-fn applyFolderFilters(coders: []const ParsedCoder, data: []u8) Failure!void {
+fn applyFolderFilters(coders: []const ParsedCoder, data: []u8) Exception!void {
     var filters: [4]ParsedCoder = undefined;
     var filter_count: usize = 0;
     for (coders) |coder| {
         if (isFilterMethod(coder.method)) {
-            if (filter_count >= filters.len) return error.UnsupportedFailure;
+            if (filter_count >= filters.len) return error.UnsupportedException;
             filters[filter_count] = coder;
             filter_count += 1;
         }
@@ -818,19 +818,19 @@ fn applyFolderFilters(coders: []const ParsedCoder, data: []u8) Failure!void {
     for (filters[0..filter_count]) |coder| {
         switch (coder.method) {
             .delta => {
-                if (coder.attributes.len != 1) return error.DataFailure;
+                if (coder.attributes.len != 1) return error.DataException;
                 delta.decode(data, coder.attributes[0]);
             },
             .x86, .ppc, .ia64, .arm, .armt, .sparc, .arm64, .riscv => {
                 const start_offset: u32 = if (coder.attributes.len == 0) 0 else if (coder.attributes.len == 4)
                     std.mem.readInt(u32, coder.attributes[0..4], .little)
                 else
-                    return error.DataFailure;
+                    return error.DataException;
                 const kind = bcjKindFromMethod(coder.method);
-                if (start_offset % bcj.alignment(kind) != 0) return error.DataFailure;
+                if (start_offset % bcj.alignment(kind) != 0) return error.DataException;
                 bcj.decode(kind, start_offset, data);
             },
-            else => return error.InternalFailure,
+            else => return error.InternalException,
         }
     }
 }
@@ -864,10 +864,10 @@ const LoadedArchive = struct {
     entries: []const Info,
 };
 
-fn readAt(data: []const u8, offset: u64, buffer: []u8) Failure!void {
-    const start = std.math.cast(usize, offset) orelse return error.DataFailure;
+fn readAt(data: []const u8, offset: u64, buffer: []u8) Exception!void {
+    const start = std.math.cast(usize, offset) orelse return error.DataException;
     const end = try bounds.addUsize(start, buffer.len);
-    if (end > data.len) return error.DataFailure;
+    if (end > data.len) return error.DataException;
     @memcpy(buffer, data[start..end]);
 }
 
@@ -887,8 +887,8 @@ pub const SevenZipLoadOptions = struct {
 const k_header: u8 = 0x01;
 const k_encoded_header: u8 = 0x17;
 
-fn loadArchive(data: []const u8, workspace: *Workspace, limits: Limits, options: *const SevenZipLoadOptions) Failure!LoadedArchive {
-    if (data.len > limits.encoded_bytes) return error.ResourceFailure;
+fn loadArchive(data: []const u8, workspace: *Workspace, limits: Limits, options: *const SevenZipLoadOptions) Exception!LoadedArchive {
+    if (data.len > limits.encoded_bytes) return error.ResourceException;
     var archive: LoadedArchive = .{
         .data = data,
         .count = 0,
@@ -896,29 +896,29 @@ fn loadArchive(data: []const u8, workspace: *Workspace, limits: Limits, options:
     };
     var start_buffer: [start_header_size]u8 = undefined;
     try readAt(data, 0, &start_buffer);
-    if (!std.mem.eql(u8, start_buffer[0..6], &signature)) return error.DataFailure;
-    if (!std.mem.eql(u8, start_buffer[6..8], &version)) return error.UnsupportedFailure;
+    if (!std.mem.eql(u8, start_buffer[0..6], &signature)) return error.DataException;
+    if (!std.mem.eql(u8, start_buffer[6..8], &version)) return error.UnsupportedException;
     const recorded_start_crc = std.mem.readInt(u32, start_buffer[8..12], .little);
     const start_header_crc = checksum.crc32With(options.provider, start_buffer[12..32]);
-    if (recorded_start_crc != start_header_crc) return error.IntegrityFailure;
+    if (recorded_start_crc != start_header_crc) return error.IntegrityException;
     const next_header_offset = std.mem.readInt(u64, start_buffer[12..20], .little);
     const next_header_size = std.mem.readInt(u64, start_buffer[20..28], .little);
     const recorded_header_crc = std.mem.readInt(u32, start_buffer[28..32], .little);
-    if (next_header_size > limits.metadata_records) return error.ResourceFailure;
+    if (next_header_size > limits.metadata_records) return error.ResourceException;
     const header_start = try bounds.addU64(start_header_size, next_header_offset);
-    const header_size_usize = std.math.cast(usize, next_header_size) orelse return error.ResourceFailure;
+    const header_size_usize = std.math.cast(usize, next_header_size) orelse return error.ResourceException;
     const header_buffer = try workspace.take(u8, header_size_usize);
     try readAt(archive.data, header_start, header_buffer);
-    if (checksum.crc32With(options.provider, header_buffer) != recorded_header_crc) return error.IntegrityFailure;
+    if (checksum.crc32With(options.provider, header_buffer) != recorded_header_crc) return error.IntegrityException;
     var header_bytes: []const u8 = header_buffer;
     var cursor = binary.ReadCursor.init(header_bytes);
     const header_id = try cursor.readU8();
     if (header_id == k_encoded_header) {
         header_bytes = try decodeEncodedHeader(data, &cursor, workspace, limits, options);
         cursor = binary.ReadCursor.init(header_bytes);
-        if (try cursor.readU8() != k_header) return error.DataFailure;
+        if (try cursor.readU8() != k_header) return error.DataException;
     } else if (header_id != k_header) {
-        return error.UnsupportedFailure;
+        return error.UnsupportedException;
     }
     var streams: ?StreamsInfo = null;
     var files: ?FilesInfo = null;
@@ -929,11 +929,11 @@ fn loadArchive(data: []const u8, workspace: *Workspace, limits: Limits, options:
             0x04 => streams = try parseStreamsInfo(&cursor, workspace, false),
             0x05 => files = try parseFilesInfo(&cursor, workspace),
             0x02 => try skipArchiveProperties(&cursor),
-            else => return error.UnsupportedFailure,
+            else => return error.UnsupportedException,
         }
     }
-    const si = streams orelse return error.DataFailure;
-    const fi = files orelse return error.DataFailure;
+    const si = streams orelse return error.DataException;
+    const fi = files orelse return error.DataException;
     archive.entries = try buildEntries(&si, &fi, workspace, limits);
     archive.count = archive.entries.len;
     return archive;
@@ -943,30 +943,30 @@ fn loadArchive(data: []const u8, workspace: *Workspace, limits: Limits, options:
 // packed stream: a StreamsInfo describing one folder, usually LZMA, optionally
 // behind the 7z AES-256 coder (-mhe=on). Decrypting and decompressing yields
 // the ordinary kHeader bytes, which are then parsed as if stored directly.
-fn decodeEncodedHeader(archive_data: []const u8, cursor: *binary.ReadCursor, workspace: *Workspace, limits: Limits, options: *const SevenZipLoadOptions) Failure![]const u8 {
+fn decodeEncodedHeader(archive_data: []const u8, cursor: *binary.ReadCursor, workspace: *Workspace, limits: Limits, options: *const SevenZipLoadOptions) Exception![]const u8 {
     // StreamsInfo (with its own terminating kEnd, per 7zOut.cpp's encoded
     // header writer) is the whole of the structure: nothing may follow it.
     const si = try parseStreamsInfo(cursor, workspace, true);
-    if (cursor.remaining() != 0) return error.DataFailure;
-    if (si.folders.len != 1) return error.UnsupportedFailure;
+    if (cursor.remaining() != 0) return error.DataException;
+    if (si.folders.len != 1) return error.UnsupportedException;
     const folder = &si.folders[0];
-    if (folder.bcj2) return error.UnsupportedFailure;
-    if (folder.num_pack_streams != 1 or si.pack_sizes.len != 1) return error.UnsupportedFailure;
+    if (folder.bcj2) return error.UnsupportedException;
+    if (folder.num_pack_streams != 1 or si.pack_sizes.len != 1) return error.UnsupportedException;
     for (folder.coders) |coder| {
-        if (isFilterMethod(coder.method)) return error.UnsupportedFailure;
+        if (isFilterMethod(coder.method)) return error.UnsupportedException;
     }
-    const unpack_size = std.math.cast(usize, folder.unpack_size) orelse return error.ResourceFailure;
-    if (unpack_size == 0) return error.DataFailure;
-    if (unpack_size > limits.metadata_records) return error.ResourceFailure;
-    const pack_size = std.math.cast(usize, si.pack_sizes[0]) orelse return error.ResourceFailure;
-    if (pack_size > limits.encoded_bytes) return error.ResourceFailure;
-    const pack_pos = std.math.cast(usize, si.pack_pos) orelse return error.ResourceFailure;
+    const unpack_size = std.math.cast(usize, folder.unpack_size) orelse return error.ResourceException;
+    if (unpack_size == 0) return error.DataException;
+    if (unpack_size > limits.metadata_records) return error.ResourceException;
+    const pack_size = std.math.cast(usize, si.pack_sizes[0]) orelse return error.ResourceException;
+    if (pack_size > limits.encoded_bytes) return error.ResourceException;
+    const pack_pos = std.math.cast(usize, si.pack_pos) orelse return error.ResourceException;
     const packed_data = try workspace.take(u8, pack_size);
     try readAt(archive_data, try bounds.addUsize(start_header_size, pack_pos), packed_data);
     if (si.pack_crcs.len == 1 and si.pack_crcs[0] != 0 and
         checksum.crc32With(options.provider, packed_data) != si.pack_crcs[0])
     {
-        return error.IntegrityFailure;
+        return error.IntegrityException;
     }
     const output = try workspace.take(u8, unpack_size);
     decodeFolderStream(folder, packed_data, output, workspace, limits, options) catch |err| {
@@ -980,7 +980,7 @@ fn decodeEncodedHeader(archive_data: []const u8, cursor: *binary.ReadCursor, wor
         checksum.crc32With(options.provider, output) != folder.substream_crcs[0])
     {
         if (folder.encrypted) options.failure_cause.* = .wrong_password;
-        return error.IntegrityFailure;
+        return error.IntegrityException;
     }
     return output;
 }
@@ -988,73 +988,73 @@ fn decodeEncodedHeader(archive_data: []const u8, cursor: *binary.ReadCursor, wor
 // Decrypts (when the folder carries the 7z AES coder) and decodes one packed
 // stream into output, whose length the caller derives from the folder's unpack
 // size. Shared by the encoded-header path and, through it, every header form.
-fn decodeFolderStream(folder: *const Folder, packed_data: []const u8, output: []u8, workspace: *Workspace, limits: Limits, options: *const SevenZipLoadOptions) Failure!void {
+fn decodeFolderStream(folder: *const Folder, packed_data: []const u8, output: []u8, workspace: *Workspace, limits: Limits, options: *const SevenZipLoadOptions) Exception!void {
     const decrypted = try aesDecryptFolder(folder, packed_data, workspace, options);
     switch (folder.method) {
         .copy => {
-            if (decrypted.len < output.len) return error.DataFailure;
+            if (decrypted.len < output.len) return error.DataException;
             @memcpy(output, decrypted[0..output.len]);
         },
         .deflate => {
             const history = try workspace.take(u8, deflate.history_size);
             var source_reader = std.Io.Reader.fixed(decrypted);
             var dest_writer = std.Io.Writer.fixed(output);
-            var inflater = deflate_seam.Decode.initBound(options.provider, &source_reader, history) catch return error.UnsupportedFailure;
-            _ = inflater.readerPtr().streamRemaining(&dest_writer) catch return error.DataFailure;
-            if (dest_writer.end != output.len) return error.DataFailure;
+            var inflater = deflate_seam.Decode.initBound(options.provider, &source_reader, history) catch return error.UnsupportedException;
+            _ = inflater.readerPtr().streamRemaining(&dest_writer) catch return error.DataException;
+            if (dest_writer.end != output.len) return error.DataException;
         },
         .bzip2 => {
             const scratch = try workspace.take(u8, try bzip2.decodeWorkspaceSizeFor(decrypted));
             const decoded = try bzip2.decode(decrypted, output, scratch, options.provider);
-            if (decoded != output.len) return error.DataFailure;
+            if (decoded != output.len) return error.DataException;
         },
         .lzma => {
             const properties = try parseLzmaProperties(folder.attributes);
             const lzma_options: lzma.Options = .{ .properties = properties, .unpack_size = output.len, .marker_required = false, .max_work = limits.codec_work };
             const scratch = try workspace.take(u8, lzma.decodeWorkspaceSize(properties));
             const decoded = try lzma_seam.decode(options.provider, decrypted, output, scratch, lzma_options);
-            if (decoded != output.len) return error.DataFailure;
+            if (decoded != output.len) return error.DataException;
         },
         .lzma2 => {
             const dictionary = lzma2.dictionarySizeFromProperties(try readLzma2Prop(folder.attributes));
-            if (dictionary < lzma.dictionary_min or dictionary > lzma.dictionary_max) return error.UnsupportedFailure;
+            if (dictionary < lzma.dictionary_min or dictionary > lzma.dictionary_max) return error.UnsupportedException;
             const lzma2_options: lzma2.Options = .{ .dictionary_size = dictionary, .properties = lzma2.defaultProperties(dictionary), .max_work = limits.codec_work };
             const scratch = try workspace.take(u8, lzma2.decodeWorkspaceSize(dictionary));
             const decoded = try lzma2_seam.decode(options.provider, decrypted, output, scratch, lzma2_options);
-            if (decoded != output.len) return error.DataFailure;
+            if (decoded != output.len) return error.DataException;
         },
         .ppmd => {
             const ppmd_options = try parsePpmdOptions(folder.attributes, output.len, limits.codec_work);
             const scratch = try workspace.take(u8, ppmd.decodeWorkspaceSize(ppmd_options.mem_size));
             const decoded = try ppmd.decode(decrypted, output, scratch, ppmd_options);
-            if (decoded != output.len) return error.DataFailure;
+            if (decoded != output.len) return error.DataException;
         },
-        else => return error.UnsupportedFailure,
+        else => return error.UnsupportedException,
     }
 }
 
-fn aesDecryptFolder(folder: *const Folder, packed_data: []const u8, workspace: *Workspace, options: *const SevenZipLoadOptions) Failure![]const u8 {
+fn aesDecryptFolder(folder: *const Folder, packed_data: []const u8, workspace: *Workspace, options: *const SevenZipLoadOptions) Exception![]const u8 {
     return aesDecryptStream(folder.encrypted, folder.aes_num_cycles, folder.aes_salt, folder.aes_iv, packed_data, workspace, options);
 }
 
-fn aesDecryptStream(encrypted: bool, num_cycles: u8, salt: []const u8, iv: [16]u8, packed_data: []const u8, workspace: *Workspace, options: *const SevenZipLoadOptions) Failure![]const u8 {
+fn aesDecryptStream(encrypted: bool, num_cycles: u8, salt: []const u8, iv: [16]u8, packed_data: []const u8, workspace: *Workspace, options: *const SevenZipLoadOptions) Exception![]const u8 {
     if (!encrypted) return packed_data;
-    const password = options.password orelse return error.UnsupportedFailure;
+    const password = options.password orelse return error.UnsupportedException;
     const rounds: u64 = if (num_cycles == 0x3F) 0 else @as(u64, 1) << @intCast(num_cycles);
     if (options.kdf_rounds_limit != 0 and rounds > options.kdf_rounds_limit) {
         options.failure_cause.* = .kdf_limit;
-        return error.ResourceFailure;
+        return error.ResourceException;
     }
     if (options.password_lifetime != 0 and packed_data.len > options.password_lifetime) {
         options.failure_cause.* = .password_lifetime;
-        return error.ResourceFailure;
+        return error.ResourceException;
     }
     const password_utf16 = try passwordToUtf16(password, workspace);
     var key: [crypto.seven_zip_key_length]u8 = undefined;
     if (num_cycles == 0x3F) {
         // Direct-key mode is bounded by the fixed key-material word; refuse
         // passwords that would overflow it instead of smashing the stack.
-        if (salt.len + password_utf16.len > 64) return error.UnsupportedFailure;
+        if (salt.len + password_utf16.len > 64) return error.UnsupportedException;
         var key_material: [64]u8 = @splat(0);
         @memcpy(key_material[0..salt.len], salt);
         @memcpy(key_material[salt.len..][0..password_utf16.len], password_utf16);
@@ -1130,7 +1130,7 @@ const FilesInfo = struct {
     names: []const []const u8,
 };
 
-fn parseStreamsInfo(cursor: *binary.ReadCursor, workspace: *Workspace, comptime aes_only_folders: bool) Failure!StreamsInfo {
+fn parseStreamsInfo(cursor: *binary.ReadCursor, workspace: *Workspace, comptime aes_only_folders: bool) Exception!StreamsInfo {
     var pack_pos: u64 = 0;
     var pack_sizes: []const u64 = &.{};
     var pack_crcs: []const u32 = &.{};
@@ -1145,8 +1145,8 @@ fn parseStreamsInfo(cursor: *binary.ReadCursor, workspace: *Workspace, comptime 
                 has_pack = true;
                 pack_pos = try readUint64(cursor);
                 const num_pack_streams = try readUint64(cursor);
-                if (num_pack_streams == 0) return error.DataFailure;
-                const sizes = try workspace.take(u64, std.math.cast(usize, num_pack_streams) orelse return error.ResourceFailure);
+                if (num_pack_streams == 0) return error.DataException;
+                const sizes = try workspace.take(u64, std.math.cast(usize, num_pack_streams) orelse return error.ResourceException);
                 var has_sizes = false;
                 while (true) {
                     const pid = try cursor.readU8();
@@ -1157,7 +1157,7 @@ fn parseStreamsInfo(cursor: *binary.ReadCursor, workspace: *Workspace, comptime 
                     } else if (pid == 0x0A) {
                         pack_crcs = try readDigests(cursor, num_pack_streams, workspace);
                     } else {
-                        return error.UnsupportedFailure;
+                        return error.UnsupportedException;
                     }
                 }
                 // kSize absence reads as zero-length streams, matching p7zip's
@@ -1172,19 +1172,19 @@ fn parseStreamsInfo(cursor: *binary.ReadCursor, workspace: *Workspace, comptime 
             0x08 => {
                 try parseSubStreamsInfo(cursor, workspace, folders);
             },
-            else => return error.UnsupportedFailure,
+            else => return error.UnsupportedException,
         }
     }
-    if (!has_pack or !has_unpack) return error.DataFailure;
+    if (!has_pack or !has_unpack) return error.DataException;
     // Packed streams are per-folder runs, and a BCJ2 folder owns four, so the runs tile the
     // pack size array in folder order.
     var next_pack_index: usize = 0;
     for (folders) |*folder| {
         folder.pack_index = next_pack_index;
-        const run = std.math.cast(usize, folder.num_pack_streams) orelse return error.ResourceFailure;
+        const run = std.math.cast(usize, folder.num_pack_streams) orelse return error.ResourceException;
         next_pack_index = try bounds.addUsize(next_pack_index, run);
     }
-    if (next_pack_index != pack_sizes.len) return error.DataFailure;
+    if (next_pack_index != pack_sizes.len) return error.DataException;
     return .{
         .pack_pos = pack_pos,
         .pack_sizes = pack_sizes,
@@ -1193,24 +1193,24 @@ fn parseStreamsInfo(cursor: *binary.ReadCursor, workspace: *Workspace, comptime 
     };
 }
 
-fn parseFolders(cursor: *binary.ReadCursor, workspace: *Workspace, comptime aes_only_folders: bool) Failure![]Folder {
+fn parseFolders(cursor: *binary.ReadCursor, workspace: *Workspace, comptime aes_only_folders: bool) Exception![]Folder {
     const folder_id = try cursor.readU8();
     if (folder_id != 0x0B) {
-        return error.DataFailure;
+        return error.DataException;
     }
     const num_folders = try readUint64(cursor);
-    const folder_count = std.math.cast(usize, num_folders) orelse return error.ResourceFailure;
+    const folder_count = std.math.cast(usize, num_folders) orelse return error.ResourceException;
     const external = try cursor.readU8();
     if (external != 0) {
-        return error.UnsupportedFailure;
+        return error.UnsupportedException;
     }
     const folders = try workspace.take(Folder, folder_count);
     for (folders) |*folder| {
         const num_coders = try readUint64(cursor);
         // A BCJ2 folder carries four compressor coders and the recombiner, so the bound leaves
         // headroom without going open-ended.
-        if (num_coders < 1 or num_coders > 8) return error.UnsupportedFailure;
-        const coder_count = std.math.cast(usize, num_coders) orelse return error.ResourceFailure;
+        if (num_coders < 1 or num_coders > 8) return error.UnsupportedException;
+        const coder_count = std.math.cast(usize, num_coders) orelse return error.ResourceException;
         const coders = try workspace.take(ParsedCoder, coder_count);
         for (coders) |*coder| {
             coder.* = try parseCoder(cursor, workspace);
@@ -1231,11 +1231,11 @@ fn parseFolders(cursor: *binary.ReadCursor, workspace: *Workspace, comptime aes_
             folder_in_streams = try bounds.addUsize(folder_in_streams, coder.num_in_streams);
             folder_out_streams = try bounds.addUsize(folder_out_streams, coder.num_out_streams);
             if (std.mem.eql(u8, coder.method_id, &method_7z_aes_id)) {
-                if (encrypted) return error.UnsupportedFailure;
+                if (encrypted) return error.UnsupportedException;
                 encrypted = true;
                 aes = try parse7zAesProps(coder.attributes);
             } else if (coder.method == .bcj2) {
-                if (bcj2_idx != null) return error.UnsupportedFailure;
+                if (bcj2_idx != null) return error.UnsupportedException;
                 bcj2_idx = i;
             } else if (isFilterMethod(coder.method)) {
                 filter_present = true;
@@ -1247,9 +1247,9 @@ fn parseFolders(cursor: *binary.ReadCursor, workspace: *Workspace, comptime aes_
         // An AES-only folder is the -mhe encoded-header shape (stored header,
         // one AES coder); file-data folders always carry a real data coder.
         if (data_coder_count == 0) {
-            if (!(aes_only_folders and encrypted)) return error.UnsupportedFailure;
-        } else if (encrypted and data_coder_count != 1) return error.UnsupportedFailure;
-        if (bcj2_idx != null and (encrypted or filter_present)) return error.UnsupportedFailure;
+            if (!(aes_only_folders and encrypted)) return error.UnsupportedException;
+        } else if (encrypted and data_coder_count != 1) return error.UnsupportedException;
+        if (bcj2_idx != null and (encrypted or filter_present)) return error.UnsupportedException;
         var method: CoderMethod = .copy;
         var attributes: []const u8 = &.{};
         var num_in_streams: u64 = 1;
@@ -1266,29 +1266,29 @@ fn parseFolders(cursor: *binary.ReadCursor, workspace: *Workspace, comptime aes_
         const bcj2_in_base = if (bcj2_idx) |i| coder_in_base[i] else 0;
         if (num_coders > 1) {
             const num_bonds = num_coders - 1;
-            const bond_count = std.math.cast(usize, num_bonds) orelse return error.ResourceFailure;
+            const bond_count = std.math.cast(usize, num_bonds) orelse return error.ResourceException;
             const bond_list = try workspace.take(Bond, bond_count);
             var bond: u64 = 0;
             while (bond < num_bonds) : (bond += 1) {
                 const in_index = try readUint64(cursor);
                 const coder_index = try readUint64(cursor);
-                if (in_index >= folder_in_streams or coder_index >= num_coders) return error.DataFailure;
+                if (in_index >= folder_in_streams or coder_index >= num_coders) return error.DataException;
                 // An input stream feeds from exactly one place, so a repeat means a malformed folder.
                 for (bond_list[0..@intCast(bond)]) |existing| {
-                    if (existing.in_index == in_index) return error.DataFailure;
+                    if (existing.in_index == in_index) return error.DataException;
                 }
                 bond_list[@intCast(bond)] = .{ .in_index = in_index, .coder_index = coder_index };
             }
             bonds = bond_list;
             const num_packed_streams = folder_in_streams - num_bonds;
-            if (num_packed_streams == 0) return error.DataFailure;
+            if (num_packed_streams == 0) return error.DataException;
             if (num_packed_streams != 1) {
-                const packed_count = std.math.cast(usize, num_packed_streams) orelse return error.ResourceFailure;
+                const packed_count = std.math.cast(usize, num_packed_streams) orelse return error.ResourceException;
                 const packed_list = try workspace.take(u64, packed_count);
                 var packed_index: u64 = 0;
                 while (packed_index < num_packed_streams) : (packed_index += 1) {
                     const index = try readUint64(cursor);
-                    if (index >= folder_in_streams) return error.DataFailure;
+                    if (index >= folder_in_streams) return error.DataException;
                     packed_list[@intCast(packed_index)] = index;
                 }
                 packed_inputs = packed_list;
@@ -1306,7 +1306,7 @@ fn parseFolders(cursor: *binary.ReadCursor, workspace: *Workspace, comptime aes_
                     if (existing.in_index == global_in) producer = @intCast(existing.coder_index);
                 }
                 if (producer) |ci| {
-                    if (coders[ci].num_in_streams != 1 or coders[ci].method == .bcj2) return error.UnsupportedFailure;
+                    if (coders[ci].num_in_streams != 1 or coders[ci].method == .bcj2) return error.UnsupportedException;
                     bcj2_sources[k] = .{
                         .pack_ordinal = try packedOrdinal(packed_inputs, folder_in_streams - bonds.len, coder_in_base[ci]),
                         .producer = ci,
@@ -1342,9 +1342,9 @@ fn parseFolders(cursor: *binary.ReadCursor, workspace: *Workspace, comptime aes_
         };
     }
     const unpack_id = try cursor.readU8();
-    if (unpack_id != 0x0C) return error.DataFailure;
+    if (unpack_id != 0x0C) return error.DataException;
     for (folders) |*folder| {
-        const stream_count = std.math.cast(usize, folder.total_out_streams) orelse return error.ResourceFailure;
+        const stream_count = std.math.cast(usize, folder.total_out_streams) orelse return error.ResourceException;
         const arr = try workspace.take(u64, stream_count);
         for (0..stream_count) |index| {
             arr[index] = try readUint64(cursor);
@@ -1363,22 +1363,22 @@ fn parseFolders(cursor: *binary.ReadCursor, workspace: *Workspace, comptime aes_
             for (folders, 0..) |*folder, i| {
                 if (i < digests.len) folder.substream_crcs = digests[i .. i + 1];
             }
-        } else return error.UnsupportedFailure;
+        } else return error.UnsupportedException;
     }
     return folders;
 }
 
 // Maps a global input stream index to its ordinal among the folder's packed streams. A
 // bonded (coder-fed) input has no packed ordinal.
-fn packedOrdinal(packed_inputs: []const u64, num_packed_streams: u64, global_in: u64) Failure!u64 {
+fn packedOrdinal(packed_inputs: []const u64, num_packed_streams: u64, global_in: u64) Exception!u64 {
     if (packed_inputs.len != 0) {
         for (packed_inputs, 0..) |input, ordinal| {
             if (input == global_in) return ordinal;
         }
-        return error.UnsupportedFailure;
+        return error.UnsupportedException;
     }
     if (num_packed_streams == 1 and global_in == 0) return 0;
-    return error.UnsupportedFailure;
+    return error.UnsupportedException;
 }
 
 // The global index of the folder output stream no bond consumes, if exactly one exists.
@@ -1412,13 +1412,13 @@ fn globalOutputBase(folder: *const Folder, coder_index: u64) u64 {
     return base;
 }
 
-fn parseCoder(cursor: *binary.ReadCursor, workspace: *Workspace) Failure!ParsedCoder {
+fn parseCoder(cursor: *binary.ReadCursor, workspace: *Workspace) Exception!ParsedCoder {
     const flags = try cursor.readU8();
     const id_size = flags & 0x0F;
     const is_complex = (flags & 0x10) != 0;
     const has_attributes = (flags & 0x20) != 0;
-    if ((flags & 0x40) != 0 or (flags & 0x80) != 0) return error.UnsupportedFailure;
-    if (id_size == 0 or id_size > 8) return error.UnsupportedFailure;
+    if ((flags & 0x40) != 0 or (flags & 0x80) != 0) return error.UnsupportedException;
+    if (id_size == 0 or id_size > 8) return error.UnsupportedException;
     const method_id = try cursor.readSlice(id_size);
     const method: CoderMethod = if (std.mem.eql(u8, method_id, &method_7z_aes_id)) .copy else try methodFromId(method_id);
     var num_in_streams: u64 = 1;
@@ -1429,20 +1429,20 @@ fn parseCoder(cursor: *binary.ReadCursor, workspace: *Workspace) Failure!ParsedC
     }
     if (method == .bcj2) {
         // BCJ2 is the one many-to-one coder, with four sub-stream inputs and one output.
-        if (num_in_streams != 4 or num_out_streams != 1) return error.UnsupportedFailure;
-    } else if (num_in_streams != 1 or num_out_streams != 1) return error.UnsupportedFailure;
+        if (num_in_streams != 4 or num_out_streams != 1) return error.UnsupportedException;
+    } else if (num_in_streams != 1 or num_out_streams != 1) return error.UnsupportedException;
     const attributes = blk: {
         if (has_attributes) {
             const prop_size = try readUint64(cursor);
-            const prop_count = std.math.cast(usize, prop_size) orelse return error.ResourceFailure;
-            if (prop_size > cursor.remaining()) return error.DataFailure;
+            const prop_count = std.math.cast(usize, prop_size) orelse return error.ResourceException;
+            if (prop_size > cursor.remaining()) return error.DataException;
             const bytes = try workspace.take(u8, prop_count);
             const start = cursor.pos;
             try cursor.advance(prop_size);
             @memcpy(bytes, cursor.buffer[start..cursor.pos]);
             break :blk bytes;
         } else {
-            if (method == .lzma or method == .lzma2) return error.DataFailure;
+            if (method == .lzma or method == .lzma2) return error.DataException;
             break :blk &[_]u8{};
         }
     };
@@ -1455,22 +1455,22 @@ fn parseCoder(cursor: *binary.ReadCursor, workspace: *Workspace) Failure!ParsedC
     };
 }
 
-fn parse7zAesProps(attributes: []const u8) Failure!AesCoderProps {
-    if (attributes.len == 0) return error.DataFailure;
+fn parse7zAesProps(attributes: []const u8) Exception!AesCoderProps {
+    if (attributes.len == 0) return error.DataException;
     const b0 = attributes[0];
     const num_cycles = b0 & 0x3F;
     // Both wire shapes share the cost ceiling; a single-byte 0x3E props must
     // not reach the KDF as an unchecked 2^62 rounds.
-    if (num_cycles > crypto.seven_zip_cycles_max and num_cycles != 0x3F) return error.UnsupportedFailure;
+    if (num_cycles > crypto.seven_zip_cycles_max and num_cycles != 0x3F) return error.UnsupportedException;
     if ((b0 & 0xC0) == 0) {
-        if (attributes.len != 1) return error.DataFailure;
+        if (attributes.len != 1) return error.DataException;
         return .{ .num_cycles = num_cycles, .salt = &.{}, .iv = @splat(0), .iv_size = 0 };
     }
-    if (attributes.len <= 1) return error.DataFailure;
+    if (attributes.len <= 1) return error.DataException;
     const b1 = attributes[1];
     const salt_size = @as(usize, (b0 >> 7) & 1) + (b1 >> 4);
     const iv_size = @as(usize, (b0 >> 6) & 1) + (b1 & 0x0F);
-    if (attributes.len != 2 + salt_size + iv_size) return error.DataFailure;
+    if (attributes.len != 2 + salt_size + iv_size) return error.DataException;
     var iv: [16]u8 = @splat(0);
     @memcpy(iv[0..iv_size], attributes[2 + salt_size ..][0..iv_size]);
     return .{
@@ -1481,7 +1481,7 @@ fn parse7zAesProps(attributes: []const u8) Failure!AesCoderProps {
     };
 }
 
-fn parseSubStreamsInfo(cursor: *binary.ReadCursor, workspace: *Workspace, folders: []Folder) Failure!void {
+fn parseSubStreamsInfo(cursor: *binary.ReadCursor, workspace: *Workspace, folders: []Folder) Exception!void {
     while (cursor.remaining() > 0) {
         const id = try cursor.readU8();
         if (id == 0x00) break;
@@ -1489,7 +1489,7 @@ fn parseSubStreamsInfo(cursor: *binary.ReadCursor, workspace: *Workspace, folder
             0x0D => {
                 for (folders) |*folder| {
                     const count = try readUint64(cursor);
-                    if (count == 0) return error.DataFailure;
+                    if (count == 0) return error.DataException;
                     folder.num_substreams = count;
                 }
             },
@@ -1502,14 +1502,14 @@ fn parseSubStreamsInfo(cursor: *binary.ReadCursor, workspace: *Workspace, folder
                 }
                 var index: usize = 0;
                 for (folders) |*folder| {
-                    const count = std.math.cast(usize, folder.num_substreams) orelse return error.ResourceFailure;
+                    const count = std.math.cast(usize, folder.num_substreams) orelse return error.ResourceException;
                     // The size list omits each folder's final substream: it is
                     // the folder's unpack total minus the listed sizes.
                     var known: u64 = 0;
                     for (arr[index .. index + count - 1]) |size| {
                         known = try bounds.addU64(known, size);
                     }
-                    if (known > folder.unpack_size) return error.DataFailure;
+                    if (known > folder.unpack_size) return error.DataException;
                     arr[index + count - 1] = folder.unpack_size - known;
                     folder.substream_sizes = arr[index .. index + count];
                     index += count;
@@ -1520,57 +1520,57 @@ fn parseSubStreamsInfo(cursor: *binary.ReadCursor, workspace: *Workspace, folder
                 const digests = try readDigests(cursor, total, workspace);
                 var index: usize = 0;
                 for (folders) |*folder| {
-                    const count = std.math.cast(usize, folder.num_substreams) orelse return error.ResourceFailure;
+                    const count = std.math.cast(usize, folder.num_substreams) orelse return error.ResourceException;
                     if (index + count <= digests.len) {
                         folder.substream_crcs = digests[index .. index + count];
                     }
                     index += count;
                 }
             },
-            else => return error.UnsupportedFailure,
+            else => return error.UnsupportedException,
         }
     }
     try finalizeSubstreamSizes(folders);
 }
 
-fn totalSubstreams(folders: []const Folder) Failure!usize {
+fn totalSubstreams(folders: []const Folder) Exception!usize {
     var total: usize = 0;
     for (folders) |folder| {
-        const count = std.math.cast(usize, folder.num_substreams) orelse return error.ResourceFailure;
+        const count = std.math.cast(usize, folder.num_substreams) orelse return error.ResourceException;
         total = try bounds.addUsize(total, count);
     }
     return total;
 }
 
-fn substreamSizeCount(folders: []const Folder) Failure!usize {
+fn substreamSizeCount(folders: []const Folder) Exception!usize {
     var total: usize = 0;
     for (folders) |folder| {
-        const count = std.math.cast(usize, folder.num_substreams) orelse return error.ResourceFailure;
+        const count = std.math.cast(usize, folder.num_substreams) orelse return error.ResourceException;
         if (count > 0) total = try bounds.addUsize(total, count - 1);
     }
     return total;
 }
 
-fn finalizeSubstreamSizes(folders: []Folder) Failure!void {
+fn finalizeSubstreamSizes(folders: []Folder) Exception!void {
     for (folders) |*folder| {
-        const count = std.math.cast(usize, folder.num_substreams) orelse return error.ResourceFailure;
-        if (folder.substream_sizes.len != count) return error.DataFailure;
+        const count = std.math.cast(usize, folder.num_substreams) orelse return error.ResourceException;
+        if (folder.substream_sizes.len != count) return error.DataException;
         if (count == 1) {
-            if (folder.substream_sizes[0] != folder.unpack_size) return error.DataFailure;
+            if (folder.substream_sizes[0] != folder.unpack_size) return error.DataException;
             continue;
         }
         var sum: u64 = 0;
         for (folder.substream_sizes[0 .. count - 1]) |size| {
             sum = try bounds.addU64(sum, size);
         }
-        if (sum > folder.unpack_size) return error.DataFailure;
+        if (sum > folder.unpack_size) return error.DataException;
         folder.substream_sizes[count - 1] = folder.unpack_size - sum;
     }
 }
 
-fn parseFilesInfo(cursor: *binary.ReadCursor, workspace: *Workspace) Failure!FilesInfo {
+fn parseFilesInfo(cursor: *binary.ReadCursor, workspace: *Workspace) Exception!FilesInfo {
     const num_files = try readUint64(cursor);
-    const count = std.math.cast(usize, num_files) orelse return error.ResourceFailure;
+    const count = std.math.cast(usize, num_files) orelse return error.ResourceException;
     const empty_streams = try workspace.take(bool, count);
     const empty_files = try workspace.take(bool, count);
     const names = try workspace.take([]const u8, count);
@@ -1582,7 +1582,7 @@ fn parseFilesInfo(cursor: *binary.ReadCursor, workspace: *Workspace) Failure!Fil
         const id = try cursor.readU8();
         if (id == 0x00) break;
         const prop_size = try readUint64(cursor);
-        if (prop_size > cursor.remaining()) return error.DataFailure;
+        if (prop_size > cursor.remaining()) return error.DataException;
         const prop_start = cursor.pos;
         try cursor.advance(prop_size);
         var sub = binary.ReadCursor.init(cursor.buffer[prop_start..cursor.pos]);
@@ -1600,12 +1600,12 @@ fn parseFilesInfo(cursor: *binary.ReadCursor, workspace: *Workspace) Failure!Fil
                 const empty_count = countEmpty(empty_streams);
                 const bits = try readBitVectorRaw(&sub, empty_count, workspace);
                 for (bits) |b| {
-                    if (b) return error.UnsupportedFailure;
+                    if (b) return error.UnsupportedException;
                 }
             },
             0x11 => {
                 const external = try sub.readU8();
-                if (external != 0) return error.UnsupportedFailure;
+                if (external != 0) return error.UnsupportedException;
                 for (0..count) |i| {
                     names[i] = try readUtf16Name(&sub, workspace);
                 }
@@ -1613,10 +1613,10 @@ fn parseFilesInfo(cursor: *binary.ReadCursor, workspace: *Workspace) Failure!Fil
             0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x19 => {},
             // kStartPos shifts per-file data offsets; pack offsets here are
             // computed sequentially, so accepting it would mis-locate data.
-            0x18 => return error.UnsupportedFailure,
-            else => return error.UnsupportedFailure,
+            0x18 => return error.UnsupportedException,
+            else => return error.UnsupportedException,
         }
-        if (id >= 0x0E and id <= 0x11 and sub.remaining() != 0) return error.DataFailure;
+        if (id >= 0x0E and id <= 0x11 and sub.remaining() != 0) return error.DataException;
     }
     return .{
         .empty_streams = empty_streams,
@@ -1625,19 +1625,19 @@ fn parseFilesInfo(cursor: *binary.ReadCursor, workspace: *Workspace) Failure!Fil
     };
 }
 
-fn skipArchiveProperties(cursor: *binary.ReadCursor) Failure!void {
+fn skipArchiveProperties(cursor: *binary.ReadCursor) Exception!void {
     while (cursor.remaining() > 0) {
         const id = try cursor.readU8();
         if (id == 0x00) break;
         const size = try readUint64(cursor);
-        if (size > cursor.remaining()) return error.DataFailure;
+        if (size > cursor.remaining()) return error.DataException;
         try cursor.advance(size);
     }
 }
 
-fn buildEntries(si: *const StreamsInfo, fi: *const FilesInfo, workspace: *Workspace, limits: Limits) Failure![]const Info {
+fn buildEntries(si: *const StreamsInfo, fi: *const FilesInfo, workspace: *Workspace, limits: Limits) Exception![]const Info {
     const count = fi.names.len;
-    if (@as(u64, count) > limits.entries) return error.ResourceFailure;
+    if (@as(u64, count) > limits.entries) return error.ResourceException;
     const entries = try workspace.take(Info, count);
     var folder_index: usize = 0;
     var substream_index: usize = 0;
@@ -1661,25 +1661,25 @@ fn buildEntries(si: *const StreamsInfo, fi: *const FilesInfo, workspace: *Worksp
         var entry_pack_stream_sizes: []const u64 = &.{};
         if (!is_empty) {
             while (folder_index < si.folders.len) {
-                const folder_substream_count = std.math.cast(usize, si.folders[folder_index].num_substreams) orelse return error.ResourceFailure;
+                const folder_substream_count = std.math.cast(usize, si.folders[folder_index].num_substreams) orelse return error.ResourceException;
                 if (substream_index < folder_substream_count) break;
                 folder_index += 1;
                 substream_index = 0;
                 substream_offset = 0;
             }
-            if (folder_index >= si.folders.len) return error.DataFailure;
+            if (folder_index >= si.folders.len) return error.DataException;
             const folder = &si.folders[folder_index];
             entry_folder = folder;
-            if (substream_index >= folder.substream_sizes.len) return error.DataFailure;
+            if (substream_index >= folder.substream_sizes.len) return error.DataException;
             size = folder.substream_sizes[substream_index];
-            if (size > limits.decoded_bytes) return error.ResourceFailure;
-            const pack_run = std.math.cast(usize, folder.num_pack_streams) orelse return error.ResourceFailure;
-            if (folder.pack_index + pack_run > si.pack_sizes.len) return error.DataFailure;
+            if (size > limits.decoded_bytes) return error.ResourceException;
+            const pack_run = std.math.cast(usize, folder.num_pack_streams) orelse return error.ResourceException;
+            if (folder.pack_index + pack_run > si.pack_sizes.len) return error.DataException;
             entry_pack_stream_sizes = si.pack_sizes[folder.pack_index..][0..pack_run];
             for (entry_pack_stream_sizes) |stream_size| {
                 pack_size = try bounds.addU64(pack_size, stream_size);
             }
-            if (pack_size > limits.encoded_bytes) return error.ResourceFailure;
+            if (pack_size > limits.encoded_bytes) return error.ResourceException;
             data_offset = try bounds.addU64(start_header_size, try folderPackOffset(si, folder_index));
             method = folder.method;
             attributes = folder.attributes;
@@ -1694,7 +1694,7 @@ fn buildEntries(si: *const StreamsInfo, fi: *const FilesInfo, workspace: *Worksp
             }
             substream_index += 1;
             substream_offset = try bounds.addU64(substream_offset, size);
-            const folder_substream_count = std.math.cast(usize, folder.num_substreams) orelse return error.ResourceFailure;
+            const folder_substream_count = std.math.cast(usize, folder.num_substreams) orelse return error.ResourceException;
             if (substream_index >= folder_substream_count) {
                 folder_index += 1;
                 substream_index = 0;
@@ -1704,7 +1704,7 @@ fn buildEntries(si: *const StreamsInfo, fi: *const FilesInfo, workspace: *Worksp
         const name = try utf16LeToUtf8(fi.names[i], workspace);
         // Decode-side parity with ZIP: refuse traversal, absolute, backslash,
         // and embedded-NUL names instead of delegating tar-slip checks to consumers.
-        if (bounds.isAbsoluteOrTraversal(name) or std.mem.findScalar(u8, name, 0) != null) return error.DataFailure;
+        if (bounds.isAbsoluteOrTraversal(name) or std.mem.findScalar(u8, name, 0) != null) return error.DataException;
         entries[i] = .{
             .name = name,
             .size = size,
@@ -1724,14 +1724,14 @@ fn buildEntries(si: *const StreamsInfo, fi: *const FilesInfo, workspace: *Worksp
             .pack_stream_sizes = entry_pack_stream_sizes,
         };
     }
-    if (folder_index != si.folders.len) return error.DataFailure;
+    if (folder_index != si.folders.len) return error.DataException;
     return entries;
 }
 
-fn folderPackOffset(si: *const StreamsInfo, folder_index: usize) Failure!u64 {
+fn folderPackOffset(si: *const StreamsInfo, folder_index: usize) Exception!u64 {
     var offset = si.pack_pos;
     for (0..folder_index) |index| {
-        const run = std.math.cast(usize, si.folders[index].num_pack_streams) orelse return error.ResourceFailure;
+        const run = std.math.cast(usize, si.folders[index].num_pack_streams) orelse return error.ResourceException;
         for (0..run) |sub| {
             offset = try bounds.addU64(offset, si.pack_sizes[si.folders[index].pack_index + sub]);
         }
@@ -1739,16 +1739,16 @@ fn folderPackOffset(si: *const StreamsInfo, folder_index: usize) Failure!u64 {
     return offset;
 }
 
-fn folderOutputSize(folder: *const Folder) Failure!usize {
+fn folderOutputSize(folder: *const Folder) Exception!usize {
     var total: usize = 0;
     for (folder.substream_sizes) |size| {
-        const part = std.math.cast(usize, size) orelse return error.ResourceFailure;
+        const part = std.math.cast(usize, size) orelse return error.ResourceException;
         total = try bounds.addUsize(total, part);
     }
     return total;
 }
 
-fn writeHeader(writer: *std.Io.Writer, entries: []const Entry, packed_entries: []const PackedEntry, workspace: *Workspace) Failure!void {
+fn writeHeader(writer: *std.Io.Writer, entries: []const Entry, packed_entries: []const PackedEntry, workspace: *Workspace) Exception!void {
     try io.writeBytes(writer, &.{0x01});
     try io.writeBytes(writer, &.{0x04});
     try writeStreamsInfo(writer, entries, packed_entries, workspace);
@@ -1764,7 +1764,7 @@ const FolderPlan = struct {
     count: usize,
 };
 
-fn buildFolderPlan(packed_entries: []const PackedEntry, workspace: *Workspace) Failure![]const FolderPlan {
+fn buildFolderPlan(packed_entries: []const PackedEntry, workspace: *Workspace) Exception![]const FolderPlan {
     const plan = try workspace.take(FolderPlan, packed_entries.len);
     var plan_count: usize = 0;
     var i: usize = 0;
@@ -1783,7 +1783,7 @@ fn buildFolderPlan(packed_entries: []const PackedEntry, workspace: *Workspace) F
     return plan[0..plan_count];
 }
 
-fn folderUnpackSize(entries: []const Entry, folder: FolderPlan) Failure!usize {
+fn folderUnpackSize(entries: []const Entry, folder: FolderPlan) Exception!usize {
     var total: usize = 0;
     var index: usize = 0;
     for (entries) |entry| {
@@ -1799,7 +1799,7 @@ fn folderUnpackSize(entries: []const Entry, folder: FolderPlan) Failure!usize {
     return total;
 }
 
-fn writeStreamsInfo(writer: *std.Io.Writer, entries: []const Entry, packed_entries: []const PackedEntry, workspace: *Workspace) Failure!void {
+fn writeStreamsInfo(writer: *std.Io.Writer, entries: []const Entry, packed_entries: []const PackedEntry, workspace: *Workspace) Exception!void {
     const plan = try buildFolderPlan(packed_entries, workspace);
     try io.writeBytes(writer, &.{0x06});
     try writeUint64(writer, 0);
@@ -1887,7 +1887,7 @@ fn writeStreamsInfo(writer: *std.Io.Writer, entries: []const Entry, packed_entri
     try io.writeBytes(writer, &.{0x00});
 }
 
-fn writeFolderCoder(writer: *std.Io.Writer, method: CoderMethod, unpacked_crc: u32) Failure!void {
+fn writeFolderCoder(writer: *std.Io.Writer, method: CoderMethod, unpacked_crc: u32) Exception!void {
     const id = methodId(method);
     const attr_size = coderAttributeSize(method);
     const flags: u8 = @as(u8, @intCast(id.len)) | (if (attr_size != 0) @as(u8, 0x20) else @as(u8, 0));
@@ -1899,7 +1899,7 @@ fn writeFolderCoder(writer: *std.Io.Writer, method: CoderMethod, unpacked_crc: u
     }
 }
 
-fn writeCoderAttributes(writer: *std.Io.Writer, method: CoderMethod, unpacked_crc: u32) Failure!void {
+fn writeCoderAttributes(writer: *std.Io.Writer, method: CoderMethod, unpacked_crc: u32) Exception!void {
     _ = unpacked_crc;
     switch (method) {
         .lzma => {
@@ -1925,7 +1925,7 @@ fn writeCoderAttributes(writer: *std.Io.Writer, method: CoderMethod, unpacked_cr
     }
 }
 
-fn writeFilesInfo(writer: *std.Io.Writer, entries: []const Entry, workspace: *Workspace) Failure!void {
+fn writeFilesInfo(writer: *std.Io.Writer, entries: []const Entry, workspace: *Workspace) Exception!void {
     try io.writeBytes(writer, &.{0x05});
     try writeUint64(writer, entries.len);
     const empty_count = emptyCount(entries);
@@ -1933,7 +1933,7 @@ fn writeFilesInfo(writer: *std.Io.Writer, entries: []const Entry, workspace: *Wo
         try writeSizedProperty(writer, workspace, 0x0E, struct {
             entries: []const Entry,
 
-            fn write(self: @This(), w: *std.Io.Writer) Failure!void {
+            fn write(self: @This(), w: *std.Io.Writer) Exception!void {
                 try writeBitVector(w, self.entries.len, struct {
                     entries: []const Entry,
 
@@ -1946,7 +1946,7 @@ fn writeFilesInfo(writer: *std.Io.Writer, entries: []const Entry, workspace: *Wo
         try writeSizedProperty(writer, workspace, 0x0F, struct {
             entries: []const Entry,
 
-            fn write(self: @This(), w: *std.Io.Writer) Failure!void {
+            fn write(self: @This(), w: *std.Io.Writer) Exception!void {
                 const empty_count2 = emptyCount(self.entries);
                 try writeBitVector(w, empty_count2, struct {
                     entries: []const Entry,
@@ -1961,7 +1961,7 @@ fn writeFilesInfo(writer: *std.Io.Writer, entries: []const Entry, workspace: *Wo
     try writeSizedProperty(writer, workspace, 0x11, struct {
         entries: []const Entry,
 
-        fn write(self: @This(), w: *std.Io.Writer) Failure!void {
+        fn write(self: @This(), w: *std.Io.Writer) Exception!void {
             try io.writeBytes(w, &.{0x00});
             for (self.entries) |entry| {
                 try writeUtf16Name(w, entry.name);
@@ -1971,7 +1971,7 @@ fn writeFilesInfo(writer: *std.Io.Writer, entries: []const Entry, workspace: *Wo
     try writeSizedProperty(writer, workspace, 0x14, struct {
         entries: []const Entry,
 
-        fn write(self: @This(), w: *std.Io.Writer) Failure!void {
+        fn write(self: @This(), w: *std.Io.Writer) Exception!void {
             try io.writeBytes(w, &.{ 0x01, 0x00 });
             for (self.entries) |_| {
                 var bytes: [8]u8 = @splat(0);
@@ -1982,7 +1982,7 @@ fn writeFilesInfo(writer: *std.Io.Writer, entries: []const Entry, workspace: *Wo
     try writeSizedProperty(writer, workspace, 0x15, struct {
         entries: []const Entry,
 
-        fn write(self: @This(), w: *std.Io.Writer) Failure!void {
+        fn write(self: @This(), w: *std.Io.Writer) Exception!void {
             try io.writeBytes(w, &.{ 0x01, 0x00 });
             for (self.entries) |entry| {
                 const attr: u32 = if (isDirectoryEntry(entry)) 0x10 else 0x20;
@@ -1995,7 +1995,7 @@ fn writeFilesInfo(writer: *std.Io.Writer, entries: []const Entry, workspace: *Wo
     try io.writeBytes(writer, &.{0x00});
 }
 
-fn writeSizedProperty(writer: *std.Io.Writer, workspace: *Workspace, id: u8, ctx: anytype) Failure!void {
+fn writeSizedProperty(writer: *std.Io.Writer, workspace: *Workspace, id: u8, ctx: anytype) Exception!void {
     var counter = measurement.Counter.init(null);
     try ctx.write(&counter.writer);
     const size = counter.written();
@@ -2010,7 +2010,7 @@ fn writeSizedProperty(writer: *std.Io.Writer, workspace: *Workspace, id: u8, ctx
         try ctx.write(writer);
         return;
     }
-    const buffer = try workspace.take(u8, std.math.cast(usize, size) orelse return error.ResourceFailure);
+    const buffer = try workspace.take(u8, std.math.cast(usize, size) orelse return error.ResourceException);
     var fixed_writer = std.Io.Writer.fixed(buffer);
     try ctx.write(&fixed_writer);
     try io.writeBytes(writer, &.{id});
@@ -2053,8 +2053,8 @@ fn emptyFileAt(entries: []const Entry, index: usize) bool {
     return false;
 }
 
-fn readDigests(cursor: *binary.ReadCursor, count: u64, workspace: *Workspace) Failure![]const u32 {
-    const n = std.math.cast(usize, count) orelse return error.ResourceFailure;
+fn readDigests(cursor: *binary.ReadCursor, count: u64, workspace: *Workspace) Exception![]const u32 {
+    const n = std.math.cast(usize, count) orelse return error.ResourceException;
     const all_defined = try cursor.readU8();
     if (all_defined == 1) {
         const crcs = try workspace.take(u32, n);
@@ -2076,10 +2076,10 @@ fn readDigests(cursor: *binary.ReadCursor, count: u64, workspace: *Workspace) Fa
         }
         return crcs;
     }
-    return error.UnsupportedFailure;
+    return error.UnsupportedException;
 }
 
-fn readBoolVectorRaw(cursor: *binary.ReadCursor, count: usize, workspace: *Workspace) Failure![]const bool {
+fn readBoolVectorRaw(cursor: *binary.ReadCursor, count: usize, workspace: *Workspace) Exception![]const bool {
     if (count == 0) return &.{};
     const all = try cursor.readU8();
     const result = try workspace.take(bool, count);
@@ -2091,7 +2091,7 @@ fn readBoolVectorRaw(cursor: *binary.ReadCursor, count: usize, workspace: *Works
         @memset(result, true);
         return result;
     }
-    if (all != 1) return error.DataFailure;
+    if (all != 1) return error.DataException;
     const bytes_count = (count + 7) / 8;
     const bytes = try cursor.readSlice(bytes_count);
     for (0..count) |i| {
@@ -2101,10 +2101,10 @@ fn readBoolVectorRaw(cursor: *binary.ReadCursor, count: usize, workspace: *Works
     return result;
 }
 
-fn readBitVectorRaw(cursor: *binary.ReadCursor, count: usize, workspace: *Workspace) Failure![]const bool {
+fn readBitVectorRaw(cursor: *binary.ReadCursor, count: usize, workspace: *Workspace) Exception![]const bool {
     if (count == 0) return &.{};
     const bytes_count = (count + 7) / 8;
-    if (cursor.remaining() < bytes_count) return error.DataFailure;
+    if (cursor.remaining() < bytes_count) return error.DataException;
     const bytes = try cursor.readSlice(bytes_count);
     const result = try workspace.take(bool, count);
     for (0..count) |i| {
@@ -2122,7 +2122,7 @@ fn countEmpty(bits: []const bool) usize {
     return count;
 }
 
-fn emptyIndex(bits: []const bool, target: usize) Failure!usize {
+fn emptyIndex(bits: []const bool, target: usize) Exception!usize {
     var seen: usize = 0;
     for (bits, 0..) |b, i| {
         if (b) {
@@ -2130,14 +2130,14 @@ fn emptyIndex(bits: []const bool, target: usize) Failure!usize {
             seen += 1;
         }
     }
-    return error.DataFailure;
+    return error.DataException;
 }
 
-fn readUtf16Name(cursor: *binary.ReadCursor, workspace: *Workspace) Failure![]const u8 {
+fn readUtf16Name(cursor: *binary.ReadCursor, workspace: *Workspace) Exception![]const u8 {
     const start = cursor.pos;
     var byte_len: usize = 0;
     while (true) {
-        if (cursor.remaining() < 2) return error.DataFailure;
+        if (cursor.remaining() < 2) return error.DataException;
         const unit = std.mem.readInt(u16, &(try cursor.readBytes(2)), .little);
         byte_len += 2;
         if (unit == 0) break;
@@ -2147,8 +2147,8 @@ fn readUtf16Name(cursor: *binary.ReadCursor, workspace: *Workspace) Failure![]co
     return bytes;
 }
 
-fn utf16LeToUtf8(name_utf16: []const u8, workspace: *Workspace) Failure![]const u8 {
-    if (name_utf16.len < 2 or name_utf16.len % 2 != 0) return error.DataFailure;
+fn utf16LeToUtf8(name_utf16: []const u8, workspace: *Workspace) Exception![]const u8 {
+    if (name_utf16.len < 2 or name_utf16.len % 2 != 0) return error.DataException;
     var utf8_len: usize = 0;
     var i: usize = 0;
     while (i + 2 <= name_utf16.len) : (i += 2) {
@@ -2156,15 +2156,15 @@ fn utf16LeToUtf8(name_utf16: []const u8, workspace: *Workspace) Failure![]const 
         if (unit == 0) break;
         var cp: u21 = unit;
         if (unit >= 0xD800 and unit <= 0xDBFF) {
-            if (i + 4 > name_utf16.len) return error.DataFailure;
+            if (i + 4 > name_utf16.len) return error.DataException;
             const low = std.mem.readInt(u16, name_utf16[i + 2 ..][0..2], .little);
-            if (low < 0xDC00 or low > 0xDFFF) return error.DataFailure;
+            if (low < 0xDC00 or low > 0xDFFF) return error.DataException;
             cp = 0x10000 + ((@as(u21, unit - 0xD800) << 10) | @as(u21, low - 0xDC00));
             i += 2;
         } else if (unit >= 0xDC00 and unit <= 0xDFFF) {
-            return error.DataFailure;
+            return error.DataException;
         }
-        utf8_len += std.unicode.utf8CodepointSequenceLength(cp) catch return error.DataFailure;
+        utf8_len += std.unicode.utf8CodepointSequenceLength(cp) catch return error.DataException;
     }
     const result = try workspace.take(u8, utf8_len);
     i = 0;
@@ -2178,14 +2178,14 @@ fn utf16LeToUtf8(name_utf16: []const u8, workspace: *Workspace) Failure![]const 
             cp = 0x10000 + ((@as(u21, unit - 0xD800) << 10) | @as(u21, low - 0xDC00));
             i += 2;
         }
-        offset += std.unicode.utf8Encode(cp, result[offset..]) catch return error.DataFailure;
+        offset += std.unicode.utf8Encode(cp, result[offset..]) catch return error.DataException;
     }
     return result;
 }
 
-fn writeUtf16Name(writer: *std.Io.Writer, name: []const u8) Failure!void {
+fn writeUtf16Name(writer: *std.Io.Writer, name: []const u8) Exception!void {
     const stripped = if (name.len > 0 and name[name.len - 1] == '/') name[0 .. name.len - 1] else name;
-    const view = std.unicode.Utf8View.init(stripped) catch return error.DataFailure;
+    const view = std.unicode.Utf8View.init(stripped) catch return error.DataException;
     var it = view.iterator();
     while (it.nextCodepoint()) |cp| {
         if (cp < 0x10000) {
@@ -2205,8 +2205,8 @@ fn writeUtf16Name(writer: *std.Io.Writer, name: []const u8) Failure!void {
     try io.writeBytes(writer, &zero);
 }
 
-fn passwordToUtf16(password: []const u8, workspace: *Workspace) Failure![]const u8 {
-    const view = std.unicode.Utf8View.init(password) catch return error.DataFailure;
+fn passwordToUtf16(password: []const u8, workspace: *Workspace) Exception![]const u8 {
+    const view = std.unicode.Utf8View.init(password) catch return error.DataException;
     var byte_len: usize = 0;
     var it = view.iterator();
     while (it.nextCodepoint()) |cp| byte_len = try bounds.addUsize(byte_len, 2 * binary.utf16LeUnits(cp));
@@ -2217,7 +2217,7 @@ fn passwordToUtf16(password: []const u8, workspace: *Workspace) Failure![]const 
     return bytes;
 }
 
-fn writeBitVector(writer: *std.Io.Writer, count: usize, ctx: anytype) Failure!void {
+fn writeBitVector(writer: *std.Io.Writer, count: usize, ctx: anytype) Exception!void {
     if (count == 0) return;
     var byte: u8 = 0;
     for (0..count) |i| {
@@ -2229,7 +2229,7 @@ fn writeBitVector(writer: *std.Io.Writer, count: usize, ctx: anytype) Failure!vo
     }
 }
 
-fn readUint64(cursor: *binary.ReadCursor) Failure!u64 {
+fn readUint64(cursor: *binary.ReadCursor) Exception!u64 {
     const first = try cursor.readU8();
     if (first < 0x80) return first;
     if (first == 0xFF) {
@@ -2253,7 +2253,7 @@ fn readUint64(cursor: *binary.ReadCursor) Failure!u64 {
     return value;
 }
 
-fn writeUint64(writer: *std.Io.Writer, value: u64) Failure!void {
+fn writeUint64(writer: *std.Io.Writer, value: u64) Exception!void {
     if (value < 0x80) {
         try io.writeBytes(writer, &.{@intCast(value)});
         return;
@@ -2356,7 +2356,7 @@ test "sevenzip encrypted roundtrip with salt and custom cycles" {
     cause = .none;
     const refuse_out = try allocator.alloc(u8, data.len);
     defer allocator.free(refuse_out);
-    try testing.expectError(error.ResourceFailure, sevenZipDecodeOrdinal(archive, &refuse_ws, .{}, 0, refuse_out, .{
+    try testing.expectError(error.ResourceException, sevenZipDecodeOrdinal(archive, &refuse_ws, .{}, 0, refuse_out, .{
         .password = "pw",
         .kdf_rounds_limit = (1 << 10) - 1,
         .failure_cause = &cause,
@@ -2507,7 +2507,7 @@ test "sevenzip encoded headers roundtrip in both modes" {
         try testing.expectEqualSlices(u8, data, out[0..produced]);
         if (mode.encrypt) {
             var fail_ws = try Workspace.init(backing.ptr, backing.len);
-            try testing.expectError(error.UnsupportedFailure, sevenZipInspectCountEx(archive, &fail_ws, .{}, &.{ .failure_cause = &cause }));
+            try testing.expectError(error.UnsupportedException, sevenZipInspectCountEx(archive, &fail_ws, .{}, &.{ .failure_cause = &cause }));
             var wrong_ws = try Workspace.init(backing.ptr, backing.len);
             // The wrong password surfaces wherever the garbage stream first
             // fails: the LZMA property byte, the decompressor, or the header
@@ -2554,7 +2554,7 @@ fn hexBytes(comptime len: usize, comptime hex: []const u8) [len]u8 {
     return out;
 }
 
-// Captured from ip7z/7zip 26.x CLI output (`7zz a -m0=BCJ2 -m1=LZMA2 -mx=5`) and inlined
+// Captured from vendor/7zip 26.x CLI output (`7zz a -m0=BCJ2 -m1=LZMA2 -mx=5`) and inlined
 // as hex, so no binary fixture enters the tree.
 const bcj2_lzma2_7z_hex =
     "377abcaf271c0004680dc853c101000000000000720000000000000003d82b46e0032b00285d00486bb62414e8bbc1f7" ++

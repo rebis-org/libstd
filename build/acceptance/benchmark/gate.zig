@@ -5,11 +5,11 @@ const matrix = @import("matrix.zig");
 const metric = @import("metric.zig");
 const tsv = @import("tsv.zig");
 
-pub const Class = enum { pass, fail, noisy, unmeasurable, unhealthy };
+pub const GateClass = enum { pass, fail, noisy, unmeasurable, unhealthy };
 
-pub const Result = struct {
+pub const GateResult = struct {
     name: []const u8,
-    class: Class,
+    class: GateClass,
     ratio_gap: ?f64 = null,
     compress_gap: ?f64 = null,
     decompress_gap: ?f64 = null,
@@ -28,41 +28,37 @@ pub const Summary = struct {
     }
 };
 
-pub const header = "class\tworst_gap_pct\tformat\tratio_gap_pct\tc_mibps_gap_pct\td_mibps_gap_pct\n";
+pub const gate_header = "class\tworst_gap_pct\tformat\tratio_gap_pct\tc_mibps_gap_pct\td_mibps_gap_pct\n";
 
-fn bestRatio(totals: metric.Totals, available: [4]bool) ?f64 {
+fn bestMetric(totals: metric.Totals, available: [4]bool, comptime side_kind: enum { ratio, speed }, ns: [4]u64) ?f64 {
     var best: f64 = 0;
     for (1..4) |side| {
         if (!available[side] or !totals.ok[side]) continue;
-        best = @max(best, metric.ratio(totals.input_bytes, totals.encoded[side]));
+        const value = switch (side_kind) {
+            .ratio => metric.compressionRatio(totals.input_bytes, totals.encoded[side]),
+            .speed => metric.throughputMibps(totals.input_bytes, ns[side]),
+        };
+        best = @max(best, value);
     }
     return if (best > 0) best else null;
+}
+
+fn bestRatio(totals: metric.Totals, available: [4]bool) ?f64 {
+    return bestMetric(totals, available, .ratio, .{ 0, 0, 0, 0 });
 }
 
 fn bestSpeed(ns: [4]u64, totals: metric.Totals, available: [4]bool) ?f64 {
-    var best: f64 = 0;
-    for (1..4) |side| {
-        if (!available[side] or !totals.ok[side]) continue;
-        best = @max(best, metric.mibps(totals.input_bytes, ns[side]));
-    }
-    return if (best > 0) best else null;
+    return bestMetric(totals, available, .speed, ns);
 }
 
-fn speedGap(ours: f64, target: ?f64) ?f64 {
-    const wanted = target orelse return null;
-    if (ours <= 0) return null;
-    return (wanted - ours) / wanted;
+fn exceedsGap(gap_value: ?f64, limit: f64) ?bool {
+    const value = gap_value orelse return null;
+    return value > limit;
 }
 
-fn checkGap(gap_value: ?f64, limit: f64, measurable: *bool, beyond: *bool) void {
-    const value = gap_value orelse return;
-    measurable.* = true;
-    if (value > limit) beyond.* = true;
-}
-
-pub fn classify(candidate: matrix.Row, totals: metric.Totals, available: [4]bool, cfg: env_mod.Gate) Result {
+pub fn classify(candidate: matrix.BenchmarkRow, totals: metric.Totals, available: [4]bool, cfg: env_mod.Gate) GateResult {
     const ours = @backingInt(metric.Side.ours);
-    var result = Result{ .name = candidate.name, .class = .pass };
+    var result = GateResult{ .name = candidate.name, .class = .pass };
     if (!totals.ok[ours]) {
         result.class = .fail;
         result.worst_gap = std.math.inf(f64);
@@ -82,12 +78,12 @@ pub fn classify(candidate: matrix.Row, totals: metric.Totals, available: [4]bool
     }
     if (!candidate.decode_only) {
         if (bestRatio(totals, available)) |target| {
-            const ours_ratio = metric.ratio(totals.input_bytes, totals.encoded[ours]);
+            const ours_ratio = metric.compressionRatio(totals.input_bytes, totals.encoded[ours]);
             if (ours_ratio > 0) result.ratio_gap = target / ours_ratio - 1.0;
         }
-        result.compress_gap = speedGap(metric.mibps(totals.input_bytes, totals.encode_ns[ours]), bestSpeed(totals.encode_ns, totals, available));
+        result.compress_gap = speedGap(metric.throughputMibps(totals.input_bytes, totals.encode_ns[ours]), bestSpeed(totals.encode_ns, totals, available));
     }
-    result.decompress_gap = speedGap(metric.mibps(totals.input_bytes, totals.decode_ns[ours]), bestSpeed(totals.decode_ns, totals, available));
+    result.decompress_gap = speedGap(metric.throughputMibps(totals.input_bytes, totals.decode_ns[ours]), bestSpeed(totals.decode_ns, totals, available));
     for ([_]?f64{ result.ratio_gap, result.compress_gap, result.decompress_gap }) |gap_value| {
         if (gap_value) |value| result.worst_gap = @max(result.worst_gap orelse value, value);
     }
@@ -101,27 +97,36 @@ pub fn classify(candidate: matrix.Row, totals: metric.Totals, available: [4]bool
         const ratio_limit = cfg.ratio_pct / 100.0 - 1.0;
         var measurable = false;
         var beyond = false;
-        checkGap(result.ratio_gap, ratio_limit, &measurable, &beyond);
-        checkGap(result.compress_gap, speed_limit, &measurable, &beyond);
-        checkGap(result.decompress_gap, speed_limit, &measurable, &beyond);
+        for ([_]?bool{ exceedsGap(result.ratio_gap, ratio_limit), exceedsGap(result.compress_gap, speed_limit), exceedsGap(result.decompress_gap, speed_limit) }) |exceeded| {
+            if (exceeded) |is_beyond| {
+                measurable = true;
+                beyond = beyond or is_beyond;
+            }
+        }
         result.class = if (!measurable) .unmeasurable else if (beyond) .fail else .pass;
     }
     return result;
 }
 
-fn rankedGap(result: Result) f64 {
+fn speedGap(ours: f64, target: ?f64) ?f64 {
+    const wanted = target orelse return null;
+    if (ours <= 0) return null;
+    return (wanted - ours) / wanted;
+}
+
+fn rankedGap(result: GateResult) f64 {
     return result.worst_gap orelse -std.math.inf(f64);
 }
 
-fn isWorse(_: void, left: Result, right: Result) bool {
+fn isWorse(_: void, left: GateResult, right: GateResult) bool {
     return rankedGap(left) > rankedGap(right);
 }
 
-pub fn sort(results: []Result) void {
-    std.mem.sort(Result, results, {}, isWorse);
+pub fn sortByWorstGap(results: []GateResult) void {
+    std.mem.sort(GateResult, results, {}, isWorse);
 }
 
-pub fn summarize(results: []const Result) Summary {
+pub fn summarize(results: []const GateResult) Summary {
     var summary = Summary{};
     for (results) |result| switch (result.class) {
         .pass => summary.pass += 1,
@@ -133,10 +138,10 @@ pub fn summarize(results: []const Result) Summary {
     return summary;
 }
 
-pub fn emitGateRow(report: *std.ArrayList(u8), allocator: std.mem.Allocator, result: Result) !void {
+pub fn emitGateRow(report: *std.ArrayList(u8), allocator: std.mem.Allocator, result: GateResult) !void {
     var cells: [4][16]u8 = undefined;
     const gaps = [_]?f64{ result.worst_gap, result.ratio_gap, result.compress_gap, result.decompress_gap };
     var values: [4][]const u8 = undefined;
-    for (gaps, 0..) |gap_value, index| values[index] = tsv.gap(&cells[index], gap_value);
+    for (gaps, 0..) |gap_value, index| values[index] = tsv.formatGap(&cells[index], gap_value);
     try tsv.emitRow(report, allocator, &.{ @tagName(result.class), values[0], result.name }, values[1..]);
 }

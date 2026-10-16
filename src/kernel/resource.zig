@@ -9,7 +9,7 @@ pub const Workspace = io.Workspace;
 pub const WorkspacePlan = io.WorkspacePlan;
 pub const checkedConstBytes = io.checkedConstBytes;
 pub const checkedMutBytes = io.checkedMutBytes;
-pub const Failure = vocabulary.Failure;
+pub const Exception = vocabulary.Exception;
 pub const capability_bit_read = vocabulary.resource_capability_bit_read;
 pub const capability_bit_replay = vocabulary.resource_capability_bit_replay;
 pub const capability_bit_size = vocabulary.resource_capability_bit_size;
@@ -42,7 +42,7 @@ pub const Resource = struct {
         };
     }
 
-    fn fromNode(call: *abi.Call, node: *abi.Node, capabilities: u32, comptime reading: bool) Failure!Resource {
+    fn fromNode(call: *abi.Call, node: *abi.Node, capabilities: u32, comptime reading: bool) Exception!Resource {
         if (node.flags & abi.node_flag_callback_resource == 0) {
             return direct(if (reading)
                 .{ .direct_read = try checkedConstBytes(node.bytes, node.byte_length) }
@@ -58,11 +58,11 @@ pub const Resource = struct {
         };
     }
 
-    pub fn sourceFromNode(call: *abi.Call, node: *abi.Node, capabilities: u32) Failure!Resource {
+    pub fn sourceFromNode(call: *abi.Call, node: *abi.Node, capabilities: u32) Exception!Resource {
         return fromNode(call, node, capabilities, true);
     }
 
-    pub fn sinkFromNode(call: *abi.Call, node: *abi.Node, capabilities: u32) Failure!Resource {
+    pub fn sinkFromNode(call: *abi.Call, node: *abi.Node, capabilities: u32) Exception!Resource {
         return fromNode(call, node, capabilities, false);
     }
 
@@ -70,23 +70,23 @@ pub const Resource = struct {
         return self.capabilities & bit != 0;
     }
 
-    pub fn requireCapability(self: Resource, bit: u32) Failure!void {
-        if (!self.hasCapability(bit)) return error.UnsupportedFailure;
+    pub fn requireCapability(self: Resource, bit: u32) Exception!void {
+        if (!self.hasCapability(bit)) return error.UnsupportedException;
     }
 
-    pub fn size(self: *Resource) Failure!usize {
+    pub fn size(self: *Resource) Exception!usize {
         switch (self.kind) {
             .direct_read => |bytes| return bytes.len,
             .callback_read => {
                 const result = try self.invoke(vocabulary.ids.callback_size, null, null);
-                if (result.value_high != 0) return error.ResourceFailure;
-                return std.math.cast(usize, result.value_low) orelse error.ResourceFailure;
+                if (result.value_high != 0) return error.ResourceException;
+                return std.math.cast(usize, result.value_low) orelse error.ResourceException;
             },
-            else => return error.UnsupportedFailure,
+            else => return error.UnsupportedException,
         }
     }
 
-    pub fn rewind(self: *Resource) Failure!void {
+    pub fn rewind(self: *Resource) Exception!void {
         switch (self.kind) {
             .direct_read, .direct_write => self.offset = 0,
             .callback_read => _ = try self.invoke(vocabulary.ids.callback_rewind, null, null),
@@ -94,7 +94,7 @@ pub const Resource = struct {
         }
     }
 
-    pub fn read(self: *Resource, staging: []u8) Failure!usize {
+    pub fn read(self: *Resource, staging: []u8) Exception!usize {
         if (staging.len == 0) return 0;
         switch (self.kind) {
             .direct_read => |bytes| {
@@ -107,19 +107,19 @@ pub const Resource = struct {
             },
             .callback_read => {
                 const result = try self.invoke(vocabulary.ids.callback_read, null, staging);
-                const bytes_read = std.math.cast(usize, result.bytes) orelse return error.IoFailure;
-                if (bytes_read > staging.len) return error.IoFailure;
+                const bytes_read = std.math.cast(usize, result.bytes) orelse return error.IoException;
+                if (bytes_read > staging.len) return error.IoException;
                 return bytes_read;
             },
-            else => return error.UnsupportedFailure,
+            else => return error.UnsupportedException,
         }
     }
 
-    pub fn write(self: *Resource, chunk: []const u8) Failure!usize {
+    pub fn write(self: *Resource, chunk: []const u8) Exception!usize {
         if (chunk.len == 0) return 0;
         switch (self.kind) {
             .direct_write => |destination| {
-                if (self.offset + chunk.len > destination.len) return error.CapacityFailure;
+                if (self.offset + chunk.len > destination.len) return error.CapacityException;
                 @memcpy(destination[self.offset..][0..chunk.len], chunk);
                 self.offset += chunk.len;
                 return chunk.len;
@@ -127,25 +127,25 @@ pub const Resource = struct {
             .callback_write => {
                 const initial = self.committed;
                 const result = try self.invoke(vocabulary.ids.callback_write, chunk, null);
-                const bytes_written = std.math.cast(usize, result.bytes) orelse return error.IoFailure;
-                if (bytes_written > chunk.len) return error.IoFailure;
-                self.committed = std.math.add(u64, initial, bytes_written) catch return error.ResourceFailure;
+                const bytes_written = std.math.cast(usize, result.bytes) orelse return error.IoException;
+                if (bytes_written > chunk.len) return error.IoException;
+                self.committed = std.math.add(u64, initial, bytes_written) catch return error.ResourceException;
                 return bytes_written;
             },
-            else => return error.UnsupportedFailure,
+            else => return error.UnsupportedException,
         }
     }
 
-    pub fn writeAll(self: *Resource, chunk: []const u8) Failure!void {
+    pub fn writeAll(self: *Resource, chunk: []const u8) Exception!void {
         var cursor: usize = 0;
         while (cursor < chunk.len) {
             const bytes_written = try self.write(chunk[cursor..]);
-            if (bytes_written == 0) return error.IoFailure;
+            if (bytes_written == 0) return error.IoException;
             cursor += bytes_written;
         }
     }
 
-    pub fn materialize(self: *Resource, staging: []u8) Failure![]const u8 {
+    pub fn materialize(self: *Resource, staging: []u8) Exception![]const u8 {
         var cursor: usize = 0;
         while (cursor < staging.len) {
             const bytes_read = try self.read(staging[cursor..]);
@@ -155,13 +155,13 @@ pub const Resource = struct {
         if (cursor == staging.len) {
             var extra: [1]u8 = undefined;
             const tail_read = try self.read(&extra);
-            if (tail_read != 0) return error.ResourceFailure;
+            if (tail_read != 0) return error.ResourceException;
         }
         return staging[0..cursor];
     }
 
-    fn invoke(self: *Resource, verb: abi.Id, request_bytes: ?[]const u8, response_bytes: ?[]u8) Failure!CallbackResult {
-        const callback = self.call.callback orelse return error.CallFailure;
+    fn invoke(self: *Resource, verb: abi.Id, request_bytes: ?[]const u8, response_bytes: ?[]u8) Exception!CallbackResult {
+        const callback = self.call.callback orelse return error.CallException;
         var request = abi.Node.init();
         request.value_low = self.token_low;
         request.value_high = self.token_high;
@@ -183,9 +183,9 @@ pub const Resource = struct {
         const status = callback(&callback_call);
         if (status != abi.Status.ok) {
             self.downstream_status = status;
-            return error.IoFailure;
+            return error.IoException;
         }
-        if (response_bytes != null and response.byte_length > response.byte_capacity) return error.IoFailure;
+        if (response_bytes != null and response.byte_length > response.byte_capacity) return error.IoException;
         return .{ .bytes = response.byte_length, .value_low = response.value_low, .value_high = response.value_high };
     }
 };

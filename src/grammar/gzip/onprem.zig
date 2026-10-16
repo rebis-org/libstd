@@ -2,14 +2,14 @@ const std = @import("std");
 
 const bounds = @import("../../common/primitive/bounds.zig");
 const checksum = @import("../../common/primitive/checksum.zig");
-const failure_prim = @import("../../common/primitive/failure.zig");
+const exception_prim = @import("../../common/primitive/exception.zig");
 const io = @import("../../common/primitive/io.zig");
 const measurement = @import("../../common/primitive/measurement.zig");
 const tee = @import("../../common/primitive/tee.zig");
 const deflate = @import("../../leaf/deflate/onprem.zig");
 const deflate_seam = @import("../../leaf/deflate/seam.zig");
 
-const Failure = failure_prim.Failure;
+const Exception = exception_prim.Exception;
 pub const deflate_history_size = deflate.history_size;
 
 const Crc32Tee = tee.CountingTee(.{ .crc32 = true });
@@ -57,12 +57,12 @@ pub const StreamInfo = struct {
 
 // First-member fixed-header fields for the read-side inspect projection,
 // parsed without walking the payload.
-pub fn inspectStream(input: []const u8) Failure!StreamInfo {
-    if (input.len < 10) return error.DataFailure;
-    if (input[0] != magic_1 or input[1] != magic_2) return error.DataFailure;
-    if (input[2] != cm_deflate) return error.UnsupportedFailure;
+pub fn inspectStream(input: []const u8) Exception!StreamInfo {
+    if (input.len < 10) return error.DataException;
+    if (input[0] != magic_1 or input[1] != magic_2) return error.DataException;
+    if (input[2] != cm_deflate) return error.UnsupportedException;
     const flags = input[3];
-    if (flags & reserved_flags != 0) return error.DataFailure;
+    if (flags & reserved_flags != 0) return error.DataException;
     return .{
         .flags = flags,
         .modification_time = std.mem.readInt(u32, input[4..8], .little),
@@ -71,8 +71,8 @@ pub fn inspectStream(input: []const u8) Failure!StreamInfo {
     };
 }
 
-pub fn decodedSize(input: []const u8, history: []u8, provider: checksum.Provider) Failure!usize {
-    if (history.len < deflate_history_size) return error.CapacityFailure;
+pub fn decodedSize(input: []const u8, history: []u8, provider: checksum.Provider) Exception!usize {
+    if (history.len < deflate_history_size) return error.CapacityException;
     var counter = measurement.Counter.init(null);
     _ = try decode(input, &counter.writer, history, provider);
     return measurement.measuredLength(&counter);
@@ -98,19 +98,19 @@ const Member = struct {
 // The one member read: header, payload, and the verified trailer. Single-pass
 // and two-pass decoding and the inspector all resolve a member through this,
 // so they cannot disagree on where a member ends or what verifies it.
-fn readMember(input: []const u8, at: usize, history: []u8, output: *std.Io.Writer, provider: checksum.Provider) Failure!Member {
+fn readMember(input: []const u8, at: usize, history: []u8, output: *std.Io.Writer, provider: checksum.Provider) Exception!Member {
     const header = try parseHeader(input[at..], provider);
     const data_start = at + header.len;
     var tee_writer = Crc32Tee.initWithProvider(output, provider);
     const inflated = inflatePayload(input, data_start, history, &tee_writer.writer, provider) catch |err| return switch (err) {
-        error.WriteFailed => error.IoFailure,
-        else => error.DataFailure,
+        error.WriteFailed => error.IoException,
+        else => error.DataException,
     };
     const trailer_at = data_start + inflated.consumed;
-    if (input.len - trailer_at < trailer_len) return error.DataFailure;
+    if (input.len - trailer_at < trailer_len) return error.DataException;
     const stored_crc = std.mem.readInt(u32, input[trailer_at..][0..4], .little);
     const stored_size = std.mem.readInt(u32, input[trailer_at + 4 ..][0..4], .little);
-    if (stored_crc != tee_writer.crc32Value() or stored_size != @as(u32, @truncate(tee_writer.size))) return error.IntegrityFailure;
+    if (stored_crc != tee_writer.crc32Value() or stored_size != @as(u32, @truncate(tee_writer.size))) return error.IntegrityException;
     return .{
         .header = header,
         .data_start = data_start,
@@ -123,8 +123,8 @@ fn readMember(input: []const u8, at: usize, history: []u8, output: *std.Io.Write
 // ISIZE only seeds the attempt; commit needs exact count, CRC32, and trailer.
 // Mismatch defers to the two-pass route. A fallback carries the byte count
 // already written, so the caller can erase the tentative prefix.
-pub fn decodeSinglePass(input: []const u8, output: []u8, history: []u8, provider: checksum.Provider) Failure!SinglePass {
-    if (history.len < deflate_history_size) return error.CapacityFailure;
+pub fn decodeSinglePass(input: []const u8, output: []u8, history: []u8, provider: checksum.Provider) Exception!SinglePass {
+    if (history.len < deflate_history_size) return error.CapacityException;
     if (input.len >= std.math.maxInt(u32)) return .{ .fallback = 0 };
     if (input.len < minimum_member_len) return .{ .fallback = 0 };
     const claimed_size = std.mem.readInt(u32, input[input.len - 4 ..][0..4], .little);
@@ -135,11 +135,11 @@ pub fn decodeSinglePass(input: []const u8, output: []u8, history: []u8, provider
     return .{ .decoded = member.decoded_size };
 }
 
-pub fn decode(input: []const u8, output: *std.Io.Writer, history: []u8, provider: checksum.Provider) Failure!usize {
-    if (history.len < deflate_history_size) return error.CapacityFailure;
+pub fn decode(input: []const u8, output: *std.Io.Writer, history: []u8, provider: checksum.Provider) Exception!usize {
+    if (history.len < deflate_history_size) return error.CapacityException;
     // An empty byte string is not a gzip stream; accepting it would let
     // non-archive empty files pass as valid zero-member decodes.
-    if (input.len == 0) return error.DataFailure;
+    if (input.len == 0) return error.DataException;
     var total: usize = 0;
     var at: usize = 0;
     while (at < input.len) {
@@ -150,24 +150,24 @@ pub fn decode(input: []const u8, output: *std.Io.Writer, history: []u8, provider
     return total;
 }
 
-pub fn encodeStream(source: *std.Io.Reader, output: *std.Io.Writer, history: []u8, options: Options) Failure!void {
-    if (history.len < deflate_history_size) return error.CapacityFailure;
+pub fn encodeStream(source: *std.Io.Reader, output: *std.Io.Writer, history: []u8, options: Options) Exception!void {
+    if (history.len < deflate_history_size) return error.CapacityException;
     try writeHeader(output, options);
     // Optimal mode carves scratch past deflate_history_size, so the full slice is required.
     var compressor = try deflate.Compress.init(output, history, options.deflate);
     var crc32 = checksum.Crc32.bind(options.provider);
     const total = try deflate.feed(checksum.Crc32, source, &compressor, &crc32);
-    compressor.finish() catch return error.IoFailure;
+    compressor.finish() catch return error.IoException;
     try writeTrailer(output, crc32.final(), total);
 }
 
-fn parseHeader(input: []const u8, provider: checksum.Provider) Failure!HeaderTail {
-    if (input.len < 10) return error.DataFailure;
+fn parseHeader(input: []const u8, provider: checksum.Provider) Exception!HeaderTail {
+    if (input.len < 10) return error.DataException;
     const fixed = input[0..10];
-    if (fixed[0] != magic_1 or fixed[1] != magic_2) return error.DataFailure;
-    if (fixed[2] != cm_deflate) return error.UnsupportedFailure;
+    if (fixed[0] != magic_1 or fixed[1] != magic_2) return error.DataException;
+    if (fixed[2] != cm_deflate) return error.UnsupportedException;
     const flags = fixed[3];
-    if (flags & reserved_flags != 0) return error.DataFailure;
+    if (flags & reserved_flags != 0) return error.DataException;
     var hasher = checksum.Crc32.bind(provider);
     hasher.update(fixed);
     var cursor: usize = fixed.len;
@@ -175,31 +175,31 @@ fn parseHeader(input: []const u8, provider: checksum.Provider) Failure!HeaderTai
     var name: []const u8 = &.{};
     var comment: []const u8 = &.{};
     if (flags & flag_extra != 0) {
-        if (input.len - cursor < 2) return error.DataFailure;
+        if (input.len - cursor < 2) return error.DataException;
         const remaining: usize = (@as(usize, input[cursor + 1]) << 8) | input[cursor];
         hasher.update(input[cursor..][0..2]);
         cursor += 2;
-        if (input.len - cursor < remaining) return error.DataFailure;
+        if (input.len - cursor < remaining) return error.DataException;
         extra = input[cursor .. cursor + remaining];
         hasher.update(extra);
         cursor += remaining;
     }
     if (flags & flag_name != 0) {
-        const end = std.mem.findScalarPos(u8, input, cursor, 0) orelse return error.DataFailure;
+        const end = std.mem.findScalarPos(u8, input, cursor, 0) orelse return error.DataException;
         name = input[cursor..end];
         hasher.update(input[cursor .. end + 1]);
         cursor = end + 1;
     }
     if (flags & flag_comment != 0) {
-        const end = std.mem.findScalarPos(u8, input, cursor, 0) orelse return error.DataFailure;
+        const end = std.mem.findScalarPos(u8, input, cursor, 0) orelse return error.DataException;
         comment = input[cursor..end];
         hasher.update(input[cursor .. end + 1]);
         cursor = end + 1;
     }
     if (flags & flag_header_crc != 0) {
-        if (input.len - cursor < 2) return error.DataFailure;
+        if (input.len - cursor < 2) return error.DataException;
         const stored_crc = (@as(u16, input[cursor + 1]) << 8) | input[cursor];
-        if (stored_crc != @as(u16, @truncate(hasher.final()))) return error.IntegrityFailure;
+        if (stored_crc != @as(u16, @truncate(hasher.final()))) return error.IntegrityException;
         cursor += 2;
     }
     return .{ .extra = extra, .name = name, .comment = comment, .len = cursor };
@@ -219,14 +219,14 @@ const Inflated = struct {
 
 fn inflatePayload(input: []const u8, data_start: usize, history: []u8, output: *std.Io.Writer, provider: checksum.Provider) !Inflated {
     var inflater: deflate_seam.Decode = undefined;
-    inflater.initSliceBoundInPlace(provider, input[data_start..], history) catch return error.UnsupportedFailure;
+    inflater.initSliceBoundInPlace(provider, input[data_start..], history) catch return error.UnsupportedException;
     const produced = try inflater.readerPtr().streamRemaining(output);
     return .{ .produced = produced, .consumed = (inflater.inputBitsConsumed() + 7) / 8 };
 }
 
-fn writeHeader(writer: *std.Io.Writer, options: Options) Failure!void {
-    if (options.extra.len > std.math.maxInt(u16)) return error.CallFailure;
-    if (std.mem.findScalar(u8, options.name, 0) != null or std.mem.findScalar(u8, options.comment, 0) != null) return error.CallFailure;
+fn writeHeader(writer: *std.Io.Writer, options: Options) Exception!void {
+    if (options.extra.len > std.math.maxInt(u16)) return error.CallException;
+    if (std.mem.findScalar(u8, options.name, 0) != null or std.mem.findScalar(u8, options.comment, 0) != null) return error.CallException;
     var flags: u8 = 0;
     if (options.text) flags |= flag_text;
     if (options.header_crc) flags |= flag_header_crc;
@@ -267,9 +267,9 @@ fn writeHeader(writer: *std.Io.Writer, options: Options) Failure!void {
     }
 }
 
-fn writeTrailer(writer: *std.Io.Writer, crc32: u32, uncompressed_size: u64) Failure!void {
-    writer.writeInt(u32, crc32, .little) catch return error.IoFailure;
-    writer.writeInt(u32, @truncate(uncompressed_size), .little) catch return error.IoFailure;
+fn writeTrailer(writer: *std.Io.Writer, crc32: u32, uncompressed_size: u64) Exception!void {
+    writer.writeInt(u32, crc32, .little) catch return error.IoException;
+    writer.writeInt(u32, @truncate(uncompressed_size), .little) catch return error.IoException;
 }
 
 pub const MemberInfo = struct {
@@ -296,9 +296,9 @@ pub const MemberIterator = struct {
     provider: checksum.Provider,
     offset: usize = 0,
 
-    pub fn next(self: *MemberIterator) Failure!?MemberInfo {
+    pub fn next(self: *MemberIterator) Exception!?MemberInfo {
         if (self.offset >= self.input.len) return null;
-        if (self.input.len - self.offset < minimum_member_len) return error.DataFailure;
+        if (self.input.len - self.offset < minimum_member_len) return error.DataException;
         const member = try inspectMember(self.input[self.offset..], self.history, self.provider);
         self.offset = try bounds.addUsize(self.offset, member.total_size);
         return member;
@@ -312,8 +312,8 @@ pub fn inspectMembers(input: []const u8, history: []u8, provider: checksum.Provi
     return .{ .input = input, .history = history, .provider = provider };
 }
 
-fn inspectMember(input: []const u8, history: []u8, provider: checksum.Provider) Failure!MemberInfo {
-    if (history.len < deflate_history_size) return error.CapacityFailure;
+fn inspectMember(input: []const u8, history: []u8, provider: checksum.Provider) Exception!MemberInfo {
+    if (history.len < deflate_history_size) return error.CapacityException;
     var counter = measurement.Counter.init(null);
     const member = try readMember(input, 0, history, &counter.writer, provider);
     return .{

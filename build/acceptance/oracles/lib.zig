@@ -323,12 +323,12 @@ pub fn archiveReadMatches(bytes: []const u8, expected: []const ExpectedEntry) Ar
         const e = entry orelse return .mismatch;
         const name_ptr = c.archive_entry_pathname(e) orelse return .mismatch;
         if (!std.mem.eql(u8, std.mem.span(name_ptr), exp.name)) {
-            std.debug.print("Archive entry {d}: expected name {s}, got {s}.\n", .{ expected_index, exp.name, std.mem.span(name_ptr) });
+            std.debug.print("archive entry {d}: expected name {s}, got {s}.\n", .{ expected_index, exp.name, std.mem.span(name_ptr) });
             return .mismatch;
         }
         if (exp.filetype) |filetype| {
             if (c.archive_entry_filetype(e) != filetype) {
-                std.debug.print("Archive entry {s}: expected filetype 0o{x}, got 0o{x}.\n", .{ exp.name, filetype, c.archive_entry_filetype(e) });
+                std.debug.print("archive entry {s}: expected filetype 0o{x}, got 0o{x}.\n", .{ exp.name, filetype, c.archive_entry_filetype(e) });
                 return .mismatch;
             }
         }
@@ -338,14 +338,14 @@ pub fn archiveReadMatches(bytes: []const u8, expected: []const ExpectedEntry) Ar
         if (exp.symlink) |expected_link| {
             const link_ptr = c.archive_entry_symlink(e) orelse return .mismatch;
             if (!std.mem.eql(u8, std.mem.span(link_ptr), expected_link)) {
-                std.debug.print("Archive entry {s}: expected symlink {s}, got {s}.\n", .{ exp.name, expected_link, std.mem.span(link_ptr) });
+                std.debug.print("archive entry {s}: expected symlink {s}, got {s}.\n", .{ exp.name, expected_link, std.mem.span(link_ptr) });
                 return .mismatch;
             }
         }
         if (exp.hardlink) |expected_link| {
             const link_ptr = c.archive_entry_hardlink(e) orelse return .mismatch;
             if (!std.mem.eql(u8, std.mem.span(link_ptr), expected_link)) {
-                std.debug.print("Archive entry {s}: expected hardlink {s}, got {s}.\n", .{ exp.name, expected_link, std.mem.span(link_ptr) });
+                std.debug.print("archive entry {s}: expected hardlink {s}, got {s}.\n", .{ exp.name, expected_link, std.mem.span(link_ptr) });
                 return .mismatch;
             }
         }
@@ -359,7 +359,7 @@ pub fn archiveReadMatches(bytes: []const u8, expected: []const ExpectedEntry) Ar
                 if (n == 0) break;
                 const chunk: usize = @intCast(n);
                 if (!std.mem.eql(u8, buffer[0..chunk], data[got .. got + chunk])) {
-                    std.debug.print("Archive entry {s}: data mismatch at {d}.\n", .{ exp.name, got });
+                    std.debug.print("archive entry {s}: data mismatch at {d}.\n", .{ exp.name, got });
                     return .mismatch;
                 }
                 got += chunk;

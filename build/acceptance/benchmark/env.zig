@@ -2,8 +2,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 
 pub const silesia_url = "https://sun.aei.polsl.pl/~sdeor/corpus/silesia.zip";
-// The corpus zip is pinned by content: a swapped or truncated download must
-// fail before it can skew a benchmark campaign.
+// Pinned by content: a bad download fails before skewing a campaign.
 pub const silesia_sha256 = "0626e25f45c0ffb5dc801f13b7c82a3b75743ba07e3a71835a41e3d9f63c77af";
 pub const silesia_files = [_][]const u8{ "dickens", "mozilla", "mr", "nci", "ooffice", "osdb", "reymont", "samba", "sao", "webster", "xml", "x-ray" };
 
@@ -33,7 +32,7 @@ pub const Env = struct {
     limit: usize = silesia_files.len,
     bounded: bool = true,
 
-    pub fn now(self: *const Env) u64 {
+    pub fn nowNs(self: *const Env) u64 {
         return @intCast(std.Io.Clock.Timestamp.now(self.io, .awake).raw.nanoseconds);
     }
 
@@ -45,7 +44,7 @@ pub const Env = struct {
         return self.allocator.printSentinel(fmt, args, 0);
     }
 
-    pub fn print(self: *Env, comptime fmt: []const u8, args: anytype) ![]u8 {
+    pub fn format(self: *Env, comptime fmt: []const u8, args: anytype) ![]u8 {
         return self.arena.allocator().print(fmt, args);
     }
 
@@ -78,7 +77,7 @@ pub const Env = struct {
         }
     };
 
-    // Mmap keeps pages resident across repeated passes.
+    // Mapped pages stay resident across repeated passes.
     pub fn mapFile(self: *Env, path: []const u8, max: u64) !Mapped {
         if (builtin.target.os.tag == .windows) {
             const buf = try self.readFile(path, max);
@@ -102,7 +101,7 @@ pub const Env = struct {
         try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = data });
     }
 
-    pub fn size(self: *Env, path: []const u8) !usize {
+    pub fn fileSize(self: *Env, path: []const u8) !usize {
         return @intCast((try std.Io.Dir.cwd().statFile(self.io, path, .{})).size);
     }
 
@@ -111,7 +110,7 @@ pub const Env = struct {
     }
 };
 
-fn parseOr(comptime T: type, raw: ?[]const u8, default: T, parse: fn ([]const u8) anyerror!T) T {
+fn parseWithDefault(comptime T: type, raw: ?[]const u8, default: T, parse: fn ([]const u8) anyerror!T) T {
     const text = raw orelse return default;
     return parse(text) catch default;
 }
@@ -129,7 +128,7 @@ fn parseFlagBody(text: []const u8) !bool {
 }
 
 pub fn parseRuns(raw: ?[]const u8) usize {
-    return parseOr(usize, raw, 1, parseUsize);
+    return parseWithDefault(usize, raw, 1, parseUsize);
 }
 
 pub const Gate = struct {
@@ -150,10 +149,10 @@ pub fn parseDefaultOn(raw: ?[]const u8) bool {
 }
 
 pub fn parsePercent(raw: ?[]const u8, default: f64) f64 {
-    return parseOr(f64, raw, default, parseFloat);
+    return parseWithDefault(f64, raw, default, parseFloat);
 }
 
-pub fn gate(environ_map: *const std.process.Environ.Map) Gate {
+pub fn gateConfig(environ_map: *const std.process.Environ.Map) Gate {
     return .{
         .enabled = parseFlag(environ_map.get("STDK_BENCH_GATE")),
         .fatal = parseFlag(environ_map.get("STDK_BENCH_GATE_FATAL")),

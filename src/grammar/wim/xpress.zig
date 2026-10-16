@@ -1,17 +1,12 @@
-const failure_prim = @import("../../common/primitive/failure.zig");
-
+const exception_prim = @import("../../common/primitive/exception.zig");
 const bits = @import("bits.zig");
 
-const Failure = failure_prim.Failure;
+const Exception = exception_prim.Exception;
 
-// WIM XPRESS resource codec, ported from wimlib's decompressor
-// (src/xpress_decompress.c). A 256-byte nibble header carries canonical
-// Huffman lengths for 512 symbols. Symbols 0..255 are literals; 256..511
-// are matches: low nibble length code, high nibble offset bucket log2.
-// The bit stream mirrors wimlib's input_bitstream: LE16 words, high byte
-// first, MSB first. Extra length bytes after a 0xff marker come from the
-// raw byte cursor with no realignment. Overrun reads yield zeroes.
-
+// WIM XPRESS codec, ported from wimlib src/xpress_decompress.c.
+// Nibble header carries canonical Huffman lengths for 512 symbols.
+// Symbols 0..255 are literals; 256..511 are matches.
+// Length bytes after a 0xff marker come from the raw cursor.
 
 const num_symbols: usize = 512;
 const num_chars: usize = 256;
@@ -20,8 +15,8 @@ const min_match_len: usize = 3;
 
 const Code = bits.Code(max_codeword_len, num_symbols);
 
-pub fn xpressDecode(input: []const u8, output: []u8) Failure!void {
-    if (input.len < num_symbols / 2) return error.DataFailure;
+pub fn xpressDecode(input: []const u8, output: []u8) Exception!void {
+    if (input.len < num_symbols / 2) return error.DataException;
     var lens: [num_symbols]u8 = undefined;
     for (0..num_symbols / 2) |i| {
         lens[2 * i] = input[i] & 0xf;
@@ -51,8 +46,8 @@ pub fn xpressDecode(input: []const u8, output: []u8) Failure!void {
         }
         length += min_match_len;
         const off: usize = @intCast(offset);
-        if (off > op or off == 0) return error.DataFailure;
-        if (length > output.len - op) return error.CapacityFailure;
+        if (off > op or off == 0) return error.DataException;
+        if (length > output.len - op) return error.CapacityException;
         var i: usize = 0;
         while (i < length) : (i += 1) {
             output[op + i] = output[op - off + i];

@@ -6,10 +6,10 @@
 #define nullptr ((void *)0)
 #endif
 
-#define STDK_C_SAME(expression, type) \
-	_Generic((expression),        \
-		type: 1,              \
-		default: 0) /* NOLINT(bugprone-macro-parentheses) */
+#define STDK_C_SAME(expression, type)                             \
+	_Generic((expression),                                    \
+		type: 1, /* NOLINT(bugprone-macro-parentheses) */ \
+		default: 0)
 #define STDK_C_RUN(kind, ...) STDK_C_##kind(__VA_ARGS__)
 #define STDK_C_TYPE(expression, type) \
 	_Static_assert(STDK_C_SAME(expression, type), #expression " : " #type)
