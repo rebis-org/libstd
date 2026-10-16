@@ -647,6 +647,10 @@ fn decodeMetaBlock(
     empty_end: *bool,
 ) DecodeError!void {
     empty_end.* = false;
+    // Prefix code tables are per-metablock state (RFC 7932 section 6): a
+    // fresh set of trees begins here, so the scratch pool resets even though
+    // the surrounding stream scratch outlives the metablock.
+    sc.trees_used = 0;
     is_last.* = (try br.readBit()) != 0;
     if (is_last.* and (try br.readBit()) != 0) {
         // ISLASTEMPTY: the stream ends at this bit; the caller validates
