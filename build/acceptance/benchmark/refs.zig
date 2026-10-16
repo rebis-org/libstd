@@ -392,9 +392,9 @@ fn addDwarfsTools(b: *std.Build) struct { mkdwarfs: *std.Build.Step.InstallFile,
     // Homebrew supplies boost, utf8cpp, nlohmann-json, and fmt.
     // Keg-only libarchive needs PKG_CONFIG_PATH.
 
-    // range-v3 must postdate 0.12.0.
+    // range-v3 must postdate 0.12.0; CI pins 5ba3911.
     // Its meta.hpp collides with Xcode 27 libc++.
-    // date.h covers the missing from_stream.
+    // date.h covers the missing from_stream; CI pins date 43d052d.
     var cfg = std.ArrayList([]const u8).empty;
     cfg.appendSlice(b.allocator, &.{
         "-DCMAKE_BUILD_TYPE=Release",

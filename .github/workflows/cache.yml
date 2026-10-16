@@ -69,7 +69,6 @@ jobs:
             zig-project-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-
       - name: Restore the Homebrew cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: inputs.profile == 'build'
         with:
           path: ~/Library/Caches/Homebrew
           key: brew-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.mise.toml') }}
@@ -85,6 +84,21 @@ jobs:
           key: benchmark-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-${{ hashFiles('build/acceptance/benchmark/command.zig', 'build/acceptance/benchmark/env.zig') }}
           restore-keys: |
             benchmark-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-
+      - name: Provision the reference toolchains
+        run: |
+          brew install autoconf automake bison libtool gettext pkg-config cmake boost fmt utf8cpp nlohmann-json libarchive xxhash zstd lz4 lzo xz brotli openssl@3
+          rm -rf /tmp/range-v3
+          git init -q /tmp/range-v3
+          git -C /tmp/range-v3 remote add origin https://github.com/ericniebler/range-v3.git
+          git -C /tmp/range-v3 fetch -q --depth 1 origin 5ba39112d2eafbb3c851a16a537f29b445022998
+          git -C /tmp/range-v3 checkout -q FETCH_HEAD
+          rm -rf /tmp/date-src /tmp/date_include
+          git init -q /tmp/date-src
+          git -C /tmp/date-src remote add origin https://github.com/HowardHinnant/date.git
+          git -C /tmp/date-src fetch -q --depth 1 origin 43d052df84ab7ed0abfde93c6cc0074da042bdc5
+          git -C /tmp/date-src checkout -q FETCH_HEAD
+          mkdir -p /tmp/date_include/date
+          cp /tmp/date-src/include/date/date.h /tmp/date_include/date/date.h
       - name: Build and package
         if: inputs.profile == 'build'
         run: |
@@ -93,7 +107,6 @@ jobs:
           zig build -Doptimize=fast
           zig build -Doptimize=small
           zig build abi
-          brew install autoconf automake bison boost
           [ "${{ inputs.benchmark }}" = true ] && zig build benchmark -Doptimize=fast
           brew install llvm
           echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
