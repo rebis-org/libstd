@@ -253,6 +253,7 @@ const writer_vtable = std.Io.Writer.VTable{ .drain = boundedWriterDrain };
 
 fn boundedWriterDrain(writer: *std.Io.Writer, chunks: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
     const self: *BoundedWriter = @fieldParentPtr("writer", writer);
+    if (chunks.len == 0) return 0;
     var total: usize = 0;
     for (chunks[0 .. chunks.len - 1]) |part| {
         total = std.math.add(usize, total, part.len) catch return error.WriteFailed;
