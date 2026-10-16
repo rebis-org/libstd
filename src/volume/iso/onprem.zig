@@ -15,6 +15,7 @@ const Exception = exception_prim.Exception;
 pub const scratch_size: usize = 4096;
 
 const sector_size: usize = 2048;
+const max_dir_depth: u32 = 64;
 const pvd_sector: u64 = 16;
 const descriptor_terminator: u8 = 255;
 const descriptor_primary: u8 = 1;
@@ -139,14 +140,15 @@ fn walkRoot(archive: []const u8, desc: Descriptor, target: Target) Exception!u64
         .count => target,
         .resolve => |res| Target{ .resolve = .{ .ordinal = res.ordinal, .info = res.info, .output = res.output, .found = &found } },
     };
-    try walkIsoDir(archive, desc.root_extent, desc.root_size, resolved, &state);
+    try walkIsoDir(archive, desc.root_extent, desc.root_size, resolved, &state, 0);
     return switch (target) {
         .count => state.ordinal,
         .resolve => if (found) state.ordinal else error.DataException,
     };
 }
 
-fn walkIsoDir(archive: []const u8, extent: u32, size: u32, target: Target, state: *WalkState) Exception!void {
+fn walkIsoDir(archive: []const u8, extent: u32, size: u32, target: Target, state: *WalkState, depth: u32) Exception!void {
+    if (depth > max_dir_depth) return error.DataException;
     const dir = try bounds.slice(archive, std.math.mul(u64, extent, sector_size) catch return error.DataException, size);
     const dot = (try parseRecord(dir, 0)) orelse return error.DataException;
     if (!dot.is_dot) return error.DataException;
@@ -165,7 +167,7 @@ fn walkIsoDir(archive: []const u8, extent: u32, size: u32, target: Target, state
         pos += rec.skip;
         if (rec.is_dot or rec.is_dotdot) continue;
         if (rec.flags & flag_directory != 0) {
-            try walkIsoDir(archive, rec.extent, rec.size, target, state);
+            try walkIsoDir(archive, rec.extent, rec.size, target, state, depth + 1);
             continue;
         }
         switch (target) {
@@ -324,6 +326,8 @@ fn buildIsoPlan(entries: []const Entry, alloc: std.mem.Allocator) Exception!IsoP
         const len: u32 = if (nodes.items[ni].name.len == 0) 1 else @intCast(nodes.items[ni].name.len);
         path_table_size += 8 + len + (len & 1);
     }
+    // The writer emits one 2048-byte sector per byte-order table.
+    if (path_table_size > sector_size) return error.UnsupportedException;
 
     return .{
         .nodes = nodes.items,
