@@ -30,9 +30,9 @@ test {
     _ = @import("leaf/lzo/onprem.zig");
     _ = @import("volume/dwarfs/offprem.zig");
     _ = @import("volume/dwarfs/onprem.zig");
+    _ = @import("volume/apfs/onprem.zig");
     _ = @import("volume/iso/offprem.zig");
     _ = @import("volume/iso/onprem.zig");
     _ = @import("volume/squashfs/offprem.zig");
     _ = @import("volume/squashfs/onprem.zig");
 }
-
