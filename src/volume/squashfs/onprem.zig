@@ -38,6 +38,7 @@ const block_log_default: u16 = 17;
 const block_log_min: u16 = 12;
 const block_log_max: u16 = 20;
 const metadata_size: usize = 8192;
+const max_dir_depth: u32 = 64;
 const frag_buffer_size: usize = block_size_default;
 const super_disk_size: u64 = 96;
 const compression_gzip: u16 = 1;
@@ -358,14 +359,15 @@ fn walkDir(archive: []const u8, super: Super, scratch: *Scratch, target: DirTarg
         .count => target,
         .resolve => |res| DirTarget{ .resolve = .{ .ordinal = res.ordinal, .info = res.info, .output = res.output, .found = &found } },
     };
-    try walkInodeDir(archive, super, scratch, super.root_ref, resolved, &state);
+    try walkInodeDir(archive, super, scratch, super.root_ref, resolved, &state, 0);
     return switch (target) {
         .count => state.ordinal,
         .resolve => if (found) state.ordinal else error.DataException,
     };
 }
 
-fn walkInodeDir(archive: []const u8, super: Super, scratch: *Scratch, ref: u64, target: DirTarget, state: *WalkState) Exception!void {
+fn walkInodeDir(archive: []const u8, super: Super, scratch: *Scratch, ref: u64, target: DirTarget, state: *WalkState, depth: u32) Exception!void {
+    if (depth > max_dir_depth) return error.DataException;
     const dir_inode = try readInode(archive, super, ref, scratch);
     if (dir_inode.dir_file_size < 3) return error.DataException;
     const content_len = dir_inode.dir_file_size - 3;
@@ -434,7 +436,7 @@ fn walkInodeDir(archive: []const u8, super: Super, scratch: *Scratch, ref: u64, 
             if (fp.*) return;
         }
         switch (entry_type) {
-            inode_type_dir => try walkInodeDir(archive, super, scratch, child_ref, target, state),
+            inode_type_dir => try walkInodeDir(archive, super, scratch, child_ref, target, state, depth + 1),
             inode_type_reg, inode_type_lreg => {
                 switch (target) {
                     .count => {},
