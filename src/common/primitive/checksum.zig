@@ -22,6 +22,12 @@ const has_crc32_kernel = crc32_hw and builtin.target.cpu.has(.aarch64, .crc);
 const has_crc32_pmull = has_crc32_kernel and builtin.target.cpu.has(.aarch64, .aes);
 const crc64_hw = builtin.target.cpu.arch == .aarch64 and !options.crc64xz_portable;
 const has_crc64_pmull = crc64_hw and builtin.target.cpu.has(.aarch64, .aes);
+// PCLMULQDQ multiplies carry-less like PMULL, so the fold kernels below stay shared.
+const x86_clmul = builtin.target.cpu.arch == .x86_64 and
+    builtin.zig_backend != .stage2_c and
+    builtin.target.cpu.has(.x86, .pclmul);
+const has_crc32_clmul = x86_clmul and !options.crc32_portable;
+const has_crc64_clmul = x86_clmul and !options.crc64xz_portable;
 
 const crc_lane = @Vector(2, u64);
 
@@ -72,8 +78,34 @@ inline fn pmull2(a: crc_lane, b: crc_lane) crc_lane {
     );
 }
 
+// PCLMULQDQ counterpart of the PMULL pair; the early-clobber output copies first because
+// the instruction cannot write a tied operand. Encoding per Chromium zlib crc32_simd.c.
+inline fn clmul1(a: crc_lane, b: crc_lane) crc_lane {
+    return asm (
+        \\ movdqa     %[a], %[ret]
+        \\ pclmulqdq  $0, %[b], %[ret]
+        : [ret] "=&x" (-> crc_lane),
+        : [a] "x" (a),
+          [b] "x" (b),
+    );
+}
+
+inline fn clmul2(a: crc_lane, b: crc_lane) crc_lane {
+    return asm (
+        \\ movdqa     %[a], %[ret]
+        \\ pclmulqdq  $0x11, %[b], %[ret]
+        : [ret] "=&x" (-> crc_lane),
+        : [a] "x" (a),
+          [b] "x" (b),
+    );
+}
+
 inline fn foldLane(lane: crc_lane, input: crc_lane, k: crc_lane) crc_lane {
-    return pmull1(lane, k) ^ input ^ pmull2(lane, k);
+    if (comptime builtin.target.cpu.arch == .aarch64) {
+        return pmull1(lane, k) ^ input ^ pmull2(lane, k);
+    } else {
+        return clmul1(lane, k) ^ input ^ clmul2(lane, k);
+    }
 }
 
 // One 16-byte load per lane. The helper must inline: a call in the fold loop
@@ -98,13 +130,50 @@ fn crc32Aarch64Scalar(crc_in: u32, input: []const u8) u32 {
     return crc;
 }
 
-// CRC32 state via four-lane PMULL folding. The caller routes only inputs at or above
-// crc32_pmull_threshold, because folding costs a fixed setup that short inputs never repay.
-fn crc32Aarch64Fold(crc_in: u32, input: []const u8) u32 {
+// The fold tail re-enters the folded state and drains the remainder: hardware CRC
+// steps on aarch64, table steps where no such instruction exists.
+const Crc32Aarch64Tail = struct {
+    const folds_16_byte_lanes = true;
+
+    inline fn byte(crc: u32, data: u8) u32 {
+        return crc32b(crc, data);
+    }
+
+    inline fn word(crc: u32, data: u64) u32 {
+        return crc32x(crc, data);
+    }
+};
+
+// A chain of 16-byte lanes ending in table steps loses to slicing-by-4, so it never folds here.
+fn Crc32TableTail(comptime tables: *const [4][256]u32) type {
+    return struct {
+        const folds_16_byte_lanes = false;
+
+        inline fn byte(crc: u32, data: u8) u32 {
+            return (crc >> 8) ^ tables[0][@as(usize, @intCast((crc ^ data) & 0xff))];
+        }
+
+        // Two slicing-by-4 steps drain the eight little-endian bytes of the word.
+        inline fn word(crc: u32, data: u64) u32 {
+            var c = crc;
+            for ([_]u32{ @truncate(data), @truncate(data >> 32) }) |half| {
+                c = tables[3][@as(usize, @intCast((c ^ half) & 0xff))] ^
+                    tables[2][@as(usize, @intCast(((c >> 8) ^ (half >> 8)) & 0xff))] ^
+                    tables[1][@as(usize, @intCast(((c >> 16) ^ (half >> 16)) & 0xff))] ^
+                    tables[0][@as(usize, @intCast(((c >> 24) ^ (half >> 24)) & 0xff))];
+            }
+            return c;
+        }
+    };
+}
+
+// CRC32 state via carry-less folding (PMULL or PCLMULQDQ). The caller routes only inputs at
+// or above crc32_pmull_threshold, because folding costs a fixed setup that short inputs never repay.
+fn crc32Fold(crc_in: u32, input: []const u8, comptime Tail: type) u32 {
     var crc = crc_in;
     var data = input;
     while (data.len != 0 and @intFromPtr(data.ptr) & 15 != 0) {
-        crc = crc32b(crc, data[0]);
+        crc = Tail.byte(crc, data[0]);
         data = data[1..];
     }
     if (data.len >= 128) {
@@ -127,8 +196,8 @@ fn crc32Aarch64Fold(crc_in: u32, input: []const u8) u32 {
         lanes[0] = foldLane(lanes[0], lanes[2], crc_k2);
         lanes[4] = foldLane(lanes[4], lanes[6], crc_k2);
         lanes[0] = foldLane(lanes[0], lanes[4], crc_k0);
-        crc = crc32x(0, lanes[0][0]);
-        crc = crc32x(crc, lanes[0][1]);
+        crc = Tail.word(0, lanes[0][0]);
+        crc = Tail.word(crc, lanes[0][1]);
     }
     if (data.len >= 64) {
         var lanes: [4]crc_lane = undefined;
@@ -146,25 +215,27 @@ fn crc32Aarch64Fold(crc_in: u32, input: []const u8) u32 {
         lanes[0] = foldLane(lanes[0], lanes[1], crc_k1);
         lanes[2] = foldLane(lanes[2], lanes[3], crc_k1);
         lanes[0] = foldLane(lanes[0], lanes[2], crc_k2);
-        crc = crc32x(0, lanes[0][0]);
-        crc = crc32x(crc, lanes[0][1]);
+        crc = Tail.word(0, lanes[0][0]);
+        crc = Tail.word(crc, lanes[0][1]);
     }
-    while (data.len >= 16) {
-        var lane = loadLane(data[0..16]);
-        lane[0] ^= crc;
-        data = data[16..];
-        while (data.len >= 16) {
-            lane = foldLane(lane, loadLane(data[0..16]), crc_k1);
+    if (comptime Tail.folds_16_byte_lanes) {
+        if (data.len >= 16) {
+            var lane = loadLane(data[0..16]);
+            lane[0] ^= crc;
             data = data[16..];
+            while (data.len >= 16) {
+                lane = foldLane(lane, loadLane(data[0..16]), crc_k1);
+                data = data[16..];
+            }
+            crc = Tail.word(0, lane[0]);
+            crc = Tail.word(crc, lane[1]);
         }
-        crc = crc32x(0, lane[0]);
-        crc = crc32x(crc, lane[1]);
     }
-    if (data.len >= 8) {
-        crc = crc32x(crc, std.mem.readInt(u64, data[0..8], .little));
+    while (data.len >= 8) {
+        crc = Tail.word(crc, std.mem.readInt(u64, data[0..8], .little));
         data = data[8..];
     }
-    for (data) |byte| crc = crc32b(crc, byte);
+    for (data) |byte| crc = Tail.byte(crc, byte);
     return crc;
 }
 
@@ -187,9 +258,9 @@ const crc64_k1: crc_lane = .{ crc64Xpow(128), crc64Xpow(64) };
 const crc64_k2: crc_lane = .{ crc64Xpow(256), crc64Xpow(192) };
 const crc64_k3: crc_lane = .{ crc64Xpow(1024), crc64Xpow(960) };
 
-// CRC-64/XZ state via PMULL folding. No hardware crc64 instruction exists, so each folded
+// CRC-64/XZ state via carry-less folding. No hardware crc64 instruction exists, so each folded
 // lane re-enters the register through 16 byte-table steps, amortized over the region.
-fn crc64Aarch64Fold(crc_in: u64, input: []const u8, comptime table: *const [256]u64) u64 {
+fn crc64Fold(crc_in: u64, input: []const u8, comptime table: *const [256]u64) u64 {
     var crc = crc_in;
     var data = input;
     while (data.len != 0 and @intFromPtr(data.ptr) & 15 != 0) {
@@ -328,11 +399,17 @@ fn TableCrc(comptime T: type, comptime poly: T, comptime reflected: bool) type {
             if (comptime T == u32 and reflected) {
                 if (comptime has_crc32_kernel) {
                     if (input.len >= crc_pmull_threshold and comptime has_crc32_pmull) {
-                        self.state = crc32Aarch64Fold(self.state, input);
+                        self.state = crc32Fold(self.state, input, Crc32Aarch64Tail);
                     } else {
                         self.state = crc32Aarch64Scalar(self.state, input);
                     }
                     return;
+                }
+                if (comptime has_crc32_clmul) {
+                    if (input.len >= crc_pmull_threshold) {
+                        self.state = crc32Fold(self.state, input, Crc32TableTail(&tables));
+                        return;
+                    }
                 }
                 var crc = self.state;
                 var i: usize = 0;
@@ -349,9 +426,9 @@ fn TableCrc(comptime T: type, comptime poly: T, comptime reflected: bool) type {
                 return;
             }
             if (comptime reflected) {
-                if (comptime T == u64 and has_crc64_pmull) {
+                if (comptime T == u64 and (has_crc64_pmull or has_crc64_clmul)) {
                     if (input.len >= crc_pmull_threshold) {
-                        self.state = crc64Aarch64Fold(self.state, input, &table);
+                        self.state = crc64Fold(self.state, input, &table);
                         return;
                     }
                 }
