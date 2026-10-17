@@ -36,6 +36,10 @@ jobs:
     name: Cached run
     runs-on: xcode-27
     steps:
+      - name: Point the nested GNU submodules at the mirrors
+        run: |
+          git config --global --add url."https://github.com/rebis-org/".insteadOf https://git.savannah.gnu.org/git/
+          git config --global --add url."https://github.com/rebis-org/".insteadOf git://git.sv.gnu.org/
       - name: Check out sources
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
