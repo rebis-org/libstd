@@ -29,8 +29,10 @@ const crc_lane = @Vector(2, u64);
 const crc_k0: crc_lane = .{ 0x000000008f352d95, 0x000000001d9513d7 };
 const crc_k1: crc_lane = .{ 0x00000000ae689191, 0x00000000ccaa009e };
 const crc_k2: crc_lane = .{ 0x00000000f1da05aa, 0x0000000081256527 };
+// 128-byte window fold, same recurrence as the vendor literals: {x^1024, x^960} mod poly.
+const crc_k3: crc_lane = .{ 0x0000000033fff533, 0x00000000910eeec1 };
 
-fn crc32x(crc: u32, word: u64) u32 {
+inline fn crc32x(crc: u32, word: u64) u32 {
     return asm ("crc32x w8, w8, x9"
         : [ret] "={x8}" (-> u32),
         : [crc] "{x8}" (crc),
@@ -38,7 +40,7 @@ fn crc32x(crc: u32, word: u64) u32 {
     );
 }
 
-fn crc32w(crc: u32, data: u32) u32 {
+inline fn crc32w(crc: u32, data: u32) u32 {
     return asm ("crc32w w8, w8, w9"
         : [ret] "={x8}" (-> u32),
         : [crc] "{x8}" (crc),
@@ -46,7 +48,7 @@ fn crc32w(crc: u32, data: u32) u32 {
     );
 }
 
-fn crc32b(crc: u32, data: u8) u32 {
+inline fn crc32b(crc: u32, data: u8) u32 {
     return asm ("crc32b w8, w8, w9"
         : [ret] "={x8}" (-> u32),
         : [crc] "{x8}" (crc),
@@ -54,7 +56,7 @@ fn crc32b(crc: u32, data: u8) u32 {
     );
 }
 
-fn pmull1(a: crc_lane, b: crc_lane) crc_lane {
+inline fn pmull1(a: crc_lane, b: crc_lane) crc_lane {
     return asm ("pmull %[ret].1q, %[a].1d, %[b].1d"
         : [ret] "=x" (-> crc_lane),
         : [a] "x" (a),
@@ -62,7 +64,7 @@ fn pmull1(a: crc_lane, b: crc_lane) crc_lane {
     );
 }
 
-fn pmull2(a: crc_lane, b: crc_lane) crc_lane {
+inline fn pmull2(a: crc_lane, b: crc_lane) crc_lane {
     return asm ("pmull2 %[ret].1q, %[a].2d, %[b].2d"
         : [ret] "=x" (-> crc_lane),
         : [a] "x" (a),
@@ -70,8 +72,15 @@ fn pmull2(a: crc_lane, b: crc_lane) crc_lane {
     );
 }
 
-fn foldLane(lane: crc_lane, input: crc_lane, k: crc_lane) crc_lane {
+inline fn foldLane(lane: crc_lane, input: crc_lane, k: crc_lane) crc_lane {
     return pmull1(lane, k) ^ input ^ pmull2(lane, k);
+}
+
+// One 16-byte load per lane. The helper must inline: a call in the fold loop
+// costs more than the load itself, because no q register survives a call.
+inline fn loadLane(bytes: *const [16]u8) crc_lane {
+    const lane: *align(1) const crc_lane = @ptrCast(bytes);
+    return lane.*;
 }
 
 fn crc32Aarch64Scalar(crc_in: u32, input: []const u8) u32 {
@@ -98,16 +107,39 @@ fn crc32Aarch64Fold(crc_in: u32, input: []const u8) u32 {
         crc = crc32b(crc, data[0]);
         data = data[1..];
     }
+    if (data.len >= 128) {
+        var lanes: [8]crc_lane = undefined;
+        for (0..8) |i| {
+            lanes[i] = loadLane(data[i * 16 ..][0..16]);
+        }
+        lanes[0][0] ^= crc;
+        data = data[128..];
+        while (data.len >= 128) {
+            for (0..8) |i| {
+                lanes[i] = foldLane(lanes[i], loadLane(data[i * 16 ..][0..16]), crc_k3);
+            }
+            data = data[128..];
+        }
+        lanes[0] = foldLane(lanes[0], lanes[1], crc_k1);
+        lanes[2] = foldLane(lanes[2], lanes[3], crc_k1);
+        lanes[4] = foldLane(lanes[4], lanes[5], crc_k1);
+        lanes[6] = foldLane(lanes[6], lanes[7], crc_k1);
+        lanes[0] = foldLane(lanes[0], lanes[2], crc_k2);
+        lanes[4] = foldLane(lanes[4], lanes[6], crc_k2);
+        lanes[0] = foldLane(lanes[0], lanes[4], crc_k0);
+        crc = crc32x(0, lanes[0][0]);
+        crc = crc32x(crc, lanes[0][1]);
+    }
     if (data.len >= 64) {
         var lanes: [4]crc_lane = undefined;
         for (0..4) |i| {
-            lanes[i] = std.mem.bytesToValue(crc_lane, data[i * 16 ..][0..16]);
+            lanes[i] = loadLane(data[i * 16 ..][0..16]);
         }
         lanes[0][0] ^= crc;
         data = data[64..];
         while (data.len >= 64) {
             for (0..4) |i| {
-                lanes[i] = foldLane(lanes[i], std.mem.bytesToValue(crc_lane, data[i * 16 ..][0..16]), crc_k0);
+                lanes[i] = foldLane(lanes[i], loadLane(data[i * 16 ..][0..16]), crc_k0);
             }
             data = data[64..];
         }
@@ -118,11 +150,11 @@ fn crc32Aarch64Fold(crc_in: u32, input: []const u8) u32 {
         crc = crc32x(crc, lanes[0][1]);
     }
     while (data.len >= 16) {
-        var lane = std.mem.bytesToValue(crc_lane, data[0..16]);
+        var lane = loadLane(data[0..16]);
         lane[0] ^= crc;
         data = data[16..];
         while (data.len >= 16) {
-            lane = foldLane(lane, std.mem.bytesToValue(crc_lane, data[0..16]), crc_k1);
+            lane = foldLane(lane, loadLane(data[0..16]), crc_k1);
             data = data[16..];
         }
         crc = crc32x(0, lane[0]);
@@ -142,6 +174,7 @@ const crc64_poly: u64 = 0xC96C5795D7870F42;
 
 fn crc64Xpow(comptime n: u16) u64 {
     // The same register recurrence as the byte table, from x^0 = 1.
+    @setEvalBranchQuota(4 * n + 64);
     var v: u64 = 1;
     for (0..n) |_| {
         v = (v >> 1) ^ (if (v & 1 != 0) crc64_poly else 0);
@@ -152,6 +185,7 @@ fn crc64Xpow(comptime n: u16) u64 {
 const crc64_k0: crc_lane = .{ crc64Xpow(512), crc64Xpow(448) };
 const crc64_k1: crc_lane = .{ crc64Xpow(128), crc64Xpow(64) };
 const crc64_k2: crc_lane = .{ crc64Xpow(256), crc64Xpow(192) };
+const crc64_k3: crc_lane = .{ crc64Xpow(1024), crc64Xpow(960) };
 
 // CRC-64/XZ state via PMULL folding. No hardware crc64 instruction exists, so each folded
 // lane re-enters the register through 16 byte-table steps, amortized over the region.
@@ -162,16 +196,41 @@ fn crc64Aarch64Fold(crc_in: u64, input: []const u8, comptime table: *const [256]
         crc = (crc >> 8) ^ table[(crc ^ data[0]) & 0xff];
         data = data[1..];
     }
+    if (data.len >= 128) {
+        var lanes: [8]crc_lane = undefined;
+        for (0..8) |i| {
+            lanes[i] = loadLane(data[i * 16 ..][0..16]);
+        }
+        lanes[0][0] ^= crc;
+        data = data[128..];
+        while (data.len >= 128) {
+            for (0..8) |i| {
+                lanes[i] = foldLane(lanes[i], loadLane(data[i * 16 ..][0..16]), crc64_k3);
+            }
+            data = data[128..];
+        }
+        lanes[0] = foldLane(lanes[0], lanes[1], crc64_k1);
+        lanes[2] = foldLane(lanes[2], lanes[3], crc64_k1);
+        lanes[4] = foldLane(lanes[4], lanes[5], crc64_k1);
+        lanes[6] = foldLane(lanes[6], lanes[7], crc64_k1);
+        lanes[0] = foldLane(lanes[0], lanes[2], crc64_k2);
+        lanes[4] = foldLane(lanes[4], lanes[6], crc64_k2);
+        lanes[0] = foldLane(lanes[0], lanes[4], crc64_k0);
+        crc = 0;
+        for (std.mem.toBytes(lanes[0])) |byte| {
+            crc = (crc >> 8) ^ table[(crc ^ byte) & 0xff];
+        }
+    }
     if (data.len >= 64) {
         var lanes: [4]crc_lane = undefined;
         for (0..4) |i| {
-            lanes[i] = std.mem.bytesToValue(crc_lane, data[i * 16 ..][0..16]);
+            lanes[i] = loadLane(data[i * 16 ..][0..16]);
         }
         lanes[0][0] ^= crc;
         data = data[64..];
         while (data.len >= 64) {
             for (0..4) |i| {
-                lanes[i] = foldLane(lanes[i], std.mem.bytesToValue(crc_lane, data[i * 16 ..][0..16]), crc64_k0);
+                lanes[i] = foldLane(lanes[i], loadLane(data[i * 16 ..][0..16]), crc64_k0);
             }
             data = data[64..];
         }
@@ -184,11 +243,11 @@ fn crc64Aarch64Fold(crc_in: u64, input: []const u8, comptime table: *const [256]
         }
     }
     while (data.len >= 16) {
-        var lane = std.mem.bytesToValue(crc_lane, data[0..16]);
+        var lane = loadLane(data[0..16]);
         lane[0] ^= crc;
         data = data[16..];
         while (data.len >= 16) {
-            lane = foldLane(lane, std.mem.bytesToValue(crc_lane, data[0..16]), crc64_k1);
+            lane = foldLane(lane, loadLane(data[0..16]), crc64_k1);
             data = data[16..];
         }
         crc = 0;
