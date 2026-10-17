@@ -29,16 +29,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { impl: onprem, portable: false }
-          - { impl: offprem, portable: false }
-          - { impl: mergeable, portable: false }
-          - { impl: onprem, portable: true }
-          - { impl: mergeable, portable: true }
+          - { impl: onprem, portable: false, sanitizer: ubsan }
+          - { impl: offprem, portable: false, sanitizer: "" }
+          - { impl: mergeable, portable: false, sanitizer: "" }
+          - { impl: onprem, portable: true, sanitizer: "" }
+          - { impl: mergeable, portable: true, sanitizer: "" }
     uses: ./.github/workflows/cache.yml
     with:
       profile: suite
       impl: ${{ matrix.impl }}
       portable: ${{ matrix.portable }}
+      sanitizer: ${{ matrix.sanitizer }}
 
   publish:
     name: Publish
