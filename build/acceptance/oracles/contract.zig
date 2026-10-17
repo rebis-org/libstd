@@ -67,7 +67,7 @@ pub fn main(init: std.process.Init) !void {
     // One profile row per component plus descriptor-less protocol fixtures.
     const all = kernel.discovery.enumerate();
     check(catalog_profiles == all.len, "catalog profile count");
-    check(all.len == 31, "descriptor count");
+    check(all.len == 32, "descriptor count");
     for (all) |*descriptor| {
         check(kernel.discovery.findById(descriptor.id) == descriptor, "id lookup round trip");
     }

@@ -401,9 +401,7 @@ pub const ZipCryptoKeys = struct {
 };
 
 // Known-answer vectors pin the glue: FIPS 197, NIST SP 800-38A, RFC 2202,
-// RFC 4231, RFC 6070, the scrypt draft, NIST SHA-256, and the 7z KDF layout
-// from vendor/7zip. Each capability's onprem file carries its own
-// differential test against std.
+// RFC 4231, RFC 6070, the scrypt draft, NIST SHA-256, and the 7z KDF layout from 7-Zip.
 
 test "mergeable digest binds both providers to the same contract" {
     if (options.sha256_impl != .mergeable) return error.SkipZigTest;
