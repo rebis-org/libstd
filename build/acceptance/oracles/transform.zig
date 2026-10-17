@@ -32,6 +32,7 @@ fn runRoundtrip(r: *Runner, profile_id: harness.Id) anyerror!void {
 
 pub fn runDeflate(r: *Runner) anyerror!void {
     try runRoundtrip(r, harness.ids.deflate);
+    try steps.writeLimitReject(&steps.noParams, r);
 }
 
 pub fn runBrotli(r: *Runner) anyerror!void {
@@ -75,6 +76,7 @@ pub fn runGzipOptimal(r: *Runner) anyerror!void {
 pub fn runGzip(r: *Runner) anyerror!void {
     try runRoundtrip(r, harness.ids.gzip);
     try steps.truncateReject(&steps.noParams, r);
+    try steps.writeLimitReject(&steps.noParams, r);
     try steps.foreignTool(r);
 }
 

@@ -21,6 +21,7 @@ fn setupContainer(r: *Runner, profile_id: harness.Id) void {
 fn runZlib(r: *Runner) anyerror!void {
     setupContainer(r, harness.ids.zlib);
     try steps.roundtrip(&steps.noParams, r);
+    try steps.writeLimitReject(&steps.noParams, r);
     if (!lib.zlibValid(r.encoded[0..r.encoded_len])) return error.ReferenceToolRejectedOutput;
     // Reference encoder produces, our decoder reads.
     var fixture_input: [65536]u8 = undefined;

@@ -5,6 +5,10 @@ const options = @import("options");
 
 // FIPS-197.
 // AES-192 needs the classic word expansion because the vectorized schedule requires 16-byte key groups.
+//
+// OpenSSL, crypto/aes/asm.
+//
+// Mode-level batch pipelines (aesni-mb, vpaes, bsaes) belong to callers.
 
 pub const block_length = 16;
 

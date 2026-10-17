@@ -214,6 +214,7 @@ fn roundtrip(comptime params: steps.Params) fn (*Runner) anyerror!void {
         fn run(r: *Runner) anyerror!void {
             setupProfile(r);
             try steps.roundtripTruncate(params, r);
+            try steps.writeLimitReject(params, r);
         }
     }.run;
 }

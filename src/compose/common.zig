@@ -114,6 +114,17 @@ pub fn materializeSource(comptime sizing: SourceSizing, source: *Resource, works
     };
 }
 
+// A bounded reader stops at its cap without reading past it, so a source that
+// spans the cap is indistinguishable from an exact fit until one byte is read
+// past it. The caller reports `at_cap` after draining and re-rewinds on
+// success; over-limit input is a resource failure, never a truncation.
+pub fn rejectOverLimit(source: *Resource, at_cap: bool) Exception!void {
+    if (!at_cap) return;
+    var extra: [1]u8 = undefined;
+    const tail_read = try source.read(&extra);
+    if (tail_read != 0) return error.ResourceException;
+}
+
 pub fn measureSource(source: *Resource, limit: u64) Exception!usize {
     if (source.hasCapability(resource.capability_bit_size)) {
         const total = try source.size();
@@ -125,9 +136,9 @@ pub fn measureSource(source: *Resource, limit: u64) Exception!usize {
     var bounded_source: resource.BoundedReader = undefined;
     bounded_source.init(source, limit);
     _ = std.Io.Reader.streamRemaining(&bounded_source.reader, &counter.writer) catch |exception| return mapStreamError(exception);
-    try source.rewind();
     const total = counter.written();
-    if (total > limit) return error.ResourceException;
+    try rejectOverLimit(source, total == limit);
+    try source.rewind();
     return std.math.cast(usize, total) orelse error.ResourceException;
 }
 

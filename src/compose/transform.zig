@@ -277,7 +277,9 @@ fn parseDeflateOptions(request: ?*Node, command_mask: u32) Exception!deflate.Opt
 
 // The counting pass replays the exact encode so the commit pass produces
 // identical bytes. Codec policy errors propagate when map_io_failure is
-// false. Transport failures on the counting sink carry no data.
+// false. Transport failures on the counting sink carry no data. The pass caps
+// at the decoded limit without reading past it, so one probe byte separates an
+// exact fit from an over-limit source, which is a resource failure.
 fn planCountedEncode(source: *Resource, decoded_limit: u64, encoded_limit: u64, comptime map_io_failure: bool, comptime encode_fn: fn (input: *std.Io.Reader, output: *std.Io.Writer, args: anytype) Exception!void, args: anytype) Exception!usize {
     var bounded_source: resource.BoundedReader = undefined;
     bounded_source.init(source, decoded_limit);
@@ -289,6 +291,7 @@ fn planCountedEncode(source: *Resource, decoded_limit: u64, encoded_limit: u64, 
     }
     const output_size = counter.written();
     if (output_size > encoded_limit) return error.ResourceException;
+    try common.rejectOverLimit(source, bounded_source.limit == 0);
     try source.rewind();
     return std.math.cast(usize, output_size) orelse error.ResourceException;
 }

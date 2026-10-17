@@ -333,7 +333,7 @@ fn packAllEntries(entries: []const Entry, provider: crypto.Provider, workspace: 
             continue;
         }
         // One folder and one continuous codec stream per run, so coder state
-        // carries across the substreams as in vendor/7zip's solid folders.
+        // carries across the substreams as in 7-Zip's solid folders.
         if ((entries[i].method == .lzma2 or entries[i].method == .ppmd) and !entries[i].encrypted) {
             var j = i + 1;
             while (j < entries.len and !isEmptyEntry(entries[j]) and entries[j].method == entries[i].method and !entries[j].encrypted and entries[j].filter == entries[i].filter) j += 1;
@@ -2554,7 +2554,7 @@ fn hexBytes(comptime len: usize, comptime hex: []const u8) [len]u8 {
     return out;
 }
 
-// Captured from vendor/7zip 26.x CLI output (`7zz a -m0=BCJ2 -m1=LZMA2 -mx=5`) and inlined
+// Captured from 7-Zip 26.x CLI output (`7zz a -m0=BCJ2 -m1=LZMA2 -mx=5`) and inlined
 // as hex, so no binary fixture enters the tree.
 const bcj2_lzma2_7z_hex =
     "377abcaf271c0004680dc853c101000000000000720000000000000003d82b46e0032b00285d00486bb62414e8bbc1f7" ++
