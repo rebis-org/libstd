@@ -15,6 +15,11 @@ on:
         description: Restrict primitive seams to their portable paths.
         type: boolean
         required: true
+      sanitizer:
+        description: Sanitizer suite to run after the tests (empty for none).
+        type: string
+        required: false
+        default: ''
       export:
         description: Hand the archives this run produced to the caller's release job.
         type: boolean
@@ -41,31 +46,33 @@ jobs:
           install: true
       - id: keys
         name: Resolve cache keys
+        env:
+          SOURCE_HASH: ${{ hashFiles('build.zig', 'build.zig.zon', 'build/**', 'src/**') }}
         run: |
           zig="$(zig version)"
-          vendor="$(git submodule status --recursive | sha256sum | cut -d' ' -f1)"
+          vendor="$(git ls-files --stage | awk '$1 == "160000" { print $2, $4 }' | sha256sum | cut -d' ' -f1)"
           cache="$(zig env | sed -n 's/^[[:space:]]*\.global_cache_dir = "\(.*\)",$/\1/p')"
           [ -d "$cache" ] || { echo "unresolved zig global cache: '$cache'" >&2; exit 1; }
           {
             echo "zig=$zig"
             echo "vendor=$vendor"
+            echo "source=$SOURCE_HASH"
             echo "cache=$cache"
           } >> "$GITHUB_OUTPUT"
       - name: Restore the dependency cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ steps.keys.outputs.cache }}
-          key: zig-global-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-${{ hashFiles('build.zig.zon', 'pkg/**') }}
+          key: zig-global-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-${{ steps.keys.outputs.vendor }}
           restore-keys: |
             zig-global-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-
-      - name: Restore the project cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - id: project
+        name: Restore the project cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .zig-cache
-          key: zig-project-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-${{ steps.keys.outputs.vendor }}-${{ inputs.impl }}-${{ inputs.portable }}-${{ hashFiles('build.zig', 'build.zig.zon', 'build/**', 'src/**', 'pkg/**') }}
+          key: zig-project-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-${{ steps.keys.outputs.vendor }}-${{ steps.keys.outputs.source }}
           restore-keys: |
-            zig-project-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-${{ steps.keys.outputs.vendor }}-${{ inputs.impl }}-${{ inputs.portable }}-
-            zig-project-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-${{ steps.keys.outputs.vendor }}-
             zig-project-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-
       - name: Restore the Homebrew cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -74,9 +81,9 @@ jobs:
           key: brew-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.mise.toml') }}
           restore-keys: |
             brew-${{ runner.os }}-${{ runner.arch }}-
-      - name: Restore the benchmark cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: inputs.benchmark
+      - id: corpus
+        name: Restore the benchmark cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             zig-out/benchmark/bin/pkgs
@@ -134,6 +141,38 @@ jobs:
           zig build corpus
           zig build unit -Dprimitives_impl=${{ inputs.impl }} -Dportable=${{ inputs.portable }}
           zig build oracles -Dprimitives_impl=${{ inputs.impl }} -Dportable=${{ inputs.portable }} -Doptimize=safe
-          if [ "${{ inputs.impl }}" = onprem ] && [ "${{ inputs.portable }}" = false ]; then
-            zig build oracles_ubsan
-          fi
+      - id: ubsan
+        name: Restore the UBSan cache
+        if: inputs.profile == 'suite' && inputs.sanitizer == 'ubsan'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .zig-cache-ubsan
+          key: zig-ubsan-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-${{ steps.keys.outputs.vendor }}-${{ steps.keys.outputs.source }}
+          restore-keys: |
+            zig-ubsan-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-
+      - name: Run the sanitizer oracle suite
+        if: inputs.profile == 'suite' && inputs.sanitizer == 'ubsan'
+        run: zig build ubsan --cache-dir .zig-cache-ubsan
+      - name: Save the project cache
+        if: ${{ !cancelled() && github.ref == 'refs/heads/main' && steps.project.outcome == 'success' && steps.project.outputs.cache-hit != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .zig-cache
+          key: ${{ steps.project.outputs.cache-primary-key }}
+      - name: Save the UBSan cache
+        if: ${{ !cancelled() && github.ref == 'refs/heads/main' && steps.ubsan.outcome == 'success' && steps.ubsan.outputs.cache-hit != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .zig-cache-ubsan
+          key: ${{ steps.ubsan.outputs.cache-primary-key }}
+      - name: Save the benchmark cache
+        if: ${{ !cancelled() && github.ref == 'refs/heads/main' && steps.corpus.outcome == 'success' && steps.corpus.outputs.cache-hit != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            zig-out/benchmark/bin/pkgs
+            zig-out/benchmark/corpus
+          key: ${{ steps.corpus.outputs.cache-primary-key }}
