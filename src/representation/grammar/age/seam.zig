@@ -5,9 +5,9 @@ const onprem = @import("onprem.zig");
 
 const impl = build_options.grammar_impl;
 pub const Provider = seam.Provider;
-pub const Exception = onprem.Exception;
 pub const Entry = onprem.Entry;
 pub const EntryInfo = onprem.EntryInfo;
+pub const Exception = onprem.Exception;
 pub const Options = onprem.Options;
 pub const scratch_size = onprem.scratch_size;
 

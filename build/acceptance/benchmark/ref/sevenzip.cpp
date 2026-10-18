@@ -87,8 +87,9 @@ class CMemStream : public IInStream, public IOutStream, public CMyUnknownImp {
 			break;
 		case STREAM_SEEK_CUR:
 		case STREAM_SEEK_END: {
-			const UInt64 base =
-				seekOrigin == STREAM_SEEK_CUR ? position_ : (UInt64)size_;
+			const UInt64 base = seekOrigin == STREAM_SEEK_CUR ?
+						    position_ :
+						    (UInt64)size_;
 			if (offset < 0) {
 				// -(offset + 1) + 1 avoids negating INT64_MIN.
 				const UInt64 back = (UInt64)(-(offset + 1)) + 1;

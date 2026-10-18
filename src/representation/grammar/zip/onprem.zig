@@ -7,7 +7,6 @@ const exception_prim = @import("../../../common/primitive/exception.zig");
 const io = @import("../../../common/primitive/io.zig");
 const limits_prim = @import("../../../common/primitive/limits.zig");
 const measurement = @import("../../../common/primitive/measurement.zig");
-const xz = @import("../xz/onprem.zig");
 const bzip2 = @import("../../leaf/bzip2/onprem.zig");
 const deflate = @import("../../leaf/deflate/onprem.zig");
 const deflate_seam = @import("../../leaf/deflate/seam.zig");
@@ -15,6 +14,7 @@ const lzma = @import("../../leaf/lzma/onprem.zig");
 const lzma_seam = @import("../../leaf/lzma/seam.zig");
 const ppmd_zip = @import("../../leaf/ppmd/zip.zig");
 const zstd = @import("../../leaf/zstd/onprem.zig");
+const xz = @import("../xz/onprem.zig");
 
 const winzip_aes_hmac_length = crypto.winzip_hmac_length;
 const winzip_aes_verify_length = crypto.winzip_verify_length;

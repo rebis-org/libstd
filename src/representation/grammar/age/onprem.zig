@@ -3,6 +3,14 @@ const std = @import("std");
 const crypto_prim = @import("../../../common/primitive/crypto.zig");
 const exception_prim = @import("../../../common/primitive/exception.zig");
 
+const b64_pad = std.base64.standard;
+const b64 = std.base64.standard_no_pad;
+const ChaCha20Poly1305 = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
+const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+const X25519 = std.crypto.dh.X25519;
+const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
+const scrypt = std.crypto.pwhash.scrypt;
+const testing = std.testing;
 pub const Exception = exception_prim.Exception;
 
 // age v1 file encryption per C2SP age.md; vectors from the CCTV age testkit
@@ -41,14 +49,6 @@ const armor_end = "-----END AGE ENCRYPTED FILE-----";
 const chunk_size: usize = 64 * 1024;
 const file_key_len: usize = 16;
 const mac_encoded_len: usize = 43;
-
-const b64 = std.base64.standard_no_pad;
-const b64_pad = std.base64.standard;
-const ChaCha20Poly1305 = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
-const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
-const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
-const X25519 = std.crypto.dh.X25519;
-const scrypt = std.crypto.pwhash.scrypt;
 
 const zero_nonce: [12]u8 = std.mem.zeroes([12]u8);
 
@@ -848,9 +848,7 @@ const vec_scrypt_work_factor_23 = [_]u8{
 };
 const meta_scrypt_work_factor_23_passphrase = "password";
 // CCTV age testdata/empty; expect header failure.
-const vec_empty = [_]u8{
-
-};
+const vec_empty = [_]u8{};
 // CCTV age testdata/stream_trailing_garbage_short: expect payload failure.
 const vec_stream_trailing_garbage_short = [_]u8{
     0x78, 0xda, 0xec, 0xc0, 0xb1, 0x6e, 0x12, 0x01, 0x00, 0x00, 0x50, 0x66, 0xd2, 0xb8, 0x18, 0x13,
@@ -877,8 +875,6 @@ const vec_stream_trailing_garbage_short = [_]u8{
     0x4b, 0x89,
 };
 const meta_stream_trailing_garbage_short_identity = "AGE-SECRET-KEY-1EGTZVFFV20835NWYV6270LXYVK2VKNX2MMDKWYKLMGR48UAWX40Q2P2LM0";
-
-const testing = std.testing;
 
 fn hexToBytes(comptime hex: []const u8) [hex.len / 2]u8 {
     var out: [hex.len / 2]u8 = undefined;

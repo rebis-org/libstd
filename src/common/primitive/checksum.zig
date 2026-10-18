@@ -34,7 +34,7 @@ const crc_lane = @Vector(2, u64);
 // Fold constants for the reflected CRC32 polynomial 0xEDB88320 (vendor 7zCrc arm64 literal pool).
 const crc32_fold_k = FoldK{
     .k0 = .{ 0x000000008f352d95, 0x000000001d9513d7 },
-.k1 = .{ 0x00000000ae689191, 0x00000000ccaa009e },
+    .k1 = .{ 0x00000000ae689191, 0x00000000ccaa009e },
     .k2 = .{ 0x00000000f1da05aa, 0x0000000081256527 },
     .k3 = .{ 0x0000000033fff533, 0x00000000910eeec1 },
 };
