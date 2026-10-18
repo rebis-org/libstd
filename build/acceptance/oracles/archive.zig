@@ -414,6 +414,224 @@ fn runIsoTree(r: *Runner) anyerror!void {
     _ = std.Io.Dir.cwd().deleteFile(oracle_io, image_path) catch {};
 }
 
+fn runApfs(r: *Runner) anyerror!void {
+    if (isOffpremUnsupported()) return;
+    setupArchive(r, harness.ids.apfs);
+    try arcQueryWrite(r);
+    try arcWrite(r);
+    try arcQueryRead(r);
+    try arcReadOrdinal(r, 0, &arc_state.data1);
+    try arcReadOrdinal(r, 1, &arc_state.data2);
+    // 7-Zip must read our image back: extract and compare both payloads.
+    const bin = squashfs_bin_dir ++ "/7zz";
+    std.Io.Dir.cwd().access(harness.oracle_io, bin, .{}) catch return error.ReferenceToolUnavailable;
+    const oracle_io = harness.oracle_io;
+    const image_path = try r.gpa.print("zig-out/oracles/apfs-ours-{d}.img", .{r.corpus_index});
+    defer r.gpa.free(image_path);
+    std.Io.Dir.cwd().createDirPath(oracle_io, "zig-out/oracles") catch {};
+    try std.Io.Dir.cwd().writeFile(oracle_io, .{ .sub_path = image_path, .data = arc_state.archive[0..arc_state.archive_size] });
+    const out_path = try r.gpa.print("zig-out/oracles/apfs-out-{d}", .{r.corpus_index});
+    defer r.gpa.free(out_path);
+    _ = std.Io.Dir.cwd().deleteTree(oracle_io, out_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(oracle_io, out_path);
+    const out_arg = try r.gpa.print("-o{s}", .{out_path});
+    defer r.gpa.free(out_arg);
+    var child = try std.process.spawn(oracle_io, .{ .argv = &.{ bin, "x", "-y", out_arg, image_path } });
+    const term = try child.wait(oracle_io);
+    if (term != .exited or term.exited != 0) return error.ReferenceToolExtractFailed;
+    const got_path1 = try r.gpa.print("{s}/m1.txt", .{out_path});
+    defer r.gpa.free(got_path1);
+    const got1 = try std.Io.Dir.cwd().readFileAlloc(oracle_io, got_path1, r.gpa, .limited(1 << 20));
+    defer r.gpa.free(got1);
+    const got_path2 = try r.gpa.print("{s}/m2.txt", .{out_path});
+    defer r.gpa.free(got_path2);
+    const got2 = try std.Io.Dir.cwd().readFileAlloc(oracle_io, got_path2, r.gpa, .limited(1 << 20));
+    defer r.gpa.free(got2);
+    if (!std.mem.eql(u8, got1, &arc_state.data1)) return error.ApfsExtractMismatch;
+    if (!std.mem.eql(u8, got2, &arc_state.data2)) return error.ApfsExtractMismatch;
+    _ = std.Io.Dir.cwd().deleteTree(oracle_io, out_path) catch {};
+    _ = std.Io.Dir.cwd().deleteFile(oracle_io, image_path) catch {};
+}
+
+const age_identity = "AGE-SECRET-KEY-1EGTZVFFV20835NWYV6270LXYVK2VKNX2MMDKWYKLMGR48UAWX40Q2P2LM0";
+const age_recipient = "age1xmwwc06ly3ee5rytxm9mflaz2u56jjj36s0mypdrwsvlul66mv4q47ryef";
+const age_password = "test-password";
+
+fn runAge(r: *Runner) anyerror!void {
+    if (isOffpremUnsupported()) return;
+    harness.setup(r, harness.ids.age, harness.mode_archive);
+    var payload: [4096]u8 = undefined;
+    corpus.fillTiled(r.corpus_index, payload[0..445]);
+    var store: harness.ArchiveEntryNodes = undefined;
+    const entry = harness.archiveEntryNode(&store.name, &store.data, "m1.txt", payload[0..445]);
+
+    // X25519 round trip through the facade with the fixed test identity.
+    const x25519_params = [_]harness.Node{
+        ageParamBytes(6, age_recipient),
+        ageParamWord(8, 1),
+    };
+    const x_size = try ageWrite(r, entry, &x25519_params);
+    try ageReadBack(r, x_size, payload[0..445], &[_]harness.Node{ageParamBytes(5, age_identity)});
+
+    // scrypt round trip with a small work factor for the suite's budget.
+    const scrypt_params = [_]harness.Node{
+        harness.cryptoProfile(),
+        harness.cryptoPasswordParam(age_password),
+        ageParamWord(7, 10),
+    };
+    const s_size = try ageWrite(r, entry, &scrypt_params);
+    try ageReadBack(r, s_size, payload[0..445], &scrypt_params);
+
+    // Wrong passphrase reports the crypto diagnostic.
+    var diag: harness.CryptoDiag = undefined;
+    harness.cryptoDiag(&diag);
+    _ = harness.call(r, harness.ids.read, &.{
+        harness.archiveOrdinalParam(0),
+        harness.sourceSpan(r.output[0..0]),
+        harness.sinkSpan(r.output),
+        harness.cryptoProfile(),
+        harness.cryptoPasswordParam("wrong"),
+        ageParamWord(7, 10),
+    }, .{ .ctx = true, .diagnostic = &diag.diagnostic });
+    if (r.status != abi.Status.invalid_data) return error.AgeWrongPasswordStatus;
+}
+
+// age family-1 parameters ride the crypto family with the ordinals from the
+// age descriptor (identity 5, recipient 6, work_factor 7, armor 8).
+fn ageParamBytes(ordinal: u32, value: []const u8) harness.Node {
+    return harness.paramBytes(harness.param_family_crypto, ordinal, harness.cmds, value);
+}
+
+fn ageParamWord(ordinal: u32, value: u64) harness.Node {
+    return harness.paramScalar(harness.param_family_crypto, ordinal, harness.cmds, value);
+}
+
+fn ageWrite(r: *Runner, entry: harness.Node, extra: []const harness.Node) !usize {
+    var nodes: [12]harness.Node = undefined;
+    var count: usize = 0;
+    nodes[count] = harness.scalarNode(harness.ids.source);
+    count += 1;
+    for (extra) |node| {
+        nodes[count] = node;
+        count += 1;
+    }
+    // Query first: the exact size drives the sink span for the write.
+    var query_nodes: [10]harness.Node = undefined;
+    var query_count: usize = 0;
+    query_nodes[query_count] = harness.paramTargetCommand(harness.ids.write);
+    query_count += 1;
+    query_nodes[query_count] = harness.scalarNode(harness.ids.source);
+    query_count += 1;
+    query_nodes[query_count] = harness.capabilityParam(arc_caps);
+    query_count += 1;
+    query_nodes[query_count] = harness.sizingModeParam(harness.size_metadata_exact);
+    query_count += 1;
+    query_nodes[query_count] = harness.commitModeParam(harness.commit_confirmed);
+    query_count += 1;
+    query_nodes[query_count] = entry;
+    query_count += 1;
+    for (extra) |node| {
+        query_nodes[query_count] = node;
+        query_count += 1;
+    }
+    _ = harness.call(r, harness.ids.query, query_nodes[0..query_count], .{});
+    try harness.requireStatus(r, abi.Status.ok);
+    if (r.response.byte_length == 0 or r.response.byte_length > arc_state.archive.len) return error.AgeQueryCapacity;
+    const size = r.response.byte_length;
+    var write_nodes: [14]harness.Node = undefined;
+    var write_count: usize = 0;
+    write_nodes[write_count] = harness.scalarNode(harness.ids.source);
+    write_count += 1;
+    write_nodes[write_count] = harness.sinkSpan(arc_state.archive[0..size]);
+    write_count += 1;
+    write_nodes[write_count] = harness.capabilityParam(arc_caps);
+    write_count += 1;
+    write_nodes[write_count] = harness.sizingModeParam(harness.size_metadata_exact);
+    write_count += 1;
+    write_nodes[write_count] = harness.commitModeParam(r.commit_write);
+    write_count += 1;
+    write_nodes[write_count] = entry;
+    write_count += 1;
+    for (extra) |node| {
+        write_nodes[write_count] = node;
+        write_count += 1;
+    }
+    _ = harness.call(r, harness.ids.write, write_nodes[0..write_count], .{});
+    try harness.requireStatus(r, abi.Status.ok);
+    return size;
+}
+
+fn ageReadBack(r: *Runner, size: usize, expected: []const u8, extra: []const harness.Node) !void {
+    var nodes: [10]harness.Node = undefined;
+    var count: usize = 0;
+    nodes[count] = harness.archiveOrdinalParam(0);
+    count += 1;
+    nodes[count] = harness.sourceSpan(arc_state.archive[0..size]);
+    count += 1;
+    nodes[count] = harness.sinkSpan(r.output[0..expected.len]);
+    count += 1;
+    for (extra) |node| {
+        nodes[count] = node;
+        count += 1;
+    }
+    _ = harness.call(r, harness.ids.read, nodes[0..count], .{ .ctx = true });
+    try harness.requireStatus(r, abi.Status.ok);
+    if (r.response.byte_length != expected.len or !std.mem.eql(u8, r.output[0..expected.len], expected)) {
+        return error.AgeRoundtripMismatch;
+    }
+}
+
+// Reference interop both directions: the reference tool decrypts what the
+// facade writes, and the facade reads what the reference encrypts, armored
+// and binary.
+fn runAgeInterop(r: *Runner) anyerror!void {
+    if (isOffpremUnsupported()) return;
+    const oracle_io = harness.oracle_io;
+    std.Io.Dir.cwd().access(oracle_io, "/tmp/age_ref", .{}) catch return error.ReferenceToolUnavailable;
+    harness.setup(r, harness.ids.age, harness.mode_archive);
+    var payload: [445]u8 = undefined;
+    corpus.fillTiled(r.corpus_index, &payload);
+    var store: harness.ArchiveEntryNodes = undefined;
+    const entry = harness.archiveEntryNode(&store.name, &store.data, "m1.txt", &payload);
+
+    const key_path = "zig-out/oracles/age-interop-key.txt";
+    try std.Io.Dir.cwd().writeFile(oracle_io, .{ .sub_path = key_path, .data = age_identity ++ "\n" });
+    defer std.Io.Dir.cwd().deleteFile(oracle_io, key_path) catch {};
+
+    // Ours writes, the reference decrypts.
+    const x_params = [_]harness.Node{ageParamBytes(6, age_recipient)};
+    const ours_size = try ageWrite(r, entry, &x_params);
+    const ours_path = try r.gpa.print("zig-out/oracles/age-ours-{d}.age", .{r.corpus_index});
+    defer r.gpa.free(ours_path);
+    try std.Io.Dir.cwd().writeFile(oracle_io, .{ .sub_path = ours_path, .data = arc_state.archive[0..ours_size] });
+    defer std.Io.Dir.cwd().deleteFile(oracle_io, ours_path) catch {};
+    const ref_out = try r.gpa.print("zig-out/oracles/age-ref-out-{d}", .{r.corpus_index});
+    defer r.gpa.free(ref_out);
+    defer std.Io.Dir.cwd().deleteFile(oracle_io, ref_out) catch {};
+    var child = try std.process.spawn(oracle_io, .{ .argv = &.{ "/tmp/age_ref", "-d", "-i", key_path, "-o", ref_out, ours_path } });
+    const term = try child.wait(oracle_io);
+    if (term != .exited or term.exited != 0) return error.ReferenceToolDecryptFailed;
+    const ref_plain = try std.Io.Dir.cwd().readFileAlloc(oracle_io, ref_out, r.gpa, .limited(1 << 20));
+    defer r.gpa.free(ref_plain);
+    if (!std.mem.eql(u8, ref_plain, &payload)) return error.AgeInteropMismatch;
+
+    // The reference encrypts (armored), ours reads.
+    const plain_path = try r.gpa.print("zig-out/oracles/age-plain-{d}", .{r.corpus_index});
+    defer r.gpa.free(plain_path);
+    try std.Io.Dir.cwd().writeFile(oracle_io, .{ .sub_path = plain_path, .data = &payload });
+    defer std.Io.Dir.cwd().deleteFile(oracle_io, plain_path) catch {};
+    const ref_path = try r.gpa.print("zig-out/oracles/age-ref-{d}.age", .{r.corpus_index});
+    defer r.gpa.free(ref_path);
+    defer std.Io.Dir.cwd().deleteFile(oracle_io, ref_path) catch {};
+    child = try std.process.spawn(oracle_io, .{ .argv = &.{ "/tmp/age_ref", "-a", "-r", age_recipient, "-o", ref_path, plain_path } });
+    const term2 = try child.wait(oracle_io);
+    if (term2 != .exited or term2.exited != 0) return error.ReferenceToolEncryptFailed;
+    const foreign = try std.Io.Dir.cwd().readFileAlloc(oracle_io, ref_path, r.gpa, .limited(1 << 20));
+    defer r.gpa.free(foreign);
+    @memcpy(arc_state.archive[0..foreign.len], foreign);
+    try ageReadBack(r, foreign.len, &payload, &[_]harness.Node{ageParamBytes(5, age_identity)});
+}
+
 pub fn runIso(r: *Runner) anyerror!void {
     if (isOffpremUnsupported()) return;
     arc_state.corrupt_offset = 16 * 2048;
@@ -1253,6 +1471,9 @@ pub const scenarios = harness.scenarios("archive", &.{
     .{ .label = "archive iso", .run = runIso, .workspace_size = 256 * 1024, .output_size = 512, .encoded_size = 65536 },
     .{ .label = "archive iso tree", .run = runIsoTree, .workspace_size = 256 * 1024, .output_size = 512, .encoded_size = 65536 },
     .{ .label = "archive iso foreign", .run = runIsoForeign, .workspace_size = 256 * 1024, .output_size = 512, .encoded_size = 65536 },
+    .{ .label = "archive apfs", .run = runApfs, .workspace_size = 4 * 1024 * 1024, .output_size = 512, .encoded_size = 65536 },
+    .{ .label = "archive age", .run = runAge, .workspace_size = 8 * 1024 * 1024, .output_size = 512, .encoded_size = 16384 },
+    .{ .label = "archive age interop", .run = runAgeInterop, .workspace_size = 8 * 1024 * 1024, .output_size = 512, .encoded_size = 16384 },
     .{ .label = "archive dwarfs", .run = runDwarfs, .workspace_size = 8 * 1024 * 1024, .output_size = 512, .encoded_size = 65536 },
     .{ .label = "archive dwarfs tree", .run = runDwarfsTree, .workspace_size = 8 * 1024 * 1024, .output_size = 512, .encoded_size = 65536 },
     .{ .label = "archive dwarfs foreign", .run = runDwarfsForeign, .workspace_size = 4 * 1024 * 1024, .output_size = 512, .encoded_size = 65536 },
