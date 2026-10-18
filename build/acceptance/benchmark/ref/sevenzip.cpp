@@ -75,24 +75,39 @@ class CMemStream : public IInStream, public IOutStream, public CMyUnknownImp {
 	Z7_COM7F_IMF(Seek(Int64 offset, UInt32 seekOrigin, UInt64 *newPosition))
 	Z7_override
 	{
-		Int64 target;
+		// Signed add would be UB near INT64_MAX (LLVM UB series, signed
+		// overflow class); compute in UInt64 with explicit negativity.
+		UInt64 target;
 		switch (seekOrigin) {
 		case STREAM_SEEK_SET:
-			target = offset;
+			if (offset < 0) {
+				return MY_E_ERROR_NEGATIVE_SEEK;
+			}
+			target = (UInt64)offset;
 			break;
 		case STREAM_SEEK_CUR:
-			target = (Int64)position_ + offset;
+		case STREAM_SEEK_END: {
+			const UInt64 base =
+				seekOrigin == STREAM_SEEK_CUR ? position_ : (UInt64)size_;
+			if (offset < 0) {
+				// -(offset + 1) + 1 avoids negating INT64_MIN.
+				const UInt64 back = (UInt64)(-(offset + 1)) + 1;
+				if (back > base) {
+					return MY_E_ERROR_NEGATIVE_SEEK;
+				}
+				target = base - back;
+			} else {
+				if ((UInt64)offset > (UInt64)INT64_MAX - base) {
+					return MY_E_ERROR_NEGATIVE_SEEK;
+				}
+				target = base + (UInt64)offset;
+			}
 			break;
-		case STREAM_SEEK_END:
-			target = (Int64)size_ + offset;
-			break;
+		}
 		default:
 			return E_INVALIDARG;
 		}
-		if (target < 0) {
-			return MY_E_ERROR_NEGATIVE_SEEK;
-		}
-		position_ = (UInt64)target;
+		position_ = target;
 		if (newPosition != NULL) {
 			*newPosition = position_;
 		}
