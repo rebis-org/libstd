@@ -32,11 +32,12 @@ const has_crc64_clmul = x86_clmul and !options.crc64xz_portable;
 const crc_lane = @Vector(2, u64);
 
 // Fold constants for the reflected CRC32 polynomial 0xEDB88320 (vendor 7zCrc arm64 literal pool).
-const crc_k0: crc_lane = .{ 0x000000008f352d95, 0x000000001d9513d7 };
-const crc_k1: crc_lane = .{ 0x00000000ae689191, 0x00000000ccaa009e };
-const crc_k2: crc_lane = .{ 0x00000000f1da05aa, 0x0000000081256527 };
-// 128-byte window fold, same recurrence as the vendor literals: {x^1024, x^960} mod poly.
-const crc_k3: crc_lane = .{ 0x0000000033fff533, 0x00000000910eeec1 };
+const crc32_fold_k = FoldK{
+    .k0 = .{ 0x000000008f352d95, 0x000000001d9513d7 },
+.k1 = .{ 0x00000000ae689191, 0x00000000ccaa009e },
+    .k2 = .{ 0x00000000f1da05aa, 0x0000000081256527 },
+    .k3 = .{ 0x0000000033fff533, 0x00000000910eeec1 },
+};
 
 inline fn crc32x(crc: u32, word: u64) u32 {
     return asm ("crc32x w8, w8, x9"
@@ -130,8 +131,6 @@ fn crc32Aarch64Scalar(crc_in: u32, input: []const u8) u32 {
     return crc;
 }
 
-// The fold tail re-enters the folded state and drains the remainder: hardware CRC
-// steps on aarch64, table steps where no such instruction exists.
 const Crc32Aarch64Tail = struct {
     const folds_16_byte_lanes = true;
 
@@ -144,32 +143,14 @@ const Crc32Aarch64Tail = struct {
     }
 };
 
-// A chain of 16-byte lanes ending in table steps loses to slicing-by-4, so it never folds here.
-fn Crc32TableTail(comptime tables: *const [4][256]u32) type {
-    return struct {
-        const folds_16_byte_lanes = false;
+const FoldK = struct { k0: crc_lane, k1: crc_lane, k2: crc_lane, k3: crc_lane };
 
-        inline fn byte(crc: u32, data: u8) u32 {
-            return (crc >> 8) ^ tables[0][@as(usize, @intCast((crc ^ data) & 0xff))];
-        }
-
-        // Two slicing-by-4 steps drain the eight little-endian bytes of the word.
-        inline fn word(crc: u32, data: u64) u32 {
-            var c = crc;
-            for ([_]u32{ @truncate(data), @truncate(data >> 32) }) |half| {
-                c = tables[3][@as(usize, @intCast((c ^ half) & 0xff))] ^
-                    tables[2][@as(usize, @intCast(((c >> 8) ^ (half >> 8)) & 0xff))] ^
-                    tables[1][@as(usize, @intCast(((c >> 16) ^ (half >> 16)) & 0xff))] ^
-                    tables[0][@as(usize, @intCast(((c >> 24) ^ (half >> 24)) & 0xff))];
-            }
-            return c;
-        }
-    };
-}
-
-// CRC32 state via carry-less folding (PMULL or PCLMULQDQ). The caller routes only inputs at
-// or above crc32_pmull_threshold, because folding costs a fixed setup that short inputs never repay.
-fn crc32Fold(crc_in: u32, input: []const u8, comptime Tail: type) u32 {
+// Carry-less fold state (PMULL or PCLMULQDQ) shared by every width; the
+// caller routes only inputs at or above crc_pmull_threshold, because folding
+// costs a fixed setup that short inputs never repay. The tail re-enters the
+// folded state and drains the remainder: hardware CRC steps on aarch64,
+// table steps where no such instruction exists.
+fn crcFold(comptime T: type, comptime K: FoldK, crc_in: T, input: []const u8, comptime Tail: type) T {
     var crc = crc_in;
     var data = input;
     while (data.len != 0 and @intFromPtr(data.ptr) & 15 != 0) {
@@ -185,17 +166,17 @@ fn crc32Fold(crc_in: u32, input: []const u8, comptime Tail: type) u32 {
         data = data[128..];
         while (data.len >= 128) {
             for (0..8) |i| {
-                lanes[i] = foldLane(lanes[i], loadLane(data[i * 16 ..][0..16]), crc_k3);
+                lanes[i] = foldLane(lanes[i], loadLane(data[i * 16 ..][0..16]), K.k3);
             }
             data = data[128..];
         }
-        lanes[0] = foldLane(lanes[0], lanes[1], crc_k1);
-        lanes[2] = foldLane(lanes[2], lanes[3], crc_k1);
-        lanes[4] = foldLane(lanes[4], lanes[5], crc_k1);
-        lanes[6] = foldLane(lanes[6], lanes[7], crc_k1);
-        lanes[0] = foldLane(lanes[0], lanes[2], crc_k2);
-        lanes[4] = foldLane(lanes[4], lanes[6], crc_k2);
-        lanes[0] = foldLane(lanes[0], lanes[4], crc_k0);
+        lanes[0] = foldLane(lanes[0], lanes[1], K.k1);
+        lanes[2] = foldLane(lanes[2], lanes[3], K.k1);
+        lanes[4] = foldLane(lanes[4], lanes[5], K.k1);
+        lanes[6] = foldLane(lanes[6], lanes[7], K.k1);
+        lanes[0] = foldLane(lanes[0], lanes[2], K.k2);
+        lanes[4] = foldLane(lanes[4], lanes[6], K.k2);
+        lanes[0] = foldLane(lanes[0], lanes[4], K.k0);
         crc = Tail.word(0, lanes[0][0]);
         crc = Tail.word(crc, lanes[0][1]);
     }
@@ -208,13 +189,13 @@ fn crc32Fold(crc_in: u32, input: []const u8, comptime Tail: type) u32 {
         data = data[64..];
         while (data.len >= 64) {
             for (0..4) |i| {
-                lanes[i] = foldLane(lanes[i], loadLane(data[i * 16 ..][0..16]), crc_k0);
+                lanes[i] = foldLane(lanes[i], loadLane(data[i * 16 ..][0..16]), K.k0);
             }
             data = data[64..];
         }
-        lanes[0] = foldLane(lanes[0], lanes[1], crc_k1);
-        lanes[2] = foldLane(lanes[2], lanes[3], crc_k1);
-        lanes[0] = foldLane(lanes[0], lanes[2], crc_k2);
+        lanes[0] = foldLane(lanes[0], lanes[1], K.k1);
+        lanes[2] = foldLane(lanes[2], lanes[3], K.k1);
+        lanes[0] = foldLane(lanes[0], lanes[2], K.k2);
         crc = Tail.word(0, lanes[0][0]);
         crc = Tail.word(crc, lanes[0][1]);
     }
@@ -224,7 +205,7 @@ fn crc32Fold(crc_in: u32, input: []const u8, comptime Tail: type) u32 {
             lane[0] ^= crc;
             data = data[16..];
             while (data.len >= 16) {
-                lane = foldLane(lane, loadLane(data[0..16]), crc_k1);
+                lane = foldLane(lane, loadLane(data[0..16]), K.k1);
                 data = data[16..];
             }
             crc = Tail.word(0, lane[0]);
@@ -237,6 +218,36 @@ fn crc32Fold(crc_in: u32, input: []const u8, comptime Tail: type) u32 {
     }
     for (data) |byte| crc = Tail.byte(crc, byte);
     return crc;
+}
+
+// A chain of 16-byte lanes ending in table steps loses to slicing-by-8, so
+// the table tail never folds here; it drains whole words instead.
+fn Crc32TableTail(comptime tables: *const [8][256]u32) type {
+    return struct {
+        const folds_16_byte_lanes = false;
+
+        inline fn byte(crc: u32, data: u8) u32 {
+            return (crc >> 8) ^ tables[0][@as(usize, @intCast((crc ^ data) & 0xff))];
+        }
+
+        inline fn word(crc: u32, data: u64) u32 {
+            return fold8(u32, tables, true, crc, &std.mem.toBytes(data));
+        }
+    };
+}
+
+fn Crc64Tail(comptime tables: *const [8][256]u64) type {
+    return struct {
+        const folds_16_byte_lanes = true;
+
+        inline fn byte(crc: u64, data: u8) u64 {
+            return (crc >> 8) ^ tables[0][(crc ^ data) & 0xff];
+        }
+
+        inline fn word(crc: u64, data: u64) u64 {
+            return fold8(u64, tables, true, crc, &std.mem.toBytes(data));
+        }
+    };
 }
 
 // CRC-64/XZ (reflected ECMA polynomial) fold constants. A fold by shift s pairs x^s with
@@ -253,88 +264,12 @@ fn crc64Xpow(comptime n: u16) u64 {
     return v;
 }
 
-const crc64_k0: crc_lane = .{ crc64Xpow(512), crc64Xpow(448) };
-const crc64_k1: crc_lane = .{ crc64Xpow(128), crc64Xpow(64) };
-const crc64_k2: crc_lane = .{ crc64Xpow(256), crc64Xpow(192) };
-const crc64_k3: crc_lane = .{ crc64Xpow(1024), crc64Xpow(960) };
-
-// CRC-64/XZ state via carry-less folding. No hardware crc64 instruction exists, so each folded
-// lane re-enters the register through 16 byte-table steps, amortized over the region.
-fn crc64Fold(crc_in: u64, input: []const u8, comptime table: *const [256]u64) u64 {
-    var crc = crc_in;
-    var data = input;
-    while (data.len != 0 and @intFromPtr(data.ptr) & 15 != 0) {
-        crc = (crc >> 8) ^ table[(crc ^ data[0]) & 0xff];
-        data = data[1..];
-    }
-    if (data.len >= 128) {
-        var lanes: [8]crc_lane = undefined;
-        for (0..8) |i| {
-            lanes[i] = loadLane(data[i * 16 ..][0..16]);
-        }
-        lanes[0][0] ^= crc;
-        data = data[128..];
-        while (data.len >= 128) {
-            for (0..8) |i| {
-                lanes[i] = foldLane(lanes[i], loadLane(data[i * 16 ..][0..16]), crc64_k3);
-            }
-            data = data[128..];
-        }
-        lanes[0] = foldLane(lanes[0], lanes[1], crc64_k1);
-        lanes[2] = foldLane(lanes[2], lanes[3], crc64_k1);
-        lanes[4] = foldLane(lanes[4], lanes[5], crc64_k1);
-        lanes[6] = foldLane(lanes[6], lanes[7], crc64_k1);
-        lanes[0] = foldLane(lanes[0], lanes[2], crc64_k2);
-        lanes[4] = foldLane(lanes[4], lanes[6], crc64_k2);
-        lanes[0] = foldLane(lanes[0], lanes[4], crc64_k0);
-        crc = 0;
-        for (std.mem.toBytes(lanes[0])) |byte| {
-            crc = (crc >> 8) ^ table[(crc ^ byte) & 0xff];
-        }
-    }
-    if (data.len >= 64) {
-        var lanes: [4]crc_lane = undefined;
-        for (0..4) |i| {
-            lanes[i] = loadLane(data[i * 16 ..][0..16]);
-        }
-        lanes[0][0] ^= crc;
-        data = data[64..];
-        while (data.len >= 64) {
-            for (0..4) |i| {
-                lanes[i] = foldLane(lanes[i], loadLane(data[i * 16 ..][0..16]), crc64_k0);
-            }
-            data = data[64..];
-        }
-        lanes[0] = foldLane(lanes[0], lanes[1], crc64_k1);
-        lanes[2] = foldLane(lanes[2], lanes[3], crc64_k1);
-        lanes[0] = foldLane(lanes[0], lanes[2], crc64_k2);
-        crc = 0;
-        for (std.mem.toBytes(lanes[0])) |byte| {
-            crc = (crc >> 8) ^ table[(crc ^ byte) & 0xff];
-        }
-    }
-    while (data.len >= 16) {
-        var lane = loadLane(data[0..16]);
-        lane[0] ^= crc;
-        data = data[16..];
-        while (data.len >= 16) {
-            lane = foldLane(lane, loadLane(data[0..16]), crc64_k1);
-            data = data[16..];
-        }
-        crc = 0;
-        for (std.mem.toBytes(lane)) |byte| {
-            crc = (crc >> 8) ^ table[(crc ^ byte) & 0xff];
-        }
-    }
-    if (data.len >= 8) {
-        for (data[0..8]) |byte| {
-            crc = (crc >> 8) ^ table[(crc ^ byte) & 0xff];
-        }
-        data = data[8..];
-    }
-    for (data) |byte| crc = (crc >> 8) ^ table[(crc ^ byte) & 0xff];
-    return crc;
-}
+const crc64_fold_k = FoldK{
+    .k0 = .{ crc64Xpow(512), crc64Xpow(448) },
+    .k1 = .{ crc64Xpow(128), crc64Xpow(64) },
+    .k2 = .{ crc64Xpow(256), crc64Xpow(192) },
+    .k3 = .{ crc64Xpow(1024), crc64Xpow(960) },
+};
 
 // Folding pays off above this length; the threshold comes from a synthetic sweep.
 const crc_pmull_threshold = 256;
@@ -386,6 +321,47 @@ pub fn xxh32With(provider: seam.Provider, input: []const u8) u32 {
     return seal(XxHash32, XxHash32.bind(provider, 0), input);
 }
 
+// One slicing-by-8 step over eight input bytes; the table index order is
+// the reflected xz layout (crc32_fast.c / crc64_fast.c) and the big-endian
+// braid (crc32_table_be.h), selected by comptime direction.
+inline fn fold8(comptime T: type, comptime tables: *const [8][256]T, comptime reflected: bool, crc: T, chunk: *const [8]u8) T {
+    if (comptime reflected) {
+        const bytes_per_word = @bitSizeOf(T) / 8;
+        const words = 8 / bytes_per_word;
+        var out: T = 0;
+        var x = crc;
+        inline for (0..words) |wi| {
+            const w = x ^ std.mem.readInt(T, chunk[wi * bytes_per_word ..][0..bytes_per_word], .little);
+            x = 0;
+            inline for (0..bytes_per_word) |bi| {
+                out ^= tables[7 - wi * bytes_per_word - bi][@as(usize, @intCast((w >> (bi * 8)) & 0xff))];
+            }
+        }
+        return out;
+    } else {
+        var c = crc ^ std.mem.readInt(u32, chunk[0..4], .big);
+        c = tables[7][@as(usize, @intCast((c >> 24) & 0xff))] ^
+            tables[6][@as(usize, @intCast((c >> 16) & 0xff))] ^
+            tables[5][@as(usize, @intCast((c >> 8) & 0xff))] ^
+            tables[4][@as(usize, @intCast(c & 0xff))];
+        const v = std.mem.readInt(u32, chunk[4..8], .big);
+        return c ^ tables[3][@as(usize, @intCast((v >> 24) & 0xff))] ^
+            tables[2][@as(usize, @intCast((v >> 16) & 0xff))] ^
+            tables[1][@as(usize, @intCast((v >> 8) & 0xff))] ^
+            tables[0][@as(usize, @intCast(v & 0xff))];
+    }
+}
+
+inline fn fold4(comptime T: type, comptime tables: *const [8][256]T, crc: T, chunk: *const [4]u8) T {
+    const w: T = (crc & 0xffff_ffff) ^ std.mem.readInt(u32, chunk[0..4], .little);
+    var out: T = tables[3][@as(usize, @intCast(w & 0xff))] ^
+        tables[2][@as(usize, @intCast((w >> 8) & 0xff))] ^
+        tables[1][@as(usize, @intCast((w >> 16) & 0xff))] ^
+        tables[0][@as(usize, @intCast((w >> 24) & 0xff))];
+    if (comptime T == u64) out ^= crc >> 32;
+    return out;
+}
+
 fn TableCrc(comptime T: type, comptime poly: T, comptime reflected: bool) type {
     const bits = @bitSizeOf(T);
     return struct {
@@ -399,7 +375,7 @@ fn TableCrc(comptime T: type, comptime poly: T, comptime reflected: bool) type {
             if (comptime T == u32 and reflected) {
                 if (comptime has_crc32_kernel) {
                     if (input.len >= crc_pmull_threshold and comptime has_crc32_pmull) {
-                        self.state = crc32Fold(self.state, input, Crc32Aarch64Tail);
+                        self.state = crcFold(u32, crc32_fold_k, self.state, input, Crc32Aarch64Tail);
                     } else {
                         self.state = crc32Aarch64Scalar(self.state, input);
                     }
@@ -407,32 +383,17 @@ fn TableCrc(comptime T: type, comptime poly: T, comptime reflected: bool) type {
                 }
                 if (comptime has_crc32_clmul) {
                     if (input.len >= crc_pmull_threshold) {
-                        self.state = crc32Fold(self.state, input, Crc32TableTail(&tables));
+                        self.state = crcFold(u32, crc32_fold_k, self.state, input, Crc32TableTail(&tables));
                         return;
                     }
                 }
-                // Slicing-by-8 per the xz generic path (crc32_fast.c) halves
-                // the table lookups per byte.
                 var crc = self.state;
                 var i: usize = 0;
                 while (i + 8 <= input.len) : (i += 8) {
-                    const w = crc ^ std.mem.readInt(u32, input[i..][0..4], .little);
-                    const v = std.mem.readInt(u32, input[i + 4 ..][0..4], .little);
-                    crc = tables[7][@as(usize, @intCast(w & 0xff))] ^
-                        tables[6][@as(usize, @intCast((w >> 8) & 0xff))] ^
-                        tables[5][@as(usize, @intCast((w >> 16) & 0xff))] ^
-                        tables[4][@as(usize, @intCast((w >> 24) & 0xff))] ^
-                        tables[3][@as(usize, @intCast(v & 0xff))] ^
-                        tables[2][@as(usize, @intCast((v >> 8) & 0xff))] ^
-                        tables[1][@as(usize, @intCast((v >> 16) & 0xff))] ^
-                        tables[0][@as(usize, @intCast((v >> 24) & 0xff))];
+                    crc = fold8(u32, &tables, true, crc, input[i..][0..8]);
                 }
                 if (i + 4 <= input.len) {
-                    const w = crc ^ std.mem.readInt(u32, input[i..][0..4], .little);
-                    crc = tables[3][@as(usize, @intCast(w & 0xff))] ^
-                        tables[2][@as(usize, @intCast((w >> 8) & 0xff))] ^
-                        tables[1][@as(usize, @intCast((w >> 16) & 0xff))] ^
-                        tables[0][@as(usize, @intCast((w >> 24) & 0xff))];
+                    crc = fold4(u32, &tables, crc, input[i..][0..4]);
                     i += 4;
                 }
                 while (i < input.len) : (i += 1) {
@@ -444,31 +405,17 @@ fn TableCrc(comptime T: type, comptime poly: T, comptime reflected: bool) type {
             if (comptime reflected) {
                 if (comptime T == u64 and (has_crc64_pmull or has_crc64_clmul)) {
                     if (input.len >= crc_pmull_threshold) {
-                        self.state = crc64Fold(self.state, input, &table);
+                        self.state = crcFold(u64, crc64_fold_k, self.state, input, Crc64Tail(&tables));
                         return;
                     }
                 }
-                // Slicing-by-8 over the full register (xz crc64_fast.c shape);
-                // a 64-bit register folds in one step, no upper-half rescue.
                 var crc = self.state;
                 var i: usize = 0;
                 while (i + 8 <= input.len) : (i += 8) {
-                    const w = crc ^ std.mem.readInt(u64, input[i..][0..8], .little);
-                    crc = tables[7][@as(usize, @intCast(w & 0xff))] ^
-                        tables[6][@as(usize, @intCast((w >> 8) & 0xff))] ^
-                        tables[5][@as(usize, @intCast((w >> 16) & 0xff))] ^
-                        tables[4][@as(usize, @intCast((w >> 24) & 0xff))] ^
-                        tables[3][@as(usize, @intCast((w >> 32) & 0xff))] ^
-                        tables[2][@as(usize, @intCast((w >> 40) & 0xff))] ^
-                        tables[1][@as(usize, @intCast((w >> 48) & 0xff))] ^
-                        tables[0][@as(usize, @intCast((w >> 56) & 0xff))];
+                    crc = fold8(u64, &tables, true, crc, input[i..][0..8]);
                 }
                 if (i + 4 <= input.len) {
-                    const w: u64 = @as(u64, @truncate(crc)) ^ std.mem.readInt(u32, input[i..][0..4], .little);
-                    crc = tables[3][@as(usize, @intCast(w & 0xff))] ^
-                        tables[2][@as(usize, @intCast((w >> 8) & 0xff))] ^
-                        tables[1][@as(usize, @intCast((w >> 16) & 0xff))] ^
-                        tables[0][@as(usize, @intCast((w >> 24) & 0xff))] ^ (crc >> 32);
+                    crc = fold4(u64, &tables, crc, input[i..][0..4]);
                     i += 4;
                 }
                 while (i < input.len) : (i += 1) {
@@ -476,20 +423,10 @@ fn TableCrc(comptime T: type, comptime poly: T, comptime reflected: bool) type {
                 }
                 self.state = crc;
             } else {
-                // Slicing-by-8 over big-endian words (xz crc32_table_be.h braid).
                 var crc = self.state;
                 var i: usize = 0;
                 while (i + 8 <= input.len) : (i += 8) {
-                    crc ^= std.mem.readInt(u32, input[i..][0..4], .big);
-                    crc = tables[7][(crc >> 24) & 0xff] ^
-                        tables[6][((crc >> 16) & 0xff)] ^
-                        tables[5][((crc >> 8) & 0xff)] ^
-                        tables[4][crc & 0xff];
-                    const v = std.mem.readInt(u32, input[i + 4 ..][0..4], .big);
-                    crc ^= tables[3][(v >> 24) & 0xff] ^
-                        tables[2][((v >> 16) & 0xff)] ^
-                        tables[1][((v >> 8) & 0xff)] ^
-                        tables[0][v & 0xff];
+                    crc = fold8(u32, &tables, false, crc, input[i..][0..8]);
                 }
                 if (i + 4 <= input.len) {
                     crc ^= std.mem.readInt(u32, input[i..][0..4], .big);
