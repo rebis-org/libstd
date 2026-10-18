@@ -20,6 +20,11 @@ on:
         type: string
         required: false
         default: ''
+      ubsan_shard:
+        description: UBSan shard name (empty for the single run).
+        type: string
+        required: false
+        default: ''
       export:
         description: Hand the archives this run produced to the caller's release job.
         type: boolean
@@ -166,7 +171,7 @@ jobs:
           if-no-files-found: error
           retention-days: 7
       - name: Run the test suites
-        if: inputs.profile == 'suite'
+        if: inputs.profile == 'suite' && inputs.sanitizer == ''
         run: |
           case "${{ inputs.impl }}" in
             onprem|offprem|mergeable) ;;
@@ -180,13 +185,23 @@ jobs:
         if: inputs.profile == 'suite' && inputs.sanitizer == 'ubsan'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: .zig-cache-ubsan
-          key: zig-ubsan-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-${{ steps.keys.outputs.vendor }}-${{ steps.keys.outputs.source }}
+          path: .zig-cache-ubsan${{ inputs.ubsan_shard }}
+          key: zig-ubsan${{ inputs.ubsan_shard }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-${{ steps.keys.outputs.vendor }}-${{ steps.keys.outputs.source }}
           restore-keys: |
-            zig-ubsan-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-
+            zig-ubsan${{ inputs.ubsan_shard }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-
       - name: Run the sanitizer oracle suite
         if: inputs.profile == 'suite' && inputs.sanitizer == 'ubsan'
-        run: zig build ubsan --cache-dir .zig-cache-ubsan
+        run: |
+          zig build corpus
+          case "${{ inputs.ubsan_shard }}" in
+            archive) suites="archive" ;;
+            codecs) suites="lzma seven_zip tar xz zip zstd inflate" ;;
+            kernel) suites="api bound checksum containers interop protocol provider transform" ;;
+            *) echo "unknown ubsan shard: '${{ inputs.ubsan_shard }}'" >&2; exit 1 ;;
+          esac
+          for suite in $suites; do
+            zig build ubsan -Dsuite="$suite" --cache-dir ".zig-cache-ubsan-${{ inputs.ubsan_shard }}"
+          done
       - name: Save the project cache
         if: ${{ !cancelled() && github.ref == 'refs/heads/main' && steps.project.outcome == 'success' && steps.project.outputs.cache-hit != 'true' }}
         continue-on-error: true
@@ -199,7 +214,7 @@ jobs:
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: .zig-cache-ubsan
+          path: .zig-cache-ubsan${{ inputs.ubsan_shard }}
           key: ${{ steps.ubsan.outputs.cache-primary-key }}
       - name: Save the vendored build tree
         if: ${{ !cancelled() && github.ref == 'refs/heads/main' && steps.vendor_build.outcome == 'success' && steps.vendor_build.outputs.cache-hit != 'true' }}

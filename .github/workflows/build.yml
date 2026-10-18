@@ -29,7 +29,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { impl: onprem, portable: false, sanitizer: ubsan }
+          - { impl: onprem, portable: false, sanitizer: ubsan, ubsan_shard: archive }
+          - { impl: onprem, portable: false, sanitizer: ubsan, ubsan_shard: codecs }
+          - { impl: onprem, portable: false, sanitizer: ubsan, ubsan_shard: kernel }
           - { impl: offprem, portable: false, sanitizer: "" }
           - { impl: mergeable, portable: false, sanitizer: "" }
           - { impl: onprem, portable: true, sanitizer: "" }
@@ -40,6 +42,7 @@ jobs:
       impl: ${{ matrix.impl }}
       portable: ${{ matrix.portable }}
       sanitizer: ${{ matrix.sanitizer }}
+      ubsan_shard: ${{ matrix.ubsan_shard }}
 
   publish:
     name: Publish
