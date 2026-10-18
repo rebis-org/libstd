@@ -1,7 +1,6 @@
 const builtin = @import("builtin");
 const std = @import("std");
 
-const bounds = @import("../../../common/primitive/bounds.zig");
 const exception_prim = @import("../../../common/primitive/exception.zig");
 
 pub const Exception = exception_prim.Exception;
@@ -23,10 +22,10 @@ pub const EntryInfo = struct {
 };
 
 pub const Options = struct {
-    password: []const u8 = &.{}, // scrypt recipient
-    identity: []const u8 = &.{}, // AGE-SECRET-KEY-... (decrypt)
-    recipient: []const u8 = &.{}, // age1... (encrypt)
-    work_factor: u8 = 18, // scrypt logN when password is set
+    password: []const u8 = &.{},
+    identity: []const u8 = &.{},
+    recipient: []const u8 = &.{},
+    work_factor: u8 = 18,
     armor: bool = false,
 };
 
@@ -37,12 +36,45 @@ const x25519_info = "age-encryption.org/v1/X25519";
 const scrypt_label = "age-encryption.org/v1/scrypt";
 const header_info = "header";
 const payload_info = "payload";
-const armor_label = "AGE ENCRYPTED FILE";
 const armor_begin = "-----BEGIN AGE ENCRYPTED FILE-----";
 const armor_end = "-----END AGE ENCRYPTED FILE-----";
 const chunk_size: usize = 64 * 1024;
 const file_key_len: usize = 16;
 const mac_encoded_len: usize = 43;
+
+const b64 = std.base64.standard_no_pad;
+const b64_pad = std.base64.standard;
+const ChaCha20Poly1305 = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
+const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
+const X25519 = std.crypto.dh.X25519;
+const scrypt = std.crypto.pwhash.scrypt;
+
+const zero_nonce: [12]u8 = std.mem.zeroes([12]u8);
+
+fn b64Len(n: usize) usize {
+    return b64.Encoder.calcSize(n);
+}
+
+fn decodeB64(dst: []u8, src: []const u8) Exception!void {
+    // The no-pad decoder rejects non-canonical trailing bits and any '=',
+    // both of which the age header grammar forbids.
+    if ((b64.Decoder.calcSizeForSlice(src) catch return error.DataException) != dst.len) return error.DataException;
+    b64.Decoder.decode(dst, src) catch return error.DataException;
+}
+
+fn decodeB64Fixed(comptime n: usize, src: []const u8) Exception![n]u8 {
+    var out: [n]u8 = undefined;
+    try decodeB64(&out, src);
+    return out;
+}
+
+fn decodeB64Alloc(alloc: std.mem.Allocator, src: []const u8) Exception![]u8 {
+    const n = b64.Decoder.calcSizeForSlice(src) catch return error.DataException;
+    const dst = alloc.alloc(u8, n) catch return error.ResourceException;
+    try decodeB64(dst, src);
+    return dst;
+}
 
 // OS entropy without a libc dependency on Linux: the getrandom syscall
 // directly, libc's arc4random_buf on Apple platforms.
@@ -61,100 +93,6 @@ fn randomBytes(comptime n: usize) [n]u8 {
         else => @compileError("age: no OS entropy source for this target"),
     }
     return out;
-}
-
-const b64_alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-fn b64EncodedLen(n: usize) usize {
-    return (n / 3) * 4 + switch (n % 3) {
-        0 => @as(usize, 0),
-        1 => 2,
-        else => 3,
-    };
-}
-
-fn b64Encode(dst: []u8, src: []const u8) void {
-    var i: usize = 0;
-    var o: usize = 0;
-    while (i + 3 <= src.len) : (i += 3) {
-        const v = (@as(u32, src[i]) << 16) | (@as(u32, src[i + 1]) << 8) | src[i + 2];
-        dst[o] = b64_alphabet[(v >> 18) & 63];
-        dst[o + 1] = b64_alphabet[(v >> 12) & 63];
-        dst[o + 2] = b64_alphabet[(v >> 6) & 63];
-        dst[o + 3] = b64_alphabet[v & 63];
-        o += 4;
-    }
-    const rest = src.len - i;
-    if (rest == 1) {
-        const v = @as(u32, src[i]) << 16;
-        dst[o] = b64_alphabet[(v >> 18) & 63];
-        dst[o + 1] = b64_alphabet[(v >> 12) & 63];
-    } else if (rest == 2) {
-        const v = (@as(u32, src[i]) << 16) | (@as(u32, src[i + 1]) << 8);
-        dst[o] = b64_alphabet[(v >> 18) & 63];
-        dst[o + 1] = b64_alphabet[(v >> 12) & 63];
-        dst[o + 2] = b64_alphabet[(v >> 6) & 63];
-    }
-}
-
-fn b64Value(c: u8) ?u32 {
-    return switch (c) {
-        'A'...'Z' => c - 'A',
-        'a'...'z' => c - 'a' + 26,
-        '0'...'9' => c - '0' + 52,
-        '+' => 62,
-        '/' => 63,
-        else => null,
-    };
-}
-
-fn b64DecodedLen(n: usize) usize {
-    return n / 4 * 3 + switch (n % 4) {
-        0 => @as(usize, 0),
-        2 => 1,
-        3 => 2,
-        else => unreachable,
-    };
-}
-
-fn b64Quad(chars: []const u8) Exception!u32 {
-    var v: u32 = 0;
-    for (chars) |c| {
-        const value = b64Value(c) orelse return error.DataException;
-        v = (v << 6) | value;
-    }
-    return v & 0xffffff;
-}
-
-// Strict canonical decode: reject non-alphabet characters, non-canonical
-// trailing bits, and any '=' padding.
-fn b64Decode(dst: []u8, src: []const u8) Exception!void {
-    if (src.len % 4 == 1) return error.DataException;
-    if (dst.len != b64DecodedLen(src.len)) return error.CallException;
-    var i: usize = 0;
-    var o: usize = 0;
-    while (i + 4 <= src.len) : (i += 4) {
-        const v = try b64Quad(src[i..][0..4]);
-        dst[o] = @truncate(v >> 16);
-        dst[o + 1] = @truncate(v >> 8);
-        dst[o + 2] = @truncate(v);
-        o += 3;
-    }
-    const rest = src.len - i;
-    if (rest == 2) {
-        var tail = [4]u8{ src[i], src[i + 1], 'A', 'A' };
-        _ = &tail;
-        const v = try b64Quad(&tail);
-        if (v & 0xffff != 0) return error.DataException;
-        dst[o] = @truncate(v >> 16);
-    } else if (rest == 3) {
-        var tail = [4]u8{ src[i], src[i + 1], src[i + 2], 'A' };
-        _ = &tail;
-        const v = try b64Quad(&tail);
-        if (v & 0xff != 0) return error.DataException;
-        dst[o] = @truncate(v >> 16);
-        dst[o + 1] = @truncate(v >> 8);
-    }
 }
 
 // Bech32 per BIP 173 without length limits; the lowercase-checksum rule is
@@ -190,47 +128,34 @@ fn bech32HrpExpand(hrp: []const u8, out: []u5) []u5 {
     return out[0..i];
 }
 
-fn bytesTo5Bits(data: []const u8, out: []u5) Exception![]u5 {
+fn convertBits(comptime in_t: type, comptime out_t: type, comptime in_bits: u5, comptime out_bits: u5, comptime pad: bool, data: []const in_t, out: []out_t) Exception![]out_t {
     var acc: u32 = 0;
     var bits: u5 = 0;
     var i: usize = 0;
-    for (data) |byte| {
-        acc = (acc << 8) | byte;
-        bits += 8;
-        while (bits >= 5) {
-            bits -= 5;
+    const maxv: u32 = (@as(u32, 1) << out_bits) - 1;
+    for (data) |v| {
+        acc = (acc << in_bits) | v;
+        bits += in_bits;
+        while (bits >= out_bits) {
+            bits -= out_bits;
             if (i >= out.len) return error.DataException;
-            out[i] = @intCast((acc >> bits) & 0x1f);
+            out[i] = @intCast((acc >> bits) & maxv);
             i += 1;
         }
     }
-    if (bits != 0) {
-        if (i >= out.len) return error.DataException;
-        out[i] = @intCast((acc << (5 - bits)) & 0x1f);
-        i += 1;
+    if (pad) {
+        if (bits != 0) {
+            if (i >= out.len) return error.DataException;
+            out[i] = @intCast((acc << (out_bits - bits)) & maxv);
+            i += 1;
+        }
+    } else if (bits >= in_bits or (acc & ((@as(u32, 1) << bits) - 1)) != 0) {
+        return error.DataException;
     }
     return out[0..i];
 }
 
-fn fiveBitsToBytes(data: []const u5, out: []u8) Exception![]u8 {
-    var acc: u32 = 0;
-    var bits: u5 = 0;
-    var i: usize = 0;
-    for (data) |value| {
-        acc = (acc << 5) | value;
-        bits += 5;
-        while (bits >= 8) {
-            bits -= 8;
-            if (i >= out.len) return error.DataException;
-            out[i] = @truncate(acc >> bits);
-            i += 1;
-        }
-    }
-    if (bits >= 5 or (acc & ((@as(u32, 1) << bits) - 1)) != 0) return error.DataException;
-    return out[0..i];
-}
-
-fn bech32CreateChecksum(hrp_upper: []const u8, data: []const u5, out: []u5) void {
+fn bech32Checksum(hrp_upper: []const u8, data: []const u5) [6]u5 {
     // The checksum is always computed over the lowercase HRP (BIP 173), even
     // though the emitted string may be uppercase.
     var hrp_buf: [128]u8 = undefined;
@@ -242,22 +167,21 @@ fn bech32CreateChecksum(hrp_upper: []const u8, data: []const u5, out: []u5) void
     @memcpy(chk_input[hrp_expanded.len..][0..data.len], data);
     for (0..6) |i| chk_input[hrp_expanded.len + data.len + i] = 0;
     const polymod = bech32Polymod(chk_input[0 .. hrp_expanded.len + data.len + 6]) ^ 1;
-    for (0..6) |i| {
-        out[i] = @intCast((polymod >> @intCast(5 * (5 - i))) & 0x1f);
-    }
+    var out: [6]u5 = undefined;
+    for (0..6) |i| out[i] = @intCast((polymod >> @intCast(5 * (5 - i))) & 0x1f);
+    return out;
 }
 
 fn bech32Encode(hrp: []const u8, data: []const u8, out: []u8) Exception![]const u8 {
     var data5: [2 * 256]u5 = undefined;
-    const data5_slice = try bytesTo5Bits(data, &data5);
+    const data5_slice = try convertBits(u8, u5, 8, 5, true, data, &data5);
     if (out.len < hrp.len + 1 + data5_slice.len + 6) return error.CapacityException;
     @memcpy(out[0..hrp.len], hrp);
     out[hrp.len] = '1';
     for (data5_slice, 0..) |value, i| {
         out[hrp.len + 1 + i] = bech32_charset[value];
     }
-    var checksum: [6]u5 = undefined;
-    bech32CreateChecksum(hrp, data5_slice, &checksum);
+    const checksum = bech32Checksum(hrp, data5_slice);
     for (checksum, 0..) |value, i| {
         out[hrp.len + 1 + data5_slice.len + i] = bech32_charset[value];
     }
@@ -299,9 +223,56 @@ fn bech32Decode(encoded: []const u8, hrp_out: []u8, data_out: []u8) Exception!st
     @memcpy(chk_input[0..hrp_expanded.len], hrp_expanded);
     @memcpy(chk_input[hrp_expanded.len..][0..value_len], values[0..value_len]);
     if (bech32Polymod(chk_input[0 .. hrp_expanded.len + value_len]) != 1) return error.DataException;
-    const data = try fiveBitsToBytes(values[0 .. value_len - 6], data_out);
+    const data = try convertBits(u5, u8, 5, 8, false, values[0 .. value_len - 6], data_out);
     return .{ .hrp = hrp_out[0..hrp.len], .data = data };
 }
+
+fn bech32Key(text: []const u8, comptime hrp: []const u8) Exception![32]u8 {
+    var hrp_buf: [16]u8 = undefined;
+    var data: [64]u8 = undefined;
+    const decoded = try bech32Decode(text, &hrp_buf, &data);
+    if (!std.mem.eql(u8, decoded.hrp, hrp) or decoded.data.len != 32) return error.DataException;
+    return decoded.data[0..32].*;
+}
+
+pub const Identity = struct {
+    secret: [32]u8,
+
+    pub fn fromString(text: []const u8) Exception!Identity {
+        return .{ .secret = try bech32Key(text, "age-secret-key-") };
+    }
+
+    pub fn toString(self: Identity, out: []u8) Exception![]const u8 {
+        return bech32Encode("AGE-SECRET-KEY-", &self.secret, out);
+    }
+
+    pub fn recipientString(self: Identity, out: []u8) Exception![]const u8 {
+        return bech32Encode("age", &X25519.recoverPublicKey(self.secret), out);
+    }
+};
+
+pub const Recipient = struct {
+    public: [32]u8,
+
+    pub fn fromString(text: []const u8) Exception!Recipient {
+        return .{ .public = try bech32Key(text, "age") };
+    }
+};
+
+const Cursor = struct {
+    buf: []u8,
+    pos: usize = 0,
+
+    fn write(self: *Cursor, bytes: []const u8) Exception!void {
+        if (self.buf.len - self.pos < bytes.len) return error.CapacityException;
+        @memcpy(self.buf[self.pos..][0..bytes.len], bytes);
+        self.pos += bytes.len;
+    }
+
+    fn byte(self: *Cursor, b: u8) Exception!void {
+        try self.write(&[_]u8{b});
+    }
+};
 
 const Stanza = struct {
     args: []const []const u8,
@@ -310,7 +281,7 @@ const Stanza = struct {
 
 const Header = struct {
     stanzas: []const Stanza,
-    // The MAC covers input[0 .. mac_line_start + 3], through the "---" mark.
+    // The MAC covers buf[0 .. mac_line_start + 3], through the "---" mark.
     mac_line_start: usize,
     payload_offset: usize,
 };
@@ -330,9 +301,8 @@ fn parseHeader(input: []const u8, alloc: std.mem.Allocator) Exception!Header {
         if (std.mem.startsWith(u8, line, "---")) {
             if (line.len != 4 + mac_encoded_len or line[3] != ' ') return error.DataException;
             var mac: [32]u8 = undefined;
-            try b64Decode(&mac, line[4..]);
-            const payload_offset = eol + 1;
-            return .{ .stanzas = stanzas.items, .mac_line_start = pos, .payload_offset = payload_offset };
+            try decodeB64(&mac, line[4..]);
+            return .{ .stanzas = stanzas.items, .mac_line_start = pos, .payload_offset = eol + 1 };
         }
         if (!std.mem.startsWith(u8, line, "-> ") or line.len == 3) return error.DataException;
         var args: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -340,37 +310,21 @@ fn parseHeader(input: []const u8, alloc: std.mem.Allocator) Exception!Header {
         while (it.next()) |arg| {
             args.append(alloc, arg) catch return error.ResourceException;
         }
-        if (args.items.len == 0) return error.DataException;
         var body: std.ArrayListUnmanaged(u8) = .empty;
         var body_pos = eol + 1;
         while (true) {
-            const line_end = std.mem.indexOfScalarPos(u8, input, body_pos, '\n') orelse return error.DataException;
-            const body_line = input[body_pos..line_end];
-            if (body_line.len == 64) {
-                body.appendSlice(alloc, body_line) catch return error.ResourceException;
-                body_pos = line_end + 1;
-                continue;
-            }
-            if (body_line.len > 64) return error.DataException;
-            body.appendSlice(alloc, body_line) catch return error.ResourceException;
-            body_pos = line_end + 1;
-            break;
+            const end = std.mem.indexOfScalarPos(u8, input, body_pos, '\n') orelse return error.DataException;
+            const part = input[body_pos..end];
+            if (part.len > 64) return error.DataException;
+            body.appendSlice(alloc, part) catch return error.ResourceException;
+            body_pos = end + 1;
+            if (part.len < 64) break;
         }
-        const body_text = body.items;
-        const body_bin = alloc.alloc(u8, b64DecodedLen(body_text.len)) catch return error.ResourceException;
-        try b64Decode(body_bin, body_text);
+        const body_bin = try decodeB64Alloc(alloc, body.items);
         stanzas.append(alloc, .{ .args = args.items, .body = body_bin }) catch return error.ResourceException;
         pos = body_pos;
     }
 }
-
-const ChaCha20Poly1305 = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
-const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
-const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
-const X25519 = std.crypto.dh.X25519;
-const scrypt = std.crypto.pwhash.scrypt;
-
-const zero_nonce: [12]u8 = std.mem.zeroes([12]u8);
 
 fn hkdfSha256(ikm: []const u8, salt: []const u8, info: []const u8) [32]u8 {
     const prk = HkdfSha256.extract(salt, ikm);
@@ -387,32 +341,28 @@ fn payloadKey(file_key: [file_key_len]u8, nonce: [16]u8) [32]u8 {
     return hkdfSha256(&file_key, &nonce, payload_info);
 }
 
-fn wrapX25519(file_key: [file_key_len]u8, recipient: [32]u8, ephemeral: [32]u8, body_out: *[48]u8) [32]u8 {
-    const share = X25519.recoverPublicKey(ephemeral);
-    var salt: [64]u8 = undefined;
-    @memcpy(salt[0..32], &share);
-    @memcpy(salt[32..64], &recipient);
-    const shared = X25519.scalarmult(ephemeral, recipient) catch unreachable;
-    const wrap_key = hkdfSha256(&shared, &salt, x25519_info);
-    ChaCha20Poly1305.encrypt(body_out, &file_key, "", zero_nonce, wrap_key);
-    return share;
+// Every stanza type wraps the file key with the same AEAD shape; only the
+// wrap key derivation differs.
+fn sealFileKey(file_key: [file_key_len]u8, wrap_key: [32]u8) [file_key_len + 16]u8 {
+    var body: [file_key_len + 16]u8 = undefined;
+    var tag: [16]u8 = undefined;
+    ChaCha20Poly1305.encrypt(body[0..file_key_len], &tag, &file_key, "", zero_nonce, wrap_key);
+    body[file_key_len..][0..16].* = tag;
+    return body;
 }
 
-fn unwrapX25519(stanza: Stanza, identity: [32]u8) Exception![file_key_len]u8 {
-    if (stanza.args.len != 2 or !std.mem.eql(u8, stanza.args[0], "X25519")) return error.UnsupportedException;
-    if (stanza.body.len != file_key_len + 16) return error.DataException;
-    var share: [32]u8 = undefined;
-    try b64Decode(&share, stanza.args[1]);
-    const shared = X25519.scalarmult(identity, share) catch return error.IntegrityException;
-    var salt: [64]u8 = undefined;
-    @memcpy(salt[0..32], &share);
-    const recipient = X25519.recoverPublicKey(identity);
-    @memcpy(salt[32..64], &recipient);
-    const wrap_key = hkdfSha256(&shared, &salt, x25519_info);
+fn openFileKey(body: []const u8, wrap_key: [32]u8) Exception![file_key_len]u8 {
+    if (body.len != file_key_len + 16) return error.DataException;
     var file_key: [file_key_len]u8 = undefined;
-    if (stanza.body.len != file_key_len + 16) return error.DataException;
-    ChaCha20Poly1305.decrypt(&file_key, stanza.body[0..file_key_len], stanza.body[file_key_len..][0..16].*, "", zero_nonce, wrap_key) catch return error.IntegrityException;
+    ChaCha20Poly1305.decrypt(&file_key, body[0..file_key_len], body[file_key_len..][0..16].*, "", zero_nonce, wrap_key) catch return error.IntegrityException;
     return file_key;
+}
+
+fn x25519WrapKey(shared: [32]u8, share: [32]u8, recipient: [32]u8) [32]u8 {
+    var salt: [64]u8 = undefined;
+    salt[0..32].* = share;
+    salt[32..64].* = recipient;
+    return hkdfSha256(&shared, &salt, x25519_info);
 }
 
 fn scryptWrapKey(password: []const u8, salt: [16]u8, work_factor: u8, scratch: []u8) Exception![32]u8 {
@@ -429,15 +379,134 @@ fn scryptWrapKey(password: []const u8, salt: [16]u8, work_factor: u8, scratch: [
     return key;
 }
 
+fn decimalWorkFactor(text: []const u8) Exception!u8 {
+    if (text.len == 0 or text[0] == '0') return error.DataException;
+    return std.fmt.parseInt(u8, text, 10) catch return error.DataException;
+}
+
+fn wrapStanzas(file_key: [file_key_len]u8, options: Options, alloc: std.mem.Allocator, scratch: []u8) Exception![]Stanza {
+    if (options.password.len != 0 and options.recipient.len != 0) return error.CallException;
+    if (options.password.len == 0 and options.recipient.len == 0) return error.CallException;
+    var list: std.ArrayListUnmanaged(Stanza) = .empty;
+    if (options.password.len != 0) {
+        if (options.work_factor < 1 or options.work_factor > scrypt_work_factor_max) return error.UnsupportedException;
+        const salt: [16]u8 = randomBytes(16);
+        var salt_b64: [b64Len(16)]u8 = undefined;
+        const wrap_key = try scryptWrapKey(options.password, salt, options.work_factor, scratch);
+        const args = alloc.alloc([]const u8, 3) catch return error.ResourceException;
+        args[0] = "scrypt";
+        args[1] = alloc.dupe(u8, b64.Encoder.encode(&salt_b64, &salt)) catch return error.ResourceException;
+        args[2] = std.fmt.allocPrint(alloc, "{d}", .{options.work_factor}) catch return error.ResourceException;
+        const body = alloc.dupe(u8, &sealFileKey(file_key, wrap_key)) catch return error.ResourceException;
+        list.append(alloc, .{ .args = args, .body = body }) catch return error.ResourceException;
+        return list.items;
+    }
+    const recipient = Recipient.fromString(options.recipient) catch return error.CallException;
+    const ephemeral: [32]u8 = randomBytes(32);
+    const share = X25519.recoverPublicKey(ephemeral);
+    const shared = X25519.scalarmult(ephemeral, recipient.public) catch return error.InternalException;
+    const wrap_key = x25519WrapKey(shared, share, recipient.public);
+    var share_b64: [b64Len(32)]u8 = undefined;
+    const args = alloc.alloc([]const u8, 2) catch return error.ResourceException;
+    args[0] = "X25519";
+    args[1] = alloc.dupe(u8, b64.Encoder.encode(&share_b64, &share)) catch return error.ResourceException;
+    const body = alloc.dupe(u8, &sealFileKey(file_key, wrap_key)) catch return error.ResourceException;
+    list.append(alloc, .{ .args = args, .body = body }) catch return error.ResourceException;
+    return list.items;
+}
+
+fn unwrapX25519(stanza: Stanza, identity: [32]u8) Exception![file_key_len]u8 {
+    if (stanza.args.len != 2) return error.DataException;
+    const share = try decodeB64Fixed(32, stanza.args[1]);
+    const shared = X25519.scalarmult(identity, share) catch return error.IntegrityException;
+    return openFileKey(stanza.body, x25519WrapKey(shared, share, X25519.recoverPublicKey(identity)));
+}
+
+fn unwrapFileKey(stanzas: []const Stanza, options: Options, scratch: []u8) Exception![file_key_len]u8 {
+    if (options.password.len != 0) {
+        // A scrypt stanza must be the only stanza; anything else is not a
+        // passphrase-encrypted header.
+        if (stanzas.len != 1 or !std.mem.eql(u8, stanzas[0].args[0], "scrypt")) return error.IntegrityException;
+        const stanza = stanzas[0];
+        if (stanza.args.len != 3) return error.DataException;
+        const salt = try decodeB64Fixed(16, stanza.args[1]);
+        const work_factor = try decimalWorkFactor(stanza.args[2]);
+        if (work_factor > scrypt_work_factor_max) return error.UnsupportedException;
+        const wrap_key = try scryptWrapKey(options.password, salt, work_factor, scratch);
+        return openFileKey(stanza.body, wrap_key);
+    }
+    if (options.identity.len != 0) {
+        const identity = Identity.fromString(options.identity) catch return error.CallException;
+        for (stanzas) |stanza| {
+            if (stanza.args.len == 0 or !std.mem.eql(u8, stanza.args[0], "X25519")) continue;
+            // An authenticated failure means this identity does not own the
+            // stanza; the next one may.
+            return unwrapX25519(stanza, identity.secret) catch |err| switch (err) {
+                error.IntegrityException => continue,
+                else => return err,
+            };
+        }
+        return error.IntegrityException;
+    }
+    return error.CallException;
+}
+
+fn writeHeader(file_key: [file_key_len]u8, stanzas: []const Stanza, dest: []u8) Exception!usize {
+    var c = Cursor{ .buf = dest };
+    try c.write(version_line ++ "\n");
+    for (stanzas) |stanza| {
+        try c.write("-> ");
+        for (stanza.args, 0..) |arg, i| {
+            if (i != 0) try c.byte(' ');
+            try c.write(arg);
+        }
+        try c.byte('\n');
+        var encoded: [b64Len(48)]u8 = undefined;
+        const body_b64 = b64.Encoder.encode(encoded[0..b64Len(stanza.body.len)], stanza.body);
+        for (body_b64, 0..) |ch, i| {
+            if (i % 64 == 0 and i != 0) try c.byte('\n');
+            try c.byte(ch);
+        }
+        try c.byte('\n');
+    }
+    try c.write("---");
+    const mac_key = headerMacKey(file_key);
+    var mac: [32]u8 = undefined;
+    HmacSha256.create(&mac, c.buf[0..c.pos], &mac_key);
+    try c.byte(' ');
+    var mac_b64: [mac_encoded_len]u8 = undefined;
+    try c.write(b64.Encoder.encode(&mac_b64, &mac));
+    try c.byte('\n');
+    return c.pos;
+}
+
+fn verifyHeaderMac(input: []const u8, header: Header, file_key: [file_key_len]u8) Exception!void {
+    const mac_key = headerMacKey(file_key);
+    var mac: [32]u8 = undefined;
+    HmacSha256.create(&mac, input[0 .. header.mac_line_start + 3], &mac_key);
+    const line = input[header.mac_line_start .. header.payload_offset - 1];
+    if (line.len != 4 + mac_encoded_len or line[3] != ' ') return error.DataException;
+    var expected: [32]u8 = undefined;
+    try decodeB64(&expected, line[4..]);
+    if (!std.mem.eql(u8, &mac, &expected)) return error.IntegrityException;
+}
+
 fn payloadCiphertextLen(plain_len: u64) u64 {
     const chunks = if (plain_len == 0) 1 else (plain_len + chunk_size - 1) / chunk_size;
     return 16 + plain_len + chunks * 16;
 }
 
+fn chunkNonce(counter: u64, final: bool) [12]u8 {
+    var nonce: [12]u8 = @splat(0);
+    std.mem.writeInt(u64, nonce[3..11], counter, .big);
+    nonce[11] = @intFromBool(final);
+    return nonce;
+}
+
 fn encryptPayload(file_key: [file_key_len]u8, source: []const u8, dest: []u8) Exception!void {
     if (dest.len < payloadCiphertextLen(source.len)) return error.CapacityException;
     const nonce: [16]u8 = randomBytes(16);
-    @memcpy(dest[0..16], &nonce);
+    dest[0..16].* = nonce;
     const key = payloadKey(file_key, nonce);
     var offset: usize = 16;
     var counter: u64 = 0;
@@ -445,12 +514,9 @@ fn encryptPayload(file_key: [file_key_len]u8, source: []const u8, dest: []u8) Ex
     while (true) {
         const take = @min(chunk_size, source.len - pos);
         const final = pos + take == source.len;
-        var chunk_nonce: [12]u8 = @splat(0);
-        std.mem.writeInt(u64, chunk_nonce[3..11], counter, .big);
-        chunk_nonce[11] = if (final) 1 else 0;
         var tag: [16]u8 = undefined;
-        ChaCha20Poly1305.encrypt(dest[offset..][0..take], &tag, source[pos..][0..take], "", chunk_nonce, key);
-        @memcpy(dest[offset + take ..][0..16], &tag);
+        ChaCha20Poly1305.encrypt(dest[offset..][0..take], &tag, source[pos..][0..take], "", chunkNonce(counter, final), key);
+        dest[offset + take ..][0..16].* = tag;
         offset += take + 16;
         pos += take;
         counter += 1;
@@ -462,7 +528,7 @@ fn encryptPayload(file_key: [file_key_len]u8, source: []const u8, dest: []u8) Ex
 // may be short (or empty, when the plaintext is empty).
 fn chunkCount(ciphertext_payload: usize) Exception!usize {
     if (ciphertext_payload < 16) return error.DataException;
-    if (ciphertext_payload == 16) return 1; // empty plaintext, single empty final chunk
+    if (ciphertext_payload == 16) return 1;
     const n = (ciphertext_payload - 16 + chunk_size - 1) / chunk_size;
     const plain = ciphertext_payload - n * 16;
     if (n != (plain + chunk_size - 1) / chunk_size) return error.DataException;
@@ -471,8 +537,7 @@ fn chunkCount(ciphertext_payload: usize) Exception!usize {
 
 fn decryptPayload(file_key: [file_key_len]u8, source: []const u8, dest: []u8) Exception!usize {
     if (source.len < 16) return error.DataException;
-    var nonce: [16]u8 = undefined;
-    @memcpy(&nonce, source[0..16]);
+    const nonce: [16]u8 = source[0..16].*;
     const key = payloadKey(file_key, nonce);
     const n = try chunkCount(source.len - 16);
     var offset: usize = 16;
@@ -481,11 +546,8 @@ fn decryptPayload(file_key: [file_key_len]u8, source: []const u8, dest: []u8) Ex
         const remaining = source.len - offset;
         const take = @min(chunk_size, remaining - 16);
         const final = i == n - 1;
-        var chunk_nonce: [12]u8 = @splat(0);
-        std.mem.writeInt(u64, chunk_nonce[3..11], @as(u64, @intCast(i)), .big);
-        chunk_nonce[11] = if (final) 1 else 0;
         if (dest.len < out + take) return error.CapacityException;
-        ChaCha20Poly1305.decrypt(dest[out..][0..take], source[offset..][0..take], source[offset + take ..][0..16].*, "", chunk_nonce, key) catch return error.IntegrityException;
+        ChaCha20Poly1305.decrypt(dest[out..][0..take], source[offset..][0..take], source[offset + take ..][0..16].*, "", chunkNonce(@intCast(i), final), key) catch return error.IntegrityException;
         offset += take + 16;
         out += take;
         if (final and offset != source.len) return error.DataException;
@@ -493,246 +555,43 @@ fn decryptPayload(file_key: [file_key_len]u8, source: []const u8, dest: []u8) Ex
     return out;
 }
 
-pub const Identity = struct {
-    secret: [32]u8,
-
-    pub fn fromString(text: []const u8) Exception!Identity {
-        var hrp_buf: [64]u8 = undefined;
-        var data: [64]u8 = undefined;
-        const decoded = bech32Decode(text, &hrp_buf, &data) catch return error.DataException;
-        if (!std.mem.eql(u8, decoded.hrp, "age-secret-key-") or decoded.data.len != 32) return error.DataException;
-        var secret: [32]u8 = undefined;
-        @memcpy(&secret, decoded.data[0..32]);
-        return .{ .secret = secret };
-    }
-
-    pub fn toString(self: Identity, out: []u8) Exception![]const u8 {
-        return bech32Encode("AGE-SECRET-KEY-", &self.secret, out);
-    }
-
-    pub fn recipientString(self: Identity, out: []u8) Exception![]const u8 {
-        const public = X25519.recoverPublicKey(self.secret);
-        return bech32Encode("age", &public, out);
-    }
-};
-
-pub const Recipient = struct {
-    public: [32]u8,
-
-    pub fn fromString(text: []const u8) Exception!Recipient {
-        var hrp_buf: [16]u8 = undefined;
-        var data: [64]u8 = undefined;
-        const decoded = bech32Decode(text, &hrp_buf, &data) catch return error.DataException;
-        if (!std.mem.eql(u8, decoded.hrp, "age") or decoded.data.len != 32) return error.DataException;
-        var public: [32]u8 = undefined;
-        @memcpy(&public, decoded.data[0..32]);
-        return .{ .public = public };
-    }
-};
-
-fn wrapStanzas(file_key: [file_key_len]u8, options: Options, alloc: std.mem.Allocator, scratch: []u8) Exception![]Stanza {
-    var list: std.ArrayListUnmanaged(Stanza) = .empty;
-    if (options.password.len != 0 and options.recipient.len != 0) return error.CallException;
-    if (options.password.len == 0 and options.recipient.len == 0) return error.CallException;
-    if (options.password.len != 0) {
-        if (options.work_factor < 1 or options.work_factor > scrypt_work_factor_max) return error.UnsupportedException;
-        const salt: [16]u8 = randomBytes(16);
-        var salt_b64: [b64EncodedLen(16)]u8 = undefined;
-        b64Encode(&salt_b64, &salt);
-        var work_buf: [8]u8 = undefined;
-        const work = std.fmt.bufPrint(&work_buf, "{d}", .{options.work_factor}) catch return error.InternalException;
-        const wrap_key = try scryptWrapKey(options.password, salt, options.work_factor, scratch);
-        var body: [file_key_len + 16]u8 = undefined;
-        var tag: [16]u8 = undefined;
-        ChaCha20Poly1305.encrypt(body[0..file_key_len], &tag, &file_key, "", zero_nonce, wrap_key);
-        @memcpy(body[file_key_len..][0..16], &tag);
-        const args = alloc.alloc([]const u8, 3) catch return error.ResourceException;
-        args[0] = "scrypt";
-        args[1] = alloc.dupe(u8, &salt_b64) catch return error.ResourceException;
-        args[2] = alloc.dupe(u8, work) catch return error.ResourceException;
-        const body_copy = alloc.dupe(u8, &body) catch return error.ResourceException;
-        list.append(alloc, .{ .args = args, .body = body_copy }) catch return error.ResourceException;
-        return list.items;
-    }
-    const recipient = Recipient.fromString(options.recipient) catch return error.CallException;
-    const ephemeral: [32]u8 = randomBytes(32);
-    var body: [file_key_len + 16]u8 = undefined;
-    var tag: [16]u8 = undefined;
-    const shared = X25519.scalarmult(ephemeral, recipient.public) catch return error.InternalException;
-    var salt: [64]u8 = undefined;
-    const ephemeral_share = X25519.recoverPublicKey(ephemeral);
-    @memcpy(salt[0..32], &ephemeral_share);
-    @memcpy(salt[32..64], &recipient.public);
-    const wrap_key = hkdfSha256(&shared, &salt, x25519_info);
-    ChaCha20Poly1305.encrypt(body[0..file_key_len], &tag, &file_key, "", zero_nonce, wrap_key);
-    @memcpy(body[file_key_len..][0..16], &tag);
-    var share_b64: [b64EncodedLen(32)]u8 = undefined;
-    b64Encode(&share_b64, &ephemeral_share);
-    const args = alloc.alloc([]const u8, 2) catch return error.ResourceException;
-    args[0] = "X25519";
-    args[1] = alloc.dupe(u8, &share_b64) catch return error.ResourceException;
-    const body_copy = alloc.dupe(u8, &body) catch return error.ResourceException;
-    list.append(alloc, .{ .args = args, .body = body_copy }) catch return error.ResourceException;
-    return list.items;
-}
-
-fn decimalWorkFactor(text: []const u8) Exception!u8 {
-    if (text.len == 0 or text.len > 2) return error.DataException;
-    if (text[0] < '1' or text[0] > '9') return error.DataException;
-    var value: u8 = text[0] - '0';
-    for (text[1..]) |c| {
-        if (c < '0' or c > '9') return error.DataException;
-        value = value * 10 + (c - '0');
-    }
-    return value;
-}
-
-fn unwrapFileKey(stanzas: []const Stanza, options: Options, scratch: []u8) Exception![file_key_len]u8 {
-    if (options.password.len != 0) {
-        if (stanzas.len != 1 or !std.mem.eql(u8, stanzas[0].args[0], "scrypt")) {
-            // A scrypt stanza must be the only stanza; any header without
-            // exactly one is not passphrase-encrypted.
-            return error.IntegrityException;
-        }
-        const stanza = stanzas[0];
-        if (stanza.args.len != 3) return error.DataException;
-        var salt: [16]u8 = undefined;
-        try b64Decode(&salt, stanza.args[1]);
-        const work_factor = try decimalWorkFactor(stanza.args[2]);
-        if (work_factor > scrypt_work_factor_max) return error.UnsupportedException;
-        if (stanza.body.len != file_key_len + 16) return error.DataException;
-        const wrap_key = try scryptWrapKey(options.password, salt, work_factor, scratch);
-        var file_key: [file_key_len]u8 = undefined;
-        ChaCha20Poly1305.decrypt(&file_key, stanza.body[0..file_key_len], stanza.body[file_key_len..][0..16].*, "", zero_nonce, wrap_key) catch return error.IntegrityException;
-        return file_key;
-    }
-    if (options.identity.len != 0) {
-        const identity = Identity.fromString(options.identity) catch return error.CallException;
-        for (stanzas) |stanza| {
-            if (stanza.args.len == 0 or !std.mem.eql(u8, stanza.args[0], "X25519")) continue;
-            return unwrapX25519(stanza, identity.secret) catch |err| switch (err) {
-                error.UnsupportedException => continue,
-                error.DataException => return error.DataException,
-                error.IntegrityException => continue,
-                else => return err,
-            };
-        }
-        return error.IntegrityException;
-    }
-    return error.CallException;
-}
-
-fn writeHeader(file_key: [file_key_len]u8, stanzas: []const Stanza, dest: []u8) Exception!usize {
-    var pos: usize = 0;
-    @memcpy(dest[pos..][0..version_line.len], version_line);
-    pos += version_line.len;
-    dest[pos] = '\n';
-    pos += 1;
-    for (stanzas) |stanza| {
-        if (dest.len - pos < 4) return error.CapacityException;
-        @memcpy(dest[pos..][0..3], "-> ");
-        pos += 3;
-        for (stanza.args, 0..) |arg, i| {
-            if (i != 0) {
-                dest[pos] = ' ';
-                pos += 1;
-            }
-            if (dest.len - pos < arg.len + 1) return error.CapacityException;
-            @memcpy(dest[pos..][0..arg.len], arg);
-            pos += arg.len;
-        }
-        dest[pos] = '\n';
-        pos += 1;
-        var encoded: [b64EncodedLen(48)]u8 = undefined;
-        const body_b64 = encoded[0..b64EncodedLen(stanza.body.len)];
-        b64Encode(body_b64, stanza.body);
-        var at: usize = 0;
-        while (at < body_b64.len) {
-            const take = @min(64, body_b64.len - at);
-            if (dest.len - pos < take + 1) return error.CapacityException;
-            @memcpy(dest[pos..][0..take], body_b64[at..][0..take]);
-            pos += take;
-            dest[pos] = '\n';
-            pos += 1;
-            at += take;
-        }
-    }
-    if (dest.len - pos < 4 + mac_encoded_len + 1) return error.CapacityException;
-    @memcpy(dest[pos..][0..3], "---");
-    pos += 3;
-    const mac_key = headerMacKey(file_key);
-    var mac: [32]u8 = undefined;
-    HmacSha256.create(&mac, dest[0..pos], &mac_key);
-    var mac_b64: [mac_encoded_len]u8 = undefined;
-    b64Encode(&mac_b64, &mac);
-    dest[pos] = ' ';
-    pos += 1;
-    @memcpy(dest[pos..][0..mac_encoded_len], &mac_b64);
-    pos += mac_encoded_len;
-    dest[pos] = '\n';
-    pos += 1;
-    return pos;
-}
-
-fn verifyHeaderMac(input: []const u8, header: Header, file_key: [file_key_len]u8) Exception!void {
-    const mac_key = headerMacKey(file_key);
-    var mac: [32]u8 = undefined;
-    HmacSha256.create(&mac, input[0 .. header.mac_line_start + 3], &mac_key);
-    const line = input[header.mac_line_start .. header.payload_offset - 1];
-    if (line.len != 4 + mac_encoded_len or line[3] != ' ') return error.DataException;
-    var expected: [32]u8 = undefined;
-    try b64Decode(&expected, line[4..]);
-    if (!std.mem.eql(u8, &mac, &expected)) return error.IntegrityException;
-}
-
 fn armoredLen(binary_len: usize) usize {
-    const b64_len = std.base64.standard.Encoder.calcSize(binary_len);
+    const b64_len = b64_pad.Encoder.calcSize(binary_len);
     const lines = (b64_len + 63) / 64;
     return armor_begin.len + 1 + lines * 65 + armor_end.len + 1;
 }
 
 fn armorEncode(binary: []const u8, dest: []u8) Exception!usize {
     if (dest.len < armoredLen(binary.len)) return error.CapacityException;
-    var pos: usize = 0;
-    @memcpy(dest[pos..][0..armor_begin.len], armor_begin);
-    pos += armor_begin.len;
-    dest[pos] = '\n';
-    pos += 1;
+    var c = Cursor{ .buf = dest };
+    try c.write(armor_begin ++ "\n");
     var line: [64]u8 = undefined;
     var at: usize = 0;
     while (at < binary.len) {
         const take = @min(48, binary.len - at);
-        const encoded = std.base64.standard.Encoder.encode(&line, binary[at..][0..take]);
-        @memcpy(dest[pos..][0..encoded.len], encoded);
-        pos += encoded.len;
-        dest[pos] = '\n';
-        pos += 1;
+        try c.write(b64_pad.Encoder.encode(&line, binary[at..][0..take]));
+        try c.byte('\n');
         at += take;
     }
-    @memcpy(dest[pos..][0..armor_end.len], armor_end);
-    pos += armor_end.len;
-    dest[pos] = '\n';
-    pos += 1;
-    return pos;
+    try c.write(armor_end ++ "\n");
+    return c.pos;
+}
+
+fn isArmorSpace(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\n' or c == '\r';
 }
 
 // Whitespace (LF/CRLF/space/tab) may surround the PEM block; nothing else.
 fn armorDecode(text: []const u8, alloc: std.mem.Allocator) Exception![]const u8 {
-    var start: usize = 0;
-    var end: usize = text.len;
-    while (start < end and isArmorSpace(text[start])) start += 1;
-    while (end > start and isArmorSpace(text[end - 1])) end -= 1;
-    const body = text[start..end];
-    if (!std.mem.startsWith(u8, body, armor_begin)) return error.DataException;
-    if (body.len < armor_begin.len + 1 + armor_end.len) return error.DataException;
-    if (body[armor_begin.len] != '\n') {
-        if (!(body[armor_begin.len] == '\r' and body[armor_begin.len + 1] == '\n')) return error.DataException;
-    }
-    var inner = body[armor_begin.len..];
-    if (inner[0] == '\r') inner = inner[1..];
-    inner = inner[1..];
-    const close = std.mem.lastIndexOf(u8, inner, armor_end) orelse return error.DataException;
-    const payload = inner[0..close];
+    const trimmed = std.mem.trim(u8, text, " \t\n\r");
+    if (!std.mem.startsWith(u8, trimmed, armor_begin)) return error.DataException;
+    const inner = trimmed[armor_begin.len..];
+    const after_begin = if (std.mem.startsWith(u8, inner, "\r\n")) inner[2..] else blk: {
+        if (!std.mem.startsWith(u8, inner, "\n")) return error.DataException;
+        break :blk inner[1..];
+    };
+    const close = std.mem.lastIndexOf(u8, after_begin, armor_end) orelse return error.DataException;
+    const payload = after_begin[0..close];
     if (payload.len == 0 or payload[payload.len - 1] != '\n') return error.DataException;
     const b64_text = payload[0 .. payload.len - 1];
     const cleaned = alloc.alloc(u8, b64_text.len) catch return error.ResourceException;
@@ -747,31 +606,35 @@ fn armorDecode(text: []const u8, alloc: std.mem.Allocator) Exception![]const u8 
         n += line.len;
         line_start = if (eol == b64_text.len) eol else eol + 1;
     }
-    const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(cleaned[0..n]) catch return error.DataException;
+    const decoded_len = b64_pad.Decoder.calcSizeForSlice(cleaned[0..n]) catch return error.DataException;
     const decoded = alloc.alloc(u8, decoded_len) catch return error.ResourceException;
-    std.base64.standard.Decoder.decode(decoded, cleaned[0..n]) catch return error.DataException;
+    b64_pad.Decoder.decode(decoded, cleaned[0..n]) catch return error.DataException;
     return decoded;
 }
 
-fn isArmorSpace(c: u8) bool {
-    return c == ' ' or c == '\t' or c == '\n' or c == '\r';
+fn dearmor(input: []const u8, alloc: std.mem.Allocator) Exception![]const u8 {
+    const trimmed = std.mem.trim(u8, input, " \t\n\r");
+    if (std.mem.startsWith(u8, trimmed, armor_begin)) return armorDecode(input, alloc);
+    if (std.mem.indexOf(u8, trimmed, armor_begin) != null) return error.DataException;
+    return input;
 }
 
-fn dearmor(input: []const u8, alloc: std.mem.Allocator) Exception!struct { binary: []const u8, armored: bool } {
-    const trimmed = std.mem.trim(u8, input, " \t\n\r");
-    if (std.mem.startsWith(u8, trimmed, armor_begin)) {
-        return .{ .binary = try armorDecode(input, alloc), .armored = true };
-    }
-    if (std.mem.indexOf(u8, trimmed, armor_begin) != null) return error.DataException;
-    return .{ .binary = input, .armored = false };
+// Parse-time allocations live in an arena over the front half of the caller
+// scratch; the scrypt KDF carves its peak memory from the back half.
+fn peelAndParse(input: []const u8, scratch: []u8) Exception!struct { binary: []const u8, header: Header, scrypt_scratch: []u8 } {
+    const split = scratch.len / 2;
+    var fba = std.heap.FixedBufferAllocator.init(scratch[0..split]);
+    const binary = try dearmor(input, fba.allocator());
+    const header = try parseHeader(binary, fba.allocator());
+    return .{ .binary = binary, .header = header, .scrypt_scratch = scratch[split..] };
 }
 
 pub fn stanzaSize(options: Options) usize {
     if (options.password.len != 0) {
         const digits: usize = if (options.work_factor < 10) 1 else 2;
-        return 10 + 22 + 1 + digits + 1 + 44;
+        return 10 + b64Len(16) + 1 + digits + 1 + b64Len(file_key_len + 16) + 1;
     }
-    return 10 + 43 + 1 + 44;
+    return 10 + b64Len(32) + 1 + b64Len(file_key_len + 16) + 1;
 }
 
 pub fn headerSize(options: Options) usize {
@@ -803,22 +666,10 @@ pub fn encode(entries: []const Entry, output: []u8, scratch: []u8, options: Opti
         try encryptPayload(file_key, entries[0].data, output[written..]);
         return total;
     }
-    const binary_len = header_len + payload_len;
-    const staging = fba.allocator().alloc(u8, binary_len) catch return error.ResourceException;
+    const staging = fba.allocator().alloc(u8, header_len + payload_len) catch return error.ResourceException;
     const written = try writeHeader(file_key, stanzas, staging[0..header_len]);
     try encryptPayload(file_key, entries[0].data, staging[written..]);
     return armorEncode(staging, output);
-}
-
-// Parse-time allocations live in an arena over the front half of the
-// caller scratch; the scrypt KDF carves its peak memory from the back half.
-fn peelAndParse(input: []const u8, scratch: []u8) Exception!struct { binary: []const u8, header: Header, scrypt_scratch: []u8 } {
-    const split = scratch.len / 2;
-    var fba = std.heap.FixedBufferAllocator.init(scratch[0..split]);
-    var arena = std.heap.ArenaAllocator.init(fba.allocator());
-    const peeled = try dearmor(input, arena.allocator());
-    const header = try parseHeader(peeled.binary, arena.allocator());
-    return .{ .binary = peeled.binary, .header = header, .scrypt_scratch = scratch[split..] };
 }
 
 pub fn inspectCount(input: []const u8, scratch: []u8) Exception!u64 {
@@ -833,14 +684,12 @@ pub fn decodedSize(input: []const u8, options: Options, scratch: []u8) Exception
     try verifyHeaderMac(parsed.binary, parsed.header, file_key);
     const payload = parsed.binary[parsed.header.payload_offset..];
     const n = try chunkCount(payload.len - 16);
-    const total = payload.len - 16;
-    return total - n * 16;
+    return payload.len - 16 - n * 16;
 }
 
 pub fn inspectOrdinal(input: []const u8, ordinal: u64, options: Options, scratch: []u8) Exception!EntryInfo {
     if (ordinal != 0) return error.DataException;
-    const size = try decodedSize(input, options, scratch);
-    return .{ .size = size, .ordinal = 0 };
+    return .{ .size = try decodedSize(input, options, scratch), .ordinal = 0 };
 }
 
 pub fn decodeOrdinal(input: []const u8, ordinal: u64, output: []u8, scratch: []u8, options: Options) Exception!usize {
@@ -850,9 +699,6 @@ pub fn decodeOrdinal(input: []const u8, ordinal: u64, output: []u8, scratch: []u
     try verifyHeaderMac(parsed.binary, parsed.header, file_key);
     return decryptPayload(file_key, parsed.binary[parsed.header.payload_offset..], output);
 }
-
-const testing = std.testing;
-
 // CCTV age testdata/x25519: expect success, payload 013f54400c82da08037759ada907a8b8...
 const vec_x25519 = [_]u8{
     0x61, 0x67, 0x65, 0x2d, 0x65, 0x6e, 0x63, 0x72, 0x79, 0x70, 0x74, 0x69, 0x6f, 0x6e, 0x2e, 0x6f,
@@ -1041,6 +887,8 @@ const vec_stream_trailing_garbage_short = [_]u8{
 };
 const meta_stream_trailing_garbage_short_identity = "AGE-SECRET-KEY-1EGTZVFFV20835NWYV6270LXYVK2VKNX2MMDKWYKLMGR48UAWX40Q2P2LM0";
 
+const testing = std.testing;
+
 fn hexToBytes(comptime hex: []const u8) [hex.len / 2]u8 {
     var out: [hex.len / 2]u8 = undefined;
     _ = std.fmt.hexToBytes(&out, hex) catch unreachable;
@@ -1095,20 +943,17 @@ test "CCTV negative vectors reject" {
 
 test "base64 raw round trip and canonical rejection" {
     const plain = "Nobody inspects the spammish repetition";
-    var encoded: [b64EncodedLen(plain.len)]u8 = undefined;
-    b64Encode(&encoded, plain);
-    try testing.expectEqualStrings("Tm9ib2R5IGluc3BlY3RzIHRoZSBzcGFtbWlzaCByZXBldGl0aW9u", &encoded);
+    var encoded: [b64Len(plain.len)]u8 = undefined;
+    try testing.expectEqualStrings("Tm9ib2R5IGluc3BlY3RzIHRoZSBzcGFtbWlzaCByZXBldGl0aW9u", b64.Encoder.encode(&encoded, plain));
     var decoded: [plain.len]u8 = undefined;
-    try b64Decode(&decoded, &encoded);
+    try decodeB64(&decoded, &encoded);
     try testing.expectEqualStrings(plain, &decoded);
     // Non-canonical trailing bits in a partial group: "TW" keeps 4 bits that
-    // must be zero in canonical encoding.
-    var bad: [2]u8 = .{ 'T', 'W' };
+    // must be zero in canonical encoding; padding is never legal unpadded.
     var one: [1]u8 = undefined;
-    try testing.expectError(error.DataException, b64Decode(&one, &bad));
-    var padded: [3]u8 = .{ 'T', 'W', '=' };
+    try testing.expectError(error.DataException, decodeB64(&one, "TW"));
     var two: [2]u8 = undefined;
-    try testing.expectError(error.DataException, b64Decode(&two, &padded));
+    try testing.expectError(error.DataException, decodeB64(&two, "TW="));
 }
 
 test "bech32 identity round trip" {
