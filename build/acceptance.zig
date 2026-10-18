@@ -209,6 +209,10 @@ fn addOraclesUbsan(b: *std.Build, ctx: *common.Settings, refs: reference.Refs) v
     const c_module = translateCModule(b, ctx.target, ctx.optimize);
 
     const app = addOracleApp(b, &ubsan_ctx, refs, "ubsan", "baseline", modules_pair, c_module, ubsan_ctx.host, "ubsan", "Run the oracle suite with UBSan");
+    if (b.option([]const u8, "suite", "Restrict the ubsan oracle run to one suite")) |suite| {
+        app.run.addArg("--suite");
+        app.run.addArg(suite);
+    }
     refs.dependOnTools(&app.run.step);
     app.run.step.dependOn(&addTrapRun(b, &ubsan_ctx, ctx.target, ctx.optimize, "oracles_trap_ubsan").step);
     app.run.step.dependOn(&addContractCheck(b, modules_pair.interface, modules_pair.components, ctx.target, ctx.optimize, .full, "contract_check_ubsan", ctx.generated.catalog).step);
