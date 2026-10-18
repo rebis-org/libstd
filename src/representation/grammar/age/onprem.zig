@@ -1,6 +1,6 @@
-const builtin = @import("builtin");
 const std = @import("std");
 
+const crypto_prim = @import("../../../common/primitive/crypto.zig");
 const exception_prim = @import("../../../common/primitive/exception.zig");
 
 pub const Exception = exception_prim.Exception;
@@ -74,25 +74,6 @@ fn decodeB64Alloc(alloc: std.mem.Allocator, src: []const u8) Exception![]u8 {
     const dst = alloc.alloc(u8, n) catch return error.ResourceException;
     try decodeB64(dst, src);
     return dst;
-}
-
-// OS entropy without a libc dependency on Linux: the getrandom syscall
-// directly, libc's arc4random_buf on Apple platforms.
-fn randomBytes(comptime n: usize) [n]u8 {
-    var out: [n]u8 = undefined;
-    switch (builtin.target.os.tag) {
-        .linux => {
-            var filled: usize = 0;
-            while (filled < n) {
-                const rc = std.os.linux.getrandom(out[filled..].ptr, n - filled, 0);
-                if (std.os.linux.E.init(rc) != .SUCCESS) @panic("getrandom failed");
-                filled += rc;
-            }
-        },
-        .macos, .ios, .tvos, .watchos, .visionos => std.c.arc4random_buf(&out, n),
-        else => @compileError("age: no OS entropy source for this target"),
-    }
-    return out;
 }
 
 // Bech32 per BIP 173 without length limits; the lowercase-checksum rule is
@@ -233,6 +214,12 @@ fn bech32Key(text: []const u8, comptime hrp: []const u8) Exception![32]u8 {
     const decoded = try bech32Decode(text, &hrp_buf, &data);
     if (!std.mem.eql(u8, decoded.hrp, hrp) or decoded.data.len != 32) return error.DataException;
     return decoded.data[0..32].*;
+}
+
+fn randomIdentity() Identity {
+    var secret: [32]u8 = undefined;
+    crypto_prim.fillRandom(&secret) catch @panic("OS entropy failed");
+    return .{ .secret = secret };
 }
 
 pub const Identity = struct {
@@ -390,7 +377,8 @@ fn wrapStanzas(file_key: [file_key_len]u8, options: Options, alloc: std.mem.Allo
     var list: std.ArrayListUnmanaged(Stanza) = .empty;
     if (options.password.len != 0) {
         if (options.work_factor < 1 or options.work_factor > scrypt_work_factor_max) return error.UnsupportedException;
-        const salt: [16]u8 = randomBytes(16);
+        var salt: [16]u8 = undefined;
+        try crypto_prim.fillRandom(&salt);
         var salt_b64: [b64Len(16)]u8 = undefined;
         const wrap_key = try scryptWrapKey(options.password, salt, options.work_factor, scratch);
         const args = alloc.alloc([]const u8, 3) catch return error.ResourceException;
@@ -402,7 +390,8 @@ fn wrapStanzas(file_key: [file_key_len]u8, options: Options, alloc: std.mem.Allo
         return list.items;
     }
     const recipient = Recipient.fromString(options.recipient) catch return error.CallException;
-    const ephemeral: [32]u8 = randomBytes(32);
+    var ephemeral: [32]u8 = undefined;
+    try crypto_prim.fillRandom(&ephemeral);
     const share = X25519.recoverPublicKey(ephemeral);
     const shared = X25519.scalarmult(ephemeral, recipient.public) catch return error.InternalException;
     const wrap_key = x25519WrapKey(shared, share, recipient.public);
@@ -505,7 +494,8 @@ fn chunkNonce(counter: u64, final: bool) [12]u8 {
 
 fn encryptPayload(file_key: [file_key_len]u8, source: []const u8, dest: []u8) Exception!void {
     if (dest.len < payloadCiphertextLen(source.len)) return error.CapacityException;
-    const nonce: [16]u8 = randomBytes(16);
+    var nonce: [16]u8 = undefined;
+    try crypto_prim.fillRandom(&nonce);
     dest[0..16].* = nonce;
     const key = payloadKey(file_key, nonce);
     var offset: usize = 16;
@@ -655,7 +645,8 @@ pub fn encode(entries: []const Entry, output: []u8, scratch: []u8, options: Opti
     // peak memory (128 * r * N) is carved from the back half.
     const split = scratch.len / 2;
     var fba = std.heap.FixedBufferAllocator.init(scratch[0..split]);
-    const file_key: [file_key_len]u8 = randomBytes(file_key_len);
+    var file_key: [file_key_len]u8 = undefined;
+    try crypto_prim.fillRandom(&file_key);
     const stanzas = try wrapStanzas(file_key, options, fba.allocator(), scratch[split..]);
     const header_len = headerSize(options);
     const payload_len = payloadCiphertextLen(entries[0].data.len);
@@ -971,7 +962,8 @@ test "bech32 identity round trip" {
 
 test "x25519 passwordless round trip" {
     var id_buf: [80]u8 = undefined;
-    const secret: [32]u8 = randomBytes(32);
+    var secret: [32]u8 = undefined;
+    try crypto_prim.fillRandom(&secret);
     const identity = Identity{ .secret = secret };
     const identity_text = try identity.toString(&id_buf);
     var rec_buf: [100]u8 = undefined;
@@ -1004,7 +996,7 @@ test "armor round trip and garbage rejection" {
     var out: [4096]u8 = undefined;
     const options = Options{ .recipient = "", .password = "pw", .work_factor = 4, .armor = true };
     _ = options;
-    const id = Identity{ .secret = randomBytes(32) };
+    const id = randomIdentity();
     var id_buf: [80]u8 = undefined;
     var rec_buf: [100]u8 = undefined;
     const written = try encode(&entries, &out, &scratch, .{ .recipient = try id.recipientString(&rec_buf), .armor = true });
@@ -1025,7 +1017,7 @@ test "multi chunk payload round trip" {
     const entries = [_]Entry{.{ .name = "payload", .data = &payload }};
     var scratch: [256 * 1024]u8 = undefined;
     var out: [220 * 1024]u8 = undefined;
-    const id = Identity{ .secret = randomBytes(32) };
+    const id = randomIdentity();
     var id_buf: [80]u8 = undefined;
     var rec_buf: [100]u8 = undefined;
     const options = Options{ .recipient = try id.recipientString(&rec_buf) };
@@ -1046,7 +1038,7 @@ test "empty payload round trip" {
     const entries = [_]Entry{.{ .name = "payload", .data = "" }};
     var scratch: [256 * 1024]u8 = undefined;
     var out: [4096]u8 = undefined;
-    const id = Identity{ .secret = randomBytes(32) };
+    const id = randomIdentity();
     var id_buf: [80]u8 = undefined;
     var rec_buf: [100]u8 = undefined;
     const written = try encode(&entries, &out, &scratch, .{ .recipient = try id.recipientString(&rec_buf) });
