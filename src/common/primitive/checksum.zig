@@ -411,13 +411,29 @@ fn TableCrc(comptime T: type, comptime poly: T, comptime reflected: bool) type {
                         return;
                     }
                 }
+                // Slicing-by-8 per the xz generic path (crc32_fast.c) halves
+                // the table lookups per byte.
                 var crc = self.state;
                 var i: usize = 0;
-                while (i + 4 <= input.len) : (i += 4) {
-                    crc = tables[3][@as(usize, @intCast((crc ^ input[i]) & 0xff))] ^
-                        tables[2][@as(usize, @intCast(((crc >> 8) ^ input[i + 1]) & 0xff))] ^
-                        tables[1][@as(usize, @intCast(((crc >> 16) ^ input[i + 2]) & 0xff))] ^
-                        tables[0][@as(usize, @intCast(((crc >> 24) ^ input[i + 3]) & 0xff))];
+                while (i + 8 <= input.len) : (i += 8) {
+                    const w = crc ^ std.mem.readInt(u32, input[i..][0..4], .little);
+                    const v = std.mem.readInt(u32, input[i + 4 ..][0..4], .little);
+                    crc = tables[7][@as(usize, @intCast(w & 0xff))] ^
+                        tables[6][@as(usize, @intCast((w >> 8) & 0xff))] ^
+                        tables[5][@as(usize, @intCast((w >> 16) & 0xff))] ^
+                        tables[4][@as(usize, @intCast((w >> 24) & 0xff))] ^
+                        tables[3][@as(usize, @intCast(v & 0xff))] ^
+                        tables[2][@as(usize, @intCast((v >> 8) & 0xff))] ^
+                        tables[1][@as(usize, @intCast((v >> 16) & 0xff))] ^
+                        tables[0][@as(usize, @intCast((v >> 24) & 0xff))];
+                }
+                if (i + 4 <= input.len) {
+                    const w = crc ^ std.mem.readInt(u32, input[i..][0..4], .little);
+                    crc = tables[3][@as(usize, @intCast(w & 0xff))] ^
+                        tables[2][@as(usize, @intCast((w >> 8) & 0xff))] ^
+                        tables[1][@as(usize, @intCast((w >> 16) & 0xff))] ^
+                        tables[0][@as(usize, @intCast((w >> 24) & 0xff))];
+                    i += 4;
                 }
                 while (i < input.len) : (i += 1) {
                     crc = (crc >> 8) ^ table[@as(usize, @intCast((crc ^ input[i]) & 0xff))];
@@ -432,30 +448,56 @@ fn TableCrc(comptime T: type, comptime poly: T, comptime reflected: bool) type {
                         return;
                     }
                 }
-                // Slicing-by-4 over little-endian words; the 64-bit fold keeps
-                // the upper half via the trailing shift.
+                // Slicing-by-8 over the full register (xz crc64_fast.c shape);
+                // a 64-bit register folds in one step, no upper-half rescue.
                 var crc = self.state;
                 var i: usize = 0;
-                while (i + 4 <= input.len) : (i += 4) {
-                    crc = tables[3][(crc ^ input[i]) & 0xff] ^
-                        tables[2][((crc >> 8) ^ input[i + 1]) & 0xff] ^
-                        tables[1][((crc >> 16) ^ input[i + 2]) & 0xff] ^
-                        tables[0][((crc >> 24) ^ input[i + 3]) & 0xff] ^ (crc >> 32);
+                while (i + 8 <= input.len) : (i += 8) {
+                    const w = crc ^ std.mem.readInt(u64, input[i..][0..8], .little);
+                    crc = tables[7][@as(usize, @intCast(w & 0xff))] ^
+                        tables[6][@as(usize, @intCast((w >> 8) & 0xff))] ^
+                        tables[5][@as(usize, @intCast((w >> 16) & 0xff))] ^
+                        tables[4][@as(usize, @intCast((w >> 24) & 0xff))] ^
+                        tables[3][@as(usize, @intCast((w >> 32) & 0xff))] ^
+                        tables[2][@as(usize, @intCast((w >> 40) & 0xff))] ^
+                        tables[1][@as(usize, @intCast((w >> 48) & 0xff))] ^
+                        tables[0][@as(usize, @intCast((w >> 56) & 0xff))];
+                }
+                if (i + 4 <= input.len) {
+                    const w: u64 = @as(u64, @truncate(crc)) ^ std.mem.readInt(u32, input[i..][0..4], .little);
+                    crc = tables[3][@as(usize, @intCast(w & 0xff))] ^
+                        tables[2][@as(usize, @intCast((w >> 8) & 0xff))] ^
+                        tables[1][@as(usize, @intCast((w >> 16) & 0xff))] ^
+                        tables[0][@as(usize, @intCast((w >> 24) & 0xff))] ^ (crc >> 32);
+                    i += 4;
                 }
                 while (i < input.len) : (i += 1) {
                     crc = (crc >> 8) ^ table[(crc ^ input[i]) & 0xff];
                 }
                 self.state = crc;
             } else {
-                // Slicing-by-4 over big-endian words (zlib braid structure).
+                // Slicing-by-8 over big-endian words (xz crc32_table_be.h braid).
                 var crc = self.state;
                 var i: usize = 0;
-                while (i + 4 <= input.len) : (i += 4) {
+                while (i + 8 <= input.len) : (i += 8) {
+                    crc ^= std.mem.readInt(u32, input[i..][0..4], .big);
+                    crc = tables[7][(crc >> 24) & 0xff] ^
+                        tables[6][((crc >> 16) & 0xff)] ^
+                        tables[5][((crc >> 8) & 0xff)] ^
+                        tables[4][crc & 0xff];
+                    const v = std.mem.readInt(u32, input[i + 4 ..][0..4], .big);
+                    crc ^= tables[3][(v >> 24) & 0xff] ^
+                        tables[2][((v >> 16) & 0xff)] ^
+                        tables[1][((v >> 8) & 0xff)] ^
+                        tables[0][v & 0xff];
+                }
+                if (i + 4 <= input.len) {
                     crc ^= std.mem.readInt(u32, input[i..][0..4], .big);
                     crc = tables[3][(crc >> 24) & 0xff] ^
                         tables[2][((crc >> 16) & 0xff)] ^
                         tables[1][((crc >> 8) & 0xff)] ^
                         tables[0][crc & 0xff];
+                    i += 4;
                 }
                 while (i < input.len) : (i += 1) {
                     crc = (crc << 8) ^ table[((crc >> (bits - 8)) ^ input[i]) & 0xff];
@@ -487,21 +529,21 @@ fn TableCrc(comptime T: type, comptime poly: T, comptime reflected: bool) type {
             break :blk t;
         };
 
-        const tables: [4][256]T = blk: {
-            @setEvalBranchQuota(10000);
-            var t: [4][256]T = undefined;
+        const tables: [8][256]T = blk: {
+            @setEvalBranchQuota(20000);
+            var t: [8][256]T = undefined;
             if (reflected) {
                 for (0..256) |i| {
                     var crc: T = table[i];
                     t[0][i] = crc;
-                    for (1..4) |k| {
+                    for (1..8) |k| {
                         crc = table[@intCast(crc & 0xff)] ^ (crc >> 8);
                         t[k][i] = crc;
                     }
                 }
             } else {
                 for (0..256) |i| t[0][i] = table[i];
-                for (1..4) |k| {
+                for (1..8) |k| {
                     for (0..256) |i| {
                         const prev = t[k - 1][i];
                         t[k][i] = (prev << 8) ^ table[(prev >> (bits - 8)) & 0xff];
