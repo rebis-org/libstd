@@ -73,3 +73,6 @@
 [submodule "vendor/cpio"]
 	path = vendor/cpio
 	url = https://github.com/rebis-org/cpio.git
+[submodule "vendor/age"]
+	path = vendor/age
+	url = git@github.com:FiloSottile/age.git
