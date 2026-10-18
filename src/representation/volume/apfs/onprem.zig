@@ -826,7 +826,6 @@ const PlanNode = struct {
     is_dir: bool,
     ino: u64 = 0,
     data: []const u8 = &.{},
-    data_block: u64 = 0,
     parent: *PlanNode,
     kids: std.ArrayListUnmanaged(*PlanNode) = .empty,
     rank: usize = 0,
@@ -835,8 +834,8 @@ const PlanNode = struct {
 const LevelSpan = struct { start: u32, end: u32 };
 
 const TreeLevel = struct {
-    // Each entry points at a child node one level below (or at a record
-    // range for leaves); first_key is the first key of that subtree.
+    // Internal descent compares first keys, so each span's first_key must
+    // be the first key of that subtree.
     first_keys: []const []const u8,
     spans: []const LevelSpan, // children grouped into this level's nodes
 };
@@ -856,7 +855,7 @@ const WriterPlan = struct {
     vol_omap_levels: []TreeLevel, // volume omap levels over fs nodes
     fs_first_block: u64,
     data_start: u64,
-    file_blocks: []u64,
+    files: []const *PlanNode,
 };
 
 fn componentValid(name: []const u8) bool {
@@ -943,26 +942,30 @@ fn rankNode(node: *PlanNode, next_ino: *u64, next_rank: *usize, is_root: bool) E
 }
 
 // Generation order (pre-order over increasing inode numbers) is already
-// fsKeyCompare order, so records need no sort.
-fn emitRecords(root: *PlanNode, alloc: std.mem.Allocator) Exception![]FsRec {
-    var records: std.ArrayListUnmanaged(FsRec) = .empty;
-    try emitNodeRecords(root, &records, alloc);
-    return records.items;
-}
-
-fn emitNodeRecords(node: *PlanNode, records: *std.ArrayListUnmanaged(FsRec), alloc: std.mem.Allocator) Exception!void {
+// fsKeyCompare order, so records need no sort. Non-empty files also land in
+// `files`, parallel to `extent_idx`, so data blocks can be assigned by
+// position instead of by a search.
+fn emitNodeRecords(
+    node: *PlanNode,
+    records: *std.ArrayListUnmanaged(FsRec),
+    files: *std.ArrayListUnmanaged(*PlanNode),
+    extent_idx: *std.ArrayListUnmanaged(usize),
+    alloc: std.mem.Allocator,
+) Exception!void {
     if (node.is_dir) {
         records.append(alloc, .{ .id = node.ino, .rec_type = rec_type_inode, .val_kind = .inode_dir }) catch return error.ResourceException;
         for (node.kids.items) |kid| {
             records.append(alloc, .{ .id = node.ino, .rec_type = rec_type_dir_rec, .name = kid.name, .val_kind = .drec, .file_id = kid.ino }) catch return error.ResourceException;
         }
         for (node.kids.items) |kid| {
-            try emitNodeRecords(kid, records, alloc);
+            try emitNodeRecords(kid, records, files, extent_idx, alloc);
         }
     } else {
         records.append(alloc, .{ .id = node.ino, .rec_type = rec_type_inode, .val_kind = .inode_file, .size = node.data.len }) catch return error.ResourceException;
         if (node.data.len != 0) {
+            files.append(alloc, node) catch return error.ResourceException;
             records.append(alloc, .{ .id = node.ino, .rec_type = rec_type_file_extent, .val_kind = .extent, .size = node.data.len }) catch return error.ResourceException;
+            extent_idx.append(alloc, records.items.len - 1) catch return error.ResourceException;
         }
     }
 }
@@ -986,9 +989,32 @@ fn packNodes(costs: []const usize, capacity: usize, alloc: std.mem.Allocator) Ex
     return spans.items;
 }
 
+fn buildOmapLevels(first_keys: []const []const u8, alloc: std.mem.Allocator) Exception![]TreeLevel {
+    var levels: std.ArrayListUnmanaged(TreeLevel) = .empty;
+    const leaf_costs = alloc.alloc(usize, first_keys.len) catch return error.ResourceException;
+    for (leaf_costs) |*cost| cost.* = 4 + 16 + 16;
+    const capacity = writer_block_size - btree_node_header_size - btree_info_size;
+    const leaf_spans = try packNodes(leaf_costs, capacity, alloc);
+    levels.append(alloc, .{ .first_keys = first_keys, .spans = leaf_spans }) catch return error.ResourceException;
+    while (levels.items[levels.items.len - 1].spans.len > 1) {
+        const below = levels.items[levels.items.len - 1];
+        const costs = alloc.alloc(usize, below.spans.len) catch return error.ResourceException;
+        for (costs) |*cost| cost.* = 4 + 16 + 8;
+        const spans = try packNodes(costs, capacity, alloc);
+        const firsts = alloc.alloc([]const u8, below.spans.len) catch return error.ResourceException;
+        for (below.spans, 0..) |span, i| firsts[i] = below.first_keys[span.start];
+        levels.append(alloc, .{ .first_keys = firsts, .spans = spans }) catch return error.ResourceException;
+    }
+    return levels.items;
+}
+
 fn makePlan(entries: []const Entry, alloc: std.mem.Allocator) Exception!WriterPlan {
     const root = try buildTree(entries, alloc);
-    const records = try emitRecords(root, alloc);
+    var records_list: std.ArrayListUnmanaged(FsRec) = .empty;
+    var files: std.ArrayListUnmanaged(*PlanNode) = .empty;
+    var extent_idx: std.ArrayListUnmanaged(usize) = .empty;
+    try emitNodeRecords(root, &records_list, &files, &extent_idx, alloc);
+    const records = records_list.items;
 
     const keys = alloc.alloc([]const u8, records.len) catch return error.ResourceException;
     const vals = alloc.alloc([]const u8, records.len) catch return error.ResourceException;
@@ -1025,47 +1051,23 @@ fn makePlan(entries: []const Entry, alloc: std.mem.Allocator) Exception!WriterPl
     // Every virtual fs node needs an (oid, xid) -> paddr entry here;
     // 7-Zip resolves the fs tree root through this map unconditionally.
     const fs_node_count = levelNodeCount(levels.items);
-    var vol_levels: std.ArrayListUnmanaged(TreeLevel) = .empty;
-    {
-        const entry_keys = alloc.alloc([]const u8, fs_node_count) catch return error.ResourceException;
-        const key_storage = alloc.alloc([16]u8, fs_node_count) catch return error.ResourceException;
-        for (0..fs_node_count) |i| {
-            std.mem.writeInt(u64, key_storage[i][0..8], fs_oid_base + @as(u64, @intCast(i)), .little);
-            std.mem.writeInt(u64, key_storage[i][8..16], writer_xid, .little);
-            entry_keys[i] = &key_storage[i];
-        }
-        // Fixed-size nodes: leaf entry 4 + 16 + 16 bytes; internal entry
-        // 4 + 16 + 8. The root of each level pays the footer on top.
-        const vol_leaf_capacity = writer_block_size - btree_node_header_size - btree_info_size;
-        const vol_leaf_costs = alloc.alloc(usize, fs_node_count) catch return error.ResourceException;
-        for (vol_leaf_costs) |*cost| cost.* = 4 + 16 + 16;
-        const vol_leaf_spans = packNodes(vol_leaf_costs, vol_leaf_capacity, alloc) catch return error.ResourceException;
-        vol_levels.append(alloc, .{ .first_keys = entry_keys, .spans = vol_leaf_spans }) catch return error.ResourceException;
-        while (vol_levels.items[vol_levels.items.len - 1].spans.len > 1) {
-            const below = vol_levels.items[vol_levels.items.len - 1];
-            const vol_below_costs = alloc.alloc(usize, below.spans.len) catch return error.ResourceException;
-            for (vol_below_costs) |*cost| cost.* = 4 + 16 + 8;
-            const vol_internal_capacity = writer_block_size - btree_node_header_size - btree_info_size;
-            const vol_spans = packNodes(vol_below_costs, vol_internal_capacity, alloc) catch return error.ResourceException;
-            const firsts = alloc.alloc([]const u8, below.spans.len) catch return error.ResourceException;
-            for (below.spans, 0..) |span, i| firsts[i] = below.first_keys[span.start];
-            vol_levels.append(alloc, .{ .first_keys = firsts, .spans = vol_spans }) catch return error.ResourceException;
-        }
+    const entry_keys = alloc.alloc([]const u8, fs_node_count) catch return error.ResourceException;
+    const key_storage = alloc.alloc([16]u8, fs_node_count) catch return error.ResourceException;
+    for (0..fs_node_count) |i| {
+        std.mem.writeInt(u64, key_storage[i][0..8], fs_oid_base + @as(u64, @intCast(i)), .little);
+        std.mem.writeInt(u64, key_storage[i][8..16], writer_xid, .little);
+        entry_keys[i] = &key_storage[i];
     }
+    const vol_levels = try buildOmapLevels(entry_keys, alloc);
 
-    const fs_first_block = writer_volume_omap_first_block + levelNodeCount(vol_levels.items);
+    const fs_first_block = writer_volume_omap_first_block + levelNodeCount(vol_levels);
     const data_start = fs_first_block + fs_node_count;
-    var file_count: usize = 0;
-    countFiles(root, &file_count);
-    const file_blocks = alloc.alloc(u64, file_count) catch return error.ResourceException;
+    // Data blocks follow the fs nodes in emission order; extent records are
+    // patched by position, not by a search.
     var cursor = data_start;
-    var file_index: usize = 0;
-    assignFileBlocks(root, &cursor, file_blocks, &file_index);
-    for (records) |*rec| {
-        if (rec.val_kind == .extent) {
-            const file_node = findNodeByIno(root, rec.id) orelse return error.InternalException;
-            rec.phys = file_node.data_block;
-        }
+    for (files.items, extent_idx.items) |file, rec_idx| {
+        records_list.items[rec_idx].phys = cursor;
+        cursor += (file.data.len + writer_block_size - 1) / writer_block_size;
     }
     for (records, 0..) |rec, i| {
         vals[i] = val_bufs[i][0..writeFsVal(&val_bufs[i], rec)];
@@ -1077,39 +1079,11 @@ fn makePlan(entries: []const Entry, alloc: std.mem.Allocator) Exception!WriterPl
         .keys = keys,
         .vals = vals,
         .levels = levels.items,
-        .vol_omap_levels = vol_levels.items,
+        .vol_omap_levels = vol_levels,
         .fs_first_block = fs_first_block,
         .data_start = data_start,
-        .file_blocks = file_blocks,
+        .files = files.items,
     };
-}
-
-fn findNodeByIno(node: *PlanNode, ino: u64) ?*PlanNode {
-    if (!node.is_dir and node.ino == ino) return node;
-    for (node.kids.items) |kid| {
-        const found = findNodeByIno(kid, ino);
-        if (found) |hit| return hit;
-    }
-    return null;
-}
-
-fn countFiles(node: *PlanNode, count: *usize) void {
-    for (node.kids.items) |kid| {
-        if (kid.is_dir) countFiles(kid, count) else count.* += 1;
-    }
-}
-
-fn assignFileBlocks(node: *PlanNode, cursor: *u64, blocks: []u64, index: *usize) void {
-    for (node.kids.items) |kid| {
-        if (kid.is_dir) {
-            assignFileBlocks(kid, cursor, blocks, index);
-        } else if (kid.data.len != 0) {
-            blocks[index.*] = cursor.*;
-            kid.data_block = cursor.*;
-            index.* += 1;
-            cursor.* += (kid.data.len + writer_block_size - 1) / writer_block_size;
-        }
-    }
 }
 
 fn blockAt(output: []u8, index: u64) Exception![]u8 {
@@ -1140,78 +1114,55 @@ fn writeOmapObject(block: []u8, oid: u64, tree_block: u64) void {
     seal(block);
 }
 
-fn writeOmapTree(block: []u8, oid: u64, entries: []const OmapEntry) void {
-    @memset(block, 0);
-    writeObj(block, oid, writer_xid, obj_flag_physical | obj_type_btree, obj_subtype_omap);
-    std.mem.writeInt(u16, block[0x20..0x22], btn_flag_root | btn_flag_leaf | btn_flag_fixed_kv, .little);
-    std.mem.writeInt(u16, block[0x22..0x24], 0, .little);
-    std.mem.writeInt(u32, block[0x24..0x28], @intCast(entries.len), .little);
-    const table_len = entries.len * 4;
-    std.mem.writeInt(u16, block[0x28..0x2a], 0, .little);
-    std.mem.writeInt(u16, block[0x2a..0x2c], @intCast(table_len), .little);
-    const key_area = btree_node_header_size + table_len;
-    const end = block.len - btree_info_size;
-    var key_pos = key_area;
-    var val_pos = end;
-    var toc: usize = btree_node_header_size;
-    for (entries) |entry| {
-        var key: [16]u8 = undefined;
-        var val: [16]u8 = undefined;
-        std.mem.writeInt(u64, key[0..8], entry.oid, .little);
-        std.mem.writeInt(u64, key[8..16], writer_xid, .little);
-        std.mem.writeInt(u32, val[0..4], 0, .little);
-        std.mem.writeInt(u32, val[4..8], writer_block_size, .little); // object size in bytes (7-Zip requires this) v2
-        std.mem.writeInt(u64, val[8..16], entry.paddr, .little);
-        val_pos -= val.len;
-        @memcpy(block[key_pos..][0..key.len], &key);
-        @memcpy(block[val_pos..][0..val.len], &val);
-        std.mem.writeInt(u16, block[toc..][0..2], @intCast(key_pos - key_area), .little);
-        std.mem.writeInt(u16, block[toc + 2 ..][0..2], @intCast(end - val_pos), .little);
-        key_pos += key.len;
-        toc += 4;
+// Writes one fixed-size b-tree per level, leaves first. Leaf values are
+// 16-byte omap values pointing at leaf_paddr_base + entry; internal values
+// are 8-byte child block numbers.
+fn writeOmapTree(
+    output: []u8,
+    fba: *std.heap.FixedBufferAllocator,
+    levels: []const TreeLevel,
+    first_block: u64,
+    leaf_paddr_base: u64,
+    key_count: u64,
+    node_count: u64,
+) Exception!void {
+    var cursor = first_block;
+    var child_blocks: []u64 = &.{};
+    for (levels, 0..) |lvl, level| {
+        const spans = lvl.spans;
+        const blocks = fba.allocator().alloc(u64, spans.len) catch return error.ResourceException;
+        for (spans, 0..) |span, i| {
+            const block = try blockAt(output, cursor + @as(u64, @intCast(i)));
+            const oid = cursor + @as(u64, @intCast(i));
+            const pairs = fba.allocator().alloc(KVPair, fsPairCount(span)) catch return error.ResourceException;
+            if (level == 0) {
+                for (pairs, 0..) |*pair, j| {
+                    const entry = span.start + @as(u32, @intCast(j));
+                    var val: [16]u8 = undefined;
+                    std.mem.writeInt(u32, val[0..4], 0, .little);
+                    std.mem.writeInt(u32, val[4..8], writer_block_size, .little);
+                    std.mem.writeInt(u64, val[8..16], leaf_paddr_base + entry, .little);
+                    pair.* = .{ .key = levels[0].first_keys[entry], .val = try dupBytes(fba, &val) };
+                }
+            } else {
+                for (pairs, 0..) |*pair, j| {
+                    const child = span.start + @as(u32, @intCast(j));
+                    var val: [8]u8 = undefined;
+                    std.mem.writeInt(u64, &val, child_blocks[child], .little);
+                    pair.* = .{ .key = levels[level - 1].first_keys[child], .val = try dupBytes(fba, &val) };
+                }
+            }
+            const is_root = level == levels.len - 1;
+            writeFixedNode(block, oid, writer_xid, obj_subtype_omap, true, (if (level == 0) btn_flag_leaf else 0) | btn_flag_fixed_kv | (if (is_root) btn_flag_root else 0), @intCast(level), btinfo_flag_physical, 16, 16, pairs, is_root, key_count, node_count);
+            blocks[i] = oid;
+        }
+        child_blocks = blocks;
+        cursor += spans.len;
     }
-    writeBtreeFooter(block, btinfo_flag_physical, 16, 16, @intCast(entries.len), 1);
-    seal(block);
 }
 
 // A fixed-size omap node (the volume object map): leaf values are 16-byte
 // omap values, internal values are 8-byte child block numbers.
-fn writeOmapFixedNode(
-    block: []u8,
-    oid: u64,
-    node_flags: u16,
-    level: u16,
-    pairs: []const KVPair,
-    root: bool,
-    key_count: u64,
-    node_count: u64,
-) void {
-    @memset(block, 0);
-    writeObj(block, oid, writer_xid, obj_flag_physical | (if (root) obj_type_btree else obj_type_btree_node), obj_subtype_omap);
-    std.mem.writeInt(u16, block[0x20..0x22], node_flags, .little);
-    std.mem.writeInt(u16, block[0x22..0x24], level, .little);
-    std.mem.writeInt(u32, block[0x24..0x28], @intCast(pairs.len), .little);
-    const table_len = pairs.len * 4;
-    std.mem.writeInt(u16, block[0x28..0x2a], 0, .little);
-    std.mem.writeInt(u16, block[0x2a..0x2c], @intCast(table_len), .little);
-    const key_area = btree_node_header_size + table_len;
-    const end = if (root) block.len - btree_info_size else block.len;
-    var key_pos = key_area;
-    var val_pos = end;
-    var toc: usize = btree_node_header_size;
-    for (pairs) |pair| {
-        val_pos -= pair.val.len;
-        @memcpy(block[key_pos..][0..pair.key.len], pair.key);
-        @memcpy(block[val_pos..][0..pair.val.len], pair.val);
-        std.mem.writeInt(u16, block[toc..][0..2], @intCast(key_pos - key_area), .little);
-        std.mem.writeInt(u16, block[toc + 2 ..][0..2], @intCast(end - val_pos), .little);
-        key_pos += pair.key.len;
-        toc += 4;
-    }
-    if (root) writeBtreeFooter(block, btinfo_flag_physical, 16, 16, key_count, node_count);
-    seal(block);
-}
-
 fn writeVolume(block: []u8, fs_root_oid: u64) void {
     @memset(block, 0);
     writeObj(block, volume_oid, writer_xid, obj_type_fs, 0);
@@ -1224,44 +1175,6 @@ fn writeVolume(block: []u8, fs_root_oid: u64) void {
 }
 
 // Variable-size fs node, virtual like the fixture's fs tree.
-fn writeFsNode(
-    block: []u8,
-    oid: u64,
-    node_flags: u16,
-    level: u16,
-    pairs: []const KVPair,
-    root: bool,
-    key_count: u64,
-    node_count: u64,
-) void {
-    @memset(block, 0);
-    writeObj(block, oid, writer_xid, if (root) obj_type_btree else obj_type_btree_node, obj_subtype_fs_tree);
-    std.mem.writeInt(u16, block[0x20..0x22], node_flags, .little);
-    std.mem.writeInt(u16, block[0x22..0x24], level, .little);
-    std.mem.writeInt(u32, block[0x24..0x28], @intCast(pairs.len), .little);
-    const table_len = pairs.len * 8;
-    std.mem.writeInt(u16, block[0x28..0x2a], 0, .little);
-    std.mem.writeInt(u16, block[0x2a..0x2c], @intCast(table_len), .little);
-    const key_area = btree_node_header_size + table_len;
-    const end = if (root) block.len - btree_info_size else block.len;
-    var key_pos = key_area;
-    var val_pos = end;
-    var toc: usize = btree_node_header_size;
-    for (pairs) |pair| {
-        val_pos -= pair.val.len;
-        @memcpy(block[key_pos..][0..pair.key.len], pair.key);
-        @memcpy(block[val_pos..][0..pair.val.len], pair.val);
-        std.mem.writeInt(u16, block[toc..][0..2], @intCast(key_pos - key_area), .little);
-        std.mem.writeInt(u16, block[toc + 2 ..][0..2], @intCast(pair.key.len), .little);
-        std.mem.writeInt(u16, block[toc + 4 ..][0..2], @intCast(end - val_pos), .little);
-        std.mem.writeInt(u16, block[toc + 6 ..][0..2], @intCast(pair.val.len), .little);
-        key_pos += pair.key.len;
-        toc += 8;
-    }
-    if (root) writeBtreeFooter(block, 0, 0, 0, key_count, node_count);
-    seal(block);
-}
-
 fn fsPairCount(span: LevelSpan) usize {
     return span.end - span.start;
 }
@@ -1281,48 +1194,20 @@ pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Exception!usi
 
     writeNx(try blockAt(output, writer_nx_block), plan.blocks);
     writeOmapObject(try blockAt(output, writer_container_omap_obj), writer_container_omap_obj, writer_container_omap_tree);
-    writeOmapTree(try blockAt(output, writer_container_omap_tree), writer_container_omap_tree, &[_]OmapEntry{.{ .oid = volume_oid, .paddr = writer_volume_block }});
+    {
+        var key: [16]u8 = undefined;
+        std.mem.writeInt(u64, key[0..8], volume_oid, .little);
+        std.mem.writeInt(u64, key[8..16], writer_xid, .little);
+        const keys = [_][]const u8{&key};
+        const levels = try buildOmapLevels(&keys, fba.allocator());
+        try writeOmapTree(output, &fba, levels, writer_container_omap_tree, writer_volume_block, 1, 1);
+    }
     writeOmapObject(try blockAt(output, writer_volume_omap_obj), writer_volume_omap_obj, writer_volume_omap_first_block);
     const fs_root_oid = fs_oid_base + totalFsNodes(&plan) - 1;
     writeVolume(try blockAt(output, writer_volume_block), fs_root_oid);
 
     // Entry i maps the virtual fs node oid fs_oid_base + i to its block.
-    {
-        var cursor = writer_volume_omap_first_block;
-        var child_blocks: []u64 = &.{};
-        var level: usize = 0;
-        while (level < plan.vol_omap_levels.len) : (level += 1) {
-            const spans = plan.vol_omap_levels[level].spans;
-            const blocks = fba.allocator().alloc(u64, spans.len) catch return error.ResourceException;
-            for (spans, 0..) |span, i| {
-                const block = try blockAt(output, cursor + @as(u64, @intCast(i)));
-                const oid = cursor + @as(u64, @intCast(i));
-                const pairs = fba.allocator().alloc(KVPair, fsPairCount(span)) catch return error.ResourceException;
-                if (level == 0) {
-                    for (pairs, 0..) |*pair, j| {
-                        const entry = span.start + @as(u32, @intCast(j));
-                        var val: [16]u8 = undefined;
-                        std.mem.writeInt(u32, val[0..4], 0, .little);
-                        std.mem.writeInt(u32, val[4..8], writer_block_size, .little);
-                        std.mem.writeInt(u64, val[8..16], plan.fs_first_block + entry, .little);
-                        pair.* = .{ .key = plan.vol_omap_levels[0].first_keys[entry], .val = try dupBytes(&fba, &val) };
-                    }
-                } else {
-                    for (pairs, 0..) |*pair, j| {
-                        const child = span.start + @as(u32, @intCast(j));
-                        var val: [8]u8 = undefined;
-                        std.mem.writeInt(u64, &val, child_blocks[child], .little);
-                        pair.* = .{ .key = plan.vol_omap_levels[level - 1].first_keys[child], .val = try dupBytes(&fba, &val) };
-                    }
-                }
-                const is_root = level == plan.vol_omap_levels.len - 1;
-                writeOmapFixedNode(block, oid, (if (level == 0) btn_flag_leaf else 0) | btn_flag_fixed_kv | (if (is_root) btn_flag_root else 0), @intCast(level), pairs, is_root, totalFsNodes(&plan), totalVolOmapNodes(&plan));
-                blocks[i] = oid;
-            }
-            child_blocks = blocks;
-            cursor += spans.len;
-        }
-    }
+    try writeOmapTree(output, &fba, plan.vol_omap_levels, writer_volume_omap_first_block, plan.fs_first_block, totalFsNodes(&plan), totalVolOmapNodes(&plan));
 
     // Nodes are virtual: oids are fs_oid_base + index, internal values are
     // child oids.
@@ -1344,7 +1229,7 @@ pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Exception!usi
                     pair.* = .{ .key = plan.keys[at], .val = plan.vals[at] };
                 }
                 const lone_root = plan.levels.len == 1;
-                writeFsNode(block, oid, btn_flag_leaf | (if (lone_root) btn_flag_root else 0), 0, pairs, lone_root, @intCast(plan.records.len), 1);
+                writeVarNode(block, oid, writer_xid, obj_subtype_fs_tree, false, btn_flag_leaf | (if (lone_root) btn_flag_root else 0), 0, 0, pairs, lone_root, @intCast(plan.records.len), 1);
             } else {
                 const pairs = fba.allocator().alloc(KVPair, fsPairCount(span)) catch return error.ResourceException;
                 for (pairs, 0..) |*pair, j| {
@@ -1354,7 +1239,7 @@ pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Exception!usi
                     pair.* = .{ .key = plan.levels[level - 1].first_keys[child], .val = try dupBytes(&fba, &val) };
                 }
                 const is_root = level == plan.levels.len - 1;
-                writeFsNode(block, oid, if (is_root) btn_flag_root else 0, @intCast(level), pairs, is_root, @intCast(plan.records.len), totalFsNodes(&plan));
+                writeVarNode(block, oid, writer_xid, obj_subtype_fs_tree, false, if (is_root) btn_flag_root else 0, @intCast(level), 0, pairs, is_root, @intCast(plan.records.len), totalFsNodes(&plan));
             }
             oids[i] = oid;
         }
@@ -1363,9 +1248,16 @@ pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Exception!usi
         cursor += spans.len;
     }
 
-    // File payloads in DFS order.
-    var file_index: usize = 0;
-    try writeFileData(entries, output, plan.file_blocks, &file_index);
+    // File payloads in DFS order; block numbers walk the same cursor the
+    // plan used, so the extent records stay in agreement.
+    var data_cursor = plan.data_start;
+    for (plan.files) |file| {
+        const at = std.math.mul(u64, data_cursor, writer_block_size) catch return error.DataException;
+        const end = std.math.add(u64, at, file.data.len) catch return error.DataException;
+        if (end > output.len) return error.DataException;
+        @memcpy(output[at..][0..file.data.len], file.data);
+        data_cursor += (file.data.len + writer_block_size - 1) / writer_block_size;
+    }
     return @intCast(total_bytes);
 }
 
@@ -1381,19 +1273,6 @@ fn dupBytes(fba: *std.heap.FixedBufferAllocator, bytes: []const u8) Exception![]
     const copy = fba.allocator().alloc(u8, bytes.len) catch return error.ResourceException;
     @memcpy(copy, bytes);
     return copy;
-}
-
-fn writeFileData(entries: []const Entry, output: []u8, file_blocks: []const u64, index: *usize) Exception!void {
-    // The DFS order of files equals the (verified) entry order, so payloads
-    // copy directly.
-    for (entries) |entry| {
-        if (entry.data.len == 0) continue;
-        const at = std.math.mul(u64, file_blocks[index.*], writer_block_size) catch return error.DataException;
-        const end = std.math.add(u64, at, entry.data.len) catch return error.DataException;
-        if (end > output.len) return error.DataException;
-        @memcpy(output[at..][0..entry.data.len], entry.data);
-        index.* += 1;
-    }
 }
 
 test "apfs write roundtrips nested directories" {
@@ -1637,6 +1516,7 @@ const KVPair = struct { key: []const u8, val: []const u8 };
 fn writeVarNode(
     node: []u8,
     oid: u64,
+    xid: u64,
     subtype: u32,
     physical: bool,
     node_flags: u16,
@@ -1647,7 +1527,7 @@ fn writeVarNode(
     key_count: u64,
     node_count: u64,
 ) void {
-    writeObj(node, oid, 6, (if (physical) obj_flag_physical else 0) | (if (root) obj_type_btree else obj_type_btree_node), subtype);
+    writeObj(node, oid, xid, (if (physical) obj_flag_physical else 0) | (if (root) obj_type_btree else obj_type_btree_node), subtype);
     std.mem.writeInt(u16, node[0x20..0x22], node_flags, .little);
     std.mem.writeInt(u16, node[0x22..0x24], level, .little);
     std.mem.writeInt(u32, node[0x24..0x28], @intCast(pairs.len), .little);
@@ -1693,7 +1573,7 @@ fn buildOmapTree(node: []u8, oid: u64, entries: []const OmapEntry) void {
     var vals: [4][16]u8 = undefined;
     var pairs: [4]KVPair = undefined;
     fillOmapPairs(entries, &keys, &vals, &pairs);
-    writeFixedNode(node, oid, obj_subtype_omap, true, btn_flag_root | btn_flag_leaf | btn_flag_fixed_kv, 0, btinfo_flag_physical, 16, 16, pairs[0..entries.len], true, entries.len, 1);
+    writeFixedNode(node, oid, 6, obj_subtype_omap, true, btn_flag_root | btn_flag_leaf | btn_flag_fixed_kv, 0, btinfo_flag_physical, 16, 16, pairs[0..entries.len], true, entries.len, 1);
 }
 
 // Lays out a fixed-size b-tree node: 4-byte table-of-contents entries,
@@ -1701,6 +1581,7 @@ fn buildOmapTree(node: []u8, oid: u64, entries: []const OmapEntry) void {
 fn writeFixedNode(
     node: []u8,
     oid: u64,
+    xid: u64,
     subtype: u32,
     physical: bool,
     node_flags: u16,
@@ -1713,7 +1594,7 @@ fn writeFixedNode(
     key_count: u64,
     node_count: u64,
 ) void {
-    writeObj(node, oid, 6, (if (physical) obj_flag_physical else 0) | (if (root) obj_type_btree else obj_type_btree_node), subtype);
+    writeObj(node, oid, xid, (if (physical) obj_flag_physical else 0) | (if (root) obj_type_btree else obj_type_btree_node), subtype);
     std.mem.writeInt(u16, node[0x20..0x22], node_flags, .little);
     std.mem.writeInt(u16, node[0x22..0x24], level, .little);
     std.mem.writeInt(u32, node[0x24..0x28], @intCast(pairs.len), .little);
@@ -1748,7 +1629,7 @@ fn buildOmapRoot(node: []u8, oid: u64, child_paddr: u64, first: OmapEntry) void 
     std.mem.writeInt(u64, key[8..16], 6, .little);
     std.mem.writeInt(u64, val[0..8], child_paddr, .little);
     const pairs = [1]KVPair{.{ .key = &key, .val = &val }};
-    writeFixedNode(node, oid, obj_subtype_omap, true, btn_flag_root | btn_flag_fixed_kv, 1, btinfo_flag_physical, 16, 16, &pairs, true, 3, 2);
+    writeFixedNode(node, oid, 6, obj_subtype_omap, true, btn_flag_root | btn_flag_fixed_kv, 1, btinfo_flag_physical, 16, 16, &pairs, true, 3, 2);
 }
 
 fn buildOmapLeaf(node: []u8, oid: u64, entries: []const OmapEntry) void {
@@ -1757,7 +1638,7 @@ fn buildOmapLeaf(node: []u8, oid: u64, entries: []const OmapEntry) void {
     var vals: [4][16]u8 = undefined;
     var pairs: [4]KVPair = undefined;
     fillOmapPairs(entries, &keys, &vals, &pairs);
-    writeFixedNode(node, oid, obj_subtype_omap, true, btn_flag_leaf | btn_flag_fixed_kv, 0, 0, 16, 16, pairs[0..entries.len], false, 3, 2);
+    writeFixedNode(node, oid, 6, obj_subtype_omap, true, btn_flag_leaf | btn_flag_fixed_kv, 0, 0, 16, 16, pairs[0..entries.len], false, 3, 2);
 }
 
 fn fillFsPairs(records: []const FsRec, key_bufs: [][64]u8, val_bufs: [][160]u8, pairs: []KVPair) void {
@@ -1812,13 +1693,13 @@ fn buildFsTree(root: []u8, leaf_a: []u8, leaf_b: []u8) void {
     var vals_a: [fs_records_a.len][160]u8 = undefined;
     var pairs_a: [fs_records_a.len]KVPair = undefined;
     fillFsPairs(&fs_records_a, &keys_a, &vals_a, &pairs_a);
-    writeVarNode(leaf_a, 301, obj_subtype_fs_tree, false, btn_flag_leaf, 0, 0, &pairs_a, false, 0, 0);
+    writeVarNode(leaf_a, 301, 6, obj_subtype_fs_tree, false, btn_flag_leaf, 0, 0, &pairs_a, false, 0, 0);
 
     var keys_b: [fs_records_b.len][64]u8 = undefined;
     var vals_b: [fs_records_b.len][160]u8 = undefined;
     var pairs_b: [fs_records_b.len]KVPair = undefined;
     fillFsPairs(&fs_records_b, &keys_b, &vals_b, &pairs_b);
-    writeVarNode(leaf_b, 302, obj_subtype_fs_tree, false, btn_flag_leaf, 0, 0, &pairs_b, false, 0, 0);
+    writeVarNode(leaf_b, 302, 6, obj_subtype_fs_tree, false, btn_flag_leaf, 0, 0, &pairs_b, false, 0, 0);
 
     // The root repeats the first key of each leaf; the values are child oids.
     var root_keys: [2][64]u8 = undefined;
@@ -1831,7 +1712,7 @@ fn buildFsTree(root: []u8, leaf_a: []u8, leaf_b: []u8) void {
         std.mem.writeInt(u64, root_vals[j][0..8], child_oid, .little);
         root_pairs[j] = .{ .key = root_keys[j][0..key_len], .val = root_vals[j][0..8] };
     }
-    writeVarNode(root, 300, obj_subtype_fs_tree, false, btn_flag_root, 1, 0, &root_pairs, true, fs_records_a.len + fs_records_b.len, 3);
+    writeVarNode(root, 300, 6, obj_subtype_fs_tree, false, btn_flag_root, 1, 0, &root_pairs, true, fs_records_a.len + fs_records_b.len, 3);
 }
 
 fn inodeVal(out: []u8, private_id: u64, mode: u16, nchildren: u32) u32 {
