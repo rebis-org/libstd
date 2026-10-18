@@ -95,6 +95,15 @@ jobs:
           key: benchmark-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-${{ hashFiles('build/acceptance/benchmark/command.zig', 'build/acceptance/benchmark/env.zig') }}
           restore-keys: |
             benchmark-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-
+      - name: Restore the Go module cache
+        if: inputs.profile == 'suite'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/go/pkg/mod
+          key: go-mod-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.vendor }}-${{ hashFiles('vendor/age/go.sum') }}
+      - name: Build the age reference tool
+        if: inputs.profile == 'suite'
+        run: cd vendor/age && go build -o /tmp/age_ref ./cmd/age
       - name: Provision the reference toolchains
         run: |
           brew install autoconf automake bison libtool gettext pkg-config cmake boost fmt utf8cpp nlohmann-json libarchive xxhash zstd lz4 lzo xz brotli openssl@3
