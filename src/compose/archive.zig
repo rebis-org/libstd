@@ -2,31 +2,32 @@ const std = @import("std");
 
 const bounds = @import("../common/primitive/bounds.zig");
 const crypto = @import("../common/primitive/crypto.zig");
-const cpio = @import("../grammar/cpio/onprem.zig");
-const cpio_seam = @import("../grammar/cpio/seam.zig");
-const rar = @import("../grammar/rar/onprem.zig");
-const rar_writer = @import("../grammar/rar/writer.zig");
-const seven_zip = @import("../grammar/sevenzip/onprem.zig");
-const tar = @import("../grammar/tar/onprem.zig");
-const tar_seam = @import("../grammar/tar/seam.zig");
-const wim = @import("../grammar/wim/onprem.zig");
-const wim_seam = @import("../grammar/wim/seam.zig");
-const xar = @import("../grammar/xar/onprem.zig");
-const xar_seam = @import("../grammar/xar/seam.zig");
-const zip = @import("../grammar/zip/onprem.zig");
+const cpio = @import("../representation/grammar/cpio/onprem.zig");
+const cpio_seam = @import("../representation/grammar/cpio/seam.zig");
+const rar = @import("../representation/grammar/rar/onprem.zig");
+const rar_writer = @import("../representation/grammar/rar/writer.zig");
+const seven_zip = @import("../representation/grammar/sevenzip/onprem.zig");
+const tar = @import("../representation/grammar/tar/onprem.zig");
+const tar_seam = @import("../representation/grammar/tar/seam.zig");
+const wim = @import("../representation/grammar/wim/onprem.zig");
+const wim_seam = @import("../representation/grammar/wim/seam.zig");
+const xar = @import("../representation/grammar/xar/onprem.zig");
+const xar_seam = @import("../representation/grammar/xar/seam.zig");
+const zip = @import("../representation/grammar/zip/onprem.zig");
 const kernel_catalog = @import("../kernel/catalog.zig");
 const discovery = @import("../kernel/discovery.zig");
 const abi = @import("../kernel/envelope.zig");
 const node_graph = @import("../kernel/node.zig");
 const resource = @import("../kernel/resource.zig");
 const vocabulary = @import("../kernel/vocabulary.zig");
-const apfs_seam = @import("../volume/apfs/seam.zig");
-const dwarfs = @import("../volume/dwarfs/onprem.zig");
-const dwarfs_seam = @import("../volume/dwarfs/seam.zig");
-const iso = @import("../volume/iso/onprem.zig");
-const iso_seam = @import("../volume/iso/seam.zig");
-const squashfs = @import("../volume/squashfs/onprem.zig");
-const squashfs_seam = @import("../volume/squashfs/seam.zig");
+const apfs_seam = @import("../representation/volume/apfs/seam.zig");
+const age_seam = @import("../representation/grammar/age/seam.zig");
+const dwarfs = @import("../representation/volume/dwarfs/onprem.zig");
+const dwarfs_seam = @import("../representation/volume/dwarfs/seam.zig");
+const iso = @import("../representation/volume/iso/onprem.zig");
+const iso_seam = @import("../representation/volume/iso/seam.zig");
+const squashfs = @import("../representation/volume/squashfs/onprem.zig");
+const squashfs_seam = @import("../representation/volume/squashfs/seam.zig");
 const common = @import("common.zig");
 
 const Call = abi.Call;
@@ -408,7 +409,8 @@ pub fn dwarfsHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resou
     }
 }
 
-// APFS is read-only: inspect and decode_ordinal, no encode path.
+// APFS writes are mkfs-shaped: a fresh single-volume image from the entry
+// list, read back through the same ordinal surface.
 pub fn apfsHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
     _ = sizing;
     const source_resource = source orelse return error.CallException;
@@ -444,9 +446,154 @@ pub fn apfsHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resourc
             try common.commitBytesToSink(sink_resource, call, staged);
         }
         response.byte_length = size;
+    } else if (command_mask == vocabulary.command_mask_write) {
+        try requireVerified(commit);
+        const entries = try collectEntries(apfs_seam.Entry, call.request, &workspace, NoCtx{}, fillApfsEntry);
+        const scratch = try workspace.take(u8, apfs_seam.scratch_size);
+        const required = try apfs_seam.archiveSize(plan.provider, entries, scratch);
+        if (sink == null) {
+            response.byte_length = required;
+            return;
+        }
+        const sink_resource = sink.?;
+        try common.requireSinkCapacity(sink_resource, call, required);
+        if (sink_resource.kind == .direct_write) {
+            const output = try common.sinkDirectBuffer(sink_resource, required);
+            const written = try apfs_seam.encode(plan.provider, entries, output, scratch);
+            response.byte_length = written;
+        } else {
+            const staging = try workspace.take(u8, required);
+            const written = try apfs_seam.encode(plan.provider, entries, staging, scratch);
+            try common.commitBytesToSink(sink_resource, call, staging[0..written]);
+            response.byte_length = written;
+        }
     } else {
         return error.UnsupportedException;
     }
+}
+
+// age is a single-entry store: the whole payload is one unnamed entry, and
+// the family-1 parameters carry the recipient material (password for scrypt,
+// identity/recipient for X25519).
+fn ageOptions(crypto_params: ?CryptoParams, request: ?*Node) Exception!age_seam.Options {
+    var options = age_seam.Options{ .password = cryptoPasswordOrEmpty(crypto_params) };
+    if (node_graph.findSelector(request, comptime discovery.parameter("age", "identity").family, comptime discovery.parameter("age", "identity").ordinal)) |node| {
+        options.identity = try resource.checkedConstBytes(node.bytes, node.byte_length);
+    }
+    if (node_graph.findSelector(request, comptime discovery.parameter("age", "recipient").family, comptime discovery.parameter("age", "recipient").ordinal)) |node| {
+        options.recipient = try resource.checkedConstBytes(node.bytes, node.byte_length);
+    }
+    if (node_graph.findSelector(request, comptime discovery.parameter("age", "work_factor").family, comptime discovery.parameter("age", "work_factor").ordinal)) |node| {
+        options.work_factor = try narrow(u8, node.value_low);
+    }
+    if (node_graph.findSelector(request, comptime discovery.parameter("age", "armor").family, comptime discovery.parameter("age", "armor").ordinal)) |node| {
+        options.armor = node.value_low != 0;
+    }
+    return options;
+}
+
+fn ageScratch(workspace: *resource.Workspace, options: age_seam.Options) Exception![]u8 {
+    // scrypt peaks at 1024 * N bytes inside the back half the codec splits
+    // off; size the take for the worst arm actually in play.
+    const peak = if (options.password.len != 0) @as(usize, 4096) + (@as(usize, 1024) << @intCast(options.work_factor)) else 0;
+    return workspace.take(u8, @max(age_seam.scratch_size, peak) * 2);
+}
+
+pub fn ageHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
+    _ = sizing;
+    const source_resource = source orelse return error.CallException;
+    var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
+    var crypto_cause: crypto.FailureCause = .none;
+    const crypto_params = parseCryptoParams("age", call.request, &crypto_cause) catch |err| {
+        writeCryptoFailure(call, crypto_cause);
+        return err;
+    };
+    const options = try ageOptions(crypto_params, call.request);
+    if (command_mask == vocabulary.command_mask_read) {
+        if (sink == null) {
+            const archive = try materializeArchive(source_resource, &workspace, limits);
+            const scratch = try ageScratch(&workspace, options);
+            if (try projectedEntrySize(call.request)) |ordinal| {
+                const info = age_seam.inspectOrdinal(plan.provider, archive, ordinal, options, scratch) catch |err| {
+                    writeCryptoFailure(call, .wrong_password);
+                    return err;
+                };
+                response.byte_length = info.size;
+                return;
+            }
+            _ = age_seam.inspectCount(plan.provider, archive, scratch) catch |err| switch (err) {
+                error.UnsupportedException => return error.UnsupportedException,
+                else => return error.DataException,
+            };
+            response.byte_length = 1;
+            return;
+        }
+        const head = try readHead(sink, call, commit);
+        const sink_resource = head.sink;
+        const archive = try materializeArchive(source_resource, &workspace, limits);
+        const scratch = try ageScratch(&workspace, options);
+        const info = age_seam.inspectOrdinal(plan.provider, archive, head.ordinal, options, scratch) catch |err| {
+            writeCryptoFailure(call, .wrong_password);
+            return err;
+        };
+        const size = std.math.cast(usize, info.size) orelse return error.ResourceException;
+        if (size > limits.decoded_bytes) return error.ResourceException;
+        try common.requireSinkCapacity(sink_resource, call, size);
+        if (sink_resource.kind == .direct_write) {
+            const output = try common.sinkDirectBuffer(sink_resource, size);
+            _ = age_seam.decodeOrdinal(plan.provider, archive, head.ordinal, output, scratch, options) catch |err| {
+                writeCryptoFailure(call, .wrong_password);
+                return err;
+            };
+        } else {
+            const staged = try workspace.take(u8, size);
+            _ = age_seam.decodeOrdinal(plan.provider, archive, head.ordinal, staged, scratch, options) catch |err| {
+                writeCryptoFailure(call, .wrong_password);
+                return err;
+            };
+            try common.commitBytesToSink(sink_resource, call, staged);
+        }
+        response.byte_length = size;
+    } else if (command_mask == vocabulary.command_mask_write) {
+        try requireVerified(commit);
+        const entries = try collectEntries(age_seam.Entry, call.request, &workspace, NoCtx{}, fillAgeEntry);
+        const scratch = try ageScratch(&workspace, options);
+        const required = try age_seam.archiveSize(plan.provider, entries, options, scratch);
+        if (sink == null) {
+            response.byte_length = required;
+            return;
+        }
+        const sink_resource = sink.?;
+        try common.requireSinkCapacity(sink_resource, call, required);
+        if (sink_resource.kind == .direct_write) {
+            const output = try common.sinkDirectBuffer(sink_resource, required);
+            const written = age_seam.encode(plan.provider, entries, output, scratch, options) catch |err| {
+                writeCryptoFailure(call, crypto_cause);
+                return err;
+            };
+            response.byte_length = written;
+        } else {
+            const staging = try workspace.take(u8, required);
+            const written = age_seam.encode(plan.provider, entries, staging, scratch, options) catch |err| {
+                writeCryptoFailure(call, crypto_cause);
+                return err;
+            };
+            try common.commitBytesToSink(sink_resource, call, staging[0..written]);
+            response.byte_length = written;
+        }
+    } else {
+        return error.UnsupportedException;
+    }
+}
+
+fn fillAgeEntry(entry: *age_seam.Entry, node: *Node, _: NoCtx) Exception!void {
+    const parts = try entryNameData(node.child);
+    entry.* = .{ .name = parts.name, .data = parts.data };
+}
+
+fn fillApfsEntry(entry: *apfs_seam.Entry, node: *Node, _: NoCtx) Exception!void {
+    const parts = try entryNameData(node.child);
+    entry.* = .{ .name = parts.name, .data = parts.data };
 }
 
 pub fn isoHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
