@@ -1,8 +1,8 @@
 const std = @import("std");
 
 const io = @import("../common/primitive/io.zig");
-const abi = @import("./envelope.zig");
-const vocabulary = @import("./vocabulary.zig");
+const abi = @import("envelope.zig");
+const vocabulary = @import("vocabulary.zig");
 pub const Limits = @import("../common/primitive/limits.zig").Limits;
 
 pub const Workspace = io.Workspace;

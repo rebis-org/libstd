@@ -1,7 +1,7 @@
-const catalog = @import("./catalog.zig");
-const discovery = @import("./discovery.zig");
-const abi = @import("./envelope.zig");
-const vocabulary = @import("./vocabulary.zig");
+const catalog = @import("catalog.zig");
+const discovery = @import("discovery.zig");
+const abi = @import("envelope.zig");
+const vocabulary = @import("vocabulary.zig");
 
 const Exception = vocabulary.Exception;
 

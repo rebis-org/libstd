@@ -4,7 +4,7 @@ const options = @import("options");
 
 const drivers = @import("compose/drivers.zig");
 const sessions = @import("compose/sessions.zig");
-const gzip = @import("grammar/gzip/onprem.zig");
+const gzip = @import("representation/grammar/gzip/onprem.zig");
 
 // A performance claim is fatal only at three or more runs.
 // Five rounds keeps a single preemption from deciding this one.

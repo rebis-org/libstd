@@ -3,8 +3,8 @@ const std = @import("std");
 const interface = @import("interface");
 
 const exception = @import("../common/primitive/exception.zig");
-const zstd = @import("../leaf/zstd/onprem.zig");
-const zstd_seam = @import("../leaf/zstd/seam.zig");
+const zstd = @import("../representation/leaf/zstd/onprem.zig");
+const zstd_seam = @import("../representation/leaf/zstd/seam.zig");
 const sizing = @import("sizing.zig");
 
 pub const Exception = exception.Exception;

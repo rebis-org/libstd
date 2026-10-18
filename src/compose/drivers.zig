@@ -3,11 +3,11 @@ const std = @import("std");
 const checksum = @import("../common/primitive/checksum.zig");
 const exception_prim = @import("../common/primitive/exception.zig");
 const measurement = @import("../common/primitive/measurement.zig");
-const gzip = @import("../grammar/gzip/onprem.zig");
-const zlib = @import("../grammar/zlib/onprem.zig");
-const deflate = @import("../leaf/deflate/onprem.zig");
-const deflate_seam = @import("../leaf/deflate/seam.zig");
-const lz4 = @import("../leaf/lz4/onprem.zig");
+const gzip = @import("../representation/grammar/gzip/onprem.zig");
+const zlib = @import("../representation/grammar/zlib/onprem.zig");
+const deflate = @import("../representation/leaf/deflate/onprem.zig");
+const deflate_seam = @import("../representation/leaf/deflate/seam.zig");
+const lz4 = @import("../representation/leaf/lz4/onprem.zig");
 const composition = @import("composition.zig");
 const sessions = @import("sessions.zig");
 
