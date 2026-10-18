@@ -48,6 +48,7 @@ jobs:
         uses: jdx/mise-action@08ae2a091c038e1e05ec6f5115dc5c69d5a2a6b8 # v5.1.2
         with:
           install: true
+          cache: true
       - id: keys
         name: Resolve cache keys
         env:
@@ -101,9 +102,23 @@ jobs:
         with:
           path: ~/go/pkg/mod
           key: go-mod-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.vendor }}-${{ hashFiles('vendor/age/go.sum') }}
-      - name: Build the age reference tool
+      - id: age_ref
+        name: Restore the age reference binary
         if: inputs.profile == 'suite'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /tmp/age_ref
+          key: age-ref-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.vendor }}
+      - name: Build the age reference tool
+        if: inputs.profile == 'suite' && steps.age_ref.outputs.cache-hit != 'true'
         run: cd vendor/age && go build -o /tmp/age_ref ./cmd/age
+      - name: Save the age reference binary
+        if: ${{ !cancelled() && inputs.profile == 'suite' && steps.age_ref.outcome == 'success' && steps.age_ref.outputs.cache-hit != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /tmp/age_ref
+          key: age-ref-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.vendor }}
       - name: Provision the reference toolchains
         run: |
           brew install autoconf automake bison libtool gettext pkg-config cmake boost fmt utf8cpp nlohmann-json libarchive xxhash zstd lz4 lzo xz brotli openssl@3
