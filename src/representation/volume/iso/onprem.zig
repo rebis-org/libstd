@@ -163,9 +163,19 @@ fn walkIsoDir(archive: []const u8, extent: u32, size: u32, target: Target, state
         if (found_ptr) |fp| {
             if (fp.*) return;
         }
+        // Records never cross sector boundaries: a zero length byte or an
+        // over-long record pads the sector, and records resume at the next.
+        const remain = sector_size - (pos % sector_size);
+        if (dir[pos] == 0 or dir[pos] > remain) {
+            pos += remain;
+            continue;
+        }
         const rec = (try parseRecord(dir, pos)) orelse break;
         pos += rec.skip;
         if (rec.is_dot or rec.is_dotdot) continue;
+        // Multi-extent and interleaved records change the data layout; the
+        // slice covers contiguous single-extent regular files.
+        if (rec.flags & ((1 << 7) | (1 << 2)) != 0) return error.UnsupportedException;
         if (rec.flags & flag_directory != 0) {
             try walkIsoDir(archive, rec.extent, rec.size, target, state, depth + 1);
             continue;
@@ -254,12 +264,16 @@ fn buildIsoPlan(entries: []const Entry, alloc: std.mem.Allocator) Exception!IsoP
         try validateName(entry.name);
         if (entry.data.len > std.math.maxInt(u32)) return error.UnsupportedException;
         var parent: u32 = 0;
+        var depth: u32 = 1;
         var it = std.mem.splitScalar(u8, entry.name, '/');
         var comp = it.next().?;
         while (it.next()) |next| {
             parent = try isoFindOrCreateDir(&nodes, alloc, parent, comp);
             comp = next;
+            depth += 1;
         }
+        // The deepest directory sits at walk depth components - 1.
+        if (depth > max_dir_depth + 1) return error.UnsupportedException;
         nodes.append(alloc, .{ .kind = .file, .name = comp, .parent = parent, .data = entry.data }) catch return error.ResourceException;
         nodes.items[parent].child_count += 1;
     }
@@ -304,10 +318,15 @@ fn buildIsoPlan(entries: []const Entry, alloc: std.mem.Allocator) Exception!IsoP
         var size: u32 = 33 + 1; // dot record
         size += if (di == 0) 33 + 1 + rr_size_dot_sua else 33 + 1; // dotdot record
         for (kids[node.first_child .. node.first_child + node.child_count]) |ci| {
-            size += @intCast(dirRecordSize(nodes.items[ci].name.len, true));
+            const child = &nodes.items[ci];
+            // Planning and encoding must reject the same record sets.
+            const rec_len = dirRecordSize(child.name.len, true, child.kind == .file);
+            if (rec_len > 255) return error.UnsupportedException;
+            size += @intCast(rec_len);
         }
         if (size > sector_size) return error.UnsupportedException;
-        dir_content[di] = size;
+        // Directory data lengths are multiples of the block size.
+        dir_content[di] = @intCast(std.mem.alignForward(usize, size, sector_size));
     }
 
     const dir_lba_of = alloc.alloc(u32, dir_order.items.len) catch return error.ResourceException;
@@ -360,11 +379,11 @@ fn validateName(name: []const u8) Exception!void {
     }
 }
 
-// The interchange name carries the ";1" version suffix.
-// Even-length names take a padding byte.
-fn isoNameArea(name_len: usize) usize {
-    const with_version = name_len + 2;
-    return with_version + (1 - (with_version & 1));
+// File identifiers carry the ";1" version suffix; directory identifiers
+// never do. Even-length names take a padding byte.
+fn nameArea(name_len: usize, with_version: bool) usize {
+    const stored = if (with_version) name_len + 2 else name_len;
+    return stored + (1 - (stored & 1));
 }
 
 fn rrSizeNm(name_len: usize) usize {
@@ -374,8 +393,8 @@ fn rrSizeNm(name_len: usize) usize {
 
 const rr_size_px: usize = 44;
 
-fn dirRecordSize(name_len: usize, has_nm: bool) usize {
-    var size = 33 + isoNameArea(name_len) + rr_size_px;
+fn dirRecordSize(name_len: usize, has_nm: bool, with_version: bool) usize {
+    var size = 33 + nameArea(name_len, with_version) + rr_size_px;
     if (has_nm) size += rrSizeNm(name_len);
     return size;
 }
@@ -604,15 +623,16 @@ pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Exception!usi
         for (plan.kids[node.first_child .. node.first_child + node.child_count]) |ci| {
             const child = &plan.nodes[ci];
             var stored: [252]u8 = undefined;
-            if (child.name.len + 2 > stored.len) return error.UnsupportedException;
             @memcpy(stored[0..child.name.len], child.name);
-            stored[child.name.len] = ';';
-            stored[child.name.len + 1] = '1';
             if (child.kind == .dir) {
+                // Directory identifiers never carry a version suffix.
                 const child_rank = childRank(&plan, ci);
-                try writeDirRecord(&dir, &pos, plan.dir_lba_of[child_rank], plan.dir_content[child_rank], true, stored[0 .. child.name.len + 2], @intCast(child.name.len + 2), child.name, serial);
+                try writeDirRecord(&dir, &pos, plan.dir_lba_of[child_rank], plan.dir_content[child_rank], true, stored[0..child.name.len], @intCast(child.name.len), child.name, serial);
                 serial += 1;
             } else {
+                if (child.name.len + 2 > stored.len) return error.UnsupportedException;
+                stored[child.name.len] = ';';
+                stored[child.name.len + 1] = '1';
                 const file_rank = fileRank(&plan, ci);
                 try writeDirRecord(&dir, &pos, plan.file_lba_of[file_rank], @intCast(child.data.len), false, stored[0 .. child.name.len + 2], @intCast(child.name.len + 2), child.name, serial);
                 serial += 1;
@@ -694,4 +714,128 @@ test "iso store roundtrips flat files" {
     var out: [16]u8 = undefined;
     const n = try decodeOrdinal(archive[0..written], 1, &out, &scratch);
     try testing.expectEqualSlices(u8, "hello iso", out[0..n]);
+}
+
+test "iso directory records resume at sector boundaries" {
+    const testing = std.testing;
+    const entries = [_]Entry{
+        .{ .name = "a.txt", .data = "AAA" },
+        .{ .name = "b.txt", .data = "BBB" },
+    };
+    var archive: [64 * sector_size]u8 = undefined;
+    var scratch: [scratch_size]u8 = undefined;
+    const written = try encode(&entries, &archive, &scratch);
+    // Move the second file's record into the second sector of the root
+    // directory: zero padding ends the first sector, records resume at 2048.
+    const pvd = archive[16 * sector_size ..][0..sector_size];
+    const root = archive[dir_lba * sector_size ..][0 .. 2 * sector_size];
+    var pos: usize = 0;
+    var second: [255]u8 = undefined;
+    var second_len: usize = 0;
+    var cut: usize = 0;
+    while (pos < sector_size and root[pos] != 0) : (pos += root[pos]) {
+        const rec = root[pos .. pos + root[pos]];
+        if (rec[32] > 2 and rec[33] == 'b') {
+            second_len = rec.len;
+            @memcpy(second[0..second_len], rec);
+            cut = pos;
+            break;
+        }
+    }
+    try testing.expect(second_len > 0);
+    @memset(root[cut..sector_size], 0);
+    @memcpy(root[sector_size .. sector_size + second_len], second[0..second_len]);
+    @memset(root[sector_size + second_len .. 2 * sector_size], 0);
+    std.mem.writeInt(u32, pvd[166..170], 2 * sector_size, .little);
+    std.mem.writeInt(u32, pvd[170..174], 2 * sector_size, .big);
+    try testing.expectEqual(@as(u64, 2), try inspectCount(archive[0..written], &scratch));
+    var out: [8]u8 = undefined;
+    const n = try decodeOrdinal(archive[0..written], 1, &out, &scratch);
+    try testing.expectEqualSlices(u8, "BBB", out[0..n]);
+}
+
+test "iso rejects multi-extent and interleaved records" {
+    const testing = std.testing;
+    const entries = [_]Entry{
+        .{ .name = "a.txt", .data = "AAA" },
+        .{ .name = "b.txt", .data = "BBB" },
+    };
+    var archive: [64 * sector_size]u8 = undefined;
+    var scratch: [scratch_size]u8 = undefined;
+    const written = try encode(&entries, &archive, &scratch);
+    const root = archive[dir_lba * sector_size ..][0..sector_size];
+    const first_at = 226 + 34; // dot record then dotdot record.
+    try testing.expect(root[first_at] != 0);
+    for ([_]u8{ 1 << 7, 1 << 2 }) |flag| {
+        root[first_at + 25] |= flag;
+        try testing.expectError(error.UnsupportedException, inspectCount(archive[0..written], &scratch));
+        root[first_at + 25] &= ~flag;
+    }
+}
+
+test "iso directory sizes are block multiples and directory names carry no version" {
+    const testing = std.testing;
+    const entries = [_]Entry{
+        .{ .name = "top.txt", .data = "root file" },
+        .{ .name = "sub/inner.txt", .data = "inner" },
+    };
+    var archive: [64 * sector_size]u8 = undefined;
+    var scratch: [scratch_size]u8 = undefined;
+    const written = try encode(&entries, &archive, &scratch);
+    const pvd = archive[16 * sector_size ..][0..sector_size];
+    try testing.expectEqual(@as(u32, sector_size), std.mem.readInt(u32, pvd[166..170], .little));
+    // The sub-directory record carries the plain identifier; the file
+    // record keeps the ";1" interchange suffix.
+    const root = archive[dir_lba * sector_size ..][0..sector_size];
+    var pos: usize = 226 + 34;
+    var saw_dir = false;
+    var saw_file = false;
+    while (pos < sector_size and root[pos] != 0) : (pos += root[pos]) {
+        const rec = root[pos .. pos + root[pos]];
+        const name = rec[33..][0..rec[32]];
+        if (std.mem.eql(u8, name, "sub")) {
+            saw_dir = true;
+            try testing.expectEqual(@as(u32, sector_size), std.mem.readInt(u32, rec[10..14], .little));
+        }
+        if (std.mem.eql(u8, name, "top.txt;1")) saw_file = true;
+    }
+    try testing.expect(saw_dir and saw_file);
+    try testing.expectEqual(@as(u64, 2), try inspectCount(archive[0..written], &scratch));
+}
+
+test "iso rejects oversized directory records at planning time" {
+    const testing = std.testing;
+    var name_buf: [90]u8 = undefined;
+    @memset(&name_buf, 'n');
+    const entries = [_]Entry{.{ .name = name_buf[0..], .data = "x" }};
+    // The 33-byte header, name area, PX and NM exceed the 255-byte record
+    // limit; sizing and encoding must agree on the rejection.
+    try testing.expectError(error.UnsupportedException, archiveSize(&entries));
+    var archive: [64 * sector_size]u8 = undefined;
+    var scratch: [scratch_size]u8 = undefined;
+    try testing.expectError(error.UnsupportedException, encode(&entries, &archive, &scratch));
+}
+
+test "iso write depth stays within the reader walk limit" {
+    const testing = std.testing;
+    var deep: [300]u8 = undefined;
+    var len: usize = 0;
+    var i: usize = 0;
+    while (i < 64) : (i += 1) {
+        @memcpy(deep[len .. len + 2], "a/");
+        len += 2;
+    }
+    @memcpy(deep[len .. len + 5], "f.txt");
+    // 65 path components: the deepest directory sits at walk depth 64.
+    const ok_entries = [_]Entry{.{ .name = deep[0 .. len + 5], .data = "deep" }};
+    var archive: [128 * sector_size]u8 = undefined;
+    var scratch: [scratch_size]u8 = undefined;
+    const written = try encode(&ok_entries, &archive, &scratch);
+    try testing.expectEqual(@as(u64, 1), try inspectCount(archive[0..written], &scratch));
+    // One more component would push the deepest directory past the limit.
+    @memcpy(deep[len .. len + 2], "a/");
+    @memcpy(deep[len + 2 .. len + 7], "f.txt");
+    const too_deep = [_]Entry{.{ .name = deep[0 .. len + 7], .data = "deep" }};
+    try testing.expectError(error.UnsupportedException, archiveSize(&too_deep));
+    try testing.expectError(error.UnsupportedException, encode(&too_deep, &archive, &scratch));
 }

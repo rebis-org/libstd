@@ -11,6 +11,7 @@ pub const Kinds = packed struct {
     crc32: bool = false,
     crc64: bool = false,
     adler32: bool = false,
+    xxh64: bool = false,
 };
 
 pub fn CountingTee(comptime kinds: Kinds) type {
@@ -20,6 +21,7 @@ pub fn CountingTee(comptime kinds: Kinds) type {
         crc32: checksum.Crc32,
         crc64: checksum.XzCrc64,
         adler32: checksum.Adler32,
+        xxh64: checksum.XxHash64,
         size: u64,
 
         pub fn init(downstream: ?*std.Io.Writer) @This() {
@@ -33,6 +35,7 @@ pub fn CountingTee(comptime kinds: Kinds) type {
                 .crc32 = checksum.Crc32.bind(provider),
                 .crc64 = checksum.XzCrc64.bind(provider),
                 .adler32 = checksum.Adler32.bind(provider),
+                .xxh64 = checksum.XxHash64.bind(provider, 0),
                 .size = 0,
             };
         }
@@ -51,6 +54,10 @@ pub fn CountingTee(comptime kinds: Kinds) type {
 
         pub fn crc64Value(self: *const @This()) u64 {
             return self.crc64.final();
+        }
+
+        pub fn xxh64Value(self: *@This()) u64 {
+            return self.xxh64.final();
         }
 
         fn feed(self: *@This(), part: []const u8) std.Io.Writer.Error!void {

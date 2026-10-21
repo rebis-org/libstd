@@ -482,12 +482,14 @@ const Reader = struct {
         if (recorded_checksum != tarChecksum(header)) return error.IntegrityException;
         const size = try tarNumber(header[124..136]);
         const data_offset = try bounds.addU64(self.offset, block_size);
-        // The prefix and device fields are ustar extensions; V7 headers
-        // carry unrelated data there.
+        // The device fields are ustar extensions; V7 headers carry
+        // unrelated data there. The prefix needs the POSIX version too:
+        // the GNU magic stores atime and ctime in its place.
         const ustar = std.mem.eql(u8, header[257..262], "ustar");
+        const posix = ustar and std.mem.eql(u8, header[263..265], "00");
         return .{
             .name = tarField(header[0..100]),
-            .prefix = if (ustar) tarField(header[345..500]) else &.{},
+            .prefix = if (posix) tarField(header[345..500]) else &.{},
             .link_name = tarField(header[157..257]),
             .mode = std.math.cast(u32, try tarNumber(header[100..108])) orelse return error.DataException,
             .uid = std.math.cast(u32, try tarNumber(header[108..116])) orelse return error.DataException,
@@ -614,7 +616,7 @@ const Reader = struct {
                     if (self.long_link) |link_name| entry.link_name = link_name;
                     // Decode-side parity with ZIP: refuse traversal, absolute,
                     // backslash, and embedded-NUL member names.
-                    if (bounds.isAbsoluteOrTraversal(entry.name) or std.mem.findScalar(u8, entry.name, 0) != null) return error.DataException;
+                    if (bounds.isAbsoluteOrTraversal(entry.name) or (entry.prefix.len > 0 and bounds.isAbsoluteOrTraversal(entry.prefix)) or std.mem.findScalar(u8, entry.name, 0) != null) return error.DataException;
                     entry.ordinal = self.ordinal;
                     self.ordinal = try bounds.addU64(self.ordinal, 1);
                     self.long_name = null;
@@ -647,7 +649,7 @@ const Reader = struct {
                     if (self.long_link) |link_name| entry.link_name = link_name;
                     // Decode-side parity with ZIP: refuse traversal, absolute,
                     // backslash, and embedded-NUL member names.
-                    if (bounds.isAbsoluteOrTraversal(entry.name) or std.mem.findScalar(u8, entry.name, 0) != null) return error.DataException;
+                    if (bounds.isAbsoluteOrTraversal(entry.name) or (entry.prefix.len > 0 and bounds.isAbsoluteOrTraversal(entry.prefix)) or std.mem.findScalar(u8, entry.name, 0) != null) return error.DataException;
                     entry.ordinal = self.ordinal;
                     self.ordinal = try bounds.addU64(self.ordinal, 1);
                     try self.advance(advance_size);
@@ -1020,4 +1022,73 @@ test "tar pax records keep embedded newlines and equals signs in long names" {
     var out: [16]u8 = undefined;
     const size = try decodeOrdinal(archive[0..written], 0, &out);
     try testing.expectEqualStrings("payload", out[0..size]);
+}
+
+fn tarSealTestHeader(block: *[512]u8) void {
+    var checksum = tarChecksum(block);
+    var index: usize = 154;
+    while (index > 148) {
+        index -= 1;
+        block[index] = '0' + @as(u8, @truncate(checksum & 7));
+        checksum >>= 3;
+    }
+    block[154] = 0;
+    block[155] = ' ';
+}
+
+test "tar posix prefix split stays inside the ustar header" {
+    const testing = std.testing;
+    var long_name: [151]u8 = undefined;
+    @memset(&long_name, 'p');
+    long_name[130] = '/';
+    @memcpy(long_name[131..139], "leaf.txt");
+    const entries = [_]Entry{
+        .{ .name = &long_name, .data = "prefix payload" },
+    };
+    var archive: [4096]u8 = undefined;
+    var scratch: [4096]u8 = undefined;
+    const written = try encode(&entries, &archive, &scratch);
+    try testing.expectEqual(@as(u64, written), try archiveSize(&entries));
+    try testing.expect(std.mem.indexOf(u8, archive[0..written], "path=") == null);
+    const info = try inspectOrdinal(archive[0..written], 0);
+    try testing.expectEqualSlices(u8, long_name[0..130], info.prefix);
+    try testing.expectEqualSlices(u8, long_name[131..], info.name);
+    var out: [16]u8 = undefined;
+    const size = try decodeOrdinal(archive[0..written], 0, &out);
+    try testing.expectEqualStrings("prefix payload", out[0..size]);
+}
+
+test "tar rejects unsafe ustar prefix fields" {
+    const testing = std.testing;
+    var block: [512]u8 = @splat(0);
+    @memcpy(block[0..6], "ok.txt");
+    tarWriteNumber(block[100..108], 0o644);
+    tarWriteNumber(block[124..136], 3);
+    block[156] = '0';
+    @memcpy(block[257..262], "ustar");
+    block[262] = 0;
+    @memcpy(block[263..265], "00");
+    @memcpy(block[345..352], "../evil");
+    tarSealTestHeader(&block);
+    var archive: [2560]u8 = @splat(0);
+    @memcpy(archive[0..512], &block);
+    @memcpy(archive[512..515], "abc");
+    try testing.expectError(error.DataException, inspectOrdinal(&archive, 0));
+
+    @memset(block[345..354], 0);
+    @memcpy(block[345..354], "/abs/evil");
+    tarSealTestHeader(&block);
+    @memcpy(archive[0..512], &block);
+    try testing.expectError(error.DataException, inspectOrdinal(&archive, 0));
+
+    @memset(block[345..354], 0);
+    @memcpy(block[345..352], "dir/sub");
+    tarSealTestHeader(&block);
+    @memcpy(archive[0..512], &block);
+    const info = try inspectOrdinal(&archive, 0);
+    try testing.expectEqualSlices(u8, "ok.txt", info.name);
+    try testing.expectEqualSlices(u8, "dir/sub", info.prefix);
+    var out: [4]u8 = undefined;
+    const size = try decodeOrdinal(&archive, 0, &out);
+    try testing.expectEqualStrings("abc", out[0..size]);
 }

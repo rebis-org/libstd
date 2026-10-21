@@ -507,6 +507,27 @@ fn unpackLzBlock(st: *Decoder) Exception!void {
     }
 }
 
+// A solid successor skips its own table read, so the encoder can place a table
+// refresh at the very end of the previous file's stream. The reference consumes
+// that refresh here (ReadLastTables) instead of leaving it for the successor,
+// whose bit input starts at its own packed region.
+// The gate mirrors the reference check for five more input bytes, and every
+// error is swallowed, because the reference also treats this as best effort
+// once the declared byte count is complete.
+fn readLastTables(st: *Decoder) void {
+    if (st.br.remainingBits() < 40) return;
+
+    const table: *const DecodeTable = if (st.audio_block)
+        &st.audio_tables[st.cur_channel]
+    else
+        &st.literal_table;
+    const symbol = huffman.decodeNumber(&st.br, table) catch return;
+    const refresh_symbol: u16 = if (st.audio_block) 256 else 269;
+    if (symbol == refresh_symbol) {
+        readTables(st) catch {};
+    }
+}
+
 pub const Session = struct {
     state: *Decoder,
 
@@ -570,6 +591,10 @@ pub const Session = struct {
             // Running out of input after the declared byte count is success, not truncation.
             if (st.written_size < st.unpacked_size) return err;
         };
+
+        // A trailing refresh must be consumed before a solid successor continues
+        // on the carried tables, because the successor never re-reads them.
+        readLastTables(st);
 
         if (st.stream_out != null) {
             try flushDecoded(st, 0);
@@ -647,4 +672,65 @@ test "old-distance ring: rep matches count back and every match pushes" {
     st.old_dist_ptr = (st.old_dist_ptr +% 1) & 3;
     try std.testing.expectEqual(@as(u32, 40), st.old_dist[0]);
     try std.testing.expectEqual(@as(u32, 1), st.old_dist_ptr);
+}
+
+test "v20 readLastTables feeds a trailing refresh to the solid successor" {
+    var st: Decoder = undefined;
+    var window_buf: [1 << 16]u8 = undefined;
+    var pool: [table_pool_words]u16 = undefined;
+    var session = try Session.init(&st, &window_buf, &pool);
+
+    // The code-length alphabet carries only symbol 1 (a +1 length delta) and
+    // symbol 18 (a zero run of 11 plus seven extra bits), one bit each.
+    const bd_lengths = [bc20]u8{ 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+
+    var packed1: [64]u8 = undefined;
+    var w = bits.BitWriter.init(&packed1);
+
+    // File 1 declares LD = {65: 1 bit, 269: 1 bit} with empty DD and RD tables.
+    try w.writeBits(0b01, 2); // LZ block, keep the zeroed old table.
+    for (bd_lengths) |len| try w.writeBits(len, 4);
+    try w.writeBit(1);
+    try w.writeBits(54, 7); // 65 zeros.
+    try w.writeBit(0); // Literal 65 gains length 1.
+    try w.writeBit(1);
+    try w.writeBits(127, 7); // 138 zeros.
+    try w.writeBit(1);
+    try w.writeBits(54, 7); // 65 zeros close the gap to index 269.
+    try w.writeBit(0); // Literal 269 gains length 1.
+    try w.writeBit(1);
+    try w.writeBits(93, 7); // 104 zeros fill the remaining 374 entries.
+
+    // Four literals through LD, where literal 65 takes the single-bit code 0.
+    for (0..4) |_| try w.writeBit(0);
+
+    // The trailing refresh symbol 269 (code 1) and the tables it announces:
+    // LD = {66: 1 bit}, so a solid successor must decode literal 66 instead.
+    try w.writeBit(1);
+    try w.writeBits(0b01, 2);
+    for (bd_lengths) |len| try w.writeBits(len, 4);
+    try w.writeBit(1);
+    try w.writeBits(55, 7); // 66 zeros.
+    try w.writeBit(0); // Literal 66 gains length 1.
+    try w.writeBit(1);
+    try w.writeBits(127, 7);
+    try w.writeBit(1);
+    try w.writeBits(127, 7);
+    try w.writeBit(1);
+    try w.writeBits(30, 7); // 41 zeros, clamped at the 374th entry.
+
+    const len1 = try w.flush();
+
+    var out1_buf: [16]u8 = undefined;
+    var out1 = sink.BufferSink.init(&out1_buf);
+    try session.decodeFile(packed1[0..len1], 4, false, out1.sink());
+    try std.testing.expectEqualSlices(u8, "AAAA", out1_buf[0..out1.len]);
+
+    // The solid file skips its table read, so it decodes through the refreshed LD.
+    // Without the trailing refresh consumption it would emit "AAA" through the old one.
+    const packed2 = [_]u8{0x00};
+    var out2_buf: [16]u8 = undefined;
+    var out2 = sink.BufferSink.init(&out2_buf);
+    try session.decodeFile(&packed2, 3, true, out2.sink());
+    try std.testing.expectEqualSlices(u8, "BBB", out2_buf[0..out2.len]);
 }

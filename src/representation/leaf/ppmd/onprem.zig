@@ -11,7 +11,7 @@ pub const order_max = 64;
 pub const mem_min = 1 << 11;
 pub const mem_max = 0x7FFFFFFF;
 const unit_size = 12;
-const num_indexes = 12;
+const num_indexes = 38;
 const int_bits = 7;
 const period_bits = 7;
 const bin_scale = 1 << (int_bits + period_bits);
@@ -337,7 +337,7 @@ const Model = struct {
         var i: usize = 0;
         var k: usize = 0;
         while (i < num_indexes) : (i += 1) {
-            var step: usize = (i >> 2) + 1;
+            var step: usize = if (i >= 12) 4 else (i >> 2) + 1;
             while (step > 0) : (step -= 1) {
                 self.tables.units2_indx[k] = @intCast(i);
                 k += 1;
@@ -1019,7 +1019,7 @@ const Model = struct {
             }
             if (count >= freq_sum) return error.DataException;
             try range_coder.decodeRange(hi_cnt, freq_sum - hi_cnt);
-            esc.see.summ = @intCast(esc.see.summ + freq_sum);
+            esc.see.summ = @truncate(esc.see.summ + freq_sum);
             while (i != 0) {
                 i -= 1;
                 mask[self.state(ps[i]).symbol] = 0;
@@ -1142,7 +1142,7 @@ const Model = struct {
                 if (i == 0) break;
             }
             const total = sum + esc.esc_freq;
-            esc.see.summ = @intCast(esc.see.summ + total);
+            esc.see.summ = @truncate(esc.see.summ + total);
             range_coder.range /= total;
             range_coder.encode(sum, esc.esc_freq);
             var scan = self.statsOf(mc);
@@ -1181,6 +1181,33 @@ test "ppmd leaf roundtrip period-97 repetitive 4500" {
     const output = try testing.allocator.alloc(u8, input.len);
     defer testing.allocator.free(output);
     const produced = try decode(encoded[0..encoded_len], output, scratch, .{ .order = 8, .mem_size = 4 << 20, .unpack_size = input.len });
+    try testing.expectEqual(input.len, produced);
+    try testing.expectEqualSlices(u8, input, output);
+}
+
+test "ppmd leaf roundtrip allocator stress glue and large indexes" {
+    const testing = std.testing;
+    var rng = std.Random.DefaultPrng.init(0x5EED_5EED);
+    const input = try testing.allocator.alloc(u8, 1 << 16);
+    defer testing.allocator.free(input);
+    for (input, 0..) |*byte, i| {
+        byte.* = switch (i % 8) {
+            0...3 => rng.random().int(u8),
+            else => @truncate(i / 61),
+        };
+    }
+    // Small memory forces unit exhaustion, GlueFreeBlocks, model restarts,
+    // and multi-unit stat blocks mapped to allocator indexes above 11.
+    const mem = 1 << 14;
+    const backing = try testing.allocator.alloc(u8, decodeWorkspaceSize(mem));
+    defer testing.allocator.free(backing);
+    const bound = try requiredSize(input, backing, .{ .order = 8, .mem_size = mem, .unpack_size = input.len });
+    const encoded = try testing.allocator.alloc(u8, bound);
+    defer testing.allocator.free(encoded);
+    const encoded_len = try encode(input, encoded, backing, .{ .order = 8, .mem_size = mem, .unpack_size = input.len });
+    const output = try testing.allocator.alloc(u8, input.len);
+    defer testing.allocator.free(output);
+    const produced = try decode(encoded[0..encoded_len], output, backing, .{ .order = 8, .mem_size = mem, .unpack_size = input.len });
     try testing.expectEqual(input.len, produced);
     try testing.expectEqualSlices(u8, input, output);
 }

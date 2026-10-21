@@ -111,11 +111,15 @@ fn readMember(input: []const u8, at: usize, history: []u8, output: *std.Io.Write
     const stored_crc = std.mem.readInt(u32, input[trailer_at..][0..4], .little);
     const stored_size = std.mem.readInt(u32, input[trailer_at + 4 ..][0..4], .little);
     if (stored_crc != tee_writer.crc32Value() or stored_size != @as(u32, @truncate(tee_writer.size))) return error.IntegrityException;
+    // ISIZE wraps modulo 2^32 (RFC 1952), so the trailer comparison accepts a
+    // member whose true size is the claim plus a multiple of 4 GiB. The tee's
+    // count is the truth: decoded_size carries the real byte count, not the
+    // wrapped trailer field.
     return .{
         .header = header,
         .data_start = data_start,
         .data_size = inflated.consumed,
-        .decoded_size = stored_size,
+        .decoded_size = std.math.cast(usize, tee_writer.size) orelse return error.ResourceException,
         .crc32 = stored_crc,
     };
 }
@@ -123,15 +127,22 @@ fn readMember(input: []const u8, at: usize, history: []u8, output: *std.Io.Write
 // ISIZE only seeds the attempt; commit needs exact count, CRC32, and trailer.
 // Mismatch defers to the two-pass route. A fallback carries the byte count
 // already written, so the caller can erase the tentative prefix.
-pub fn decodeSinglePass(input: []const u8, output: []u8, history: []u8, provider: checksum.Provider) Exception!SinglePass {
+// The decoded limit joins the fit conditions: a caller whose limit is narrower
+// than the span must learn the failure from the two-pass route, never after
+// the single-pass commit.
+pub fn decodeSinglePass(input: []const u8, output: []u8, history: []u8, provider: checksum.Provider, max_decoded_bytes: u64) Exception!SinglePass {
     if (history.len < deflate_history_size) return error.CapacityException;
     if (input.len >= std.math.maxInt(u32)) return .{ .fallback = 0 };
     if (input.len < minimum_member_len) return .{ .fallback = 0 };
     const claimed_size = std.mem.readInt(u32, input[input.len - 4 ..][0..4], .little);
     if (output.len < claimed_size) return .{ .fallback = 0 };
+    if (claimed_size > max_decoded_bytes) return .{ .fallback = 0 };
     var sink_writer = std.Io.Writer.fixed(output);
     const member = readMember(input, 0, history, &sink_writer, provider) catch return .{ .fallback = sink_writer.end };
     if (member.total() != input.len) return .{ .fallback = sink_writer.end };
+    // A wrapped ISIZE can hide a member past the limit; the tee's count is
+    // checked before the commit, and the tentative prefix rides the fallback.
+    if (member.decoded_size > max_decoded_bytes) return .{ .fallback = sink_writer.end };
     return .{ .decoded = member.decoded_size };
 }
 
@@ -389,4 +400,42 @@ test "inspectMembers enumerates concatenated members with their fields" {
     try std.testing.expectEqual(@as(usize, 255), m2.operating_system);
     try std.testing.expectEqual(total, m1.total_size + m2.total_size);
     try std.testing.expect((try iterator.next()) == null);
+}
+
+test "decodeSinglePass defers to the two-pass route when the decoded limit excludes the member" {
+    // See the decode gate above: a mixed build cannot serve one call with
+    // both arms.
+    if (!deflate_seam.decodeServed(checksum.default_provider)) return;
+
+    const payload = "single pass payload that a decoded limit must exclude";
+    const options: Options = .{
+        .modification_time = 0,
+        .extra_flags = 0,
+        .operating_system = 3,
+        .text = false,
+        .header_crc = false,
+        .extra = &.{},
+        .name = "",
+        .comment = "",
+        .deflate = .{ .good = 8, .nice = 128, .lazy = 16, .chain = 8 },
+    };
+    var history: [deflate_history_size]u8 = undefined;
+    var encoded: [128]u8 = undefined;
+    var reader = std.Io.Reader.fixed(payload);
+    var writer = std.Io.Writer.fixed(&encoded);
+    try encodeStream(&reader, &writer, &history, options);
+    const input = encoded[0..writer.end];
+
+    var output: [256]u8 = @splat(0xa5);
+    switch (try decodeSinglePass(input, &output, &history, checksum.default_provider, payload.len - 1)) {
+        .fallback => |tentative| try std.testing.expectEqual(@as(usize, 0), tentative),
+        .decoded => return error.LimitNotApplied,
+    }
+    for (output) |byte| try std.testing.expectEqual(@as(u8, 0xa5), byte);
+
+    switch (try decodeSinglePass(input, &output, &history, checksum.default_provider, payload.len)) {
+        .decoded => |produced| try std.testing.expectEqual(payload.len, produced),
+        .fallback => return error.LimitRejectedFit,
+    }
+    try std.testing.expectEqualSlices(u8, payload, output[0..payload.len]);
 }

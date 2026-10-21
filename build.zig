@@ -91,5 +91,5 @@ pub fn build(b: *std.Build) void {
     const micro_exe = b.addExecutable(.{ .name = "micro", .root_module = micro_module });
     const run_micro = b.addRunArtifact(micro_exe);
     run_micro.addPassthruArgs();
-    b.step("micro", "Run leaf-level micro benchmarks (time budget, p75/p99, allocation counts)").dependOn(&run_micro.step);
+    b.step("micro", "Run micro benchmarks (time budget, p75/p99, allocation counts)").dependOn(&run_micro.step);
 }

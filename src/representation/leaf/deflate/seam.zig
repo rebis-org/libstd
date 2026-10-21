@@ -105,6 +105,15 @@ const Mergeable = union(Provider) {
         }
     }
 
+    // The session driver tells starvation from corruption through this:
+    // a starved parse stays resumable, a failed one is terminal.
+    pub fn isFailed(self: *const @This()) bool {
+        return switch (self.*) {
+            .onprem => |*inner| inner.isFailed(),
+            .offprem => |*inner| inner.isFailed(),
+        };
+    }
+
     pub fn readerPtr(self: *@This()) *std.Io.Reader {
         return switch (self.*) {
             .onprem => |*inner| inner.readerPtr(),

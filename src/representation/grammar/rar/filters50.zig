@@ -110,7 +110,11 @@ pub fn applyArm(data: []u8, file_offset: u64) void {
             const high_byte: u32 = data[i + 2];
             var offset: u32 = (high_byte << 16) | (mid_byte << 8) | low_byte;
 
-            offset -%= @truncate((file_offset +% @as(u64, i)) / 4);
+            // The reference truncates the file offset to 32 bits before the
+            // wrapping addition and the shift, so entries beyond 4 GiB keep
+            // byte-exact behavior (unpack50.cpp FILTER_ARM).
+            const file_offset32: u32 = @truncate(file_offset);
+            offset -%= (file_offset32 +% @as(u32, @truncate(i))) / 4;
 
             data[i] = @truncate(offset);
             data[i + 1] = @truncate(offset >> 8);
@@ -176,6 +180,14 @@ test "arm filter subtracts the instruction offset" {
     applyArm(&data, 0);
     try std.testing.expectEqual(@as(u8, 0x0E), data[8]);
     try std.testing.expectEqual(@as(u8, 0xEB), data[11]);
+}
+
+test "arm filter truncates the file offset to 32 bits" {
+    // A 4 GiB file offset must wrap like the reference's 32-bit addition:
+    // the old 64-bit path subtracted 2^30 here and flipped the high byte.
+    var data = [_]u8{ 0x00, 0x00, 0x00, 0xEB };
+    applyArm(&data, 1 << 32);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x00, 0x00, 0x00, 0xEB }, &data);
 }
 
 test "readFilterSize assembles little-endian across 1-4 bytes" {

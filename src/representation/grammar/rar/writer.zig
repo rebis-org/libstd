@@ -228,7 +228,9 @@ const block_writer = struct {
         } else {
             file_flags |= rar.rar5_file_crc32;
         }
-        const attributes: u64 = if (entry.is_directory) 0x10 else 0x20;
+        // The attributes are unix st_mode values, because host_os is 1 below:
+        // the reference chmods extracted files with this field (extract.cpp).
+        const attributes: u64 = if (entry.is_directory) 0o40755 else 0o100644;
 
         var body: usize = 0;
         body += vintSize(file_flags);
@@ -274,7 +276,9 @@ const block_writer = struct {
         } else {
             file_flags |= rar.rar5_file_crc32;
         }
-        const attributes: u64 = if (entry.is_directory) 0x10 else 0x20;
+        // The attributes are unix st_mode values, because host_os is 1 below:
+        // the reference chmods extracted files with this field (extract.cpp).
+        const attributes: u64 = if (entry.is_directory) 0o40755 else 0o100644;
         var data_crc = if (entry.is_directory) 0 else checksum.crc32With(provider, entry.data);
         var keys: ?rar.Rar5Keys = null;
         if (data_encrypted) {
@@ -479,6 +483,60 @@ test "vint encoding matches the rar5 wire form" {
     try std.testing.expectEqual(@as(u8, 0x42), buf[1]);
     try std.testing.expectEqual(vintSize(0x2101), 2);
     try std.testing.expectEqual(vintSize(0), 1);
+}
+
+test "file headers carry unix st_mode attributes" {
+    // host_os is 1 (unix), so the attributes field must be a real st_mode,
+    // not a Windows attribute: extractors chmod extracted files with it.
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const entries = [_]RarEntry{
+        .{ .name = "a", .data = "hi", .method = 0 },
+        .{ .name = "d", .is_directory = true },
+    };
+
+    const sizes = pack50.workspacesFor(2);
+    const hash = try allocator.alloc(u32, sizes.hash_words);
+    defer allocator.free(hash);
+    const hash2 = try allocator.alloc(u32, sizes.hash2_words);
+    defer allocator.free(hash2);
+    const hash3 = try allocator.alloc(u32, sizes.hash3_words);
+    defer allocator.free(hash3);
+    const bt_left = try allocator.alloc(u32, sizes.bt_words);
+    defer allocator.free(bt_left);
+    const bt_right = try allocator.alloc(u32, sizes.bt_words);
+    defer allocator.free(bt_right);
+    const tokens = try allocator.alloc(finder.LzToken, sizes.token_count);
+    defer allocator.free(tokens);
+    const staging = try allocator.alloc(u8, sizes.staging_bytes);
+    defer allocator.free(staging);
+    const packed_buf = try allocator.alloc(u8, packedBound(entries[0]));
+    defer allocator.free(packed_buf);
+    const packed_sizes = try allocator.alloc(usize, entries.len);
+    defer allocator.free(packed_sizes);
+    var ws = WriteBuffers{
+        .hash = hash,
+        .hash2 = hash2,
+        .hash3 = hash3,
+        .bt_left = bt_left,
+        .bt_right = bt_right,
+        .tokens = tokens,
+        .staging = staging,
+        .packed_buf = packed_buf,
+        .packed_sizes = packed_sizes,
+    };
+    const required = try rarWriteSize(&entries, &ws);
+    const archive = try allocator.alloc(u8, required);
+    defer allocator.free(archive);
+    const written = try rarEncode(&entries, archive, &ws, crypto.default_provider);
+    try testing.expectEqual(required, written);
+
+    // Signature (8) + main block (8) place the first file block at 16; the
+    // block prefix holds type, flags, and data_size, so the body follows at 24.
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xA4, 0x83, 0x02 }, archive[26..29]); // 0o100644
+    try testing.expectEqual(@as(u8, 1), archive[38]); // host_os = unix.
+    // The directory block follows the stored data at 43; its attrs sit at 52.
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xED, 0x83, 0x01 }, archive[52..55]); // 0o40755.
 }
 
 test "created archive round-trips through the facade reader (store and lz)" {

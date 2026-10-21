@@ -831,6 +831,13 @@ pub fn DecoderOf(comptime slice_input: bool) type {
         }
 
         pub fn resetDictionary(self: *Self) void {
+            // The position state restarts with the dictionary: the SDK zeroes
+            // processedPos on initDic and xz rewinds dict.pos. A constant
+            // position offset is decode-invariant (each position-indexed table
+            // row accumulates the same bit subsequence, rotated), so this is
+            // convention parity; the reference counters double as dictionary
+            // trackers, which this decoder keeps in the ring buffer instead.
+            self.total_pos = 0;
             if (self.clear_dictionary) {
                 @memset(self.dictionary, 0);
                 self.dictionary_pos = 0;
@@ -909,6 +916,7 @@ pub fn DecoderOf(comptime slice_input: bool) type {
                         length = try self.decodeLength(&range_coder, position_state, false);
                         self.rep0 = try self.decodeDistance(&range_coder, length);
                         if (self.rep0 == 0xFFFFFFFF) {
+                            if (range_coder.corrupted) return error.DataException;
                             if (!range_coder.isFinishedOk()) return error.DataException;
                             if (marker_required and remaining != null and remaining.? != 0) return error.DataException;
                             try self.finishOutput();
@@ -921,10 +929,16 @@ pub fn DecoderOf(comptime slice_input: bool) type {
                             if (range_coder.decodeBit(&self.is_rep0_long[state2]) == 0) {
                                 self.state = updateStateShortRep(self.state);
                                 if (!self.isDistanceValid(self.rep0)) return error.DataException;
+                                if (remaining) |*remaining_count| {
+                                    // A short rep past the declared size is corruption
+                                    // for the same reason as a literal: the decrement
+                                    // would wrap the counter.
+                                    if (remaining_count.* == 0) return error.DataException;
+                                    remaining_count.* -= 1;
+                                }
                                 const byte = self.getByte(self.rep0 + 1);
                                 try self.putByte(byte);
                                 prev_byte = byte;
-                                if (remaining) |*remaining_count| remaining_count.* -= 1;
                                 continue;
                             }
                         } else {
@@ -967,6 +981,7 @@ pub fn DecoderOf(comptime slice_input: bool) type {
             } else {
                 var prev_byte: u32 = if (self.dictionary_pos == 0 and !self.dictionary_full) 0 else self.getByte(1);
                 while (true) {
+                    if (self.range_coder.corrupted) return error.DataException;
                     if (remaining) |*remaining_count| {
                         if (remaining_count.* == 0) {
                             if (!marker_required) {
@@ -1002,6 +1017,7 @@ pub fn DecoderOf(comptime slice_input: bool) type {
                         length = try self.decodeLength(&self.range_coder, position_state, false);
                         self.rep0 = try self.decodeDistance(&self.range_coder, length);
                         if (self.rep0 == 0xFFFFFFFF) {
+                            if (self.range_coder.corrupted) return error.DataException;
                             if (!self.range_coder.isFinishedOk()) return error.DataException;
                             if (marker_required and remaining != null and remaining.? != 0) return error.DataException;
                             try self.finishOutput();
@@ -1014,10 +1030,16 @@ pub fn DecoderOf(comptime slice_input: bool) type {
                             if (try self.range_coder.decodeBit(&self.is_rep0_long[state2]) == 0) {
                                 self.state = updateStateShortRep(self.state);
                                 if (!self.isDistanceValid(self.rep0)) return error.DataException;
+                                if (remaining) |*remaining_count| {
+                                    // A short rep past the declared size is corruption
+                                    // for the same reason as a literal: the decrement
+                                    // would wrap the counter.
+                                    if (remaining_count.* == 0) return error.DataException;
+                                    remaining_count.* -= 1;
+                                }
                                 const byte = self.getByte(self.rep0 + 1);
                                 try self.putByte(byte);
                                 prev_byte = byte;
-                                if (remaining) |*remaining_count| remaining_count.* -= 1;
                                 continue;
                             }
                         } else {
@@ -2078,6 +2100,9 @@ pub const Encoder = struct {
                 var previous_length: u32 = match_min_len - 1;
                 for (matches[0..count]) |match_pair| {
                     const clipped_length = @min(@as(usize, match_pair.length), window_length - i);
+                    // A tail scan can lead with a length-1 entry; skipping it keeps
+                    // the strictly-increasing break valid for the entries behind it.
+                    if (clipped_length < match_min_len) continue;
                     if (clipped_length <= previous_length) break;
                     var next_distances: [4]u32 = .{ match_pair.distance - 1, node.rep_distances[0], node.rep_distances[1], node.rep_distances[2] };
                     var candidate_length: usize = previous_length + 1;
@@ -2609,4 +2634,42 @@ test "lzma bt4 honors nice_len and still roundtrips" {
     defer allocator.free(output);
     const decoded = try decode(encoded[0..encoded_len], output, decode_scratch, .{ .properties = properties, .unpack_size = input.len, .marker_required = false, .max_work = 64 << 20 });
     try std.testing.expectEqualSlices(u8, &input, output[0..decoded]);
+}
+
+test "lzma short rep past declared size is a data error" {
+    // A stream that emits one literal and then a short rep at the size
+    // boundary must report corruption, not wrap the unpack-size counter
+    // into a capacity error or a silent overrun.
+    var crafted: [32]u8 = undefined;
+    var dest = std.Io.Writer.fixed(&crafted);
+    var range_coder = RangeEncoder.init(&dest);
+    var is_match: Prob = prob_init;
+    var is_rep: Prob = prob_init;
+    var is_rep_g0: Prob = prob_init;
+    var is_rep0_long: Prob = prob_init;
+    var literal_probs: [literal_probs_count]Prob = undefined;
+    for (&literal_probs) |*prob| prob.* = prob_init;
+    // Literal 'a' from the initial state, then a short rep.
+    try range_coder.encodeBit(&is_match, 0);
+    var symbol: u32 = 1;
+    var shift: u5 = 7;
+    while (true) {
+        const bit: u1 = @truncate(@as(u32, 'a') >> shift);
+        try range_coder.encodeBit(&literal_probs[symbol], bit);
+        symbol = (symbol << 1) | bit;
+        if (shift == 0) break;
+        shift -= 1;
+    }
+    try range_coder.encodeBit(&is_match, 1);
+    try range_coder.encodeBit(&is_rep, 1);
+    try range_coder.encodeBit(&is_rep_g0, 0);
+    try range_coder.encodeBit(&is_rep0_long, 0);
+    try range_coder.finish();
+
+    const properties = Properties{ .lc = 0, .lp = 0, .pb = 0, .dictionary_size = dictionary_min };
+    const scratch = try std.testing.allocator.alloc(u8, decodeWorkspaceSize(properties));
+    defer std.testing.allocator.free(scratch);
+    var output: [1]u8 = undefined;
+    const options: Options = .{ .properties = properties, .unpack_size = 1, .marker_required = true };
+    try std.testing.expectError(error.DataException, decode(crafted[0..dest.end], &output, scratch, options));
 }

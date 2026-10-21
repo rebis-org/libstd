@@ -14,11 +14,11 @@ pub const block_length = 16;
 
 const Repr = @Vector(2, u64);
 
-const has_arm8 = !options.portable and builtin.target.cpu.arch == .aarch64 and
+const has_arm8 = !options.aes_portable and builtin.target.cpu.arch == .aarch64 and
     builtin.zig_backend != .stage2_c and
     builtin.target.cpu.has(.aarch64, .aes);
 
-const has_aesni = !options.portable and builtin.target.cpu.arch == .x86_64 and
+const has_aesni = !options.aes_portable and builtin.target.cpu.arch == .x86_64 and
     builtin.zig_backend != .stage2_c and
     builtin.target.cpu.has(.x86, .aes);
 
@@ -400,15 +400,24 @@ fn KeySchedule(comptime Aes: type) type {
         fn nkSecond(t: Repr, tx: Repr) Repr {
             var s: Repr = undefined;
             var s2: Repr = undefined;
+            var ts: Repr = undefined;
 
             return asm (
                 \\ aeskeygenassist $0, %[t], %[s]
                 \\ pshufd $0xaa, %[s], %[s2]
                 \\ movdqa %[tx], %[r]
+                \\ movdqa %[r], %[ts]
+                \\ pslldq $4, %[ts]
+                \\ pxor %[ts], %[r]
+                \\ pslldq $4, %[ts]
+                \\ pxor %[ts], %[r]
+                \\ pslldq $4, %[ts]
+                \\ pxor %[ts], %[r]
                 \\ pxor %[s2], %[r]
                 : [r] "=&x" (-> Repr),
                   [s] "=&x" (s),
                   [s2] "=&x" (s2),
+                  [ts] "=&x" (ts),
                 : [t] "x" (t),
                   [tx] "x" (tx),
             );
@@ -523,12 +532,12 @@ pub const Aes256 = AesParams(256);
 
 // AES-192 fills the same round-key walker from the word expansion; no
 // 16-byte key groups exist, so the vectorized schedule cannot apply.
-pub const Aes192Hw = struct {
+pub const Aes192 = struct {
     const rounds = 12;
 
     round_keys: [rounds + 1]Block,
 
-    pub fn initEnc(key: [24]u8) Aes192Hw {
+    pub fn initEnc(key: [24]u8) Aes192 {
         var words: [52]u32 = undefined;
         for (0..6) |index| {
             words[index] = std.mem.readInt(u32, key[4 * index ..][0..4], .big);
@@ -539,11 +548,11 @@ pub const Aes192Hw = struct {
         return .{ .round_keys = round_keys };
     }
 
-    pub fn initDec(key: [24]u8) Aes192Hw {
+    pub fn initDec(key: [24]u8) Aes192 {
         return initEnc(key).invert();
     }
 
-    fn invert(self: Aes192Hw) Aes192Hw {
+    fn invert(self: Aes192) Aes192 {
         var round_keys: [rounds + 1]Block = undefined;
         invertSchedule(self.round_keys[0..], round_keys[0..]);
         return .{ .round_keys = round_keys };
@@ -551,7 +560,7 @@ pub const Aes192Hw = struct {
 
     const BlockDirection = enum { encrypt, decrypt };
 
-    fn cryptBlock(self: Aes192Hw, dst: *[block_length]u8, src: *const [block_length]u8, comptime direction: BlockDirection) void {
+    fn cryptBlock(self: Aes192, dst: *[block_length]u8, src: *const [block_length]u8, comptime direction: BlockDirection) void {
         var t = Block.fromBytes(src).xorBlocks(self.round_keys[0]);
         inline for (1..rounds) |index| {
             t = switch (direction) {
@@ -566,19 +575,19 @@ pub const Aes192Hw = struct {
         dst.* = t.toBytes();
     }
 
-    pub fn encrypt(self: Aes192Hw, dst: *[block_length]u8, src: *const [block_length]u8) void {
+    pub fn encrypt(self: Aes192, dst: *[block_length]u8, src: *const [block_length]u8) void {
         cryptBlock(self, dst, src, .encrypt);
     }
 
-    pub fn encryptWide4(self: Aes192Hw, dst: *[64]u8, src: *const [64]u8) void {
+    pub fn encryptWide4(self: Aes192, dst: *[64]u8, src: *const [64]u8) void {
         wide4(&self.round_keys, dst, src, rounds, Block.encrypt, Block.encryptLast);
     }
 
-    pub fn decrypt(self: Aes192Hw, dst: *[block_length]u8, src: *const [block_length]u8) void {
+    pub fn decrypt(self: Aes192, dst: *[block_length]u8, src: *const [block_length]u8) void {
         cryptBlock(self, dst, src, .decrypt);
     }
 
-    pub fn decryptWide4(self: Aes192Hw, dst: *[64]u8, src: *const [64]u8) void {
+    pub fn decryptWide4(self: Aes192, dst: *[64]u8, src: *const [64]u8) void {
         wide4(&self.round_keys, dst, src, rounds, Block.decrypt, Block.decryptLast);
     }
 };
@@ -626,13 +635,7 @@ fn subWord(word: u32) u32 {
 }
 
 fn addRoundKey(state: *[16]u8, key_bytes: *const [16]u8) void {
-    for (0..4) |index| {
-        const word = std.mem.readInt(u32, key_bytes[4 * index ..][0..4], .big);
-        state[4 * index] ^= @truncate(word >> 24);
-        state[4 * index + 1] ^= @truncate(word >> 16);
-        state[4 * index + 2] ^= @truncate(word >> 8);
-        state[4 * index + 3] ^= @truncate(word);
-    }
+    for (state, key_bytes) |*byte, key| byte.* ^= key;
 }
 
 fn subBytesWith(state: *[16]u8, table: *const [256]u8) void {
@@ -807,11 +810,19 @@ test "aes onprem matches the stdlib oracle" {
     std256.encrypt(&expected, &pt);
     try std.testing.expectEqualSlices(u8, &expected, &out);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0x8e, 0xa2, 0xb7, 0xca, 0x51, 0x67, 0x45, 0xbf, 0xea, 0xfc, 0x49, 0x90, 0x4b, 0x49, 0x60, 0x89 }, &out);
+    // Decrypting the FIPS-197 C.3 ciphertext pins the inverted schedule: the
+    // plaintext is the known answer.
+    const dec256 = Aes256.initDec(key256);
+    dec256.decrypt(&back, &out);
+    try std.testing.expectEqualSlices(u8, &pt, &back);
+    var std_back: [16]u8 = undefined;
+    std.crypto.core.aes.Aes256.initDec(key256).decrypt(&std_back, &out);
+    try std.testing.expectEqualSlices(u8, &std_back, &back);
 
-    const ours192 = Aes192Hw.initEnc(key192);
+    const ours192 = Aes192.initEnc(key192);
     ours192.encrypt(&out, &pt);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0xdd, 0xa9, 0x7c, 0xa4, 0x86, 0x4c, 0xdf, 0xe0, 0x6e, 0xaf, 0x70, 0xa0, 0xec, 0x0d, 0x71, 0x91 }, &out);
-    const dec192 = Aes192Hw.initDec(key192);
+    const dec192 = Aes192.initDec(key192);
     dec192.decrypt(&back, &out);
     try std.testing.expectEqualSlices(u8, &pt, &back);
 }
@@ -837,8 +848,7 @@ test "aesni block rounds match the software tables" {
     }
 }
 
-test "aesni schedule matches the word expansion" {
-    if (comptime !has_aesni) return error.SkipZigTest;
+fn expectScheduleAgreesWithWordExpansion() !void {
     var rng = std.Random.DefaultPrng.init(0xAE5C);
     var i: usize = 0;
     while (i < 64) : (i += 1) {
@@ -863,4 +873,52 @@ test "aesni schedule matches the word expansion" {
             try std.testing.expectEqualSlices(u8, &sw_key.toBytes(), &hw_key.toBytes());
         }
     }
+}
+
+test "aesni schedule matches the word expansion" {
+    if (comptime !has_aesni) return error.SkipZigTest;
+    try expectScheduleAgreesWithWordExpansion();
+}
+
+test "arm schedule matches the word expansion" {
+    if (comptime !has_arm8) return error.SkipZigTest;
+    try expectScheduleAgreesWithWordExpansion();
+}
+
+fn expectEncryptWide4Agrees(ctx: anytype, src: *const [64]u8) !void {
+    var wide: [64]u8 = undefined;
+    var single: [64]u8 = undefined;
+    ctx.encryptWide4(&wide, src);
+    for (0..4) |block| {
+        ctx.encrypt(single[block * 16 ..][0..16], src[block * 16 ..][0..16]);
+    }
+    try std.testing.expectEqualSlices(u8, &single, &wide);
+}
+
+fn expectDecryptWide4Agrees(ctx: anytype, src: *const [64]u8) !void {
+    var wide: [64]u8 = undefined;
+    var single: [64]u8 = undefined;
+    ctx.decryptWide4(&wide, src);
+    for (0..4) |block| {
+        ctx.decrypt(single[block * 16 ..][0..16], src[block * 16 ..][0..16]);
+    }
+    try std.testing.expectEqualSlices(u8, &single, &wide);
+}
+
+test "wide4 agrees with the per-block rounds" {
+    var rng = std.Random.DefaultPrng.init(0xAE57);
+    var src: [64]u8 = undefined;
+    var key128: [16]u8 = undefined;
+    var key192: [24]u8 = undefined;
+    var key256: [32]u8 = undefined;
+    rng.random().bytes(&src);
+    rng.random().bytes(&key128);
+    rng.random().bytes(&key192);
+    rng.random().bytes(&key256);
+    try expectEncryptWide4Agrees(Aes128.initEnc(key128), &src);
+    try expectDecryptWide4Agrees(Aes128.initDec(key128), &src);
+    try expectEncryptWide4Agrees(Aes192.initEnc(key192), &src);
+    try expectDecryptWide4Agrees(Aes192.initDec(key192), &src);
+    try expectEncryptWide4Agrees(Aes256.initEnc(key256), &src);
+    try expectDecryptWide4Agrees(Aes256.initDec(key256), &src);
 }

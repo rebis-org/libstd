@@ -319,7 +319,11 @@ pub const Unpacker = struct {
         if (first_byte & 0x80 != 0) {
             filt_pos = try rarvm.readData(&cr);
             if (filt_pos == 0) {
+                // The reference InitFilters30(false) also drops the remembered
+                // block lengths and every not-yet-applied invocation here.
                 st.filter_count = 0;
+                st.old_filter_lengths = @splat(0);
+                st.pending_count = 0;
             } else {
                 filt_pos -= 1;
             }
@@ -850,4 +854,57 @@ test "distance table slots 0-3 carry no extra bits" {
     }
     try std.testing.expectEqual(@as(u32, 4), dist_decode[4]);
     try std.testing.expectEqual(@as(u5, 1), dist_bits[4]);
+}
+
+test "v29 filter position zero resets lengths and pending invocations" {
+    // A filter program identifies by length, CRC32, and the leading XOR byte, so
+    // these bytes carry the delta filter's CRC 0x0e06077d at length 29.
+    const delta_prog = [29]u8{
+        0xeb, 0x03, 0x0a, 0x11, 0x18, 0x1f, 0x26, 0x2d, 0x34, 0x3b, 0x42, 0x49,
+        0x50, 0x57, 0x5e, 0x65, 0x6c, 0x73, 0x7a, 0x81, 0x88, 0x8f, 0x96, 0x9d,
+        0xa4, 0xca, 0xbd, 0x9d, 0x61,
+    };
+
+    var st: Unpacker = undefined;
+    var window_buffer: [1 << 12]u8 = undefined;
+    var pool: [table_pool_words * 4]u16 = undefined;
+    var pending: [4]PendingFilter = undefined;
+    var filter_scratch: [16]u8 = undefined;
+    var ppm_heap: [16]u8 = undefined;
+    try Unpacker.init(&st, &window_buffer, &pool, &pending, &filter_scratch, &ppm_heap, checksum.default_provider);
+
+    // First invocation: register filter 0 with an explicit block length of 16.
+    var code1: [64]u8 = undefined;
+    var w = bits.BitWriter.init(&code1);
+    try w.writeBits(1, 6); // Filter position 1, which becomes position 0.
+    try w.writeBits(0, 6); // Block start 0.
+    try w.writeBits(272, 10); // Block length 16 in the 0x4000 width.
+    try w.writeBits(285, 10); // Program size 29 in the 0x4000 width.
+    for (delta_prog) |b| try w.writeBits(b, 8);
+    const len1 = try w.flush();
+    try st.addVMCode(0x80 | 0x20, code1[0..len1]);
+
+    try std.testing.expectEqual(@as(usize, 1), st.pending_count);
+    try std.testing.expectEqual(rarvm.StandardFilter.delta, st.pending[0].filter);
+    try std.testing.expectEqual(@as(u64, 0), st.pending[0].start);
+    try std.testing.expectEqual(@as(u32, 16), st.pending[0].length);
+
+    // Second invocation: position zero resets the filter set, so the new filter
+    // reads a zero remembered length and the first invocation is dropped.
+    var code2: [64]u8 = undefined;
+    w = bits.BitWriter.init(&code2);
+    try w.writeBits(0, 6); // Filter position zero: reset.
+    try w.writeBits(4, 6); // Block start 4.
+    try w.writeBits(285, 10); // Program size 29 in the 0x4000 width.
+    for (delta_prog) |b| try w.writeBits(b, 8);
+    const len2 = try w.flush();
+    try st.addVMCode(0x80, code2[0..len2]);
+
+    try std.testing.expectEqual(@as(usize, 1), st.pending_count);
+    try std.testing.expectEqual(rarvm.StandardFilter.delta, st.pending[0].filter);
+    try std.testing.expectEqual(@as(u64, 4), st.pending[0].start);
+    try std.testing.expectEqual(@as(u32, 0), st.pending[0].length);
+    try std.testing.expectEqual(@as(u32, 1), st.filter_count);
+    try std.testing.expectEqual(@as(u32, 0), st.old_filter_lengths[0]);
+    try std.testing.expect(!st.unsupported_filter_seen);
 }

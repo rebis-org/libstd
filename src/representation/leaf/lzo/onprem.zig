@@ -144,12 +144,18 @@ fn decodeInner(input: []const u8, output: []u8, count_only: bool) Exception!usiz
     var t: usize = try takeToken(input, &ip);
     var phase: Phase = .literal;
 
-    // A first token above 17 opens a literal run without the usual length encoding.
+    // A first token above 17 opens a literal run without the usual length
+    // encoding. Runs of one to three literals join the match chain directly
+    // (the reference decoder's match_next path); longer runs take the
+    // after-literal M1 instead.
     if (t > 17) {
+        const short_run = t < 21;
         t -= 17;
         try copyLiterals(input, output, &ip, &op, t, count_only);
         t = try takeToken(input, &ip);
-        if (t < 16) {
+        if (short_run) {
+            phase = .match;
+        } else if (t < 16) {
             t = try m1AfterLiteral(input, output, &ip, &op, t, count_only);
             if (t == 0) {
                 t = try takeToken(input, &ip);
@@ -447,5 +453,22 @@ test "lzo1x roundtrips reference fixtures" {
         try testing.expectEqual(plain.len, m);
         try testing.expectEqualSlices(u8, plain, back[0..m]);
         try testing.expectEqual(m, try countDecoded(comp[0..n]));
+    }
+}
+
+test "lzo1x decodes reference short literal runs" {
+    // Streams opening with 18..20 hold one to three literals, then join the
+    // match chain directly (the reference decoder's match_next path). The
+    // expected outputs are pinned by vendor/lzo minilzo behavior.
+    const cases = [_]struct { stream: []const u8, plain: []const u8 }{
+        .{ .stream = &.{ 0x12, 'X', 0x00, 0x00, 0x11, 0x00, 0x00 }, .plain = "XXX" },
+        .{ .stream = &.{ 0x13, 'X', 'Y', 0x00, 0x00, 0x11, 0x00, 0x00 }, .plain = "XYYY" },
+        .{ .stream = &.{ 0x14, 'A', 'B', 'C', 0x04, 0x00, 0x11, 0x00, 0x00 }, .plain = "ABCBC" },
+    };
+    for (cases) |case| {
+        var back: [128]u8 = undefined;
+        const m = try decode(case.stream, &back, &.{}, .{});
+        try std.testing.expectEqualSlices(u8, case.plain, back[0..m]);
+        try std.testing.expectEqual(case.plain.len, try countDecoded(case.stream));
     }
 }

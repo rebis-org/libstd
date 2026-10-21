@@ -114,7 +114,7 @@ fn decodeStreamImpl(reader: *std.Io.Reader, writer: ?*std.Io.Writer, output: []u
     var need_dictionary_reset = true;
     while (true) {
         const control = try io.readByte(reader);
-        if (control == control_end) return decoder.total_pos;
+        if (control == control_end) return std.math.cast(usize, decoder.decoded) orelse return error.ResourceException;
         if (control >= control_lzma_new_props_reset_dict or control == control_copy_reset_dict) {
             need_properties = true;
             need_dictionary_reset = true;
@@ -177,7 +177,7 @@ fn decodeStreamImpl(reader: *std.Io.Reader, writer: ?*std.Io.Writer, output: []u
             }
         }
     }
-    return decoder.total_pos;
+    return std.math.cast(usize, decoder.decoded) orelse return error.ResourceException;
 }
 
 fn validateProperties(props: lzma.Properties) Exception!lzma.Properties {
@@ -391,4 +391,86 @@ fn writeCopyChunk(writer: *std.Io.Writer, chunk: []const u8, reset_dictionary: b
         try io.writeBytes(writer, chunk[copy_offset..][0..batch_len]);
         copy_offset += batch_len;
     }
+}
+
+// A multithreaded encoder shape: every group starts from an empty dictionary,
+// a fresh model, and position zero, announced with a dict-reset chunk.
+fn appendResetChunk(stream: *std.Io.Writer, props: lzma.Properties, input: []const u8, encoder_scratch: []u8) Exception!void {
+    var pack_buffer: [max_pack_size]u8 = undefined;
+    var pack_writer = std.Io.Writer.fixed(&pack_buffer);
+    var encoder = try lzma.Encoder.init(props, &pack_writer, encoder_scratch, .{
+        .properties = props,
+        .unpack_size = null,
+        .marker_required = false,
+        .max_work = std.math.maxInt(u64),
+        .match_finder_depth = 32,
+        .lazy = false,
+        .nice_len = 273,
+        .match_finder = .bt4,
+    });
+    try encoder.encodeInput(input, false);
+    const packed_len = pack_writer.end;
+    const raw_unpack_size = input.len - 1;
+    const raw_pack_size = packed_len - 1;
+    const control: u8 = control_lzma_new_props_reset_dict |
+        @as(u8, @intCast((raw_unpack_size >> 16) & 0x1F));
+    try io.writeByte(stream, control);
+    try io.writeByte(stream, @intCast((raw_unpack_size >> 8) & 0xFF));
+    try io.writeByte(stream, @intCast(raw_unpack_size & 0xFF));
+    try io.writeByte(stream, @intCast((raw_pack_size >> 8) & 0xFF));
+    try io.writeByte(stream, @intCast(raw_pack_size & 0xFF));
+    try io.writeByte(stream, props.encode());
+    try io.writeBytes(stream, pack_buffer[0..packed_len]);
+}
+
+test "lzma2 decodes a mid-stream dictionary reset stream" {
+    const alloc = std.testing.allocator;
+
+    const dictionary: u32 = 1 << 20;
+    const props = defaultProperties(dictionary);
+    const options: Options = .{ .dictionary_size = dictionary, .properties = props };
+
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const input_a = try alloc.alloc(u8, 2001);
+    defer alloc.free(input_a);
+    prng.random().bytes(input_a);
+    const input_b = try alloc.alloc(u8, 2400);
+    defer alloc.free(input_b);
+    @memset(input_b[0..512], 'x');
+    prng.random().bytes(input_b[512..]);
+
+    const encoder_scratch = try alloc.alloc(u8, lzma.encodeWorkspaceSizeBt(props));
+    defer alloc.free(encoder_scratch);
+
+    const stream = try alloc.alloc(u8, input_a.len + input_b.len + 32);
+    defer alloc.free(stream);
+    var sink = std.Io.Writer.fixed(stream);
+    try appendResetChunk(&sink, props, input_a, encoder_scratch);
+    try appendResetChunk(&sink, props, input_b, encoder_scratch);
+    try io.writeByte(&sink, control_end);
+
+    const expected = try alloc.alloc(u8, input_a.len + input_b.len);
+    defer alloc.free(expected);
+    @memcpy(expected[0..input_a.len], input_a);
+    @memcpy(expected[input_a.len..], input_b);
+
+    // The stdlib decoder cross-validates the crafted two-group stream before
+    // the onprem decode checks bit-exact agreement. A constant position-state
+    // offset is decode-invariant in LZMA, so this covers the multithreaded
+    // reset path and its stdlib parity, not an observable restart.
+    var std_reader = std.Io.Reader.fixed(stream[0..sink.end]);
+    var std_decoder = std.compress.lzma2.Decode.init(alloc) catch return error.TestUnexpectedResult;
+    defer std_decoder.deinit(alloc);
+    var std_sink: std.Io.Writer.Allocating = .init(alloc);
+    defer std_sink.deinit();
+    _ = std_decoder.decompress(&std_reader, &std_sink) catch return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, expected, std_sink.writer.buffer[0..std_sink.writer.end]);
+
+    const output = try alloc.alloc(u8, expected.len);
+    defer alloc.free(output);
+    const decode_scratch = try alloc.alloc(u8, decodeWorkspaceSize(dictionary));
+    defer alloc.free(decode_scratch);
+    const produced = try decode(stream[0..sink.end], output, decode_scratch, options);
+    try std.testing.expectEqual(expected.len, produced);
+    try std.testing.expectEqualSlices(u8, expected, output);
 }

@@ -1395,6 +1395,13 @@ pub fn DecompressOf(comptime variant: enum { deflate, deflate64 }) type {
             self.failed = false;
         }
 
+        // A starved slice parse stays resumable: the step rolled back and
+        // this stays false so the session driver can tell starvation from
+        // corruption.
+        pub fn isFailed(self: *const @This()) bool {
+            return self.failed;
+        }
+
         pub fn readerPtr(self: *@This()) *std.Io.Reader {
             return &self.reader;
         }
@@ -1428,8 +1435,15 @@ pub fn DecompressOf(comptime variant: enum { deflate, deflate64 }) type {
                     r.seek = 0;
                 }
                 if (r.end == r.buffer.len) break;
-                decompressor.step() catch {
-                    decompressor.failed = true;
+                decompressor.step() catch |step_err| {
+                    // A truncated slice is a suspension, not corruption: the
+                    // step rolled its parse back, so the session restages
+                    // more input and retries from the same bits. A truncated
+                    // reader is a genuinely short stream, like every other
+                    // parse error.
+                    if (step_err != error.Truncated or decompressor.input == .reader) {
+                        decompressor.failed = true;
+                    }
                     return error.ReadFailed;
                 };
             }
@@ -1465,7 +1479,35 @@ pub fn DecompressOf(comptime variant: enum { deflate, deflate64 }) type {
             if (capacity > r.buffer.len - r.end) return error.EndOfStream;
         }
 
+        // zlib inf_leave pattern: a parse step can abort mid-way with
+        // structure-partial bit state consumed. Snapshot the resumable
+        // position and restore it on truncation so the retry re-parses from
+        // the same bits once more input arrives. Stored copies commit per
+        // byte instead, so they are excluded: a rollback would
+        // double-consume committed bytes.
         fn step(d: *@This()) InflateError!void {
+            if (d.state == .stored_copy) return d.copyStored();
+            const saved_bits = d.bits;
+            const saved_bit_count = d.bit_count;
+            const saved_end = d.reader.end;
+            const saved_pos = switch (d.input) {
+                .reader => |rd| rd.seek,
+                .slice => |s| s.pos,
+            };
+            d.parseStep() catch |err| {
+                if (err != error.Truncated) return err;
+                d.bits = saved_bits;
+                d.bit_count = saved_bit_count;
+                d.reader.end = saved_end;
+                switch (d.input) {
+                    .reader => |rd| rd.seek = saved_pos,
+                    .slice => |*s| s.pos = saved_pos,
+                }
+                return error.Truncated;
+            };
+        }
+
+        fn parseStep(d: *@This()) InflateError!void {
             switch (d.state) {
                 .header => try d.readHeader(),
                 .tables => try d.readTables(),

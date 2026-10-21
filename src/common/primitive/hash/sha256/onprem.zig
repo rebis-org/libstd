@@ -7,9 +7,11 @@ const seam = @import("seam");
 const merkle = @import("../merkle.zig");
 
 // FIPS 180-4.
-// The scalar loop is needed as a portable fallback for targets without the aarch64 sha2 extension.
+// The scalar arm serves featureless targets and the portable flag.
 
-const has_x86sha = !options.portable and builtin.target.cpu.arch == .x86_64 and builtin.zig_backend != .stage2_c and builtin.target.cpu.hasAll(.x86, &.{ .sha, .avx2 });
+const has_x86sha = !options.sha256_portable and builtin.target.cpu.arch == .x86_64 and builtin.zig_backend != .stage2_c and builtin.target.cpu.hasAll(.x86, &.{ .sha, .avx2 });
+const has_arm8sha256 = !options.sha256_portable and builtin.target.cpu.arch == .aarch64 and
+    builtin.zig_backend != .stage2_c and builtin.target.cpu.has(.aarch64, .sha2);
 
 const initial_state: [8]u32 = .{
     0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
@@ -22,12 +24,8 @@ fn compressSha256(state: *align(16) [8]u32, block: *const [64]u8) void {
         compressX8664(state, block);
         return;
     }
-    if (comptime builtin.target.cpu.arch == .aarch64 and builtin.zig_backend != .stage2_c and builtin.target.cpu.has(.aarch64, .sha2)) {
-        var w: [64]u32 align(16) = undefined;
-        for (0..16) |index| {
-            w[index] = std.mem.readInt(u32, block[4 * index ..][0..4], .big);
-        }
-        compressAarch64(state, &w);
+    if (comptime has_arm8sha256) {
+        compressAarch64(state, block);
         return;
     }
     compressScalar(state, block);
@@ -79,11 +77,15 @@ fn compressScalar(state: *align(16) [8]u32, block: *const [64]u8) void {
     state[7] +%= h;
 }
 
-fn compressAarch64(state: *align(16) [8]u32, w: *align(16) [64]u32) void {
+fn compressAarch64(state: *align(16) [8]u32, block: *const [64]u8) void {
     const V4u32 = @Vector(4, u32);
+    var w: [64]u32 align(16) = undefined;
+    for (0..16) |index| {
+        w[index] = std.mem.readInt(u32, block[4 * index ..][0..4], .big);
+    }
     var x: V4u32 = state[0..4].*;
     var y: V4u32 = state[4..8].*;
-    const w_v = @as(*[16]V4u32, @ptrCast(w));
+    const w_v = @as(*[16]V4u32, @ptrCast(&w));
 
     comptime var round_group: u8 = 0;
     inline while (round_group < 16) : (round_group += 1) {
@@ -203,11 +205,26 @@ fn checkHwScalar(rng: *std.Random.DefaultPrng, comptime Hw: type, comptime Sw: t
     }
 }
 
-test "sha256 hw matches the scalar path" {
+test "sha256 x86 hw matches the scalar path" {
     if (comptime !has_x86sha) return error.SkipZigTest;
     const Hw = merkle.Digest(8, 32, initial_state, compressX8664);
     const Sw = merkle.Digest(8, 32, initial_state, compressScalar);
     var rng = std.Random.DefaultPrng.init(0x5A2D1);
+    // Linear sweep covers every tail residue twice; spots cover multi-block and megabyte scales.
+    var size: usize = 0;
+    while (size <= 256) : (size += 1) {
+        try checkHwScalar(&rng, Hw, Sw, size);
+    }
+    for ([_]usize{ 512, 1000, 4096, 5552, 65536, 1 << 20 }) |big| {
+        try checkHwScalar(&rng, Hw, Sw, big);
+    }
+}
+
+test "sha256 aarch64 hw matches the scalar path" {
+    if (comptime !has_arm8sha256) return error.SkipZigTest;
+    const Hw = merkle.Digest(8, 32, initial_state, compressAarch64);
+    const Sw = merkle.Digest(8, 32, initial_state, compressScalar);
+    var rng = std.Random.DefaultPrng.init(0x5A2D2);
     // Linear sweep covers every tail residue twice; spots cover multi-block and megabyte scales.
     var size: usize = 0;
     while (size <= 256) : (size += 1) {

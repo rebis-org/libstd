@@ -491,10 +491,19 @@ fn writeFrameHeader(writer: *std.Io.Writer, content_size: usize, window_size: u3
 
 fn encodeWindowDescriptor(window_size: u32) u8 {
     if (window_size < 1024) return 0;
-    const exponent: u5 = @intCast(31 - @clz(window_size) - 10);
-    const base: u64 = @as(u64, 1) << @intCast(exponent + 10);
-    const add_unit = base / 8;
-    const mantissa_raw = @divCeil(window_size - base, add_unit);
+    var exponent: u5 = @intCast(31 - @clz(window_size) - 10);
+    var base: u64 = @as(u64, 1) << @intCast(exponent + 10);
+    // The mantissa saturates at 7 add units; past that the declared window
+    // would fall short of the encoder's search window, so bump the exponent
+    // and start the next band instead of clamping.
+    if (window_size > base + 7 * (base / 8)) {
+        exponent += 1;
+        base <<= 1;
+    }
+    const mantissa_raw: u64 = if (window_size > base)
+        @divCeil(@as(u64, window_size) - base, base / 8)
+    else
+        0;
     const mantissa: u8 = @intCast(@min(mantissa_raw, 7));
     return (@as(u8, exponent) << 3) | mantissa;
 }
@@ -2871,9 +2880,10 @@ const BackwardBitStream = struct {
 };
 
 // Parses a formatted dictionary and returns its referenceable content.
-// Raw-content dictionaries without magic are their own content.
+// Raw-content dictionaries without magic are their own content; reference
+// zstd routes anything shorter than 8 bytes to content mode as well.
 pub fn dictionaryContent(dictionary: []const u8) DecodeError![]const u8 {
-    if (dictionary.len < 8) return error.DataException;
+    if (dictionary.len < 8) return dictionary;
     if (std.mem.readInt(u32, dictionary[0..4], .little) != dictionary_magic) return dictionary;
     // RFC 8878 permits a zero Dictionary_ID (it means "unspecified"); only
     // the raw-content fast path (magic mismatch) bypasses parsing entirely.
@@ -2990,9 +3000,9 @@ const Decoder = struct {
     }
 
     fn loadDictionary(d: *Decoder, dictionary: []const u8, expected_id: u32) DecodeError!void {
-        if (dictionary.len < 8) return error.DataException;
-        const magic = std.mem.readInt(u32, dictionary[0..4], .little);
-        if (magic != dictionary_magic) {
+        // Reference zstd routes any dictionary shorter than 8 bytes, or
+        // without the magic, to raw-content mode.
+        if (dictionary.len < 8 or std.mem.readInt(u32, dictionary[0..4], .little) != dictionary_magic) {
             if (expected_id != 0) return error.DataException;
             if (dictionary.len > d.history.len) return error.ResourceException;
             @memcpy(d.history[0..dictionary.len], dictionary);
@@ -3007,8 +3017,9 @@ const Decoder = struct {
             d.prev_tables_valid = false;
             return;
         }
+        // RFC 8878: a zero Dictionary_ID means unspecified and still loads;
+        // the frame check below only fires when the frame names a concrete ID.
         const dictionary_id = std.mem.readInt(u32, dictionary[4..8], .little);
-        if (dictionary_id == 0) return error.DataException;
         if (expected_id != 0 and dictionary_id != expected_id) return error.DataException;
         var cursor = binary.ReadCursor.init(dictionary[8..]);
         // Nodes filled below before use, so `undefined` is safe.
@@ -3081,9 +3092,14 @@ const Decoder = struct {
             literal_bits = try BackwardBitStream.init(first);
         }
         const sequences = try decodeSequencesHeader(&cursor);
-        try d.prepareFseTable(.literal, sequences.literal_mode, &cursor);
-        try d.prepareFseTable(.offset, sequences.offset_mode, &cursor);
-        try d.prepareFseTable(.match, sequences.match_mode, &cursor);
+        // A zero-sequence block carries no mode byte and no table content. Keep
+        // the previous tables intact so a later repeat-mode block can still
+        // reuse them; the reference returns early on nbSeq == 0 the same way.
+        if (sequences.count > 0) {
+            try d.prepareFseTable(.literal, sequences.literal_mode, &cursor);
+            try d.prepareFseTable(.offset, sequences.offset_mode, &cursor);
+            try d.prepareFseTable(.match, sequences.match_mode, &cursor);
+        }
         const sequences_data = d.block_buffer[cursor.pos..block_size];
         var seq_bits = try BackwardBitStream.init(sequences_data);
         var literal_state: u16 = 0;
@@ -3177,7 +3193,9 @@ const Decoder = struct {
         }
         if (seq_bits.remaining() != 0) return error.DataException;
         if (decoded_count > block_size_max) return error.DataException;
-        d.savePrevTables();
+        // Only blocks that actually decoded sequences advance the reusable
+        // table generation; a zero-sequence block leaves them untouched.
+        if (sequences.count > 0) d.savePrevTables();
         d.history_end += decoded_count;
     }
 
@@ -3864,11 +3882,12 @@ fn decodeFrameHeader(input: *std.Io.Reader, window_limit: u32) DecodeError!Frame
 fn computeWindowSize(window_descriptor: u8) u64 {
     const exponent = window_descriptor >> 3;
     const mantissa = window_descriptor & 0b111;
-    if (exponent == 0) return 1024;
-    const window_log = 10 + exponent;
+    // Normative formula: window = (1 << (10 + exponent)) +
+    // ((1 << (10 + exponent)) >> 3) * mantissa, with no special case for a
+    // zero exponent; the mantissa extends even the 1 KiB window.
+    const window_log: u32 = 10 + exponent;
     const window_base = @as(u64, 1) << @intCast(window_log);
-    const window_add = (window_base / 8) * mantissa;
-    return window_base + window_add;
+    return window_base + (window_base / 8) * mantissa;
 }
 
 fn readBlockHeader(input: *std.Io.Reader) DecodeError!BlockHeader {
@@ -4069,15 +4088,20 @@ fn buildHuffmanTree(weights: []const u4, symbol_count: usize, tree: *HuffmanTree
     for (weights[0 .. symbol_count - 1]) |value| {
         weight_power_sum += (@as(u16, 1) << @intCast(value)) >> 1;
     }
-    if (weight_power_sum >= 1 << 11) return error.DataException;
-    const max_bits: u4 = if (weight_power_sum == 0) 1 else @intCast(std.math.log2_int(u32, weight_power_sum) + 1);
+    if (weight_power_sum == 0 or weight_power_sum >= 1 << 11) return error.DataException;
+    const max_bits: u4 = @intCast(std.math.log2_int(u32, weight_power_sum) + 1);
     const next_power = @as(u32, 1) << max_bits;
     const last_weight_value = next_power - weight_power_sum;
-    if (last_weight_value == 0) return error.DataException;
+    if (!std.math.isPowerOfTwo(last_weight_value)) return error.DataException;
     const last_weight = std.math.log2_int(u32, last_weight_value) + 1;
     var local_weights: [256]u4 = undefined;
     @memcpy(local_weights[0..symbol_count], weights[0..symbol_count]);
     local_weights[symbol_count - 1] = @intCast(last_weight);
+    var weight_one_count: usize = 0;
+    for (local_weights[0..symbol_count]) |value| {
+        if (value == 1) weight_one_count += 1;
+    }
+    if (weight_one_count < 2) return error.DataException;
     const nodes = &tree.nodes;
     for (0..symbol_count) |i| {
         nodes[i] = .{ .symbol = @intCast(i), .prefix = 0, .weight = local_weights[i] };
@@ -4541,6 +4565,58 @@ test "zstd dictionary content accepts zero dictionary id" {
     std.mem.writeInt(u32, dict_buffer[4..8], 0, .little);
     const content = try dictionaryContent(dict_buffer[0..dict_len]);
     try std.testing.expect(content.len > 0);
+
+    // The zero-ID dictionary must also survive the decoder's loader and a
+    // round trip; neither frame nor dictionary declares a concrete ID.
+    const dictionary = dict_buffer[0..dict_len];
+    const input = "alpha bravo charlie delta echo foxtrot golf hotel";
+    const window: u32 = 1 << 16;
+    const history = try allocator.alloc(u8, @as(usize, window) + block_size_max + dictionary.len);
+    defer allocator.free(history);
+    const workspace = try allocator.alloc(u32, encoderWorkspaceU32Count(dictionary.len, window, .{ .window_size = window, .hash_bits = 12, .max_chain = 8, .nice_len = 32, .search_window = 4096 }));
+    defer allocator.free(workspace);
+    const encoded = try allocator.alloc(u8, encodedSizeBound(input.len, .{ .window_size = window }) + 64);
+    defer allocator.free(encoded);
+    const options: Options = .{ .window_size = window, .hash_bits = 12, .max_chain = 8, .nice_len = 32, .search_window = 4096, .dictionary = dictionary };
+    var source = std.Io.Reader.fixed(input);
+    var encoded_sink = std.Io.Writer.fixed(encoded);
+    const encoded_len = try encodeStream(&source, &encoded_sink, history, workspace, options);
+    try std.testing.expectEqual(@as(u8, 0), encoded[4] & 0x03);
+    const decoded = try allocator.alloc(u8, input.len);
+    defer allocator.free(decoded);
+    var encoded_source = std.Io.Reader.fixed(encoded[0..encoded_len]);
+    var decoded_sink = std.Io.Writer.fixed(decoded);
+    _ = try decodeStream(&encoded_source, &decoded_sink, history, .{ .window_size = window, .dictionary = dictionary });
+    try std.testing.expectEqualSlices(u8, input, decoded);
+}
+
+test "zstd raw dictionaries shorter than eight bytes load as content" {
+    const allocator = std.testing.allocator;
+    // Reference zstd routes any dictionary below 8 bytes to raw-content mode;
+    // the content view is then the dictionary itself.
+    const tiny_dictionary = "abcde";
+    try std.testing.expectEqualSlices(u8, tiny_dictionary, try dictionaryContent(tiny_dictionary));
+
+    const input = "abcdeabcdeabcdeabcde";
+    const window: u32 = 1 << 16;
+    const history = try allocator.alloc(u8, @as(usize, window) + block_size_max + tiny_dictionary.len);
+    defer allocator.free(history);
+    const workspace = try allocator.alloc(u32, encoderWorkspaceU32Count(tiny_dictionary.len, window, .{ .window_size = window, .hash_bits = 12, .max_chain = 8, .nice_len = 32, .search_window = 4096 }));
+    defer allocator.free(workspace);
+    const encoded = try allocator.alloc(u8, encodedSizeBound(input.len, .{ .window_size = window }) + 64);
+    defer allocator.free(encoded);
+    const options: Options = .{ .window_size = window, .hash_bits = 12, .max_chain = 8, .nice_len = 32, .search_window = 4096, .dictionary = tiny_dictionary };
+    var source = std.Io.Reader.fixed(input);
+    var encoded_sink = std.Io.Writer.fixed(encoded);
+    const encoded_len = try encodeStream(&source, &encoded_sink, history, workspace, options);
+    // No magic means no Dictionary_ID: the frame header must not declare one.
+    try std.testing.expectEqual(@as(u8, 0), encoded[4] & 0x03);
+    const decoded = try allocator.alloc(u8, input.len);
+    defer allocator.free(decoded);
+    var encoded_source = std.Io.Reader.fixed(encoded[0..encoded_len]);
+    var decoded_sink = std.Io.Writer.fixed(decoded);
+    _ = try decodeStream(&encoded_source, &decoded_sink, history, .{ .window_size = window, .dictionary = tiny_dictionary });
+    try std.testing.expectEqualSlices(u8, input, decoded);
 }
 
 // The strategy selector must actually reach the parser tiers. The crafted
@@ -4686,4 +4762,111 @@ test "zstd price-DP tier roundtrips at full block scale" {
     var decode_sink = std.Io.Writer.fixed(decoded);
     _ = try decodeStream(&decode_source, &decode_sink, history, .{ .window_size = window });
     try std.testing.expectEqualSlices(u8, input, decoded);
+}
+
+test "zstd window descriptor mantissa extends the window" {
+    // Reference formula: (1 << (10 + exponent)) + ((1 << (10 + exponent)) >> 3) * mantissa.
+    try std.testing.expectEqual(@as(u64, 1024), computeWindowSize(0));
+    try std.testing.expectEqual(@as(u64, 1152), computeWindowSize(1));
+    try std.testing.expectEqual(@as(u64, 1920), computeWindowSize(7));
+    try std.testing.expectEqual(@as(u64, 2048), computeWindowSize(8));
+    try std.testing.expectEqual(@as(u64, 2304), computeWindowSize(9));
+}
+
+test "zstd encoder window descriptor covers the search window" {
+    // The declared window must never be smaller than the window the encoder
+    // actually searches, or the stream is spec-invalid even if it roundtrips
+    // through a lenient decoder.
+    var window: u32 = 1024;
+    while (window <= 4096) : (window += 1) {
+        try std.testing.expect(computeWindowSize(encodeWindowDescriptor(window)) >= window);
+    }
+    var band: u32 = 12;
+    while (band <= 30) : (band += 1) {
+        const base: u64 = @as(u64, 1) << @intCast(band);
+        const edge = base + 7 * (base / 8);
+        for ([_]u64{ base, edge, edge + 1, 2 * base - 1 }) |wide_window| {
+            const window_size: u32 = @intCast(@min(wide_window, window_size_max));
+            try std.testing.expect(computeWindowSize(encodeWindowDescriptor(window_size)) >= window_size);
+        }
+    }
+}
+
+test "zstd zero-sequence block preserves repeat-mode tables" {
+    const allocator = std.testing.allocator;
+    // Three compressed blocks: the first declares RLE-mode tables and decodes
+    // one sequence, the second is a zero-sequence block (no mode byte, no
+    // table content), and the third uses repeat mode to reuse the first
+    // block's tables. A decoder that rebuilds predefined tables for the
+    // zero-sequence block fails on the third block.
+    const frame = [_]u8{
+        0x28, 0xB5, 0x2F, 0xFD, // frame magic.
+        0x00, // frame descriptor: no content size, no checksum, no dictionary id.
+        0x00, // window descriptor: 1 KiB.
+        0x5C, 0x00, 0x00, // block 1: compressed, 11 bytes.
+        0x20, 'a', 'b', 'c', 'd', // raw literals "abcd".
+        0x01, // nbSeq = 1.
+        0x54, // literal, offset, and match tables all RLE.
+        0x04, 0x01, 0x00, // RLE symbols: LL 4, OF 1, ML 0.
+        0x02, // sequence bits: offset extra bit 0.
+        0x2C, 0x00, 0x00, // block 2: compressed, 5 bytes.
+        0x18, 'e', 'f', 'g', // raw literals "efg".
+        0x00, // nbSeq = 0.
+        0x45, 0x00, 0x00, // block 3: compressed, last, 8 bytes.
+        0x20, 'h', 'i', 'j', 'k', // raw literals "hijk".
+        0x01, // nbSeq = 1.
+        0xFC, // literal, offset, and match tables all repeat.
+        0x02, // sequence bits: offset extra bit 0.
+    };
+    const window: u32 = 1024;
+    const history = try allocator.alloc(u8, @as(usize, window) + block_size_max);
+    defer allocator.free(history);
+    const decoded = try allocator.alloc(u8, 17);
+    defer allocator.free(decoded);
+    var source = std.Io.Reader.fixed(&frame);
+    var sink = std.Io.Writer.fixed(decoded);
+    _ = try decodeStream(&source, &sink, history, .{ .window_size = window });
+    // Block 1 outputs "abcdabc"; block 2 outputs "efg" without touching the
+    // repeat offsets or the RLE tables; block 3 reuses both, and its sequence
+    // resolves offset_value 2 to the second repeat offset (1), so the match
+    // repeats the final 'k' three times.
+    try std.testing.expectEqualStrings("abcdabcefghijkkkk", decoded);
+}
+
+test "zstd huffman tree completion and rank gates" {
+    const t = std.testing;
+    var tree: HuffmanTree = .{ .nodes = undefined };
+    var weights: [256]u4 = undefined;
+
+    // Minimal valid tree: one stored weight 1, the implied last weight 1.
+    @memset(&weights, 0);
+    weights[0] = 1;
+    try buildHuffmanTree(&weights, 2, &tree);
+    try t.expectEqual(@as(u4, 1), tree.max_bits);
+    try t.expectEqual(@as(u16, 2), tree.symbol_count);
+
+    // Five weight-1 symbols: no clean power-of-2 completion exists, so the
+    // description is invalid even though every weight is in range.
+    @memset(&weights, 0);
+    for (weights[0..5]) |*value| value.* = 1;
+    try t.expectError(error.DataException, buildHuffmanTree(&weights, 6, &tree));
+
+    // Weights {2, 2} complete to a full Kraft sum with the implied weight 3,
+    // but the tree has no weight-1 symbol, which the format forbids.
+    @memset(&weights, 0);
+    weights[0] = 2;
+    weights[1] = 2;
+    try t.expectError(error.DataException, buildHuffmanTree(&weights, 3, &tree));
+
+    // All-zero weights leave nothing to complete.
+    @memset(&weights, 0);
+    try t.expectError(error.DataException, buildHuffmanTree(&weights, 2, &tree));
+
+    // Wire level: the direct-weights header form used by dictionaries decodes,
+    // and the same form with an impossible completion is rejected.
+    var cursor = ReadCursor.init(&[_]u8{ 0x80, 0x10 });
+    try decodeHuffmanTree(&cursor, &tree);
+    try t.expectEqual(@as(u4, 1), tree.max_bits);
+    var bad_cursor = ReadCursor.init(&[_]u8{ 0x84, 0x11, 0x11, 0x10 });
+    try t.expectError(error.DataException, decodeHuffmanTree(&bad_cursor, &tree));
 }

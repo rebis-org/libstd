@@ -113,6 +113,10 @@ pub fn deflateHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Reso
     var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
     const history = try workspace.take(u8, deflate.history_size + @as(usize, if (deflate_opts.optimal) deflate.optimal_workspace_size else 0));
     if (command_mask == vocabulary.command_mask_read) {
+        // The planning pass below truncates at the encoded limit, so an
+        // over-limit source must be rejected here rather than surfacing as
+        // corrupt data halfway through the count.
+        _ = try common.measureSource(source_resource, limits.encoded_bytes);
         const output_size = try planDeflateDecode(source_resource, history, limits.encoded_bytes, limits.decoded_bytes);
         if (sink) |sink_resource| {
             try common.requireSink(sink_resource, call, output_size);
@@ -193,8 +197,12 @@ pub fn gzipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resourc
         }
         if (sink) |sink_resource| {
             if (plan.provider == .onprem and sink_resource.kind == .direct_write and sink_resource.hasCapability(resource.capability_bit_write)) {
-                // Single-pass: fallback recomputes exact size before further writes, so capacity never fails post-write. The abandoned fast path's bytes are erased so a failed call leaves no decoded prefix behind.
-                switch (try gzip.decodeSinglePass(input, sink_resource.kind.direct_write, history, plan.provider)) {
+                // Single-pass: fallback recomputes exact size before further writes,
+                // so capacity never fails post-write. The abandoned fast path's bytes
+                // are erased, so a failed call leaves no decoded prefix behind.
+                // The decoded limit joins the fit conditions: a narrower limit
+                // defers to the two-pass route instead of failing after the commit.
+                switch (try gzip.decodeSinglePass(input, sink_resource.kind.direct_write, history, plan.provider, limits.decoded_bytes)) {
                     .decoded => |produced| {
                         if (produced > limits.decoded_bytes) return error.ResourceException;
                         response.byte_length = produced;
@@ -416,6 +424,7 @@ pub fn zstd_seekableHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: 
         const history = try workspace.take(u8, @as(usize, frame_options.window_size) + zstd.block_size_max);
         const output_size = try zstd_seekable.decodedSize(input, history, options);
         if (output_size > limits.decoded_bytes) return error.ResourceException;
+        if (input.len + output_size > limits.codec_work) return error.ResourceException;
         if (sink) |sink_resource| {
             try common.requireSink(sink_resource, call, output_size);
             if (sink_resource.kind == .direct_write) {
@@ -537,6 +546,7 @@ pub fn zstdHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resourc
             else => return err,
         };
         if (output_size > limits.decoded_bytes) return error.ResourceException;
+        if (input.len + output_size > limits.codec_work) return error.ResourceException;
         if (sink) |sink_resource| {
             try common.requireSink(sink_resource, call, output_size);
             var source_reader = std.Io.Reader.fixed(input);
@@ -815,15 +825,26 @@ fn bufferCodecHook(comptime Codec: type, plan: *common.ExecutionPlan, source: ?*
                     }
                 }
             }
-            if (!direct_route and sink_resource.kind == .direct_write and try codecKnownOutputSize(Codec, options) == null and (Codec == lzma or Codec == bzip2)) {
-                // No size preflight: the produced length comes back from the codec. lzma2 is excluded because chunk headers give a cheap size and in-place is faster.
-                const output = try common.sinkDirectBuffer(sink_resource, common.sinkCapacity(sink_resource));
-                if (input.len + output.len > limits.codec_work) return error.ResourceException;
-                if (codecDecodeDirect(Codec, input, output, scratch, options)) |produced| {
-                    if (produced > limits.decoded_bytes) return error.ResourceException;
-                    response.byte_length = produced;
-                    direct_route = true;
-                } else |err| return err;
+            if (!direct_route and sink_resource.kind == .direct_write and common.sinkCapacity(sink_resource) <= limits.decoded_bytes and try codecKnownOutputSize(Codec, options) == null and (Codec == lzma or Codec == bzip2)) {
+                // No size preflight: the produced length comes back from the codec.
+                // lzma2 is excluded: chunk headers give a cheap size and in-place
+                // is faster. The span must fit the decoded limit: the decode is
+                // bounded only by the span, so a narrower limit would surface
+                // after the commit. Such spans take the counted route, which
+                // rejects before the first write.
+                const capacity = common.sinkCapacity(sink_resource);
+                if (input.len + capacity <= limits.codec_work and capacity <= workspace.remaining()) {
+                    // One decode into workspace staging: a rejected read leaves the
+                    // sink untouched, exactly like the counted route.
+                    const staging = try workspace.take(u8, capacity);
+                    if (codecDecodeDirect(Codec, input, staging, scratch, options)) |produced| {
+                        if (produced > limits.decoded_bytes) return error.ResourceException;
+                        try common.requireSinkCapacity(sink_resource, call, produced);
+                        try common.commitBytesToSink(sink_resource, call, staging[0..produced]);
+                        response.byte_length = produced;
+                        direct_route = true;
+                    } else |err| return err;
+                }
             }
             if (!direct_route) {
                 const output_size = if (try codecKnownOutputSize(Codec, options)) |size| size else try codecDecodedSize(Codec, input, scratch, options);
@@ -988,7 +1009,7 @@ pub fn xzHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource,
         comptime discovery.parameter("xz", "filters").family,
         comptime discovery.parameter("xz", "filters").ordinal,
     ));
-    var delta_distance: u8 = 1;
+    var delta_distance: u16 = 1;
     if (filters == .delta) {
         // The delta component's own selector carries the distance; the block
         // header round-trips it so decoders apply the same transform.
@@ -997,7 +1018,7 @@ pub fn xzHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource,
             comptime discovery.parameter("delta", "distance").family,
             comptime discovery.parameter("delta", "distance").ordinal,
         )) |node| {
-            if (node.value_low < 1 or node.value_low > 255) return error.CallException;
+            if (node.value_low < 1 or node.value_low > 256) return error.CallException;
             delta_distance = @intCast(node.value_low);
         }
     }

@@ -126,27 +126,26 @@ fn bzMutations(r: *Runner) !void {
     var mutated: [256]u8 = undefined;
     if (r.encoded_len == 0 or r.encoded_len > mutated.len) return error.EncodedSizeOutOfRange;
     @memcpy(mutated[0..r.encoded_len], r.encoded[0..r.encoded_len]);
+    // rejectAny also pins the atomicity contract: a rejected read leaves the
+    // sink byte-for-byte untouched, so a partial decoded prefix cannot survive.
     mutated[10] ^= 0x08;
-    _ = harness.call(r, harness.ids.read, &.{
+    try harness.rejectAny(r, harness.ids.read, &.{
         harness.sourceSpan(mutated[0..r.encoded_len]),
         harness.sinkSpan(r.output),
-    }, .{ .ctx = true });
-    if (r.status == abi.Status.ok) return error.MutatedBlockAccepted;
+    }, .{ .ctx = true }, r.output);
     @memcpy(mutated[0..r.encoded_len], r.encoded[0..r.encoded_len]);
     if (r.encoded_len > 20) {
         mutated[r.encoded_len / 2] ^= 0x01;
-        _ = harness.call(r, harness.ids.read, &.{
+        try harness.rejectAny(r, harness.ids.read, &.{
             harness.sourceSpan(mutated[0..r.encoded_len]),
             harness.sinkSpan(r.output),
-        }, .{ .ctx = true });
-        if (r.status == abi.Status.ok) return error.MidCorruptedBlockAccepted;
+        }, .{ .ctx = true }, r.output);
     }
     if (r.encoded_len > 14) {
-        _ = harness.call(r, harness.ids.read, &.{
+        try harness.rejectAny(r, harness.ids.read, &.{
             harness.sourceSpan(r.encoded[0 .. r.encoded_len - 10]),
             harness.sinkSpan(r.output),
-        }, .{ .ctx = true });
-        if (r.status == abi.Status.ok) return error.TruncatedBlockAccepted;
+        }, .{ .ctx = true }, r.output);
     }
 }
 

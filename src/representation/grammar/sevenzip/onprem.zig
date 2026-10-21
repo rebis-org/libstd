@@ -222,69 +222,57 @@ fn packEntry(entry: Entry, provider: crypto.Provider, workspace: *Workspace, lim
         }
     }
     const unpacked_crc = checksum.crc32With(provider, entry.data);
-    const compressed_entry = switch (entry.method) {
+    // Filter chains are supported with LZMA1/LZMA2 coders only: LZMA1 filter
+    // chains stay decodable by every 7z reader and LZMA2 is the modern
+    // default. Any other codec with an explicit filter is a caller error.
+    const source: []const u8 = if (entry.filter) |explicit| blk: {
+        if (entry.method != .lzma and entry.method != .lzma2) return error.CallException;
+        const filtered = try workspace.take(u8, entry.data.len);
+        @memcpy(filtered, entry.data);
+        try applyEncodeFilter(explicit, filtered);
+        break :blk filtered;
+    } else entry.data;
+    var compressed_entry = switch (entry.method) {
         .bcj2 => return error.CallException, // Decode-only; creation never emits BCJ2.
         .copy => blk: {
-            if (entry.filter != null) return error.CallException;
-            if (entry.data.len > limits.encoded_bytes) return error.ResourceException;
-            if (entry.data.len > limits.codec_work) return error.ResourceException;
-            break :blk PackedEntry{ .method = .copy, .data = entry.data, .crc = unpacked_crc, .pack_size = entry.data.len, .unpack_size = entry.data.len };
+            if (source.len > limits.encoded_bytes) return error.ResourceException;
+            if (source.len > limits.codec_work) return error.ResourceException;
+            break :blk PackedEntry{ .method = .copy, .data = source, .crc = unpacked_crc, .pack_size = source.len, .unpack_size = source.len };
         },
         .deflate => blk: {
             const measure_history = try workspace.take(u8, deflate.history_size);
             var counter = measurement.Counter.init(null);
             var measure_compressor = deflate.Compress.init(&counter.writer, measure_history, default_deflate_options) catch return error.CapacityException;
-            var measure_source = std.Io.Reader.fixed(entry.data);
+            var measure_source = std.Io.Reader.fixed(source);
             _ = std.Io.Reader.streamRemaining(&measure_source, &measure_compressor.writer) catch return error.IoException;
             measure_compressor.finish() catch return error.IoException;
             const packed_size = counter.written();
             if (packed_size > limits.encoded_bytes) return error.ResourceException;
-            if (entry.data.len + packed_size > limits.codec_work) return error.ResourceException;
+            if (source.len + packed_size > limits.codec_work) return error.ResourceException;
             const packed_data = try workspace.take(u8, packed_size);
             const history = try workspace.take(u8, deflate.history_size);
             var fixed_writer = std.Io.Writer.fixed(packed_data);
             var compressor = deflate.Compress.init(&fixed_writer, history, default_deflate_options) catch return error.CapacityException;
-            var source = std.Io.Reader.fixed(entry.data);
-            _ = std.Io.Reader.streamRemaining(&source, &compressor.writer) catch return error.IoException;
+            var entry_source = std.Io.Reader.fixed(source);
+            _ = std.Io.Reader.streamRemaining(&entry_source, &compressor.writer) catch return error.IoException;
             compressor.finish() catch return error.IoException;
-            break :blk PackedEntry{ .method = .deflate, .data = packed_data, .crc = unpacked_crc, .pack_size = packed_size, .unpack_size = entry.data.len };
+            break :blk PackedEntry{ .method = .deflate, .data = packed_data, .crc = unpacked_crc, .pack_size = packed_size, .unpack_size = source.len };
         },
-        .bzip2 => try packBuffer(bzip2, .bzip2, entry.data, unpacked_crc, workspace, limits, bzip2.encodeWorkspaceSize(default_bzip2_block), .{ .block_size = default_bzip2_block }),
+        .bzip2 => try packBuffer(bzip2, .bzip2, source, unpacked_crc, workspace, limits, bzip2.encodeWorkspaceSize(default_bzip2_block), .{ .block_size = default_bzip2_block }),
         .lzma => blk: {
             const properties = lzma2.defaultProperties(default_dictionary);
-            const options: lzma.Options = .{ .properties = properties, .unpack_size = entry.data.len, .marker_required = false, .max_work = limits.codec_work };
-            break :blk try packBuffer(lzma, .lzma, entry.data, unpacked_crc, workspace, limits, lzma.encodeWorkspaceSizeBt(properties), options);
+            const options: lzma.Options = .{ .properties = properties, .unpack_size = source.len, .marker_required = false, .max_work = limits.codec_work };
+            break :blk try packBuffer(lzma, .lzma, source, unpacked_crc, workspace, limits, lzma.encodeWorkspaceSizeBt(properties), options);
         },
         .lzma2 => blk: {
             const options: lzma2.Options = .{ .dictionary_size = default_dictionary, .properties = lzma2.defaultProperties(default_dictionary), .max_work = limits.codec_work };
-            break :blk try packBuffer(lzma2, .lzma2, entry.data, unpacked_crc, workspace, limits, lzma2.encodeWorkspaceSizeBt(default_dictionary), options);
+            break :blk try packBuffer(lzma2, .lzma2, source, unpacked_crc, workspace, limits, lzma2.encodeWorkspaceSizeBt(default_dictionary), options);
         },
         .ppmd => blk: {
-            const options: ppmd.Options = .{ .order = default_ppmd_order, .mem_size = default_ppmd_mem, .unpack_size = entry.data.len, .max_work = limits.codec_work };
-            break :blk try packBuffer(ppmd, .ppmd, entry.data, unpacked_crc, workspace, limits, ppmd.encodeWorkspaceSize(default_ppmd_mem), options);
+            const options: ppmd.Options = .{ .order = default_ppmd_order, .mem_size = default_ppmd_mem, .unpack_size = source.len, .max_work = limits.codec_work };
+            break :blk try packBuffer(ppmd, .ppmd, source, unpacked_crc, workspace, limits, ppmd.encodeWorkspaceSize(default_ppmd_mem), options);
         },
         .delta, .x86, .ppc, .ia64, .arm, .armt, .sparc, .arm64, .riscv => blk: {
-            if (entry.filter) |explicit| {
-                // LZMA1 filter chains stay decodable by every 7z reader and
-                // LZMA2 is the modern default, so accept either coder here.
-                const filtered = try workspace.take(u8, entry.data.len);
-                @memcpy(filtered, entry.data);
-                try applyEncodeFilter(explicit, filtered);
-                var packed_entry = switch (entry.method) {
-                    .lzma => blk2: {
-                        const properties = lzma2.defaultProperties(default_dictionary);
-                        const options: lzma.Options = .{ .properties = properties, .unpack_size = filtered.len, .marker_required = false, .max_work = limits.codec_work };
-                        break :blk2 try packBuffer(lzma, .lzma, filtered, unpacked_crc, workspace, limits, lzma.encodeWorkspaceSizeBt(properties), options);
-                    },
-                    .lzma2 => blk2: {
-                        const options: lzma2.Options = .{ .dictionary_size = default_dictionary, .properties = lzma2.defaultProperties(default_dictionary), .max_work = limits.codec_work };
-                        break :blk2 try packBuffer(lzma2, .lzma2, filtered, unpacked_crc, workspace, limits, lzma2.encodeWorkspaceSizeBt(default_dictionary), options);
-                    },
-                    else => return error.CallException,
-                };
-                packed_entry.filter = explicit;
-                break :blk packed_entry;
-            }
             const filtered = try workspace.take(u8, entry.data.len);
             @memcpy(filtered, entry.data);
             try applyEncodeFilter(entry.method, filtered);
@@ -294,6 +282,7 @@ fn packEntry(entry: Entry, provider: crypto.Provider, workspace: *Workspace, lim
             break :blk packed_entry;
         },
     };
+    if (entry.filter) |explicit| compressed_entry.filter = explicit;
     if (!entry.encrypted) return compressed_entry;
     const password_utf16 = try passwordToUtf16(entry.password, workspace);
     const cycles = if (entry.num_cycles_power == 0) crypto.seven_zip_default_cycles else entry.num_cycles_power;
@@ -333,10 +322,12 @@ fn packAllEntries(entries: []const Entry, provider: crypto.Provider, workspace: 
             continue;
         }
         // One folder and one continuous codec stream per run, so coder state
-        // carries across the substreams as in 7-Zip's solid folders.
-        if ((entries[i].method == .lzma2 or entries[i].method == .ppmd) and !entries[i].encrypted) {
+        // carries across the substreams as in 7-Zip's solid folders. Filtered
+        // entries never join a run: each needs its own pre-filter pass, so it
+        // packs individually through packEntry.
+        if ((entries[i].method == .lzma2 or entries[i].method == .ppmd) and !entries[i].encrypted and entries[i].filter == null) {
             var j = i + 1;
-            while (j < entries.len and !isEmptyEntry(entries[j]) and entries[j].method == entries[i].method and !entries[j].encrypted and entries[j].filter == entries[i].filter) j += 1;
+            while (j < entries.len and !isEmptyEntry(entries[j]) and entries[j].method == entries[i].method and !entries[j].encrypted and entries[j].filter == null) j += 1;
             if (j - i >= 2) {
                 var total: usize = 0;
                 for (entries[i..j]) |entry| total = try bounds.addUsize(total, entry.data.len);
@@ -786,8 +777,7 @@ fn decodeBcj2Substream(coder: ParsedCoder, packed_data: []const u8, workspace: *
 
 fn parsePpmdOptions(attributes: []const u8, unpack_size: usize, codec_work: u64) Exception!ppmd.Options {
     if (attributes.len != 5) return error.DataException;
-    const mem_field = std.mem.readInt(u32, attributes[1..5], .little);
-    const mem_size = mem_field << 8;
+    const mem_size = std.mem.readInt(u32, attributes[1..5], .little);
     return .{
         .order = attributes[0],
         .mem_size = mem_size,
@@ -963,10 +953,10 @@ fn decodeEncodedHeader(archive_data: []const u8, cursor: *binary.ReadCursor, wor
     const pack_pos = std.math.cast(usize, si.pack_pos) orelse return error.ResourceException;
     const packed_data = try workspace.take(u8, pack_size);
     try readAt(archive_data, try bounds.addUsize(start_header_size, pack_pos), packed_data);
-    if (si.pack_crcs.len == 1 and si.pack_crcs[0] != 0 and
-        checksum.crc32With(options.provider, packed_data) != si.pack_crcs[0])
-    {
-        return error.IntegrityException;
+    if (si.pack_crcs.len == 1) {
+        if (si.pack_crcs[0]) |expected| {
+            if (checksum.crc32With(options.provider, packed_data) != expected) return error.IntegrityException;
+        }
     }
     const output = try workspace.take(u8, unpack_size);
     decodeFolderStream(folder, packed_data, output, workspace, limits, options) catch |err| {
@@ -976,11 +966,22 @@ fn decodeEncodedHeader(archive_data: []const u8, cursor: *binary.ReadCursor, wor
         if (folder.encrypted and options.failure_cause.* == .none) options.failure_cause.* = .wrong_password;
         return err;
     };
-    if (folder.substream_crcs.len == 1 and folder.substream_crcs[0] != 0 and
-        checksum.crc32With(options.provider, output) != folder.substream_crcs[0])
-    {
-        if (folder.encrypted) options.failure_cause.* = .wrong_password;
-        return error.IntegrityException;
+    // The whole-folder CRC from UnpackInfo kCRC (vendor 7zIn.cpp checks it
+    // here), then a lone substream digest from SubStreamsInfo kCRC: each
+    // defined value must match the decoded header bytes.
+    if (folder.folder_crc) |expected| {
+        if (checksum.crc32With(options.provider, output) != expected) {
+            if (folder.encrypted) options.failure_cause.* = .wrong_password;
+            return error.IntegrityException;
+        }
+    }
+    if (folder.substream_crcs.len == 1) {
+        if (folder.substream_crcs[0]) |expected| {
+            if (checksum.crc32With(options.provider, output) != expected) {
+                if (folder.encrypted) options.failure_cause.* = .wrong_password;
+                return error.IntegrityException;
+            }
+        }
     }
     return output;
 }
@@ -1070,7 +1071,8 @@ fn aesDecryptStream(encrypted: bool, num_cycles: u8, salt: []const u8, iv: [16]u
 const StreamsInfo = struct {
     pack_pos: u64,
     pack_sizes: []const u64,
-    pack_crcs: []const u32,
+    // Null entries are pack streams whose CRC the header leaves undefined.
+    pack_crcs: []?u32,
     folders: []const Folder,
 };
 
@@ -1097,7 +1099,11 @@ const Bcj2Source = struct {
 const Folder = struct {
     num_substreams: u64,
     substream_sizes: []u64,
-    substream_crcs: []const u32,
+    // The UnpackInfo kCRC digest, when the header defines one. It is the CRC
+    // of the whole folder output and doubles as a lone substream's digest.
+    folder_crc: ?u32 = null,
+    // Null entries are substreams whose digest the header leaves undefined.
+    substream_crcs: []?u32,
     pack_index: usize,
     num_pack_streams: u64 = 1,
     method: CoderMethod,
@@ -1133,7 +1139,7 @@ const FilesInfo = struct {
 fn parseStreamsInfo(cursor: *binary.ReadCursor, workspace: *Workspace, comptime aes_only_folders: bool) Exception!StreamsInfo {
     var pack_pos: u64 = 0;
     var pack_sizes: []const u64 = &.{};
-    var pack_crcs: []const u32 = &.{};
+    var pack_crcs: []?u32 = &.{};
     var folders: []Folder = &.{};
     var has_pack = false;
     var has_unpack = false;
@@ -1155,7 +1161,7 @@ fn parseStreamsInfo(cursor: *binary.ReadCursor, workspace: *Workspace, comptime 
                         has_sizes = true;
                         for (sizes) |*s| s.* = try readUint64(cursor);
                     } else if (pid == 0x0A) {
-                        pack_crcs = try readDigests(cursor, num_pack_streams, workspace);
+                        pack_crcs = try readDigests(cursor, std.math.cast(usize, num_pack_streams) orelse return error.ResourceException, workspace);
                     } else {
                         return error.UnsupportedException;
                     }
@@ -1322,6 +1328,7 @@ fn parseFolders(cursor: *binary.ReadCursor, workspace: *Workspace, comptime aes_
         folder.* = .{
             .num_substreams = 1,
             .substream_sizes = &.{},
+            .folder_crc = null,
             .substream_crcs = &.{},
             .pack_index = 0,
             .num_pack_streams = if (bcj2_idx != null) folder_in_streams - bonds.len else 1,
@@ -1359,9 +1366,9 @@ fn parseFolders(cursor: *binary.ReadCursor, workspace: *Workspace, comptime aes_
         const id = try cursor.readU8();
         if (id == 0x00) break;
         if (id == 0x0A) {
-            const digests = try readDigests(cursor, num_folders, workspace);
+            const digests = try readDigests(cursor, std.math.cast(usize, num_folders) orelse return error.ResourceException, workspace);
             for (folders, 0..) |*folder, i| {
-                if (i < digests.len) folder.substream_crcs = digests[i .. i + 1];
+                if (i < digests.len) folder.folder_crc = digests[i];
             }
         } else return error.UnsupportedException;
     }
@@ -1482,53 +1489,64 @@ fn parse7zAesProps(attributes: []const u8) Exception!AesCoderProps {
 }
 
 fn parseSubStreamsInfo(cursor: *binary.ReadCursor, workspace: *Workspace, folders: []Folder) Exception!void {
+    var saw_counts = false;
+    var saw_sizes = false;
+    var saw_crcs = false;
     while (cursor.remaining() > 0) {
         const id = try cursor.readU8();
         if (id == 0x00) break;
         switch (id) {
             0x0D => {
+                // Vendor 7zIn.cpp reads kNumUnpackStream once, before kSize
+                // and kCRC; a repeat or late occurrence is a corrupt header.
+                if (saw_counts or saw_sizes or saw_crcs) return error.DataException;
+                saw_counts = true;
                 for (folders) |*folder| {
                     const count = try readUint64(cursor);
-                    if (count == 0) return error.DataException;
                     folder.num_substreams = count;
+                    if (count != 1) {
+                        // Drop the single-substream default inherited from
+                        // kCodersUnpackSize; 0x09 or finalize rederives sizes.
+                        folder.substream_sizes = &.{};
+                    }
                 }
             },
             0x09 => {
-                const total = try totalSubstreams(folders);
-                const size_count = try substreamSizeCount(folders);
-                const arr = try workspace.take(u64, total);
-                for (0..size_count) |index| {
-                    arr[index] = try readUint64(cursor);
-                }
-                var index: usize = 0;
+                if (saw_sizes or saw_crcs) return error.DataException;
+                saw_sizes = true;
+                // Vendor 7zIn.cpp reads each folder's size group straight off
+                // the wire in folder order: every substream except the last of
+                // its folder carries a listed size, and the last is the
+                // folder's unpack total minus the listed sizes.
                 for (folders) |*folder| {
                     const count = std.math.cast(usize, folder.num_substreams) orelse return error.ResourceException;
-                    // The size list omits each folder's final substream: it is
-                    // the folder's unpack total minus the listed sizes.
+                    if (count == 0) continue;
+                    const arr = try workspace.take(u64, count);
                     var known: u64 = 0;
-                    for (arr[index .. index + count - 1]) |size| {
-                        known = try bounds.addU64(known, size);
+                    for (arr[0 .. count - 1]) |*size| {
+                        size.* = try readUint64(cursor);
+                        known = try bounds.addU64(known, size.*);
                     }
                     if (known > folder.unpack_size) return error.DataException;
-                    arr[index + count - 1] = folder.unpack_size - known;
-                    folder.substream_sizes = arr[index .. index + count];
-                    index += count;
+                    arr[count - 1] = folder.unpack_size - known;
+                    folder.substream_sizes = arr;
                 }
             },
             0x0A => {
-                const total = try totalSubstreams(folders);
-                const digests = try readDigests(cursor, total, workspace);
-                var index: usize = 0;
-                for (folders) |*folder| {
-                    const count = std.math.cast(usize, folder.num_substreams) orelse return error.ResourceException;
-                    if (index + count <= digests.len) {
-                        folder.substream_crcs = digests[index .. index + count];
-                    }
-                    index += count;
-                }
+                if (saw_crcs) return error.DataException;
+                saw_crcs = true;
+                const digests2 = try readDigests(cursor, try foldDigestCount(folders), workspace);
+                try assignSubstreamDigests(folders, digests2, workspace);
             },
             else => return error.UnsupportedException,
         }
+    }
+    if (!saw_crcs) {
+        // Vendor applies the same fold with an all-undefined digest list when
+        // the SubStreamsInfo block carries no kCRC property.
+        const undef = try workspace.take(?u32, try foldDigestCount(folders));
+        @memset(undef, null);
+        try assignSubstreamDigests(folders, undef, workspace);
     }
     try finalizeSubstreamSizes(folders);
 }
@@ -1542,19 +1560,47 @@ fn totalSubstreams(folders: []const Folder) Exception!usize {
     return total;
 }
 
-fn substreamSizeCount(folders: []const Folder) Exception!usize {
+// Number of wire digests a kCRC list carries: every substream except those of
+// single-substream folders whose whole-folder CRC the UnpackInfo kCRC already
+// defines (vendor folds those out of the digest list).
+fn foldDigestCount(folders: []const Folder) Exception!usize {
     var total: usize = 0;
     for (folders) |folder| {
         const count = std.math.cast(usize, folder.num_substreams) orelse return error.ResourceException;
-        if (count > 0) total = try bounds.addUsize(total, count - 1);
+        if (count != 1 or folder.folder_crc == null) {
+            total = try bounds.addUsize(total, count);
+        }
     }
     return total;
+}
+
+// Spreads the kCRC digest list across the folders: single-substream folders
+// with a defined folder CRC take that CRC; the wire list fills the rest.
+fn assignSubstreamDigests(folders: []Folder, digests2: []?u32, workspace: *Workspace) Exception!void {
+    const total = try totalSubstreams(folders);
+    const arr = try workspace.take(?u32, total);
+    var k2: usize = 0;
+    var index: usize = 0;
+    for (folders) |*folder| {
+        const count = std.math.cast(usize, folder.num_substreams) orelse return error.ResourceException;
+        if (count == 1 and folder.folder_crc != null) {
+            arr[index] = folder.folder_crc;
+        } else {
+            for (0..count) |j| {
+                arr[index + j] = digests2[k2];
+                k2 += 1;
+            }
+        }
+        folder.substream_crcs = arr[index .. index + count];
+        index += count;
+    }
 }
 
 fn finalizeSubstreamSizes(folders: []Folder) Exception!void {
     for (folders) |*folder| {
         const count = std.math.cast(usize, folder.num_substreams) orelse return error.ResourceException;
         if (folder.substream_sizes.len != count) return error.DataException;
+        if (count == 0) continue;
         if (count == 1) {
             if (folder.substream_sizes[0] != folder.unpack_size) return error.DataException;
             continue;
@@ -1723,6 +1769,11 @@ fn buildEntries(si: *const StreamsInfo, fi: *const FilesInfo, workspace: *Worksp
             .substream_offset = file_substream_offset,
             .pack_stream_sizes = entry_pack_stream_sizes,
         };
+    }
+    // Vendor FillLinks skips folders that carry no substreams; tolerate them
+    // at the tail instead of rejecting the archive.
+    while (folder_index < si.folders.len and si.folders[folder_index].num_substreams == 0) {
+        folder_index += 1;
     }
     if (folder_index != si.folders.len) return error.DataException;
     return entries;
@@ -1915,7 +1966,7 @@ fn writeCoderAttributes(writer: *std.Io.Writer, method: CoderMethod, unpacked_cr
         .ppmd => {
             try io.writeBytes(writer, &.{@intCast(default_ppmd_order)});
             var bytes: [4]u8 = undefined;
-            std.mem.writeInt(u32, &bytes, default_ppmd_mem >> 8, .little);
+            std.mem.writeInt(u32, &bytes, default_ppmd_mem, .little);
             try io.writeBytes(writer, &bytes);
         },
         .delta => {
@@ -2053,11 +2104,10 @@ fn emptyFileAt(entries: []const Entry, index: usize) bool {
     return false;
 }
 
-fn readDigests(cursor: *binary.ReadCursor, count: u64, workspace: *Workspace) Exception![]const u32 {
-    const n = std.math.cast(usize, count) orelse return error.ResourceException;
+fn readDigests(cursor: *binary.ReadCursor, count: usize, workspace: *Workspace) Exception![]?u32 {
     const all_defined = try cursor.readU8();
     if (all_defined == 1) {
-        const crcs = try workspace.take(u32, n);
+        const crcs = try workspace.take(?u32, count);
         for (crcs) |*c| {
             var bytes = try cursor.readBytes(4);
             c.* = std.mem.readInt(u32, &bytes, .little);
@@ -2065,40 +2115,21 @@ fn readDigests(cursor: *binary.ReadCursor, count: u64, workspace: *Workspace) Ex
         return crcs;
     }
     if (all_defined == 0) {
-        const defined = try readBoolVectorRaw(cursor, n, workspace);
-        const crcs = try workspace.take(u32, n);
-        for (crcs) |*c| c.* = 0;
-        for (0..n) |i| {
+        // The 0 selector means raw MSB-first defined-bits follow immediately
+        // (vendor ReadBoolVector); no second selector byte precedes them.
+        const defined = try readBitVectorRaw(cursor, count, workspace);
+        const crcs = try workspace.take(?u32, count);
+        for (crcs, 0..) |*c, i| {
             if (defined[i]) {
                 var bytes = try cursor.readBytes(4);
-                crcs[i] = std.mem.readInt(u32, &bytes, .little);
+                c.* = std.mem.readInt(u32, &bytes, .little);
+            } else {
+                c.* = null;
             }
         }
         return crcs;
     }
     return error.UnsupportedException;
-}
-
-fn readBoolVectorRaw(cursor: *binary.ReadCursor, count: usize, workspace: *Workspace) Exception![]const bool {
-    if (count == 0) return &.{};
-    const all = try cursor.readU8();
-    const result = try workspace.take(bool, count);
-    if (all == 0) {
-        @memset(result, false);
-        return result;
-    }
-    if (all == 2) {
-        @memset(result, true);
-        return result;
-    }
-    if (all != 1) return error.DataException;
-    const bytes_count = (count + 7) / 8;
-    const bytes = try cursor.readSlice(bytes_count);
-    for (0..count) |i| {
-        const shift: u3 = @intCast(7 - (i % 8));
-        result[i] = (bytes[i / 8] >> shift) & 1 != 0;
-    }
-    return result;
 }
 
 fn readBitVectorRaw(cursor: *binary.ReadCursor, count: usize, workspace: *Workspace) Exception![]const bool {
@@ -2230,26 +2261,20 @@ fn writeBitVector(writer: *std.Io.Writer, count: usize, ctx: anytype) Exception!
 }
 
 fn readUint64(cursor: *binary.ReadCursor) Exception!u64 {
+    // Mirrors vendor ReadNumberSpec: the first byte's leading one bits count
+    // the continuation bytes, which follow little-endian, lowest byte first.
     const first = try cursor.readU8();
-    if (first < 0x80) return first;
-    if (first == 0xFF) {
-        const bytes = try cursor.readBytes(8);
-        return std.mem.readInt(u64, &bytes, .big);
+    var value: u64 = 0;
+    var mask: u8 = 0x80;
+    var extra: u6 = 0;
+    while (extra < 8) : (extra += 1) {
+        if ((first & mask) == 0) {
+            const payload: u64 = first & (mask - 1);
+            return value | (payload << (extra * 8));
+        }
+        value |= @as(u64, try cursor.readU8()) << (extra * 8);
+        mask >>= 1;
     }
-    if (first == 0xFE) {
-        const bytes = try cursor.readBytes(7);
-        var value: u64 = 0;
-        for (bytes) |b| value = (value << 8) | b;
-        return value;
-    }
-    var extra: usize = 1;
-    var mask: u8 = 0x40;
-    while ((first & mask) != 0 and extra < 7) : (extra += 1) mask >>= 1;
-    const shift: u6 = @intCast(8 - extra);
-    const payload: u64 = first & ((@as(u64, 1) << shift) - 1);
-    const bytes = try cursor.readSlice(extra);
-    var value: u64 = payload;
-    for (bytes) |b| value = (value << 8) | b;
     return value;
 }
 
@@ -2258,26 +2283,24 @@ fn writeUint64(writer: *std.Io.Writer, value: u64) Exception!void {
         try io.writeBytes(writer, &.{@intCast(value)});
         return;
     }
-    var extra: usize = 1;
-    while (extra < 8) : (extra += 1) {
-        const payload_bits: u6 = @intCast(8 - extra);
-        const max = ((@as(u64, 1) << payload_bits) - 1) << @intCast(8 * extra) | ((@as(u64, 1) << @intCast(8 * extra)) - 1);
-        if (value <= max) break;
-    }
+    // With `extra` continuation bytes the first byte carries `7 - extra`
+    // payload bits, so the capacity is 1 << (7 * extra + 7).
+    var extra: u6 = 1;
+    while (extra < 8 and value >= (@as(u64, 1) << @intCast(7 * @as(u32, extra) + 7))) extra += 1;
     if (extra == 8) {
         try io.writeBytes(writer, &.{0xFF});
         var bytes: [8]u8 = undefined;
-        std.mem.writeInt(u64, &bytes, value, .big);
+        std.mem.writeInt(u64, &bytes, value, .little);
         try io.writeBytes(writer, &bytes);
         return;
     }
     const pattern: u8 = @as(u8, 0xFF) << @intCast(8 - extra);
-    const payload: u8 = @intCast(value >> @intCast(8 * extra));
+    const payload: u8 = @intCast(value >> @intCast(8 * @as(u64, extra)));
     try io.writeBytes(writer, &.{pattern | payload});
-    const remainder = value & ((@as(u64, 1) << @intCast(8 * extra)) - 1);
+    const remainder = value & ((@as(u64, 1) << @intCast(8 * @as(u64, extra))) - 1);
     var bytes: [8]u8 = undefined;
-    std.mem.writeInt(u64, &bytes, remainder, .big);
-    try io.writeBytes(writer, bytes[8 - extra .. 8]);
+    std.mem.writeInt(u64, &bytes, remainder, .little);
+    try io.writeBytes(writer, bytes[0..extra]);
 }
 
 test "sevenzip ppmd solid grouping roundtrip" {
@@ -2319,6 +2342,317 @@ test "sevenzip ppmd solid grouping roundtrip" {
         try testing.expectEqual(data.len, produced);
         try testing.expectEqualSlices(u8, data, out);
     }
+}
+
+test "sevenzip filter chain roundtrips lzma and lzma2" {
+    // A mixed provider build serves no single tag for both the checksum
+    // and codec arms; run where the default tag serves the codec.
+    if (!deflate_seam.decodeServed(checksum.default_provider)) return;
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const backing = try allocator.alloc(u8, 96 * 1024 * 1024);
+    defer allocator.free(backing);
+
+    var executable: [2048]u8 = undefined;
+    // x86 call-flavored bytes so the BCJ filter has real instructions to
+    // convert, not just data it passes through unchanged.
+    for (&executable, 0..) |*byte, i| byte.* = if (i % 16 < 4) 0xE8 else @truncate(i / 29);
+    const datas = [_][]const u8{ executable[0..2048], executable[512..1536] };
+    const entries = [_]Entry{
+        .{ .name = "code.bin", .data = datas[0], .method = .lzma2, .filter = .x86 },
+        .{ .name = "patch.bin", .data = datas[1], .method = .lzma, .filter = .delta },
+    };
+
+    var workspace = try Workspace.init(backing.ptr, backing.len);
+    var cause: crypto.FailureCause = .none;
+    const packed_entries = try sevenZipPack(&entries, crypto.default_provider, &workspace, .{}, &cause);
+    try testing.expectEqual(@as(?CoderMethod, .x86), packed_entries[0].filter);
+    try testing.expectEqual(@as(?CoderMethod, .delta), packed_entries[1].filter);
+    const total = try sevenZipPackedSize(&entries, packed_entries, &workspace, crypto.default_provider, .{}, .{});
+    const archive = try allocator.alloc(u8, total);
+    defer allocator.free(archive);
+    const written = try sevenZipWritePacked(&entries, packed_entries, archive, &workspace, crypto.default_provider, .{}, .{});
+    try testing.expectEqual(total, written);
+
+    for (datas, 0..) |data, i| {
+        var decode_ws = try Workspace.init(backing.ptr, backing.len);
+        const out = try allocator.alloc(u8, data.len);
+        defer allocator.free(out);
+        const produced = try sevenZipDecodeOrdinal(archive, &decode_ws, .{}, i, out, .{ .failure_cause = &cause });
+        try testing.expectEqual(data.len, produced);
+        try testing.expectEqualSlices(u8, data, out);
+    }
+}
+
+test "sevenzip rejects filters outside lzma coders" {
+    // A mixed provider build serves no single tag for both the checksum
+    // and codec arms; run where the default tag serves the codec.
+    if (!deflate_seam.decodeServed(checksum.default_provider)) return;
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const backing = try allocator.alloc(u8, 16 * 1024 * 1024);
+    defer allocator.free(backing);
+    var data: [64]u8 = undefined;
+    for (&data, 0..) |*byte, i| byte.* = @truncate(i *% 7);
+    // Each row is a caller error: ppmd/deflate used to drop the filter
+    // silently, the filter shorthand cannot stack a second filter, and
+    // copy never takes one.
+    const bad = [_]Entry{
+        .{ .name = "a", .data = data[0..], .method = .ppmd, .filter = .x86 },
+        .{ .name = "b", .data = data[0..], .method = .deflate, .filter = .x86 },
+        .{ .name = "c", .data = data[0..], .method = .x86, .filter = .lzma },
+        .{ .name = "d", .data = data[0..], .method = .copy, .filter = .delta },
+    };
+    for (bad) |entry| {
+        var workspace = try Workspace.init(backing.ptr, backing.len);
+        var cause: crypto.FailureCause = .none;
+        const single = [_]Entry{entry};
+        try testing.expectError(error.CallException, sevenZipPack(&single, crypto.default_provider, &workspace, .{}, &cause));
+    }
+}
+
+test "sevenzip filtered entries pack outside solid runs" {
+    // A mixed provider build serves no single tag for both the checksum
+    // and codec arms; run where the default tag serves the codec.
+    if (!deflate_seam.decodeServed(checksum.default_provider)) return;
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const backing = try allocator.alloc(u8, 96 * 1024 * 1024);
+    defer allocator.free(backing);
+
+    var repetitive: [4096]u8 = undefined;
+    for (&repetitive, 0..) |*byte, i| byte.* = if (i % 8 < 2) 0xE8 else @truncate(i / 97);
+    const datas = [_][]const u8{ repetitive[0..1500], repetitive[500..2000], repetitive[1000..2500] };
+    const entries = [_]Entry{
+        .{ .name = "f.bin", .data = datas[0], .method = .lzma2, .filter = .x86 },
+        .{ .name = "s.bin", .data = datas[1], .method = .lzma2 },
+        .{ .name = "t.bin", .data = datas[2], .method = .lzma2 },
+    };
+
+    var workspace = try Workspace.init(backing.ptr, backing.len);
+    var cause: crypto.FailureCause = .none;
+    const packed_entries = try sevenZipPack(&entries, crypto.default_provider, &workspace, .{}, &cause);
+    // The filtered entry owns its packed stream and never joins the run;
+    // the two unfiltered entries form a solid folder instead.
+    try testing.expect(packed_entries[0].data.len > 0);
+    try testing.expectEqual(@as(?CoderMethod, .x86), packed_entries[0].filter);
+    try testing.expect(packed_entries[1].data.len > 0);
+    try testing.expectEqual(@as(?CoderMethod, null), packed_entries[1].filter);
+    try testing.expectEqual(@as(usize, 0), packed_entries[2].data.len);
+    try testing.expect(packed_entries[2].solid_continuation);
+    const total = try sevenZipPackedSize(&entries, packed_entries, &workspace, crypto.default_provider, .{}, .{});
+    const archive = try allocator.alloc(u8, total);
+    defer allocator.free(archive);
+    const written = try sevenZipWritePacked(&entries, packed_entries, archive, &workspace, crypto.default_provider, .{}, .{});
+    try testing.expectEqual(total, written);
+
+    for (datas, 0..) |data, i| {
+        var decode_ws = try Workspace.init(backing.ptr, backing.len);
+        const out = try allocator.alloc(u8, data.len);
+        defer allocator.free(out);
+        const produced = try sevenZipDecodeOrdinal(archive, &decode_ws, .{}, i, out, .{ .failure_cause = &cause });
+        try testing.expectEqual(data.len, produced);
+        try testing.expectEqualSlices(u8, data, out);
+    }
+}
+
+test "sevenzip vendor number wire format" {
+    // Pins the 7z varint to the vendor shape (7zIn.cpp ReadNumberSpec):
+    // leading one bits count the continuation bytes, which follow
+    // little-endian. The 152378 and 204800 samples are the pack and unpack
+    // sizes 7zz 26.04 read back from an archive this writer produced.
+    const testing = std.testing;
+    const cases = [_]struct { value: u64, wire: []const u8 }{
+        .{ .value = 0, .wire = &.{0x00} },
+        .{ .value = 0x7F, .wire = &.{0x7F} },
+        .{ .value = 0x80, .wire = &.{ 0x80, 0x80 } },
+        .{ .value = 16383, .wire = &.{ 0xBF, 0xFF } },
+        .{ .value = 16384, .wire = &.{ 0xC0, 0x00, 0x40 } },
+        .{ .value = 152378, .wire = &.{ 0xC2, 0x3A, 0x53 } },
+        .{ .value = 204800, .wire = &.{ 0xC3, 0x00, 0x20 } },
+        .{ .value = 1 << 24, .wire = &.{ 0xE1, 0x00, 0x00, 0x00 } },
+        .{ .value = (1 << 56) - 1, .wire = &.{ 0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF } },
+        .{ .value = 0xFFFFFFFFFFFFFFFF, .wire = &.{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF } },
+    };
+    for (cases) |case| {
+        var buffer: [16]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buffer);
+        try writeUint64(&writer, case.value);
+        try testing.expectEqualSlices(u8, case.wire, writer.buffered());
+        var cursor = binary.ReadCursor.init(case.wire);
+        try testing.expectEqual(case.value, try readUint64(&cursor));
+        try testing.expectEqual(@as(usize, 0), cursor.remaining());
+    }
+}
+
+test "sevenzip digest list wire format" {
+    // Pins the digest list to the vendor shape (7zIn.cpp ReadHashDigests): a
+    // selector of 1 means all defined; 0 means raw MSB-first defined bits
+    // follow immediately (ReadBoolVector) with one u32 LE per defined entry;
+    // anything else is a refusal. Undefined entries surface as null, never
+    // as a phantom second selector byte or a zero CRC.
+    const testing = std.testing;
+    var backing: [4096]u8 = undefined;
+    var workspace = try Workspace.init(&backing, backing.len);
+
+    {
+        const wire = [_]u8{ 0x01, 0x78, 0x56, 0x34, 0x12, 0xCD, 0xAB, 0x00, 0x00 };
+        var cursor = binary.ReadCursor.init(&wire);
+        const digests = try readDigests(&cursor, 2, &workspace);
+        try testing.expectEqual(@as(?u32, 0x12345678), digests[0]);
+        try testing.expectEqual(@as(?u32, 0x0000ABCD), digests[1]);
+        try testing.expectEqual(@as(usize, 0), cursor.remaining());
+    }
+    {
+        // Bits 0b10100000: entries 0 and 2 defined, 1 and 3 undefined.
+        const wire = [_]u8{ 0x00, 0xA0, 0xEF, 0xBE, 0xAD, 0xDE, 0x11, 0x00, 0x00, 0x22 };
+        var cursor = binary.ReadCursor.init(&wire);
+        const digests = try readDigests(&cursor, 4, &workspace);
+        try testing.expectEqual(@as(?u32, 0xDEADBEEF), digests[0]);
+        try testing.expectEqual(@as(?u32, null), digests[1]);
+        try testing.expectEqual(@as(?u32, 0x22000011), digests[2]);
+        try testing.expectEqual(@as(?u32, null), digests[3]);
+        try testing.expectEqual(@as(usize, 0), cursor.remaining());
+    }
+    {
+        const wire = [_]u8{0x00};
+        var cursor = binary.ReadCursor.init(&wire);
+        const digests = try readDigests(&cursor, 0, &workspace);
+        try testing.expectEqual(@as(usize, 0), digests.len);
+    }
+    {
+        const wire = [_]u8{0x02};
+        var cursor = binary.ReadCursor.init(&wire);
+        try testing.expectError(error.UnsupportedException, readDigests(&cursor, 1, &workspace));
+    }
+}
+
+test "sevenzip substream digest fold and zero-count folders" {
+    // Pins the SubStreamsInfo digest handling to vendor 7zIn.cpp
+    // ReadSubStreamsInfo: single-substream folders with a defined whole-folder
+    // CRC fold out of the kCRC wire list and take that CRC; the same fold
+    // applies when kCRC is absent (all-undefined digests); a zero count in
+    // kNumUnpackStream is legal and clears the stale single-substream default
+    // sizes; repeated properties are refused.
+    const testing = std.testing;
+    var backing: [16 * 1024]u8 = undefined;
+    var workspace = try Workspace.init(&backing, backing.len);
+    var sizes_a = [_]u64{100};
+    var sizes_c = [_]u64{ 10, 20, 30 };
+    const Fixture = struct {
+        sizes_a: []u64,
+        sizes_c: []u64,
+        fn make(self: @This()) [3]Folder {
+            // Folder A: one substream, whole-folder CRC defined. Folder B:
+            // zero substreams. Folder C: three substreams, no folder CRC.
+            return .{
+                .{ .num_substreams = 1, .substream_sizes = self.sizes_a, .substream_crcs = &.{}, .pack_index = 0, .method = .copy, .attributes = &.{}, .num_in_streams = 1, .num_out_streams = 1, .folder_crc = 0x11111111, .unpack_size = 100 },
+                .{ .num_substreams = 0, .substream_sizes = &.{}, .substream_crcs = &.{}, .pack_index = 1, .method = .copy, .attributes = &.{}, .num_in_streams = 1, .num_out_streams = 1, .unpack_size = 0 },
+                .{ .num_substreams = 3, .substream_sizes = self.sizes_c, .substream_crcs = &.{}, .pack_index = 2, .method = .copy, .attributes = &.{}, .num_in_streams = 1, .num_out_streams = 1, .unpack_size = 60 },
+            };
+        }
+    };
+    const fixture = Fixture{ .sizes_a = &sizes_a, .sizes_c = &sizes_c };
+
+    // kCRC carries three digests: A folds to its folder CRC, B contributes
+    // none, C takes all three.
+    {
+        var folders = fixture.make();
+        const wire = [_]u8{
+            0x0A, 0x01, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
+            0x00,
+        };
+        var cursor = binary.ReadCursor.init(&wire);
+        try parseSubStreamsInfo(&cursor, &workspace, &folders);
+        try testing.expectEqual(@as(usize, 1), folders[0].substream_crcs.len);
+        try testing.expectEqual(@as(?u32, 0x11111111), folders[0].substream_crcs[0]);
+        try testing.expectEqual(@as(usize, 0), folders[1].substream_crcs.len);
+        try testing.expectEqual(@as(usize, 3), folders[2].substream_crcs.len);
+        try testing.expectEqual(@as(?u32, 1), folders[2].substream_crcs[0]);
+        try testing.expectEqual(@as(?u32, 2), folders[2].substream_crcs[1]);
+        try testing.expectEqual(@as(?u32, 3), folders[2].substream_crcs[2]);
+        try testing.expectEqual(@as(usize, 0), cursor.remaining());
+    }
+
+    // Without kCRC the same fold applies over an all-undefined list: A still
+    // carries its folder CRC, C stays null and must not verify as zero.
+    {
+        var folders = fixture.make();
+        const wire = [_]u8{0x00};
+        var cursor = binary.ReadCursor.init(&wire);
+        try parseSubStreamsInfo(&cursor, &workspace, &folders);
+        try testing.expectEqual(@as(usize, 1), folders[0].substream_crcs.len);
+        try testing.expectEqual(@as(?u32, 0x11111111), folders[0].substream_crcs[0]);
+        try testing.expectEqual(@as(usize, 3), folders[2].substream_crcs.len);
+        try testing.expectEqual(@as(?u32, null), folders[2].substream_crcs[0]);
+        try testing.expectEqual(@as(?u32, null), folders[2].substream_crcs[1]);
+        try testing.expectEqual(@as(?u32, null), folders[2].substream_crcs[2]);
+    }
+
+    // A zero count in kNumUnpackStream is legal and drops the stale
+    // single-substream default sizes.
+    {
+        var folders = fixture.make();
+        const wire = [_]u8{ 0x0D, 0x00, 0x00, 0x00, 0x00 };
+        var cursor = binary.ReadCursor.init(&wire);
+        try parseSubStreamsInfo(&cursor, &workspace, &folders);
+        try testing.expectEqual(@as(u64, 0), folders[0].num_substreams);
+        try testing.expectEqual(@as(usize, 0), folders[0].substream_sizes.len);
+        try testing.expectEqual(@as(u64, 0), folders[2].num_substreams);
+        try testing.expectEqual(@as(usize, 0), folders[2].substream_sizes.len);
+    }
+
+    // A multi-substream count without kSize sizes is corrupt (vendor
+    // ThrowIncorrect): the stale default cannot satisfy it.
+    {
+        var folders = fixture.make();
+        const wire = [_]u8{ 0x0D, 0x00, 0x00, 0x03, 0x00 };
+        var cursor = binary.ReadCursor.init(&wire);
+        try testing.expectError(error.DataException, parseSubStreamsInfo(&cursor, &workspace, &folders));
+    }
+
+    // Repeated kNumUnpackStream is a corrupt header.
+    {
+        var folders = fixture.make();
+        const wire = [_]u8{ 0x0D, 0x01, 0x00, 0x00, 0x0D };
+        var cursor = binary.ReadCursor.init(&wire);
+        try testing.expectError(error.DataException, parseSubStreamsInfo(&cursor, &workspace, &folders));
+    }
+
+    // Repeated kCRC is a corrupt header.
+    {
+        var folders = fixture.make();
+        const wire = [_]u8{ 0x0A, 0x00, 0x40, 0xEE, 0x00, 0x00, 0x00, 0x0A };
+        var cursor = binary.ReadCursor.init(&wire);
+        try testing.expectError(error.DataException, parseSubStreamsInfo(&cursor, &workspace, &folders));
+    }
+}
+
+test "sevenzip buildEntries skips trailing zero-substream folders" {
+    // Vendor FillLinks tolerates folders that carry no substreams; an entry
+    // with an undefined digest must surface crc = null (no phantom zero to
+    // verify against).
+    const testing = std.testing;
+    var backing: [16 * 1024]u8 = undefined;
+    var workspace = try Workspace.init(&backing, backing.len);
+    var sizes_a = [_]u64{7};
+    var crcs_a = [_]?u32{@as(?u32, null)};
+    const pack_sizes = [_]u64{7};
+    const folders = [_]Folder{
+        .{ .num_substreams = 1, .substream_sizes = &sizes_a, .substream_crcs = &crcs_a, .pack_index = 0, .method = .copy, .attributes = &.{}, .num_in_streams = 1, .num_out_streams = 1, .unpack_size = 7 },
+        .{ .num_substreams = 0, .substream_sizes = &.{}, .substream_crcs = &.{}, .pack_index = 1, .method = .copy, .attributes = &.{}, .num_in_streams = 1, .num_out_streams = 1, .unpack_size = 0 },
+    };
+    const si = StreamsInfo{ .pack_pos = 32, .pack_sizes = &pack_sizes, .pack_crcs = &.{}, .folders = &folders };
+    const empty_streams = [_]bool{false};
+    const empty_files = [_]bool{false};
+    const name_a = [_]u8{ 0x61, 0x00 };
+    const names = [_][]const u8{&name_a};
+    const fi = FilesInfo{ .empty_streams = &empty_streams, .empty_files = &empty_files, .names = &names };
+    const entries = try buildEntries(&si, &fi, &workspace, .{});
+    try testing.expectEqual(@as(usize, 1), entries.len);
+    try testing.expectEqualStrings("a", entries[0].name);
+    try testing.expectEqual(@as(u64, 7), entries[0].size);
+    try testing.expectEqual(@as(?u32, null), entries[0].crc);
 }
 
 test "sevenzip encrypted roundtrip with salt and custom cycles" {

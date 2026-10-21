@@ -62,7 +62,8 @@ pub fn decode(main_stream: []const u8, call_stream: []const u8, jump_stream: []c
                     address = std.mem.readInt(u32, jump_stream[jump_pos..][0..4], .big);
                     jump_pos += 4;
                 }
-                address -%= @as(u32, @intCast(out_pos + 4));
+                // Vendor keeps the instruction pointer in a u32 that wraps past 4 GiB.
+                address -%= @truncate(out_pos + 4);
                 if (out_pos + 4 > output.len) return error.CapacityException;
                 output[out_pos] = @truncate(address);
                 output[out_pos + 1] = @truncate(address >> 8);

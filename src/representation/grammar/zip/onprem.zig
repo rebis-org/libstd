@@ -110,7 +110,7 @@ pub fn encode(entries: []const Entry, archive_comment: []const u8, output: []u8,
         const extra_length = try bounds.addUsize(try bounds.addUsize(entry.extra.len, if (entry.encrypted and !entry.zipcrypto) winzip_aes_extra_record_length else 0), localZip64Length(stored_size, entry.data.len, descriptor));
         try putU32(&sink, local_signature);
         try putU16(&sink, if (entry.encrypted and !entry.zipcrypto) winzip_aes_version_needed else if (zip64) 45 else zipVersionNeeded(entry.method));
-        try putU16(&sink, if (entry.encrypted and !entry.zipcrypto) entry.flags | 1 else effectiveFlags(entry));
+        try putU16(&sink, effectiveFlags(entry));
         try putU16(&sink, if (entry.encrypted and !entry.zipcrypto) winzip_aes_method else entry.method);
         try putU16(&sink, entry.dos_time);
         try putU16(&sink, entry.dos_date);
@@ -141,7 +141,7 @@ pub fn encode(entries: []const Entry, archive_comment: []const u8, output: []u8,
         try putU32(&sink, central_signature);
         try putU16(&sink, entry.version_made_by);
         try putU16(&sink, if (entry.encrypted and !entry.zipcrypto) winzip_aes_version_needed else if (zip64) 45 else zipVersionNeeded(entry.method));
-        try putU16(&sink, if (entry.encrypted and !entry.zipcrypto) entry.flags | 1 else effectiveFlags(entry));
+        try putU16(&sink, effectiveFlags(entry));
         try putU16(&sink, if (entry.encrypted and !entry.zipcrypto) winzip_aes_method else entry.method);
         try putU16(&sink, entry.dos_time);
         try putU16(&sink, entry.dos_date);
@@ -219,10 +219,15 @@ fn validateEntry(entry: Entry) Exception!void {
     }
 }
 
+// WinZip AES entries never carry a trailing descriptor: the CRC field is
+// repurposed for the encrypted-data marker, so bit 3 must not be set even
+// when the caller requested the streaming shape. ZipCrypto keeps bit 3: a
+// descriptor is written and the check byte switches to the time byte.
 fn effectiveFlags(entry: Entry) u16 {
     var flags = entry.flags;
     if (entry.method == 14) flags |= 0x0002;
     if (entry.encrypted) flags |= 0x0001;
+    if (entry.encrypted and !entry.zipcrypto) flags &= ~@as(u16, 0x0008);
     return flags;
 }
 
@@ -433,7 +438,9 @@ fn writeData(sink: *io.Sink, entry: Entry, provider: crypto.Provider, history: [
         var keys = crypto.ZipCryptoKeys.init(entry.password);
         var header: [12]u8 = undefined;
         try crypto.fillRandom(header[0..11]);
-        header[11] = @truncate(checksum.crc32With(provider, entry.data) >> 24);
+        // With the descriptor flag set the CRC is not yet written, so the
+        // spec check byte is the high byte of the file time instead.
+        header[11] = if (entry.flags & 0x0008 != 0) @truncate(entry.dos_time >> 8) else @truncate(checksum.crc32With(provider, entry.data) >> 24);
         keys.encrypt(&header, &header);
         try sink.write(&header);
         if (entry.password_lifetime != 0 and entry.data.len > entry.password_lifetime) return error.ResourceException;
@@ -957,7 +964,10 @@ fn parseWinzipAesExtra(extra: []const u8, strength: *u8, version: *u16, actual_m
             const parsed_strength = payload[4];
             if (parsed_strength < 1 or parsed_strength > 3) return error.UnsupportedException;
             const parsed_method = readU16(payload, 5);
-            if (parsed_method != 0 and parsed_method != 8) return error.UnsupportedException;
+            // The compressed stream inside AES is any supported method;
+            // WinZip ships AES with bzip2, LZMA, and PPMd alongside the
+            // classic deflate and store pair.
+            if (!zipMethodSupported(parsed_method)) return error.UnsupportedException;
             strength.* = parsed_strength;
             version.* = readU16(payload, 0);
             actual_method.* = parsed_method;
@@ -1099,4 +1109,104 @@ test "zip aes128 single entry fits a 512-byte buffer" {
     var output: [64]u8 = undefined;
     const decoded = try zipDecodeOrdinal(small[0..written], 0, &output, .{ .password = "pw", .failure_cause = &cause, .staging = &staging, .history = &decode_history });
     try testing.expectEqualSlices(u8, data, output[0..decoded]);
+}
+
+test "zip winzip aes clears the data descriptor flag" {
+    // A descriptor cannot follow WinZip AES data: the CRC field carries the
+    // encrypted marker instead, so bit 3 must be dropped from both headers
+    // even when the caller asked for the streaming shape.
+    // See the decode gate above: a mixed build cannot serve one call with
+    // both arms.
+    if (!deflate_seam.encodeServed(checksum.default_provider) or !deflate_seam.decodeServed(checksum.default_provider)) return;
+    const testing = std.testing;
+    const data = "aes entry that requested the streaming shape";
+    const entries = [_]Entry{
+        .{ .name = "a.bin", .data = data, .method = 8, .encrypted = true, .password = "pw", .aes_strength = 3, .flags = 0x0008 },
+    };
+    var cause: crypto.FailureCause = .none;
+    var history: [deflate_history_size]u8 = undefined;
+    var measure_buf: [deflate_measurement_buffer_size]u8 = undefined;
+    var staging: [256]u8 = undefined;
+    var archive: [512]u8 = undefined;
+    const written = try encode(&entries, "", &archive, crypto.default_provider, &history, &measure_buf, &staging, &.{}, &cause);
+    try testing.expectEqual(@as(u16, 0x0001), readU16(&archive, 6));
+    var offset: usize = 0;
+    while (offset + 4 <= written) : (offset += 1) {
+        if (readU32(&archive, offset) == central_signature) break;
+    }
+    try testing.expect(offset + 4 <= written);
+    try testing.expectEqual(@as(u16, 0x0001), readU16(&archive, offset + 8));
+    var decode_history: [deflate_history_size]u8 = undefined;
+    var output: [128]u8 = undefined;
+    const decoded = try zipDecodeOrdinal(archive[0..written], 0, &output, .{ .password = "pw", .failure_cause = &cause, .staging = &staging, .history = &decode_history });
+    try testing.expectEqualSlices(u8, data, output[0..decoded]);
+}
+
+test "zip zipcrypto data descriptor uses the time check byte" {
+    // With bit 3 set the zipcrypto check byte is the high byte of the file
+    // time, not the CRC: the CRC only arrives in the trailing descriptor.
+    const testing = std.testing;
+    const data = "streamed zipcrypto payload for the time check byte";
+    const crc = checksum.crc32With(crypto.default_provider, data);
+    var dos_time: u16 = 0xab00;
+    if (dos_time >> 8 == @as(u8, @truncate(crc >> 24))) dos_time = 0xcd00;
+    try testing.expect(dos_time >> 8 != @as(u8, @truncate(crc >> 24)));
+    const entries = [_]Entry{
+        .{ .name = "s.txt", .data = data, .method = 0, .encrypted = true, .zipcrypto = true, .password = "pw", .flags = 0x0008, .dos_time = dos_time },
+    };
+    var cause: crypto.FailureCause = .none;
+    var archive: [512]u8 = undefined;
+    const written = try encode(&entries, "", &archive, crypto.default_provider, &.{}, &.{}, &.{}, &.{}, &cause);
+    try testing.expectEqual(@as(u16, 0x0009), readU16(&archive, 6));
+    try testing.expectEqual(@as(u32, 0), readU32(&archive, 14));
+    try testing.expectEqual(@as(u32, 0), readU32(&archive, 18));
+    try testing.expectEqual(@as(u32, 0), readU32(&archive, 22));
+    var output: [128]u8 = undefined;
+    var staging: [128]u8 = undefined;
+    const decoded = try zipDecodeOrdinal(archive[0..written], 0, &output, .{ .password = "pw", .failure_cause = &cause, .staging = &staging });
+    try testing.expectEqualSlices(u8, data, output[0..decoded]);
+}
+
+test "zip winzip aes accepts every supported compression method" {
+    // The AES extra field records the real method: WinZip pairs AES with
+    // bzip2 and deflate64 alongside the classic deflate and store pair, so
+    // the decoder must accept the full supported set the encoder emits.
+    const testing = std.testing;
+    const chunk = "actual compression method inside the aes envelope ";
+    const data = chunk ++ chunk ++ chunk ++ chunk ++ chunk ++ chunk ++ chunk ++ chunk;
+    const password = "pw";
+    var cause: crypto.FailureCause = .none;
+
+    {
+        const entries = [_]Entry{
+            .{ .name = "d64.bin", .data = data, .method = 9, .encrypted = true, .password = password, .aes_strength = 2 },
+        };
+        var history: [deflate64_history_size]u8 = undefined;
+        var measure_buf: [deflate_measurement_buffer_size]u8 = undefined;
+        var staging: [256]u8 = undefined;
+        var archive: [1024]u8 = undefined;
+        const written = try encode(&entries, "", &archive, crypto.default_provider, &history, &measure_buf, &staging, &.{}, &cause);
+        var decode_history: [deflate64_decode_history_size]u8 = undefined;
+        var output: [data.len]u8 = undefined;
+        const decoded = try zipDecodeOrdinal(archive[0..written], 0, &output, .{ .password = password, .failure_cause = &cause, .staging = &staging, .history = &decode_history });
+        try testing.expectEqualSlices(u8, data, output[0..decoded]);
+    }
+    {
+        const entries = [_]Entry{
+            .{ .name = "bz2.bin", .data = data, .method = 12, .encrypted = true, .password = password, .aes_strength = 3 },
+        };
+        const scratch_size = bzip2.encodeWorkspaceSize(bzip2_block_default);
+        const scratch = try testing.allocator.alloc(u8, scratch_size);
+        defer testing.allocator.free(scratch);
+        const decode_scratch_size = bzip2.decodeWorkspaceSize(bzip2_block_default);
+        const decode_scratch = try testing.allocator.alloc(u8, decode_scratch_size);
+        defer testing.allocator.free(decode_scratch);
+        var archive: [1024]u8 = undefined;
+        var crypto_staging: [512]u8 = undefined;
+        const written = try encode(&entries, "", &archive, crypto.default_provider, &.{}, &.{}, &crypto_staging, scratch, &cause);
+        var output: [data.len]u8 = undefined;
+        var decrypt_staging: [512]u8 = undefined;
+        const decoded = try zipDecodeOrdinal(archive[0..written], 0, &output, .{ .password = password, .failure_cause = &cause, .staging = &decrypt_staging, .scratch = decode_scratch });
+        try testing.expectEqualSlices(u8, data, output[0..decoded]);
+    }
 }

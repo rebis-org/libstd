@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const std = @import("std");
 
 const options = @import("options");
@@ -73,7 +74,7 @@ fn BlockCipher(comptime S: type, comptime direction: Direction) type {
     const method = if (direction == .encrypt) "encrypt" else "decrypt";
     return union(enum) {
         bits128: if (direction == .encrypt) S.Enc128 else S.Dec128,
-        bits192: aes_seam.Aes192Hw,
+        bits192: aes_seam.Aes192,
         bits256: if (direction == .encrypt) S.Enc256 else S.Dec256,
 
         fn init(key: []const u8) Exception!@This() {
@@ -83,8 +84,8 @@ fn BlockCipher(comptime S: type, comptime direction: Direction) type {
                     .decrypt => S.Dec128.init(key[0..16].*),
                 } },
                 24 => .{ .bits192 = switch (direction) {
-                    .encrypt => aes_seam.Aes192Hw.initEnc(key[0..24].*),
-                    .decrypt => aes_seam.Aes192Hw.initDec(key[0..24].*),
+                    .encrypt => aes_seam.Aes192.initEnc(key[0..24].*),
+                    .decrypt => aes_seam.Aes192.initDec(key[0..24].*),
                 } },
                 32 => .{ .bits256 = switch (direction) {
                     .encrypt => S.Enc256.init(key[0..32].*),
@@ -269,6 +270,8 @@ pub fn winzipDeriveKey(provider: Provider, password: []const u8, salt: []const u
 }
 
 fn sevenZipKdfWith(comptime Sha: type, password_utf16: []const u8, salt: []const u8, num_cycles_power: u8, out_key: *[seven_zip_key_length]u8) void {
+    // The 7z writer format caps this at 24; beyond 63 the shift is undefined.
+    std.debug.assert(num_cycles_power <= seven_zip_cycles_max);
     var sha = Sha.init(.{});
     const rounds: u64 = @as(u64, 1) << @intCast(num_cycles_power);
     var counter: [8]u8 = @splat(0);
@@ -316,26 +319,41 @@ pub fn constantTimeEql(first: []const u8, second: []const u8) bool {
 // cannot obtain randomness must not produce salts or IVs derived from the
 // password and entry contents.
 pub fn fillRandom(bytes: []u8) Exception!void {
-    if (comptime @hasDecl(std.posix.system, "arc4random_buf")) {
+    // The decl also resolves to `void` where the libc lacks the symbol.
+    if (comptime @hasDecl(std.posix.system, "arc4random_buf") and
+        @TypeOf(std.posix.system.arc4random_buf) != void)
+    {
         std.posix.system.arc4random_buf(bytes.ptr, bytes.len);
         return;
     }
-    if (comptime @hasDecl(std.os.linux, "getrandom")) {
+    // std.os.linux declares getrandom on every target; the syscall ABI exists
+    // only on linux-family tags, OpenHarmony included.
+    if (comptime builtin.os.tag == .linux) {
         var filled: usize = 0;
         while (filled < bytes.len) {
             const count = std.os.linux.getrandom(bytes.ptr + filled, bytes.len - filled, 0);
-            if (@as(isize, @bitCast(count)) < 0) {
-                // Interrupted syscalls must retry rather than fail the whole
-                // fill; only a real error refuses.
-                if (count == @backingInt(std.posix.E.INTR)) continue;
-                return error.InternalException;
+            switch (std.os.linux.errno(count)) {
+                .INTR => continue,
+                // Zero progress cannot happen for a nonzero request; fail
+                // rather than spin.
+                .SUCCESS => if (count == 0) {
+                    return error.InternalException;
+                },
+                else => return error.InternalException,
             }
-            if (count == 0) return error.InternalException;
             filled += count;
         }
         return;
     }
     return error.UnsupportedException;
+}
+
+test "fill random accepts every length class" {
+    // Lengths cover the syscall-chunked path, the zero request, and the
+    // arc4random path, so a broken retry or gate fails loudly here.
+    var buf: [65]u8 = undefined;
+    for (0..buf.len + 1) |len| try fillRandom(buf[0..len]);
+    try fillRandom(&buf);
 }
 
 // ZipCrypto (PKWARE traditional cipher). No stdlib equivalent exists; the key

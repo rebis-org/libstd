@@ -62,34 +62,30 @@ pub fn archiveSizeOdc(entries: []const Entry) Exception!u64 {
 }
 
 fn archiveSizeWith(comptime format: Format, entries: []const Entry) Exception!u64 {
+    const header_size: u64 = switch (format) {
+        .newc, .crc => 110,
+        .odc => 76,
+        else => return error.UnsupportedException,
+    };
+    // Mirror the encoder byte for byte: alignment applies to the running
+    // offset (the 110-byte newc header leaves it at 2 mod 4), not to the
+    // field length in isolation, and the final 512 pad is a no-op when the
+    // total already lands on the boundary.
     var total: u64 = 0;
     for (entries) |entry| {
         try validateEntry(entry);
-        const header_size: u64 = switch (format) {
-            .newc, .crc => 110,
-            .odc => 76,
-            else => return error.UnsupportedException,
-        };
         total = try bounds.addU64(total, header_size);
-        const name_padded = switch (format) {
-            .newc, .crc => try alignUp(nameZ(entry), 4),
-            .odc => nameZ(entry),
-            else => unreachable,
-        };
-        total = try bounds.addU64(total, name_padded);
-        const data_padded = switch (format) {
-            .newc, .crc => try alignUp(entry.data.len, 4),
-            .odc => entry.data.len,
-            else => unreachable,
-        };
-        total = try bounds.addU64(total, data_padded);
+        total = try bounds.addU64(total, nameZ(entry));
+        if (format != .odc) total = try alignUp(total, 4);
+        total = try bounds.addU64(total, entry.data.len);
+        if (format != .odc) total = try alignUp(total, 4);
     }
-    total = try bounds.addU64(total, switch (format) {
-        .newc, .crc => 112,
-        .odc => 78,
-        else => unreachable,
-    });
-    if (format == .newc or format == .crc) total = try bounds.addU64(total, 512 - (total % 512));
+    total = try bounds.addU64(total, header_size);
+    total = try bounds.addU64(total, trailer_name.len + 1);
+    if (format != .odc) {
+        total = try alignUp(total, 4);
+        total = try alignUp(total, 512);
+    }
     return total;
 }
 
@@ -269,6 +265,7 @@ const Reader = struct {
         info.header_offset = self.offset;
         var namesize: u64 = 0;
         var data_size: u64 = 0;
+        var check: u64 = 0;
         var name_align: u64 = 2;
         var data_align: u64 = 2;
         if (rest.len >= 6 and std.mem.eql(u8, rest[0..6], "070707")) {
@@ -303,16 +300,10 @@ const Reader = struct {
             info.devmajor = @intCast(try parseHex(rest[62..70]));
             info.devminor = @intCast(try parseHex(rest[70..78]));
             namesize = try parseHex(rest[94..102]);
-            const check = try parseHex(rest[102..110]);
+            check = try parseHex(rest[102..110]);
             self.offset = try bounds.addU64(self.offset, 110);
             name_align = 4;
             data_align = 4;
-            if (info.format == .crc) {
-                const data = try bounds.slice(self.archive, self.offset, data_size);
-                var sum: u64 = 0;
-                for (data) |byte| sum += byte;
-                if ((sum & 0xFFFFFFFF) != check) return error.DataException;
-            }
         } else {
             const le = readU16(rest, 0, false);
             const be = readU16(rest, 0, true);
@@ -341,6 +332,14 @@ const Reader = struct {
         info.data_offset = data_start;
         const data_end = try alignUp(try bounds.addU64(data_start, data_size), data_align);
         if (data_end > self.archive.len) return error.DataException;
+        if (info.format == .crc) {
+            // The checksum covers the file data, which begins after the
+            // name field and its padding, not right after the header.
+            const data = try bounds.slice(self.archive, data_start, data_size);
+            var sum: u64 = 0;
+            for (data) |byte| sum += byte;
+            if ((sum & 0xFFFFFFFF) != check) return error.DataException;
+        }
         info.ordinal = self.ordinal;
         self.ordinal = try bounds.addU64(self.ordinal, 1);
         self.offset = data_end;
@@ -445,4 +444,65 @@ test "cpio reads little-endian binary archives" {
     var out: [4]u8 = undefined;
     const n = try decodeOrdinal(archive[0..32], 0, &out);
     try testing.expectEqualSlices(u8, "data", out[0..n]);
+}
+
+test "cpio sizing matches encoder across alignment and 512 boundaries" {
+    const testing = std.testing;
+    var archive: [4096]u8 = undefined;
+    var scratch: [scratch_size]u8 = undefined;
+    var name_buf: [9]u8 = undefined;
+    var data_buf: [600]u8 = undefined;
+    @memset(&data_buf, 0x61);
+    for (1..10) |name_len| {
+        @memset(name_buf[0..name_len], 'n');
+        for (0..601) |data_len| {
+            const entries = [_]Entry{.{ .name = name_buf[0..name_len], .data = data_buf[0..data_len] }};
+            const written = try encode(&entries, &archive, &scratch);
+            try testing.expectEqual(try archiveSize(&entries), written);
+            const written_odc = try encodeOdc(&entries, &archive, &scratch);
+            try testing.expectEqual(try archiveSizeOdc(&entries), written_odc);
+        }
+    }
+}
+
+test "cpio crc format validates checksum over file data" {
+    const testing = std.testing;
+    const entry = Entry{ .name = "f", .data = "data" };
+    const sum: u32 = 'd' + 'a' + 't' + 'a';
+    var archive: [512]u8 = undefined;
+    var bad: [512]u8 = undefined;
+    {
+        var sink = io.Sink{ .bytes = &archive };
+        try writeNewcHeader(&sink, entry, 1, "070702", sum);
+        try sink.write("f");
+        try sink.write("\x00");
+        try sink.write("data");
+        const zero = Entry{ .name = trailer_name, .data = &.{} };
+        try writeNewcHeader(&sink, zero, 0, "070702", 0);
+        try sink.write(trailer_name);
+        try sink.write("\x00");
+        try writePad(&sink, sink.offset, 4);
+        try writePad(&sink, sink.offset, 512);
+    }
+    {
+        var sink = io.Sink{ .bytes = &bad };
+        try writeNewcHeader(&sink, entry, 1, "070702", sum + 1);
+        try sink.write("f");
+        try sink.write("\x00");
+        try sink.write("data");
+        const zero = Entry{ .name = trailer_name, .data = &.{} };
+        try writeNewcHeader(&sink, zero, 0, "070702", 0);
+        try sink.write(trailer_name);
+        try sink.write("\x00");
+        try writePad(&sink, sink.offset, 4);
+        try writePad(&sink, sink.offset, 512);
+    }
+    try testing.expectEqual(@as(u64, 1), try inspectCount(&archive));
+    const info = try inspectOrdinal(&archive, 0);
+    try testing.expectEqual(Format.crc, info.format);
+    try testing.expectEqualSlices(u8, "f", info.name);
+    var out: [4]u8 = undefined;
+    const n = try decodeOrdinal(&archive, 0, &out);
+    try testing.expectEqualSlices(u8, "data", out[0..n]);
+    try testing.expectError(error.DataException, inspectCount(&bad));
 }

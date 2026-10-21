@@ -284,6 +284,7 @@ fn buildCodeLengthCode(br: *BitReader, hskip: u32, sc: *Scratch) DecodeError!*Hu
     if (hskip == 1) return error.DataException;
     var i: usize = @intCast(hskip);
     var space: u32 = 32;
+    var num_codes: u32 = 0;
     while (i < 18 and space > 0) : (i += 1) {
         const sym = order[i];
         // Code-length-symbol bit lengths use the spec's prefix code
@@ -305,11 +306,24 @@ fn buildCodeLengthCode(br: *BitReader, hskip: u32, sc: *Scratch) DecodeError!*Hu
             const weight = @as(u32, 32) >> @intCast(len);
             if (space < weight) return error.DataException;
             space -= weight;
+            num_codes += 1;
         }
     }
-    if (space != 0) return error.DataException;
+    // RFC 3.5: either the lengths sum to a complete code (space drains to
+    // zero) or exactly one code-length symbol is nonzero; a single symbol
+    // decodes with zero bits consumed (vendor huffman.c single-code case).
+    if (space != 0 and num_codes != 1) return error.DataException;
     const tree = try sc.allocTree(18);
     const table = tree.table;
+    if (num_codes == 1) {
+        for (lengths, 0..) |l, sym| {
+            if (l != 0) {
+                table.single = @intCast(sym);
+                break;
+            }
+        }
+        return table;
+    }
     for (lengths) |l| table.count[l] += 1;
     table.count[0] = 0;
     var offset = canonicalOffsets(table.count);
@@ -362,17 +376,26 @@ fn readPrefixCode(br: *BitReader, sc: *Scratch, alphabet: usize) DecodeError!*Hu
             else => return error.DataException,
         }
         for (0..nsym) |i| tree.table.count[lens[i]] += 1;
-        // For NSYM > 1 the symbols must be re-sorted per length for the
-        // canonical decode walk: bit-walk order is (len, symbol).
+        // For NSYM > 1 the codes inside one length group are assigned in
+        // symbol VALUE order (vendor BrotliBuildSimpleHuffmanTable), not
+        // stream order: sort the (len, symbol) pairs canonically.
         if (nsym > 1) {
-            var offset = canonicalOffsets(tree.table.count);
             var saved: [4]u16 = undefined;
             @memcpy(saved[0..nsym], tree.table.symbols[0..nsym]);
-            for (0..nsym) |i| {
-                const l = lens[i];
-                tree.table.symbols[offset[l]] = saved[i];
-                offset[l] += 1;
+            var order: [4]usize = .{ 0, 1, 2, 3 };
+            var a: usize = 1;
+            while (a < nsym) : (a += 1) {
+                var b = a;
+                while (b > 0 and (lens[order[b]] < lens[order[b - 1]] or
+                    (lens[order[b]] == lens[order[b - 1]] and saved[order[b]] < saved[order[b - 1]])))
+                {
+                    const t = order[b];
+                    order[b] = order[b - 1];
+                    order[b - 1] = t;
+                    b -= 1;
+                }
             }
+            for (0..nsym) |i| tree.table.symbols[i] = saved[order[i]];
         }
         return tree.table;
     }
@@ -393,7 +416,13 @@ fn readPrefixCode(br: *BitReader, sc: *Scratch, alphabet: usize) DecodeError!*Hu
             repeat_len = 0;
             if (sym != 0) {
                 prev_len = @intCast(sym);
-                space -= @as(u32, 32768) >> @intCast(sym);
+                // Guarded subtraction: the vendor relies on u32 wraparound
+                // here and fails later on `space != 0`; the wrapped value
+                // can never return to zero (drain bounded by 704*32768),
+                // so failing early is equivalent.
+                const weight = @as(u32, 32768) >> @intCast(sym);
+                if (weight > space) return error.DataException;
+                space -= weight;
             }
         } else if (sym == 16 or sym == 17) {
             // Repeat codes (RFC 3.5): the running `repeat` holds the TOTAL
@@ -666,13 +695,14 @@ fn decodeMetaBlock(
         var skiplen: usize = 0;
         if (mskipbytes > 0) {
             const v = try br.readBits(@intCast(mskipbytes * 8));
+            // RFC 9.2: the top byte of MSKIPLEN must be nonzero whenever
+            // the length spans more than one byte (vendor decode.c 340-344).
+            if (mskipbytes > 1 and (v >> @intCast((mskipbytes - 1) * 8)) == 0) return error.DataException;
             skiplen = @intCast(v + 1);
-            if (mskipbytes > 1 and (v & 0xFF) == 0 and mskipbytes == ((v >> 8) + 1)) return error.DataException;
         }
         try br.alignToByte();
         if (br.pos + skiplen > br.data.len) return error.DataException;
         br.pos += skiplen;
-        is_last.* = false;
         return;
     }
     const nibbles: u5 = @intCast(mnib_code + 4);
@@ -861,8 +891,10 @@ fn decodeMetaBlock(
         }
         const max_backward = @min(window_size, produced.* - stream_base);
         if (distance > max_backward) {
-            // RFC 8: a static dictionary reference.
-            if (implicit_dist0) return error.DataException;
+            // RFC 8: a static dictionary reference. Implicit dist0 at a
+            // position shorter than the initial ring value (4) is a valid
+            // dictionary reference too (vendor decode.c 2202): the ring is
+            // left untouched in either case.
             const dict_len = try copyDictionaryWord(output, produced, copy_len, distance, max_backward, p1, p2);
             if (pos + dict_len > mlen) return error.DataException;
             pos += dict_len;
@@ -886,13 +918,17 @@ fn decodeMetaBlock(
 // ---------------------------------------------------------------- decode
 
 fn readWbits(br: *BitReader) DecodeError!u32 {
+    // RFC 9.1 / vendor DecodeWindowBits: one leading 0 bit means 16;
+    // otherwise a 3-bit value n selects 17+n, and when n is zero a second
+    // 3-bit value m selects 17 (m == 0), a large-window stream (m == 1,
+    // unsupported here), or 8+m.
     if (try br.readBit() == 0) return 16;
     const n = try br.readBits(3);
     if (n != 0) return 17 + n;
-    if (try br.readBit() == 0) return 17;
     const m = try br.readBits(3);
-    if (m != 0) return 8 + m;
-    return 10;
+    if (m == 1) return error.DataException;
+    if (m == 0) return 17;
+    return 8 + m;
 }
 
 pub fn decodeInPlace(input: []const u8, output: []u8, scratch_buffer: []u8, options: Options) DecodeError!usize {
@@ -936,8 +972,8 @@ pub fn decode(input: []const u8, output: []u8, scratch_buffer: []u8, options: Op
                 try br.alignToByte();
                 break;
             }
-            if (is_last) break;
             if (produced > options.max_decoded_bytes) return error.ResourceException;
+            if (is_last) break;
         }
         // The last meta-block may end mid-byte; the fill must be zero and
         // a concatenated stream starts at the next byte boundary.
@@ -1092,11 +1128,12 @@ fn fermentAll(word: []u8) void {
 }
 
 fn poolString(offset: usize) []const u8 {
-    // prefix_suffix_map[offset] indexes the NUL-terminated pool.
+    // The pool is the vendor length-prefixed pool verbatim: map[offset]
+    // points at a length byte, followed by that many string bytes
+    // (transform.c kPrefixSuffix; entry 49 is the trailing 0x00 = empty).
     const start: usize = dictionary.prefix_suffix_map[offset];
-    var end = start;
-    while (dictionary.prefix_suffix[end] != 0) end += 1;
-    return dictionary.prefix_suffix[start..end];
+    const len: usize = dictionary.prefix_suffix[start];
+    return dictionary.prefix_suffix[start + 1 ..][0..len];
 }
 
 // RFC 9.3 counts the transformed length against MLEN, not the copy length.
@@ -1123,6 +1160,7 @@ fn copyDictionaryWord(
     var total: usize = 0;
     const t = transform_id * 3;
     const prefix = poolString(dictionary.transforms[t]);
+    if (prefix.len > buf.len) return error.InternalException;
     @memcpy(buf[total..][0..prefix.len], prefix);
     total += prefix.len;
 
@@ -1622,4 +1660,101 @@ test "brotli encode roundtrips" {
     const n = try decode(encoded[0..enc_len], output, scratch[encode_workspace_size..], .{});
     try std.testing.expectEqual(big.len, n);
     try std.testing.expectEqualSlices(u8, &big, output[0..n]);
+}
+
+// Streams hand-assembled bit by bit, then cross-validated against the
+// system brotli CLI before embedding: each one pins a decode path that a
+// round trip through our own encoder cannot reach.
+test "brotli decode hand-built vendor validated streams" {
+    const allocator = std.testing.allocator;
+    const scratch = try allocator.alloc(u8, decode_workspace_size);
+    defer allocator.free(scratch);
+
+    const Case = struct { input: []const u8, want: []const u8 };
+    const ok_cases = [_]Case{
+        // MLEN 5, implicit distance 4 falls into the static dictionary.
+        .{ .input = &.{ 0x82, 0x00, 0x00, 0x00, 0x04, 0x40, 0x0c, 0x10, 0x00 }, .want = "world" },
+        // Two-symbol simple literal tree: reads must return in sorted
+        // (len, value) order, so 0x41 decodes before 0x42.
+        .{ .input = &.{ 0x22, 0x00, 0x00, 0x00, 0x94, 0x50, 0x50, 0x40, 0x10, 0x80 }, .want = "AB" },
+        // Complex path whose code-length code space holds a single code:
+        // every subsequent read is a zero-width symbol.
+        .{ .input = &.{ 0x22, 0x00, 0x00, 0x00, 0x70, 0x00, 0x00, 0x00, 0x00, 0x04, 0x04, 0x01, 0x08 }, .want = "\x00\x01" },
+        // Metadata-only last metablock skipping one aligned byte.
+        .{ .input = &.{ 0x5a, 0x00, 0x00 }, .want = "" },
+    };
+    for (ok_cases) |case| {
+        const output = try allocator.alloc(u8, 4096);
+        defer allocator.free(output);
+        const n = try decode(case.input, output, scratch, .{});
+        try std.testing.expectEqualSlices(u8, case.want, output[0..n]);
+    }
+
+    const bad_cases = [_][]const u8{
+        // A third length-2 code overflows the literal code space; the
+        // vendor wraps a u32, we must answer DataException instead.
+        &.{ 0x22, 0x00, 0x00, 0x00, 0x70, 0x07, 0x00, 0x00, 0x00, 0x70 },
+        // Metadata skip length whose two payload bytes carry a
+        // redundant leading zero.
+        &.{ 0x9a, 0x00, 0x00 },
+    };
+    for (bad_cases) |input| {
+        const output = try allocator.alloc(u8, 4096);
+        defer allocator.free(output);
+        try std.testing.expectError(error.DataException, decode(input, output, scratch, .{}));
+    }
+}
+
+// WBITS edge encodings produced by the system brotli CLI: 10 and 17 use
+// the long forms, 16 the single zero bit, and --large_window sets the
+// reserved flag this decoder rejects.
+test "brotli decode wbits acceptance and rejection" {
+    const allocator = std.testing.allocator;
+    const scratch = try allocator.alloc(u8, decode_workspace_size);
+    defer allocator.free(scratch);
+    const expected = "hello hello hello hello";
+    const vectors = [_][]const u8{
+        &.{ 0xa1, 0xb0, 0x00, 0x00, 0x20, 0x01, 0x52, 0x83, 0x28, 0x53, 0x87, 0xe7, 0xf4, 0x01 },
+        &.{ 0xc2, 0x02, 0x00, 0x80, 0x04, 0x48, 0x0d, 0xa2, 0x4c, 0x1d, 0x9e, 0xd3, 0x07 },
+        &.{ 0x81, 0xb0, 0x00, 0x00, 0x20, 0x01, 0x52, 0x83, 0x28, 0x53, 0x87, 0xe7, 0xf4, 0x01 },
+    };
+    for (vectors) |input| {
+        const output = try allocator.alloc(u8, 4096);
+        defer allocator.free(output);
+        const n = try decode(input, output, scratch, .{});
+        try std.testing.expectEqualSlices(u8, expected, output[0..n]);
+    }
+    const large_window = [_]u8{ 0x11, 0x5e, 0x58, 0x00, 0x00, 0x90, 0x00, 0xa9, 0x41, 0x94, 0xa9, 0x03, 0x0f, 0xa7, 0x0f };
+    const output = try allocator.alloc(u8, 4096);
+    defer allocator.free(output);
+    try std.testing.expectError(error.DataException, decode(&large_window, output, scratch, .{}));
+}
+
+// Static-dictionary transforms, exercised directly: copy_len 5 words all
+// start at dictionary index 3 ("world"), and word_id / 1024 selects the
+// transform row. Prefixes and suffixes come from the vendor
+// length-prefixed pool, so entry 49 is the empty string.
+test "brotli copy dictionary word transforms" {
+    var p1: u8 = 0;
+    var p2: u8 = 0;
+    const Case = struct { distance: u32, want: []const u8 };
+    const cases = [_]Case{
+        .{ .distance = 4, .want = "world" },
+        .{ .distance = 1028, .want = "world " },
+        .{ .distance = 4100, .want = "World " },
+        .{ .distance = 15364, .want = " World " },
+        .{ .distance = 33796, .want = " world, " },
+    };
+    for (cases) |case| {
+        var output: [64]u8 = undefined;
+        var produced: usize = 0;
+        const total = try copyDictionaryWord(&output, &produced, 5, case.distance, 0, &p1, &p2);
+        try std.testing.expectEqual(case.want.len, total);
+        try std.testing.expectEqual(case.want.len, produced);
+        try std.testing.expectEqualSlices(u8, case.want, output[0..total]);
+    }
+    // word_id 123904 selects transform 121, one past the table end.
+    var output: [64]u8 = undefined;
+    var produced: usize = 0;
+    try std.testing.expectError(error.DataException, copyDictionaryWord(&output, &produced, 5, 123905, 0, &p1, &p2));
 }

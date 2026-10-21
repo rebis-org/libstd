@@ -11,6 +11,7 @@ const lz4 = @import("../representation/leaf/lz4/onprem.zig");
 const composition = @import("composition.zig");
 const sessions = @import("sessions.zig");
 
+const testing = std.testing;
 const Exception = exception_prim.Exception;
 const StepResult = sessions.StepResult;
 
@@ -38,6 +39,8 @@ pub const GzipDecode = struct {
     phase: Phase = .idle,
     fixed: [10]u8,
     fixed_len: usize = 0,
+    hcrc: [2]u8,
+    hcrc_len: usize = 0,
     extra_low: u8 = 0,
     extra_remaining: usize = 0,
     header_crc: checksum.Crc32,
@@ -61,7 +64,10 @@ pub const GzipDecode = struct {
     // The leftover snapshot records its length before this step appends, so consumed reporting covers only this step's bytes.
     fn restage(self: *GzipDecode, input: []const u8, result: *StepResult) Exception!void {
         const consumed = self.inflater.streamPosition();
-        const floor = if (self.phase == .deflate) consumed else self.frame_pos;
+        // Deflate compacts by the logical floor like restageInflated: bytes
+        // backing live accumulator bits survive the staging boundary. The
+        // framing phases read pending directly, so their floor is frame_pos.
+        const floor = if (self.phase == .deflate) self.inflater.inputBitsConsumed() / 8 else self.frame_pos;
         try compactPending(self.pending[0..], &self.pending_len, floor);
         if (floor > 0) {
             if (self.phase == .deflate) {
@@ -72,7 +78,11 @@ pub const GzipDecode = struct {
             }
         }
         try appendStaged(self.pending[0..], &self.pending_len, &self.leftover, input, result);
-        self.inflater.restage(self.pending[0..self.pending_len], if (floor > 0) 0 else consumed);
+        if (self.phase == .deflate) {
+            self.inflater.restage(self.pending[0..self.pending_len], consumed - floor);
+        } else {
+            self.inflater.restage(self.pending[0..self.pending_len], if (floor > 0) 0 else consumed);
+        }
     }
 
     // Each step's whole chunk is accepted into pending. Consumed is the accepted length and bytes are never re-sent.
@@ -114,9 +124,16 @@ fn carveHistory(comptime T: type, storage: []u8, comptime history_len: usize) er
 
 fn restageInflated(inflater: *deflate_seam.Decode, pending: []u8, pending_len: *usize, leftover: *usize, input: []const u8, result: *StepResult) Exception!void {
     const consumed = inflater.streamPosition();
-    try compactPending(pending, pending_len, consumed);
+    // Compact by the logical floor, not the raw position: word-granular
+    // refill over-reads, so bytes past the floor back live accumulator bits
+    // and must survive. The restaged position shifts by the same floor,
+    // keeping inputBitsConsumed relative to the retained span so the
+    // deferred end-of-stream conversion never underflows across a staging
+    // boundary.
+    const floor = inflater.inputBitsConsumed() / 8;
+    try compactPending(pending, pending_len, floor);
     try appendStaged(pending, pending_len, leftover, input, result);
-    inflater.restage(pending[0..pending_len.*], if (consumed > 0) 0 else consumed);
+    inflater.restage(pending[0..pending_len.*], consumed - floor);
 }
 
 pub fn gzipDecodeStorage() usize {
@@ -133,6 +150,7 @@ pub fn gzipDecodeInit(storage: []u8, budgets: sessions.Budgets) error{ CapacityE
         .history = history,
         .pending = undefined,
         .fixed = undefined,
+        .hcrc = undefined,
         .header_crc = checksum.Crc32.init(),
         .member_crc = checksum.Crc32.init(),
         .trailer = undefined,
@@ -203,8 +221,11 @@ fn pumpInflated(
         }
         // Both arms report a finished member as end-of-stream; the caller reads atEnd() for the boundary.
         if (err == error.EndOfStream and state.inflater.atEnd()) return null;
-        const starved = state.inflater.streamPosition() == state.pending_len;
-        if (!end_of_input and starved) {
+        // Starvation is a clean suspension, not corruption: the leaf rolled
+        // its parse back and stays resumable, waiting on more input. A
+        // failed leaf is corruption, and starving after the input end is a
+        // short stream.
+        if (err == error.ReadFailed and !state.inflater.isFailed() and !end_of_input) {
             state.inflater.clearFailure();
             result.consumed = input_len;
             result.status = .open;
@@ -265,6 +286,7 @@ pub fn gzipDecodeStep(state: *GzipDecode, input: []const u8, output: []u8, end_o
                         const byte = state.nextByte() orelse break :framing;
                         state.fixed[0] = byte;
                         state.fixed_len = 1;
+                        state.hcrc_len = 0;
                         state.header_crc = checksum.Crc32.init();
                         state.header_crc.update(&.{byte});
                         state.phase = .fixed;
@@ -327,12 +349,15 @@ pub fn gzipDecodeStep(state: *GzipDecode, input: []const u8, output: []u8, end_o
                         }
                     },
                     .hcrc => {
-                        var stored: [2]u8 = undefined;
-                        for (&stored) |*slot| {
+                        // The two HCRC16 bytes persist across suspension like
+                        // the fixed header and trailer: a local buffer would
+                        // drop a byte already consumed at the staging boundary.
+                        while (state.hcrc_len < state.hcrc.len) {
                             const byte = state.nextByte() orelse break :framing;
-                            slot.* = byte;
+                            state.hcrc[state.hcrc_len] = byte;
+                            state.hcrc_len += 1;
                         }
-                        const expected = std.mem.readInt(u16, &stored, .little);
+                        const expected = std.mem.readInt(u16, &state.hcrc, .little);
                         if (expected != @as(u16, @truncate(state.header_crc.final()))) return framingFailed(&result, state.frame_pos, error.IntegrityException);
                         enterDeflate(state) catch |exception| return framingFailed(&result, state.frame_pos, exception);
                     },
@@ -385,6 +410,7 @@ pub fn gzipDecodeStep(state: *GzipDecode, input: []const u8, output: []u8, end_o
                     break;
                 }
                 // Member ends at consumed bits, not buffered bytes: word-granular refill over-reads up to seven bytes past the final block.
+                // Epoch-relative: compaction retained the partial byte, so this is the trailer offset within the compacted pending.
                 const consumed_bits = state.inflater.inputBitsConsumed();
                 state.frame_pos = (consumed_bits + 7) / 8;
                 state.inflater.setFramePos(state.frame_pos);
@@ -392,6 +418,9 @@ pub fn gzipDecodeStep(state: *GzipDecode, input: []const u8, output: []u8, end_o
                 state.trailer_len = 0;
                 continue :outer;
             }
+            break;
+        } else {
+            // Output full (or empty): suspend mid-deflate with progress preserved. The caller resumes with a fresh buffer.
             break;
         }
     }
@@ -456,7 +485,6 @@ pub const DeflateDecode = struct {
     pending_len: usize = 0,
     leftover: usize = 0,
     started: bool = false,
-    stream_end: usize = 0,
     budgets: sessions.Budgets,
 
     fn restage(self: *DeflateDecode, input: []const u8, result: *StepResult) Exception!void {
@@ -508,11 +536,13 @@ pub fn deflateDecodeStep(state: *DeflateDecode, input: []const u8, output: []u8,
             return result;
         }
         // The stream ends at consumed bits, not buffered bytes: word-granular
-        // refill over-reads up to seven bytes past the final block. Trailing
-        // bytes after the logical end are an error.
+        // refill over-reads up to seven bytes past the final block. Epoch-
+        // relative: compaction retained the partial byte, so this is the
+        // logical end offset within the compacted pending. Trailing bytes
+        // after it are an error.
         const consumed_bits = state.inflater.inputBitsConsumed();
-        state.stream_end = (consumed_bits + 7) / 8;
-        if (state.stream_end != state.pending_len) {
+        const stream_end = (consumed_bits + 7) / 8;
+        if (stream_end != state.pending_len) {
             return framingFailed(&result, input.len, error.DataException);
         }
         result.consumed = input.len;
@@ -539,7 +569,6 @@ pub const ZlibDecode = struct {
     pending: [pending_cap]u8,
     pending_len: usize = 0,
     started: bool = false,
-    stream_end: usize = 0,
     adler: checksum.Adler32,
     leftover: usize = 0,
     budgets: sessions.Budgets,
@@ -607,9 +636,12 @@ pub fn zlibDecodeStep(state: *ZlibDecode, input: []const u8, output: []u8, end_o
             result.status = .open;
             return result;
         }
+        // Epoch-relative like the raw deflate session: compaction retained
+        // the partial byte, so this is the trailer offset within the
+        // compacted pending.
         const consumed_bits = state.inflater.inputBitsConsumed();
-        state.stream_end = (consumed_bits + 7) / 8;
-        const trailer_pos = state.stream_end;
+        const stream_end = (consumed_bits + 7) / 8;
+        const trailer_pos = stream_end;
         if (state.pending_len - trailer_pos < zlib_trailer_size) {
             if (end_of_input) return framingFailed(&result, input.len, error.DataException);
             result.consumed = input.len;
@@ -948,7 +980,12 @@ pub fn lz4DecodeStep(state: *Lz4Decode, input: []const u8, output: []u8, end_of_
                 if (std.mem.readInt(u32, avail[0..4], .little) != lz4_magic_value) return framingFailed(&result, input.len, error.DataException);
                 state.flags = avail[4];
                 if ((state.flags & 0xC0) != 0x40) return framingFailed(&result, input.len, error.UnsupportedException);
-                const block_code = (avail[5] >> 4) & 0x07;
+                // Reserved FLG bit and BD bits must read zero, as the leaf and
+                // the reference decoder require.
+                if (state.flags & 0x02 != 0) return framingFailed(&result, input.len, error.DataException);
+                const bd = avail[5];
+                if (bd & 0x8F != 0) return framingFailed(&result, input.len, error.DataException);
+                const block_code = (bd >> 4) & 0x07;
                 if (block_code < 4 or block_code > 7) return framingFailed(&result, input.len, error.DataException);
                 state.max_block = @as(usize, 65536) << @intCast(2 * (@as(usize, block_code) - 4));
                 var offset: usize = 6;
@@ -1014,11 +1051,12 @@ pub fn lz4DecodeStep(state: *Lz4Decode, input: []const u8, output: []u8, end_of_
                 const produced = if (state.block_is_stored) blk: {
                     @memcpy(state.staging[0..block_data.len], block_data);
                     break :blk block_data.len;
-                } else lz4.decompressBlock(block_data, state.staging, state.window[0..state.window_len]) catch |err| {
-                    return framingFailed(&result, input.len, switch (err) {
-                        error.DataException => error.DataException,
-                        error.OutputTooSmall => error.InternalException,
-                    });
+                } else lz4.decompressBlock(block_data, state.staging, state.window[0..state.window_len]) catch {
+                    // A corrupt block answers DataException; an overrun of the
+                    // staging buffer sized to the largest decompressed block
+                    // the format allows is equally invalid data, not an
+                    // internal fault.
+                    return framingFailed(&result, input.len, error.DataException);
                 };
                 state.content_hasher.update(state.staging[0..produced]);
                 state.total = std.math.add(usize, state.total, produced) catch return framingFailed(&result, input.len, error.ResourceException);
@@ -1217,4 +1255,247 @@ pub fn lz4EncodeStep(state: *Lz4Encode, input: []const u8, output: []u8, end_of_
     }
     result.status = .open;
     return result;
+}
+
+// Deterministic, compressible, non-periodic text: the deflate frame decodes in
+// one history fill, so end-of-stream lands inside a step with buffered output
+// left over, which is the boundary the chunked decode must survive.
+fn fillPayload(payload: []u8) void {
+    var state: u32 = 0x1234567;
+    for (payload, 0..) |*slot, index| {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        slot.* = @truncate('a' + ((state >> 8) % 26) + (index % 3));
+    }
+}
+
+const StateStorage = struct { raw: []u8, aligned: []u8 };
+
+fn allocStateStorage(comptime Driver: type, plan: usize, allocator: std.mem.Allocator) !StateStorage {
+    const raw = try allocator.alloc(u8, plan + @alignOf(Driver));
+    const base = @intFromPtr(raw.ptr);
+    const offset = std.mem.alignForward(usize, base, @alignOf(Driver)) - base;
+    return .{ .raw = raw, .aligned = raw[offset..][0..plan] };
+}
+
+fn expectChunkedDecode(
+    comptime Driver: type,
+    comptime initDriver: fn ([]u8, sessions.Budgets) error{ CapacityException, UnsupportedException }!*Driver,
+    comptime stepDriver: fn (*Driver, []const u8, []u8, bool) StepResult,
+    storage: []u8,
+    compressed: []const u8,
+    expected: []const u8,
+    input_chunk: usize,
+    output_chunk: usize,
+) !void {
+    const allocator = testing.allocator;
+    const state = try initDriver(storage, .{});
+    const scratch = try allocator.alloc(u8, output_chunk);
+    defer allocator.free(scratch);
+    var decoded: std.ArrayList(u8) = .empty;
+    defer decoded.deinit(allocator);
+    var pos: usize = 0;
+    var guard: usize = 0;
+    while (true) : (guard += 1) {
+        try testing.expect(guard < 100000);
+        const take = @min(input_chunk, compressed.len - pos);
+        const result = stepDriver(state, compressed[pos..][0..take], scratch, pos + take == compressed.len);
+        try decoded.appendSlice(allocator, scratch[0..result.produced]);
+        if (result.status == .failed) {
+            if (result.exception) |exception| {
+                return exception;
+            }
+            return error.TestUnexpectedResult;
+        }
+        pos += result.consumed;
+        if (result.status == .done) break;
+    }
+    try testing.expectEqualSlices(u8, expected, decoded.items);
+}
+
+test "decode sessions drain the final block across output boundaries" {
+    const allocator = testing.allocator;
+    var payload: [600]u8 = undefined;
+    fillPayload(&payload);
+
+    const history = try allocator.alloc(u8, gzip.deflate_history_size);
+    defer allocator.free(history);
+
+    const gzip_size = gzipEncodedSizeBound(payload.len);
+    const gzip_frame = try allocator.alloc(u8, gzip_size);
+    defer allocator.free(gzip_frame);
+    const gzip_len = try gzipEncode(gzip_frame, &payload, history, default_encode_options, .bounded);
+
+    const zlib_options: zlib.Options = .{ .deflate = default_encode_options.deflate };
+    const zlib_size = zlib.encodedSizeBound(payload.len, zlib_options);
+    const zlib_frame = try allocator.alloc(u8, zlib_size);
+    defer allocator.free(zlib_frame);
+    var zlib_len: usize = 0;
+    {
+        var source = std.Io.Reader.fixed(&payload);
+        var sink = std.Io.Writer.fixed(zlib_frame);
+        try zlib.encodeStream(&source, &sink, history, zlib_options);
+        zlib_len = sink.end;
+    }
+    const deflate_frame = zlib_frame[2 .. zlib_len - 4];
+
+    {
+        const holder = try allocStateStorage(GzipDecode, gzipDecodeStorage(), allocator);
+        defer allocator.free(holder.raw);
+        try expectChunkedDecode(GzipDecode, gzipDecodeInit, gzipDecodeStep, holder.aligned, gzip_frame[0..gzip_len], &payload, gzip_len, 8);
+    }
+    {
+        const holder = try allocStateStorage(ZlibDecode, zlibDecodeStorage(), allocator);
+        defer allocator.free(holder.raw);
+        try expectChunkedDecode(ZlibDecode, zlibDecodeInit, zlibDecodeStep, holder.aligned, zlib_frame[0..zlib_len], &payload, zlib_len, 8);
+    }
+    {
+        const holder = try allocStateStorage(DeflateDecode, deflateDecodeStorage(), allocator);
+        defer allocator.free(holder.raw);
+        try expectChunkedDecode(DeflateDecode, deflateDecodeInit, deflateDecodeStep, holder.aligned, deflate_frame, &payload, deflate_frame.len, 8);
+    }
+
+    const multi_frame = try allocator.alloc(u8, gzip_len * 2);
+    defer allocator.free(multi_frame);
+    @memcpy(multi_frame[0..gzip_len], gzip_frame[0..gzip_len]);
+    @memcpy(multi_frame[gzip_len..], gzip_frame[0..gzip_len]);
+    var joined: [payload.len * 2]u8 = undefined;
+    @memcpy(joined[0..payload.len], &payload);
+    @memcpy(joined[payload.len..], &payload);
+    {
+        const holder = try allocStateStorage(GzipDecode, gzipDecodeStorage(), allocator);
+        defer allocator.free(holder.raw);
+        try expectChunkedDecode(GzipDecode, gzipDecodeInit, gzipDecodeStep, holder.aligned, multi_frame, &joined, multi_frame.len, 8);
+    }
+}
+
+test "decode sessions split the stream across input boundaries" {
+    const allocator = testing.allocator;
+    var payload: [600]u8 = undefined;
+    fillPayload(&payload);
+
+    const history = try allocator.alloc(u8, gzip.deflate_history_size);
+    defer allocator.free(history);
+
+    const gzip_size = gzipEncodedSizeBound(payload.len);
+    const gzip_frame = try allocator.alloc(u8, gzip_size);
+    defer allocator.free(gzip_frame);
+    const gzip_len = try gzipEncode(gzip_frame, &payload, history, default_encode_options, .bounded);
+
+    const zlib_options: zlib.Options = .{ .deflate = default_encode_options.deflate };
+    const zlib_size = zlib.encodedSizeBound(payload.len, zlib_options);
+    const zlib_frame = try allocator.alloc(u8, zlib_size);
+    defer allocator.free(zlib_frame);
+    var zlib_len: usize = 0;
+    {
+        var source = std.Io.Reader.fixed(&payload);
+        var sink = std.Io.Writer.fixed(zlib_frame);
+        try zlib.encodeStream(&source, &sink, history, zlib_options);
+        zlib_len = sink.end;
+    }
+    const deflate_frame = zlib_frame[2 .. zlib_len - 4];
+
+    const gzip_holder = try allocStateStorage(GzipDecode, gzipDecodeStorage(), allocator);
+    defer allocator.free(gzip_holder.raw);
+    const zlib_holder = try allocStateStorage(ZlibDecode, zlibDecodeStorage(), allocator);
+    defer allocator.free(zlib_holder.raw);
+    const deflate_holder = try allocStateStorage(DeflateDecode, deflateDecodeStorage(), allocator);
+    defer allocator.free(deflate_holder.raw);
+    inline for (1..17) |chunk| {
+        try expectChunkedDecode(GzipDecode, gzipDecodeInit, gzipDecodeStep, gzip_holder.aligned, gzip_frame[0..gzip_len], &payload, chunk, 4096);
+        try expectChunkedDecode(ZlibDecode, zlibDecodeInit, zlibDecodeStep, zlib_holder.aligned, zlib_frame[0..zlib_len], &payload, chunk, 4096);
+        try expectChunkedDecode(DeflateDecode, deflateDecodeInit, deflateDecodeStep, deflate_holder.aligned, deflate_frame, &payload, chunk, 4096);
+    }
+}
+
+test "gzip header crc field survives a mid-field suspension" {
+    const allocator = testing.allocator;
+    var payload: [600]u8 = undefined;
+    fillPayload(&payload);
+
+    const hcrc_options: gzip.Options = b: {
+        var options = default_encode_options;
+        options.header_crc = true;
+        break :b options;
+    };
+    const history = try allocator.alloc(u8, gzip.deflate_history_size);
+    defer allocator.free(history);
+    const hcrc_size = gzip.encodedSizeBound(payload.len, hcrc_options);
+    const hcrc_frame = try allocator.alloc(u8, hcrc_size);
+    defer allocator.free(hcrc_frame);
+    const hcrc_len = try gzipEncode(hcrc_frame, &payload, history, hcrc_options, .bounded);
+
+    // The option must engage: FLG carries FHCRC and the header extends past
+    // the fixed ten bytes, or the sweep below stops exercising the phase.
+    try testing.expect(hcrc_frame[3] & flag_hcrc != 0);
+    try testing.expect(hcrc_len > 12);
+
+    const holder = try allocStateStorage(GzipDecode, gzipDecodeStorage(), allocator);
+    defer allocator.free(holder.raw);
+    // Every split of the twelve-byte header region, including the two bytes
+    // between HCRC16 halves (chunk 11) and the deflate start (chunk 12).
+    inline for (1..17) |chunk| {
+        try expectChunkedDecode(GzipDecode, gzipDecodeInit, gzipDecodeStep, holder.aligned, hcrc_frame[0..hcrc_len], &payload, chunk, 4096);
+    }
+
+    // Multi-member: the second member resets the HCRC accumulator mid-stream.
+    const two_member = try allocator.alloc(u8, hcrc_len * 2);
+    defer allocator.free(two_member);
+    @memcpy(two_member[0..hcrc_len], hcrc_frame[0..hcrc_len]);
+    @memcpy(two_member[hcrc_len..], hcrc_frame[0..hcrc_len]);
+    var joined: [payload.len * 2]u8 = undefined;
+    @memcpy(joined[0..payload.len], &payload);
+    @memcpy(joined[payload.len..], &payload);
+    try expectChunkedDecode(GzipDecode, gzipDecodeInit, gzipDecodeStep, holder.aligned, two_member, &joined, 11, 4096);
+}
+
+test "lz4 sessions roundtrip and reject reserved header bits" {
+    const allocator = testing.allocator;
+    var payload: [600]u8 = undefined;
+    fillPayload(&payload);
+
+    // Encoder session emits header, one block, end mark, content checksum.
+    const enc_holder = try allocStateStorage(Lz4Encode, lz4EncodeStorage(), allocator);
+    defer allocator.free(enc_holder.raw);
+    const encoder = try lz4EncodeInit(enc_holder.aligned, .{});
+    var frame: std.ArrayList(u8) = .empty;
+    defer frame.deinit(allocator);
+    var out: [4096]u8 = undefined;
+    while (true) {
+        const result = lz4EncodeStep(encoder, &payload, &out, true);
+        try frame.appendSlice(allocator, out[0..result.produced]);
+        if (result.status == .failed) return result.exception.?;
+        if (result.status == .done) break;
+    }
+
+    // Decoder session has had no chunked coverage at all: sweep input splits.
+    const dec_holder = try allocStateStorage(Lz4Decode, lz4DecodeStorage(), allocator);
+    defer allocator.free(dec_holder.raw);
+    inline for (1..17) |chunk| {
+        try expectChunkedDecode(Lz4Decode, lz4DecodeInit, lz4DecodeStep, dec_holder.aligned, frame.items, &payload, chunk, 4096);
+    }
+
+    // Reserved FLG bit 1 and BD bits 7..4-beyond-code plus the low nibble are
+    // invalid however the header checksum reads, so each mutation gets a
+    // recomputed HC: only the reserved bit may vary.
+    const mutations = [_]struct { offset: usize, mask: u8 }{
+        .{ .offset = 4, .mask = 0x02 },
+        .{ .offset = 5, .mask = 0x80 },
+        .{ .offset = 5, .mask = 0x01 },
+    };
+    for (mutations) |mutation| {
+        const bad = try allocator.alloc(u8, frame.items.len);
+        defer allocator.free(bad);
+        @memcpy(bad, frame.items);
+        bad[mutation.offset] |= mutation.mask;
+        bad[6] = @truncate(checksum.xxh32With(checksum.default_provider, bad[4..6]) >> 8);
+        try testing.expectError(error.DataException, expectChunkedDecode(Lz4Decode, lz4DecodeInit, lz4DecodeStep, dec_holder.aligned, bad, &payload, bad.len, 4096));
+    }
+
+    // Legacy frames need their own 8 MiB staging; the streaming route answers
+    // DataException like the leaf's modern-only writer route.
+    var legacy: [8]u8 = undefined;
+    std.mem.writeInt(u32, legacy[0..4], 0x184C2102, .little);
+    try testing.expectError(error.DataException, expectChunkedDecode(Lz4Decode, lz4DecodeInit, lz4DecodeStep, dec_holder.aligned, &legacy, &payload, legacy.len, 4096));
 }

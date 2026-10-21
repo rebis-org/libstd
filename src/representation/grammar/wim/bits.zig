@@ -25,6 +25,17 @@ pub const Bits = struct {
         b.bitbuf |= word << @intCast(16 - b.bitsleft);
         b.next += 2;
         b.bitsleft += 16;
+        // 17-bit requests that entered with an empty buffer need a second
+        // word; wimlib loads it at shift 0 and marks the buffer full.
+        if (num_bits == 17 and b.bitsleft == 16) {
+            if (b.data.len - b.next < 2) {
+                b.bitsleft = 32;
+                return;
+            }
+            b.bitbuf |= @as(u32, b.data[b.next]) | (@as(u32, b.data[b.next + 1]) << 8);
+            b.next += 2;
+            b.bitsleft = 32;
+        }
     }
 
     pub fn peek(b: *Bits, width: u5) u32 {
@@ -131,4 +142,27 @@ pub fn Code(comptime max_len: usize, comptime num_symbols: usize) type {
             }
         }
     };
+}
+
+test "bits ensure loads the second word for 17-bit requests" {
+    var b = Bits{ .data = &.{ 0xAB, 0xCD, 0xEF, 0x9A } };
+    b.ensure(17);
+    try std.testing.expectEqual(@as(u32, 0xCDAB9AEF), b.bitbuf);
+    try std.testing.expectEqual(@as(u6, 32), b.bitsleft);
+    try std.testing.expectEqual(@as(usize, 4), b.next);
+    try std.testing.expectEqual(@as(u32, 0x19B57), b.peek(17));
+    b.pop(17);
+    try std.testing.expectEqual(@as(u32, 0x35DE0000), b.bitbuf);
+    try std.testing.expectEqual(@as(u6, 15), b.bitsleft);
+    try std.testing.expectEqual(@as(u32, 0x1AEF), b.peek(15));
+}
+
+test "bits ensure marks the stream exhausted at the 17-bit boundary" {
+    var b = Bits{ .data = &.{ 0xAB, 0xCD } };
+    b.ensure(17);
+    try std.testing.expectEqual(@as(u32, 0xCDAB0000), b.bitbuf);
+    try std.testing.expectEqual(@as(u6, 32), b.bitsleft);
+    try std.testing.expectEqual(@as(usize, 2), b.next);
+    // The missing second word reads as zeroes, matching wimlib's contract.
+    try std.testing.expectEqual(@as(u32, 0x19B56), b.peek(17));
 }

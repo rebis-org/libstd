@@ -36,4 +36,5 @@ test {
     _ = @import("representation/volume/iso/onprem.zig");
     _ = @import("representation/volume/squashfs/offprem.zig");
     _ = @import("representation/volume/squashfs/onprem.zig");
+    _ = @import("compose/drivers.zig");
 }

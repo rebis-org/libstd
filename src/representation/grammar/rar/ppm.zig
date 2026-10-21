@@ -780,6 +780,7 @@ pub const PpmModel = struct {
         }
         if (nps == 0) return pc;
 
+        if (up_branch >= heap.len) return null_off;
         var up: Occurrence = .{
             .sym = heap[up_branch],
             .freq = 0,
@@ -795,12 +796,19 @@ pub const PpmModel = struct {
                     if (stAt(heap, pp).sym == up.sym) break;
                 }
             }
-            const cf: u32 = @as(u32, stAt(heap, pp).freq) - 1;
+            // Vendor computes `uint cf = Freq - 1`, so a zero-frequency state (which valid
+            // streams contain after rescale) wraps to 0xFFFFFFFF and every product after it
+            // wraps too; mirror the wraparound instead of panicking, and truncate the final
+            // uint-to-byte assignment like the vendor struct field write does.
+            const cf: u32 = @as(u32, stAt(heap, pp).freq) -% 1;
             const escape_sum: u32 = @as(u32, ctxAt(heap, pc).summ_freq) -% ctxAt(heap, pc).num_stats -% cf;
-            up.freq = @intCast(1 + (if (2 * cf <= escape_sum)
-                @intFromBool(5 * cf > escape_sum)
-            else
-                (2 * cf + 3 * escape_sum - 1) / (2 * escape_sum)));
+            up.freq = blk: {
+                if (2 *% cf <= escape_sum) {
+                    break :blk @as(u8, 1) + @intFromBool(5 *% cf > escape_sum);
+                }
+                if (2 *% escape_sum == 0) return null_off;
+                break :blk @truncate(1 +% (2 *% cf +% 3 *% escape_sum -% 1) / (2 *% escape_sum));
+            };
         } else {
             up.freq = stAt(heap, ctxOneState(pc)).freq;
         }
@@ -1089,7 +1097,11 @@ pub const PpmModel = struct {
         if (num_stats != 256) {
             const suffix_ns: u32 = ctxAt(heap, cctx.suffix).num_stats;
             const ns_idx: usize = self.ns2indx[unmasked_count - 1];
-            const cond_idx: usize = @as(usize, @intFromBool(unmasked_count < suffix_ns - num_stats)) +
+            // Vendor compares `Diff < Suffix->NumStats - NumStats` with ushort-to-int
+            // promotion, i.e. a signed compare that is false when the suffix context
+            // holds fewer stats than this one (valid streams reach this after rescale);
+            // the rearranged unsigned form below is identical without underflowing.
+            const cond_idx: usize = @as(usize, @intFromBool(unmasked_count + num_stats < suffix_ns)) +
                 2 * @as(usize, @intFromBool(cctx.summ_freq < 11 * num_stats)) +
                 4 * @as(usize, @intFromBool(self.num_masked > unmasked_count)) +
                 self.hi_bits_flag;
@@ -1261,4 +1273,84 @@ test "extern views preserve the packed six-byte state stride" {
     s0.setSucc(0x12345678);
     try std.testing.expectEqual(@as(u32, 0x12345678), s0.succ());
     try std.testing.expectEqual(@as(u32, 0x12345678), stAt(h, stats).succ());
+}
+
+test "createSuccessors wraps the reference arithmetic around a zero-frequency state" {
+    var heap: [4 * 1024 * 1024]u8 = undefined;
+    var m = PpmModel.init();
+    try m.startModel(&heap, 4, 1);
+    const h = m.sub.heap;
+
+    // Craft the found state, its suffix-less context, and the matching stats inside the
+    // virgin unit space above lo_unit; createChild only allocates from the hi_unit side.
+    const pc: u32 = m.sub.lo_unit + 4;
+    const stats: u32 = pc + 12;
+    const fs: u32 = pc + 24;
+    const up_branch: u32 = pc + 36;
+    h[up_branch] = 0x41;
+    const ctx = ctxAt(h, pc);
+    ctx.num_stats = 2;
+    ctx.summ_freq = 25;
+    ctx.stats = stats;
+    ctx.suffix = null_off;
+    stAt(h, stats).sym = 0x41;
+    stAt(h, stats).freq = 0;
+    stAt(h, fs).sym = 0x41;
+    stAt(h, fs).freq = 1;
+    stAt(h, fs).setSucc(up_branch);
+    m.min_context = pc;
+    m.found_state = fs;
+
+    // The vendor's `uint cf = Freq - 1` wraps a zero frequency to 0xFFFFFFFF and the
+    // wrapped products yield an UpState frequency of 2 where a straight u32 subtraction
+    // would overflow.
+    const child = m.createSuccessors(false, null_off);
+    try std.testing.expect(child != null_off);
+    const one = stAt(h, ctxOneState(child));
+    try std.testing.expectEqual(@as(u8, 0x41), one.sym);
+    try std.testing.expectEqual(@as(u8, 2), one.freq);
+    try std.testing.expectEqual(up_branch + 1, one.succ());
+
+    // A freq-255 state with s0 = 1 makes the reference's uint-to-byte field assignment
+    // truncate 256 down to a zero byte.
+    stAt(h, stats).freq = 255;
+    ctx.summ_freq = 257;
+    stAt(h, fs).setSucc(up_branch);
+    const wide = m.createSuccessors(false, null_off);
+    try std.testing.expect(wide != null_off);
+    try std.testing.expectEqual(@as(u8, 0), stAt(h, ctxOneState(wide)).freq);
+
+    // An UpBranch past the heap end is refused instead of read out of bounds.
+    stAt(h, fs).setSucc(0xFFFFFFFF);
+    try std.testing.expectEqual(null_off, m.createSuccessors(false, null_off));
+}
+
+test "makeEscFreq2 compares the suffix stats through the reference's signed promotion" {
+    var heap: [4 * 1024 * 1024]u8 = undefined;
+    var m = PpmModel.init();
+    try m.startModel(&heap, 4, 1);
+    const h = m.sub.heap;
+
+    // A suffix context holding fewer stats than the current one turns the vendor's
+    // `Diff < Suffix->NumStats - NumStats` into a signed compare against a negative
+    // value; a straight unsigned subtraction would underflow instead.
+    const c_off: u32 = m.sub.lo_unit + 4;
+    const s_off: u32 = c_off + 12;
+    const cctx = ctxAt(h, c_off);
+    cctx.num_stats = 5;
+    cctx.summ_freq = 30;
+    cctx.stats = 0;
+    cctx.suffix = s_off;
+    ctxAt(h, s_off).num_stats = 2;
+    m.num_masked = 0;
+    m.hi_bits_flag = 0;
+
+    const psee = m.makeEscFreq2(c_off, 3);
+    try std.testing.expectEqual(@intFromPtr(&m.see2[2][2]), @intFromPtr(psee));
+    try std.testing.expectEqual(@as(u32, 20), m.coder.scale);
+
+    // With more suffix stats the first condition flag flips and the column moves.
+    ctxAt(h, s_off).num_stats = 20;
+    const psee2 = m.makeEscFreq2(c_off, 3);
+    try std.testing.expectEqual(@intFromPtr(&m.see2[2][3]), @intFromPtr(psee2));
 }

@@ -35,10 +35,14 @@ pub const EntryInfo = struct {
     ordinal: u64,
 };
 
+const BlockRef = struct {
+    at: u64,
+    len: u64,
+    compression: u16,
+};
+
 const Sections = struct {
-    blocks_at: u64,
-    blocks_len: u64,
-    blocks_compression: u16,
+    blocks: []BlockRef,
     schema_at: u64,
     schema_len: u64,
     schema_compression: u16,
@@ -47,30 +51,27 @@ const Sections = struct {
     metadata_compression: u16,
 };
 
-fn parseSections(archive: []const u8) Exception!Sections {
+fn parseSections(archive: []const u8, arena: std.mem.Allocator) Exception!Sections {
     if (archive.len < section_header_size) return error.DataException;
     if (!std.mem.eql(u8, archive[0..6], section_magic)) return error.DataException;
-    var out: Sections = undefined;
-    var have_blocks = false;
+    // One BLOCK section per block; chunk.block indexes this list.
+    var blocks: std.ArrayList(BlockRef) = .empty;
     var have_schema = false;
     var have_metadata = false;
+    var out: Sections = undefined;
     var at: u64 = 0;
     while (at + section_header_size <= archive.len) {
         const head = archive[at .. at + section_header_size];
         if (!std.mem.eql(u8, head[0..6], section_magic)) return error.DataException;
+        // Header bytes [6]/[7] carry the format version: vendor accepts
+        // 2.2 through 2.6, older bytes mean the v1 layout.
+        if (head[6] != 2 or head[7] < 2 or head[7] > 6) return error.UnsupportedException;
         const stype = std.mem.readInt(u16, head[52..54], .little);
         const compression = std.mem.readInt(u16, head[54..56], .little);
         const length = std.mem.readInt(u64, head[56..64], .little);
         const payload_at = try bounds.addU64(at, section_header_size);
         switch (stype) {
-            section_type_block => {
-                if (!have_blocks) {
-                    out.blocks_at = payload_at;
-                    out.blocks_len = length;
-                    out.blocks_compression = compression;
-                    have_blocks = true;
-                }
-            },
+            section_type_block => blocks.append(arena, .{ .at = payload_at, .len = length, .compression = compression }) catch return error.ResourceException,
             section_type_schema => {
                 out.schema_at = payload_at;
                 out.schema_len = length;
@@ -87,18 +88,18 @@ fn parseSections(archive: []const u8) Exception!Sections {
         }
         at = try bounds.addU64(payload_at, length);
     }
-    if (!have_blocks or !have_schema or !have_metadata) return error.DataException;
+    if (!have_schema or !have_metadata) return error.DataException;
+    out.blocks = blocks.items;
     return out;
 }
 
-fn sectionPayload(archive: []const u8, at: u64, len: u64, compression: u16, arena: std.mem.Allocator) Exception![]const u8 {
+fn sectionPayload(archive: []const u8, at: u64, len: u64, compression: u16, arena: std.mem.Allocator, history: []u8) Exception![]const u8 {
     const raw = try bounds.slice(archive, at, len);
     if (compression == compression_none) return raw;
     const out = arena.alloc(u8, raw.len * 16 + (1 << 16)) catch return error.ResourceException;
     var writer = std.Io.Writer.fixed(out);
     switch (compression) {
         compression_zstd => {
-            const history = arena.alloc(u8, zstd_history) catch return error.ResourceException;
             var reader = std.Io.Reader.fixed(raw);
             _ = zstd_leaf.decodeStream(&reader, &writer, history, .{ .window_size = zstd_window }) catch return error.DataException;
         },
@@ -109,6 +110,67 @@ fn sectionPayload(archive: []const u8, at: u64, len: u64, compression: u16, aren
     }
     return out[0..writer.end];
 }
+
+// Block payloads resolve lazily, one decode buffer reused per block.
+const BlockStore = struct {
+    archive: []const u8,
+    refs: []BlockRef,
+    chunks: []const Chunk,
+    arena: std.mem.Allocator,
+    block_size: u32,
+    history: []u8 = &.{},
+    buf: ?[]u8 = null,
+    cached_index: u32 = std.math.maxInt(u32),
+    cached: []const u8 = &.{},
+
+    fn payload(store: *BlockStore, index: u32) Exception![]const u8 {
+        if (index >= store.refs.len) return error.DataException;
+        if (index == store.cached_index) return store.cached;
+        const ref = store.refs[index];
+        const raw = try bounds.slice(store.archive, ref.at, ref.len);
+        if (ref.compression == compression_none) {
+            store.cached_index = index;
+            store.cached = raw;
+            return raw;
+        }
+        // Size the decode buffer by the chunk-reachable tail of this block,
+        // not the declared block size: mkdwarfs writes a 16 MiB default that
+        // would swamp the scratch for a mostly-empty block.
+        var max_end: u64 = 0;
+        for (store.chunks) |chunk| {
+            if (chunk.block != index) continue;
+            const end = @as(u64, chunk.offset) + chunk.size;
+            if (end > max_end) max_end = end;
+        }
+        if (max_end == 0 or max_end > store.block_size) return error.DataException;
+        const cap = std.math.cast(usize, max_end) orelse return error.ResourceException;
+        if (store.buf == null or store.buf.?.len < cap) {
+            const grown: usize = if (store.buf) |b| @min(@as(usize, store.block_size), @max(cap, b.len *| 2)) else cap;
+            store.buf = store.arena.alloc(u8, grown) catch return error.ResourceException;
+        }
+        const buf = store.buf.?[0..cap];
+        var writer = std.Io.Writer.fixed(buf);
+        switch (ref.compression) {
+            compression_zstd => {
+                var reader = std.Io.Reader.fixed(raw);
+                _ = zstd_leaf.decodeStream(&reader, &writer, store.history, .{ .window_size = zstd_window }) catch {
+                    // The buffer spans every chunk range of this block, so a
+                    // full writer means surplus output no chunk can reach.
+                    if (writer.end != buf.len) return error.DataException;
+                };
+            },
+            compression_lz4 => {
+                lz4_leaf.decodeToWriter(raw, &writer, store.buf.?, .{}) catch {
+                    if (writer.end != buf.len) return error.DataException;
+                };
+            },
+            else => return error.UnsupportedException,
+        }
+        store.cached_index = index;
+        store.cached = buf[0..writer.end];
+        return store.cached;
+    }
+};
 
 // Dwarfs thrift dialect: map size precedes the key/value type byte.
 // Booleans ride inline in field headers.
@@ -317,7 +379,7 @@ fn fpos(base: usize, off: i16) usize {
     return if (off < 0) base + @as(usize, @intCast(-off)) else base + @as(usize, @intCast(off)) * 8;
 }
 
-const Chunk = struct { offset: u32, size: u32 };
+const Chunk = struct { block: u32, offset: u32, size: u32 };
 const DirEntry = struct { name_index: u32, inode_num: u32 };
 
 const Metadata = struct {
@@ -330,6 +392,8 @@ const Metadata = struct {
     names_buffer: []const u8 = &.{},
     names_index: []u32 = &.{},
     block_size: u32 = 0,
+    packed_chunk_table: bool = false,
+    packed_directories: bool = false,
 };
 
 const Decoder = struct {
@@ -404,8 +468,21 @@ const Decoder = struct {
         return out;
     }
 
+    // Chunk fields are optional in frozen schemas; absent fields read zero.
     fn chunkVector(d: *Decoder, lid: i16, pos: usize) Exception![]Chunk {
-        return d.pairVector(Chunk, lid, pos, 2, "offset", 3, "size");
+        const head = try d.vectorHead(lid, pos);
+        const item = head.item orelse return error.DataException;
+        const stride = d.layouts[@intCast(item.layout)].bits;
+        const out = d.arena.alloc(Chunk, head.count) catch return error.ResourceException;
+        for (out, 0..) |*o, i| {
+            const at = head.dist * 8 + i * stride;
+            const inner = d.layouts[@intCast(item.layout)];
+            o.* = .{ .block = 0, .offset = 0, .size = 0 };
+            if (find(inner, 1)) |cf| o.block = try d.u32At(cf.layout, fpos(at, cf.offset));
+            if (find(inner, 2)) |cf| o.offset = try d.u32At(cf.layout, fpos(at, cf.offset));
+            if (find(inner, 3)) |cf| o.size = try d.u32At(cf.layout, fpos(at, cf.offset));
+        }
+        return out;
     }
 
     fn dirEntryVector(d: *Decoder, lid: i16, pos: usize) Exception![]DirEntry {
@@ -428,6 +505,12 @@ const Decoder = struct {
         const present = (try d.integral(pf.layout, fpos(pos, pf.offset))) != 0;
         return .{ .present = present, .value_field = find(l, 2) };
     }
+
+    fn flagAt(d: *Decoder, lid: i16, pos: usize, field_id: i16) Exception!bool {
+        const l = d.layouts[@intCast(lid)];
+        const f = find(l, field_id) orelse return false;
+        return (try d.integral(f.layout, fpos(pos, f.offset))) != 0;
+    }
 };
 
 fn decodeMetadata(meta_raw: []const u8, schema: Schema, arena: std.mem.Allocator) Exception!Metadata {
@@ -444,7 +527,19 @@ fn decodeMetadata(meta_raw: []const u8, schema: Schema, arena: std.mem.Allocator
             6 => if ((try dec.vectorHead(f.layout, pos)).count > 0) return error.UnsupportedException,
             9 => md.modes = try dec.scalarVector(f.layout, pos),
             10 => if ((try dec.vectorHead(f.layout, pos)).count > 0) return error.UnsupportedException,
+            // Plain symlinks: any entry puts a symlink inode in the tree.
+            11 => if ((try dec.vectorHead(f.layout, pos)).count > 0) return error.UnsupportedException,
             15 => md.block_size = try dec.u32At(f.layout, pos),
+            // Packed forms: record the fs_options flags; the running-sum
+            // unpacks below run only when the flags are set.
+            18 => {
+                const p = try dec.presence(f.layout, pos);
+                if (p.present) {
+                    const vf = p.value_field orelse return error.DataException;
+                    md.packed_chunk_table = try dec.flagAt(vf.layout, fpos(pos, vf.offset), 3);
+                    md.packed_directories = try dec.flagAt(vf.layout, fpos(pos, vf.offset), 4);
+                }
+            },
             19 => {
                 const p = try dec.presence(f.layout, pos);
                 if (p.present) {
@@ -470,8 +565,43 @@ fn decodeMetadata(meta_raw: []const u8, schema: Schema, arena: std.mem.Allocator
                     }
                 }
             },
+            // FSST-compressed symlinks. Vendor string_table::unpack yields
+            // index.size() - 1 strings (index carries a trailing sentinel),
+            // so more than one index entry means at least one symlink.
+            25 => {
+                const p = try dec.presence(f.layout, pos);
+                if (p.present) {
+                    const vf = p.value_field orelse return error.DataException;
+                    const table = dec.layouts[@intCast(vf.layout)];
+                    for (table.fields) |inf| {
+                        if (inf.id == 3) {
+                            if ((try dec.vectorHead(inf.layout, fpos(fpos(pos, vf.offset), inf.offset))).count > 1) return error.UnsupportedException;
+                        }
+                    }
+                }
+            },
+            27 => {},
+            // Sparse files: tolerate both a presence wrapper and a direct
+            // scalar; either shape set means hole chunks exist.
+            34 => {
+                const l = dec.layouts[@intCast(f.layout)];
+                if (Decoder.find(l, 1)) |pf| {
+                    if ((try dec.integral(pf.layout, fpos(pos, pf.offset))) != 0) return error.UnsupportedException;
+                } else if ((try dec.integral(f.layout, pos)) != 0) return error.UnsupportedException;
+            },
+            35 => {},
             else => {},
         }
+    }
+    // Vendor unpacks with running sums only under the fs_options flags;
+    // the first element stays as written.
+    if (md.packed_directories) {
+        var i: usize = 1;
+        while (i < md.directories.len) : (i += 1) md.directories[i] = md.directories[i - 1] +% md.directories[i];
+    }
+    if (md.packed_chunk_table) {
+        var i: usize = 1;
+        while (i < md.chunk_table.len) : (i += 1) md.chunk_table[i] = md.chunk_table[i - 1] +% md.chunk_table[i];
     }
     return md;
 }
@@ -490,18 +620,32 @@ fn runTarget(archive: []const u8, scratch: []u8, target: Target) Exception!u64 {
     if (scratch.len < scratch_size) return error.CapacityException;
     var fba = std.heap.FixedBufferAllocator.init(scratch);
     const arena = fba.allocator();
-    const sections = try parseSections(archive);
-    const schema_raw = try sectionPayload(archive, sections.schema_at, sections.schema_len, sections.schema_compression, arena);
+    // One zstd history buffer is shared by every stream decompression
+    // (schema, metadata, blocks); the calls are sequential so the reuse
+    // is safe and keeps peak scratch at one window instead of three.
+    const history = arena.alloc(u8, zstd_history) catch return error.ResourceException;
+    const sections = try parseSections(archive, arena);
+    const schema_raw = try sectionPayload(archive, sections.schema_at, sections.schema_len, sections.schema_compression, arena, history);
     const schema = try parseSchema(schema_raw, arena);
-    const meta_raw = try sectionPayload(archive, sections.metadata_at, sections.metadata_len, sections.metadata_compression, arena);
+    const meta_raw = try sectionPayload(archive, sections.metadata_at, sections.metadata_len, sections.metadata_compression, arena, history);
     const md = try decodeMetadata(meta_raw, schema, arena);
     if (md.block_size == 0 or md.names_index.len == 0) return error.DataException;
-    const blocks = try sectionPayload(archive, sections.blocks_at, sections.blocks_len, sections.blocks_compression, arena);
+    // Vendor requires a power-of-two block size.
+    if (!std.math.isPowerOfTwo(md.block_size)) return error.DataException;
+    // Every chunk must name an existing block and fit inside it; the
+    // check runs up front so count mode never loads block payloads.
+    for (md.chunks) |chunk| {
+        if (chunk.block >= sections.blocks.len) return error.DataException;
+        if (chunk.offset >= md.block_size) return error.DataException;
+        if (chunk.size > md.block_size) return error.DataException;
+        if (@as(u64, chunk.offset) + chunk.size > md.block_size) return error.DataException;
+    }
     if (md.directories.len < 2) return error.DataException;
+    var store = BlockStore{ .archive = archive, .refs = sections.blocks, .chunks = md.chunks, .arena = arena, .block_size = md.block_size, .history = history };
     const dir_count = md.directories.len - 1;
-    const file_off: u32 = @intCast(dir_count);
+    const file_off: u32 = std.math.cast(u32, dir_count) orelse return error.DataException;
     var state = WalkState{};
-    try walkDwarfsDir(md, blocks, 0, file_off, resolved, &state, 0);
+    try walkDwarfsDir(md, &store, 0, file_off, resolved, &state, 0);
     return switch (target) {
         .count => state.ordinal,
         .resolve => if (found) state.ordinal else error.DataException,
@@ -510,7 +654,7 @@ fn runTarget(archive: []const u8, scratch: []u8, target: Target) Exception!u64 {
 
 const WalkState = struct { ordinal: u64 = 0 };
 
-fn walkDwarfsDir(md: Metadata, blocks: []const u8, dir_index: usize, file_off: u32, target: Target, state: *WalkState, depth: u32) Exception!void {
+fn walkDwarfsDir(md: Metadata, store: *BlockStore, dir_index: usize, file_off: u32, target: Target, state: *WalkState, depth: u32) Exception!void {
     if (depth > max_dir_depth) return error.DataException;
     const start = md.directories[dir_index];
     const end = md.directories[dir_index + 1];
@@ -527,7 +671,7 @@ fn walkDwarfsDir(md: Metadata, blocks: []const u8, dir_index: usize, file_off: u
         const entry = md.dir_entries[e];
         if (entry.inode_num < file_off) {
             if (@as(u64, entry.inode_num) + 1 >= md.directories.len) return error.DataException;
-            try walkDwarfsDir(md, blocks, entry.inode_num, file_off, target, state, depth + 1);
+            try walkDwarfsDir(md, store, entry.inode_num, file_off, target, state, depth + 1);
             continue;
         }
         if (entry.inode_num >= md.inodes.len) return error.DataException;
@@ -538,19 +682,31 @@ fn walkDwarfsDir(md: Metadata, blocks: []const u8, dir_index: usize, file_off: u
         if (idx + 1 >= md.chunk_table.len) return error.DataException;
         const c0 = md.chunk_table[idx];
         const c1 = md.chunk_table[idx + 1];
-        if (c1 != c0 + 1) return error.UnsupportedException;
-        if (c0 >= md.chunks.len) return error.DataException;
-        const chunk = md.chunks[c0];
+        // A file may span consecutive chunks in any blocks; an empty
+        // range decodes as a zero-length file.
+        if (c1 < c0 or c1 > md.chunks.len) return error.DataException;
+        var total: u64 = 0;
+        var ci: usize = c0;
+        while (ci < c1) : (ci += 1) {
+            total = try bounds.addU64(total, md.chunks[ci].size);
+        }
         switch (target) {
             .count => {},
             .resolve => |res| {
                 if (state.ordinal == res.ordinal) {
-                    res.info.size = chunk.size;
+                    res.info.size = total;
                     res.info.ordinal = state.ordinal;
                     if (res.output) |out| {
-                        if (out.len < chunk.size) return error.CapacityException;
-                        const data = try bounds.slice(blocks, chunk.offset, chunk.size);
-                        @memcpy(out[0..chunk.size], data);
+                        if (@as(u64, out.len) < total) return error.CapacityException;
+                        var written: usize = 0;
+                        var cj: usize = c0;
+                        while (cj < c1) : (cj += 1) {
+                            const chunk = md.chunks[cj];
+                            const payload = try store.payload(chunk.block);
+                            const data = try bounds.slice(payload, chunk.offset, chunk.size);
+                            @memcpy(out[written..][0..chunk.size], data);
+                            written += chunk.size;
+                        }
                     }
                     res.found.* = true;
                     return;
@@ -678,7 +834,7 @@ fn sectionHeader(out: *[section_header_size]u8, number: u32, stype: u16, payload
     @memcpy(out[8..40], &digest);
 }
 
-fn writeSchema(out: *std.ArrayList(u8), alloc0: std.mem.Allocator) Exception!void {
+fn writeSchemaBytes(out: *std.ArrayList(u8), alloc0: std.mem.Allocator, layouts: []const WLayout, root: i16) Exception!void {
     const w = struct {
         fn byte(list: *std.ArrayList(u8), a: std.mem.Allocator, b: u8) Exception!void {
             list.append(a, b) catch return error.ResourceException;
@@ -699,9 +855,9 @@ fn writeSchema(out: *std.ArrayList(u8), alloc0: std.mem.Allocator) Exception!voi
     try w.byte(out, alloc0, (1 << 4) | 1);
     // Field 2: layouts map<i16, Layout>.
     try w.byte(out, alloc0, (1 << 4) | 11);
-    try w.varint(out, alloc0, wlayouts.len);
+    try w.varint(out, alloc0, layouts.len);
     try w.byte(out, alloc0, 0x4c);
-    for (wlayouts, 0..) |lay, lid| {
+    for (layouts, 0..) |lay, lid| {
         try w.zz(out, alloc0, @as(i64, @intCast(lid)));
         var last: i16 = 0;
         try w.byte(out, alloc0, (1 << 4) | 5);
@@ -728,10 +884,14 @@ fn writeSchema(out: *std.ArrayList(u8), alloc0: std.mem.Allocator) Exception!voi
     }
     // Field 3: rootLayout i16, field 4: fileVersion i32 = 1.
     try w.byte(out, alloc0, (1 << 4) | 4);
-    try w.zz(out, alloc0, wl_root);
+    try w.zz(out, alloc0, root);
     try w.byte(out, alloc0, (1 << 4) | 5);
     try w.zz(out, alloc0, 1);
     try w.byte(out, alloc0, 0);
+}
+
+fn writeSchema(out: *std.ArrayList(u8), alloc0: std.mem.Allocator) Exception!void {
+    return writeSchemaBytes(out, alloc0, &wlayouts, wl_root);
 }
 
 const DwNode = struct {
@@ -1177,4 +1337,256 @@ test "dwarfs write roundtrips nested directories" {
     try testing.expectEqualSlices(u8, "sibling", out[0..n1]);
     const n2 = try decodeOrdinal(archive[0..written], 2, &out, &scratch);
     try testing.expectEqualSlices(u8, "root file", out[0..n2]);
+}
+
+test "dwarfs rejects unknown format versions" {
+    const testing = std.testing;
+    var bad = mkdwarfs_fixture;
+    var scratch: [scratch_size]u8 = undefined;
+    bad[6] = 3;
+    try testing.expectError(error.UnsupportedException, inspectCount(&bad, &scratch));
+    bad[6] = 2;
+    bad[7] = 7;
+    try testing.expectError(error.UnsupportedException, inspectCount(&bad, &scratch));
+    bad[7] = 1;
+    try testing.expectError(error.UnsupportedException, inspectCount(&bad, &scratch));
+    bad[7] = 5;
+    try testing.expectEqual(@as(u64, 2), try inspectCount(&bad, &scratch));
+}
+
+test "dwarfs decodes a multi-block image" {
+    const testing = std.testing;
+    const entries = [_]Entry{
+        .{ .name = "one.txt", .data = "AAAABBBBCCCC" },
+        .{ .name = "two.txt", .data = "hello dwarfs\n" },
+    };
+    var archive: [4096]u8 = undefined;
+    var scratch: [scratch_size]u8 = undefined;
+    const written = try encode(&entries, &archive, &scratch);
+    // Splice a second, zstd-compressed BLOCK section in after the first
+    // block's payload; a 16 MiB declared block size over a tiny compressed
+    // block mirrors the mkdwarfs default that must not size the decode
+    // buffer by block_size.
+    var fba = std.heap.FixedBufferAllocator.init(&scratch);
+    const sections = try parseSections(archive[0..written], fba.allocator());
+    const insert_at: usize = @intCast(sections.blocks[0].at + sections.blocks[0].len);
+    const extra = [26]u8{
+        0x28, 0xb5, 0x2f, 0xfd, 0x04, 0x00, 0x69, 0x00, 0x00, 0x44, 0x49, 0x46,
+        0x46, 0x45, 0x52, 0x45, 0x4e, 0x54, 0x44, 0x41, 0x54, 0x41, 0x53, 0xde,
+        0x99, 0x93,
+    };
+    const splice_len = section_header_size + extra.len;
+    var buf: [8192]u8 = undefined;
+    @memcpy(buf[0..insert_at], archive[0..insert_at]);
+    var head: [section_header_size]u8 = undefined;
+    sectionHeader(&head, 1, section_type_block, &extra);
+    std.mem.writeInt(u16, head[54..56], compression_zstd, .little);
+    @memcpy(buf[insert_at..][0..section_header_size], &head);
+    @memcpy(buf[insert_at + section_header_size ..][0..extra.len], &extra);
+    @memcpy(buf[insert_at + splice_len ..][0 .. written - insert_at], archive[insert_at..written]);
+    const view = buf[0 .. written + splice_len];
+    // Point chunk 1 at the new block.
+    var fba2 = std.heap.FixedBufferAllocator.init(&scratch);
+    const sections2 = try parseSections(view, fba2.allocator());
+    try testing.expectEqual(@as(usize, 2), sections2.blocks.len);
+    const meta_at: usize = @intCast(sections2.metadata_at);
+    const chunks_at: usize = std.mem.readInt(u32, view[meta_at + 4 ..][0..4], .little);
+    std.mem.writeInt(u32, view[meta_at + chunks_at + 12 ..][0..4], 1, .little);
+    std.mem.writeInt(u32, view[meta_at + chunks_at + 16 ..][0..4], 0, .little);
+    try testing.expectEqual(@as(u64, 2), try inspectCount(view, &scratch));
+    var out: [16]u8 = undefined;
+    const n0 = try decodeOrdinal(view, 0, &out, &scratch);
+    try testing.expectEqualSlices(u8, "AAAABBBBCCCC", out[0..n0]);
+    const n1 = try decodeOrdinal(view, 1, &out, &scratch);
+    try testing.expectEqualSlices(u8, "DIFFERENTDATA", out[0..n1]);
+}
+
+test "dwarfs decodes multi-chunk and empty files" {
+    const testing = std.testing;
+    const entries = [_]Entry{
+        .{ .name = "a.txt", .data = "AAA" },
+        .{ .name = "b.txt", .data = "BBB" },
+        .{ .name = "c.txt", .data = "CCC" },
+    };
+    var archive: [4096]u8 = undefined;
+    var scratch: [scratch_size]u8 = undefined;
+    const written = try encode(&entries, &archive, &scratch);
+    const view = archive[0..written];
+    // Shift chunk_table[2] so b.txt spans two chunks and c.txt empties.
+    var fba = std.heap.FixedBufferAllocator.init(&scratch);
+    const sections = try parseSections(view, fba.allocator());
+    const meta_at: usize = @intCast(sections.metadata_at);
+    const table_at: usize = std.mem.readInt(u32, view[meta_at + 28 ..][0..4], .little);
+    try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, view[meta_at + table_at + 8 ..][0..4], .little));
+    std.mem.writeInt(u32, view[meta_at + table_at + 8 ..][0..4], 3, .little);
+    try testing.expectEqual(@as(u64, 3), try inspectCount(view, &scratch));
+    var out: [16]u8 = undefined;
+    const n0 = try decodeOrdinal(view, 0, &out, &scratch);
+    try testing.expectEqualSlices(u8, "AAA", out[0..n0]);
+    const n1 = try decodeOrdinal(view, 1, &out, &scratch);
+    try testing.expectEqualSlices(u8, "BBBCCC", out[0..n1]);
+    const n2 = try decodeOrdinal(view, 2, &out, &scratch);
+    try testing.expectEqual(@as(usize, 0), n2);
+}
+
+test "dwarfs crafted metadata gates" {
+    const testing = std.testing;
+    // A hand-built schema mirrors the frozen shapes decodeMetadata gates.
+    var fd_vec_u32 = [_]Field{
+        .{ .id = 2, .layout = 0, .offset = 0 },
+        .{ .id = 1, .layout = 0, .offset = -32 },
+        .{ .id = 3, .layout = 0, .offset = 0 },
+    };
+    var fd_chunk = [_]Field{
+        .{ .id = 1, .layout = 0, .offset = 0 },
+        .{ .id = 2, .layout = 0, .offset = -32 },
+        .{ .id = 3, .layout = 0, .offset = -64 },
+    };
+    var fd_vec_chunk = [_]Field{
+        .{ .id = 2, .layout = 0, .offset = 0 },
+        .{ .id = 1, .layout = 0, .offset = -32 },
+        .{ .id = 3, .layout = 4, .offset = 0 },
+    };
+    var fd_dir = [_]Field{
+        .{ .id = 1, .layout = 0, .offset = 0 },
+        .{ .id = 2, .layout = 0, .offset = -32 },
+        .{ .id = 3, .layout = 0, .offset = -64 },
+    };
+    var fd_vec_dir = [_]Field{
+        .{ .id = 2, .layout = 0, .offset = 0 },
+        .{ .id = 1, .layout = 0, .offset = -32 },
+        .{ .id = 3, .layout = 6, .offset = 0 },
+    };
+    var fd_strtab = [_]Field{
+        .{ .id = 3, .layout = 3, .offset = 0 },
+    };
+    var fd_opt_strtab = [_]Field{
+        .{ .id = 1, .layout = 2, .offset = 0 },
+        .{ .id = 2, .layout = 8, .offset = -1 },
+    };
+    var fd_fsopt = [_]Field{
+        .{ .id = 3, .layout = 2, .offset = 0 },
+        .{ .id = 4, .layout = 2, .offset = -1 },
+    };
+    var fd_opt_fsopt = [_]Field{
+        .{ .id = 1, .layout = 2, .offset = 0 },
+        .{ .id = 2, .layout = 10, .offset = -1 },
+    };
+    var fd_opt_u32 = [_]Field{
+        .{ .id = 1, .layout = 2, .offset = 0 },
+        .{ .id = 2, .layout = 0, .offset = -1 },
+    };
+    var fd_root = [_]Field{
+        .{ .id = 1, .layout = 5, .offset = 0 },
+        .{ .id = 2, .layout = 7, .offset = -64 },
+        .{ .id = 4, .layout = 3, .offset = -128 },
+        .{ .id = 18, .layout = 11, .offset = -192 },
+        .{ .id = 25, .layout = 9, .offset = -195 },
+    };
+    var fd_root11 = [_]Field{
+        .{ .id = 11, .layout = 3, .offset = 0 },
+    };
+    var fd_root34d = [_]Field{
+        .{ .id = 34, .layout = 0, .offset = 0 },
+    };
+    var fd_root34p = [_]Field{
+        .{ .id = 34, .layout = 12, .offset = 0 },
+    };
+    var layouts = [_]Layout{
+        .{ .size = 0, .bits = 32, .fields = &.{} },
+        .{ .size = 0, .bits = 32, .fields = &.{} },
+        .{ .size = 0, .bits = 1, .fields = &.{} },
+        .{ .size = 0, .bits = 64, .fields = &fd_vec_u32 },
+        .{ .size = 0, .bits = 96, .fields = &fd_chunk },
+        .{ .size = 0, .bits = 64, .fields = &fd_vec_chunk },
+        .{ .size = 0, .bits = 96, .fields = &fd_dir },
+        .{ .size = 0, .bits = 64, .fields = &fd_vec_dir },
+        .{ .size = 0, .bits = 64, .fields = &fd_strtab },
+        .{ .size = 0, .bits = 33, .fields = &fd_opt_strtab },
+        .{ .size = 0, .bits = 2, .fields = &fd_fsopt },
+        .{ .size = 0, .bits = 3, .fields = &fd_opt_fsopt },
+        .{ .size = 0, .bits = 33, .fields = &fd_opt_u32 },
+        .{ .size = 0, .bits = 0, .fields = &fd_root },
+        .{ .size = 0, .bits = 0, .fields = &fd_root11 },
+        .{ .size = 0, .bits = 0, .fields = &fd_root34d },
+        .{ .size = 0, .bits = 0, .fields = &fd_root34p },
+    };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // Base blob: two chunks, two directories, a three-entry chunk table.
+    var base: [128]u8 = undefined;
+    @memset(&base, 0);
+    var bw = BitWriter{ .bytes = &base };
+    bw.write(2, 32);
+    bw.write(32, 32);
+    bw.write(2, 32);
+    bw.write(64, 32);
+    bw.write(3, 32);
+    bw.write(96, 32);
+    std.mem.writeInt(u32, base[32..36], 0, .little);
+    std.mem.writeInt(u32, base[36..40], 0, .little);
+    std.mem.writeInt(u32, base[40..44], 5, .little);
+    std.mem.writeInt(u32, base[44..48], 0, .little);
+    std.mem.writeInt(u32, base[48..52], 5, .little);
+    std.mem.writeInt(u32, base[52..56], 8, .little);
+    std.mem.writeInt(u32, base[68..72], 1, .little);
+    std.mem.writeInt(u32, base[80..84], 2, .little);
+    std.mem.writeInt(u32, base[96..100], 0, .little);
+    std.mem.writeInt(u32, base[100..104], 1, .little);
+    std.mem.writeInt(u32, base[104..108], 1, .little);
+    // Packed forms: fs_options presence plus flags 3 and 4 unpack both
+    // vectors with running sums.
+    var blob_a: [128]u8 = undefined;
+    @memcpy(&blob_a, &base);
+    blob_a[24] |= 0b111;
+    const md_a = try decodeMetadata(&blob_a, .{ .layouts = &layouts, .root = 13 }, arena);
+    try testing.expect(md_a.packed_chunk_table);
+    try testing.expect(md_a.packed_directories);
+    try testing.expectEqual(Chunk{ .block = 0, .offset = 0, .size = 5 }, md_a.chunks[0]);
+    try testing.expectEqual(Chunk{ .block = 0, .offset = 5, .size = 8 }, md_a.chunks[1]);
+    try testing.expectEqualSlices(u32, &[_]u32{ 0, 1, 2 }, md_a.chunk_table);
+    try testing.expectEqualSlices(u32, &[_]u32{ 1, 3 }, md_a.directories);
+    // Presence without the flags leaves the packed vectors untouched.
+    var blob_b: [128]u8 = undefined;
+    @memcpy(&blob_b, &base);
+    blob_b[24] = 0b001;
+    const md_b = try decodeMetadata(&blob_b, .{ .layouts = &layouts, .root = 13 }, arena);
+    try testing.expect(!md_b.packed_chunk_table);
+    try testing.expect(!md_b.packed_directories);
+    try testing.expectEqualSlices(u32, &[_]u32{ 0, 1, 1 }, md_b.chunk_table);
+    try testing.expectEqualSlices(u32, &[_]u32{ 1, 2 }, md_b.directories);
+    // FSST symlinks: the vendor index carries a trailing sentinel, so
+    // more than one entry means a real symlink.
+    var blob_c: [128]u8 = undefined;
+    @memcpy(&blob_c, &base);
+    var bwc = BitWriter{ .bytes = &blob_c, .bit = 195 };
+    bwc.write(1, 1);
+    bwc.write(2, 32);
+    try testing.expectError(error.UnsupportedException, decodeMetadata(&blob_c, .{ .layouts = &layouts, .root = 13 }, arena));
+    var blob_d: [128]u8 = undefined;
+    @memcpy(&blob_d, &base);
+    var bwd = BitWriter{ .bytes = &blob_d, .bit = 195 };
+    bwd.write(1, 1);
+    bwd.write(1, 32);
+    const md_d = try decodeMetadata(&blob_d, .{ .layouts = &layouts, .root = 13 }, arena);
+    try testing.expectEqual(@as(usize, 2), md_d.chunks.len);
+    // Plain symlinks (field 11): any entry is rejected.
+    var blob11: [8]u8 = undefined;
+    @memset(&blob11, 0);
+    std.mem.writeInt(u32, blob11[0..4], 1, .little);
+    try testing.expectError(error.UnsupportedException, decodeMetadata(&blob11, .{ .layouts = &layouts, .root = 14 }, arena));
+    std.mem.writeInt(u32, blob11[0..4], 0, .little);
+    _ = try decodeMetadata(&blob11, .{ .layouts = &layouts, .root = 14 }, arena);
+    // Sparse files: field 34 rejects both the direct and presence shapes.
+    var blob34: [8]u8 = undefined;
+    @memset(&blob34, 0);
+    std.mem.writeInt(u32, blob34[0..4], 7, .little);
+    try testing.expectError(error.UnsupportedException, decodeMetadata(&blob34, .{ .layouts = &layouts, .root = 15 }, arena));
+    std.mem.writeInt(u32, blob34[0..4], 0, .little);
+    _ = try decodeMetadata(&blob34, .{ .layouts = &layouts, .root = 15 }, arena);
+    blob34[0] = 1;
+    try testing.expectError(error.UnsupportedException, decodeMetadata(&blob34, .{ .layouts = &layouts, .root = 16 }, arena));
+    blob34[0] = 0;
+    _ = try decodeMetadata(&blob34, .{ .layouts = &layouts, .root = 16 }, arena);
 }

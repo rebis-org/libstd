@@ -16,8 +16,12 @@ pub const block_size_default: u32 = block_size_max;
 
 const magic: u32 = 0x184D2204;
 // The pre-1.8 legacy format: one magic (the low nibble carried a version
-// digit), then dependent raw LZ4 blocks, no header descriptor at all.
+// digit), then independent raw LZ4 blocks, no header descriptor at all.
 const legacy_magic: u32 = 0x184C2102;
+// Legacy blocks decode up to 8 MiB each; a size word beyond the largest
+// valid compressed block is the next frame's magic, so the bound doubles
+// as the stream's end marker.
+const legacy_block_size: usize = 8 * 1024 * 1024;
 const version_bits: u8 = 0x40; // LZ4 frame spec fixes the version field at 01.
 const flag_block_independence: u8 = 0x20;
 const flag_block_checksum: u8 = 0x10;
@@ -26,6 +30,10 @@ const window_size: usize = 64 * 1024;
 const flag_content_size: u8 = 0x08;
 const flag_content_checksum: u8 = 0x04;
 const flag_dict_id: u8 = 0x01;
+// FLG bit 1 and BD bit 7 plus BD's low nibble stay zero; the reference
+// decoder rejects anything else.
+const flag_reserved: u8 = 0x02;
+const bd_reserved_mask: u8 = 0x8F;
 const uncompressed_block: u32 = 0x80000000;
 
 const min_match = 4;
@@ -144,17 +152,20 @@ pub fn decodeInPlace(input: []const u8, output: []u8, scratch: []u8, options: Op
 // A span overrun answers insufficient_capacity: the adapter re-runs the
 // measured route, separating a too-small sink from a corrupt stream.
 fn decodeBlocksInto(input: []const u8, output: []u8, options: Options) Exception!usize {
-    if (input.len < 7) return error.DataException;
+    if (input.len < 4) return error.DataException;
     const magic_value = std.mem.readInt(u32, input[0..4], .little);
-    // The legacy frame format (pre-1.8): fixed magic, then dependent LZ4
+    // The legacy frame format (pre-1.8): fixed magic, then independent LZ4
     // blocks with no header fields, checksums, or block-size descriptor.
     if (magic_value >= legacy_magic and magic_value <= legacy_magic + 7)
         return decodeLegacyBlocksInto(input, output, options);
+    if (input.len < 7) return error.DataException;
     if (magic_value != magic) return error.DataException;
     const flags = input[4];
     if ((flags & 0xC0) != version_bits) return error.UnsupportedException;
+    if (flags & flag_reserved != 0) return error.DataException;
     const linked = flags & flag_block_independence == 0;
     const block_size_byte = input[5];
+    if (block_size_byte & bd_reserved_mask != 0) return error.DataException;
     const block_code = (block_size_byte >> 4) & 0x07;
     if (block_code < 4 or block_code > 7) return error.DataException;
     const max_block: usize = @as(usize, 65536) << @intCast(2 * (@as(usize, block_code) - 4));
@@ -227,24 +238,33 @@ fn decodeBlocksInto(input: []const u8, output: []u8, options: Options) Exception
     return total;
 }
 
-// Legacy frames (pre-1.8 interop): dependent raw LZ4 blocks, no BD byte, no
-// checksums, end marked by a zero size. Decode-only, as the modern encoder
-// never produces them.
+// Legacy frames (pre-1.8 interop): independent raw LZ4 blocks decoding up to
+// 8 MiB each, no BD byte, no checksums. The stream ends at the last block
+// (EOF), at a four-zero size word (the kernel variant), or before a size word
+// too large for a valid block, which is the next frame's magic. The reference
+// decodes each block into a fresh buffer, so no history crosses a block
+// boundary. Decode-only, as the modern encoder never produces them.
 fn decodeLegacyBlocksInto(input: []const u8, output: []u8, options: Options) Exception!usize {
     var offset: usize = 4;
     var total: usize = 0;
     while (true) {
-        if (input.len < offset + 4) return error.DataException;
+        // Real legacy files end at the last block; fewer than four trailing
+        // bytes cannot start another one.
+        if (input.len < offset + 4) break;
         const block_len: usize = std.mem.readInt(u32, input[offset..][0..4], .little);
         offset += 4;
         if (block_len == 0) break;
+        if (block_len > blockCompressBound(legacy_block_size)) return error.DataException;
         if (input.len < offset + block_len) return error.DataException;
         const block_data = input[offset .. offset + block_len];
         offset += block_len;
-        const prefix_len = @min(total, window_size);
-        const produced = decompressBlock(block_data, output[total..], output[total - prefix_len .. total]) catch |err| return switch (err) {
+        const room = output.len - total;
+        const cap = @min(room, legacy_block_size);
+        const produced = decompressBlock(block_data, output[total..][0..cap], &[_]u8{}) catch |err| return switch (err) {
             error.DataException => error.DataException,
-            error.OutputTooSmall => error.CapacityException,
+            // With full 8 MiB headroom an overrun breaks the format's
+            // block-size limit; below it the output is merely short.
+            error.OutputTooSmall => if (room >= legacy_block_size) error.DataException else error.CapacityException,
         };
         total += produced;
         if (try bounds.addUsize(input.len, total) > options.max_work) return error.ResourceException;
@@ -308,14 +328,19 @@ pub fn decodeToWriter(input: []const u8, output: *std.Io.Writer, scratch: []u8, 
     _ = try decodeBlocks(input, output, scratch, options.provider, options.max_work);
 }
 
+// Modern frames only: legacy blocks would need their own 8 MiB staging on
+// this route, so legacy input answers DataException here and callers use
+// decode/decodeInPlace instead.
 fn decodeBlocks(input: []const u8, output: *std.Io.Writer, scratch: []u8, provider: checksum.Provider, max_work: u64) Exception!usize {
     if (scratch.len < decodeWorkspaceSize()) return error.CapacityException;
     if (input.len < 7) return error.DataException;
     if (std.mem.readInt(u32, input[0..4], .little) != magic) return error.DataException;
     const flags = input[4];
     if ((flags & 0xC0) != version_bits) return error.UnsupportedException;
+    if (flags & flag_reserved != 0) return error.DataException;
     const linked = flags & flag_block_independence == 0;
     const block_size_byte = input[5];
+    if (block_size_byte & bd_reserved_mask != 0) return error.DataException;
     const block_code = (block_size_byte >> 4) & 0x07;
     if (block_code < 4 or block_code > 7) return error.DataException;
     const max_block: usize = @as(usize, 65536) << @intCast(2 * (@as(usize, block_code) - 4));
@@ -937,4 +962,143 @@ test "lz4 dictionary id flag parses and skips" {
     var bad = frame;
     bad[4 + 1 + 1 + 8] ^= 0x01;
     try std.testing.expectError(error.IntegrityException, decode(bad[0..len], &output, decode_scratch, .{}));
+}
+
+test "lz4 legacy frame decodes eof-terminated blocks" {
+    const allocator = std.testing.allocator;
+    var block_a: [16 + 300]u8 = undefined;
+    @memcpy(block_a[0..16], "legacy block a: ");
+    @memset(block_a[16..], 'a');
+    var block_b: [16 + 300]u8 = undefined;
+    @memcpy(block_b[0..16], "legacy block b: ");
+    @memset(block_b[16..], 'b');
+    const hash_table = try allocator.alloc(u32, hash_size);
+    defer allocator.free(hash_table);
+    var comp_a: [blockCompressBound(block_a.len)]u8 = undefined;
+    var comp_b: [blockCompressBound(block_b.len)]u8 = undefined;
+    const a_compressed = compressBlock(&block_a, &comp_a, hash_table, 1);
+    const b_compressed = compressBlock(&block_b, &comp_b, hash_table, 1);
+    // No terminator: real legacy files end at the last block.
+    var frame: [4 + 4 + comp_a.len + 4 + comp_b.len + 4]u8 = undefined;
+    var len: usize = 0;
+    std.mem.writeInt(u32, frame[len..][0..4], legacy_magic, .little);
+    len += 4;
+    std.mem.writeInt(u32, frame[len..][0..4], @intCast(a_compressed), .little);
+    len += 4;
+    @memcpy(frame[len..][0..a_compressed], comp_a[0..a_compressed]);
+    len += a_compressed;
+    std.mem.writeInt(u32, frame[len..][0..4], @intCast(b_compressed), .little);
+    len += 4;
+    @memcpy(frame[len..][0..b_compressed], comp_b[0..b_compressed]);
+    len += b_compressed;
+    const decode_scratch = try allocator.alloc(u8, decodeWorkspaceSize());
+    defer allocator.free(decode_scratch);
+    var output: [block_a.len + block_b.len]u8 = undefined;
+    const produced = try decode(frame[0..len], &output, decode_scratch, .{});
+    try std.testing.expectEqual(block_a.len + block_b.len, produced);
+    try std.testing.expectEqualSlices(u8, &block_a, output[0..block_a.len]);
+    try std.testing.expectEqualSlices(u8, &block_b, output[block_a.len..]);
+
+    // One to three trailing bytes cannot start another block.
+    frame[len] = 0xAA;
+    frame[len + 1] = 0xBB;
+    try std.testing.expectError(error.DataException, decode(frame[0 .. len + 2], &output, decode_scratch, .{}));
+}
+
+test "lz4 legacy blocks are independent" {
+    // Block 0 decodes to "12345678"; block 1 hand-crafts a match whose
+    // 8-byte offset reaches into block 0's content. The reference decodes
+    // legacy blocks into a fresh buffer, so the crossing must be rejected.
+    const block0 = "12345678";
+    const hash_table = try std.testing.allocator.alloc(u32, hash_size);
+    defer std.testing.allocator.free(hash_table);
+    var comp0: [blockCompressBound(block0.len)]u8 = undefined;
+    const compressed = compressBlock(block0, &comp0, hash_table, 1);
+    const block1 = [_]u8{ 0x40, 'A', 'B', 'C', 'D', 8, 0, 0x10, 'E' };
+    var frame: [4 + 4 + blockCompressBound(block0.len) + 4 + block1.len]u8 = undefined;
+    var len: usize = 0;
+    std.mem.writeInt(u32, frame[len..][0..4], legacy_magic, .little);
+    len += 4;
+    std.mem.writeInt(u32, frame[len..][0..4], @intCast(compressed), .little);
+    len += 4;
+    @memcpy(frame[len..][0..compressed], comp0[0..compressed]);
+    len += compressed;
+    std.mem.writeInt(u32, frame[len..][0..4], block1.len, .little);
+    len += 4;
+    @memcpy(frame[len..][0..block1.len], &block1);
+    len += block1.len;
+    const decode_scratch = try std.testing.allocator.alloc(u8, decodeWorkspaceSize());
+    defer std.testing.allocator.free(decode_scratch);
+    var output: [32]u8 = undefined;
+    try std.testing.expectError(error.DataException, decode(frame[0..len], &output, decode_scratch, .{}));
+}
+
+test "lz4 legacy frame accepts the kernel zero terminator" {
+    const allocator = std.testing.allocator;
+    const payload = "kernel variant terminator payload 0123456789";
+    const hash_table = try allocator.alloc(u32, hash_size);
+    defer allocator.free(hash_table);
+    var comp: [blockCompressBound(payload.len)]u8 = undefined;
+    const compressed = compressBlock(payload, &comp, hash_table, 1);
+    var frame: [4 + 4 + blockCompressBound(payload.len) + 4]u8 = undefined;
+    var len: usize = 0;
+    std.mem.writeInt(u32, frame[len..][0..4], legacy_magic, .little);
+    len += 4;
+    std.mem.writeInt(u32, frame[len..][0..4], @intCast(compressed), .little);
+    len += 4;
+    @memcpy(frame[len..][0..compressed], comp[0..compressed]);
+    len += compressed;
+    std.mem.writeInt(u32, frame[len..][0..4], 0, .little);
+    len += 4;
+    const decode_scratch = try allocator.alloc(u8, decodeWorkspaceSize());
+    defer allocator.free(decode_scratch);
+    var output: [64]u8 = undefined;
+    const produced = try decode(frame[0..len], &output, decode_scratch, .{});
+    try std.testing.expectEqualSlices(u8, payload, output[0..produced]);
+
+    // A magic-sized size word is the next frame's start, not a block: this
+    // buffer API takes exactly one frame.
+    std.mem.writeInt(u32, frame[len - 4 ..][0..4], magic, .little);
+    try std.testing.expectError(error.DataException, decode(frame[0..len], &output, decode_scratch, .{}));
+
+    // The magic alone is a well-formed empty legacy frame.
+    try std.testing.expectEqual(@as(usize, 0), try decode(frame[0..4], &output, decode_scratch, .{}));
+}
+
+test "lz4 frame rejects reserved descriptor bits" {
+    const allocator = std.testing.allocator;
+    const input = "reserved descriptor bit frame payload";
+    const scratch = try allocator.alloc(u8, encodeWorkspaceSize());
+    defer allocator.free(scratch);
+    const encoded = try allocator.alloc(u8, encodedSizeBound(input.len));
+    defer allocator.free(encoded);
+    const encoded_len = try encode(input, encoded, scratch, .{});
+    const decode_scratch = try allocator.alloc(u8, decodeWorkspaceSize());
+    defer allocator.free(decode_scratch);
+    var output: [64]u8 = undefined;
+
+    // Header layout: magic(4) FLG(1) BD(1) Content_Size(8) Header_Checksum(1).
+    // Each corruption re-seals the header checksum so only the reserved bit
+    // can fail the decode.
+    {
+        var frame = try allocator.dupe(u8, encoded[0..encoded_len]);
+        defer allocator.free(frame);
+        frame[4] |= flag_reserved;
+        frame[14] = @truncate(checksum.xxh32With(checksum.default_provider, frame[4..14]) >> 8);
+        try std.testing.expectError(error.DataException, decode(frame, &output, decode_scratch, .{}));
+    }
+    {
+        var frame = try allocator.dupe(u8, encoded[0..encoded_len]);
+        defer allocator.free(frame);
+        frame[5] |= 0x80;
+        frame[14] = @truncate(checksum.xxh32With(checksum.default_provider, frame[4..14]) >> 8);
+        try std.testing.expectError(error.DataException, decode(frame, &output, decode_scratch, .{}));
+    }
+    {
+        var frame = try allocator.dupe(u8, encoded[0..encoded_len]);
+        defer allocator.free(frame);
+        frame[5] |= 0x01;
+        frame[14] = @truncate(checksum.xxh32With(checksum.default_provider, frame[4..14]) >> 8);
+        try std.testing.expectError(error.DataException, decode(frame, &output, decode_scratch, .{}));
+    }
 }

@@ -70,10 +70,12 @@ const LenCode = bits.Code(max_len_codeword_len, num_len_syms + len_overrun);
 const PreCode = bits.Code(max_pre_codeword_len, precode_num_symbols);
 const AlignedCode = bits.Code(max_aligned_codeword_len, aligned_num_symbols);
 
-fn windowOrder(out_len: usize) Exception!u5 {
-    if (out_len == 0 or out_len > (1 << 21)) return error.DataException;
+// wimlib derives the window order from the decompressor's max_block_size
+// (the WIM chunk size), never from the actual uncompressed output length.
+fn windowOrder(chunk_size: usize) Exception!u5 {
+    if (chunk_size == 0 or chunk_size > (1 << 21)) return error.DataException;
     var order: u5 = 15;
-    while (@as(usize, 1) << order < out_len) order += 1;
+    while (@as(usize, 1) << order < chunk_size) order += 1;
     return order;
 }
 
@@ -148,8 +150,8 @@ fn e8Postprocess(data: []u8) void {
     }
 }
 
-pub fn lzxDecode(input: []const u8, output: []u8) Exception!void {
-    const order = try windowOrder(output.len);
+pub fn lzxDecode(chunk_size: usize, input: []const u8, output: []u8) Exception!void {
+    const order = try windowOrder(chunk_size);
     const num_main_syms = numMainSymbols(order);
     var main_lens: [max_main_num_symbols + len_overrun]u8 = @splat(0);
     var len_lens: [num_len_syms + len_overrun]u8 = @splat(0);

@@ -970,9 +970,9 @@ fn emitNodeRecords(
     }
 }
 
-// The root node pays the footer on top of what packing allowed; packing
-// without it is conservative and stays correct because the root is alone
-// on its level.
+// Packs record costs greedily into node-sized spans. Callers reserve the
+// b-tree footer in the capacity: the root pays the footer, and packNodes
+// cannot tell which span becomes the root, so every span reserves it.
 fn packNodes(costs: []const usize, capacity: usize, alloc: std.mem.Allocator) Exception![]LevelSpan {
     var spans: std.ArrayListUnmanaged(LevelSpan) = .empty;
     var start: u32 = 0;
@@ -1025,10 +1025,13 @@ fn makePlan(entries: []const Entry, alloc: std.mem.Allocator) Exception!WriterPl
         vals[i] = val_bufs[i][0..writeFsVal(&val_bufs[i], rec)];
     }
 
-    // Leaves: greedy byte fit over the record costs.
+    // Leaves: greedy byte fit over the record costs. The capacity reserves
+    // the b-tree footer everywhere, not just on the root: packNodes cannot
+    // know which span ends up as the root, and a root packed without the
+    // reservation would overlap its own footer.
     const rec_costs = alloc.alloc(usize, records.len) catch return error.ResourceException;
     for (records, 0..) |_, i| rec_costs[i] = 8 + keys[i].len + vals[i].len;
-    const leaf_capacity = writer_block_size - btree_node_header_size;
+    const leaf_capacity = writer_block_size - btree_node_header_size - btree_info_size;
     const leaf_spans = try packNodes(rec_costs, leaf_capacity, alloc);
 
     var levels: std.ArrayListUnmanaged(TreeLevel) = .empty;
@@ -1041,7 +1044,7 @@ fn makePlan(entries: []const Entry, alloc: std.mem.Allocator) Exception!WriterPl
         for (below.spans, 0..) |span, i| {
             below_costs[i] = 8 + below.first_keys[span.start].len + 8;
         }
-        const internal_capacity = writer_block_size - btree_node_header_size;
+        const internal_capacity = writer_block_size - btree_node_header_size - btree_info_size;
         const internal_spans = try packNodes(below_costs, internal_capacity, alloc);
         const internal_first = alloc.alloc([]const u8, below.spans.len) catch return error.ResourceException;
         for (below.spans, 0..) |span, i| internal_first[i] = below.first_keys[span.start];
@@ -1149,7 +1152,7 @@ fn writeOmapTree(
                     const child = span.start + @as(u32, @intCast(j));
                     var val: [8]u8 = undefined;
                     std.mem.writeInt(u64, &val, child_blocks[child], .little);
-                    pair.* = .{ .key = levels[level - 1].first_keys[child], .val = try dupBytes(fba, &val) };
+                    pair.* = .{ .key = levels[level].first_keys[child], .val = try dupBytes(fba, &val) };
                 }
             }
             const is_root = level == levels.len - 1;
@@ -1236,7 +1239,7 @@ pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Exception!usi
                     const child = span.start + @as(u32, @intCast(j));
                     var val: [8]u8 = undefined;
                     std.mem.writeInt(u64, &val, child_oids[child], .little);
-                    pair.* = .{ .key = plan.levels[level - 1].first_keys[child], .val = try dupBytes(&fba, &val) };
+                    pair.* = .{ .key = plan.levels[level].first_keys[child], .val = try dupBytes(&fba, &val) };
                 }
                 const is_root = level == plan.levels.len - 1;
                 writeVarNode(block, oid, writer_xid, obj_subtype_fs_tree, false, if (is_root) btn_flag_root else 0, @intCast(level), 0, pairs, is_root, @intCast(plan.records.len), totalFsNodes(&plan));
@@ -1317,6 +1320,49 @@ test "apfs write roundtrips a multi-block file through extents" {
     const n = try decodeOrdinal(archive, 0, &out, &scratch);
     try testing.expectEqual(payload.len, n);
     try testing.expectEqualSlices(u8, &payload, &out);
+}
+
+test "apfs node packing reserves the root footer" {
+    const testing = std.testing;
+    // packNodes returns the items slice of an internal ArrayList; freeing
+    // it with the testing allocator would trip the capacity/length check,
+    // so the packing math runs against an arena.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    // 101 records of 40 bytes: 4040 in total. The block minus the node
+    // header alone admits them in a single span, but a root packed that
+    // full would overlap its own 40-byte b-tree footer; the reservation
+    // must split the span instead.
+    const costs: [101]usize = @splat(40);
+    const spans = try packNodes(&costs, writer_block_size - btree_node_header_size - btree_info_size, alloc);
+    try testing.expectEqual(@as(usize, 2), spans.len);
+    try testing.expectEqual(LevelSpan{ .start = 0, .end = 100 }, spans[0]);
+    try testing.expectEqual(LevelSpan{ .start = 100, .end = 101 }, spans[1]);
+}
+
+test "apfs write roundtrips a multi-level tree" {
+    const testing = std.testing;
+    var names: [150][12]u8 = undefined;
+    var payloads: [150][12]u8 = undefined;
+    var entries: [150]Entry = undefined;
+    for (&names, &payloads, &entries, 0..) |*name, *payload, *entry, i| {
+        const text = std.fmt.bufPrint(name, "f{d:0>3}.txt", .{i}) catch unreachable;
+        const body = std.fmt.bufPrint(payload, "payload {d:0>3}", .{i}) catch unreachable;
+        entry.* = .{ .name = text, .data = body };
+    }
+    var scratch: [scratch_size]u8 = undefined;
+    const required = try archiveSize(&entries, &scratch);
+    const archive = try testing.allocator.alloc(u8, required);
+    defer testing.allocator.free(archive);
+    const written = try encode(&entries, archive, &scratch);
+    try testing.expectEqual(required, written);
+    try testing.expectEqual(@as(u64, 150), try inspectCount(archive, &scratch));
+    var out: [16]u8 = undefined;
+    const first = try decodeOrdinal(archive, 0, &out, &scratch);
+    try testing.expectEqualSlices(u8, "payload 000", out[0..first]);
+    const last = try decodeOrdinal(archive, 149, &out, &scratch);
+    try testing.expectEqualSlices(u8, "payload 149", out[0..last]);
 }
 
 test "apfs write rejects unsorted entries" {

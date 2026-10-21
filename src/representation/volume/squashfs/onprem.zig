@@ -291,7 +291,9 @@ const FragmentEntry = struct {
 fn readFragmentEntry(archive: []const u8, super: Super, index: u32, scratch: *Scratch) Exception!FragmentEntry {
     if (super.fragments == 0 or index >= super.fragments) return error.DataException;
     const table_bytes = std.math.mul(u64, super.fragments, 16) catch return error.DataException;
-    const indexes = table_bytes / metadata_size + 1;
+    // unsquashfs sizes the index by ceil(bytes / 8 KiB); floor + 1 reads a
+    // slot past the table whenever the byte count is an exact multiple.
+    const indexes = (table_bytes + metadata_size - 1) / metadata_size;
     const index_bytes = std.math.mul(u64, indexes, 8) catch return error.ResourceException;
     const table = try bounds.slice(archive, super.fragment_table_start, index_bytes);
     const slot = std.math.mul(u64, index, 16) catch return error.DataException;
@@ -486,7 +488,10 @@ fn readFile(archive: []const u8, super: Super, inode: Inode, output: []u8, scrat
     if (inode.fragment != invalid_fragment) {
         const frag_bytes = inode.file_size - written;
         if (frag_bytes > 0) {
-            if (inode.frag_offset > scratch.frag.len) return error.DataException;
+            // unsquashfs bounds the fragment offset by block_size, not by any
+            // decoder buffer: a foreign image with block_log above 17 carries
+            // valid offsets past 128 KiB.
+            if (inode.frag_offset >= super.block_size) return error.DataException;
             const entry = try readFragmentEntry(archive, super, inode.fragment, scratch);
             const c_byte = entry.size & data_size_mask;
             const payload = try bounds.slice(archive, entry.start_block, c_byte);
@@ -1034,6 +1039,8 @@ fn findOrCreateDir(nodes: *std.ArrayList(Node), alloc: std.mem.Allocator, parent
     const idx: u32 = @intCast(nodes.items.len);
     nodes.append(alloc, .{ .kind = .dir, .name = name, .parent = parent }) catch return error.ResourceException;
     nodes.items[parent].child_count += 1;
+    // mksquashfs writes directory nlink as 2 + subdirectory count.
+    nodes.items[parent].subdir_count += 1;
     return idx;
 }
 
@@ -1163,4 +1170,131 @@ test "squashfs reads mksquashfs gzip image" {
     var out: [445]u8 = undefined;
     const n = try decodeOrdinal(&mksquashfs_fixture, 1, &out, &scratch);
     try testing.expectEqual(@as(usize, 445), n);
+}
+
+test "squashfs fragment index count uses ceil like unsquashfs" {
+    const testing = std.testing;
+    var image: [mksquashfs_fixture.len]u8 = undefined;
+    @memcpy(&image, &mksquashfs_fixture);
+    // 512 fragments make the entry table an exact 8 KiB: one index slot.
+    std.mem.writeInt(u32, image[16..20], 512, .little);
+    // Trim the archive to the end of the 8-byte index. The old floor + 1
+    // formula demanded a second slot and failed past the archive end.
+    std.mem.writeInt(u64, image[40..48], 255, .little);
+    const trimmed = image[0..255];
+    var scratch: [scratch_size]u8 = undefined;
+    try testing.expectEqual(@as(u64, 2), try inspectCount(trimmed, &scratch));
+    var out: [445]u8 = undefined;
+    const n = try decodeOrdinal(trimmed, 1, &out, &scratch);
+    try testing.expectEqual(@as(usize, 445), n);
+}
+
+test "squashfs fragment offset bound follows block size" {
+    const testing = std.testing;
+    // A foreign image with block_log 18: valid fragment offsets reach past
+    // the 128 KiB scratch bound the old check used. All blocks are stored
+    // raw, so no compressor runs.
+    const bs: u32 = 256 * 1024;
+    const file1_len: usize = 131073; // just past the old scratch bound.
+    const file2_len: usize = 100;
+    const frag_total = file1_len + file2_len;
+    const inode_meta_at: u64 = 96 + frag_total;
+    const dir_meta_at: u64 = inode_meta_at + 2 + 96;
+    const frag_meta_at: u64 = dir_meta_at + 2 + 42;
+    const frag_index_at: u64 = frag_meta_at + 2 + 16;
+    const total: usize = @intCast(frag_index_at + 8);
+    var image: [131437]u8 = @splat(0);
+    try testing.expect(image.len == total);
+    std.mem.writeInt(u32, image[0..4], magic, .little);
+    std.mem.writeInt(u32, image[4..8], 3, .little);
+    std.mem.writeInt(u32, image[12..16], bs, .little);
+    std.mem.writeInt(u32, image[16..20], 1, .little);
+    std.mem.writeInt(u16, image[20..22], compression_gzip, .little);
+    std.mem.writeInt(u16, image[22..24], 18, .little);
+    std.mem.writeInt(u16, image[26..28], 1, .little);
+    std.mem.writeInt(u16, image[28..30], major_version, .little);
+    std.mem.writeInt(u64, image[40..48], total, .little);
+    std.mem.writeInt(u64, image[64..72], inode_meta_at, .little);
+    std.mem.writeInt(u64, image[72..80], dir_meta_at, .little);
+    std.mem.writeInt(u64, image[80..88], frag_index_at, .little);
+    @memset(image[96 .. 96 + file1_len], 0xd1);
+    @memset(image[96 + file1_len .. 96 + frag_total], 0xe2);
+    // Inode metadata block: root dir, file1, file2.
+    std.mem.writeInt(u16, image[@intCast(inode_meta_at)..][0..2], flag_uncompressed_metadata | 96, .little);
+    const inodes = image[@intCast(inode_meta_at + 2)..];
+    std.mem.writeInt(u16, inodes[0..2], inode_type_dir, .little);
+    std.mem.writeInt(u16, inodes[2..4], mode_dir, .little);
+    std.mem.writeInt(u32, inodes[12..16], 1, .little);
+    std.mem.writeInt(u32, inodes[16..20], 0, .little);
+    std.mem.writeInt(u32, inodes[20..24], 1, .little);
+    std.mem.writeInt(u16, inodes[24..26], 45, .little);
+    std.mem.writeInt(u32, inodes[28..32], 1, .little);
+    std.mem.writeInt(u16, inodes[32..34], inode_type_reg, .little);
+    std.mem.writeInt(u16, inodes[34..36], mode_file, .little);
+    std.mem.writeInt(u32, inodes[44..48], 2, .little);
+    std.mem.writeInt(u32, inodes[48..52], 0, .little);
+    std.mem.writeInt(u32, inodes[52..56], 0, .little);
+    std.mem.writeInt(u32, inodes[56..60], 0, .little);
+    std.mem.writeInt(u32, inodes[60..64], file1_len, .little);
+    std.mem.writeInt(u16, inodes[64..66], inode_type_reg, .little);
+    std.mem.writeInt(u16, inodes[66..68], mode_file, .little);
+    std.mem.writeInt(u32, inodes[76..80], 3, .little);
+    std.mem.writeInt(u32, inodes[80..84], 0, .little);
+    std.mem.writeInt(u32, inodes[84..88], 0, .little);
+    std.mem.writeInt(u32, inodes[88..92], file1_len, .little);
+    std.mem.writeInt(u32, inodes[92..96], file2_len, .little);
+    // Directory metadata block: one header, two 7-byte names.
+    std.mem.writeInt(u16, image[@intCast(dir_meta_at)..][0..2], flag_uncompressed_metadata | 42, .little);
+    const dir = image[@intCast(dir_meta_at + 2)..];
+    std.mem.writeInt(u32, dir[0..4], 1, .little);
+    std.mem.writeInt(u32, dir[4..8], 0, .little);
+    std.mem.writeInt(u32, dir[8..12], 2, .little);
+    std.mem.writeInt(u16, dir[12..14], 32, .little);
+    std.mem.writeInt(i16, dir[14..16], 0, .little);
+    std.mem.writeInt(u16, dir[16..18], inode_type_reg, .little);
+    std.mem.writeInt(u16, dir[18..20], 6, .little);
+    @memcpy(dir[20..27], "one.bin");
+    std.mem.writeInt(u16, dir[27..29], 64, .little);
+    std.mem.writeInt(i16, dir[29..31], 1, .little);
+    std.mem.writeInt(u16, dir[31..33], inode_type_reg, .little);
+    std.mem.writeInt(u16, dir[33..35], 6, .little);
+    @memcpy(dir[35..42], "two.bin");
+    // Fragment table: raw entry block plus index.
+    std.mem.writeInt(u16, image[@intCast(frag_meta_at)..][0..2], flag_uncompressed_metadata | 16, .little);
+    std.mem.writeInt(u64, image[@intCast(frag_meta_at + 2)..][0..8], 96, .little);
+    std.mem.writeInt(u32, image[@intCast(frag_meta_at + 10)..][0..4], data_uncompressed_bit | frag_total, .little);
+    std.mem.writeInt(u64, image[@intCast(frag_index_at)..][0..8], frag_meta_at, .little);
+    var scratch: [scratch_size]u8 = undefined;
+    try testing.expectEqual(@as(u64, 2), try inspectCount(&image, &scratch));
+    var out1: [file1_len]u8 = undefined;
+    const n0 = try decodeOrdinal(&image, 0, &out1, &scratch);
+    try testing.expectEqual(@as(usize, file1_len), n0);
+    try testing.expect(std.mem.allEqual(u8, &out1, 0xd1));
+    var out2: [file2_len]u8 = undefined;
+    const n1 = try decodeOrdinal(&image, 1, &out2, &scratch);
+    try testing.expectEqual(@as(usize, file2_len), n1);
+    try testing.expect(std.mem.allEqual(u8, &out2, 0xe2));
+}
+
+test "squashfs written directories carry mksquashfs nlink" {
+    const testing = std.testing;
+    const entries = [_]Entry{
+        .{ .name = "a/b/deep.txt", .data = "nested payload" },
+        .{ .name = "a/sib.txt", .data = "sibling" },
+        .{ .name = "top.txt", .data = "root file" },
+    };
+    var archive: [8192]u8 = undefined;
+    var scratch: [scratch_size]u8 = undefined;
+    const written = try encode(&entries, &archive, &scratch);
+    const image = archive[0..written];
+    var carved = try Scratch.carve(&scratch);
+    const super = try parseSuper(image);
+    try testing.expectEqual(@as(u64, 0), super.root_ref);
+    const block = try inflateMeta(super.compression, image, super.inode_table_start, carved.meta, carved.history, carved.aux);
+    try testing.expect(block.len >= 128);
+    const raw = carved.meta[0..block.len];
+    // DFS order: root, a, b. mksquashfs writes nlink = 2 + subdirs.
+    try testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, raw[20..24], .little));
+    try testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, raw[52..56], .little));
+    try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, raw[84..88], .little));
 }

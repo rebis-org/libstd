@@ -76,16 +76,61 @@ pub const Decompress = struct {
         self.inner.err = null;
     }
 
+    // A starvation pull records EndOfStream; the session driver clears it
+    // and restages more input. Anything else is terminal corruption.
+    pub fn isFailed(self: *const @This()) bool {
+        const err = self.inner.err orelse return false;
+        return err != error.EndOfStream;
+    }
+
+    // stdlib flate reports input exhaustion as `ReadFailed` with `EndOfStream`
+    // recorded on the decompressor; a rolled-back fill keys off this.
+    fn starved(self: *const @This()) bool {
+        const err = self.inner.err orelse return false;
+        return err == error.EndOfStream;
+    }
+
     pub fn readerPtr(self: *@This()) *std.Io.Reader {
         return &self.inner.reader;
     }
 
-    // stdlib's stream entry ignores the writer and decodes into the history buffer instead.
+    // stdlib's stream entry ignores the writer and decodes into the history
+    // buffer instead. Stdlib flate cannot be suspended mid-block: its state
+    // machine persists progress only where it assigns `state`, so a fill that
+    // starves mid-parse would resume from stale state and re-read the block
+    // header at the advanced bit position. Fill rounds are therefore
+    // transactional: the whole stdlib state is snapshotted before a fill and
+    // restored on starvation, leaving the next pump to re-parse from the
+    // round's start. Serve rounds write no parse state and need no rollback.
     pub fn streamTo(self: *@This(), writer: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
         const reader = &self.inner.reader;
         var produced: usize = 0;
         while (true) {
-            const emitted = reader.stream(writer, limit) catch |err| return err;
+            const fill = reader.seek >= reader.end;
+            if (fill) {
+                // Collapse the window before the fill, mirroring stdlib's
+                // own rebase condition: with nothing left to serve the
+                // keep-set is exactly the trailing window, and a collapsed
+                // fill never re-moves history mid-round, so a rollback
+                // restores buffer-consistent state.
+                const window = std.compress.flate.history_len;
+                if (reader.buffer.len - reader.end < window) {
+                    @memmove(reader.buffer[0..window], reader.buffer[reader.end - window .. reader.end]);
+                    reader.end = window;
+                    reader.seek = window;
+                }
+            }
+            const saved_inner = if (fill) self.inner else undefined;
+            const saved_input = if (fill) self.fixed_input else undefined;
+            const emitted = reader.stream(writer, limit) catch |err| {
+                // Starvation undoes the fill and stays resumable. Corruption
+                // and a finished member keep their state for the driver.
+                if (fill and err == error.ReadFailed and self.starved()) {
+                    self.inner = saved_inner;
+                    self.fixed_input = saved_input;
+                }
+                return err;
+            };
             produced += emitted;
             if (produced >= @backingInt(limit)) break;
             // A pull that neither moved nor staged cannot move again.
@@ -147,5 +192,69 @@ test "offprem arm decodes byte-identical to onprem across shapes" {
         try std.testing.expectEqual(size, produced_on);
         try std.testing.expectEqual(compressed_len, consumed_on);
         try std.testing.expectEqualSlices(u8, input[0..size], offprem_out[0..produced_off]);
+    }
+}
+
+// Regression: stdlib flate cannot be suspended mid-block, so a starved fill
+// must roll back to the round's start and re-parse after a restage. Feeding
+// the same stream in every chunk size must stay byte-identical to the
+// one-shot decode, including multi-window sizes that force the pre-fill
+// window collapse and its rollback.
+test "offprem arm restaged chunk feeds decode byte-identical to one-shot" {
+    const onprem = @import("onprem.zig");
+    const alloc = std.testing.allocator;
+
+    const input = try alloc.alloc(u8, 70000);
+    defer alloc.free(input);
+    var prng = std.Random.DefaultPrng.init(0x9e3779b97f4a7c15);
+    prng.random().bytes(input);
+    @memset(input[30000..65000], 0);
+
+    const history = try alloc.alloc(u8, onprem.history_size);
+    defer alloc.free(history);
+    var sink: [70000]u8 = undefined;
+
+    for ([_]usize{ 258, 4096, 70000 }) |size| {
+        // A dedicated compressor buffer: `history` doubles as the window and
+        // must stay untouched between compress and the decode loops below.
+        const compressed = try alloc.alloc(u8, 80000);
+        defer alloc.free(compressed);
+        var staging: [onprem.history_size]u8 = undefined;
+        var writer = std.Io.Writer.fixed(compressed);
+        var compressor = try onprem.Compress.init(&writer, &staging, .{
+            .good = 8,
+            .nice = 258,
+            .lazy = 16,
+            .chain = 128,
+        });
+        compressor.writer.writeAll(input[0..size]) catch return error.TestUnexpectedResult;
+        compressor.finish() catch return error.TestUnexpectedResult;
+        const compressed_len = writer.end;
+
+        const chunks = [_]usize{ 1, 2, 3, 5, 8, 11, 13, 16, 17, 23, 64, 1024 };
+        for (chunks) |chunk| {
+            var inflater: Decompress = undefined;
+            inflater.initSliceInPlace(compressed[0..@min(chunk, compressed_len)], history);
+            var counting = std.Io.Writer.fixed(&sink);
+            var fed: usize = @min(chunk, compressed_len);
+            var guard: usize = 0;
+            while (!inflater.atEnd()) : (guard += 1) {
+                try std.testing.expect(guard < 100000);
+                _ = inflater.streamTo(&counting, .limited(sink.len - counting.end)) catch |err| switch (err) {
+                    error.ReadFailed => {
+                        // Starvation before the input end restages more;
+                        // starvation at the input end is a short stream.
+                        try std.testing.expect(fed < compressed_len);
+                        fed = @min(fed + chunk, compressed_len);
+                        inflater.restage(compressed[0..fed], inflater.streamPosition());
+                    },
+                    error.EndOfStream => break,
+                    else => return error.TestUnexpectedResult,
+                };
+            }
+            try std.testing.expectEqual(size, counting.end);
+            try std.testing.expectEqual(compressed_len, (inflater.inputBitsConsumed() + 7) / 8);
+            try std.testing.expectEqualSlices(u8, input[0..size], sink[0..counting.end]);
+        }
     }
 }

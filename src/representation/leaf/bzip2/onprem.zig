@@ -1394,3 +1394,91 @@ test "bzip2 full-block encode roundtrips" {
     try std.testing.expectEqual(input.len, decoded);
     try std.testing.expectEqualSlices(u8, &input, output);
 }
+
+fn testReadBitsMsb(bytes: []const u8, bit_off: usize, comptime count: usize) u64 {
+    var value: u64 = 0;
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const bit = bit_off + i;
+        value = (value << 1) | ((bytes[bit / 8] >> @intCast(7 - (bit % 8))) & 1);
+    }
+    return value;
+}
+
+// bzip2 0.9.0 randomised blocks: the stored block is the mask-applied BWT
+// input, and the decoder XORs the schedule back out of every inverse-BWT byte
+// before RLE1 (vendor/bzip2 decompress.c). The encoder never sets the bit, so
+// this builds the stream by hand: pre-apply the mask to the input, encode the
+// masked bytes, flip the randomised bit, and re-seal both CRCs. If the
+// decoder ignored the flag it would emit the masked bytes and fail the CRC.
+test "bzip2 decodes a randomised block" {
+    const allocator = std.testing.allocator;
+    const phrase = "the quick brown fox jumps over the lazy dog";
+    var data: [phrase.len * 100]u8 = undefined;
+    for (&data, 0..) |*b, i| b.* = phrase[i % phrase.len];
+    var masked: [data.len]u8 = undefined;
+    {
+        var r_to_go: u32 = 0;
+        var r_pos: usize = 0;
+        for (&data, &masked) |*in, *out| {
+            if (r_to_go == 0) {
+                r_to_go = randomisation_counts[r_pos];
+                r_pos = (r_pos + 1) & 511;
+            }
+            r_to_go -= 1;
+            out.* = in.* ^ @as(u8, if (r_to_go == 1) 1 else 0);
+        }
+    }
+    // The construction needs RLE1-inert bytes on both sides of the mask: the
+    // phrase cycle has no adjacent equal bytes, so no run reaches four.
+    var i: usize = 3;
+    while (i < data.len) : (i += 1) {
+        try std.testing.expect(data[i] != data[i - 1] or data[i - 1] != data[i - 2] or data[i - 2] != data[i - 3]);
+        try std.testing.expect(masked[i] != masked[i - 1] or masked[i - 1] != masked[i - 2] or masked[i - 2] != masked[i - 3]);
+    }
+
+    const scratch = try allocator.alloc(u8, encodeWorkspaceSize(100_000));
+    defer allocator.free(scratch);
+    const encoded = try allocator.alloc(u8, encodedSizeBound(data.len));
+    defer allocator.free(encoded);
+    const len = try encode(&masked, encoded, scratch, .{ .block_size = 100_000 });
+
+    // Bits 80..112 hold the block CRC (4-byte header, 6-byte magic) and bit
+    // 112 is the randomised flag; both sit in the fixed byte-aligned header.
+    var crc = Bzip2Crc32.bind(checksum.default_provider);
+    crc.update(&data);
+    const data_crc = crc.final();
+    std.mem.writeInt(u32, encoded[10..][0..4], data_crc, .big);
+    encoded[14] |= 0x80;
+
+    // The EOS magic and combined CRC land at an arbitrary bit offset; find
+    // the trailing EOS and rewrite the 32 combined bits after it. A single
+    // block folds combined = rotate(0) xor block_crc = block_crc.
+    var eos_bit: usize = len * 8 - 48;
+    while (testReadBitsMsb(encoded[0..len], eos_bit, 48) != 0x177245385090) eos_bit -= 1;
+    const combined_bit = eos_bit + 48;
+    const patched = try allocator.alloc(u8, (combined_bit + 32 + 7) / 8);
+    defer allocator.free(patched);
+    @memset(patched, 0);
+    var bit: usize = 0;
+    while (bit < combined_bit) : (bit += 1) {
+        if (((encoded[bit / 8] >> @intCast(7 - (bit % 8))) & 1) == 1) {
+            patched[bit / 8] |= @as(u8, 1) << @intCast(7 - (bit % 8));
+        }
+    }
+    var shift: usize = 0;
+    while (shift < 32) : (shift += 1) {
+        if (((data_crc >> @intCast(31 - shift)) & 1) == 1) {
+            const target = combined_bit + shift;
+            patched[target / 8] |= @as(u8, 1) << @intCast(7 - (target % 8));
+        }
+    }
+
+    const decode_scratch = try allocator.alloc(u8, try decodeWorkspaceSizeFor(patched));
+    defer allocator.free(decode_scratch);
+    const output = try allocator.alloc(u8, data.len);
+    defer allocator.free(output);
+    const decoded = try decode(patched, output, decode_scratch, checksum.default_provider);
+    try std.testing.expectEqual(data.len, decoded);
+    try std.testing.expectEqualSlices(u8, &data, output);
+}

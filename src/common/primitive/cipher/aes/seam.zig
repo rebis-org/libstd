@@ -4,14 +4,10 @@ const options = @import("options");
 
 const onprem = @import("onprem.zig");
 
-// AES-192 stays on-prem because stdlib ships no 192-bit context; either provider
-// tag resolves to the on-prem schedule.
 const std_aes = std.crypto.core.aes;
-// The 192-bit schedule has no stdlib context, so it is the same type under
-// every provider tag.
-// Matching the stdlib suite's method names lets one accessor serve all three
-// key sizes.
-pub const Aes192Hw = onprem.Aes192Hw;
+// The 192-bit schedule has no stdlib context; either provider tag resolves to
+// the on-prem schedule.
+pub const Aes192 = onprem.Aes192;
 
 const StdDirection = enum { encrypt, decrypt };
 
@@ -35,9 +31,19 @@ fn StdCtx(comptime Params: type, comptime direction: StdDirection) type {
             self.inner.encrypt(dst, src);
         }
 
+        pub fn encryptWide4(self: @This(), dst: *[64]u8, src: *const [64]u8) void {
+            if (direction != .encrypt) @compileError("a decrypt context cannot encrypt.");
+            self.inner.encryptWide(4, dst, src);
+        }
+
         pub fn decrypt(self: @This(), dst: *[16]u8, src: *const [16]u8) void {
             if (direction != .decrypt) @compileError("an encrypt context cannot decrypt.");
             self.inner.decrypt(dst, src);
+        }
+
+        pub fn decryptWide4(self: @This(), dst: *[64]u8, src: *const [64]u8) void {
+            if (direction != .decrypt) @compileError("an encrypt context cannot decrypt.");
+            self.inner.decryptWide(4, dst, src);
         }
     };
 }

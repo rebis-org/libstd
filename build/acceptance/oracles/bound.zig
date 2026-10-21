@@ -186,6 +186,40 @@ fn runCapacity(r: *Runner) anyerror!void {
     }
 }
 
+fn runLimitRejects(r: *Runner) anyerror!void {
+    corpus.fillTiled(r.corpus_index, &roundtrip_input);
+    const input = roundtrip_input[0..];
+    for (cases) |case| {
+        setupCase(r, case);
+        const bound = try queryWriteSize(r, case, input, true);
+        if (bound > r.encoded.len) return error.BoundRange;
+        const produced = try writeSpan(r, case, input, r.encoded[0..bound], true);
+        if (produced > bound) return error.BoundViolated;
+        // A decoded limit between the encoded and decoded sizes must be
+        // rejected before the first decoded byte reaches the sink, whatever
+        // route the hook picks, so the sentinel survives intact.
+        var nodes: [12]harness.Node = undefined;
+        var list = harness.NodeList{ .nodes = &nodes };
+        list.push(harness.sourceSpan(r.encoded[0..produced]));
+        list.push(harness.sinkSpan(r.output));
+        list.push(harness.resourceLimitParam(input.len / 2));
+        addParams(&list, case);
+        try harness.reject(r, harness.ids.read, list.items(), .{ .ctx = true }, abi.Status.resource_limit, r.output);
+        // A limit below the encoded length must classify the read as
+        // resource_limit too: a truncated planning pass answering invalid_data
+        // confuses an over-budget caller with corrupt data.
+        if (produced > 1) {
+            var over_nodes: [12]harness.Node = undefined;
+            var over_list = harness.NodeList{ .nodes = &over_nodes };
+            over_list.push(harness.sourceSpan(r.encoded[0..produced]));
+            over_list.push(harness.sinkSpan(r.output));
+            over_list.push(harness.resourceLimitParam(produced / 2));
+            addParams(&over_list, case);
+            try harness.reject(r, harness.ids.read, over_list.items(), .{ .ctx = true }, abi.Status.resource_limit, r.output);
+        }
+    }
+}
+
 var path_random: [1 << 20]u8 = undefined;
 var path_same: [1 << 20]u8 = undefined;
 var path_period: [1 << 20]u8 = undefined;
@@ -414,6 +448,7 @@ fn runGzipHeaders(r: *Runner) anyerror!void {
 pub const scenarios = harness.scenarios("bound", &.{
     .{ .label = "bound roundtrip", .run = runRoundtrip, .workspace_size = 256 * 1024 * 1024, .output_size = 128 * 1024, .encoded_size = 384 * 1024 },
     .{ .label = "bound capacity", .run = runCapacity, .workspace_size = 256 * 1024 * 1024, .output_size = 1024, .encoded_size = 384 * 1024 },
+    .{ .label = "bound limit rejects", .run = runLimitRejects, .workspace_size = 256 * 1024 * 1024, .output_size = 128 * 1024, .encoded_size = 384 * 1024 },
     .{ .label = "bound callback", .run = runCallback, .workspace_size = 256 * 1024 * 1024, .output_size = 1024, .encoded_size = 384 * 1024 },
     .{ .label = "bound gzip headers", .run = runGzipHeaders, .workspace_size = 128 * 1024, .output_size = 128 * 1024, .encoded_size = 384 * 1024 },
 }, &.{
