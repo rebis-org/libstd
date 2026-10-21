@@ -101,7 +101,7 @@ pub fn decodedSize(input: []const u8, scratch: []u8, options: Options) Exception
         if (!endedShortOfDeclared(&decoder, options)) return mapStreamError(err);
         try drainShortRun(&decoder, &counter.writer);
     };
-    return counter.written();
+    return std.math.cast(usize, counter.written()) orelse error.ResourceException;
 }
 
 test "offprem lzma payload decodes byte-identical to onprem" {

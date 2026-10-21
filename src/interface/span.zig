@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const std = @import("std");
 
 const diagnostic = @import("diagnostic.zig");
@@ -17,8 +18,12 @@ pub fn trap(violation: Violation, context: []const u8) noreturn {
     var message_writer: std.Io.Writer = std.Io.Writer.fixed(&message_storage);
     const message = if (message_writer.print("interface trap: {s}: {s}\n", .{ @tagName(violation), context })) |_| message_writer.buffered() else |_| "interface trap.\n";
     diagnostic.writeStderr(message);
-    std.posix.raise(std.posix.SIG.TRAP) catch {};
-    unreachable;
+    // raise needs a C runtime; without one (msvc, android, ohos) the trap
+    // instruction carries the violation alone.
+    if (comptime diagnostic.has_libc and builtin.target.os.tag != .windows) {
+        std.posix.raise(std.posix.SIG.TRAP) catch {};
+    }
+    @trap();
 }
 
 pub fn checkRange(total: usize, offset: usize, length: usize) void {

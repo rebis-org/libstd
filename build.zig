@@ -17,6 +17,11 @@ fn rejectOffpremPortable(comptime subject: []const u8, comptime flag: []const u8
 }
 
 pub fn build(b: *std.Build) void {
+    const dist_sha = b.graph.environ_map.get("STDK_GIT_SHA") orelse blk: {
+        const result = std.process.run(b.allocator, b.graph.io, .{ .argv = &.{ "git", "rev-parse", "--short=8", "HEAD" } }) catch break :blk "nogit";
+        if (result.term == .exited and result.term.exited == 0) break :blk std.mem.trim(u8, result.stdout, "\n");
+        break :blk "nogit";
+    };
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const portable = b.option(bool, "portable", "Compatible implementation for primitive seam") orelse false;
@@ -59,6 +64,7 @@ pub fn build(b: *std.Build) void {
         .portable = portable,
         .options = options_module,
         .dist_providers = &dist_providers,
+        .dist_tag = b.fmt("{d}.{d}.{d}-{s}", .{ version.major, version.minor, version.patch, dist_sha }),
     };
     // Exposes the boundary to package-manager consumers.
     // Stays inert here because nothing imports it.

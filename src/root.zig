@@ -12,10 +12,13 @@ const Call = @import("kernel/envelope.zig").Call;
 pub const panic = std.debug.FullPanic(struct {
     fn panicFn(msg: []const u8, first_trace_addr: ?usize) noreturn {
         _ = first_trace_addr;
+        // The write is per-OS (kernel32 on Windows, the syscall on linux
+        // ABIs without libc); only the abort needs a C runtime.
+        diagnostic.writeStderr(msg);
+        diagnostic.writeStderr("\n");
         if (comptime diagnostic.has_libc) {
-            diagnostic.writeStderr(msg);
-            diagnostic.writeStderr("\n");
             std.c.abort();
+            unreachable;
         }
         // No libc to name: the contract violation still traps, without a message.
         @trap();

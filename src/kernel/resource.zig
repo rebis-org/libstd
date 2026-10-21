@@ -217,7 +217,8 @@ pub const BoundedReader = struct {
 const reader_vtable = std.Io.Reader.VTable{ .stream = boundedReaderStream };
 
 fn boundedReaderStream(reader: *std.Io.Reader, writer: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
-    const self: *BoundedReader = @fieldParentPtr("reader", reader);
+    // std.Io.Reader aligns below u64 fields on wasm32 and arm32.
+    const self: *BoundedReader = @alignCast(@fieldParentPtr("reader", reader));
     if (self.limit == 0) return error.EndOfStream;
     const requested = @min(@backingInt(limit), std.math.cast(usize, self.limit) orelse std.math.maxInt(usize));
     if (requested == 0) return 0;
@@ -252,7 +253,8 @@ pub const BoundedWriter = struct {
 const writer_vtable = std.Io.Writer.VTable{ .drain = boundedWriterDrain };
 
 fn boundedWriterDrain(writer: *std.Io.Writer, chunks: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
-    const self: *BoundedWriter = @fieldParentPtr("writer", writer);
+    // std.Io.Writer aligns below u64 fields on wasm32 and arm32.
+    const self: *BoundedWriter = @alignCast(@fieldParentPtr("writer", writer));
     if (chunks.len == 0) return 0;
     var total: usize = 0;
     for (chunks[0 .. chunks.len - 1]) |part| {

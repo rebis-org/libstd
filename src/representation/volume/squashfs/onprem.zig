@@ -297,7 +297,7 @@ fn readFragmentEntry(archive: []const u8, super: Super, index: u32, scratch: *Sc
     const index_bytes = std.math.mul(u64, indexes, 8) catch return error.ResourceException;
     const table = try bounds.slice(archive, super.fragment_table_start, index_bytes);
     const slot = std.math.mul(u64, index, 16) catch return error.DataException;
-    const block_ptr = std.mem.readInt(u64, table[(slot / metadata_size) * 8 ..][0..8], .little);
+    const block_ptr = std.mem.readInt(u64, table[@as(usize, @intCast((slot / metadata_size) * 8))..][0..8], .little);
     const block = try inflateMeta(super.compression, archive, block_ptr, scratch.frag[0..metadata_size], scratch.history, scratch.aux);
     const off: usize = @intCast(slot % metadata_size);
     if (off + 16 > block.len) return error.DataException;
@@ -469,17 +469,18 @@ fn readFile(archive: []const u8, super: Super, inode: Inode, output: []u8, scrat
     for (0..inode.block_list.len / 4) |i| {
         const head = std.mem.readInt(u32, inode.block_list[4 * i ..][0..4], .little);
         const take = @min(@as(u64, super.block_size), inode.file_size - written);
+        const written_usize: usize = std.math.cast(usize, written) orelse return error.CapacityException;
         const take_usize: usize = @intCast(take);
         if (head == 0) {
-            @memset(output[written..][0..take_usize], 0);
+            @memset(output[written_usize..][0..take_usize], 0);
         } else {
             const c_byte = head & data_size_mask;
             const payload = try bounds.slice(archive, data_pos, c_byte);
             if (head & data_uncompressed_bit != 0) {
                 if (c_byte != take) return error.DataException;
-                @memcpy(output[written..][0..take_usize], payload);
+                @memcpy(output[written_usize..][0..take_usize], payload);
             } else {
-                try inflateData(super.compression, payload, output[written..][0..take_usize], scratch.history, scratch.aux);
+                try inflateData(super.compression, payload, output[written_usize..][0..take_usize], scratch.history, scratch.aux);
             }
             data_pos = try bounds.addU64(data_pos, c_byte);
         }
@@ -488,6 +489,7 @@ fn readFile(archive: []const u8, super: Super, inode: Inode, output: []u8, scrat
     if (inode.fragment != invalid_fragment) {
         const frag_bytes = inode.file_size - written;
         if (frag_bytes > 0) {
+            const written_usize: usize = std.math.cast(usize, written) orelse return error.CapacityException;
             // unsquashfs bounds the fragment offset by block_size, not by any
             // decoder buffer: a foreign image with block_log above 17 carries
             // valid offsets past 128 KiB.
@@ -498,13 +500,13 @@ fn readFile(archive: []const u8, super: Super, inode: Inode, output: []u8, scrat
             if (entry.size & data_uncompressed_bit != 0) {
                 const off: usize = @intCast(inode.frag_offset);
                 if (off + frag_bytes > c_byte) return error.DataException;
-                @memcpy(output[written..][0..@intCast(frag_bytes)], payload[off..][0..@intCast(frag_bytes)]);
+                @memcpy(output[written_usize..][0..@intCast(frag_bytes)], payload[off..][0..@intCast(frag_bytes)]);
             } else {
                 if (super.block_size > scratch.frag.len) return error.UnsupportedException;
                 const produced = try inflateBlock(super.compression, payload, scratch.frag[0..super.block_size], scratch.history, scratch.aux);
                 const off: usize = @intCast(inode.frag_offset);
                 if (off + frag_bytes > produced) return error.DataException;
-                @memcpy(output[written..][0..@intCast(frag_bytes)], scratch.frag[off..][0..@intCast(frag_bytes)]);
+                @memcpy(output[written_usize..][0..@intCast(frag_bytes)], scratch.frag[off..][0..@intCast(frag_bytes)]);
             }
             written += frag_bytes;
         }

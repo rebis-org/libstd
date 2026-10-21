@@ -315,6 +315,16 @@ pub fn constantTimeEql(first: []const u8, second: []const u8) bool {
     return accumulator == 0;
 }
 
+// BCryptGenRandom is a frozen Windows extern; the system-preferred RNG flag
+// skips the algorithm provider, so no handle stays open to release.
+extern "bcrypt" fn BCryptGenRandom(
+    h_algorithm: ?*anyopaque,
+    buffer: [*]u8,
+    buffer_len: c_ulong,
+    flags: c_ulong,
+) callconv(.winapi) std.os.windows.NTSTATUS;
+const bcrypt_use_system_preferred_rng: c_ulong = 0x00000002;
+
 // Fails loudly instead of degrading to predictable material: a caller that
 // cannot obtain randomness must not produce salts or IVs derived from the
 // password and entry contents.
@@ -343,6 +353,14 @@ pub fn fillRandom(bytes: []u8) Exception!void {
             }
             filled += count;
         }
+        return;
+    }
+    // Windows ships no POSIX RNG entry point; BCryptGenRandom fills the
+    // buffer in one call and needs no provider handle.
+    if (comptime builtin.os.tag == .windows) {
+        if (bytes.len == 0) return;
+        const status = BCryptGenRandom(null, bytes.ptr, @intCast(bytes.len), bcrypt_use_system_preferred_rng);
+        if (status != .SUCCESS) return error.InternalException;
         return;
     }
     return error.UnsupportedException;

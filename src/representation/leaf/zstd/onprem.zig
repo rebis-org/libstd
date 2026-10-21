@@ -99,7 +99,8 @@ const LimitedReader = struct {
     }
 
     fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
-        const self: *LimitedReader = @fieldParentPtr("interface", r);
+        // std.Io.Reader aligns below u64 fields on wasm32 and arm32.
+        const self: *LimitedReader = @alignCast(@fieldParentPtr("interface", r));
         if (self.consumed >= self.limit) {
             self.limit_reached = true;
             return error.EndOfStream;
@@ -112,7 +113,8 @@ const LimitedReader = struct {
     }
 
     fn discard(r: *std.Io.Reader, limit: std.Io.Limit) std.Io.Reader.Error!usize {
-        const self: *LimitedReader = @fieldParentPtr("interface", r);
+        // std.Io.Reader aligns below u64 fields on wasm32 and arm32.
+        const self: *LimitedReader = @alignCast(@fieldParentPtr("interface", r));
         if (self.consumed >= self.limit) {
             self.limit_reached = true;
             return error.EndOfStream;

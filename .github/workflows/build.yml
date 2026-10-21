@@ -11,10 +11,25 @@ on:
         type: boolean
         required: false
         default: false
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: "Job set to run"
+        required: true
+        type: choice
+        default: ALL
+        options:
+          - ALL
+          - build
+          - suite
+          - targets
+          - runtime
+          - publish
 
 jobs:
   build:
     name: Build
+    if: github.event_name != 'workflow_dispatch' || inputs.scope == 'ALL' || inputs.scope == 'build'
     uses: ./.github/workflows/cache.yml
     with:
       profile: build
@@ -25,6 +40,7 @@ jobs:
 
   suite:
     name: Test matrix
+    if: github.event_name != 'workflow_dispatch' || inputs.scope == 'ALL' || inputs.scope == 'suite'
     strategy:
       fail-fast: false
       matrix:
@@ -44,10 +60,28 @@ jobs:
       sanitizer: ${{ matrix.sanitizer }}
       ubsan_shard: ${{ matrix.ubsan_shard }}
 
+  targets:
+    name: Support matrix
+    if: github.event_name != 'workflow_dispatch' || inputs.scope == 'all' || inputs.scope == 'targets'
+    uses: ./.github/workflows/unit.yml
+    with:
+      runner: ubuntu-slim
+
+  runtime:
+    if: github.event_name != 'workflow_dispatch' || inputs.scope == 'all' || inputs.scope == 'runtime'
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        runner: [macos-26, macos-26-intel, ubuntu-26.04, ubuntu-26.04-arm, windows-2025-vs2026, windows-11-vs2026-arm]
+    uses: ./.github/workflows/unit.yml
+    with:
+      runner: ${{ matrix.runner }}
+
   publish:
     name: Publish
-    needs: [build, suite]
-    if: inputs.publish
+    needs: [build, suite, targets, runtime]
+    if: (github.event_name == 'workflow_dispatch' && inputs.scope == 'publish') || inputs.publish
     runs-on: ubuntu-latest
     steps:
       - name: Check out sources
@@ -64,10 +98,8 @@ jobs:
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
           subject-path: |
-            dist/libstd.*.zip
-            dist/stdk.*.aar
-            dist/StdK.*.zip
-            dist/stdk.*.zip
+            dist/*.aar
+            dist/*.zip
           show-summary: false
       - name: Publish the release
         env:

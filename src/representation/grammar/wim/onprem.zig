@@ -316,7 +316,7 @@ pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Exception!usi
     sink.write(&zeros) catch return error.CapacityException;
     var pad: [8]u8 = @splat(0);
     const blob_pad = blob_table_len - @as(u64, (entries.len + 2) * blob_disk_size);
-    if (blob_pad > 0) sink.write(pad[0..blob_pad]) catch return error.CapacityException;
+    if (blob_pad > 0) sink.write(pad[0..@as(usize, @intCast(blob_pad))]) catch return error.CapacityException;
 
     var xml_sink = RealSink{ .bytes = scratch[@intCast(metadata_len)..@intCast(try bounds.addU64(metadata_len, xml_len))] };
     try writeTocXml(&xml_sink, entries, try archiveSize(entries));
@@ -342,12 +342,8 @@ fn headerCodec(archive: []const u8) Exception!Codec {
     return .unsupported;
 }
 
-// A compressed resource is stored as chunks of at most chunk_size bytes,
-// prefixed by a chunk table. A normal table lists the end offset of every
-// chunk but the first and last; the last chunk size is derived from the
-// resource area length. Solid resources use an alternate table: a 16-byte
-// header followed by the compressed size of every chunk; offsets are the
-// running sums and the last entry is ignored (wimlib resource.c).
+// wimlib names two table shapes: end-offsets with a derived last chunk, and
+// solid tables of sizes under a 16-byte header with a ignored last entry.
 const ChunkLoc = struct {
     offset: u64, // File offset of the compressed chunk bytes.
     start: u64, // Uncompressed offset of the chunk.

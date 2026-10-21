@@ -22,7 +22,7 @@ pub fn requireSink(sink: *Resource, call: *Call, required: usize) Exception!void
     return requireSinkCapacity(sink, call, required);
 }
 
-pub fn requireSinkCapacity(sink: *Resource, call: *Call, required: usize) Exception!void {
+pub fn requireSinkCapacity(sink: *Resource, call: *Call, required: u64) Exception!void {
     const capacity = sinkCapacity(sink);
     if (required > capacity) {
         writeCapacityDiagnostic(call, required, capacity);
@@ -143,7 +143,7 @@ pub fn measureSource(source: *Resource, limit: u64) Exception!usize {
 }
 
 pub fn measureOutputSize(source: *Resource, limits: Limits) Exception!u64 {
-    return measureSource(source, limits.encoded_bytes);
+    return std.math.cast(u64, try measureSource(source, limits.encoded_bytes)) orelse error.ResourceException;
 }
 
 fn mapStreamError(err: anyerror) Exception {
@@ -229,7 +229,9 @@ fn overlapsWorkspace(workspace_ptr: usize, workspace_len: usize, ptr: usize, len
 
 fn workspaceRange(call: *Call) ?struct { ptr: usize, len: usize } {
     if (call.workspace == null or call.workspace_capacity == 0) return null;
-    return .{ .ptr = @intFromPtr(call.workspace.?), .len = call.workspace_capacity };
+    // A workspace larger than the address space cannot exist on this target.
+    const len = std.math.cast(usize, call.workspace_capacity) orelse return null;
+    return .{ .ptr = @intFromPtr(call.workspace.?), .len = len };
 }
 
 pub fn checkWorkspaceOverlap(call: *Call, source: *Resource, sink: *Resource) Exception!void {
@@ -252,7 +254,7 @@ pub fn validateBoundary(call: *Call, plan: *const ExecutionPlan, source_node: ?*
     _ = plan;
     if (call.workspace) |workspace| {
         const workspace_ptr = @intFromPtr(workspace);
-        const workspace_len = call.workspace_capacity;
+        const workspace_len = std.math.cast(usize, call.workspace_capacity) orelse return error.CallException;
         if (source_node) |node| {
             if ((node.flags & abi.node_flag_callback_resource) == 0 and node.byte_length != 0) {
                 const bytes = try resource.checkedConstBytes(node.bytes, node.byte_length);
@@ -328,5 +330,5 @@ pub fn respondWrite(response: *Node, sizing: vocabulary.SizingMode, produced: an
 pub fn boundedProduced(bounded_sink: *resource.BoundedWriter, encoded_limit: u64, planned: usize) Exception!usize {
     const produced = encoded_limit - bounded_sink.limit;
     if (produced > planned) return error.InternalException;
-    return produced;
+    return std.math.cast(usize, produced) orelse error.InternalException;
 }

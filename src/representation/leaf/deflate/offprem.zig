@@ -94,14 +94,9 @@ pub const Decompress = struct {
         return &self.inner.reader;
     }
 
-    // stdlib's stream entry ignores the writer and decodes into the history
-    // buffer instead. Stdlib flate cannot be suspended mid-block: its state
-    // machine persists progress only where it assigns `state`, so a fill that
-    // starves mid-parse would resume from stale state and re-read the block
-    // header at the advanced bit position. Fill rounds are therefore
-    // transactional: the whole stdlib state is snapshotted before a fill and
-    // restored on starvation, leaving the next pump to re-parse from the
-    // round's start. Serve rounds write no parse state and need no rollback.
+    // stdlib flate cannot suspend mid-block: its state machine only persists where
+    // it assigns `state`, so a starved fill would resume from stale state.
+    // Fills are therefore transactional: snapshot, restore on starvation, re-parse.
     pub fn streamTo(self: *@This(), writer: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
         const reader = &self.inner.reader;
         var produced: usize = 0;

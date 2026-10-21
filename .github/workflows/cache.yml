@@ -164,10 +164,8 @@ jobs:
         with:
           name: dist
           path: |
-            zig-out/libstd.*.zip
-            zig-out/stdk.*.aar
-            zig-out/StdK.*.zip
-            zig-out/stdk.*.zip
+            zig-out/*.zip
+            zig-out/*.aar
           if-no-files-found: error
           retention-days: 7
       - name: Run the test suites

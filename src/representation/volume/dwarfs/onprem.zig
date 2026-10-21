@@ -61,7 +61,8 @@ fn parseSections(archive: []const u8, arena: std.mem.Allocator) Exception!Sectio
     var out: Sections = undefined;
     var at: u64 = 0;
     while (at + section_header_size <= archive.len) {
-        const head = archive[at .. at + section_header_size];
+        const at_usize: usize = std.math.cast(usize, at) orelse return error.DataException;
+        const head = archive[at_usize .. at_usize + section_header_size];
         if (!std.mem.eql(u8, head[0..6], section_magic)) return error.DataException;
         // Header bytes [6]/[7] carry the format version: vendor accepts
         // 2.2 through 2.6, older bytes mean the v1 layout.

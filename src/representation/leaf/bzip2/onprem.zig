@@ -1284,7 +1284,7 @@ fn decodeHuffman(br: *BitReader, table: *const HuffTable) Exception!u32 {
     }
     const idx = zvec - table.base[zn];
     if (idx >= max_alpha_size) return error.DataException;
-    return table.perm[idx];
+    return table.perm[@intCast(idx)];
 }
 
 test "bzip2 concatenated streams decode in sequence" {
@@ -1405,12 +1405,9 @@ fn testReadBitsMsb(bytes: []const u8, bit_off: usize, comptime count: usize) u64
     return value;
 }
 
-// bzip2 0.9.0 randomised blocks: the stored block is the mask-applied BWT
-// input, and the decoder XORs the schedule back out of every inverse-BWT byte
-// before RLE1 (vendor/bzip2 decompress.c). The encoder never sets the bit, so
-// this builds the stream by hand: pre-apply the mask to the input, encode the
-// masked bytes, flip the randomised bit, and re-seal both CRCs. If the
-// decoder ignored the flag it would emit the masked bytes and fail the CRC.
+// Randomised blocks store the mask-applied BWT input; the decoder XORs the
+// schedule back out (vendor decompress.c). The encoder never sets the bit,
+// so the fixture pre-masks, flips bit 112, and re-seals both CRCs.
 test "bzip2 decodes a randomised block" {
     const allocator = std.testing.allocator;
     const phrase = "the quick brown fox jumps over the lazy dog";

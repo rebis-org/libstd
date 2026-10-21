@@ -218,7 +218,8 @@ const Sha256Tee = struct {
     }
 
     fn drain(writer: *std.Io.Writer, chunks: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
-        const self: *Sha256Tee = @fieldParentPtr("writer", writer);
+        // std.Io.Writer aligns below u64 fields on wasm32 and arm32.
+        const self: *Sha256Tee = @alignCast(@fieldParentPtr("writer", writer));
         if (chunks.len == 0) return 0;
         var total: usize = 0;
         for (chunks[0 .. chunks.len - 1]) |part| total += part.len;

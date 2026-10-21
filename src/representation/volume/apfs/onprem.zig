@@ -1054,9 +1054,10 @@ fn makePlan(entries: []const Entry, alloc: std.mem.Allocator) Exception!WriterPl
     // Every virtual fs node needs an (oid, xid) -> paddr entry here;
     // 7-Zip resolves the fs tree root through this map unconditionally.
     const fs_node_count = levelNodeCount(levels.items);
-    const entry_keys = alloc.alloc([]const u8, fs_node_count) catch return error.ResourceException;
-    const key_storage = alloc.alloc([16]u8, fs_node_count) catch return error.ResourceException;
-    for (0..fs_node_count) |i| {
+    const node_count = std.math.cast(usize, fs_node_count) orelse return error.ResourceException;
+    const entry_keys = alloc.alloc([]const u8, node_count) catch return error.ResourceException;
+    const key_storage = alloc.alloc([16]u8, node_count) catch return error.ResourceException;
+    for (0..node_count) |i| {
         std.mem.writeInt(u64, key_storage[i][0..8], fs_oid_base + @as(u64, @intCast(i)), .little);
         std.mem.writeInt(u64, key_storage[i][8..16], writer_xid, .little);
         entry_keys[i] = &key_storage[i];
@@ -1092,7 +1093,8 @@ fn makePlan(entries: []const Entry, alloc: std.mem.Allocator) Exception!WriterPl
 fn blockAt(output: []u8, index: u64) Exception![]u8 {
     const offset = std.math.mul(u64, index, writer_block_size) catch return error.DataException;
     if ((std.math.add(u64, offset, writer_block_size) catch return error.DataException) > output.len) return error.DataException;
-    return output[offset..][0..writer_block_size];
+    const offset_usize: usize = std.math.cast(usize, offset) orelse return error.DataException;
+    return output[offset_usize..][0..@as(usize, @intCast(writer_block_size))];
 }
 
 fn writeNx(block: []u8, total_blocks: u64) void {
@@ -1258,7 +1260,7 @@ pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Exception!usi
         const at = std.math.mul(u64, data_cursor, writer_block_size) catch return error.DataException;
         const end = std.math.add(u64, at, file.data.len) catch return error.DataException;
         if (end > output.len) return error.DataException;
-        @memcpy(output[at..][0..file.data.len], file.data);
+        @memcpy(output[std.math.cast(usize, at) orelse return error.DataException ..][0..file.data.len], file.data);
         data_cursor += (file.data.len + writer_block_size - 1) / writer_block_size;
     }
     return @intCast(total_bytes);
