@@ -1162,23 +1162,7 @@ fn executeSeqData(output: *std.Io.Writer, src: []const u8, literal_buf: []const 
 
 fn encodeBlockDfast(output: *std.Io.Writer, content: []const u8, block_start: usize, block_end: usize, head: []u32, chain: []u32, literal_table: []const FseEntry, match_table: []const FseEntry, offset_table: []const FseEntry, is_last: bool, options: Options, block_workspace: []u32, repeat_offsets: *[3]u32, prev: *PrevFseTables) EncodeError!void {
     const src = content[block_start..block_end];
-    if (src.len == 0) {
-        try writeBlockHeader(output, .raw, 0, is_last);
-        return;
-    }
-    const first_byte = src[0];
-    var is_all_same = true;
-    for (src) |b| {
-        if (b != first_byte) {
-            is_all_same = false;
-            break;
-        }
-    }
-    if (is_all_same) {
-        try writeBlockHeader(output, .rle, src.len, is_last);
-        try writeByte(output, first_byte);
-        return;
-    }
+    if (try storeOnlyPrefix(output, src, is_last)) return;
     const seq_data = std.mem.bytesAsSlice(Sequence, std.mem.sliceAsBytes(block_workspace[0..encoder_block_seq_u32s]));
     const literal_buf = std.mem.sliceAsBytes(block_workspace[encoder_block_seq_u32s..][0..encoder_block_lit_u32s])[0..encoder_block_size_max];
     var literal_freq: [256]u32 = undefined;
@@ -1377,23 +1361,7 @@ fn rowScan(content: []const u8, pos_table: []const u32, base: u32, mask: u16, po
 
 fn encodeBlockRow(output: *std.Io.Writer, content: []const u8, block_start: usize, block_end: usize, head: []u32, chain: []u32, literal_table: []const FseEntry, match_table: []const FseEntry, offset_table: []const FseEntry, is_last: bool, options: Options, block_workspace: []u32, repeat_offsets: *[3]u32, prev: *PrevFseTables) EncodeError!void {
     const src = content[block_start..block_end];
-    if (src.len == 0) {
-        try writeBlockHeader(output, .raw, 0, is_last);
-        return;
-    }
-    const first_byte = src[0];
-    var is_all_same = true;
-    for (src) |b| {
-        if (b != first_byte) {
-            is_all_same = false;
-            break;
-        }
-    }
-    if (is_all_same) {
-        try writeBlockHeader(output, .rle, src.len, is_last);
-        try writeByte(output, first_byte);
-        return;
-    }
+    if (try storeOnlyPrefix(output, src, is_last)) return;
     const seq_data = std.mem.bytesAsSlice(Sequence, std.mem.sliceAsBytes(block_workspace[0..encoder_block_seq_u32s]));
     const literal_buf = std.mem.sliceAsBytes(block_workspace[encoder_block_seq_u32s..][0..encoder_block_lit_u32s])[0..encoder_block_size_max];
     var literal_freq: [256]u32 = undefined;

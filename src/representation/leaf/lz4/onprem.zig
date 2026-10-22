@@ -149,21 +149,22 @@ pub fn decodeInPlace(input: []const u8, output: []u8, scratch: []u8, options: Op
     return decode(input, output, scratch, options);
 }
 
-// A span overrun answers insufficient_capacity: the adapter re-runs the
-// measured route, separating a too-small sink from a corrupt stream.
-fn decodeBlocksInto(input: []const u8, output: []u8, options: Options) Exception!usize {
-    if (input.len < 4) return error.DataException;
-    const magic_value = std.mem.readInt(u32, input[0..4], .little);
-    // The legacy frame format (pre-1.8): fixed magic, then independent LZ4
-    // blocks with no header fields, checksums, or block-size descriptor.
-    if (magic_value >= legacy_magic and magic_value <= legacy_magic + 7)
-        return decodeLegacyBlocksInto(input, output, options);
+const FrameDescriptor = struct {
+    flags: u8,
+    linked: bool,
+    max_block: usize,
+    content_size: ?u64,
+    offset: usize, // first block-size field
+};
+
+// FLG/BD validation, optional content size and dictionary ID, and the header
+// checksum read identically on every modern-frame decode route.
+fn readFrameDescriptor(input: []const u8, provider: checksum.Provider) Exception!FrameDescriptor {
     if (input.len < 7) return error.DataException;
-    if (magic_value != magic) return error.DataException;
+    if (std.mem.readInt(u32, input[0..4], .little) != magic) return error.DataException;
     const flags = input[4];
     if ((flags & 0xC0) != version_bits) return error.UnsupportedException;
     if (flags & flag_reserved != 0) return error.DataException;
-    const linked = flags & flag_block_independence == 0;
     const block_size_byte = input[5];
     if (block_size_byte & bd_reserved_mask != 0) return error.DataException;
     const block_code = (block_size_byte >> 4) & 0x07;
@@ -178,13 +179,36 @@ fn decodeBlocksInto(input: []const u8, output: []u8, options: Options) Exception
     }
     // A dictionary ID declares an external dictionary the frame may
     // reference; without it, matches reaching before the frame start still
-    // fail as invalid data below.
+    // fail as invalid data in the block decode.
     if (flags & flag_dict_id != 0) offset += 4;
     if (input.len <= offset) return error.DataException;
     // Header_Checksum: the high byte of xxh32 over FLG..end-of-header.
     const stored_header_sum = input[offset];
-    if (stored_header_sum != @as(u8, @truncate(checksum.xxh32With(options.provider, input[4..offset]) >> 8))) return error.IntegrityException;
+    if (stored_header_sum != @as(u8, @truncate(checksum.xxh32With(provider, input[4..offset]) >> 8))) return error.IntegrityException;
     offset += 1;
+    return .{
+        .flags = flags,
+        .linked = flags & flag_block_independence == 0,
+        .max_block = max_block,
+        .content_size = content_size,
+        .offset = offset,
+    };
+}
+
+// A span overrun answers insufficient_capacity: the adapter re-runs the
+// measured route, separating a too-small sink from a corrupt stream.
+fn decodeBlocksInto(input: []const u8, output: []u8, options: Options) Exception!usize {
+    if (input.len < 4) return error.DataException;
+    const magic_value = std.mem.readInt(u32, input[0..4], .little);
+    // The legacy frame format (pre-1.8): fixed magic, then independent LZ4
+    // blocks with no header fields, checksums, or block-size descriptor.
+    if (magic_value >= legacy_magic and magic_value <= legacy_magic + 7)
+        return decodeLegacyBlocksInto(input, output, options);
+    const header = try readFrameDescriptor(input, options.provider);
+    const flags = header.flags;
+    const max_block = header.max_block;
+    var offset = header.offset;
+    const content_size = header.content_size;
     var content_hasher = checksum.XxHash32.bind(options.provider, 0);
     var total: usize = 0;
     while (true) {
@@ -204,7 +228,7 @@ fn decodeBlocksInto(input: []const u8, output: []u8, options: Options) Exception
             offset += 4;
         }
         const room = output.len - total;
-        const prefix_len = if (linked) @min(total, window_size) else 0;
+        const prefix_len = if (header.linked) @min(total, window_size) else 0;
         const prefix = output[total - prefix_len .. total];
         if (is_stored) {
             if (block_len > max_block) return error.DataException;
@@ -333,33 +357,11 @@ pub fn decodeToWriter(input: []const u8, output: *std.Io.Writer, scratch: []u8, 
 // decode/decodeInPlace instead.
 fn decodeBlocks(input: []const u8, output: *std.Io.Writer, scratch: []u8, provider: checksum.Provider, max_work: u64) Exception!usize {
     if (scratch.len < decodeWorkspaceSize()) return error.CapacityException;
-    if (input.len < 7) return error.DataException;
-    if (std.mem.readInt(u32, input[0..4], .little) != magic) return error.DataException;
-    const flags = input[4];
-    if ((flags & 0xC0) != version_bits) return error.UnsupportedException;
-    if (flags & flag_reserved != 0) return error.DataException;
-    const linked = flags & flag_block_independence == 0;
-    const block_size_byte = input[5];
-    if (block_size_byte & bd_reserved_mask != 0) return error.DataException;
-    const block_code = (block_size_byte >> 4) & 0x07;
-    if (block_code < 4 or block_code > 7) return error.DataException;
-    const max_block: usize = @as(usize, 65536) << @intCast(2 * (@as(usize, block_code) - 4));
-    var offset: usize = 6;
-    var content_size: ?u64 = null;
-    if (flags & flag_content_size != 0) {
-        if (input.len < offset + 8) return error.DataException;
-        content_size = std.mem.readInt(u64, input[offset..][0..8], .little);
-        offset += 8;
-    }
-    // A dictionary ID declares an external dictionary the frame may
-    // reference; without it, matches reaching before the frame start still
-    // fail as invalid data in the block decode.
-    if (flags & flag_dict_id != 0) offset += 4;
-    if (input.len <= offset) return error.DataException;
-    // Header_Checksum: the high byte of xxh32 over FLG..end-of-header.
-    const stored_header_sum = input[offset];
-    if (stored_header_sum != @as(u8, @truncate(checksum.xxh32With(provider, input[4..offset]) >> 8))) return error.IntegrityException;
-    offset += 1;
+    const header = try readFrameDescriptor(input, provider);
+    const flags = header.flags;
+    const max_block = header.max_block;
+    var offset = header.offset;
+    const content_size = header.content_size;
     var content_hasher = checksum.XxHash32.bind(provider, 0);
     const block_buffer = scratch[0..max_block];
     const history = scratch[max_block..][0..window_size];
@@ -398,7 +400,7 @@ fn decodeBlocks(input: []const u8, output: *std.Io.Writer, scratch: []u8, provid
         };
         total = try bounds.addUsize(total, produced);
         if (try bounds.addUsize(input.len, total) > max_work) return error.ResourceException;
-        if (linked) {
+        if (header.linked) {
             const produced_bytes = if (is_stored) block_data else block_buffer[0..produced];
             if (produced_bytes.len >= window_size) {
                 @memcpy(history, produced_bytes[produced_bytes.len - window_size ..][0..window_size]);

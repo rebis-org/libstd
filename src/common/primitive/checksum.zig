@@ -176,7 +176,11 @@ const Bzip2Aarch64Tail = struct {
     }
 };
 
+// The fold needs PMULL (aes) and the tail drains through the crc32
+// instructions, so both features must be present; iOS baseline (apple_a7)
+// carries aes without crc.
 const has_bzip2_pmull = builtin.target.cpu.arch == .aarch64 and
+    builtin.target.cpu.has(.aarch64, .crc) and
     builtin.target.cpu.has(.aarch64, .aes) and !options.bzip2crc32_portable;
 
 const FoldK = struct { k0: crc_lane, k1: crc_lane, k2: crc_lane, k3: crc_lane };
@@ -259,6 +263,24 @@ fn crcFold(comptime T: type, comptime K: FoldK, crc_in: T, input: []const u8, co
 
 // A chain of 16-byte lanes ending in table steps loses to slicing-by-8, so
 // the table tail never folds here; it drains whole words instead.
+// The slicing-by-8 tail shared by the reflected widths: whole words down to
+// the four-byte fold, then single table steps for the byte remainder.
+fn drainReflected(comptime T: type, comptime tables: *const [8][256]T, crc_in: T, input: []const u8) T {
+    var crc = crc_in;
+    var i: usize = 0;
+    while (i + 8 <= input.len) : (i += 8) {
+        crc = fold8(T, tables, true, crc, input[i..][0..8]);
+    }
+    if (i + 4 <= input.len) {
+        crc = fold4(T, tables, crc, input[i..][0..4]);
+        i += 4;
+    }
+    while (i < input.len) : (i += 1) {
+        crc = (crc >> 8) ^ tables[0][@as(usize, @intCast((crc ^ input[i]) & 0xff))];
+    }
+    return crc;
+}
+
 fn Crc32TableTail(comptime tables: *const [8][256]u32) type {
     return struct {
         const folds_16_byte_lanes = false;
@@ -428,19 +450,7 @@ fn TableCrc(comptime T: type, comptime poly: T, comptime reflected: bool) type {
                         return;
                     }
                 }
-                var crc = self.state;
-                var i: usize = 0;
-                while (i + 8 <= input.len) : (i += 8) {
-                    crc = fold8(u32, &tables, true, crc, input[i..][0..8]);
-                }
-                if (i + 4 <= input.len) {
-                    crc = fold4(u32, &tables, crc, input[i..][0..4]);
-                    i += 4;
-                }
-                while (i < input.len) : (i += 1) {
-                    crc = (crc >> 8) ^ table[@as(usize, @intCast((crc ^ input[i]) & 0xff))];
-                }
-                self.state = crc;
+                self.state = drainReflected(u32, &tables, self.state, input);
                 return;
             }
             if (comptime reflected) {
@@ -450,19 +460,7 @@ fn TableCrc(comptime T: type, comptime poly: T, comptime reflected: bool) type {
                         return;
                     }
                 }
-                var crc = self.state;
-                var i: usize = 0;
-                while (i + 8 <= input.len) : (i += 8) {
-                    crc = fold8(u64, &tables, true, crc, input[i..][0..8]);
-                }
-                if (i + 4 <= input.len) {
-                    crc = fold4(u64, &tables, crc, input[i..][0..4]);
-                    i += 4;
-                }
-                while (i < input.len) : (i += 1) {
-                    crc = (crc >> 8) ^ table[@as(usize, @intCast((crc ^ input[i]) & 0xff))];
-                }
-                self.state = crc;
+                self.state = drainReflected(u64, &tables, self.state, input);
             } else {
                 if (comptime has_bzip2_pmull) {
                     if (input.len >= crc_pmull_threshold) {

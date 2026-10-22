@@ -163,38 +163,9 @@ fn compressScalar(state: *align(16) [5]u32, block: *const [64]u8) void {
     state[4] +%= e;
 }
 
-fn checkHwScalar(rng: *std.Random.DefaultPrng, comptime Hw: type, comptime Sw: type, size: usize) !void {
-    const buf = try std.testing.allocator.alloc(u8, size + 8);
-    defer std.testing.allocator.free(buf);
-    rng.random().bytes(buf);
-    for ([_]usize{ 0, 1, 7 }) |align_off| {
-        const input = buf[align_off..][0..size];
-        for ([_]usize{ 0, 1, 63, 64, 65, size / 2, size }) |split_at| {
-            const cut = @min(split_at, size);
-            var hw = Hw.init(.{});
-            hw.update(input[0..cut]);
-            hw.update(input[cut..]);
-            var sw = Sw.init(.{});
-            sw.update(input[0..cut]);
-            sw.update(input[cut..]);
-            try std.testing.expectEqualSlices(u8, &sw.finalResult(), &hw.finalResult());
-        }
-    }
-}
-
 test "sha1 hw matches the scalar path" {
     if (comptime !has_arm8sha1) return error.SkipZigTest;
-    const Hw = merkle.Digest(5, 20, initial_state, compressAarch64);
-    const Sw = merkle.Digest(5, 20, initial_state, compressScalar);
-    var rng = std.Random.DefaultPrng.init(0x5A1D1);
-    // Linear sweep covers every tail residue twice; spots cover multi-block and megabyte scales.
-    var size: usize = 0;
-    while (size <= 256) : (size += 1) {
-        try checkHwScalar(&rng, Hw, Sw, size);
-    }
-    for ([_]usize{ 512, 1000, 4096, 5552, 65536, 1 << 20 }) |big| {
-        try checkHwScalar(&rng, Hw, Sw, big);
-    }
+    try merkle.expectHwMatchesScalar(5, 20, initial_state, compressAarch64, compressScalar, 0x5A1D1);
 }
 
 test "sha1 onprem matches the stdlib oracle" {

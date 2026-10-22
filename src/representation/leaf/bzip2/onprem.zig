@@ -450,6 +450,15 @@ fn saisLmsEqual(comptime T: type, text: []const T, types: []const u8, a: usize, 
     }
 }
 
+// Bucket end offsets: the inclusive prefix sum each induced pass resets to.
+fn saisBucketEnds(alphabet: u32, hist: []const u32, bptr: []u32) void {
+    var sum: u32 = 0;
+    for (0..alphabet) |c| {
+        sum += hist[c];
+        bptr[c] = sum;
+    }
+}
+
 fn saisInduce(comptime T: type, text: []const T, sa: []u32, alphabet: u32, types: []const u8, hist: []const u32, bptr: []u32) void {
     const m = text.len;
     {
@@ -471,14 +480,7 @@ fn saisInduce(comptime T: type, text: []const T, sa: []u32, alphabet: u32, types
             bptr[ch] += 1;
         }
     }
-    {
-        var sum: u32 = 0;
-        var c: usize = 0;
-        while (c < alphabet) : (c += 1) {
-            sum += hist[c];
-            bptr[c] = sum;
-        }
-    }
+    saisBucketEnds(alphabet, hist, bptr);
     i = m;
     while (i > 0) {
         i -= 1;
@@ -510,14 +512,7 @@ fn sais(comptime T: type, text: []const T, sa: []u32, alphabet: u32, types: []u8
         }
         hist[text[m - 1]] += 1;
     }
-    {
-        var sum: u32 = 0;
-        var c: usize = 0;
-        while (c < alphabet) : (c += 1) {
-            sum += hist[c];
-            bptr[c] = sum;
-        }
-    }
+    saisBucketEnds(alphabet, hist, bptr);
     @memset(sa, sais_empty);
     var n1: usize = 0;
     var i: usize = 1;

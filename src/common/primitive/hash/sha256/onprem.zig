@@ -189,53 +189,14 @@ const k = [64]u32{
     0x748F82EE, 0x78A5636F, 0x84C87814, 0x8CC70208, 0x90BEFFFA, 0xA4506CEB, 0xBEF9A3F7, 0xC67178F2,
 };
 
-fn checkHwScalar(rng: *std.Random.DefaultPrng, comptime Hw: type, comptime Sw: type, size: usize) !void {
-    const buf = try std.testing.allocator.alloc(u8, size + 8);
-    defer std.testing.allocator.free(buf);
-    rng.random().bytes(buf);
-    for ([_]usize{ 0, 1, 7 }) |align_off| {
-        const input = buf[align_off..][0..size];
-        for ([_]usize{ 0, 1, 63, 64, 65, size / 2, size }) |split_at| {
-            const cut = @min(split_at, size);
-            var hw = Hw.init(.{});
-            hw.update(input[0..cut]);
-            hw.update(input[cut..]);
-            var sw = Sw.init(.{});
-            sw.update(input[0..cut]);
-            sw.update(input[cut..]);
-            try std.testing.expectEqualSlices(u8, &sw.finalResult(), &hw.finalResult());
-        }
-    }
-}
-
 test "sha256 x86 hw matches the scalar path" {
     if (comptime !has_x86sha) return error.SkipZigTest;
-    const Hw = merkle.Digest(8, 32, initial_state, compressX8664);
-    const Sw = merkle.Digest(8, 32, initial_state, compressScalar);
-    var rng = std.Random.DefaultPrng.init(0x5A2D1);
-    // Linear sweep covers every tail residue twice; spots cover multi-block and megabyte scales.
-    var size: usize = 0;
-    while (size <= 256) : (size += 1) {
-        try checkHwScalar(&rng, Hw, Sw, size);
-    }
-    for ([_]usize{ 512, 1000, 4096, 5552, 65536, 1 << 20 }) |big| {
-        try checkHwScalar(&rng, Hw, Sw, big);
-    }
+    try merkle.expectHwMatchesScalar(8, 32, initial_state, compressX8664, compressScalar, 0x5A2D1);
 }
 
 test "sha256 aarch64 hw matches the scalar path" {
     if (comptime !has_arm8sha256) return error.SkipZigTest;
-    const Hw = merkle.Digest(8, 32, initial_state, compressAarch64);
-    const Sw = merkle.Digest(8, 32, initial_state, compressScalar);
-    var rng = std.Random.DefaultPrng.init(0x5A2D2);
-    // Linear sweep covers every tail residue twice; spots cover multi-block and megabyte scales.
-    var size: usize = 0;
-    while (size <= 256) : (size += 1) {
-        try checkHwScalar(&rng, Hw, Sw, size);
-    }
-    for ([_]usize{ 512, 1000, 4096, 5552, 65536, 1 << 20 }) |big| {
-        try checkHwScalar(&rng, Hw, Sw, big);
-    }
+    try merkle.expectHwMatchesScalar(8, 32, initial_state, compressAarch64, compressScalar, 0x5A2D2);
 }
 test "sha256 onprem matches the stdlib oracle" {
     try seam.expectAgreement(Sha256.init(.{}), std.crypto.hash.sha2.Sha256.init(.{}), 0x5A256, true, null);

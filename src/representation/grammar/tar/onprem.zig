@@ -119,27 +119,27 @@ fn encodeWith(comptime format: Format, entries: []const Entry, output: []u8, scr
             var pax_buffer: [512]u8 = undefined;
             const pax_len = try writePaxRecords(entry, data_size, parts.uses_long_name, &pax_buffer);
             if (pax_len > 0) {
-                try tarWriteHeader(&sink, scratch, "././@PaxHeader", &.{}, &.{}, 0o644, 0, 0, 0, typeflag_pax, pax_len, 0, 0);
+                try tarWriteHeader(.posix, &sink, scratch, "././@PaxHeader", &.{}, &.{}, 0o644, 0, 0, 0, typeflag_pax, pax_len, 0, 0);
                 try sink.write(pax_buffer[0..pax_len]);
                 try tarWritePadding(&sink, scratch, pax_len);
             }
-            try tarWriteHeader(&sink, scratch, parts.name, parts.prefix, if (entry.link_name.len > 100) &.{} else entry.link_name, entry.mode, entry.uid, entry.gid, entry.modification_time, entry.typeflag, data_size, entry.devmajor, entry.devminor);
+            try tarWriteHeader(.posix, &sink, scratch, parts.name, parts.prefix, if (entry.link_name.len > 100) &.{} else entry.link_name, entry.mode, entry.uid, entry.gid, entry.modification_time, entry.typeflag, data_size, entry.devmajor, entry.devminor);
         } else {
             if (entry.name.len > 100) {
                 const long_size: u64 = @as(u64, entry.name.len) + 1;
-                try tarWriteHeaderGnu(&sink, scratch, "././@LongLink", &.{}, 0o644, 0, 0, 0, typeflag_gnu_long_name, long_size, 0, 0);
+                try tarWriteHeader(.gnu, &sink, scratch, "././@LongLink", &.{}, &.{}, 0o644, 0, 0, 0, typeflag_gnu_long_name, long_size, 0, 0);
                 try sink.write(entry.name);
                 try sink.write("\x00");
                 try tarWritePadding(&sink, scratch, long_size);
             }
             if (entry.link_name.len > 100) {
                 const long_size: u64 = @as(u64, entry.link_name.len) + 1;
-                try tarWriteHeaderGnu(&sink, scratch, "././@LongLink", &.{}, 0o644, 0, 0, 0, typeflag_gnu_long_link, long_size, 0, 0);
+                try tarWriteHeader(.gnu, &sink, scratch, "././@LongLink", &.{}, &.{}, 0o644, 0, 0, 0, typeflag_gnu_long_link, long_size, 0, 0);
                 try sink.write(entry.link_name);
                 try sink.write("\x00");
                 try tarWritePadding(&sink, scratch, long_size);
             }
-            try tarWriteHeaderGnu(&sink, scratch, parts.name, if (entry.link_name.len > 100) &.{} else entry.link_name, entry.mode, entry.uid, entry.gid, entry.modification_time, entry.typeflag, data_size, entry.devmajor, entry.devminor);
+            try tarWriteHeader(.gnu, &sink, scratch, parts.name, &.{}, if (entry.link_name.len > 100) &.{} else entry.link_name, entry.mode, entry.uid, entry.gid, entry.modification_time, entry.typeflag, data_size, entry.devmajor, entry.devminor);
         }
         try sink.write(entry.data);
         try tarWritePadding(&sink, scratch, data_size);
@@ -379,7 +379,9 @@ fn tarDataSize(typeflag: u8, data: []const u8) Exception!u64 {
     };
 }
 
-fn tarWriteHeader(sink: *io.Sink, scratch: []u8, name: []const u8, prefix: []const u8, link_name: []const u8, mode: u32, uid: u32, gid: u32, modification_time: u64, typeflag: u8, size: u64, devmajor: u32, devminor: u32) Exception!void {
+// POSIX headers carry the version and prefix fields; GNU headers carry the
+// OLDGNU magic and no prefix.
+fn tarWriteHeader(comptime format: Format, sink: *io.Sink, scratch: []u8, name: []const u8, prefix: []const u8, link_name: []const u8, mode: u32, uid: u32, gid: u32, modification_time: u64, typeflag: u8, size: u64, devmajor: u32, devminor: u32) Exception!void {
     if (scratch.len < scratch_size) return error.CapacityException;
     const block = scratch[0..scratch_size];
     @memset(block, 0);
@@ -391,43 +393,23 @@ fn tarWriteHeader(sink: *io.Sink, scratch: []u8, name: []const u8, prefix: []con
     tarWriteNumber(block[136..148], modification_time);
     block[156] = typeflag;
     tarWriteField(block[157..257], link_name);
-    tarWriteField(block[257..263], "ustar");
-    tarWriteField(block[263..265], "00");
+    if (format == .posix) {
+        tarWriteField(block[257..263], "ustar");
+        tarWriteField(block[263..265], "00");
+    } else {
+        tarWriteField(block[257..265], "ustar  ");
+    }
     if (typeflag == '3' or typeflag == '4') {
         tarWriteNumber(block[329..337], devmajor);
         tarWriteNumber(block[337..345], devminor);
     }
-    tarWriteField(block[345..500], prefix);
-    var checksum = tarChecksum(block);
-    var index: usize = 154;
-    while (index > 148) {
-        index -= 1;
-        block[index] = '0' + @as(u8, @truncate(checksum & 7));
-        checksum >>= 3;
-    }
-    block[154] = 0;
-    block[155] = ' ';
+    if (format == .posix) tarWriteField(block[345..500], prefix);
+    tarSealHeader(block);
     try sink.write(block);
 }
 
-// GNU headers carry the OLDGNU magic and no prefix field.
-fn tarWriteHeaderGnu(sink: *io.Sink, scratch: []u8, name: []const u8, link_name: []const u8, mode: u32, uid: u32, gid: u32, modification_time: u64, typeflag: u8, size: u64, devmajor: u32, devminor: u32) Exception!void {
-    if (scratch.len < scratch_size) return error.CapacityException;
-    const block = scratch[0..scratch_size];
-    @memset(block, 0);
-    tarWriteField(block[0..100], name);
-    tarWriteNumber(block[100..108], mode);
-    tarWriteNumber(block[108..116], uid);
-    tarWriteNumber(block[116..124], gid);
-    tarWriteNumber(block[124..136], size);
-    tarWriteNumber(block[136..148], modification_time);
-    block[156] = typeflag;
-    tarWriteField(block[157..257], link_name);
-    tarWriteField(block[257..265], "ustar  ");
-    if (typeflag == '3' or typeflag == '4') {
-        tarWriteNumber(block[329..337], devmajor);
-        tarWriteNumber(block[337..345], devminor);
-    }
+// The checksum field carries six octal digits, a NUL, and a space.
+fn tarSealHeader(block: *[512]u8) void {
     var checksum = tarChecksum(block);
     var index: usize = 154;
     while (index > 148) {
@@ -437,7 +419,6 @@ fn tarWriteHeaderGnu(sink: *io.Sink, scratch: []u8, name: []const u8, link_name:
     }
     block[154] = 0;
     block[155] = ' ';
-    try sink.write(block);
 }
 
 fn tarWritePadding(sink: *io.Sink, scratch: []u8, size: u64) Exception!void {
@@ -614,9 +595,7 @@ const Reader = struct {
                         entry.prefix = &.{};
                     }
                     if (self.long_link) |link_name| entry.link_name = link_name;
-                    // Decode-side parity with ZIP: refuse traversal, absolute,
-                    // backslash, and embedded-NUL member names.
-                    if (bounds.isAbsoluteOrTraversal(entry.name) or (entry.prefix.len > 0 and bounds.isAbsoluteOrTraversal(entry.prefix)) or std.mem.findScalar(u8, entry.name, 0) != null) return error.DataException;
+                    try tarValidateEntryName(entry);
                     entry.ordinal = self.ordinal;
                     self.ordinal = try bounds.addU64(self.ordinal, 1);
                     self.long_name = null;
@@ -647,9 +626,7 @@ const Reader = struct {
                         entry.prefix = &.{};
                     }
                     if (self.long_link) |link_name| entry.link_name = link_name;
-                    // Decode-side parity with ZIP: refuse traversal, absolute,
-                    // backslash, and embedded-NUL member names.
-                    if (bounds.isAbsoluteOrTraversal(entry.name) or (entry.prefix.len > 0 and bounds.isAbsoluteOrTraversal(entry.prefix)) or std.mem.findScalar(u8, entry.name, 0) != null) return error.DataException;
+                    try tarValidateEntryName(entry);
                     entry.ordinal = self.ordinal;
                     self.ordinal = try bounds.addU64(self.ordinal, 1);
                     try self.advance(advance_size);
@@ -774,6 +751,12 @@ fn readSparseLine(archive: []const u8, offset: *u64) Exception!u64 {
         value = std.math.mul(u64, value, 10) catch return error.DataException;
         value = std.math.add(u64, value, byte - '0') catch return error.DataException;
     }
+}
+
+// Decode-side parity with ZIP: refuse traversal, absolute, backslash, and
+// embedded-NUL member names.
+fn tarValidateEntryName(entry: EntryInfo) Exception!void {
+    if (bounds.isAbsoluteOrTraversal(entry.name) or (entry.prefix.len > 0 and bounds.isAbsoluteOrTraversal(entry.prefix)) or std.mem.findScalar(u8, entry.name, 0) != null) return error.DataException;
 }
 
 fn tarValidateType(typeflag: u8) Exception!void {

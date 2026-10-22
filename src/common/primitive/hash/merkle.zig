@@ -67,3 +67,48 @@ pub fn Digest(
         }
     };
 }
+
+// The hardware-versus-scalar differential every accelerated digest reuses:
+// misaligned inputs across a spread of split points, since both ends of a
+// pipeline crossing must agree on every tail residue. Callers guard with a
+// comptime `if (!hw) return error.SkipZigTest` so the foreign-arch asm stays
+// unreferenced on targets that lack it.
+fn checkHwScalar(rng: *std.Random.DefaultPrng, comptime Hw: type, comptime Sw: type, size: usize) !void {
+    const buf = try std.testing.allocator.alloc(u8, size + 8);
+    defer std.testing.allocator.free(buf);
+    rng.random().bytes(buf);
+    for ([_]usize{ 0, 1, 7 }) |align_off| {
+        const input = buf[align_off..][0..size];
+        for ([_]usize{ 0, 1, 63, 64, 65, size / 2, size }) |split_at| {
+            const cut = @min(split_at, size);
+            var hw = Hw.init(.{});
+            hw.update(input[0..cut]);
+            hw.update(input[cut..]);
+            var sw = Sw.init(.{});
+            sw.update(input[0..cut]);
+            sw.update(input[cut..]);
+            try std.testing.expectEqualSlices(u8, &sw.finalResult(), &hw.finalResult());
+        }
+    }
+}
+
+pub fn expectHwMatchesScalar(
+    comptime state_len: usize,
+    comptime digest_len: usize,
+    comptime initial: [state_len]u32,
+    comptime hw: *const fn (state: *align(16) [state_len]u32, block: *const [64]u8) void,
+    comptime sw: *const fn (state: *align(16) [state_len]u32, block: *const [64]u8) void,
+    seed: u64,
+) !void {
+    const Hw = Digest(state_len, digest_len, initial, hw);
+    const Sw = Digest(state_len, digest_len, initial, sw);
+    var rng = std.Random.DefaultPrng.init(seed);
+    // Linear sweep covers every tail residue twice; spots cover multi-block and megabyte scales.
+    var size: usize = 0;
+    while (size <= 256) : (size += 1) {
+        try checkHwScalar(&rng, Hw, Sw, size);
+    }
+    for ([_]usize{ 512, 1000, 4096, 5552, 65536, 1 << 20 }) |big| {
+        try checkHwScalar(&rng, Hw, Sw, big);
+    }
+}

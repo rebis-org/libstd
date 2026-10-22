@@ -885,24 +885,15 @@ test "arm schedule matches the word expansion" {
     try expectScheduleAgreesWithWordExpansion();
 }
 
-fn expectEncryptWide4Agrees(ctx: anytype, src: *const [64]u8) !void {
-    var wide: [64]u8 = undefined;
-    var single: [64]u8 = undefined;
-    ctx.encryptWide4(&wide, src);
+fn expectWide4Agrees(ctx: anytype, comptime single: []const u8, comptime wide: []const u8, src: *const [64]u8) !void {
+    var wide_out: [64]u8 = undefined;
+    var single_out: [64]u8 = undefined;
+    const Ctx = @TypeOf(ctx);
+    @field(Ctx, wide)(ctx, &wide_out, src);
     for (0..4) |block| {
-        ctx.encrypt(single[block * 16 ..][0..16], src[block * 16 ..][0..16]);
+        @field(Ctx, single)(ctx, single_out[block * 16 ..][0..16], src[block * 16 ..][0..16]);
     }
-    try std.testing.expectEqualSlices(u8, &single, &wide);
-}
-
-fn expectDecryptWide4Agrees(ctx: anytype, src: *const [64]u8) !void {
-    var wide: [64]u8 = undefined;
-    var single: [64]u8 = undefined;
-    ctx.decryptWide4(&wide, src);
-    for (0..4) |block| {
-        ctx.decrypt(single[block * 16 ..][0..16], src[block * 16 ..][0..16]);
-    }
-    try std.testing.expectEqualSlices(u8, &single, &wide);
+    try std.testing.expectEqualSlices(u8, &single_out, &wide_out);
 }
 
 test "wide4 agrees with the per-block rounds" {
@@ -915,10 +906,10 @@ test "wide4 agrees with the per-block rounds" {
     rng.random().bytes(&key128);
     rng.random().bytes(&key192);
     rng.random().bytes(&key256);
-    try expectEncryptWide4Agrees(Aes128.initEnc(key128), &src);
-    try expectDecryptWide4Agrees(Aes128.initDec(key128), &src);
-    try expectEncryptWide4Agrees(Aes192.initEnc(key192), &src);
-    try expectDecryptWide4Agrees(Aes192.initDec(key192), &src);
-    try expectEncryptWide4Agrees(Aes256.initEnc(key256), &src);
-    try expectDecryptWide4Agrees(Aes256.initDec(key256), &src);
+    try expectWide4Agrees(Aes128.initEnc(key128), "encrypt", "encryptWide4", &src);
+    try expectWide4Agrees(Aes128.initDec(key128), "decrypt", "decryptWide4", &src);
+    try expectWide4Agrees(Aes192.initEnc(key192), "encrypt", "encryptWide4", &src);
+    try expectWide4Agrees(Aes192.initDec(key192), "decrypt", "decryptWide4", &src);
+    try expectWide4Agrees(Aes256.initEnc(key256), "encrypt", "encryptWide4", &src);
+    try expectWide4Agrees(Aes256.initDec(key256), "decrypt", "decryptWide4", &src);
 }

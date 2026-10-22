@@ -46,94 +46,10 @@ pub fn Pair(comptime On: type, comptime Off: type) type {
     };
 }
 
-pub fn Digest(comptime mode: Mode, comptime On: type, comptime Off: type) type {
-    return switch (mode) {
-        .onprem => FixedDigest(.onprem, On),
-        .offprem => FixedDigest(.offprem, Off),
-        .mergeable => MergeableDigest(On, Off),
-    };
-}
-
-fn FixedDigest(comptime tag: Provider, comptime Impl: type) type {
-    return struct {
-        inner: Impl,
-
-        pub const digest_length = Impl.digest_length;
-        pub const block_length = Impl.block_length;
-        pub const Options = Impl.Options;
-
-        pub fn init(opts: Options) @This() {
-            return .{ .inner = Impl.init(opts) };
-        }
-
-        // The boundary validated the tag; a mismatch is a caller defect.
-        pub fn bind(provider: Provider, opts: Options) @This() {
-            std.debug.assert(provider == tag);
-            return init(opts);
-        }
-
-        pub fn update(self: *@This(), input: []const u8) void {
-            self.inner.update(input);
-        }
-
-        pub fn final(self: *@This(), out: *[digest_length]u8) void {
-            self.inner.final(out);
-        }
-
-        pub fn finalResult(self: *@This()) [digest_length]u8 {
-            return self.inner.finalResult();
-        }
-    };
-}
-
-fn MergeableDigest(comptime On: type, comptime Off: type) type {
-    return struct {
-        state: Pair(On, Off),
-
-        pub const digest_length = On.digest_length;
-        pub const block_length = On.block_length;
-        pub const Options = On.Options;
-
-        pub fn init(opts: Options) @This() {
-            return bind(default_provider, opts);
-        }
-
-        // stdlib's Options is a distinct nominal type; both are empty today, so
-        // the offprem arm constructs from defaults.
-        pub fn bind(provider: Provider, opts: Options) @This() {
-            return switch (provider) {
-                .onprem => .{ .state = .{ .onprem = On.init(opts) } },
-                .offprem => .{ .state = .{ .offprem = Off.init(.{}) } },
-            };
-        }
-
-        pub fn update(self: *@This(), input: []const u8) void {
-            switch (self.state) {
-                inline else => |*inner| inner.update(input),
-            }
-        }
-
-        pub fn final(self: *@This(), out: *[digest_length]u8) void {
-            switch (self.state) {
-                inline else => |*inner| inner.final(out),
-            }
-        }
-
-        pub fn finalResult(self: *@This()) [digest_length]u8 {
-            switch (self.state) {
-                inline else => |*inner| return inner.finalResult(),
-            }
-        }
-    };
-}
-
-pub fn Hash(comptime mode: Mode, comptime On: type, comptime Off: type) type {
-    return switch (mode) {
-        .onprem => FixedHash(.onprem, On),
-        .offprem => FixedHash(.offprem, Off),
-        .mergeable => MergeableHash(On, Off),
-    };
-}
+// The four capability families differ only in construction arguments and the
+// final shape; one comptime core carries the implementation, and each family
+// wrapper below pins its own interface.
+const Family = enum { digest, mac, hash, checksum };
 
 fn hashSeed(comptime Impl: type) type {
     return @typeInfo(@TypeOf(Impl.init)).@"fn".param_types[0].?;
@@ -143,47 +59,100 @@ fn hashFinal(comptime Impl: type) type {
     return @typeInfo(@TypeOf(Impl.final)).@"fn".return_type.?;
 }
 
-fn FixedHash(comptime tag: Provider, comptime Impl: type) type {
+// A mutable copy keeps `final` pure for the value families and matches the
+// stdlib digest signature without forwarding the wrapper's constness.
+fn finish(comptime family: Family, inner: anytype, args: anytype) hashFinal(@TypeOf(inner.*)) {
+    var copy = inner.*;
+    return switch (family) {
+        .digest, .mac => blk: {
+            if (@TypeOf(args) == void) @compileError("out-style final requires an output pointer");
+            copy.final(args);
+            break :blk;
+        },
+        .hash, .checksum => blk: {
+            if (@TypeOf(args) != void) @compileError("value-style final takes no arguments");
+            break :blk copy.final();
+        },
+    };
+}
+
+fn Core(comptime mode: Mode, comptime family: Family, comptime On: type, comptime Off: type) type {
+    return switch (mode) {
+        .onprem => Fixed(.onprem, family, On),
+        .offprem => Fixed(.offprem, family, Off),
+        .mergeable => Mergeable(family, On, Off),
+    };
+}
+
+fn Fixed(comptime tag: Provider, comptime family: Family, comptime Impl: type) type {
     return struct {
         inner: Impl,
 
+        pub const digest_length = Impl.digest_length;
+        pub const block_length = Impl.block_length;
+        pub const mac_length = Impl.mac_length;
+        pub const Options = Impl.Options;
         pub const Seed = hashSeed(Impl);
         pub const Final = hashFinal(Impl);
 
-        pub fn init(seed: Seed) @This() {
-            return .{ .inner = Impl.init(seed) };
+        pub fn init(args: anytype) @This() {
+            const inner = switch (family) {
+                .checksum => Impl.init(),
+                else => Impl.init(args),
+            };
+            return .{ .inner = inner };
         }
 
-        pub fn bind(provider: Provider, seed: Seed) @This() {
+        // The boundary validated the tag; a mismatch is a caller defect.
+        pub fn bind(provider: Provider, args: anytype) @This() {
             std.debug.assert(provider == tag);
-            return init(seed);
+            return init(args);
         }
 
         pub fn update(self: *@This(), input: []const u8) void {
             self.inner.update(input);
         }
 
-        pub fn final(self: *@This()) Final {
-            return self.inner.final();
+        pub fn final(self: *const @This(), args: anytype) Final {
+            return finish(family, &self.inner, args);
+        }
+
+        pub fn finalResult(self: *const @This()) [digest_length]u8 {
+            var copy = self.inner;
+            return copy.finalResult();
         }
     };
 }
 
-fn MergeableHash(comptime On: type, comptime Off: type) type {
+fn Mergeable(comptime family: Family, comptime On: type, comptime Off: type) type {
     return struct {
         state: Pair(On, Off),
 
+        pub const digest_length = On.digest_length;
+        pub const block_length = On.block_length;
+        pub const mac_length = On.mac_length;
+        pub const Options = On.Options;
         pub const Seed = hashSeed(On);
         pub const Final = hashFinal(On);
 
-        pub fn init(seed: Seed) @This() {
-            return bind(default_provider, seed);
+        pub fn init(args: anytype) @This() {
+            return bind(default_provider, args);
         }
 
-        pub fn bind(provider: Provider, seed: Seed) @This() {
+        pub fn bind(provider: Provider, args: anytype) @This() {
             return switch (provider) {
-                .onprem => .{ .state = .{ .onprem = On.init(seed) } },
-                .offprem => .{ .state = .{ .offprem = Off.init(seed) } },
+                .onprem => .{ .state = .{ .onprem = make(On, args) } },
+                .offprem => .{ .state = .{ .offprem = make(Off, args) } },
+            };
+        }
+
+        fn make(comptime Impl: type, args: anytype) Impl {
+            return switch (family) {
+                .checksum => Impl.init(),
+                // The stdlib Options type is nominally distinct from the on-prem
+                // one; both are empty today, so the foreign arm default-constructs.
+                .digest => if (Impl.Options == On.Options) Impl.init(args) else Impl.init(.{}),
+                .hash, .mac => Impl.init(args),
             };
         }
 
@@ -193,35 +162,93 @@ fn MergeableHash(comptime On: type, comptime Off: type) type {
             }
         }
 
-        pub fn final(self: *@This()) Final {
+        pub fn final(self: *const @This(), args: anytype) Final {
             switch (self.state) {
-                inline else => |*inner| return inner.final(),
+                inline else => |*inner| return finish(family, inner, args),
             }
+        }
+
+        pub fn finalResult(self: *const @This()) [digest_length]u8 {
+            switch (self.state) {
+                inline else => |*inner| {
+                    var copy = inner.*;
+                    return copy.finalResult();
+                },
+            }
+        }
+    };
+}
+
+pub fn Digest(comptime mode: Mode, comptime On: type, comptime Off: type) type {
+    const CoreImpl = Core(mode, .digest, On, Off);
+    return struct {
+        inner: CoreImpl,
+
+        pub const digest_length = CoreImpl.digest_length;
+        pub const block_length = CoreImpl.block_length;
+        pub const Options = CoreImpl.Options;
+
+        pub fn init(opts: Options) @This() {
+            return .{ .inner = CoreImpl.init(opts) };
+        }
+
+        pub fn bind(provider: Provider, opts: Options) @This() {
+            return .{ .inner = CoreImpl.bind(provider, opts) };
+        }
+
+        pub fn update(self: *@This(), input: []const u8) void {
+            self.inner.update(input);
+        }
+
+        pub fn final(self: *@This(), out: *[digest_length]u8) void {
+            self.inner.final(out);
+        }
+
+        pub fn finalResult(self: *@This()) [digest_length]u8 {
+            return self.inner.finalResult();
+        }
+    };
+}
+
+pub fn Hash(comptime mode: Mode, comptime On: type, comptime Off: type) type {
+    const CoreImpl = Core(mode, .hash, On, Off);
+    return struct {
+        inner: CoreImpl,
+
+        pub const Seed = CoreImpl.Seed;
+        pub const Final = CoreImpl.Final;
+
+        pub fn init(seed: Seed) @This() {
+            return .{ .inner = CoreImpl.init(seed) };
+        }
+
+        pub fn bind(provider: Provider, seed: Seed) @This() {
+            return .{ .inner = CoreImpl.bind(provider, seed) };
+        }
+
+        pub fn update(self: *@This(), input: []const u8) void {
+            self.inner.update(input);
+        }
+
+        pub fn final(self: *@This()) Final {
+            return self.inner.final({});
         }
     };
 }
 
 pub fn Checksum(comptime mode: Mode, comptime On: type, comptime Off: type) type {
-    return switch (mode) {
-        .onprem => FixedChecksum(.onprem, On),
-        .offprem => FixedChecksum(.offprem, Off),
-        .mergeable => MergeableChecksum(On, Off),
-    };
-}
-
-fn FixedChecksum(comptime tag: Provider, comptime Impl: type) type {
+    const CoreImpl = Core(mode, .checksum, On, Off);
     return struct {
-        inner: Impl,
+        inner: CoreImpl,
 
-        pub const Final = hashFinal(Impl);
+        pub const Final = CoreImpl.Final;
 
         pub fn init() @This() {
-            return .{ .inner = Impl.init() };
+            return .{ .inner = CoreImpl.init({}) };
         }
 
         pub fn bind(provider: Provider) @This() {
-            std.debug.assert(provider == tag);
-            return init();
+            return .{ .inner = CoreImpl.bind(provider, {}) };
         }
 
         pub fn update(self: *@This(), input: []const u8) void {
@@ -229,63 +256,24 @@ fn FixedChecksum(comptime tag: Provider, comptime Impl: type) type {
         }
 
         pub fn final(self: *const @This()) Final {
-            return self.inner.final();
-        }
-    };
-}
-
-fn MergeableChecksum(comptime On: type, comptime Off: type) type {
-    return struct {
-        state: Pair(On, Off),
-
-        pub const Final = hashFinal(On);
-
-        pub fn init() @This() {
-            return bind(default_provider);
-        }
-
-        pub fn bind(provider: Provider) @This() {
-            return switch (provider) {
-                .onprem => .{ .state = .{ .onprem = On.init() } },
-                .offprem => .{ .state = .{ .offprem = Off.init() } },
-            };
-        }
-
-        pub fn update(self: *@This(), input: []const u8) void {
-            switch (self.state) {
-                inline else => |*inner| inner.update(input),
-            }
-        }
-
-        pub fn final(self: *const @This()) Final {
-            switch (self.state) {
-                inline else => |*inner| return inner.final(),
-            }
+            return self.inner.final({});
         }
     };
 }
 
 pub fn Mac(comptime mode: Mode, comptime On: type, comptime Off: type) type {
-    return switch (mode) {
-        .onprem => FixedMac(.onprem, On),
-        .offprem => FixedMac(.offprem, Off),
-        .mergeable => MergeableMac(On, Off),
-    };
-}
-
-fn FixedMac(comptime tag: Provider, comptime Impl: type) type {
+    const CoreImpl = Core(mode, .mac, On, Off);
     return struct {
-        inner: Impl,
+        inner: CoreImpl,
 
-        pub const mac_length = Impl.mac_length;
+        pub const mac_length = CoreImpl.mac_length;
 
         pub fn init(key: []const u8) @This() {
-            return .{ .inner = Impl.init(key) };
+            return .{ .inner = CoreImpl.init(key) };
         }
 
         pub fn bind(provider: Provider, key: []const u8) @This() {
-            std.debug.assert(provider == tag);
-            return init(key);
+            return .{ .inner = CoreImpl.bind(provider, key) };
         }
 
         pub fn update(self: *@This(), input: []const u8) void {
@@ -298,43 +286,6 @@ fn FixedMac(comptime tag: Provider, comptime Impl: type) type {
 
         pub fn finalResult(self: *@This()) [mac_length]u8 {
             return self.inner.finalResult();
-        }
-    };
-}
-
-fn MergeableMac(comptime On: type, comptime Off: type) type {
-    return struct {
-        state: Pair(On, Off),
-
-        pub const mac_length = On.mac_length;
-
-        pub fn init(key: []const u8) @This() {
-            return bind(default_provider, key);
-        }
-
-        pub fn bind(provider: Provider, key: []const u8) @This() {
-            return switch (provider) {
-                .onprem => .{ .state = .{ .onprem = On.init(key) } },
-                .offprem => .{ .state = .{ .offprem = Off.init(key) } },
-            };
-        }
-
-        pub fn update(self: *@This(), input: []const u8) void {
-            switch (self.state) {
-                inline else => |*inner| inner.update(input),
-            }
-        }
-
-        pub fn final(self: *@This(), out: *[mac_length]u8) void {
-            switch (self.state) {
-                inline else => |*inner| inner.final(out),
-            }
-        }
-
-        pub fn finalResult(self: *@This()) [mac_length]u8 {
-            switch (self.state) {
-                inline else => |*inner| return inner.finalResult(),
-            }
         }
     };
 }

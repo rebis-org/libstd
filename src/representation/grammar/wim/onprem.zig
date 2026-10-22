@@ -880,29 +880,8 @@ pub fn inspectCount(archive: []const u8, scratch: []u8) Exception!u64 {
     return count;
 }
 
-pub fn inspectOrdinal(archive: []const u8, ordinal: u64, scratch: []u8) Exception!EntryInfo {
-    if (scratch.len < 2048) return error.ResourceException;
-    const parsed = try parse(archive, scratch[0 .. scratch.len - 1024]);
-    var info: ?EntryInfo = null;
-    const Ctx = struct {
-        ordinal: u64,
-        index: u64 = 0,
-        found: *?EntryInfo,
-        name_buf: []u8,
-    };
-    var ctx = Ctx{ .ordinal = ordinal, .found = &info, .name_buf = scratch[scratch.len - 1024 ..] };
-    try walk(parsed.metadata, &ctx, recordOrdinal);
-    if (info) |*result| {
-        result.size = (try blobLookup(parsed.blobs, result.hash)).size;
-        return result.*;
-    }
-    return error.DataException;
-}
-
-pub fn decodeOrdinal(archive: []const u8, ordinal: u64, output: []u8, scratch: []u8) Exception!usize {
-    if (scratch.len < 2048) return error.ResourceException;
-    const name_buf = scratch[scratch.len - 1024 ..];
-    const parsed = try parse(archive, scratch[0 .. scratch.len - 1024]);
+// Ordinal lookup parses with the name staging carved off the scratch tail.
+fn findEntry(parsed: Parsed, ordinal: u64, name_buf: []u8) Exception!?EntryInfo {
     var info: ?EntryInfo = null;
     const Ctx = struct {
         ordinal: u64,
@@ -912,7 +891,21 @@ pub fn decodeOrdinal(archive: []const u8, ordinal: u64, output: []u8, scratch: [
     };
     var ctx = Ctx{ .ordinal = ordinal, .found = &info, .name_buf = name_buf };
     try walk(parsed.metadata, &ctx, recordOrdinal);
-    const found = info orelse return error.DataException;
+    return info;
+}
+
+pub fn inspectOrdinal(archive: []const u8, ordinal: u64, scratch: []u8) Exception!EntryInfo {
+    if (scratch.len < 2048) return error.ResourceException;
+    const parsed = try parse(archive, scratch[0 .. scratch.len - 1024]);
+    var found = (try findEntry(parsed, ordinal, scratch[scratch.len - 1024 ..])) orelse return error.DataException;
+    found.size = (try blobLookup(parsed.blobs, found.hash)).size;
+    return found;
+}
+
+pub fn decodeOrdinal(archive: []const u8, ordinal: u64, output: []u8, scratch: []u8) Exception!usize {
+    if (scratch.len < 2048) return error.ResourceException;
+    const parsed = try parse(archive, scratch[0 .. scratch.len - 1024]);
+    const found = (try findEntry(parsed, ordinal, scratch[scratch.len - 1024 ..])) orelse return error.DataException;
     const blob = try blobLookup(parsed.blobs, found.hash);
     const size = std.math.cast(usize, blob.size) orelse return error.ResourceException;
     if (output.len < size) return error.CapacityException;

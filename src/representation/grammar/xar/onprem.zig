@@ -508,10 +508,10 @@ const ScanState = struct {
             info.mode = mode_value;
         }
         if (try file.numberAfter("uid")) |uid_value| {
-            info.uid = @intCast(uid_value);
+            info.uid = std.math.cast(u32, uid_value) orelse return error.DataException;
         }
         if (try file.numberAfter("gid")) |gid_value| {
-            info.gid = @intCast(gid_value);
+            info.gid = std.math.cast(u32, gid_value) orelse return error.DataException;
         }
         if (try file.timeAfter("mtime")) |mtime_value| {
             info.modification_time = mtime_value;
@@ -722,6 +722,38 @@ test "xar rejects malformed headers and corrupted toc digests" {
     // Truncating the data tail is caught when the entry data is read.
     var out: [16]u8 = undefined;
     try testing.expectError(error.DataException, decodeOrdinal(archive[0 .. written - 2], 0, &out, &scratch));
+}
+
+test "xar rejects out of range uid and gid without trapping" {
+    const testing = std.testing;
+    const xml =
+        \\<?xml version="1.0" encoding="UTF-8"?>
+        \\<xar><toc>
+        \\  <checksum style="sha1"><offset>0</offset><size>20</size></checksum>
+        \\  <file id="1"><name>a</name><type>file</type><uid>4294967296</uid><gid>7</gid>
+        \\   <data><length>1</length><offset>20</offset><size>1</size><encoding style="application/octet-stream"/></data>
+        \\  </file>
+        \\</toc></xar>
+    ;
+    var toc_buf: [4096]u8 = undefined;
+    var toc_sink = io.Sink{ .bytes = &toc_buf };
+    try writeZlibStored(&toc_sink, xml, std.hash.Adler32.hash(xml));
+    const toc_comp = toc_sink.offset;
+    var archive: [8192]u8 = undefined;
+    @memcpy(archive[0..4], "xar!");
+    std.mem.writeInt(u16, archive[4..6], header_size, .big);
+    std.mem.writeInt(u16, archive[6..8], 1, .big);
+    std.mem.writeInt(u64, archive[8..16], toc_comp, .big);
+    std.mem.writeInt(u64, archive[16..24], xml.len, .big);
+    std.mem.writeInt(u32, archive[24..28], cksum_sha1, .big);
+    @memcpy(archive[28..][0..toc_comp], toc_buf[0..toc_comp]);
+    var digest: [sha1_len]u8 = undefined;
+    std.crypto.hash.Sha1.hash(archive[28..][0..toc_comp], &digest, .{});
+    @memcpy(archive[28 + toc_comp ..][0..sha1_len], &digest);
+    archive[28 + toc_comp + sha1_len] = 'x';
+    const total = 29 + toc_comp + sha1_len;
+    var scratch: [16384]u8 = undefined;
+    try testing.expectError(error.DataException, inspectOrdinal(archive[0..total], 0, &scratch));
 }
 
 test "xar decodes libarchive-style nested and empty-file tocs" {
