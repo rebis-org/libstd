@@ -21,6 +21,8 @@ fn writeRandom(init: std.process.Init, name: []const u8, size: usize, seed: u64)
 }
 
 fn libzipBuild(init: std.process.Init, build_dir: []const u8, options: []const []const u8) Status {
+    // Vendor bumps change what the cached configuration means; configure from clean.
+    _ = std.Io.Dir.cwd().deleteTree(init.io, build_dir) catch {};
     var argv: [16][]const u8 = undefined;
     var count: usize = 0;
     for ([_][]const u8{ "cmake", "-S", "vendor/libzip", "-B", build_dir, "-DCMAKE_BUILD_TYPE=Release" }) |arg| {
@@ -76,7 +78,7 @@ fn suiteXzOssfuzz(init: std.process.Init) !Status {
     defer std.heap.page_allocator.free(seed);
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = seed, .data = "xz fuzz seed payload\n" });
 
-    const fuzzers = [_][]const u8{ "fuzz_decode_alone", "fuzz_decode_stream", "fuzz_decode_stream_mt", "fuzz_encode_stream" };
+    const fuzzers = [_][]const u8{ "fuzz_decode_alone", "fuzz_decode_index", "fuzz_decode_stream", "fuzz_decode_stream_mt", "fuzz_encode_stream" };
     for (fuzzers) |fuzzer| {
         const src = try std.heap.page_allocator.print("vendor/xz/tests/ossfuzz/{s}.c", .{fuzzer});
         defer std.heap.page_allocator.free(src);
@@ -103,7 +105,7 @@ fn suiteXzOssfuzz(init: std.process.Init) !Status {
 fn suiteLibzipRegress(init: std.process.Init) !Status {
     if (libzipBuild(init, "zig-out/benchmark/test/libzip-regress", &.{
         "-DBUILD_REGRESS=ON",
-        "-DBUILD_TOOLS=OFF",
+        "-DBUILD_TOOLS=ON",
         "-DBUILD_EXAMPLES=OFF",
         "-DBUILD_DOC=OFF",
         "-DBUILD_OSSFUZZ=OFF",
@@ -126,7 +128,7 @@ fn suiteLibzipOssfuzz(init: std.process.Init) !Status {
     const seed = try std.heap.page_allocator.print("{s}/input.zip", .{work_dir});
     defer std.heap.page_allocator.free(seed);
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = seed, .data = "zip fuzz seed payload\n" });
-    const fuzzers = [_][]const u8{ "zip_read_file_fuzzer", "zip_read_fuzzer", "zip_write_encrypt_aes256_file_fuzzer", "zip_write_encrypt_pkware_file_fuzzer" };
+    const fuzzers = [_][]const u8{ "zip_read_file_fuzzer", "zip_read_fuzzer", "zip_read_metadata_fuzzer", "zip_write_encrypt_aes256_file_fuzzer", "zip_write_encrypt_pkware_file_fuzzer", "zip_write_roundtrip_fuzzer" };
     for (fuzzers) |fuzzer| {
         const bin = try std.heap.page_allocator.print("{s}/ossfuzz/{s}", .{ build_dir, fuzzer });
         defer std.heap.page_allocator.free(bin);

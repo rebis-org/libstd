@@ -1,0 +1,27 @@
+name: Cache entry save
+
+description: Saves one cache entry. Failures never fail the job; the caller combines every condition into 'enabled'.
+
+inputs:
+  path:
+    required: true
+  key:
+    required: true
+  enabled:
+    description: Combined caller-side condition.
+    required: false
+    default: 'false'
+  main-only:
+    description: Restrict the save to the default branch; entries shared with pull requests stay writable.
+    required: false
+    default: 'true'
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      if: ${{ inputs.enabled == 'true' && !cancelled() && (inputs.main-only != 'true' || github.ref == 'refs/heads/main') }}
+      continue-on-error: true
+      with:
+        path: ${{ inputs.path }}
+        key: ${{ inputs.key }}

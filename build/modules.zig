@@ -105,7 +105,8 @@ pub fn componentsWithInterface(
     return .{ .interface = interface_module, .components = components_module };
 }
 
-pub fn withKernelFeatures(target: std.Build.ResolvedTarget) std.Build.ResolvedTarget {
+pub fn withKernelFeatures(target: std.Build.ResolvedTarget, kernel_isa: common.KernelIsa) std.Build.ResolvedTarget {
+    if (kernel_isa == .detected) return target;
     var adjusted = target;
     const arch = adjusted.result.cpu.arch;
     const aarch64_features = [_]std.Target.aarch64.Feature{ .crc, .crypto };
@@ -120,8 +121,9 @@ pub fn withKernelFeatures(target: std.Build.ResolvedTarget) std.Build.ResolvedTa
         adjusted.query.cpu_features_add.addFeature(bit);
         adjusted.result.cpu.features.addFeature(bit);
     };
-    // Non-portable x86_64 builds require SHA-NI, AVX2, and AES-NI; portable builds keep the scalar arms.
-    // AArch64 crypto implies aes/pmull, which the CRC32 fold kernel multiplies with.
+    // 'extended' builds hard-require SHA-NI, AVX2, and AES-NI on x86_64 and
+    // crc+crypto on aarch64 at runtime; 'detected' keeps whatever the
+    // resolved target already carries.
     return adjusted;
 }
 
@@ -134,7 +136,7 @@ pub fn createFor(
 ) *std.Build.Module {
     const module = b.createModule(.{
         .root_source_file = b.path(module_spec.root),
-        .target = kernelAdjustedTarget(module_spec, target, ctx.portable),
+        .target = kernelAdjustedTarget(module_spec, target, ctx.portable, ctx.kernel_isa),
         .optimize = optimize,
     });
     if (ctx.sanitize_c) |sanitize| module.sanitize_c = sanitize;
@@ -147,9 +149,9 @@ pub fn createFor(
 
 // crc_kernel specs ask for the hardware feature set the optimized paths need.
 // Portable builds stay on the unadjusted target with software arms only.
-pub fn kernelAdjustedTarget(comptime module_spec: Module, target: std.Build.ResolvedTarget, portable: bool) std.Build.ResolvedTarget {
-    if (!portable and module_spec.crc_kernel and (target.result.cpu.arch == .aarch64 or target.result.cpu.arch == .x86_64)) {
-        return withKernelFeatures(target);
+pub fn kernelAdjustedTarget(comptime module_spec: Module, target: std.Build.ResolvedTarget, portable: bool, kernel_isa: common.KernelIsa) std.Build.ResolvedTarget {
+    if (!portable and kernel_isa == .extended and module_spec.crc_kernel and (target.result.cpu.arch == .aarch64 or target.result.cpu.arch == .x86_64)) {
+        return withKernelFeatures(target, kernel_isa);
     }
     return target;
 }

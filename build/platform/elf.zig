@@ -15,7 +15,7 @@ pub fn addArchive(
     comptime arch: ?[]const u8,
 ) std.Build.LazyPath {
     const stage = common.beginLibstdStage(b, ctx, distribution);
-    const arches = comptime pick(manifest.slices[0..], os_tag, abi, arch);
+    const arches = comptime manifest.pickSlices(os_tag, abi, arch);
     inline for (arches) |slice| {
         var query = std.Target.Query{ .cpu_arch = slice.arch, .os_tag = os_tag };
         if (comptime abi) |a| query.abi = a;
@@ -40,32 +40,4 @@ fn libName(comptime os_tag: std.Target.Os.Tag, comptime linkage: std.lang.LinkMo
 fn linkages(comptime os_tag: std.Target.Os.Tag) []const std.lang.LinkMode {
     // WASI has no shared-library model.
     return if (os_tag == .wasi) &.{.static} else &.{ .static, .dynamic };
-}
-
-fn pick(comptime table: []const manifest.TargetSlice, comptime os_tag: std.Target.Os.Tag, comptime abi: ?std.Target.Abi, comptime arch: ?[]const u8) []const manifest.TargetSlice {
-    comptime {
-        const os_arches: []const []const u8 = switch (os_tag) {
-            .linux => if (abi == .musl) &.{ "x86_64", "aarch64", "riscv64" } else if (abi == .ohos) &.{ "x86_64", "aarch64" } else &.{ "x86_64", "aarch64", "riscv64", "loongarch64" },
-            .freebsd, .openbsd, .macos => &.{ "x86_64", "aarch64" },
-            .wasi => &.{"wasm32"},
-            else => @compileError("no elf table for " ++ @tagName(os_tag)),
-        };
-        var chosen: [table.len]manifest.TargetSlice = undefined;
-        var n: usize = 0;
-        for (table) |slice| {
-            for (os_arches) |name| {
-                if (std.mem.eql(u8, @tagName(slice.arch), name)) {
-                    chosen[n] = slice;
-                    n += 1;
-                }
-            }
-        }
-        if (arch) |a| {
-            for (chosen[0..n]) |slice| {
-                if (std.mem.eql(u8, @tagName(slice.arch), a)) return &.{slice};
-            }
-            @compileError("unknown arch: " ++ a);
-        }
-        return chosen[0..n];
-    }
 }

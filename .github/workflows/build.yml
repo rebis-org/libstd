@@ -83,14 +83,27 @@ jobs:
     with:
       runner: ${{ matrix.runner }}
 
+  gate:
+    name: Gate
+    needs: [build, suite, targets, runtime]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify the verification matrix
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          printf '%s\n' "$NEEDS" | jq -e '
+            to_entries | all(.value.result == "success" or .value.result == "skipped")
+          ' > /dev/null || { echo "verification matrix is not green" >&2; exit 1; }
+
   publish:
     name: Publish
-    needs: [build, suite, targets, runtime]
+    needs: [build, suite, targets, runtime, gate]
     if: (github.event_name == 'workflow_dispatch' && inputs.scope == 'publish') || inputs.publish
     runs-on: ubuntu-latest
     steps:
-      - name: Check out sources
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: false
       - name: Download the archives
@@ -136,8 +149,7 @@ jobs:
       actions: write
       contents: read
     steps:
-      - name: Check out sources
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: false
       - id: pin
@@ -146,20 +158,22 @@ jobs:
           pin="$(sed -n 's/^zig[[:space:]]*=[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p' .mise.toml)"
           [ -n "$pin" ] || { echo "no zig pin in .mise.toml" >&2; exit 1; }
           echo "ZIG_VERSION=$pin" >> "$GITHUB_ENV"
-      - name: Delete superseded cache entries
+      - name: Reap caches down to the size budget
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
         run: |
-          gh cache list --limit 200 --json key,id,lastAccessedAt \
-            | jq -r --arg v "$ZIG_VERSION" --arg floor "$(date -u -d '2 days ago' +%Y-%m-%dT%H:%M:%SZ)" \
-                '.[] | select(.key | startswith("zig-")) \
-                 | select((.key | contains("-" + $v + "-")) | not) \
-                 | select(.lastAccessedAt < $floor) \
-                 | .id' \
-            | while read -r id; do
-                if [ -n "$id" ]; then
-                  echo "deleting cache $id"
-                  gh cache delete "$id"
-                fi
-              done
+          budget=$((95 * 1073741824 / 10))
+          floor="$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)"
+          total=0
+          gh api "repos/$REPO/actions/caches?per_page=100" --paginate \
+              --jq '.actions_caches[] | [.id, .size_in_bytes, .last_accessed_at, .key] | @tsv' \
+          | sort -t$'\t' -k3,3r \
+          | while IFS=$'\t' read -r id size accessed key; do
+              total=$((total + size))
+              if [ "$total" -le "$budget" ]; then continue; fi
+              [[ "$accessed" > "$floor" ]] && continue
+              echo "reaping $((size / 1048576)) MiB (accessed $accessed) $key"
+              gh cache delete "$id" || true
+            done

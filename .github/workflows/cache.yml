@@ -40,20 +40,17 @@ jobs:
   cached:
     name: Cached run
     runs-on: xcode-27
+    env:
+      GIT_CONFIG_COUNT: "2"
+      GIT_CONFIG_KEY_0: url.https://github.com/rebis-org/.insteadof
+      GIT_CONFIG_VALUE_0: https://git.savannah.gnu.org/git/
+      GIT_CONFIG_KEY_1: url.https://github.com/rebis-org/.insteadof
+      GIT_CONFIG_VALUE_1: git://git.sv.gnu.org/
     steps:
-      - name: Point the nested GNU submodules at the mirrors
-        run: |
-          git config --global --add url."https://github.com/rebis-org/".insteadOf https://git.savannah.gnu.org/git/
-          git config --global --add url."https://github.com/rebis-org/".insteadOf git://git.sv.gnu.org/
-      - name: Check out sources
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
-      - name: Install the toolchain
-        uses: jdx/mise-action@9b200bcecbfd6303e69a4a261b2e09e3757440a7 # v5.2.0
-        with:
-          install: true
-          cache: true
+      - uses: ./.github/actions/toolchain
       - id: keys
         name: Resolve cache keys
         env:
@@ -69,31 +66,30 @@ jobs:
             echo "source=$SOURCE_HASH"
             echo "cache=$cache"
           } >> "$GITHUB_OUTPUT"
-      - name: Restore the dependency cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - id: global
+        uses: ./.github/actions/restore
         with:
           path: ${{ steps.keys.outputs.cache }}
-          key: zig-global-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-${{ steps.keys.outputs.vendor }}
+          key: zig-global-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}
           restore-keys: |
-            zig-global-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-
+            zig-global-${{ runner.os }}-${{ runner.arch }}-
       - id: project
-        name: Restore the project cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: ./.github/actions/restore
         with:
           path: .zig-cache
           key: zig-project-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-${{ steps.keys.outputs.vendor }}-${{ steps.keys.outputs.source }}
           restore-keys: |
             zig-project-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-
-      - name: Restore the Homebrew cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - id: brew
+        name: Restore the Homebrew cache
+        uses: ./.github/actions/restore
         with:
           path: ~/Library/Caches/Homebrew
           key: brew-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.mise.toml') }}
           restore-keys: |
             brew-${{ runner.os }}-${{ runner.arch }}-
       - id: corpus
-        name: Restore the benchmark cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: ./.github/actions/restore
         with:
           path: |
             zig-out/benchmark/bin/pkgs
@@ -101,16 +97,20 @@ jobs:
           key: benchmark-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-${{ hashFiles('build/acceptance/benchmark/command.zig', 'build/acceptance/benchmark/env.zig') }}
           restore-keys: |
             benchmark-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-
-      - name: Restore the Go module cache
+      - name: Materialize the corpus
+        if: steps.corpus.outputs.cache-hit != 'true'
+        run: zig build corpus
+      - id: gomod
+        name: Restore the Go module cache
         if: inputs.profile == 'suite'
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: ./.github/actions/restore
         with:
           path: ~/go/pkg/mod
           key: go-mod-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.vendor }}-${{ hashFiles('vendor/age/go.sum') }}
       - id: age_ref
         name: Restore the age reference binary
         if: inputs.profile == 'suite'
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: ./.github/actions/restore
         with:
           path: /tmp/age_ref
           key: age-ref-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.vendor }}
@@ -118,21 +118,26 @@ jobs:
         if: inputs.profile == 'suite' && steps.age_ref.outputs.cache-hit != 'true'
         run: cd vendor/age && go build -o /tmp/age_ref ./cmd/age
       - name: Save the age reference binary
-        if: ${{ !cancelled() && inputs.profile == 'suite' && steps.age_ref.outcome == 'success' && steps.age_ref.outputs.cache-hit != 'true' }}
-        continue-on-error: true
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: ./.github/actions/save
         with:
           path: /tmp/age_ref
           key: age-ref-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.vendor }}
+          enabled: ${{ inputs.profile == 'suite' && steps.age_ref.outcome == 'success' && steps.age_ref.outputs.cache-hit != 'true' }}
       - id: vendor_build
         name: Restore the vendored build tree
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: ./.github/actions/restore
         with:
           path: zig-out/benchmark/build
-          key: vendor-build-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-${{ steps.keys.outputs.vendor }}-${{ hashFiles('build/vendor.zig', 'build/acceptance/benchmark/refs.zig') }}
+          key: vendor-build-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-${{ steps.keys.outputs.vendor }}-${{ hashFiles('build/vendor.zig', 'build/acceptance/benchmark/refs.zig') }}-${{ inputs.impl }}-${{ inputs.portable }}-${{ inputs.sanitizer }}${{ inputs.ubsan_shard }}
       - name: Provision the reference toolchains
         run: |
-          brew install autoconf automake bison libtool gettext pkg-config cmake boost fmt utf8cpp nlohmann-json libarchive xxhash zstd lz4 lzo xz brotli openssl@3
+          missing=()
+          for formula in autoconf automake bison libtool gettext pkg-config cmake boost fmt utf8cpp nlohmann-json libarchive xxhash zstd lz4 lzo xz brotli openssl@3; do
+            brew list --versions "$formula" >/dev/null 2>&1 || missing+=("$formula")
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            brew install "${missing[@]}"
+          fi
           rm -rf /tmp/range-v3
           git init -q /tmp/range-v3
           git -C /tmp/range-v3 remote add origin https://github.com/ericniebler/range-v3.git
@@ -154,7 +159,7 @@ jobs:
           zig build -Doptimize=small
           zig build abi
           [ "${{ inputs.benchmark }}" = true ] && zig build benchmark -Doptimize=fast
-          brew install llvm
+          brew list --versions llvm >/dev/null 2>&1 || brew install llvm
           echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
           zig build dist -Doptimize=fast
           zig build package -Doptimize=fast
@@ -175,22 +180,20 @@ jobs:
             onprem|offprem|mergeable) ;;
             *) echo "unknown primitive implementation" >&2; exit 1 ;;
           esac
-          zig build corpus
           zig build unit -Dprimitives_impl=${{ inputs.impl }} -Dportable=${{ inputs.portable }}
           zig build oracles -Dprimitives_impl=${{ inputs.impl }} -Dportable=${{ inputs.portable }} -Doptimize=safe
       - id: ubsan
         name: Restore the UBSan cache
         if: inputs.profile == 'suite' && inputs.sanitizer == 'ubsan'
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: ./.github/actions/restore
         with:
-          path: .zig-cache-ubsan${{ inputs.ubsan_shard }}
+          path: .zig-cache-ubsan-${{ inputs.ubsan_shard }}
           key: zig-ubsan${{ inputs.ubsan_shard }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-${{ steps.keys.outputs.vendor }}-${{ steps.keys.outputs.source }}
           restore-keys: |
             zig-ubsan${{ inputs.ubsan_shard }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-
       - name: Run the sanitizer oracle suite
         if: inputs.profile == 'suite' && inputs.sanitizer == 'ubsan'
         run: |
-          zig build corpus
           case "${{ inputs.ubsan_shard }}" in
             archive) suites="archive" ;;
             codecs) suites="lzma seven_zip tar xz zip zstd inflate" ;;
@@ -200,33 +203,60 @@ jobs:
           for suite in $suites; do
             zig build ubsan -Dsuite="$suite" --cache-dir ".zig-cache-ubsan-${{ inputs.ubsan_shard }}"
           done
+      - name: Save the dependency cache
+        uses: ./.github/actions/save
+        with:
+          path: ${{ steps.keys.outputs.cache }}
+          key: ${{ steps.global.outputs.primary-key }}
+          enabled: ${{ steps.global.outcome == 'success' && steps.global.outputs.cache-hit != 'true' }}
       - name: Save the project cache
-        if: ${{ !cancelled() && github.ref == 'refs/heads/main' && steps.project.outcome == 'success' && steps.project.outputs.cache-hit != 'true' }}
-        continue-on-error: true
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: ./.github/actions/save
         with:
           path: .zig-cache
-          key: ${{ steps.project.outputs.cache-primary-key }}
+          key: ${{ steps.project.outputs.primary-key }}
+          enabled: ${{ steps.project.outcome == 'success' && steps.project.outputs.cache-hit != 'true' }}
       - name: Save the UBSan cache
-        if: ${{ !cancelled() && github.ref == 'refs/heads/main' && steps.ubsan.outcome == 'success' && steps.ubsan.outputs.cache-hit != 'true' }}
-        continue-on-error: true
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: ./.github/actions/save
         with:
-          path: .zig-cache-ubsan${{ inputs.ubsan_shard }}
-          key: ${{ steps.ubsan.outputs.cache-primary-key }}
+          path: .zig-cache-ubsan-${{ inputs.ubsan_shard }}
+          key: ${{ steps.ubsan.outputs.primary-key }}
+          enabled: ${{ steps.ubsan.outcome == 'success' && steps.ubsan.outputs.cache-hit != 'true' }}
       - name: Save the vendored build tree
-        if: ${{ !cancelled() && github.ref == 'refs/heads/main' && steps.vendor_build.outcome == 'success' && steps.vendor_build.outputs.cache-hit != 'true' }}
-        continue-on-error: true
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: ./.github/actions/save
         with:
           path: zig-out/benchmark/build
-          key: vendor-build-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-${{ steps.keys.outputs.vendor }}-${{ hashFiles('build/vendor.zig', 'build/acceptance/benchmark/refs.zig') }}
+          key: vendor-build-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-${{ steps.keys.outputs.vendor }}-${{ hashFiles('build/vendor.zig', 'build/acceptance/benchmark/refs.zig') }}-${{ inputs.impl }}-${{ inputs.portable }}-${{ inputs.sanitizer }}${{ inputs.ubsan_shard }}
+          enabled: ${{ steps.vendor_build.outcome == 'success' && steps.vendor_build.outputs.cache-hit != 'true' }}
       - name: Save the benchmark cache
-        if: ${{ !cancelled() && github.ref == 'refs/heads/main' && steps.corpus.outcome == 'success' && steps.corpus.outputs.cache-hit != 'true' }}
-        continue-on-error: true
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: ./.github/actions/save
         with:
           path: |
             zig-out/benchmark/bin/pkgs
             zig-out/benchmark/corpus
-          key: ${{ steps.corpus.outputs.cache-primary-key }}
+          key: ${{ steps.corpus.outputs.primary-key }}
+          enabled: ${{ steps.corpus.outcome == 'success' && steps.corpus.outputs.cache-hit != 'true' }}
+      - name: Save the Homebrew cache
+        uses: ./.github/actions/save
+        with:
+          path: ~/Library/Caches/Homebrew
+          key: ${{ steps.brew.outputs.primary-key }}
+          enabled: ${{ steps.brew.outcome == 'success' && steps.brew.outputs.cache-hit != 'true' }}
+      - name: Save the Go module cache
+        if: inputs.profile == 'suite'
+        uses: ./.github/actions/save
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ steps.gomod.outputs.primary-key }}
+          enabled: ${{ steps.gomod.outcome == 'success' && steps.gomod.outputs.cache-hit != 'true' }}
+      - name: Report cache effectiveness
+        if: ${{ !cancelled() }}
+        run: |
+          {
+            echo "| cache | restored |"
+            echo "| --- | --- |"
+            echo "| dependency | $([[ "${{ steps.global.outputs.cache-hit }}" == true ]] && echo hit || echo miss) |"
+            echo "| project | $([[ "${{ steps.project.outputs.cache-hit }}" == true ]] && echo hit || echo miss) |"
+            echo "| homebrew | $([[ "${{ steps.brew.outputs.cache-hit }}" == true ]] && echo hit || echo miss) |"
+            echo "| benchmark | $([[ "${{ steps.corpus.outputs.cache-hit }}" == true ]] && echo hit || echo miss) |"
+            echo "| ubsan | $([[ "${{ steps.ubsan.outputs.cache-hit }}" == true ]] && echo hit || echo miss) |"
+          } >> "$GITHUB_STEP_SUMMARY"

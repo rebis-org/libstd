@@ -1,0 +1,12 @@
+name: Install toolchain
+
+description: Installs the pinned toolchain.
+
+runs:
+  using: composite
+  steps:
+    - name: Install the toolchain
+      uses: jdx/mise-action@9b200bcecbfd6303e69a4a261b2e09e3757440a7 # v5.2.0
+      with:
+        install: true
+        cache: ${{ github.ref == 'refs/heads/main' }}

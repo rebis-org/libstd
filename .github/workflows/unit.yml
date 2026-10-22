@@ -12,19 +12,17 @@ jobs:
   run:
     name: Unit run (${{ inputs.runner }})
     runs-on: ${{ inputs.runner }}
+    env:
+      GIT_CONFIG_COUNT: "2"
+      GIT_CONFIG_KEY_0: url.https://github.com/rebis-org/.insteadof
+      GIT_CONFIG_VALUE_0: https://git.savannah.gnu.org/git/
+      GIT_CONFIG_KEY_1: url.https://github.com/rebis-org/.insteadof
+      GIT_CONFIG_VALUE_1: git://git.sv.gnu.org/
     steps:
-      - name: Point the nested GNU submodules at the mirrors
-        run: |
-          git config --global --add url."https://github.com/rebis-org/".insteadOf https://git.savannah.gnu.org/git/
-          git config --global --add url."https://github.com/rebis-org/".insteadOf git://git.sv.gnu.org/
-      - name: Check out sources
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
-      - name: Install the toolchain
-        uses: jdx/mise-action@9b200bcecbfd6303e69a4a261b2e09e3757440a7 # v5.2.0
-        with:
-          install: true
+      - uses: ./.github/actions/toolchain
       - name: Run the unit suite natively
         run: zig build unit
       - name: Build the host libraries

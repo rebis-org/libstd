@@ -70,6 +70,13 @@ pub const HostLibraries = struct {
 pub const Implementation = enum { onprem, offprem, mergeable };
 pub const capabilities = .{ "sha256", "sha1", "hmac", "pbkdf2", "adler32", "xxh32", "xxh64", "aes", "crc32", "crc64xz", "bzip2crc32" };
 
+// Hardware ISA the crc kernels may assume. 'detected' compiles them for the
+// resolved target's own cpu features, so a baseline x86_64 artifact never
+// carries instructions the triple does not promise. 'extended' adds
+// sha/avx2/aes on x86_64 and crc/crypto on aarch64 and hard-requires those
+// extensions at runtime; it exists for measured native-hardware runs only.
+pub const KernelIsa = enum { detected, extended };
+
 pub fn KindedUnit(comptime Kind: type) type {
     return struct {
         name: []const u8,
@@ -105,6 +112,7 @@ pub const Settings = struct {
     host: HostLibraries,
     refs: ?reference.Refs = null,
     portable: bool = false,
+    kernel_isa: KernelIsa = .detected,
     options: *std.Build.Module,
     sanitize_c: ?std.zig.SanitizeC = null,
     dist_providers: []const DistProvider = &.{},

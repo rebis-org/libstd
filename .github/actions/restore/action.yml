@@ -1,0 +1,28 @@
+name: Cache entry restore
+
+description: Restores one cache entry and exposes its identity for the save step.
+
+inputs:
+  path:
+    required: true
+  key:
+    required: true
+  restore-keys:
+    required: false
+    default: ''
+
+outputs:
+  primary-key:
+    value: ${{ steps.entry.outputs.cache-primary-key }}
+  cache-hit:
+    value: ${{ steps.entry.outputs.cache-hit }}
+
+runs:
+  using: composite
+  steps:
+    - id: entry
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ inputs.path }}
+        key: ${{ inputs.key }}
+        restore-keys: ${{ inputs.restore-keys }}
