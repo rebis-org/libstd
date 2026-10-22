@@ -2,7 +2,9 @@ const std = @import("std");
 
 const checksum = @import("checksum");
 const crypto = @import("crypto");
-const kernels = @import("kernels");
+const bench_shim = @import("bench_shim");
+const brotli = bench_shim.brotli;
+const kernels = bench_shim.kernels;
 
 const runner = @import("runner.zig");
 
@@ -60,6 +62,20 @@ const CopyMatchCase = struct {
     }
 };
 
+// Decodes a fixed system-brotli-shaped fixture produced by our own encoder;
+// the literal-heavy random corpus exercises the table decode path.
+const BrotliDecodeCase = struct {
+    encoded: []const u8,
+    output: []u8,
+    scratch: []u8,
+    pub fn run(self: *const @This(), allocator: std.mem.Allocator) void {
+        _ = allocator;
+        const n = brotli.decode(self.encoded, self.output, self.scratch, .{}) catch
+            @panic("brotli decode case failed");
+        std.mem.doNotOptimizeAway(n);
+    }
+};
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
 
@@ -105,6 +121,36 @@ pub fn main(init: std.process.Init) !void {
     const sha256_case: Sha256Case = .{ .input = input };
     const copy_match_case: CopyMatchCase = .{ .window = window };
 
+    // Compressible corpus: repeated sentence plus random chunks, so both the
+    // short-code literal path and the match path carry real weight.
+    const sentence = "The quick brown fox jumps over the lazy dog. ";
+    const compressible = try allocator.alloc(u8, input.len);
+    defer allocator.free(compressible);
+    var filled: usize = 0;
+    while (filled + 65536 <= compressible.len) : (filled += 65536) {
+        @memcpy(compressible[filled..][0..sentence.len], sentence);
+        var rest = filled + sentence.len;
+        while (rest + sentence.len <= filled + 65536) : (rest += sentence.len) {
+            @memcpy(compressible[rest..][0..sentence.len], sentence);
+        }
+        @memcpy(compressible[filled + 32768 ..][0..8192], input[filled .. filled + 8192]);
+    }
+    @memcpy(compressible[filled..], input[filled..]);
+    const compressed = try allocator.alloc(u8, brotli.encodedSizeBound(compressible.len));
+    defer allocator.free(compressed);
+    const enc_ws = try allocator.alloc(u8, brotli.encode_workspace_size);
+    defer allocator.free(enc_ws);
+    const brotli_out = try allocator.alloc(u8, compressible.len);
+    defer allocator.free(brotli_out);
+    const dec_ws = try allocator.alloc(u8, brotli.decode_workspace_size);
+    defer allocator.free(dec_ws);
+    const enc_len = try brotli.encode(compressible, compressed, enc_ws, .{});
+    const brotli_decode_case: BrotliDecodeCase = .{
+        .encoded = compressed[0..enc_len],
+        .output = brotli_out,
+        .scratch = dec_ws,
+    };
+
     const registry = .{
         .{ "checksum.adler32", &adler32_case },
         .{ "checksum.crc32", &crc32_case },
@@ -115,6 +161,7 @@ pub fn main(init: std.process.Init) !void {
         .{ "crypto.sha1", &sha1_case },
         .{ "crypto.sha256", &sha256_case },
         .{ "kernels.copy_match", &copy_match_case },
+        .{ "brotli.decode", &brotli_decode_case },
     };
     inline for (registry) |entry| {
         if (name_filter == null or std.mem.find(u8, entry[0], name_filter.?) != null) {
@@ -151,4 +198,23 @@ test "micro cases stay runnable without runner" {
     sha1_case.run(std.testing.allocator);
     sha256_case.run(std.testing.allocator);
     copy_match_case.run(std.testing.allocator);
+
+    const fixture = try std.testing.allocator.alloc(u8, 4096);
+    defer std.testing.allocator.free(fixture);
+    @memcpy(fixture, &scratch);
+    const enc_ws = try std.testing.allocator.alloc(u8, brotli.encode_workspace_size);
+    defer std.testing.allocator.free(enc_ws);
+    const compressed = try std.testing.allocator.alloc(u8, brotli.encodedSizeBound(fixture.len));
+    defer std.testing.allocator.free(compressed);
+    const out = try std.testing.allocator.alloc(u8, fixture.len);
+    defer std.testing.allocator.free(out);
+    const dec_ws = try std.testing.allocator.alloc(u8, brotli.decode_workspace_size);
+    defer std.testing.allocator.free(dec_ws);
+    const enc_len = try brotli.encode(fixture, compressed, enc_ws, .{});
+    const brotli_decode_case: BrotliDecodeCase = .{
+        .encoded = compressed[0..enc_len],
+        .output = out,
+        .scratch = dec_ws,
+    };
+    brotli_decode_case.run(std.testing.allocator);
 }
