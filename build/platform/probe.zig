@@ -6,7 +6,8 @@ pub fn main(init: std.process.Init) !u8 {
     const alloc = arena.allocator();
 
     var collected: std.ArrayList([]const u8) = .empty;
-    var args = std.process.Args.Iterator.init(init.minimal.args);
+    var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, alloc);
+    defer args.deinit();
     while (args.next()) |arg| try collected.append(alloc, arg);
     if (collected.items.len < 2) return error.usage;
     const tail = collected.items[1..];

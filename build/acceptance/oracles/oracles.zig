@@ -141,7 +141,10 @@ const scenarios = scenario_block: {
 
 pub fn main(init: std.process.Init) !void {
     harness.oracle_io = init.io;
-    var args = std.process.Args.Iterator.init(init.minimal.args);
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    const allocator = arena.allocator();
+    var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
+    defer args.deinit();
     _ = args.next();
     var filter_suite: ?[]const u8 = null;
     var filter_scenario: ?[]const u8 = null;

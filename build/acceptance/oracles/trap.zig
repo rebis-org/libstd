@@ -275,7 +275,10 @@ fn drive(init: std.process.Init, self_exe: [:0]const u8) !void {
 }
 
 pub fn main(init: std.process.Init) !void {
-    var args = std.process.Args.Iterator.init(init.minimal.args);
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    const allocator = arena.allocator();
+    var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
+    defer args.deinit();
     const self_exe = args.next() orelse {
         std.debug.print("usage: oracles_trap [scenario]\n", .{});
         std.process.exit(2);

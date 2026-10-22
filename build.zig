@@ -22,9 +22,22 @@ pub fn build(b: *std.Build) void {
         if (result.term == .exited and result.term.exited == 0) break :blk std.mem.trim(u8, result.stdout, "\n");
         break :blk "nogit";
     };
-    const target = b.standardTargetOptions(.{});
+    const target = blk: {
+        var resolved = b.standardTargetOptions(.{});
+        // Rosetta executes x86_64 macOS on the CI runners: CPUID reports
+        // SHA-NI, the instructions fault, and std's Sha256 compiles its
+        // SHA-NI arm on the detected feature. Strip 'sha' from native
+        // x86_64-macos targets; explicit -Dcpu keeps it.
+        if (resolved.query.isNative() and resolved.result.cpu.arch == .x86_64 and resolved.result.os.tag == .macos) {
+            const sha_bit = @backingInt(std.Target.x86.Feature.sha);
+            resolved.query.cpu_features_sub.addFeature(sha_bit);
+            resolved.result.cpu.features.removeFeature(sha_bit);
+        }
+        break :blk resolved;
+    };
     const optimize = b.standardOptimizeOption(.{});
     const portable = b.option(bool, "portable", "Compatible implementation for primitive seam") orelse false;
+    const kernel_isa = b.option(common.KernelIsa, "kernel_isa", "Hardware ISA the crc kernels may assume; 'extended' hard-requires sha/avx2/aes on x86_64 and crc/crypto on aarch64 at runtime") orelse .detected;
     const primitives_impl = b.option(Implementation, "primitives_impl", "Default implementation for primitive seam") orelse .onprem;
     const options = b.addOptions();
     options.addOption(bool, "portable", portable);
@@ -62,6 +75,7 @@ pub fn build(b: *std.Build) void {
         .generated = generated,
         .host = host,
         .portable = portable,
+        .kernel_isa = kernel_isa,
         .options = options_module,
         .dist_providers = &dist_providers,
         .dist_tag = b.fmt("{d}.{d}.{d}-{s}", .{ version.major, version.minor, version.patch, dist_sha }),
@@ -70,7 +84,7 @@ pub fn build(b: *std.Build) void {
     // Stays inert here because nothing imports it.
     const package_module = b.addModule("libstd", .{
         .root_source_file = b.path("main.zig"),
-        .target = modules.kernelAdjustedTarget(modules.package_entry, target, portable),
+        .target = modules.kernelAdjustedTarget(modules.package_entry, target, portable, kernel_isa),
         .optimize = optimize,
     });
     common.attachPackageImports(b, package_module, target, optimize, &ctx);
@@ -79,16 +93,25 @@ pub fn build(b: *std.Build) void {
 
     // Unit blocks pin fast in-process invariants.
     // System interop and contract pins stay in oracles.
+    // std.Build's TestOptions.filters is inert in Zig 0.17 (only the Maker
+    // build system forwards --test-filter), so filtering is module-grained:
+    // the option selects which unit test binaries run, not tests inside one.
+    const test_filter = b.option([]const u8, "test_filter", "Only run unit test binaries whose module name contains the substring");
     const unit_step = b.step("unit", "Run unit-level test blocks");
-    inline for (&.{ modules.interface, modules.checksum, modules.implementations }) |spec| {
-        const test_module = modules.createFor(b, spec, ctx.target, ctx.optimize, &ctx);
-        const unit_tests = b.addTest(.{ .root_module = test_module });
-        const run_unit = b.addRunArtifact(unit_tests);
-        unit_step.dependOn(&run_unit.step);
+    inline for ([_]modules.Module{ modules.interface, modules.checksum, modules.implementations }) |spec| {
+        const selected = test_filter == null or std.mem.indexOf(u8, spec.name, test_filter.?) != null;
+        if (selected) {
+            const test_module = modules.createFor(b, spec, ctx.target, ctx.optimize, &ctx);
+            const unit_tests = b.addTest(.{ .root_module = test_module });
+            const run_unit = b.addRunArtifact(unit_tests);
+            unit_step.dependOn(&run_unit.step);
+        }
     }
     // Runner invariants ride the unit step with library blocks.
-    const micro_tests = b.addTest(.{ .root_module = modules.createFor(b, modules.micro, ctx.target, .debug, &ctx) });
-    unit_step.dependOn(&b.addRunArtifact(micro_tests).step);
+    if (test_filter == null or std.mem.indexOf(u8, modules.micro.name, test_filter.?) != null) {
+        const micro_tests = b.addTest(.{ .root_module = modules.createFor(b, modules.micro, ctx.target, .debug, &ctx) });
+        unit_step.dependOn(&b.addRunArtifact(micro_tests).step);
+    }
 
     // Micro benchmarks run through the time-budgeted runner.
     // Defaults to fast because debug numbers carry no evidence.

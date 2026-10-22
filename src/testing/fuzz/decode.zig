@@ -78,7 +78,7 @@ test "fuzz deflate decode" {
         fn f(_: void, smith: *testing.Smith) anyerror!void {
             try drive(smith, runDeflate);
         }
-    }.f, .{ .corpus = &.{} });
+    }.f, .{ .corpus = &.{corpus.deflate_small[0..]} });
 }
 
 fn runZstd(data: []const u8) anyerror!void {
@@ -94,7 +94,7 @@ test "fuzz zstd decode" {
         fn f(_: void, smith: *testing.Smith) anyerror!void {
             try drive(smith, runZstd);
         }
-    }.f, .{ .corpus = &.{} });
+    }.f, .{ .corpus = &.{corpus.zstd_frame[0..]} });
 }
 
 fn runLz4(data: []const u8) anyerror!void {
@@ -108,7 +108,7 @@ test "fuzz lz4 decode" {
         fn f(_: void, smith: *testing.Smith) anyerror!void {
             try drive(smith, runLz4);
         }
-    }.f, .{ .corpus = &.{} });
+    }.f, .{ .corpus = &.{corpus.lz4_frame[0..]} });
 }
 
 fn runXz(data: []const u8) anyerror!void {
@@ -123,7 +123,7 @@ test "fuzz xz decode" {
         fn f(_: void, smith: *testing.Smith) anyerror!void {
             try drive(smith, runXz);
         }
-    }.f, .{ .corpus = &.{} });
+    }.f, .{ .corpus = &.{corpus.xz_stream[0..]} });
 }
 
 fn runLzmaAlone(data: []const u8) anyerror!void {
@@ -137,7 +137,7 @@ test "fuzz lzma alone decode" {
         fn f(_: void, smith: *testing.Smith) anyerror!void {
             try drive(smith, runLzmaAlone);
         }
-    }.f, .{ .corpus = &.{} });
+    }.f, .{ .corpus = &.{corpus.lzma_alone[0..]} });
 }
 
 fn runBzip2(data: []const u8) anyerror!void {
@@ -155,7 +155,7 @@ test "fuzz bzip2 decode" {
         fn f(_: void, smith: *testing.Smith) anyerror!void {
             try drive(smith, runBzip2);
         }
-    }.f, .{ .corpus = &.{} });
+    }.f, .{ .corpus = &.{corpus.bzip2_stream[0..]} });
 }
 
 fn runSevenZip(data: []const u8) anyerror!void {
@@ -174,7 +174,7 @@ test "fuzz sevenzip header walk" {
         fn f(_: void, smith: *testing.Smith) anyerror!void {
             try drive(smith, runSevenZip);
         }
-    }.f, .{ .corpus = &.{} });
+    }.f, .{ .corpus = &.{corpus.ppmd_sevenzip[0..]} });
 }
 
 fn runZip(data: []const u8) anyerror!void {

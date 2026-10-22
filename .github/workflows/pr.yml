@@ -15,4 +15,4 @@ jobs:
     permissions:
       issues: write
       pull-requests: write
-    uses: rebis-org/Actions/.github/workflows/pr-label-status.yml@8f8e08465891af6fda3a774c5b3a1262b88c9590 # main
+    uses: rebis-org/Actions/.github/workflows/pr-label-status.yml@main

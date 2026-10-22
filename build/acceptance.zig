@@ -166,30 +166,61 @@ fn addAbComparison(b: *std.Build, baseline_exe: *std.Build.Step.Compile, skip_ex
     b.step("oracles_ab", "Compare LZMA encode output between the baseline and skip variants").dependOn(&diff.step);
 }
 
-fn addOracles(b: *std.Build, ctx: *common.Settings, refs: reference.Refs) void {
-    const modules_pair = modules.componentsWithInterface(b, ctx, ctx.target, ctx.target, ctx.optimize);
+const OracleApp = struct {
+    app: AcceptanceApp,
+    modules_pair: modules.Components,
+    c_module: *std.Build.Module,
+    run_ctx: common.Settings,
+};
+
+// The baseline oracle app assembly both entry points share: sanitized ctx
+// variant, translated C module, tool/archive dependency wiring.
+fn baselineOracle(
+    b: *std.Build,
+    ctx: *common.Settings,
+    refs: reference.Refs,
+    sanitize_c: ?std.zig.SanitizeC,
+    exe_name: []const u8,
+    step_name: []const u8,
+    step_description: []const u8,
+    trap_name: []const u8,
+    contract_name: []const u8,
+) OracleApp {
+    var run_ctx = ctx.*;
+    run_ctx.sanitize_c = sanitize_c;
+    if (sanitize_c != null) {
+        run_ctx.host = common.addHostLibrariesWithOptions(b, ctx.target, ctx.optimize, ctx.portable, ctx.options, sanitize_c);
+    }
+
+    const modules_pair = modules.componentsWithInterface(b, &run_ctx, ctx.target, ctx.target, ctx.optimize);
     const c_module = translateCModule(b, ctx.target, ctx.optimize);
-
-    const app = addOracleApp(b, ctx, refs, "oracles", "baseline", modules_pair, c_module, ctx.host, "oracles", "Run the oracle suite against the system libraries");
-
-    const skip_host = skipVariantHostLibraries(b, ctx);
-    const skip_app = addOracleApp(b, ctx, refs, "oracles_skip", "skip", modules_pair, c_module, skip_host, "oracles_skip", "Run the oracle suite against the encode A/B variant slot");
+    const app = addOracleApp(b, &run_ctx, refs, exe_name, "baseline", modules_pair, c_module, run_ctx.host, step_name, step_description);
 
     // Foreign scenarios shell out to the reference CLIs at run time, so the
     // oracles step installs them even when the benchmark never runs.
     refs.dependOnTools(&app.run.step);
+
+    // Each scenario runs in its own process: a contract violation traps, so
+    // the driver and the scenarios cannot share one address space.
+    app.run.step.dependOn(&addTrapRun(b, &run_ctx, ctx.target, ctx.optimize, trap_name).step);
+    app.run.step.dependOn(&addContractCheck(b, modules_pair.interface, modules_pair.components, ctx.target, ctx.optimize, sanitize_c, contract_name, ctx.generated.catalog).step);
+
+    return .{ .app = app, .modules_pair = modules_pair, .c_module = c_module, .run_ctx = run_ctx };
+}
+
+fn addOracles(b: *std.Build, ctx: *common.Settings, refs: reference.Refs) void {
+    const oracle = baselineOracle(b, ctx, refs, ctx.sanitize_c, "oracles", "oracles", "Run the oracle suite against the system libraries", "oracles_trap", "contract_check");
+    const app = oracle.app;
+
+    const skip_host = skipVariantHostLibraries(b, ctx);
+    const skip_app = addOracleApp(b, ctx, refs, "oracles_skip", "skip", oracle.modules_pair, oracle.c_module, skip_host, "oracles_skip", "Run the oracle suite against the encode A/B variant slot");
     refs.dependOnTools(&skip_app.run.step);
 
     addAbComparison(b, app.exe, skip_app.exe, ctx.generated.catalog);
 
-    // Each scenario runs in its own process: a contract violation traps, so the
-    // driver and the scenarios cannot share one address space.
-    app.run.step.dependOn(&addTrapRun(b, ctx, ctx.target, ctx.optimize, "oracles_trap").step);
-    app.run.step.dependOn(&addContractCheck(b, modules_pair.interface, modules_pair.components, ctx.target, ctx.optimize, ctx.sanitize_c, "contract_check", ctx.generated.catalog).step);
-
     const compose_ab_module = b.createModule(.{
         .root_source_file = b.path("src/compose_ab.zig"),
-        .target = modules.withKernelFeatures(ctx.target),
+        .target = modules.withKernelFeatures(ctx.target, ctx.kernel_isa),
         .optimize = ctx.optimize,
     });
     compose_ab_module.addImport("options", ctx.options);
@@ -200,26 +231,15 @@ fn addOracles(b: *std.Build, ctx: *common.Settings, refs: reference.Refs) void {
 }
 
 fn addOraclesUbsan(b: *std.Build, ctx: *common.Settings, refs: reference.Refs) void {
-    // Zig 0.17 ships no ASan runtime, so UBSan is the only implementable sanitizer step.
-    var ubsan_ctx = ctx.*;
-    ubsan_ctx.sanitize_c = .full;
-    ubsan_ctx.host = common.addHostLibrariesWithOptions(b, ctx.target, ctx.optimize, ctx.portable, ctx.options, .full);
-
-    const modules_pair = modules.componentsWithInterface(b, &ubsan_ctx, ctx.target, ctx.target, ctx.optimize);
-    const c_module = translateCModule(b, ctx.target, ctx.optimize);
-
-    const app = addOracleApp(b, &ubsan_ctx, refs, "ubsan", "baseline", modules_pair, c_module, ubsan_ctx.host, "ubsan", "Run the oracle suite with UBSan");
+    const oracle = baselineOracle(b, ctx, refs, .full, "ubsan", "ubsan", "Run the oracle suite with UBSan", "oracles_trap_ubsan", "contract_check_ubsan");
     if (b.option([]const u8, "suite", "Restrict the ubsan oracle run to one suite")) |suite| {
-        app.run.addArg("--suite");
-        app.run.addArg(suite);
+        oracle.app.run.addArg("--suite");
+        oracle.app.run.addArg(suite);
     }
-    refs.dependOnTools(&app.run.step);
-    app.run.step.dependOn(&addTrapRun(b, &ubsan_ctx, ctx.target, ctx.optimize, "oracles_trap_ubsan").step);
-    app.run.step.dependOn(&addContractCheck(b, modules_pair.interface, modules_pair.components, ctx.target, ctx.optimize, .full, "contract_check_ubsan", ctx.generated.catalog).step);
 
     // compose_ab is a throughput gate that flakes under contention, and the
     // sanitizer slowdown would fault it, so this step leaves it out.
-    b.step("oracles_san", "Run all sanitizer suites (ASan is absent: Zig ships no ASan runtime)").dependOn(&app.run.step);
+    b.step("oracles_san", "Run all sanitizer suites (ASan is absent: Zig ships no ASan runtime)").dependOn(&oracle.app.run.step);
 }
 
 fn addBenchmarkApp(
@@ -260,7 +280,7 @@ fn addBenchmark(b: *std.Build, ctx: *common.Settings, refs: reference.Refs) void
     // kernel and no dylib.
     const bypass_module = b.createModule(.{
         .root_source_file = b.path("src/bypass.zig"),
-        .target = modules.withKernelFeatures(ref_target),
+        .target = modules.withKernelFeatures(ref_target, ctx.kernel_isa),
         .optimize = ctx.optimize,
     });
     bypass_module.addImport("options", ctx.options);

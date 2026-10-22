@@ -54,6 +54,34 @@ pub const slices = [_]TargetSlice{
     .{ .arch = .wasm32, .elf_machine = 0, .pe_machine = 0 },
 };
 
+pub fn pickSlices(comptime os_tag: std.Target.Os.Tag, comptime abi: ?std.Target.Abi, comptime arch: ?[]const u8) []const TargetSlice {
+    comptime {
+        const os_arches: []const []const u8 = switch (os_tag) {
+            .linux => if (abi == .musl) &.{ "x86_64", "aarch64", "riscv64" } else if (abi == .ohos) &.{ "x86_64", "aarch64" } else &.{ "x86_64", "aarch64", "riscv64", "loongarch64" },
+            .windows, .freebsd, .openbsd, .macos => &.{ "x86_64", "aarch64" },
+            .wasi => &.{"wasm32"},
+            else => @compileError("no slice table for " ++ @tagName(os_tag)),
+        };
+        var chosen: [slices.len]TargetSlice = undefined;
+        var n: usize = 0;
+        for (&slices) |*slice| {
+            for (os_arches) |name| {
+                if (std.mem.eql(u8, @tagName(slice.arch), name)) {
+                    chosen[n] = slice.*;
+                    n += 1;
+                }
+            }
+        }
+        if (arch) |a| {
+            for (chosen[0..n]) |slice| {
+                if (std.mem.eql(u8, @tagName(slice.arch), a)) return &.{slice};
+            }
+            @compileError("unknown arch: " ++ a);
+        }
+        return chosen[0..n];
+    }
+}
+
 pub fn sliceFor(comptime arch: []const u8) *const TargetSlice {
     comptime {
         for (&slices) |*entry| {
@@ -245,9 +273,13 @@ fn makeForm(comptime provider: []const u8, comptime spec: *const FormSpec, compt
 fn makeEntries(comptime spec: *const FormSpec, comptime arch: ?[]const u8) []const []const u8 {
     const arch_list: []const []const u8 = if (arch) |a| &.{a} else if (spec.arches.len == 0) &.{"universal"} else spec.arches;
     return switch (spec.layout) {
-        .pe => peEntries(arch_list, std.mem.eql(u8, spec.abi.?, "msvc")),
-        .elf => elfEntries(arch_list),
-        .dylib => dylibEntries(arch_list),
+        .pe => libstdEntries(arch_list, &.{
+            "libstd/lib/{s}/std.lib",
+            "libstd/bin/{s}/std.dll",
+            "libstd/import/{s}/" ++ (if (std.mem.eql(u8, spec.abi.?, "msvc")) "std.lib" else "std.dll.a"),
+        }),
+        .elf => libstdEntries(arch_list, &.{ "libstd/lib/{s}/libstd.a", "libstd/lib/{s}/libstd.so" }),
+        .dylib => libstdEntries(arch_list, &.{ "libstd/lib/{s}/libstd.a", "libstd/lib/{s}/libstd.dylib" }),
         .wasi => wasiEntries(),
         .aar => aarEntries(),
         .cjpm => cjpmEntries(),
@@ -262,45 +294,21 @@ const libstd_tree = [_][]const u8{
     "libstd/stdk.catalog.json",
 };
 
-fn peEntries(comptime arch_ids: []const []const u8, comptime msvc: bool) []const []const u8 {
-    const import_name = if (msvc) "std.lib" else "std.dll.a";
-    const entries: [libstd_tree.len + 3 * arch_ids.len][]const u8 = blk: {
-        var list: [libstd_tree.len + 3 * arch_ids.len][]const u8 = undefined;
-        for (libstd_tree, 0..) |entry, i| list[i] = entry;
-        inline for (arch_ids, 0..) |arch_id, index| {
-            list[libstd_tree.len + index * 3] = "libstd/lib/" ++ arch_id ++ "/std.lib";
-            list[libstd_tree.len + index * 3 + 1] = "libstd/bin/" ++ arch_id ++ "/std.dll";
-            list[libstd_tree.len + index * 3 + 2] = "libstd/import/" ++ arch_id ++ "/" ++ import_name;
-        }
-        break :blk list;
-    };
-    return &entries;
-}
-
-fn elfEntries(comptime arch_ids: []const []const u8) []const []const u8 {
-    const entries: [libstd_tree.len + 2 * arch_ids.len][]const u8 = blk: {
-        var list: [libstd_tree.len + 2 * arch_ids.len][]const u8 = undefined;
-        for (libstd_tree, 0..) |entry, i| list[i] = entry;
-        inline for (arch_ids, 0..) |arch_id, index| {
-            list[libstd_tree.len + index * 2] = "libstd/lib/" ++ arch_id ++ "/libstd.a";
-            list[libstd_tree.len + index * 2 + 1] = "libstd/lib/" ++ arch_id ++ "/libstd.so";
-        }
-        break :blk list;
-    };
-    return &entries;
-}
-
-fn dylibEntries(comptime arch_ids: []const []const u8) []const []const u8 {
-    const entries: [libstd_tree.len + 2 * arch_ids.len][]const u8 = blk: {
-        var list: [libstd_tree.len + 2 * arch_ids.len][]const u8 = undefined;
-        for (libstd_tree, 0..) |entry, i| list[i] = entry;
-        inline for (arch_ids, 0..) |arch_id, index| {
-            list[libstd_tree.len + index * 2] = "libstd/lib/" ++ arch_id ++ "/libstd.a";
-            list[libstd_tree.len + index * 2 + 1] = "libstd/lib/" ++ arch_id ++ "/libstd.dylib";
-        }
-        break :blk list;
-    };
-    return &entries;
+// Every libstd layout appends per-arch files from one template list.
+fn libstdEntries(comptime arch_ids: []const []const u8, comptime per_arch: []const []const u8) []const []const u8 {
+    comptime {
+        const entries = blk: {
+            var list: [libstd_tree.len + per_arch.len * arch_ids.len][]const u8 = undefined;
+            for (libstd_tree, 0..) |entry, index| list[index] = entry;
+            for (arch_ids, 0..) |arch_id, index| {
+                for (per_arch, 0..) |template, offset| {
+                    list[libstd_tree.len + index * per_arch.len + offset] = std.fmt.comptimePrint(template, .{arch_id});
+                }
+            }
+            break :blk list;
+        };
+        return &entries;
+    }
 }
 
 fn wasiEntries() []const []const u8 {

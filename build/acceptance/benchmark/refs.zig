@@ -303,7 +303,7 @@ fn addGzip(b: *std.Build, dummy_dir: std.Build.LazyPath) *std.Build.Step.Install
 
 fn addTar(b: *std.Build, dummy_dir: std.Build.LazyPath) *std.Build.Step.InstallFile {
     const check_bison = b.addSystemCommand(&.{ "sh", "-c", "if [ ! -x /opt/homebrew/opt/bison/bin/bison ]; then echo 'GNU tar build requires bison >= 2.4 (for example Homebrew bison); install it and retry' >&2; exit 1; fi" });
-    const make_tar = gnuChain(b, "vendor/tar", dummy_dir, &check_bison.step, &.{ "sh", "-c", "export PATH=\"/opt/homebrew/opt/bison/bin:$PATH\"; exec ./bootstrap --skip-po" }, &.{ "sh", "-c", "export PATH=\"/opt/homebrew/opt/bison/bin:$PATH\"; export CXX=\"${CXX:-c++}\"; exec ./configure --disable-nls" }, &.{ "sh", "-c", "export PATH=\"/opt/homebrew/opt/bison/bin:$PATH\"; exec make -j4 LIBS=-liconv" });
+    const make_tar = gnuChain(b, "vendor/tar", dummy_dir, &check_bison.step, &.{ "sh", "-c", "export PATH=\"/opt/homebrew/opt/bison/bin:$PATH\"; exec ./bootstrap --skip-po" }, &.{ "sh", "-c", "export PATH=\"/opt/homebrew/opt/bison/bin:$PATH\"; export CXX=\"${CXX:-c++}\"; exec ./configure --disable-nls" }, &.{ "sh", "-c", "export PATH=\"/opt/homebrew/opt/bison/bin:$PATH\"; exec make -j4 LIBS=-liconv MAKEINFO=true" });
     return installOut(b, &make_tar.step, "vendor/tar/src/tar", "tar");
 }
 
