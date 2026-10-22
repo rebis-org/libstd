@@ -2,6 +2,7 @@ const std = @import("std");
 
 const checksum = @import("checksum");
 const crypto = @import("crypto");
+const kernels = @import("kernels");
 
 const runner = @import("runner.zig");
 
@@ -35,6 +36,30 @@ const XxHash32Case = HashCase(checksum.XxHash32, .seeded);
 const Sha1Case = HashCase(crypto.Sha1, .crypto);
 const Sha256Case = HashCase(crypto.Sha256, .crypto);
 
+// Drives the shared match-copy ladder across its distance and length
+// branches; the distances stay inside the history the window seeds.
+const CopyMatchCase = struct {
+    window: []u8,
+    pub fn run(self: *const @This(), allocator: std.mem.Allocator) void {
+        _ = allocator;
+        const distances = [_]u32{ 1, 2, 3, 4, 5, 8, 15, 16, 17, 64, 4096, 32768 };
+        const lengths = [_]u32{ 4, 8, 16, 32, 273, 300 };
+        var produced: usize = @min(65536, self.window.len / 2);
+        var mix: usize = 0;
+        outer: while (produced + 400 < self.window.len) {
+            for (distances) |distance| {
+                for (lengths) |length| {
+                    if (produced + length > self.window.len) break :outer;
+                    kernels.copyMatch(self.window, produced, distance, length);
+                    produced += length;
+                    mix += self.window[produced - 1];
+                }
+            }
+        }
+        std.mem.doNotOptimizeAway(mix);
+    }
+};
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
 
@@ -60,8 +85,11 @@ pub fn main(init: std.process.Init) !void {
 
     const input = try allocator.alloc(u8, buffer_len_bytes);
     defer allocator.free(input);
+    const window = try allocator.alloc(u8, buffer_len_bytes);
+    defer allocator.free(window);
     var random = std.Random.DefaultPrng.init(0x5eed);
     random.random().bytes(input);
+    random.random().bytes(window);
 
     var benchmark = runner.Benchmark.init(allocator, config);
     defer benchmark.deinit();
@@ -75,6 +103,7 @@ pub fn main(init: std.process.Init) !void {
     const xxh32_case: XxHash32Case = .{ .input = input };
     const sha1_case: Sha1Case = .{ .input = input };
     const sha256_case: Sha256Case = .{ .input = input };
+    const copy_match_case: CopyMatchCase = .{ .window = window };
 
     const registry = .{
         .{ "checksum.adler32", &adler32_case },
@@ -85,6 +114,7 @@ pub fn main(init: std.process.Init) !void {
         .{ "checksum.xxh64", &xxhash64_case },
         .{ "crypto.sha1", &sha1_case },
         .{ "crypto.sha256", &sha256_case },
+        .{ "kernels.copy_match", &copy_match_case },
     };
     inline for (registry) |entry| {
         if (name_filter == null or std.mem.find(u8, entry[0], name_filter.?) != null) {
@@ -110,6 +140,7 @@ test "micro cases stay runnable without runner" {
     const xxh32_case: XxHash32Case = .{ .input = &scratch };
     const sha1_case: Sha1Case = .{ .input = &scratch };
     const sha256_case: Sha256Case = .{ .input = &scratch };
+    const copy_match_case: CopyMatchCase = .{ .window = &scratch };
 
     adler32_case.run(std.testing.allocator);
     crc32_case.run(std.testing.allocator);
@@ -119,4 +150,5 @@ test "micro cases stay runnable without runner" {
     xxhash64_case.run(std.testing.allocator);
     sha1_case.run(std.testing.allocator);
     sha256_case.run(std.testing.allocator);
+    copy_match_case.run(std.testing.allocator);
 }

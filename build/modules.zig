@@ -17,6 +17,7 @@ pub const Module = struct {
 pub const seam = Module{ .name = "seam", .root = "src/common/primitive/seam.zig" };
 pub const checksum = Module{ .name = "checksum", .root = "src/common/primitive/checksum.zig", .imports = &.{.{ .name = "seam", .module = "seam" }}, .crc_kernel = true };
 pub const crypto = Module{ .name = "crypto", .root = "src/common/primitive/crypto.zig", .imports = &.{.{ .name = "seam", .module = "seam" }} };
+pub const kernels = Module{ .name = "kernels", .root = "src/common/kernels.zig" };
 
 pub const library = Module{ .name = "library", .root = "src/root.zig", .imports = &.{.{ .name = "seam", .module = "seam" }}, .crc_kernel = true };
 // Package-manager entry: the same import closure as the
@@ -65,10 +66,11 @@ pub const micro = Module{
     .imports = &.{
         .{ .name = "checksum", .module = "checksum" },
         .{ .name = "crypto", .module = "crypto" },
+        .{ .name = "kernels", .module = "kernels" },
     },
 };
 
-const importable = [_]Module{ seam, checksum, crypto, library, manifest, package_check, abi_exports, harness, run, oracles, interface, implementations, trap, component, benchmark, micro };
+const importable = [_]Module{ seam, checksum, crypto, kernels, library, manifest, package_check, abi_exports, harness, run, oracles, interface, implementations, trap, component, benchmark, micro };
 
 fn moduleForName(name: []const u8) Module {
     for (importable) |module| {
