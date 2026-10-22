@@ -99,7 +99,8 @@ const LimitedReader = struct {
     }
 
     fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
-        const self: *LimitedReader = @fieldParentPtr("interface", r);
+        // std.Io.Reader aligns below u64 fields on wasm32 and arm32.
+        const self: *LimitedReader = @alignCast(@fieldParentPtr("interface", r));
         if (self.consumed >= self.limit) {
             self.limit_reached = true;
             return error.EndOfStream;
@@ -112,7 +113,8 @@ const LimitedReader = struct {
     }
 
     fn discard(r: *std.Io.Reader, limit: std.Io.Limit) std.Io.Reader.Error!usize {
-        const self: *LimitedReader = @fieldParentPtr("interface", r);
+        // std.Io.Reader aligns below u64 fields on wasm32 and arm32.
+        const self: *LimitedReader = @alignCast(@fieldParentPtr("interface", r));
         if (self.consumed >= self.limit) {
             self.limit_reached = true;
             return error.EndOfStream;
@@ -263,11 +265,13 @@ pub fn trainDictionary(samples: []const []const u8, max_size: usize, output: []u
 
     const train_count = @max(1, samples.len * train_split_numerator / train_split_denominator);
 
-    // Frequency table over the training split.
+    // Frequency table over the training split. Saturating: a corpus past
+    // 2^32 dmers would otherwise overflow-panic; saturation keeps ranking
+    // monotone and the output deterministic at any scale.
     for (samples[0..train_count]) |sample| {
         if (sample.len < train_d) continue;
         for (0..sample.len - train_d + 1) |pos| {
-            freqs[trainHash(provider, sample[pos..][0..train_d])] += 1;
+            freqs[trainHash(provider, sample[pos..][0..train_d])] +|= 1;
         }
     }
 

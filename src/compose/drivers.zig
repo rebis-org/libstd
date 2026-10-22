@@ -124,12 +124,9 @@ fn carveHistory(comptime T: type, storage: []u8, comptime history_len: usize) er
 
 fn restageInflated(inflater: *deflate_seam.Decode, pending: []u8, pending_len: *usize, leftover: *usize, input: []const u8, result: *StepResult) Exception!void {
     const consumed = inflater.streamPosition();
-    // Compact by the logical floor, not the raw position: word-granular
-    // refill over-reads, so bytes past the floor back live accumulator bits
-    // and must survive. The restaged position shifts by the same floor,
-    // keeping inputBitsConsumed relative to the retained span so the
-    // deferred end-of-stream conversion never underflows across a staging
-    // boundary.
+    // Word-granular refill over-reads past the logical floor; those bytes back live
+    // accumulator bits and must survive compaction, or the deferred end-of-stream
+    // conversion underflows across the staging boundary.
     const floor = inflater.inputBitsConsumed() / 8;
     try compactPending(pending, pending_len, floor);
     try appendStaged(pending, pending_len, leftover, input, result);

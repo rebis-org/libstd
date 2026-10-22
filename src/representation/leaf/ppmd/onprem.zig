@@ -551,7 +551,7 @@ const Model = struct {
             while (k < 16) : (k += 1) {
                 const s = &self.tables.see[i][k];
                 s.shift = period_bits - 4;
-                s.summ = @intCast((5 * i + 10) << @as(u6, @intCast(s.shift)));
+                s.summ = @intCast((5 * i + 10) << @as(u5, @intCast(s.shift)));
                 s.count = 4;
             }
         }

@@ -831,12 +831,8 @@ pub fn DecoderOf(comptime slice_input: bool) type {
         }
 
         pub fn resetDictionary(self: *Self) void {
-            // The position state restarts with the dictionary: the SDK zeroes
-            // processedPos on initDic and xz rewinds dict.pos. A constant
-            // position offset is decode-invariant (each position-indexed table
-            // row accumulates the same bit subsequence, rotated), so this is
-            // convention parity; the reference counters double as dictionary
-            // trackers, which this decoder keeps in the ring buffer instead.
+            // The SDK zeroes processedPos on initDic and xz rewinds dict.pos;
+            // the offset is decode-invariant, so this is convention parity.
             self.total_pos = 0;
             if (self.clear_dictionary) {
                 @memset(self.dictionary, 0);

@@ -648,8 +648,9 @@ pub fn encode(entries: []const Entry, output: []u8, scratch: []u8, options: Opti
     var file_key: [file_key_len]u8 = undefined;
     try crypto_prim.fillRandom(&file_key);
     const stanzas = try wrapStanzas(file_key, options, fba.allocator(), scratch[split..]);
-    const header_len = headerSize(options);
-    const payload_len = payloadCiphertextLen(entries[0].data.len);
+    // Both sizes address memory below, so they must fit the target.
+    const header_len: usize = std.math.cast(usize, headerSize(options)) orelse return error.ResourceException;
+    const payload_len: usize = std.math.cast(usize, payloadCiphertextLen(entries[0].data.len)) orelse return error.ResourceException;
     if (!options.armor) {
         const total = header_len + payload_len;
         if (output.len < total) return error.CapacityException;

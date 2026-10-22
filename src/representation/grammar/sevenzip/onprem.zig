@@ -246,7 +246,7 @@ fn packEntry(entry: Entry, provider: crypto.Provider, workspace: *Workspace, lim
             var measure_source = std.Io.Reader.fixed(source);
             _ = std.Io.Reader.streamRemaining(&measure_source, &measure_compressor.writer) catch return error.IoException;
             measure_compressor.finish() catch return error.IoException;
-            const packed_size = counter.written();
+            const packed_size = std.math.cast(usize, counter.written()) orelse return error.ResourceException;
             if (packed_size > limits.encoded_bytes) return error.ResourceException;
             if (source.len + packed_size > limits.codec_work) return error.ResourceException;
             const packed_data = try workspace.take(u8, packed_size);
@@ -630,7 +630,7 @@ pub fn sevenZipInspectOrdinal(archive_bytes: []const u8, workspace: *Workspace, 
 pub fn sevenZipInspectOrdinalEx(archive_bytes: []const u8, workspace: *Workspace, limits: Limits, ordinal: u64, options: *const SevenZipLoadOptions) Exception!Info {
     const loaded = try loadArchive(archive_bytes, workspace, limits, options);
     if (ordinal >= loaded.count) return error.DataException;
-    return loaded.entries[ordinal];
+    return loaded.entries[std.math.cast(usize, ordinal) orelse return error.DataException];
 }
 
 pub fn sevenZipDecodeOrdinal(archive_bytes: []const u8, workspace: *Workspace, limits: Limits, ordinal: u64, output: []u8, decode_options: SevenZipDecodeOptions) Exception!usize {
@@ -644,7 +644,7 @@ pub fn sevenZipDecodeOrdinal(archive_bytes: []const u8, workspace: *Workspace, l
     };
     const loaded = try loadArchive(archive_bytes, workspace, limits, &load_options);
     if (ordinal >= loaded.count) return error.DataException;
-    const entry = loaded.entries[ordinal];
+    const entry = loaded.entries[std.math.cast(usize, ordinal) orelse return error.DataException];
     const size = std.math.cast(usize, entry.size) orelse return error.ResourceException;
     if (output.len < size) return error.CapacityException;
     if (size == 0) return 0;
@@ -1227,15 +1227,15 @@ fn parseFolders(cursor: *binary.ReadCursor, workspace: *Workspace, comptime aes_
         var last_data: ?ParsedCoder = null;
         var bcj2_idx: ?usize = null;
         var filter_present = false;
-        var folder_in_streams: u64 = 0;
-        var folder_out_streams: u64 = 0;
+        var folder_in_streams: usize = 0;
+        var folder_out_streams: usize = 0;
         const coder_in_base = try workspace.take(u64, coder_count);
         const coder_out_base = try workspace.take(u64, coder_count);
         for (coders, 0..) |coder, i| {
             coder_in_base[i] = folder_in_streams;
             coder_out_base[i] = folder_out_streams;
-            folder_in_streams = try bounds.addUsize(folder_in_streams, coder.num_in_streams);
-            folder_out_streams = try bounds.addUsize(folder_out_streams, coder.num_out_streams);
+            folder_in_streams = try bounds.addUsize(folder_in_streams, std.math.cast(usize, coder.num_in_streams) orelse return error.DataException);
+            folder_out_streams = try bounds.addUsize(folder_out_streams, std.math.cast(usize, coder.num_out_streams) orelse return error.DataException);
             if (std.mem.eql(u8, coder.method_id, &method_7z_aes_id)) {
                 if (encrypted) return error.UnsupportedException;
                 encrypted = true;
@@ -1398,7 +1398,9 @@ fn folderSinkOutput(folder: *const Folder) ?usize {
             const global_out = out_index + local;
             var consumed = false;
             for (folder.bonds) |bond| {
-                if (folder.coders[bond.coder_index].num_out_streams == 1 and globalOutputBase(folder, bond.coder_index) == global_out) consumed = true;
+                // The parse bounds coder_index to the coder table, so the cast cannot fail.
+                const bond_index: usize = @intCast(bond.coder_index);
+                if (folder.coders[bond_index].num_out_streams == 1 and globalOutputBase(folder, bond_index) == global_out) consumed = true;
             }
             if (!consumed) {
                 if (unbound != null) return null;

@@ -150,7 +150,7 @@ fn writePad(sink: *io.Sink, offset: u64, alignment: u64) Exception!void {
     const rem = offset % alignment;
     if (rem == 0) return;
     const zeros: [512]u8 = @splat(0);
-    sink.write(zeros[0 .. alignment - rem]) catch return error.CapacityException;
+    sink.write(zeros[0..@as(usize, @intCast(alignment - rem))]) catch return error.CapacityException;
 }
 
 fn writeHex8(sink: *io.Sink, value: u64) Exception!void {
@@ -160,7 +160,7 @@ fn writeHex8(sink: *io.Sink, value: u64) Exception!void {
     var i: usize = 8;
     while (i > 0) {
         i -= 1;
-        buf[i] = digits[v & 0xF];
+        buf[i] = digits[@as(usize, @intCast(v & 0xF))];
         v >>= 4;
     }
     sink.write(&buf) catch return error.CapacityException;

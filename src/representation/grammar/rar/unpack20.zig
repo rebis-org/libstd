@@ -507,13 +507,9 @@ fn unpackLzBlock(st: *Decoder) Exception!void {
     }
 }
 
-// A solid successor skips its own table read, so the encoder can place a table
-// refresh at the very end of the previous file's stream. The reference consumes
-// that refresh here (ReadLastTables) instead of leaving it for the successor,
-// whose bit input starts at its own packed region.
-// The gate mirrors the reference check for five more input bytes, and every
-// error is swallowed, because the reference also treats this as best effort
-// once the declared byte count is complete.
+// A solid successor never re-reads tables, so a refresh may end the previous
+// stream; the reference consumes it here rather than stranding it.
+// Errors are swallowed like the reference: best effort once the byte count completes.
 fn readLastTables(st: *Decoder) void {
     if (st.br.remainingBits() < 40) return;
 

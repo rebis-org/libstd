@@ -2,7 +2,6 @@ const std = @import("std");
 
 const common = @import("common.zig");
 const manifest = @import("manifest.zig");
-const slices = @import("slices.zig");
 
 const android_api_level: u32 = 33;
 
@@ -23,7 +22,7 @@ fn addClassesJar(b: *std.Build) std.Build.LazyPath {
         ,
         "_",  "unused",
     });
-    compile.addFileArg2(b.path("build/templates/android/dev/stdk/StdK.java"), .{});
+    compile.addFileArg2(b.path("build/templates/android/dev/stdk/stdk.java"), .{});
     return compile.addOutputFileArg("classes.jar");
 }
 
@@ -46,10 +45,11 @@ fn addJniBridge(b: *std.Build, library: *std.Build.Step.Compile) void {
     });
 }
 
-pub fn addArchive(
+pub fn addAar(
     b: *std.Build,
     ctx: *const common.Settings,
     distribution: manifest.Distribution,
+    output_name: []const u8,
 ) std.Build.LazyPath {
     const stage = b.addWriteFiles();
     _ = stage.add("AndroidManifest.xml", b.fmt(
@@ -58,15 +58,67 @@ pub fn addArchive(
     ));
     common.stageHeaderCatalog(stage, ctx, distribution);
     _ = stage.addCopyFile(addClassesJar(b), "classes.jar");
-    for (slices.android_abis) |abi| {
+    for (manifest.android_abis) |abi| {
+        // 32-bit arm rides the softfp ABI; the others use the plain android ABI.
         const library = common.addLibrary(b, b.resolveTargetQuery(.{
-            .cpu_arch = abi.arch,
+            .cpu_arch = abi.slice.arch,
             .os_tag = .linux,
-            .abi = .android,
+            .abi = abi.abi,
             .android_api_level = android_api_level,
         }), ctx.optimize, .dynamic, ctx);
         addJniBridge(b, library);
         _ = stage.addCopyFile(library.getEmittedBin(), abi.zip_path);
     }
-    return common.addZipArchive(b, distribution, stage);
+    return common.addZipArchive(b, distribution, stage, output_name);
+}
+
+// [ffi.c] entries name the native library each target links.
+pub fn addArchive(
+    b: *std.Build,
+    ctx: *const common.Settings,
+    distribution: manifest.Distribution,
+    output_name: []const u8,
+) std.Build.LazyPath {
+    const stage = b.addWriteFiles();
+    _ = stage.add("stdk/cjpm.toml", tomlManifest(b, ctx));
+    _ = stage.addCopyFile(b.path("build/templates/cjpm/stdk.cj"), "stdk/src/stdk.cj");
+    common.stageHeaderCatalog(stage, ctx, distribution);
+    for (manifest.ohos_abis) |abi| {
+        const target = b.resolveTargetQuery(.{
+            .cpu_arch = abi.slice.arch,
+            .os_tag = .linux,
+            .abi = .ohos,
+        });
+        inline for ([_]std.lang.LinkMode{ .static, .dynamic }) |linkage| {
+            const library = common.addLibrary(b, target, ctx.optimize, linkage, ctx);
+            const extension = if (linkage == .static) "a" else "so";
+            _ = stage.addCopyFile(library.getEmittedBin(), b.fmt("stdk/libs/{s}/libstd.{s}", .{ abi.triple, extension }));
+        }
+    }
+    return common.addZipArchive(b, distribution, stage, output_name);
+}
+
+fn tomlManifest(b: *std.Build, ctx: *const common.Settings) []const u8 {
+    var text: std.ArrayList(u8) = .empty;
+    text.appendSlice(b.allocator, b.fmt(
+        \\[package]
+        \\  cjc-version = "1.2.0"
+        \\  name = "stdk"
+        \\  description = "Library (for standard) in Zig as a C ABI and platform packages"
+        \\  version = "{d}.{d}.{d}"
+        \\  compile-option = ""
+        \\  link-option = ""
+        \\  output-type = "static"
+        \\  src-dir = "src"
+        \\
+    , .{ ctx.version.major, ctx.version.minor, ctx.version.patch })) catch @panic("the cjpm manifest is out of memory.");
+    for (manifest.ohos_abis) |abi| {
+        text.appendSlice(b.allocator, b.fmt(
+            \\
+            \\[target.{s}.ffi.c]
+            \\  std = {{ path = "libs/{s}" }}
+            \\
+        , .{ abi.triple, abi.triple })) catch @panic("the cjpm target entry is out of memory.");
+    }
+    return text.items;
 }

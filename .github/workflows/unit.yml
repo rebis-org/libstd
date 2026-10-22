@@ -1,0 +1,31 @@
+name: Unit
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: The pinned image label to run on.
+        type: string
+        required: true
+
+jobs:
+  run:
+    name: Unit run (${{ inputs.runner }})
+    runs-on: ${{ inputs.runner }}
+    steps:
+      - name: Point the nested GNU submodules at the mirrors
+        run: |
+          git config --global --add url."https://github.com/rebis-org/".insteadOf https://git.savannah.gnu.org/git/
+          git config --global --add url."https://github.com/rebis-org/".insteadOf git://git.sv.gnu.org/
+      - name: Check out sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+      - name: Install the toolchain
+        uses: jdx/mise-action@9b200bcecbfd6303e69a4a261b2e09e3757440a7 # v5.2.0
+        with:
+          install: true
+      - name: Run the unit suite natively
+        run: zig build unit
+      - name: Build the host libraries
+        run: zig build exe -Doptimize=safe

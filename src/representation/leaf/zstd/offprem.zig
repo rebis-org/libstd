@@ -55,7 +55,7 @@ pub fn decodedSize(input: []const u8, history: []u8, options: onprem.Options) on
     var counter = @import("../../../common/primitive/measurement.zig").Counter.init(null);
     var decoder = std.compress.zstd.Decompress.init(&reader, history, .{ .window_len = options.window_size });
     _ = decoder.reader.streamRemaining(&counter.writer) catch |err| return mapStreamError(err);
-    return counter.written();
+    return std.math.cast(usize, counter.written()) orelse error.ResourceException;
 }
 
 test "offprem zstd decodes byte-identical to onprem across shapes" {

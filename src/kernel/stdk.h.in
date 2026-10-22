@@ -6,9 +6,17 @@
 extern "C" {
 #endif
 @STDK_STATUS@
+// The library forces 8-byte alignment for these words (envelope.zig); the
+// header states the same so 32-bit consumers see one layout. C++ spells the
+// keyword without the underscore.
+#if defined(__cplusplus)
+#define STDK_ALIGNAS alignas
+#else
+#define STDK_ALIGNAS _Alignas
+#endif
 typedef struct stdk_id {
-	uint64_t low;
-	uint64_t high;
+	STDK_ALIGNAS(8) uint64_t low;
+	STDK_ALIGNAS(8) uint64_t high;
 } stdk_id;
 typedef struct stdk_node stdk_node;
 typedef struct stdk_call_envelope stdk_call_envelope;

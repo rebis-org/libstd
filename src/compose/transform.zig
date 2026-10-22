@@ -484,6 +484,7 @@ pub fn zdictHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resour
             error.DataException, error.UnsupportedException, error.ResourceException, error.IoException, error.IntegrityException => |e| return e,
         };
         if (content.len > limits.decoded_bytes) return error.ResourceException;
+        if (input.len + content.len > limits.codec_work) return error.ResourceException;
         if (sink) |sink_resource| {
             try common.checkWorkspaceOverlap(call, source_resource, sink_resource);
             if (!sink_resource.hasCapability(resource.capability_bit_write)) return error.UnsupportedException;

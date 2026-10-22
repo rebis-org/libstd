@@ -5,6 +5,7 @@ const bench_env = @import("acceptance/benchmark/env.zig");
 const checks = @import("checks.zig");
 const dist = @import("dist.zig");
 const common = @import("platform/common.zig");
+const targets = @import("targets.zig");
 const vendor = @import("vendor.zig");
 
 pub const Category = enum {
@@ -12,6 +13,7 @@ pub const Category = enum {
     acceptance,
     vendor,
     checks,
+    targets,
 };
 
 pub const registry = .{
@@ -19,11 +21,13 @@ pub const registry = .{
     .acceptance = .{ .category = Category.acceptance, .units = acceptance.units, .expand = acceptance.expand },
     .distribution = .{ .category = Category.distribution, .units = dist.units, .expand = dist.expand },
     .checks = .{ .category = Category.checks, .units = checks.units, .expand = checks.expand },
+    .targets = .{ .category = Category.targets, .units = targets.units, .expand = targets.expand },
 };
 
 const registry_fields = @typeInfo(@TypeOf(registry)).@"struct";
 
 comptime {
+    @setEvalBranchQuota(100_000);
     for (registry_fields.field_names) |name| {
         if (!@hasField(Category, name)) @compileError("registry field is not a category: " ++ name ++ ".");
         const layer = @field(registry, name);
@@ -44,6 +48,7 @@ pub fn expand(b: *std.Build, ctx: *common.Settings) void {
 
 fn renderList() []const u8 {
     comptime {
+        @setEvalBranchQuota(200_000);
         var out: []const u8 = "";
         for (registry_fields.field_names) |name| {
             const layer = @field(registry, name);
@@ -58,6 +63,7 @@ fn renderList() []const u8 {
 
 fn zigStringLiteral(comptime s: []const u8) []const u8 {
     comptime {
+        @setEvalBranchQuota(200_000);
         var out: []const u8 = "\"";
         for (s) |c| {
             out = out ++ switch (c) {

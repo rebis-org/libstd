@@ -123,7 +123,8 @@ pub fn main(init: std.process.Init) !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     const allocator = arena.allocator();
 
-    var args = std.process.Args.Iterator.init(init.minimal.args);
+    var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
+    defer args.deinit();
     _ = args.next();
     // Each descriptor is a file argument, because a directory argument is unfingerprinted.
     var descriptors: std.ArrayList(ZonDescriptor) = .empty;

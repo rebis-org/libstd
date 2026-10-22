@@ -90,14 +90,10 @@ fn addRender(b: *std.Build, ctx: *common.Settings) void {
 }
 
 fn addPackage(b: *std.Build, ctx: *common.Settings) void {
-    const archives = ctx.archives orelse @panic("the distribution units must expand before the checks units.");
     const package_exe = b.addExecutable(.{ .name = "package", .root_module = modules.create(b, modules.package_check, ctx) });
     const package_run = b.addRunArtifact(package_exe);
-    for (archives) |provider| {
-        inline for (@typeInfo(common.ProviderArchives).@"struct".field_names) |field_name| {
-            if (comptime std.mem.eql(u8, field_name, "name")) continue;
-            package_run.addFileArg2(@field(provider, field_name), .{});
-        }
+    for (ctx.dist_forms) |archive| {
+        package_run.addFileArg2(archive, .{});
     }
     package_run.addFileArg2(ctx.host.dynamic_library.getEmittedBin(), .{});
     b.step("package", "Check the distribution archives").dependOn(&package_run.step);

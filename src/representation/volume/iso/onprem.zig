@@ -600,7 +600,7 @@ pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Exception!usi
     var fba = std.heap.FixedBufferAllocator.init(scratch);
     const plan = try buildIsoPlan(entries, fba.allocator());
     if (output.len < plan.total) return error.CapacityException;
-    @memset(output[0..plan.total], 0);
+    @memset(output[0..@as(usize, @intCast(plan.total))], 0);
     writePvd(output[16 * sector_size ..][0..sector_size], &plan);
     const vdst = output[17 * sector_size ..][0..sector_size];
     @memset(vdst, 0);
@@ -638,12 +638,14 @@ pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Exception!usi
                 serial += 1;
             }
         }
-        @memcpy(output[std.math.mul(u64, plan.dir_lba_of[di], sector_size) catch return error.DataException ..][0..sector_size], &dir);
+        const dir_at: usize = std.math.cast(usize, std.math.mul(u64, plan.dir_lba_of[di], sector_size) catch return error.DataException) orelse return error.DataException;
+        @memcpy(output[dir_at..][0..sector_size], &dir);
     }
     for (plan.file_order, 0..) |ni, fi| {
         const node = &plan.nodes[ni];
         const at = std.math.mul(u64, plan.file_lba_of[fi], sector_size) catch return error.DataException;
-        @memcpy(output[at .. at + node.data.len], node.data);
+        const at_usize: usize = std.math.cast(usize, at) orelse return error.DataException;
+        @memcpy(output[at_usize .. at_usize + node.data.len], node.data);
     }
     return @intCast(plan.total);
 }

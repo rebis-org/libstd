@@ -1158,8 +1158,8 @@ fn copyDictionaryWord(
 
     var buf: [64]u8 = undefined;
     var total: usize = 0;
-    const t = transform_id * 3;
-    const prefix = poolString(dictionary.transforms[t]);
+    const t: usize = std.math.cast(usize, transform_id *% 3) orelse return error.DataException;
+    const prefix = poolString(dictionary.transforms[std.math.cast(usize, t) orelse return error.DataException]);
     if (prefix.len > buf.len) return error.InternalException;
     @memcpy(buf[total..][0..prefix.len], prefix);
     total += prefix.len;

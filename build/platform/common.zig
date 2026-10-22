@@ -104,25 +104,18 @@ pub const Settings = struct {
     generated: Generated,
     host: HostLibraries,
     refs: ?reference.Refs = null,
-    archives: ?[]const ProviderArchives = null,
     portable: bool = false,
     options: *std.Build.Module,
     sanitize_c: ?std.zig.SanitizeC = null,
     dist_providers: []const DistProvider = &.{},
+    dist_forms: []const std.Build.LazyPath = &.{},
+    dist_tag: []const u8 = "",
 };
 
 pub const DistProvider = struct {
     name: []const u8,
     options: *std.Build.Module,
     host: HostLibraries,
-};
-
-pub const ProviderArchives = struct {
-    name: []const u8,
-    host: std.Build.LazyPath,
-    android: std.Build.LazyPath,
-    apple: std.Build.LazyPath,
-    cjpm: std.Build.LazyPath,
 };
 
 pub fn addLibrary(
@@ -234,14 +227,42 @@ pub fn installGenerated(b: *std.Build, generated: Generated) void {
     b.getInstallStep().dependOn(&b.addInstallFile(generated.module_map, "module.modulemap").step);
 }
 
+// pkg-config is the Linux integration currency; the .pc is relocatable via
+// pcfiledir so the archive unpacks anywhere.
+// Every libstd form opens with the same four files; the builders add their
+// architecture payloads on top.
+pub fn beginLibstdStage(b: *std.Build, ctx: *const Settings, distribution: manifest.Distribution) *std.Build.Step.WriteFile {
+    const stage = b.addWriteFiles();
+    stageHeaderCatalog(stage, ctx, distribution);
+    stagePkgConfig(b, stage, ctx);
+    _ = stage.addCopyFile(ctx.generated.module_map, "libstd/include/module.modulemap");
+    return stage;
+}
+
+pub fn stagePkgConfig(b: *std.Build, stage: *std.Build.Step.WriteFile, ctx: *const Settings) void {
+    const content = b.fmt(
+        \\prefix=${{pcfiledir}}/../..
+        \\libdir=${{prefix}}/lib
+        \\includedir=${{prefix}}/include
+        \\
+        \\Name: libstd
+        \\Description: Library (for standard) in Zig as a C ABI and platform packages
+        \\Version: {d}.{d}.{d}
+        \\Libs: -L${{libdir}} -lstd
+        \\Cflags: -I${{includedir}}
+        \\
+    , .{ ctx.version.major, ctx.version.minor, ctx.version.patch });
+    _ = stage.add("libstd/lib/pkgconfig/libstd.pc", content);
+}
+
 pub fn stageHeaderCatalog(stage: *std.Build.Step.WriteFile, ctx: *const Settings, distribution: manifest.Distribution) void {
     _ = stage.addCopyFile(ctx.generated.header, distribution.header);
     _ = stage.addCopyFile(ctx.generated.catalog, distribution.catalog);
 }
 
-pub fn addZipArchive(b: *std.Build, distribution: manifest.Distribution, stage: *std.Build.Step.WriteFile) std.Build.LazyPath {
+pub fn addZipArchive(b: *std.Build, distribution: manifest.Distribution, stage: *std.Build.Step.WriteFile, output_name: []const u8) std.Build.LazyPath {
     const zip = b.addSystemCommand(&.{ "zip", "-qry" });
-    const archive = zip.addOutputFileArg(distribution.archive);
+    const archive = zip.addOutputFileArg(output_name);
     zip.addArg(archiveRoot(distribution));
     zip.setCwd(stage.getDirectory());
     return archive;

@@ -294,12 +294,9 @@ fn rar5BlakeMac(provider: crypto.Provider, digest: *const [32]u8, hash_key: *con
 
 const Rar4Keys = struct { key: [16]u8, iv: [16]u8 };
 
-// The RAR 2.x-4.x KDF needs unrar's SHA-1 variant: sha1_process_rar29 overwrites
-// every full 64-byte block that it hashes directly from the caller's buffer with
-// the transform's final message-schedule words, so later rounds hash a modified
-// RawPsw (vendor sha1.cpp, Steve Reid's public-domain SHA-1). A plain SHA-1 KDF
-// diverges whenever RawPsw plus the internal buffer offset exceeds 127 bytes.
-// This is an algorithm-level port of vendor/unrar/sha1.cpp.
+// SetKey30 hashes a self-modifying RawPsw: each full block hashed in place
+// receives the transform's final schedule words (vendor sha1.cpp).
+// A plain SHA-1 KDF diverges past 127 bytes of buffered state.
 const Rar29Sha1 = struct {
     state: [5]u32,
     count: u64,
@@ -420,9 +417,8 @@ const Rar29Sha1 = struct {
     }
 };
 
-// The RAR 2.x-4.x KDF accumulates SHA1 over RawPsw||round-le24 for 0x40000 rounds
-// through the rar29 SHA-1, takes one IV byte from every 0x4000th digest fork, and
-// uses the UTF-16LE password with salt as RawPsw (vendor crypt3.cpp SetKey30).
+// SetKey30: 0x40000 rar29 rounds over RawPsw||round-le24, an IV byte from every
+// 0x4000th fork, UTF-16LE password with salt as RawPsw (vendor crypt3.cpp).
 fn rar4Kdf(password_utf16le: []const u8, salt: ?[]const u8, opts: DecodeOptions) Exception!Rar4Keys {
     const hash_rounds: u32 = 0x40000;
     if (opts.kdf_rounds_limit != 0 and hash_rounds > opts.kdf_rounds_limit) {
@@ -901,15 +897,9 @@ const Rar4Header = struct {
     enc_len: usize = 0,
 };
 
-// The generic header CRC covers only the bytes that unrar reads into its Raw
-// buffer for the type (ReadHeader15): a CMT block and a MAIN with MHD_COMMENT
-// cover 13 bytes, SIGN and AV are exempt because old producers never set a
-// valid CRC, and an old-service UO header is exempt because its CRC spans
-// string fields beyond head_size. Everything else covers the full header.
-// The returned value is the Raw size, CRC field included; the check covers
-// coverage - 2 bytes after the CRC field, like unrar's GetCRC15. A returned
-// coverage of 0 exempts the block. `source` is the archive at `offset` for
-// cleartext blocks, or the decrypted staging at 0 for -hp blocks.
+// GetCRC15 covers the bytes ReadHeader15 actually reads: 13 for CMT and
+// comment-bearing MAIN, nothing for SIGN/AV and old-service UO, else all.
+// 0 exempts; `source` is the archive at `offset` or staging at 0 for -hp.
 fn rar4CrcCoverage(header_type: u8, flags: u16, head_size: u16, source: []const u8, offset: usize) usize {
     return switch (header_type) {
         rar4_sign, rar4_av => 0,
@@ -921,11 +911,8 @@ fn rar4CrcCoverage(header_type: u8, flags: u16, head_size: u16, source: []const 
     };
 }
 
-// The add-size at offset 7 is read unconditionally for FILE, SERVICE, PROTECT,
-// and OLDSERVICE; MAIN, CMT, and ENDARC never read it, and every remaining type
-// (MARK, SIGN, AV, unknown) reads it only under LONG_BLOCK. In every case where
-// it is read, unrar's switch adds it to the next-block position. A header
-// shorter than 11 bytes reads nothing, like an overrun of unrar's Raw buffer.
+// ReadHeader15 reads add-size at offset 7 for FILE/SERVICE/PROTECT/OLDSERVICE,
+// never for MAIN/CMT/ENDARC, else only under LONG_BLOCK; under 11 bytes, nothing.
 fn rar4DataSize(header_type: u8, flags: u16, head_size: u16, source: []const u8, offset: usize) u64 {
     const reads_add = switch (header_type) {
         rar4_file, rar4_service, rar4_protect, rar4_old_service => true,
@@ -1038,11 +1025,8 @@ fn parseRar4File(archive: []const u8, header: Rar4Header) Exception!Rar4File {
     };
 }
 
-// The -hp header-cryption state: the UTF-16LE password bytes and the keys
-// derived from them. Every encrypted block carries its own 8-byte salt and
-// restarts CBC from the KDF IV (unrar SetCryptKeys per block), so the keys are
-// re-derived only when the salt actually changes; a real archive repeats one
-// salt throughout, and the memo pays the KDF once per walk.
+// Per-block salts re-key lazily: archives repeat one salt, so the memo pays
+// the 0x40000-round KDF once per walk, not per header.
 const Rar4HeaderCrypt = struct {
     utf16: [2 * 512]u8,
     utf16_len: usize,
@@ -1051,10 +1035,8 @@ const Rar4HeaderCrypt = struct {
     keys: Rar4Keys = undefined,
 };
 
-// A -hp encrypted block is [an 8-byte salt][AES-128-CBC of the header, padded
-// to 16]. The 7-byte fixed header sits inside the ciphertext, so the first
-// cipher block is decrypted alone and the size read comes from the staging
-// copy; the remaining blocks chain from the first ciphertext block.
+// Each -hp block salts and re-keys independently (vendor SetCryptKeys), so CBC
+// restarts from the KDF IV and the 7-byte fixed header decrypts alone.
 fn parseRar4HeaderEncrypted(
     archive: []const u8,
     offset: usize,
@@ -1344,10 +1326,8 @@ fn entryPayload(entry: Entry, archive: []const u8, opts: DecodeOptions, bufs: *D
     return bufs.packed_stage[0..payload.len];
 }
 
-// One replay drives one unpacker through the whole solid chain, so the chain
-// must map to a single unpacker: 20 and 26 share Unpack20, 29 and 36 share
-// Unpack29, but 50 and 70 differ in the huffman table size. Vendor switches
-// per file; a chain that mixes classes is refused instead of misdecoded.
+// One replay drives one session built from the target's tables, and table sizes
+// differ per version class: a mixed solid chain is refused, never misdecoded.
 fn versionClass(version: u8) u8 {
     return switch (version) {
         20, 26 => 20,

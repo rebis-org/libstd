@@ -9,7 +9,10 @@ const merkle = @import("../merkle.zig");
 // FIPS 180-4.
 // The scalar arm serves featureless targets and the portable flag.
 
-const has_x86sha = !options.sha256_portable and builtin.target.cpu.arch == .x86_64 and builtin.zig_backend != .stage2_c and builtin.target.cpu.hasAll(.x86, &.{ .sha, .avx2 });
+// x86_64 macOS survives only under Rosetta, which reports SHA-NI in CPUID
+// but raises #UD on sha256rnds2; no Intel Mac shipped the extension.
+const has_x86sha = !options.sha256_portable and builtin.target.cpu.arch == .x86_64 and
+    builtin.os.tag != .macos and builtin.zig_backend != .stage2_c and builtin.target.cpu.hasAll(.x86, &.{ .sha, .avx2 });
 const has_arm8sha256 = !options.sha256_portable and builtin.target.cpu.arch == .aarch64 and
     builtin.zig_backend != .stage2_c and builtin.target.cpu.has(.aarch64, .sha2);
 

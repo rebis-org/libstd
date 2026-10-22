@@ -1,6 +1,6 @@
 # libstd
 
-Library (for standard) in Zig as XCFramework, cjpm and AAR
+Library (for standard) in Zig as a C ABI and platform packages
 
 > [!WARNING]
 > This project is an experimental implementation and should be treated as such in production environments.

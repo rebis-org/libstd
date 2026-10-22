@@ -858,10 +858,10 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
             lit_freq[256] = 1;
             for (tokens) |token| {
                 if (token & token_literal != 0) {
-                    lit_freq[token & 0xFF] += 1;
+                    lit_freq[@as(usize, @intCast(token & 0xFF))] += 1;
                 } else {
-                    const li = lengthIndexFor(((token >> 16) & 0xFFFF) + min_match);
-                    const di = distIndexFor((token & 0xFFFF) + 1);
+                    const li = lengthIndexFor(@as(usize, @intCast((token >> 16) & 0xFFFF)) + min_match);
+                    const di = distIndexFor(@as(usize, @intCast(token & 0xFFFF)) + 1);
                     lit_freq[257 + @as(usize, li)] += 1;
                     dist_freq[di] += 1;
                     extra_sum += config.length_extra[li] + config.dist_extra[di];
@@ -959,11 +959,11 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
         fn emitTokens(c: *@This(), tokens: []const u64, lit_codes: []const u16, lit_lengths: []const u8, dist_codes: []const u16, dist_lengths: []const u8) std.Io.Writer.Error!void {
             for (tokens) |token| {
                 if (token & token_literal != 0) {
-                    const symbol: usize = token & 0xFF;
+                    const symbol: usize = @intCast(token & 0xFF);
                     try c.writeBits(lit_codes[symbol], lit_lengths[symbol]);
                 } else {
-                    const length = ((token >> 16) & 0xFFFF) + min_match;
-                    const distance = (token & 0xFFFF) + 1;
+                    const length: usize = @intCast(((token >> 16) & 0xFFFF) + min_match);
+                    const distance: usize = @intCast((token & 0xFFFF) + 1);
                     const li = lengthIndexFor(length);
                     const di = distIndexFor(distance);
                     try c.writeBits(lit_codes[257 + @as(usize, li)], lit_lengths[257 + @as(usize, li)]);

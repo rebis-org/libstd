@@ -419,7 +419,7 @@ fn TableCrc(comptime T: type, comptime poly: T, comptime reflected: bool) type {
                     i += 4;
                 }
                 while (i < input.len) : (i += 1) {
-                    crc = (crc >> 8) ^ table[(crc ^ input[i]) & 0xff];
+                    crc = (crc >> 8) ^ table[@as(usize, @intCast((crc ^ input[i]) & 0xff))];
                 }
                 self.state = crc;
             } else {
