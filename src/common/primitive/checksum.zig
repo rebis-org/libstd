@@ -116,6 +116,18 @@ inline fn loadLane(bytes: *const [16]u8) crc_lane {
     return lane.*;
 }
 
+// CRC-32/BZIP2 is the bit reflection of CRC-32/ZIP: rev32(zipStep(rev32(R), rbit8(b)))
+// equals the bzip2 step for every register and byte, so the bzip2 state rides the
+// reflected fold in the zip domain with per-byte bit-reversed data and one rev32
+// at each boundary. RBIT reverses the bits of every byte in one instruction.
+inline fn loadLaneRbit(bytes: *const [16]u8) crc_lane {
+    const lane: *align(1) const crc_lane = @ptrCast(bytes);
+    return asm ("rbit %[ret].16b, %[a].16b"
+        : [ret] "=x" (-> crc_lane),
+        : [a] "x" (lane.*),
+    );
+}
+
 fn crc32Aarch64Scalar(crc_in: u32, input: []const u8) u32 {
     var crc = crc_in;
     var data = input;
@@ -141,7 +153,31 @@ const Crc32Aarch64Tail = struct {
     inline fn word(crc: u32, data: u64) u32 {
         return crc32x(crc, data);
     }
+
+    const data_word = word;
 };
+
+// CRC-32/BZIP2 rides the reflected fold in the zip domain: original data is
+// bit-reversed per byte on the way in (lanes and data words), while the fold's
+// drained state is raw and stays plain.
+const Bzip2Aarch64Tail = struct {
+    const folds_16_byte_lanes = true;
+
+    inline fn byte(crc: u32, data: u8) u32 {
+        return crc32b(crc, @bitReverse(data));
+    }
+
+    inline fn word(crc: u32, data: u64) u32 {
+        return crc32x(crc, data);
+    }
+
+    inline fn data_word(crc: u32, data: u64) u32 {
+        return crc32x(crc, @bitReverse(@byteSwap(data)));
+    }
+};
+
+const has_bzip2_pmull = builtin.target.cpu.arch == .aarch64 and
+    builtin.target.cpu.has(.aarch64, .aes) and !options.bzip2crc32_portable;
 
 const FoldK = struct { k0: crc_lane, k1: crc_lane, k2: crc_lane, k3: crc_lane };
 
@@ -150,7 +186,8 @@ const FoldK = struct { k0: crc_lane, k1: crc_lane, k2: crc_lane, k3: crc_lane };
 // costs a fixed setup that short inputs never repay. The tail re-enters the
 // folded state and drains the remainder: hardware CRC steps on aarch64,
 // table steps where no such instruction exists.
-fn crcFold(comptime T: type, comptime K: FoldK, crc_in: T, input: []const u8, comptime Tail: type) T {
+fn crcFold(comptime T: type, comptime K: FoldK, crc_in: T, input: []const u8, comptime Tail: type, comptime reversed_loads: bool) T {
+    const load = if (reversed_loads) loadLaneRbit else loadLane;
     var crc = crc_in;
     var data = input;
     while (data.len != 0 and @intFromPtr(data.ptr) & 15 != 0) {
@@ -160,13 +197,13 @@ fn crcFold(comptime T: type, comptime K: FoldK, crc_in: T, input: []const u8, co
     if (data.len >= 128) {
         var lanes: [8]crc_lane = undefined;
         for (0..8) |i| {
-            lanes[i] = loadLane(data[i * 16 ..][0..16]);
+            lanes[i] = load(data[i * 16 ..][0..16]);
         }
         lanes[0][0] ^= crc;
         data = data[128..];
         while (data.len >= 128) {
             for (0..8) |i| {
-                lanes[i] = foldLane(lanes[i], loadLane(data[i * 16 ..][0..16]), K.k3);
+                lanes[i] = foldLane(lanes[i], load(data[i * 16 ..][0..16]), K.k3);
             }
             data = data[128..];
         }
@@ -183,13 +220,13 @@ fn crcFold(comptime T: type, comptime K: FoldK, crc_in: T, input: []const u8, co
     if (data.len >= 64) {
         var lanes: [4]crc_lane = undefined;
         for (0..4) |i| {
-            lanes[i] = loadLane(data[i * 16 ..][0..16]);
+            lanes[i] = load(data[i * 16 ..][0..16]);
         }
         lanes[0][0] ^= crc;
         data = data[64..];
         while (data.len >= 64) {
             for (0..4) |i| {
-                lanes[i] = foldLane(lanes[i], loadLane(data[i * 16 ..][0..16]), K.k0);
+                lanes[i] = foldLane(lanes[i], load(data[i * 16 ..][0..16]), K.k0);
             }
             data = data[64..];
         }
@@ -201,11 +238,11 @@ fn crcFold(comptime T: type, comptime K: FoldK, crc_in: T, input: []const u8, co
     }
     if (comptime Tail.folds_16_byte_lanes) {
         if (data.len >= 16) {
-            var lane = loadLane(data[0..16]);
+            var lane = load(data[0..16]);
             lane[0] ^= crc;
             data = data[16..];
             while (data.len >= 16) {
-                lane = foldLane(lane, loadLane(data[0..16]), K.k1);
+                lane = foldLane(lane, load(data[0..16]), K.k1);
                 data = data[16..];
             }
             crc = Tail.word(0, lane[0]);
@@ -213,7 +250,7 @@ fn crcFold(comptime T: type, comptime K: FoldK, crc_in: T, input: []const u8, co
         }
     }
     while (data.len >= 8) {
-        crc = Tail.word(crc, std.mem.readInt(u64, data[0..8], .little));
+        crc = Tail.data_word(crc, std.mem.readInt(u64, data[0..8], .little));
         data = data[8..];
     }
     for (data) |byte| crc = Tail.byte(crc, byte);
@@ -233,6 +270,8 @@ fn Crc32TableTail(comptime tables: *const [8][256]u32) type {
         inline fn word(crc: u32, data: u64) u32 {
             return fold8(u32, tables, true, crc, &std.mem.toBytes(data));
         }
+
+        const data_word = word;
     };
 }
 
@@ -247,6 +286,8 @@ fn Crc64Tail(comptime tables: *const [8][256]u64) type {
         inline fn word(crc: u64, data: u64) u64 {
             return fold8(u64, tables, true, crc, &std.mem.toBytes(data));
         }
+
+        const data_word = word;
     };
 }
 
@@ -375,7 +416,7 @@ fn TableCrc(comptime T: type, comptime poly: T, comptime reflected: bool) type {
             if (comptime T == u32 and reflected) {
                 if (comptime has_crc32_kernel) {
                     if (input.len >= crc_pmull_threshold and comptime has_crc32_pmull) {
-                        self.state = crcFold(u32, crc32_fold_k, self.state, input, Crc32Aarch64Tail);
+                        self.state = crcFold(u32, crc32_fold_k, self.state, input, Crc32Aarch64Tail, false);
                     } else {
                         self.state = crc32Aarch64Scalar(self.state, input);
                     }
@@ -383,7 +424,7 @@ fn TableCrc(comptime T: type, comptime poly: T, comptime reflected: bool) type {
                 }
                 if (comptime has_crc32_clmul) {
                     if (input.len >= crc_pmull_threshold) {
-                        self.state = crcFold(u32, crc32_fold_k, self.state, input, Crc32TableTail(&tables));
+                        self.state = crcFold(u32, crc32_fold_k, self.state, input, Crc32TableTail(&tables), false);
                         return;
                     }
                 }
@@ -405,7 +446,7 @@ fn TableCrc(comptime T: type, comptime poly: T, comptime reflected: bool) type {
             if (comptime reflected) {
                 if (comptime T == u64 and (has_crc64_pmull or has_crc64_clmul)) {
                     if (input.len >= crc_pmull_threshold) {
-                        self.state = crcFold(u64, crc64_fold_k, self.state, input, Crc64Tail(&tables));
+                        self.state = crcFold(u64, crc64_fold_k, self.state, input, Crc64Tail(&tables), false);
                         return;
                     }
                 }
@@ -423,6 +464,12 @@ fn TableCrc(comptime T: type, comptime poly: T, comptime reflected: bool) type {
                 }
                 self.state = crc;
             } else {
+                if (comptime has_bzip2_pmull) {
+                    if (input.len >= crc_pmull_threshold) {
+                        self.state = @bitReverse(crcFold(u32, crc32_fold_k, @bitReverse(self.state), input, Bzip2Aarch64Tail, true));
+                        return;
+                    }
+                }
                 var crc = self.state;
                 var i: usize = 0;
                 while (i + 8 <= input.len) : (i += 8) {
