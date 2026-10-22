@@ -176,7 +176,11 @@ const Bzip2Aarch64Tail = struct {
     }
 };
 
+// The fold needs PMULL (aes) and the tail drains through the crc32
+// instructions, so both features must be present; iOS baseline (apple_a7)
+// carries aes without crc.
 const has_bzip2_pmull = builtin.target.cpu.arch == .aarch64 and
+    builtin.target.cpu.has(.aarch64, .crc) and
     builtin.target.cpu.has(.aarch64, .aes) and !options.bzip2crc32_portable;
 
 const FoldK = struct { k0: crc_lane, k1: crc_lane, k2: crc_lane, k3: crc_lane };
