@@ -193,6 +193,291 @@ pub fn encode(entries: []const Entry, archive_comment: []const u8, output: []u8,
     return sink.offset;
 }
 
+pub const SpannedResult = struct { total_len: usize, volumes: u64 };
+
+const spanning_signature: u32 = 0x0807_4b50;
+
+// Split/spanned writer (Info-ZIP "zip -s" conventions, verified against
+// the system zip and 7zz): the byte stream stays contiguous; disk 1 opens
+// with the 4-byte spanning signature, record headers never straddle a disk
+// boundary (file data may), the central directory and EOCD live on the
+// last disk, the EOCD's central offset is relative to that disk's start,
+// and each central record names its local header's disk with an offset
+// relative to that disk's start.
+pub fn encodeSpanned(entries: []const Entry, archive_comment: []const u8, output: []u8, volume_size: u64, provider: crypto.Provider, history: []u8, measurement_buffer: []u8, staging: []u8, scratch: []u8, failure_cause: *crypto.FailureCause, plan_scratch: []usize) Exception!SpannedResult {
+    if (volume_size < 4096) return error.CallException;
+    const vs: usize = std.math.cast(usize, volume_size) orelse return error.ResourceException;
+    const required = try requiredSize(entries, archive_comment, history, measurement_buffer, scratch, failure_cause);
+    const total = try bounds.addUsize(required, 4);
+    if (output.len < total) return error.CapacityException;
+
+    // Plan the disks: walk the logical records, filling each disk up to
+    // its capacity and splitting only inside file data regions.
+    if (plan_scratch.len < entries.len * 2 + 8) return error.CapacityException;
+    const boundaries = plan_scratch;
+    var boundary_count: usize = 0;
+    var pos: usize = 0; // logical position, signature excluded
+    var remaining: usize = vs - 4;
+    var central_disk_start: usize = 0;
+    var central_total: usize = 0;
+    for (entries) |entry| {
+        const compressed = try compressedSize(entry, history, measurement_buffer, scratch);
+        const overhead = try aesOverhead(entry);
+        const stored = try bounds.addUsize(compressed, overhead);
+        const descriptor = entry.flags & 0x0008 != 0 and !(entry.encrypted and !entry.zipcrypto);
+        const header_len = try bounds.addUsize(30 + entry.name.len + entry.extra.len + (if (entry.encrypted and !entry.zipcrypto) winzip_aes_extra_record_length else 0), localZip64Length(stored, entry.data.len, descriptor));
+        const record_len = try bounds.addUsize(header_len, try bounds.addUsize(stored, dataDescriptorLength(stored, entry.data.len, descriptor)));
+        central_total = try bounds.addUsize(central_total, 46 + entry.name.len + entry.extra.len + (if (entry.encrypted and !entry.zipcrypto) winzip_aes_extra_record_length else 0) + entry.comment.len + centralZip64Length(stored, entry.data.len, pos));
+        if (record_len <= remaining) {
+            pos = try bounds.addUsize(pos, record_len);
+            remaining -= record_len;
+            continue;
+        }
+        if (header_len < remaining and stored > 0) {
+            // Header fits; the data fills this disk and continues raw on
+            // the next one (no per-continuation marker, like zip -s).
+            pos = try bounds.addUsize(pos, header_len);
+            remaining -= header_len;
+            var data_left = stored;
+            while (data_left > remaining) {
+                data_left -= remaining;
+                pos = try bounds.addUsize(pos, remaining);
+                boundaries[boundary_count] = pos;
+                boundary_count += 1;
+                remaining = vs;
+            }
+            pos = try bounds.addUsize(pos, data_left);
+            remaining -= data_left;
+            pos = try bounds.addUsize(pos, dataDescriptorLength(stored, entry.data.len, descriptor));
+            remaining -= dataDescriptorLength(stored, entry.data.len, descriptor);
+            continue;
+        }
+        // The whole record moves to the next disk.
+        boundaries[boundary_count] = pos;
+        boundary_count += 1;
+        remaining = vs;
+        if (record_len <= remaining) {
+            pos = try bounds.addUsize(pos, record_len);
+            remaining -= record_len;
+            continue;
+        }
+        return error.ResourceException; // one record larger than a whole disk
+    }
+    const eocd_len = 22 + archive_comment.len + blk: {
+        const needs_zip64 = entries.len >= std.math.maxInt(u16) or central_total >= std.math.maxInt(u32) or pos >= std.math.maxInt(u32);
+        break :blk @as(usize, if (needs_zip64) 76 else 0);
+    };
+    if (try bounds.addUsize(central_total, eocd_len) > remaining) {
+        boundaries[boundary_count] = pos;
+        boundary_count += 1;
+    }
+    central_disk_start = boundaries[boundary_count - 1];
+
+    // Emit: signature, then the ordinary single-volume encode shifted by 4.
+    std.mem.writeInt(u32, output[0..4], spanning_signature, .little);
+    const written = try encode(entries, archive_comment, output[4..], provider, history, measurement_buffer, staging, scratch, failure_cause);
+    if (written != required) return error.InternalException;
+
+    // Local header offsets in the central directory were written relative
+    // to the shifted base (signature excluded). The spanning convention
+    // (verified against Info-ZIP): the record's disk number names the disk
+    // holding the local header, and the offset is relative to that disk's
+    // first byte. Disk 0 starts at archive offset 0 (signature included);
+    // disk d starts right after the signature plus the preceding boundaries.
+    {
+        var cursor: usize = 4 + pos;
+        for (entries) |_| {
+            if (readU32(output, cursor) != central_signature) return error.InternalException;
+            const name_length = readU16(output, cursor + 28);
+            const extra_length = readU16(output, cursor + 30);
+            const comment_length = readU16(output, cursor + 32);
+            const header_disk_u16 = readU16(output, cursor + 34);
+            if (header_disk_u16 == std.math.maxInt(u16)) return error.UnsupportedException;
+            const rel = readU32(output, cursor + 42);
+            const absolute = if (rel != std.math.maxInt(u32)) try bounds.addUsize(rel, 4) else blk: {
+                var field: usize = cursor + 46 + name_length;
+                const extra_end = field + extra_length;
+                var found = false;
+                var wide: usize = 0;
+                while (field + 4 <= extra_end) {
+                    const tag = readU16(output, field);
+                    const size = readU16(output, field + 2);
+                    if (field + 4 + size > extra_end) break;
+                    if (tag == 0x0001) {
+                        var value_offset = field + 4;
+                        if (readU32(output, cursor + 20) == std.math.maxInt(u32)) value_offset += 8; // uncompressed
+                        if (readU32(output, cursor + 24) == std.math.maxInt(u32)) value_offset += 8; // compressed
+                        if (value_offset + 8 > field + 4 + size) return error.InternalException;
+                        wide = value_offset;
+                        found = true;
+                        break;
+                    }
+                    field += 4 + size;
+                }
+                if (!found) return error.InternalException;
+                break :blk std.math.cast(usize, readU64(output, wide)) orelse return error.ResourceException;
+            };
+            // Locate the disk holding the local header and convert.
+            var disk: usize = 0;
+            for (boundaries[0..boundary_count], 0..) |boundary, i| {
+                if (absolute >= 4 + boundary) disk = i + 1 else break;
+            }
+            const disk_start: usize = if (disk == 0) 0 else 4 + boundaries[disk - 1];
+            const relative = absolute - disk_start;
+            if (disk > std.math.maxInt(u16)) return error.UnsupportedException;
+            std.mem.writeInt(u16, output[cursor + 34 ..][0..2], @intCast(disk), .little);
+            if (rel != std.math.maxInt(u32)) {
+                if (relative >= std.math.maxInt(u32)) return error.ResourceException;
+                std.mem.writeInt(u32, output[cursor + 42 ..][0..4], @intCast(relative), .little);
+            } else {
+                // The spilled zip64 offset keeps its slot; only the value narrows.
+                var field: usize = cursor + 46 + name_length;
+                const extra_end = field + extra_length;
+                var patched = false;
+                while (field + 4 <= extra_end) {
+                    const tag = readU16(output, field);
+                    const size = readU16(output, field + 2);
+                    if (field + 4 + size > extra_end) break;
+                    if (tag == 0x0001) {
+                        var value_offset = field + 4;
+                        if (readU32(output, cursor + 20) == std.math.maxInt(u32)) value_offset += 8; // uncompressed
+                        if (readU32(output, cursor + 24) == std.math.maxInt(u32)) value_offset += 8; // compressed
+                        if (value_offset + 8 > field + 4 + size) return error.InternalException;
+                        std.mem.writeInt(u64, output[value_offset..][0..8], relative, .little);
+                        patched = true;
+                        break;
+                    }
+                    field += 4 + size;
+                }
+                if (!patched) return error.InternalException;
+            }
+            cursor += 46 + name_length + extra_length + comment_length;
+        }
+    }
+
+    // Patch the EOCD (and zip64 EOCD when present) disk fields.
+    const disks: u64 = boundary_count + 1;
+    const eocd_pos = total - 22 - archive_comment.len;
+    const end_pos = eocd_pos - eocd_len + 22; // start of EOCD (zip64 records precede)
+    if (readU32(output, eocd_pos) != end_signature) return error.InternalException;
+    const needs_zip64 = eocd_len != 22;
+    if (entries.len >= std.math.maxInt(u16) or disks > std.math.maxInt(u16)) return error.UnsupportedException;
+    const central_logical = 4 + pos;
+    const central_offset_value = central_logical - (4 + central_disk_start);
+    if (!needs_zip64) {
+        std.mem.writeInt(u16, output[eocd_pos + 4 ..][0..2], @intCast(disks - 1), .little);
+        std.mem.writeInt(u16, output[eocd_pos + 6 ..][0..2], @intCast(disks - 1), .little);
+        std.mem.writeInt(u16, output[eocd_pos + 8 ..][0..2], @intCast(entries.len), .little);
+        std.mem.writeInt(u32, output[eocd_pos + 16 ..][0..4], std.math.cast(u32, central_offset_value) orelse return error.ResourceException, .little);
+    } else {
+        if (readU32(output, end_pos) != zip64_end_signature) return error.InternalException;
+        std.mem.writeInt(u32, output[end_pos + 16 ..][0..4], @intCast(disks - 1), .little);
+        std.mem.writeInt(u32, output[end_pos + 20 ..][0..4], @intCast(disks - 1), .little);
+        std.mem.writeInt(u64, output[end_pos + 24 ..][0..8], entries.len, .little);
+        std.mem.writeInt(u64, output[end_pos + 32 ..][0..8], entries.len, .little);
+        std.mem.writeInt(u64, output[end_pos + 48 ..][0..8], central_offset_value, .little);
+        const locator = end_pos + 56;
+        if (readU32(output, locator) != zip64_locator_signature) return error.InternalException;
+        std.mem.writeInt(u32, output[locator + 4 ..][0..4], @intCast(disks - 1), .little);
+        std.mem.writeInt(u16, output[eocd_pos + 4 ..][0..2], std.math.maxInt(u16), .little);
+        std.mem.writeInt(u16, output[eocd_pos + 6 ..][0..2], std.math.maxInt(u16), .little);
+        std.mem.writeInt(u16, output[eocd_pos + 8 ..][0..2], std.math.maxInt(u16), .little);
+    }
+    return .{ .total_len = total, .volumes = disks };
+}
+
+// Splits a spanned archive into its disk extents (all but the last are
+// exactly volume_size bytes).
+pub fn spannedVolumeExtents(total_len: usize, volume_size: u64) Exception!VolumePlan {
+    if (volume_size == 0) return error.CallException;
+    const vs: usize = std.math.cast(usize, volume_size) orelse return error.ResourceException;
+    if (total_len <= vs) return .{ .volumes = 1 };
+    return .{ .volumes = (total_len + vs - 1) / vs };
+}
+
+pub const VolumePlan = struct { volumes: u64 };
+
+// Reads a spanned archive given its disks. The disks concatenate into the
+// caller's join buffer; the EOCD's central offset is resolved relative to
+// the disk holding the central directory, and each record's local header
+// offset is resolved relative to the disk named by its disk-number field
+// (the Info-ZIP convention, verified against the system zip and 7zz).
+pub fn zipDecodeOrdinalSpanned(volumes: []const []const u8, ordinal: usize, output: []u8, join: []u8, disk_starts_scratch: []usize, options: ZipDecodeOptions) Exception!usize {
+    options.failure_cause.* = .none;
+    if (volumes.len == 0) return error.DataException;
+    var total: usize = 0;
+    for (volumes) |v| total = try bounds.addUsize(total, v.len);
+    if (join.len < total) return error.CapacityException;
+    if (disk_starts_scratch.len < volumes.len) return error.CapacityException;
+    const disk_starts = disk_starts_scratch[0..volumes.len];
+    var at: usize = 0;
+    for (volumes, 0..) |v, i| {
+        disk_starts[i] = at;
+        @memcpy(join[at..][0..v.len], v);
+        at += v.len;
+    }
+    const archive = join[0..total];
+    if (readU32(archive, 0) != spanning_signature) return error.DataException;
+
+    // EOCD scan over the tail (same walk as the single-volume reader).
+    if (archive.len < 22) return error.DataException;
+    const earliest = if (archive.len > 22 + std.math.maxInt(u16)) archive.len - (22 + std.math.maxInt(u16)) else 0;
+    var position = archive.len - 22;
+    var eocd_pos: ?usize = null;
+    while (true) {
+        if (readU32(archive, position) == end_signature) {
+            const comment = readU16(archive, position + 20);
+            if (position + 22 + comment == archive.len) {
+                eocd_pos = position;
+                break;
+            }
+        }
+        if (position == earliest) break;
+        position -= 1;
+    }
+    const eocd = eocd_pos orelse return error.DataException;
+    const disk_count_total = readU16(archive, eocd + 4);
+    const central_disk = readU16(archive, eocd + 6);
+    const size: usize = std.math.cast(usize, readU32(archive, eocd + 12)) orelse return error.ResourceException;
+    const offset: usize = std.math.cast(usize, readU32(archive, eocd + 16)) orelse return error.ResourceException;
+    var central_abs: usize = undefined;
+    var count: usize = std.math.cast(usize, readU16(archive, eocd + 10)) orelse return error.ResourceException;
+    if (disk_count_total == std.math.maxInt(u16)) {
+        // zip64 spanned: disk numbers and 64-bit extents live in the records.
+        if (eocd < 20 or readU32(archive, eocd - 20) != zip64_locator_signature) return error.DataException;
+        const locator = eocd - 20;
+        const record_rel = std.math.cast(usize, readU64(archive, locator + 8)) orelse return error.ResourceException;
+        const record = locator - 12 - record_rel;
+        if (readU32(archive, record) != zip64_end_signature) return error.DataException;
+        const cd64 = std.math.cast(usize, readU32(archive, record + 20)) orelse return error.ResourceException;
+        const size64 = std.math.cast(usize, readU64(archive, record + 40)) orelse return error.ResourceException;
+        const off64 = std.math.cast(usize, readU64(archive, record + 48)) orelse return error.ResourceException;
+        if (cd64 >= disk_starts.len) return error.DataException;
+        central_abs = disk_starts[cd64] + off64;
+        count = std.math.cast(usize, readU64(archive, record + 32)) orelse return error.ResourceException;
+        _ = size64;
+    } else {
+        if (central_disk >= disk_starts.len) return error.DataException;
+        central_abs = try bounds.addUsize(disk_starts[central_disk], offset);
+        _ = size;
+    }
+    if (central_abs > eocd) return error.DataException;
+    const directory: ZipDirectory = .{ .offset = central_abs, .size = eocd - central_abs, .count = count, .base = 0 };
+    if (ordinal >= directory.count) return error.DataException;
+    var cursor = directory.offset;
+    var index: usize = 0;
+    var entry: Info = undefined;
+    while (index < directory.count) : (index += 1) {
+        entry = try zipNext(archive, directory, &cursor, index);
+        if (index == ordinal) break;
+    }
+    // The central records may declare a smaller byte size than the scan:
+    // re-derive the record walk exactly like the single-volume decoder.
+    var spanned_options = options;
+    spanned_options.disk_starts = disk_starts;
+    return try zipDecodeEntry(archive, entry, output, spanned_options);
+}
+
 fn validateEntry(entry: Entry) Exception!void {
     if (entry.name.len == 0 or entry.name.len > std.math.maxInt(u16) or entry.extra.len > std.math.maxInt(u16) or entry.comment.len > std.math.maxInt(u16)) return error.CallException;
     // The writable flag set: UTF-8 names (0x0800), the data-descriptor
@@ -566,6 +851,8 @@ pub const Info = struct {
     compressed_size: usize,
     uncompressed_size: usize,
     local_offset: usize,
+    local_relative: usize = 0,
+    disk_number: u32 = 0,
     ordinal: usize,
     version_made_by: u16,
     internal_attributes: u16,
@@ -586,6 +873,9 @@ pub const ZipDecodeOptions = struct {
     scratch: []u8 = &.{},
     history: []u8 = &.{},
     provider: crypto.Provider = crypto.default_provider,
+    // Spanned reads: absolute stream offset of each disk's first byte. When
+    // empty, the archive must be single-volume (every disk number is 0).
+    disk_starts: []const usize = &.{},
 };
 
 pub fn zipInspectCount(archive: []const u8) Exception!usize {
@@ -622,13 +912,26 @@ pub fn zipInspectOrdinalEx(archive: []const u8, ordinal: usize, limits: Limits) 
 pub fn zipDecodeOrdinal(archive: []const u8, ordinal: usize, output: []u8, options: ZipDecodeOptions) Exception!usize {
     options.failure_cause.* = .none;
     const entry = try zipInspectOrdinal(archive, ordinal);
+    return try zipDecodeEntry(archive, entry, output, options);
+}
+
+fn zipDecodeEntry(archive: []const u8, entry: Info, output: []u8, options: ZipDecodeOptions) Exception!usize {
     if (output.len < entry.uncompressed_size) return error.CapacityException;
     if (entry.flags & 0x40 != 0) return error.UnsupportedException;
     if (entry.flags & 0x20 != 0) return error.UnsupportedException;
     const encrypted = entry.flags & 1 != 0;
     if (encrypted and entry.method != winzip_aes_method and !zipMethodSupported(entry.method)) return error.UnsupportedException;
     if (!encrypted and entry.method == winzip_aes_method) return error.DataException;
-    const header = try bounds.slice(archive, entry.local_offset, 30);
+    // The central record's offset is relative to the disk that holds the
+    // local header; single-volume archives have one disk starting at 0.
+    const local_offset = if (options.disk_starts.len > 0) blk: {
+        if (entry.disk_number >= options.disk_starts.len) return error.DataException;
+        break :blk try bounds.addUsize(options.disk_starts[entry.disk_number], entry.local_relative);
+    } else blk: {
+        if (entry.disk_number != 0) return error.UnsupportedException;
+        break :blk entry.local_offset;
+    };
+    const header = try bounds.slice(archive, local_offset, 30);
     if (readU32(header, 0) != local_signature) return error.DataException;
     const local_method = readU16(header, 8);
     const local_flags = readU16(header, 6);
@@ -638,12 +941,12 @@ pub fn zipDecodeOrdinal(archive: []const u8, ordinal: usize, output: []u8, optio
     const name_length = readU16(header, 26);
     const extra_length = readU16(header, 28);
     if (local_flags != entry.flags or local_method != entry.method) return error.DataException;
-    const local_name = try bounds.slice(archive, entry.local_offset + 30, name_length);
+    const local_name = try bounds.slice(archive, local_offset + 30, name_length);
     if (!std.mem.eql(u8, local_name, entry.name)) return error.DataException;
     if (entry.flags & 8 == 0) {
         if (local_crc != entry.crc or (local_compressed != std.math.maxInt(u32) and local_compressed != entry.compressed_size) or (local_uncompressed != std.math.maxInt(u32) and local_uncompressed != entry.uncompressed_size)) return error.DataException;
     }
-    const data_offset = try bounds.addUsize(entry.local_offset, 30 + name_length + extra_length);
+    const data_offset = try bounds.addUsize(local_offset, 30 + name_length + extra_length);
     const compressed = try bounds.slice(archive, data_offset, entry.compressed_size);
     if (entry.flags & 8 != 0) try zipValidateDataDescriptor(archive, data_offset, entry);
     if (encrypted) {
@@ -935,7 +1238,8 @@ fn zipNext(archive: []const u8, directory: ZipDirectory, cursor: *usize, ordinal
     var compressed: u64 = readU32(record, 20);
     var uncompressed: u64 = readU32(record, 24);
     var local_relative: u64 = readU32(record, 42);
-    try zip64Extents(extra, &compressed, &uncompressed, &local_relative);
+    var disk: u64 = readU16(record, 34);
+    try zip64Extents(extra, &compressed, &uncompressed, &local_relative, &disk);
     cursor.* = try bounds.addUsize(cursor.*, record_length);
     var aes_strength: u8 = 0;
     var aes_version: u16 = 0;
@@ -945,7 +1249,7 @@ fn zipNext(archive: []const u8, directory: ZipDirectory, cursor: *usize, ordinal
     } else {
         actual_method = method;
     }
-    return .{ .name = name, .method = method, .flags = flags, .dos_time = readU16(record, 12), .crc = readU32(record, 16), .compressed_size = std.math.cast(usize, compressed) orelse return error.ResourceException, .uncompressed_size = std.math.cast(usize, uncompressed) orelse return error.ResourceException, .local_offset = try bounds.addUsize(directory.base, std.math.cast(usize, local_relative) orelse return error.ResourceException), .ordinal = ordinal, .version_made_by = readU16(record, 4), .internal_attributes = readU16(record, 36), .external_attributes = readU32(record, 38), .encrypted = flags & 1 != 0, .aes_strength = aes_strength, .aes_version = aes_version, .actual_method = actual_method, .extra = extra };
+    return .{ .name = name, .method = method, .flags = flags, .dos_time = readU16(record, 12), .crc = readU32(record, 16), .compressed_size = std.math.cast(usize, compressed) orelse return error.ResourceException, .uncompressed_size = std.math.cast(usize, uncompressed) orelse return error.ResourceException, .local_offset = try bounds.addUsize(directory.base, std.math.cast(usize, local_relative) orelse return error.ResourceException), .local_relative = std.math.cast(usize, local_relative) orelse return error.ResourceException, .disk_number = std.math.cast(u32, disk) orelse return error.ResourceException, .ordinal = ordinal, .version_made_by = readU16(record, 4), .internal_attributes = readU16(record, 36), .external_attributes = readU32(record, 38), .encrypted = flags & 1 != 0, .aes_strength = aes_strength, .aes_version = aes_version, .actual_method = actual_method, .extra = extra };
 }
 
 fn parseWinzipAesExtra(extra: []const u8, strength: *u8, version: *u16, actual_method: *u16) Exception!void {
@@ -978,7 +1282,7 @@ fn parseWinzipAesExtra(extra: []const u8, strength: *u8, version: *u16, actual_m
     return error.DataException;
 }
 
-fn zip64Extents(extra: []const u8, compressed: *u64, uncompressed: *u64, local_offset: *u64) Exception!void {
+fn zip64Extents(extra: []const u8, compressed: *u64, uncompressed: *u64, local_offset: *u64, disk: *u64) Exception!void {
     var offset: usize = 0;
     while (offset < extra.len) {
         if (extra.len - offset < 4) return error.DataException;
@@ -1001,12 +1305,17 @@ fn zip64Extents(extra: []const u8, compressed: *u64, uncompressed: *u64, local_o
             if (local_offset.* == std.math.maxInt(u32)) {
                 if (length - value_offset < 8) return error.DataException;
                 local_offset.* = readU64(extra, offset + value_offset);
+                value_offset += 8;
+            }
+            if (disk.* == std.math.maxInt(u16)) {
+                if (length - value_offset < 4) return error.DataException;
+                disk.* = readU32(extra, offset + value_offset);
             }
             return;
         }
         offset = try bounds.addUsize(offset, length);
     }
-    if (compressed.* == std.math.maxInt(u32) or uncompressed.* == std.math.maxInt(u32) or local_offset.* == std.math.maxInt(u32)) return error.DataException;
+    if (compressed.* == std.math.maxInt(u32) or uncompressed.* == std.math.maxInt(u32) or local_offset.* == std.math.maxInt(u32) or disk.* == std.math.maxInt(u16)) return error.DataException;
 }
 
 fn readU16(data: []const u8, offset: usize) u16 {
@@ -1209,4 +1518,66 @@ test "zip winzip aes accepts every supported compression method" {
         const decoded = try zipDecodeOrdinal(archive[0..written], 0, &output, .{ .password = password, .failure_cause = &cause, .staging = &decrypt_staging, .scratch = decode_scratch });
         try testing.expectEqualSlices(u8, data, output[0..decoded]);
     }
+}
+
+test "zip spanned write and read roundtrip" {
+    const allocator = std.testing.allocator;
+
+    var payload_a: [400000]u8 = undefined;
+    var rng: u64 = 0x243F6A8885A308D3;
+    for (&payload_a) |*b| {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        b.* = @as(u8, @truncate(rng)) & 15;
+    }
+    for (1..48) |i| @memcpy(payload_a[i * 4096 ..][0..2048], payload_a[0..2048]);
+    const payload_b = "tail entry payload";
+
+    const entries = [_]Entry{
+        .{ .name = "a.bin", .data = &payload_a, .flags = 0x0008 },
+        .{ .name = "b.bin", .data = payload_b },
+    };
+    var failure_cause: crypto.FailureCause = .none;
+    const history = try allocator.alloc(u8, deflate_history_size);
+    defer allocator.free(history);
+    const measurement_buffer = try allocator.alloc(u8, deflate_measurement_buffer_size);
+    defer allocator.free(measurement_buffer);
+    const staging = try allocator.alloc(u8, 1 << 20);
+    defer allocator.free(staging);
+    const scratch = try allocator.alloc(u8, 1 << 20);
+    defer allocator.free(scratch);
+
+    const required = try requiredSize(&entries, "", history, measurement_buffer, scratch, &failure_cause);
+    const volume_size: u64 = 4096;
+    const disks = try allocator.alloc(usize, required / @as(usize, @intCast(volume_size)) + 2);
+    defer allocator.free(disks);
+    const plan_bounds = try allocator.alloc(usize, required / @as(usize, @intCast(volume_size)) + entries.len + 4);
+    defer allocator.free(plan_bounds);
+    const output = try allocator.alloc(u8, required + 4);
+    defer allocator.free(output);
+    const result = try encodeSpanned(&entries, "", output, volume_size, crypto.default_provider, history, measurement_buffer, staging, scratch, &failure_cause, plan_bounds);
+    try std.testing.expect(result.volumes > 1);
+    try std.testing.expect(std.mem.readInt(u32, output[0..4], .little) == 0x0807_4b50);
+
+    // Slice the disks back out and decode through the spanned entry.
+    const volumes_count = (result.total_len + volume_size - 1) / volume_size;
+    const volumes = try allocator.alloc([]const u8, volumes_count);
+    defer allocator.free(volumes);
+    var at: usize = 0;
+    for (0..volumes_count) |i| {
+        const take = @min(@as(usize, @intCast(volume_size)), result.total_len - at);
+        volumes[i] = output[at..][0..take];
+        at += take;
+    }
+    const join = try allocator.alloc(u8, result.total_len);
+    defer allocator.free(join);
+    const options: ZipDecodeOptions = .{ .failure_cause = &failure_cause, .staging = staging, .scratch = scratch, .history = history, .provider = crypto.default_provider };
+    var out_a: [payload_a.len]u8 = undefined;
+    const n_a = try zipDecodeOrdinalSpanned(volumes, 0, &out_a, join, disks, options);
+    try std.testing.expectEqual(payload_a.len, n_a);
+    try std.testing.expectEqualSlices(u8, &payload_a, out_a[0..n_a]);
+    var out_b: [payload_b.len]u8 = undefined;
+    const n_b = try zipDecodeOrdinalSpanned(volumes, 1, &out_b, join, disks, options);
+    try std.testing.expectEqualSlices(u8, payload_b, out_b[0..n_b]);
 }
