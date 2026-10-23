@@ -96,7 +96,7 @@ pub const catalog_json = blk: {
             },
         );
     }
-    break :blk "{\n  \"epoch\": 8,\n  \"parameter_selector\": \"value_high: family(16)|ordinal(32)|attrs(8)|flags(8); value_low: scalar value\",\n  \"descriptors\": [\n" ++ descriptor_json ++ "  ]\n}\n";
+    break :blk "{\n  \"epoch\": 9,\n  \"parameter_selector\": \"value_high: family(16)|ordinal(32)|attrs(8)|flags(8); value_low: scalar value\",\n  \"descriptors\": [\n" ++ descriptor_json ++ "  ]\n}\n";
 };
 
 comptime {

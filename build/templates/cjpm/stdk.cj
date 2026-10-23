@@ -1,10 +1,10 @@
-// FFI bindings for the libstd C ABI (stdk.h, STDK_ABI_EPOCH 8).
+// FFI bindings for the libstd C ABI (stdk.h, STDK_ABI_EPOCH 9).
 // Foreign declarations are package-private in Cangjie; the public wrappers
 // below are the importable surface and encapsulate the unsafe calls.
 package stdk
 
 // Status codes (stdk.h STDK_STATUS_*).
-public let STDK_ABI_EPOCH: UInt32 = 8
+public let STDK_ABI_EPOCH: UInt32 = 9
 public let STDK_STATUS_OK: UInt32 = 0
 public let STDK_STATUS_INVALID_CALL: UInt32 = 1
 public let STDK_STATUS_UNSUPPORTED: UInt32 = 2
