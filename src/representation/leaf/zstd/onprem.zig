@@ -506,8 +506,9 @@ pub fn encodeStream(input: *std.Io.Reader, output: *std.Io.Writer, history: []u8
     if (options.nice_len < min_match_len) return error.DataException;
     if (options.search_window == 0) return error.DataException;
     const dictionary = options.dictionary orelse &.{};
-    // Preload only the content view, like the decoder; formatted dictionaries
-    // carry magic/ID/entropy tables that are not match-finder material.
+    // The match finder needs only the dictionary's content region here; the
+    // declared repeat offsets are seeded per frame in encodeBlocks, and the
+    // entropy tables stay decoder-side material the encoder never reuses.
     const dict_content: []const u8 = if (dictionary.len >= 8 and std.mem.readInt(u32, dictionary[0..4], .little) == dictionary_magic)
         dictionaryContent(dictionary) catch return error.DataException
     else
@@ -679,7 +680,15 @@ fn encodeBlocks(output: *std.Io.Writer, content: []const u8, content_start: usiz
     }
     const block_workspace = workspace[hash_size + chain.len ..];
     var offset: usize = 0;
+    // A frame that references a formatted dictionary starts from the
+    // dictionary's declared repeat offsets, mirroring the decoder's
+    // loadDictionary; the no-dictionary defaults apply only to raw-content
+    // dictionaries and dictionary-less frames.
     var repeat_offsets = [3]u32{ start_repeated_offset_1, start_repeated_offset_2, start_repeated_offset_3 };
+    if (options.dictionary) |dict| {
+        if (dict.len >= 8 and std.mem.readInt(u32, dict[0..4], .little) == dictionary_magic)
+            repeat_offsets = (dictionaryView(dict) catch return error.DataException).repcodes;
+    }
     // Written before use and gated by valid flags, so `undefined` is safe.
     var prev: PrevFseTables = .{ .literal = undefined, .match = undefined, .offset = undefined };
     while (offset < frame_len) {
@@ -2982,12 +2991,20 @@ const BackwardBitStream = struct {
     }
 };
 
-// Parses a formatted dictionary and returns its referenceable content.
-// Raw-content dictionaries without magic are their own content; reference
-// zstd routes anything shorter than 8 bytes to content mode as well.
-pub fn dictionaryContent(dictionary: []const u8) DecodeError![]const u8 {
-    if (dictionary.len < 8) return dictionary;
-    if (std.mem.readInt(u32, dictionary[0..4], .little) != dictionary_magic) return dictionary;
+// Parses a formatted dictionary into its referenceable content and declared
+// repeat offsets. Raw-content dictionaries without magic are their own
+// content and carry the no-dictionary offsets; reference zstd routes
+// anything shorter than 8 bytes to content mode as well.
+const DictionaryView = struct {
+    content: []const u8,
+    repcodes: [3]u32,
+};
+
+fn dictionaryView(dictionary: []const u8) DecodeError!DictionaryView {
+    if (dictionary.len < 8)
+        return .{ .content = dictionary, .repcodes = .{ start_repeated_offset_1, start_repeated_offset_2, start_repeated_offset_3 } };
+    if (std.mem.readInt(u32, dictionary[0..4], .little) != dictionary_magic)
+        return .{ .content = dictionary, .repcodes = .{ start_repeated_offset_1, start_repeated_offset_2, start_repeated_offset_3 } };
     // RFC 8878 permits a zero Dictionary_ID (it means "unspecified"); only
     // the raw-content fast path (magic mismatch) bypasses parsing entirely.
     var cursor = binary.ReadCursor.init(dictionary[8..]);
@@ -3008,10 +3025,22 @@ pub fn dictionaryContent(dictionary: []const u8) DecodeError![]const u8 {
         const decoded = try decodeFseTable(cursor.remainingSlice(), 36, 9, &literal_entries, .literal);
         cursor.pos += decoded.consumed;
     }
-    _ = try cursor.readU32Le();
-    _ = try cursor.readU32Le();
-    _ = try cursor.readU32Le();
-    return cursor.remainingSlice();
+    const recent_offset_1 = try cursor.readU32Le();
+    const recent_offset_2 = try cursor.readU32Le();
+    const recent_offset_3 = try cursor.readU32Le();
+    const content = cursor.remainingSlice();
+    // Reference zstd rejects a dictionary whose declared offsets are zero or
+    // reach past its content (ZSTD_loadCEntropy's dictionary_corrupted
+    // checks); no frame referencing such a dictionary can use those values,
+    // so the parse fails rather than returning them.
+    if (recent_offset_1 == 0 or recent_offset_2 == 0 or recent_offset_3 == 0) return error.DataException;
+    if (recent_offset_1 > content.len or recent_offset_2 > content.len or recent_offset_3 > content.len) return error.DataException;
+    return .{ .content = content, .repcodes = .{ recent_offset_1, recent_offset_2, recent_offset_3 } };
+}
+
+// Parses a formatted dictionary and returns its referenceable content.
+pub fn dictionaryContent(dictionary: []const u8) DecodeError![]const u8 {
+    return (try dictionaryView(dictionary)).content;
 }
 
 const Decoder = struct {
@@ -4653,6 +4682,122 @@ test "zstd encoder seeds dictionary matches and writes dictionary id" {
     var bare_source = std.Io.Reader.fixed(with_dict[0..with_len]);
     var bare_sink = std.Io.Writer.fixed(decoded);
     try std.testing.expectError(error.UnsupportedException, decodeStream(&bare_source, &bare_sink, plain_history, .{ .window_size = window }));
+}
+
+test "zstd encoder adopts dictionary repeat offsets" {
+    const allocator = std.testing.allocator;
+    const sample_texts = [_][]const u8{
+        "the quick brown fox jumps over the lazy dog and keeps running through the forest",
+        "pack my box with five dozen liquor jugs, then seal the box with heavy tape",
+        "how vexingly quick daft zebras jump over the lazy dogs in the meadow",
+        "the five boxing wizards jump quickly while the lazy dogs sleep all day",
+    };
+    var samples: [4][]const u8 = undefined;
+    for (sample_texts, 0..) |text, i| samples[i] = text;
+    const train_scratch = try allocator.alloc(u8, trainWorkspaceSize());
+    defer allocator.free(train_scratch);
+    var dict_buffer: [512]u8 = undefined;
+    const dict_len = try trainDictionary(&samples, dict_buffer.len, &dict_buffer, train_scratch, checksum.default_provider);
+    const content = try dictionaryContent(dict_buffer[0..dict_len]);
+    // The patched offsets below must stay addressable inside the content.
+    try std.testing.expect(content.len >= 21);
+    // Replace the default (1, 4, 8) with declared offsets a conforming
+    // decoder installs when loading the dictionary: the encoder must seed
+    // its repcode state from them, not from the no-dictionary defaults.
+    std.mem.writeInt(u32, dict_buffer[16..20], 7, .little);
+    std.mem.writeInt(u32, dict_buffer[20..24], 13, .little);
+    std.mem.writeInt(u32, dict_buffer[24..28], 21, .little);
+    const dictionary = dict_buffer[0..dict_len];
+
+    const window: u32 = 1 << 16;
+    const history = try allocator.alloc(u8, @as(usize, window) + block_size_max + dictionary.len);
+    defer allocator.free(history);
+    const workspace = try allocator.alloc(u32, encoderWorkspaceU32Count(dictionary.len, window, .{ .window_size = window, .hash_bits = 12, .max_chain = 8, .nice_len = 32, .search_window = 4096 }));
+    defer allocator.free(workspace);
+    const bound = encodedSizeBound(64, .{ .window_size = window }) + 64;
+    const encoded = try allocator.alloc(u8, bound);
+    defer allocator.free(encoded);
+    const decoded = try allocator.alloc(u8, 64);
+    defer allocator.free(decoded);
+    const encode_options: Options = .{ .window_size = window, .hash_bits = 12, .max_chain = 8, .nice_len = 32, .search_window = 4096, .dictionary = dictionary };
+
+    // An eight-byte run at the frame start: its distance-1 match clears the
+    // minimum sequence length, so the offset travels through the repcode
+    // ring, and only a ring seeded from the declared offsets keeps encoder
+    // and decoder in agreement. With the no-dictionary defaults the encoder
+    // emits a repcode-0 reference that the decoder reads as the declared
+    // offset 7, copying from the dictionary's content tail instead of the
+    // run and diverging immediately; a longer uniform run would mask the
+    // error, since every distance inside it yields the same bytes.
+    const run_input = "MMMMMMMMThe quick brown fox jumps over";
+    var run_source = std.Io.Reader.fixed(run_input);
+    var encoded_sink = std.Io.Writer.fixed(encoded);
+    const run_encoded_len = try encodeStream(&run_source, &encoded_sink, history, workspace, encode_options);
+    var run_encoded_source = std.Io.Reader.fixed(encoded[0..run_encoded_len]);
+    var run_decoded_sink = std.Io.Writer.fixed(decoded);
+    _ = try decodeStream(&run_encoded_source, &run_decoded_sink, history, .{ .window_size = window, .dictionary = dictionary });
+    try std.testing.expectEqualSlices(u8, run_input, decoded[0..run_input.len]);
+
+    // A repetition at declared offset 7 round-trips through the repcode
+    // path that both sides seed identically from the dictionary.
+    const rep_input = "ABCDEFGABCDEFG";
+    var rep_source = std.Io.Reader.fixed(rep_input);
+    var rep_sink = std.Io.Writer.fixed(encoded);
+    const rep_encoded_len = try encodeStream(&rep_source, &rep_sink, history, workspace, encode_options);
+    var rep_encoded_source = std.Io.Reader.fixed(encoded[0..rep_encoded_len]);
+    var rep_decoded_sink = std.Io.Writer.fixed(decoded[0..rep_input.len]);
+    _ = try decodeStream(&rep_encoded_source, &rep_decoded_sink, history, .{ .window_size = window, .dictionary = dictionary });
+    try std.testing.expectEqualSlices(u8, rep_input, decoded[0..rep_input.len]);
+}
+
+test "zstd rejects dictionaries with unusable repeat offsets" {
+    const allocator = std.testing.allocator;
+    const sample_texts = [_][]const u8{
+        "the quick brown fox jumps over the lazy dog and keeps running through the forest",
+        "pack my box with five dozen liquor jugs, then seal the box with heavy tape",
+        "how vexingly quick daft zebras jump over the lazy dogs in the meadow",
+        "the five boxing wizards jump quickly while the lazy dogs sleep all day",
+    };
+    var samples: [4][]const u8 = undefined;
+    for (sample_texts, 0..) |text, i| samples[i] = text;
+    const train_scratch = try allocator.alloc(u8, trainWorkspaceSize());
+    defer allocator.free(train_scratch);
+    var dict_buffer: [512]u8 = undefined;
+    const dict_len = try trainDictionary(&samples, dict_buffer.len, &dict_buffer, train_scratch, checksum.default_provider);
+    const window: u32 = 1 << 16;
+    const dictionary = dict_buffer[0..dict_len];
+    const input = "the lazy dogs jump over the box in the meadow";
+    const history = try allocator.alloc(u8, @as(usize, window) + block_size_max + dictionary.len);
+    defer allocator.free(history);
+    const workspace = try allocator.alloc(u32, encoderWorkspaceU32Count(dictionary.len, window, .{ .window_size = window, .hash_bits = 12, .max_chain = 8, .nice_len = 32, .search_window = 4096 }));
+    defer allocator.free(workspace);
+    const encoded = try allocator.alloc(u8, encodedSizeBound(input.len, .{ .window_size = window }) + 64);
+    defer allocator.free(encoded);
+    const decoded = try allocator.alloc(u8, input.len);
+    defer allocator.free(decoded);
+    const encode_options: Options = .{ .window_size = window, .hash_bits = 12, .max_chain = 8, .nice_len = 32, .search_window = 4096, .dictionary = dictionary };
+
+    // A frame produced against the healthy dictionary.
+    var source = std.Io.Reader.fixed(input);
+    var encoded_sink = std.Io.Writer.fixed(encoded);
+    const encoded_len = try encodeStream(&source, &encoded_sink, history, workspace, encode_options);
+
+    // A zero declared offset marks the dictionary corrupt: the content
+    // view, the encoder's dictionary preload, and the decoder's dictionary
+    // loader all refuse it, mirroring ZSTD_loadCEntropy's checks.
+    std.mem.writeInt(u32, dict_buffer[16..20], 0, .little);
+    try std.testing.expectError(error.DataException, dictionaryContent(dictionary));
+    try std.testing.expectError(error.DataException, encodeStream(&source, &encoded_sink, history, workspace, encode_options));
+    var bad_source = std.Io.Reader.fixed(encoded[0..encoded_len]);
+    var bad_sink = std.Io.Writer.fixed(decoded);
+    try std.testing.expectError(error.DataException, decodeStream(&bad_source, &bad_sink, history, .{ .window_size = window, .dictionary = dictionary }));
+
+    // An offset past the content is equally unusable.
+    std.mem.writeInt(u32, dict_buffer[16..20], @intCast(dict_len - dictionary_header_size + 1), .little);
+    try std.testing.expectError(error.DataException, dictionaryContent(dictionary));
+    var over_source = std.Io.Reader.fixed(encoded[0..encoded_len]);
+    var over_sink = std.Io.Writer.fixed(decoded);
+    try std.testing.expectError(error.DataException, decodeStream(&over_source, &over_sink, history, .{ .window_size = window, .dictionary = dictionary }));
 }
 
 test "zstd dictionary content accepts zero dictionary id" {
