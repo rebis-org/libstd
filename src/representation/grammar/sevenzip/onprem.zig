@@ -278,11 +278,16 @@ fn packEntry(entry: Entry, provider: crypto.Provider, workspace: *Workspace, lim
             try applyEncodeFilter(entry.method, filtered);
             const options: lzma2.Options = .{ .dictionary_size = default_dictionary, .properties = lzma2.defaultProperties(default_dictionary), .max_work = limits.codec_work };
             var packed_entry = try packBuffer(lzma2, .lzma2, filtered, unpacked_crc, workspace, limits, lzma2.encodeWorkspaceSizeBt(default_dictionary), options);
-            packed_entry.filters = entry.filters;
+            // The primary filter rides as a one-element chain so the folder
+            // plan emits its filter coder; entry.filters is always empty here
+            // because explicit chains require the .lzma/.lzma2 methods.
+            const chain = try workspace.take(CoderMethod, 1);
+            chain[0] = entry.method;
+            packed_entry.filters = chain;
             break :blk packed_entry;
         },
     };
-    compressed_entry.filters = entry.filters;
+    if (entry.filters.len != 0) compressed_entry.filters = entry.filters;
     if (!entry.encrypted) return compressed_entry;
     const password_utf16 = try passwordToUtf16(entry.password, workspace);
     const cycles = if (entry.num_cycles_power == 0) crypto.seven_zip_default_cycles else entry.num_cycles_power;
@@ -2433,6 +2438,51 @@ test "sevenzip filter chain roundtrips lzma and lzma2" {
     var workspace = try Workspace.init(backing.ptr, backing.len);
     var cause: crypto.FailureCause = .none;
     const packed_entries = try sevenZipPack(&entries, crypto.default_provider, &workspace, .{}, &cause);
+    try testing.expectEqual(@as(usize, 1), packed_entries[0].filters.len);
+    try testing.expectEqual(CoderMethod.x86, packed_entries[0].filters[0]);
+    try testing.expectEqual(@as(usize, 1), packed_entries[1].filters.len);
+    try testing.expectEqual(CoderMethod.delta, packed_entries[1].filters[0]);
+    const total = try sevenZipPackedSize(&entries, packed_entries, &workspace, crypto.default_provider, .{}, .{});
+    const archive = try allocator.alloc(u8, total);
+    defer allocator.free(archive);
+    const written = try sevenZipWritePacked(&entries, packed_entries, archive, &workspace, crypto.default_provider, .{}, .{});
+    try testing.expectEqual(total, written);
+
+    for (datas, 0..) |data, i| {
+        var decode_ws = try Workspace.init(backing.ptr, backing.len);
+        const out = try allocator.alloc(u8, data.len);
+        defer allocator.free(out);
+        const produced = try sevenZipDecodeOrdinal(archive, &decode_ws, .{}, i, out, .{ .failure_cause = &cause });
+        try testing.expectEqual(data.len, produced);
+        try testing.expectEqualSlices(u8, data, out);
+    }
+}
+
+test "sevenzip primary filter methods encode the filter coder" {
+    // A mixed provider build serves no single tag for both the checksum
+    // and codec arms; run where the default tag serves the codec.
+    if (!deflate_seam.decodeServed(checksum.default_provider)) return;
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const backing = try allocator.alloc(u8, 96 * 1024 * 1024);
+    defer allocator.free(backing);
+
+    var executable: [2048]u8 = undefined;
+    // x86 call-flavored bytes so the BCJ filter has real instructions to
+    // convert, not just data it passes through unchanged.
+    for (&executable, 0..) |*byte, i| byte.* = if (i % 16 < 4) 0xE8 else @truncate(i / 29);
+    const datas = [_][]const u8{ executable[0..2048], executable[256..1792] };
+    const entries = [_]Entry{
+        .{ .name = "x.bin", .data = datas[0], .method = .x86 },
+        .{ .name = "d.bin", .data = datas[1], .method = .delta },
+    };
+
+    var workspace = try Workspace.init(backing.ptr, backing.len);
+    var cause: crypto.FailureCause = .none;
+    const packed_entries = try sevenZipPack(&entries, crypto.default_provider, &workspace, .{}, &cause);
+    // The shorthand filter method is its own one-element chain; dropping it
+    // omits the filter coder from the folder plan and the archive fails its
+    // CRC on decode.
     try testing.expectEqual(@as(usize, 1), packed_entries[0].filters.len);
     try testing.expectEqual(CoderMethod.x86, packed_entries[0].filters[0]);
     try testing.expectEqual(@as(usize, 1), packed_entries[1].filters.len);
