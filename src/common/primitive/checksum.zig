@@ -18,10 +18,6 @@ pub const XxHash64 = xxh64_seam.XxHash64;
 
 const crc32_hw = builtin.target.cpu.arch == .aarch64 and !options.crc32_portable;
 const has_crc32_kernel = crc32_hw and builtin.target.cpu.has(.aarch64, .crc);
-// SSE4.2's crc32 instruction covers the same short-and-tail ground on x86.
-const x86_crc32 = builtin.target.cpu.arch == .x86_64 and !options.crc32_portable and
-    builtin.zig_backend != .stage2_c and builtin.target.cpu.has(.x86, .sse4_2);
-const has_crc32_hw = has_crc32_kernel or x86_crc32;
 // LLVM's aes feature implies pmull, which the fold kernel multiplies with.
 const has_crc32_pmull = has_crc32_kernel and builtin.target.cpu.has(.aarch64, .aes);
 const crc64_hw = builtin.target.cpu.arch == .aarch64 and !options.crc64xz_portable;
@@ -144,50 +140,6 @@ fn crc32Aarch64Scalar(crc_in: u32, input: []const u8) u32 {
         data = data[4..];
     }
     for (data) |byte| crc = crc32b(crc, byte);
-    return crc;
-}
-
-inline fn crc32qX86(crc: u32, word: u64) u32 {
-    // The 64-bit-source form wants a 64-bit destination register; the
-    // instruction zero-extends the 32-bit result.
-    var out: u64 = crc;
-    asm ("crc32q %[word], %[out]"
-        : [out] "+r" (out),
-        : [word] "r" (word),
-    );
-    return @truncate(out);
-}
-
-inline fn crc32wX86(crc: u32, word: u32) u32 {
-    var out = crc;
-    asm ("crc32l %[word], %[out]"
-        : [out] "+r" (out),
-        : [word] "r" (word),
-    );
-    return out;
-}
-
-inline fn crc32bX86(crc: u32, byte: u8) u32 {
-    var out = crc;
-    asm ("crc32b %[byte], %[out]"
-        : [out] "+r" (out),
-        : [byte] "r" (byte),
-    );
-    return out;
-}
-
-fn crc32X8664Scalar(crc_in: u32, input: []const u8) u32 {
-    var crc = crc_in;
-    var data = input;
-    while (data.len >= 8) {
-        crc = crc32qX86(crc, std.mem.readInt(u64, data[0..8], .little));
-        data = data[8..];
-    }
-    if (data.len >= 4) {
-        crc = crc32wX86(crc, std.mem.readInt(u32, data[0..4], .little));
-        data = data[4..];
-    }
-    for (data) |byte| crc = crc32bX86(crc, byte);
     return crc;
 }
 
@@ -484,14 +436,11 @@ fn TableCrc(comptime T: type, comptime poly: T, comptime reflected: bool) type {
 
         pub fn update(self: *@This(), input: []const u8) void {
             if (comptime T == u32 and reflected) {
-                if (comptime has_crc32_hw) {
+                if (comptime has_crc32_kernel) {
                     if (input.len >= crc_pmull_threshold and comptime has_crc32_pmull) {
                         self.state = crcFold(u32, crc32_fold_k, self.state, input, Crc32Aarch64Tail, false);
                     } else {
-                        self.state = if (comptime builtin.target.cpu.arch == .aarch64)
-                            crc32Aarch64Scalar(self.state, input)
-                        else
-                            crc32X8664Scalar(self.state, input);
+                        self.state = crc32Aarch64Scalar(self.state, input);
                     }
                     return;
                 }
