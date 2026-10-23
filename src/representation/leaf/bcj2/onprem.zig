@@ -104,6 +104,139 @@ fn rangeDecode(prob: *u16, range: *u32, code: *u32, stream: []const u8, pos: *us
     return bit;
 }
 
+pub const EncodedSizes = struct { main: usize, call: usize, jump: usize, rc: usize };
+
+// Caller-buffer upper bounds: the main stream is a subsequence of the
+// input, each call/jump entry consumes five input bytes to write four,
+// and one range-code bit per candidate marker costs at most 1.25 bytes.
+pub fn encodeSizesBound(input_len: usize) EncodedSizes {
+    return .{
+        .main = input_len,
+        .call = input_len,
+        .jump = input_len,
+        .rc = input_len / 4 + 64,
+    };
+}
+
+const relat_limit: u32 = @as(u32, 0x0f) << 24;
+
+// Carry-aware range encoder, the exact Subbotin scheme the vendor encoder
+// uses: pending 0xFF bytes ride in (cache, cacheSize) until a carry or the
+// stream end resolves them. The first emitted byte is the discarded
+// initialization byte the decoder skips.
+const RangeEncoder = struct {
+    low: u64 = 0,
+    range: u32 = 0xFFFFFFFF,
+    cache: u8 = 0,
+    cache_size: u32 = 1,
+    out: []u8 = &.{},
+    len: usize = 0,
+
+    fn shiftLow(self: *RangeEncoder) Exception!void {
+        const low32: u32 = @truncate(self.low);
+        const high: u32 = @truncate(self.low >> 32);
+        if (low32 < 0xFF000000 or high != 0) {
+            const carry_byte: u8 = self.cache +% @as(u8, @truncate(high));
+            if (self.len >= self.out.len) return error.CapacityException;
+            self.out[self.len] = carry_byte;
+            self.len += 1;
+            var remaining = self.cache_size - 1;
+            while (remaining > 0) : (remaining -= 1) {
+                if (self.len >= self.out.len) return error.CapacityException;
+                self.out[self.len] = 0xFF;
+                self.len += 1;
+            }
+            self.cache_size = 1;
+            self.cache = @truncate(low32 >> 24);
+        } else {
+            self.cache_size += 1;
+        }
+        self.low = low32 << 8;
+    }
+
+    fn encodeBit(self: *RangeEncoder, prob: *u16, bit: u1) Exception!void {
+        const bound: u32 = (self.range >> 11) *% @as(u32, prob.*);
+        if (bit == 0) {
+            self.range = bound;
+            prob.* +%= @intCast((@as(u32, bit_model_total) - prob.*) >> num_move_bits);
+        } else {
+            self.low += bound;
+            self.range -= bound;
+            prob.* -%= @intCast(prob.* >> num_move_bits);
+        }
+        // The decoder mirrors this single-shift-per-symbol schedule, so the
+        // two sides stay in lockstep even when range dips below the top.
+        if (self.range < top) {
+            try self.shiftLow();
+            self.range <<= 8;
+        }
+    }
+};
+
+// Splits x86 code into the four BCJ2 streams. Conversion decisions match
+// vendor Bcj2Enc.c: fileIp 0, unlimited size, the default relative limit,
+// and the multi-block overlap guard. The probability table layout follows
+// this decoder (any bijective layout interoperates, since the probability
+// state is per-symbol on both sides).
+pub fn encode(input: []const u8, main_out: []u8, call_out: []u8, jump_out: []u8, rc_out: []u8) Exception!EncodedSizes {
+    var probs: [num_probs]u16 = undefined;
+    for (&probs) |*prob| prob.* = bit_model_total / 2;
+
+    var rc = RangeEncoder{ .out = rc_out };
+    var main_len: usize = 0;
+    var call_len: usize = 0;
+    var jump_len: usize = 0;
+
+    var ip: u64 = 0;
+    var v: u32 = 0;
+    var pos: usize = 0;
+    while (pos < input.len) {
+        const b = input[pos];
+        if (main_len >= main_out.len) return error.CapacityException;
+        main_out[main_len] = b;
+        main_len += 1;
+        v = (v << 24) | b;
+        const is_e8e9 = ((b +% (0x100 - 0xe8)) & 0xfe) == 0;
+        const is_jcc = ((v -% ((@as(u32, 0x0f) << 24) + 0x80)) & 0xfffffff0) == 0;
+        if (!is_e8e9 and !is_jcc) {
+            pos += 1;
+            ip += 1;
+            continue;
+        }
+        pos += 1;
+        ip += 1;
+        const prob_index: usize = if (b == 0xe8) @as(usize, @intCast(v >> 24)) else if (b == 0xe9) 256 else 257;
+        var convert = false;
+        if (input.len - pos >= 4) {
+            const relat = std.mem.readInt(u32, input[pos..][0..4], .little);
+            if (ip > @as(u64, (v +% 0x20) >> 5 & 1) and ((relat +% relat_limit) >> 1) < relat_limit)
+                convert = true;
+        }
+        if (convert) {
+            const relat = std.mem.readInt(u32, input[pos..][0..4], .little);
+            try rc.encodeBit(&probs[prob_index], 1);
+            const absol: u32 = @as(u32, @truncate(ip)) +% relat +% 4;
+            if (b == 0xe8) {
+                if (call_len + 4 > call_out.len) return error.CapacityException;
+                std.mem.writeInt(u32, call_out[call_len..][0..4], absol, .big);
+                call_len += 4;
+            } else {
+                if (jump_len + 4 > jump_out.len) return error.CapacityException;
+                std.mem.writeInt(u32, jump_out[jump_len..][0..4], absol, .big);
+                jump_len += 4;
+            }
+            ip += 4;
+            pos += 4;
+            v = relat >> 24;
+        } else {
+            try rc.encodeBit(&probs[prob_index], 0);
+        }
+    }
+    // The flush emits the four code bytes after the discarded init byte.
+    for (0..5) |_| try rc.shiftLow();
+    return .{ .main = main_len, .call = call_len, .jump = jump_len, .rc = rc.len };
+}
+
 test "bcj2 no-branch passthrough" {
     const rc = [_]u8{ 0, 0, 0, 0, 0 };
     var out: [12]u8 = undefined;
@@ -215,4 +348,77 @@ test "bcj2 call then jump through one range-code word" {
     try std.testing.expectEqual(@as(u8, 0xE9), out[9]);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0x12, 0, 0, 0 }, out[10..14]);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0x90, 0x90, 0x90, 0x90 }, out[14..18]);
+}
+
+test "bcj2 encode roundtrips through the decoder" {
+    const allocator = std.testing.allocator;
+    // Synthetic x86-ish code: NOP sleds, calls, jumps, a Jcc, and data
+    // bytes that must stay literal.
+    var input: [4096]u8 = undefined;
+    var rng: u64 = 0x243F6A8885A308D3;
+    for (&input) |*b| {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        b.* = @as(u8, @truncate(rng)) & 3;
+    }
+    // Pad with sleds and plant branch instructions at varied offsets.
+    for (0..16) |i| {
+        const at = i * 256;
+        @memset(input[at..][0..200], 0x90);
+        input[at + 200] = 0xE8;
+        std.mem.writeInt(u32, input[at + 201 ..][0..4], @intCast(1000 -% @as(u32, @intCast(at % 2000))), .little);
+        @memset(input[at + 205 ..][0..40], 0x90);
+        input[at + 245] = 0xE9;
+        std.mem.writeInt(u32, input[at + 246 ..][0..4], @intCast(2000 -% @as(u32, @intCast(at % 3000))), .little);
+        input[at + 250] = 0x0F;
+        input[at + 251] = 0x85;
+        std.mem.writeInt(u32, input[at + 252 ..][0..4], @intCast(3000 -% @as(u32, @intCast(at % 4000))), .little);
+    }
+
+    const bounds = encodeSizesBound(input.len);
+    const main_buf = try allocator.alloc(u8, bounds.main);
+    defer allocator.free(main_buf);
+    const call_buf = try allocator.alloc(u8, bounds.call);
+    defer allocator.free(call_buf);
+    const jump_buf = try allocator.alloc(u8, bounds.jump);
+    defer allocator.free(jump_buf);
+    const rc_buf = try allocator.alloc(u8, bounds.rc);
+    defer allocator.free(rc_buf);
+
+    const sizes = try encode(&input, main_buf, call_buf, jump_buf, rc_buf);
+    try std.testing.expect(sizes.call > 0);
+    try std.testing.expect(sizes.jump > 0);
+
+    var out: [input.len]u8 = undefined;
+    const n = try decode(main_buf[0..sizes.main], call_buf[0..sizes.call], jump_buf[0..sizes.jump], rc_buf[0..sizes.rc], &out);
+    try std.testing.expectEqual(input.len, n);
+    try std.testing.expectEqualSlices(u8, &input, out[0..n]);
+
+    // A second pass over the same input is byte-identical (determinism).
+    const main2 = try allocator.alloc(u8, bounds.main);
+    defer allocator.free(main2);
+    const call2 = try allocator.alloc(u8, bounds.call);
+    defer allocator.free(call2);
+    const jump2 = try allocator.alloc(u8, bounds.jump);
+    defer allocator.free(jump2);
+    const rc2 = try allocator.alloc(u8, bounds.rc);
+    defer allocator.free(rc2);
+    const sizes2 = try encode(&input, main2, call2, jump2, rc2);
+    try std.testing.expectEqual(sizes.main, sizes2.main);
+    try std.testing.expectEqualSlices(u8, main_buf[0..sizes.main], main2[0..sizes2.main]);
+    try std.testing.expectEqualSlices(u8, rc_buf[0..sizes.rc], rc2[0..sizes2.rc]);
+}
+
+test "bcj2 encode stream sizes respect their bounds" {
+    var input: [64]u8 = undefined;
+    for (&input) |*b| b.* = 0xE8;
+    var main: [64]u8 = undefined;
+    var call: [64]u8 = undefined;
+    var jump: [64]u8 = undefined;
+    var rc: [16 + 64]u8 = undefined;
+    const sizes = try encode(&input, &main, &call, &jump, &rc);
+    // E8 at position 0 cannot convert (the ip guard requires ip > 0), and
+    // the relative-limit check rejects the zero-paged offsets here.
+    try std.testing.expect(sizes.main == 64);
 }
