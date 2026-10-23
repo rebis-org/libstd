@@ -1,12 +1,13 @@
 const std = @import("std");
 
+const bench_shim = @import("bench_shim");
 const checksum = @import("checksum");
 const crypto = @import("crypto");
-const bench_shim = @import("bench_shim");
-const brotli = bench_shim.brotli;
-const kernels = bench_shim.kernels;
 
 const runner = @import("runner.zig");
+
+const brotli = bench_shim.brotli;
+const kernels = bench_shim.kernels;
 
 const buffer_len_bytes = 1 << 20;
 
