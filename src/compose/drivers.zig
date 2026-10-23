@@ -4,7 +4,9 @@ const checksum = @import("../common/primitive/checksum.zig");
 const exception_prim = @import("../common/primitive/exception.zig");
 const measurement = @import("../common/primitive/measurement.zig");
 const gzip = @import("../representation/grammar/gzip/onprem.zig");
+const tar = @import("../representation/grammar/tar/onprem.zig");
 const zlib = @import("../representation/grammar/zlib/onprem.zig");
+const brotli = @import("../representation/leaf/brotli/onprem.zig");
 const deflate = @import("../representation/leaf/deflate/onprem.zig");
 const deflate_seam = @import("../representation/leaf/deflate/seam.zig");
 const lz4 = @import("../representation/leaf/lz4/onprem.zig");
@@ -1295,7 +1297,7 @@ fn expectChunkedDecode(
     var pos: usize = 0;
     var guard: usize = 0;
     while (true) : (guard += 1) {
-        try testing.expect(guard < 100000);
+        try testing.expect(guard < 4_000_000);
         const take = @min(input_chunk, compressed.len - pos);
         const result = stepDriver(state, compressed[pos..][0..take], scratch, pos + take == compressed.len);
         try decoded.appendSlice(allocator, scratch[0..result.produced]);
@@ -1309,6 +1311,416 @@ fn expectChunkedDecode(
         if (result.status == .done) break;
     }
     try testing.expectEqualSlices(u8, expected, decoded.items);
+}
+
+// ------------------------------------------------------------ lz4 legacy
+// The pre-1.8 legacy frame (magic 0x184C2102 + version nibble) carries
+// independent raw LZ4 blocks of at most 8 MiB, with no descriptor, no
+// checksums, and EOF termination. Blocks stage compressed (bound-sized) and
+// decompress into an 8 MiB staging span that drains across steps; the modern
+// lz4 session keeps rejecting the legacy magic.
+const lz4_legacy_block_size: usize = 8 * 1024 * 1024;
+const lz4_legacy_bound: usize = lz4BlockCompressBound(lz4_legacy_block_size);
+const lz4_legacy_magic: u32 = 0x184C2102;
+
+const Lz4LegacyPhase = enum { magic, block_size, block_data, block_drain, done };
+
+pub const Lz4LegacyDecode = struct {
+    phase: Lz4LegacyPhase = .magic,
+    pending: [lz4_legacy_bound]u8 = undefined,
+    pending_len: usize = 0,
+    pending_read: usize = 0,
+    staging: []u8 = &.{},
+    staging_len: usize = 0,
+    out: []u8 = &.{},
+    out_len: usize = 0,
+    out_read: usize = 0,
+    block_len: usize = 0,
+    budgets: sessions.Budgets,
+};
+
+pub fn lz4LegacyDecodeStorage() usize {
+    return stateSize(Lz4LegacyDecode) + lz4_legacy_bound + lz4_legacy_block_size;
+}
+
+pub fn lz4LegacyDecodeInit(storage: []u8, budgets: sessions.Budgets) error{CapacityException}!*Lz4LegacyDecode {
+    const size = stateSize(Lz4LegacyDecode);
+    if (storage.len < size + lz4_legacy_bound + lz4_legacy_block_size) return error.CapacityException;
+    const state: *Lz4LegacyDecode = @ptrCast(@alignCast(storage.ptr));
+    state.* = .{
+        .staging = storage[size..][0..lz4_legacy_bound],
+        .out = storage[size + lz4_legacy_bound ..][0..lz4_legacy_block_size],
+        .budgets = budgets,
+    };
+    return state;
+}
+
+const lz4_legacy_decode_ops = StepOps(Lz4LegacyDecode, lz4LegacyDecodeStep);
+
+pub fn lz4LegacyDecodeSession(storage: []u8, budgets: sessions.Budgets) error{ CapacityException, UnsupportedException }!sessions.Session {
+    const state = try lz4LegacyDecodeInit(storage, budgets);
+    return .{ .state = state, .ops = &lz4_legacy_decode_ops };
+}
+
+fn lz4LegacyDecodeStep(state: *Lz4LegacyDecode, input: []const u8, output: []u8, end_of_input: bool) StepResult {
+    var result = StepResult{};
+    if (state.phase == .done) {
+        // The slice route requires the frame to end exactly at input end.
+        if (input.len > 0) return framingFailed(&result, 0, error.DataException);
+        result.consumed = 0;
+        result.status = .done;
+        return result;
+    }
+    compactPending(state.pending[0..], &state.pending_len, state.pending_read) catch |exception| {
+        return framingFailed(&result, 0, exception);
+    };
+    state.pending_read = 0;
+    var accepted: usize = 0;
+    while (accepted < input.len and state.pending_len < state.pending.len) {
+        state.pending[state.pending_len] = input[accepted];
+        state.pending_len += 1;
+        accepted += 1;
+    }
+    result.consumed = accepted;
+    var stalled = false;
+    while (!stalled) {
+        const avail = state.pending[state.pending_read..state.pending_len];
+        switch (state.phase) {
+            .magic => {
+                if (avail.len < 4) {
+                    if (end_of_input) return framingFailed(&result, accepted, error.DataException);
+                    stalled = true;
+                    continue;
+                }
+                const magic_value = std.mem.readInt(u32, avail[0..4], .little);
+                if (magic_value < lz4_legacy_magic or magic_value > lz4_legacy_magic + 7) return framingFailed(&result, accepted, error.DataException);
+                state.pending_read += 4;
+                state.phase = .block_size;
+            },
+            .block_size => {
+                if (avail.len < 4) {
+                    // EOF at a block boundary ends the frame; a partial
+                    // size word is truncation.
+                    if (end_of_input and state.pending_read == state.pending_len) {
+                        state.phase = .done;
+                        result.status = .done;
+                        return result;
+                    }
+                    if (end_of_input) return framingFailed(&result, accepted, error.DataException);
+                    stalled = true;
+                    continue;
+                }
+                const block_len: usize = std.mem.readInt(u32, avail[0..4], .little);
+                state.pending_read += 4;
+                if (block_len == 0) {
+                    // The kernel terminator: nothing may follow, matching
+                    // the slice route's exact-consumption check.
+                    if (end_of_input and state.pending_read < state.pending_len) return framingFailed(&result, accepted, error.DataException);
+                    state.phase = .done;
+                    result.status = .done;
+                    return result;
+                }
+                if (block_len > lz4_legacy_bound) return framingFailed(&result, accepted, error.DataException);
+                state.block_len = block_len;
+                state.staging_len = 0;
+                state.phase = .block_data;
+            },
+            .block_data => {
+                const want = state.block_len - state.staging_len;
+                const take = @min(want, avail.len);
+                @memcpy(state.staging[state.staging_len..][0..take], avail[0..take]);
+                state.staging_len += take;
+                state.pending_read += take;
+                if (state.staging_len == state.block_len) {
+                    state.out_len = lz4.decompressBlock(state.staging[0..state.staging_len], state.out, &[_]u8{}) catch |err| {
+                        return framingFailed(&result, accepted, switch (err) {
+                            error.DataException => error.DataException,
+                            error.OutputTooSmall => error.DataException,
+                        });
+                    };
+                    state.out_read = 0;
+                    state.budgets.addDecoded(state.out_len) catch |exception| {
+                        return framingFailed(&result, accepted, exception);
+                    };
+                    state.phase = .block_drain;
+                } else if (end_of_input) {
+                    return framingFailed(&result, accepted, error.DataException);
+                } else {
+                    stalled = true;
+                }
+            },
+            .block_drain => {
+                const take = @min(state.out_len - state.out_read, output.len - result.produced);
+                if (take > 0) {
+                    @memcpy(output[result.produced..][0..take], state.out[state.out_read..][0..take]);
+                    result.produced += take;
+                    state.out_read += take;
+                }
+                if (state.out_read == state.out_len) {
+                    state.phase = .block_size;
+                } else {
+                    stalled = true;
+                }
+            },
+            .done => {
+                result.status = .done;
+                return result;
+            },
+        }
+    }
+    return result;
+}
+
+// ---------------------------------------------------------------- tar
+// Stepped streaming tar writer. The caller streams, per entry, the
+// 512-byte header block (from tar.formatHeaderBlock) followed by the raw
+// data bytes; the driver pads each entry to the 512-block grid and closes
+// with the two zero blocks the slice encoder emits. GNU/pax long-name spill
+// entries are ordinary size-carrying entries, so they pass through
+// unchanged.
+const TarEncodePhase = enum { header, data, pad, trailer, done };
+
+pub const TarEncode = struct {
+    phase: TarEncodePhase = .header,
+    hold: [512]u8 = undefined,
+    hold_len: usize = 0,
+    entry_size: u64 = 0,
+    data_remaining: u64 = 0,
+    pad_len: usize = 0,
+    trailer_remaining: usize = 0,
+    budgets: sessions.Budgets,
+};
+
+pub fn tarEncodeStorage() usize {
+    return stateSize(TarEncode);
+}
+
+pub fn tarEncodeInit(storage: []u8, budgets: sessions.Budgets) error{CapacityException}!*TarEncode {
+    if (storage.len < stateSize(TarEncode)) return error.CapacityException;
+    const state: *TarEncode = @ptrCast(@alignCast(storage.ptr));
+    state.* = .{ .budgets = budgets };
+    return state;
+}
+
+const tar_encode_ops = StepOps(TarEncode, tarEncodeStep);
+
+pub fn tarEncodeSession(storage: []u8, budgets: sessions.Budgets) error{ CapacityException, UnsupportedException }!sessions.Session {
+    const state = try tarEncodeInit(storage, budgets);
+    return .{ .state = state, .ops = &tar_encode_ops };
+}
+
+fn tarEncodeStep(state: *TarEncode, input: []const u8, output: []u8, end_of_input: bool) StepResult {
+    var result = StepResult{};
+    var in_off: usize = 0;
+    var out_off: usize = 0;
+    while (true) {
+        switch (state.phase) {
+            .header => {
+                if (in_off >= input.len) {
+                    if (end_of_input and state.hold_len == 0) {
+                        state.phase = .trailer;
+                        state.trailer_remaining = 1024;
+                        continue;
+                    }
+                    if (end_of_input) return framingFailed(&result, in_off, error.DataException);
+                    break;
+                }
+                if (state.hold_len == 0 and input.len - in_off >= 512 and output.len - out_off >= 512) {
+                    // Fast path: whole block in and out, no hold traffic.
+                    @memcpy(output[out_off..][0..512], input[in_off..][0..512]);
+                    in_off += 512;
+                    out_off += 512;
+                    const size = tar.parseHeaderDataSize(output[out_off - 512 ..][0..512]) catch |exception| {
+                        return framingFailed(&result, in_off, exception);
+                    };
+                    state.entry_size = size;
+                    state.data_remaining = size;
+                    state.phase = .data;
+                    continue;
+                }
+                const take = @min(512 - state.hold_len, input.len - in_off);
+                @memcpy(state.hold[state.hold_len..][0..take], input[in_off..][0..take]);
+                state.hold_len += take;
+                in_off += take;
+                if (state.hold_len == 512) {
+                    if (output.len - out_off < 512) {
+                        // The header block must land whole; ask the caller
+                        // for more output room. Keep the hold.
+                        result.status = .open;
+                        break;
+                    }
+                    @memcpy(output[out_off..][0..512], &state.hold);
+                    out_off += 512;
+                    const size = tar.parseHeaderDataSize(&state.hold) catch |exception| {
+                        return framingFailed(&result, in_off, exception);
+                    };
+                    state.hold_len = 0;
+                    state.entry_size = size;
+                    state.data_remaining = size;
+                    state.phase = .data;
+                }
+            },
+            .data => {
+                if (state.data_remaining == 0) {
+                    state.pad_len = @intCast((512 - (state.entry_size % 512)) % 512);
+                    state.phase = .pad;
+                    continue;
+                }
+                if (in_off >= input.len) {
+                    if (end_of_input) return framingFailed(&result, in_off, error.DataException);
+                    break;
+                }
+                const want: usize = @intCast(@min(state.data_remaining, std.math.maxInt(u32)));
+                const take = @min(want, @min(input.len - in_off, output.len - out_off));
+                if (take == 0) break;
+                @memcpy(output[out_off..][0..take], input[in_off..][0..take]);
+                in_off += take;
+                out_off += take;
+                state.data_remaining -= take;
+            },
+            .pad => {
+                if (state.pad_len == 0) {
+                    state.phase = .header;
+                    continue;
+                }
+                if (output.len - out_off == 0) break;
+                const take = @min(state.pad_len, output.len - out_off);
+                @memset(output[out_off..][0..take], 0);
+                out_off += take;
+                state.pad_len -= take;
+                if (state.pad_len == 0) {
+                    state.phase = .header;
+                    continue;
+                }
+            },
+            .trailer => {
+                if (state.trailer_remaining == 0) {
+                    state.phase = .done;
+                    result.status = .done;
+                    break;
+                }
+                if (output.len - out_off == 0) break;
+                const take = @min(state.trailer_remaining, output.len - out_off);
+                @memset(output[out_off..][0..take], 0);
+                out_off += take;
+                state.trailer_remaining -= take;
+                if (state.trailer_remaining == 0) {
+                    state.phase = .done;
+                    result.status = .done;
+                }
+            },
+            .done => {
+                // The slice encoder writes nothing after the trailer; any
+                // further input is a caller error.
+                if (in_off < input.len) return framingFailed(&result, in_off, error.DataException);
+                result.status = .done;
+                break;
+            },
+        }
+        // Stall exits live inside each phase; reaching here means a phase
+        // transition asked for another iteration.
+    }
+    result.consumed = in_off;
+    result.produced = out_off;
+    state.budgets.addEncoded(in_off) catch |exception| {
+        return framingFailed(&result, in_off, exception);
+    };
+    state.budgets.addDecoded(out_off) catch |exception| {
+        return framingFailed(&result, in_off, exception);
+    };
+    return result;
+}
+
+// ---------------------------------------------------------------- brotli
+// The windowed incremental decode drives the session: the state owns the
+// 16 MiB history ring, input is staged (4 MiB), output drains through a 1 MiB
+// staging span, and every phase suspends on starvation or a full span.
+const brotli_in_staging_len: usize = 4 << 20;
+const brotli_out_staging_len: usize = 1 << 20;
+
+pub const BrotliDecode = struct {
+    inc: brotli.Incremental,
+    pending: []u8 = &.{},
+    pending_len: usize = 0,
+    pending_read: usize = 0,
+    out: []u8 = &.{},
+    out_read: usize = 0,
+    // The decoder reports done while its staging still holds undrained
+    // output; the session may only answer done once the staging is empty.
+    finishing: bool = false,
+    budgets: sessions.Budgets,
+};
+
+pub fn brotliDecodeStorage() usize {
+    return stateSize(BrotliDecode) + brotli.incrementalWorkspaceSize(.{}) + brotli_in_staging_len + brotli_out_staging_len;
+}
+
+pub fn brotliDecodeInit(storage: []u8, budgets: sessions.Budgets) error{ CapacityException, UnsupportedException }!*BrotliDecode {
+    const size = stateSize(BrotliDecode);
+    const ws = brotli.incrementalWorkspaceSize(.{});
+    if (storage.len < size + ws + brotli_in_staging_len + brotli_out_staging_len) return error.CapacityException;
+    const state: *BrotliDecode = @ptrCast(@alignCast(storage.ptr));
+    const workspace = storage[size..][0..ws];
+    state.* = .{
+        .inc = brotli.incrementalInit(workspace, .{}) catch return error.CapacityException,
+        .pending = storage[size + ws ..][0..brotli_in_staging_len],
+        .out = storage[size + ws + brotli_in_staging_len ..][0..brotli_out_staging_len],
+        .budgets = budgets,
+    };
+    return state;
+}
+
+const brotli_decode_ops = StepOps(BrotliDecode, brotliDecodeStep);
+
+pub fn brotliDecodeSession(storage: []u8, budgets: sessions.Budgets) error{ CapacityException, UnsupportedException }!sessions.Session {
+    const state = try brotliDecodeInit(storage, budgets);
+    return .{ .state = state, .ops = &brotli_decode_ops };
+}
+
+fn brotliDecodeStep(state: *BrotliDecode, input: []const u8, output: []u8, end_of_input: bool) StepResult {
+    var result = StepResult{};
+    compactPending(state.pending[0..], &state.pending_len, state.pending_read) catch |exception| {
+        return framingFailed(&result, 0, exception);
+    };
+    state.pending_read = 0;
+    var accepted: usize = 0;
+    while (accepted < input.len and state.pending_len < state.pending.len) {
+        state.pending[state.pending_len] = input[accepted];
+        state.pending_len += 1;
+        accepted += 1;
+    }
+    result.consumed = accepted;
+    // The stream's own end flag reaches the decoder only once the caller's
+    // input is fully staged.
+    const stream_end = end_of_input and accepted == input.len;
+    while (true) {
+        const res = state.inc.run(state.pending[state.pending_read..state.pending_len], state.out[state.out_read..], stream_end) catch |exception| {
+            return framingFailed(&result, accepted, exception);
+        };
+        state.pending_read += res.consumed;
+        state.out_read += res.produced;
+        state.budgets.addEncoded(res.consumed) catch |exception| {
+            return framingFailed(&result, accepted, exception);
+        };
+        const take = @min(state.out_read, output.len - result.produced);
+        if (take > 0) {
+            @memcpy(output[result.produced..][0..take], state.out[0..take]);
+            result.produced += take;
+            state.out_read -= take;
+            if (state.out_read > 0) @memmove(state.out[0..state.out_read], state.out[take .. take + state.out_read]);
+            state.budgets.addDecoded(take) catch |exception| {
+                return framingFailed(&result, accepted, exception);
+            };
+        }
+        if (res.status == .done) state.finishing = true;
+        if (state.finishing and state.out_read == 0) {
+            result.status = .done;
+            return result;
+        }
+        if (state.out_read > 0) return result; // caller's output is full
+        if (accepted < input.len) return result; // staging full; caller re-feeds
+        if (res.consumed == 0 and res.produced == 0) return result; // starved, awaiting input
+    }
 }
 
 test "decode sessions drain the final block across output boundaries" {
@@ -1495,4 +1907,266 @@ test "lz4 sessions roundtrip and reject reserved header bits" {
     var legacy: [8]u8 = undefined;
     std.mem.writeInt(u32, legacy[0..4], 0x184C2102, .little);
     try testing.expectError(error.DataException, expectChunkedDecode(Lz4Decode, lz4DecodeInit, lz4DecodeStep, dec_holder.aligned, &legacy, &payload, legacy.len, 4096));
+}
+
+test "brotli session decodes chunked like the one-shot decoder" {
+    const allocator = testing.allocator;
+    const dec_holder = try allocStateStorage(BrotliDecode, brotliDecodeStorage(), allocator);
+    defer allocator.free(dec_holder.raw);
+    const enc_holder = try allocStateStorage(BrotliDecode, brotli.encodeWorkspaceSize(.{}) + 65536, allocator);
+    defer allocator.free(enc_holder.raw);
+
+    const inputs = [_][]const u8{
+        "hello world, hello world, hello world!",
+        "abcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabc",
+    };
+    for (inputs) |input| {
+        const bound = brotli.encodedSizeBound(input.len);
+        const encoded = try allocator.alloc(u8, bound);
+        defer allocator.free(encoded);
+        const enc_len = try brotli.encode(input, encoded, enc_holder.aligned[0..brotli.encodeWorkspaceSize(.{})], .{});
+        var oracle: [256]u8 = undefined;
+        const oracle_scratch = try allocator.alloc(u8, brotli.decode_workspace_size);
+        defer allocator.free(oracle_scratch);
+        const n = try brotli.decode(encoded[0..enc_len], &oracle, oracle_scratch, .{});
+        for ([_]usize{ 1, 7, 64, enc_len }) |chunk| {
+            try expectChunkedDecode(BrotliDecode, brotliDecodeInit, brotliDecodeStep, dec_holder.aligned, encoded[0..enc_len], oracle[0..n], chunk, 4096);
+        }
+    }
+
+    // A multi-megablock stream plus a concatenated second stream exercise
+    // metablock boundaries and the stream-boundary reset across steps.
+    var big: [1 << 17]u8 = undefined;
+    var state: u64 = 0x243F6A8885A308D3;
+    for (&big) |*b| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        b.* = @as(u8, @truncate(state)) & 7;
+    }
+    for (1..8) |i| @memcpy(big[(1 << 14) * i ..][0..4096], big[0..4096]);
+    const big_bound = brotli.encodedSizeBound(big.len) + brotli.encodedSizeBound(64);
+    const stream = try allocator.alloc(u8, big_bound);
+    defer allocator.free(stream);
+    const part_len = try brotli.encode(&big, stream, enc_holder.aligned[0..brotli.encodeWorkspaceSize(.{})], .{});
+    const tail_len = try brotli.encode("second stream", stream[part_len..], enc_holder.aligned[0..brotli.encodeWorkspaceSize(.{})], .{});
+    const total = part_len + tail_len;
+    const oracle = try allocator.alloc(u8, big.len + 16);
+    defer allocator.free(oracle);
+    const oracle_scratch = try allocator.alloc(u8, brotli.decode_workspace_size);
+    defer allocator.free(oracle_scratch);
+    const n = try brotli.decode(stream[0..total], oracle, oracle_scratch, .{});
+    for ([_]usize{ 1, 13, 4096, total }) |chunk| {
+        for ([_]usize{ 1, 1000, 65536 }) |out_chunk| {
+            try expectChunkedDecode(BrotliDecode, brotliDecodeInit, brotliDecodeStep, dec_holder.aligned, stream[0..total], oracle[0..n], chunk, out_chunk);
+        }
+    }
+}
+
+test "lz4 legacy session decodes chunked frames" {
+    const allocator = testing.allocator;
+    const holder = try allocStateStorage(Lz4LegacyDecode, lz4LegacyDecodeStorage(), allocator);
+    defer allocator.free(holder.raw);
+
+    const payload_a = try allocator.alloc(u8, 70000);
+    defer allocator.free(payload_a);
+    @memcpy(payload_a[0..16], "legacy block a: ");
+    @memset(payload_a[16..], 'a');
+    const payload_b = try allocator.alloc(u8, 1024 * 1024 - 13);
+    defer allocator.free(payload_b);
+    var rng: u64 = 0x9E3779B97F4A7C15;
+    for (payload_b) |*b| {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        b.* = @as(u8, @truncate(rng)) & 3;
+    }
+    for (1..15) |i| @memcpy(payload_b[i * 65536 ..][0..8192], payload_b[0..8192]);
+
+    const hash_table = try allocator.alloc(u32, lz4_hash_words);
+    defer allocator.free(hash_table);
+    const comp_a = try allocator.alloc(u8, lz4BlockCompressBound(payload_a.len));
+    defer allocator.free(comp_a);
+    const comp_b = try allocator.alloc(u8, lz4BlockCompressBound(payload_b.len));
+    defer allocator.free(comp_b);
+    const a_len = lz4.compressBlock(payload_a, comp_a, hash_table, 1);
+    const b_len = lz4.compressBlock(payload_b, comp_b, hash_table, 1);
+
+    var frame = try allocator.alloc(u8, 4 + 4 + a_len + 4 + b_len);
+    defer allocator.free(frame);
+    var len: usize = 0;
+    std.mem.writeInt(u32, frame[len..][0..4], 0x184C2102, .little);
+    len += 4;
+    std.mem.writeInt(u32, frame[len..][0..4], @intCast(a_len), .little);
+    len += 4;
+    @memcpy(frame[len..][0..a_len], comp_a[0..a_len]);
+    len += a_len;
+    std.mem.writeInt(u32, frame[len..][0..4], @intCast(b_len), .little);
+    len += 4;
+    @memcpy(frame[len..][0..b_len], comp_b[0..b_len]);
+    len += b_len;
+
+    const expected = try allocator.alloc(u8, payload_a.len + payload_b.len);
+    defer allocator.free(expected);
+    @memcpy(expected[0..payload_a.len], payload_a);
+    @memcpy(expected[payload_a.len..], payload_b);
+    for ([_]usize{ 1, 7, 4096, frame.len }) |chunk| {
+        try expectChunkedDecode(Lz4LegacyDecode, lz4LegacyDecodeInit, lz4LegacyDecodeStep, holder.aligned, frame, expected, chunk, 65536);
+    }
+
+    // The near-8 MiB block exercises the staging bound; larger chunks keep
+    // the step count sane.
+    const payload_c = try allocator.alloc(u8, 8 * 1024 * 1024 - 13);
+    defer allocator.free(payload_c);
+    @memcpy(payload_c[0..16], "legacy block c: ");
+    var rng_c: u64 = 0xD1B54A32D192ED03;
+    for (payload_c[16..]) |*b| {
+        rng_c ^= rng_c << 13;
+        rng_c ^= rng_c >> 7;
+        rng_c ^= rng_c << 17;
+        b.* = @as(u8, @truncate(rng_c)) & 3;
+    }
+    for (1..128) |i| @memcpy(payload_c[i * 65536 ..][0..8192], payload_c[0..8192]);
+    const comp_c = try allocator.alloc(u8, lz4BlockCompressBound(payload_c.len));
+    defer allocator.free(comp_c);
+    const c_len = lz4.compressBlock(payload_c, comp_c, hash_table, 1);
+    const frame_c = try allocator.alloc(u8, 4 + 4 + c_len + 4);
+    defer allocator.free(frame_c);
+    std.mem.writeInt(u32, frame_c[0..4], 0x184C2102, .little);
+    std.mem.writeInt(u32, frame_c[4..8], @intCast(c_len), .little);
+    @memcpy(frame_c[8..][0..c_len], comp_c[0..c_len]);
+    std.mem.writeInt(u32, frame_c[8 + c_len ..][0..4], 0, .little);
+    for ([_]usize{ 4096, frame_c.len }) |chunk| {
+        try expectChunkedDecode(Lz4LegacyDecode, lz4LegacyDecodeInit, lz4LegacyDecodeStep, holder.aligned, frame_c, payload_c, chunk, 1 << 20);
+    }
+
+    // The kernel zero terminator ends the frame; trailing bytes are a
+    // format error, as is a block past the 8 MiB bound.
+    var terminated: [8]u8 = undefined;
+    std.mem.writeInt(u32, terminated[0..4], 0x184C2106, .little);
+    std.mem.writeInt(u32, terminated[4..8], 0, .little);
+    try expectChunkedDecode(Lz4LegacyDecode, lz4LegacyDecodeInit, lz4LegacyDecodeStep, holder.aligned, &terminated, &[_]u8{}, terminated.len, 16);
+    var trailing = terminated;
+    trailing[0] = 0xAA;
+    try testing.expectError(error.DataException, expectChunkedDecode(Lz4LegacyDecode, lz4LegacyDecodeInit, lz4LegacyDecodeStep, holder.aligned, &trailing, &[_]u8{}, trailing.len, 16));
+    var oversize: [8]u8 = undefined;
+    std.mem.writeInt(u32, oversize[0..4], 0x184C2102, .little);
+    std.mem.writeInt(u32, oversize[4..8], @intCast(lz4BlockCompressBound(8 * 1024 * 1024) + 1), .little);
+    try testing.expectError(error.DataException, expectChunkedDecode(Lz4LegacyDecode, lz4LegacyDecodeInit, lz4LegacyDecodeStep, holder.aligned, &oversize, &[_]u8{}, oversize.len, 16));
+    // Truncation inside a block is a data error at end of input.
+    try testing.expectError(error.DataException, expectChunkedDecode(Lz4LegacyDecode, lz4LegacyDecodeInit, lz4LegacyDecodeStep, holder.aligned, frame[0 .. len - 3], expected, 1, 65536));
+}
+
+test "tar encode session frames like the slice encoder" {
+    const allocator = testing.allocator;
+    const holder = try allocStateStorage(TarEncode, tarEncodeStorage(), allocator);
+    defer allocator.free(holder.raw);
+
+    const small = "hello tar streaming";
+    var binary: [600]u8 = undefined;
+    var rng: u64 = 0x2545F4914F6CDD1D;
+    for (&binary) |*b| {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        b.* = @as(u8, @truncate(rng));
+    }
+    const entries = [_]tar.Entry{
+        .{ .name = "a.txt", .data = small, .modification_time = 1000000000 },
+        .{ .name = "empty.bin", .data = &.{} },
+        .{ .name = "dir/nested.bin", .data = &binary, .mode = 0o600, .uid = 7, .gid = 8 },
+        .{ .name = "five", .data = "12345" },
+    };
+    // No pax fields: the slice encoder emits exactly one header per entry,
+    // so its output is the framing oracle for the same logical stream.
+    const oracle = try allocator.alloc(u8, try tar.archiveSize(&entries));
+    defer allocator.free(oracle);
+    const oracle_scratch = try allocator.alloc(u8, tar.scratch_size);
+    defer allocator.free(oracle_scratch);
+    const oracle_len = try tar.encode(&entries, oracle, oracle_scratch);
+
+    var logical = try allocator.alloc(u8, oracle_len);
+    defer allocator.free(logical);
+    var logical_len: usize = 0;
+    for (entries) |entry| {
+        var header: [512]u8 = undefined;
+        try tar.formatHeaderBlock(.posix, entry.name, &.{}, entry.link_name, entry.mode, entry.uid, entry.gid, entry.modification_time, entry.typeflag, entry.data.len, entry.devmajor, entry.devminor, &header);
+        @memcpy(logical[logical_len..][0..512], &header);
+        logical_len += 512;
+        @memcpy(logical[logical_len..][0..entry.data.len], entry.data);
+        logical_len += entry.data.len;
+    }
+    // formatHeaderBlock and the slice encoder must emit identical header
+    // bytes for the same entry.
+    var probe: [512]u8 = undefined;
+    try tar.formatHeaderBlock(.posix, entries[2].name, &.{}, entries[2].link_name, entries[2].mode, entries[2].uid, entries[2].gid, entries[2].modification_time, entries[2].typeflag, entries[2].data.len, 0, 0, &probe);
+    // Entry 3 begins at 1024 + 512: entry 1 aligned to 1024, entry 2
+    // has no data.
+    try testing.expectEqualSlices(u8, oracle[1536 .. 1536 + 512], &probe);
+
+    for ([_]usize{ 1, 7, 511, 512, 513, 4096, logical_len }) |chunk| {
+        const state = try tarEncodeInit(holder.aligned, .{});
+        const out = try allocator.alloc(u8, 1024);
+        defer allocator.free(out);
+        const produced_all = try allocator.alloc(u8, oracle_len);
+        defer allocator.free(produced_all);
+        var in_pos: usize = 0;
+        var out_pos: usize = 0;
+        var guard: usize = 0;
+        while (true) : (guard += 1) {
+            try testing.expect(guard < 4_000_000);
+            const take = @min(chunk, logical_len - in_pos);
+            const result = tarEncodeStep(state, logical[in_pos..][0..take], out, in_pos + take == logical_len);
+            try testing.expect(result.status != .failed);
+            @memcpy(produced_all[out_pos..][0..result.produced], out[0..result.produced]);
+            in_pos += result.consumed;
+            out_pos += result.produced;
+            if (result.status == .done) break;
+        }
+        try testing.expectEqual(oracle_len, out_pos);
+        try testing.expectEqualSlices(u8, oracle[0..oracle_len], produced_all[0..out_pos]);
+    }
+
+    // A pax-style spill entry (an 'x' header whose data carries the pax
+    // records) frames through the driver like any size-carrying entry.
+    const pax_data = "20 mtime=1700000000\n";
+    var pax_header: [512]u8 = undefined;
+    try tar.formatHeaderBlock(.posix, "././@PaxHeader", &.{}, &.{}, 0o644, 0, 0, 0, 'x', pax_data.len, 0, 0, &pax_header);
+    const with_pax = [_]tar.Entry{
+        .{ .name = "a.txt", .data = small, .modification_time = 1700000000 },
+    };
+    const pax_oracle = try allocator.alloc(u8, try tar.archiveSize(&with_pax));
+    defer allocator.free(pax_oracle);
+    const pax_oracle_len = try tar.encode(&with_pax, pax_oracle, oracle_scratch);
+    var pax_logical = try allocator.alloc(u8, 512 + pax_data.len + 512 + with_pax[0].data.len);
+    defer allocator.free(pax_logical);
+    var pax_pos: usize = 0;
+    @memcpy(pax_logical[pax_pos..][0..512], &pax_header);
+    pax_pos += 512;
+    @memcpy(pax_logical[pax_pos..][0..pax_data.len], pax_data);
+    pax_pos += pax_data.len;
+    var main_header: [512]u8 = undefined;
+    try tar.formatHeaderBlock(.posix, with_pax[0].name, &.{}, &.{}, with_pax[0].mode, 0, 0, with_pax[0].modification_time, with_pax[0].typeflag, with_pax[0].data.len, 0, 0, &main_header);
+    @memcpy(pax_logical[pax_pos..][0..512], &main_header);
+    pax_pos += 512;
+    @memcpy(pax_logical[pax_pos..][0..with_pax[0].data.len], with_pax[0].data);
+    pax_pos += with_pax[0].data.len;
+    const pax_state = try tarEncodeInit(holder.aligned, .{});
+    const pax_out = try allocator.alloc(u8, 4096);
+    defer allocator.free(pax_out);
+    var pax_produced = try allocator.alloc(u8, pax_oracle_len);
+    defer allocator.free(pax_produced);
+    var pax_in: usize = 0;
+    var pax_out_pos: usize = 0;
+    while (true) {
+        const take = @min(97, pax_logical.len - pax_in);
+        const result = tarEncodeStep(pax_state, pax_logical[pax_in..][0..take], pax_out, pax_in + take == pax_logical.len);
+        try testing.expect(result.status != .failed);
+        @memcpy(pax_produced[pax_out_pos..][0..result.produced], pax_out[0..result.produced]);
+        pax_in += result.consumed;
+        pax_out_pos += result.produced;
+        if (result.status == .done) break;
+    }
+    try testing.expectEqual(pax_oracle_len, pax_out_pos);
+    try testing.expectEqualSlices(u8, pax_oracle[0..pax_oracle_len], pax_produced[0..pax_out_pos]);
 }

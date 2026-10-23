@@ -49,6 +49,9 @@ const session_defs = [_]SessionDef{
     .{ .component = "zlib", .verb = "encode", .storage = drivers.zlibEncodeStorage, .session = drivers.zlibEncodeSession },
     .{ .component = "lz4", .verb = "decode", .storage = drivers.lz4DecodeStorage, .session = drivers.lz4DecodeSession },
     .{ .component = "lz4", .verb = "encode", .storage = drivers.lz4EncodeStorage, .session = drivers.lz4EncodeSession },
+    .{ .component = "brotli", .verb = "decode", .storage = drivers.brotliDecodeStorage, .session = drivers.brotliDecodeSession },
+    .{ .component = "lz4-legacy", .verb = "decode", .storage = drivers.lz4LegacyDecodeStorage, .session = drivers.lz4LegacyDecodeSession },
+    .{ .component = "tar", .verb = "encode", .storage = drivers.tarEncodeStorage, .session = drivers.tarEncodeSession },
 };
 
 fn matchSessionIndex(component: ?[*:0]const u8, verb: ?[*:0]const u8) ?usize {

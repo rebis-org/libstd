@@ -64,7 +64,7 @@ const NameParts = struct {
     uses_long_name: bool,
 };
 
-const Format = enum { posix, gnu };
+pub const Format = enum { posix, gnu };
 
 pub fn archiveSize(entries: []const Entry) Exception!u64 {
     return archiveSizeWith(.posix, entries);
@@ -379,9 +379,22 @@ fn tarDataSize(typeflag: u8, data: []const u8) Exception!u64 {
     };
 }
 
-// POSIX headers carry the version and prefix fields; GNU headers carry the
-// OLDGNU magic and no prefix.
-fn tarWriteHeader(comptime format: Format, sink: *io.Sink, scratch: []u8, name: []const u8, prefix: []const u8, link_name: []const u8, mode: u32, uid: u32, gid: u32, modification_time: u64, typeflag: u8, size: u64, devmajor: u32, devminor: u32) Exception!void {
+// Formats one 512-byte header block; the streaming encode driver and slice
+// encode share this so both emit byte-identical headers. Long-name spill
+// entries (pax/GNU LongLink) are ordinary entries the caller emits first.
+pub fn formatHeaderBlock(format: Format, name: []const u8, prefix: []const u8, link_name: []const u8, mode: u32, uid: u32, gid: u32, modification_time: u64, typeflag: u8, size: u64, devmajor: u32, devminor: u32, out: *[512]u8) Exception!void {
+    var block: [512]u8 = undefined;
+    var sink = io.Sink{ .bytes = out[0..512] };
+    try tarWriteHeader(format, &sink, &block, name, prefix, link_name, mode, uid, gid, modification_time, typeflag, size, devmajor, devminor);
+}
+
+// The streaming encode driver reads the data length back from the header it
+// just passed through; octal or GNU base-256, same as the slice reader.
+pub fn parseHeaderDataSize(block: *const [512]u8) Exception!u64 {
+    return tarNumber(block[124..136]);
+}
+
+fn tarWriteHeader(format: Format, sink: *io.Sink, scratch: []u8, name: []const u8, prefix: []const u8, link_name: []const u8, mode: u32, uid: u32, gid: u32, modification_time: u64, typeflag: u8, size: u64, devmajor: u32, devminor: u32) Exception!void {
     if (scratch.len < scratch_size) return error.CapacityException;
     const block = scratch[0..scratch_size];
     @memset(block, 0);
