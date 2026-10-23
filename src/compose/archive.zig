@@ -1061,7 +1061,9 @@ fn sevenZipGeneric(comptime coded: bool, plan: *common.ExecutionPlan, source: ?*
             .password_lifetime = cryptoLifetime(crypto_params),
             .failure_cause = &crypto_cause,
         };
-        const entries = try collectEntries(seven_zip.Entry, call.request, &workspace, SevenZipFillCtx{ .default_method = .copy, .allow_method = coded, .crypto = crypto_params }, fillSevenZipEntry);
+        const filter_slots = try workspace.take(seven_zip.CoderMethod, entryCount(call.request));
+        var filter_next: usize = 0;
+        const entries = try collectEntries(seven_zip.Entry, call.request, &workspace, SevenZipFillCtx{ .default_method = .copy, .allow_method = coded, .crypto = crypto_params, .filter_slots = filter_slots, .filter_next = &filter_next }, fillSevenZipEntry);
         const packed_entries = seven_zip.sevenZipPack(entries, plan.provider, &workspace, limits, &crypto_cause) catch |err| {
             writeCryptoFailure(call, crypto_cause);
             return err;
@@ -1132,6 +1134,8 @@ const SevenZipFillCtx = struct {
     default_method: seven_zip.CoderMethod,
     allow_method: bool,
     crypto: ?CryptoParams,
+    filter_slots: []seven_zip.CoderMethod,
+    filter_next: *usize,
 };
 
 fn fillSevenZipEntry(entry: *seven_zip.Entry, node: *Node, ctx: SevenZipFillCtx) Exception!void {
@@ -1143,7 +1147,12 @@ fn fillSevenZipEntry(entry: *seven_zip.Entry, node: *Node, ctx: SevenZipFillCtx)
         null;
     const method = if (method_node) |n| try parseSevenZipMethod(n) else ctx.default_method;
     entry.* = .{ .name = parts.name, .data = parts.data, .method = method };
-    if (filter_node) |n| entry.filter = try parseSevenZipMethod(n);
+    if (filter_node) |n| {
+        const slot = ctx.filter_next.*;
+        ctx.filter_next.* = slot + 1;
+        ctx.filter_slots[slot] = try parseSevenZipMethod(n);
+        entry.filters = ctx.filter_slots[slot..][0..1];
+    }
     if (ctx.crypto) |params| {
         entry.encrypted = true;
         entry.password = params.password;

@@ -51,7 +51,7 @@ pub const Entry = struct {
     name: []const u8,
     data: []const u8,
     method: CoderMethod = .copy,
-    filter: ?CoderMethod = null,
+    filters: []const CoderMethod = &.{},
     encrypted: bool = false,
     password: []const u8 = &.{},
     iv: [16]u8 = @splat(0),
@@ -186,7 +186,7 @@ const PackedEntry = struct {
     data: []const u8,
     crc: u32,
     encrypted: bool = false,
-    filter: ?CoderMethod = null,
+    filters: []const CoderMethod = &.{},
     iv: [16]u8 = @splat(0),
     salt: [16]u8 = @splat(0),
     salt_length: u8 = 0,
@@ -225,11 +225,11 @@ fn packEntry(entry: Entry, provider: crypto.Provider, workspace: *Workspace, lim
     // Filter chains are supported with LZMA1/LZMA2 coders only: LZMA1 filter
     // chains stay decodable by every 7z reader and LZMA2 is the modern
     // default. Any other codec with an explicit filter is a caller error.
-    const source: []const u8 = if (entry.filter) |explicit| blk: {
+    const source: []const u8 = if (entry.filters.len != 0) blk: {
         if (entry.method != .lzma and entry.method != .lzma2) return error.CallException;
         const filtered = try workspace.take(u8, entry.data.len);
         @memcpy(filtered, entry.data);
-        try applyEncodeFilter(explicit, filtered);
+        for (entry.filters) |filter| try applyEncodeFilter(filter, filtered);
         break :blk filtered;
     } else entry.data;
     var compressed_entry = switch (entry.method) {
@@ -278,11 +278,11 @@ fn packEntry(entry: Entry, provider: crypto.Provider, workspace: *Workspace, lim
             try applyEncodeFilter(entry.method, filtered);
             const options: lzma2.Options = .{ .dictionary_size = default_dictionary, .properties = lzma2.defaultProperties(default_dictionary), .max_work = limits.codec_work };
             var packed_entry = try packBuffer(lzma2, .lzma2, filtered, unpacked_crc, workspace, limits, lzma2.encodeWorkspaceSizeBt(default_dictionary), options);
-            packed_entry.filter = entry.method;
+            packed_entry.filters = entry.filters;
             break :blk packed_entry;
         },
     };
-    if (entry.filter) |explicit| compressed_entry.filter = explicit;
+    compressed_entry.filters = entry.filters;
     if (!entry.encrypted) return compressed_entry;
     const password_utf16 = try passwordToUtf16(entry.password, workspace);
     const cycles = if (entry.num_cycles_power == 0) crypto.seven_zip_default_cycles else entry.num_cycles_power;
@@ -301,7 +301,7 @@ fn packEntry(entry: Entry, provider: crypto.Provider, workspace: *Workspace, lim
         try crypto.fillRandom(&iv);
     }
     try crypto.aesCbcEncrypt(provider, &key, iv, encrypted_data, encrypted_data);
-    return .{ .method = compressed_entry.method, .data = encrypted_data, .crc = compressed_entry.crc, .encrypted = true, .filter = compressed_entry.filter, .iv = iv, .salt = entry.salt, .salt_length = entry.salt_length, .num_cycles_power = cycles, .pack_size = compressed_entry.pack_size, .unpack_size = compressed_entry.unpack_size };
+    return .{ .method = compressed_entry.method, .data = encrypted_data, .crc = compressed_entry.crc, .encrypted = true, .filters = compressed_entry.filters, .iv = iv, .salt = entry.salt, .salt_length = entry.salt_length, .num_cycles_power = cycles, .pack_size = compressed_entry.pack_size, .unpack_size = compressed_entry.unpack_size };
 }
 
 fn applyEncodeFilter(method: CoderMethod, data: []u8) Exception!void {
@@ -325,9 +325,9 @@ fn packAllEntries(entries: []const Entry, provider: crypto.Provider, workspace: 
         // carries across the substreams as in 7-Zip's solid folders. Filtered
         // entries never join a run: each needs its own pre-filter pass, so it
         // packs individually through packEntry.
-        if ((entries[i].method == .lzma2 or entries[i].method == .ppmd) and !entries[i].encrypted and entries[i].filter == null) {
+        if ((entries[i].method == .lzma2 or entries[i].method == .ppmd) and !entries[i].encrypted and entries[i].filters.len == 0) {
             var j = i + 1;
-            while (j < entries.len and !isEmptyEntry(entries[j]) and entries[j].method == entries[i].method and !entries[j].encrypted and entries[j].filter == null) j += 1;
+            while (j < entries.len and !isEmptyEntry(entries[j]) and entries[j].method == entries[i].method and !entries[j].encrypted and entries[j].filters.len == 0) j += 1;
             if (j - i >= 2) {
                 var total: usize = 0;
                 for (entries[i..j]) |entry| total = try bounds.addUsize(total, entry.data.len);
@@ -610,6 +610,60 @@ fn writeArchive(output: []u8, entries: []const Entry, packed_entries: []const Pa
     }
     try sink.write(header.pack);
     return required;
+}
+
+pub const VolumeLayout = struct {
+    total_len: usize,
+    volumes: u64,
+};
+
+// Multi-volume view: volume 1 carries the 32-byte signature header and
+// volume_size - 32 bytes of payload; every later volume is pure payload.
+// Chopping the single-archive byte stream at volume_size boundaries is
+// byte-identical to 7-Zip's split writer (7zz -v), so the volumes need no
+// extra encoding; the caller slices the returned extents.
+pub fn sevenZipVolumeExtents(total_len: usize, volume_size: u64) Exception!VolumeLayout {
+    if (volume_size <= start_header_size) return error.CallException;
+    if (total_len == 0) return error.DataException;
+    const first_data = volume_size - start_header_size;
+    if (total_len <= start_header_size + first_data) {
+        return .{ .total_len = total_len, .volumes = 1 };
+    }
+    const rest = total_len - start_header_size - first_data;
+    const later = (rest + volume_size - 1) / volume_size;
+    return .{ .total_len = total_len, .volumes = 1 + later };
+}
+
+pub fn sevenZipWritePackedVolumes(entries: []const Entry, packed_entries: []const PackedEntry, output: []u8, volume_size: u64, workspace: *Workspace, provider: crypto.Provider, limits: Limits, header_options: SevenZipHeaderOptions) Exception!VolumeLayout {
+    const total = try writeArchive(output, entries, packed_entries, workspace, provider, limits, header_options);
+    return try sevenZipVolumeExtents(total, volume_size);
+}
+
+// Reads a multi-volume 7z archive: volume 1's start header is validated,
+// the payload areas are concatenated in the workspace, and the ordinary
+// single-volume loader runs over the result.
+pub fn sevenZipDecodeVolumes(volumes: []const []const u8, workspace: *Workspace, limits: Limits, ordinal: u64, output: []u8, decode_options: SevenZipDecodeOptions) Exception!usize {
+    if (volumes.len == 0) return error.DataException;
+    decode_options.failure_cause.* = .none;
+    var total: usize = 0;
+    for (volumes, 0..) |volume, i| {
+        if (volume.len < start_header_size and i == 0) return error.DataException;
+        const payload = if (i == 0) volume[start_header_size..] else volume;
+        total = try bounds.addUsize(total, payload.len);
+        if (total > limits.encoded_bytes) return error.ResourceException;
+    }
+    // The joined payload follows volume 1's start header; materialize one
+    // contiguous stream so the loader's offsets line up.
+    const first = volumes[0];
+    const full = try workspace.take(u8, start_header_size + total);
+    @memcpy(full[0..start_header_size], first[0..start_header_size]);
+    var at: usize = start_header_size;
+    for (volumes, 0..) |volume, i| {
+        const payload = if (i == 0) volume[start_header_size..] else volume;
+        @memcpy(full[at..][0..payload.len], payload);
+        at += payload.len;
+    }
+    return try sevenZipDecodeOrdinal(full, workspace, limits, ordinal, output, decode_options);
 }
 
 pub fn sevenZipWritePacked(entries: []const Entry, packed_entries: []const PackedEntry, output: []u8, workspace: *Workspace, provider: crypto.Provider, limits: Limits, header_options: SevenZipHeaderOptions) Exception!usize {
@@ -1810,7 +1864,7 @@ fn writeHeader(writer: *std.Io.Writer, entries: []const Entry, packed_entries: [
 }
 
 const FolderPlan = struct {
-    filter: ?CoderMethod,
+    filters: []const CoderMethod,
     method: CoderMethod,
     encrypted: bool,
     first: usize,
@@ -1829,7 +1883,7 @@ fn buildFolderPlan(packed_entries: []const PackedEntry, workspace: *Workspace) E
         // packed bytes (directories and encrypted entries break runs there,
         // so they must break folders here too).
         while (j < packed_entries.len and packed_entries[j].solid_continuation) j += 1;
-        plan[plan_count] = .{ .filter = p.filter, .method = p.method, .encrypted = p.encrypted, .first = i, .count = j - i };
+        plan[plan_count] = .{ .filters = p.filters, .method = p.method, .encrypted = p.encrypted, .first = i, .count = j - i };
         plan_count += 1;
         i = j;
     }
@@ -1870,7 +1924,7 @@ fn writeStreamsInfo(writer: *std.Io.Writer, entries: []const Entry, packed_entri
     try io.writeBytes(writer, &.{0x00});
     for (plan) |folder| {
         const p = packed_entries[folder.first];
-        const num_coders = @as(usize, if (p.encrypted) 1 else 0) + @as(usize, if (p.filter != null) 1 else 0) + 1;
+        const num_coders = @as(usize, if (p.encrypted) 1 else 0) + p.filters.len + 1;
         try writeUint64(writer, num_coders);
         if (p.encrypted) {
             const aes_flags: u8 = @as(u8, @intCast(method_7z_aes_id.len)) | 0x20;
@@ -1892,7 +1946,14 @@ fn writeStreamsInfo(writer: *std.Io.Writer, entries: []const Entry, packed_entri
         }
         const method = p.method;
         try writeFolderCoder(writer, method, p.crc);
-        if (p.filter) |filter| try writeFolderCoder(writer, filter, p.crc);
+        // Coders decode in written order, so the filter nearest the packed
+        // stream (last in the encode chain) is written first after the
+        // payload coder.
+        var filter_index = p.filters.len;
+        while (filter_index > 0) {
+            filter_index -= 1;
+            try writeFolderCoder(writer, p.filters[filter_index], p.crc);
+        }
         var bond_index: usize = 0;
         while (bond_index + 1 < num_coders) : (bond_index += 1) {
             try writeUint64(writer, bond_index + 1);
@@ -1904,8 +1965,12 @@ fn writeStreamsInfo(writer: *std.Io.Writer, entries: []const Entry, packed_entri
         const p = packed_entries[folder.first];
         const unpack_size = try folderUnpackSize(entries, folder);
         if (p.encrypted) try writeUint64(writer, p.pack_size);
-        try writeUint64(writer, unpack_size);
-        if (p.filter != null) try writeUint64(writer, unpack_size);
+        // Every filter in the chain is size-preserving, so each coder's
+        // unpack size is the entry's unpacked size.
+        var size_count: usize = p.filters.len + 1;
+        while (size_count > 0) : (size_count -= 1) {
+            try writeUint64(writer, unpack_size);
+        }
     }
     try io.writeBytes(writer, &.{0x00});
     if (plan.len > 0) {
@@ -2361,15 +2426,17 @@ test "sevenzip filter chain roundtrips lzma and lzma2" {
     for (&executable, 0..) |*byte, i| byte.* = if (i % 16 < 4) 0xE8 else @truncate(i / 29);
     const datas = [_][]const u8{ executable[0..2048], executable[512..1536] };
     const entries = [_]Entry{
-        .{ .name = "code.bin", .data = datas[0], .method = .lzma2, .filter = .x86 },
-        .{ .name = "patch.bin", .data = datas[1], .method = .lzma, .filter = .delta },
+        .{ .name = "code.bin", .data = datas[0], .method = .lzma2, .filters = &.{.x86} },
+        .{ .name = "patch.bin", .data = datas[1], .method = .lzma, .filters = &.{.delta} },
     };
 
     var workspace = try Workspace.init(backing.ptr, backing.len);
     var cause: crypto.FailureCause = .none;
     const packed_entries = try sevenZipPack(&entries, crypto.default_provider, &workspace, .{}, &cause);
-    try testing.expectEqual(@as(?CoderMethod, .x86), packed_entries[0].filter);
-    try testing.expectEqual(@as(?CoderMethod, .delta), packed_entries[1].filter);
+    try testing.expectEqual(@as(usize, 1), packed_entries[0].filters.len);
+    try testing.expectEqual(CoderMethod.x86, packed_entries[0].filters[0]);
+    try testing.expectEqual(@as(usize, 1), packed_entries[1].filters.len);
+    try testing.expectEqual(CoderMethod.delta, packed_entries[1].filters[0]);
     const total = try sevenZipPackedSize(&entries, packed_entries, &workspace, crypto.default_provider, .{}, .{});
     const archive = try allocator.alloc(u8, total);
     defer allocator.free(archive);
@@ -2400,10 +2467,10 @@ test "sevenzip rejects filters outside lzma coders" {
     // silently, the filter shorthand cannot stack a second filter, and
     // copy never takes one.
     const bad = [_]Entry{
-        .{ .name = "a", .data = data[0..], .method = .ppmd, .filter = .x86 },
-        .{ .name = "b", .data = data[0..], .method = .deflate, .filter = .x86 },
-        .{ .name = "c", .data = data[0..], .method = .x86, .filter = .lzma },
-        .{ .name = "d", .data = data[0..], .method = .copy, .filter = .delta },
+        .{ .name = "a", .data = data[0..], .method = .ppmd, .filters = &.{.x86} },
+        .{ .name = "b", .data = data[0..], .method = .deflate, .filters = &.{.x86} },
+        .{ .name = "c", .data = data[0..], .method = .x86, .filters = &.{.lzma} },
+        .{ .name = "d", .data = data[0..], .method = .copy, .filters = &.{.delta} },
     };
     for (bad) |entry| {
         var workspace = try Workspace.init(backing.ptr, backing.len);
@@ -2426,7 +2493,7 @@ test "sevenzip filtered entries pack outside solid runs" {
     for (&repetitive, 0..) |*byte, i| byte.* = if (i % 8 < 2) 0xE8 else @truncate(i / 97);
     const datas = [_][]const u8{ repetitive[0..1500], repetitive[500..2000], repetitive[1000..2500] };
     const entries = [_]Entry{
-        .{ .name = "f.bin", .data = datas[0], .method = .lzma2, .filter = .x86 },
+        .{ .name = "f.bin", .data = datas[0], .method = .lzma2, .filters = &.{.x86} },
         .{ .name = "s.bin", .data = datas[1], .method = .lzma2 },
         .{ .name = "t.bin", .data = datas[2], .method = .lzma2 },
     };
@@ -2437,9 +2504,10 @@ test "sevenzip filtered entries pack outside solid runs" {
     // The filtered entry owns its packed stream and never joins the run;
     // the two unfiltered entries form a solid folder instead.
     try testing.expect(packed_entries[0].data.len > 0);
-    try testing.expectEqual(@as(?CoderMethod, .x86), packed_entries[0].filter);
+    try testing.expectEqual(@as(usize, 1), packed_entries[0].filters.len);
+    try testing.expectEqual(CoderMethod.x86, packed_entries[0].filters[0]);
     try testing.expect(packed_entries[1].data.len > 0);
-    try testing.expectEqual(@as(?CoderMethod, null), packed_entries[1].filter);
+    try testing.expectEqual(@as(usize, 0), packed_entries[1].filters.len);
     try testing.expectEqual(@as(usize, 0), packed_entries[2].data.len);
     try testing.expect(packed_entries[2].solid_continuation);
     const total = try sevenZipPackedSize(&entries, packed_entries, &workspace, crypto.default_provider, .{}, .{});
@@ -3036,4 +3104,89 @@ test "sevenzip decodes 7zz AES-256 encrypted archive" {
     } else |_| {
         // The wrong password rejects the decode; that is the expected outcome.
     }
+}
+
+test "sevenzip compound filter chain roundtrips" {
+    const allocator = std.testing.allocator;
+
+    var executable: [8192]u8 = undefined;
+    var rng: u64 = 0x243F6A8885A308D3;
+    for (&executable) |*b| {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        b.* = @as(u8, @truncate(rng)) & 15;
+    }
+    const exe_seed: [256]u8 = executable[0..256].*;
+    for (0..16) |i| @memcpy(executable[i * 512 ..][0..256], &exe_seed);
+    for (0..8) |i| {
+        executable[i * 1024] = 0xE8;
+        std.mem.writeInt(u32, executable[i * 1024 + 1 ..][0..4], @intCast(4096 -% @as(u32, @intCast(i * 512))), .little);
+    }
+
+    const entries = [_]Entry{
+        .{ .name = "chained.bin", .data = &executable, .method = .lzma2, .filters = &.{ .delta, .x86 } },
+    };
+    const backing = try allocator.alloc(u8, 64 * 1024 * 1024);
+    defer allocator.free(backing);
+    var workspace = try Workspace.init(backing.ptr, backing.len);
+    var cause: crypto.FailureCause = .none;
+    const packed_entries = try sevenZipPack(&entries, crypto.default_provider, &workspace, .{}, &cause);
+    const archive_size = try sevenZipPackedSize(&entries, packed_entries, &workspace, crypto.default_provider, .{}, .{});
+    const archive = try allocator.alloc(u8, archive_size);
+    defer allocator.free(archive);
+    _ = try sevenZipWritePacked(&entries, packed_entries, archive, &workspace, crypto.default_provider, .{}, .{});
+
+    // Our decoder reverses the chain.
+    var out: [executable.len]u8 = undefined;
+    const n = try sevenZipDecodeOrdinal(archive, &workspace, .{}, 0, &out, .{ .failure_cause = &cause });
+    try std.testing.expectEqual(executable.len, n);
+    try std.testing.expectEqualSlices(u8, &executable, out[0..n]);
+}
+
+test "sevenzip multi-volume write and read" {
+    const allocator = std.testing.allocator;
+
+    var payload: [300000]u8 = undefined;
+    var rng: u64 = 0x243F6A8885A308D3;
+    for (&payload) |*b| {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        b.* = @as(u8, @truncate(rng)) & 15;
+    }
+    for (1..64) |i| @memcpy(payload[i * 4096 ..][0..2048], payload[0..2048]);
+
+    const entries = [_]Entry{
+        .{ .name = "big.bin", .data = &payload, .method = .lzma2 },
+    };
+    const backing = try allocator.alloc(u8, 96 * 1024 * 1024);
+    defer allocator.free(backing);
+    var workspace = try Workspace.init(backing.ptr, backing.len);
+    var cause: crypto.FailureCause = .none;
+    const packed_entries = try sevenZipPack(&entries, crypto.default_provider, &workspace, .{}, &cause);
+    const single_size = try sevenZipPackedSize(&entries, packed_entries, &workspace, crypto.default_provider, .{}, .{});
+    const archive = try allocator.alloc(u8, single_size);
+    defer allocator.free(archive);
+    const volume_size: u64 = 64 * 1024;
+    const layout = try sevenZipWritePackedVolumes(&entries, packed_entries, archive, volume_size, &workspace, crypto.default_provider, .{}, .{});
+    try std.testing.expect(layout.total_len == single_size);
+    try std.testing.expect(layout.volumes > 1);
+
+    // Slice the volumes back out and read through the multi-volume entry.
+    const volumes = try allocator.alloc([]const u8, layout.volumes);
+    defer allocator.free(volumes);
+    var at: usize = 0;
+    for (0..layout.volumes) |i| {
+        const take = @min(volume_size, single_size - at);
+        volumes[i] = archive[at..][0..take];
+        at += take;
+    }
+    const decode_ws_backing = try allocator.alloc(u8, 96 * 1024 * 1024);
+    defer allocator.free(decode_ws_backing);
+    var decode_ws = try Workspace.init(decode_ws_backing.ptr, decode_ws_backing.len);
+    var out: [payload.len]u8 = undefined;
+    const n = try sevenZipDecodeVolumes(volumes, &decode_ws, .{}, 0, &out, .{ .failure_cause = &cause });
+    try std.testing.expectEqual(payload.len, n);
+    try std.testing.expectEqualSlices(u8, &payload, out[0..n]);
 }
