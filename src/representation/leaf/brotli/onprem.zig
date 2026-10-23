@@ -298,6 +298,13 @@ const Scratch = struct {
     trees_used: usize = 0,
     cmapl: []u8,
     cmapd: []u8,
+    // The code-length-code tree is transient (only live while one complex
+    // prefix code reads its lengths), so a single dedicated table serves
+    // every tree; the scratch pool budget then never charges the 18-symbol
+    // code-length code against the 784-tree pool. Both decoders share this
+    // storage.
+    cl_table: HufTable = .{},
+    cl_symbols: [18]u16 = undefined,
 
     fn allocTree(self: *Scratch, alphabet: usize) DecodeError!struct { table: *HufTable, symbols: []u16 } {
         if (alphabet > max_alphabet) return error.DataException;
@@ -357,8 +364,11 @@ fn buildCodeLengthCode(br: *BitReader, hskip: u32, sc: *Scratch) DecodeError!*Hu
     // zero) or exactly one code-length symbol is nonzero; a single symbol
     // decodes with zero bits consumed (vendor huffman.c single-code case).
     if (space != 0 and num_codes != 1) return error.DataException;
-    const tree = try sc.allocTree(18);
-    const table = tree.table;
+    // The 18-symbol code-length code lives in dedicated scratch storage, not
+    // the tree pool: a header can carry up to 768 prefix codes, and a pool
+    // slot per code-length code would overflow the 784-tree budget.
+    const table = &sc.cl_table;
+    table.* = .{ .symbols = &sc.cl_symbols };
     if (num_codes == 1) {
         for (lengths, 0..) |l, sym| {
             if (l != 0) {
@@ -373,7 +383,7 @@ fn buildCodeLengthCode(br: *BitReader, hskip: u32, sc: *Scratch) DecodeError!*Hu
     var offset = canonicalOffsets(table.count);
     for (lengths, 0..) |l, sym| {
         if (l != 0) {
-            tree.symbols[offset[l]] = @intCast(sym);
+            table.symbols[offset[l]] = @intCast(sym);
             offset[l] += 1;
         }
     }
@@ -390,7 +400,11 @@ fn readPrefixCode(br: *BitReader, sc: *Scratch, alphabet: usize, alphabet_limit:
         const nsym = (try br.readBits(2)) + 1;
         const abits: u5 = @intCast(std.math.log2_int(usize, std.math.ceilPowerOfTwoAssert(usize, alphabet)));
         var lens: [4]u8 = @splat(0);
-        const tree = try sc.allocTree(alphabet);
+        // Allocate by the limit, not the max: the large-window distance
+        // alphabet max reaches 1128 symbols (past the 704-symbol pool
+        // stride) while the limit stays <= 544 (vendor decode.c validates
+        // symbols against alphabet_size_limit).
+        const tree = try sc.allocTree(alphabet_limit);
         var last: [4]u16 = undefined;
         for (0..nsym) |i| {
             const sym = try br.readBits(abits);
@@ -448,7 +462,8 @@ fn readPrefixCode(br: *BitReader, sc: *Scratch, alphabet: usize, alphabet_limit:
     }
     // Complex prefix code (RFC 3.5); the 2 bits just read are the HSKIP.
     const clcode = try buildCodeLengthCode(br, hskip_bits, sc);
-    var lengths = try sc.allocTree(alphabet);
+    // Same limit-not-max allocation as the simple branch above.
+    var lengths = try sc.allocTree(alphabet_limit);
     var symbol_count: usize = 0;
     var prev_len: u8 = 8;
     var repeat: u32 = 0;
@@ -488,7 +503,10 @@ fn readPrefixCode(br: *BitReader, sc: *Scratch, alphabet: usize, alphabet_limit:
             if (repeat > 0) repeat = (repeat - 2) << extra_bits;
             repeat += 3 + extra;
             const delta = repeat - old_repeat;
-            if (symbol_count + delta > alphabet) return error.DataException;
+            // The vendor checks repeat overshoot against the limit and lets
+            // the final space check reject; an early check on the same
+            // boundary is equivalent and keeps every write in bounds.
+            if (symbol_count + delta > alphabet_limit) return error.DataException;
             if (new_len != 0) {
                 const per = @as(u32, 32768) >> @as(u5, @intCast(new_len));
                 if (per * delta > space) return error.DataException;
@@ -503,7 +521,7 @@ fn readPrefixCode(br: *BitReader, sc: *Scratch, alphabet: usize, alphabet_limit:
             }
         } else return error.DataException;
     }
-    if (space != 0 or symbol_count > alphabet) return error.DataException;
+    if (space != 0 or symbol_count > alphabet_limit) return error.DataException;
     const total = symbol_count;
     var counts: [16]u32 = @splat(0);
     for (lengths.table.symbols[0..total]) |l| counts[l] += 1;
@@ -1604,12 +1622,6 @@ pub const Incremental = struct {
     cm: CmapProgress = .{},
     cmd: CmdProgress = .{},
     hw: HuffWalk = .{},
-    // The code-length-code tree is transient (only live while one complex
-    // prefix code reads its lengths), so a single dedicated table serves
-    // every tree; the scratch pool budget then matches the one-shot
-    // decoder exactly.
-    cl_table_storage: HufTable = .{},
-    cl_symbols: [18]u16 = undefined,
 
     fn ringByte(self: *const Incremental, pos: usize) u8 {
         return self.ring[pos & self.ring_mask];
@@ -2099,7 +2111,10 @@ pub const Incremental = struct {
         // re-reads an already-consumed selector.
         if (self.tr.phase == .done) self.tr = .{};
         if (self.tr.init_step == 0 and self.tr.phase == .idle) {
-            const rt = try self.sc.allocTree(alphabet);
+            // Allocate by the limit, not the max: the large-window distance
+            // alphabet max reaches 1128 symbols (past the 704-symbol pool
+            // stride) while the limit stays <= 544.
+            const rt = try self.sc.allocTree(limit);
             self.tr = .{
                 .alphabet = alphabet,
                 .limit = limit,
@@ -2118,8 +2133,8 @@ pub const Incremental = struct {
                 self.tr.simple_i = 0;
                 self.tr.phase = .simple;
             } else {
-                self.cl_table_storage = .{ .symbols = &self.cl_symbols };
-                self.tr.cl_table = &self.cl_table_storage;
+                self.sc.cl_table = .{ .symbols = &self.sc.cl_symbols };
+                self.tr.cl_table = &self.sc.cl_table;
                 self.tr.cl_i = @intCast(self.tr.hskip);
                 self.tr.cl_space = 32;
                 self.tr.cl_num = 0;
@@ -2313,7 +2328,7 @@ pub const Incremental = struct {
                 }
             } else return error.DataException;
         }
-        if (self.tr.space != 0 or self.tr.sym_count > self.tr.alphabet) return error.DataException;
+        if (self.tr.space != 0 or self.tr.sym_count > self.tr.limit) return error.DataException;
         var cnt: [16]u32 = @splat(0);
         for (lt.symbols[0..self.tr.sym_count]) |l| cnt[l] += 1;
         const nonzero = cnt[1] + cnt[2] + cnt[3] + cnt[4] + cnt[5] + cnt[6] + cnt[7] + cnt[8] + cnt[9] + cnt[10] + cnt[11] + cnt[12] + cnt[13] + cnt[14] + cnt[15];
@@ -2549,7 +2564,20 @@ pub const Incremental = struct {
                             self.cmd.copy_from_dict = 0;
                         }
                         self.cmd.copy_remaining = self.cmd.copy_len - self.cmd.copy_from_dict;
-                        self.cmd.copy_src_pos = self.ring_pos - self.cmd.distance;
+                        // Guarded source position. A pure-dictionary copy
+                        // (copy_remaining == 0) never reads the ring, so no
+                        // source is computed: ring_pos - distance would
+                        // underflow at the stream start (ring_pos <
+                        // distance). A spanning copy starts reading where
+                        // the stream begins, ring_pos - in_stream, which the
+                        // guarded form yields exactly:
+                        // ring_pos + copy_from_dict - distance with
+                        // copy_from_dict == distance - in_stream.
+                        if (self.cmd.copy_remaining > 0) {
+                            self.cmd.copy_src_pos = self.ring_pos + self.cmd.copy_from_dict - self.cmd.distance;
+                        } else {
+                            self.cmd.copy_src_pos = 0;
+                        }
                         self.cmd.phase = .copy;
                     }
                 },
@@ -3349,6 +3377,81 @@ test "brotli custom dictionary roundtrip and spanning copy" {
     try std.testing.expectEqualSlices(u8, input2, output[0..n2]);
 }
 
+// Incremental custom-dictionary fixtures. A pure dictionary copy at the
+// stream start has copy_remaining == 0 (the ring source must not be
+// computed: ring_pos - distance underflows), a spanning copy starts reading
+// where the stream begins (ring_pos + copy_from_dict - distance), and a
+// repeated pattern crosses the boundary over and over. Each fixture reuses
+// one workspace across every incrementalInit, the 1-byte-sink counting
+// decode, and the writer path.
+test "brotli incremental custom dictionary fixtures" {
+    const allocator = std.testing.allocator;
+    const inc_scratch = try allocator.alloc(u8, incrementalWorkspaceSize(.{}));
+    defer allocator.free(inc_scratch);
+    const one_shot_scratch = try allocator.alloc(u8, decode_workspace_size);
+    defer allocator.free(one_shot_scratch);
+    const enc_scratch = try allocator.alloc(u8, encode_workspace_size);
+    defer allocator.free(enc_scratch);
+
+    const Fixture = struct { dict: []const u8, input: []const u8 };
+    const fixtures = [_]Fixture{
+        .{ .dict = "the quick brown fox", .input = "the quick brown fox!" },
+        .{ .dict = "0123456789abcdef the quick brown fox jumps over the lazy dog", .input = "jumps over the lazy dog and jumps over the lazy dog again" },
+        .{ .dict = "zzzzzabcabc", .input = "abcabcabcabcabcabcabcabcabcabc" },
+    };
+
+    for (fixtures) |fixture| {
+        const options: Options = .{ .custom_dictionary = fixture.dict };
+        const bound = encodedSizeBound(fixture.input.len);
+        const encoded = try allocator.alloc(u8, bound);
+        defer allocator.free(encoded);
+        const enc_len = try encode(fixture.input, encoded, enc_scratch, options);
+
+        var oracle: [128]u8 = undefined;
+        const n = try decode(encoded[0..enc_len], &oracle, one_shot_scratch, options);
+        try std.testing.expectEqual(fixture.input.len, n);
+        try std.testing.expectEqualSlices(u8, fixture.input, oracle[0..n]);
+
+        // Adversarial (input chunk, output span) grid; 1-byte drains force
+        // NeedDrain suspension on every emit out of the dictionary prefix.
+        const chunk_sizes = [_]usize{ 1, 3, 7, enc_len };
+        const span_sizes = [_]usize{ 1, 5, n };
+        for (chunk_sizes) |chunk| {
+            for (span_sizes) |span| {
+                var inc = try incrementalInit(inc_scratch, options);
+                var out: [128]u8 = undefined;
+                var fed: usize = 0;
+                var produced: usize = 0;
+                var guard: usize = 0;
+                while (true) {
+                    const end = @min(fed + chunk, enc_len);
+                    const out_end = @min(produced + span, n);
+                    const res = try inc.run(encoded[fed..end], out[produced..out_end], end == enc_len);
+                    if (res.produced > 0) {
+                        try std.testing.expectEqualSlices(u8, oracle[produced .. produced + res.produced], out[produced .. produced + res.produced]);
+                    }
+                    fed += res.consumed;
+                    produced += res.produced;
+                    guard += 1;
+                    if (guard > 64 * (enc_len + n + 8)) return error.ResourceException;
+                    if (res.status == .done) break;
+                }
+                try std.testing.expectEqual(n, produced);
+                try std.testing.expectEqualSlices(u8, oracle[0..n], out[0..produced]);
+            }
+        }
+
+        // Counting decode reuses the same workspace through the 1-byte sink.
+        try std.testing.expectEqual(n, try decodedSize(encoded[0..enc_len], inc_scratch, options));
+
+        // Writer path drains the same incremental machine.
+        var sink: std.Io.Writer.Allocating = .init(allocator);
+        defer sink.deinit();
+        try decodeToWriter(encoded[0..enc_len], &sink.writer, inc_scratch, options);
+        try std.testing.expectEqualSlices(u8, oracle[0..n], sink.writer.buffer[0..sink.writer.end]);
+    }
+}
+
 // Static-dictionary transforms, exercised directly: copy_len 5 words all
 // start at dictionary index 3 ("world"), and word_id / 1024 selects the
 // transform row. Prefixes and suffixes come from the vendor
@@ -3464,4 +3567,91 @@ test "brotli incremental matches one-shot across chunkings" {
         if (res.status == .done) break;
     }
     try std.testing.expectEqualSlices(u8, oracle[0..n], out_buf[0..produced_final]);
+}
+
+// The large-window NPOSTFIX=3/NDIRECT=120 distance alphabet reaches 1128
+// symbols (past the 704-symbol pool stride) while the valid-symbol limit is
+// 544: vendor BrotliCalculateDistanceCodeLimit(0x7FFFFFFC, 3, 120). Trees
+// are allocated by the limit, symbols are validated against it, and the
+// code-length code must not consume a tree-pool slot.
+test "brotli large window distance code limit" {
+    const allocator = std.testing.allocator;
+
+    const limit = distanceCodeLimit(0x7FFFFFFC, 3, 120);
+    try std.testing.expectEqual(@as(usize, 544), limit.max_alphabet_size);
+    try std.testing.expect(limit.max_distance <= 0x7FFFFFFC);
+    // The ndirect=112 neighbour pins the table walk: the last permitted
+    // distance group is fixed by the forbidden distance, while the alphabet
+    // bound tracks ndirect.
+    const limit112 = distanceCodeLimit(0x7FFFFFFC, 3, 112);
+    try std.testing.expectEqual(@as(usize, 536), limit112.max_alphabet_size);
+    const dist_alphabet_max = 16 + 120 + (@as(usize, 124) << 3);
+    try std.testing.expectEqual(@as(usize, 1128), dist_alphabet_max);
+
+    // Simple NSYM=1 code, symbol 543 (last valid): HSKIP 01, NSYM-1 00, then
+    // the 11-bit symbol (abits from the 1128-symbol alphabet).
+    const last_valid = [_]u8{ 0xF1, 0x21 };
+    // Symbol 544, one past the limit.
+    const first_invalid = [_]u8{ 0x01, 0x22 };
+    // HSKIP 00, two len-1 code-length-code entries (bits 1110 1110), then
+    // four 1-bit code-length symbols selecting length 2: a complete
+    // 4-symbol complex code.
+    const complex_bits = [_]u8{ 0xDC, 0x3D };
+
+    const one_shot_scratch = try allocator.alloc(u8, decode_workspace_size);
+    defer allocator.free(one_shot_scratch);
+    const ws = try alignedWorkspace(one_shot_scratch);
+    const table_bytes = max_trees * @sizeOf(HufTable);
+    const symbol_bytes = max_trees * max_alphabet * @sizeOf(u16);
+    var sc = Scratch{
+        .tables = std.mem.bytesAsSlice(HufTable, @as([]align(8) u8, @alignCast(ws.buf[0..table_bytes]))),
+        .symbols = std.mem.bytesAsSlice(u16, @as([]align(2) u8, @alignCast(ws.buf[table_bytes..][0..symbol_bytes]))),
+        .cmapl = ws.buf[table_bytes + symbol_bytes ..][0 .. 64 * 256],
+        .cmapd = ws.buf[table_bytes + symbol_bytes ..][64 * 256 ..][0 .. 4 * 256],
+    };
+
+    {
+        var br = BitReader{ .data = &last_valid };
+        const t = try readPrefixCode(&br, &sc, dist_alphabet_max, limit.max_alphabet_size);
+        try std.testing.expectEqual(@as(u16, 543), t.single);
+        try std.testing.expectEqual(@as(usize, 1), sc.trees_used);
+    }
+    {
+        var br = BitReader{ .data = &first_invalid };
+        try std.testing.expectError(error.DataException, readPrefixCode(&br, &sc, dist_alphabet_max, limit.max_alphabet_size));
+    }
+    {
+        var br = BitReader{ .data = &complex_bits };
+        const t = try readPrefixCode(&br, &sc, 4, 4);
+        try std.testing.expectEqual(@as(u32, 4), t.count[2]);
+        const want_syms = [_]u16{ 0, 1, 2, 3 };
+        try std.testing.expectEqualSlices(u16, &want_syms, t.symbols[0..4]);
+        // One pool tree for each simple code plus one for this complex
+        // result: the code-length code must not consume a pool slot.
+        try std.testing.expectEqual(@as(usize, 3), sc.trees_used);
+    }
+
+    const inc_scratch = try allocator.alloc(u8, incrementalWorkspaceSize(.{}));
+    defer allocator.free(inc_scratch);
+    {
+        var inc = try incrementalInit(inc_scratch, .{});
+        inc.br.data = &last_valid;
+        const t = try inc.readTree(dist_alphabet_max, limit.max_alphabet_size);
+        try std.testing.expectEqual(@as(u16, 543), t.single);
+        try std.testing.expectEqual(@as(usize, 1), inc.sc.trees_used);
+    }
+    {
+        var inc = try incrementalInit(inc_scratch, .{});
+        inc.br.data = &first_invalid;
+        try std.testing.expectError(error.DataException, inc.readTree(dist_alphabet_max, limit.max_alphabet_size));
+    }
+    {
+        var inc = try incrementalInit(inc_scratch, .{});
+        inc.br.data = &complex_bits;
+        const t = try inc.readTree(4, 4);
+        try std.testing.expectEqual(@as(u32, 4), t.count[2]);
+        const want_syms = [_]u16{ 0, 1, 2, 3 };
+        try std.testing.expectEqualSlices(u16, &want_syms, t.symbols[0..4]);
+        try std.testing.expectEqual(@as(usize, 1), inc.sc.trees_used);
+    }
 }
