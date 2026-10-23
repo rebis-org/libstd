@@ -15,37 +15,49 @@ pub const EncodeError = error{ UnsupportedException, DataException, ResourceExce
 pub const Options = struct {
     quality: u32 = 5,
     max_decoded_bytes: u64 = std.math.maxInt(u64),
+    // RFC 7932 large-window extension (vendor BROTLI_PARAM_LARGE_WINDOW):
+    // decode accepts the reserved WBITS form; encode may emit windows past
+    // 2^24 when the input needs one.
+    large_window: bool = false,
+    // Shared-dictionary raw LZ77 prefix (vendor
+    // BrotliDecoderAttachDictionary RAW type): bytes are addressable as
+    // history before the first stream position.
+    custom_dictionary: ?[]const u8 = null,
+    // Encode-side window cap in bytes; zero picks the smallest window that
+    // covers the input (and dictionary), clamped by large_window.
+    window_size: u32 = 0,
 };
 
 pub const window_size_min = 1 << 10;
 pub const window_size_max = (1 << 24) - 16;
+// The large-window extension raises the ceiling to lgwin 30 (1 GiB).
+pub const window_size_large_max = (1 << 30) - 16;
 
 pub fn encodedSizeBound(input_len: usize) usize {
     return input_len +| (input_len >> 1) +| 1024;
 }
 
 pub fn decodedSize(input: []const u8, scratch: []u8, options: Options) DecodeError!usize {
-    // No size field exists in the format, so the measured route decodes
-    // into the writer staging and counts. Outputs beyond the staging
-    // answer ResourceException; the windowed streaming decode is the
-    // recorded follow-up.
-    _ = try alignedWorkspace(scratch);
-    const staging = scratch[scratch.len - writer_staging_size ..][0..writer_staging_size];
-    return decode(input, staging, scratch, options);
+    // The windowed incremental decode counts without materializing: emit
+    // spans are drained and discarded.
+    var inc = try incrementalInit(scratch, options);
+    var fed: usize = 0;
+    var sink: [1]u8 = undefined;
+    while (true) {
+        const res = try inc.run(input[fed..], &sink, true);
+        fed += res.consumed;
+        if (res.status == .done) return inc.produced;
+    }
 }
 
-// Writer-sink staging: the format carries no output size, and the v1
-// decoder is one-shot over a slice. decodeToWriter therefore stages through
-// the workspace. A windowed streaming decode is the recorded follow-up.
-// Measured-size staging must cover the largest corpus output until the
-// windowed streaming decode replaces the one-shot count.
-const writer_staging_size = 64 << 20;
-
+// One-shot slice decode workspace: tables, symbols, context maps. The
+// writer-staging lower bound is gone; the windowed incremental decode
+// below needs only its own ring.
 pub const decode_workspace_size: usize = blk: {
     const tables = max_trees * @sizeOf(HufTable);
     const symbols = max_trees * max_alphabet * @sizeOf(u16);
     const maps = 64 * 256 + 4 * 256;
-    break :blk tables + symbols + maps + writer_staging_size + 4096 + 16;
+    break :blk tables + symbols + maps + 4096 + 16;
 };
 
 fn alignedSlice(scratch_buffer: []u8, comptime size: usize) error{ResourceException}![]u8 {
@@ -61,18 +73,23 @@ fn alignedWorkspace(scratch_buffer: []u8) DecodeError!struct { buf: []u8 } {
 }
 
 pub fn decodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options: Options) DecodeError!void {
-    _ = try alignedWorkspace(scratch);
-    const staging = scratch[scratch.len - writer_staging_size ..][0..writer_staging_size];
-    const produced = try decode(input, staging, scratch, options);
-    writer.writeAll(staging[0..produced]) catch return error.IoException;
+    var inc = try incrementalInit(scratch, options);
+    var fed: usize = 0;
+    var staging: [1 << 16]u8 = undefined;
+    while (true) {
+        const res = try inc.run(input[fed..], &staging, true);
+        fed += res.consumed;
+        if (res.produced > 0) writer.writeAll(staging[0..res.produced]) catch return error.IoException;
+        if (res.status == .done) return;
+    }
 }
 
 pub fn requiredSize(input: []const u8, scratch: []u8, options: Options) EncodeError!usize {
     return encodeCountedSize(input, scratch, options);
 }
 
-pub fn decodeWorkspaceSize(_: Options) usize {
-    return decode_workspace_size;
+pub fn decodeWorkspaceSize(options: Options) usize {
+    return incrementalWorkspaceSize(options);
 }
 
 fn hash4At(src: []const u8, pos: usize) usize {
@@ -80,20 +97,40 @@ fn hash4At(src: []const u8, pos: usize) usize {
     return (w *% 0x9E37_79B1) >> (32 - 17);
 }
 
-fn parseCommands(src: []const u8, commands: []Command, head: []u32, ring: *[4]u32) usize {
+fn parseCommands(src: []const u8, dict: []const u8, commands: []Command, head: []u32, ring: *[4]u32, dist_cap: u32) usize {
     @memset(head, 0);
+    // The dictionary is the virtual prefix of the stream: byte j sits at
+    // position j - dict.len. Hash-chain entries store the position shifted
+    // up by dict.len + 1 so zero stays the empty sentinel; a raw value below
+    // dict.len is a dictionary position.
+    for (0..dict.len -| 3) |j| {
+        head[hash4At(dict, j)] = @intCast(j + 1);
+    }
     var count: usize = 0;
     var pos: usize = 0;
     var anchor: usize = 0;
     while (pos + 4 <= src.len) {
         const h = hash4At(src, pos);
         const cand_plus1 = head[h];
-        head[h] = @intCast(pos + 1);
+        head[h] = @intCast(pos + dict.len + 1);
         if (cand_plus1 != 0) {
-            const cand: usize = cand_plus1 - 1;
-            const dist = pos - cand;
-            if (dist <= (1 << 22) - 16) {
-                const len = kernels.matchLen8(src, cand, pos, src.len - pos);
+            const raw = cand_plus1 - 1;
+            const cand: usize = if (raw < dict.len) raw else raw - dict.len;
+            const dist: usize = if (raw < dict.len) pos + (dict.len - raw) else pos - cand;
+            if (dist <= dist_cap) {
+                var len: usize = 0;
+                if (raw < dict.len) {
+                    // A dictionary candidate compares through the
+                    // dictionary/stream boundary: virtual bytes after the
+                    // dictionary tail continue at src[0].
+                    while (len < src.len - pos) {
+                        const cb = if (cand + len < dict.len) dict[cand + len] else src[cand + len - dict.len];
+                        if (cb != src[pos + len]) break;
+                        len += 1;
+                    }
+                } else {
+                    len = kernels.matchLen8(src, cand, pos, src.len - pos);
+                }
                 if (len >= 4) {
                     const ins = src[anchor..pos];
                     var cmd: Command = .{
@@ -198,7 +235,14 @@ const BitReader = struct {
         var v: u32 = 0;
         var i: u5 = 0;
         while (i < n) : (i += 1) {
-            v |= (try self.readBit()) << i;
+            if (self.mask == 0) {
+                if (self.pos >= self.data.len) return error.DataException;
+                self.mask = 1;
+            }
+            const bit = (self.data[self.pos] & self.mask) != 0;
+            self.mask <<= 1;
+            if (self.mask == 0) self.pos += 1;
+            v |= @as(u32, @intFromBool(bit)) << i;
         }
         return v;
     }
@@ -336,7 +380,10 @@ fn buildCodeLengthCode(br: *BitReader, hskip: u32, sc: *Scratch) DecodeError!*Hu
     return table;
 }
 
-fn readPrefixCode(br: *BitReader, sc: *Scratch, alphabet: usize) DecodeError!*HufTable {
+// Symbol width comes from alphabet_size_max; symbol validation and the
+// complex-code loop bound use alphabet_size_limit. The two differ only for
+// the large-window distance code (vendor ReadHuffmanCode).
+fn readPrefixCode(br: *BitReader, sc: *Scratch, alphabet: usize, alphabet_limit: usize) DecodeError!*HufTable {
     const hskip_bits = try br.readBits(2);
     if (hskip_bits == 1) {
         // Simple prefix code (RFC 3.4).
@@ -347,7 +394,7 @@ fn readPrefixCode(br: *BitReader, sc: *Scratch, alphabet: usize) DecodeError!*Hu
         var last: [4]u16 = undefined;
         for (0..nsym) |i| {
             const sym = try br.readBits(abits);
-            if (sym >= alphabet) return error.DataException;
+            if (sym >= alphabet_limit) return error.DataException;
             for (last[0..i]) |p| if (p == sym) return error.DataException;
             last[i] = @intCast(sym);
             tree.table.symbols[i] = @intCast(sym);
@@ -407,7 +454,7 @@ fn readPrefixCode(br: *BitReader, sc: *Scratch, alphabet: usize) DecodeError!*Hu
     var repeat: u32 = 0;
     var repeat_len: u8 = 0;
     var space: u32 = 32768;
-    while (symbol_count < alphabet and space > 0) {
+    while (symbol_count < alphabet_limit and space > 0) {
         const sym = try clcode.decode(br);
         if (sym < 16) {
             lengths.table.symbols[symbol_count] = sym;
@@ -622,7 +669,7 @@ fn readContextMap(br: *BitReader, sc: *Scratch, size: usize, num_trees: u32, map
     if (try br.readBit() != 0) {
         rlemax = (try br.readBits(4)) + 1;
     }
-    const tree = try readPrefixCode(br, sc, @intCast(num_trees + rlemax));
+    const tree = try readPrefixCode(br, sc, @intCast(num_trees + rlemax), @intCast(num_trees + rlemax));
     var i: usize = 0;
     while (i < size) {
         const sym = try tree.decode(br);
@@ -662,16 +709,50 @@ fn readContextMap(br: *BitReader, sc: *Scratch, size: usize, num_trees: u32, map
 // The earlier slots start at 11, 15, and 16.
 const distance_ring_init = [4]u32{ 4, 11, 15, 16 };
 
+const DistanceCodeLimit = struct { max_alphabet_size: usize, max_distance: u32 };
+
+// Vendor common/constants.h BrotliCalculateDistanceCodeLimit: the largest
+// complete distance-code group that cannot represent distances beyond
+// max_distance. Only max_alphabet_size is needed here.
+fn distanceCodeLimit(max_distance: u32, npostfix: u5, ndirect: u32) DistanceCodeLimit {
+    const short_codes: usize = 16;
+    if (max_distance <= ndirect) {
+        return .{ .max_alphabet_size = @as(usize, max_distance) + short_codes, .max_distance = max_distance };
+    }
+    const forbidden: u64 = @as(u64, max_distance) + 1;
+    var offset: u64 = forbidden - ndirect - 1;
+    offset = (offset >> npostfix) + 4;
+    var ndistbits: u32 = 0;
+    var tmp: u64 = offset / 2;
+    while (tmp != 0) : (tmp >>= 1) ndistbits += 1;
+    ndistbits -= 1;
+    const half: u64 = (offset >> @intCast(ndistbits)) & 1;
+    var group: u64 = ((@as(u64, ndistbits) - 1) << 1) | half;
+    if (group == 0) {
+        return .{ .max_alphabet_size = @as(usize, ndirect) + short_codes, .max_distance = ndirect };
+    }
+    group -= 1;
+    const ndb: u5 = @intCast((group >> 1) + 1);
+    const extra: u64 = (@as(u64, 1) << ndb) - 1;
+    var start: u64 = (@as(u64, 1) << (ndb + 1)) - 4;
+    start += (group & 1) << ndb;
+    const max_alphabet_size: usize = @intCast(((group << npostfix) | ((@as(u64, 1) << npostfix) - 1)) + ndirect + short_codes + 1);
+    const max_distance_out: u64 = ((start + extra) << npostfix) + ((@as(u64, 1) << npostfix) - 1) + ndirect + 1;
+    return .{ .max_alphabet_size = max_alphabet_size, .max_distance = @intCast(max_distance_out & 0xFFFFFFFF) };
+}
+
 fn decodeMetaBlock(
     br: *BitReader,
     sc: *Scratch,
     output: []u8,
     produced: *usize,
     stream_base: usize,
+    dict: []const u8,
     p1: *u8,
     p2: *u8,
     ring: *[4]u32,
     window_size: u32,
+    large_window: bool,
     is_last: *bool,
     empty_end: *bool,
 ) DecodeError!void {
@@ -731,14 +812,26 @@ fn decodeMetaBlock(
     inline for (.{ &lit, &ins, &dist }) |cat| {
         cat.num_types = try readBlockCount(br);
         if (cat.num_types >= 2) {
-            cat.type_tree = try readPrefixCode(br, sc, @intCast(cat.num_types + 2));
-            cat.count_tree = try readPrefixCode(br, sc, 26);
+            cat.type_tree = try readPrefixCode(br, sc, @intCast(cat.num_types + 2), @intCast(cat.num_types + 2));
+            cat.count_tree = try readPrefixCode(br, sc, 26, 26);
             try cat.readCount(br);
         }
     }
     const npostfix: u5 = @intCast(try br.readBits(2));
     const ndirect: u32 = (try br.readBits(4)) << npostfix;
     const postfix_mask: u32 = (@as(u32, 1) << npostfix) - 1;
+
+    // Distance code alphabet. The large-window extension widens the symbol
+    // pool so distances up to BROTLI_MAX_ALLOWED_DISTANCE stay
+    // representable: symbol width comes from the max size, validation and
+    // the complex-code bound from the limit (vendor decode.c CONTEXT_MAP_2 /
+    // BrotliCalculateDistanceCodeLimit in common/constants.h).
+    var dist_alphabet_max: usize = 16 + ndirect + (@as(usize, 48) << npostfix);
+    var dist_alphabet_limit: usize = dist_alphabet_max;
+    if (large_window) {
+        dist_alphabet_max = 16 + ndirect + (@as(usize, 124) << npostfix);
+        dist_alphabet_limit = distanceCodeLimit(0x7FFFFFFC, npostfix, ndirect).max_alphabet_size;
+    }
 
     var context_modes: [256]u8 = @splat(0);
     for (0..lit.num_types) |i| {
@@ -759,11 +852,11 @@ fn decodeMetaBlock(
     }
 
     var lit_trees: [256]*HufTable = undefined;
-    for (0..ntreesl) |i| lit_trees[i] = try readPrefixCode(br, sc, 256);
+    for (0..ntreesl) |i| lit_trees[i] = try readPrefixCode(br, sc, 256, 256);
     var ins_trees: [256]*HufTable = undefined;
-    for (0..ins.num_types) |i| ins_trees[i] = try readPrefixCode(br, sc, 704);
+    for (0..ins.num_types) |i| ins_trees[i] = try readPrefixCode(br, sc, 704, 704);
     var dist_trees: [256]*HufTable = undefined;
-    for (0..ntreesd) |i| dist_trees[i] = try readPrefixCode(br, sc, @intCast(16 + ndirect + (@as(u32, 48) << npostfix)));
+    for (0..ntreesd) |i| dist_trees[i] = try readPrefixCode(br, sc, dist_alphabet_max, dist_alphabet_limit);
 
     // Command loop (RFC 9.3).
     var pos: usize = 0;
@@ -889,7 +982,7 @@ fn decodeMetaBlock(
                 push_ring = true;
             }
         }
-        const max_backward = @min(window_size, produced.* - stream_base);
+        const max_backward = @min(window_size, (produced.* - stream_base) + dict.len);
         if (distance > max_backward) {
             // RFC 8: a static dictionary reference. Implicit dist0 at a
             // position shorter than the initial ring value (4) is a valid
@@ -908,8 +1001,26 @@ fn decodeMetaBlock(
         }
         if (pos + copy_len > mlen) return error.DataException;
         if (produced.* + copy_len > output.len) return error.CapacityException;
-        kernels.copyMatch(output, produced.*, distance, @intCast(copy_len));
-        produced.* += copy_len;
+        const in_stream = produced.* - stream_base;
+        if (distance > in_stream) {
+            // The match reaches into the custom-dictionary prefix: the first
+            // bytes come from the dictionary tail, the rest continue as an
+            // ordinary (possibly overlapping) copy from produced output. The
+            // equivalent distance stays valid because
+            // distance == in_stream + (dict bytes sourced).
+            const from_dict = distance - in_stream;
+            const dict_part = @min(copy_len, from_dict);
+            @memcpy(output[produced.*..][0..dict_part], dict[dict.len - from_dict ..][0..dict_part]);
+            produced.* += dict_part;
+            const rest = copy_len - dict_part;
+            if (rest > 0) {
+                kernels.copyMatch(output, produced.*, distance, @intCast(rest));
+                produced.* += rest;
+            }
+        } else {
+            kernels.copyMatch(output, produced.*, distance, @intCast(copy_len));
+            produced.* += copy_len;
+        }
         trackContext(p1, p2, output, produced.* - 1, copy_len);
         pos += copy_len;
     }
@@ -917,16 +1028,27 @@ fn decodeMetaBlock(
 
 // ---------------------------------------------------------------- decode
 
-fn readWbits(br: *BitReader) DecodeError!u32 {
+fn readWbits(br: *BitReader, large_window: bool) DecodeError!u32 {
     // RFC 9.1 / vendor DecodeWindowBits: one leading 0 bit means 16;
     // otherwise a 3-bit value n selects 17+n, and when n is zero a second
-    // 3-bit value m selects 17 (m == 0), a large-window stream (m == 1,
-    // unsupported here), or 8+m.
+    // 3-bit value m selects 17 (m == 0), a large-window stream (m == 1), or
+    // 8+m. The large-window extension then reads one zero bit (a one bit is
+    // invalid) and a 6-bit window size in [10, 30]
+    // (vendor decode.c DecodeWindowBits / LARGE_WINDOW_BITS).
     if (try br.readBit() == 0) return 16;
     const n = try br.readBits(3);
     if (n != 0) return 17 + n;
     const m = try br.readBits(3);
-    if (m == 1) return error.DataException;
+    if (m == 1) {
+        if (!large_window) return error.DataException;
+        // Vendor DecodeWindowBits: one reserved bit (must be zero), then
+        // the LARGE_WINDOW_BITS state reads a 6-bit window size in
+        // [BROTLI_LARGE_MIN_WBITS, BROTLI_LARGE_MAX_WBITS] = [10, 30].
+        if (try br.readBit() != 0) return error.DataException;
+        const wbits = try br.readBits(6);
+        if (wbits < 10 or wbits > 30) return error.DataException;
+        return wbits;
+    }
     if (m == 0) return 17;
     return 8 + m;
 }
@@ -950,11 +1072,17 @@ pub fn decode(input: []const u8, output: []u8, scratch_buffer: []u8, options: Op
     var p1: u8 = 0;
     var p2: u8 = 0;
     var ring = distance_ring_init;
+    const dict = options.custom_dictionary orelse &.{};
     // Concatenated streams (gzip-style): each stream carries its own WBITS
-    // header. The ring and context bytes reset per stream (RFC 4, 7.1).
+    // header. The ring and context bytes reset per stream (RFC 4, 7.1);
+    // the custom dictionary stays attached across the concatenation.
     while (true) {
-        const wbits = try readWbits(&br);
-        const window_size: u32 = (@as(u32, 1) << @intCast(wbits)) - 16;
+        const wbits = try readWbits(&br, options.large_window);
+        // window_size saturates: the 13-bit large-window form can carry
+        // values past 31 (the system CLI writes 60 for --large_window=30);
+        // distances are validated against produced output, which never
+        // approaches the saturation point in practice.
+        const window_size: u32 = if (wbits >= 31) std.math.maxInt(u32) else (@as(u32, 1) << @intCast(wbits)) - 16;
         // RFC 4 and 7.1: the distance ring, the literal context bytes, and
         // the addressable history reset at the beginning of every stream in
         // a concatenation.
@@ -965,7 +1093,7 @@ pub fn decode(input: []const u8, output: []u8, scratch_buffer: []u8, options: Op
         while (true) {
             var is_last = false;
             var empty_end = false;
-            try decodeMetaBlock(&br, &sc, output, &produced, stream_base, &p1, &p2, &ring, window_size, &is_last, &empty_end);
+            try decodeMetaBlock(&br, &sc, output, &produced, stream_base, dict, &p1, &p2, &ring, window_size, options.large_window, &is_last, &empty_end);
             if (empty_end) {
                 // ISLASTEMPTY: zero fill to the byte boundary, no trailing
                 // bytes except the start of a concatenated stream.
@@ -1045,7 +1173,9 @@ test "brotli decodedSize then exact decode" {
     const text = pseudoText();
     const text_br = pseudo_text_br;
 
-    const scratch = try allocator.alloc(u8, decode_workspace_size);
+    // decodedSize drives the windowed incremental decode, whose workspace
+    // carries the history ring.
+    const scratch = try allocator.alloc(u8, incrementalWorkspaceSize(.{}));
     defer allocator.free(scratch);
     const size = try decodedSize(&text_br, scratch, .{});
     try std.testing.expectEqual(text.len, size);
@@ -1062,10 +1192,10 @@ test "brotli decode unaligned scratch with trailing input" {
     const text = pseudoText();
     const text_br = pseudo_text_br;
 
-    const buffer = try allocator.alloc(u8, decode_workspace_size + text_br.len + 3);
+    const buffer = try allocator.alloc(u8, incrementalWorkspaceSize(.{}) + text_br.len + 3);
     defer allocator.free(buffer);
     @memset(buffer, 0xaa);
-    const scratch = buffer[3..][0..decode_workspace_size];
+    const scratch = buffer[3..][0..incrementalWorkspaceSize(.{})];
     const staged = buffer[3 + decode_workspace_size ..][0..text_br.len];
     @memcpy(staged, &text_br);
     const size = try decodedSize(staged, scratch, .{});
@@ -1212,6 +1342,1363 @@ fn copyDictionaryWord(
     produced.* += total;
     trackContext(p1, p2, output, produced.* - 1, total);
     return total;
+}
+
+// ---------------------------------------------------------------- incremental
+
+// Refillable LSB-first bit reader over the caller's input window. The
+// accumulator keeps live bits across step boundaries; when it cannot supply
+// the requested width the decoder reports need_input and resumes from the
+// same bit position once more input arrives.
+const RefillReader = struct {
+    data: []const u8 = &.{},
+    pos: usize = 0,
+    acc: u64 = 0,
+    nbits: u6 = 0,
+    // Cumulative across feed windows so consumed-byte accounting survives
+    // the accumulator's live-bit leftovers at window switches.
+    loaded_bytes: u64 = 0,
+
+    fn refill(self: *RefillReader) bool {
+        var advanced = false;
+        while (self.nbits < 56 and self.pos < self.data.len) {
+            self.acc |= @as(u64, self.data[self.pos]) << self.nbits;
+            self.nbits += 8;
+            self.pos += 1;
+            self.loaded_bytes += 1;
+            advanced = true;
+        }
+        return advanced;
+    }
+
+    fn have(self: *const RefillReader, n: u6) bool {
+        return self.nbits >= n;
+    }
+
+    fn peek(self: *RefillReader, n: u6) u64 {
+        return self.acc & ((@as(u64, 1) << n) - 1);
+    }
+
+    // Up to `want` bits without consuming; suspension stays whole-symbol.
+    fn peekUpTo(self: *RefillReader, want: u6) struct { bits: u64, n: u6 } {
+        if (self.nbits < want) _ = self.refill();
+        const n = @min(self.nbits, want);
+        return .{ .bits = self.peek(n), .n = n };
+    }
+
+    fn drop(self: *RefillReader, n: u6) void {
+        self.acc >>= n;
+        self.nbits -= n;
+    }
+
+    fn readBits(self: *RefillReader, n: u6) Status!u64 {
+        if (self.nbits < n) {
+            _ = self.refill();
+            if (self.nbits < n) return error.NeedInput;
+        }
+        const v = self.peek(n);
+        self.drop(n);
+        return v;
+    }
+
+    fn readBit(self: *RefillReader) Status!u32 {
+        return @intCast(try self.readBits(1));
+    }
+
+    // RFC 9.2: fill bits to the next byte boundary must be zero. Only the
+    // bits already accumulated are checked; an empty accumulator has no
+    // fill bits to validate.
+    fn alignToByte(self: *RefillReader) Status!void {
+        const rem: u6 = self.nbits & 7;
+        if (rem != 0) {
+            const fill = self.peek(rem);
+            if (fill != 0) return error.DataException;
+            self.drop(rem);
+        }
+    }
+
+    fn bytePos(self: *const RefillReader) usize {
+        return self.pos - self.nbits / 8;
+    }
+
+    fn bitCount(self: *const RefillReader) u64 {
+        return self.loaded_bytes * 8 - self.nbits;
+    }
+};
+
+const Status = error{ NeedInput, NeedDrain } || DecodeError;
+
+// Resumable canonical prefix-code walk: mirrors HufTable.decode bit-for-bit.
+const HuffWalk = struct {
+    active: bool = false,
+    single: u16 = std.math.maxInt(u16),
+    code: u32 = 0,
+    first: u32 = 0,
+    index: u32 = 0,
+    len: u32 = 1,
+};
+
+const TreePhase = enum { idle, clcode, simple, complex, done };
+
+const TreeProgress = struct {
+    phase: TreePhase = .idle,
+    init_step: u8 = 0,
+    alphabet: usize = 0,
+    limit: usize = 0,
+    hskip: u32 = 0,
+    result: ?*HufTable = null,
+    single: bool = false,
+    cl_i: usize = 0,
+    cl_space: u32 = 32,
+    cl_num: u32 = 0,
+    cl_lengths: [18]u8 = @splat(0),
+    nsym: u32 = 0,
+    simple_i: u32 = 0,
+    syms: [4]u16 = undefined,
+    lens: [4]u8 = @splat(0),
+    sym_count: usize = 0,
+    prev_len: u8 = 8,
+    repeat: u32 = 0,
+    repeat_len: u8 = 0,
+    space: u32 = 32768,
+    sym_pending: ?u16 = null,
+    cl_table: ?*HufTable = null,
+    lengths_table: ?*HufTable = null,
+};
+
+const CmapPhase = enum { idle, rle, tree, body, imtf, done };
+
+const CmapProgress = struct {
+    phase: CmapPhase = .idle,
+    rlemax: u32 = 0,
+    size: usize = 0,
+    i: usize = 0,
+    tree: ?*HufTable = null,
+    pending_rep: u32 = 0,
+    sym_pending: ?u16 = null,
+    mtf: [256]u8 = undefined,
+};
+
+const CmdPhase = enum {
+    ins_switch,
+    icode,
+    ins_extra,
+    copy_extra,
+    lits,
+    dist_switch,
+    dist_tree,
+    dist_extra,
+    copy,
+    word,
+};
+
+const CmdProgress = struct {
+    phase: CmdPhase = .icode,
+    pos: usize = 0,
+    ins_len: usize = 0,
+    copy_len: usize = 0,
+    ins_code: usize = 0,
+    copy_code: usize = 0,
+    icode: u16 = 0,
+    dcode_pending: ?u16 = null,
+    implicit: bool = false,
+    distance: u32 = 0,
+    push_ring: bool = false,
+    lits_done: usize = 0,
+    ins_sw_pending: bool = false,
+    lit_sw_pending: bool = false,
+    dist_sw_pending: bool = false,
+    word: [64]u8 = undefined,
+    word_len: usize = 0,
+    word_off: usize = 0,
+    copy_remaining: usize = 0,
+    copy_from_dict: usize = 0,
+    copy_dict_off: usize = 0,
+    copy_src_pos: usize = 0,
+    lit_pending: ?u8 = null,
+};
+
+const IncState = enum {
+    wbits,
+    metablock_header,
+    metadata_skip,
+    uncompressed,
+    block_counts,
+    block_header,
+    context_maps,
+    trees,
+    command,
+    stream_end,
+    done,
+};
+
+pub const IncRunResult = struct {
+    consumed: usize = 0,
+    produced: usize = 0,
+    status: enum { open, done } = .open,
+};
+
+// Windowed streaming brotli decode. History lives in a power-of-two ring
+// (so distance lookups never cross the stream boundary), output drains
+// through a caller-provided span, and every phase can suspend on input
+// starvation or a full output span and resume transparently.
+pub const Incremental = struct {
+    br: RefillReader = .{},
+    sc: Scratch = undefined,
+    ring: []u8 = &.{},
+    ring_mask: usize = 0,
+    ring_pos: usize = 0,
+    stream_ring_start: usize = 0,
+    produced: usize = 0,
+    stream_base: usize = 0,
+    stream_produced: usize = 0,
+    p1: u8 = 0,
+    p2: u8 = 0,
+    ring4: [4]u32 = distance_ring_init,
+    dict: []const u8 = &.{},
+    large_window: bool = false,
+    window_size: u32 = 0,
+    max_decoded: u64 = std.math.maxInt(u64),
+    out: []u8 = &.{},
+    out_len: usize = 0,
+    input: []const u8 = &.{},
+    input_pos: usize = 0,
+    end_of_input: bool = false,
+    state: IncState = .wbits,
+    failed: ?DecodeError = null,
+
+    is_last: bool = false,
+    mlen: usize = 0,
+    wb_step: u8 = 0,
+    wb_first: u32 = 0,
+    mb_step: u8 = 0,
+    mb_mnib: u64 = 0,
+    mb_nibbles: u6 = 0,
+    mb_mskipbytes: u64 = 0,
+    mb_mskipv: u64 = 0,
+    bh_step: u8 = 0,
+    bc_step: u8 = 0,
+    bc_n: u64 = 0,
+    rc_sym: u16 = 0xFFFF,
+    mb_pos: usize = 0,
+    skip_remaining: usize = 0,
+    unc_remaining: usize = 0,
+    npostfix: u5 = 0,
+    ndirect: u32 = 0,
+    postfix_mask: u32 = 0,
+    cats: [3]BlockCategory = .{ .{}, .{}, .{} },
+    cat_i: usize = 0,
+    cat_count_pending: bool = false,
+    context_modes: [256]u8 = @splat(0),
+    ctx_i: usize = 0,
+    ntreesl: u32 = 0,
+    ntreesd: u32 = 0,
+    tree_i: usize = 0,
+    cm_stage: usize = 0,
+    dist_alphabet_max: usize = 0,
+    dist_alphabet_limit: usize = 0,
+    lit_trees: [256]*HufTable = undefined,
+    ins_trees: [256]*HufTable = undefined,
+    dist_trees: [256]*HufTable = undefined,
+    tr: TreeProgress = .{},
+    cm: CmapProgress = .{},
+    cmd: CmdProgress = .{},
+    hw: HuffWalk = .{},
+    // The code-length-code tree is transient (only live while one complex
+    // prefix code reads its lengths), so a single dedicated table serves
+    // every tree; the scratch pool budget then matches the one-shot
+    // decoder exactly.
+    cl_table_storage: HufTable = .{},
+    cl_symbols: [18]u16 = undefined,
+
+    fn ringByte(self: *const Incremental, pos: usize) u8 {
+        return self.ring[pos & self.ring_mask];
+    }
+
+    fn emitByte(self: *Incremental, b: u8) Status!void {
+        if (self.out_len >= self.out.len) return error.NeedDrain;
+        self.out[self.out_len] = b;
+        self.out_len += 1;
+        self.ring[self.ring_pos & self.ring_mask] = b;
+        self.ring_pos += 1;
+        self.stream_produced += 1;
+        self.produced += 1;
+        if (self.produced > self.max_decoded) return error.ResourceException;
+    }
+
+    fn trackCtx(self: *Incremental, n: usize) void {
+        if (n >= 2) {
+            self.p2 = self.ringByte(self.ring_pos - 2);
+            self.p1 = self.ringByte(self.ring_pos - 1);
+        } else if (n == 1) {
+            self.p2 = self.p1;
+            self.p1 = self.ringByte(self.ring_pos - 1);
+        }
+    }
+
+    pub fn run(self: *Incremental, input: []const u8, output: []u8, end_of_input: bool) DecodeError!IncRunResult {
+        self.input = input;
+        self.out = output;
+        self.out_len = 0;
+        self.end_of_input = end_of_input;
+        // Leftover accumulator bits from the previous window stay live in
+        // the reader; the caller drops every byte the reader loaded this
+        // run (consumed == pos) and feeds only fresh bytes next call.
+        self.br.data = input;
+        self.br.pos = 0;
+
+        var status: IncRunResult = .{};
+        self.stepInner() catch |err| switch (err) {
+            error.NeedInput => {
+                if (end_of_input and self.state != .done and self.state != .stream_end) {
+                    // A truncated stream: the one-shot decoder fails on the
+                    // same input when the bit reader runs dry mid-phase.
+                    return error.DataException;
+                }
+            },
+            error.NeedDrain => {},
+            else => |e| return @errorCast(e),
+        };
+        status.consumed = self.br.pos;
+        status.produced = self.out_len;
+        status.status = if (self.state == .done) .done else .open;
+        return status;
+    }
+
+    fn stepInner(self: *Incremental) Status!void {
+        while (true) {
+            switch (self.state) {
+                .wbits => try self.stWbits(),
+                .metablock_header => try self.stMetablockHeader(),
+                .metadata_skip => try self.stMetadataSkip(),
+                .uncompressed => try self.stUncompressed(),
+                .block_counts => try self.stBlockCounts(),
+                .block_header => try self.stBlockHeader(),
+                .context_maps => try self.stContextMaps(),
+                .trees => try self.stTrees(),
+                .command => try self.stCommand(),
+                .stream_end => try self.stStreamEnd(),
+                .done => return,
+            }
+        }
+    }
+
+    fn stWbits(self: *Incremental) Status!void {
+        // Large-window and standard forms share the leading bit grammar;
+        // the incremental form mirrors readWbits exactly. Each step is a
+        // separate suspension point.
+        var wbits: u32 = 16;
+        switch (self.wb_step) {
+            0 => {
+                self.wb_first = try self.br.readBit();
+                self.wb_step = 1;
+                if (self.wb_first == 0) {
+                    self.finishWbits(16);
+                    return;
+                }
+            },
+            1 => {},
+            else => {},
+        }
+        if (self.wb_step == 1) {
+            const n = try self.br.readBits(3);
+            if (n != 0) {
+                self.finishWbits(17 + @as(u32, @intCast(n)));
+                return;
+            }
+            self.wb_step = 2;
+        }
+        if (self.wb_step == 2) {
+            const m = try self.br.readBits(3);
+            if (m == 0) {
+                self.finishWbits(17);
+                return;
+            }
+            if (m != 1) {
+                self.finishWbits(8 + @as(u32, @intCast(m)));
+                return;
+            }
+            if (!self.large_window) return error.DataException;
+            self.wb_step = 3;
+        }
+        // Large window: one reserved bit (step 3), then the 6-bit window
+        // size (step 4); each is its own suspension point.
+        if (self.wb_step == 3) {
+            if (try self.br.readBit() != 0) return error.DataException;
+            self.wb_step = 4;
+        }
+        if (self.wb_step == 4) {
+            const lw = try self.br.readBits(6);
+            wbits = @intCast(lw);
+            if (wbits < 10 or wbits > 30) return error.DataException;
+            self.finishWbits(wbits);
+        }
+    }
+
+    fn finishWbits(self: *Incremental, wbits: u32) void {
+        self.window_size = if (wbits >= 31) std.math.maxInt(u32) else (@as(u32, 1) << @intCast(wbits)) - 16;
+        self.ring4 = distance_ring_init;
+        self.p1 = 0;
+        self.p2 = 0;
+        self.stream_base = self.produced;
+        self.stream_ring_start = self.ring_pos;
+        self.stream_produced = 0;
+        self.wb_step = 0;
+        self.mb_step = 0;
+        self.state = .metablock_header;
+    }
+
+    fn stMetablockHeader(self: *Incremental) Status!void {
+        // Stepwise so a starved run resumes mid-header: 0 = ISLAST,
+        // 1 = ISLASTEMPTY (only when ISLAST), 2 = MNIB, 3.. = metadata
+        // sub-reads, 6 = MLEN, 7 = ISUNCOMPRESSED.
+        switch (self.mb_step) {
+            0 => {
+                self.sc.trees_used = 0;
+                self.is_last = (try self.br.readBit()) != 0;
+                self.mb_step = 1;
+                if (!self.is_last) self.mb_step = 2;
+            },
+            1 => {
+                if ((try self.br.readBit()) != 0) {
+                    // ISLASTEMPTY.
+                    self.mb_step = 0;
+                    self.state = .stream_end;
+                    return;
+                }
+                self.mb_step = 2;
+            },
+            else => {},
+        }
+        if (self.mb_step == 2) {
+            self.mb_mnib = try self.br.readBits(2);
+            if (self.mb_mnib == 3) {
+                self.mb_step = 3;
+            } else {
+                self.mb_nibbles = @intCast(self.mb_mnib + 4);
+                self.mb_step = 6;
+            }
+        }
+        if (self.mb_step == 3) {
+            if (try self.br.readBit() != 0) return error.DataException;
+            self.mb_step = 4;
+        }
+        if (self.mb_step == 4) {
+            self.mb_mskipbytes = try self.br.readBits(2);
+            self.mb_step = 5;
+        }
+        if (self.mb_step == 5) {
+            if (self.mb_mskipbytes > 0) {
+                self.mb_mskipv = try self.br.readBits(@intCast(self.mb_mskipbytes * 8));
+            }
+            self.mb_step = 55;
+        }
+        if (self.mb_step == 55) {
+            var skiplen: usize = 0;
+            if (self.mb_mskipbytes > 0) {
+                if (self.mb_mskipbytes > 1 and (self.mb_mskipv >> @intCast((self.mb_mskipbytes - 1) * 8)) == 0) return error.DataException;
+                skiplen = @intCast(self.mb_mskipv + 1);
+            }
+            try self.br.alignToByte();
+            self.skip_remaining = skiplen;
+            self.mb_step = 0;
+            self.state = .metadata_skip;
+            return;
+        }
+        if (self.mb_step == 6) {
+            self.mlen = @as(usize, @intCast(try self.br.readBits(self.mb_nibbles * 4))) + 1;
+            if (self.mb_nibbles > 4 and ((self.mlen - 1) >> @intCast((self.mb_nibbles - 1) * 4)) == 0) {
+                return error.DataException;
+            }
+            self.mb_step = 7;
+        }
+        if (self.mb_step == 7) {
+            if (!self.is_last) {
+                if ((try self.br.readBit()) != 0) {
+                    try self.br.alignToByte();
+                    self.unc_remaining = self.mlen;
+                    self.mb_step = 0;
+                    self.state = .uncompressed;
+                    return;
+                }
+            }
+            self.cats = .{ .{}, .{}, .{} };
+            self.cat_i = 0;
+            self.cat_count_pending = false;
+            self.mb_step = 0;
+            self.state = .block_counts;
+        }
+    }
+
+    fn nextRawByte(self: *Incremental) Status!u8 {
+        if (self.br.nbits >= 8) {
+            const b: u8 = @intCast(self.br.peek(8));
+            self.br.drop(8);
+            return b;
+        }
+        if (self.br.pos < self.br.data.len) {
+            const b = self.br.data[self.br.pos];
+            self.br.pos += 1;
+            return b;
+        }
+        _ = self.br.refill();
+        if (self.br.nbits >= 8) {
+            const b: u8 = @intCast(self.br.peek(8));
+            self.br.drop(8);
+            return b;
+        }
+        return error.NeedInput;
+    }
+
+    fn stMetadataSkip(self: *Incremental) Status!void {
+        while (self.skip_remaining > 0) {
+            _ = try self.nextRawByte();
+            self.skip_remaining -= 1;
+        }
+        self.state = .metablock_header;
+    }
+
+    fn stUncompressed(self: *Incremental) Status!void {
+        while (self.unc_remaining > 0) {
+            const b = try self.nextRawByte();
+            try self.emitByte(b);
+            self.unc_remaining -= 1;
+        }
+        self.trackCtx(self.mlen);
+        self.mb_step = 0;
+        self.state = if (self.is_last) .stream_end else .metablock_header;
+    }
+
+    // Resumable canonical prefix-code walk; suspends bit-starved with the
+    // partial code saved in self.hw.
+    fn walk(self: *Incremental, table: *const HufTable) Status!u16 {
+        if (!self.hw.active) {
+            if (table.single != std.math.maxInt(u16)) return table.single;
+            self.hw = .{ .active = true, .single = table.single };
+        }
+        while (self.hw.len <= 15) : (self.hw.len += 1) {
+            self.hw.code |= try self.br.readBit();
+            const n = table.count[self.hw.len];
+            if (self.hw.code -% self.hw.first < n) {
+                const idx = self.hw.index + (self.hw.code - self.hw.first);
+                if (idx >= table.symbols.len) return error.DataException;
+                self.hw.active = false;
+                return table.symbols[idx];
+            }
+            self.hw.index += n;
+            self.hw.first = (self.hw.first + n) << 1;
+            self.hw.code <<= 1;
+        }
+        self.hw.active = false;
+        return error.DataException;
+    }
+
+    fn readBlockCountInc(self: *Incremental) Status!u32 {
+        // Suspension-safe: the selector bit and the 3-bit count width are
+        // saved across starved runs.
+        if (self.bc_step == 0) {
+            if (try self.br.readBit() == 0) return 1;
+            self.bc_step = 1;
+        }
+        if (self.bc_step == 1) {
+            self.bc_n = try self.br.readBits(3);
+            self.bc_step = 2;
+        }
+        const v = (@as(u32, 1) << @intCast(self.bc_n)) + 1 + @as(u32, @intCast(try self.br.readBits(@intCast(self.bc_n))));
+        self.bc_step = 0;
+        return v;
+    }
+
+    fn readTypeInc(self: *Incremental, cat: *BlockCategory) Status!void {
+        const sym = try self.walk(cat.type_tree.?);
+        if (sym == 0) {
+            const swap = cat.cur_type;
+            cat.cur_type = cat.prev_type;
+            cat.prev_type = swap;
+        } else if (sym == 1) {
+            cat.prev_type = cat.cur_type;
+            cat.cur_type +%= 1;
+            if (cat.cur_type == cat.num_types) cat.cur_type = 0;
+        } else {
+            cat.prev_type = cat.cur_type;
+            cat.cur_type = @as(u32, sym) - 2;
+            if (cat.cur_type >= cat.num_types) return error.DataException;
+        }
+    }
+
+    fn readCountInc(self: *Incremental, cat: *BlockCategory) Status!void {
+        if (self.rc_sym == 0xFFFF) {
+            self.rc_sym = try self.walk(cat.count_tree.?);
+            if (self.rc_sym >= 26) return error.DataException;
+        }
+        const sym = self.rc_sym;
+        const count = block_count_base[sym] + @as(u32, @intCast(try self.br.readBits(block_count_extra[sym])));
+        self.rc_sym = 0xFFFF;
+        cat.count = count;
+    }
+
+    fn stBlockCounts(self: *Incremental) Status!void {
+        while (self.cat_i < 3) {
+            const cat = &self.cats[self.cat_i];
+            if (cat.num_types == 1 and cat.type_tree == null and !self.cat_count_pending and cat.count == 0) {
+                // First visit: read NBLTYPES.
+                cat.num_types = try self.readBlockCountInc();
+                if (cat.num_types == 1) {
+                    self.cat_i += 1;
+                    continue;
+                }
+            }
+            if (cat.type_tree == null) {
+                cat.type_tree = try self.readTree(@intCast(cat.num_types + 2), @intCast(cat.num_types + 2));
+                cat.count_tree = try self.readTree(26, 26);
+            }
+            if (!self.cat_count_pending) {
+                try self.readTypeInc(cat);
+                self.cat_count_pending = true;
+            }
+            try self.readCountInc(cat);
+            self.cat_count_pending = false;
+            self.cat_i += 1;
+        }
+        self.cat_i = 0;
+        self.state = .block_header;
+    }
+
+    fn stBlockHeader(self: *Incremental) Status!void {
+        if (self.bh_step == 0) {
+            self.npostfix = @intCast(try self.br.readBits(2));
+            self.bh_step = 1;
+        }
+        if (self.bh_step == 1) {
+            self.ndirect = @as(u32, @intCast(try self.br.readBits(4))) << self.npostfix;
+            self.bh_step = 0;
+        }
+        self.postfix_mask = (@as(u32, 1) << self.npostfix) - 1;
+
+        var dist_alphabet_max: usize = 16 + self.ndirect + (@as(usize, 48) << self.npostfix);
+        var dist_alphabet_limit: usize = dist_alphabet_max;
+        if (self.large_window) {
+            dist_alphabet_max = 16 + self.ndirect + (@as(usize, 124) << self.npostfix);
+            dist_alphabet_limit = distanceCodeLimit(0x7FFFFFFC, self.npostfix, self.ndirect).max_alphabet_size;
+        }
+        self.dist_alphabet_max = dist_alphabet_max;
+        self.dist_alphabet_limit = dist_alphabet_limit;
+
+        self.ctx_i = 0;
+        self.state = .context_maps;
+    }
+
+    // cm_stage: 0 = context modes, 1 = NTREESL + literal map,
+    // 2 = NTREESD + distance map.
+    fn stContextMaps(self: *Incremental) Status!void {
+        if (self.cm_stage == 0) {
+            while (self.ctx_i < self.cats[0].num_types) {
+                self.context_modes[self.ctx_i] = @intCast(try self.br.readBits(2));
+                self.ctx_i += 1;
+            }
+            self.cm_stage = 1;
+        }
+        // ntreesl / cmapl / ntreesd / cmapd are separate stages so a
+        // suspended context map never re-reads the tree count.
+        if (self.cm_stage == 1) {
+            self.ntreesl = try self.readBlockCountInc();
+            self.cm_stage = 2;
+        }
+        if (self.cm_stage == 2) {
+            if (self.ntreesl >= 2) {
+                try self.readContextMapInc(self.sc.cmapl[0 .. 64 * @as(usize, self.cats[0].num_types)], self.ntreesl);
+                if (self.cm.phase != .done) return; // suspended mid-map
+            } else {
+                @memset(self.sc.cmapl[0 .. 64 * @as(usize, self.cats[0].num_types)], 0);
+            }
+            self.cm.phase = .idle;
+            self.cm_stage = 3;
+        }
+        if (self.cm_stage == 3) {
+            self.ntreesd = try self.readBlockCountInc();
+            self.cm_stage = 4;
+        }
+        if (self.cm_stage == 4) {
+            if (self.ntreesd >= 2) {
+                try self.readContextMapInc(self.sc.cmapd[0 .. 4 * @as(usize, self.cats[2].num_types)], self.ntreesd);
+                if (self.cm.phase != .done) return;
+            } else {
+                @memset(self.sc.cmapd[0 .. 4 * @as(usize, self.cats[2].num_types)], 0);
+            }
+            self.cm.phase = .idle;
+        }
+        self.cm_stage = 0;
+        self.tree_i = 0;
+        self.state = .trees;
+    }
+
+    fn readContextMapInc(self: *Incremental, map: []u8, num_trees: u32) Status!void {
+        // cm.phase != idle means resuming a read already in progress.
+        if (self.cm.phase == .idle) {
+            self.cm.phase = .rle;
+            self.cm.size = map.len;
+            self.cm.i = 0;
+            self.cm.rlemax = 0;
+        }
+        if (self.cm.phase == .rle) {
+            if (try self.br.readBit() != 0) {
+                self.cm.rlemax = @as(u32, @intCast(try self.br.readBits(4))) + 1;
+            }
+            self.cm.phase = .tree;
+        }
+        if (self.cm.phase == .tree) {
+            self.cm.tree = try self.readTree(@intCast(num_trees + self.cm.rlemax), @intCast(num_trees + self.cm.rlemax));
+            self.cm.phase = .body;
+        }
+        const tree = self.cm.tree.?;
+        while (self.cm.i < self.cm.size) {
+            if (self.cm.sym_pending == null) self.cm.sym_pending = try self.walk(tree);
+            const sym = self.cm.sym_pending.?;
+            if (sym == 0) {
+                self.cm.sym_pending = null;
+                map[self.cm.i] = 0;
+                self.cm.i += 1;
+            } else if (sym <= self.cm.rlemax) {
+                const rep = (@as(u32, 1) << @intCast(sym)) + @as(u32, @intCast(try self.br.readBits(@intCast(sym))));
+                self.cm.sym_pending = null;
+                if (self.cm.i + rep > self.cm.size) return error.DataException;
+                @memset(map[self.cm.i .. self.cm.i + rep], 0);
+                self.cm.i += rep;
+            } else {
+                self.cm.sym_pending = null;
+                const v = sym - self.cm.rlemax;
+                if (v >= num_trees) return error.DataException;
+                map[self.cm.i] = @intCast(v);
+                self.cm.i += 1;
+            }
+        }
+        if (try self.br.readBit() != 0) {
+            // IMTF (RFC 7.3).
+            for (&self.cm.mtf, 0..) |*b, j| b.* = @intCast(j);
+            self.cm.phase = .imtf;
+            self.cm.i = 0;
+            while (self.cm.i < self.cm.size) {
+                const idx: usize = map[self.cm.i];
+                const value = self.cm.mtf[idx];
+                map[self.cm.i] = value;
+                var j = idx;
+                while (j > 0) : (j -= 1) self.cm.mtf[j] = self.cm.mtf[j - 1];
+                self.cm.mtf[0] = value;
+                self.cm.i += 1;
+            }
+        }
+        self.cm.phase = .done;
+    }
+    // Resumable prefix-code reader; mirrors readPrefixCode. Callers leave
+    // self.tr.phase != .idle to resume a suspended read.
+    fn readTree(self: *Incremental, alphabet: usize, limit: usize) Status!*HufTable {
+        // A completed tree leaves .done; the next read starts fresh. The
+        // result table is allocated exactly once per tree, up front, so
+        // suspension resumes never double-advance the scratch pool.
+        // init_step splits the selector reads so a starved run never
+        // re-reads an already-consumed selector.
+        if (self.tr.phase == .done) self.tr = .{};
+        if (self.tr.init_step == 0 and self.tr.phase == .idle) {
+            const rt = try self.sc.allocTree(alphabet);
+            self.tr = .{
+                .alphabet = alphabet,
+                .limit = limit,
+                .result = rt.table,
+                .init_step = 1,
+            };
+            rt.table.symbols = rt.symbols;
+        }
+        if (self.tr.init_step == 1) {
+            self.tr.hskip = @intCast(try self.br.readBits(2));
+            self.tr.init_step = 2;
+        }
+        if (self.tr.init_step == 2) {
+            if (self.tr.hskip == 1) {
+                self.tr.nsym = @intCast((try self.br.readBits(2)) + 1);
+                self.tr.simple_i = 0;
+                self.tr.phase = .simple;
+            } else {
+                self.cl_table_storage = .{ .symbols = &self.cl_symbols };
+                self.tr.cl_table = &self.cl_table_storage;
+                self.tr.cl_i = @intCast(self.tr.hskip);
+                self.tr.cl_space = 32;
+                self.tr.cl_num = 0;
+                self.tr.cl_lengths = @splat(0);
+                self.tr.phase = .clcode;
+            }
+            self.tr.init_step = 0;
+        }
+        switch (self.tr.phase) {
+            .idle => unreachable,
+            .clcode => try self.treeClCode(),
+            .simple => try self.treeSimple(),
+            .complex => try self.treeComplex(),
+            .done => return self.tr.result.?,
+        }
+        if (self.tr.phase == .done) return self.tr.result.?;
+        return error.NeedInput; // a sub-phase suspended
+    }
+
+    fn treeClCode(self: *Incremental) Status!void {
+        const order = [18]u8{ 1, 2, 3, 4, 0, 5, 17, 6, 16, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+        if (self.tr.hskip == 1) return error.DataException;
+        var i = self.tr.cl_i;
+        while (i < 18 and self.tr.cl_space > 0) : (i += 1) {
+            // Save progress before the (possibly starved) read so a
+            // suspended run resumes at this length, not the previous one.
+            self.tr.cl_i = i;
+            // The 2..4-bit length encodings are decodable from a 4-bit
+            // window, which keeps suspension between whole lengths.
+            const w = self.br.peekUpTo(4);
+            var len: u8 = undefined;
+            var used: u6 = undefined;
+            if (w.bits & 1 == 0) {
+                if (w.n < 2) return error.NeedInput;
+                len = if ((w.bits >> 1) & 1 != 0) 3 else 0;
+                used = 2;
+            } else if ((w.bits >> 1) & 1 == 0) {
+                if (w.n < 2) return error.NeedInput;
+                len = 4;
+                used = 2;
+            } else if ((w.bits >> 2) & 1 == 0) {
+                if (w.n < 3) return error.NeedInput;
+                len = 2;
+                used = 3;
+            } else {
+                if (w.n < 4) return error.NeedInput;
+                len = if ((w.bits >> 3) & 1 != 0) 5 else 1;
+                used = 4;
+            }
+            self.br.drop(used);
+            const sym = order[i];
+            self.tr.cl_lengths[sym] = len;
+            if (len != 0) {
+                const weight = @as(u32, 32) >> @intCast(len);
+                if (self.tr.cl_space < weight) return error.DataException;
+                self.tr.cl_space -= weight;
+                self.tr.cl_num += 1;
+            }
+        }
+        self.tr.cl_i = i;
+        if (self.tr.cl_space != 0 and self.tr.cl_num != 1) return error.DataException;
+        const table = self.tr.cl_table.?;
+        if (self.tr.cl_num == 1) {
+            for (self.tr.cl_lengths, 0..) |l, sym| {
+                if (l != 0) {
+                    table.single = @intCast(sym);
+                    break;
+                }
+            }
+        } else {
+            for (self.tr.cl_lengths) |l| table.count[l] += 1;
+            table.count[0] = 0;
+            var offset = canonicalOffsets(table.count);
+            for (self.tr.cl_lengths, 0..) |l, sym| {
+                if (l != 0) {
+                    table.symbols[offset[l]] = @intCast(sym);
+                    offset[l] += 1;
+                }
+            }
+        }
+        const lt = self.tr.result.?;
+        self.tr.lengths_table = lt;
+        lt.single = std.math.maxInt(u16);
+        @memset(lt.count[0..], 0);
+        self.tr.sym_count = 0;
+        self.tr.prev_len = 8;
+        self.tr.repeat = 0;
+        self.tr.repeat_len = 0;
+        self.tr.space = 32768;
+        self.tr.phase = .complex;
+        try self.treeComplex();
+    }
+
+    fn treeSimple(self: *Incremental) Status!void {
+        const tree = self.tr.result.?;
+        const abits: u6 = @intCast(std.math.log2_int(usize, std.math.ceilPowerOfTwoAssert(usize, self.tr.alphabet)));
+        while (self.tr.simple_i < self.tr.nsym) : (self.tr.simple_i += 1) {
+            const sym = try self.br.readBits(abits);
+            if (sym >= self.tr.limit) return error.DataException;
+            const i = self.tr.simple_i;
+            self.tr.syms[i] = @intCast(sym);
+            tree.symbols[i] = @intCast(sym);
+        }
+        var lens: [4]u8 = @splat(0);
+        switch (self.tr.nsym) {
+            1 => {
+                self.tr.result.?.single = self.tr.result.?.symbols[0];
+                self.tr.single = true;
+                self.tr.phase = .done;
+                return;
+            },
+            2 => lens[0..2].* = .{ 1, 1 },
+            3 => lens[0..3].* = .{ 1, 2, 2 },
+            4 => {
+                const ts = try self.br.readBit();
+                if (ts == 0) {
+                    lens[0..4].* = .{ 2, 2, 2, 2 };
+                } else {
+                    lens[0..4].* = .{ 1, 2, 3, 3 };
+                }
+            },
+            else => return error.DataException,
+        }
+        const table = self.tr.result.?;
+        for (0..self.tr.nsym) |i| table.count[lens[i]] += 1;
+        // Canonical order: (len, symbol) sort, as in readPrefixCode.
+        var saved: [4]u16 = undefined;
+        @memcpy(saved[0..self.tr.nsym], table.symbols[0..self.tr.nsym]);
+        var order: [4]usize = .{ 0, 1, 2, 3 };
+        var a: usize = 1;
+        while (a < self.tr.nsym) : (a += 1) {
+            var b = a;
+            while (b > 0 and (lens[order[b]] < lens[order[b - 1]] or
+                (lens[order[b]] == lens[order[b - 1]] and saved[order[b]] < saved[order[b - 1]])))
+            {
+                const t = order[b];
+                order[b] = order[b - 1];
+                order[b - 1] = t;
+                b -= 1;
+            }
+        }
+        for (0..self.tr.nsym) |i| table.symbols[i] = saved[order[i]];
+        self.tr.single = false;
+        self.tr.phase = .done;
+    }
+
+    fn treeComplex(self: *Incremental) Status!void {
+        const cl = self.tr.cl_table.?;
+        const lt = self.tr.lengths_table.?;
+        self.tr.result = lt;
+        while (self.tr.sym_count < self.tr.limit and self.tr.space > 0) {
+            if (self.tr.sym_pending == null) self.tr.sym_pending = try self.walk(cl);
+            const sym = self.tr.sym_pending.?;
+            if (sym < 16) {
+                self.tr.sym_pending = null;
+                lt.symbols[self.tr.sym_count] = sym;
+                self.tr.sym_count += 1;
+                self.tr.repeat = 0;
+                self.tr.repeat_len = 0;
+                if (sym != 0) {
+                    self.tr.prev_len = @intCast(sym);
+                    const weight = @as(u32, 32768) >> @intCast(sym);
+                    if (weight > self.tr.space) return error.DataException;
+                    self.tr.space -= weight;
+                }
+            } else if (sym == 16 or sym == 17) {
+                const new_len: u32 = if (sym == 16) self.tr.prev_len else 0;
+                const extra_bits: u6 = if (sym == 16) 2 else 3;
+                const extra = try self.br.readBits(extra_bits);
+                self.tr.sym_pending = null;
+                if (self.tr.repeat_len != new_len) {
+                    self.tr.repeat = 0;
+                    self.tr.repeat_len = @intCast(new_len);
+                }
+                const old_repeat = self.tr.repeat;
+                if (self.tr.repeat > 0) self.tr.repeat = (self.tr.repeat - 2) << @intCast(extra_bits);
+                self.tr.repeat += 3 + @as(u32, @intCast(extra));
+                const delta = self.tr.repeat - old_repeat;
+                if (self.tr.sym_count + delta > self.tr.limit) return error.DataException;
+                if (new_len != 0) {
+                    const per = @as(u32, 32768) >> @intCast(new_len);
+                    if (per * delta > self.tr.space) return error.DataException;
+                    for (0..delta) |_| {
+                        lt.symbols[self.tr.sym_count] = @intCast(new_len);
+                        self.tr.sym_count += 1;
+                    }
+                    self.tr.space -= per * delta;
+                } else {
+                    @memset(lt.symbols[self.tr.sym_count..][0..delta], 0);
+                    self.tr.sym_count += delta;
+                }
+            } else return error.DataException;
+        }
+        if (self.tr.space != 0 or self.tr.sym_count > self.tr.alphabet) return error.DataException;
+        var cnt: [16]u32 = @splat(0);
+        for (lt.symbols[0..self.tr.sym_count]) |l| cnt[l] += 1;
+        const nonzero = cnt[1] + cnt[2] + cnt[3] + cnt[4] + cnt[5] + cnt[6] + cnt[7] + cnt[8] + cnt[9] + cnt[10] + cnt[11] + cnt[12] + cnt[13] + cnt[14] + cnt[15];
+        if (nonzero == 0) return error.DataException;
+        if (nonzero == 1) {
+            for (lt.symbols[0..self.tr.sym_count], 0..) |l, sidx| {
+                if (l != 0) {
+                    lt.single = @intCast(sidx);
+                    break;
+                }
+            }
+            self.tr.single = true;
+            self.tr.phase = .done;
+            return;
+        }
+        var offset = canonicalOffsets(cnt);
+        var len_copy: [max_alphabet]u16 = undefined;
+        @memcpy(len_copy[0..self.tr.sym_count], lt.symbols[0..self.tr.sym_count]);
+        for (len_copy[0..self.tr.sym_count], 0..) |l, sidx| {
+            if (l != 0) {
+                lt.symbols[offset[l]] = @intCast(sidx);
+                offset[l] += 1;
+            }
+        }
+        lt.count = cnt;
+        self.tr.single = false;
+        self.tr.phase = .done;
+    }
+
+    fn stTrees(self: *Incremental) Status!void {
+        const total = @as(usize, self.ntreesl) + @as(usize, self.cats[1].num_types) + @as(usize, self.ntreesd);
+        while (self.tree_i < total) {
+            const idx = self.tree_i;
+            if (idx < self.ntreesl) {
+                const t = try self.readTree(256, 256);
+                self.lit_trees[idx] = t;
+            } else if (idx < self.ntreesl + self.cats[1].num_types) {
+                const t = try self.readTree(704, 704);
+                self.ins_trees[idx - self.ntreesl] = t;
+            } else {
+                const t = try self.readTree(self.dist_alphabet_max, self.dist_alphabet_limit);
+                self.dist_trees[idx - self.ntreesl - self.cats[1].num_types] = t;
+            }
+            self.tree_i += 1;
+        }
+        self.cmd = .{};
+        self.mb_pos = 0;
+        self.state = .command;
+    }
+
+    fn endMetaBlock(self: *Incremental) void {
+        self.state = if (self.is_last) .stream_end else .metablock_header;
+    }
+
+    fn stCommand(self: *Incremental) Status!void {
+        while (self.mb_pos < self.mlen) {
+            switch (self.cmd.phase) {
+                .ins_switch => {
+                    const ins = &self.cats[1];
+                    if (ins.num_types >= 2) {
+                        if (!self.cmd.ins_sw_pending and ins.count == 0) {
+                            try self.readTypeInc(ins);
+                            self.cmd.ins_sw_pending = true;
+                        }
+                        if (self.cmd.ins_sw_pending) {
+                            try self.readCountInc(ins);
+                            self.cmd.ins_sw_pending = false;
+                        }
+                        ins.count -= 1;
+                    }
+                    self.cmd.phase = .icode;
+                },
+                .icode => {
+                    const icode = try self.walk(self.ins_trees[self.cats[1].cur_type]);
+                    if (icode >= 704) return error.DataException;
+                    self.cmd.icode = icode;
+                    var cell: u32 = icode;
+                    self.cmd.implicit = cell < 128;
+                    if (cell < 128) cell += 128;
+                    var ins_base_code: u32 = 0;
+                    var copy_base_code: u32 = 0;
+                    switch (cell >> 6) {
+                        2 => {},
+                        3 => copy_base_code = 8,
+                        4 => ins_base_code = 8,
+                        5 => {
+                            ins_base_code = 8;
+                            copy_base_code = 8;
+                        },
+                        6 => copy_base_code = 16,
+                        7 => ins_base_code = 16,
+                        8 => {
+                            ins_base_code = 8;
+                            copy_base_code = 16;
+                        },
+                        9 => {
+                            ins_base_code = 16;
+                            copy_base_code = 8;
+                        },
+                        10 => {
+                            ins_base_code = 16;
+                            copy_base_code = 16;
+                        },
+                        else => return error.DataException,
+                    }
+                    self.cmd.ins_code = ins_base_code + ((cell >> 3) & 7);
+                    self.cmd.copy_code = copy_base_code + (cell & 7);
+                    self.cmd.phase = .ins_extra;
+                },
+                .ins_extra => {
+                    self.cmd.ins_len = @intCast(insert_base[self.cmd.ins_code] + try self.br.readBits(insert_extra[self.cmd.ins_code]));
+                    self.cmd.phase = .copy_extra;
+                },
+                .copy_extra => {
+                    self.cmd.copy_len = @intCast(copy_base[self.cmd.copy_code] + try self.br.readBits(copy_extra[self.cmd.copy_code]));
+                    if (self.mb_pos + self.cmd.ins_len > self.mlen) return error.DataException;
+                    self.cmd.lits_done = 0;
+                    self.cmd.phase = .lits;
+                },
+                .lits => {
+                    const lit = &self.cats[0];
+                    while (self.cmd.lits_done < self.cmd.ins_len) {
+                        if (self.cmd.lit_pending == null) {
+                            // Starting a new literal: block switch, context
+                            // id and the tree walk all complete before the
+                            // emit can suspend.
+                            if (lit.num_types >= 2) {
+                                if (!self.cmd.lit_sw_pending and lit.count == 0) {
+                                    try self.readTypeInc(lit);
+                                    self.cmd.lit_sw_pending = true;
+                                }
+                                if (self.cmd.lit_sw_pending) {
+                                    try self.readCountInc(lit);
+                                    self.cmd.lit_sw_pending = false;
+                                }
+                                lit.count -= 1;
+                            }
+                            const cid = literalContext(self.context_modes[lit.cur_type], self.p1, self.p2);
+                            const tree_idx = self.sc.cmapl[64 * @as(usize, lit.cur_type) + cid];
+                            self.cmd.lit_pending = @intCast(try self.walk(self.lit_trees[tree_idx]));
+                        }
+                        try self.emitByte(self.cmd.lit_pending.?);
+                        const byte = self.cmd.lit_pending.?;
+                        self.cmd.lit_pending = null;
+                        self.p2 = self.p1;
+                        self.p1 = byte;
+                        self.mb_pos += 1;
+                        self.cmd.lits_done += 1;
+                    }
+                    if (self.mb_pos == self.mlen) {
+                        self.endMetaBlock();
+                        return;
+                    }
+                    self.cmd.phase = .dist_switch;
+                },
+                .dist_switch => {
+                    if (!self.cmd.implicit) {
+                        const dist = &self.cats[2];
+                        if (dist.num_types >= 2) {
+                            if (!self.cmd.dist_sw_pending and dist.count == 0) {
+                                try self.readTypeInc(dist);
+                                self.cmd.dist_sw_pending = true;
+                            }
+                            if (self.cmd.dist_sw_pending) {
+                                try self.readCountInc(dist);
+                                self.cmd.dist_sw_pending = false;
+                            }
+                            dist.count -= 1;
+                        }
+                    }
+                    self.cmd.phase = .dist_tree;
+                },
+                .dist_tree => {
+                    var distance: u32 = 0;
+                    var push_ring = false;
+                    if (self.cmd.implicit) {
+                        distance = self.ring4[0];
+                    } else {
+                        const dcid: usize = if (self.cmd.copy_len > 4) 3 else self.cmd.copy_len - 2;
+                        const tree_idx = self.sc.cmapd[4 * @as(usize, self.cats[2].cur_type) + dcid];
+                        if (self.cmd.dcode_pending == null) self.cmd.dcode_pending = try self.walk(self.dist_trees[tree_idx]);
+                        const dcode = self.cmd.dcode_pending.?;
+                        if (dcode < 16) {
+                            self.cmd.dcode_pending = null;
+                            const idx = ring_slot[dcode];
+                            const v = @as(i64, self.ring4[idx]) + ring_off[dcode];
+                            if (v <= 0) return error.DataException;
+                            distance = @intCast(v);
+                            push_ring = dcode != 0;
+                        } else if (dcode < 16 + self.ndirect) {
+                            self.cmd.dcode_pending = null;
+                            distance = dcode - 16 + 1;
+                            push_ring = true;
+                        } else {
+                            const dc: u32 = dcode - self.ndirect - 16;
+                            const ndistbits: u6 = @intCast(1 + (dc >> (self.npostfix + 1)));
+                            const dextra = try self.br.readBits(ndistbits);
+                            self.cmd.dcode_pending = null;
+                            const hcode = dc >> self.npostfix;
+                            const lcode = dc & self.postfix_mask;
+                            const offset = ((@as(u32, 2) + (hcode & 1)) << @intCast(ndistbits)) - 4;
+                            distance = ((offset + @as(u32, @intCast(dextra))) << self.npostfix) + lcode + self.ndirect + 1;
+                            push_ring = true;
+                        }
+                    }
+                    self.cmd.distance = distance;
+                    self.cmd.push_ring = push_ring;
+                    self.cmd.phase = .dist_extra;
+                },
+                .dist_extra => {
+                    const max_backward = @min(self.window_size, self.stream_produced + self.dict.len);
+                    if (self.cmd.distance > max_backward) {
+                        // Static dictionary reference. Build the transformed
+                        // word first (no input consumed), bound-check, then
+                        // emit with drain suspension.
+                        self.cmd.word_len = try self.buildDictionaryWord(self.cmd.copy_len, self.cmd.distance, max_backward);
+                        if (self.mb_pos + self.cmd.word_len > self.mlen) return error.DataException;
+                        self.cmd.word_off = 0;
+                        self.cmd.phase = .word;
+                    } else {
+                        if (self.cmd.push_ring) {
+                            self.ring4[3] = self.ring4[2];
+                            self.ring4[2] = self.ring4[1];
+                            self.ring4[1] = self.ring4[0];
+                            self.ring4[0] = self.cmd.distance;
+                        }
+                        if (self.mb_pos + self.cmd.copy_len > self.mlen) return error.DataException;
+                        const in_stream = self.stream_produced;
+                        if (self.cmd.distance > in_stream) {
+                            self.cmd.copy_from_dict = @min(self.cmd.copy_len, self.cmd.distance - in_stream);
+                            self.cmd.copy_dict_off = self.dict.len - (self.cmd.distance - in_stream);
+                        } else {
+                            self.cmd.copy_from_dict = 0;
+                        }
+                        self.cmd.copy_remaining = self.cmd.copy_len - self.cmd.copy_from_dict;
+                        self.cmd.copy_src_pos = self.ring_pos - self.cmd.distance;
+                        self.cmd.phase = .copy;
+                    }
+                },
+                .word => {
+                    while (self.cmd.word_off < self.cmd.word_len) {
+                        try self.emitByte(self.cmd.word[self.cmd.word_off]);
+                        self.cmd.word_off += 1;
+                    }
+                    self.mb_pos += self.cmd.word_len;
+                    self.trackCtx(self.cmd.word_len);
+                    self.cmd = .{ .phase = .ins_switch };
+                },
+                .copy => {
+                    while (self.cmd.copy_from_dict > 0) {
+                        const b = self.dict[self.cmd.copy_dict_off];
+                        try self.emitByte(b);
+                        self.cmd.copy_dict_off += 1;
+                        self.cmd.copy_from_dict -= 1;
+                    }
+                    while (self.cmd.copy_remaining > 0) {
+                        const b = self.ringByte(self.cmd.copy_src_pos);
+                        try self.emitByte(b);
+                        self.cmd.copy_src_pos += 1;
+                        self.cmd.copy_remaining -= 1;
+                    }
+                    self.mb_pos += self.cmd.copy_len;
+                    self.trackCtx(self.cmd.copy_len);
+                    self.cmd = .{ .phase = .ins_switch };
+                },
+            }
+        }
+        self.endMetaBlock();
+    }
+
+    // Transformed static-dictionary word; mirrors copyDictionaryWord but
+    // writes into the command word buffer instead of the output slice.
+    fn buildDictionaryWord(self: *Incremental, copy_len: usize, distance: u32, max_backward: u32) DecodeError!usize {
+        if (copy_len < dictionary.min_word_length or copy_len > dictionary.max_word_length) return error.DataException;
+        const word_id: u64 = @as(u64, distance) - max_backward - 1;
+        const nd: u6 = @intCast(dictionary.ndbits[copy_len]);
+        const nwords: u64 = @as(u64, 1) << nd;
+        const index = word_id % nwords;
+        const transform_id = word_id / nwords;
+        if (transform_id >= dictionary.transform_count) return error.DataException;
+        const base_off: usize = dictionary.doffset[copy_len] + @as(usize, @intCast(index)) * copy_len;
+        const word = dictionary.data[base_off..][0..copy_len];
+        var buf: [64]u8 = undefined;
+        var total: usize = 0;
+        const t: usize = std.math.cast(usize, transform_id *% 3) orelse return error.DataException;
+        const prefix = poolString(dictionary.transforms[std.math.cast(usize, t) orelse return error.DataException]);
+        if (prefix.len > buf.len) return error.InternalException;
+        @memcpy(buf[total..][0..prefix.len], prefix);
+        total += prefix.len;
+        const op = dictionary.transforms[t + 1];
+        var word_part: []const u8 = word;
+        var bufw: [dictionary.max_word_length]u8 = undefined;
+        switch (op) {
+            0 => {},
+            1 => {
+                @memcpy(bufw[0..word.len], word);
+                fermentFirst(bufw[0..word.len]);
+                word_part = bufw[0..word.len];
+            },
+            2 => {
+                @memcpy(bufw[0..word.len], word);
+                fermentAll(bufw[0..word.len]);
+                word_part = bufw[0..word.len];
+            },
+            3...11 => {
+                const k: usize = op - 2;
+                word_part = if (word.len < k) word[0..0] else word[k..];
+            },
+            12...20 => {
+                const k: usize = op - 11;
+                word_part = if (word.len < k) word[0..0] else word[0 .. word.len - k];
+            },
+            else => return error.DataException,
+        }
+        @memcpy(buf[total..][0..word_part.len], word_part);
+        total += word_part.len;
+        const suffix = poolString(dictionary.transforms[t + 2]);
+        if (total + suffix.len > buf.len) return error.InternalException;
+        @memcpy(buf[total..][0..suffix.len], suffix);
+        total += suffix.len;
+        @memcpy(self.cmd.word[0..total], buf[0..total]);
+        return total;
+    }
+
+    fn stStreamEnd(self: *Incremental) Status!void {
+        try self.br.alignToByte();
+        // Pull in whatever the current window still holds before deciding
+        // more input is needed, so the caller always sees progress.
+        _ = self.br.refill();
+        const leftover: usize = self.br.nbits + (self.br.data.len - self.br.pos) * 8;
+        if (leftover == 0) {
+            if (self.end_of_input) {
+                self.state = .done;
+                return;
+            }
+            // The window is exhausted and the accumulator is empty; a
+            // concatenated stream may still arrive.
+            return error.NeedInput;
+        }
+        // Match the one-shot loop: another stream header is attempted
+        // immediately; garbage fails there per the format rules. This also
+        // keeps run boundaries making progress when the accumulator is
+        // full, since stream-end yields would otherwise spin.
+        self.wb_step = 0;
+        self.mb_step = 0;
+        self.state = .wbits;
+    }
+};
+
+fn ringSizeFor(options: Options) usize {
+    if (!options.large_window) return 1 << 24;
+    return @as(usize, 1) << 30;
+}
+
+pub fn incrementalWorkspaceSize(options: Options) usize {
+    const tables = max_trees * @sizeOf(HufTable);
+    const symbols = max_trees * max_alphabet * @sizeOf(u16);
+    const maps = 64 * 256 + 4 * 256;
+    const header = std.mem.alignForward(usize, @sizeOf(Incremental) + 4096 + 16, 16);
+    return header + tables + symbols + maps + ringSizeFor(options) + 4096;
+}
+
+pub fn incrementalInit(storage: []u8, options: Options) error{ResourceException}!Incremental {
+    if (storage.len < incrementalWorkspaceSize(options)) return error.ResourceException;
+    var inc = Incremental{};
+    inc.large_window = options.large_window;
+    inc.max_decoded = options.max_decoded_bytes;
+    inc.dict = options.custom_dictionary orelse &.{};
+    const ring_len = ringSizeFor(options);
+    inc.ring_mask = ring_len - 1;
+    var buf = storage;
+    const off = std.mem.alignForward(usize, @intFromPtr(buf.ptr), 16) - @intFromPtr(buf.ptr);
+    buf = buf[off..];
+    const header_bytes = std.mem.alignForward(usize, @sizeOf(Incremental) + 4096 + 16, 16);
+    if (buf.len < header_bytes + 16) return error.ResourceException;
+    inc.sc = .{
+        .tables = std.mem.bytesAsSlice(HufTable, @as([]align(8) u8, @alignCast(buf[header_bytes..][0 .. max_trees * @sizeOf(HufTable)]))),
+        .symbols = std.mem.bytesAsSlice(u16, @as([]align(2) u8, @alignCast(buf[header_bytes + max_trees * @sizeOf(HufTable) ..][0 .. max_trees * max_alphabet * @sizeOf(u16)]))),
+        .cmapl = buf[header_bytes + max_trees * @sizeOf(HufTable) + max_trees * max_alphabet * @sizeOf(u16) ..][0 .. 64 * 256],
+        .cmapd = buf[header_bytes + max_trees * @sizeOf(HufTable) + max_trees * max_alphabet * @sizeOf(u16) + 64 * 256 ..][0 .. 4 * 256],
+    };
+    const ring_start = header_bytes + max_trees * @sizeOf(HufTable) + max_trees * max_alphabet * @sizeOf(u16) + 64 * 256 + 4 * 256;
+    if (buf.len < ring_start + ring_len) return error.ResourceException;
+    inc.ring = buf[ring_start..][0..ring_len];
+    return inc;
 }
 
 const encode_mb_cap = 1 << 20;
@@ -1441,17 +2928,21 @@ fn writePrefixCode(bw: *BitWriter, lens: []u8, alphabet: usize) EncodeError!bool
     return false;
 }
 
-fn encodeMetaBlock(bw: *BitWriter, src: []const u8, is_last: bool, ring: *[4]u32, workspace: []u8) EncodeError!void {
+fn encodeMetaBlock(bw: *BitWriter, src: []const u8, is_last: bool, ring: *[4]u32, workspace: []u8, dict: []const u8, dist_cap: u32, dist_alphabet: usize) EncodeError!void {
     const head = std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(workspace[0 .. encode_head_words * 4])));
     const commands = std.mem.bytesAsSlice(Command, @as([]align(4) u8, @alignCast(workspace[encode_head_words * 4 ..][0 .. encode_command_cap * @sizeOf(Command)])));
-    const cmd_count = parseCommands(src, commands, head, ring);
+    const cmd_count = parseCommands(src, dict, commands, head, ring, dist_cap);
 
     var lit_lens: [256]u8 = undefined;
     var icode_lens: [704]u8 = undefined;
-    var dcode_lens: [64]u8 = undefined;
+    // The large-window decoder reads distance simple symbols with the wide
+    // alphabet (BROTLI_DISTANCE_ALPHABET_SIZE with LARGE_MAX_DISTANCE_BITS),
+    // so the emitted tree must use the same width; codes beyond 63 stay
+    // unused (the encoder never emits them).
+    var dcode_lens: [140]u8 = @splat(0);
     var lit_freq: [256]u32 = @splat(0);
     var icode_freq: [704]u32 = @splat(0);
-    var dcode_freq: [64]u32 = @splat(0);
+    var dcode_freq: [140]u32 = @splat(0);
     for (commands[0..cmd_count]) |cmd| {
         icode_freq[cmd.icode] += 1;
         if (cmd.dcode != 0xFFFF) dcode_freq[cmd.dcode] += 1;
@@ -1460,10 +2951,10 @@ fn encodeMetaBlock(bw: *BitWriter, src: []const u8, is_last: bool, ring: *[4]u32
     }
     huffman.limitedLengths(lit_freq[0..256], lit_lens[0..256], 15);
     huffman.limitedLengths(icode_freq[0..704], icode_lens[0..704], 15);
-    huffman.limitedLengths(dcode_freq[0..64], dcode_lens[0..64], 15);
+    huffman.limitedLengths(dcode_freq[0..140], dcode_lens[0..140], 15);
     var lit_codes: [256]u16 = undefined;
     var icode_codes: [704]u16 = undefined;
-    var dcode_codes: [64]u16 = undefined;
+    var dcode_codes: [140]u16 = undefined;
 
     // Meta-block header per RFC 9.2.
     // One block type and one tree per category keep the middle trivial.
@@ -1489,12 +2980,12 @@ fn encodeMetaBlock(bw: *BitWriter, src: []const u8, is_last: bool, ring: *[4]u32
     try bw.writeBit(0); // NTREESD = 1
     const lit_single = try writePrefixCode(bw, lit_lens[0..256], 256);
     const icode_single = try writePrefixCode(bw, icode_lens[0..704], 704);
-    const dcode_single = try writePrefixCode(bw, dcode_lens[0..64], 64);
+    const dcode_single = try writePrefixCode(bw, dcode_lens[0..dist_alphabet], dist_alphabet);
     // The writer fixes the final lengths first.
     // Canonical codes for the symbol bits come after it.
     canonicalCodes(lit_lens[0..256], lit_codes[0..256]);
     canonicalCodes(icode_lens[0..704], icode_codes[0..704]);
-    canonicalCodes(dcode_lens[0..64], dcode_codes[0..64]);
+    canonicalCodes(dcode_lens[0..dist_alphabet], dcode_codes[0..dist_alphabet]);
 
     for (commands[0..cmd_count]) |cmd| {
         if (!icode_single) try writeSymbol(bw, icode_codes[cmd.icode], icode_lens[cmd.icode]);
@@ -1511,8 +3002,44 @@ fn encodeMetaBlock(bw: *BitWriter, src: []const u8, is_last: bool, ring: *[4]u32
     }
 }
 
-fn encodeBits(input: []const u8, bw: *BitWriter, ws: []u8) EncodeError!void {
-    try bw.writeBits(0b1011, 4); // WBITS 22
+fn writeWindowBits(bw: *BitWriter, wbits: u5, large_window: bool) EncodeError!void {
+    // Vendor EncodeWindowBits (enc/encode.c), LSB-first.
+    if (large_window) {
+        try bw.writeBits(0x11, 8); // 1, n=0, m=1, zero bit
+        try bw.writeBits(wbits, 6);
+    } else if (wbits == 16) {
+        try bw.writeBits(0, 1);
+    } else if (wbits == 17) {
+        try bw.writeBits(1, 7);
+    } else if (wbits > 17) {
+        try bw.writeBits((@as(u32, wbits) - 17) << 1 | 1, 4);
+    } else {
+        try bw.writeBits((@as(u32, wbits) - 8) << 4 | 1, 7);
+    }
+}
+
+fn pickWindow(input_len: usize, dict_len: usize, options: Options) struct { wbits: u5, large: bool } {
+    const hard_cap: u64 = if (options.window_size != 0)
+        @min(@as(u64, options.window_size), window_size_large_max)
+    else if (options.large_window)
+        window_size_large_max
+    else
+        window_size_max;
+    const needed: u64 = @min(@as(u64, input_len) + dict_len, hard_cap);
+    var wbits: u5 = 10;
+    while (wbits < 30 and (@as(u64, 1) << wbits) - 16 < needed) wbits += 1;
+    if ((@as(u64, 1) << wbits) - 16 > hard_cap or (wbits > 24 and !options.large_window)) {
+        wbits = 24;
+        while (wbits > 10 and (@as(u64, 1) << (wbits - 1)) - 16 >= needed) wbits -= 1;
+    }
+    return .{ .wbits = wbits, .large = wbits > 24 };
+}
+
+fn encodeBits(input: []const u8, bw: *BitWriter, ws: []u8, options: Options) EncodeError!void {
+    const dict = options.custom_dictionary orelse &.{};
+    const window = pickWindow(input.len, dict.len, options);
+    const dist_cap: u32 = (@as(u32, 1) << window.wbits) - 16;
+    try writeWindowBits(bw, window.wbits, window.large);
     var ring = distance_ring_init;
     if (input.len == 0) {
         try bw.writeBit(1); // ISLAST
@@ -1523,7 +3050,7 @@ fn encodeBits(input: []const u8, bw: *BitWriter, ws: []u8) EncodeError!void {
     while (offset < input.len) {
         const chunk = @min(encode_mb_cap, input.len - offset);
         const is_last = offset + chunk == input.len;
-        try encodeMetaBlock(bw, input[offset..][0..chunk], is_last, &ring, ws);
+        try encodeMetaBlock(bw, input[offset..][0..chunk], is_last, &ring, ws, dict, dist_cap, if (window.large) 140 else 64);
         offset += chunk;
     }
 }
@@ -1533,18 +3060,16 @@ fn encodeWorkspace(scratch: []u8) EncodeError![]u8 {
 }
 
 pub fn encode(input: []const u8, output: []u8, scratch: []u8, options: Options) EncodeError!usize {
-    _ = options;
     const ws = try encodeWorkspace(scratch);
     var bw = BitWriter{ .out = output };
-    try encodeBits(input, &bw, ws);
+    try encodeBits(input, &bw, ws, options);
     return bw.finish();
 }
 
 pub fn encodeCountedSize(input: []const u8, scratch: []u8, options: Options) EncodeError!usize {
-    _ = options;
     const ws = try encodeWorkspace(scratch);
     var bw = BitWriter{ .out = &.{}, .count_only = true };
-    try encodeBits(input, &bw, ws);
+    try encodeBits(input, &bw, ws, options);
     return bw.finish();
 }
 
@@ -1717,7 +3242,7 @@ test "brotli decode hand-built vendor validated streams" {
 
 // WBITS edge encodings produced by the system brotli CLI: 10 and 17 use
 // the long forms, 16 the single zero bit, and --large_window sets the
-// reserved flag this decoder rejects.
+// reserved flag that only the large-window opt-in accepts.
 test "brotli decode wbits acceptance and rejection" {
     const allocator = std.testing.allocator;
     const scratch = try allocator.alloc(u8, decode_workspace_size);
@@ -1734,10 +3259,94 @@ test "brotli decode wbits acceptance and rejection" {
         const n = try decode(input, output, scratch, .{});
         try std.testing.expectEqualSlices(u8, expected, output[0..n]);
     }
+    // CLI --large-window=30 output: the reserved marker plus a 6-bit window
+    // size. Strict by default; accepted under the large-window opt-in.
     const large_window = [_]u8{ 0x11, 0x5e, 0x58, 0x00, 0x00, 0x90, 0x00, 0xa9, 0x41, 0x94, 0xa9, 0x03, 0x0f, 0xa7, 0x0f };
     const output = try allocator.alloc(u8, 4096);
     defer allocator.free(output);
     try std.testing.expectError(error.DataException, decode(&large_window, output, scratch, .{}));
+    const n = try decode(&large_window, output, scratch, .{ .large_window = true });
+    try std.testing.expectEqualSlices(u8, expected, output[0..n]);
+    // A set reserved bit after the marker is invalid even with the opt-in.
+    const large_window_bad = [_]u8{ 0x11, 0xde, 0x58, 0x00, 0x00, 0x90, 0x00, 0xa9, 0x41, 0x94, 0xa9, 0x03, 0x0f, 0xa7, 0x0f };
+    try std.testing.expectError(error.DataException, decode(&large_window_bad, output, scratch, .{ .large_window = true }));
+}
+
+test "brotli large window encode roundtrip" {
+    const allocator = std.testing.allocator;
+    const scratch = try allocator.alloc(u8, encode_workspace_size + decode_workspace_size);
+    defer allocator.free(scratch);
+    // The window option is a cap: an empty input still picks the smallest
+    // legal window (WBITS 10 in the long form).
+    const encoded = try allocator.alloc(u8, 64);
+    defer allocator.free(encoded);
+    const enc_len = try encode("", encoded, scratch[0..encode_workspace_size], .{ .large_window = true, .window_size = 1 << 25 });
+    try std.testing.expectEqual(@as(usize, 2), enc_len);
+    try std.testing.expectEqualSlices(u8, &.{ 0xa1, 0x01 }, encoded[0..2]);
+    try std.testing.expectEqual(0, try decode(encoded[0..enc_len], encoded[30..50], scratch[encode_workspace_size..], .{}));
+
+    // A payload past the 2^24 RFC window forces the large-window header
+    // (marker + reserved zero + 6-bit window size 25) and round-trips.
+    const size = (1 << 24) + 1;
+    const big = try allocator.alloc(u8, size);
+    defer allocator.free(big);
+    var state: u64 = 0x243F6A8885A308D3;
+    for (big) |*b| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        b.* = @as(u8, @truncate(state)) & 7;
+    }
+    for (1..256) |i| @memcpy(big[(1 << 16) * i ..][0..4096], big[0..4096]);
+    const bound = encodedSizeBound(big.len);
+    const big_encoded = try allocator.alloc(u8, bound);
+    defer allocator.free(big_encoded);
+    const big_len = try encode(big, big_encoded, scratch[0..encode_workspace_size], .{ .large_window = true });
+    try std.testing.expectEqual(@as(u8, 0x11), big_encoded[0]);
+    try std.testing.expectEqual(@as(u8, 25), big_encoded[1] & 0x3f);
+    const big_output = try allocator.alloc(u8, big.len + 16);
+    defer allocator.free(big_output);
+    const n = try decode(big_encoded[0..big_len], big_output, scratch[encode_workspace_size..], .{ .large_window = true });
+    try std.testing.expectEqual(big.len, n);
+    try std.testing.expectEqualSlices(u8, big, big_output[0..n]);
+    // The same stream is rejected without the opt-in.
+    try std.testing.expectError(error.DataException, decode(big_encoded[0..big_len], big_output, scratch[encode_workspace_size..], .{}));
+}
+
+test "brotli custom dictionary roundtrip and spanning copy" {
+    const allocator = std.testing.allocator;
+    const scratch = try allocator.alloc(u8, encode_workspace_size + decode_workspace_size);
+    defer allocator.free(scratch);
+    const dict = "0123456789abcdef the quick brown fox jumps over the lazy dog";
+    // The payload begins with a repeat of the dictionary tail and then
+    // crosses into newly produced output: one match spans the boundary.
+    const input = "jumps over the lazy dog and jumps over the lazy dog again";
+    const bound = encodedSizeBound(input.len);
+    const encoded = try allocator.alloc(u8, bound);
+    defer allocator.free(encoded);
+    const enc_len = try encode(input, encoded, scratch[0..encode_workspace_size], .{ .custom_dictionary = dict });
+    // Header is the smallest covering window (auto-picked, non-large).
+    const output = try allocator.alloc(u8, input.len + 16);
+    defer allocator.free(output);
+    const n = try decode(encoded[0..enc_len], output, scratch[encode_workspace_size..], .{ .custom_dictionary = dict });
+    try std.testing.expectEqual(input.len, n);
+    try std.testing.expectEqualSlices(u8, input, output[0..n]);
+    // Without the dictionary the distances reach before position zero and
+    // either mis-decode or fail; they must never read out of bounds.
+    if (decode(encoded[0..enc_len], output, scratch[encode_workspace_size..], .{})) |m| {
+        try std.testing.expect(m != n or !std.mem.eql(u8, input, output[0..m]));
+    } else |err| {
+        try std.testing.expect(err == error.DataException);
+    }
+    // Encoded distance into the dictionary prefix: force a pure dictionary
+    // match. "the quick brown fox" appears only in the dictionary.
+    const dict2 = "the quick brown fox";
+    const input2 = "the quick brown fox!";
+    const enc2 = try allocator.alloc(u8, encodedSizeBound(input2.len));
+    defer allocator.free(enc2);
+    const enc2_len = try encode(input2, enc2, scratch[0..encode_workspace_size], .{ .custom_dictionary = dict2 });
+    const n2 = try decode(enc2[0..enc2_len], output, scratch[encode_workspace_size..], .{ .custom_dictionary = dict2 });
+    try std.testing.expectEqualSlices(u8, input2, output[0..n2]);
 }
 
 // Static-dictionary transforms, exercised directly: copy_len 5 words all
@@ -1767,4 +3376,92 @@ test "brotli copy dictionary word transforms" {
     var output: [64]u8 = undefined;
     var produced: usize = 0;
     try std.testing.expectError(error.DataException, copyDictionaryWord(&output, &produced, 5, 123905, 0, &p1, &p2));
+}
+
+test "brotli incremental matches one-shot across chunkings" {
+    const allocator = std.testing.allocator;
+    const scratch = try allocator.alloc(u8, incrementalWorkspaceSize(.{}));
+    defer allocator.free(scratch);
+    const one_shot_scratch = try allocator.alloc(u8, decode_workspace_size);
+    defer allocator.free(one_shot_scratch);
+
+    const payloads = [_][]const u8{
+        "A",
+        "hello world, hello world, hello world!",
+        "abcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabc",
+    };
+    for (payloads) |input| {
+        const bound = encodedSizeBound(input.len);
+        const encoded = try allocator.alloc(u8, bound);
+        defer allocator.free(encoded);
+        const enc_len = try encode(input, encoded, scratch[0..encode_workspace_size], .{});
+        var oracle: [256]u8 = undefined;
+        const n = try decode(encoded[0..enc_len], &oracle, one_shot_scratch, .{});
+        var inc = try incrementalInit(scratch, .{});
+        var out: [256]u8 = undefined;
+        const res = try inc.run(encoded[0..enc_len], &out, true);
+        try std.testing.expect(res.status == .done);
+        try std.testing.expectEqualSlices(u8, oracle[0..n], out[0..res.produced]);
+    }
+
+    // A multi-block stream plus a concatenated second stream, exercised
+    // with adversarial (input chunk, output span) combinations including
+    // 1-byte drains, which stress NeedDrain suspension on every emit.
+    var big: [1 << 17]u8 = undefined;
+    var state: u64 = 0x243F6A8885A308D3;
+    for (&big) |*b| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        b.* = @as(u8, @truncate(state)) & 7;
+    }
+    for (1..8) |i| @memcpy(big[(1 << 14) * i ..][0..4096], big[0..4096]);
+    const bound = encodedSizeBound(big.len) + encodedSizeBound(64);
+    const stream = try allocator.alloc(u8, bound);
+    defer allocator.free(stream);
+    const part_len = try encode(&big, stream, scratch[0..encode_workspace_size], .{});
+    const tail_len = try encode("tail stream two", stream[part_len..], scratch[0..encode_workspace_size], .{});
+    const total_len = part_len + tail_len;
+
+    var oracle: [big.len + 64]u8 = undefined;
+    const n = try decode(stream[0..total_len], &oracle, one_shot_scratch, .{});
+    try std.testing.expectEqual(big.len + "tail stream two".len, n);
+
+    var out_buf: [big.len + 64]u8 = undefined;
+    const chunk_sizes = [_]usize{ 1, 3, 7, 64, 1024, total_len };
+    const span_sizes = [_]usize{ 1, 5, 4096, oracle.len };
+    for (chunk_sizes) |chunk| {
+        for (span_sizes) |span| {
+            var inc = try incrementalInit(scratch, .{});
+            var fed: usize = 0;
+            var produced: usize = 0;
+            var guard: usize = 0;
+            while (true) {
+                const end = @min(fed + chunk, total_len);
+                const out_end = @min(produced + span, out_buf.len);
+                const res = try inc.run(stream[fed..end], out_buf[produced..out_end], end == total_len);
+                if (res.produced > 0) {
+                    try std.testing.expectEqualSlices(u8, oracle[produced .. produced + res.produced], out_buf[produced .. produced + res.produced]);
+                }
+                fed += res.consumed;
+                produced += res.produced;
+                guard += 1;
+                if (guard > 64 * (total_len + out_buf.len + 8)) return error.ResourceException;
+                if (res.status == .done) break;
+            }
+            try std.testing.expectEqual(n, produced);
+            try std.testing.expectEqualSlices(u8, oracle[0..n], out_buf[0..produced]);
+        }
+    }
+    // Whole-input single-run equivalence with an independent buffer.
+    var inc = try incrementalInit(scratch, .{});
+    var produced_final: usize = 0;
+    var fed: usize = 0;
+    while (true) {
+        const res = try inc.run(stream[fed..total_len], out_buf[produced_final..], true);
+        fed += res.consumed;
+        produced_final += res.produced;
+        if (res.status == .done) break;
+    }
+    try std.testing.expectEqualSlices(u8, oracle[0..n], out_buf[0..produced_final]);
 }
