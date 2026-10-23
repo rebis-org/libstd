@@ -1235,3 +1235,418 @@ test "wim vendor solid and chunked fixtures" {
         try testing.expectEqualSlices(u8, "hello", small[0..5]);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Compressed write side. encode() above remains the store-only path;
+// encodeEx() routes through the XPRESS/LZX/LZMS encoders, chunking each blob
+// (or one shared solid resource) exactly as the reader expects.
+
+pub const Compression = enum { store, xpress, lzx, lzms };
+
+pub const EncodeOptions = struct {
+    compression: Compression = .store,
+    chunk_size: u32 = 0, // 0 selects the codec default.
+    solid: bool = false,
+    // Delta WIM: entries whose SHA1 matches a delta_base entry are emitted
+    // as unbacked blob-table entries (wimlib's wire shape: real hash,
+    // uncompressed_size 0) resolved by hash against a referenced base WIM.
+    delta_base: ?[]const Entry = null,
+};
+
+fn codecOf(compression: Compression) Codec {
+    return switch (compression) {
+        .store => .store,
+        .xpress => .xpress,
+        .lzx => .lzx,
+        .lzms => .lzms,
+    };
+}
+
+fn codecFlag(compression: Compression) u32 {
+    return switch (compression) {
+        .store => 0,
+        .xpress => flag_compress_xpress,
+        .lzx => flag_compress_lzx,
+        .lzms => flag_compress_lzms,
+    };
+}
+
+fn codecDefaultChunk(compression: Compression) u32 {
+    return switch (compression) {
+        .store => 0,
+        .xpress => 65536,
+        .lzx => 32768,
+        .lzms => 1 << 22,
+    };
+}
+
+fn codecFormatNumber(compression: Compression) u32 {
+    return switch (compression) {
+        .store => 0,
+        .xpress => 1,
+        .lzx => 2,
+        .lzms => 3,
+    };
+}
+
+fn numChunks(len: u64, chunk_size: u64) u64 {
+    if (len == 0) return 0;
+    return len / chunk_size + @intFromBool(len % chunk_size != 0);
+}
+
+// Scratch for encodeEx: metadata image, blob descriptors, staged compressed
+// bytes (tables plus raw fallback), then the codec workspace at the tail.
+pub fn encodeWorkspaceSize(entries: []const Entry, options: EncodeOptions) Exception!usize {
+    if (options.compression == .store and !options.solid) return 0;
+    const cs: u64 = if (options.chunk_size == 0) codecDefaultChunk(options.compression) else options.chunk_size;
+    try validateChunking(codecOf(options.compression), cs);
+    const metadata_len = try metadataLen(entries);
+    var staged: u64 = @as(u64, entries.len + 1) * @sizeOf(StagedBlob);
+    var total: u64 = 0;
+    for (entries) |entry| {
+        const chunks = numChunks(entry.data.len, cs);
+        staged = try bounds.addU64(staged, try bounds.addU64((chunks -| 1) * 4, entry.data.len));
+        total = try bounds.addU64(total, entry.data.len);
+    }
+    if (options.solid) {
+        const chunks = numChunks(total, cs);
+        staged = try bounds.addU64(staged, 16 + chunks * 4 + total);
+    }
+    const codec_ws: u64 = switch (options.compression) {
+        .xpress => xpress.encodeWorkspaceSize(@intCast(cs)),
+        .lzx => lzx.encodeWorkspaceSize(@intCast(cs)),
+        .lzms => lzms.encodeWorkspaceSize(@intCast(cs)),
+        .store => 0,
+    };
+    var need = try bounds.addU64(metadata_len, staged);
+    need = try bounds.addU64(need, codec_ws);
+    need = try bounds.addU64(need, 2 * (cs + 16)); // chunk staging + compression region
+    return std.math.cast(usize, need) orelse return error.ResourceException;
+}
+
+// Compress one chunk, falling back to raw bytes when the codec expands it.
+fn compressChunk(compression: Compression, chunk_size: u32, chunk: []const u8, out: []u8, ws: []u8) Exception!usize {
+    switch (compression) {
+        .store => {
+            @memcpy(out[0..chunk.len], chunk);
+            return chunk.len;
+        },
+        .xpress, .lzx, .lzms => {
+            const n = switch (compression) {
+                .xpress => xpress.xpressEncode(chunk, out, ws),
+                .lzx => lzx.lzxEncode(chunk_size, chunk, out, ws),
+                .lzms => lzms.lzmsEncode(chunk, out, ws),
+                else => unreachable,
+            } catch |err| switch (err) {
+                error.CapacityException => chunk.len,
+                else => return err,
+            };
+            if (n >= chunk.len) {
+                @memcpy(out[0..chunk.len], chunk);
+                return chunk.len;
+            }
+            return n;
+        },
+    }
+}
+
+const StagedBlob = struct {
+    offset: usize, // In the staging area.
+    len: usize, // Wire bytes.
+    hash: [sha1_len]u8,
+    size: u64, // Uncompressed bytes.
+    resource_off: u64, // Solid: uncompressed offset in the shared resource.
+};
+
+pub fn encodeEx(entries: []const Entry, output: []u8, scratch: []u8, options: EncodeOptions) Exception!usize {
+    if (options.compression == .store and !options.solid) return encode(entries, output, scratch);
+    if (options.solid and options.delta_base != null) return error.UnsupportedException;
+    const codec = codecOf(options.compression);
+    const cs: u32 = if (options.chunk_size == 0) codecDefaultChunk(options.compression) else options.chunk_size;
+    try validateChunking(codec, cs);
+    const cs64: u64 = cs;
+    const metadata_len = try metadataLen(entries);
+    const codec_ws: usize = switch (options.compression) {
+        .xpress => xpress.encodeWorkspaceSize(cs),
+        .lzx => lzx.encodeWorkspaceSize(cs),
+        .lzms => lzms.encodeWorkspaceSize(cs),
+        .store => 0,
+    };
+    if (scratch.len < metadata_len + (entries.len + 1) * @sizeOf(StagedBlob)) return error.ResourceException;
+
+    // Metadata image (the blob table carries its digest).
+    @memset(scratch[0..@intCast(metadata_len)], 0);
+    std.mem.writeInt(u32, scratch[0..4], 8, .little);
+    std.mem.writeInt(u64, scratch[8..16], 104, .little);
+    std.mem.writeInt(u32, scratch[16..20], 0x10, .little);
+    std.mem.writeInt(u32, scratch[20..24], 0xFFFFFFFF, .little);
+    std.mem.writeInt(u64, scratch[24..32], 8 + 104, .little);
+    var md_pos: usize = 8 + 104;
+    for (entries) |entry| {
+        var hash: [sha1_len]u8 = undefined;
+        std.crypto.hash.Sha1.hash(entry.data, &hash, .{});
+        md_pos += try writeDentry(scratch[md_pos..], entry.name, &hash, 0);
+    }
+    var metadata_hash: [sha1_len]u8 = undefined;
+    std.crypto.hash.Sha1.hash(scratch[0..@intCast(metadata_len)], &metadata_hash, .{});
+
+    // Scratch carve: descriptors, staging, chunk buffer, codec workspace.
+    const desc_bytes = (entries.len + 1) * @sizeOf(StagedBlob);
+    const desc: []StagedBlob = @alignCast(std.mem.bytesAsSlice(StagedBlob, scratch[@intCast(metadata_len)..][0..desc_bytes]));
+    var stage_off: usize = @intCast(metadata_len + desc_bytes);
+    stage_off = (stage_off + 7) & ~@as(usize, 7);
+    if (scratch.len < stage_off + codec_ws + 2 * (cs + 16)) return error.ResourceException;
+    const chunk_buf = scratch[scratch.len - codec_ws - 2 * (cs + 16) ..][0 .. 2 * (cs + 16)];
+    const ws = scratch[scratch.len - codec_ws ..];
+    const stage = scratch[stage_off .. scratch.len - codec_ws - 2 * (cs + 16)];
+    var staged_len: usize = 0;
+    var blob_count: usize = 0;
+
+    if (!options.solid) {
+        for (entries) |entry| {
+            var hash: [sha1_len]u8 = undefined;
+            std.crypto.hash.Sha1.hash(entry.data, &hash, .{});
+            if (options.delta_base) |base| {
+                var matched = false;
+                for (base) |base_entry| {
+                    var base_hash: [sha1_len]u8 = undefined;
+                    std.crypto.hash.Sha1.hash(base_entry.data, &base_hash, .{});
+                    if (std.mem.eql(u8, &hash, &base_hash)) {
+                        matched = true;
+                        break;
+                    }
+                }
+                if (matched) {
+                    // Unbacked: delta WIMs omit the blob-table entry; the
+                    // dentry hash resolves against the referenced base.
+                    continue;
+                }
+            }
+            const chunks = numChunks(entry.data.len, cs64);
+            const table_bytes: usize = @intCast((chunks -| 1) * 4);
+            if (staged_len + table_bytes + entry.data.len > stage.len) return error.ResourceException;
+            const blob = stage[staged_len .. staged_len + table_bytes + entry.data.len];
+            var cursor: usize = table_bytes;
+            var end: u32 = 0;
+            var i: u64 = 0;
+            while (i < chunks) : (i += 1) {
+                const start: usize = @intCast(i * cs64);
+                const take: usize = @intCast(@min(cs64, entry.data.len - start));
+                const n = try compressChunk(options.compression, cs, entry.data[start..][0..take], chunk_buf[0 .. take + 16], ws);
+                @memcpy(blob[cursor..][0..n], chunk_buf[0..n]);
+                if (i + 1 != chunks) {
+                    end = std.math.add(u32, end, std.math.cast(u32, n) orelse return error.ResourceException) catch return error.ResourceException;
+                    std.mem.writeInt(u32, blob[@intCast(i * 4)..][0..4], end, .little);
+                }
+                cursor += n;
+            }
+            desc[blob_count] = .{ .offset = staged_len, .len = cursor, .hash = hash, .size = entry.data.len, .resource_off = 0 };
+            blob_count += 1;
+            staged_len += cursor;
+        }
+    } else {
+        // One solid resource over the concatenated stream.
+        var total: u64 = 0;
+        for (entries) |entry| total = try bounds.addU64(total, entry.data.len);
+        const chunks = numChunks(total, cs64);
+        const table_bytes: u64 = chunks * 4;
+        const need: u64 = 16 + table_bytes + total;
+        const need_usize = std.math.cast(usize, need) orelse return error.ResourceException;
+        if (staged_len + need_usize > stage.len) return error.ResourceException;
+        const blob = stage[staged_len .. staged_len + @as(usize, @intCast(need))];
+        std.mem.writeInt(u64, blob[0..8], total, .little);
+        std.mem.writeInt(u32, blob[8..12], cs, .little);
+        std.mem.writeInt(u32, blob[12..16], codecFormatNumber(options.compression), .little);
+        var cursor: usize = 16 + @as(usize, @intCast(table_bytes));
+        var uoff: u64 = 0;
+        var i: u64 = 0;
+        while (i < chunks) : (i += 1) {
+            const want: usize = @intCast(@min(cs64, total - uoff));
+            // Gather the chunk's bytes (it may span entries).
+            var gathered: usize = 0;
+            var src_off: u64 = uoff;
+            while (gathered < want) {
+                var e: usize = 0;
+                var base: u64 = 0;
+                while (e < entries.len) : (e += 1) {
+                    const next = try bounds.addU64(base, entries[e].data.len);
+                    if (src_off < next) break;
+                    base = next;
+                }
+                const avail: usize = @intCast(try bounds.addU64(base, entries[e].data.len) - src_off);
+                const take = @min(avail, want - gathered);
+                @memcpy(chunk_buf[gathered..][0..take], entries[e].data[@intCast(src_off - base)..][0..take]);
+                gathered += take;
+                src_off = try bounds.addU64(src_off, take);
+            }
+            const n = try compressChunk(options.compression, cs, chunk_buf[0..want], chunk_buf[cs + 16 ..][0 .. want + 16], ws);
+            @memcpy(blob[cursor..][0..n], chunk_buf[cs + 16 ..][0..n]);
+            std.mem.writeInt(u32, blob[16 + @as(usize, @intCast(i * 4)) ..][0..4], std.math.cast(u32, n) orelse return error.ResourceException, .little);
+            cursor += n;
+            uoff += want;
+        }
+        desc[blob_count] = .{ .offset = staged_len, .len = cursor, .hash = undefined, .size = total, .resource_off = 0 };
+        blob_count += 1;
+        staged_len += cursor;
+        var run_off: u64 = 0;
+        for (entries) |entry| {
+            var hash: [sha1_len]u8 = undefined;
+            std.crypto.hash.Sha1.hash(entry.data, &hash, .{});
+            desc[blob_count] = .{ .offset = staged_len, .len = 0, .hash = hash, .size = entry.data.len, .resource_off = run_off };
+            blob_count += 1;
+            run_off = try bounds.addU64(run_off, entry.data.len);
+        }
+    }
+
+    // Emit: header, blob table, xml, metadata, staged data.
+    const blob_table_len = blobTableLen(entries);
+    const xml_len = try xmlLen(entries);
+    const blob_off: u64 = header_disk_size;
+    const xml_off = try bounds.addU64(blob_off, blob_table_len);
+    const metadata_off = try bounds.addU64(xml_off, xml_len);
+    const data_off = try bounds.addU64(metadata_off, metadata_len);
+
+    var header: [header_disk_size]u8 = @splat(0);
+    std.mem.writeInt(u64, header[0..8], wim_magic, .little);
+    std.mem.writeInt(u32, header[8..12], header_disk_size, .little);
+    std.mem.writeInt(u32, header[12..16], if (options.solid) wim_version_solid else wim_version, .little);
+    std.mem.writeInt(u32, header[16..20], flag_compression | codecFlag(options.compression), .little);
+    std.mem.writeInt(u32, header[20..24], cs, .little);
+    for (header[24..40], 0..) |*byte, i| byte.* = @intCast(0x5A + i);
+    std.mem.writeInt(u16, header[40..42], 1, .little);
+    std.mem.writeInt(u16, header[42..44], 1, .little);
+    std.mem.writeInt(u32, header[44..48], 1, .little);
+    writeReshdr(header[48..72], .{ .size_in_wim = blob_table_len, .flags = 0, .offset = blob_off, .uncompressed_size = blob_table_len });
+    writeReshdr(header[72..96], .{ .size_in_wim = xml_len, .flags = 0, .offset = xml_off, .uncompressed_size = xml_len });
+    writeReshdr(header[96..120], .{ .size_in_wim = 0, .flags = reshdr_flag_metadata, .offset = 0, .uncompressed_size = 0 });
+    std.mem.writeInt(u32, header[120..124], 0, .little);
+    writeReshdr(header[124..148], .{ .size_in_wim = 0, .flags = 0, .offset = 0, .uncompressed_size = 0 });
+
+    var sink = io.Sink{ .bytes = output };
+    sink.write(&header) catch return error.CapacityException;
+
+    var running_off: u64 = data_off;
+    if (!options.solid) {
+        for (desc[0..blob_count]) |blob| {
+            try emitBlobEntry(&sink, .{ .size_in_wim = blob.len, .flags = reshdr_flag_compressed, .offset = running_off, .uncompressed_size = blob.size }, &blob.hash);
+            running_off = try bounds.addU64(running_off, blob.len);
+        }
+    } else {
+        // Run leader: the solid resource itself.
+        try emitBlobEntry(&sink, .{ .size_in_wim = desc[0].len, .flags = reshdr_flag_solid | reshdr_flag_compressed, .offset = running_off, .uncompressed_size = solid_resource_magic }, &zero_hash);
+        running_off = try bounds.addU64(running_off, desc[0].len);
+        for (desc[1..blob_count]) |blob| {
+            try emitBlobEntry(&sink, .{ .size_in_wim = blob.size, .flags = reshdr_flag_solid, .offset = blob.resource_off, .uncompressed_size = blob.size }, &blob.hash);
+        }
+    }
+    emitBlobEntry(&sink, .{ .size_in_wim = metadata_len, .flags = reshdr_flag_metadata, .offset = metadata_off, .uncompressed_size = metadata_len }, &metadata_hash) catch return error.CapacityException;
+    while (@as(u64, sink.offset) < xml_off) {
+        sink.write(&[_]u8{0}) catch return error.CapacityException;
+    }
+
+    try writeTocXml(&sink, entries, try archiveSize(entries));
+    sink.write(scratch[0..@intCast(metadata_len)]) catch return error.CapacityException;
+
+    if (!options.solid) {
+        for (desc[0..blob_count]) |blob| {
+            sink.write(stage[blob.offset..][0..blob.len]) catch return error.CapacityException;
+        }
+    } else {
+        sink.write(stage[desc[0].offset..][0..desc[0].len]) catch return error.CapacityException;
+    }
+    return sink.offset;
+}
+
+const zero_hash: [sha1_len]u8 = @splat(0);
+
+fn emitBlobEntry(sink: *io.Sink, res: Reshdr, hash: *const [sha1_len]u8) Exception!void {
+    var blob: [blob_disk_size]u8 = undefined;
+    writeReshdr(blob[0..24], res);
+    std.mem.writeInt(u16, blob[24..26], 1, .little);
+    std.mem.writeInt(u32, blob[26..30], 1, .little);
+    @memcpy(blob[30..50], hash);
+    sink.write(&blob) catch return error.CapacityException;
+}
+
+test "wim encodeEx compressed roundtrip" {
+    const allocator = std.testing.allocator;
+    var rng: u64 = 0x2C179AC1A428B5F1;
+    const payloads = try allocator.alloc(u8, 300000);
+    defer allocator.free(payloads);
+    for (payloads) |*b| {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        b.* = @truncate(rng >> 32);
+    }
+    for (1..32) |i| @memcpy(payloads[i * 8192 ..][0..6000], payloads[0..6000]);
+    const real = [_]Entry{
+        .{ .name = "a.bin", .data = payloads[0..200000] },
+        .{ .name = "b.bin", .data = payloads[200000..] },
+    };
+
+    const combos = [_]EncodeOptions{
+        .{ .compression = .xpress },
+        .{ .compression = .lzx },
+        .{ .compression = .lzms },
+        .{ .compression = .lzx, .solid = true },
+        .{ .compression = .lzms, .solid = true },
+    };
+    for (combos) |options| {
+        const scratch = try allocator.alignedAlloc(u8, .@"8", try encodeWorkspaceSize(&real, options));
+        defer allocator.free(scratch);
+        const archive = try allocator.alloc(u8, 4 << 20);
+        defer allocator.free(archive);
+        const written = try encodeEx(&real, archive, scratch, options);
+        for (real, 0..) |entry, ordinal| {
+            const info = try inspectOrdinal(archive[0..written], ordinal, scratch);
+            try std.testing.expectEqual(entry.data.len, info.size);
+            const out = try allocator.alloc(u8, entry.data.len);
+            defer allocator.free(out);
+            const n = try decodeOrdinal(archive[0..written], ordinal, out, scratch);
+            try std.testing.expectEqualSlices(u8, entry.data, out[0..n]);
+        }
+    }
+}
+
+test "wim delta write roundtrip shape" {
+    const allocator = std.testing.allocator;
+    // Base has two blobs; the delta reuses one and adds one.
+    var rng: u64 = 0x5DEECE66D3D2A1B3;
+    const base_payload = try allocator.alloc(u8, 60000);
+    defer allocator.free(base_payload);
+    for (base_payload) |*b| {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        b.* = @truncate(rng >> 24);
+    }
+    const new_payload = try allocator.alloc(u8, 40000);
+    defer allocator.free(new_payload);
+    for (new_payload) |*b| {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        b.* = @truncate(rng >> 24);
+    }
+    const base = [_]Entry{.{ .name = "old.bin", .data = base_payload }};
+    const delta_entries = [_]Entry{
+        .{ .name = "old.bin", .data = base_payload },
+        .{ .name = "new.bin", .data = new_payload },
+    };
+    const options: EncodeOptions = .{ .compression = .lzx, .delta_base = &base };
+    const scratch = try allocator.alignedAlloc(u8, .@"8", try encodeWorkspaceSize(&delta_entries, options));
+    defer allocator.free(scratch);
+    const archive = try allocator.alloc(u8, 1 << 20);
+    defer allocator.free(archive);
+    const written = try encodeEx(&delta_entries, archive, scratch, options);
+    // The delta file itself must carry only the new blob's bytes.
+    const count = try inspectCount(archive[0..written], scratch);
+    try std.testing.expectEqual(@as(u64, 2), count);
+    const info = try inspectOrdinal(archive[0..written], 1, scratch);
+    try std.testing.expectEqual(new_payload.len, info.size);
+    const out = try allocator.alloc(u8, new_payload.len);
+    defer allocator.free(out);
+    const n = try decodeOrdinal(archive[0..written], 1, out, scratch);
+    try std.testing.expectEqualSlices(u8, new_payload, out[0..n]);
+}

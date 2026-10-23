@@ -343,6 +343,10 @@ fn numOffsetSlots(uncompressed_size: usize) usize {
 // The usages table is stack-resident, mirroring wimlib's per-resource
 // temporary.
 fn x86Filter(data: []u8, last_target_usages: *[65536]i32) void {
+    x86FilterDirected(data, last_target_usages, true);
+}
+
+fn x86FilterDirected(data: []u8, last_target_usages: *[65536]i32, comptime undo: bool) void {
     const size: usize = data.len;
     if (size <= 17) return;
     var last_x86_pos: i32 = -x86_max_translation_offset - 1;
@@ -357,11 +361,11 @@ fn x86Filter(data: []u8, last_target_usages: *[65536]i32) void {
             p += 1;
         }
         if (p >= tail) break;
-        p = translateIfNeeded(data, p, &last_x86_pos, last_target_usages);
+        p = translateIfNeededDirected(data, p, &last_x86_pos, last_target_usages, undo);
     }
 }
 
-fn translateIfNeeded(data: []u8, pos: usize, last_x86_pos: *i32, last_target_usages: *[65536]i32) usize {
+fn translateIfNeededDirected(data: []u8, pos: usize, last_x86_pos: *i32, last_target_usages: *[65536]i32, comptime undo: bool) usize {
     const b = data[pos];
     var max_trans_offset: i32 = x86_max_translation_offset;
     var opcode_nbytes: usize = undefined;
@@ -397,11 +401,21 @@ fn translateIfNeeded(data: []u8, pos: usize, last_x86_pos: *i32, last_target_usa
     }
     const i: i32 = @intCast(pos);
     const target = pos + opcode_nbytes;
-    if (i - last_x86_pos.* <= max_trans_offset) {
-        const n = std.mem.readInt(u32, data[target..][0..4], .little);
-        std.mem.writeInt(u32, data[target..][0..4], n -% @as(u32, @bitCast(i)), .little);
+    var le16: u32 = undefined;
+    if (undo) {
+        if (i - last_x86_pos.* <= max_trans_offset) {
+            const n = std.mem.readInt(u32, data[target..][0..4], .little);
+            std.mem.writeInt(u32, data[target..][0..4], n -% @as(u32, @bitCast(i)), .little);
+        }
+        le16 = std.mem.readInt(u16, data[target..][0..2], .little);
+    } else {
+        // Forward: the lookup key uses the pre-translation bytes.
+        le16 = std.mem.readInt(u16, data[target..][0..2], .little);
+        if (i - last_x86_pos.* <= max_trans_offset) {
+            const n = std.mem.readInt(u32, data[target..][0..4], .little);
+            std.mem.writeInt(u32, data[target..][0..4], n +% @as(u32, @bitCast(i)), .little);
+        }
     }
-    const le16: u32 = std.mem.readInt(u16, data[target..][0..2], .little);
     const target16: usize = @as(u16, @truncate(@as(u32, @bitCast(i)) +% le16));
     const done: i32 = i + @as(i32, @intCast(opcode_nbytes)) + 3;
     if (done - last_target_usages[target16] <= x86_id_window_size) {
@@ -409,6 +423,10 @@ fn translateIfNeeded(data: []u8, pos: usize, last_x86_pos: *i32, last_target_usa
     }
     last_target_usages[target16] = done;
     return target + 4;
+}
+
+fn translateIfNeeded(data: []u8, pos: usize, last_x86_pos: *i32, last_target_usages: *[65536]i32) usize {
+    return translateIfNeededDirected(data, pos, last_x86_pos, last_target_usages, true);
 }
 
 pub fn lzmsDecode(input: []const u8, output: []u8) Exception!void {
@@ -718,3 +736,332 @@ pub const extra_length_bits = [54]u8{
     2, 2, 2, 2,  3,  3,  3, 3, 4, 4, 4, 4, 4, 5, 5, 6,
     7, 8, 9, 10, 16, 30,
 };
+
+// ---------------------------------------------------------------------------
+// Encoder, ported from wimlib src/lzms_compress.c.
+// Decision bits go to a forwards range encoder; Huffman codewords and extra
+// bits go to a backwards bitstream sharing one buffer. Only literals and
+// explicit-offset LZ matches are emitted; the rep and delta paths exist in
+// the format but are optional, and skipping them keeps both sides' adaptive
+// states in lockstep.
+
+const lzms_window_bits: u5 = 21;
+const lzms_window: usize = 1 << lzms_window_bits;
+
+pub fn encodeWorkspaceSize(input_len: usize) usize {
+    const aligned = (input_len + 7) & ~@as(usize, 7);
+    return aligned + (1 << 16) * 4 + lzms_window * 4;
+}
+
+const RangeEnc = struct {
+    lower: u64 = 0,
+    range: u32 = 0xffffffff,
+    cache: u16 = 0,
+    cache_size: u32 = 1,
+    buf: []u8,
+    next: isize,
+    end: usize,
+    overflow: bool = false,
+
+    fn init(buf: []u8) RangeEnc {
+        return .{ .buf = buf, .next = -2, .end = buf.len & ~@as(usize, 1) };
+    }
+
+    fn shiftLow(self: *RangeEnc) void {
+        const lo32: u32 = @truncate(self.lower);
+        if (lo32 < 0xffff0000 or self.lower >> 32 != 0) {
+            while (true) {
+                if (self.next >= 0) {
+                    if (self.next < @as(isize, @intCast(self.end))) {
+                        std.mem.writeInt(u16, self.buf[@intCast(self.next)..][0..2], self.cache +% @as(u16, @truncate(self.lower >> 32)), .little);
+                        self.next += 2;
+                    } else {
+                        self.overflow = true;
+                    }
+                } else {
+                    self.next += 2;
+                }
+                self.cache = 0xffff;
+                self.cache_size -= 1;
+                if (self.cache_size == 0) break;
+            }
+            self.cache = @truncate(self.lower >> 16);
+        }
+        self.cache_size += 1;
+        self.lower = (self.lower & 0xffff) << 16;
+    }
+
+    fn encodeBit(self: *RangeEnc, bit: u32, prob: u32) void {
+        if (self.range <= 0xffff) {
+            self.range <<= 16;
+            self.shiftLow();
+        }
+        const bound = (self.range >> prob_denom_bits) * prob;
+        if (bit == 0) {
+            self.range = bound;
+        } else {
+            self.lower += bound;
+            self.range -= bound;
+        }
+    }
+
+    fn flushRc(self: *RangeEnc) void {
+        for (0..4) |_| self.shiftLow();
+    }
+};
+
+const BackEnc = struct {
+    bitbuf: u64 = 0,
+    bitcount: u6 = 0,
+    buf: []u8,
+    next: usize,
+    overflow: bool = false,
+
+    fn init(buf: []u8) BackEnc {
+        return .{ .buf = buf, .next = buf.len & ~@as(usize, 1) };
+    }
+
+    fn writeBits(self: *BackEnc, value: u64, num_bits: u6) void {
+        self.bitcount += num_bits;
+        self.bitbuf = (self.bitbuf << num_bits) | value;
+        while (self.bitcount >= 16) {
+            self.bitcount -= 16;
+            if (self.next != 0) {
+                self.next -= 2;
+                std.mem.writeInt(u16, self.buf[self.next..][0..2], @truncate(self.bitbuf >> @intCast(self.bitcount)), .little);
+            } else {
+                self.overflow = true;
+            }
+        }
+    }
+
+    fn flushBack(self: *BackEnc) bool {
+        if (self.next == 0) return false;
+        if (self.bitcount != 0) {
+            self.next -= 2;
+            std.mem.writeInt(u16, self.buf[self.next..][0..2], @truncate(self.bitbuf << @intCast(16 - self.bitcount)), .little);
+        }
+        return true;
+    }
+};
+
+fn canonicalCodewords(num_syms: usize, lens: []const u8, codes: []u32) void {
+    var counts: [max_codeword_len + 1]u32 = @splat(0);
+    for (lens[0..num_syms]) |l| counts[l] += 1;
+    counts[0] = 0;
+    var next: [max_codeword_len + 1]u32 = undefined;
+    var code: u32 = 0;
+    for (1..max_codeword_len + 1) |l| {
+        next[l] = code;
+        code = (code + counts[l]) << 1;
+    }
+    for (0..num_syms) |sym| {
+        const l = lens[sym];
+        if (l != 0) {
+            codes[sym] = next[l];
+            next[l] += 1;
+        } else {
+            codes[sym] = 0;
+        }
+    }
+}
+
+const EncCode = struct {
+    num_syms: usize,
+    until: u32,
+    rebuild_freq: u32,
+    freqs: []u32,
+    lens: [max_num_syms]u8 = @splat(0),
+    codes: [max_num_syms]u32 = @splat(0),
+
+    fn init(self: *EncCode, num_syms: usize, rebuild_freq: u32, freqs: []u32) void {
+        self.num_syms = num_syms;
+        self.rebuild_freq = rebuild_freq;
+        self.freqs = freqs[0..num_syms];
+        for (self.freqs) |*f| f.* = 1;
+        self.rebuild();
+    }
+
+    fn rebuild(self: *EncCode) void {
+        makeCanonicalCode(self.freqs, self.lens[0..self.num_syms]);
+        canonicalCodewords(self.num_syms, self.lens[0..self.num_syms], self.codes[0..self.num_syms]);
+        self.until = self.rebuild_freq;
+    }
+
+    fn emit(self: *EncCode, sym: usize, os: *BackEnc) void {
+        os.writeBits(self.codes[sym], @intCast(self.lens[sym]));
+        self.freqs[sym] += 1;
+        self.until -= 1;
+        if (self.until == 0) {
+            self.rebuild();
+            for (self.freqs) |*f| f.* = (f.* >> 1) + 1;
+        }
+    }
+};
+
+fn encBit(rc: *RangeEnc, bit: u32, state: *u32, comptime num_states: u32, probs: []ProbEntry) void {
+    const entry = &probs[state.*];
+    state.* = ((state.* << 1) | bit) & (num_states - 1);
+    const prob = entry.get();
+    entry.update(bit);
+    rc.encodeBit(bit, prob);
+}
+
+const LzmsFinder = struct {
+    data: []const u8,
+    head: []u32,
+    chain: []u32,
+    inserted: usize = 0,
+
+    fn hash(self: *const LzmsFinder, pos: usize) usize {
+        const v = std.mem.readInt(u32, self.data[pos..][0..4], .little);
+        return (v *% 2654435761) >> 16;
+    }
+
+    fn insertOne(self: *LzmsFinder, pos: usize) void {
+        if (pos + 4 > self.data.len) return;
+        const h = self.hash(pos);
+        self.chain[pos & (lzms_window - 1)] = self.head[h];
+        self.head[h] = @intCast(pos);
+    }
+
+    fn prepare(self: *LzmsFinder, pos: usize) void {
+        while (self.inserted < pos) : (self.inserted += 1) {
+            self.insertOne(self.inserted);
+        }
+    }
+
+    fn find(self: *LzmsFinder, pos: usize, max_len: usize) ?struct { len: u32, offset: u32 } {
+        if (pos + 4 > self.data.len or max_len < 3) return null;
+        self.prepare(pos);
+        var best_len: usize = 2;
+        var best_offset: usize = 0;
+        var candidate: u32 = self.head[self.hash(pos)];
+        var depth: usize = 32;
+        while (candidate != 0xFFFFFFFF and depth != 0) : (depth -= 1) {
+            const cand: usize = candidate;
+            if (cand >= pos or pos - cand > lzms_window) break;
+            if (self.data[cand + best_len] == self.data[pos + best_len]) {
+                var l: usize = 0;
+                while (l < max_len and self.data[cand + l] == self.data[pos + l]) l += 1;
+                if (l > best_len) {
+                    best_len = l;
+                    best_offset = pos - cand;
+                    if (l >= 64 or l == max_len) break;
+                }
+            }
+            candidate = self.chain[cand & (lzms_window - 1)];
+        }
+        if (best_offset == 0) return null;
+        return .{ .len = @intCast(best_len), .offset = @intCast(best_offset) };
+    }
+};
+
+pub fn lzmsEncode(input: []const u8, output: []u8, scratch: []u8) Exception!usize {
+    if (output.len < 16) return error.CapacityException;
+    const aligned = (input.len + 7) & ~@as(usize, 7);
+    if (scratch.len < aligned + (1 << 16) * 4 + lzms_window * 4) return error.CapacityException;
+    const filtered = scratch[0..input.len];
+    @memcpy(filtered, input);
+    var usages: [65536]i32 = undefined;
+    x86FilterDirected(filtered, &usages, false);
+    const head: []u32 = @alignCast(std.mem.bytesAsSlice(u32, scratch[aligned .. aligned + (1 << 16) * 4]));
+    const chain_base = aligned + (1 << 16) * 4;
+    const chain: []u32 = @alignCast(std.mem.bytesAsSlice(u32, scratch[chain_base .. chain_base + lzms_window * 4]));
+    @memset(head, 0xFFFFFFFF);
+
+    var rc = RangeEnc.init(output);
+    var os = BackEnc.init(output);
+    var probs: Probabilities = undefined;
+    probs.init();
+
+    var literal_freqs: [num_literal_syms]u32 = undefined;
+    var lz_offset_freqs: [max_num_offset_syms]u32 = undefined;
+    var length_freqs: [num_length_syms]u32 = undefined;
+    const num_offset_slots = numOffsetSlots(input.len);
+
+    var literal: EncCode = undefined;
+    literal.init(num_literal_syms, literal_rebuild_freq, &literal_freqs);
+    var lz_offset: EncCode = undefined;
+    lz_offset.init(num_offset_slots, lz_offset_rebuild_freq, &lz_offset_freqs);
+    var length: EncCode = undefined;
+    length.init(num_length_syms, length_rebuild_freq, &length_freqs);
+
+    var main_state: u32 = 0;
+    var match_state: u32 = 0;
+    var lz_state: u32 = 0;
+
+    var finder = LzmsFinder{ .data = filtered, .head = head, .chain = chain };
+    var pos: usize = 0;
+    while (pos < filtered.len) {
+        const max_len = filtered.len - pos;
+        const here = finder.find(pos, max_len);
+        if (here == null) {
+            encBit(&rc, 0, &main_state, num_main_probs, &probs.main);
+            literal.emit(filtered[pos], &os);
+            pos += 1;
+            continue;
+        }
+        const m = here.?;
+        if (pos + 1 < filtered.len) {
+            const next = finder.find(pos + 1, filtered.len - (pos + 1));
+            if (next != null and next.?.len > m.len + 1) {
+                encBit(&rc, 0, &main_state, num_main_probs, &probs.main);
+                literal.emit(filtered[pos], &os);
+                pos += 1;
+                continue;
+            }
+        }
+        encBit(&rc, 1, &main_state, num_main_probs, &probs.main);
+        encBit(&rc, 0, &match_state, num_match_probs, &probs.match);
+        encBit(&rc, 0, &lz_state, num_lz_probs, &probs.lz);
+        const slot = getSlot(m.offset, offset_slot_base[0..800]);
+        lz_offset.emit(slot, &os);
+        const oextra = extra_offset_bits[slot];
+        if (oextra != 0) os.writeBits(m.offset - offset_slot_base[slot], @intCast(oextra));
+        const lslot = getSlot(m.len, length_slot_base[0..55]);
+        length.emit(lslot, &os);
+        const lextra = extra_length_bits[lslot];
+        if (lextra != 0) os.writeBits(m.len - length_slot_base[lslot], @intCast(lextra));
+        pos += m.len;
+    }
+
+    if (!os.flushBack()) return error.CapacityException;
+    rc.flushRc();
+    if (rc.overflow or os.overflow) return error.CapacityException;
+    const fwd_end: usize = @intCast(rc.next);
+    if (rc.next < 0 or fwd_end > os.next) return error.CapacityException;
+    const back_bytes = (output.len & ~@as(usize, 1)) - os.next;
+    if (back_bytes > 0) {
+        std.mem.copyForwards(u8, output[fwd_end..][0..back_bytes], output[os.next..][0..back_bytes]);
+    }
+    return fwd_end + back_bytes;
+}
+
+test "lzms encode roundtrip" {
+    const allocator = std.testing.allocator;
+    var rng: u64 = 0x243F6A8885A308D3;
+    const cases = [_]usize{ 0, 1, 3, 17, 100, 4096, 1 << 18 };
+    for (cases) |n| {
+        const input = try allocator.alloc(u8, n);
+        defer allocator.free(input);
+        for (input) |*b| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            b.* = @truncate(rng >> 32);
+        }
+        if (n > 128) {
+            for (1..n / 128) |i| @memcpy(input[i * 128 ..][0..96], input[0..96]);
+        }
+        const workspace = try allocator.alignedAlloc(u8, .@"8", encodeWorkspaceSize(n));
+        defer allocator.free(workspace);
+        const compressed = try allocator.alloc(u8, n + 512);
+        defer allocator.free(compressed);
+        const written = try lzmsEncode(input, compressed, workspace);
+        const back = try allocator.alloc(u8, n);
+        defer allocator.free(back);
+        try lzmsDecode(compressed[0..written], back);
+        try std.testing.expectEqualSlices(u8, input, back);
+    }
+}

@@ -166,3 +166,26 @@ test "bits ensure marks the stream exhausted at the 17-bit boundary" {
     // The missing second word reads as zeroes, matching wimlib's contract.
     try std.testing.expectEqual(@as(u32, 0x19B56), b.peek(17));
 }
+
+// Canonical codeword assignment from explicit lengths: the encoder-side
+// mirror of Code.init's first_code walk, assigning in symbol order.
+pub fn canonicalCodewords(max_len: usize, num_syms: usize, lens: []const u8, codes: []u32) void {
+    var counts: [17]u32 = @splat(0);
+    for (lens[0..num_syms]) |l| counts[l] += 1;
+    counts[0] = 0;
+    var next: [17]u32 = undefined;
+    var code: u32 = 0;
+    for (1..max_len + 1) |l| {
+        next[l] = code;
+        code = (code + counts[l]) << 1;
+    }
+    for (0..num_syms) |sym| {
+        const l = lens[sym];
+        if (l != 0) {
+            codes[sym] = next[l];
+            next[l] += 1;
+        } else {
+            codes[sym] = 0;
+        }
+    }
+}
