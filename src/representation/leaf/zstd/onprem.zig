@@ -249,52 +249,60 @@ fn trainHash(provider: checksum.Provider, bytes: *const [train_d]u8) u32 {
     return @truncate(hasher.final() >> @as(u6, @intCast(64 - train_f)));
 }
 
-pub fn trainDictionary(samples: []const []const u8, max_size: usize, output: []u8, scratch: []u8, provider: checksum.Provider) TrainError!usize {
+fn trainHashD(provider: checksum.Provider, bytes: []const u8, f: usize) u32 {
+    var hasher = checksum.XxHash64.bind(provider, 0);
+    hasher.update(bytes);
+    return @truncate(hasher.final() >> @as(u6, @intCast(64 - f)));
+}
+
+// Generalized fastcover core with runtime parameters. The content-building
+// pass is identical to trainDictionary; the header is written by the caller.
+fn trainContentParams(samples: []const []const u8, max_size: usize, output: []u8, scratch: []u8, provider: checksum.Provider, d: usize, f: usize, k: usize, train_count: usize) TrainError!usize {
     if (samples.len == 0) return error.CallException;
     if (max_size < dictionary_header_size + 8) return error.CallException;
+    if (d == 0 or d > 32 or f == 0 or f > 24 or k < d or k > 4096) return error.CallException;
     var total: usize = 0;
     for (samples) |sample| total = std.math.add(usize, total, sample.len) catch return error.ResourceException;
     if (total == 0) return error.CallException;
     if (output.len < @min(total, max_size - dictionary_header_size) + dictionary_header_size) return error.CapacityException;
-    if (scratch.len < trainWorkspaceSize()) return error.CapacityException;
+    const buckets: usize = @as(usize, 1) << @intCast(f);
+    if (scratch.len < 2 * buckets * @sizeOf(u32)) return error.CapacityException;
     const content_cap = @min(total, max_size - dictionary_header_size);
 
-    const freqs: []u32 = @alignCast(std.mem.bytesAsSlice(u32, scratch[0 .. train_buckets * @sizeOf(u32)]));
-    const seg_freqs: []u32 = @alignCast(std.mem.bytesAsSlice(u32, scratch[train_buckets * @sizeOf(u32) ..][0 .. train_buckets * @sizeOf(u32)]));
+    const freqs: []u32 = @alignCast(std.mem.bytesAsSlice(u32, scratch[0 .. buckets * @sizeOf(u32)]));
+    const seg_freqs: []u32 = @alignCast(std.mem.bytesAsSlice(u32, scratch[buckets * @sizeOf(u32) ..][0 .. buckets * @sizeOf(u32)]));
     @memset(freqs, 0);
-
-    const train_count = @max(1, samples.len * train_split_numerator / train_split_denominator);
 
     // Frequency table over the training split. Saturating: a corpus past
     // 2^32 dmers would otherwise overflow-panic; saturation keeps ranking
     // monotone and the output deterministic at any scale.
     for (samples[0..train_count]) |sample| {
-        if (sample.len < train_d) continue;
-        for (0..sample.len - train_d + 1) |pos| {
-            freqs[trainHash(provider, sample[pos..][0..train_d])] +|= 1;
+        if (sample.len < d) continue;
+        for (0..sample.len - d + 1) |pos| {
+            freqs[trainHashD(provider, sample[pos..][0..d], f)] +|= 1;
         }
     }
 
     // Ties keep the earliest window.
     @memset(seg_freqs, 0);
-    var chosen: [train_k]u8 = undefined;
     var content_len: usize = 0;
-    while (content_len + train_k <= content_cap) {
+    const dmers_in_k = k - d + 1;
+    while (content_len + k <= content_cap) {
         var best_score: u64 = 0;
         var best_sample: []const u8 = &.{};
         var best_begin: usize = 0;
         for (samples[train_count..]) |sample| {
-            if (sample.len < train_k) continue;
+            if (sample.len < k) continue;
             var begin: usize = 0;
             var end: usize = 0;
             var score: u64 = 0;
-            while (end < sample.len - train_d + 1) {
-                const idx = trainHash(provider, sample[end..][0..train_d]);
+            while (end < sample.len - d + 1) {
+                const idx = trainHashD(provider, sample[end..][0..d], f);
                 end += 1;
                 if (seg_freqs[idx] == 0) score += freqs[idx];
                 seg_freqs[idx] += 1;
-                if (end - begin == train_dmers_in_k + 1) {
-                    const leaving = trainHash(provider, sample[begin..][0..train_d]);
+                if (end - begin == dmers_in_k + 1) {
+                    const leaving = trainHashD(provider, sample[begin..][0..d], f);
                     begin += 1;
                     seg_freqs[leaving] -= 1;
                     if (seg_freqs[leaving] == 0) score -= freqs[leaving];
@@ -306,17 +314,16 @@ pub fn trainDictionary(samples: []const []const u8, max_size: usize, output: []u
                 }
             }
             while (begin < end) : (begin += 1) {
-                const leaving = trainHash(provider, sample[begin..][0..train_d]);
+                const leaving = trainHashD(provider, sample[begin..][0..d], f);
                 seg_freqs[leaving] -= 1;
             }
         }
         if (best_score == 0) break;
-        @memcpy(&chosen, best_sample[best_begin..][0..train_k]);
-        for (best_begin..best_begin + train_dmers_in_k) |pos| {
-            freqs[trainHash(provider, best_sample[pos..][0..train_d])] = 0;
+        @memcpy(output[dictionary_header_size + content_len ..][0..k], best_sample[best_begin..][0..k]);
+        for (best_begin..best_begin + dmers_in_k) |pos| {
+            freqs[trainHashD(provider, best_sample[pos..][0..d], f)] = 0;
         }
-        @memcpy(output[dictionary_header_size + content_len ..][0..train_k], &chosen);
-        content_len += train_k;
+        content_len += k;
     }
 
     // Small or degenerate corpora yield no segments: fall back to the
@@ -329,7 +336,27 @@ pub fn trainDictionary(samples: []const []const u8, max_size: usize, output: []u
             content_len += take;
         }
     }
+    return content_len;
+}
 
+fn totalSampleLen(samples: []const []const u8) usize {
+    var total: usize = 0;
+    for (samples) |sample| total +|= sample.len;
+    return total;
+}
+
+pub fn trainDictionary(samples: []const []const u8, max_size: usize, output: []u8, scratch: []u8, provider: checksum.Provider) TrainError!usize {
+    if (samples.len == 0) return error.CallException;
+    if (max_size < dictionary_header_size + 8) return error.CallException;
+    if (output.len < @min(totalSampleLen(samples), max_size - dictionary_header_size) + dictionary_header_size) return error.CapacityException;
+    if (scratch.len < trainWorkspaceSize()) return error.CapacityException;
+    const train_count = @max(1, samples.len * train_split_numerator / train_split_denominator);
+    const content_len = try trainContentParams(samples, max_size, output, scratch, provider, train_d, train_f, train_k, train_count);
+
+    return writeDictionaryHeader(samples, output, content_len, provider);
+}
+
+fn writeDictionaryHeader(samples: []const []const u8, output: []u8, content_len: usize, provider: checksum.Provider) usize {
     var hasher = checksum.XxHash64.bind(provider, 0);
     for (samples) |sample| hasher.update(sample);
     const span: u64 = dictionary_id_max - dictionary_id_min;
@@ -360,6 +387,110 @@ pub fn trainDictionary(samples: []const []const u8, max_size: usize, output: []u
         header_pos += 4;
     }
     return dictionary_header_size + content_len;
+}
+
+// COVER-style parameter search: sweep the d/f/k grid, score each candidate
+// dictionary by compressing the held-out validation split with it (fast
+// encoder settings), and keep the smallest total. The winning content is
+// written to `output` with the standard header.
+pub const SearchOptions = struct {
+    d_values: []const usize = &.{ 6, 8, 12 },
+    f_values: []const usize = &.{ 15, 17, 19 },
+    k_values: []const usize = &.{ 32, 50, 84 },
+    // First (denominator - 1) / denominator of the samples train, the rest
+    // validate. The plain trainer uses 3/4; the default keeps that split.
+    denominator: usize = 4,
+};
+
+fn fastScoreOptions(dictionary: []const u8) Options {
+    return .{
+        .window_size = window_size_min,
+        .hash_bits = 10,
+        .max_chain = 4,
+        .nice_len = 16,
+        .search_window = 1024,
+        .double_hash = false,
+        .entropy = 1,
+        .dictionary = dictionary,
+        .provider = checksum.default_provider,
+    };
+}
+
+pub fn trainSearchWorkspaceSize(max_dict: usize, max_sample: usize, options: SearchOptions) usize {
+    var f_max: usize = 1;
+    for (options.f_values) |f| f_max = @max(f_max, f);
+    const buckets = @as(usize, 1) << @intCast(f_max);
+    const freq_bytes = std.mem.alignForward(usize, 2 * buckets * @sizeOf(u32), 16);
+    const dict_bytes = std.mem.alignForward(usize, max_dict, 16);
+    const history_bytes = std.mem.alignForward(usize, window_size_min + block_size_max + max_dict, 16);
+    const fast = fastScoreOptions(&.{});
+    const frame_cap = @min(window_size_min, encoder_frame_size_max);
+    const ws_bytes = std.mem.alignForward(usize, encoderWorkspaceU32Count(max_dict -| dictionary_header_size, frame_cap, fast) * @sizeOf(u32), 16);
+    const out_bytes = std.mem.alignForward(usize, encodedSizeBound(max_sample, fast), 16);
+    return freq_bytes + dict_bytes + history_bytes + ws_bytes + out_bytes + 256;
+}
+
+pub fn trainDictionarySearch(samples: []const []const u8, max_size: usize, output: []u8, scratch: []u8, provider: checksum.Provider, options: SearchOptions) TrainError!usize {
+    if (samples.len < 2) return error.CallException;
+    if (options.denominator < 2) return error.CallException;
+    if (max_size < dictionary_header_size + 8) return error.CallException;
+    var max_sample: usize = 0;
+    for (samples) |sample| max_sample = @max(max_sample, sample.len);
+    if (scratch.len < trainSearchWorkspaceSize(max_size, max_sample, options)) return error.CapacityException;
+    if (output.len < @min(totalSampleLen(samples), max_size - dictionary_header_size) + dictionary_header_size) return error.CapacityException;
+
+    var f_max: usize = 1;
+    for (options.f_values) |f| f_max = @max(f_max, f);
+    const buckets = @as(usize, 1) << @intCast(f_max);
+    var offset: usize = 0;
+    const freq_scratch = scratch[offset..][0 .. 2 * buckets * @sizeOf(u32)];
+    offset += std.mem.alignForward(usize, 2 * buckets * @sizeOf(u32), 16);
+    const candidate = scratch[offset..][0..max_size];
+    offset += std.mem.alignForward(usize, max_size, 16);
+    const history = scratch[offset..][0 .. window_size_min + block_size_max + max_size];
+    offset += std.mem.alignForward(usize, window_size_min + block_size_max + max_size, 16);
+    const fast = fastScoreOptions(&.{});
+    const frame_cap = @min(window_size_min, encoder_frame_size_max);
+    const ws_u32_count = encoderWorkspaceU32Count(max_size -| dictionary_header_size, frame_cap, fast);
+    const encode_ws: []u32 = @alignCast(std.mem.bytesAsSlice(u32, scratch[offset..][0 .. ws_u32_count * @sizeOf(u32)]));
+    offset += std.mem.alignForward(usize, ws_u32_count * @sizeOf(u32), 16);
+    const encode_out = scratch[offset..];
+
+    const train_count = @max(1, samples.len * (options.denominator - 1) / options.denominator);
+    const validate = samples[train_count..];
+    const score_samples = if (validate.len == 0) samples else validate;
+
+    var best_score: u64 = std.math.maxInt(u64);
+    var best_content: usize = 0;
+    var have_candidate = false;
+    for (options.d_values) |d| {
+        for (options.f_values) |f| {
+            for (options.k_values) |k| {
+                if (k < d) continue;
+                const content_len = try trainContentParams(samples, max_size, candidate, freq_scratch, provider, d, f, k, train_count);
+                const dict_len = writeDictionaryHeader(samples, candidate, content_len, provider);
+                const dict_content = dictionaryContent(candidate[0..dict_len]) catch return error.ResourceException;
+                @memcpy(history[0..dict_content.len], dict_content);
+                var score: u64 = 0;
+                for (score_samples) |sample| {
+                    var source = std.Io.Reader.fixed(sample);
+                    var counted = std.Io.Writer.fixed(encode_out[0..encodedSizeBound(sample.len, fast)]);
+                    const written = encodeStream(&source, &counted, history, encode_ws, fast) catch return error.ResourceException;
+                    score = std.math.add(u64, score, written) catch return error.ResourceException;
+                    // encodeStream mutates the content prefix; restore it per sample.
+                    @memcpy(history[0..dict_content.len], dict_content);
+                }
+                if (!have_candidate or score < best_score) {
+                    have_candidate = true;
+                    best_score = score;
+                    best_content = content_len;
+                    @memcpy(output[0..dict_len], candidate[0..dict_len]);
+                }
+            }
+        }
+    }
+    if (!have_candidate) return error.CallException;
+    return dictionary_header_size + best_content;
 }
 
 pub const EncodeError = error{
@@ -4841,4 +4972,121 @@ test "zstd huffman tree completion and rank gates" {
     try t.expectEqual(@as(u4, 1), tree.max_bits);
     var bad_cursor = ReadCursor.init(&[_]u8{ 0x84, 0x11, 0x11, 0x10 });
     try t.expectError(error.DataException, decodeHuffmanTree(&bad_cursor, &tree));
+}
+
+test "zstd dictionary search beats the single-pass trainer on validation" {
+    const allocator = std.testing.allocator;
+    // Structured samples with shared substrings so a good dictionary pays.
+    const sample_count = 60;
+    const samples = try allocator.alloc([]const u8, sample_count);
+    defer allocator.free(samples);
+    var rng: u64 = 0xDEADBEEFCAFEF00D;
+    var storage: [sample_count][]u8 = undefined;
+    for (0..sample_count) |i| {
+        const len = 2048 + (i % 7) * 1024;
+        const buf = try allocator.alloc(u8, len);
+        storage[i] = buf;
+        for (buf) |*b| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            b.* = @as(u8, @truncate(rng)) & 31;
+        }
+        const http_hdr = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nServer: stdk\r\n";
+        @memcpy(buf[0..http_hdr.len], http_hdr);
+        const phrase = "the quick brown fox jumps over the lazy dog and runs";
+        @memcpy(buf[500 .. 500 + phrase.len], phrase);
+        const decl = "struct { int field_a; long field_b; char field_name[128]; /* pad */ }";
+        @memcpy(buf[1200 .. 1200 + decl.len], decl);
+        samples[i] = buf;
+    }
+    defer for (0..sample_count) |i| allocator.free(storage[i]);
+
+    const max_dict: usize = 4096;
+    const scratch_a = try allocator.alloc(u8, trainWorkspaceSize());
+    defer allocator.free(scratch_a);
+    const scratch_b = try allocator.alloc(u8, trainSearchWorkspaceSize(max_dict, 8192, .{}));
+    defer allocator.free(scratch_b);
+    const scratch_c = try allocator.alloc(u8, trainSearchWorkspaceSize(max_dict, 8192, .{}));
+    defer allocator.free(scratch_c);
+    const dict_a = try allocator.alloc(u8, max_dict);
+    defer allocator.free(dict_a);
+    const dict_b = try allocator.alloc(u8, max_dict);
+    defer allocator.free(dict_b);
+    const dict_c = try allocator.alloc(u8, max_dict);
+    defer allocator.free(dict_c);
+
+    const len_a = try trainDictionary(samples, max_dict, dict_a, scratch_a, checksum.default_provider);
+    const len_b = try trainDictionarySearch(samples, max_dict, dict_b, scratch_b, checksum.default_provider, .{ .d_values = &.{8}, .f_values = &.{ 15, 17 }, .k_values = &.{ 32, 50 } });
+    const len_c = try trainDictionarySearch(samples, max_dict, dict_c, scratch_c, checksum.default_provider, .{ .d_values = &.{8}, .f_values = &.{ 15, 17 }, .k_values = &.{ 32, 50 } });
+
+    // Deterministic at fixed parameters.
+    try std.testing.expectEqual(len_b, len_c);
+    try std.testing.expectEqualSlices(u8, dict_b[0..len_b], dict_c[0..len_c]);
+
+    // Score both over the validation split with the same fast encoder.
+    const train_count = sample_count * 3 / 4;
+    const score_ws = try allocator.alloc(u8, trainSearchWorkspaceSize(max_dict, 8192, .{}));
+    defer allocator.free(score_ws);
+    const score = struct {
+        fn run(dict: []const u8, validate: []const []const u8, ws: []u8, alloc2: std.mem.Allocator) !u64 {
+            var f_max: usize = 1;
+            for ([_]usize{ 15, 17, 19 }) |f| f_max = @max(f_max, f);
+            const buckets = @as(usize, 1) << @intCast(f_max);
+            _ = buckets;
+            var off: usize = std.mem.alignForward(usize, 2 * (@as(usize, 1) << 19) * @sizeOf(u32), 16);
+            const history = ws[off .. off + window_size_min + block_size_max + max_dict];
+            off += std.mem.alignForward(usize, window_size_min + block_size_max + max_dict, 16);
+            const fast = fastScoreOptions(&.{});
+            const frame_cap = @min(window_size_min, encoder_frame_size_max);
+            const ws_u32_count = encoderWorkspaceU32Count(max_dict -| dictionary_header_size, frame_cap, fast);
+            const encode_ws: []u32 = @alignCast(std.mem.bytesAsSlice(u32, ws[off .. off + ws_u32_count * @sizeOf(u32)]));
+            off += std.mem.alignForward(usize, ws_u32_count * @sizeOf(u32), 16);
+            const encode_out = ws[off..];
+            const dict_content = try dictionaryContent(dict);
+            @memcpy(history[0..dict_content.len], dict_content);
+            var total: u64 = 0;
+            for (validate) |sample| {
+                var source = std.Io.Reader.fixed(sample);
+                var counted = std.Io.Writer.fixed(encode_out[0..encodedSizeBound(sample.len, fast)]);
+                const written = encodeStream(&source, &counted, history, encode_ws, fast) catch return error.ResourceException;
+                total += written;
+                @memcpy(history[0..dict_content.len], dict_content);
+            }
+            _ = alloc2;
+            return total;
+        }
+    }.run;
+    const score_a = try score(dict_a[0..len_a], samples[train_count..], score_ws, allocator);
+    const score_b = try score(dict_b[0..len_b], samples[train_count..], score_ws, allocator);
+    try std.testing.expect(score_b <= score_a);
+
+    // The searched dictionary works end to end: encode a validation sample
+    // with it and decode it back.
+    const enc_ws = try allocator.alloc(u8, trainSearchWorkspaceSize(max_dict, 8192, .{}) + (1 << 16));
+    defer allocator.free(enc_ws);
+    var off_e: usize = std.mem.alignForward(usize, 2 * (@as(usize, 1) << 19) * @sizeOf(u32), 16);
+    const enc_history = enc_ws[off_e .. off_e + window_size_min + block_size_max + max_dict];
+    off_e += std.mem.alignForward(usize, window_size_min + block_size_max + max_dict, 16);
+    const fast_e = fastScoreOptions(&.{});
+    const frame_cap_e = @min(window_size_min, encoder_frame_size_max);
+    const enc_ws_u32_count = encoderWorkspaceU32Count(max_dict -| dictionary_header_size, frame_cap_e, fast_e);
+    const enc_ws32: []u32 = @alignCast(std.mem.bytesAsSlice(u32, enc_ws[off_e .. off_e + enc_ws_u32_count * @sizeOf(u32)]));
+    off_e += std.mem.alignForward(usize, enc_ws_u32_count * @sizeOf(u32), 16);
+    const enc_out = enc_ws[off_e..];
+    const sample = samples[train_count];
+    const dict_content_b = try dictionaryContent(dict_b[0..len_b]);
+    @memcpy(enc_history[0..dict_content_b.len], dict_content_b);
+    const score_opts = fastScoreOptions(dict_b[0..len_b]);
+    var enc_src = std.Io.Reader.fixed(sample);
+    var enc_counted = std.Io.Writer.fixed(enc_out[0..encodedSizeBound(sample.len, fast_e)]);
+    const enc_len = try encodeStream(&enc_src, &enc_counted, enc_history, enc_ws32, score_opts);
+    var dec_src = std.Io.Reader.fixed(enc_out[0..enc_len]);
+    var decoded_buf: [8192]u8 = undefined;
+    var dec_out = std.Io.Writer.fixed(&decoded_buf);
+    const dec_history = try allocator.alloc(u8, window_size_min + block_size_max + max_dict);
+    defer allocator.free(dec_history);
+    const dec_len = try decodeStream(&dec_src, &dec_out, dec_history, .{ .window_size = window_size_min, .dictionary = dict_b[0..len_b], .provider = checksum.default_provider });
+    try std.testing.expectEqual(sample.len, dec_len);
+    try std.testing.expectEqualSlices(u8, sample, decoded_buf[0..dec_len]);
 }
