@@ -4,7 +4,8 @@ const std = @import("std");
 const build_options = @import("options");
 
 // NEON is baseline on aarch64, so the wide match-copy path needs no extra
-// target feature. Other targets keep the portable word-at-a-time path.
+// target feature there. x86_64 keeps the portable path: the 16-byte vector
+// ladder measured slower than the word-at-a-time copy under x86_64_v2.
 pub const vector_match_copy = !build_options.portable and builtin.target.cpu.arch == .aarch64;
 
 // One short-run copy per codec, one answer for whether the wide path applies.
