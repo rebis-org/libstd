@@ -36,6 +36,11 @@ pub const Options = struct {
     chain: u16,
     optimal: bool = false,
     strategy: Strategy = .default,
+    // Optimal-parse cost-model iterations. 1 is the single frozen-price
+    // pass; >1 re-gathers symbol statistics from each parse and re-prices
+    // (the zopfli outer loop) until the cost stops improving or the budget
+    // runs out. Only meaningful with optimal = true.
+    iterations: u16 = 1,
 };
 
 const window_size = 32768;
@@ -66,6 +71,9 @@ const hash3_size = 1 << hash3_bits;
 
 const OptimalScratch = struct {
     tokens: [optimal_span]u64,
+    // The best parse so far survives a non-improving re-plan, which would
+    // otherwise overwrite `tokens` in place.
+    tokens_best: [optimal_span]u64,
     cost: [optimal_span + 1]u32,
     choice: [optimal_span]u32,
     candidates: [optimal_span * optimal_stride]u32,
@@ -338,6 +346,7 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
             if (options.lazy > options.nice) return error.CallException;
             if (options.chain == 0) return error.CallException;
             if (options.optimal and options.strategy != .default) return error.CallException;
+            if (options.iterations > 1 and !options.optimal) return error.CallException;
             var effective = options;
             if (options.strategy == .filtered) {
                 // zlib's filtered configuration: good 4, lazy 4, nice 16,
@@ -598,7 +607,29 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
                 lit_freq[c.history[span_end - 1]] += 1;
                 stats_tokens += 1;
             }
-            const token_count = c.planBlock(span, &lit_freq, &dist_freq, stats_tokens);
+            var token_count = c.planBlock(span, &lit_freq, &dist_freq, stats_tokens);
+            // Zopfli-style outer loop: each pass re-gathers the symbol
+            // statistics from the parse it just produced, rebuilds the
+            // Huffman prices, and re-runs the DP. The parse is kept only
+            // while its self-consistent cost keeps dropping.
+            if (c.options.iterations > 1) {
+                @memcpy(scratch.tokens_best[0..token_count], scratch.tokens[0..token_count]);
+                var best_cost = scratch.cost[0];
+                var best_count = token_count;
+                var run: u16 = 1;
+                while (run < c.options.iterations) : (run += 1) {
+                    const iter_tokens = countTokenStats(scratch.tokens_best[0..best_count], &lit_freq, &dist_freq);
+                    const next_count = c.planBlock(span, &lit_freq, &dist_freq, iter_tokens);
+                    if (scratch.cost[0] < best_cost) {
+                        best_cost = scratch.cost[0];
+                        @memcpy(scratch.tokens_best[0..next_count], scratch.tokens[0..next_count]);
+                        best_count = next_count;
+                    } else break;
+                }
+                // Downstream emitters read `tokens`; move the best parse back.
+                @memcpy(scratch.tokens[0..best_count], scratch.tokens_best[0..best_count]);
+                token_count = best_count;
+            }
             c.cursor = span_end;
             c.finalized = span_end;
             if (finishing and span_end == c.end) {
@@ -607,6 +638,27 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
                 return;
             }
             try c.emitBlock(false, scratch.tokens[0..token_count]);
+        }
+
+        // Counts the literal/length/distance symbols a token stream would
+        // emit, feeding the next cost-model iteration.
+        fn countTokenStats(tokens: []const u64, lit_freq: *[lit_alphabet]u32, dist_freq: *[dist_alphabet]u32) u64 {
+            lit_freq.* = @splat(0);
+            dist_freq.* = @splat(0);
+            lit_freq[256] = 1; // end-of-block
+            var count: u64 = 0;
+            for (tokens) |token| {
+                if (token & token_literal != 0) {
+                    lit_freq[@as(usize, @intCast(token & 0xFF))] += 1;
+                } else {
+                    const len: usize = min_match + @as(usize, @intCast(token >> 16));
+                    const dist: u32 = @as(u32, @intCast(token & 0xFFFF)) + 1;
+                    lit_freq[257 + @as(usize, lengthIndexFor(@intCast(len)))] += 1;
+                    dist_freq[distIndexFor(@intCast(dist))] += 1;
+                }
+                count += 1;
+            }
+            return count;
         }
 
         fn planBlock(c: *@This(), span: usize, lit_freq: *[lit_alphabet]u32, dist_freq: *[dist_alphabet]u32, stats_tokens: u64) usize {
@@ -1875,5 +1927,71 @@ test "deflate strategies roundtrip and shape blocks" {
         var inflater = Decompress.init(&in, &history);
         _ = inflater.reader.streamRemaining(&out) catch return error.DecompressStream;
         try std_testing.expectEqualSlices(u8, &payload, &decoded);
+    }
+}
+
+test "deflate optimal iterations improve or hold the parse cost" {
+    var input: [1 << 15]u8 = undefined;
+    var rng: u64 = 0x9E3779B97F4A7C15;
+    for (&input) |*b| {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        b.* = @as(u8, @truncate(rng)) & 15;
+    }
+    for (1..7) |i| @memcpy(input[i * 4096 ..][0..2048], input[0..2048]);
+
+    const single_options: Options = .{ .good = 8, .nice = 258, .lazy = 258, .chain = 128, .optimal = true };
+    const multi_options: Options = .{ .good = 8, .nice = 258, .lazy = 258, .chain = 128, .optimal = true, .iterations = 8 };
+
+    var history: [history_size + optimal_workspace_size]u8 = undefined;
+    var encoded_single: [encodedSizeBound(input.len) + 16]u8 = undefined;
+    var encoded_multi: [encodedSizeBound(input.len) + 16]u8 = undefined;
+    var encoded_repeat: [encodedSizeBound(input.len) + 16]u8 = undefined;
+
+    const single_len = blk: {
+        var w = std.Io.Writer.fixed(&encoded_single);
+        var c = try Compress.init(&w, &history, single_options);
+        var r = std.Io.Reader.fixed(&input);
+        _ = std.Io.Reader.streamRemaining(&r, &c.writer) catch return error.CompressStream;
+        try c.finish();
+        break :blk w.end;
+    };
+    const multi_len = blk: {
+        var w = std.Io.Writer.fixed(&encoded_multi);
+        var c = try Compress.init(&w, &history, multi_options);
+        var r = std.Io.Reader.fixed(&input);
+        _ = std.Io.Reader.streamRemaining(&r, &c.writer) catch return error.CompressStream;
+        try c.finish();
+        break :blk w.end;
+    };
+    const repeat_len = blk: {
+        var w = std.Io.Writer.fixed(&encoded_repeat);
+        var c = try Compress.init(&w, &history, multi_options);
+        var r = std.Io.Reader.fixed(&input);
+        _ = std.Io.Reader.streamRemaining(&r, &c.writer) catch return error.CompressStream;
+        try c.finish();
+        break :blk w.end;
+    };
+
+    // Iteration is deterministic and never expands the stream; on this
+    // corpus it strictly improves the frozen-price single pass.
+    try std.testing.expectEqual(multi_len, repeat_len);
+    try std.testing.expect(multi_len <= single_len);
+    try std.testing.expect(multi_len < single_len);
+
+    // The iterated stream round-trips through the leaf inflater.
+    var decoded: [input.len]u8 = undefined;
+    var source = std.Io.Reader.fixed(encoded_multi[0..multi_len]);
+    var dest = std.Io.Writer.fixed(&decoded);
+    var inflater = Decompress.init(&source, history[0..history_size]);
+    _ = inflater.reader.streamRemaining(&dest) catch return error.InflateStream;
+    try std.testing.expectEqualSlices(u8, &input, &decoded);
+
+    // iterations > 1 without the optimal parser is a caller error.
+    {
+        var sink_buf: [8]u8 = undefined;
+        var sink = std.Io.Writer.fixed(&sink_buf);
+        try std.testing.expectError(error.CallException, Compress.init(&sink, &history, .{ .good = 8, .nice = 128, .lazy = 16, .chain = 8, .iterations = 3 }));
     }
 }
