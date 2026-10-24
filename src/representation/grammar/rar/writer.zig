@@ -29,6 +29,10 @@ pub const WriteOptions = struct {
     kdf_lg2_count: u8 = 15,
     kdf_rounds_limit: u64 = 0,
     failure_cause: ?*crypto.FailureCause = null,
+    // Non-zero switches the create calls to multi-volume mode: each volume
+    // holds at most this many bytes, and rarEncodeVolumes/rarVolumeSize take
+    // over. Single-volume calls reject a non-zero budget.
+    volume_size: usize = 0,
 };
 
 // Every buffer is caller-provided, so this struct never allocates.
@@ -161,19 +165,29 @@ const block_writer = struct {
         return pos + plain_len;
     }
 
-    fn mainBlockSize(encrypted: bool) usize {
-        // Contents are type, flags, and archive flags (3 bytes), plus a one-byte size vint and 4 CRC bytes.
-        const plain = 4 + 1 + 3;
+    fn mainBlockSize(encrypted: bool, volume_index: usize) usize {
+        // Contents are type, flags, and archive flags (3 bytes), plus a volume
+        // number vint when this is not the first volume.
+        var contents: usize = 3;
+        if (volume_index >= 1) contents += vintSize(volume_index);
+        const plain = 4 + 1 + contents;
         if (!encrypted) return plain;
         return 16 + std.mem.alignForward(usize, plain, 16);
     }
 
-    fn writeMainBlock(out: []u8, pos: usize, header_keys: ?*const rar.Rar5Keys, provider: crypto.Provider) Exception!usize {
-        var contents: [8]u8 = undefined;
+    fn writeMainBlock(out: []u8, pos: usize, volume_index: usize, multi: bool, header_keys: ?*const rar.Rar5Keys, provider: crypto.Provider) Exception!usize {
+        var contents: [16]u8 = undefined;
         var c: usize = 0;
         c += writeVint(rar.rar5_type_main, contents[c..]);
         c += writeVint(0, contents[c..]);
-        c += writeVint(0, contents[c..]);
+        // MHFL_VOLUME marks every volume of a multi-volume set; MHFL_VOLNUMBER
+        // carries the zero-based number and is only set for volumes after the
+        // first (headers5.hpp).
+        var archive_flags: u64 = 0;
+        if (multi) archive_flags |= rar.rar5_archive_volume;
+        if (volume_index >= 1) archive_flags |= rar.rar5_archive_volnum;
+        c += writeVint(archive_flags, contents[c..]);
+        if (volume_index >= 1) c += writeVint(volume_index, contents[c..]);
         return emitHeader(out, pos, contents[0..c], header_keys, provider);
     }
 
@@ -211,12 +225,13 @@ const block_writer = struct {
         return 16 + std.mem.alignForward(usize, plain, 16);
     }
 
-    fn writeEndBlock(out: []u8, pos: usize, header_keys: ?*const rar.Rar5Keys, provider: crypto.Provider) Exception!usize {
+    fn writeEndBlock(out: []u8, pos: usize, next_volume: bool, header_keys: ?*const rar.Rar5Keys, provider: crypto.Provider) Exception!usize {
         var contents: [8]u8 = undefined;
         var c: usize = 0;
         c += writeVint(rar.rar5_type_end, contents[c..]);
         c += writeVint(0, contents[c..]);
-        c += writeVint(0, contents[c..]);
+        // EARC_NEXT_VOLUME tells a reader that another volume follows.
+        c += writeVint(if (next_volume) rar.rar5_earc_next_volume else 0, contents[c..]);
         return emitHeader(out, pos, contents[0..c], header_keys, provider);
     }
 
@@ -258,13 +273,32 @@ const block_writer = struct {
         return header_size + packed_len;
     }
 
+    // Writes one file block. In multi-volume mode the caller passes the final
+    // wire bytes for this part in `packed_data` (it has already staged, padded,
+    // and encrypted them), the per-entry data keys in `data_keys`, and the
+    // FHEXTRA_CRYPT record IV in `record_iv`; the same record rides in every
+    // part header of a split entry so `fileBlockSize` stays split-independent.
+    // Single-volume callers pass null for both and the block derives its keys
+    // from the workspace, byte-identical to the original single-volume path.
+    // Every part header of a split entry carries the TOTAL unpacked size and
+    // its own part's packed size. `part_crc` overrides the hash field for
+    // non-final split parts: unrar verifies, at every volume switch, that the
+    // packed bytes read from the closing volume hash to that volume's own
+    // header copy (volume.cpp MergeArchive; rdwrfn.cpp hashes the raw on-disk
+    // bytes, so an encrypted part hashes its ciphertext). The final part keeps
+    // the whole-file value that `part_crc == null` computes here.
     fn writeFileBlock(
         out: []u8,
         pos: usize,
         entry: RarEntry,
         packed_data: []const u8,
+        split_before: bool,
+        split_after: bool,
         options: WriteOptions,
         header_keys: ?*const rar.Rar5Keys,
+        data_keys: ?*const rar.Rar5Keys,
+        record_iv: ?*const [16]u8,
+        part_crc: ?u32,
         entry_index: usize,
         ws: *WriteBuffers,
         provider: crypto.Provider,
@@ -279,14 +313,18 @@ const block_writer = struct {
         // The attributes are unix st_mode values, because host_os is 1 below:
         // the reference chmods extracted files with this field (extract.cpp).
         const attributes: u64 = if (entry.is_directory) 0o40755 else 0o100644;
-        var data_crc = if (entry.is_directory) 0 else checksum.crc32With(provider, entry.data);
+        var data_crc: u32 = if (part_crc) |pc| pc else if (entry.is_directory) 0 else checksum.crc32With(provider, entry.data);
         var keys: ?rar.Rar5Keys = null;
         if (data_encrypted) {
             // The stored CRC is the MAC of the plaintext CRC so the header
             // leaks nothing about the data (unrar ConvertHashToMAC).
-            const decode_opts: rar.DecodeOptions = .{ .provider = provider };
-            keys = try rar.rar5Kdf(options.password, &ws.crypt_salts[entry_index], options.kdf_lg2_count, decode_opts);
-            data_crc = rar.rar5CrcMac(provider, data_crc, &keys.?.hash_key);
+            if (data_keys) |dk| {
+                keys = dk.*;
+            } else {
+                const decode_opts: rar.DecodeOptions = .{ .provider = provider };
+                keys = try rar.rar5Kdf(options.password, &ws.crypt_salts[entry_index], options.kdf_lg2_count, decode_opts);
+            }
+            if (part_crc == null) data_crc = rar.rar5CrcMac(provider, data_crc, &keys.?.hash_key);
         }
 
         var body: [4200]u8 = undefined;
@@ -315,7 +353,8 @@ const block_writer = struct {
             r += writeVint(rar.rar5_extra_crypt, record[r..]);
             const pswcheck = rar.rar5PswCheck(&keys.?.pswcheck);
             const csum = pswCheckCsum(&pswcheck, provider);
-            r += writeCryptExtra(record[r..], options.kdf_lg2_count, &ws.crypt_salts[entry_index], &ws.crypt_ivs[entry_index], &pswcheck, &csum);
+            const iv: *const [16]u8 = if (record_iv) |riv| riv else &ws.crypt_ivs[entry_index];
+            r += writeCryptExtra(record[r..], options.kdf_lg2_count, &ws.crypt_salts[entry_index], iv, &pswcheck, &csum);
             @memcpy(extra[0..r], record[0..r]);
             extra_len = r;
         }
@@ -325,6 +364,8 @@ const block_writer = struct {
         var c: usize = 0;
         c += writeVint(rar.rar5_type_file, contents[c..]);
         var block_flags: u64 = if (entry.is_directory) 0 else rar.rar5_flag_data;
+        if (split_before) block_flags |= rar.rar5_flag_split_before;
+        if (split_after) block_flags |= rar.rar5_flag_split_after;
         if (data_encrypted) block_flags |= rar.rar5_flag_extra;
         c += writeVint(block_flags, contents[c..]);
         if (data_encrypted) c += writeVint(extra_len, contents[c..]);
@@ -363,9 +404,9 @@ fn packEntries(entries: []const RarEntry, ws: *WriteBuffers, options: WriteOptio
     if (options.encrypt_headers) {
         // -hp leads with the encryption block and an encrypted main block;
         // every later block's header rides behind its own IV.
-        total = rar.rar5_signature.len + block_writer.encryptionBlockSize() + block_writer.mainBlockSize(true) + block_writer.endBlockSize(true);
+        total = rar.rar5_signature.len + block_writer.encryptionBlockSize() + block_writer.mainBlockSize(true, 0) + block_writer.endBlockSize(true);
     } else {
-        total = rar.rar5_signature.len + block_writer.mainBlockSize(false) + block_writer.endBlockSize(false);
+        total = rar.rar5_signature.len + block_writer.mainBlockSize(false, 0) + block_writer.endBlockSize(false);
     }
     var packed_cursor: usize = 0;
     for (entries, 0..) |entry, i| {
@@ -396,20 +437,26 @@ fn packEntries(entries: []const RarEntry, ws: *WriteBuffers, options: WriteOptio
             break :blk written;
         };
         if (data_encryption and !entry.is_directory) {
-            if (ws.crypt_salts.len < entries.len or ws.crypt_ivs.len < entries.len) return error.InternalException;
+            if (ws.crypt_salts.len < entries.len) return error.InternalException;
             try crypto.fillRandom(&ws.crypt_salts[i]);
-            try crypto.fillRandom(&ws.crypt_ivs[i]);
-            const decode_opts: rar.DecodeOptions = .{
-                .kdf_rounds_limit = options.kdf_rounds_limit,
-                .failure_cause = options.failure_cause,
-                .provider = crypto.default_provider,
-            };
-            const keys = try rar.rar5Kdf(options.password, &ws.crypt_salts[i], options.kdf_lg2_count, decode_opts);
-            const padded = std.mem.alignForward(usize, packed_len, crypto.block_length);
-            if (ws.packed_buf.len - packed_cursor < padded) return error.InternalException;
-            @memset(ws.packed_buf[packed_cursor + packed_len .. packed_cursor + padded], 0);
-            crypto.aesCbcEncrypt(crypto.default_provider, keys.key[0..], ws.crypt_ivs[i], ws.packed_buf[packed_cursor .. packed_cursor + padded], ws.packed_buf[packed_cursor .. packed_cursor + padded]) catch return error.CallException;
-            packed_len = padded;
+            if (options.volume_size == 0) {
+                // Single-volume mode encrypts in place right here; volume mode
+                // leaves the packed bytes plaintext because each part is
+                // staged, padded, and encrypted with its own chain IV later.
+                if (ws.crypt_ivs.len < entries.len) return error.InternalException;
+                try crypto.fillRandom(&ws.crypt_ivs[i]);
+                const decode_opts: rar.DecodeOptions = .{
+                    .kdf_rounds_limit = options.kdf_rounds_limit,
+                    .failure_cause = options.failure_cause,
+                    .provider = crypto.default_provider,
+                };
+                const keys = try rar.rar5Kdf(options.password, &ws.crypt_salts[i], options.kdf_lg2_count, decode_opts);
+                const padded = std.mem.alignForward(usize, packed_len, crypto.block_length);
+                if (ws.packed_buf.len - packed_cursor < padded) return error.InternalException;
+                @memset(ws.packed_buf[packed_cursor + packed_len .. packed_cursor + padded], 0);
+                crypto.aesCbcEncrypt(crypto.default_provider, keys.key[0..], ws.crypt_ivs[i], ws.packed_buf[packed_cursor .. packed_cursor + padded], ws.packed_buf[packed_cursor .. packed_cursor + padded]) catch return error.CallException;
+                packed_len = padded;
+            }
         }
         if (ws.packed_sizes.len < entries.len) return error.InternalException;
         ws.packed_sizes[i] = packed_len;
@@ -424,6 +471,7 @@ pub fn rarWriteSize(entries: []const RarEntry, ws: *WriteBuffers) Exception!usiz
 }
 
 pub fn rarWriteSizeEx(entries: []const RarEntry, ws: *WriteBuffers, options: WriteOptions) Exception!usize {
+    if (options.volume_size != 0) return error.CallException;
     try checkWriteEntries(entries, options);
     return packEntries(entries, ws, options);
 }
@@ -433,6 +481,7 @@ pub fn rarEncode(entries: []const RarEntry, output: []u8, ws: *WriteBuffers, pro
 }
 
 pub fn rarEncodeEx(entries: []const RarEntry, output: []u8, ws: *WriteBuffers, provider: crypto.Provider, options: WriteOptions) Exception!usize {
+    if (options.volume_size != 0) return error.CallException;
     const required = try rarWriteSizeEx(entries, ws, options);
     if (output.len < required) return error.CapacityException;
 
@@ -455,9 +504,9 @@ pub fn rarEncodeEx(entries: []const RarEntry, output: []u8, ws: *WriteBuffers, p
         const pswcheck = rar.rar5PswCheck(&header_keys.?.pswcheck);
         const csum = pswCheckCsum(&pswcheck, provider);
         pos = try block_writer.writeEncryptionBlock(output, pos, options.kdf_lg2_count, &header_salt, &pswcheck, &csum, provider);
-        pos = try block_writer.writeMainBlock(output, pos, &header_keys.?, provider);
+        pos = try block_writer.writeMainBlock(output, pos, 0, false, &header_keys.?, provider);
     } else {
-        pos = try block_writer.writeMainBlock(output, pos, null, provider);
+        pos = try block_writer.writeMainBlock(output, pos, 0, false, null, provider);
     }
 
     var i: usize = 0;
@@ -466,12 +515,307 @@ pub fn rarEncodeEx(entries: []const RarEntry, output: []u8, ws: *WriteBuffers, p
         const entry = entries[i];
         const packed_len = ws.packed_sizes[i];
         const packed_slice = ws.packed_buf[cursor .. cursor + packed_len];
-        pos = try block_writer.writeFileBlock(output, pos, entry, packed_slice, options, if (options.encrypt_headers) &header_keys.? else null, i, ws, provider);
+        pos = try block_writer.writeFileBlock(output, pos, entry, packed_slice, false, false, options, if (options.encrypt_headers) &header_keys.? else null, null, null, null, i, ws, provider);
         cursor = try bounds.addUsize(cursor, packed_len);
     }
 
-    pos = try block_writer.writeEndBlock(output, pos, if (options.encrypt_headers) &header_keys.? else null, provider);
+    pos = try block_writer.writeEndBlock(output, pos, false, if (options.encrypt_headers) &header_keys.? else null, provider);
     return pos;
+}
+
+// One data part of one entry, as laid out across volumes. `data_offset` is the
+// global offset into `ws.packed_buf` (across all entries); `data_len` counts
+// plaintext bytes while `part_len` is the on-wire data size (it includes any
+// CBC zero padding of the final part).
+pub const VolumePart = struct {
+    entry_index: usize,
+    data_offset: usize,
+    data_len: usize,
+    part_len: usize,
+    split_before: bool,
+    split_after: bool,
+};
+
+// The layout engine reports volumes, data parts, and volume ends in order; the
+// sizing and the emit passes each walk the same steps.
+pub const VolumeStep = union(enum) {
+    volume: usize,
+    part: VolumePart,
+    end: bool,
+};
+
+// The fixed prefix of one volume: signature, the -hp encryption block when
+// headers are encrypted (every volume repeats it so its headers decrypt
+// standalone), and that volume's main block.
+fn volumePrefixSize(volume_index: usize, options: WriteOptions) usize {
+    var size: usize = rar.rar5_signature.len;
+    if (options.encrypt_headers) {
+        size += block_writer.encryptionBlockSize() + block_writer.mainBlockSize(true, volume_index);
+    } else {
+        size += block_writer.mainBlockSize(false, volume_index);
+    }
+    return size;
+}
+
+// Greedy layout: fill the current volume, and when a part cannot land in it,
+// close the volume and retry on a fresh one. One part per volume per entry is
+// load-bearing: a part with stream remaining always closes the volume, which
+// bounds the parts per entry by the volume count (the reader sizes its part
+// scratch that way) and matches real WinRAR output. Encrypted entries split on
+// 16-byte boundaries so every interior part is block-aligned and the per-part
+// encryptions concatenate to exactly the single-volume padded stream.
+fn layoutVolumes(
+    entries: []const RarEntry,
+    ws: *WriteBuffers,
+    options: WriteOptions,
+    ctx: anytype,
+    comptime onStep: fn (@TypeOf(ctx), VolumeStep) Exception!void,
+) Exception!void {
+    const data_encryption = options.password.len != 0;
+    var volume: usize = 0;
+    var used: usize = volumePrefixSize(0, options);
+    if (used > options.volume_size) return error.CallException;
+    try onStep(ctx, .{ .volume = 0 });
+    var stream_base: usize = 0;
+    for (entries, 0..) |entry, ei| {
+        const encrypted = data_encryption and !entry.is_directory;
+        const raw = ws.packed_sizes[ei];
+        const padded_total: usize = if (encrypted) std.mem.alignForward(usize, raw, crypto.block_length) else raw;
+        const step: usize = if (encrypted) crypto.block_length else 1;
+        var offset: usize = 0;
+        var first = true;
+        while (true) {
+            const free = options.volume_size - used;
+            var ds: usize = @min(padded_total - offset, free);
+            if (encrypted) ds &= ~@as(usize, crypto.block_length - 1);
+            while (ds > 0 and block_writer.fileBlockSize(entry, ds, options) > free) ds -= step;
+            const remaining = padded_total - offset;
+            const min_ds: usize = if (remaining == 0) 0 else step;
+            const fits = ds >= min_ds and block_writer.fileBlockSize(entry, ds, options) <= free;
+            if (!fits) {
+                // A fresh volume is the widest fit there is; if even its
+                // empty prefix plus this part overflows, no layout exists.
+                if (used == volumePrefixSize(volume, options)) return error.CallException;
+                try onStep(ctx, .{ .end = true });
+                volume += 1;
+                used = volumePrefixSize(volume, options);
+                if (used > options.volume_size) return error.CallException;
+                try onStep(ctx, .{ .volume = volume });
+                continue;
+            }
+            const is_last = offset + ds >= padded_total;
+            const data_len: usize = if (is_last) raw - offset else ds;
+            try onStep(ctx, .{ .part = .{
+                .entry_index = ei,
+                .data_offset = try bounds.addUsize(stream_base, offset),
+                .data_len = data_len,
+                .part_len = ds,
+                .split_before = !first,
+                .split_after = !is_last,
+            } });
+            used = try bounds.addUsize(used, block_writer.fileBlockSize(entry, ds, options));
+            if (is_last) break;
+            offset += ds;
+            first = false;
+            // Stream remains, so this volume is done; open the next one.
+            try onStep(ctx, .{ .end = true });
+            volume += 1;
+            used = volumePrefixSize(volume, options);
+            if (used > options.volume_size) return error.CallException;
+            try onStep(ctx, .{ .volume = volume });
+        }
+        stream_base = try bounds.addUsize(stream_base, raw);
+    }
+    try onStep(ctx, .{ .end = false });
+}
+
+pub const VolumePlan = struct {
+    count: usize,
+    total: usize,
+};
+
+const VolumeSizeCtx = struct {
+    entries: []const RarEntry,
+    options: WriteOptions,
+    count: usize = 0,
+    total: usize = 0,
+
+    fn step(self: *VolumeSizeCtx, s: VolumeStep) Exception!void {
+        switch (s) {
+            .volume => |v| {
+                self.count = v + 1;
+                self.total = try bounds.addUsize(self.total, volumePrefixSize(v, self.options));
+            },
+            .part => |p| {
+                self.total = try bounds.addUsize(self.total, block_writer.fileBlockSize(self.entries[p.entry_index], p.part_len, self.options));
+            },
+            .end => {
+                self.total = try bounds.addUsize(self.total, block_writer.endBlockSize(self.options.encrypt_headers));
+            },
+        }
+    }
+};
+
+const VolumeEmitCtx = struct {
+    entries: []const RarEntry,
+    options: WriteOptions,
+    ws: *WriteBuffers,
+    provider: crypto.Provider,
+    header_keys: ?*const rar.Rar5Keys,
+    header_salt: *const [16]u8,
+    header_pswcheck: *const [8]u8,
+    header_csum: *const [4]u8,
+    output: []u8,
+    volume_slices: [][]u8,
+    pos: usize = 0,
+    volume_start: usize = 0,
+    volume_index: usize = 0,
+    current: usize = std.math.maxInt(usize),
+    data_keys: rar.Rar5Keys = undefined,
+    entry_iv: [16]u8 = undefined,
+    chain_iv: [16]u8 = undefined,
+
+    fn step(self: *VolumeEmitCtx, s: VolumeStep) Exception!void {
+        switch (s) {
+            .volume => |v| {
+                self.volume_start = self.pos;
+                self.volume_index = v;
+                if (self.output.len < self.pos + rar.rar5_signature.len) return error.CapacityException;
+                @memcpy(self.output[self.pos..][0..rar.rar5_signature.len], &rar.rar5_signature);
+                self.pos += rar.rar5_signature.len;
+                if (self.options.encrypt_headers) {
+                    self.pos = try block_writer.writeEncryptionBlock(self.output, self.pos, self.options.kdf_lg2_count, self.header_salt, self.header_pswcheck, self.header_csum, self.provider);
+                    self.pos = try block_writer.writeMainBlock(self.output, self.pos, v, true, self.header_keys, self.provider);
+                } else {
+                    self.pos = try block_writer.writeMainBlock(self.output, self.pos, v, true, null, self.provider);
+                }
+            },
+            .part => |p| {
+                const entry = self.entries[p.entry_index];
+                const encrypted = self.options.password.len != 0 and !entry.is_directory;
+                if (p.entry_index != self.current) {
+                    // First part of this entry: a fresh record IV and the
+                    // per-entry data keys; every part header repeats them.
+                    self.current = p.entry_index;
+                    try crypto.fillRandom(&self.entry_iv);
+                    if (encrypted) {
+                        const decode_opts: rar.DecodeOptions = .{
+                            .kdf_rounds_limit = self.options.kdf_rounds_limit,
+                            .failure_cause = self.options.failure_cause,
+                            .provider = self.provider,
+                        };
+                        self.data_keys = try rar.rar5Kdf(self.options.password, &self.ws.crypt_salts[p.entry_index], self.options.kdf_lg2_count, decode_opts);
+                        self.chain_iv = self.entry_iv;
+                    }
+                }
+                var wire: []const u8 = undefined;
+                if (encrypted) {
+                    const data_end = try bounds.addUsize(p.data_offset, p.data_len);
+                    if (self.ws.packed_buf.len < data_end) return error.InternalException;
+                    if (self.ws.staging.len < p.part_len) return error.InternalException;
+                    // Stage the plaintext, zero-pad to the part's block
+                    // boundary, and encrypt in place: part 0 uses the record
+                    // IV and each later part chains from the previous part's
+                    // last ciphertext block, so the parts concatenate to one
+                    // continuous CBC stream (unrar decrypts split files as a
+                    // single stream; extract.cpp SetEncryption runs once).
+                    @memcpy(self.ws.staging[0..p.data_len], self.ws.packed_buf[p.data_offset..][0..p.data_len]);
+                    @memset(self.ws.staging[p.data_len..p.part_len], 0);
+                    crypto.aesCbcEncrypt(self.provider, self.data_keys.key[0..], self.chain_iv, self.ws.staging[0..p.part_len], self.ws.staging[0..p.part_len]) catch return error.CallException;
+                    wire = self.ws.staging[0..p.part_len];
+                    if (p.split_after) self.chain_iv = self.ws.staging[p.part_len - crypto.block_length ..][0..crypto.block_length].*;
+                } else {
+                    const data_end = try bounds.addUsize(p.data_offset, p.data_len);
+                    if (self.ws.packed_buf.len < data_end) return error.InternalException;
+                    wire = self.ws.packed_buf[p.data_offset..][0..p.data_len];
+                    if (wire.len != p.part_len) return error.InternalException;
+                }
+                // Non-final parts carry the packed-chunk hash of their own
+                // on-disk bytes (MAC'd for encrypted files, because the
+                // FHEXTRA_CRYPT record sets HASHMAC), so unrar's per-volume
+                // MergeArchive check passes; the final part keeps the
+                // whole-file value writeFileBlock computes itself.
+                var part_crc: ?u32 = null;
+                if (p.split_after) {
+                    const pc = checksum.crc32With(self.provider, wire);
+                    part_crc = if (encrypted) rar.rar5CrcMac(self.provider, pc, &self.data_keys.hash_key) else pc;
+                }
+                self.pos = try block_writer.writeFileBlock(
+                    self.output,
+                    self.pos,
+                    entry,
+                    wire,
+                    p.split_before,
+                    p.split_after,
+                    self.options,
+                    self.header_keys,
+                    if (encrypted) &self.data_keys else null,
+                    if (encrypted) &self.entry_iv else null,
+                    part_crc,
+                    p.entry_index,
+                    self.ws,
+                    self.provider,
+                );
+            },
+            .end => |has_next| {
+                self.pos = try block_writer.writeEndBlock(self.output, self.pos, has_next, self.header_keys, self.provider);
+                if (self.volume_slices.len <= self.volume_index) return error.CapacityException;
+                self.volume_slices[self.volume_index] = self.output[self.volume_start..self.pos];
+            },
+        }
+    }
+};
+
+// Sizes a multi-volume create: packs the entries, lays them out, and returns
+// the volume count plus the total bytes across all volumes.
+pub fn rarVolumeSize(entries: []const RarEntry, ws: *WriteBuffers, options: WriteOptions) Exception!VolumePlan {
+    if (options.volume_size == 0) return error.CallException;
+    try checkWriteEntries(entries, options);
+    _ = try packEntries(entries, ws, options);
+    var ctx = VolumeSizeCtx{ .entries = entries, .options = options };
+    try layoutVolumes(entries, ws, options, &ctx, VolumeSizeCtx.step);
+    return .{ .count = ctx.count, .total = ctx.total };
+}
+
+// Creates a multi-volume set: the volumes are written back to back into
+// `output` (which must hold the plan's total) and each volume's exact byte
+// range is stored into `volume_slices` (which must hold at least the plan's
+// count). Returns the number of volumes written.
+pub fn rarEncodeVolumes(entries: []const RarEntry, output: []u8, volume_slices: [][]u8, ws: *WriteBuffers, provider: crypto.Provider, options: WriteOptions) Exception!usize {
+    if (options.volume_size == 0) return error.CallException;
+    try checkWriteEntries(entries, options);
+    _ = try packEntries(entries, ws, options);
+
+    var header_keys: ?rar.Rar5Keys = null;
+    var header_salt: [16]u8 = @splat(0);
+    var header_pswcheck: [8]u8 = @splat(0);
+    var header_csum: [4]u8 = @splat(0);
+    if (options.encrypt_headers) {
+        const decode_opts: rar.DecodeOptions = .{
+            .kdf_rounds_limit = options.kdf_rounds_limit,
+            .failure_cause = options.failure_cause,
+            .provider = provider,
+        };
+        try crypto.fillRandom(&header_salt);
+        header_keys = try rar.rar5Kdf(options.password, &header_salt, options.kdf_lg2_count, decode_opts);
+        header_pswcheck = rar.rar5PswCheck(&header_keys.?.pswcheck);
+        header_csum = pswCheckCsum(&header_pswcheck, provider);
+    }
+
+    var ctx = VolumeEmitCtx{
+        .entries = entries,
+        .options = options,
+        .ws = ws,
+        .provider = provider,
+        .header_keys = if (options.encrypt_headers) &header_keys.? else null,
+        .header_salt = &header_salt,
+        .header_pswcheck = &header_pswcheck,
+        .header_csum = &header_csum,
+        .output = output,
+        .volume_slices = volume_slices,
+    };
+    try layoutVolumes(entries, ws, options, &ctx, VolumeEmitCtx.step);
+    return ctx.volume_index + 1;
 }
 
 test "vint encoding matches the rar5 wire form" {
@@ -751,4 +1095,368 @@ test "created encrypted archives roundtrip through the facade reader" {
         }
         try testing.expectEqual(crypto.FailureCause.wrong_password, cause);
     }
+}
+
+// Test-only harnesses for the volume calls: the create side allocates the
+// write workspace and the plan-sized output, and the decode side allocates
+// the facade reader's buffers once for reuse across ordinals.
+
+const VolumeTestWrite = struct {
+    ws: WriteBuffers = .{
+        .hash = &.{},
+        .hash2 = &.{},
+        .hash3 = &.{},
+        .bt_left = &.{},
+        .bt_right = &.{},
+        .tokens = &.{},
+        .staging = &.{},
+        .packed_buf = &.{},
+        .packed_sizes = &.{},
+    },
+    plan: VolumePlan = .{ .count = 0, .total = 0 },
+    output: []u8 = &.{},
+    volume_slices: [][]u8 = &.{},
+    view: [][]const u8 = &.{},
+    written: usize = 0,
+
+    fn init(allocator: std.mem.Allocator, entries: []const RarEntry, options: WriteOptions) Exception!VolumeTestWrite {
+        var self = VolumeTestWrite{};
+        errdefer self.deinit(allocator);
+        const sizes = pack50.workspacesFor(maxEntryInput(entries));
+        const data_encryption = options.password.len != 0;
+        // The staging also stages one part for the per-part encryption, so it
+        // must cover the largest entry's aligned part, not just the finder's need.
+        var stage_bound: usize = sizes.staging_bytes;
+        var packed_total: usize = 0;
+        for (entries) |e| {
+            const encrypted = data_encryption and !e.is_directory;
+            packed_total += packedBoundEx(e, encrypted);
+            if (encrypted) stage_bound = @max(stage_bound, std.mem.alignForward(usize, packedBoundEx(e, true), crypto.block_length));
+        }
+        self.ws.hash = allocator.alloc(u32, sizes.hash_words) catch return error.ResourceException;
+        self.ws.hash2 = allocator.alloc(u32, sizes.hash2_words) catch return error.ResourceException;
+        self.ws.hash3 = allocator.alloc(u32, sizes.hash3_words) catch return error.ResourceException;
+        self.ws.bt_left = allocator.alloc(u32, sizes.bt_words) catch return error.ResourceException;
+        self.ws.bt_right = allocator.alloc(u32, sizes.bt_words) catch return error.ResourceException;
+        self.ws.tokens = allocator.alloc(finder.LzToken, sizes.token_count) catch return error.ResourceException;
+        self.ws.staging = allocator.alloc(u8, stage_bound) catch return error.ResourceException;
+        self.ws.packed_buf = allocator.alloc(u8, packed_total) catch return error.ResourceException;
+        self.ws.packed_sizes = allocator.alloc(usize, entries.len) catch return error.ResourceException;
+        if (data_encryption) self.ws.crypt_salts = allocator.alloc([16]u8, entries.len) catch return error.ResourceException;
+        self.plan = try rarVolumeSize(entries, &self.ws, options);
+        self.output = allocator.alloc(u8, self.plan.total) catch return error.ResourceException;
+        self.volume_slices = allocator.alloc([]u8, self.plan.count) catch return error.ResourceException;
+        self.written = try rarEncodeVolumes(entries, self.output, self.volume_slices, &self.ws, crypto.default_provider, options);
+        self.view = allocator.alloc([]const u8, self.plan.count) catch return error.ResourceException;
+        for (self.view, self.volume_slices) |*dst, src| dst.* = src;
+        return self;
+    }
+
+    fn deinit(self: *VolumeTestWrite, allocator: std.mem.Allocator) void {
+        allocator.free(self.view);
+        allocator.free(self.volume_slices);
+        allocator.free(self.output);
+        allocator.free(self.ws.crypt_salts);
+        allocator.free(self.ws.packed_sizes);
+        allocator.free(self.ws.packed_buf);
+        allocator.free(self.ws.staging);
+        allocator.free(self.ws.tokens);
+        allocator.free(self.ws.bt_right);
+        allocator.free(self.ws.bt_left);
+        allocator.free(self.ws.hash3);
+        allocator.free(self.ws.hash2);
+        allocator.free(self.ws.hash);
+    }
+};
+
+fn maxEntryInput(entries: []const RarEntry) usize {
+    var max_input: usize = 0;
+    for (entries) |e| max_input = @max(max_input, e.data.len);
+    return max_input;
+}
+
+const VolumeTestDecode = struct {
+    state_store: []u64 = &.{},
+    window: []u8 = &.{},
+    table_pool: []u16 = &.{},
+    pending50: []rar.PendingFilter50 = &.{},
+    pending29: []rar.PendingFilter29 = &.{},
+    filter_scratch: []u8 = &.{},
+    ppm_heap: []u8 = &.{},
+
+    fn init(allocator: std.mem.Allocator) Exception!VolumeTestDecode {
+        var self = VolumeTestDecode{};
+        errdefer self.deinit(allocator);
+        self.window = allocator.alloc(u8, 1 << 20) catch return error.ResourceException;
+        self.state_store = allocator.alloc(u64, (rar.max_unpacker_bytes + 7) / 8) catch return error.ResourceException;
+        self.table_pool = allocator.alloc(u16, rar.table_pool_words) catch return error.ResourceException;
+        self.pending50 = allocator.alloc(rar.PendingFilter50, rar.max_pending50) catch return error.ResourceException;
+        self.pending29 = allocator.alloc(rar.PendingFilter29, rar.max_pending29) catch return error.ResourceException;
+        self.filter_scratch = allocator.alloc(u8, (1 << 20) + rar.filter_scratch_extra) catch return error.ResourceException;
+        self.ppm_heap = allocator.alloc(u8, 1 << 20) catch return error.ResourceException;
+        return self;
+    }
+
+    // The split-part scratch and the packed stage stay per-test locals, because
+    // their sizing is part of what the tests pin.
+    fn buffers(self: *VolumeTestDecode, split_parts: []rar.SplitPart, packed_stage: []u8) rar.DecodeBuffers {
+        return .{
+            .state = std.mem.sliceAsBytes(self.state_store),
+            .window = self.window,
+            .table_pool = self.table_pool,
+            .pending50 = self.pending50,
+            .pending29 = self.pending29,
+            .filter_scratch = self.filter_scratch,
+            .ppm_heap = self.ppm_heap,
+            .split_parts = split_parts,
+            .packed_stage = packed_stage,
+        };
+    }
+
+    fn deinit(self: *VolumeTestDecode, allocator: std.mem.Allocator) void {
+        allocator.free(self.ppm_heap);
+        allocator.free(self.filter_scratch);
+        allocator.free(self.pending29);
+        allocator.free(self.pending50);
+        allocator.free(self.table_pool);
+        allocator.free(self.state_store);
+        allocator.free(self.window);
+    }
+};
+
+test "multi-volume archives round-trip through the volume reader" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    var data2: [600]u8 = undefined;
+    // Incompressible bytes: a repeating pattern would let the LZ stage shrink
+    // the packed stream enough that the split paths never fire.
+    var seed: u32 = 0x9E3779B9;
+    for (&data2) |*byte| {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        byte.* = @truncate(seed);
+    }
+    const entries = [_]RarEntry{
+        .{ .name = "m1.txt", .data = "hello rar5 stored", .method = 0 },
+        .{ .name = "m2.txt", .data = &data2, .method = 3 },
+        .{ .name = "empty.txt", .data = "", .method = 0 },
+        .{ .name = "sub", .data = &.{}, .is_directory = true },
+    };
+
+    var w = try VolumeTestWrite.init(allocator, &entries, .{ .volume_size = 200 });
+    defer w.deinit(allocator);
+    try testing.expect(w.plan.count >= 3);
+    try testing.expectEqual(w.plan.count, w.written);
+    // Directories are listed but not counted as readable entries.
+    try testing.expectEqual(@as(usize, 3), try rar.rarVolumeCount(w.view, 128, .{}));
+
+    var d = try VolumeTestDecode.init(allocator);
+    defer d.deinit(allocator);
+    var split_parts: [32]rar.SplitPart = undefined;
+    var packed_stage: [8192]u8 = undefined;
+    const bufs = d.buffers(&split_parts, &packed_stage);
+
+    const out1 = try allocator.alloc(u8, "hello rar5 stored".len);
+    defer allocator.free(out1);
+    const out2 = try allocator.alloc(u8, data2.len);
+    defer allocator.free(out2);
+    try testing.expectEqual(out1.len, try rar.rarVolumeDecodeOrdinal(w.view, 0, out1, @constCast(&bufs), .{}));
+    try testing.expectEqualSlices(u8, "hello rar5 stored", out1);
+    try testing.expectEqual(out2.len, try rar.rarVolumeDecodeOrdinal(w.view, 1, out2, @constCast(&bufs), .{}));
+    try testing.expectEqualSlices(u8, &data2, out2);
+    try testing.expectEqual(@as(usize, 0), try rar.rarVolumeDecodeOrdinal(w.view, 2, &.{}, @constCast(&bufs), .{}));
+}
+
+test "multi-volume encrypted splits round-trip and reject wrong passwords" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const password = "secret-pw";
+    var data2: [600]u8 = undefined;
+    // Incompressible bytes, so the encrypted split spans several parts.
+    var seed: u32 = 0x9E3779B9;
+    for (&data2) |*byte| {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        byte.* = @truncate(seed);
+    }
+    const entries = [_]RarEntry{
+        .{ .name = "e1.txt", .data = "hello encrypted rar5 stored", .method = 0 },
+        .{ .name = "e2.bin", .data = &data2, .method = 3 },
+        .{ .name = "sub", .data = &.{}, .is_directory = true },
+    };
+
+    var d = try VolumeTestDecode.init(allocator);
+    defer d.deinit(allocator);
+    var header_scratch: [4096]u8 = undefined;
+    var split_parts: [32]rar.SplitPart = undefined;
+    var packed_stage: [8192]u8 = undefined;
+    const out1 = try allocator.alloc(u8, "hello encrypted rar5 stored".len);
+    defer allocator.free(out1);
+    const out2 = try allocator.alloc(u8, data2.len);
+    defer allocator.free(out2);
+
+    const cases = [_]WriteOptions{
+        .{ .password = password, .volume_size = 220 },
+        .{ .password = password, .encrypt_headers = true, .volume_size = 512 },
+    };
+    for (cases) |options| {
+        var w = try VolumeTestWrite.init(allocator, &entries, options);
+        defer w.deinit(allocator);
+        try testing.expect(w.plan.count >= 2);
+        try testing.expectEqual(w.plan.count, w.written);
+
+        const decode_opts: rar.DecodeOptions = .{
+            .password = password,
+            .scratch = &header_scratch,
+        };
+        const bufs = d.buffers(&split_parts, &packed_stage);
+        try testing.expectEqual(@as(usize, 2), try rar.rarVolumeCount(w.view, 128, decode_opts));
+        try testing.expectEqual(out1.len, try rar.rarVolumeDecodeOrdinal(w.view, 0, out1, @constCast(&bufs), decode_opts));
+        try testing.expectEqualSlices(u8, "hello encrypted rar5 stored", out1);
+        try testing.expectEqual(out2.len, try rar.rarVolumeDecodeOrdinal(w.view, 1, out2, @constCast(&bufs), decode_opts));
+        try testing.expectEqualSlices(u8, &data2, out2);
+
+        // The wrong password fails the volume paths like the single-volume
+        // ones: -p dies at the entry's password check, -hp at the header one.
+        var cause: crypto.FailureCause = .none;
+        const wrong_opts: rar.DecodeOptions = .{
+            .password = "wrong",
+            .scratch = &header_scratch,
+            .failure_cause = &cause,
+        };
+        if (options.encrypt_headers) {
+            try testing.expectError(error.IntegrityException, rar.rarVolumeCount(w.view, 128, wrong_opts));
+        } else {
+            try testing.expectError(error.DataException, rar.rarVolumeDecodeOrdinal(w.view, 0, out1, @constCast(&bufs), wrong_opts));
+        }
+        try testing.expectEqual(crypto.FailureCause.wrong_password, cause);
+    }
+}
+
+test "volume headers pin the volume number and next-volume end marker" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    var data: [500]u8 = undefined;
+    for (&data, 0..) |*byte, i| byte.* = @truncate(i *% 7 +% (i >> 2));
+
+    const entries = [_]RarEntry{
+        .{ .name = "big.bin", .data = &data, .method = 0 },
+    };
+
+    var w = try VolumeTestWrite.init(allocator, &entries, .{ .volume_size = 180 });
+    defer w.deinit(allocator);
+    try testing.expect(w.plan.count >= 3);
+    try testing.expectEqual(w.plan.count, w.written);
+
+    for (w.view, 0..) |vol, v| {
+        const final = v + 1 == w.view.len;
+        // The signature repeats on every volume. The CRC spans the size vint
+        // and the body, so the pins start after it: volume 0's main block is
+        // {size 3, type 1, flags 0, MHFL_VOLUME}, and every later volume
+        // carries MHFL_VOLUME|MHFL_VOLNUMBER plus its zero-based number.
+        try testing.expectEqualSlices(u8, &rar.rar5_signature, vol[0..8]);
+        if (v == 0) {
+            try testing.expectEqualSlices(u8, &[_]u8{ 0x03, 0x01, 0x00, 0x01 }, vol[12..16]);
+        } else {
+            try testing.expectEqual(@as(u8, 0x04), vol[12]);
+            try testing.expectEqualSlices(u8, &[_]u8{ 0x01, 0x00, 0x03, @intCast(v) }, vol[13..17]);
+        }
+        // Every volume closes with an end block: size 3, type 5, and the
+        // next-volume flag set on all but the final volume.
+        const tail: [4]u8 = if (final) .{ 0x03, 0x05, 0x00, 0x00 } else .{ 0x03, 0x05, 0x00, 0x01 };
+        try testing.expectEqualSlices(u8, &tail, vol[vol.len - 4 ..]);
+    }
+
+    var d = try VolumeTestDecode.init(allocator);
+    defer d.deinit(allocator);
+    var split_parts: [16]rar.SplitPart = undefined;
+    var packed_stage: [1024]u8 = undefined;
+    const bufs = d.buffers(&split_parts, &packed_stage);
+    try testing.expectEqual(@as(usize, 1), try rar.rarVolumeCount(w.view, 128, .{}));
+    const out = try allocator.alloc(u8, data.len);
+    defer allocator.free(out);
+    try testing.expectEqual(data.len, try rar.rarVolumeDecodeOrdinal(w.view, 0, out, @constCast(&bufs), .{}));
+    try testing.expectEqualSlices(u8, &data, out);
+}
+
+test "volume reader rejects short, misordered, and single-volume reads" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    var a_data: [300]u8 = undefined;
+    for (&a_data, 0..) |*byte, i| byte.* = @truncate(i *% 7 +% (i >> 2));
+    var b_data: [600]u8 = undefined;
+    // Incompressible bytes: a compressible stream could pack both entries
+    // into too few volumes to exercise the split paths.
+    var seed: u32 = 0x9E3779B9;
+    for (&b_data) |*byte| {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        byte.* = @truncate(seed);
+    }
+    const entries = [_]RarEntry{
+        .{ .name = "a.txt", .data = &a_data, .method = 0 },
+        .{ .name = "b.bin", .data = &b_data, .method = 3 },
+    };
+
+    var w = try VolumeTestWrite.init(allocator, &entries, .{ .volume_size = 170 });
+    defer w.deinit(allocator);
+    try testing.expect(w.plan.count >= 3);
+    try testing.expectEqual(w.plan.count, w.written);
+
+    var d = try VolumeTestDecode.init(allocator);
+    defer d.deinit(allocator);
+    var split_parts: [32]rar.SplitPart = undefined;
+    var packed_stage: [8192]u8 = undefined;
+    const bufs = d.buffers(&split_parts, &packed_stage);
+    const out_a = try allocator.alloc(u8, a_data.len);
+    defer allocator.free(out_a);
+    const out_b = try allocator.alloc(u8, b_data.len);
+    defer allocator.free(out_b);
+
+    try testing.expectEqual(@as(usize, 2), try rar.rarVolumeCount(w.view, 128, .{}));
+    try testing.expectEqual(a_data.len, try rar.rarVolumeDecodeOrdinal(w.view, 0, out_a, @constCast(&bufs), .{}));
+    try testing.expectEqualSlices(u8, &a_data, out_a);
+    try testing.expectEqual(b_data.len, try rar.rarVolumeDecodeOrdinal(w.view, 1, out_b, @constCast(&bufs), .{}));
+    try testing.expectEqualSlices(u8, &b_data, out_b);
+
+    // The walk refuses a hole (the survivors renumber), a dropped head, and a
+    // lone non-final volume.
+    const gap = try allocator.alloc([]const u8, w.written - 1);
+    defer allocator.free(gap);
+    gap[0] = w.view[0];
+    @memcpy(gap[1..], w.view[2..]);
+    try testing.expectError(error.DataException, rar.rarVolumeCount(gap, 128, .{}));
+    try testing.expectError(error.DataException, rar.rarVolumeCount(w.view[1..w.written], 128, .{}));
+    try testing.expectError(error.DataException, rar.rarVolumeCount(w.view[0..1], 128, .{}));
+
+    // The single-volume facade refuses volume-set members: a main block with
+    // the volume flags never passes the single-volume walk.
+    try testing.expectError(error.UnsupportedException, rar.rarInspectCount(w.view[0], 128));
+    try testing.expectError(error.UnsupportedException, rar.rarDecodeOrdinal(w.view[1], 0, out_a, @constCast(&bufs), .{}));
+
+    // An empty part scratch cannot record a split entry's chain.
+    const no_parts = d.buffers(&.{}, &packed_stage);
+    try testing.expectError(error.InternalException, rar.rarVolumeDecodeOrdinal(w.view, 0, out_a, @constCast(&no_parts), .{}));
+    try testing.expectError(error.InternalException, rar.rarVolumeDecodeOrdinal(w.view, 1, out_b, @constCast(&no_parts), .{}));
+
+    // A budget that cannot hold the fixed prefix refuses instead of laying
+    // out, and the single-volume calls reject a volume budget.
+    try testing.expectError(error.CallException, rarVolumeSize(&entries, &w.ws, .{ .volume_size = 8 }));
+    try testing.expectError(error.CallException, rarWriteSizeEx(&entries, &w.ws, .{ .volume_size = 170 }));
+    var tiny: [64]u8 = undefined;
+    try testing.expectError(error.CallException, rarEncodeEx(&entries, &tiny, &w.ws, crypto.default_provider, .{ .volume_size = 170 }));
+
+    // The volume reader also accepts a one-volume set: the writer marks even a
+    // single volume with MHFL_VOLUME.
+    var sw = try VolumeTestWrite.init(allocator, &entries, .{ .volume_size = 1 << 16 });
+    defer sw.deinit(allocator);
+    try testing.expectEqual(@as(usize, 1), sw.plan.count);
+    try testing.expectEqual(@as(usize, 2), try rar.rarVolumeCount(sw.view, 128, .{}));
+    try testing.expectEqual(a_data.len, try rar.rarVolumeDecodeOrdinal(sw.view, 0, out_a, @constCast(&bufs), .{}));
+    try testing.expectEqualSlices(u8, &a_data, out_a);
+    try testing.expectEqual(b_data.len, try rar.rarVolumeDecodeOrdinal(sw.view, 1, out_b, @constCast(&bufs), .{}));
+    try testing.expectEqualSlices(u8, &b_data, out_b);
 }

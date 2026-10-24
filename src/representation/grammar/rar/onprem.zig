@@ -23,6 +23,15 @@ pub const max_pending50 = unpack50.max_pending_filters;
 
 pub const Family = enum { rar4, rar5 };
 
+// One data part of a multi-volume split entry: the volume it lives in (an
+// index into the caller's volume list), the part's offset inside that volume,
+// and its packed size on the wire.
+pub const SplitPart = struct {
+    volume: usize,
+    offset: usize,
+    packed_size: usize,
+};
+
 pub const RarInfo = struct {
     name: []const u8,
     size: u64,
@@ -62,6 +71,11 @@ pub const Entry = struct {
     // The encryption parameters from the header of the entry, for -p and -m file data. The
     // walk handles -hp header encryption and does not set this field.
     crypt: ?Crypt = null,
+    // The data parts of a split entry from the multi-volume walk, in volume
+    // order. The parts point into the caller's part scratch, which the walk
+    // reuses per entry, so they are valid only until the next entry completes:
+    // a volume decode consumes them inside its own walk.
+    parts: []const SplitPart = &.{},
 };
 
 pub const Crypt = union(enum) {
@@ -106,7 +120,9 @@ const sfx_scan_limit: usize = 1024 * 1024;
 // The decode-side buffers, carved by the caller from the call workspace. One engine
 // state is live at a time, so `state` holds it and `ppm_heap` is the last PPMd carve.
 pub const DecodeBuffers = struct {
-    // The staging for decrypted packed data, because AES-CBC needs a mutable copy.
+    // The staging for decrypted packed data, because AES-CBC needs a mutable
+    // copy. The multi-volume gather also uses it to concatenate a plain split
+    // entry's parts, so it must hold the largest entry's packed bytes.
     packed_stage: []u8 = &.{},
     state: []align(8) u8,
     window: []u8,
@@ -115,6 +131,11 @@ pub const DecodeBuffers = struct {
     pending29: []unpack29.PendingFilter,
     filter_scratch: []u8,
     ppm_heap: []u8,
+    // The part scratch for the multi-volume walk: one slot per data part of
+    // the longest split entry, which the volume count bounds (one part per
+    // volume per entry). The walk records each completed entry's chain at the
+    // scratch start, so the scratch only has to outlive one entry.
+    split_parts: []SplitPart = &.{},
 
     pub fn state50(self: *DecodeBuffers) Exception!*unpack50.Unpacker {
         if (self.state.len < @sizeOf(unpack50.Unpacker)) return error.InternalException;
@@ -170,13 +191,14 @@ pub const rar5_type_end: u64 = 5;
 pub const rar5_flag_extra: u64 = 0x0001;
 pub const rar5_flag_data: u64 = 0x0002;
 pub const rar5_flag_split_before: u64 = 0x0008;
-const rar5_flag_split_after: u64 = 0x0010;
+pub const rar5_flag_split_after: u64 = 0x0010;
 // HFL_CHILD and HFL_INHERITED: a child block refines its parent and inherits
 // nothing on its own; listing counts a HEAD_FILE child and skips a service one.
 const rar5_flag_child: u64 = 0x0020;
 const rar5_flag_inherited: u64 = 0x0040;
-const rar5_archive_volume: u64 = 0x0001;
-const rar5_archive_volnum: u64 = 0x0002;
+pub const rar5_archive_volume: u64 = 0x0001;
+pub const rar5_archive_volnum: u64 = 0x0002;
+pub const rar5_earc_next_volume: u64 = 0x0001;
 pub const rar5_file_directory: u64 = 0x0001;
 pub const rar5_file_mtime: u64 = 0x0002;
 pub const rar5_file_crc32: u64 = 0x0004;
@@ -489,6 +511,8 @@ const Rar5Block = struct {
     blake2: ?[32]u8 = null,
     is_directory: bool = false,
     archive_flags: u64 = 0,
+    // The zero-based volume number from a MHFL_VOLNUMBER main header.
+    archive_volnum: u64 = 0,
     mtime: u64 = 0,
     crypt: ?Crypt = null,
     // The HEAD_CRYPT fields, which are valid only when header_type is encryption.
@@ -634,15 +658,12 @@ fn finishRar5Block(provider: crypto.Provider, body: *binary.ReadCursor) Exceptio
         rar5_type_main => {
             result.archive_flags = try body.readUleb128();
             if (result.archive_flags & rar5_archive_volnum != 0) {
-                _ = try body.readUleb128();
+                result.archive_volnum = try body.readUleb128();
             }
         },
         rar5_type_file, rar5_type_service => {
-            // Splits need the peer volume, which this facade never reads. The child
-            // and inherited bits refine a parent block and stay walkable: unrar lists
-            // a HEAD_FILE child as its own entry and skips a service child entirely.
-            if (flags & (rar5_flag_split_before | rar5_flag_split_after) != 0)
-                return error.UnsupportedException;
+            // The split flags stay walkable here, because only the volume walk
+            // can parse a split chain; the single-volume walk rejects them.
             try parseRar5FileBody(provider, body, flags, extra_size, &result);
         },
         rar5_type_encryption => {
@@ -713,6 +734,83 @@ fn parseRar5BlockEncrypted(
     return block;
 }
 
+// The file-entry construction and validation shared by the single-volume walk
+// and the multi-volume walk. The caller checks the split flags and supplies the
+// packed total (the summed parts for a split chain, the block data size
+// otherwise) plus the crypt record that the chain opened with, because a
+// continuation header alone would only know its own part.
+fn rar5FileEntry(header: Rar5Block, ordinal: usize, packed_total: u64, crypt: ?Crypt) Exception!Entry {
+    var entry: Entry = .{
+        .info = .{
+            .name = header.name,
+            .size = header.unpacked_size,
+            .data_offset = header.data_offset,
+            .packed_size = packed_total,
+            .crc = header.data_crc32,
+            .has_crc = header.file_flags & rar5_file_crc32 != 0,
+            .ordinal = ordinal,
+            .mtime = header.mtime,
+        },
+        .family = .rar5,
+        .is_directory = header.is_directory,
+        .method = 0,
+        .unpack_version = 0,
+        .solid = false,
+        .file_flags = 0,
+        .dict_bits = 0,
+        .blake2 = header.blake2,
+        .crypt = crypt,
+    };
+    if (!header.is_directory) {
+        if (header.file_flags & rar5_file_size_unknown != 0) return error.UnsupportedException;
+        if (header.flags & rar5_flag_data == 0) return error.UnsupportedException;
+        const method = (header.compression >> 7) & 0x7;
+        const algo_raw: u8 = @intCast(header.compression & 0x3F);
+        const compat_flag = (header.compression >> 20) & 1 != 0;
+        if (method == 0) {
+            // An encrypted stored file still pads its data to the AES block, so
+            // the packed total can exceed unpacked_size by up to 15 bytes;
+            // plaintext stored must match exactly.
+            if (crypt) |c| {
+                if (c != .rar5) return error.UnsupportedException;
+                if (packed_total < header.unpacked_size or packed_total > header.unpacked_size + 15) return error.UnsupportedException;
+            } else if (packed_total != header.unpacked_size) return error.UnsupportedException;
+            entry.method = 0;
+        } else {
+            if (method > 5) return error.UnsupportedException;
+            // The version field is the raw algorithm version: 0 is RAR5,
+            // 1 is RAR7, and anything above has no unpacker here or upstream.
+            if (algo_raw > 1) return error.UnsupportedException;
+            // The window that the entry requires. A smaller window silently truncates
+            // history, so a window that does not fit is refused, never clamped. The
+            // exponent mask follows the raw version, not the compat-mapped one
+            // (unrar arcread.cpp ReadHeader50): 4 bits for v50, 5 bits for v70.
+            const window_bits_field: u6 = @intCast((header.compression >> 10) & (if (algo_raw == 0) @as(u64, 0x0F) else 0x1F));
+            var window_bytes: u64 = @as(u64, 0x20000) << window_bits_field;
+            if (algo_raw == 1) {
+                // The RAR7 window adds a 5-bit fraction of 1/32 steps, and the
+                // 64 GiB unpacker ceiling rejects the result (unrar VER_UNKNOWN).
+                window_bytes += window_bytes / 32 * ((header.compression >> 15) & 0x1F);
+                if (window_bytes > 0x1000000000) return error.UnsupportedException;
+            }
+            entry.method = @intCast(method);
+            entry.unpack_version = if (compat_flag) 50 else if (algo_raw == 0) 50 else 70;
+            entry.dict_bits = windowBitsCeil(window_bytes);
+            entry.solid = (header.compression >> 6) & 1 != 0;
+        }
+        // Integrity coverage is CRC32 or better; a file block that carries neither
+        // (some producers strip both) is refused rather than delivered unverifiable.
+        if (header.file_flags & rar5_file_crc32 == 0 and header.blake2 == null)
+            return error.UnsupportedException;
+    }
+    entry.info.family = .rar5;
+    entry.info.method = entry.method;
+    entry.info.unpack_version = entry.unpack_version;
+    entry.info.window_bytes = if (entry.method == 0) 0 else @as(u64, 1) << entry.dict_bits;
+    entry.info.solid = entry.solid;
+    return entry;
+}
+
 // Walk the archive and call `visit` for every file entry in archive order, verifying each
 // header CRC; a directory is walked but not visited, and a HEAD_CRYPT block decrypts the rest.
 fn walkRar5(archive: []const u8, offset: usize, opts: DecodeOptions, ctx: anytype, comptime visit: fn (@TypeOf(ctx), Entry) Exception!void) Exception!void {
@@ -754,82 +852,21 @@ fn walkRar5(archive: []const u8, offset: usize, opts: DecodeOptions, ctx: anytyp
             },
             rar5_type_service => {
                 if (!seen_main) return error.DataException;
-                // Service blocks, such as QuickOpen, carry no payload for this
-                // facade, so skip their data.
+                // A split service header needs the peer volume, which this walk
+                // never reads. Service blocks, such as QuickOpen, carry no
+                // payload for this facade, so the rest is skipped.
+                if (header.flags & (rar5_flag_split_before | rar5_flag_split_after) != 0)
+                    return error.UnsupportedException;
                 continue;
             },
             rar5_type_file => {
                 if (!seen_main) return error.DataException;
-                var entry: Entry = .{
-                    .info = .{
-                        .name = header.name,
-                        .size = header.unpacked_size,
-                        .data_offset = header.data_offset,
-                        .packed_size = header.data_size,
-                        .crc = header.data_crc32,
-                        .has_crc = header.file_flags & rar5_file_crc32 != 0,
-                        .ordinal = ordinal,
-                        .mtime = header.mtime,
-                    },
-                    .family = .rar5,
-                    .is_directory = header.is_directory,
-                    .method = 0,
-                    .unpack_version = 0,
-                    .solid = false,
-                    .file_flags = 0,
-                    .dict_bits = 0,
-                    .blake2 = header.blake2,
-                    .crypt = header.crypt,
-                };
-                if (!header.is_directory) {
-                    if (header.file_flags & rar5_file_size_unknown != 0) return error.UnsupportedException;
-                    if (header.flags & rar5_flag_data == 0) return error.UnsupportedException;
-                    const method = (header.compression >> 7) & 0x7;
-                    const algo_raw: u8 = @intCast(header.compression & 0x3F);
-                    const compat_flag = (header.compression >> 20) & 1 != 0;
-                    if (method == 0) {
-                        // An encrypted stored file still pads its data to the
-                        // AES block, so data_size can exceed unpacked_size by
-                        // up to 15 bytes; plaintext stored must match exactly.
-                        if (header.crypt) |c| {
-                            if (c != .rar5) return error.UnsupportedException;
-                            if (header.data_size < header.unpacked_size or header.data_size > header.unpacked_size + 15) return error.UnsupportedException;
-                        } else if (header.data_size != header.unpacked_size) return error.UnsupportedException;
-                        entry.method = 0;
-                    } else {
-                        if (method > 5) return error.UnsupportedException;
-                        // The version field is the raw algorithm version: 0 is RAR5,
-                        // 1 is RAR7, and anything above has no unpacker here or upstream.
-                        if (algo_raw > 1) return error.UnsupportedException;
-                        // The window that the entry requires. A smaller window silently truncates
-                        // history, so a window that does not fit is refused, never clamped. The
-                        // exponent mask follows the raw version, not the compat-mapped one
-                        // (unrar arcread.cpp ReadHeader50): 4 bits for v50, 5 bits for v70.
-                        const window_bits_field: u6 = @intCast((header.compression >> 10) & (if (algo_raw == 0) @as(u64, 0x0F) else 0x1F));
-                        var window_bytes: u64 = @as(u64, 0x20000) << window_bits_field;
-                        if (algo_raw == 1) {
-                            // The RAR7 window adds a 5-bit fraction of 1/32 steps, and the
-                            // 64 GiB unpacker ceiling rejects the result (unrar VER_UNKNOWN).
-                            window_bytes += window_bytes / 32 * ((header.compression >> 15) & 0x1F);
-                            if (window_bytes > 0x1000000000) return error.UnsupportedException;
-                        }
-                        entry.method = @intCast(method);
-                        entry.unpack_version = if (compat_flag) 50 else if (algo_raw == 0) 50 else 70;
-                        entry.dict_bits = windowBitsCeil(window_bytes);
-                        entry.solid = (header.compression >> 6) & 1 != 0;
-                    }
-                    // Integrity coverage is CRC32 or better; a file block that carries neither
-                    // (some producers strip both) is refused rather than delivered unverifiable.
-                    if (header.file_flags & rar5_file_crc32 == 0 and header.blake2 == null)
-                        return error.UnsupportedException;
-                }
-                entry.info.family = .rar5;
-                entry.info.method = entry.method;
-                entry.info.unpack_version = entry.unpack_version;
-                entry.info.window_bytes = if (entry.method == 0) 0 else @as(u64, 1) << entry.dict_bits;
-                entry.info.solid = entry.solid;
-                // Ordinals count the entries that a caller can read: the walk lists a directory
-                // but never exposes it, so a directory must not shift the file ordinals.
+                // Splits need the peer volume, which this walk never reads.
+                if (header.flags & (rar5_flag_split_before | rar5_flag_split_after) != 0)
+                    return error.UnsupportedException;
+                const entry = try rar5FileEntry(header, ordinal, header.data_size, header.crypt);
+                // Ordinals count the entries that a caller can read: the walk lists a
+                // directory but never exposes it, so a directory must not shift the ordinals.
                 if (!entry.is_directory) {
                     ordinal = try bounds.addUsize(ordinal, 1);
                     try visit(ctx, entry);
@@ -1507,6 +1544,416 @@ fn replayVisitCtx(comptime Session: type) fn (*ReplayCtx(Session), Entry) Except
             try replayVisit(ctx.session, ctx.archive, ctx.locate, entry, ctx.output, ctx.opts, ctx.bufs, ctx.target_version);
         }
     }.visit;
+}
+
+// A split chain in progress across volumes: the head's identity that every
+// continuation must match, stored as a name hash and length because a -hp
+// volume reuses the header scratch per block, so a name pointer from an
+// earlier block would dangle. One part per volume per entry is the layout
+// rule (both this writer and WinRAR), so the volume count bounds part_count.
+const VolumeWalkState = struct {
+    name_hash: u32,
+    name_len: usize,
+    compression: u64,
+    last_volume: usize,
+    first_crypt: ?Crypt = null,
+    part_count: usize = 0,
+    total_packed: usize = 0,
+};
+
+// Walk an ordered multi-volume RAR5 set and call `visit` for every completed
+// file entry in set order. Volume 0 must open the set (no MHFL_VOLNUMBER),
+// every later volume must carry the matching volume number, and a non-final
+// volume must end with the EARC_NEXT_VOLUME marker; the last volume ends with
+// a plain end block or a block-boundary EOF. Split chains complete at their
+// last part: the entry then carries the summed packed size, the head's crypt
+// record, and the parts recorded into `parts_scratch`, which the walk reuses
+// per entry. Service headers may span volumes (QuickOpen does); their payload
+// is not read, so their split flags are tolerated.
+fn walkRar5Volumes(
+    volumes: []const []const u8,
+    parts_scratch: []SplitPart,
+    opts: DecodeOptions,
+    ctx: anytype,
+    comptime visit: fn (@TypeOf(ctx), Entry) Exception!void,
+) Exception!void {
+    if (volumes.len == 0) return error.DataException;
+    var ordinal: usize = 0;
+    var chain: ?VolumeWalkState = null;
+    for (volumes, 0..) |archive, volume_index| {
+        if (archive.len < rar5_signature.len or
+            !std.mem.eql(u8, archive[0..rar5_signature.len], &rar5_signature))
+        {
+            // A RAR4 volume would need the legacy walk, which this path never drives.
+            if (archive.len >= rar4_signature.len and
+                std.mem.eql(u8, archive[0..rar4_signature.len], &rar4_signature))
+                return error.UnsupportedException;
+            return error.DataException;
+        }
+        var cursor = rar5_signature.len;
+        var seen_main = false;
+        var header_crypt: ?Rar5Keys = null;
+        var ended = false;
+        while (cursor < archive.len) {
+            const header = if (header_crypt) |*keys|
+                try parseRar5BlockEncrypted(archive, &cursor, keys, opts.provider, opts.scratch)
+            else
+                try parseRar5Block(archive, &cursor, opts.provider);
+            switch (header.header_type) {
+                rar5_type_encryption => {
+                    // -hp repeats the encryption block on every volume, so the
+                    // headers decrypt standalone; the KDF memo makes the repeat free.
+                    if (header.enc_lg2count > rar5_kdf_lg2_count_max) return error.UnsupportedException;
+                    const password = opts.password orelse return error.UnsupportedException;
+                    const keys = try rar5Kdf(password, &header.enc_salt, header.enc_lg2count, opts);
+                    if (header.enc_pswcheck) |expected| {
+                        if (!crypto.constantTimeEql(&rar5PswCheck(&keys.pswcheck), &expected)) {
+                            if (opts.failure_cause) |cause| cause.* = .wrong_password;
+                            return error.IntegrityException;
+                        }
+                    }
+                    header_crypt = keys;
+                },
+                rar5_type_main => {
+                    if (header.flags & (rar5_flag_data | rar5_flag_split_before | rar5_flag_split_after | rar5_flag_child | rar5_flag_inherited) != 0)
+                        return error.UnsupportedException;
+                    if (volume_index == 0) {
+                        // Volume 0 never carries a number (unrar FirstVolume:
+                        // Volume && VolNumber == 0), and a single-volume list
+                        // also accepts a plain archive, so the volume flag is
+                        // required only when a set was promised.
+                        if (header.archive_flags & rar5_archive_volnum != 0) return error.DataException;
+                        if (volumes.len > 1 and header.archive_flags & rar5_archive_volume == 0)
+                            return error.DataException;
+                    } else {
+                        if (header.archive_flags & rar5_archive_volume == 0) return error.DataException;
+                        if (header.archive_flags & rar5_archive_volnum == 0) return error.DataException;
+                        if (header.archive_volnum != volume_index) return error.DataException;
+                    }
+                    seen_main = true;
+                },
+                rar5_type_end => {
+                    if (!seen_main) return error.DataException;
+                    if (header.archive_flags & rar5_earc_next_volume != 0) {
+                        // The set must continue with the next volume in order.
+                        if (volume_index + 1 >= volumes.len) return error.DataException;
+                        ended = true;
+                        break;
+                    }
+                    if (volume_index + 1 != volumes.len) return error.DataException;
+                    if (chain != null) return error.DataException;
+                    return;
+                },
+                rar5_type_service => {
+                    if (!seen_main) return error.DataException;
+                    continue;
+                },
+                rar5_type_file => {
+                    if (!seen_main) return error.DataException;
+                    const split_before = header.flags & rar5_flag_split_before != 0;
+                    const split_after = header.flags & rar5_flag_split_after != 0;
+                    // A directory is walked but never split: a producer that
+                    // marks one is reporting a layout this reader cannot name.
+                    if (header.is_directory and (split_before or split_after))
+                        return error.DataException;
+                    if (header.is_directory) continue;
+                    if (chain == null) {
+                        // A chain opens only at a part-0 header.
+                        if (split_before) return error.DataException;
+                        chain = .{
+                            .name_hash = checksum.crc32With(opts.provider, header.name),
+                            .name_len = header.name.len,
+                            .compression = header.compression,
+                            .last_volume = volume_index,
+                            .first_crypt = header.crypt,
+                        };
+                    } else {
+                        // A continuation must match its head — the same name
+                        // and compression — and arrive from a strictly later
+                        // volume, because one part per volume is the layout rule.
+                        if (!split_before) return error.DataException;
+                        if (checksum.crc32With(opts.provider, header.name) != chain.?.name_hash or
+                            header.name.len != chain.?.name_len or
+                            header.compression != chain.?.compression)
+                            return error.DataException;
+                        if (volume_index <= chain.?.last_volume) return error.DataException;
+                        chain.?.last_volume = volume_index;
+                        if (chain.?.first_crypt == null) chain.?.first_crypt = header.crypt;
+                    }
+                    const part_packed = std.math.cast(usize, header.data_size) orelse return error.ResourceException;
+                    chain.?.total_packed = try bounds.addUsize(chain.?.total_packed, part_packed);
+                    if (parts_scratch.len > 0) {
+                        if (chain.?.part_count >= parts_scratch.len) return error.InternalException;
+                        parts_scratch[chain.?.part_count] = .{
+                            .volume = volume_index,
+                            .offset = header.data_offset,
+                            .packed_size = part_packed,
+                        };
+                    }
+                    chain.?.part_count = try bounds.addUsize(chain.?.part_count, 1);
+                    if (!split_after) {
+                        const head = chain.?;
+                        var entry = try rar5FileEntry(header, ordinal, head.total_packed, head.first_crypt);
+                        if (parts_scratch.len > 0) {
+                            entry.parts = parts_scratch[0..head.part_count];
+                            entry.info.data_offset = parts_scratch[0].offset;
+                        }
+                        chain = null;
+                        ordinal = try bounds.addUsize(ordinal, 1);
+                        try visit(ctx, entry);
+                    }
+                },
+                else => {},
+            }
+        }
+        if (ended) continue;
+        // A block-boundary EOF without the end block, which older producers
+        // write; the same ordering rules as the final end block apply.
+        if (!seen_main) return error.DataException;
+        if (volume_index + 1 != volumes.len) return error.DataException;
+        if (chain != null) return error.DataException;
+        return;
+    }
+    // Unreachable in a valid set: every volume ends through the end block or
+    // the EOF rule, and a NEXT end never lands on the final volume.
+    return error.DataException;
+}
+
+// Gather the packed bytes of one split entry from its volumes. A plain
+// single-part entry slices its volume directly; everything else stages
+// through packed_stage, because a multi-part plain chain needs the
+// concatenation and CBC decryption needs a mutable copy. Encrypted chains
+// decrypt as one continuous AES-CBC stream: part 0 restarts from the record
+// IV and each later part chains from the previous part's final ciphertext
+// block (unrar decrypts a split file as a single stream; extract.cpp
+// SetEncryption runs once), so the parts concatenate to exactly the
+// single-volume padded stream.
+fn volumeGather(
+    entry: Entry,
+    volumes: []const []const u8,
+    opts: DecodeOptions,
+    bufs: *DecodeBuffers,
+) Exception![]const u8 {
+    if (entry.parts.len == 0) return error.InternalException;
+    var total: usize = 0;
+    for (entry.parts) |part| total = try bounds.addUsize(total, part.packed_size);
+    const crypt = entry.crypt orelse {
+        if (entry.parts.len == 1) {
+            const part = entry.parts[0];
+            return bounds.slice(volumes[part.volume], part.offset, part.packed_size);
+        }
+        if (bufs.packed_stage.len < total) return error.InternalException;
+        var staged: usize = 0;
+        for (entry.parts) |part| {
+            const src = try bounds.slice(volumes[part.volume], part.offset, part.packed_size);
+            @memcpy(bufs.packed_stage[staged..][0..src.len], src);
+            staged += src.len;
+        }
+        if (staged != total) return error.InternalException;
+        return bufs.packed_stage[0..total];
+    };
+    switch (crypt) {
+        // The RAR4 file crypt has no split surface here: the legacy walk never
+        // drives a volume set.
+        .rar4 => return error.UnsupportedException,
+        .rar5 => |c| {
+            const password = opts.password orelse return error.UnsupportedException;
+            if (opts.password_lifetime != 0 and total > opts.password_lifetime) {
+                if (opts.failure_cause) |cause| cause.* = .password_lifetime;
+                return error.ResourceException;
+            }
+            const keys = try rar5Kdf(password, &c.salt, c.lg2count, opts);
+            if (c.pswcheck) |expected| {
+                if (!crypto.constantTimeEql(&rar5PswCheck(&keys.pswcheck), &expected)) {
+                    if (opts.failure_cause) |cause| cause.* = .wrong_password;
+                    return error.DataException;
+                }
+            }
+            if (bufs.packed_stage.len < total) return error.InternalException;
+            var chain_iv: [16]u8 = undefined;
+            var staged: usize = 0;
+            for (entry.parts, 0..) |part, i| {
+                const src = try bounds.slice(volumes[part.volume], part.offset, part.packed_size);
+                // With data on the wire every part is a whole number of AES
+                // blocks: interior parts by construction, the final part because
+                // it carries the stream's zero padding. A zero-size entry keeps
+                // its empty stream valid.
+                if (total != 0 and (src.len < crypto.block_length or src.len % crypto.block_length != 0))
+                    return error.DataException;
+                const iv: *const [16]u8 = if (i == 0) &c.iv else &chain_iv;
+                const dst = bufs.packed_stage[staged..][0..src.len];
+                crypto.aesCbcDecrypt(opts.provider, keys.key[0..], iv.*, dst, src) catch return error.DataException;
+                staged += src.len;
+                if (i + 1 < entry.parts.len) @memcpy(&chain_iv, src[src.len - 16 ..][0..16]);
+            }
+            if (staged != total) return error.InternalException;
+            return bufs.packed_stage[0..total];
+        },
+    }
+}
+
+// The store decode of a volume set: a second walk that fires at the target
+// ordinal, because the part scratch is reused per entry, so the locate walk's
+// entry cannot keep its parts alive until the decode.
+const VolumeStoreCtx = struct {
+    target: usize,
+    done: bool = false,
+    volumes: []const []const u8,
+    output: []u8,
+    opts: DecodeOptions,
+    bufs: *DecodeBuffers,
+
+    fn visit(ctx: *VolumeStoreCtx, entry: Entry) Exception!void {
+        if (ctx.done) return;
+        if (entry.info.ordinal != ctx.target) return;
+        const size = std.math.cast(usize, entry.info.size) orelse return error.ResourceException;
+        const payload = try volumeGather(entry, ctx.volumes, ctx.opts, ctx.bufs);
+        if (payload.len < size) return error.DataException;
+        @memcpy(ctx.output[0..size], payload[0..size]);
+        ctx.done = true;
+    }
+};
+
+// The compressed replay of a volume set: each entry's parts are gathered at
+// its own visit, when the walk has just recorded them, so the per-entry scratch
+// reuse is invisible. The group window comes from the locate pass.
+const VolumeReplayCtx = struct {
+    session: *unpack50.Session,
+    volumes: []const []const u8,
+    locate: *const LocateCtx,
+    output: []u8,
+    opts: DecodeOptions,
+    bufs: *DecodeBuffers,
+    target_version: u8,
+
+    fn visit(ctx: *VolumeReplayCtx, entry: Entry) Exception!void {
+        if (entry.info.ordinal > ctx.locate.target) return;
+        if (entry.info.ordinal < ctx.locate.group_start) return;
+        // A store entry never joins a compressed stream, so it never reaches the session.
+        if (entry.method == 0) return;
+        // The session's tables come from the target's unpack version, so a mixed
+        // chain would feed predecessors through the wrong table sizes.
+        if (versionClass(entry.unpack_version) != versionClass(ctx.target_version)) return error.UnsupportedException;
+        const payload = try volumeGather(entry, ctx.volumes, ctx.opts, ctx.bufs);
+        if (entry.info.ordinal == ctx.locate.target) {
+            const size = std.math.cast(usize, entry.info.size) orelse return error.ResourceException;
+            var bs = sink.BufferSink.init(ctx.output[0..size]);
+            try ctx.session.decodeFile(payload, entry.info.size, entry.solid, bs.sink());
+            if (bs.overflowed) return error.DataException;
+        } else {
+            var discard = sink.DiscardSink{};
+            try ctx.session.decodeFile(payload, entry.info.size, entry.solid, discard.sink());
+        }
+    }
+};
+
+fn replayVolumesCompressed(
+    volumes: []const []const u8,
+    opts: DecodeOptions,
+    locate: *const LocateCtx,
+    target: Entry,
+    output: []u8,
+    bufs: *DecodeBuffers,
+    window_len: usize,
+) Exception!void {
+    if (bufs.window.len < window_len) return error.InternalException;
+    if (bufs.filter_scratch.len < window_len + filter_scratch_extra) return error.InternalException;
+    if (bufs.table_pool.len < unpack50.table_pool_words * 4) return error.InternalException;
+    if (bufs.pending50.len < unpack50.max_pending_filters) return error.InternalException;
+    const st = try bufs.state50();
+    var session = try unpack50.Session.init(
+        st,
+        bufs.window[0..window_len],
+        bufs.table_pool[0 .. unpack50.table_pool_words * 4],
+        bufs.pending50,
+        bufs.filter_scratch,
+        target.unpack_version == 70,
+    );
+    var replay: VolumeReplayCtx = .{
+        .session = &session,
+        .volumes = volumes,
+        .locate = locate,
+        .output = output,
+        .opts = opts,
+        .bufs = bufs,
+        .target_version = target.unpack_version,
+    };
+    try walkRar5Volumes(volumes, bufs.split_parts, opts, &replay, VolumeReplayCtx.visit);
+}
+
+// Counts the readable entries of an ordered multi-volume RAR5 set.
+pub fn rarVolumeCount(volumes: []const []const u8, max_entries: u64, opts: DecodeOptions) Exception!usize {
+    var ctx: CountCtx = .{ .max_entries = max_entries };
+    try walkRar5Volumes(volumes, &.{}, opts, &ctx, countVisit);
+    return ctx.count;
+}
+
+// Decodes one entry of an ordered multi-volume RAR5 set by its ordinal. The
+// locate pass runs with an empty part scratch (it needs no parts), the decode
+// pass re-walks with the caller's scratch and either stores the gathered
+// bytes or replays the compression group through the shared session. The
+// integrity tail matches rarDecodeOrdinal: the CRC32 (as an HMAC conversion
+// for an encrypted RAR5 entry) plus BLAKE2sp when the entry carries the hash.
+pub fn rarVolumeDecodeOrdinal(
+    volumes: []const []const u8,
+    ordinal: usize,
+    output: []u8,
+    bufs: *DecodeBuffers,
+    opts: DecodeOptions,
+) Exception!usize {
+    var kdf_memo: Rar5KdfMemo = .{};
+    var memo_opts = opts;
+    memo_opts.kdf_memo = &kdf_memo;
+    var locate: LocateCtx = .{ .target = ordinal };
+    try walkRar5Volumes(volumes, &.{}, memo_opts, &locate, locateVisit);
+    const entry = locate.target_entry orelse return error.DataException;
+    if (entry.is_directory) return error.DataException;
+
+    const size = std.math.cast(usize, entry.info.size) orelse return error.ResourceException;
+    if (output.len < size) return error.CapacityException;
+
+    if (entry.method == 0) {
+        var store: VolumeStoreCtx = .{
+            .target = ordinal,
+            .volumes = volumes,
+            .output = output,
+            .opts = memo_opts,
+            .bufs = bufs,
+        };
+        try walkRar5Volumes(volumes, bufs.split_parts, memo_opts, &store, VolumeStoreCtx.visit);
+        if (!store.done) return error.DataException;
+    } else {
+        const window_len = std.math.cast(usize, locate.group_max_window) orelse return error.ResourceException;
+        try replayVolumesCompressed(volumes, memo_opts, &locate, entry, output[0..size], bufs, window_len);
+    }
+
+    var hash_key: ?[32]u8 = null;
+    if (entry.crypt) |c| {
+        switch (c) {
+            .rar5 => |r5| if (r5.hashmac) {
+                const password = opts.password orelse return error.UnsupportedException;
+                const keys = try rar5Kdf(password, &r5.salt, r5.lg2count, memo_opts);
+                hash_key = keys.hash_key;
+            },
+            .rar4 => {},
+        }
+    }
+    if (entry.info.has_crc) {
+        const crc = checksum.crc32With(opts.provider, output[0..size]);
+        if (hash_key) |key| {
+            const mac = rar5CrcMac(opts.provider, crc, &key);
+            if (!crypto.constantTimeEql(std.mem.asBytes(&mac), std.mem.asBytes(&entry.info.crc))) return error.IntegrityException;
+        } else if (crc != entry.info.crc) return error.IntegrityException;
+    }
+    if (entry.blake2) |expected| {
+        var got: [32]u8 = undefined;
+        blake2sp.blake2sp(output[0..size], &got);
+        if (hash_key) |key| {
+            const mac = rar5BlakeMac(opts.provider, &got, &key);
+            if (!crypto.constantTimeEql(&expected, &mac)) return error.IntegrityException;
+        } else if (!crypto.constantTimeEql(&expected, &got)) return error.IntegrityException;
+    }
+    return size;
 }
 
 test "rar4 kdf reproduces the unrar sha1_process_rar29 self-modification" {
