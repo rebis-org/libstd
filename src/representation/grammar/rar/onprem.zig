@@ -190,6 +190,7 @@ pub const rar5_type_encryption: u64 = 4;
 pub const rar5_type_end: u64 = 5;
 pub const rar5_flag_extra: u64 = 0x0001;
 pub const rar5_flag_data: u64 = 0x0002;
+pub const rar5_flag_skip_if_unknown: u64 = 0x0004;
 pub const rar5_flag_split_before: u64 = 0x0008;
 pub const rar5_flag_split_after: u64 = 0x0010;
 // HFL_CHILD and HFL_INHERITED: a child block refines its parent and inherits
@@ -198,6 +199,14 @@ const rar5_flag_child: u64 = 0x0020;
 const rar5_flag_inherited: u64 = 0x0040;
 pub const rar5_archive_volume: u64 = 0x0001;
 pub const rar5_archive_volnum: u64 = 0x0002;
+// MHFL_PROTECT: the archive carries a recovery record. Unrar only reports it;
+// the recovery record itself is a RR-named service block the walk skips.
+pub const rar5_archive_protect: u64 = 0x0008;
+// Main-header extra records live in their own namespace: MHEXTRA_LOCATOR is 1
+// even though file-extra FHEXTRA_CRYPT is also 1.
+pub const rar5_main_extra_locator: u64 = 0x01;
+pub const rar5_locator_qlist: u64 = 0x01;
+pub const rar5_locator_rr: u64 = 0x02;
 pub const rar5_earc_next_volume: u64 = 0x0001;
 pub const rar5_file_directory: u64 = 0x0001;
 pub const rar5_file_mtime: u64 = 0x0002;
@@ -206,6 +215,9 @@ const rar5_file_size_unknown: u64 = 0x0008;
 pub const rar5_extra_crypt: u64 = 0x01;
 pub const rar5_extra_hash: u64 = 0x02;
 const rar5_extra_redir: u64 = 0x05;
+// FHEXTRA_SUBDATA: opaque per-file payload; the reader tolerates it and the
+// RR service block uses it to carry the recovery-percent vint.
+pub const rar5_extra_subdata: u64 = 0x07;
 const rar5_hash_blake2sp: u64 = 0x00;
 
 pub const Rar5Keys = struct { key: [32]u8, hash_key: [32]u8, pswcheck: [32]u8 };
