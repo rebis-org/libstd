@@ -7,6 +7,7 @@ const exception = @import("../../../common/primitive/exception.zig");
 const finder = @import("finder.zig");
 const rar = @import("onprem.zig");
 const pack50 = @import("pack50.zig");
+const recovery = @import("recovery.zig");
 
 const Exception = exception.Exception;
 pub const LzToken = finder.LzToken;
@@ -33,6 +34,10 @@ pub const WriteOptions = struct {
     // holds at most this many bytes, and rarEncodeVolumes/rarVolumeSize take
     // over. Single-volume calls reject a non-zero budget.
     volume_size: usize = 0,
+    // Non-zero appends a RAR5 recovery record with this much redundancy in
+    // percent (10 = 10%); the reference caps the value at 1000. Volumes and
+    // header encryption refuse it, matching the reference tool.
+    recovery_percent: u16 = 0,
 };
 
 // Every buffer is caller-provided, so this struct never allocates.
@@ -49,6 +54,10 @@ pub const WriteBuffers = struct {
     // Per-entry AES salt and IV, filled while packing encrypted entries.
     crypt_salts: [][16]u8 = &.{},
     crypt_ivs: [][16]u8 = &.{},
+    // GF(2^16) exponent and log tables for the recovery record. The encoder
+    // fills them once per archive; empty slices reject a recovery request.
+    rs_exp: []u16 = &.{},
+    rs_log: []u32 = &.{},
 };
 
 pub fn packedBound(entry: RarEntry) usize {
@@ -85,6 +94,14 @@ fn vintSize(value: u64) usize {
         size += 1;
     }
     return size;
+}
+
+// The main-header locator encodes both of its offsets as exactly four bytes
+// regardless of magnitude, so the archive layout stays fixed while the reader
+// still accepts a plain vint there.
+fn writeVintFixed4(value: u64, out: *[4]u8) void {
+    for (0..3) |n| out[n] = @intCast(((value >> @intCast(7 * n)) & 0x7F) | 0x80);
+    out[3] = @intCast(value >> 21);
 }
 
 // The compression_info field sets algo 0, solid 0, method 1-5, and dict_bits 3 (1 MiB window).
@@ -165,29 +182,56 @@ const block_writer = struct {
         return pos + plain_len;
     }
 
-    fn mainBlockSize(encrypted: bool, volume_index: usize) usize {
+    fn mainBlockSize(encrypted: bool, volume_index: usize, rr: bool) usize {
         // Contents are type, flags, and archive flags (3 bytes), plus a volume
-        // number vint when this is not the first volume.
+        // number vint when this is not the first volume, plus the MHEXTRA
+        // LOCATOR record (a 12-byte constant) when a recovery record follows.
         var contents: usize = 3;
         if (volume_index >= 1) contents += vintSize(volume_index);
+        if (rr) contents += 12;
         const plain = 4 + 1 + contents;
         if (!encrypted) return plain;
         return 16 + std.mem.alignForward(usize, plain, 16);
     }
 
-    fn writeMainBlock(out: []u8, pos: usize, volume_index: usize, multi: bool, header_keys: ?*const rar.Rar5Keys, provider: crypto.Provider) Exception!usize {
-        var contents: [16]u8 = undefined;
+    fn writeMainBlock(out: []u8, pos: usize, volume_index: usize, multi: bool, recovery_offset: ?usize, header_keys: ?*const rar.Rar5Keys, provider: crypto.Provider) Exception!usize {
+        var contents: [32]u8 = undefined;
         var c: usize = 0;
         c += writeVint(rar.rar5_type_main, contents[c..]);
-        c += writeVint(0, contents[c..]);
+        var block_flags: u64 = 0;
+        if (recovery_offset != null) block_flags |= rar.rar5_flag_extra | rar.rar5_flag_skip_if_unknown;
+        c += writeVint(block_flags, contents[c..]);
+        // The extra-area size vint rides before the archive flags; the records
+        // themselves close the block.
+        if (recovery_offset != null) c += writeVint(11, contents[c..]);
         // MHFL_VOLUME marks every volume of a multi-volume set; MHFL_VOLNUMBER
         // carries the zero-based number and is only set for volumes after the
         // first (headers5.hpp).
         var archive_flags: u64 = 0;
         if (multi) archive_flags |= rar.rar5_archive_volume;
         if (volume_index >= 1) archive_flags |= rar.rar5_archive_volnum;
+        if (recovery_offset != null) archive_flags |= rar.rar5_archive_protect;
         c += writeVint(archive_flags, contents[c..]);
         if (volume_index >= 1) c += writeVint(volume_index, contents[c..]);
+        if (recovery_offset != null) {
+            // The MHEXTRA_LOCATOR record closes the block: a record size vint
+            // (10, covering type, flags, and both offsets), the locator type,
+            // flags naming the quick-list and recovery-record offsets, then
+            // the two offsets as fixed four-byte vints — the first absent
+            // (zero), the second relative to this block.
+            const ro = recovery_offset.?;
+            if (ro < pos) return error.InternalException;
+            const rel = ro - pos;
+            if (rel >= 1 << 28) return error.CallException;
+            c += writeVint(10, contents[c..]);
+            c += writeVint(rar.rar5_main_extra_locator, contents[c..]);
+            contents[c] = @intCast(rar.rar5_locator_qlist | rar.rar5_locator_rr);
+            c += 1;
+            writeVintFixed4(0, contents[c..][0..4]);
+            c += 4;
+            writeVintFixed4(rel, contents[c..][0..4]);
+            c += 4;
+        }
         return emitHeader(out, pos, contents[0..c], header_keys, provider);
     }
 
@@ -233,6 +277,49 @@ const block_writer = struct {
         // EARC_NEXT_VOLUME tells a reader that another volume follows.
         c += writeVint(if (next_volume) rar.rar5_earc_next_volume else 0, contents[c..]);
         return emitHeader(out, pos, contents[0..c], header_keys, provider);
+    }
+
+    // The RR service header: type, extra|data|skip flags, the FHEXTRA_SUBDATA
+    // record holding the recovery percent, then the file-name "RR". Its data
+    // size is the encoded recovery stream, written by the caller after this
+    // header.
+    fn rrBlockSize(percent: u64, data_size: usize) usize {
+        // FHEXTRA_SUBDATA record: a size vint, the type vint, the percent vint.
+        const subdata = 1 + vintSize(percent);
+        const contents = 10 + 2 * vintSize(data_size) + (vintSize(subdata) + subdata);
+        return 4 + vintSize(contents) + contents + data_size;
+    }
+
+    fn writeRrBlock(out: []u8, pos: usize, percent: u64, data_size: usize, provider: crypto.Provider) Exception!usize {
+        var contents: [64]u8 = undefined;
+        var c: usize = 0;
+        c += writeVint(rar.rar5_type_service, contents[c..]);
+        c += writeVint(rar.rar5_flag_extra | rar.rar5_flag_data | rar.rar5_flag_skip_if_unknown, contents[c..]);
+        // The FHEXTRA_SUBDATA record holds only the recovery percent; a repair
+        // pass re-derives everything else. Its inner size covers the type and
+        // percent vints, and extra_size additionally counts that size vint.
+        const subdata = 1 + vintSize(percent);
+        c += writeVint(subdata + 1, contents[c..]);
+        c += writeVint(data_size, contents[c..]);
+        // File header body: flags 0, the unpacked size (the record stores its
+        // data, so the two sizes match), empty attributes, an empty
+        // compression info, host_os 1 (unix), and the two-byte name "RR".
+        c += writeVint(0, contents[c..]);
+        c += writeVint(data_size, contents[c..]);
+        c += writeVint(0, contents[c..]);
+        c += writeVint(0, contents[c..]);
+        c += writeVint(1, contents[c..]);
+        contents[c] = 2;
+        c += 1;
+        contents[c] = 'R';
+        contents[c + 1] = 'R';
+        c += 2;
+        // The extra area closes the block: the record's own size vint, the
+        // subdata type, then the percent.
+        c += writeVint(subdata, contents[c..]);
+        c += writeVint(rar.rar5_extra_subdata, contents[c..]);
+        c += writeVint(percent, contents[c..]);
+        return emitHeader(out, pos, contents[0..c], null, provider);
     }
 
     fn fileBlockSize(entry: RarEntry, packed_len: usize, options: WriteOptions) usize {
@@ -390,6 +477,10 @@ const block_writer = struct {
 fn checkWriteEntries(entries: []const RarEntry, options: WriteOptions) Exception!void {
     if (options.encrypt_headers and options.password.len == 0) return error.CallException;
     if (options.kdf_lg2_count > 24) return error.CallException;
+    // The reference caps rr at 1000 percent and refuses it alongside volumes
+    // or header encryption.
+    if (options.recovery_percent > 1000) return error.CallException;
+    if (options.recovery_percent != 0 and (options.volume_size != 0 or options.encrypt_headers)) return error.CallException;
     for (entries) |entry| {
         if (entry.name.len > 4096) return error.CallException;
         if (entry.method > 5) return error.CallException;
@@ -400,13 +491,18 @@ fn checkWriteEntries(entries: []const RarEntry, options: WriteOptions) Exception
 // The sizing query and the commit pass each run this, so one encode compresses twice.
 fn packEntries(entries: []const RarEntry, ws: *WriteBuffers, options: WriteOptions) Exception!usize {
     const data_encryption = options.password.len != 0;
+    const with_rr = options.recovery_percent != 0;
     var total: usize = undefined;
     if (options.encrypt_headers) {
         // -hp leads with the encryption block and an encrypted main block;
         // every later block's header rides behind its own IV.
-        total = rar.rar5_signature.len + block_writer.encryptionBlockSize() + block_writer.mainBlockSize(true, 0) + block_writer.endBlockSize(true);
+        total = rar.rar5_signature.len + block_writer.encryptionBlockSize() + block_writer.mainBlockSize(true, 0, false) + block_writer.endBlockSize(true);
+    } else if (with_rr) {
+        // The recovery record parks itself between the last file block and
+        // the end block, so the main block's locator can point at it.
+        total = rar.rar5_signature.len + block_writer.mainBlockSize(false, 0, true);
     } else {
-        total = rar.rar5_signature.len + block_writer.mainBlockSize(false, 0) + block_writer.endBlockSize(false);
+        total = rar.rar5_signature.len + block_writer.mainBlockSize(false, 0, false) + block_writer.endBlockSize(false);
     }
     var packed_cursor: usize = 0;
     for (entries, 0..) |entry, i| {
@@ -463,6 +559,18 @@ fn packEntries(entries: []const RarEntry, ws: *WriteBuffers, options: WriteOptio
         packed_cursor = try bounds.addUsize(packed_cursor, packed_len);
         total = try bounds.addUsize(total, block_writer.fileBlockSize(entry, packed_len, options));
     }
+    if (with_rr) {
+        // The recovery stream protects everything the locator spans: the main
+        // block through the last file byte. Its offset must stay inside the
+        // fixed four-byte vint the locator carries.
+        const rr_offset = total;
+        if (rr_offset - rar.rar5_signature.len >= 1 << 28) return error.CallException;
+        const layout = try recovery.layoutFor(rr_offset, options.recovery_percent);
+        const data_len = try layout.dataLen();
+        if (ws.rs_exp.len < recovery.gf_exp_len or ws.rs_log.len < recovery.gf_log_len) return error.InternalException;
+        total = try bounds.addUsize(total, block_writer.rrBlockSize(options.recovery_percent, data_len));
+        total = try bounds.addUsize(total, block_writer.endBlockSize(false));
+    }
     return total;
 }
 
@@ -482,6 +590,7 @@ pub fn rarEncode(entries: []const RarEntry, output: []u8, ws: *WriteBuffers, pro
 
 pub fn rarEncodeEx(entries: []const RarEntry, output: []u8, ws: *WriteBuffers, provider: crypto.Provider, options: WriteOptions) Exception!usize {
     if (options.volume_size != 0) return error.CallException;
+    const with_rr = options.recovery_percent != 0;
     const required = try rarWriteSizeEx(entries, ws, options);
     if (output.len < required) return error.CapacityException;
 
@@ -497,6 +606,17 @@ pub fn rarEncodeEx(entries: []const RarEntry, output: []u8, ws: *WriteBuffers, p
         header_keys = try rar.rar5Kdf(options.password, &header_salt, options.kdf_lg2_count, decode_opts);
     }
 
+    // The locator points at the recovery header, which sits between the last
+    // file block and the end block. rarWriteSizeEx already packed every
+    // entry, so the per-entry sizes pinned above place it exactly.
+    var rr_offset: usize = 0;
+    if (with_rr) {
+        rr_offset = rar.rar5_signature.len + block_writer.mainBlockSize(false, 0, true);
+        for (entries, 0..) |entry, i| {
+            rr_offset = try bounds.addUsize(rr_offset, block_writer.fileBlockSize(entry, ws.packed_sizes[i], options));
+        }
+    }
+
     var pos: usize = 0;
     @memcpy(output[pos..][0..rar.rar5_signature.len], &rar.rar5_signature);
     pos += rar.rar5_signature.len;
@@ -504,9 +624,9 @@ pub fn rarEncodeEx(entries: []const RarEntry, output: []u8, ws: *WriteBuffers, p
         const pswcheck = rar.rar5PswCheck(&header_keys.?.pswcheck);
         const csum = pswCheckCsum(&pswcheck, provider);
         pos = try block_writer.writeEncryptionBlock(output, pos, options.kdf_lg2_count, &header_salt, &pswcheck, &csum, provider);
-        pos = try block_writer.writeMainBlock(output, pos, 0, false, &header_keys.?, provider);
+        pos = try block_writer.writeMainBlock(output, pos, 0, false, null, &header_keys.?, provider);
     } else {
-        pos = try block_writer.writeMainBlock(output, pos, 0, false, null, provider);
+        pos = try block_writer.writeMainBlock(output, pos, 0, false, if (with_rr) rr_offset else null, null, provider);
     }
 
     var i: usize = 0;
@@ -517,6 +637,19 @@ pub fn rarEncodeEx(entries: []const RarEntry, output: []u8, ws: *WriteBuffers, p
         const packed_slice = ws.packed_buf[cursor .. cursor + packed_len];
         pos = try block_writer.writeFileBlock(output, pos, entry, packed_slice, false, false, options, if (options.encrypt_headers) &header_keys.? else null, null, null, null, i, ws, provider);
         cursor = try bounds.addUsize(cursor, packed_len);
+    }
+
+    if (with_rr) {
+        if (pos != rr_offset) return error.InternalException;
+        const layout = try recovery.layoutFor(rr_offset, options.recovery_percent);
+        const data_len = try layout.dataLen();
+        // One random slot per archive, shared by every sub-block.
+        var slot: u64 = undefined;
+        try crypto.fillRandom(std.mem.asBytes(&slot));
+        pos = try block_writer.writeRrBlock(output, pos, options.recovery_percent, data_len, provider);
+        try recovery.initTables(ws.rs_exp, ws.rs_log);
+        try recovery.encodeUnits(output[0..rr_offset], layout, slot, output[pos..][0..data_len], ws.rs_exp, ws.rs_log);
+        pos = try bounds.addUsize(pos, data_len);
     }
 
     pos = try block_writer.writeEndBlock(output, pos, false, if (options.encrypt_headers) &header_keys.? else null, provider);
@@ -550,9 +683,9 @@ pub const VolumeStep = union(enum) {
 fn volumePrefixSize(volume_index: usize, options: WriteOptions) usize {
     var size: usize = rar.rar5_signature.len;
     if (options.encrypt_headers) {
-        size += block_writer.encryptionBlockSize() + block_writer.mainBlockSize(true, volume_index);
+        size += block_writer.encryptionBlockSize() + block_writer.mainBlockSize(true, volume_index, false);
     } else {
-        size += block_writer.mainBlockSize(false, volume_index);
+        size += block_writer.mainBlockSize(false, volume_index, false);
     }
     return size;
 }
@@ -685,9 +818,9 @@ const VolumeEmitCtx = struct {
                 self.pos += rar.rar5_signature.len;
                 if (self.options.encrypt_headers) {
                     self.pos = try block_writer.writeEncryptionBlock(self.output, self.pos, self.options.kdf_lg2_count, self.header_salt, self.header_pswcheck, self.header_csum, self.provider);
-                    self.pos = try block_writer.writeMainBlock(self.output, self.pos, v, true, self.header_keys, self.provider);
+                    self.pos = try block_writer.writeMainBlock(self.output, self.pos, v, true, null, self.header_keys, self.provider);
                 } else {
-                    self.pos = try block_writer.writeMainBlock(self.output, self.pos, v, true, null, self.provider);
+                    self.pos = try block_writer.writeMainBlock(self.output, self.pos, v, true, null, null, self.provider);
                 }
             },
             .part => |p| {
@@ -1459,4 +1592,131 @@ test "volume reader rejects short, misordered, and single-volume reads" {
     try testing.expectEqualSlices(u8, &a_data, out_a);
     try testing.expectEqual(b_data.len, try rar.rarVolumeDecodeOrdinal(sw.view, 1, out_b, @constCast(&bufs), .{}));
     try testing.expectEqualSlices(u8, &b_data, out_b);
+}
+
+test "locator offsets use fixed four-byte vints" {
+    var buf: [4]u8 = undefined;
+    writeVintFixed4(0, &buf);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x80, 0x80, 0x80, 0x00 }, &buf);
+    writeVintFixed4(4149, &buf);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xb5, 0xa0, 0x80, 0x00 }, &buf);
+    writeVintFixed4(4158, &buf);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xbe, 0xa0, 0x80, 0x00 }, &buf);
+    writeVintFixed4((1 << 28) - 1, &buf);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xff, 0xff, 0xff, 0x7f }, &buf);
+}
+
+test "recovery record round-trips and pins the r1 wire form" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    var source: [4096]u8 = undefined;
+    var seed: u32 = 0x9E3779B9;
+    for (&source) |*byte| {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        byte.* = @truncate(seed);
+    }
+    const entries = [_]RarEntry{.{ .name = "rnd.bin", .data = &source, .method = 0 }};
+    const sizes = pack50.workspacesFor(4096);
+    const hash = try allocator.alloc(u32, sizes.hash_words);
+    defer allocator.free(hash);
+    const hash2 = try allocator.alloc(u32, sizes.hash2_words);
+    defer allocator.free(hash2);
+    const hash3 = try allocator.alloc(u32, sizes.hash3_words);
+    defer allocator.free(hash3);
+    const bt_left = try allocator.alloc(u32, sizes.bt_words);
+    defer allocator.free(bt_left);
+    const bt_right = try allocator.alloc(u32, sizes.bt_words);
+    defer allocator.free(bt_right);
+    const tokens = try allocator.alloc(finder.LzToken, sizes.token_count);
+    defer allocator.free(tokens);
+    const staging = try allocator.alloc(u8, sizes.staging_bytes);
+    defer allocator.free(staging);
+    const packed_buf = try allocator.alloc(u8, 4096);
+    defer allocator.free(packed_buf);
+    const packed_sizes = try allocator.alloc(usize, 1);
+    defer allocator.free(packed_sizes);
+    const rs_exp = try allocator.alloc(u16, recovery.gf_exp_len);
+    defer allocator.free(rs_exp);
+    const rs_log = try allocator.alloc(u32, recovery.gf_log_len);
+    defer allocator.free(rs_log);
+    var ws = WriteBuffers{
+        .hash = hash,
+        .hash2 = hash2,
+        .hash3 = hash3,
+        .bt_left = bt_left,
+        .bt_right = bt_right,
+        .tokens = tokens,
+        .staging = staging,
+        .packed_buf = packed_buf,
+        .packed_sizes = packed_sizes,
+        .rs_exp = rs_exp,
+        .rs_log = rs_log,
+    };
+
+    // Reference-imposed limits: a percent above 1000, or a recovery record
+    // alongside header encryption, refuse the call before any packing.
+    try testing.expectError(error.CallException, rarWriteSizeEx(&entries, &ws, .{ .recovery_percent = 1001 }));
+    try testing.expectError(error.CallException, rarWriteSizeEx(&entries, &ws, .{ .password = "pw", .encrypt_headers = true, .recovery_percent = 10 }));
+    // An empty GF table surface refuses the recovery sizing.
+    ws.rs_exp = &.{};
+    try testing.expectError(error.InternalException, rarWriteSizeEx(&entries, &ws, .{ .recovery_percent = 10 }));
+    ws.rs_exp = rs_exp;
+
+    const required = try rarWriteSizeEx(&entries, &ws, .{ .recovery_percent = 10 });
+    try testing.expectEqual(@as(usize, 5131), required);
+    const archive = try allocator.alloc(u8, required);
+    defer allocator.free(archive);
+    const written = try rarEncodeEx(&entries, archive, &ws, crypto.default_provider, .{ .recovery_percent = 10 });
+    try testing.expectEqual(@as(usize, 5131), written);
+
+    // Main block: 15 content bytes, the locator naming the RR header at
+    // relative offset 4149 through a fixed four-byte vint.
+    try testing.expectEqual(@as(u8, 0x0f), archive[12]);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x01, 0x05, 0x0b, 0x08, 0x0a, 0x01, 0x03, 0x80, 0x80, 0x80, 0x00, 0xb5, 0xa0, 0x80, 0x00 }, archive[13..28]);
+    // The stored payload sits between the file header and the RR header.
+    try testing.expectEqualSlices(u8, &source, archive[61..4157]);
+    // RR header contents: the FHEXTRA_SUBDATA record holds percent 10, and
+    // data_size matches the 944-byte single unit.
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x03, 0x07, 0x03, 0xb0, 0x07, 0x00, 0xb0, 0x07, 0x00, 0x00, 0x01, 0x02, 0x52, 0x52, 0x02, 0x07, 0x0a }, archive[4162..4179]);
+
+    // Unit 0 pins: the fixed header fields and the per-chunk CRC-64 entries
+    // over the protected region. The slot at +104 is random per archive and
+    // the parity words are the interop probe's oracle, so neither is pinned
+    // here; the trailing checksum covers everything but itself.
+    const unit0 = archive[4179..5123];
+    try testing.expectEqual(@as(u32, 0x7d42527b), std.mem.readInt(u32, unit0[0..4], .little));
+    try testing.expectEqual(@as(u32, 944), std.mem.readInt(u32, unit0[12..16], .little));
+    try testing.expectEqual(@as(u32, 112), std.mem.readInt(u32, unit0[16..20], .little));
+    try testing.expectEqual(@as(u8, 1), unit0[20]);
+    try testing.expectEqual(@as(u8, 1), unit0[21]);
+    try testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, unit0[22..30], .little));
+    try testing.expectEqual(@as(u32, 829), std.mem.readInt(u32, unit0[30..34], .little));
+    try testing.expectEqual(@as(u64, 4157), std.mem.readInt(u64, unit0[34..42], .little));
+    try testing.expectEqual(@as(u64, 832), std.mem.readInt(u64, unit0[42..50], .little));
+    try testing.expectEqual(@as(u64, 944), std.mem.readInt(u64, unit0[50..58], .little));
+    try testing.expectEqual(@as(u16, 5), std.mem.readInt(u16, unit0[58..60], .little));
+    try testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, unit0[60..62], .little));
+    try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, unit0[62..64], .little));
+    for (0..5) |k| {
+        const clen: usize = if (k < 4) 832 else 829;
+        try testing.expectEqual(recovery.crc64Raw(archive[k * 832 .. k * 832 + clen]), std.mem.readInt(u64, unit0[64 + k * 8 ..][0..8], .little));
+    }
+    var c1c2 = checksum.XzCrc64.init();
+    c1c2.update(unit0[12..944]);
+    try testing.expectEqual(c1c2.final(), std.mem.readInt(u64, unit0[4..12], .little));
+
+    // The end block closes the archive.
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x03, 0x05, 0x00, 0x00 }, archive[5127..5131]);
+
+    // The facade reader skips the service block and decodes the one file.
+    try testing.expectEqual(@as(usize, 1), try rar.rarInspectCount(archive, 128));
+    var d = try VolumeTestDecode.init(allocator);
+    defer d.deinit(allocator);
+    const bufs = d.buffers(&.{}, &.{});
+    const out = try allocator.alloc(u8, source.len);
+    defer allocator.free(out);
+    try testing.expectEqual(source.len, try rar.rarDecodeOrdinal(archive, 0, out, @constCast(&bufs), .{}));
+    try testing.expectEqualSlices(u8, &source, out);
 }
