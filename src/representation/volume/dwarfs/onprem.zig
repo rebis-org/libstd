@@ -1,11 +1,14 @@
 const std = @import("std");
 
+const entry_prim = @import("../../../common/entry.zig");
 const bounds = @import("../../../common/primitive/bounds.zig");
 const exception_prim = @import("../../../common/primitive/exception.zig");
 const tree_order = @import("../../../common/primitive/order.zig");
 const lz4_leaf = @import("../../leaf/lz4/onprem.zig");
 const zstd_leaf = @import("../../leaf/zstd/onprem.zig");
 
+pub const Entry = entry_prim.Entry;
+pub const EntryInfo = entry_prim.Sized;
 const Exception = exception_prim.Exception;
 
 // DwarFS v2 slice: one root directory of regular files.
@@ -24,16 +27,6 @@ const section_magic = "DWARFS";
 
 const zstd_window: u32 = 256 * 1024;
 const zstd_history: usize = zstd_window + zstd_leaf.block_size_max;
-
-pub const Entry = struct {
-    name: []const u8,
-    data: []const u8,
-};
-
-pub const EntryInfo = struct {
-    size: u64,
-    ordinal: u64,
-};
 
 const BlockRef = struct {
     at: u64,
@@ -907,14 +900,51 @@ const DwNode = struct {
 
 const max_tree_nodes = 512;
 
-fn dwFindOrCreateDir(nodes: *std.ArrayList(DwNode), alloc: std.mem.Allocator, parent: u32, name: []const u8) Exception!u32 {
+fn dwFindChild(nodes: *std.ArrayList(DwNode), parent: u32, name: []const u8) ?u32 {
     for (nodes.items, 0..) |node, i| {
-        if (node.kind == .dir and node.parent == parent and std.mem.eql(u8, node.name, name)) return @intCast(i);
+        if (node.parent == parent and std.mem.eql(u8, node.name, name)) return @intCast(i);
+    }
+    return null;
+}
+
+fn dwFindOrCreateDir(nodes: *std.ArrayList(DwNode), alloc: std.mem.Allocator, parent: u32, name: []const u8) Exception!u32 {
+    if (dwFindChild(nodes, parent, name)) |existing| {
+        if (nodes.items[existing].kind != .dir) return error.CallException;
+        return existing;
     }
     const idx: u32 = @intCast(nodes.items.len);
     nodes.append(alloc, .{ .kind = .dir, .name = name, .parent = parent }) catch return error.ResourceException;
     nodes.items[parent].child_count += 1;
     return idx;
+}
+
+// Directories first, then leaves: an entry that names a directory is that
+// directory, so a path and its own entry cannot become two siblings.
+fn dwBuildNodes(nodes: *std.ArrayList(DwNode), alloc: std.mem.Allocator, entries: []const Entry) Exception!void {
+    nodes.append(alloc, .{ .kind = .dir, .name = "", .parent = 0 }) catch return error.ResourceException;
+    const parents = alloc.alloc(u32, entries.len) catch return error.ResourceException;
+    for (entries, 0..) |entry, index| {
+        try dwValidate(entry.name);
+        if (entry.data.len > write_block_size) return error.UnsupportedException;
+        var parent: u32 = 0;
+        var it = std.mem.splitScalar(u8, entry.name, '/');
+        var comp = it.next().?;
+        while (it.next()) |next| {
+            parent = try dwFindOrCreateDir(nodes, alloc, parent, comp);
+            comp = next;
+        }
+        parents[index] = parent;
+    }
+    for (entries, 0..) |entry, index| {
+        const parent = parents[index];
+        const comp = entry_prim.leafName(entry.name) orelse return error.CallException;
+        if (dwFindChild(nodes, parent, comp)) |existing| {
+            if (nodes.items[existing].kind != .dir or entry.data.len != 0) return error.CallException;
+            continue;
+        }
+        nodes.append(alloc, .{ .kind = .file, .name = comp, .parent = parent, .data = entry.data }) catch return error.ResourceException;
+        nodes.items[parent].child_count += 1;
+    }
 }
 
 fn dwValidate(name: []const u8) Exception!void {
@@ -935,20 +965,7 @@ pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Exception!usi
 
     // Tree build: nodes[0] roots the directory tree.
     var nodes: std.ArrayList(DwNode) = .empty;
-    nodes.append(alloc, .{ .kind = .dir, .name = "", .parent = 0 }) catch return error.ResourceException;
-    for (entries) |entry| {
-        try dwValidate(entry.name);
-        if (entry.data.len > write_block_size) return error.UnsupportedException;
-        var parent: u32 = 0;
-        var it = std.mem.splitScalar(u8, entry.name, '/');
-        var comp = it.next().?;
-        while (it.next()) |next| {
-            parent = try dwFindOrCreateDir(&nodes, alloc, parent, comp);
-            comp = next;
-        }
-        nodes.append(alloc, .{ .kind = .file, .name = comp, .parent = parent, .data = entry.data }) catch return error.ResourceException;
-        nodes.items[parent].child_count += 1;
-    }
+    try dwBuildNodes(&nodes, alloc, entries);
     if (nodes.items.len > max_tree_nodes) return error.UnsupportedException;
 
     // Per-directory child lists in name order.
@@ -1175,20 +1192,7 @@ pub fn archiveSize(entries: []const Entry) Exception!u64 {
     var fba = std.heap.FixedBufferAllocator.init(&stack);
     const alloc = fba.allocator();
     var nodes: std.ArrayList(DwNode) = .empty;
-    nodes.append(alloc, .{ .kind = .dir, .name = "", .parent = 0 }) catch return error.ResourceException;
-    for (entries) |entry| {
-        try dwValidate(entry.name);
-        if (entry.data.len > write_block_size) return error.UnsupportedException;
-        var parent: u32 = 0;
-        var it = std.mem.splitScalar(u8, entry.name, '/');
-        var comp = it.next().?;
-        while (it.next()) |next| {
-            parent = try dwFindOrCreateDir(&nodes, alloc, parent, comp);
-            comp = next;
-        }
-        nodes.append(alloc, .{ .kind = .file, .name = comp, .parent = parent, .data = entry.data }) catch return error.ResourceException;
-        nodes.items[parent].child_count += 1;
-    }
+    try dwBuildNodes(&nodes, alloc, entries);
     if (nodes.items.len > max_tree_nodes) return error.UnsupportedException;
     var dirs: u64 = 0;
     var files: u64 = 0;

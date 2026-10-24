@@ -427,16 +427,10 @@ pub fn zstd_seekableHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: 
         if (input.len + output_size > limits.codec_work) return error.ResourceException;
         if (sink) |sink_resource| {
             try common.requireSink(sink_resource, call, output_size);
-            if (sink_resource.kind == .direct_write) {
-                const output = try common.sinkDirectBuffer(sink_resource, output_size);
-                var fixed = std.Io.Writer.fixed(output);
-                try zstd_seekable.decode(input, &fixed, history, options);
-            } else {
-                const staging = try workspace.take(u8, output_size);
-                var fixed = std.Io.Writer.fixed(staging);
-                try zstd_seekable.decode(input, &fixed, history, options);
-                try common.commitBytesToSink(sink_resource, call, staging);
-            }
+            const target = try common.SinkTarget.open(sink_resource, &workspace, output_size);
+            var fixed = std.Io.Writer.fixed(target.output);
+            try zstd_seekable.decode(input, &fixed, history, options);
+            _ = try target.publish(sink_resource, call, output_size);
         }
         response.byte_length = output_size;
     } else if (command_mask == vocabulary.command_mask_write) {
@@ -460,12 +454,10 @@ pub fn zstd_seekableHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: 
         if (input.len + output_size > limits.codec_work) return error.ResourceException;
         if (sink) |sink_resource| {
             try common.requireSink(sink_resource, call, output_size);
-            const staging = try workspace.take(u8, output_size);
-            const produced = try zstd_seekable.encode(input, staging, history, workspace_u32, entries, options);
-            if (try common.verifiedCommitLength(sink_resource, call, sizing, staging, output_size, produced)) |produced_length| {
-                response.byte_length = produced_length;
-                return;
-            }
+            const target = try common.SinkTarget.open(sink_resource, &workspace, output_size);
+            const produced = try zstd_seekable.encode(input, target.output, history, workspace_u32, entries, options);
+            response.byte_length = try target.publishSized(sink_resource, call, sizing, output_size, produced);
+            return;
         }
         response.byte_length = output_size;
     } else {
@@ -602,15 +594,13 @@ pub fn zstdHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resourc
         } else try planCountedEncode(source_resource, limits.decoded_bytes, limits.encoded_bytes, false, zstdEncodeStream, .{ .history = history, .workspace = encoder_workspace, .options = encode_options });
         if (sink) |sink_resource| {
             try common.requireSink(sink_resource, call, output_size);
-            const staging = try workspace.take(u8, output_size);
+            const target = try common.SinkTarget.open(sink_resource, &workspace, output_size);
             var bounded_source: resource.BoundedReader = undefined;
             bounded_source.init(source_resource, limits.decoded_bytes);
-            var staging_writer = std.Io.Writer.fixed(staging);
-            const produced = try zstd.encodeStream(&bounded_source.reader, &staging_writer, history, encoder_workspace, encode_options);
-            if (try common.verifiedCommitLength(sink_resource, call, sizing, staging, output_size, produced)) |produced_length| {
-                response.byte_length = produced_length;
-                return;
-            }
+            var sink_writer = std.Io.Writer.fixed(target.output);
+            const produced = try zstd.encodeStream(&bounded_source.reader, &sink_writer, history, encoder_workspace, encode_options);
+            response.byte_length = try target.publishSized(sink_resource, call, sizing, output_size, produced);
+            return;
         }
         response.byte_length = output_size;
     } else {
@@ -879,22 +869,10 @@ fn bufferCodecHook(comptime Codec: type, plan: *common.ExecutionPlan, source: ?*
         if (sink) |sink_resource| {
             try common.checkWorkspaceOverlap(call, source_resource, sink_resource);
             try common.requireSink(sink_resource, call, output_size);
-            if (sink_resource.kind == .direct_write) {
-                const output = try common.sinkDirectBuffer(sink_resource, output_size);
-                const produced = try Codec.encode(input, output, scratch, options);
-                if (sizing == .bounded) {
-                    if (produced > output_size) return error.InternalException;
-                    response.byte_length = produced;
-                    return;
-                }
-            } else {
-                const staging = try workspace.take(u8, output_size);
-                const produced = try Codec.encode(input, staging, scratch, options);
-                if (try common.verifiedCommitLength(sink_resource, call, sizing, staging, output_size, produced)) |produced_length| {
-                    response.byte_length = produced_length;
-                    return;
-                }
-            }
+            const target = try common.SinkTarget.open(sink_resource, &workspace, output_size);
+            const produced = try Codec.encode(input, target.output, scratch, options);
+            response.byte_length = try target.publishSized(sink_resource, call, sizing, output_size, produced);
+            return;
         }
         response.byte_length = output_size;
     } else {
@@ -978,12 +956,10 @@ pub fn lzma_fileHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Re
         if (sink) |sink_resource| {
             try common.checkWorkspaceOverlap(call, source_resource, sink_resource);
             try common.requireSink(sink_resource, call, output_size);
-            const staging = try workspace.take(u8, output_size);
-            const produced = try lzma_file.encode(input, staging, scratch, options);
-            if (try common.verifiedCommitLength(sink_resource, call, sizing, staging, output_size, produced)) |produced_length| {
-                response.byte_length = produced_length;
-                return;
-            }
+            const target = try common.SinkTarget.open(sink_resource, &workspace, output_size);
+            const produced = try lzma_file.encode(input, target.output, scratch, options);
+            response.byte_length = try target.publishSized(sink_resource, call, sizing, output_size, produced);
+            return;
         }
         response.byte_length = output_size;
     } else {
@@ -1075,12 +1051,10 @@ pub fn xzHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource,
         if (input.len + output_size > limits.codec_work) return error.ResourceException;
         if (sink) |sink_resource| {
             try common.requireSink(sink_resource, call, output_size);
-            const staging = try workspace.take(u8, output_size);
-            const produced = try xz.encode(input, staging, scratch, options);
-            if (try common.verifiedCommitLength(sink_resource, call, sizing, staging, output_size, produced)) |produced_length| {
-                response.byte_length = produced_length;
-                return;
-            }
+            const target = try common.SinkTarget.open(sink_resource, &workspace, output_size);
+            const produced = try xz.encode(input, target.output, scratch, options);
+            response.byte_length = try target.publishSized(sink_resource, call, sizing, output_size, produced);
+            return;
         }
         response.byte_length = output_size;
     } else {

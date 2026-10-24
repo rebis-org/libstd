@@ -1,9 +1,12 @@
 const std = @import("std");
 
+const entry_prim = @import("../../../common/entry.zig");
 const bounds = @import("../../../common/primitive/bounds.zig");
 const exception_prim = @import("../../../common/primitive/exception.zig");
 const tree_order = @import("../../../common/primitive/order.zig");
 
+pub const Entry = entry_prim.Entry;
+pub const EntryInfo = entry_prim.Sized;
 const Exception = exception_prim.Exception;
 
 // ISO 9660 slice: one root directory of regular files.
@@ -31,16 +34,6 @@ const joliet_escape_3 = [3]u8{ '%', '/', 'E' };
 const max_entries = 256;
 const path_table_lba: u32 = 18;
 const dir_lba: u32 = 20;
-
-pub const Entry = struct {
-    name: []const u8,
-    data: []const u8,
-};
-
-pub const EntryInfo = struct {
-    size: u64,
-    ordinal: u64,
-};
 
 const Descriptor = struct {
     block_size: u32,
@@ -128,56 +121,57 @@ fn parseRecord(dir: []const u8, at: usize) Exception!?Record {
 
 const Target = union(enum) {
     count,
-    resolve: struct { ordinal: u64, info: *EntryInfo, output: ?[]u8, found: *bool = undefined },
+    resolve: struct { ordinal: u64, info: *EntryInfo, output: ?[]u8 },
 };
 
 const WalkState = struct { ordinal: u64 = 0 };
 
-fn walkRoot(archive: []const u8, desc: Descriptor, target: Target) Exception!u64 {
-    var state = WalkState{};
-    var found = false;
-    const resolved = switch (target) {
-        .count => target,
-        .resolve => |res| Target{ .resolve = .{ .ordinal = res.ordinal, .info = res.info, .output = res.output, .found = &found } },
-    };
-    try walkIsoDir(archive, desc.root_extent, desc.root_size, resolved, &state, 0);
-    return switch (target) {
-        .count => state.ordinal,
-        .resolve => if (found) state.ordinal else error.DataException,
-    };
-}
+const Frame = struct { dir: []const u8, pos: usize };
 
-fn walkIsoDir(archive: []const u8, extent: u32, size: u32, target: Target, state: *WalkState, depth: u32) Exception!void {
-    if (depth > max_dir_depth) return error.DataException;
-    const dir = try bounds.slice(archive, std.math.mul(u64, extent, sector_size) catch return error.DataException, size);
+fn openDir(archive: []const u8, extent: u32, size: u32) Exception!Frame {
+    const offset = std.math.mul(u64, extent, sector_size) catch return error.DataException;
+    const dir = try bounds.slice(archive, offset, size);
     const dot = (try parseRecord(dir, 0)) orelse return error.DataException;
     if (!dot.is_dot) return error.DataException;
     const dotdot = (try parseRecord(dir, dot.skip)) orelse return error.DataException;
     if (!dotdot.is_dotdot) return error.DataException;
-    var pos: usize = dot.skip + dotdot.skip;
-    const found_ptr = switch (target) {
-        .resolve => |res| res.found,
-        .count => null,
-    };
-    while (pos < dir.len) {
-        if (found_ptr) |fp| {
-            if (fp.*) return;
+    return .{ .dir = dir, .pos = dot.skip + dotdot.skip };
+}
+
+// An explicit frame stack, not recursion: the depth bound is the array the
+// walk indexes, so a hostile tree cannot reach the stack.
+fn walkTree(archive: []const u8, desc: Descriptor, target: Target, state: *WalkState) Exception!bool {
+    var stack: [max_dir_depth + 1]Frame = undefined;
+    var depth: usize = 0;
+    stack[0] = try openDir(archive, desc.root_extent, desc.root_size);
+    while (true) {
+        const frame = &stack[depth];
+        if (frame.pos >= frame.dir.len) {
+            if (depth == 0) return false;
+            depth -= 1;
+            continue;
         }
         // Records never cross sector boundaries: a zero length byte or an
         // over-long record pads the sector, and records resume at the next.
-        const remain = sector_size - (pos % sector_size);
-        if (dir[pos] == 0 or dir[pos] > remain) {
-            pos += remain;
+        const remain = sector_size - (frame.pos % sector_size);
+        if (frame.dir[frame.pos] == 0 or frame.dir[frame.pos] > remain) {
+            frame.pos += remain;
             continue;
         }
-        const rec = (try parseRecord(dir, pos)) orelse break;
-        pos += rec.skip;
+        const rec = (try parseRecord(frame.dir, frame.pos)) orelse {
+            if (depth == 0) return false;
+            depth -= 1;
+            continue;
+        };
+        frame.pos += rec.skip;
         if (rec.is_dot or rec.is_dotdot) continue;
         // Multi-extent and interleaved records change the data layout; the
         // slice covers contiguous single-extent regular files.
         if (rec.flags & ((1 << 7) | (1 << 2)) != 0) return error.UnsupportedException;
         if (rec.flags & flag_directory != 0) {
-            try walkIsoDir(archive, rec.extent, rec.size, target, state, depth + 1);
+            if (depth == max_dir_depth) return error.DataException;
+            depth += 1;
+            stack[depth] = try openDir(archive, rec.extent, rec.size);
             continue;
         }
         switch (target) {
@@ -188,16 +182,25 @@ fn walkIsoDir(archive: []const u8, extent: u32, size: u32, target: Target, state
                     res.info.ordinal = state.ordinal;
                     if (res.output) |out| {
                         if (out.len < rec.size) return error.CapacityException;
-                        const data = try bounds.slice(archive, std.math.mul(u64, rec.extent, sector_size) catch return error.DataException, rec.size);
+                        const offset = std.math.mul(u64, rec.extent, sector_size) catch return error.DataException;
+                        const data = try bounds.slice(archive, offset, rec.size);
                         @memcpy(out[0..rec.size], data);
                     }
-                    res.found.* = true;
-                    return;
+                    return true;
                 }
             },
         }
         state.ordinal += 1;
     }
+}
+
+fn walkRoot(archive: []const u8, desc: Descriptor, target: Target) Exception!u64 {
+    var state = WalkState{};
+    const found = try walkTree(archive, desc, target, &state);
+    return switch (target) {
+        .count => state.ordinal,
+        .resolve => if (found) state.ordinal else error.DataException,
+    };
 }
 
 fn walkChosen(archive: []const u8, target: Target) Exception!u64 {

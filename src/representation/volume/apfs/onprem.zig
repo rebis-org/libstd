@@ -1,8 +1,11 @@
 const std = @import("std");
 
+const entry_prim = @import("../../../common/entry.zig");
 const bounds = @import("../../../common/primitive/bounds.zig");
 const exception_prim = @import("../../../common/primitive/exception.zig");
 
+pub const Entry = entry_prim.Entry;
+pub const EntryInfo = entry_prim.Sized;
 const Exception = exception_prim.Exception;
 
 // Layouts: apfs_raw.h (linux-apfs/linux-apfs-rw); ApfsHandler (vendor/7zip).
@@ -11,16 +14,6 @@ const Exception = exception_prim.Exception;
 // physical fs tree over one container object map, no checkpoint area.
 
 pub const scratch_size: usize = 1024 * 1024;
-
-pub const Entry = struct {
-    name: []const u8,
-    data: []const u8,
-};
-
-pub const EntryInfo = struct {
-    size: u64,
-    ordinal: u64,
-};
 
 const max_dir_depth: u32 = 64;
 const max_descriptor_blocks = 10000;
@@ -864,12 +857,13 @@ fn componentValid(name: []const u8) bool {
         std.mem.indexOfScalar(u8, name, 0) == null;
 }
 
-// The rank check pins the entry-order contract: the entry list must already
-// be the DFS flatten over sorted siblings, or read ordinals desync.
+// The tree is built from the names, so the entry list need not arrive in any
+// particular order: directories are resolved first, then every leaf attaches.
 fn buildTree(entries: []const Entry, alloc: std.mem.Allocator) Exception!*PlanNode {
     const root = alloc.create(PlanNode) catch return error.ResourceException;
     root.* = .{ .name = "", .is_dir = true, .parent = undefined };
-    for (entries, 0..) |entry, rank| {
+    const parents = alloc.alloc(*PlanNode, entries.len) catch return error.ResourceException;
+    for (entries, 0..) |entry, index| {
         if (entry.name.len == 0 or entry.name[0] == '/' or
             std.mem.indexOfScalar(u8, entry.name, 0) != null) return error.UnsupportedException;
         var parent = root;
@@ -891,18 +885,27 @@ fn buildTree(entries: []const Entry, alloc: std.mem.Allocator) Exception!*PlanNo
                 depth += 1;
                 continue;
             }
-            if (isKid(parent, part) != null) return error.UnsupportedException;
-            const file = alloc.create(PlanNode) catch return error.ResourceException;
-            file.* = .{ .name = part, .is_dir = false, .data = entry.data, .parent = parent, .rank = rank };
-            parent.kids.append(alloc, file) catch return error.ResourceException;
+            parents[index] = parent;
         }
+    }
+    for (entries, 0..) |entry, index| {
+        const parent = parents[index];
+        const part = entry_prim.leafName(entry.name) orelse return error.UnsupportedException;
+        if (!componentValid(part)) return error.UnsupportedException;
+        if (isKid(parent, part)) |existing| {
+            // The entry names a directory a deeper path already implied, or
+            // two entries claim one name; only an empty directory is fine.
+            if (!existing.is_dir or entry.data.len != 0) return error.UnsupportedException;
+            continue;
+        }
+        const file = alloc.create(PlanNode) catch return error.ResourceException;
+        file.* = .{ .name = part, .is_dir = false, .data = entry.data, .parent = parent };
+        parent.kids.append(alloc, file) catch return error.ResourceException;
     }
     // Inodes 0..15 are reserved (root 2, private dir 3); 7-Zip drops any
     // file whose id lands in the private-dir slot.
     var next_ino: u64 = 16;
-    var next_rank: usize = 0;
-    try rankNode(root, &next_ino, &next_rank, true);
-    if (next_rank != entries.len) return error.UnsupportedException;
+    rankNode(root, &next_ino, true);
     return root;
 }
 
@@ -913,7 +916,7 @@ fn isKid(parent: *PlanNode, name: []const u8) ?*PlanNode {
     return null;
 }
 
-fn rankNode(node: *PlanNode, next_ino: *u64, next_rank: *usize, is_root: bool) Exception!void {
+fn rankNode(node: *PlanNode, next_ino: *u64, is_root: bool) void {
     node.ino = if (is_root) root_ino else blk: {
         const ino = next_ino.*;
         next_ino.* += 1;
@@ -924,19 +927,12 @@ fn rankNode(node: *PlanNode, next_ino: *u64, next_rank: *usize, is_root: bool) E
             return std.mem.order(u8, a.name, b.name) == .lt;
         }
     }.lessThan);
-    var prev: ?[]const u8 = null;
     for (node.kids.items) |kid| {
-        if (prev) |prior| {
-            if (std.mem.eql(u8, prior, kid.name)) return error.UnsupportedException;
-        }
-        prev = kid.name;
         if (kid.is_dir) {
-            try rankNode(kid, next_ino, next_rank, false);
+            rankNode(kid, next_ino, false);
         } else {
             kid.ino = next_ino.*;
             next_ino.* += 1;
-            if (kid.rank != next_rank.*) return error.UnsupportedException;
-            next_rank.* += 1;
         }
     }
 }
@@ -1367,14 +1363,25 @@ test "apfs write roundtrips a multi-level tree" {
     try testing.expectEqualSlices(u8, "payload 149", out[0..last]);
 }
 
-test "apfs write rejects unsorted entries" {
+test "apfs write accepts entries in any order" {
     const testing = std.testing;
+    // The tree is derived from the names, so the caller's order carries no
+    // meaning; a sorted projection must come out the same either way.
     const entries = [_]Entry{
         .{ .name = "top.txt", .data = "root file" },
         .{ .name = "a/b/deep.txt", .data = "nested payload" },
     };
     var scratch: [scratch_size]u8 = undefined;
-    try testing.expectError(error.UnsupportedException, archiveSize(&entries, &scratch));
+    const required = try archiveSize(&entries, &scratch);
+    const archive = try testing.allocator.alloc(u8, required);
+    defer testing.allocator.free(archive);
+    const written = try encode(&entries, archive, &scratch);
+    try testing.expectEqual(required, written);
+    var out: [16]u8 = undefined;
+    const n0 = try decodeOrdinal(archive[0..written], 0, &out, &scratch);
+    try testing.expectEqualSlices(u8, "nested payload", out[0..n0]);
+    const n1 = try decodeOrdinal(archive[0..written], 1, &out, &scratch);
+    try testing.expectEqualSlices(u8, "root file", out[0..n1]);
 }
 
 test "apfs write rejects duplicate and malformed names" {

@@ -228,6 +228,12 @@ fn addOracles(b: *std.Build, ctx: *common.Settings, refs: reference.Refs) void {
     const compose_ab_exe = b.addExecutable(.{ .name = "compose_ab", .root_module = compose_ab_module });
     const compose_ab_run = b.addRunArtifact(compose_ab_exe);
     app.run.step.dependOn(&compose_ab_run.step);
+
+    // The oracle app alone, without the run step: a host that cannot rebuild
+    // the reference CLIs still gets the app, and one suite can be driven by
+    // hand with `oracles --suite <name>`.
+    const build_only = b.addInstallArtifact(app.exe, .{ .dest_sub_path = "oracles" });
+    b.step("oracles_build", "Build the oracle app without running it").dependOn(&build_only.step);
 }
 
 fn addOraclesUbsan(b: *std.Build, ctx: *common.Settings, refs: reference.Refs) void {

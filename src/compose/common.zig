@@ -30,18 +30,6 @@ pub fn requireSinkCapacity(sink: *Resource, call: *Call, required: u64) Exceptio
     }
 }
 
-// Verified commit: a bounded write reports the produced length, and an
-// overrun of the analytic bound is a correctness defect, never a silent truncation.
-pub fn verifiedCommitLength(sink: *Resource, call: *Call, sizing: vocabulary.SizingMode, staged: []const u8, planned: usize, produced: usize) Exception!?usize {
-    if (sizing == .bounded) {
-        if (produced > planned) return error.InternalException;
-        try commitBytesToSink(sink, call, staged[0..produced]);
-        return produced;
-    }
-    try commitBytesToSink(sink, call, staged);
-    return null;
-}
-
 pub fn commitBytesToSink(sink: *Resource, call: *Call, chunk: []const u8) Exception!void {
     sink.writeAll(chunk) catch |exception| return mapSinkError(exception, call, sink);
 }
@@ -310,6 +298,39 @@ pub fn sinkDirectBuffer(sink: *Resource, required: usize) Exception![]u8 {
         else => return error.UnsupportedException,
     };
 }
+
+// A codec or format produces its bytes into a buffer and then hands them to
+// the sink. A direct sink already holds that buffer; a callback sink
+// publishes a staged copy. This is the whole of the difference, so no hook
+// branches on it.
+pub const SinkTarget = struct {
+    output: []u8,
+    staged: bool,
+
+    pub fn open(sink: *Resource, workspace: *resource.Workspace, byte_length: u64) Exception!SinkTarget {
+        const len = std.math.cast(usize, byte_length) orelse return error.ResourceException;
+        return switch (sink.kind) {
+            .direct_write => .{ .output = try sinkDirectBuffer(sink, len), .staged = false },
+            else => .{ .output = try workspace.take(u8, len), .staged = true },
+        };
+    }
+
+    pub fn publish(self: SinkTarget, sink: *Resource, call: *Call, produced: usize) Exception!usize {
+        if (self.staged) try commitBytesToSink(sink, call, self.output[0..produced]);
+        return produced;
+    }
+
+    // The transform write shape: a bounded-sizing write reports the produced
+    // length — an overrun of the plan is a correctness defect, never a silent
+    // truncation — while a measured write stands on the planned size.
+    pub fn publishSized(self: SinkTarget, sink: *Resource, call: *Call, sizing: vocabulary.SizingMode, planned: usize, produced: usize) Exception!usize {
+        if (sizing == .bounded) {
+            if (produced > planned) return error.InternalException;
+            return self.publish(sink, call, produced);
+        }
+        return self.publish(sink, call, planned);
+    }
+};
 
 pub fn mapSinkError(exception: Exception, call: *Call, sink: *Resource) Exception {
     if (sink.downstream_status != 0) writeDownstreamDiagnostic(call, sink.downstream_status);

@@ -1,9 +1,11 @@
 const std = @import("std");
 
+const entry_prim = @import("../../../common/entry.zig");
 const bounds = @import("../../../common/primitive/bounds.zig");
 const exception_prim = @import("../../../common/primitive/exception.zig");
 const io = @import("../../../common/primitive/io.zig");
 
+pub const Entry = entry_prim.Entry;
 const Exception = exception_prim.Exception;
 
 const block_size: u64 = 512;
@@ -25,19 +27,6 @@ pub const SparseInfo = struct {
     realsize: u64,
     segment_count: usize,
     segments: [max_sparse_segments]SparseSegment,
-};
-
-pub const Entry = struct {
-    name: []const u8,
-    data: []const u8,
-    link_name: []const u8 = &.{},
-    mode: u32 = 0o644,
-    uid: u32 = 0,
-    gid: u32 = 0,
-    modification_time: u64 = 0,
-    typeflag: u8 = typeflag_regular,
-    devmajor: u32 = 0,
-    devminor: u32 = 0,
 };
 
 pub const EntryInfo = struct {
@@ -75,24 +64,63 @@ pub fn archiveSizeGnu(entries: []const Entry) Exception!u64 {
 }
 
 fn archiveSizeWith(comptime format: Format, entries: []const Entry) Exception!u64 {
-    var total: u64 = 1024;
+    var counter = CountSink{};
+    var scratch: [scratch_size]u8 = undefined;
+    try layout(format, entries, &counter, &scratch);
+    return counter.total;
+}
+
+// A destination that only measures. Size and bytes come from one traversal, so
+// the two cannot disagree about a header, a long-name entry, or padding.
+const CountSink = struct {
+    total: u64 = 0,
+
+    fn write(self: *CountSink, bytes: []const u8) Exception!void {
+        self.total = try bounds.addU64(self.total, bytes.len);
+    }
+};
+
+fn layout(comptime format: Format, entries: []const Entry, sink: anytype, scratch: []u8) Exception!void {
     for (entries) |entry| {
         const parts = try tarNameParts(entry.name);
         if (std.mem.findScalar(u8, entry.link_name, 0) != null) return error.CallException;
         if ((entry.typeflag == '1' or entry.typeflag == '2') and entry.link_name.len == 0) return error.CallException;
         const data_size = try tarDataSize(entry.typeflag, entry.data);
         if (format == .posix) {
-            var pax_buffer: [512]u8 = undefined;
-            const pax_len = try writePaxRecords(entry, data_size, parts.uses_long_name, &pax_buffer);
-            if (pax_len > 0) total = try bounds.addU64(total, try bounds.addU64(block_size, try tarAligned(pax_len)));
+            var numbers: [5][32]u8 = undefined;
+            var records: [7]PaxRecord = undefined;
+            const record_count = paxRecords(entry, data_size, parts.uses_long_name, &numbers, &records);
+            var pax_len: u64 = 0;
+            for (records[0..record_count]) |record| pax_len = try bounds.addU64(pax_len, paxRecordLen(record.key, record.text));
+            if (pax_len > 0) {
+                try tarWriteHeader(.posix, sink, scratch, "././@PaxHeader", &.{}, &.{}, 0o644, 0, 0, 0, typeflag_pax, pax_len, 0, 0);
+                for (records[0..record_count]) |record| try paxWriteRecord(sink, record.key, record.text);
+                try tarWritePadding(sink, scratch, pax_len);
+            }
+            try tarWriteHeader(.posix, sink, scratch, parts.name, parts.prefix, if (entry.link_name.len > 100) &.{} else entry.link_name, entry.mode, entry.uid, entry.gid, entry.modification_time, entry.typeflag, data_size, entry.devmajor, entry.devminor);
         } else {
-            if (entry.name.len > 100) total = try bounds.addU64(total, try bounds.addU64(block_size, try tarAligned(@as(u64, entry.name.len) + 1)));
-            if (entry.link_name.len > 100) total = try bounds.addU64(total, try bounds.addU64(block_size, try tarAligned(@as(u64, entry.link_name.len) + 1)));
+            if (entry.name.len > 100) {
+                const long_size: u64 = @as(u64, entry.name.len) + 1;
+                try tarWriteHeader(.gnu, sink, scratch, "././@LongLink", &.{}, &.{}, 0o644, 0, 0, 0, typeflag_gnu_long_name, long_size, 0, 0);
+                try sink.write(entry.name);
+                try sink.write("\x00");
+                try tarWritePadding(sink, scratch, long_size);
+            }
+            if (entry.link_name.len > 100) {
+                const long_size: u64 = @as(u64, entry.link_name.len) + 1;
+                try tarWriteHeader(.gnu, sink, scratch, "././@LongLink", &.{}, &.{}, 0o644, 0, 0, 0, typeflag_gnu_long_link, long_size, 0, 0);
+                try sink.write(entry.link_name);
+                try sink.write("\x00");
+                try tarWritePadding(sink, scratch, long_size);
+            }
+            try tarWriteHeader(.gnu, sink, scratch, parts.name, &.{}, if (entry.link_name.len > 100) &.{} else entry.link_name, entry.mode, entry.uid, entry.gid, entry.modification_time, entry.typeflag, data_size, entry.devmajor, entry.devminor);
         }
-        total = try bounds.addU64(total, block_size);
-        total = try bounds.addU64(total, try tarAligned(data_size));
+        try sink.write(entry.data);
+        try tarWritePadding(sink, scratch, data_size);
     }
-    return total;
+    @memset(scratch[0..scratch_size], 0);
+    try sink.write(scratch[0..scratch_size]);
+    try sink.write(scratch[0..scratch_size]);
 }
 
 pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Exception!usize {
@@ -106,70 +134,70 @@ pub fn encodeGnu(entries: []const Entry, output: []u8, scratch: []u8) Exception!
 }
 
 fn encodeWith(comptime format: Format, entries: []const Entry, output: []u8, scratch: []u8) Exception!usize {
-    const required = try archiveSizeWith(format, entries);
-    if (output.len < required) return error.CapacityException;
     if (scratch.len < scratch_size) return error.CapacityException;
     var sink = io.Sink{ .bytes = output };
-    for (entries) |entry| {
-        const parts = try tarNameParts(entry.name);
-        if (std.mem.findScalar(u8, entry.link_name, 0) != null) return error.CallException;
-        if ((entry.typeflag == '1' or entry.typeflag == '2') and entry.link_name.len == 0) return error.CallException;
-        const data_size = try tarDataSize(entry.typeflag, entry.data);
-        if (format == .posix) {
-            var pax_buffer: [512]u8 = undefined;
-            const pax_len = try writePaxRecords(entry, data_size, parts.uses_long_name, &pax_buffer);
-            if (pax_len > 0) {
-                try tarWriteHeader(.posix, &sink, scratch, "././@PaxHeader", &.{}, &.{}, 0o644, 0, 0, 0, typeflag_pax, pax_len, 0, 0);
-                try sink.write(pax_buffer[0..pax_len]);
-                try tarWritePadding(&sink, scratch, pax_len);
-            }
-            try tarWriteHeader(.posix, &sink, scratch, parts.name, parts.prefix, if (entry.link_name.len > 100) &.{} else entry.link_name, entry.mode, entry.uid, entry.gid, entry.modification_time, entry.typeflag, data_size, entry.devmajor, entry.devminor);
-        } else {
-            if (entry.name.len > 100) {
-                const long_size: u64 = @as(u64, entry.name.len) + 1;
-                try tarWriteHeader(.gnu, &sink, scratch, "././@LongLink", &.{}, &.{}, 0o644, 0, 0, 0, typeflag_gnu_long_name, long_size, 0, 0);
-                try sink.write(entry.name);
-                try sink.write("\x00");
-                try tarWritePadding(&sink, scratch, long_size);
-            }
-            if (entry.link_name.len > 100) {
-                const long_size: u64 = @as(u64, entry.link_name.len) + 1;
-                try tarWriteHeader(.gnu, &sink, scratch, "././@LongLink", &.{}, &.{}, 0o644, 0, 0, 0, typeflag_gnu_long_link, long_size, 0, 0);
-                try sink.write(entry.link_name);
-                try sink.write("\x00");
-                try tarWritePadding(&sink, scratch, long_size);
-            }
-            try tarWriteHeader(.gnu, &sink, scratch, parts.name, &.{}, if (entry.link_name.len > 100) &.{} else entry.link_name, entry.mode, entry.uid, entry.gid, entry.modification_time, entry.typeflag, data_size, entry.devmajor, entry.devminor);
-        }
-        try sink.write(entry.data);
-        try tarWritePadding(&sink, scratch, data_size);
-    }
-    @memset(scratch[0..scratch_size], 0);
-    try sink.write(scratch[0..scratch_size]);
-    try sink.write(scratch[0..scratch_size]);
+    try layout(format, entries, &sink, scratch);
     return sink.offset;
 }
 
-fn writePaxRecords(entry: Entry, data_size: u64, uses_long_name: bool, buffer: []u8) Exception!usize {
-    var written: usize = 0;
-    if (uses_long_name) written = try paxRecord(buffer, "path", entry.name);
-    if (entry.link_name.len > 100) {
-        written += try paxRecord(buffer[written..], "linkpath", entry.link_name);
+const PaxRecord = struct { key: []const u8, text: []const u8 };
+
+fn decimal(buffer: *[32]u8, value: u64) []const u8 {
+    var count: usize = 0;
+    var remaining = value;
+    while (true) {
+        buffer[count] = '0' + @as(u8, @truncate(remaining % 10));
+        count += 1;
+        remaining /= 10;
+        if (remaining == 0) break;
     }
-    if (entry.mode > 0o7777777) written += try paxNumberRecord(buffer[written..], "mode", entry.mode);
+    var index: usize = 0;
+    while (index < count / 2) : (index += 1) {
+        const swap = buffer[index];
+        buffer[index] = buffer[count - 1 - index];
+        buffer[count - 1 - index] = swap;
+    }
+    return buffer[0..count];
+}
+
+// One list decides which fields need a pax record; the size pass and the write
+// pass both read it, so they cannot drift.
+fn paxRecords(entry: Entry, data_size: u64, uses_long_name: bool, numbers: *[5][32]u8, out: *[7]PaxRecord) usize {
+    var count: usize = 0;
+    if (uses_long_name) {
+        out[count] = .{ .key = "path", .text = entry.name };
+        count += 1;
+    }
+    if (entry.link_name.len > 100) {
+        out[count] = .{ .key = "linkpath", .text = entry.link_name };
+        count += 1;
+    }
+    if (entry.mode > 0o7777777) {
+        out[count] = .{ .key = "mode", .text = decimal(&numbers[0], entry.mode) };
+        count += 1;
+    }
     if (entry.uid > 0o7777777) {
-        written += try paxNumberRecord(buffer[written..], "uid", entry.uid);
+        out[count] = .{ .key = "uid", .text = decimal(&numbers[1], entry.uid) };
+        count += 1;
     }
     if (entry.gid > 0o7777777) {
-        written += try paxNumberRecord(buffer[written..], "gid", entry.gid);
+        out[count] = .{ .key = "gid", .text = decimal(&numbers[2], entry.gid) };
+        count += 1;
     }
     if (data_size > 0o7777777777) {
-        written += try paxNumberRecord(buffer[written..], "size", data_size);
+        out[count] = .{ .key = "size", .text = decimal(&numbers[3], data_size) };
+        count += 1;
     }
     if (entry.modification_time > 0o7777777777) {
-        written += try paxNumberRecord(buffer[written..], "mtime", entry.modification_time);
+        out[count] = .{ .key = "mtime", .text = decimal(&numbers[4], entry.modification_time) };
+        count += 1;
     }
-    return written;
+    return count;
+}
+
+fn paxRecordLen(key: []const u8, text: []const u8) u64 {
+    const content_len = key.len + 1 + text.len + 1;
+    return @as(u64, paxPrefixLen(content_len)) + 1 + content_len;
 }
 
 fn paxPrefixLen(content_len: usize) usize {
@@ -189,50 +217,23 @@ fn paxPrefixLen(content_len: usize) usize {
     return len_count;
 }
 
-fn paxRecord(buffer: []u8, key: []const u8, payload: []const u8) Exception!usize {
-    const content_len = key.len + 1 + payload.len + 1;
+fn paxWriteRecord(sink: anytype, key: []const u8, text: []const u8) Exception!void {
+    const content_len = key.len + 1 + text.len + 1;
     const len_count = paxPrefixLen(content_len);
-    const total = len_count + 1 + content_len;
-    if (total > buffer.len) return error.CallException;
-    var m = total;
-    var len_index = len_count;
-    while (true) {
-        len_index -= 1;
-        buffer[len_index] = '0' + @as(u8, @truncate(m % 10));
-        m /= 10;
-        if (len_index == 0) break;
+    var digits: [20]u8 = undefined;
+    var remaining = len_count + 1 + content_len;
+    var index = len_count;
+    while (index > 0) {
+        index -= 1;
+        digits[index] = '0' + @as(u8, @truncate(remaining % 10));
+        remaining /= 10;
     }
-    var pos = len_count;
-    buffer[pos] = ' ';
-    pos += 1;
-    @memcpy(buffer[pos..][0..key.len], key);
-    pos += key.len;
-    buffer[pos] = '=';
-    pos += 1;
-    @memcpy(buffer[pos..][0..payload.len], payload);
-    pos += payload.len;
-    buffer[pos] = '\n';
-    pos += 1;
-    return pos;
-}
-
-fn paxNumberRecord(buffer: []u8, key: []const u8, value: u64) Exception!usize {
-    var digits: [32]u8 = undefined;
-    var n = value;
-    var digit_count: usize = 0;
-    while (true) {
-        digits[digit_count] = '0' + @as(u8, @truncate(n % 10));
-        digit_count += 1;
-        n /= 10;
-        if (n == 0) break;
-    }
-    var i: usize = 0;
-    while (i < digit_count / 2) : (i += 1) {
-        const t = digits[i];
-        digits[i] = digits[digit_count - 1 - i];
-        digits[digit_count - 1 - i] = t;
-    }
-    return paxRecord(buffer, key, digits[0..digit_count]);
+    try sink.write(digits[0..len_count]);
+    try sink.write(" ");
+    try sink.write(key);
+    try sink.write("=");
+    try sink.write(text);
+    try sink.write("\n");
 }
 
 pub fn inspectCount(archive: []const u8) Exception!u64 {
@@ -394,7 +395,7 @@ pub fn parseHeaderDataSize(block: *const [512]u8) Exception!u64 {
     return tarNumber(block[124..136]);
 }
 
-fn tarWriteHeader(format: Format, sink: *io.Sink, scratch: []u8, name: []const u8, prefix: []const u8, link_name: []const u8, mode: u32, uid: u32, gid: u32, modification_time: u64, typeflag: u8, size: u64, devmajor: u32, devminor: u32) Exception!void {
+fn tarWriteHeader(format: Format, sink: anytype, scratch: []u8, name: []const u8, prefix: []const u8, link_name: []const u8, mode: u32, uid: u32, gid: u32, modification_time: u64, typeflag: u8, size: u64, devmajor: u32, devminor: u32) Exception!void {
     if (scratch.len < scratch_size) return error.CapacityException;
     const block = scratch[0..scratch_size];
     @memset(block, 0);
@@ -434,7 +435,7 @@ fn tarSealHeader(block: *[512]u8) void {
     block[155] = ' ';
 }
 
-fn tarWritePadding(sink: *io.Sink, scratch: []u8, size: u64) Exception!void {
+fn tarWritePadding(sink: anytype, scratch: []u8, size: u64) Exception!void {
     const padding = (block_size - size % block_size) % block_size;
     if (padding != 0) {
         if (scratch.len < scratch_size) return error.CapacityException;

@@ -348,10 +348,12 @@ const block_writer = struct {
         var contents: usize = 0;
         contents += vintSize(rar.rar5_type_file);
         // The walk requires HFL_DATA on file blocks, and the RAR5 table sets it even when data_size is 0.
-        var block_flags: u64 = if (entry.is_directory) 0 else rar.rar5_flag_data;
+        // The data flag is present on every file block, a directory included:
+        // readers reject a file block that states no data area at all.
+        var block_flags: u64 = rar.rar5_flag_data;
         if (data_encrypted) block_flags |= rar.rar5_flag_extra;
         contents += vintSize(block_flags);
-        if (!entry.is_directory) contents += vintSize(packed_len);
+        contents += vintSize(if (entry.is_directory) 0 else packed_len);
         if (data_encrypted) contents += cryptExtraSize();
         contents += body;
 
@@ -450,13 +452,13 @@ const block_writer = struct {
         var contents: [4400]u8 = undefined;
         var c: usize = 0;
         c += writeVint(rar.rar5_type_file, contents[c..]);
-        var block_flags: u64 = if (entry.is_directory) 0 else rar.rar5_flag_data;
+        var block_flags: u64 = rar.rar5_flag_data;
         if (split_before) block_flags |= rar.rar5_flag_split_before;
         if (split_after) block_flags |= rar.rar5_flag_split_after;
         if (data_encrypted) block_flags |= rar.rar5_flag_extra;
         c += writeVint(block_flags, contents[c..]);
         if (data_encrypted) c += writeVint(extra_len, contents[c..]);
-        if (!entry.is_directory) c += writeVint(data_size, contents[c..]);
+        c += writeVint(data_size, contents[c..]);
         @memcpy(contents[c..][0..b], body[0..b]);
         c += b;
         if (data_encrypted) {
@@ -1008,12 +1010,10 @@ test "file headers carry unix st_mode attributes" {
     const written = try rarEncode(&entries, archive, &ws, crypto.default_provider);
     try testing.expectEqual(required, written);
 
-    // Signature (8) + main block (8) place the first file block at 16; the
-    // block prefix holds type, flags, and data_size, so the body follows at 24.
-    try testing.expectEqualSlices(u8, &[_]u8{ 0xA4, 0x83, 0x02 }, archive[26..29]); // 0o100644
-    try testing.expectEqual(@as(u8, 1), archive[38]); // host_os = unix.
-    // The directory block follows the stored data at 43; its attrs sit at 52.
-    try testing.expectEqualSlices(u8, &[_]u8{ 0xED, 0x83, 0x01 }, archive[52..55]); // 0o40755.
+    // The attribute vints are searched rather than addressed: an offset here
+    // would encode the block prefix's own length and stop testing the point.
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, archive, &[_]u8{ 0xA4, 0x83, 0x02 })); // 0o100644
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, archive, &[_]u8{ 0xED, 0x83, 0x01 })); // 0o40755
 }
 
 test "created archive round-trips through the facade reader (store and lz)" {

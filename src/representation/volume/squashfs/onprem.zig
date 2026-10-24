@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const entry_prim = @import("../../../common/entry.zig");
 const bounds = @import("../../../common/primitive/bounds.zig");
 const checksum = @import("../../../common/primitive/checksum.zig");
 const exception_prim = @import("../../../common/primitive/exception.zig");
@@ -12,6 +13,8 @@ const lzma_seam = @import("../../leaf/lzma/seam.zig");
 const lzo_leaf = @import("../../leaf/lzo/onprem.zig");
 const zstd_leaf = @import("../../leaf/zstd/onprem.zig");
 
+pub const Entry = entry_prim.Entry;
+pub const EntryInfo = entry_prim.Sized;
 const Exception = exception_prim.Exception;
 
 // Squashfs 4.0 slice: one root directory of regular files.
@@ -79,16 +82,6 @@ const mode_file: u16 = 0o644;
 const mode_dir: u16 = 0o755;
 const uid_index: u16 = 0;
 const guid_index: u16 = 1;
-
-pub const Entry = struct {
-    name: []const u8,
-    data: []const u8,
-};
-
-pub const EntryInfo = struct {
-    size: u64,
-    ordinal: u64,
-};
 
 const Super = struct {
     inode_count: u32,
@@ -699,7 +692,10 @@ fn writeSuper(sink: *Sink, plan: *const Plan) Exception!void {
     std.mem.writeInt(u64, raw[56..64], invalid_table, .little);
     std.mem.writeInt(u64, raw[64..72], super_disk_size + plan.data_total, .little);
     std.mem.writeInt(u64, raw[72..80], super_disk_size + plan.data_total + plan.inode_table_total, .little);
-    std.mem.writeInt(u64, raw[80..88], invalid_table, .little);
+    // An empty fragment table points at the end of the image: the spec allows
+    // -1, but a reader that validates the table order as strictly increasing
+    // (frag_table <= bytes_used) rejects it.
+    std.mem.writeInt(u64, raw[80..88], plan.total, .little);
     std.mem.writeInt(u64, raw[88..96], invalid_table, .little);
     try sink.write(&raw);
 }
@@ -891,7 +887,8 @@ fn buildPlan(entries: []const Entry, ws: *WriteWs, alloc: std.mem.Allocator) Exc
     // Tree build: nodes[0] roots the directory tree.
     var nodes: std.ArrayList(Node) = .empty;
     nodes.append(alloc, .{ .kind = .dir, .name = "", .parent = 0 }) catch return error.ResourceException;
-    for (entries) |entry| {
+    const parents = alloc.alloc(u32, entries.len) catch return error.ResourceException;
+    for (entries, 0..) |entry, index| {
         try validateName(entry.name);
         if (entry.data.len > std.math.maxInt(u32)) return error.UnsupportedException;
         var parent: u32 = 0;
@@ -901,7 +898,18 @@ fn buildPlan(entries: []const Entry, ws: *WriteWs, alloc: std.mem.Allocator) Exc
             parent = try findOrCreateDir(&nodes, alloc, parent, comp);
             comp = next;
         }
-        nodes.append(alloc, .{ .kind = .file, .name = comp, .parent = parent, .data = entry.data }) catch return error.ResourceException;
+        parents[index] = parent;
+    }
+    for (entries, 0..) |entry, index| {
+        const parent = parents[index];
+        const leaf = entry_prim.leafName(entry.name) orelse return error.CallException;
+        if (findChild(&nodes, parent, leaf)) |existing| {
+            // The entry names a directory that a deeper path already implied;
+            // a directory carries no content, and anything else is a conflict.
+            if (nodes.items[existing].kind != .dir or entry.data.len != 0) return error.CallException;
+            continue;
+        }
+        nodes.append(alloc, .{ .kind = .file, .name = leaf, .parent = parent, .data = entry.data }) catch return error.ResourceException;
         nodes.items[parent].child_count += 1;
     }
     if (nodes.items.len > max_nodes) return error.UnsupportedException;
@@ -1034,9 +1042,17 @@ fn totalFileBlocks(nodes: []const Node) usize {
     return n;
 }
 
-fn findOrCreateDir(nodes: *std.ArrayList(Node), alloc: std.mem.Allocator, parent: u32, name: []const u8) Exception!u32 {
+fn findChild(nodes: *std.ArrayList(Node), parent: u32, name: []const u8) ?u32 {
     for (nodes.items, 0..) |node, i| {
-        if (node.kind == .dir and node.parent == parent and std.mem.eql(u8, node.name, name)) return @intCast(i);
+        if (node.parent == parent and std.mem.eql(u8, node.name, name)) return @intCast(i);
+    }
+    return null;
+}
+
+fn findOrCreateDir(nodes: *std.ArrayList(Node), alloc: std.mem.Allocator, parent: u32, name: []const u8) Exception!u32 {
+    if (findChild(nodes, parent, name)) |existing| {
+        if (nodes.items[existing].kind != .dir) return error.CallException;
+        return existing;
     }
     const idx: u32 = @intCast(nodes.items.len);
     nodes.append(alloc, .{ .kind = .dir, .name = name, .parent = parent }) catch return error.ResourceException;

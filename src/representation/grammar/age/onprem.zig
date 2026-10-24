@@ -1,16 +1,17 @@
 const std = @import("std");
 
+const entry_prim = @import("../../../common/entry.zig");
 const crypto_prim = @import("../../../common/primitive/crypto.zig");
 const exception_prim = @import("../../../common/primitive/exception.zig");
 
 const b64_pad = std.base64.standard;
 const b64 = std.base64.standard_no_pad;
 const ChaCha20Poly1305 = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
-const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const X25519 = std.crypto.dh.X25519;
-const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
 const scrypt = std.crypto.pwhash.scrypt;
 const testing = std.testing;
+pub const Entry = entry_prim.Entry;
+pub const EntryInfo = entry_prim.Sized;
 pub const Exception = exception_prim.Exception;
 
 // age v1 file encryption per C2SP age.md; vectors from the CCTV age testkit
@@ -18,16 +19,6 @@ pub const Exception = exception_prim.Exception;
 // recipient types are out of scope.
 
 pub const scratch_size: usize = 64 * 1024;
-
-pub const Entry = struct {
-    name: []const u8,
-    data: []const u8,
-};
-
-pub const EntryInfo = struct {
-    size: u64,
-    ordinal: u64,
-};
 
 pub const Options = struct {
     password: []const u8 = &.{},
@@ -313,10 +304,24 @@ fn parseHeader(input: []const u8, alloc: std.mem.Allocator) Exception!Header {
     }
 }
 
+// HMAC comes from the capability seam, not a second copy in the stdlib, so the
+// provider axis covers every keyed hash age derives.
+fn hmacSha256(out: *[32]u8, message: []const u8, key: []const u8) void {
+    var mac = crypto_prim.HmacSha256.bind(crypto_prim.default_provider, key);
+    mac.update(message);
+    mac.final(out);
+}
+
+// RFC 5869 with a 32-byte output, which is one expand block: every age
+// derivation below asks for exactly one.
 fn hkdfSha256(ikm: []const u8, salt: []const u8, info: []const u8) [32]u8 {
-    const prk = HkdfSha256.extract(salt, ikm);
+    var prk: [32]u8 = undefined;
+    hmacSha256(&prk, ikm, salt);
     var out: [32]u8 = undefined;
-    HkdfSha256.expand(&out, info, prk);
+    var mac = crypto_prim.HmacSha256.bind(crypto_prim.default_provider, &prk);
+    mac.update(info);
+    mac.update(&.{1});
+    mac.final(&out);
     return out;
 }
 
@@ -461,7 +466,7 @@ fn writeHeader(file_key: [file_key_len]u8, stanzas: []const Stanza, dest: []u8) 
     try c.write("---");
     const mac_key = headerMacKey(file_key);
     var mac: [32]u8 = undefined;
-    HmacSha256.create(&mac, c.buf[0..c.pos], &mac_key);
+    hmacSha256(&mac, c.buf[0..c.pos], &mac_key);
     try c.byte(' ');
     var mac_b64: [mac_encoded_len]u8 = undefined;
     try c.write(b64.Encoder.encode(&mac_b64, &mac));
@@ -472,7 +477,7 @@ fn writeHeader(file_key: [file_key_len]u8, stanzas: []const Stanza, dest: []u8) 
 fn verifyHeaderMac(input: []const u8, header: Header, file_key: [file_key_len]u8) Exception!void {
     const mac_key = headerMacKey(file_key);
     var mac: [32]u8 = undefined;
-    HmacSha256.create(&mac, input[0 .. header.mac_line_start + 3], &mac_key);
+    hmacSha256(&mac, input[0 .. header.mac_line_start + 3], &mac_key);
     const line = input[header.mac_line_start .. header.payload_offset - 1];
     if (line.len != 4 + mac_encoded_len or line[3] != ' ') return error.DataException;
     var expected: [32]u8 = undefined;

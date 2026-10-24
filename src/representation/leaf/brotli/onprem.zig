@@ -991,7 +991,10 @@ fn decodeMetaBlock(
                 push_ring = true;
             } else {
                 const dc: u32 = dcode - ndirect - 16;
-                const ndistbits: u5 = @intCast(1 + (dc >> (npostfix + 1)));
+                // The extra-bit count comes off the wire: a code past the
+                // window's own reach must not narrow into a u5 or outrun the
+                // accumulator.
+                const ndistbits: u5 = std.math.cast(u5, 1 + (dc >> (npostfix + 1))) orelse return error.DataException;
                 const dextra = try br.readBits(ndistbits);
                 const hcode = dc >> npostfix;
                 const lcode = dc & postfix_mask;
@@ -2524,7 +2527,10 @@ pub const Incremental = struct {
                             push_ring = true;
                         } else {
                             const dc: u32 = dcode - self.ndirect - 16;
-                            const ndistbits: u6 = @intCast(1 + (dc >> (self.npostfix + 1)));
+                            // Same wire-derived width guard as the one-shot
+                            // decoder: beyond 31 bits no distance exists.
+                            const ndistbits: u6 = std.math.cast(u6, 1 + (dc >> (self.npostfix + 1))) orelse return error.DataException;
+                            if (ndistbits > 31) return error.DataException;
                             const dextra = try self.br.readBits(ndistbits);
                             self.cmd.dcode_pending = null;
                             const hcode = dc >> self.npostfix;

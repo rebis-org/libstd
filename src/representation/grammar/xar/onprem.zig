@@ -1,9 +1,15 @@
 const std = @import("std");
 
+const entry_prim = @import("../../../common/entry.zig");
 const bounds = @import("../../../common/primitive/bounds.zig");
+const checksum = @import("../../../common/primitive/checksum.zig");
+const crypto = @import("../../../common/primitive/crypto.zig");
 const exception_prim = @import("../../../common/primitive/exception.zig");
 const io = @import("../../../common/primitive/io.zig");
+const gzip = @import("../gzip/onprem.zig");
+const zlib = @import("../zlib/onprem.zig");
 
+pub const Entry = entry_prim.Entry;
 const Exception = exception_prim.Exception;
 
 // XAR: big-endian header, zlib-compressed XML TOC, heap at TOC-declared
@@ -23,15 +29,6 @@ const sha1_len = 20;
 // (9999-12-31T23:59:59Z).
 const epoch_max_iso = 253402300799;
 
-pub const Entry = struct {
-    name: []const u8,
-    data: []const u8,
-    mode: u32 = 0o644,
-    uid: u32 = 0,
-    gid: u32 = 0,
-    modification_time: u64 = 0,
-};
-
 pub const EntryInfo = struct {
     name: []const u8,
     mode: u32,
@@ -46,8 +43,7 @@ pub const EntryInfo = struct {
 };
 
 fn validateEntry(entry: Entry) Exception!void {
-    if (entry.name.len == 0 or std.mem.findScalar(u8, entry.name, 0) != null) return error.CallException;
-    if (bounds.isAbsoluteOrTraversal(entry.name)) return error.CallException;
+    try entry_prim.validateName(entry.name);
     for (entry.name) |byte| {
         if (byte < 0x20 or byte == '<' or byte == '>' or byte == '&' or byte == '"' or byte == '\'') return error.UnsupportedException;
     }
@@ -94,40 +90,100 @@ fn writeTimeIso(sink: anytype, epoch: u64) Exception!void {
     sink.write(text) catch return error.CapacityException;
 }
 
-fn writeTocXml(sink: anytype, entries: []const Entry) Exception!void {
+// xar states a path by nesting, never by a slash inside a name: the reference
+// reader replaces '/' with ':' so a flat table cannot carry a directory tree.
+// The writer therefore walks the entries in name order and keeps a stack of
+// open elements, which makes the tree shape a function of the names alone.
+const tree_depth_max = 64;
+
+fn isAncestor(prefix: []const u8, name: []const u8) bool {
+    return name.len > prefix.len and name[prefix.len] == '/' and std.mem.startsWith(u8, name, prefix);
+}
+
+fn indexLessThan(entries: []const Entry, lhs: u32, rhs: u32) bool {
+    return std.mem.lessThan(u8, entries[lhs].name, entries[rhs].name);
+}
+
+fn sortedIndices(entries: []const Entry, storage: []u8) Exception![]u32 {
+    // Caller scratch only promises byte alignment; the index area starts at
+    // the next u32 boundary, not at the slice start.
+    const pad = std.mem.alignForward(usize, @intFromPtr(storage.ptr), @alignOf(u32)) - @intFromPtr(storage.ptr);
+    const bytes = entries.len * @sizeOf(u32);
+    if (storage.len < pad + bytes) return error.CapacityException;
+    const indices = std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(storage[pad..][0..bytes])));
+    for (indices, 0..) |*slot, position| slot.* = @intCast(position);
+    std.mem.sortUnstable(u32, indices, entries, indexLessThan);
+    return indices;
+}
+
+fn writeSyntheticDir(sink: anytype, component: []const u8, id: u64) Exception!void {
+    try sink.write("<file id=\"");
+    try writeNum(sink, "{d}", id);
+    try sink.write("\">\n<name>");
+    try sink.write(component);
+    try sink.write("</name>\n<type>directory</type>\n");
+}
+
+fn writeTocXml(sink: anytype, entries: []const Entry, order: []const u32) Exception!void {
     sink.write(xml_prolog) catch return error.CapacityException;
     // Offsets are heap-relative; the heap opens with the TOC digest.
     // File data starts past it; libarchive seeks from the digest.
     var offset: u64 = sha1_len;
-    for (entries, 0..) |entry, index| {
+    var open: [tree_depth_max][]const u8 = undefined;
+    var depth: usize = 0;
+    var id: u64 = 0;
+    for (order, 0..) |entry_index, position| {
+        const entry = entries[entry_index];
         try validateEntry(entry);
+        const next_name: ?[]const u8 = if (position + 1 < order.len) entries[order[position + 1]].name else null;
+        while (depth > 0 and !isAncestor(open[depth - 1], entry.name)) : (depth -= 1) {
+            sink.write("</file>\n") catch return error.CapacityException;
+        }
+        var segment: usize = if (depth == 0) 0 else open[depth - 1].len + 1;
+        while (std.mem.findScalarPos(u8, entry.name, segment, '/')) |slash| {
+            if (depth == tree_depth_max) return error.UnsupportedException;
+            id += 1;
+            try writeSyntheticDir(sink, entry.name[segment..slash], id);
+            open[depth] = entry.name[0..slash];
+            depth += 1;
+            segment = slash + 1;
+        }
+        const is_dir = next_name != null and isAncestor(entry.name, next_name.?);
         var digest_buf: [sha1_len * 2]u8 = undefined;
         sha1Hex(&digest_buf, entry.data);
-        try sink.write("    <file id=\"");
-        try writeNum(sink, "{d}", index + 1);
-        try sink.write("\">\n      <name>");
-        try sink.write(entry.name);
-        try sink.write("</name>\n      <type>file</type>\n      <mode>");
+        id += 1;
+        sink.write("<file id=\"") catch return error.CapacityException;
+        try writeNum(sink, "{d}", id);
+        sink.write("\">\n<name>") catch return error.CapacityException;
+        sink.write(entry.name[segment..]) catch return error.CapacityException;
+        sink.write(if (is_dir) "</name>\n<type>directory</type>\n" else "</name>\n<type>file</type>\n") catch return error.CapacityException;
+        sink.write("<mode>") catch return error.CapacityException;
         try writeNum(sink, "{o}", entry.mode);
-        try sink.write("</mode>\n      <uid>");
+        sink.write("</mode>\n<uid>") catch return error.CapacityException;
         try writeNum(sink, "{d}", entry.uid);
-        try sink.write("</uid>\n      <gid>");
+        sink.write("</uid>\n<gid>") catch return error.CapacityException;
         try writeNum(sink, "{d}", entry.gid);
-        try sink.write("</gid>\n      <mtime>");
+        sink.write("</gid>\n<mtime>") catch return error.CapacityException;
         try writeTimeIso(sink, entry.modification_time);
-        try sink.write("</mtime>\n      <data>\n        <encoding style=\"application/octet-stream\"/>\n        <offset>");
-        try writeNum(sink, "{d}", offset);
-        try sink.write("</offset>\n        <length>");
-        try writeNum(sink, "{d}", entry.data.len);
-        try sink.write("</length>\n        <size>");
-        try writeNum(sink, "{d}", entry.data.len);
-        try sink.write("</size>\n        <archived-checksum method=\"sha1\">");
-        try sink.write(&digest_buf);
-        try sink.write("</archived-checksum>\n        <extracted-checksum method=\"sha1\">");
-        try sink.write(&digest_buf);
-        try sink.write("</extracted-checksum>\n      </data>\n    </file>\n");
-        offset = try bounds.addU64(offset, entry.data.len);
+        sink.write("</mtime>\n") catch return error.CapacityException;
+        if (!is_dir) {
+            sink.write("<data>\n<encoding style=\"application/octet-stream\"/>\n<offset>") catch return error.CapacityException;
+            try writeNum(sink, "{d}", offset);
+            sink.write("</offset>\n<length>") catch return error.CapacityException;
+            try writeNum(sink, "{d}", entry.data.len);
+            sink.write("</length>\n<size>") catch return error.CapacityException;
+            try writeNum(sink, "{d}", entry.data.len);
+            sink.write("</size>\n<archived-checksum style=\"sha1\">") catch return error.CapacityException;
+            sink.write(&digest_buf) catch return error.CapacityException;
+            sink.write("</archived-checksum>\n<extracted-checksum style=\"sha1\">") catch return error.CapacityException;
+            sink.write(&digest_buf) catch return error.CapacityException;
+            sink.write("</extracted-checksum>\n</data>\n") catch return error.CapacityException;
+            offset = try bounds.addU64(offset, entry.data.len);
+        }
+        open[depth] = entry.name;
+        depth += 1;
     }
+    while (depth > 0) : (depth -= 1) sink.write("</file>\n") catch return error.CapacityException;
     sink.write(xml_epilog) catch return error.CapacityException;
 }
 
@@ -136,9 +192,9 @@ fn zlibStoredLen(src_len: u64) Exception!u64 {
     return bounds.addU64(6 + src_len + 5 * blocks, 0);
 }
 
-fn tocLayout(entries: []const Entry) Exception!struct { xml_len: u64, toc_len: u64, heap_start: u64 } {
+fn tocLayout(entries: []const Entry, scratch: []u8) Exception!struct { xml_len: u64, toc_len: u64, heap_start: u64 } {
     var counter = CountSink{};
-    try writeTocXml(&counter, entries);
+    try writeTocXml(&counter, entries, try sortedIndices(entries, scratch));
     const toc_len = try zlibStoredLen(counter.offset);
     return .{
         .xml_len = counter.offset,
@@ -147,8 +203,8 @@ fn tocLayout(entries: []const Entry) Exception!struct { xml_len: u64, toc_len: u
     };
 }
 
-pub fn archiveSize(entries: []const Entry) Exception!u64 {
-    const layout = try tocLayout(entries);
+pub fn archiveSize(entries: []const Entry, scratch: []u8) Exception!u64 {
+    const layout = try tocLayout(entries, scratch);
     var total = try bounds.addU64(layout.heap_start, sha1_len);
     for (entries) |entry| total = try bounds.addU64(total, entry.data.len);
     return total;
@@ -174,9 +230,17 @@ fn writeZlibStored(sink: *io.Sink, src: []const u8, adler: u32) Exception!void {
     sink.write(&adler_buf) catch return error.CapacityException;
 }
 
+// Both digests the container needs come from the tree's own primitives: the
+// stdlib versions would bypass the capability provider axis.
+fn sha1Digest(out: *[sha1_len]u8, data: []const u8) void {
+    var hasher = crypto.Sha1.bind(crypto.default_provider, .{});
+    hasher.update(data);
+    hasher.final(out);
+}
+
 fn sha1Hex(out: *[sha1_len * 2]u8, data: []const u8) void {
     var digest: [sha1_len]u8 = undefined;
-    std.crypto.hash.Sha1.hash(data, &digest, .{});
+    sha1Digest(&digest, data);
     const digits = "0123456789abcdef";
     for (digest, 0..) |byte, i| {
         out[i * 2] = digits[byte >> 4];
@@ -185,13 +249,16 @@ fn sha1Hex(out: *[sha1_len * 2]u8, data: []const u8) void {
 }
 
 pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Exception!usize {
-    if (scratch.len < 4096) return error.CapacityException;
-    const layout = try tocLayout(entries);
-    if (scratch.len < layout.xml_len + 4 + sha1_len) return error.ResourceException;
+    // The index area aligns to the u32 the sort moves; the XML follows it.
+    const index_at = std.mem.alignForward(usize, @intFromPtr(scratch.ptr), 4) - @intFromPtr(scratch.ptr);
+    const index_bytes = entries.len * @sizeOf(u32);
+    if (scratch.len < index_at + index_bytes) return error.CapacityException;
+    const indices = try sortedIndices(entries, scratch[index_at..][0..index_bytes]);
+    const xml_area = scratch[index_at + index_bytes ..];
 
-    var toc_sink = io.Sink{ .bytes = scratch };
-    try writeTocXml(&toc_sink, entries);
-    const xml = scratch[0..toc_sink.offset];
+    var toc_sink = io.Sink{ .bytes = xml_area };
+    try writeTocXml(&toc_sink, entries, indices);
+    const xml = xml_area[0..toc_sink.offset];
 
     var sink = io.Sink{ .bytes = output };
     const compressed_len = try zlibStoredLen(xml.len);
@@ -206,14 +273,16 @@ pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Exception!usi
     std.mem.writeInt(u32, header[24..28], cksum_sha1, .big);
     sink.write(&header) catch return error.CapacityException;
     const toc_start = sink.offset;
-    try writeZlibStored(&sink, xml, std.hash.Adler32.hash(xml));
+    try writeZlibStored(&sink, xml, checksum.adler32With(checksum.default_provider, xml));
     // The TOC checksum covers the compressed bytes.
     // libarchive hashes what sits on disk between header and digest.
     var digest: [sha1_len]u8 = undefined;
-    std.crypto.hash.Sha1.hash(output[toc_start..sink.offset], &digest, .{});
+    sha1Digest(&digest, output[toc_start..sink.offset]);
     sink.write(&digest) catch return error.CapacityException;
-    for (entries) |entry| {
-        sink.write(entry.data) catch return error.CapacityException;
+    // The heap follows the TOC's own order: the offsets the writer just
+    // declared are emission order, not the caller's order.
+    for (indices) |entry_index| {
+        sink.write(entries[entry_index].data) catch return error.CapacityException;
     }
     return sink.offset;
 }
@@ -232,16 +301,18 @@ const Toc = struct {
     alg: u32,
 };
 
-fn inflateInto(src: []const u8, dst: []u8) Exception!usize {
-    const container: std.compress.flate.Container = if (src.len >= 2 and src[0] == 0x1f and src[1] == 0x8b) .gzip else if (src.len >= 1 and src[0] == 0x78) .zlib else .raw;
-    var reader = std.Io.Reader.fixed(src);
-    var decomp = std.compress.flate.Decompress.init(&reader, container, &.{});
+// A TOC is zlib by construction (vendor writes zlib); a compressed entry may
+// also arrive as gzip. Both decode through the tree's grammars, so the
+// payload path shares one framing story with the rest of the library.
+fn inflateInto(src: []const u8, dst: []u8, history: []u8) Exception!usize {
     var sink = std.Io.Writer.fixed(dst);
-    const written = decomp.reader.stream(&sink, .unlimited) catch return error.DataException;
-    return written;
+    if (src.len >= 2 and src[0] == 0x1f and src[1] == 0x8b) {
+        return gzip.decode(src, &sink, history, checksum.default_provider);
+    }
+    return zlib.decode(src, &sink, history, checksum.default_provider);
 }
 
-fn inflateToc(archive: []const u8, scratch: []u8) Exception!Toc {
+fn inflateToc(archive: []const u8, scratch: []u8, history: []u8) Exception!Toc {
     if (archive.len < header_size) return error.DataException;
     if (!std.mem.eql(u8, archive[0..4], "xar!")) return error.DataException;
     const hlen: u64 = be16(archive, 4);
@@ -264,7 +335,7 @@ fn inflateToc(archive: []const u8, scratch: []u8) Exception!Toc {
     const toc_bytes = try bounds.slice(archive, hlen, toc_comp);
     const uncomp_len = std.math.cast(usize, toc_uncomp) orelse return error.ResourceException;
     if (scratch.len < uncomp_len) return error.ResourceException;
-    const xml_len = try inflateInto(toc_bytes, scratch[0..uncomp_len]);
+    const xml_len = try inflateInto(toc_bytes, scratch[0..uncomp_len], history);
     if (xml_len != uncomp_len) return error.DataException;
     const toc = Toc{
         .xml = scratch[0..xml_len],
@@ -306,7 +377,7 @@ fn verifyToc(toc: *const Toc, toc_bytes: []const u8) Exception!void {
     if (size != sha1_len) return error.DataException;
     const stored = try bounds.slice(toc.heap, offset, sha1_len);
     var digest: [sha1_len]u8 = undefined;
-    std.crypto.hash.Sha1.hash(toc_bytes, &digest, .{});
+    sha1Digest(&digest, toc_bytes);
     if (!std.mem.eql(u8, stored, &digest)) return error.DataException;
 }
 
@@ -466,6 +537,49 @@ fn findFileElementEnd(xml: []const u8, start: usize, limit: usize) Exception!usi
     return pos;
 }
 
+const Span = struct { start: usize, end: usize };
+
+// Extended-attribute blocks repeat the tag names a file element uses, and the
+// vendor writes a file's own fields in no fixed order: `name` follows `type`
+// in a libarchive TOC. Every field therefore searches the whole element from
+// its start, and skips the attribute blocks.
+fn attributeSpans(xml: []const u8, from: usize, limit: usize, out: []Span) Exception![]Span {
+    var count: usize = 0;
+    var pos = from;
+    while (std.mem.findPos(u8, xml[0..limit], pos, "<ea")) |at| {
+        const open_end = std.mem.findScalarPos(u8, xml[0..limit], at, '>') orelse return error.DataException;
+        const close = std.mem.findPos(u8, xml[0..limit], open_end, "</ea>") orelse return error.DataException;
+        if (count == out.len) return error.DataException;
+        out[count] = .{ .start = at, .end = close + "</ea>".len };
+        count += 1;
+        pos = close + "</ea>".len;
+    }
+    return out[0..count];
+}
+
+fn insideSpans(spans: []const Span, at: usize) bool {
+    for (spans) |span| {
+        if (at >= span.start and at < span.end) return true;
+    }
+    return false;
+}
+
+fn fieldText(xml: []const u8, from: usize, limit: usize, comptime tag: []const u8, spans: []const Span) Exception!?[]const u8 {
+    const open = "<" ++ tag ++ ">";
+    const close = "</" ++ tag ++ ">";
+    var pos = from;
+    while (std.mem.findPos(u8, xml[0..limit], pos, open)) |at| {
+        if (!insideSpans(spans, at)) {
+            const inner = at + open.len;
+            const end = std.mem.findPos(u8, xml[0..limit], inner, close) orelse return error.DataException;
+            return xml[inner..end];
+        }
+        const end = std.mem.findPos(u8, xml[0..limit], at + open.len, close) orelse return error.DataException;
+        pos = end + close.len;
+    }
+    return null;
+}
+
 const ScanState = struct {
     xml: []const u8,
     want: ?u64,
@@ -490,7 +604,8 @@ const ScanState = struct {
         // A file's own elements precede any nested child; bound the field
         // scan so a child's fields cannot leak into the parent.
         const field_limit = std.mem.findPos(u8, self.xml[0..file_end], file_start, "<file") orelse file_end;
-        var file = XmlCursor{ .data = self.xml, .pos = file_start, .limit = field_limit };
+        var span_storage: [16]Span = undefined;
+        const spans = try attributeSpans(self.xml, file_start, field_limit, &span_storage);
         var info: EntryInfo = undefined;
         info.ordinal = self.count;
         self.count += 1;
@@ -502,19 +617,21 @@ const ScanState = struct {
         info.data_length = 0;
         info.size = 0;
         info.stored = true;
-        const name_raw = (try file.tagContent("name")) orelse return error.DataException;
-        const type_text = (try file.tagContent("type")) orelse "file";
-        if (try file.modeAfter("mode")) |mode_value| {
-            info.mode = mode_value;
+        const name_raw = (try fieldText(self.xml, file_start, field_limit, "name", spans)) orelse return error.DataException;
+        const type_text = (try fieldText(self.xml, file_start, field_limit, "type", spans)) orelse "file";
+        if (try fieldText(self.xml, file_start, field_limit, "mode", spans)) |text| {
+            info.mode = try parseMode(std.mem.trim(u8, text, " \t\r\n"));
         }
-        if (try file.numberAfter("uid")) |uid_value| {
+        if (try fieldText(self.xml, file_start, field_limit, "uid", spans)) |text| {
+            const uid_value = try parseNumber(std.mem.trim(u8, text, " \t\r\n"));
             info.uid = std.math.cast(u32, uid_value) orelse return error.DataException;
         }
-        if (try file.numberAfter("gid")) |gid_value| {
+        if (try fieldText(self.xml, file_start, field_limit, "gid", spans)) |text| {
+            const gid_value = try parseNumber(std.mem.trim(u8, text, " \t\r\n"));
             info.gid = std.math.cast(u32, gid_value) orelse return error.DataException;
         }
-        if (try file.timeAfter("mtime")) |mtime_value| {
-            info.modification_time = mtime_value;
+        if (try fieldText(self.xml, file_start, field_limit, "mtime", spans)) |text| {
+            info.modification_time = parseTimeValue(std.mem.trim(u8, text, " \t\r\n"));
         }
         if (std.mem.eql(u8, std.mem.trim(u8, type_text, " \t\r\n"), "file") and
             std.mem.findPos(u8, self.xml[file_start..field_limit], 0, "<data>") != null)
@@ -581,21 +698,29 @@ fn scanEntries(xml: []const u8, want: ?u64, name_buf: ?[]u8) Exception!ScanResul
     return .{ .count = state.count, .found = state.found };
 }
 
-fn splitScratch(scratch: []u8) Exception!struct { toc: []u8, name: []u8 } {
-    if (scratch.len < 4096 + 512) return error.ResourceException;
-    return .{ .toc = scratch[0 .. scratch.len - 512], .name = scratch[scratch.len - 512 ..] };
+// The TOC bytes, the inflate history, and the joined-name buffer share one
+// caller slice: history first because the deflate framing owns it whole.
+fn splitScratch(scratch: []u8) Exception!struct { history: []u8, toc: []u8, name: []u8 } {
+    const history_len = zlib.deflate_history_size;
+    if (scratch.len < history_len + 4096 + 512) return error.ResourceException;
+    const name_at = scratch.len - 512;
+    return .{
+        .history = scratch[0..history_len],
+        .toc = scratch[history_len..name_at],
+        .name = scratch[name_at..],
+    };
 }
 
 pub fn inspectCount(archive: []const u8, scratch: []u8) Exception!u64 {
     const parts = try splitScratch(scratch);
-    const toc = try inflateToc(archive, parts.toc);
+    const toc = try inflateToc(archive, parts.toc, parts.history);
     const result = try scanEntries(toc.xml, null, null);
     return result.count;
 }
 
 pub fn inspectOrdinal(archive: []const u8, ordinal: u64, scratch: []u8) Exception!EntryInfo {
     const parts = try splitScratch(scratch);
-    const toc = try inflateToc(archive, parts.toc);
+    const toc = try inflateToc(archive, parts.toc, parts.history);
     const result = try scanEntries(toc.xml, ordinal, parts.name);
     if (result.found) |info| return info;
     return error.DataException;
@@ -603,7 +728,7 @@ pub fn inspectOrdinal(archive: []const u8, ordinal: u64, scratch: []u8) Exceptio
 
 pub fn decodeOrdinal(archive: []const u8, ordinal: u64, output: []u8, scratch: []u8) Exception!usize {
     const parts = try splitScratch(scratch);
-    const toc = try inflateToc(archive, parts.toc);
+    const toc = try inflateToc(archive, parts.toc, parts.history);
     const result = try scanEntries(toc.xml, ordinal, parts.name);
     const info = result.found orelse return error.DataException;
     const size = std.math.cast(usize, info.size) orelse return error.ResourceException;
@@ -614,7 +739,7 @@ pub fn decodeOrdinal(archive: []const u8, ordinal: u64, output: []u8, scratch: [
         @memcpy(output[0..size], payload);
         return size;
     }
-    const written = try inflateInto(payload, output[0..size]);
+    const written = try inflateInto(payload, output[0..size], parts.history);
     if (written != size) return error.DataException;
     return written;
 }
@@ -626,23 +751,32 @@ test "xar roundtrips entries through the envelope layout" {
         .{ .name = "dir/nested.bin", .data = "payload", .mode = 0o755 },
     };
     var archive: [8192]u8 = undefined;
-    var scratch: [16384]u8 = undefined;
+    var scratch: [96 * 1024]u8 = undefined;
     const written = try encode(&entries, &archive, &scratch);
-    try testing.expectEqual(written, try archiveSize(&entries));
+    try testing.expectEqual(written, try archiveSize(&entries, &scratch));
+    // Scratch only promises byte alignment: a stack array can sit at any
+    // address, and the Linux CI placed one off a u32 boundary, so the size
+    // walk must survive a slice that is misaligned on purpose.
+    try testing.expectEqual(written, try archiveSize(&entries, scratch[1..]));
     try testing.expectEqualSlices(u8, "xar!", archive[0..4]);
+    // The TOC states a path by nesting, so the implied directory becomes an
+    // element of its own.
     const count = try inspectCount(archive[0..written], &scratch);
-    try testing.expectEqual(@as(u64, 2), count);
-    const first = try inspectOrdinal(archive[0..written], 0, &scratch);
+    try testing.expectEqual(@as(u64, 3), count);
+    const dir = try inspectOrdinal(archive[0..written], 0, &scratch);
+    try testing.expectEqualSlices(u8, "dir", dir.name);
+    const nested = try inspectOrdinal(archive[0..written], 1, &scratch);
+    try testing.expectEqualSlices(u8, "dir/nested.bin", nested.name);
+    try testing.expectEqual(@as(u32, 0o755), nested.mode);
+    var out: [16]u8 = undefined;
+    const n = try decodeOrdinal(archive[0..written], 1, &out, &scratch);
+    try testing.expectEqualSlices(u8, "payload", out[0..n]);
+    const first = try inspectOrdinal(archive[0..written], 2, &scratch);
     try testing.expectEqualSlices(u8, "hello.txt", first.name);
     try testing.expectEqual(@as(u64, 11), first.size);
     try testing.expectEqual(@as(u32, 0o644), first.mode);
     try testing.expectEqual(@as(u32, 7), first.uid);
     try testing.expectEqual(@as(u64, 123456789), first.modification_time);
-    var out: [16]u8 = undefined;
-    const n = try decodeOrdinal(archive[0..written], 1, &out, &scratch);
-    try testing.expectEqualSlices(u8, "payload", out[0..n]);
-    const second = try inspectOrdinal(archive[0..written], 1, &scratch);
-    try testing.expectEqual(@as(u32, 0o755), second.mode);
 }
 
 test "xar formats and parses iso 8601 times" {
@@ -692,7 +826,7 @@ test "xar rejects malformed headers and corrupted toc digests" {
     const testing = std.testing;
     const entries = [_]Entry{.{ .name = "a.txt", .data = "data" }};
     var archive: [8192]u8 = undefined;
-    var scratch: [16384]u8 = undefined;
+    var scratch: [96 * 1024]u8 = undefined;
     const written = try encode(&entries, &archive, &scratch);
 
     var copy: [8192]u8 = undefined;
@@ -737,7 +871,7 @@ test "xar rejects out of range uid and gid without trapping" {
     ;
     var toc_buf: [4096]u8 = undefined;
     var toc_sink = io.Sink{ .bytes = &toc_buf };
-    try writeZlibStored(&toc_sink, xml, std.hash.Adler32.hash(xml));
+    try writeZlibStored(&toc_sink, xml, checksum.adler32With(checksum.default_provider, xml));
     const toc_comp = toc_sink.offset;
     var archive: [8192]u8 = undefined;
     @memcpy(archive[0..4], "xar!");
@@ -748,11 +882,11 @@ test "xar rejects out of range uid and gid without trapping" {
     std.mem.writeInt(u32, archive[24..28], cksum_sha1, .big);
     @memcpy(archive[28..][0..toc_comp], toc_buf[0..toc_comp]);
     var digest: [sha1_len]u8 = undefined;
-    std.crypto.hash.Sha1.hash(archive[28..][0..toc_comp], &digest, .{});
+    sha1Digest(&digest, archive[28..][0..toc_comp]);
     @memcpy(archive[28 + toc_comp ..][0..sha1_len], &digest);
     archive[28 + toc_comp + sha1_len] = 'x';
     const total = 29 + toc_comp + sha1_len;
-    var scratch: [16384]u8 = undefined;
+    var scratch: [96 * 1024]u8 = undefined;
     try testing.expectError(error.DataException, inspectOrdinal(archive[0..total], 0, &scratch));
 }
 
@@ -792,7 +926,7 @@ test "xar decodes libarchive-style nested and empty-file tocs" {
     ;
     var toc_buf: [4096]u8 = undefined;
     var toc_sink = io.Sink{ .bytes = &toc_buf };
-    try writeZlibStored(&toc_sink, xml, std.hash.Adler32.hash(xml));
+    try writeZlibStored(&toc_sink, xml, checksum.adler32With(checksum.default_provider, xml));
     const toc_comp = toc_sink.offset;
     var archive: [8192]u8 = undefined;
     @memcpy(archive[0..4], "xar!");
@@ -803,11 +937,11 @@ test "xar decodes libarchive-style nested and empty-file tocs" {
     std.mem.writeInt(u32, archive[24..28], cksum_sha1, .big);
     @memcpy(archive[28..][0..toc_comp], toc_buf[0..toc_comp]);
     var digest: [sha1_len]u8 = undefined;
-    std.crypto.hash.Sha1.hash(archive[28..][0..toc_comp], &digest, .{});
+    sha1Digest(&digest, archive[28..][0..toc_comp]);
     @memcpy(archive[28 + toc_comp ..][0..sha1_len], &digest);
     @memcpy(archive[28 + toc_comp + sha1_len ..][0..4], "data");
     const total = 28 + toc_comp + sha1_len + 4;
-    var scratch: [16384]u8 = undefined;
+    var scratch: [96 * 1024]u8 = undefined;
 
     try testing.expectEqual(@as(u64, 3), try inspectCount(archive[0..total], &scratch));
     const dir = try inspectOrdinal(archive[0..total], 0, &scratch);

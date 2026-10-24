@@ -51,7 +51,13 @@ pub const trap = Module{
         .{ .name = "interface", .module = "interface" },
     },
 };
-pub const component = Module{ .name = "component", .root = "build/component.zig" };
+pub const component = Module{
+    .name = "component",
+    .root = "build/component.zig",
+    .imports = &.{
+        .{ .name = "interface", .module = "interface" },
+    },
+};
 pub const benchmark = Module{
     .name = "benchmark",
     .root = "build/acceptance/benchmark/benchmark.zig",
