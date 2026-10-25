@@ -14,7 +14,11 @@ const lzo_leaf = @import("../../leaf/lzo/onprem.zig");
 const zstd_leaf = @import("../../leaf/zstd/onprem.zig");
 
 pub const Entry = entry_prim.Entry;
-pub const EntryInfo = entry_prim.Sized;
+pub const EntryInfo = struct {
+    name: []const u8,
+    size: u64,
+    ordinal: u64,
+};
 const Exception = exception_prim.Exception;
 
 // SquashFS 4.0 slice: one root directory of regular files.
@@ -70,7 +74,7 @@ const meta_staging_size: usize = 48 * 1024;
 const block_staging_size: usize = block_size_default + 64;
 const zstd_workspace_extra: usize = 3 << 20;
 const write_staging_size: usize = block_staging_size + meta_staging_size + max_data_blocks * 4;
-const read_scratch_size: usize = 2 * metadata_size + frag_buffer_size + deflate.history_size + xz_grammar.decodeWorkspaceSize(xz_dictionary_cap);
+const read_scratch_size: usize = 2 * metadata_size + frag_buffer_size + deflate.history_size + xz_grammar.decodeWorkspaceSize(xz_dictionary_cap) + path_size;
 pub const scratch_size: usize = read_scratch_size + zstd_workspace_extra + write_staging_size;
 
 const max_entries = 256;
@@ -91,21 +95,28 @@ const Super = struct {
     fragment_table_start: u64,
 };
 
+// Joined listing paths stage here; depth-bounded by max_dir_depth.
+const path_size: usize = (max_dir_depth + 1) * 257;
+
 const Scratch = struct {
     meta: []u8,
     dir: []u8,
     frag: []u8,
     history: []u8,
     aux: []u8,
+    path: []u8,
 
     fn carve(scratch: []u8) Exception!Scratch {
         if (scratch.len < scratch_size) return error.CapacityException;
+        const aux = scratch[2 * metadata_size + frag_buffer_size + deflate.history_size ..];
+        if (aux.len < path_size) return error.ResourceException;
         return .{
             .meta = scratch[0..metadata_size],
             .dir = scratch[metadata_size .. 2 * metadata_size],
             .frag = scratch[2 * metadata_size ..][0..frag_buffer_size],
             .history = scratch[2 * metadata_size + frag_buffer_size ..][0..deflate.history_size],
-            .aux = scratch[2 * metadata_size + frag_buffer_size + deflate.history_size ..],
+            .aux = aux[path_size..],
+            .path = aux[0..path_size],
         };
     }
 };
@@ -340,10 +351,43 @@ const DirTarget = union(enum) {
 
 const WalkState = struct {
     ordinal: u64 = 0,
+    path_len: usize = 0,
+    spans: [max_dir_depth]usize = undefined,
+    path: []u8 = &.{},
+
+    fn push(self: *WalkState, name: []const u8, depth: usize) Exception!void {
+        if (depth >= max_dir_depth) return error.DataException;
+        self.spans[depth] = self.path_len;
+        const extra = if (self.path_len == 0) name.len else name.len + 1;
+        if (self.path_len + extra > self.path.len) return error.DataException;
+        if (self.path_len != 0) {
+            self.path[self.path_len] = '/';
+            self.path_len += 1;
+        }
+        @memcpy(self.path[self.path_len..][0..name.len], name);
+        self.path_len += name.len;
+    }
+
+    fn pop(self: *WalkState, depth: usize) void {
+        self.path_len = self.spans[depth];
+    }
+
+    // The joined name outlives the walk: found unwinds before any mutation.
+    fn joined(self: *WalkState, name: []const u8) Exception![]const u8 {
+        const extra = if (self.path_len == 0) name.len else name.len + 1;
+        if (self.path_len + extra > self.path.len) return error.DataException;
+        var end = self.path_len;
+        if (end != 0) {
+            self.path[end] = '/';
+            end += 1;
+        }
+        @memcpy(self.path[end..][0..name.len], name);
+        return self.path[0 .. end + name.len];
+    }
 };
 
 fn walkDir(archive: []const u8, super: Super, scratch: *Scratch, target: DirTarget) Exception!u64 {
-    var state = WalkState{};
+    var state = WalkState{ .path = scratch.path };
     var found = false;
     const resolved = switch (target) {
         .count => target,
@@ -373,9 +417,9 @@ fn walkInodeDir(archive: []const u8, super: Super, scratch: *Scratch, ref: u64, 
     try stream.read(scratch.frag[0..content_len], scratch.history);
 
     // Collect children first: recursion would clobber staged bytes mid-parse.
-    // Names carry no meaning for counting or resolution.
     var refs: [max_entries]u64 = undefined;
     var types: [max_entries]u16 = undefined;
+    var names: [max_entries][]const u8 = undefined;
     var count: usize = 0;
     var remaining: u64 = content_len;
     var entries_in_header: u32 = 0;
@@ -402,6 +446,7 @@ fn walkInodeDir(archive: []const u8, super: Super, scratch: *Scratch, ref: u64, 
         remaining -= 8;
         name_len = std.mem.readInt(u16, ent[6..8], .little) + 1;
         if (name_len > 256 or remaining < name_len) return error.DataException;
+        names[count] = scratch.frag[cursor..][0..name_len];
         cursor += name_len;
         remaining -= name_len;
         const delta = std.mem.readInt(i16, ent[2..4], .little);
@@ -421,12 +466,16 @@ fn walkInodeDir(archive: []const u8, super: Super, scratch: *Scratch, ref: u64, 
         .resolve => |res| res.found,
         .count => null,
     };
-    for (refs[0..count], types[0..count]) |child_ref, entry_type| {
+    for (refs[0..count], types[0..count], names[0..count]) |child_ref, entry_type, name| {
         if (found_ptr) |fp| {
             if (fp.*) return;
         }
         switch (entry_type) {
-            inode_type_dir => try walkInodeDir(archive, super, scratch, child_ref, target, state, depth + 1),
+            inode_type_dir => {
+                try state.push(name, depth);
+                try walkInodeDir(archive, super, scratch, child_ref, target, state, depth + 1);
+                state.pop(depth);
+            },
             inode_type_reg, inode_type_lreg => {
                 switch (target) {
                     .count => {},
@@ -435,6 +484,7 @@ fn walkInodeDir(archive: []const u8, super: Super, scratch: *Scratch, ref: u64, 
                             const inode = try readInode(archive, super, child_ref, scratch);
                             res.info.size = inode.file_size;
                             res.info.ordinal = state.ordinal;
+                            res.info.name = try state.joined(name);
                             if (res.output) |out| {
                                 if (out.len < inode.file_size) return error.CapacityException;
                                 try readFile(archive, super, inode, out[0..@intCast(inode.file_size)], scratch);

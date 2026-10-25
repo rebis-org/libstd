@@ -8,7 +8,11 @@ const lz4_leaf = @import("../../leaf/lz4/onprem.zig");
 const zstd_leaf = @import("../../leaf/zstd/onprem.zig");
 
 pub const Entry = entry_prim.Entry;
-pub const EntryInfo = entry_prim.Sized;
+pub const EntryInfo = struct {
+    name: []const u8,
+    size: u64,
+    ordinal: u64,
+};
 const Exception = exception_prim.Exception;
 
 // DwarFS v2 slice: one root directory of regular files.
@@ -610,7 +614,8 @@ fn runTarget(archive: []const u8, scratch: []u8, target: Target) Exception!u64 {
         .resolve => |res| Target{ .resolve = .{ .ordinal = res.ordinal, .info = res.info, .output = res.output, .found = &found } },
     };
     if (scratch.len < scratch_size) return error.CapacityException;
-    var fba = std.heap.FixedBufferAllocator.init(scratch);
+    // Joined listing paths live outside the metadata arena.
+    var fba = std.heap.FixedBufferAllocator.init(scratch[path_size..]);
     const arena = fba.allocator();
     // One zstd history buffer serves every sequential stream decode
     // (schema, metadata, blocks); peak scratch stays at one window.
@@ -634,7 +639,7 @@ fn runTarget(archive: []const u8, scratch: []u8, target: Target) Exception!u64 {
     var store = BlockStore{ .archive = archive, .refs = sections.blocks, .chunks = md.chunks, .arena = arena, .block_size = md.block_size, .history = history };
     const dir_count = md.directories.len - 1;
     const file_off: u32 = std.math.cast(u32, dir_count) orelse return error.DataException;
-    var state = WalkState{};
+    var state = WalkState{ .path = scratch[0..path_size] };
     try walkDwarfsDir(md, &store, 0, file_off, resolved, &state, 0);
     return switch (target) {
         .count => state.ordinal,
@@ -642,7 +647,56 @@ fn runTarget(archive: []const u8, scratch: []u8, target: Target) Exception!u64 {
     };
 }
 
-const WalkState = struct { ordinal: u64 = 0 };
+// Joined listing paths stage here; depth-bounded by max_dir_depth.
+const path_size: usize = (max_dir_depth + 1) * 257;
+
+const WalkState = struct {
+    ordinal: u64 = 0,
+    path_len: usize = 0,
+    spans: [max_dir_depth]usize = undefined,
+    path: []u8 = &.{},
+
+    fn push(self: *WalkState, name: []const u8, depth: usize) Exception!void {
+        if (depth >= max_dir_depth) return error.DataException;
+        self.spans[depth] = self.path_len;
+        const extra = if (self.path_len == 0) name.len else name.len + 1;
+        if (self.path_len + extra > self.path.len) return error.DataException;
+        if (self.path_len != 0) {
+            self.path[self.path_len] = '/';
+            self.path_len += 1;
+        }
+        @memcpy(self.path[self.path_len..][0..name.len], name);
+        self.path_len += name.len;
+    }
+
+    fn pop(self: *WalkState, depth: usize) void {
+        self.path_len = self.spans[depth];
+    }
+
+    // The joined name outlives the walk: found unwinds before any mutation.
+    fn joined(self: *WalkState, name: []const u8) Exception![]const u8 {
+        const extra = if (self.path_len == 0) name.len else name.len + 1;
+        if (self.path_len + extra > self.path.len) return error.DataException;
+        var end = self.path_len;
+        if (end != 0) {
+            self.path[end] = '/';
+            end += 1;
+        }
+        @memcpy(self.path[end..][0..name.len], name);
+        return self.path[0 .. end + name.len];
+    }
+};
+
+// One name per directory entry: names_index carries len + 1 offsets.
+fn dirEntryName(md: Metadata, entry_index: usize) Exception![]const u8 {
+    if (entry_index >= md.dir_entries.len) return error.DataException;
+    const name_index = md.dir_entries[entry_index].name_index;
+    if (name_index + 1 >= md.names_index.len) return error.DataException;
+    const start = md.names_index[name_index];
+    const end = md.names_index[name_index + 1];
+    if (end < start or end > md.names_buffer.len) return error.DataException;
+    return md.names_buffer[start..end];
+}
 
 fn walkDwarfsDir(md: Metadata, store: *BlockStore, dir_index: usize, file_off: u32, target: Target, state: *WalkState, depth: u32) Exception!void {
     if (depth > max_dir_depth) return error.DataException;
@@ -661,7 +715,9 @@ fn walkDwarfsDir(md: Metadata, store: *BlockStore, dir_index: usize, file_off: u
         const entry = md.dir_entries[e];
         if (entry.inode_num < file_off) {
             if (@as(u64, entry.inode_num) + 1 >= md.directories.len) return error.DataException;
+            try state.push(try dirEntryName(md, e), depth);
             try walkDwarfsDir(md, store, entry.inode_num, file_off, target, state, depth + 1);
+            state.pop(depth);
             continue;
         }
         if (entry.inode_num >= md.inodes.len) return error.DataException;
@@ -686,6 +742,7 @@ fn walkDwarfsDir(md: Metadata, store: *BlockStore, dir_index: usize, file_off: u
                 if (state.ordinal == res.ordinal) {
                     res.info.size = total;
                     res.info.ordinal = state.ordinal;
+                    res.info.name = try state.joined(try dirEntryName(md, e));
                     if (res.output) |out| {
                         if (@as(u64, out.len) < total) return error.CapacityException;
                         var written: usize = 0;

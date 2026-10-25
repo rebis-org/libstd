@@ -236,10 +236,18 @@ pub fn runInspectMetadata(r: *Runner) anyerror!void {
     if (isOffpremUnsupported()) return;
     // The metadata projection answers an ordinal query with the entry fields
     // published into the response child graph; name bytes land in host memory.
-    inline for (.{ .{ harness.ids.xar, false }, .{ harness.ids.tar, true } }) |pair| {
+    // The volume passes name a nested entry to prove joined listing paths.
+    inline for (.{ .{ harness.ids.xar, false, "m1.txt" }, .{ harness.ids.tar, true, "m1.txt" }, .{ harness.ids.squashfs, false, "sub/m1.txt" }, .{ harness.ids.dwarfs, false, "sub/m1.txt" } }) |pair| {
         const profile_id = pair[0];
         const is_tar = pair[1];
+        const expected_name = pair[2];
         setupArchive(r, profile_id);
+        var sub_name_node: harness.Node = undefined;
+        var sub_data_node: harness.Node = undefined;
+        if (pair[2].len != 6) {
+            arc_state.entry1 = harness.archiveEntryNode(&sub_name_node, &sub_data_node, "sub/m1.txt", &arc_state.data1);
+            arc_state.entry1.next = &arc_state.entry2;
+        }
         var typeflag_node: harness.Node = undefined;
         var mtime_node: harness.Node = undefined;
         if (is_tar) {
@@ -277,7 +285,10 @@ pub fn runInspectMetadata(r: *Runner) anyerror!void {
         req_nodes[3] = harness.capabilityParam(r.caps_query);
         req_nodes[4] = harness.sizingModeParam(r.sizing);
         req_nodes[5] = harness.commitModeParam(r.commit_read);
-        req_nodes[6] = harness.paramScalar(harness.param_family_archive, harness.archive_ordinal, harness.cmd_query, 0);
+        // The volume writers order root children by name, so the nested
+        // entry lands after m2.txt; the grammars keep caller order.
+        const query_ordinal: u64 = if (expected_name.len != 6) 1 else 0;
+        req_nodes[6] = harness.paramScalar(harness.param_family_archive, harness.archive_ordinal, harness.cmd_query, query_ordinal);
         req_nodes[7] = harness.scalarNode(harness.ids.parameter);
         req_nodes[7].value_high = harness.paramSelector(harness.param_family_archive, harness.archive_entry, 0x13, harness.cmd_query);
         harness.linkNodes(&req_nodes);
@@ -287,12 +298,16 @@ pub fn runInspectMetadata(r: *Runner) anyerror!void {
             std.debug.print("metadata status {d} tar={}\n", .{ status, is_tar });
             return error.MetadataQueryFailed;
         }
-        if (response.byte_length != arc_state.data1.len or out_nodes[1].value_low != arc_state.data1.len) return error.MetadataSizeMismatch;
-        if (out_nodes[0].byte_length != 6 or !std.mem.eql(u8, name_buffer[0..6], "m1.txt")) return error.MetadataNameMismatch;
+        if (response.byte_length != arc_state.data1.len or out_nodes[1].value_low != arc_state.data1.len) {
+            std.debug.print("size mismatch name={s} bl={d} node={d} want={d}\n", .{ expected_name, response.byte_length, out_nodes[1].value_low, arc_state.data1.len });
+            return error.MetadataSizeMismatch;
+        }
+        if (out_nodes[0].byte_length != expected_name.len or !std.mem.eql(u8, name_buffer[0..expected_name.len], expected_name)) return error.MetadataNameMismatch;
         if (is_tar) {
             if (out_nodes[2].value_low != '0' or out_nodes[3].value_low != 1000000000) return error.MetadataTarMismatch;
         } else {
-            if (out_nodes[2].value_low != 0 or out_nodes[3].value_low != 0) return error.MetadataXarMismatch;
+            // xar carries uid/mtime as zero here; the volumes fill no scalars.
+            if (out_nodes[2].value_low != 0 or out_nodes[3].value_low != 0) return error.MetadataScalarMismatch;
         }
 
         // A short name buffer reports capacity instead of truncating.
@@ -1481,7 +1496,7 @@ pub const scenarios = harness.scenarios("archive", &.{
     .{ .label = "archive cpio", .run = runCpio, .workspace_size = 65536, .output_size = 512, .encoded_size = 4096 },
     .{ .label = "archive cpio foreign newc", .run = runCpioForeign(.cpio_newc), .workspace_size = 65536, .output_size = 512, .encoded_size = 4096 },
     .{ .label = "archive cpio foreign odc", .run = runCpioForeign(.cpio_odc), .workspace_size = 65536, .output_size = 512, .encoded_size = 4096 },
-    .{ .label = "archive inspect metadata", .run = runInspectMetadata, .workspace_size = 3 * 1024 * 1024, .output_size = 512, .encoded_size = 4096 },
+    .{ .label = "archive inspect metadata", .run = runInspectMetadata, .workspace_size = 8 * 1024 * 1024, .output_size = 512, .encoded_size = 4096 },
     .{ .label = "archive xar", .run = runXar, .workspace_size = 3 * 1024 * 1024, .output_size = 512, .encoded_size = 4096 },
     .{ .label = "archive xar foreign", .run = runXarForeign(.xar), .workspace_size = 3 * 1024 * 1024, .output_size = 512, .encoded_size = 4096 },
     .{ .label = "archive wim", .run = runWim, .workspace_size = 128 * 1024, .output_size = 512, .encoded_size = 4096 },

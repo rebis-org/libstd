@@ -436,7 +436,7 @@ pub fn dwarfsHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resou
             }
             if (try projectedEntryMetadata(call.request)) |ordinal| {
                 const entry = try dwarfs_seam.inspectOrdinal(plan.provider, archive, ordinal, scratch);
-                try publishEntryMetadata(call, response, .{ .size = entry.size });
+                try publishEntryMetadata(call, response, .{ .name = entry.name, .size = entry.size });
                 return;
             }
             const count = try dwarfs_seam.inspectCount(plan.provider, archive, scratch);
@@ -713,7 +713,7 @@ pub fn squashfsHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Res
             }
             if (try projectedEntryMetadata(call.request)) |ordinal| {
                 const entry = try squashfs_seam.inspectOrdinal(plan.provider, archive, ordinal, scratch);
-                try publishEntryMetadata(call, response, .{ .size = entry.size });
+                try publishEntryMetadata(call, response, .{ .name = entry.name, .size = entry.size });
                 return;
             }
             const count = try squashfs_seam.inspectCount(plan.provider, archive, scratch);
