@@ -176,6 +176,12 @@ pub fn main(init: std.process.Init) !void {
             if (!std.mem.eql(u8, scenario.name, name)) continue;
         }
         runScenario(scenario) catch |err| {
+            // A missing reference tool skips the scenario, matching the
+            // missing-library convention; everything else fails the run.
+            if (err == error.ReferenceToolUnavailable) {
+                std.debug.print("Scenario \"{s}\" skipped: reference tool unavailable.\n", .{scenario.name});
+                continue;
+            }
             std.debug.print("Scenario \"{s}\" failed: {s}.\n", .{ scenario.name, @errorName(err) });
             std.process.exit(1);
         };
