@@ -34,4 +34,7 @@ test {
     _ = @import("representation/volume/squashfs/offprem.zig");
     _ = @import("representation/volume/squashfs/onprem.zig");
     _ = @import("compose/drivers.zig");
+    _ = @import("compose/executor.zig");
+    _ = @import("compose/machines.zig");
+    _ = @import("common/primitive/hash/sha256_mb/seam.zig");
 }

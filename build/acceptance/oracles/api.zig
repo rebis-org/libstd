@@ -296,7 +296,115 @@ fn runExtended(r: *harness.Runner) anyerror!void {
     }
 }
 
+fn runSubmission(r: *harness.Runner) anyerror!void {
+    harness.setup(r, harness.ids.gzip, harness.mode_stream);
+    corpus.fillTiled(r.corpus_index, r.corpus_buffer[0..]);
+    r.input = r.corpus_buffer[0..];
+
+    var nodes: [6]harness.Node = undefined;
+    nodes[0] = harness.paramProfile(r.profile_id);
+    nodes[1] = harness.sourceSpan(r.input);
+    nodes[2] = harness.sinkSpan(r.encoded);
+    nodes[3] = harness.capabilityParam(r.caps_io);
+    nodes[4] = harness.sizingModeParam(r.sizing);
+    nodes[5] = harness.commitModeParam(r.commit_write);
+    harness.linkNodes(&nodes);
+
+    var envelope = abi.Call.init();
+    envelope.operation = harness.ids.write;
+    envelope.request = &nodes[0];
+    envelope.response = &r.response;
+    envelope.workspace = r.workspace.ptr;
+    envelope.workspace_capacity = r.workspace.len;
+
+    // A fresh record is pending, and cancellation of a pending record needs
+    // an executor that honors cancellation requests.
+    var completion = abi.Completion.init();
+    if (abi.stdk_poll(&completion) != abi.Completion.pending) return error.PollFreshNotPending;
+    if (abi.stdk_cancel(&completion) != abi.Status.unsupported) return error.CancelFreshNotUnsupported;
+    if (abi.stdk_submit(&envelope, &completion) != abi.Status.ok) return error.SubmitFailed;
+    if (completion.state != abi.Completion.done) return error.SubmitNotDone;
+    if (abi.stdk_poll(&completion) != abi.Status.ok) return error.PollSubmitNotOk;
+    if (abi.stdk_cancel(&completion) != abi.Status.ok) return error.CancelDoneNotOk;
+    r.encoded_len = @intCast(r.response.byte_length);
+    if (r.encoded_len == 0 or r.encoded_len > r.encoded.len) return error.EncodedLength;
+
+    // Malformed records fail closed; a null call completes its record as
+    // invalid_call.
+    var bad = abi.Completion.init();
+    bad.reserved = 1;
+    if (abi.stdk_submit(&envelope, &bad) != abi.Status.invalid_call) return error.BadRecordAccepted;
+    var abandoned = abi.Completion.init();
+    if (abi.stdk_submit(null, &abandoned) != abi.Status.invalid_call) return error.NullSubmitAccepted;
+    if (abandoned.state != abi.Completion.done or abandoned.status != abi.Status.invalid_call) return error.NullRecordNotCompleted;
+
+    // The submitted frame must read back through the synchronous boundary.
+    try steps.queryRead(&steps.noParams, r);
+    try steps.readSpan(&steps.noParams, r);
+
+    // The group form completes every envelope: two identical writes must
+    // produce byte-identical frames, one per record.
+    var second_frame: [4096]u8 = undefined;
+    var nodes_b: [6]harness.Node = undefined;
+    nodes_b[0] = harness.paramProfile(r.profile_id);
+    nodes_b[1] = harness.sourceSpan(r.input);
+    nodes_b[2] = harness.sinkSpan(&second_frame);
+    nodes_b[3] = harness.capabilityParam(r.caps_io);
+    nodes_b[4] = harness.sizingModeParam(r.sizing);
+    nodes_b[5] = harness.commitModeParam(r.commit_write);
+    harness.linkNodes(&nodes_b);
+    var envelope_b = abi.Call.init();
+    envelope_b.operation = harness.ids.write;
+    envelope_b.request = &nodes_b[0];
+    envelope_b.response = &r.response;
+    envelope_b.workspace = r.workspace.ptr;
+    envelope_b.workspace_capacity = r.workspace.len;
+
+    var responses: [2]abi.Completion = .{ abi.Completion.init(), abi.Completion.init() };
+    var submissions: [2]abi.Submission = .{
+        .{ .call = &envelope, .completion = &responses[0] },
+        .{ .call = &envelope_b, .completion = &responses[1] },
+    };
+    if (abi.stdk_group(&submissions, 2, null) != abi.Status.ok) return error.GroupSubmitFailed;
+    if (responses[0].status != abi.Status.ok or responses[1].status != abi.Status.ok) return error.GroupCallFailed;
+    if (r.response.byte_length == 0 or !std.mem.eql(u8, r.encoded[0..r.encoded_len], second_frame[0..r.encoded_len])) return error.GroupFramesDiffer;
+
+    // A host-provided executor in the C vtable shape drives the same group.
+    const test_vtable: abi.ExecutorVtable = .{ .run = oracleRunInline };
+    const test_executor: abi.Executor = .{ .ptr = @constCast(&test_vtable), .vtable = &test_vtable };
+    var responses2: [2]abi.Completion = .{ abi.Completion.init(), abi.Completion.init() };
+    var submissions2: [2]abi.Submission = .{
+        .{ .call = &envelope, .completion = &responses2[0] },
+        .{ .call = &envelope_b, .completion = &responses2[1] },
+    };
+    if (abi.stdk_group(&submissions2, 2, &test_executor) != abi.Status.ok) return error.GroupExecutorFailed;
+    if (responses2[0].status != abi.Status.ok or responses2[1].status != abi.Status.ok) return error.GroupExecutorCallFailed;
+
+    // One malformed record fails the group closed before any envelope runs.
+    var bad_record = abi.Completion.init();
+    bad_record.reserved = 1;
+    var mixed: [2]abi.Submission = .{
+        .{ .call = &envelope, .completion = &responses[0] },
+        .{ .call = &envelope, .completion = &bad_record },
+    };
+    if (abi.stdk_group(&mixed, 2, null) != abi.Status.invalid_call) return error.BadGroupAccepted;
+    if (abi.stdk_group(null, 2, null) != abi.Status.invalid_call) return error.NullGroupAccepted;
+    if (abi.stdk_group(&submissions, 0, null) != abi.Status.invalid_call) return error.EmptyGroupAccepted;
+}
+
+// An oracle-side executor arm in the C vtable shape: run the task now.
+fn oracleRunInline(_: *anyopaque, task: abi.Task) callconv(.c) u32 {
+    return task.invoke(task.context);
+}
+
 pub const scenarios = harness.scenarios("api", &.{}, &.{
+    .{
+        .name = "submission api boundary",
+        .run = runSubmission,
+        .workspace_size = 1 << 20,
+        .output_size = 64,
+        .encoded_size = 4096,
+    },
     .{
         .name = "session api boundary",
         .run = run,

@@ -5,6 +5,10 @@ const run = @import("run.zig");
 // Enumerated public boundary: the gate fails on extra or missing exports.
 pub const exports = [_][]const u8{
     "_stdk_call",
+    "_stdk_submit",
+    "_stdk_group",
+    "_stdk_poll",
+    "_stdk_cancel",
     "_stdk_session_storage",
     "_stdk_session_create",
     "_stdk_session_bounded",

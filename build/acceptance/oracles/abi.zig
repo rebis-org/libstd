@@ -1,3 +1,5 @@
+const std = @import("std");
+
 pub const Id = extern struct {
     low: u64,
     high: u64,
@@ -82,8 +84,54 @@ pub const Call = extern struct {
 
 pub extern fn stdk_call(call: *Call) callconv(.c) u32;
 
+// The async submission boundary: the completion record is caller-owned
+// storage and the ticket is its pointer. The submission descriptor and the
+// executor vtable are C-representable shapes for host thread pools.
+pub const Completion = extern struct {
+    structure_size: u32,
+    state: u32,
+    status: u32,
+    reserved: u32,
+
+    pub const in_progress: u32 = 0;
+    pub const done: u32 = 1;
+    pub const pending: u32 = std.math.maxInt(u32);
+
+    pub fn init() Completion {
+        return .{ .structure_size = @sizeOf(Completion), .state = in_progress, .status = 0, .reserved = 0 };
+    }
+};
+
+pub const Submission = extern struct {
+    call: ?*Call,
+    completion: ?*Completion,
+};
+
+pub const Task = extern struct {
+    context: *anyopaque,
+    invoke: *const fn (context: *anyopaque) callconv(.c) u32,
+};
+
+pub const ExecutorVtable = extern struct {
+    run: *const fn (ptr: *anyopaque, task: Task) callconv(.c) u32,
+};
+
+pub const Executor = extern struct {
+    ptr: *anyopaque,
+    vtable: *const ExecutorVtable,
+};
+
+pub extern fn stdk_submit(call: ?*Call, completion: ?*Completion) callconv(.c) u32;
+pub extern fn stdk_group(submissions: ?[*]Submission, count: u64, executor: ?*const Executor) callconv(.c) u32;
+pub extern fn stdk_poll(completion: ?*Completion) callconv(.c) u32;
+pub extern fn stdk_cancel(completion: ?*Completion) callconv(.c) u32;
+
 pub fn isIdEqual(left: Id, right: Id) bool {
     return left.low == right.low and left.high == right.high;
+}
+
+comptime {
+    if (@sizeOf(Completion) != 16) @compileError("stdk_completion layout drifted: the ABI fixes 16 bytes.");
 }
 
 comptime {

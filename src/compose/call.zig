@@ -9,6 +9,7 @@ const resource = @import("../kernel/resource.zig");
 const vocabulary = @import("../kernel/vocabulary.zig");
 const compose_catalog = @import("catalog.zig");
 const common = @import("common.zig");
+const executor = @import("executor.zig");
 const hooks = @import("hooks.zig");
 
 const catalog_json = kernel_catalog.catalog_json;
@@ -48,8 +49,23 @@ fn fail(call: *Call, exception: Exception) u32 {
     return report(call, exception);
 }
 
+// stdk_call stays synchronous: the envelope runs on the inline executor.
+// stdk_submit routes the same envelope through a caller-selected executor.
 pub fn invoke(call: ?*Call) u32 {
     const envelope = call orelse return Status.invalid_call;
+    return run(envelope, executor.inline_executor);
+}
+
+pub fn run(envelope: *Call, exec: executor.Executor) u32 {
+    return exec.run(.{ .context = envelope, .invoke = runTask });
+}
+
+fn runTask(context: *anyopaque) callconv(.c) u32 {
+    const envelope: *Call = @ptrCast(@alignCast(context));
+    return runInner(envelope);
+}
+
+fn runInner(envelope: *Call) u32 {
     if (!envelope.isValid()) return if (envelope.structure_size >= @sizeOf(Call)) report(envelope, error.CallException) else Status.invalid_call;
     const response = envelope.response orelse return report(envelope, error.CallException);
     if (!response.isValid() or !isZero(response.id)) return report(envelope, error.CallException);

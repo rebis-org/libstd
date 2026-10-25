@@ -6,8 +6,8 @@
 extern "C" {
 #endif
 @STDK_STATUS@
-// The library forces 8-byte alignment for these words (envelope.zig); the
-// header states it so 32-bit consumers see one layout.
+// The library forces 8-byte alignment for these words;
+// the header states it so 32-bit consumers see one layout.
 #if defined(__cplusplus)
 #define STDK_ALIGNAS alignas
 #else
@@ -55,27 +55,69 @@ struct stdk_call_envelope {
 @STDK_ASSERT@
 @STDK_CALL@
 
+/* Asynchronous submission, symmetric to stdk_call: submit keeps control.
+ * The completion record is caller-owned storage; the ticket is its pointer.
+ * With the inline executor the call completes before stdk_submit returns.
+ * stdk_poll is idempotent and non-blocking; cancel is idempotent like poll.
+ * A malformed envelope surfaces as an invalid_call record status.
+ * stdk_group takes caller-owned submission descriptors plus an executor.
+ * A null executor selects the inline default.
+ * The executor vtable is C-shaped: run schedules task.invoke(context)
+ * exactly once, on any thread; the task flips the completion record.
+ */
+#define STDK_COMPLETION_IN_PROGRESS UINT32_C(0)
+#define STDK_COMPLETION_DONE UINT32_C(1)
+#define STDK_COMPLETION_PENDING UINT32_C(4294967295)
+struct stdk_completion {
+	uint32_t structure_size;
+	uint32_t state;
+	uint32_t status;
+	uint32_t reserved;
+};
+STDK_STATIC_ASSERT(sizeof(struct stdk_completion) == 16,
+		   "stdk_completion size mismatch: the ABI fixes 16 bytes");
+struct stdk_submission {
+	stdk_call_envelope *call;
+	struct stdk_completion *completion;
+};
+struct stdk_task {
+	void *context;
+	uint32_t (*invoke)(void *context);
+};
+struct stdk_executor_vtable {
+	uint32_t (*run)(void *ptr, struct stdk_task task);
+};
+struct stdk_executor {
+	void *ptr;
+	const struct stdk_executor_vtable *vtable;
+};
+uint32_t stdk_submit(stdk_call_envelope *call, struct stdk_completion *completion);
+uint32_t stdk_group(struct stdk_submission *submissions, uint64_t count,
+		    const struct stdk_executor *executor);
+uint32_t stdk_poll(struct stdk_completion *completion);
+uint32_t stdk_cancel(struct stdk_completion *completion);
+
 /* Session boundary over caller-owned storage with opaque handles and no
  * allocator, so hosts keep control of every byte. Storage sizing lives in
  * stdk_session_storage because driver state is fixed per pair; the storage
  * must be aligned to 8 bytes and remain alive for the session's lifetime.
  * The step pump reports consumed and produced counts separately so callers
- * can stream across buffer boundaries, but each step accepts at most
- * 131064 input bytes (the 128 KiB pending window minus its framing slack);
- * larger inputs must be split across steps. Input and output ranges must not
+ * can stream across buffer boundaries. Each step accepts at most 131064
+ * input bytes (the 128 KiB window minus framing slack); larger inputs split
+ * across steps. Input and output ranges must not
  * overlap each other or the session storage.
  *
  * stdk_session_create applies generous default ceilings (16 GiB encoded,
- * 16 GiB decoded, 4 GiB work, 1 Mi entries) so zip-bomb limits hold engine-
+ * 16 GiB decoded, 4 GiB work, 1 Mi entries). Zip-bomb limits hold engine-
  * side by default; pass explicit ceilings through stdk_session_bounded, or
- * std.math.maxInt values to opt back into unbounded streaming.
+ * UINT64_MAX to opt back into unbounded streaming.
  *
  * A failed create poisons the storage: every later step returns
  * invalid_call and stdk_session_destroy reports ok. A failed step fails the
  * session permanently; later steps return invalid_call instead of depending
  * on driver-specific recovery. Destroy is idempotent and total: live
- * sessions are destroyed, dead sessions report ok, and storage that was
- * never successfully created is refused rather than dispatched through
+ * sessions are destroyed, dead sessions report ok. Storage that was never
+ * successfully created is refused rather than dispatched through
  * garbage. stdk_session_failure reads back the failing status and detail.
  * stdk_session_catalog carries the versioned pair list so hosts discover
  * streamable codecs without hardcoding them.

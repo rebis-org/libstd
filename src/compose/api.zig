@@ -2,7 +2,9 @@ const std = @import("std");
 
 const envelope = @import("../kernel/envelope.zig");
 const vocabulary = @import("../kernel/vocabulary.zig");
+const call = @import("call.zig");
 const drivers = @import("drivers.zig");
+const executor = @import("executor.zig");
 const sessions = @import("sessions.zig");
 const Exception = @import("../common/primitive/exception.zig").Exception;
 
@@ -227,6 +229,113 @@ export fn stdk_session_failure(
 // within a version, and a breaking change bumps the prefix.
 export fn stdk_session_catalog() callconv(.c) [*:0]const u8 {
     return session_catalog_text;
+}
+
+// The async completion record: caller-owned storage, like session storage.
+// The ticket is the record pointer; the library flips it to done once.
+pub const Completion = extern struct {
+    structure_size: u32,
+    state: u32,
+    status: u32,
+    reserved: u32,
+
+    pub const in_progress: u32 = 0;
+    pub const done: u32 = 1;
+
+    pub const pending: u32 = std.math.maxInt(u32);
+
+    comptime {
+        // The header fixes the same 16 bytes; a drift is a silent host miscompile.
+        if (@sizeOf(Completion) != 16) @compileError("stdk_completion layout drifted: the ABI fixes 16 bytes.");
+    }
+
+    pub fn init() Completion {
+        return .{ .structure_size = @sizeOf(Completion), .state = in_progress, .status = 0, .reserved = 0 };
+    }
+
+    fn isValid(self: *const Completion) bool {
+        return self.structure_size >= @sizeOf(Completion) and self.reserved == 0 and
+            (self.state == in_progress or self.state == done);
+    }
+};
+
+// The submission descriptor: caller-owned storage, alive until the record
+// is done; a threaded executor reads it on its own thread.
+pub const Submission = extern struct {
+    call: ?*envelope.Call,
+    completion: ?*Completion,
+};
+
+fn submitTask(context: *anyopaque) callconv(.c) u32 {
+    const submission: *Submission = @ptrCast(@alignCast(context));
+    const completion = submission.completion orelse return envelope.Status.invalid_call;
+    const status = if (submission.call) |handle|
+        call.run(handle, executor.inline_executor)
+    else
+        envelope.Status.invalid_call;
+    complete(completion, status);
+    return status;
+}
+
+// Returns the submission verdict; the call's own status lands in the record.
+// The inline executor completes before this returns; threaded arms flip it later.
+export fn stdk_submit(call_handle: ?*envelope.Call, record: ?*Completion) callconv(.c) u32 {
+    const completion = record orelse return envelope.Status.invalid_call;
+    if (!completion.isValid()) return envelope.Status.invalid_call;
+    if (completion.state != Completion.in_progress) return envelope.Status.invalid_call;
+    if (call_handle == null) {
+        complete(completion, envelope.Status.invalid_call);
+        return envelope.Status.invalid_call;
+    }
+    var submission = Submission{ .call = call_handle, .completion = completion };
+    _ = executor.inline_executor.run(.{ .context = &submission, .invoke = submitTask });
+    return envelope.Status.ok;
+}
+
+// The general form: N caller-owned submissions through a caller-selected
+// executor; a null executor selects the inline default. One malformed
+// record fails the batch before any task is scheduled.
+export fn stdk_group(
+    submissions: ?[*]Submission,
+    count: u64,
+    exec: ?*const executor.Executor,
+) callconv(.c) u32 {
+    const subs = submissions orelse return envelope.Status.invalid_call;
+    const total = std.math.cast(usize, count) orelse return envelope.Status.invalid_call;
+    if (total == 0) return envelope.Status.invalid_call;
+    for (subs[0..total]) |*submission| {
+        const completion = submission.completion orelse return envelope.Status.invalid_call;
+        if (!completion.isValid() or completion.state != Completion.in_progress) return envelope.Status.invalid_call;
+    }
+    const selected = if (exec) |*e| e.* else executor.inline_executor;
+    for (0..total) |index| {
+        _ = selected.run(.{ .context = &subs[index], .invoke = submitTask });
+    }
+    return envelope.Status.ok;
+}
+
+fn complete(completion: *Completion, status: u32) void {
+    completion.status = status;
+    completion.state = Completion.done;
+}
+
+// Idempotent and non-blocking: the envelope status once done, pending
+// while a threaded executor still holds the call, invalid_call for a
+// malformed record.
+export fn stdk_poll(record: ?*Completion) callconv(.c) u32 {
+    const completion = record orelse return envelope.Status.invalid_call;
+    if (!completion.isValid()) return envelope.Status.invalid_call;
+    if (completion.state == Completion.done) return completion.status;
+    return Completion.pending;
+}
+
+// Idempotent like poll. Cancellation needs an executor that honors requests;
+// with the inline executor a submitted call has already completed.
+export fn stdk_cancel(record: ?*Completion) callconv(.c) u32 {
+    const completion = record orelse return envelope.Status.invalid_call;
+    if (!completion.isValid()) return envelope.Status.invalid_call;
+    if (completion.state == Completion.done) return envelope.Status.ok;
+    return envelope.Status.unsupported;
 }
 
 const session_catalog_text: [:0]const u8 = blk: {
