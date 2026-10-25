@@ -204,7 +204,12 @@ pub fn main(init: std.process.Init) !void {
         inline for (matrix.rows, 0..) |row, idx| {
             if (isSelected(row.name, env.row)) {
                 if (run_index == 0) std.debug.print("benchmark {s} ...\n", .{row.name});
-                const totals = try measureRow(&env, row, workspace);
+                // A row failure marks that row failed and the matrix continues;
+                // one broken tool must not cost the evidence session.
+                const totals = measureRow(&env, row, workspace) catch |err| blk: {
+                    std.debug.print("benchmark {s} failed: {s}\n", .{ row.name, @errorName(err) });
+                    break :blk metric.Totals{ .ok = .{ false, false, false, false } };
+                };
                 try metric.emitMetricRow(&run_report, env.allocator, row, totals, availability(&env, row));
                 try per_row[idx].append(env.allocator, totals);
             }
