@@ -36,7 +36,7 @@ const flag_name = 0x08;
 const flag_comment = 0x10;
 const reserved_flags = 0xe0;
 const trailer_len = 8;
-// The 10 byte header and the 8 byte trailer need 18 bytes before any deflate data is read.
+// The 10-byte header and 8-byte trailer need 18 bytes before any deflate data.
 const minimum_member_len = 18;
 
 pub fn encodedSizeBound(input_len: usize, options: Options) usize {
@@ -95,9 +95,8 @@ const Member = struct {
     }
 };
 
-// The one member read: header, payload, and the verified trailer. Single-pass
-// and two-pass decoding and the inspector all resolve a member through this,
-// so they cannot disagree on where a member ends or what verifies it.
+// Every path resolves a member here, so decode passes and the inspector
+// cannot disagree on member boundaries or verification.
 fn readMember(input: []const u8, at: usize, history: []u8, output: *std.Io.Writer, provider: checksum.Provider) Exception!Member {
     const header = try parseHeader(input[at..], provider);
     const data_start = at + header.len;
@@ -111,10 +110,8 @@ fn readMember(input: []const u8, at: usize, history: []u8, output: *std.Io.Write
     const stored_crc = std.mem.readInt(u32, input[trailer_at..][0..4], .little);
     const stored_size = std.mem.readInt(u32, input[trailer_at + 4 ..][0..4], .little);
     if (stored_crc != tee_writer.crc32Value() or stored_size != @as(u32, @truncate(tee_writer.size))) return error.IntegrityException;
-    // ISIZE wraps modulo 2^32 (RFC 1952), so the trailer comparison accepts a
-    // member whose true size is the claim plus a multiple of 4 GiB. The tee's
-    // count is the truth: decoded_size carries the real byte count, not the
-    // wrapped trailer field.
+    // ISIZE wraps modulo 2^32 (RFC 1952), so the check accepts the claim
+    // plus multiples; decoded_size carries the tee's true count.
     return .{
         .header = header,
         .data_start = data_start,
@@ -124,12 +121,8 @@ fn readMember(input: []const u8, at: usize, history: []u8, output: *std.Io.Write
     };
 }
 
-// ISIZE only seeds the attempt; commit needs exact count, CRC32, and trailer.
-// Mismatch defers to the two-pass route. A fallback carries the byte count
-// already written, so the caller can erase the tentative prefix.
-// The decoded limit joins the fit conditions: a caller whose limit is narrower
-// than the span must learn the failure from the two-pass route, never after
-// the single-pass commit.
+// ISIZE only seeds the fit; a fallback carries the bytes written for
+// erasure, and the limit is checked before commit.
 pub fn decodeSinglePass(input: []const u8, output: []u8, history: []u8, provider: checksum.Provider, max_decoded_bytes: u64) Exception!SinglePass {
     if (history.len < deflate_history_size) return error.CapacityException;
     if (input.len >= std.math.maxInt(u32)) return .{ .fallback = 0 };
@@ -140,16 +133,16 @@ pub fn decodeSinglePass(input: []const u8, output: []u8, history: []u8, provider
     var sink_writer = std.Io.Writer.fixed(output);
     const member = readMember(input, 0, history, &sink_writer, provider) catch return .{ .fallback = sink_writer.end };
     if (member.total() != input.len) return .{ .fallback = sink_writer.end };
-    // A wrapped ISIZE can hide a member past the limit; the tee's count is
-    // checked before the commit, and the tentative prefix rides the fallback.
+    // A wrapped ISIZE can hide a member past the limit; the true count
+    // is checked before commit.
     if (member.decoded_size > max_decoded_bytes) return .{ .fallback = sink_writer.end };
     return .{ .decoded = member.decoded_size };
 }
 
 pub fn decode(input: []const u8, output: *std.Io.Writer, history: []u8, provider: checksum.Provider) Exception!usize {
     if (history.len < deflate_history_size) return error.CapacityException;
-    // An empty byte string is not a gzip stream; accepting it would let
-    // non-archive empty files pass as valid zero-member decodes.
+    // An empty input is not a gzip stream; accepting it would validate
+    // empty non-archives as zero-member decodes.
     if (input.len == 0) return error.DataException;
     var total: usize = 0;
     var at: usize = 0;
@@ -316,8 +309,7 @@ pub const MemberIterator = struct {
     }
 };
 
-// Enumerates the members of a possibly concatenated gzip stream.
-// Each member is decoded strictly, with the trailer CRC and ISIZE verified,
+// Each member decodes strictly with the trailer CRC and ISIZE verified,
 // so a corrupt member fails at its ordinal.
 pub fn inspectMembers(input: []const u8, history: []u8, provider: checksum.Provider) MemberIterator {
     return .{ .input = input, .history = history, .provider = provider };
@@ -345,8 +337,8 @@ fn inspectMember(input: []const u8, history: []u8, provider: checksum.Provider) 
 }
 
 test "inspectMembers enumerates concatenated members with their fields" {
-    // See the decode gate above: a mixed build cannot serve one call with
-    // both arms.
+    // A mixed provider build serves no single tag for both arms; run
+    // only where the default tag serves them.
     if (!deflate_seam.decodeServed(checksum.default_provider)) return;
 
     var first: [256]u8 = undefined;
@@ -403,8 +395,8 @@ test "inspectMembers enumerates concatenated members with their fields" {
 }
 
 test "decodeSinglePass defers to the two-pass route when the decoded limit excludes the member" {
-    // See the decode gate above: a mixed build cannot serve one call with
-    // both arms.
+    // A mixed provider build serves no single tag for both arms; run
+    // only where the default tag serves them.
     if (!deflate_seam.decodeServed(checksum.default_provider)) return;
 
     const payload = "single pass payload that a decoded limit must exclude";

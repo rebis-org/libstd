@@ -23,10 +23,8 @@ pub fn decodeServed(provider: Provider) bool {
     };
 }
 
-// Encode is the onprem arm under every tag: no offprem encoder exists, as
-// with AES-192.
-// Encoded bytes are tag-independent because every checksum arm is verified
-// byte-identical across providers.
+// Encoded bytes are tag-independent: the onprem encoder serves every
+// tag, as with AES-192.
 pub fn encodeServed(provider: Provider) bool {
     _ = provider;
     return true;

@@ -255,15 +255,3 @@ jobs:
           path: ~/go/pkg/mod
           key: ${{ steps.gomod.outputs.primary-key }}
           enabled: ${{ steps.gomod.outcome == 'success' && steps.gomod.outputs.cache-hit != 'true' }}
-      - name: Report cache effectiveness
-        if: ${{ !cancelled() }}
-        run: |
-          {
-            echo "| cache | restored |"
-            echo "| --- | --- |"
-            echo "| dependency | $([[ "${{ steps.global.outputs.cache-hit }}" == true ]] && echo hit || echo miss) |"
-            echo "| project | $([[ "${{ steps.project.outputs.cache-hit }}" == true ]] && echo hit || echo miss) |"
-            echo "| homebrew | $([[ "${{ steps.brew.outputs.cache-hit }}" == true ]] && echo hit || echo miss) |"
-            echo "| benchmark | $([[ "${{ steps.corpus.outputs.cache-hit }}" == true ]] && echo hit || echo miss) |"
-            echo "| ubsan | $([[ "${{ steps.ubsan.outputs.cache-hit }}" == true ]] && echo hit || echo miss) |"
-          } >> "$GITHUB_STEP_SUMMARY"

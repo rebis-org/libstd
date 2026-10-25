@@ -4,8 +4,8 @@ const onprem = @import("onprem.zig");
 pub const Exception = @import("../../../common/primitive/exception.zig").Exception;
 
 const std_tar = std.tar;
-// stdlib's Iterator.File lacks mtime/uid/gid/typeflag, so inspectOrdinal stays
-// onprem; encode serves only what std.tar.Writer carries faithfully.
+// The stdlib Iterator.File lacks mtime/uid/gid/typeflag, so inspectOrdinal
+// stays onprem; encode serves only what std.tar.Writer carries faithfully.
 pub const Entry = onprem.Entry;
 pub const EntryInfo = onprem.EntryInfo;
 
@@ -19,9 +19,8 @@ fn mapError(err: anyerror) Exception {
     };
 }
 
-// std.tar.Iterator borrows caller-owned name buffers (its Options demand
-// them); the decode surface takes no scratch, so the fs path cap on the
-// stack is the documented shape, matching stdlib's own expectation.
+// std.tar.Iterator demands caller-owned name buffers; the decode surface
+// takes no scratch, so the path cap lives on the stack.
 pub fn inspectCount(archive: []const u8) Exception!u64 {
     var reader = std.Io.Reader.fixed(archive);
     var name_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
@@ -57,8 +56,8 @@ pub fn decodeOrdinal(archive: []const u8, ordinal: u64, output: []u8) Exception!
     return error.CallException;
 }
 
-// archiveSize runs the same encode into a counting writer; the write arm
-// only serves shapes it can carry, so the count matches what encode emits.
+// archiveSize runs the same encode into a counting writer, so the count
+// matches what encode emits.
 pub fn archiveSize(entries: []const Entry) Exception!u64 {
     const measurement = @import("../../../common/primitive/measurement.zig");
     var counter = measurement.Counter.init(null);

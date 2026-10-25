@@ -23,8 +23,8 @@ const corpus = @import("corpus.zig");
 
 const testing = std.testing;
 
-// Input stays small so structure-aware mutation stays cheap; the output bound
-// sizes only fuzz scratch, and 256 KiB lets wrapped-window shapes form.
+// Input stays small so structure-aware mutation stays cheap; the bound sizes
+// only fuzz scratch (256 KiB for wrapped windows).
 const max_input = 16 * 1024;
 const max_output = 256 * 1024;
 
@@ -144,7 +144,7 @@ fn runBzip2(data: []const u8) anyerror!void {
     var out: [max_output]u8 = undefined;
     const size = bzip2.decodeWorkspaceSizeFor(data) catch return;
     // The BZh9 workspace is ~4.7 MiB; cap fuzz scratch at 8 MiB so every
-    // block-size digit keeps its deep decode paths reachable.
+    // block size stays reachable.
     const scratch = try testing.allocator.alloc(u8, @min(size, 8 << 20));
     defer testing.allocator.free(scratch);
     _ = bzip2.decode(data, &out, scratch, checksum.default_provider) catch {};

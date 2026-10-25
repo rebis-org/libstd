@@ -6,12 +6,14 @@ const drivers = @import("compose/drivers.zig");
 const sessions = @import("compose/sessions.zig");
 const gzip = @import("representation/grammar/gzip/onprem.zig");
 
-// A performance claim is fatal only at three or more runs.
-// Five rounds keeps a single preemption from deciding this one.
+// A performance claim is fatal only at three or more runs. Five rounds
+// keeps one preemption from deciding the result.
 const throughput_rounds: usize = 5;
 
-// Both paths run the same leaf code, so outputs and step counts must match. Input is
-// non-periodic xorshift because repeating corpora hide composition defects.
+// Both paths share one leaf; outputs and step counts must match.
+//
+// Non-periodic xorshift, because repetition hides composition defects.
+//
 // Rooted at src/: module confinement requires it for mains reaching the whole tree.
 var failures: usize = 0;
 
@@ -117,8 +119,8 @@ fn decodeBypass(allocator: std.mem.Allocator, compressed: []const u8) !DecodeOut
 }
 
 pub fn main(init: std.process.Init) !void {
-    // The comparison premise is same-leaf code; the offprem arm suspends
-    // differently at a full step span, which is recorded incompleteness.
+    // The comparison premise is same-leaf code; the offprem arm suspends at
+    // a full step span, recorded as incompleteness.
     if (comptime options.leaf_impl != .onprem) {
         try std.Io.File.stdout().writeStreamingAll(init.io, "compose_ab skipped: leaf_impl is not onprem\n");
         return;
@@ -129,9 +131,8 @@ pub fn main(init: std.process.Init) !void {
     const corpus = try makeCorpus(allocator, 1 << 20);
     const compressed = try encodeCorpus(allocator, corpus);
 
-    // The same leaf decodes on both paths, so neither drifts far from the other.
-    // The two decodes the checks need warm both arms; each timed round then
-    // brackets them and keeps the fastest round each.
+    // Both arms share one leaf, so neither drifts. The untimed decodes warm
+    // them; every round keeps the fastest time.
     const kernel = try decodeKernel(allocator, compressed, .{}, false);
     const bypass = try decodeBypass(allocator, compressed);
     var kernel_ns: u64 = std.math.maxInt(u64);

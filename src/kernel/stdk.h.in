@@ -7,8 +7,7 @@ extern "C" {
 #endif
 @STDK_STATUS@
 // The library forces 8-byte alignment for these words (envelope.zig); the
-// header states the same so 32-bit consumers see one layout. C++ spells the
-// keyword without the underscore.
+// header states it so 32-bit consumers see one layout.
 #if defined(__cplusplus)
 #define STDK_ALIGNAS alignas
 #else

@@ -419,7 +419,7 @@ pub fn runMidstreamReset(r: *Runner) anyerror!void {
     stream[n + 2] = 99;
     stream[n + 3] = 0;
     stream[n + 4] = pack_len - 1;
-    stream[n + 5] = 0x5d; // lc 3, lp 0, pb 2
+    stream[n + 5] = 0x5d; // Props byte: lc 3, lp 0, pb 2.
     n += 6;
     @memcpy(stream[n..][0..pack_len], &midstream_reset_pack);
     n += pack_len;

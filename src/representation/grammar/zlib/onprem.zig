@@ -39,8 +39,8 @@ pub fn inspect(input: []const u8) Exception!Header {
     const cmf = input[0];
     const flg = input[1];
     if (cmf & 0x0f != cm_deflate) return error.UnsupportedException;
-    // CINFO above 7 names a window larger than this decoder supports; refusing
-    // here keeps inspect and decode symmetric instead of diverging downstream.
+    // CINFO above 7 names a window this decoder never supports; refusing
+    // here keeps inspect and decode symmetric.
     if (cmf >> 4 > cinfo_max) return error.UnsupportedException;
     if ((@as(u32, cmf) << 8 | flg) % 31 != 0) return error.DataException;
     return .{
@@ -56,7 +56,7 @@ pub fn decodedSize(input: []const u8, history: []u8, provider: checksum.Provider
     return measurement.measuredLength(&counter);
 }
 
-// One stream per call: the adler32 trailer ends the stream, so trailing bytes are an error.
+// One stream per call: the Adler-32 trailer ends the stream, so trailing bytes are an error.
 pub fn decode(input: []const u8, output: *std.Io.Writer, history: []u8, provider: checksum.Provider) Exception!usize {
     if (history.len < deflate_history_size) return error.CapacityException;
     var source = std.Io.Reader.fixed(input);
@@ -96,7 +96,7 @@ pub fn encodeStream(source: *std.Io.Reader, output: *std.Io.Writer, history: []u
 }
 
 fn writeHeader(writer: *std.Io.Writer) Exception!void {
-    // FLEVEL 2 marks the default algorithm. The FCHECK bits of FLG make the 16 bit header a multiple of 31.
+    // FLEVEL 2 marks the default algorithm. The FCHECK bits make the 16-bit header a multiple of 31.
     const cmf: u8 = (cinfo_max << 4) | cm_deflate;
     var flg: u8 = level_default << 6;
     const remainder = (@as(u32, cmf) << 8 | flg) % 31;
@@ -105,8 +105,8 @@ fn writeHeader(writer: *std.Io.Writer) Exception!void {
 }
 
 test "zlib round trip restores the original input" {
-    // See the decode gate above: a mixed build cannot serve one call with
-    // both arms.
+    // A mixed provider build serves no single tag for both arms; run
+    // only where the default tag serves them.
     if (!deflate_seam.decodeServed(checksum.default_provider)) return;
 
     const history = try std.testing.allocator.alloc(u8, deflate_history_size);
@@ -129,8 +129,8 @@ test "zlib round trip restores the original input" {
 }
 
 test "zlib rejects a preset dictionary and trailing bytes" {
-    // See the decode gate above: a mixed build cannot serve one call with
-    // both arms.
+    // A mixed provider build serves no single tag for both arms; run
+    // only where the default tag serves them.
     if (!deflate_seam.decodeServed(checksum.default_provider)) return;
 
     const history = try std.testing.allocator.alloc(u8, deflate_history_size);

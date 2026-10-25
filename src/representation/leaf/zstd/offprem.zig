@@ -2,12 +2,11 @@ const std = @import("std");
 
 const onprem = @import("onprem.zig");
 
-// stdlib's verify_checksum panics instead of verifying, so the arm leaves
+// The stdlib's verify_checksum panics instead of verifying, so the arm leaves
 // checksums off; dictionaries are unsupported. Both pick onprem.
 
-// The reader vtable folds every decoder error into ReadFailed; a WriteFailed is
-// the sink rejecting bytes, which is an I/O fault against the caller's own
-// writer.
+// The reader vtable folds decoder errors into ReadFailed; WriteFailed is the
+// sink rejecting bytes, an I/O fault.
 fn mapStreamError(err: std.Io.Reader.StreamError) onprem.DecodeError {
     return switch (err) {
         error.WriteFailed => error.IoException,
@@ -39,9 +38,8 @@ pub fn decodeStream(input: *std.Io.Reader, output: *std.Io.Writer, history: []u8
 }
 
 pub fn decodeInPlace(input: *std.Io.Reader, output: []u8, options: onprem.Options) onprem.DecodeError!usize {
-    // Same precondition the onprem arm states: the span carries the output
-    // plus one block of window slack. stdlib zstd's direct mode drives the
-    // window from the writer buffer, so no separate history is passed.
+    // The span carries the output plus window slack, as onprem states; stdlib's
+    // direct mode windows from the writer buffer.
     if (output.len < @as(usize, options.window_size) + onprem.block_size_max) return error.UnsupportedException;
     try preflight(options, null);
     var fixed = std.Io.Writer.fixed(output);

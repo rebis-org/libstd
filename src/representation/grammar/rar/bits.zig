@@ -4,8 +4,8 @@ const exception = @import("../../../common/primitive/exception.zig");
 
 const Exception = exception.Exception;
 
-// RAR packs codes MSB-first within each byte. V29 uses zero padding because its
-// end-of-block marker peeks 16 bits to reach the final 1 to 2 bits.
+// RAR packs codes MSB-first within each byte. V29 pads with zeros
+// because its end-of-block marker peeks 16 bits.
 
 pub const default_pad_bytes: usize = 32;
 
@@ -38,8 +38,8 @@ pub const BitReader = struct {
         return (self.bytes.len + self.pad_bytes) * 8;
     }
 
-    // A stream can end mid-code and still exit cleanly, so a caller must check
-    // this flag to tell a complete decode from one that ran out.
+    // A stream can end mid-code and exit cleanly, so callers must check
+    // this flag.
     pub fn hasOverrun(self: *const BitReader) bool {
         return self.bit_pos > self.bytes.len * 8;
     }
@@ -70,8 +70,8 @@ pub const BitReader = struct {
         const shift: u6 = @intCast(64 - count);
         const result: u32 = @intCast(self.pending_bits >> shift);
         self.pending_bits <<= @intCast(count);
-        // Inside the padding region the buffer holds fewer bits than the call asks
-        // for, so the count saturates and the remaining bits are implicit zeros.
+        // Inside the padding the buffer holds fewer bits than asked, so
+        // the count saturates; missing bits read as zeros.
         self.pending_bit_count -= @min(count, self.pending_bit_count);
         self.bit_pos += count;
         return result;

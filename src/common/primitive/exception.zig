@@ -10,8 +10,8 @@ pub const Exception = error{
     InternalException,
 };
 
-// Both an exhausted allocator and an exhausted output surface as capacity,
-// never corrupt input: the caller retries with more workspace.
+// Allocator exhaustion and a full output surface are capacity, not corrupt
+// input; the caller retries with more workspace.
 pub fn fromStd(err: anyerror) Exception {
     return switch (err) {
         error.OutOfMemory, error.WriteFailed => error.CapacityException,

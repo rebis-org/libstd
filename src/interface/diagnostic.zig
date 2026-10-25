@@ -1,16 +1,16 @@
 const builtin = @import("builtin");
 const std = @import("std");
 
-// Zig ships no libc for these ABIs: android and ohos lack any port, and the
-// msvc ABI keeps Microsoft CRT out of the library, so archives stay
-// toolchain-independent and consumers bring their own runtime.
+// Zig ships no libc for these ABIs: android and ohos lack a port, and
+// msvc keeps the Microsoft CRT out.
 pub const has_libc: bool = switch (builtin.target.abi) {
     .android, .androideabi, .ohos, .ohoseabi, .msvc, .itanium => false,
     else => true,
 };
 
-// std.debug's default handler instantiates std.Io.Threaded, which fails to
+// The std.debug default handler instantiates std.Io.Threaded, which fails to
 // compile for the Apple embedded targets (ziglang/zig#37061, unreleased).
+//
 // A raw stderr write keeps every diagnostic path off that handler.
 extern "kernel32" fn GetStdHandle(n_std_handle: c_ulong) callconv(.winapi) std.os.windows.HANDLE;
 extern "kernel32" fn WriteFile(
@@ -26,8 +26,8 @@ extern "kernel32" fn WriteFile(
 const std_error_handle: c_ulong = @bitCast(@as(i32, -12));
 
 pub fn writeStderr(bytes: []const u8) void {
-    // Windows stderr is a handle, not an fd: WriteFile takes the pseudo
-    // handle, where std.c.write would need a real one.
+    // Windows stderr is a handle, not an fd; WriteFile takes the pseudo
+    // handle, std.c.write needs a real one.
     if (comptime builtin.target.os.tag == .windows) {
         const handle = GetStdHandle(std_error_handle);
         if (handle == std.os.windows.INVALID_HANDLE_VALUE) return;

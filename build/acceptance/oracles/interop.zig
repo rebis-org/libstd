@@ -80,7 +80,7 @@ fn run(r: *harness.Runner) anyerror!void {
     try checkBidirectional(harness.ids.zstd, harness.mode_xz, &zstdParams, r, .{ .encode = &lib.zstdCompress, .decode = &zstdRefDecode });
     try checkBidirectional(harness.ids.gzip, harness.mode_stream, &steps.noParams, r, .{ .encode = &lib.gzipCompress, .decode = &lib.gzipDecompress });
     try checkBidirectional(harness.ids.bzip2, harness.mode_stream, &steps.noParams, r, .{ .encode = &lib.bzip2Compress, .decode = &lib.bzip2Decompress });
-    r.lzma_dictionary = 1 << 20; // match xzRefEncode's dictionary
+    r.lzma_dictionary = 1 << 20; // Matches xzRefEncode's dictionary.
     try checkBidirectional(harness.ids.xz, harness.mode_xz, &xzParams, r, .{ .encode = &xzRefEncode, .decode = &lib.lzmaBufferDecode });
 }
 

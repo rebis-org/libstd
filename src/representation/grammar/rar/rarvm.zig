@@ -7,8 +7,8 @@ const bits = @import("bits.zig");
 const Exception = exception.Exception;
 const BitReader = bits.BitReader;
 
-// Only six standard filter programs exist, so a program matches only when its
-// CRC32 and its length both match. Any other program must stay unverifiable.
+// Six standard programs exist; a match needs both CRC32 and length, and
+// anything else stays unverifiable.
 
 pub const StandardFilter = enum {
     none,
@@ -30,8 +30,8 @@ const std_filters = [_]StdFilterEntry{
     .{ .length = 216, .crc = 0xbc85e701, .filter = .audio },
 };
 
-// Byte 0 is an XOR checksum over bytes 1..n. The CRC32 alone accepts a
-// truncated program, so the length must match too, and a mismatch returns .none.
+// Byte 0 is an XOR checksum over bytes 1..n; CRC32 alone would accept a
+// truncated program.
 pub fn identifyFilter(provider: checksum.Provider, code: []const u8) StandardFilter {
     if (code.len == 0) return .none;
 
@@ -46,8 +46,8 @@ pub fn identifyFilter(provider: checksum.Provider, code: []const u8) StandardFil
     return .none;
 }
 
-// A variable-width integer uses the top two bits to select the width. The
-// 0x4000 width has a sub-case that sign-extends a small negative value.
+// The top two bits select the width; the 0x4000 width sign-extends a
+// small negative value.
 pub fn readData(br: *BitReader) Exception!u32 {
     const head_bits = try br.peekBits(16);
     switch (head_bits & 0xc000) {
@@ -82,6 +82,7 @@ pub fn readData(br: *BitReader) Exception!u32 {
 
 // A false result means the parameters are out of range; the caller reports
 // the entry unverifiable.
+//
 // Each filter reads from scratch: writing over the destination would
 // overwrite unread input.
 pub fn applyFilter(
@@ -227,8 +228,11 @@ pub fn applyFilter(
             return true;
         },
         .rgb => {
-            // The predictor sums the left, upper, and upper-left neighbors, then keeps the one with the smallest absolute difference from that sum.
-            // The encoder stored red and blue as differences from green, so green must be added back afterwards.
+            // The predictor sums left, upper, and upper-left neighbors, then keeps
+            // the closest by absolute difference.
+            //
+            // The encoder stored red and blue as differences from green, so the
+            // decoder adds green back afterwards.
             const width_reg = init_r[0];
             if (width_reg < 3) return false;
             const width: usize = width_reg - 3;
@@ -279,8 +283,11 @@ pub fn applyFilter(
             return true;
         },
         .itanium => {
-            // An IA-64 instruction bundle is 16 bytes that hold three 41-bit slots and one 5-bit template.
-            // In every slot whose op type is 5, which is a branch, the encoder made the 20-bit target absolute, so convert it back.
+            // An IA-64 instruction bundle is 16 bytes that hold three 41-bit
+            // slots and one 5-bit template.
+            //
+            // Op type 5 marks a branch; the encoder made its 20-bit target
+            // absolute, so convert it back.
             if (data_size < 21) return false;
             var file_offset: u32 = init_r[6] >> 4;
 

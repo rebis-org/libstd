@@ -6,7 +6,7 @@ const Exception = exception_prim.Exception;
 
 // Bit-level port of wimlib's input_bitstream, shared by the WIM codecs.
 // Words drain high byte first, most-significant bit first.
-// Interleaved bytes read at the raw cursor.
+//
 // Overrun reads yield zeroes, matching wimlib's contract.
 
 pub const Bits = struct {
@@ -25,8 +25,8 @@ pub const Bits = struct {
         b.bitbuf |= word << @intCast(16 - b.bitsleft);
         b.next += 2;
         b.bitsleft += 16;
-        // 17-bit requests that entered with an empty buffer need a second
-        // word; wimlib loads it at shift 0 and marks the buffer full.
+        // A 17-bit request from an empty buffer needs a second word;
+        // wimlib loads it at shift 0.
         if (num_bits == 17 and b.bitsleft == 16) {
             if (b.data.len - b.next < 2) {
                 b.bitsleft = 32;

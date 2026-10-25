@@ -24,10 +24,8 @@ pub fn build(b: *std.Build) void {
     };
     const target = blk: {
         var resolved = b.standardTargetOptions(.{});
-        // Rosetta executes x86_64 macOS on the CI runners: CPUID reports
-        // SHA-NI, the instructions fault, and std's Sha256 compiles its
-        // SHA-NI arm on the detected feature. Strip 'sha' from native
-        // x86_64-macos targets; explicit -Dcpu keeps it.
+        // Rosetta CPUID reports SHA-NI but the instructions fault; strip
+        // 'sha' so std's Sha256 skips its SHA-NI arm.
         if (resolved.query.isNative() and resolved.result.cpu.arch == .x86_64 and resolved.result.os.tag == .macos) {
             const sha_bit = @backingInt(std.Target.x86.Feature.sha);
             resolved.query.cpu_features_sub.addFeature(sha_bit);
@@ -91,11 +89,8 @@ pub fn build(b: *std.Build) void {
     units.expand(b, &ctx);
     _ = units.addListingStep(b);
 
-    // Unit blocks pin fast in-process invariants.
-    // System interop and contract pins stay in oracles.
-    // std.Build's TestOptions.filters is inert in Zig 0.17 (only the Maker
-    // build system forwards --test-filter), so filtering is module-grained:
-    // the option selects which unit test binaries run, not tests inside one.
+    // Unit blocks pin in-process invariants; system pins stay in oracles.
+    // Zig 0.17 test filters are inert; selection is per binary.
     const test_filter = b.option([]const u8, "test_filter", "Only run unit test binaries whose module name contains the substring");
     const unit_step = b.step("unit", "Run unit-level test blocks");
     inline for ([_]modules.Module{ modules.interface, modules.checksum, modules.implementations }) |spec| {
@@ -113,8 +108,14 @@ pub fn build(b: *std.Build) void {
         unit_step.dependOn(&b.addRunArtifact(micro_tests).step);
     }
 
-    // Micro benchmarks run through the time-budgeted runner.
-    // Defaults to fast because debug numbers carry no evidence.
+    // The module roots at src/fuzz.zig so cross-directory imports stay
+    // legal; the step is a smoke gate, not a campaign.
+    const fuzz_module = modules.createFor(b, modules.fuzz, ctx.target, ctx.optimize, &ctx);
+    const fuzz_tests = b.addTest(.{ .root_module = fuzz_module });
+    const fuzz_step = b.step("fuzz", "Build the decode-surface fuzz harness and run its non-campaign pass");
+    fuzz_step.dependOn(&b.addRunArtifact(fuzz_tests).step);
+
+    // Debug numbers carry no evidence, so micro defaults to fast.
     const micro_optimize = b.option(std.lang.Optimize, "micro_optimize", "Optimization mode for zig build micro") orelse .fast;
     const micro_module = modules.createFor(b, modules.micro, ctx.target, micro_optimize, &ctx);
     const micro_exe = b.addExecutable(.{ .name = "micro", .root_module = micro_module });

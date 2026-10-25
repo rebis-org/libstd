@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const entry_prim = @import("../../../common/entry.zig");
 const bounds = @import("../../../common/primitive/bounds.zig");
 const checksum = @import("../../../common/primitive/checksum.zig");
 const exception_prim = @import("../../../common/primitive/exception.zig");
@@ -12,16 +13,17 @@ const lzma_seam = @import("../../leaf/lzma/seam.zig");
 const lzo_leaf = @import("../../leaf/lzo/onprem.zig");
 const zstd_leaf = @import("../../leaf/zstd/onprem.zig");
 
+pub const Entry = entry_prim.Entry;
+pub const EntryInfo = entry_prim.Sized;
 const Exception = exception_prim.Exception;
 
-// Squashfs 4.0 slice: one root directory of regular files.
+// SquashFS 4.0 slice: one root directory of regular files.
 // Read covers every compressor for data and metadata alike.
 
 // Dictionaries are capped at one MiB; larger ones fail explicitly.
 
 // Write emits the mksquashfs -comp zstd -no-fragments shape.
-// Metadata blocks are zstd frames, stored verbatim on expand.
-// Layout follows squashfs_fs.h.
+// Metadata blocks are zstd frames; layout follows squashfs_fs.h.
 
 const xz_dictionary_cap: u32 = 1 << 20;
 
@@ -56,14 +58,11 @@ const inode_type_lreg: u16 = 9;
 const flag_no_frag: u16 = 1 << 4;
 const flag_no_xattr: u16 = 1 << 9;
 const flag_noid: u16 = 1 << 11;
-// Compressed write keeps fragments, xattrs, and id tables disabled,
-// matching the slice shape.
+// Write disables fragments, xattrs, and id tables, matching the slice shape.
 const write_flags: u16 = flag_no_frag | flag_no_xattr | flag_noid;
 
-// Read carving stays at the front of scratch; the zstd encoder workspace
-// and write staging live behind it. The workspace bound covers the hash
-// and double-fast tables plus block slack. Frames use the reader's
-// one-MiB window so write and read agree on scratch.
+// The workspace covers hash and double-fast tables plus slack.
+// Frames use the reader's one-MiB window so write and read agree.
 const zstd_window: u32 = 1 << 20;
 const zstd_options: zstd_leaf.Options = .{ .window_size = zstd_window };
 const max_data_blocks: usize = 4096;
@@ -79,16 +78,6 @@ const mode_file: u16 = 0o644;
 const mode_dir: u16 = 0o755;
 const uid_index: u16 = 0;
 const guid_index: u16 = 1;
-
-pub const Entry = struct {
-    name: []const u8,
-    data: []const u8,
-};
-
-pub const EntryInfo = struct {
-    size: u64,
-    ordinal: u64,
-};
 
 const Super = struct {
     inode_count: u32,
@@ -167,7 +156,7 @@ fn inflateMeta(compression: u16, archive: []const u8, at: u64, out: []u8, histor
     return .{ .len = len, .disk_size = 2 + size };
 }
 
-// `aux` carries dictionary-sized workspaces and zstd's rolling history.
+// The `aux` slice carries dictionary-sized workspaces and zstd's rolling history.
 fn inflateBlock(compression: u16, payload: []const u8, out: []u8, history: []u8, aux: ?[]u8) Exception!usize {
     switch (compression) {
         compression_gzip => return inflateZlib(payload, out, history),
@@ -204,8 +193,7 @@ fn inflateZlib(payload: []const u8, out: []u8, history: []u8) Exception!usize {
 }
 
 fn inflateData(compression: u16, payload: []const u8, out: []u8, history: []u8, aux: ?[]u8) Exception!void {
-    // Every compressor must fill the destination exactly: a short frame is
-    // corruption, not a license to leave stale bytes in the block buffer.
+    // Every compressor must fill the destination exactly; a short frame is corruption.
     if (try inflateBlock(compression, payload, out, history, aux) != out.len) return error.DataException;
 }
 
@@ -291,8 +279,8 @@ const FragmentEntry = struct {
 fn readFragmentEntry(archive: []const u8, super: Super, index: u32, scratch: *Scratch) Exception!FragmentEntry {
     if (super.fragments == 0 or index >= super.fragments) return error.DataException;
     const table_bytes = std.math.mul(u64, super.fragments, 16) catch return error.DataException;
-    // unsquashfs sizes the index by ceil(bytes / 8 KiB); floor + 1 reads a
-    // slot past the table whenever the byte count is an exact multiple.
+    // The unsquashfs reference sizes the index by ceil(bytes / 8 KiB);
+    // floor + 1 reads one slot too many.
     const indexes = (table_bytes + metadata_size - 1) / metadata_size;
     const index_bytes = std.math.mul(u64, indexes, 8) catch return error.ResourceException;
     const table = try bounds.slice(archive, super.fragment_table_start, index_bytes);
@@ -384,8 +372,8 @@ fn walkInodeDir(archive: []const u8, super: Super, scratch: *Scratch, ref: u64, 
     try stream.skip(dir_inode.dir_offset, scratch.history);
     try stream.read(scratch.frag[0..content_len], scratch.history);
 
-    // Collect children first: recursion would clobber staged bytes
-    // mid-parse. Names carry no meaning for counting or resolution.
+    // Collect children first: recursion would clobber staged bytes mid-parse.
+    // Names carry no meaning for counting or resolution.
     var refs: [max_entries]u64 = undefined;
     var types: [max_entries]u16 = undefined;
     var count: usize = 0;
@@ -490,9 +478,8 @@ fn readFile(archive: []const u8, super: Super, inode: Inode, output: []u8, scrat
         const frag_bytes = inode.file_size - written;
         if (frag_bytes > 0) {
             const written_usize: usize = std.math.cast(usize, written) orelse return error.CapacityException;
-            // unsquashfs bounds the fragment offset by block_size, not by any
-            // decoder buffer: a foreign image with block_log above 17 carries
-            // valid offsets past 128 KiB.
+            // The unsquashfs reference bounds fragment offsets by block_size, not the
+            // buffer: block_log above 17 carries valid offsets past 128 KiB.
             if (inode.frag_offset >= super.block_size) return error.DataException;
             const entry = try readFragmentEntry(archive, super, inode.fragment, scratch);
             const c_byte = entry.size & data_size_mask;
@@ -604,8 +591,7 @@ fn pushSpan(spans: []Span, start: usize, len: usize) Exception!void {
     spans[n] = .{ .start = @intCast(start), .len = @intCast(len) };
 }
 
-// Write staging carved from scratch behind the read carving;
-// alignment resolves dynamically.
+// Write staging is carved behind the read carving; alignment follows the actual pointer.
 const WriteWs = struct {
     stage: []u8,
     meta: []u8,
@@ -655,8 +641,8 @@ fn metaSpan(ws: []u32, stage: []u8, block: []const u8) Exception!MetaSpan {
     return .{ .raw = block };
 }
 
-// Measures one metadata span; blocks that expand are stored raw per the
-// format. The header size field carries the full byte count, unlike data blocks.
+// Blocks that expand are stored raw; the header size field carries
+// the full byte count, unlike data blocks.
 fn metaSpanDisk(ws: []u32, stage: []u8, block: []const u8) Exception!u64 {
     return switch (try metaSpan(ws, stage, block)) {
         .compressed => |c| 2 + c.len,
@@ -699,7 +685,9 @@ fn writeSuper(sink: *Sink, plan: *const Plan) Exception!void {
     std.mem.writeInt(u64, raw[56..64], invalid_table, .little);
     std.mem.writeInt(u64, raw[64..72], super_disk_size + plan.data_total, .little);
     std.mem.writeInt(u64, raw[72..80], super_disk_size + plan.data_total + plan.inode_table_total, .little);
-    std.mem.writeInt(u64, raw[80..88], invalid_table, .little);
+    // The spec allows -1, but readers requiring frag_table <= bytes_used
+    // reject it; an empty table points at image end.
+    std.mem.writeInt(u64, raw[80..88], plan.total, .little);
     std.mem.writeInt(u64, raw[88..96], invalid_table, .little);
     try sink.write(&raw);
 }
@@ -708,7 +696,6 @@ fn nodeInodeSize(node: *const Node) usize {
     return if (node.kind == .dir) 32 else 32 + 4 * @as(usize, node.blocks);
 }
 
-// Directory inodes embed their dir_start/dir_size.
 fn buildInodeTableRaw(plan: *const Plan, buf: []u8, spans: []Span) Exception!usize {
     var used: usize = 0;
     var span_start: usize = 0;
@@ -764,9 +751,8 @@ fn fileBlockBase(plan: *const Plan, node_index: u32) usize {
     return base;
 }
 
-// Inodes are addressed by disk offset, so a span that compresses advances
-// the next span by its compressed size, not its raw length. Recompute rel
-// from the measured layout once the raw table exists.
+// Inode refs carry compressed disk offsets, so rel must be recomputed
+// from the measured spans once the raw table exists.
 fn recomputeInodeDiskRels(plan: *Plan, spans: []const Span, buf: []const u8, ws: *WriteWs) Exception!void {
     const count = spanCount(spans);
     var span_i: usize = 0;
@@ -793,7 +779,6 @@ fn buildDirTableRaw(plan: *Plan, ws: *WriteWs, buf: []u8, spans: []Span) Excepti
     for (plan.order) |ni| {
         const node = &plan.nodes[ni];
         if (node.kind != .dir) continue;
-        // Flush before each directory so it starts at a block boundary.
         if (used > span_start) {
             try pushSpan(spans, span_start, used - span_start);
             const span_disk = try metaSpanDisk(ws.ws, ws.stage, buf[span_start..used]);
@@ -874,7 +859,7 @@ fn orderRank(plan: *const Plan, node_index: u32) usize {
 }
 
 fn writeIdTable(sink: *Sink) Exception!void {
-    // unsquashfs checks bytes_used - id_table_start == index_bytes.
+    // The unsquashfs reference checks bytes_used - id_table_start == index_bytes.
     // The id block comes first; the index last.
     const block_start: u64 = @intCast(sink.pos);
     var head: [2]u8 = undefined;
@@ -891,7 +876,8 @@ fn buildPlan(entries: []const Entry, ws: *WriteWs, alloc: std.mem.Allocator) Exc
     // Tree build: nodes[0] roots the directory tree.
     var nodes: std.ArrayList(Node) = .empty;
     nodes.append(alloc, .{ .kind = .dir, .name = "", .parent = 0 }) catch return error.ResourceException;
-    for (entries) |entry| {
+    const parents = alloc.alloc(u32, entries.len) catch return error.ResourceException;
+    for (entries, 0..) |entry, index| {
         try validateName(entry.name);
         if (entry.data.len > std.math.maxInt(u32)) return error.UnsupportedException;
         var parent: u32 = 0;
@@ -901,7 +887,18 @@ fn buildPlan(entries: []const Entry, ws: *WriteWs, alloc: std.mem.Allocator) Exc
             parent = try findOrCreateDir(&nodes, alloc, parent, comp);
             comp = next;
         }
-        nodes.append(alloc, .{ .kind = .file, .name = comp, .parent = parent, .data = entry.data }) catch return error.ResourceException;
+        parents[index] = parent;
+    }
+    for (entries, 0..) |entry, index| {
+        const parent = parents[index];
+        const leaf = entry_prim.leafName(entry.name) orelse return error.CallException;
+        if (findChild(&nodes, parent, leaf)) |existing| {
+            // A deeper path already implied this directory; only an
+            // empty entry may name it again.
+            if (nodes.items[existing].kind != .dir or entry.data.len != 0) return error.CallException;
+            continue;
+        }
+        nodes.append(alloc, .{ .kind = .file, .name = leaf, .parent = parent, .data = entry.data }) catch return error.ResourceException;
         nodes.items[parent].child_count += 1;
     }
     if (nodes.items.len > max_nodes) return error.UnsupportedException;
@@ -982,7 +979,7 @@ fn buildPlan(entries: []const Entry, ws: *WriteWs, alloc: std.mem.Allocator) Exc
         used += size;
     }
 
-    // Compression measure assigns each dir its dir_start.
+    // Measuring the compressed directory table assigns each dir its dir_start.
     const dir_buf = ws.meta[0 .. ws.meta.len / 2];
     const inode_buf = ws.meta[ws.meta.len / 2 ..];
     var plan = Plan{
@@ -1034,14 +1031,22 @@ fn totalFileBlocks(nodes: []const Node) usize {
     return n;
 }
 
-fn findOrCreateDir(nodes: *std.ArrayList(Node), alloc: std.mem.Allocator, parent: u32, name: []const u8) Exception!u32 {
+fn findChild(nodes: *std.ArrayList(Node), parent: u32, name: []const u8) ?u32 {
     for (nodes.items, 0..) |node, i| {
-        if (node.kind == .dir and node.parent == parent and std.mem.eql(u8, node.name, name)) return @intCast(i);
+        if (node.parent == parent and std.mem.eql(u8, node.name, name)) return @intCast(i);
+    }
+    return null;
+}
+
+fn findOrCreateDir(nodes: *std.ArrayList(Node), alloc: std.mem.Allocator, parent: u32, name: []const u8) Exception!u32 {
+    if (findChild(nodes, parent, name)) |existing| {
+        if (nodes.items[existing].kind != .dir) return error.CallException;
+        return existing;
     }
     const idx: u32 = @intCast(nodes.items.len);
     nodes.append(alloc, .{ .kind = .dir, .name = name, .parent = parent }) catch return error.ResourceException;
     nodes.items[parent].child_count += 1;
-    // mksquashfs writes directory nlink as 2 + subdirectory count.
+    // The mksquashfs tool writes directory nlink as 2 + subdirectory count.
     nodes.items[parent].subdir_count += 1;
     return idx;
 }
@@ -1180,8 +1185,7 @@ test "squashfs fragment index count uses ceil like unsquashfs" {
     @memcpy(&image, &mksquashfs_fixture);
     // 512 fragments make the entry table an exact 8 KiB: one index slot.
     std.mem.writeInt(u32, image[16..20], 512, .little);
-    // Trim the archive to the end of the 8-byte index. The old floor + 1
-    // formula demanded a second slot and failed past the archive end.
+    // Trim to the index end; the old floor + 1 formula demanded a second slot.
     std.mem.writeInt(u64, image[40..48], 255, .little);
     const trimmed = image[0..255];
     var scratch: [scratch_size]u8 = undefined;
@@ -1193,11 +1197,10 @@ test "squashfs fragment index count uses ceil like unsquashfs" {
 
 test "squashfs fragment offset bound follows block size" {
     const testing = std.testing;
-    // A foreign image with block_log 18: valid fragment offsets reach past
-    // the 128 KiB scratch bound the old check used. All blocks are stored
-    // raw, so no compressor runs.
+    // block_log 18 puts valid fragment offsets past the old 128 KiB bound.
+    // All blocks stay raw, so no compressor runs.
     const bs: u32 = 256 * 1024;
-    const file1_len: usize = 131073; // just past the old scratch bound.
+    const file1_len: usize = 131073; // Just past the old scratch bound.
     const file2_len: usize = 100;
     const frag_total = file1_len + file2_len;
     const inode_meta_at: u64 = 96 + frag_total;

@@ -6,19 +6,17 @@ const drivers = @import("drivers.zig");
 const sessions = @import("sessions.zig");
 const Exception = @import("../common/primitive/exception.zig").Exception;
 
-// Caller-owned storage: the handle IS the storage pointer, so no allocator, registry, or global state and sessions stay isolated.
-// Destroy clears the cookie so post-destroy steps fail deterministically. No span constructor because it would be a no-op.
+// The handle is the caller's storage pointer, so sessions stay isolated.
+// Destroy clears the cookie. Span construction is a no-op.
 const Session = sessions.Session;
 
-// Handle identity. A live session carries the alive cookie; destroy and
-// failed-create storage carry the dead cookie, so the boundary never
-// dispatches through a garbage ops pointer.
+// Handle identity: live sessions carry the alive cookie, dead storage the
+// dead cookie; the boundary never dispatches through garbage ops.
 const alive_cookie: u64 = 0x5354_444b_5f31_0001;
 const dead_cookie: u64 = 0x5354_444b_5f31_dead;
 
-// Generous-but-bounded default ceilings for stdk_session_create: zip-bomb
-// protection holds without host policing, and unbounded streaming stays
-// available through stdk_session_bounded with explicit maxInt values.
+// Generous but bounded: zip-bomb protection holds without host policing.
+// Unbounded streaming needs stdk_session_bounded with maxInt values.
 const default_max_encoded: u64 = 16 << 30;
 const default_max_decoded: u64 = 16 << 30;
 const default_max_work: u64 = 4 << 30;
@@ -29,17 +27,16 @@ fn exceptionStatus(exception: Exception) u32 {
     return envelope.Status.internal_failure;
 }
 
-// The session-able surface, single-sourced for matchSessionIndex, sizing, and
-// the catalog projection. Ordering is ABI once released: append only.
+// Single-sourced surface for matching, sizing, and the catalog projection.
+// Ordering is ABI once released: append only.
 const SessionDef = struct {
     component: [:0]const u8,
     verb: [:0]const u8,
     storage: *const fn () usize,
     session: *const fn ([]u8, sessions.Budgets) Exception!Session,
 };
-// tar/write left the boundary: store-only fixed-mode framing cannot express
-// typeflags, links, modes, or pax names.
-// A full tar write can re-enter as a v2 pair.
+// The tar/write boundary gap: fixed-mode framing cannot express typeflags,
+// links, modes, or pax names. Full write re-entry waits for v2.
 const session_defs = [_]SessionDef{
     .{ .component = "gzip", .verb = "decode", .storage = drivers.gzipDecodeStorage, .session = drivers.gzipDecodeSession },
     .{ .component = "deflate", .verb = "decode", .storage = drivers.deflateDecodeStorage, .session = drivers.deflateDecodeSession },
@@ -65,10 +62,8 @@ fn matchSessionIndex(component: ?[*:0]const u8, verb: ?[*:0]const u8) ?usize {
     return null;
 }
 
-// Poison storage after any create failure so later step/destroy calls observe
-// the dead sentinel instead of recycled or garbage bytes. Storage too small to
-// hold a Session record cannot be helped; the handle contract then requires
-// the caller not to reuse it.
+// Poison storage after create failure; later calls see the dead sentinel.
+// Undersized storage cannot be poisoned; the contract forbids reuse.
 fn markDead(bytes: [*]u8, storage_len: u64) void {
     const len: usize = std.math.cast(usize, storage_len) orelse return;
     if (len < @sizeOf(Session)) return;
@@ -83,7 +78,11 @@ fn markDead(bytes: [*]u8, storage_len: u64) void {
 }
 
 fn checkAlive(handle: ?*anyopaque) ?*Session {
-    const session: *Session = @ptrCast(@alignCast(handle orelse return null));
+    const raw = handle orelse return null;
+    // Create checks alignment, but step and destroy take opaque handles;
+    // refuse a misaligned pointer before the cast.
+    if (@intFromPtr(raw) % @alignOf(Session) != 0) return null;
+    const session: *Session = @ptrCast(@alignCast(raw));
     if (session.cookie != alive_cookie) return null;
     if (session.ops == &destroyed_ops) return null;
     return session;
@@ -106,8 +105,8 @@ fn createWithBudgets(
     const bytes = storage orelse {
         return envelope.Status.invalid_call;
     };
-    // The Session record carries pointers and u64 words; a misaligned storage
-    // would otherwise be UB in release-fast.
+    // The Session record holds pointers and u64 words; misaligned storage would
+    // be undefined behavior in release-fast.
     if (@intFromPtr(bytes) % @alignOf(Session) != 0) return envelope.Status.invalid_call;
     if (storage_len < driverStateOffset()) {
         markDead(bytes, storage_len);
@@ -139,9 +138,8 @@ export fn stdk_session_create(
     });
 }
 
-// Per-session ceilings on encoded, decoded, work, and entry bytes.
-// Hosts pass zip-bomb limits here instead of policing produced bytes
-// themselves.
+// Hosts pass zip-bomb limits here instead of policing produced bytes.
+// max_entries is reserved: v1 session pairs are entry-less streams.
 export fn stdk_session_bounded(
     component: ?[*:0]const u8,
     verb: ?[*:0]const u8,
@@ -164,8 +162,8 @@ fn driverStateOffset() usize {
     return std.mem.alignForward(usize, @sizeOf(Session), 16);
 }
 
-// u128 arithmetic keeps the end computation overflow-free for hostile lengths.
-// The C boundary reports no failure, so the check stays infallible.
+// u128 arithmetic keeps end computations overflow-free against hostile
+// lengths. The C boundary reports no failure, so the check stays infallible.
 fn rangesOverlap(a: ?[*]const u8, a_len: u64, b: ?[*]const u8, b_len: u64) bool {
     const a_start = if (a) |ptr| @as(u128, @intFromPtr(ptr)) else return false;
     const b_start = if (b) |ptr| @as(u128, @intFromPtr(ptr)) else return false;
@@ -212,10 +210,8 @@ export fn stdk_session_step(
     return envelope.Status.ok;
 }
 
-// Failure detail for the last failed step: the envelope status vocabulary
-// plus a driver-defined scalar (the required capacity for
-// insufficient_capacity, 0 where undefined). Callers read it while the
-// storage is alive, immediately after a failed step.
+// The last failed step's status plus a driver-defined scalar: required
+// capacity for insufficient_capacity, else 0. Valid while storage is alive.
 export fn stdk_session_failure(
     handle: ?*anyopaque,
     status_out: ?*u32,
@@ -242,11 +238,12 @@ const session_catalog_text: [:0]const u8 = blk: {
     break :blk text;
 };
 
-// Destroy is idempotent and total: live sessions are destroyed, dead sessions
-// (already destroyed or failed-create) report ok, and storage that was never
-// successfully created is refused rather than dispatched through garbage.
+// Destroy is idempotent and total: live sessions are destroyed, dead ones
+// report ok, and never-created storage is refused, never dispatched.
 export fn stdk_session_destroy(handle: ?*anyopaque) callconv(.c) u32 {
-    const session: *Session = @ptrCast(@alignCast(handle orelse return envelope.Status.invalid_call));
+    const raw = handle orelse return envelope.Status.invalid_call;
+    if (@intFromPtr(raw) % @alignOf(Session) != 0) return envelope.Status.invalid_call;
+    const session: *Session = @ptrCast(@alignCast(raw));
     if (session.cookie == dead_cookie or session.ops == &destroyed_ops) return envelope.Status.ok;
     if (session.cookie != alive_cookie) return envelope.Status.invalid_call;
     session.destroy();

@@ -292,8 +292,8 @@ fn runWimForeign(r: *Runner) anyerror!void {
     setupArchive(r, harness.ids.wim);
     const bin = wimlib_path;
     std.Io.Dir.cwd().access(harness.oracle_io, bin, .{}) catch return error.ReferenceToolUnavailable;
-    // wimlib capture: build a directory with the corpus files, capture it
-    // uncompressed, then read it through the envelope.
+    // The wimlib oracle captures the corpus directory uncompressed;
+    // the envelope reads its image.
     const oracle_io = harness.oracle_io;
     const dir_path = try r.gpa.print("zig-out/oracles/wim-src-{d}", .{r.corpus_index});
     defer r.gpa.free(dir_path);
@@ -341,7 +341,7 @@ fn runIsoTree(r: *Runner) anyerror!void {
     try arcQueryRead(r);
     try arcReadOrdinal(r, 0, &arc_state.data1);
     try arcReadOrdinal(r, 1, &arc_state.data2);
-    // bsdtar must reconstruct the subdirectory from our image.
+    // The bsdtar oracle must reconstruct the subdirectory from our image.
     const bin = "/usr/bin/bsdtar";
     std.Io.Dir.cwd().access(harness.oracle_io, bin, .{}) catch return error.ReferenceToolUnavailable;
     const oracle_io = harness.oracle_io;
@@ -423,7 +423,7 @@ fn runAge(r: *Runner) anyerror!void {
     const x_size = try ageWrite(r, entry, &x25519_params);
     try ageReadBack(r, x_size, payload[0..445], &[_]harness.Node{ageParamBytes(5, age_identity)});
 
-    // scrypt round trip with a small work factor for the suite's budget.
+    // The scrypt round trip uses a small work factor for the suite's budget.
     const scrypt_params = [_]harness.Node{
         harness.cryptoProfile(),
         harness.cryptoPasswordParam(age_password),
@@ -446,8 +446,8 @@ fn runAge(r: *Runner) anyerror!void {
     if (r.status != abi.Status.invalid_data) return error.AgeWrongPasswordStatus;
 }
 
-// age family-1 parameters ride the crypto family with the ordinals from the
-// age descriptor (identity 5, recipient 6, work_factor 7, armor 8).
+// The age parameters ride the crypto family with the descriptor's ordinals:
+// identity 5, recipient 6, work_factor 7, armor 8.
 fn ageParamBytes(ordinal: u32, value: []const u8) harness.Node {
     return harness.paramBytes(harness.param_family_crypto, ordinal, harness.cmds, value);
 }
@@ -531,9 +531,8 @@ fn ageReadBack(r: *Runner, size: usize, expected: []const u8, extra: []const har
     }
 }
 
-// Reference interop both directions: the reference tool decrypts what the
-// facade writes, and the facade reads what the reference encrypts, armored
-// and binary.
+// Interop both directions: the reference decrypts what the facade writes;
+// the facade reads the reference's armored and binary output.
 fn runAgeInterop(r: *Runner) anyerror!void {
     if (isOffpremUnsupported()) return;
     const oracle_io = harness.oracle_io;
@@ -620,7 +619,7 @@ pub fn runDwarfs(r: *Runner) anyerror!void {
     if (isOffpremUnsupported()) return;
     try runArchive(r, harness.ids.dwarfs);
     const oracle_io = harness.oracle_io;
-    // dwarfsck must accept our image; then dwarfsextract must round-trip it.
+    // The dwarfsck tool must accept our image; dwarfsextract must round-trip it.
     const ck = squashfs_bin_dir ++ "/dwarfsck";
     std.Io.Dir.cwd().access(oracle_io, ck, .{}) catch return error.ReferenceToolUnavailable;
     const image_path = try r.gpa.print("zig-out/oracles/dwarfs-ours-{d}.dwarfs", .{r.corpus_index});
@@ -670,7 +669,7 @@ fn runDwarfsTree(r: *Runner) anyerror!void {
     try arcQueryRead(r);
     try arcReadOrdinal(r, 0, &arc_state.data1);
     try arcReadOrdinal(r, 1, &arc_state.data2);
-    // dwarfsck must accept the image; dwarfsextract must rebuild the tree.
+    // The dwarfsck tool must accept the image; dwarfsextract must rebuild the tree.
     const oracle_io = harness.oracle_io;
     const ck = squashfs_bin_dir ++ "/dwarfsck";
     std.Io.Dir.cwd().access(oracle_io, ck, .{}) catch return error.ReferenceToolUnavailable;
@@ -732,7 +731,7 @@ fn runDwarfsForeign(r: *Runner) anyerror!void {
 fn runIsoForeign(r: *Runner) anyerror!void {
     if (isOffpremUnsupported()) return;
     setupArchive(r, harness.ids.iso);
-    // hdiutil makehybrid is the local Rock Ridge/Joliet writer reference.
+    // The hdiutil makehybrid tool is the local Rock Ridge/Joliet writer reference.
     const oracle_io = harness.oracle_io;
     const dir_path = try r.gpa.print("zig-out/oracles/iso-src-{d}", .{r.corpus_index});
     defer r.gpa.free(dir_path);
@@ -780,7 +779,7 @@ fn runSquashfsTree(r: *Runner) anyerror!void {
     try arcQueryRead(r);
     try arcReadOrdinal(r, 0, &arc_state.data1);
     try arcReadOrdinal(r, 1, &arc_state.data2);
-    // unsquashfs must reconstruct the subdirectory.
+    // The unsquashfs tool must reconstruct the subdirectory.
     const bin = squashfs_bin_dir ++ "/unsquashfs";
     std.Io.Dir.cwd().access(harness.oracle_io, bin, .{}) catch return error.ReferenceToolUnavailable;
     const oracle_io = harness.oracle_io;
@@ -1105,9 +1104,8 @@ fn runRarEncrypted(r: *Runner) anyerror!void {
         const produced = r.response.byte_length;
         if (produced != rar_encrypted_expected.len) return error.RarEncryptedSizeMismatch;
         if (!std.mem.eql(u8, r.output[0..produced], rar_encrypted_expected)) return error.RarEncryptedMismatch;
-        // A wrong password must fail (integrity or invalid data).
-        // RAR reads are tentative-commit; a late CRC failure can leave garbage in
-        // the sink, so only the failure is asserted.
+        // A wrong password must fail. RAR reads are tentative-commit, so a
+        // late CRC failure may leave garbage in the sink.
         _ = harness.call(r, harness.ids.read, &.{
             harness.archiveOrdinalParam(0),
             harness.sourceSpan(fixture.bytes),
@@ -1214,6 +1212,7 @@ pub fn runRar(r: *Runner) anyerror!void {
     }, .{ .ctx = true }, r.output);
     try rarExpectUnsupported(r, &rar_fixture_multi_volume);
     // QuickOpen service blocks carry no payload we expose.
+    //
     // The walk ends cleanly with zero entries and invalid_data on any ordinal
     // read — the reference's observable shape.
     _ = harness.call(r, harness.ids.query, &.{
@@ -1230,10 +1229,8 @@ pub fn runRar(r: *Runner) anyerror!void {
         harness.sourceSpan(&rar_fixture_service),
         harness.sinkSpan(r.output),
     }, .{ .ctx = true }, abi.Status.invalid_data, r.output);
-    // Unknown block types are skipped by size regardless of the skip flag
-    // (the reference parses the flag but never enforces it): the walk ends
-    // cleanly at EOF with zero entries listed, and any ordinal read is
-    // invalid_data.
+    // Unknown blocks are skipped by size; the reference parses the skip
+    // flag but never enforces it.
     _ = harness.call(r, harness.ids.query, &.{
         harness.paramTargetCommand(harness.ids.read),
         harness.sourceSpan(&rar_fixture_unknown),
@@ -1442,8 +1439,8 @@ pub const scenarios = harness.scenarios("archive", &.{
     .{ .name = "rar official", .suite = "rar", .run = runRarOfficial, .workspace_size = 12 * 1024 * 1024, .output_size = 48 * 1024, .encoded_size = 1024 },
     .{ .name = "rar encrypted", .suite = "rar", .run = runRarEncrypted, .workspace_size = 32 * 1024 * 1024, .output_size = 1024, .encoded_size = 1024 },
     .{ .name = "rar encrypted provider", .suite = "rar", .run = runRarEncryptedProvider, .workspace_size = 32 * 1024 * 1024, .output_size = 1024, .encoded_size = 1024 },
-    // PPMd at -m5 asks the decoder for ~139 MiB of model heap, the format's
-    // own size, not a workaround: the encoder built its contexts that large.
+    // PPMd at -m5 needs ~139 MiB of model heap: the format's own size,
+    // not a workaround.
     .{ .name = "rar ppm", .suite = "rar", .run = runRarPpm, .workspace_size = 176 * 1024 * 1024, .output_size = 2048, .encoded_size = 2048 },
 });
 

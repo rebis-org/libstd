@@ -1,8 +1,7 @@
 const std = @import("std");
 
-// Destinations are pre-sized, so `write` cannot fail.
-// BufferSink records overflow: a partial file that still looks like success
-// is the failure an integrity layer must not allow.
+// Destinations are pre-sized, so `write` cannot fail. BufferSink records
+// overflow because silent truncation must not look like success.
 
 pub const Sink = struct {
     ctx: *anyopaque,
@@ -41,8 +40,8 @@ pub const BufferSink = struct {
     }
 };
 
-// Warms the shared window of a solid group with predecessor entries nobody
-// asked for.
+// Warms a solid group's shared window with predecessor entries the caller
+// did not request.
 pub const DiscardSink = struct {
     len: u64 = 0,
 

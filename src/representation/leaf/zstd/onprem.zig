@@ -44,25 +44,19 @@ pub const Options = struct {
     skip_interior_insert: bool = false,
     double_hash: bool = true,
     row_match: bool = false,
-    // Parser tier for the hash-chain path. 0 = chain: the lazy selector
-    // defers one position. 1 = greedy: take the best immediately. 2 = lazy2:
-    // defer up to two positions. The dfast and row finders ignore this.
+    // Hash-chain parser tier: 0 defers one position, 1 takes the best,
+    // 2 defers two. Dfast and row ignore it.
     strategy: u32 = 0,
-    // Entropy-table selection: 0 = full cost model (default), 1 = the
-    // vendor's selectEncodingType early-outs (repeat-for-small-blocks).
-    // The early-outs change the encoded bytes; gate is descriptor ordinal 12.
+    // Entropy selection: 0 = full cost model, 1 = selectEncodingType early-outs.
+    // Gate is descriptor ordinal 12.
     entropy: u32 = 0,
     provider: checksum.Provider = checksum.default_provider,
 };
 
 const strategy_greedy: u32 = 1;
 const strategy_lazy2: u32 = 2;
-// The price-DP tier: candidates per position come from the hash chain, the
-// repeat offsets, and a 3-byte side table. A greedy replay over those
-// candidates freezes per-symbol prices. A backward DP picks the cheapest
-// sequence lattice. Emission re-resolves offset values against the real
-// repeat-offset history, so the stream stays self-consistent whatever the
-// DP chose.
+// The price-DP tier: greedy replay freezes prices, backward DP picks the
+// cheapest lattice, emission re-resolves offsets against real repeat history.
 const strategy_dp: u32 = 3;
 const dp_stride = 4;
 const dp_price_shift = 6;
@@ -236,7 +230,7 @@ const train_k: usize = 50;
 const train_f: usize = 17;
 const train_buckets = 1 << train_f;
 const train_dmers_in_k = train_k - train_d + 1;
-const train_split_numerator: usize = 3; // first 3/4 of the samples train
+const train_split_numerator: usize = 3; // First 3/4 of the samples train.
 const train_split_denominator: usize = 4;
 
 pub fn trainWorkspaceSize() usize {
@@ -273,9 +267,8 @@ fn trainContentParams(samples: []const []const u8, max_size: usize, output: []u8
     const seg_freqs: []u32 = @alignCast(std.mem.bytesAsSlice(u32, scratch[buckets * @sizeOf(u32) ..][0 .. buckets * @sizeOf(u32)]));
     @memset(freqs, 0);
 
-    // Frequency table over the training split. Saturating: a corpus past
-    // 2^32 dmers would otherwise overflow-panic; saturation keeps ranking
-    // monotone and the output deterministic at any scale.
+    // Saturating counts: past 2^32 dmers the table would overflow-panic;
+    // saturation keeps ranking monotone and the output deterministic.
     for (samples[0..train_count]) |sample| {
         if (sample.len < d) continue;
         for (0..sample.len - d + 1) |pos| {
@@ -363,18 +356,14 @@ fn writeDictionaryHeader(samples: []const []const u8, output: []u8, content_len:
     const dict_id: u32 = dictionary_id_min + @as(u32, @truncate(hasher.final() % span));
     std.mem.writeInt(u32, output[0..4], dictionary_magic, .little);
     std.mem.writeInt(u32, output[4..8], dict_id, .little);
-    // Huffman tree description: direct weights, one stored weight-1 symbol
-    // plus the implied weight-1 last symbol. This is the smallest tree
-    // libzstd's HUF_readStats accepts: its construction check demands an even
-    // count of weight-1 symbols, at least two.
+    // Smallest tree libzstd's HUF_readStats accepts: the construction check demands
+    // an even count of weight-1 symbols, at least two.
     var header_pos: usize = 8;
     output[header_pos] = 128;
     output[header_pos + 1] = 0x10;
     header_pos += 2;
-    // FSE tables (offsets, match lengths, literal lengths): accuracy log 5,
-    // symbol 0 at 31, symbol 1 low-probability (-1).
-    // Bit-exact with the reference ncount writer: (tableLog-5)<<0, then
-    // 62<<(4), flush 11 bits.
+    // All three FSE tables: accuracy log 5, symbol 0 at 31, symbol 1
+    // low-probability. Matches the reference ncount writer.
     const minimal_ncount = [2]u8{ 0xE0, 0x03 };
     for (0..3) |i| {
         output[header_pos + 2 * i] = minimal_ncount[0];
@@ -389,16 +378,14 @@ fn writeDictionaryHeader(samples: []const []const u8, output: []u8, content_len:
     return dictionary_header_size + content_len;
 }
 
-// COVER-style parameter search: sweep the d/f/k grid, score each candidate
-// dictionary by compressing the held-out validation split with it (fast
-// encoder settings), and keep the smallest total. The winning content is
-// written to `output` with the standard header.
+// COVER-style search: score each d/f/k candidate by compressing the
+// validation split; keep the smallest total.
 pub const SearchOptions = struct {
     d_values: []const usize = &.{ 6, 8, 12 },
     f_values: []const usize = &.{ 15, 17, 19 },
     k_values: []const usize = &.{ 32, 50, 84 },
-    // First (denominator - 1) / denominator of the samples train, the rest
-    // validate. The plain trainer uses 3/4; the default keeps that split.
+    // First (denominator - 1)/denominator of the samples train, the rest validate;
+    // default 4 keeps the plain trainer's 3/4 split.
     denominator: usize = 4,
 };
 
@@ -506,9 +493,8 @@ pub fn encodeStream(input: *std.Io.Reader, output: *std.Io.Writer, history: []u8
     if (options.nice_len < min_match_len) return error.DataException;
     if (options.search_window == 0) return error.DataException;
     const dictionary = options.dictionary orelse &.{};
-    // The match finder needs only the dictionary's content region here; the
-    // declared repeat offsets are seeded per frame in encodeBlocks, and the
-    // entropy tables stay decoder-side material the encoder never reuses.
+    // The match finder needs only the content region: offsets seed per frame
+    // in encodeBlocks, entropy tables stay decoder-side.
     const dict_content: []const u8 = if (dictionary.len >= 8 and std.mem.readInt(u32, dictionary[0..4], .little) == dictionary_magic)
         dictionaryContent(dictionary) catch return error.DataException
     else
@@ -629,9 +615,8 @@ fn encodeWindowDescriptor(window_size: u32) u8 {
     if (window_size < 1024) return 0;
     var exponent: u5 = @intCast(31 - @clz(window_size) - 10);
     var base: u64 = @as(u64, 1) << @intCast(exponent + 10);
-    // The mantissa saturates at 7 add units; past that the declared window
-    // would fall short of the encoder's search window, so bump the exponent
-    // and start the next band instead of clamping.
+    // Past 7 add units the declared window would undershoot the search window;
+    // bump the exponent instead of clamping.
     if (window_size > base + 7 * (base / 8)) {
         exponent += 1;
         base <<= 1;
@@ -659,10 +644,8 @@ fn encodeBlocks(output: *std.Io.Writer, content: []const u8, content_start: usiz
     else
         workspace[hash_size .. hash_size + @max(content.len, dfastShortTableSize(options))];
     if (useDfast(options)) @memset(chain, encoder_no_position);
-    // Seeding lets emitted sequences address the dictionary region.
-    // dfast's single-candidate tables take a plain dual insert; the chain path
-    // links positions through chain[].
-    // Row tables are tag-indexed and stay unseeded.
+    // Seeding lets emitted sequences address the dictionary region: dfast
+    // dual-inserts, chain links through chain[], row tables stay unseeded.
     if (!useRowMatch(options) and content_start > 0) {
         if (useDfast(options)) {
             const long_bits = options.hash_bits;
@@ -680,10 +663,8 @@ fn encodeBlocks(output: *std.Io.Writer, content: []const u8, content_start: usiz
     }
     const block_workspace = workspace[hash_size + chain.len ..];
     var offset: usize = 0;
-    // A frame that references a formatted dictionary starts from the
-    // dictionary's declared repeat offsets, mirroring the decoder's
-    // loadDictionary; the no-dictionary defaults apply only to raw-content
-    // dictionaries and dictionary-less frames.
+    // A formatted-dictionary frame starts from the dictionary's declared repeat
+    // offsets, mirroring the decoder's loadDictionary.
     var repeat_offsets = [3]u32{ start_repeated_offset_1, start_repeated_offset_2, start_repeated_offset_3 };
     if (options.dictionary) |dict| {
         if (dict.len >= 8 and std.mem.readInt(u32, dict[0..4], .little) == dictionary_magic)
@@ -710,9 +691,7 @@ const encoder_no_position = std.math.maxInt(u32);
 const encoder_block_seq_u32s = (encoder_block_size_max * @sizeOf(Sequence) + 3) / 4;
 const encoder_block_lit_u32s = (encoder_block_size_max + 3) / 4;
 const encoder_block_section_u32s = (3 * encoder_block_size_max + 3) / 4;
-// Price-DP scratch, present only when the descriptor sizes the workspace
-// for strategy 3. The pieces: per-position candidate pairs and counts, the
-// DP cost and choice arrays, and the 3-byte side table.
+// Price-DP scratch, present only when the descriptor sizes the workspace for strategy 3.
 const encoder_block_dp_u32s = encoder_block_size_max * (2 * dp_stride + 3) + 1 + (1 << dp_head3_bits);
 const encoder_block_prefix_u32s = encoder_block_seq_u32s + encoder_block_lit_u32s + encoder_block_section_u32s;
 const encoder_workspace_u32_count = hash_size + encoder_zip_frame_budget + encoder_block_section_u32s;
@@ -733,8 +712,8 @@ fn dfastShortTableSize(options: Options) usize {
 }
 
 pub fn useDfast(options: Options) bool {
-    // The dispatch order runs an explicit strategy before the legacy toggles.
-    // The double-fast tables then serve only the strategy-less default path.
+    // An explicit strategy dispatches before the legacy toggles; dfast serves only
+    // the strategy-less default path.
     return options.double_hash and !options.lazy and !options.skip_interior_insert and options.strategy == 0;
 }
 
@@ -747,19 +726,16 @@ fn useFixedTables(options: Options) bool {
     return useDfast(options) or useRowMatch(options);
 }
 
-// Blocks never exceed raw form. Frames add <= 18 bytes each at min(window, 2^26) caps.
-// Accounts the multi-frame split at small windows.
+// Blocks never exceed raw form. Frames add <= 18 bytes each at
+// min(window, 2^26) caps, accounting the multi-frame split.
 pub fn encodedSizeBound(input_len: usize, options: Options) usize {
     const frame_cap = @max(@min(@as(usize, options.window_size), encoder_frame_size_max), 1);
     const frames = input_len / frame_cap + 1;
     return input_len +| 3 *| (input_len / encoder_block_size_max + frames) +| 18 *| frames +| 8;
 }
 
-// The sequence-execution stage's input record: one emitted sequence. Codes,
-// extra values, and extra bit counts are pure functions of these three
-// words. The offset word is the rep-resolved offset value, so the
-// repeat-offset history stays parse-side. That keeps the record at 12 bytes
-// and the code computation out of the parse hot path.
+// The execution stage's input record: codes derive from these three words,
+// and the rep-resolved offset keeps the repeat history parse-side.
 const Sequence = struct {
     literal_length: u32,
     match_length: u32,
@@ -849,8 +825,8 @@ fn storeOnlyPrefix(output: *std.Io.Writer, src: []const u8, is_last: bool) Encod
     return true;
 }
 
-// Every parser tier's suffix: insert the remaining positions and flush the
-// tail literals. Hand the parse product to the sequence-execution stage.
+// Every parser tier's suffix: insert remaining positions, flush tail literals,
+// hand the product to the execution stage.
 fn flushParse(output: *std.Io.Writer, content: []const u8, block_end: usize, src: []const u8, anchor: usize, insert_pos: usize, head: []u32, chain: []u32, options: Options, seq_data: []Sequence, seq_count: usize, literal_buf: []u8, literal_count: *usize, literal_freq: *[256]u32, literal_table: []const FseEntry, match_table: []const FseEntry, offset_table: []const FseEntry, is_last: bool, block_workspace: []u32, prev: *PrevFseTables, entropy: u32) EncodeError!void {
     var insert = insert_pos;
     while (insert < block_end) {
@@ -866,15 +842,12 @@ fn flushParse(output: *std.Io.Writer, content: []const u8, block_end: usize, src
 
 const Match = struct { len: usize, offset: usize };
 
-// The strategy tiers cap how far one candidate may extend: pathological
-// periodic input otherwise spends a full block scan per position. Longer
-// matches split into multiple sequences at a negligible ratio cost; the
-// legacy chain tier keeps uncapped extensions (byte-stable output).
+// Caps periodic input's full block scan per position; longer matches split
+// cheaply. The legacy chain tier stays uncapped (byte-stable output).
 const extension_cap = 1 << 12;
 
-// Repeat-offset candidates at a position: the three history entries checked
-// in order, extended forward. Ties and cheap codes make rep hits valuable
-// even when the chain walk would find a longer match later.
+// Cheap codes and tie preference make rep hits valuable even when the chain
+// walk would find a longer match later.
 fn findRepMatch(content: []const u8, block_start: usize, block_end: usize, pos: usize, repeat_offsets: *const [3]u32, min_abs: usize) Match {
     const src_len = block_end - block_start;
     if (pos + min_take_len > src_len) return .{ .len = 0, .offset = 0 };
@@ -891,8 +864,8 @@ fn findRepMatch(content: []const u8, block_start: usize, block_end: usize, pos: 
     return best;
 }
 
-// The best match at one position: repeat-offset hits first. Ties prefer the
-// rep code, which encodes cheaper. The hash-chain walk follows.
+// The best match at one position: rep hits first, ties prefer the cheaper
+// rep code, then the hash-chain walk.
 fn bestMatchAt(content: []const u8, block_start: usize, block_end: usize, pos: usize, head: []u32, chain: []u32, options: Options, repeat_offsets: *const [3]u32) Match {
     const cur_abs = block_start + pos;
     const window_limit = @min(options.window_size, options.search_window);
@@ -904,9 +877,8 @@ fn bestMatchAt(content: []const u8, block_start: usize, block_end: usize, pos: u
     return chain_best;
 }
 
-// The greedy tier: take the best match at each position immediately, no
-// deferral. Cheapest per byte of the chain-based tiers; the row finder and
-// dfast stay separate faster-shallower options.
+// The greedy tier: take the best match immediately, no deferral. The row
+// finder and dfast stay separate faster-shallower options.
 fn encodeBlockGreedy(output: *std.Io.Writer, content: []const u8, block_start: usize, block_end: usize, head: []u32, chain: []u32, literal_table: []const FseEntry, match_table: []const FseEntry, offset_table: []const FseEntry, is_last: bool, options: Options, block_workspace: []u32, repeat_offsets: *[3]u32, prev: *PrevFseTables) EncodeError!void {
     const src = content[block_start..block_end];
     if (try storeOnlyPrefix(output, src, is_last)) return;
@@ -935,10 +907,8 @@ fn encodeBlockGreedy(output: *std.Io.Writer, content: []const u8, block_start: u
     try flushParse(output, content, block_end, src, anchor, insert_pos, head, chain, options, seq_data, seq_count, literal_buf, &literal_count, &literal_freq, literal_table, match_table, offset_table, is_last, block_workspace, prev, options.entropy);
 }
 
-// The lazy2 tier: defer to the next position when it beats the current
-// match. Defer once more when the position after that beats the second.
-// That is the reference lazy2 shape. Each searched position is inserted
-// before its search, so the table never offers a self-match.
+// The reference lazy2 shape: defer while the next position wins. Insert before
+// search, so the table never offers a self-match.
 fn encodeBlockLazy2(output: *std.Io.Writer, content: []const u8, block_start: usize, block_end: usize, head: []u32, chain: []u32, literal_table: []const FseEntry, match_table: []const FseEntry, offset_table: []const FseEntry, is_last: bool, options: Options, block_workspace: []u32, repeat_offsets: *[3]u32, prev: *PrevFseTables) EncodeError!void {
     const src = content[block_start..block_end];
     if (try storeOnlyPrefix(output, src, is_last)) return;
@@ -989,12 +959,8 @@ fn encodeBlockLazy2(output: *std.Io.Writer, content: []const u8, block_start: us
     try flushParse(output, content, block_end, src, anchor, insert_pos, head, chain, options, seq_data, seq_count, literal_buf, &literal_count, &literal_freq, literal_table, match_table, offset_table, is_last, block_workspace, prev, options.entropy);
 }
 
-// --- The price-DP tier -------------------------------------------------
-
-// Candidate entries live in pairs of u32. Word zero holds the length, with
-// the repeat index (1-3) parked in the top two bits when the hit is a rep.
-// Word one holds the raw offset either way. Emission re-resolves the offset
-// value against the real repeat history.
+// Candidate pairs: word zero packs length plus the rep index in its top
+// bits, word one holds the raw offset.
 fn dpPush(cand: []u32, count: *usize, len: usize, offset: u32, rep_index: u2) bool {
     if (count.* >= dp_stride) return false;
     cand[count.* * 2] = @as(u32, @intCast(len)) | (@as(u32, rep_index) << 30);
@@ -1032,10 +998,8 @@ fn dpSequencePrice(len: usize, entry0: u32, raw_offset: u32, match_price: []cons
     return price;
 }
 
-// Collect the candidates at one position. Sources: the three repeat hits
-// (priced from the replay's history), the improving hash-chain walk, and
-// the nearest 3-byte side hit. `cand` holds dp_stride pairs; the caller
-// inserts the position afterwards.
+// Sources: replay-history repeat hits, the improving chain walk, the 3-byte
+// side hit. The caller inserts the position afterwards.
 fn dpCollect(content: []const u8, block_start: usize, block_end: usize, pos: usize, head: []u32, chain: []u32, options: Options, replay_reps: *const [3]u32, head3: []u32, cand: []u32) usize {
     var count: usize = 0;
     const src_len = block_end - block_start;
@@ -1047,9 +1011,8 @@ fn dpCollect(content: []const u8, block_start: usize, block_end: usize, pos: usi
         const prev3 = head3[h3];
         head3[h3] = @intCast(pos_abs);
         if (prev3 != encoder_no_position and prev3 >= min_abs and prev3 < pos_abs) {
-            // The hash only narrows the search: the three bytes must match
-            // before the candidate is priced, or a collision emits a match
-            // that the stream cannot replay.
+            // The hash only narrows: the three bytes must match, or a collision
+            // emits a match the stream cannot replay.
             if (std.mem.eql(u8, content[pos_abs..][0..3], content[prev3..][0..3])) {
                 const side_end = @min(block_end, pos_abs + extension_cap);
                 const len3 = 3 + countMatchLen(content, prev3 + 3, pos_abs + 3, side_end);
@@ -1058,10 +1021,8 @@ fn dpCollect(content: []const u8, block_start: usize, block_end: usize, pos: usi
         }
     }
     if (pos + min_take_len > src_len) return count;
-    // Repeat hits first: ties prefer them later, and each is a distinct
-    // offset value with its own code. The decisive-byte guard retires a rep
-    // that cannot beat the running best. A shorter rep in that shadow is
-    // priced out anyway.
+    // Each repeat hit carries a distinct offset code. The decisive-byte guard
+    // retires a rep that cannot beat the best.
     var best_len: usize = 0;
     const max_len = @min(src_len - pos, extension_cap);
     inline for (0..3) |rep_index| {
@@ -1118,10 +1079,8 @@ fn encodeBlockDp(output: *std.Io.Writer, content: []const u8, block_start: usize
     match_total = 1;
 
     @memset(head3, encoder_no_position);
-    // Candidate pass. The greedy replay over the collected candidates drives
-    // the repeat history for later rep hits. It also sets the symbol
-    // frequencies for the frozen prices. Every position is inserted for
-    // later walks.
+    // The greedy replay drives the repeat history for later rep hits and sets
+    // the frozen prices' symbol frequencies.
     var replay_reps = repeat_offsets.*;
     var replay_pos: usize = 0;
     var replay_anchor: usize = 0;
@@ -1172,8 +1131,8 @@ fn encodeBlockDp(output: *std.Io.Writer, content: []const u8, block_start: usize
     var offset_price: [64]u32 = undefined;
     for (0..64) |s| offset_price[s] = dpCodePrice(offset_freq[s], offset_total);
 
-    // Backward DP over frozen prices. Choosing a match skips its interior,
-    // so literals between matches accrue one position at a time.
+    // Backward DP over frozen prices. A chosen match skips its interior, so
+    // intermediate literals accrue one position at a time.
     dp[cost_base + span] = 0;
     var i: usize = span;
     while (i > 0) {
@@ -1185,8 +1144,7 @@ fn encodeBlockDp(output: *std.Io.Writer, content: []const u8, block_start: usize
             const cand = dp[cand_base + i * dp_stride * 2 ..][0 .. dp_stride * 2];
             for (0..count) |ci| {
                 const cand_len: usize = @intCast(cand[ci * 2] & 0x3FFFFFFF);
-                // A slot's price is constant across its lengths, so only the
-                // first length of each slot needs trying. The suffix cost
+                // A slot's price is constant across its lengths; the suffix cost
                 // decides which slot wins.
                 var slot_len: usize = match_length_code_table[0][0];
                 while (slot_len <= cand_len) {
@@ -1259,9 +1217,8 @@ fn appendSequence(seq_data: []Sequence, seq_count: *usize, literal_buf: []u8, li
     seq_count.* += 1;
 }
 
-// The sequence-execution stage: turns the parse product (literal buffer
-// plus Sequence list) into one block bitstream. Raw wins when the
-// compressed sections cannot beat it. Every parser tier ends here.
+// The sequence-execution stage: parse product in, one block bitstream out.
+// Raw wins when the compressed sections cannot beat it.
 fn executeSeqData(output: *std.Io.Writer, src: []const u8, literal_buf: []const u8, seq_data: []const Sequence, literal_freq: *[256]u32, literal_table: []const FseEntry, match_table: []const FseEntry, offset_table: []const FseEntry, is_last: bool, block_workspace: []u32, prev: *PrevFseTables, entropy: u32) EncodeError!void {
     const literal_count = literal_buf.len;
     const seq_count = seq_data.len;
@@ -1328,9 +1285,8 @@ fn encodeBlockDfast(output: *std.Io.Writer, content: []const u8, block_start: us
             inner: while (true) {
                 const pos_abs = block_start + ip;
                 const hs0 = hash5At(content, pos_abs, short_bits);
-                // The frame content streams through once: the hardware prefetcher does
-                // not see past the hash tables, so the probe lines arrive two positions
-                // early (the vendor prefetches ip+128 and ip+256 on this path).
+                // The prefetcher does not see past the hash tables, so the probe lines
+                // arrive two positions early, matching the vendor.
                 @prefetch(content.ptr + block_start + ip + 128, .{ .rw = .read, .locality = 3, .cache = .data });
                 @prefetch(content.ptr + block_start + ip + 256, .{ .rw = .read, .locality = 3, .cache = .data });
                 const idxs0 = chain[hs0];
@@ -1432,8 +1388,8 @@ fn encodeBlockDfast(output: *std.Io.Writer, content: []const u8, block_start: us
     try executeSeqData(output, src, literal_buf[0..literal_count], seq_data[0..seq_count], &literal_freq, literal_table, match_table, offset_table, is_last, block_workspace, prev, options.entropy);
 }
 
-// Row finder: 5-byte hash selects a row, 16-bit tag prefilters. Scalar computes the identical
-// mask so vector and fallback builds encode byte-identically.
+// Row finder: 5-byte hash selects a row, 16-bit tag prefilters. The scalar
+// mask keeps vector and fallback builds byte-identical.
 const row_log = 4;
 const row_size = 1 << row_log;
 
@@ -1663,9 +1619,8 @@ fn findLongestMatch(content: []const u8, block_start: usize, block_end: usize, p
     const cur_word = readU32At(content, cur_abs);
     while (candidate != encoder_no_position and candidate >= min_abs and candidate < cur_abs and steps < options.max_chain) : (steps += 1) {
         if (candidate < cur_abs) {
-            // The decisive-byte guard skips candidates that cannot improve:
-            // when best_len already reaches the block end, one comparison
-            // retires every later candidate on periodic input.
+            // The decisive-byte guard: one comparison retires every later candidate on
+            // periodic input.
             if (best_len < cap_len and content[candidate + best_len] == content[cur_abs + best_len] and readU32At(content, candidate) == cur_word) {
                 const len = kernels.matchLen8(content, candidate, cur_abs, cap_len);
                 if (len > best_len) {
@@ -1716,9 +1671,8 @@ fn matchLengthCode(length: u32) LengthCode {
     return .{ .code = @intCast(lo), .extra = length - base, .bits = bits };
 }
 
-// Resolves a raw match offset against the repeat-offset history, updating
-// the history exactly as the decoder will. The returned value is what the
-// bitstream carries: 1-3 for repeat codes, offset + 3 otherwise.
+// Updates the history exactly as the decoder will. Returns the bitstream
+// value: 1-3 for repeat codes, offset + 3 otherwise.
 fn resolveOffsetValue(offset: u32, literal_length: u32, reps: *[3]u32) u32 {
     const no_literals = literal_length == 0;
     const offset_value: u32 = if (!no_literals and offset == reps[0]) 1 else if (offset == reps[1]) @as(u32, 2) - @intFromBool(no_literals) else if (offset == reps[2]) @as(u32, 3) - @intFromBool(no_literals) else if (no_literals and offset == reps[0] - 1) 3 else offset + 3;
@@ -2019,8 +1973,8 @@ fn fseEncodeWeightStream(symbols: []const u4, normalized: []const i16, norm_log:
     return writer.finish() catch return null;
 }
 
-// The encoder's spread table keeps the symbol per position, which the FSE state
-// derivation reads. The decoder builds its packed entry instead.
+// The encoder's spread keeps the symbol per position for the FSE state
+// derivation; the decoder builds its packed entry instead.
 fn buildFseEncoderSpread(values: []const i16, entries: []FseEntry) error{DataException}!void {
     const table_size: u16 = @intCast(entries.len);
     const accuracy_log = std.math.log2_int(u16, table_size);
@@ -2374,9 +2328,8 @@ fn planMode(n: usize, symbols: []const u8, freq: *const [256]u32, symbol_count: 
             best_bits = bits;
         }
     }
-    // The vendor's selectEncodingType early-out: on small blocks the fresh
-    // table's description cost dominates. Keep the previous table without
-    // pricing the alternatives. Byte-changing; behind the entropy selector.
+    // The vendor's selectEncodingType early-out: on small blocks the fresh table's
+    // description cost dominates, so keep the previous table unpriced.
     if (entropy == 1 and best.valid and n < 32) {
         // Written behind the valid flag, so `undefined` is safe.
         var initial: usize = undefined;
@@ -2419,7 +2372,7 @@ fn planMode(n: usize, symbols: []const u8, freq: *const [256]u32, symbol_count: 
         }
     }
     if (!best.valid) return best;
-    // `initial` is written before a true return, so `undefined` is safe.
+    // The `initial` value is written before a true return, so `undefined` is safe.
     var initial: usize = undefined;
     var bits: u64 = 0;
     if (!evalFseTable(best.table, symbols, n, values, counts, &initial, &bits)) return .{ .kind = .predefined, .valid = false, .accuracy_log = default_log };
@@ -2980,9 +2933,8 @@ const BackwardBitStream = struct {
 
     inline fn read(self: *BackwardBitStream, count: u6) DecodeError!u64 {
         if (count == 0) return 0;
-        // Refill drops whole consumed bytes and reloads below the live bits, so the
-        // unconsumed prefix and the remaining count are invariant: a container that
-        // already holds count bits answers without it.
+        // Refill preserves the remaining count, so a container that already holds
+        // count bits answers without it.
         if (self.valid() < count) self.refill();
         if (self.remaining() < count) return error.DataException;
         const value = self.peek(count);
@@ -2991,10 +2943,8 @@ const BackwardBitStream = struct {
     }
 };
 
-// Parses a formatted dictionary into its referenceable content and declared
-// repeat offsets. Raw-content dictionaries without magic are their own
-// content and carry the no-dictionary offsets; reference zstd routes
-// anything shorter than 8 bytes to content mode as well.
+// Raw-content and sub-8-byte dictionaries are their own content with the
+// no-dictionary repeat offsets; the rest parse as formatted.
 const DictionaryView = struct {
     content: []const u8,
     repcodes: [3]u32,
@@ -3029,10 +2979,8 @@ fn dictionaryView(dictionary: []const u8) DecodeError!DictionaryView {
     const recent_offset_2 = try cursor.readU32Le();
     const recent_offset_3 = try cursor.readU32Le();
     const content = cursor.remainingSlice();
-    // Reference zstd rejects a dictionary whose declared offsets are zero or
-    // reach past its content (ZSTD_loadCEntropy's dictionary_corrupted
-    // checks); no frame referencing such a dictionary can use those values,
-    // so the parse fails rather than returning them.
+    // ZSTD_loadCEntropy rejects zero offsets and offsets past the content
+    // (dictionary_corrupted); fail at parse rather than on use.
     if (recent_offset_1 == 0 or recent_offset_2 == 0 or recent_offset_3 == 0) return error.DataException;
     if (recent_offset_1 > content.len or recent_offset_2 > content.len or recent_offset_3 > content.len) return error.DataException;
     return .{ .content = content, .repcodes = .{ recent_offset_1, recent_offset_2, recent_offset_3 } };
@@ -3149,8 +3097,8 @@ const Decoder = struct {
             d.prev_tables_valid = false;
             return;
         }
-        // RFC 8878: a zero Dictionary_ID means unspecified and still loads;
-        // the frame check below only fires when the frame names a concrete ID.
+        // RFC 8878: a zero Dictionary_ID means unspecified and still loads; the
+        // check below fires only on a concrete ID.
         const dictionary_id = std.mem.readInt(u32, dictionary[4..8], .little);
         if (expected_id != 0 and dictionary_id != expected_id) return error.DataException;
         var cursor = binary.ReadCursor.init(dictionary[8..]);
@@ -3210,8 +3158,8 @@ const Decoder = struct {
         try streamExact(d.input, &target, block_size);
         var cursor = ReadCursor.init(d.block_buffer[0..block_size]);
         const literals = try decodeLiteralsSection(&cursor, d);
-        // Locals keep hot loops in registers. Fields take over only on the stream-split fallback.
-        // Initialized only for compressed/treeless blocks and read only there, so `undefined` is safe.
+        // Locals for register allocation; set only for compressed or treeless
+        // blocks, read only there, so `undefined` is safe.
         var literal_bits: BackwardBitStream = undefined;
         var literal_stream_index: usize = 0;
         var literal_legacy = false;
@@ -3224,9 +3172,8 @@ const Decoder = struct {
             literal_bits = try BackwardBitStream.init(first);
         }
         const sequences = try decodeSequencesHeader(&cursor);
-        // A zero-sequence block carries no mode byte and no table content. Keep
-        // the previous tables intact so a later repeat-mode block can still
-        // reuse them; the reference returns early on nbSeq == 0 the same way.
+        // A zero-sequence block keeps the previous tables for a later repeat-mode
+        // block; the reference returns early the same way.
         if (sequences.count > 0) {
             try d.prepareFseTable(.literal, sequences.literal_mode, &cursor);
             try d.prepareFseTable(.offset, sequences.offset_mode, &cursor);
@@ -3273,8 +3220,8 @@ const Decoder = struct {
 
             const offset = computeOffsetValue(offset_value, literal_length, &reps);
             if (offset == 0) return error.DataException;
-            // The match source loads while the literal run is emitted, so its line
-            // starts early. The guard keeps the hint off a corrupt stream's wild offset.
+            // The hint loads the match source while literals emit; the guard keeps it
+            // off a corrupt stream's wild offset.
             const write_base = d.history_end + decoded_count;
             if (offset <= write_base) @prefetch(d.history[write_base - offset ..].ptr, .{ .rw = .read, .locality = 3, .cache = .data });
             if (literal_length > 0) {
@@ -3724,17 +3671,16 @@ fn literalStreamCount(literals: *const LiteralsSection) usize {
 
 const FseChoice = enum { literal, match, offset };
 
-// The encoder's spread table: the symbol at each table position plus the state
-// transition the coder walks. The decoder reads its own packed entry below.
+// The encoder's spread entry: the symbol per position plus the state
+// transition the coder walks.
 const FseEntry = struct {
     symbol: u8,
     baseline: u16,
     bits: u8,
 };
 
-// One word per decode-table entry carries the state transition and the decoded
-// fields, so the sequence loop loads once where it loaded a 6-byte entry plus a
-// second code table. The layout mirrors the vendor's ZSTD_seqSymbol.
+// One word per entry: one load replaces an entry plus a code-table lookup.
+// Mirrors the vendor's ZSTD_seqSymbol.
 const DecodeEntry = struct {
     baseline: u16,
     bits: u8,
@@ -3742,8 +3688,7 @@ const DecodeEntry = struct {
     base_value: u32,
 };
 
-// No valid extra-bit count reaches this, so the marker rejects an RLE table
-// whose symbol falls outside the stream's code table.
+// No valid extra-bit count reaches this; the marker rejects an out-of-range RLE symbol.
 const fse_invalid_extra: u8 = 0xFF;
 
 const FseTable = union(enum) {
@@ -3769,13 +3714,12 @@ fn fseTableOrRle(state: *const FseDecoder, kind: TableKind, storage: *[1]DecodeE
     };
 }
 
-// Which code table a decode table serves. The Huffman weight stream is the fourth
-// user: its symbol is the weight itself.
+// Which code table a decode table serves. The Huffman weight stream is the
+// fourth user: its symbol is the weight.
 const TableKind = enum { literal, match, offset, weight };
 
-// A symbol past the stream's code table marks the entry invalid; the
-// sequence loop rejects it where per-symbol bounds checks did.
-// An offset symbol past 31 also removes the old `1 << symbol` shift overflow.
+// Out-of-range symbols mark the entry invalid; the sequence loop rejects
+// them. Offset symbols past 31 avoid the shift overflow.
 const CodeFields = struct { base: u32, extra: u8 };
 
 fn entryFields(kind: TableKind, symbol: u16) CodeFields {
@@ -4014,9 +3958,8 @@ fn decodeFrameHeader(input: *std.Io.Reader, window_limit: u32) DecodeError!Frame
 fn computeWindowSize(window_descriptor: u8) u64 {
     const exponent = window_descriptor >> 3;
     const mantissa = window_descriptor & 0b111;
-    // Normative formula: window = (1 << (10 + exponent)) +
-    // ((1 << (10 + exponent)) >> 3) * mantissa, with no special case for a
-    // zero exponent; the mantissa extends even the 1 KiB window.
+    // Normative formula with no zero-exponent special case: the mantissa
+    // extends even the 1 KiB window.
     const window_log: u32 = 10 + exponent;
     const window_base = @as(u64, 1) << @intCast(window_log);
     return window_base + (window_base / 8) * mantissa;
@@ -4595,9 +4538,8 @@ test "zstd dictionary trainer produces a loadable dictionary" {
     const dict_id = std.mem.readInt(u32, dict_buffer[4..8], .little);
     try std.testing.expect(dict_id >= dictionary_id_min and dict_id <= dictionary_id_max);
 
-    // The trained dictionary must parse through the decoder's own dictionary
-    // loader (entropy tables included) and round-trip an encode/decode pair
-    // that references the dictionary content.
+    // The dictionary must parse through the decoder's own loader and round-trip
+    // an encode/decode pair.
     const dictionary = dict_buffer[0..dict_len];
     const input = "the lazy dogs jump over the box in the meadow and sleep all day";
     const window: u32 = 1 << 16;
@@ -4640,8 +4582,8 @@ test "zstd encoder seeds dictionary matches and writes dictionary id" {
     const dict_len = try trainDictionary(&samples, dict_buffer.len, &dict_buffer, train_scratch, checksum.default_provider);
     const dictionary = dict_buffer[0..dict_len];
 
-    // Input taken from the dictionary content itself: the no-dict encode has
-    // nothing to match against, the seeded encode reaches back into the dict.
+    // Input from the dictionary content: the no-dict encode has nothing to
+    // match; the seeded encode reaches into the dict.
     const dict_content = try dictionaryContent(dictionary);
     const input = dict_content[0..@min(dict_content.len, 120)];
     const window: u32 = 1 << 16;
@@ -4701,9 +4643,8 @@ test "zstd encoder adopts dictionary repeat offsets" {
     const content = try dictionaryContent(dict_buffer[0..dict_len]);
     // The patched offsets below must stay addressable inside the content.
     try std.testing.expect(content.len >= 21);
-    // Replace the default (1, 4, 8) with declared offsets a conforming
-    // decoder installs when loading the dictionary: the encoder must seed
-    // its repcode state from them, not from the no-dictionary defaults.
+    // Replace the default (1, 4, 8) with declared offsets: the encoder must
+    // seed its repcode state from them.
     std.mem.writeInt(u32, dict_buffer[16..20], 7, .little);
     std.mem.writeInt(u32, dict_buffer[20..24], 13, .little);
     std.mem.writeInt(u32, dict_buffer[24..28], 21, .little);
@@ -4721,14 +4662,8 @@ test "zstd encoder adopts dictionary repeat offsets" {
     defer allocator.free(decoded);
     const encode_options: Options = .{ .window_size = window, .hash_bits = 12, .max_chain = 8, .nice_len = 32, .search_window = 4096, .dictionary = dictionary };
 
-    // An eight-byte run at the frame start: its distance-1 match clears the
-    // minimum sequence length, so the offset travels through the repcode
-    // ring, and only a ring seeded from the declared offsets keeps encoder
-    // and decoder in agreement. With the no-dictionary defaults the encoder
-    // emits a repcode-0 reference that the decoder reads as the declared
-    // offset 7, copying from the dictionary's content tail instead of the
-    // run and diverging immediately; a longer uniform run would mask the
-    // error, since every distance inside it yields the same bytes.
+    // The run pushes a distance-1 match through the repcode ring; wrong seeding
+    // diverges, though longer uniform runs would mask it.
     const run_input = "MMMMMMMMThe quick brown fox jumps over";
     var run_source = std.Io.Reader.fixed(run_input);
     var encoded_sink = std.Io.Writer.fixed(encoded);
@@ -4782,9 +4717,8 @@ test "zstd rejects dictionaries with unusable repeat offsets" {
     var encoded_sink = std.Io.Writer.fixed(encoded);
     const encoded_len = try encodeStream(&source, &encoded_sink, history, workspace, encode_options);
 
-    // A zero declared offset marks the dictionary corrupt: the content
-    // view, the encoder's dictionary preload, and the decoder's dictionary
-    // loader all refuse it, mirroring ZSTD_loadCEntropy's checks.
+    // A zero declared offset corrupts the dictionary; every loader refuses it,
+    // mirroring ZSTD_loadCEntropy.
     std.mem.writeInt(u32, dict_buffer[16..20], 0, .little);
     try std.testing.expectError(error.DataException, dictionaryContent(dictionary));
     try std.testing.expectError(error.DataException, encodeStream(&source, &encoded_sink, history, workspace, encode_options));
@@ -4815,7 +4749,7 @@ test "zstd dictionary content accepts zero dictionary id" {
     try std.testing.expect(content.len > 0);
 
     // The zero-ID dictionary must also survive the decoder's loader and a
-    // round trip; neither frame nor dictionary declares a concrete ID.
+    // round trip.
     const dictionary = dict_buffer[0..dict_len];
     const input = "alpha bravo charlie delta echo foxtrot golf hotel";
     const window: u32 = 1 << 16;
@@ -4867,10 +4801,8 @@ test "zstd raw dictionaries shorter than eight bytes load as content" {
     try std.testing.expectEqualSlices(u8, input, decoded);
 }
 
-// The strategy selector must actually reach the parser tiers. The crafted
-// input: an immediate 16-byte match at offset 100 blocks a 24-byte match
-// one position later. Lazy2 defers. The DP takes the global view; the chain
-// and greedy tiers take the first match.
+// A 16-byte match shadows a longer one a position later; the DP and lazy2
+// weigh both, the others take it.
 test "zstd strategy tiers engage and decode" {
     const allocator = std.testing.allocator;
     var input: [1024]u8 = undefined;
@@ -4913,8 +4845,7 @@ test "zstd strategy tiers engage and decode" {
     var sink3 = std.Io.Writer.fixed(out_dp);
     const dp_len = try encodeStream(&source3, &sink3, history, workspace, .{ .window_size = window, .hash_bits = 12, .max_chain = 16, .nice_len = 32, .search_window = 4096, .strategy = strategy_dp });
 
-    // Deferral changes the parse; the DP changes it again. The DP must not
-    // lose to the immediate take on the crafted decision point.
+    // Deferral changes the parse; the DP must not lose to the immediate take.
     try std.testing.expect(lazy2_len != chain_len or !std.mem.eql(u8, out_lazy2[0..lazy2_len], out_chain[0..chain_len]));
     try std.testing.expect(dp_len != chain_len or !std.mem.eql(u8, out_dp[0..dp_len], out_chain[0..chain_len]));
     try std.testing.expect(dp_len <= chain_len);
@@ -4929,10 +4860,8 @@ test "zstd strategy tiers engage and decode" {
     }
 }
 
-// The entropy early-out needs a multi-block frame. The later block must
-// carry fewer than 32 sequences while a previous table exists. Block one
-// establishes the tables from dense matches; block two is random (no
-// matches). The unconditional repeat then diverges from the cost model.
+// The early-out fires on a later block with under 32 sequences after tables
+// exist: dense matches first, then random.
 test "zstd entropy early-outs engage" {
     const allocator = std.testing.allocator;
     var input: [(128 + 64) * 1024]u8 = undefined;
@@ -4985,8 +4914,7 @@ test "zstd price-DP tier roundtrips at full block scale" {
     const allocator = std.testing.allocator;
     var rng = std.Random.DefaultPrng.init(0xD03);
     const random = rng.random();
-    // Mixed runs and random islands: the DP parse diverges from the greedy
-    // replay, so the literal table must be rebuilt from the emitted buffer.
+    // Mixed runs and random islands: the DP parse diverges from greedy replay.
     const input = try allocator.alloc(u8, 2 * encoder_block_size_max + 17);
     defer allocator.free(input);
     for (input, 0..) |*b, i| b.* = if (i % 5 < 3) @as(u8, @truncate(i >> 8)) else random.int(u8);
@@ -5022,9 +4950,8 @@ test "zstd window descriptor mantissa extends the window" {
 }
 
 test "zstd encoder window descriptor covers the search window" {
-    // The declared window must never be smaller than the window the encoder
-    // actually searches, or the stream is spec-invalid even if it roundtrips
-    // through a lenient decoder.
+    // The declared window must cover the searched window, or the stream is
+    // spec-invalid even if it roundtrips.
     var window: u32 = 1024;
     while (window <= 4096) : (window += 1) {
         try std.testing.expect(computeWindowSize(encodeWindowDescriptor(window)) >= window);
@@ -5042,29 +4969,26 @@ test "zstd encoder window descriptor covers the search window" {
 
 test "zstd zero-sequence block preserves repeat-mode tables" {
     const allocator = std.testing.allocator;
-    // Three compressed blocks: the first declares RLE-mode tables and decodes
-    // one sequence, the second is a zero-sequence block (no mode byte, no
-    // table content), and the third uses repeat mode to reuse the first
-    // block's tables. A decoder that rebuilds predefined tables for the
-    // zero-sequence block fails on the third block.
+    // The zero-sequence block must keep the first block's tables: the third
+    // block's repeat mode depends on them.
     const frame = [_]u8{
-        0x28, 0xB5, 0x2F, 0xFD, // frame magic.
-        0x00, // frame descriptor: no content size, no checksum, no dictionary id.
-        0x00, // window descriptor: 1 KiB.
-        0x5C, 0x00, 0x00, // block 1: compressed, 11 bytes.
-        0x20, 'a', 'b', 'c', 'd', // raw literals "abcd".
+        0x28, 0xB5, 0x2F, 0xFD, // Frame magic.
+        0x00, // Frame descriptor: no content size, no checksum, no dictionary id.
+        0x00, // Window descriptor: 1 KiB.
+        0x5C, 0x00, 0x00, // Block 1: compressed, 11 bytes.
+        0x20, 'a', 'b', 'c', 'd', // Raw literals "abcd".
         0x01, // nbSeq = 1.
-        0x54, // literal, offset, and match tables all RLE.
+        0x54, // Literal, offset, and match tables all RLE.
         0x04, 0x01, 0x00, // RLE symbols: LL 4, OF 1, ML 0.
-        0x02, // sequence bits: offset extra bit 0.
-        0x2C, 0x00, 0x00, // block 2: compressed, 5 bytes.
-        0x18, 'e', 'f', 'g', // raw literals "efg".
+        0x02, // Sequence bits: offset extra bit 0.
+        0x2C, 0x00, 0x00, // Block 2: compressed, 5 bytes.
+        0x18, 'e', 'f', 'g', // Raw literals "efg".
         0x00, // nbSeq = 0.
-        0x45, 0x00, 0x00, // block 3: compressed, last, 8 bytes.
-        0x20, 'h', 'i', 'j', 'k', // raw literals "hijk".
+        0x45, 0x00, 0x00, // Block 3: compressed, last, 8 bytes.
+        0x20, 'h', 'i', 'j', 'k', // Raw literals "hijk".
         0x01, // nbSeq = 1.
-        0xFC, // literal, offset, and match tables all repeat.
-        0x02, // sequence bits: offset extra bit 0.
+        0xFC, // Literal, offset, and match tables all repeat.
+        0x02, // Sequence bits: offset extra bit 0.
     };
     const window: u32 = 1024;
     const history = try allocator.alloc(u8, @as(usize, window) + block_size_max);
@@ -5074,10 +4998,8 @@ test "zstd zero-sequence block preserves repeat-mode tables" {
     var source = std.Io.Reader.fixed(&frame);
     var sink = std.Io.Writer.fixed(decoded);
     _ = try decodeStream(&source, &sink, history, .{ .window_size = window });
-    // Block 1 outputs "abcdabc"; block 2 outputs "efg" without touching the
-    // repeat offsets or the RLE tables; block 3 reuses both, and its sequence
-    // resolves offset_value 2 to the second repeat offset (1), so the match
-    // repeats the final 'k' three times.
+    // Block 3 resolves offset_value 2 to the second repeat offset (1): the
+    // match repeats the final 'k' three times.
     try std.testing.expectEqualStrings("abcdabcefghijkkkk", decoded);
 }
 
@@ -5099,8 +5021,8 @@ test "zstd huffman tree completion and rank gates" {
     for (weights[0..5]) |*value| value.* = 1;
     try t.expectError(error.DataException, buildHuffmanTree(&weights, 6, &tree));
 
-    // Weights {2, 2} complete to a full Kraft sum with the implied weight 3,
-    // but the tree has no weight-1 symbol, which the format forbids.
+    // Weights {2, 2} complete the Kraft sum, but no weight-1 symbol exists,
+    // which the format forbids.
     @memset(&weights, 0);
     weights[0] = 2;
     weights[1] = 2;

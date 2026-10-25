@@ -15,8 +15,7 @@ pub const default_provider: Provider = switch (build_options.grammar_impl) {
 };
 
 // Fixed builds reject the other tag explicitly instead of serving it
-// silently; the mergeable build binds the tag per call. One dispatch per
-// call, never per symbol or block.
+// silently; the mergeable build binds the tag per call.
 fn requireServed(provider: Provider, comptime served: Provider) error{UnsupportedException}!void {
     if (provider != served) return error.UnsupportedException;
 }
@@ -86,9 +85,8 @@ pub fn encode(provider: Provider, entries: []const Entry, output: []u8, scratch:
 }
 
 pub fn inspectOrdinal(provider: Provider, archive: []const u8, ordinal: u64) Exception!EntryInfo {
-    // std.tar.Iterator.File carries no mtime/uid/gid/typeflag, so ordinal
-    // inspect resolves to onprem under every build to keep the metadata
-    // contract (see offprem.zig).
+    // std.tar.Iterator.File carries no mtime/uid/gid/typeflag, so every
+    // build resolves ordinal inspect to onprem, keeping the metadata contract.
     _ = provider;
     return onprem.inspectOrdinal(archive, ordinal);
 }

@@ -110,8 +110,8 @@ fn requireElfMachine(init: std.process.Init, archive: []const u8, entry: []const
     if (machine != expected_machine) return err;
 }
 
-// A DLL carries its machine type in the PE header; the e_lfanew pointer at
-// 0x3C names the header's offset past the DOS stub.
+// A DLL's machine type sits in the PE header; e_lfanew at 0x3C names its
+// offset past the DOS stub.
 fn requirePeMachine(init: std.process.Init, archive: []const u8, entry: []const u8, expected_machine: u16, err: anyerror) !void {
     const library = try extractEntry(init, archive, entry);
     defer std.heap.page_allocator.free(library);

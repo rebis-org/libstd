@@ -3,9 +3,8 @@ const std = @import("std");
 
 const diagnostic = @import("diagnostic.zig");
 
-// The interface module cannot import the primitive exception set, and it never
-// needs to: a span crossing only answers these two. Naming the exact set keeps
-// the substrate vocabulary from becoming a second, divergent one.
+// The interface cannot import the primitive exception set; naming the exact
+// two it answers keeps the vocabulary from diverging.
 pub const Exception = error{ CallException, ResourceException };
 
 pub const Violation = enum { out_of_bounds, use_after_free, lease_violation, overlap };
@@ -18,8 +17,8 @@ pub fn trap(violation: Violation, context: []const u8) noreturn {
     var message_writer: std.Io.Writer = std.Io.Writer.fixed(&message_storage);
     const message = if (message_writer.print("interface trap: {s}: {s}\n", .{ @tagName(violation), context })) |_| message_writer.buffered() else |_| "interface trap.\n";
     diagnostic.writeStderr(message);
-    // raise needs a C runtime; without one (msvc, android, ohos) the trap
-    // instruction carries the violation alone.
+    // The raise call needs a C runtime; without one (msvc, android, ohos)
+    // the trap instruction carries the violation alone.
     if (comptime diagnostic.has_libc and builtin.target.os.tag != .windows) {
         std.posix.raise(std.posix.SIG.TRAP) catch {};
     }
@@ -32,14 +31,13 @@ pub fn checkRange(total: usize, offset: usize, length: usize) void {
 
 pub fn hasOverlap(first_start: usize, first_len: usize, second_start: usize, second_len: usize) bool {
     if (first_len == 0 or second_len == 0) return false;
-    // Caller-supplied lengths reach here as u64, so an end offset can wrap. The
-    // subtraction form stays correct on wrap, where a wrapped end reads as
-    // disjoint and the caller traps on the copy instead of reading past it.
+    // A wrapped u64 end reads as disjoint under subtraction, so the copy
+    // traps instead of reading past it.
     return second_start < first_start +| first_len and first_start < second_start +| second_len;
 }
 
-// One span algebra for both mutabilities: the view a span hands out carries the
-// span's own mutability, so a const span cannot be written through its type.
+// One algebra for both mutabilities: the handed-out view carries the span's
+// own mutability, so const spans stay unwritable.
 fn SpanFor(comptime Pointer: type) type {
     const View = if (Pointer == [*]const u8) []const u8 else []u8;
     return struct {
@@ -71,8 +69,8 @@ pub const ConstSpan = SpanFor([*]const u8);
 
 fn spanFrom(comptime Pointer: type, base: ?Pointer, length: u64) Exception!SpanFor(Pointer) {
     const count = std.math.cast(usize, length) orelse return error.ResourceException;
-    // A zero length never dereferences the pointer, so the immutable empty
-    // storage stands in for the null a caller may legitimately pass.
+    // A zero length never dereferences, so immutable empty storage stands
+    // in for a legitimately passed null.
     if (count == 0) return .{ .ptr = @constCast(&empty_storage), .len = 0 };
     const live = base orelse return error.CallException;
     return .{ .ptr = live, .len = count };

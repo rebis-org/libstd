@@ -56,14 +56,13 @@ pub const Entry = struct {
     password: []const u8 = &.{},
     iv: [16]u8 = @splat(0),
     iv_set: bool = false,
-    // KDF cost knob: 0 selects the default 2^19 rounds, otherwise the power
-    // is written verbatim (1..24). 0x3F direct-key mode is decode-only here.
+    // KDF cost knob: 0 selects the default 2^19 rounds; 1..24 is written
+    // verbatim. 0x3F direct-key mode is decode-only.
     num_cycles_power: u8 = 0,
     salt: [16]u8 = @splat(0),
     salt_length: u8 = 0,
-    // KDF bomb defense is on by default: the ceiling matches the format maximum
-    // (seven_zip_cycles_max), so raising the parser cap alone cannot reopen it.
-    // Pass std.math.maxInt(u64) to opt back into unbounded rounds.
+    // KDF bomb defense: the default ceiling equals the format maximum
+    // (seven_zip_cycles_max); std.math.maxInt(u64) opts into unbounded rounds.
     kdf_rounds_limit: u64 = 1 << 24,
     password_lifetime: u64 = 0,
 };
@@ -84,16 +83,15 @@ pub const Info = struct {
     aes_iv_size: u8 = 0,
     folder: ?*const Folder = null,
     substream_offset: u64 = 0,
-    // Per packed-stream sizes of the entry's folder (one stream for ordinary folders, four for
-    // BCJ2), pointing into the streams-info workspace slice.
+    // The entry folder's packed-stream sizes (one, or four for BCJ2), indexing
+    // the streams-info workspace slice.
     pack_stream_sizes: []const u64 = &.{},
 };
 
 pub const SevenZipDecodeOptions = struct {
     password: ?[]const u8 = null,
-    // KDF bomb defense is on by default: the ceiling matches the format maximum
-    // (seven_zip_cycles_max), so raising the parser cap alone cannot reopen it.
-    // Pass std.math.maxInt(u64) to opt back into unbounded rounds.
+    // KDF bomb defense: the default ceiling equals the format maximum
+    // (seven_zip_cycles_max); std.math.maxInt(u64) opts into unbounded rounds.
     kdf_rounds_limit: u64 = 1 << 24,
     password_lifetime: u64 = 0,
     failure_cause: *crypto.FailureCause,
@@ -131,8 +129,8 @@ const default_deflate_options: deflate.Options = .{ .good = 8, .nice = 128, .laz
 const default_ppmd_order: u32 = 8;
 const default_ppmd_mem: u32 = 4 << 20;
 
-// Every known method id, primaries first: methodId takes the first row per
-// method, while decode also accepts the single-byte and 7z-bcj aliases.
+// Every known method id, primaries first: methodId takes the first row;
+// decode also accepts single-byte and 7z-bcj aliases.
 const method_ids = [_]struct { method: CoderMethod, id: []const u8 }{
     .{ .method = .copy, .id = &method_copy_id },
     .{ .method = .lzma, .id = &method_lzma_id },
@@ -191,9 +189,8 @@ const PackedEntry = struct {
     salt: [16]u8 = @splat(0),
     salt_length: u8 = 0,
     num_cycles_power: u8 = 0,
-    // True when this entry's bytes ride on the previous entry's packed stream
-    // (a solid run merged by packAllEntries). buildFolderPlan keys on this so
-    // the header's folder plan can never diverge from what was packed.
+    // True when the entry rides a prior entry's solid-run stream;
+    // buildFolderPlan keys on this to match the packed bytes.
     solid_continuation: bool = false,
     pack_size: usize = 0,
     unpack_size: usize = 0,
@@ -222,9 +219,8 @@ fn packEntry(entry: Entry, provider: crypto.Provider, workspace: *Workspace, lim
         }
     }
     const unpacked_crc = checksum.crc32With(provider, entry.data);
-    // Filter chains are supported with LZMA1/LZMA2 coders only: LZMA1 filter
-    // chains stay decodable by every 7z reader and LZMA2 is the modern
-    // default. Any other codec with an explicit filter is a caller error.
+    // Filter chains ride LZMA1/LZMA2 coders only; any other codec with an
+    // explicit filter is a caller error.
     const source: []const u8 = if (entry.filters.len != 0) blk: {
         if (entry.method != .lzma and entry.method != .lzma2) return error.CallException;
         const filtered = try workspace.take(u8, entry.data.len);
@@ -279,8 +275,7 @@ fn packEntry(entry: Entry, provider: crypto.Provider, workspace: *Workspace, lim
             const options: lzma2.Options = .{ .dictionary_size = default_dictionary, .properties = lzma2.defaultProperties(default_dictionary), .max_work = limits.codec_work };
             var packed_entry = try packBuffer(lzma2, .lzma2, filtered, unpacked_crc, workspace, limits, lzma2.encodeWorkspaceSizeBt(default_dictionary), options);
             // The primary filter rides as a one-element chain so the folder
-            // plan emits its filter coder; entry.filters is always empty here
-            // because explicit chains require the .lzma/.lzma2 methods.
+            // plan emits its coder; explicit chains require .lzma/.lzma2.
             const chain = try workspace.take(CoderMethod, 1);
             chain[0] = entry.method;
             packed_entry.filters = chain;
@@ -326,10 +321,8 @@ fn packAllEntries(entries: []const Entry, provider: crypto.Provider, workspace: 
             i += 1;
             continue;
         }
-        // One folder and one continuous codec stream per run, so coder state
-        // carries across the substreams as in 7-Zip's solid folders. Filtered
-        // entries never join a run: each needs its own pre-filter pass, so it
-        // packs individually through packEntry.
+        // Coder state carries across the run's substreams, as in 7-Zip's solid
+        // folders. Filtered entries need their own pre-filter pass.
         if ((entries[i].method == .lzma2 or entries[i].method == .ppmd) and !entries[i].encrypted and entries[i].filters.len == 0) {
             var j = i + 1;
             while (j < entries.len and !isEmptyEntry(entries[j]) and entries[j].method == entries[i].method and !entries[j].encrypted and entries[j].filters.len == 0) j += 1;
@@ -420,17 +413,15 @@ pub const SevenZipHeaderOptions = struct {
     // 0 selects the default 2^19 rounds, otherwise the power is written
     // verbatim (1..24), matching the file-data knob.
     num_cycles_power: u8 = 0,
-    // KDF bomb defense is on by default: the ceiling matches the format maximum
-    // (seven_zip_cycles_max), so raising the parser cap alone cannot reopen it.
-    // Pass std.math.maxInt(u64) to opt back into unbounded rounds.
+    // KDF bomb defense: the default ceiling equals the format maximum
+    // (seven_zip_cycles_max); std.math.maxInt(u64) opts into unbounded rounds.
     kdf_rounds_limit: u64 = 1 << 24,
     password_lifetime: u64 = 0,
     failure_cause: ?*crypto.FailureCause = null,
 };
 
-// The prepared next-header: `stored` is what the start header points at
-// (either the raw header bytes or the kEncodedHeader structure), and `pack`
-// is the compressed/encrypted header stream placed just before it.
+// The prepared next-header: `stored` is what the start header addresses;
+// `pack` is the compressed/encrypted stream placed just before it.
 const HeaderEncode = struct {
     stored: []const u8 = &.{},
     pack: []const u8 = &.{},
@@ -483,9 +474,8 @@ fn encodeHeaderBytes(entries: []const Entry, packed_entries: []const PackedEntry
         return .{ .stored = header_bytes, .unpack_size = header_size, .unpack_crc = unpack_crc };
     }
     if (header_options.encrypt and !header_options.compress) {
-        // The -mhe shape: one AES coder over the stored header. The folder's
-        // recorded unpack size is the real header size; the zero padding is
-        // stripped by the reader, as in 7-Zip's own archives.
+        // The -mhe shape: one AES coder over the stored header; the recorded
+        // unpack size is the unpadded header size.
         const encrypted = try encryptHeaderBytes(header_bytes, workspace, provider, header_options);
         return .{
             .pack = encrypted.data,
@@ -531,9 +521,8 @@ fn encodeHeaderBytes(entries: []const Entry, packed_entries: []const PackedEntry
     };
 }
 
-// Writes the next-header bytes: the raw header, or the kEncodedHeader
-// structure naming `pack_offset` (the header stream's position after the
-// start header, past the data pack streams).
+// Writes the raw next-header, or the kEncodedHeader structure naming the
+// header stream's offset past the data pack streams.
 fn writeNextHeader(writer: *std.Io.Writer, header: *const HeaderEncode, pack_offset: u64) Exception!void {
     if (!header.encoded) {
         try io.writeBytes(writer, header.stored);
@@ -557,8 +546,8 @@ fn writeNextHeader(writer: *std.Io.Writer, header: *const HeaderEncode, pack_off
         try io.writeBytes(writer, &.{aes_flags});
         try io.writeBytes(writer, &method_7z_aes_id);
         const iv_size: usize = 16;
-        // The size halves are a 1-bit high part plus a 4-bit low part that
-        // sum to the size, so 16 is high=1 low=15 (see parse7zAesProps).
+        // The size halves are 1-bit high plus 4-bit low summing to the size:
+        // 16 is high=1 low=15 (see parse7zAesProps).
         const iv_high: u8 = @intCast(iv_size >> 4);
         var props: [2 + 16]u8 = undefined;
         props[0] = header.cycles | (iv_high << 6);
@@ -573,8 +562,9 @@ fn writeNextHeader(writer: *std.Io.Writer, header: *const HeaderEncode, pack_off
         try writeUint64(writer, 0);
     }
     try io.writeBytes(writer, &.{0x0C});
-    // A lone AES coder records the real header size; the reader strips the
-    // padding.
+    // A lone AES coder records the real header size; the reader strips
+    // the padding.
+    //
     // An AES coder feeding a compressor records its padded output, as in
     // file-data folders.
     if (header.encrypted and header.compressed) try writeUint64(writer, header.pack_size);
@@ -622,11 +612,8 @@ pub const VolumeLayout = struct {
     volumes: u64,
 };
 
-// Multi-volume view: volume 1 carries the 32-byte signature header and
-// volume_size - 32 bytes of payload; every later volume is pure payload.
-// Chopping the single-archive byte stream at volume_size boundaries is
-// byte-identical to 7-Zip's split writer (7zz -v), so the volumes need no
-// extra encoding; the caller slices the returned extents.
+// Volume 1 carries the signature header; splitting at volume_size boundaries
+// matches 7zz -v, so volumes need no extra encoding.
 pub fn sevenZipVolumeExtents(total_len: usize, volume_size: u64) Exception!VolumeLayout {
     if (volume_size <= start_header_size) return error.CallException;
     if (total_len == 0) return error.DataException;
@@ -644,9 +631,8 @@ pub fn sevenZipWritePackedVolumes(entries: []const Entry, packed_entries: []cons
     return try sevenZipVolumeExtents(total, volume_size);
 }
 
-// Reads a multi-volume 7z archive: volume 1's start header is validated,
-// the payload areas are concatenated in the workspace, and the ordinary
-// single-volume loader runs over the result.
+// Concatenates the volume payloads behind volume 1's start header, then runs
+// the single-volume loader over the result.
 pub fn sevenZipDecodeVolumes(volumes: []const []const u8, workspace: *Workspace, limits: Limits, ordinal: u64, output: []u8, decode_options: SevenZipDecodeOptions) Exception!usize {
     if (volumes.len == 0) return error.DataException;
     decode_options.failure_cause.* = .none;
@@ -788,8 +774,8 @@ fn readLzma2Prop(attributes: []const u8) Exception!u8 {
     return attributes[0];
 }
 
-// Recombines a BCJ2 folder. Each of the four inputs is a raw packed stream or the decoded
-// output of one of the folder's compressor coders, per `folder.bcj2_sources`.
+// Recombines a BCJ2 folder: each input is a raw packed stream or a decoded
+// coder output, per `folder.bcj2_sources`.
 fn decodeBcj2Folder(folder: *const Folder, pack_sizes: []const u64, packed_data: []const u8, output: []u8, workspace: *Workspace, limits: Limits, provider: lzma2_seam.Provider) Exception!usize {
     if (!folder.bcj2 or pack_sizes.len != 4) return error.DataException;
     var packed_offset: usize = 0;
@@ -892,8 +878,7 @@ fn isFilterMethod(method: CoderMethod) bool {
 }
 
 fn bcjKindFromMethod(method: CoderMethod) bcj.Kind {
-    // The bare filter ids live in the method table above; this is the one
-    // remaining step from a 7z coder to the leaf that applies its filter.
+    // Maps a 7z coder to the leaf kind that applies its filter.
     return switch (method) {
         .x86 => bcj.fromId(method_x86_id[0]).?,
         .ppc => bcj.fromId(method_ppc_id[0]).?,
@@ -924,9 +909,8 @@ fn readAt(data: []const u8, offset: u64, buffer: []u8) Exception!void {
 // password channel serves both file-data and encoded-header decryption.
 pub const SevenZipLoadOptions = struct {
     password: ?[]const u8 = null,
-    // KDF bomb defense is on by default: the ceiling matches the format maximum
-    // (seven_zip_cycles_max), so raising the parser cap alone cannot reopen it.
-    // Pass std.math.maxInt(u64) to opt back into unbounded rounds.
+    // KDF bomb defense: the default ceiling equals the format maximum
+    // (seven_zip_cycles_max); std.math.maxInt(u64) opts into unbounded rounds.
     kdf_rounds_limit: u64 = 1 << 24,
     password_lifetime: u64 = 0,
     failure_cause: *crypto.FailureCause,
@@ -988,13 +972,11 @@ fn loadArchive(data: []const u8, workspace: *Workspace, limits: Limits, options:
     return archive;
 }
 
-// A next-header id of kEncodedHeader (0x17) means the header itself rides in a
-// packed stream: a StreamsInfo describing one folder, usually LZMA, optionally
-// behind the 7z AES-256 coder (-mhe=on). Decrypting and decompressing yields
-// the ordinary kHeader bytes, which are then parsed as if stored directly.
+// kEncodedHeader (0x17) wraps the header in a one-folder packed stream,
+// optionally AES-encrypted; the decoded bytes parse as an ordinary kHeader.
 fn decodeEncodedHeader(archive_data: []const u8, cursor: *binary.ReadCursor, workspace: *Workspace, limits: Limits, options: *const SevenZipLoadOptions) Exception![]const u8 {
-    // StreamsInfo (with its own terminating kEnd, per 7zOut.cpp's encoded
-    // header writer) is the whole of the structure: nothing may follow it.
+    // The StreamsInfo, ending in kEnd per 7zOut.cpp's writer, is the whole
+    // structure: nothing may follow.
     const si = try parseStreamsInfo(cursor, workspace, true);
     if (cursor.remaining() != 0) return error.DataException;
     if (si.folders.len != 1) return error.UnsupportedException;
@@ -1019,15 +1001,13 @@ fn decodeEncodedHeader(archive_data: []const u8, cursor: *binary.ReadCursor, wor
     }
     const output = try workspace.take(u8, unpack_size);
     decodeFolderStream(folder, packed_data, output, workspace, limits, options) catch |err| {
-        // A decode failure on an encrypted folder usually means a wrong
-        // password, but never overwrite a cause the failure already carries
-        // (kdf_limit, password_lifetime) and never label limit/data refusals.
+        // An encrypted-folder failure usually means a wrong password; keep
+        // causes already set; leave limit and data refusals unlabeled.
         if (folder.encrypted and options.failure_cause.* == .none) options.failure_cause.* = .wrong_password;
         return err;
     };
-    // The whole-folder CRC from UnpackInfo kCRC (vendor 7zIn.cpp checks it
-    // here), then a lone substream digest from SubStreamsInfo kCRC: each
-    // defined value must match the decoded header bytes.
+    // The UnpackInfo folder CRC and any SubStreamsInfo digest must each match
+    // the decoded header bytes (vendor 7zIn.cpp).
     if (folder.folder_crc) |expected| {
         if (checksum.crc32With(options.provider, output) != expected) {
             if (folder.encrypted) options.failure_cause.* = .wrong_password;
@@ -1045,9 +1025,8 @@ fn decodeEncodedHeader(archive_data: []const u8, cursor: *binary.ReadCursor, wor
     return output;
 }
 
-// Decrypts (when the folder carries the 7z AES coder) and decodes one packed
-// stream into output, whose length the caller derives from the folder's unpack
-// size. Shared by the encoded-header path and, through it, every header form.
+// Decrypts and decodes one packed stream into caller-sized output; serves the
+// encoded-header path and every header form through it.
 fn decodeFolderStream(folder: *const Folder, packed_data: []const u8, output: []u8, workspace: *Workspace, limits: Limits, options: *const SevenZipLoadOptions) Exception!void {
     const decrypted = try aesDecryptFolder(folder, packed_data, workspace, options);
     switch (folder.method) {
@@ -1148,8 +1127,8 @@ const Bond = struct {
     coder_index: u64,
 };
 
-// Where one of a BCJ2 coder's four inputs comes from: a raw packed stream at the ordinal,
-// or the decoded output of a compressor coder (whose own input is at `pack_ordinal`).
+// A BCJ2 input source: a raw packed-stream ordinal, or a producer coder whose
+// own input is at `pack_ordinal`.
 const Bcj2Source = struct {
     pack_ordinal: u64,
     producer: ?usize = null,
@@ -1158,8 +1137,8 @@ const Bcj2Source = struct {
 const Folder = struct {
     num_substreams: u64,
     substream_sizes: []u64,
-    // The UnpackInfo kCRC digest, when the header defines one. It is the CRC
-    // of the whole folder output and doubles as a lone substream's digest.
+    // The UnpackInfo kCRC digest of the whole folder output; doubles as a
+    // lone substream's digest.
     folder_crc: ?u32 = null,
     // Null entries are substreams whose digest the header leaves undefined.
     substream_crcs: []?u32,
@@ -1241,8 +1220,8 @@ fn parseStreamsInfo(cursor: *binary.ReadCursor, workspace: *Workspace, comptime 
         }
     }
     if (!has_pack or !has_unpack) return error.DataException;
-    // Packed streams are per-folder runs, and a BCJ2 folder owns four, so the runs tile the
-    // pack size array in folder order.
+    // Pack streams are per-folder runs, four for BCJ2, tiling the size array
+    // in folder order.
     var next_pack_index: usize = 0;
     for (folders) |*folder| {
         folder.pack_index = next_pack_index;
@@ -1309,8 +1288,8 @@ fn parseFolders(cursor: *binary.ReadCursor, workspace: *Workspace, comptime aes_
                 last_data = coder;
             }
         }
-        // An AES-only folder is the -mhe encoded-header shape (stored header,
-        // one AES coder); file-data folders always carry a real data coder.
+        // An AES-only folder is the -mhe encoded-header shape; file-data
+        // folders always carry a data coder.
         if (data_coder_count == 0) {
             if (!(aes_only_folders and encrypted)) return error.UnsupportedException;
         } else if (encrypted and data_coder_count != 1) return error.UnsupportedException;
@@ -1415,8 +1394,8 @@ fn parseFolders(cursor: *binary.ReadCursor, workspace: *Workspace, comptime aes_
         for (0..stream_count) |index| {
             arr[index] = try readUint64(cursor);
         }
-        // The folder's data is the one output no bond consumes. For the common single-coder
-        // folder that is the last (only) stream.
+        // The folder's data is the one output no bond consumes; usually the
+        // last (only) stream.
         const sink = folderSinkOutput(folder) orelse (stream_count - 1);
         folder.unpack_size = arr[sink];
         folder.substream_sizes = arr[sink .. sink + 1];
@@ -1434,8 +1413,8 @@ fn parseFolders(cursor: *binary.ReadCursor, workspace: *Workspace, comptime aes_
     return folders;
 }
 
-// Maps a global input stream index to its ordinal among the folder's packed streams. A
-// bonded (coder-fed) input has no packed ordinal.
+// Maps a global input index to its packed-stream ordinal; bonded (coder-fed)
+// inputs have none.
 fn packedOrdinal(packed_inputs: []const u64, num_packed_streams: u64, global_in: u64) Exception!u64 {
     if (packed_inputs.len != 0) {
         for (packed_inputs, 0..) |input, ordinal| {
@@ -1527,8 +1506,8 @@ fn parse7zAesProps(attributes: []const u8) Exception!AesCoderProps {
     if (attributes.len == 0) return error.DataException;
     const b0 = attributes[0];
     const num_cycles = b0 & 0x3F;
-    // Both wire shapes share the cost ceiling; a single-byte 0x3E props must
-    // not reach the KDF as an unchecked 2^62 rounds.
+    // Both wire shapes share the cost ceiling; single-byte 0x3E must not
+    // reach the KDF as unchecked 2^62 rounds.
     if (num_cycles > crypto.seven_zip_cycles_max and num_cycles != 0x3F) return error.UnsupportedException;
     if ((b0 & 0xC0) == 0) {
         if (attributes.len != 1) return error.DataException;
@@ -1575,10 +1554,8 @@ fn parseSubStreamsInfo(cursor: *binary.ReadCursor, workspace: *Workspace, folder
             0x09 => {
                 if (saw_sizes or saw_crcs) return error.DataException;
                 saw_sizes = true;
-                // Vendor 7zIn.cpp reads each folder's size group straight off
-                // the wire in folder order: every substream except the last of
-                // its folder carries a listed size, and the last is the
-                // folder's unpack total minus the listed sizes.
+                // Sizes read in folder order; each folder's last substream is
+                // the unpack total minus the listed sizes (vendor 7zIn.cpp).
                 for (folders) |*folder| {
                     const count = std.math.cast(usize, folder.num_substreams) orelse return error.ResourceException;
                     if (count == 0) continue;
@@ -1621,9 +1598,8 @@ fn totalSubstreams(folders: []const Folder) Exception!usize {
     return total;
 }
 
-// Number of wire digests a kCRC list carries: every substream except those of
-// single-substream folders whose whole-folder CRC the UnpackInfo kCRC already
-// defines (vendor folds those out of the digest list).
+// Wire digest count: single-substream folders with a defined UnpackInfo kCRC
+// fold out (vendor behavior).
 fn foldDigestCount(folders: []const Folder) Exception!usize {
     var total: usize = 0;
     for (folders) |folder| {
@@ -1635,8 +1611,8 @@ fn foldDigestCount(folders: []const Folder) Exception!usize {
     return total;
 }
 
-// Spreads the kCRC digest list across the folders: single-substream folders
-// with a defined folder CRC take that CRC; the wire list fills the rest.
+// Spreads the kCRC list across folders: single-substream folders take their
+// folder CRC; the wire list fills the rest.
 fn assignSubstreamDigests(folders: []Folder, digests2: []?u32, workspace: *Workspace) Exception!void {
     const total = try totalSubstreams(folders);
     const arr = try workspace.take(?u32, total);
@@ -1883,10 +1859,8 @@ fn buildFolderPlan(packed_entries: []const PackedEntry, workspace: *Workspace) E
     while (i < packed_entries.len) {
         const p = packed_entries[i];
         var j = i + 1;
-        // Solid membership was decided by packAllEntries and is recorded on
-        // the entry; grouping by any other rule desyncs the header from the
-        // packed bytes (directories and encrypted entries break runs there,
-        // so they must break folders here too).
+        // Group by the recorded solid membership only; any other rule desyncs
+        // the header from the packed bytes.
         while (j < packed_entries.len and packed_entries[j].solid_continuation) j += 1;
         plan[plan_count] = .{ .filters = p.filters, .method = p.method, .encrypted = p.encrypted, .first = i, .count = j - i };
         plan_count += 1;
@@ -1937,8 +1911,8 @@ fn writeStreamsInfo(writer: *std.Io.Writer, entries: []const Entry, packed_entri
             try io.writeBytes(writer, &method_7z_aes_id);
             const salt_size: usize = p.salt_length;
             const iv_size: usize = 16;
-            // Sizes encode as a 1-bit high half plus a 4-bit low half that
-            // SUM to the size, so 16 is high=1 low=15 (see parseAesProps).
+            // Sizes encode as 1-bit high plus 4-bit low halves summing to the
+            // size: 16 is high=1 low=15 (see parse7zAesProps).
             const salt_high: u8 = @intCast(salt_size >> 4);
             const iv_high: u8 = @intCast(iv_size >> 4);
             var props: [2 + 16 + 16]u8 = undefined;
@@ -1951,9 +1925,8 @@ fn writeStreamsInfo(writer: *std.Io.Writer, entries: []const Entry, packed_entri
         }
         const method = p.method;
         try writeFolderCoder(writer, method, p.crc);
-        // Coders decode in written order, so the filter nearest the packed
-        // stream (last in the encode chain) is written first after the
-        // payload coder.
+        // Coders decode in written order, so the chain's last filter (nearest
+        // the packed stream) is written first.
         var filter_index = p.filters.len;
         while (filter_index > 0) {
             filter_index -= 1;
@@ -2355,8 +2328,8 @@ fn writeUint64(writer: *std.Io.Writer, value: u64) Exception!void {
         try io.writeBytes(writer, &.{@intCast(value)});
         return;
     }
-    // With `extra` continuation bytes the first byte carries `7 - extra`
-    // payload bits, so the capacity is 1 << (7 * extra + 7).
+    // The `extra` count leaves the first byte `7 - extra` payload bits;
+    // capacity is 1 << (7*extra + 7).
     var extra: u6 = 1;
     while (extra < 8 and value >= (@as(u64, 1) << @intCast(7 * @as(u32, extra) + 7))) extra += 1;
     if (extra == 8) {
@@ -2376,8 +2349,8 @@ fn writeUint64(writer: *std.Io.Writer, value: u64) Exception!void {
 }
 
 test "sevenzip ppmd solid grouping roundtrip" {
-    // A mixed provider build serves no single tag for both the checksum
-    // and codec arms; run where the default tag serves the codec.
+    // Mixed provider builds serve no single tag for both arms; run where
+    // the default tag serves the codec.
     if (!deflate_seam.decodeServed(checksum.default_provider)) return;
     const testing = std.testing;
     const allocator = testing.allocator;
@@ -2417,8 +2390,8 @@ test "sevenzip ppmd solid grouping roundtrip" {
 }
 
 test "sevenzip filter chain roundtrips lzma and lzma2" {
-    // A mixed provider build serves no single tag for both the checksum
-    // and codec arms; run where the default tag serves the codec.
+    // Mixed provider builds serve no single tag for both arms; run where
+    // the default tag serves the codec.
     if (!deflate_seam.decodeServed(checksum.default_provider)) return;
     const testing = std.testing;
     const allocator = testing.allocator;
@@ -2459,8 +2432,8 @@ test "sevenzip filter chain roundtrips lzma and lzma2" {
 }
 
 test "sevenzip primary filter methods encode the filter coder" {
-    // A mixed provider build serves no single tag for both the checksum
-    // and codec arms; run where the default tag serves the codec.
+    // Mixed provider builds serve no single tag for both arms; run where
+    // the default tag serves the codec.
     if (!deflate_seam.decodeServed(checksum.default_provider)) return;
     const testing = std.testing;
     const allocator = testing.allocator;
@@ -2481,8 +2454,7 @@ test "sevenzip primary filter methods encode the filter coder" {
     var cause: crypto.FailureCause = .none;
     const packed_entries = try sevenZipPack(&entries, crypto.default_provider, &workspace, .{}, &cause);
     // The shorthand filter method is its own one-element chain; dropping it
-    // omits the filter coder from the folder plan and the archive fails its
-    // CRC on decode.
+    // fails the archive CRC on decode.
     try testing.expectEqual(@as(usize, 1), packed_entries[0].filters.len);
     try testing.expectEqual(CoderMethod.x86, packed_entries[0].filters[0]);
     try testing.expectEqual(@as(usize, 1), packed_entries[1].filters.len);
@@ -2504,8 +2476,8 @@ test "sevenzip primary filter methods encode the filter coder" {
 }
 
 test "sevenzip rejects filters outside lzma coders" {
-    // A mixed provider build serves no single tag for both the checksum
-    // and codec arms; run where the default tag serves the codec.
+    // Mixed provider builds serve no single tag for both arms; run where
+    // the default tag serves the codec.
     if (!deflate_seam.decodeServed(checksum.default_provider)) return;
     const testing = std.testing;
     const allocator = testing.allocator;
@@ -2513,9 +2485,8 @@ test "sevenzip rejects filters outside lzma coders" {
     defer allocator.free(backing);
     var data: [64]u8 = undefined;
     for (&data, 0..) |*byte, i| byte.* = @truncate(i *% 7);
-    // Each row is a caller error: ppmd/deflate used to drop the filter
-    // silently, the filter shorthand cannot stack a second filter, and
-    // copy never takes one.
+    // Each row is a caller error: filters ride LZMA coders only, shorthand
+    // cannot stack, and copy takes none.
     const bad = [_]Entry{
         .{ .name = "a", .data = data[0..], .method = .ppmd, .filters = &.{.x86} },
         .{ .name = "b", .data = data[0..], .method = .deflate, .filters = &.{.x86} },
@@ -2531,8 +2502,8 @@ test "sevenzip rejects filters outside lzma coders" {
 }
 
 test "sevenzip filtered entries pack outside solid runs" {
-    // A mixed provider build serves no single tag for both the checksum
-    // and codec arms; run where the default tag serves the codec.
+    // Mixed provider builds serve no single tag for both arms; run where
+    // the default tag serves the codec.
     if (!deflate_seam.decodeServed(checksum.default_provider)) return;
     const testing = std.testing;
     const allocator = testing.allocator;
@@ -2551,8 +2522,8 @@ test "sevenzip filtered entries pack outside solid runs" {
     var workspace = try Workspace.init(backing.ptr, backing.len);
     var cause: crypto.FailureCause = .none;
     const packed_entries = try sevenZipPack(&entries, crypto.default_provider, &workspace, .{}, &cause);
-    // The filtered entry owns its packed stream and never joins the run;
-    // the two unfiltered entries form a solid folder instead.
+    // The filtered entry owns its packed stream; the two unfiltered entries
+    // form a solid folder instead.
     try testing.expect(packed_entries[0].data.len > 0);
     try testing.expectEqual(@as(usize, 1), packed_entries[0].filters.len);
     try testing.expectEqual(CoderMethod.x86, packed_entries[0].filters[0]);
@@ -2577,10 +2548,8 @@ test "sevenzip filtered entries pack outside solid runs" {
 }
 
 test "sevenzip vendor number wire format" {
-    // Pins the 7z varint to the vendor shape (7zIn.cpp ReadNumberSpec):
-    // leading one bits count the continuation bytes, which follow
-    // little-endian. The 152378 and 204800 samples are the pack and unpack
-    // sizes 7zz 26.04 read back from an archive this writer produced.
+    // Pins the 7z varint to vendor 7zIn.cpp ReadNumberSpec; 152378 and 204800
+    // came from 7zz 26.04 reading this writer's archive.
     const testing = std.testing;
     const cases = [_]struct { value: u64, wire: []const u8 }{
         .{ .value = 0, .wire = &.{0x00} },
@@ -2606,11 +2575,8 @@ test "sevenzip vendor number wire format" {
 }
 
 test "sevenzip digest list wire format" {
-    // Pins the digest list to the vendor shape (7zIn.cpp ReadHashDigests): a
-    // selector of 1 means all defined; 0 means raw MSB-first defined bits
-    // follow immediately (ReadBoolVector) with one u32 LE per defined entry;
-    // anything else is a refusal. Undefined entries surface as null, never
-    // as a phantom second selector byte or a zero CRC.
+    // Pins the digest list to vendor 7zIn.cpp ReadHashDigests: 1 selects all,
+    // 0 precedes MSB-first bits (ReadBoolVector), else refusal.
     const testing = std.testing;
     var backing: [4096]u8 = undefined;
     var workspace = try Workspace.init(&backing, backing.len);
@@ -2648,12 +2614,8 @@ test "sevenzip digest list wire format" {
 }
 
 test "sevenzip substream digest fold and zero-count folders" {
-    // Pins the SubStreamsInfo digest handling to vendor 7zIn.cpp
-    // ReadSubStreamsInfo: single-substream folders with a defined whole-folder
-    // CRC fold out of the kCRC wire list and take that CRC; the same fold
-    // applies when kCRC is absent (all-undefined digests); a zero count in
-    // kNumUnpackStream is legal and clears the stale single-substream default
-    // sizes; repeated properties are refused.
+    // Pins SubStreamsInfo digests to vendor ReadSubStreamsInfo: single-substream
+    // folders fold out; absent kCRC folds undefined; zero counts clear stale sizes.
     const testing = std.testing;
     var backing: [16 * 1024]u8 = undefined;
     var workspace = try Workspace.init(&backing, backing.len);
@@ -2694,8 +2656,8 @@ test "sevenzip substream digest fold and zero-count folders" {
         try testing.expectEqual(@as(usize, 0), cursor.remaining());
     }
 
-    // Without kCRC the same fold applies over an all-undefined list: A still
-    // carries its folder CRC, C stays null and must not verify as zero.
+    // Without kCRC the same fold applies over all-undefined digests: A keeps
+    // its folder CRC, C stays null.
     {
         var folders = fixture.make();
         const wire = [_]u8{0x00};
@@ -2749,9 +2711,8 @@ test "sevenzip substream digest fold and zero-count folders" {
 }
 
 test "sevenzip buildEntries skips trailing zero-substream folders" {
-    // Vendor FillLinks tolerates folders that carry no substreams; an entry
-    // with an undefined digest must surface crc = null (no phantom zero to
-    // verify against).
+    // Vendor FillLinks tolerates empty folders; an undefined digest must
+    // surface crc = null, never a phantom zero.
     const testing = std.testing;
     var backing: [16 * 1024]u8 = undefined;
     var workspace = try Workspace.init(&backing, backing.len);
@@ -2776,8 +2737,8 @@ test "sevenzip buildEntries skips trailing zero-substream folders" {
 }
 
 test "sevenzip encrypted roundtrip with salt and custom cycles" {
-    // A mixed provider build serves no single tag for both the checksum
-    // and codec arms; run where the default tag serves the codec.
+    // Mixed provider builds serve no single tag for both arms; run where
+    // the default tag serves the codec.
     if (!deflate_seam.decodeServed(checksum.default_provider)) return;
     const testing = std.testing;
     const allocator = testing.allocator;
@@ -2819,8 +2780,8 @@ test "sevenzip encrypted roundtrip with salt and custom cycles" {
 }
 
 test "sevenzip folder plan stays consistent across directory and encryption breaks" {
-    // A mixed provider build serves no single tag for both the checksum
-    // and codec arms; run where the default tag serves the codec.
+    // Mixed provider builds serve no single tag for both arms; run where
+    // the default tag serves the codec.
     if (!deflate_seam.decodeServed(checksum.default_provider)) return;
     const testing = std.testing;
     const allocator = testing.allocator;
@@ -2831,10 +2792,8 @@ test "sevenzip folder plan stays consistent across directory and encryption brea
     const first = repetitive[0..1000];
     const second = repetitive[400..1400];
 
-    // Case 1: two lzma2 entries split by a directory entry. packAllEntries
-    // breaks the solid run at the directory, so the header must declare two
-    // folders / two pack streams — one folder here used to lose the second
-    // entry's bytes entirely.
+    // Case 1: the directory breaks the solid run; one folder used to lose the
+    // second entry's bytes.
     const with_dir = [_]Entry{
         .{ .name = "a.bin", .data = first, .method = .lzma2 },
         .{ .name = "sub/", .data = &.{}, .method = .copy },
@@ -2857,8 +2816,8 @@ test "sevenzip folder plan stays consistent across directory and encryption brea
         try testing.expectEqualSlices(u8, data, out[0..produced]);
     }
 
-    // Case 2: two encrypted lzma2 entries. Encryption never joins solid runs,
-    // so each entry is its own folder with its own pack stream and IV.
+    // Case 2: encrypted entries never join solid runs; each is its own folder,
+    // pack stream, and IV.
     const encrypted_pair = [_]Entry{
         .{ .name = "enc-a.bin", .data = first, .method = .lzma2, .encrypted = true, .password = "pw" },
         .{ .name = "enc-b.bin", .data = second, .method = .lzma2, .encrypted = true, .password = "pw" },
@@ -2880,8 +2839,8 @@ test "sevenzip folder plan stays consistent across directory and encryption brea
 }
 
 test "sevenzip encrypted lzma2 entry roundtrips" {
-    // A mixed provider build serves no single tag for both the checksum
-    // and codec arms; run where the default tag serves the codec.
+    // Mixed provider builds serve no single tag for both arms; run where
+    // the default tag serves the codec.
     if (!deflate_seam.decodeServed(checksum.default_provider)) return;
     const testing = std.testing;
     const allocator = testing.allocator;
@@ -2910,8 +2869,8 @@ test "sevenzip encrypted lzma2 entry roundtrips" {
 }
 
 test "sevenzip encoded headers roundtrip in both modes" {
-    // A mixed provider build serves no single tag for both the checksum
-    // and codec arms; run where the default tag serves the codec.
+    // Mixed provider builds serve no single tag for both arms; run where
+    // the default tag serves the codec.
     if (!deflate_seam.decodeServed(checksum.default_provider)) return;
     const testing = std.testing;
     const allocator = testing.allocator;
@@ -2963,9 +2922,8 @@ test "sevenzip encoded headers roundtrip in both modes" {
             var fail_ws = try Workspace.init(backing.ptr, backing.len);
             try testing.expectError(error.UnsupportedException, sevenZipInspectCountEx(archive, &fail_ws, .{}, &.{ .failure_cause = &cause }));
             var wrong_ws = try Workspace.init(backing.ptr, backing.len);
-            // The wrong password surfaces wherever the garbage stream first
-            // fails: the LZMA property byte, the decompressor, or the header
-            // CRC. The contract is the failure cause, not the exact stage.
+            // The wrong password fails wherever the garbage stream first
+            // breaks; the contract is the failure cause, not the stage.
             _ = sevenZipDecodeOrdinal(archive, &wrong_ws, .{}, 0, out, .{
                 .password = "wrong",
                 .failure_cause = &cause,
@@ -2976,8 +2934,8 @@ test "sevenzip encoded headers roundtrip in both modes" {
 }
 
 test "sevenzip decode captured failing encrypted archive" {
-    // A mixed provider build serves no single tag for both the checksum
-    // and codec arms; run where the default tag serves the codec.
+    // Mixed provider builds serve no single tag for both arms; run where
+    // the default tag serves the codec.
     if (!deflate_seam.decodeServed(checksum.default_provider)) return;
     const testing = std.testing;
     const allocator = testing.allocator;
@@ -3008,8 +2966,8 @@ fn hexBytes(comptime len: usize, comptime hex: []const u8) [len]u8 {
     return out;
 }
 
-// Captured from 7-Zip 26.x CLI output (`7zz a -m0=BCJ2 -m1=LZMA2 -mx=5`) and inlined
-// as hex, so no binary fixture enters the tree.
+// Captured from 7-Zip 26.x (`7zz a -m0=BCJ2 -m1=LZMA2 -mx=5`); hex keeps
+// binary fixtures out of the tree.
 const bcj2_lzma2_7z_hex =
     "377abcaf271c0004680dc853c101000000000000720000000000000003d82b46e0032b00285d00486bb62414e8bbc1f7" ++
     "862bf0e75602d709b27284cbf7dc450308b8467a9684be00466f3cf4843800000000004f0000007300000097000000bb" ++
@@ -3101,11 +3059,11 @@ const aes_plain_txt_hex =
     "";
 
 test "sevenzip decodes 7zz BCJ2 + LZMA2 folder" {
-    // A mixed provider build serves no single tag for both the checksum
-    // and codec arms; run where the default tag serves the codec.
+    // Mixed provider builds serve no single tag for both arms; run where
+    // the default tag serves the codec.
     if (!deflate_seam.decodeServed(checksum.default_provider)) return;
-    // The folder arrives as four packed streams: the LZMA2 main, call, and jump coders bonded
-    // into the BCJ2 recombiner, plus the raw range-coded bitmap.
+    // Four packed streams: LZMA2 main, call, and jump coders bonded into
+    // BCJ2, plus the raw bitmap.
     const testing = std.testing;
     const allocator = testing.allocator;
     const archive_bytes = hexBytes(595, bcj2_lzma2_7z_hex);
@@ -3128,8 +3086,8 @@ test "sevenzip decodes 7zz BCJ2 + LZMA2 folder" {
 }
 
 test "sevenzip decodes 7zz AES-256 encrypted archive" {
-    // A mixed provider build serves no single tag for both the checksum
-    // and codec arms; run where the default tag serves the codec.
+    // Mixed provider builds serve no single tag for both arms; run where
+    // the default tag serves the codec.
     if (!deflate_seam.decodeServed(checksum.default_provider)) return;
     // Captured from `7zz a -ppassword123` (7zAES, 2^19 KDF rounds, LZMA2).
     const testing = std.testing;
@@ -3223,7 +3181,6 @@ test "sevenzip multi-volume write and read" {
     try std.testing.expect(layout.total_len == single_size);
     try std.testing.expect(layout.volumes > 1);
 
-    // Slice the volumes back out and read through the multi-volume entry.
     const volumes = try allocator.alloc([]const u8, layout.volumes);
     defer allocator.free(volumes);
     var at: usize = 0;

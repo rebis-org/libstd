@@ -1,5 +1,7 @@
 const std = @import("std");
 
+const contract = @import("interface").contract;
+
 // Emits a comptime table, so a component change touches only its own files.
 const ZonParameter = struct {
     name: []const u8,
@@ -60,26 +62,19 @@ const ZonDescriptor = struct {
     benchmark: ?ZonBenchmark = null,
 };
 
-const known_classes = [_][]const u8{ "slice", "streaming", "grammar", "volume", "filter" };
-const known_verbs = [_][]const u8{
-    "required_size",
-    "decoded_size",
-    "encoded_size_bound",
-    "encode",
-    "decode",
-    "encode_stream",
-    "decode_stream",
-    "inspect",
-    "decode_ordinal",
-    "encode_ordinal",
-};
-const known_representations = [_][]const u8{ "scalar_words", "bytes", "node_chain", "none" };
+// Descriptor values come from the contract enums; capability names follow
+// kernel/vocabulary.zig's `resource_capability_bit_*` bit order.
 const known_capabilities = [_][]const u8{ "read", "write", "size", "replay", "seek", "range" };
-const known_sizing = [_][]const u8{ "unavailable", "metadata_exact", "measured" };
-const known_commit = [_][]const u8{ "tentative", "confirmed" };
 
-// Verb groups map to command bits: a sizing verb answers a query, a decode verb
-// serves a read, and an encode verb serves a write.
+fn isKnown(comptime Enum: type, text: []const u8) bool {
+    inline for (@typeInfo(Enum).@"enum".field_names) |name| {
+        if (std.mem.eql(u8, name, text)) return true;
+    }
+    return false;
+}
+
+// Verb groups map to command bits: sizing answers a query,
+// decode serves a read, encode serves a write.
 const sizing_verbs = [_][]const u8{ "required_size", "decoded_size", "encoded_size_bound", "inspect" };
 const decode_verbs = [_][]const u8{ "decode", "decode_stream", "decode_ordinal" };
 const encode_verbs = [_][]const u8{ "encode", "encode_stream", "encode_ordinal" };
@@ -111,6 +106,18 @@ fn isSafeTag(text: []const u8) bool {
             (character >= 'A' and character <= 'Z') or
             (index != 0 and character >= '0' and character <= '9');
         if (!is_word_char) return false;
+    }
+    return true;
+}
+
+// Identifiers reach the generated file unquoted, so only a hex literal may.
+fn isHexLiteral(text: []const u8) bool {
+    if (!std.mem.startsWith(u8, text, "0x") or text.len < 3) return false;
+    for (text[2..]) |character| {
+        const digit = character >= '0' and character <= '9';
+        const lower = character >= 'a' and character <= 'f';
+        const upper = character >= 'A' and character <= 'F';
+        if (!digit and !lower and !upper) return false;
     }
     return true;
 }
@@ -157,17 +164,17 @@ pub fn main(init: std.process.Init) !void {
     }.lessThan);
 
     for (descriptors.items) |descriptor| {
-        if (!containsString(&known_classes, descriptor.class)) return error.unknown_class;
-        for (descriptor.verbs) |verb| if (!containsString(&known_verbs, verb)) return error.unknown_verb;
+        if (!isKnown(contract.Class, descriptor.class)) return error.unknown_class;
+        for (descriptor.verbs) |verb| if (!isKnown(contract.Verb, verb)) return error.unknown_verb;
         for (descriptor.parameters) |parameter| {
-            if (!containsString(&known_representations, parameter.representation)) return error.unknown_representation;
+            if (!isKnown(contract.Representation, parameter.representation)) return error.unknown_representation;
             if (!isSafeText(parameter.name)) return error.unsafe_text;
         }
         for (descriptor.capabilities) |capability| if (!containsString(&known_capabilities, capability)) return error.unknown_capability;
-        if (!containsString(&known_sizing, descriptor.sizing)) return error.unknown_sizing;
-        if (!containsString(&known_commit, descriptor.commit)) return error.unknown_commit;
+        if (!isKnown(contract.SizingMode, descriptor.sizing)) return error.unknown_sizing;
+        if (!isKnown(contract.CommitMode, descriptor.commit)) return error.unknown_commit;
         if (!isSafeText(descriptor.name) or !isSafeTag(descriptor.name)) return error.unsafe_text;
-        if (!isSafeText(descriptor.id.low) or !isSafeText(descriptor.id.high)) return error.unsafe_text;
+        if (!isHexLiteral(descriptor.id.low) or !isHexLiteral(descriptor.id.high)) return error.unsafe_text;
         if (descriptor.benchmark) |benchmark| {
             if (!isSafeText(benchmark.row) or !isSafeText(benchmark.params)) return error.unsafe_text;
             if (!isSafeText(benchmark.kind) or !isSafeText(benchmark.ext) or !isSafeText(benchmark.ref_params)) return error.unsafe_text;
@@ -262,8 +269,8 @@ pub fn main(init: std.process.Init) !void {
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = output_path, .data = output.items });
 }
 
-// The table derives every other identity from the descriptor, so a component is one
-// descriptor file plus one convention-named hook.
+// The table derives every identity from the descriptor, so a component
+// is one descriptor file plus one convention-named hook.
 fn profileTag(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
     const tagged = try allocator.dupe(u8, name);
     for (tagged) |*character| {

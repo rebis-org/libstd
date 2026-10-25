@@ -26,8 +26,8 @@ pub fn addArchive(
     }
     xcframework.addArg("-output");
     const framework = xcframework.addOutputDirectoryArg("stdk.xcframework");
-    // WriteFile staging resolves symlinks away. The versioned macOS framework
-    // keeps its bundle root as symlinks, so stage and zip in one shell step.
+    // WriteFile staging resolves symlinks away, and the macOS framework root
+    // is symlinks, so stage and zip in one shell step.
     const archive = b.addSystemCommand(&.{
         "sh", "-c",
         \\set -eu

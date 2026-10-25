@@ -1,33 +1,29 @@
 const std = @import("std");
 
+const entry_prim = @import("../../../common/entry.zig");
 const bounds = @import("../../../common/primitive/bounds.zig");
 const exception_prim = @import("../../../common/primitive/exception.zig");
 
+pub const Entry = entry_prim.Entry;
+pub const EntryInfo = entry_prim.Sized;
 const Exception = exception_prim.Exception;
 
-// Layouts: apfs_raw.h (linux-apfs/linux-apfs-rw); ApfsHandler (vendor/7zip).
-// Checksum: APFS Fletcher-64, libfsapfs_checksum.c (libyal/libfsapfs), over block[8..] with initial value 0.
-// The writer builds a fresh single-volume image from scratch (mkfs-shaped): a
-// physical fs tree over one container object map, no checkpoint area.
+// Layouts follow apfs_raw.h (linux-apfs/linux-apfs-rw) and ApfsHandler (vendor/7zip).
+//
+// Checksum: APFS Fletcher-64, libfsapfs_checksum.c (libyal/libfsapfs),
+// over block[8..] with initial value 0.
+//
+// The writer builds a fresh single-volume, mkfs-shaped image: one physical
+// fs tree, one container object map, no checkpoint area.
 
 pub const scratch_size: usize = 1024 * 1024;
-
-pub const Entry = struct {
-    name: []const u8,
-    data: []const u8,
-};
-
-pub const EntryInfo = struct {
-    size: u64,
-    ordinal: u64,
-};
 
 const max_dir_depth: u32 = 64;
 const max_descriptor_blocks = 10000;
 const max_tree_depth = 64;
 
-const nx_magic: u32 = 0x4253584E; // "NXSB"
-const fs_magic: u32 = 0x42535041; // "APSB"
+const nx_magic: u32 = 0x4253584E; // "NXSB".
+const fs_magic: u32 = 0x42535041; // "APSB".
 
 const obj_type_btree: u32 = 0x2;
 const obj_type_btree_node: u32 = 0x3;
@@ -165,9 +161,8 @@ const Node = struct {
         if (bytes.len < btree_node_header_size) return error.DataException;
         const flags = le16(bytes[32..34]);
         const is_root = flags & btn_flag_root != 0;
-        // Roots carry OBJECT_TYPE_BTREE, children OBJECT_TYPE_BTREE_NODE;
-        // the type and the root flag must agree,
-        // and the subtype selects the tree the node belongs to.
+        // Roots carry OBJECT_TYPE_BTREE and children OBJECT_TYPE_BTREE_NODE;
+        // type, root flag, and subtype must agree.
         const ty = objType(bytes) & 0xffff;
         if (ty != obj_type_btree and ty != obj_type_btree_node) return error.DataException;
         if ((ty == obj_type_btree) != is_root) return error.DataException;
@@ -215,8 +210,8 @@ const Node = struct {
 
     fn valueLoc(self: Node, index: u32, ft: Footer) Exception!Loc {
         if (index >= self.nkeys) return error.DataException;
-        // Value offsets count backwards, from the footer when the node is a
-        // root and from the end of the block otherwise.
+        // Value offsets count backwards from the footer on a root, from
+        // the block end otherwise.
         const end = self.bytes.len - @as(usize, if (self.isRoot()) btree_info_size else 0);
         if (self.fixed_kv) {
             const base = btree_node_header_size + @as(usize, index) * 4;
@@ -354,8 +349,7 @@ fn open(archive: []const u8) Exception!Mount {
     return mount;
 }
 
-// Returns the omap tree root block number from the object map object at
-// paddr. The object map object and its tree are physical.
+// The object map object and its tree are physical.
 fn omapRootAt(image: Image, paddr: u64) Exception!u64 {
     const block_bytes = try image.block(paddr);
     if (objType(block_bytes) & 0xffff != obj_type_omap) return error.DataException;
@@ -365,8 +359,8 @@ fn omapRootAt(image: Image, paddr: u64) Exception!u64 {
     return le64(block_bytes[0x30..0x38]);
 }
 
-// A set most-significant bit in either checkpoint area count or base turns
-// the area into a B-tree, which this reader does not implement.
+// A set most-significant bit in a checkpoint area count or base marks a
+// B-tree, which this reader does not implement.
 fn checkpointAreasLinear(sb: []const u8) Exception!void {
     const desc_blocks = le32(sb[0x68..0x6c]);
     const data_blocks = le32(sb[0x6c..0x70]);
@@ -417,9 +411,8 @@ fn selectCheckpoint(mount: *Mount) Exception!void {
     mount.cp_map = .{ .entries = map_entries };
 }
 
-// B-tree node oid resolution. Physical trees use the oid as a block number;
-// ephemeral trees ask the checkpoint map; virtual trees go through the
-// owning object map. A miss is corruption, never resolved by identity.
+// Physical: oid is the block number. Ephemeral: checkpoint map. Virtual:
+// owning object map. A miss is corruption, not the oid.
 fn resolveNode(mount: *const Mount, tree_flags: u32, owning_omap_root: u64, oid: u64) Exception!u64 {
     if (tree_flags & btinfo_flag_physical != 0) return oid;
     if (tree_flags & btinfo_flag_ephemeral != 0)
@@ -428,8 +421,7 @@ fn resolveNode(mount: *const Mount, tree_flags: u32, owning_omap_root: u64, oid:
     return (try omapLookup(mount, owning_omap_root, oid)) orelse error.DataException;
 }
 
-// Walk the object map B-tree. It is a physical tree:
-// a branch value is a block number, and its root footer carries BTREE_PHYSICAL.
+// Branch values are block numbers; the root footer carries BTREE_PHYSICAL.
 // Returns the entry with the largest xid not above mount.xid.
 fn omapLookup(mount: *const Mount, root_paddr: u64, oid: u64) Exception!?u64 {
     const key_size = 16;
@@ -540,8 +532,8 @@ fn inodeFromValue(val: []const u8) Exception!Inode {
     return .{ .mode = le16(val[0x50..0x52]), .private_id = le64(val[8..16]), .size = size };
 }
 
-// Catalog keys order by object id, then type, then the payload.
-// The packed header compares id and type separately, not as one u64.
+// Catalog keys order by object id, then type, then payload; the packed
+// header compares id and type separately.
 fn fsKeyCompare(a: []const u8, b: []const u8, hashed: bool) std.math.Order {
     const ah = le64(a[0..8]);
     const bh = le64(b[0..8]);
@@ -615,9 +607,8 @@ fn fsScanNode(ctx: *ScanCtx, paddr: u64, depth: u32) Exception!void {
         }
         return;
     }
-    // An internal entry holds the first key of its child, so the child that
-    // covers the lower bound is the last entry not above it; the first child
-    // owns the range when every entry starts above the bound.
+    // Each entry holds its child's first key: descend the last entry at or
+    // below the lower bound, else the first.
     while (i + 1 < node.nkeys) : (i += 1) {
         const k = try fsKey(node, i + 1, footer);
         if (fsKeyCompare(k, ctx.lo, ctx.mount.hashed_drec) == .gt) break;
@@ -798,14 +789,13 @@ fn extentYield(ctx: *FileCtx, key: []const u8, val: []const u8) Exception!void {
 
 // Writer: a fresh single-volume image (mkfs-shaped, no checkpoint area).
 //
-// Block map (4096-byte blocks): 0 container superblock, 1 container omap
-// object, 2 container omap tree, 3 volume superblock, 4 volume omap object,
-// 5.. volume omap nodes over every fs node, then fs tree nodes (leaves,
-// internal levels bottom-up), then file data. The fs tree is virtual because
-// 7-Zip resolves the root through the volume omap unconditionally. Entries
-// must be listed in the reader's enumeration order (depth-first, sibling
-// names sorted bytewise); the plan verifies the order instead of writing an
-// image whose read ordinals scramble silently.
+// After the fixed blocks come volume omap nodes, fs tree nodes (leaves,
+// then internal levels bottom-up), then file data.
+//
+// The fs tree is virtual because 7-Zip resolves the root through the
+// volume omap unconditionally.
+//
+// Read order is depth-first with sibling names sorted bytewise.
 
 const writer_block_size: usize = 4096;
 const volume_oid: u64 = 100;
@@ -834,10 +824,10 @@ const PlanNode = struct {
 const LevelSpan = struct { start: u32, end: u32 };
 
 const TreeLevel = struct {
-    // Internal descent compares first keys, so each span's first_key must
-    // be the first key of that subtree.
+    // Internal descent compares first keys; each span's first_key must be
+    // its subtree's first key.
     first_keys: []const []const u8,
-    spans: []const LevelSpan, // children grouped into this level's nodes
+    spans: []const LevelSpan, // Children grouped into this level's nodes.
 };
 
 fn levelNodeCount(levels: []const TreeLevel) u64 {
@@ -851,8 +841,8 @@ const WriterPlan = struct {
     records: []FsRec,
     keys: [][]const u8,
     vals: [][]const u8,
-    levels: []TreeLevel, // fs levels: levels[0] = leaves, last = root
-    vol_omap_levels: []TreeLevel, // volume omap levels over fs nodes
+    levels: []TreeLevel, // File-system tree levels; levels[0] holds leaves, the last is root.
+    vol_omap_levels: []TreeLevel, // Volume omap levels over fs nodes.
     fs_first_block: u64,
     data_start: u64,
     files: []const *PlanNode,
@@ -864,12 +854,13 @@ fn componentValid(name: []const u8) bool {
         std.mem.indexOfScalar(u8, name, 0) == null;
 }
 
-// The rank check pins the entry-order contract: the entry list must already
-// be the DFS flatten over sorted siblings, or read ordinals desync.
+// The tree derives from the names, so entry order does not matter:
+// directories resolve first, then every leaf attaches.
 fn buildTree(entries: []const Entry, alloc: std.mem.Allocator) Exception!*PlanNode {
     const root = alloc.create(PlanNode) catch return error.ResourceException;
     root.* = .{ .name = "", .is_dir = true, .parent = undefined };
-    for (entries, 0..) |entry, rank| {
+    const parents = alloc.alloc(*PlanNode, entries.len) catch return error.ResourceException;
+    for (entries, 0..) |entry, index| {
         if (entry.name.len == 0 or entry.name[0] == '/' or
             std.mem.indexOfScalar(u8, entry.name, 0) != null) return error.UnsupportedException;
         var parent = root;
@@ -891,18 +882,27 @@ fn buildTree(entries: []const Entry, alloc: std.mem.Allocator) Exception!*PlanNo
                 depth += 1;
                 continue;
             }
-            if (isKid(parent, part) != null) return error.UnsupportedException;
-            const file = alloc.create(PlanNode) catch return error.ResourceException;
-            file.* = .{ .name = part, .is_dir = false, .data = entry.data, .parent = parent, .rank = rank };
-            parent.kids.append(alloc, file) catch return error.ResourceException;
+            parents[index] = parent;
         }
+    }
+    for (entries, 0..) |entry, index| {
+        const parent = parents[index];
+        const part = entry_prim.leafName(entry.name) orelse return error.UnsupportedException;
+        if (!componentValid(part)) return error.UnsupportedException;
+        if (isKid(parent, part)) |existing| {
+            // The entry names a previously implied directory, or two entries
+            // claim one name; only an empty directory passes.
+            if (!existing.is_dir or entry.data.len != 0) return error.UnsupportedException;
+            continue;
+        }
+        const file = alloc.create(PlanNode) catch return error.ResourceException;
+        file.* = .{ .name = part, .is_dir = false, .data = entry.data, .parent = parent };
+        parent.kids.append(alloc, file) catch return error.ResourceException;
     }
     // Inodes 0..15 are reserved (root 2, private dir 3); 7-Zip drops any
     // file whose id lands in the private-dir slot.
     var next_ino: u64 = 16;
-    var next_rank: usize = 0;
-    try rankNode(root, &next_ino, &next_rank, true);
-    if (next_rank != entries.len) return error.UnsupportedException;
+    rankNode(root, &next_ino, true);
     return root;
 }
 
@@ -913,7 +913,7 @@ fn isKid(parent: *PlanNode, name: []const u8) ?*PlanNode {
     return null;
 }
 
-fn rankNode(node: *PlanNode, next_ino: *u64, next_rank: *usize, is_root: bool) Exception!void {
+fn rankNode(node: *PlanNode, next_ino: *u64, is_root: bool) void {
     node.ino = if (is_root) root_ino else blk: {
         const ino = next_ino.*;
         next_ino.* += 1;
@@ -924,27 +924,18 @@ fn rankNode(node: *PlanNode, next_ino: *u64, next_rank: *usize, is_root: bool) E
             return std.mem.order(u8, a.name, b.name) == .lt;
         }
     }.lessThan);
-    var prev: ?[]const u8 = null;
     for (node.kids.items) |kid| {
-        if (prev) |prior| {
-            if (std.mem.eql(u8, prior, kid.name)) return error.UnsupportedException;
-        }
-        prev = kid.name;
         if (kid.is_dir) {
-            try rankNode(kid, next_ino, next_rank, false);
+            rankNode(kid, next_ino, false);
         } else {
             kid.ino = next_ino.*;
             next_ino.* += 1;
-            if (kid.rank != next_rank.*) return error.UnsupportedException;
-            next_rank.* += 1;
         }
     }
 }
 
-// Generation order (pre-order over increasing inode numbers) is already
-// fsKeyCompare order, so records need no sort. Non-empty files also land in
-// `files`, parallel to `extent_idx`, so data blocks can be assigned by
-// position instead of by a search.
+// Pre-order generation over increasing inode numbers matches fsKeyCompare,
+// so records need no sort. `files` parallels `extent_idx`.
 fn emitNodeRecords(
     node: *PlanNode,
     records: *std.ArrayListUnmanaged(FsRec),
@@ -970,9 +961,8 @@ fn emitNodeRecords(
     }
 }
 
-// Packs record costs greedily into node-sized spans. Callers reserve the
-// b-tree footer in the capacity: the root pays the footer, and packNodes
-// cannot tell which span becomes the root, so every span reserves it.
+// Callers reserve the b-tree footer in the capacity because packNodes
+// cannot tell which span becomes the root.
 fn packNodes(costs: []const usize, capacity: usize, alloc: std.mem.Allocator) Exception![]LevelSpan {
     var spans: std.ArrayListUnmanaged(LevelSpan) = .empty;
     var start: u32 = 0;
@@ -1025,10 +1015,8 @@ fn makePlan(entries: []const Entry, alloc: std.mem.Allocator) Exception!WriterPl
         vals[i] = val_bufs[i][0..writeFsVal(&val_bufs[i], rec)];
     }
 
-    // Leaves: greedy byte fit over the record costs. The capacity reserves
-    // the b-tree footer everywhere, not just on the root: packNodes cannot
-    // know which span ends up as the root, and a root packed without the
-    // reservation would overlap its own footer.
+    // Leaves: greedy byte fit. The capacity reserves the b-tree footer
+    // because the root span is only known after packing.
     const rec_costs = alloc.alloc(usize, records.len) catch return error.ResourceException;
     for (records, 0..) |_, i| rec_costs[i] = 8 + keys[i].len + vals[i].len;
     const leaf_capacity = writer_block_size - btree_node_header_size - btree_info_size;
@@ -1051,8 +1039,8 @@ fn makePlan(entries: []const Entry, alloc: std.mem.Allocator) Exception!WriterPl
         levels.append(alloc, .{ .first_keys = internal_first, .spans = internal_spans }) catch return error.ResourceException;
     }
 
-    // Every virtual fs node needs an (oid, xid) -> paddr entry here;
-    // 7-Zip resolves the fs tree root through this map unconditionally.
+    // Every virtual fs node needs an (oid, xid) -> paddr entry: 7-Zip
+    // resolves the root through this map unconditionally.
     const fs_node_count = levelNodeCount(levels.items);
     const node_count = std.math.cast(usize, fs_node_count) orelse return error.ResourceException;
     const entry_keys = alloc.alloc([]const u8, node_count) catch return error.ResourceException;
@@ -1103,10 +1091,10 @@ fn writeNx(block: []u8, total_blocks: u64) void {
     std.mem.writeInt(u32, block[0x20..0x24], nx_magic, .little);
     std.mem.writeInt(u32, block[0x24..0x28], writer_block_size, .little);
     std.mem.writeInt(u64, block[0x28..0x30], total_blocks, .little);
-    std.mem.writeInt(u64, block[0x58..0x60], volume_oid + 1, .little); // next oid
-    std.mem.writeInt(u64, block[0x60..0x68], writer_xid + 1, .little); // next xid
+    std.mem.writeInt(u64, block[0x58..0x60], volume_oid + 1, .little); // Next oid.
+    std.mem.writeInt(u64, block[0x60..0x68], writer_xid + 1, .little); // Next xid.
     std.mem.writeInt(u64, block[0xa0..0xa8], writer_container_omap_obj, .little);
-    std.mem.writeInt(u32, block[0xb4..0xb8], 1, .little); // one file system
+    std.mem.writeInt(u32, block[0xb4..0xb8], 1, .little); // One file system.
     std.mem.writeInt(u64, block[0xb8..0xc0], volume_oid, .little);
     seal(block);
 }
@@ -1119,9 +1107,8 @@ fn writeOmapObject(block: []u8, oid: u64, tree_block: u64) void {
     seal(block);
 }
 
-// Writes one fixed-size b-tree per level, leaves first. Leaf values are
-// 16-byte omap values pointing at leaf_paddr_base + entry; internal values
-// are 8-byte child block numbers.
+// Leaf values are 16-byte omap values at leaf_paddr_base + entry; internal
+// values are 8-byte child block numbers.
 fn writeOmapTree(
     output: []u8,
     fba: *std.heap.FixedBufferAllocator,
@@ -1166,20 +1153,17 @@ fn writeOmapTree(
     }
 }
 
-// A fixed-size omap node (the volume object map): leaf values are 16-byte
-// omap values, internal values are 8-byte child block numbers.
 fn writeVolume(block: []u8, fs_root_oid: u64) void {
     @memset(block, 0);
     writeObj(block, volume_oid, writer_xid, obj_type_fs, 0);
     std.mem.writeInt(u32, block[0x20..0x24], fs_magic, .little);
-    std.mem.writeInt(u64, block[0x38..0x40], 0, .little); // case-sensitive, plain drec
+    std.mem.writeInt(u64, block[0x38..0x40], 0, .little); // Case-sensitive, plain drec.
     std.mem.writeInt(u32, block[0x74..0x78], obj_type_btree, .little);
     std.mem.writeInt(u64, block[0x80..0x88], writer_volume_omap_obj, .little);
     std.mem.writeInt(u64, block[0x88..0x90], fs_root_oid, .little);
     seal(block);
 }
 
-// Variable-size fs node, virtual like the fixture's fs tree.
 fn fsPairCount(span: LevelSpan) usize {
     return span.end - span.start;
 }
@@ -1253,8 +1237,8 @@ pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Exception!usi
         cursor += spans.len;
     }
 
-    // File payloads in DFS order; block numbers walk the same cursor the
-    // plan used, so the extent records stay in agreement.
+    // File payloads in DFS order; the cursor repeats the plan's walk,
+    // keeping extent records in agreement.
     var data_cursor = plan.data_start;
     for (plan.files) |file| {
         const at = std.math.mul(u64, data_cursor, writer_block_size) catch return error.DataException;
@@ -1326,16 +1310,13 @@ test "apfs write roundtrips a multi-block file through extents" {
 
 test "apfs node packing reserves the root footer" {
     const testing = std.testing;
-    // packNodes returns the items slice of an internal ArrayList; freeing
-    // it with the testing allocator would trip the capacity/length check,
-    // so the packing math runs against an arena.
+    // packNodes returns an internal ArrayList's items slice; freeing it
+    // would fail the testing allocator's capacity check, so use an arena.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
-    // 101 records of 40 bytes: 4040 in total. The block minus the node
-    // header alone admits them in a single span, but a root packed that
-    // full would overlap its own 40-byte b-tree footer; the reservation
-    // must split the span instead.
+    // The costs fill a block minus the node header exactly, so only the
+    // footer reservation forces the split.
     const costs: [101]usize = @splat(40);
     const spans = try packNodes(&costs, writer_block_size - btree_node_header_size - btree_info_size, alloc);
     try testing.expectEqual(@as(usize, 2), spans.len);
@@ -1367,14 +1348,25 @@ test "apfs write roundtrips a multi-level tree" {
     try testing.expectEqualSlices(u8, "payload 149", out[0..last]);
 }
 
-test "apfs write rejects unsorted entries" {
+test "apfs write accepts entries in any order" {
     const testing = std.testing;
+    // The tree derives from the names, so caller order cannot change the
+    // sorted output.
     const entries = [_]Entry{
         .{ .name = "top.txt", .data = "root file" },
         .{ .name = "a/b/deep.txt", .data = "nested payload" },
     };
     var scratch: [scratch_size]u8 = undefined;
-    try testing.expectError(error.UnsupportedException, archiveSize(&entries, &scratch));
+    const required = try archiveSize(&entries, &scratch);
+    const archive = try testing.allocator.alloc(u8, required);
+    defer testing.allocator.free(archive);
+    const written = try encode(&entries, archive, &scratch);
+    try testing.expectEqual(required, written);
+    var out: [16]u8 = undefined;
+    const n0 = try decodeOrdinal(archive[0..written], 0, &out, &scratch);
+    try testing.expectEqualSlices(u8, "nested payload", out[0..n0]);
+    const n1 = try decodeOrdinal(archive[0..written], 1, &out, &scratch);
+    try testing.expectEqualSlices(u8, "root file", out[0..n1]);
 }
 
 test "apfs write rejects duplicate and malformed names" {
@@ -1403,9 +1395,8 @@ test "apfs empty archive roundtrips" {
     try testing.expectEqual(@as(u64, 0), try inspectCount(archive, &scratch));
 }
 
-// Synthetic single-volume image: a newer checkpoint, a checkpoint map, a
-// two-level fs tree whose internal root must be searched for the bound, and
-// an internal object map root over one leaf.
+// Synthetic image: a newer checkpoint, a checkpoint map, a two-level fs
+// tree, an internal object map root over one leaf.
 const fixture_block_count = 15;
 const fixture_block_size = 4096;
 
@@ -1487,11 +1478,11 @@ fn fixtureImage(alloc: std.mem.Allocator) ![]u8 {
     std.mem.writeInt(u64, vol_omap[0x30..0x38], 8, .little);
     seal(vol_omap);
 
-    // Block 8: volume omap b-tree root; an internal node over the block 14
-    // leaf, with the leaf's first key as its only branch key.
+    // Block 8: volume omap b-tree root; internal over the block 14 leaf,
+    // keyed by the leaf's first key.
     buildOmapRoot(vol_omap_tree, 8, 14, .{ .oid = 300, .paddr = 6 });
 
-    // Block 14: volume omap leaf mapping the fs boot records.
+    // Block 14: volume omap leaf mapping the fs tree nodes.
     buildOmapLeaf(vol_omap_leaf, 14, &.{
         .{ .oid = 300, .paddr = 6 },
         .{ .oid = 301, .paddr = 12 },
@@ -1538,9 +1529,8 @@ const FsRec = struct {
     logical: u64 = 0,
 };
 
-// The directory scan bound (2, 9) falls between the first keys of the two
-// leaves, [2, 3] and [17, 3], so the descent must pick the last entry at or
-// below it instead of the first entry above it.
+// The bound (2, 9) falls between the leaf first keys, forcing descent to
+// the last entry at or below it.
 const fs_records_a = [_]FsRec{
     .{ .id = 2, .rec_type = rec_type_inode, .val_kind = .inode_dir },
     .{ .id = 2, .rec_type = rec_type_dir_rec, .name = "dir", .val_kind = .drec, .file_id = 17 },
@@ -1559,8 +1549,8 @@ const fs_records_b = [_]FsRec{
 
 const KVPair = struct { key: []const u8, val: []const u8 };
 
-// Lays out a variable-size b-tree node: table of contents, keys forward from
-// the key area, and values backwards from the footer or the block end.
+// Variable-size node layout: table of contents, keys forward from the key
+// area, values backwards from the footer or block end.
 fn writeVarNode(
     node: []u8,
     oid: u64,
@@ -1624,8 +1614,8 @@ fn buildOmapTree(node: []u8, oid: u64, entries: []const OmapEntry) void {
     writeFixedNode(node, oid, 6, obj_subtype_omap, true, btn_flag_root | btn_flag_leaf | btn_flag_fixed_kv, 0, btinfo_flag_physical, 16, 16, pairs[0..entries.len], true, entries.len, 1);
 }
 
-// Lays out a fixed-size b-tree node: 4-byte table-of-contents entries,
-// sequential keys, and values backwards from the footer or the block end.
+// Fixed-size node layout: 4-byte table-of-contents entries, sequential
+// keys, values backwards from the footer or block end.
 fn writeFixedNode(
     node: []u8,
     oid: u64,
@@ -1887,14 +1877,14 @@ test "apfs rejects an unresolvable file system tree root" {
     const image = try fixtureImage(alloc);
     defer alloc.free(image);
 
-    // A virtual root tree oid that the volume object map does not know names
-    // no block; it must not be read as a physical address.
+    // A virtual root oid unknown to the volume object map must fail, not be
+    // read as a physical address.
     const vol = image[5 * fixture_block_size .. 6 * fixture_block_size];
     std.mem.writeInt(u64, vol[0x88..0x90], 6, .little);
     try std.testing.expectError(error.DataException, inspectCount(image, &.{}));
 
-    // An ephemeral root tree resolves through the checkpoint map alone,
-    // which is empty, even though the oid is in the object map.
+    // An ephemeral root resolves through the checkpoint map alone, which is
+    // empty, despite the object map entry.
     std.mem.writeInt(u64, vol[0x88..0x90], 300, .little);
     std.mem.writeInt(u32, vol[0x74..0x78], obj_flag_ephemeral | obj_type_btree, .little);
     try std.testing.expectError(error.DataException, inspectCount(image, &.{}));

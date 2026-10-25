@@ -30,10 +30,12 @@ pub const Options = struct {
 };
 
 pub fn frameOptions(options: Options) zstd.Options {
+    // Sizing must not trap on caller parameters; the encoder rejects the
+    // same values with CallException.
     const window_size: u32 = @max(options.window_size, zstd.window_size_min);
     return .{
         .window_size = window_size,
-        .hash_bits = @intCast(options.hash_bits),
+        .hash_bits = @intCast(@min(options.hash_bits, std.math.maxInt(u5))),
         .max_chain = options.max_chain,
         .nice_len = options.nice_len,
         .search_window = options.search_window,
@@ -46,8 +48,7 @@ fn tableSize(frame_count: usize) usize {
 }
 
 pub fn encodedSizeBound(input_len: usize, options: Options) usize {
-    const frame_count = input_len / options.frame_size + 1;
-    return zstd.encodedSizeBound(input_len, frameOptions(options)) + tableSize(frame_count);
+    return zstd.encodedSizeBound(input_len, frameOptions(options)) + tableSize(frameCountFor(input_len, options));
 }
 
 pub const FrameInfo = struct {
@@ -55,8 +56,8 @@ pub const FrameInfo = struct {
     has_checksums: bool,
 };
 
-// The footer magic must be at the end of the input. Each table entry is checked
-// against the frame magic at its compressed offset.
+// Each table entry is checked against the frame magic at its compressed
+// offset.
 pub fn inspect(input: []const u8) Exception!FrameInfo {
     if (input.len < 8 + footer_size) return error.DataException;
     if (std.mem.readInt(u32, input[input.len - 4 ..][0..4], .little) != seekable_magic) return error.DataException;
@@ -64,9 +65,8 @@ pub fn inspect(input: []const u8) Exception!FrameInfo {
     const descriptor = input[input.len - 5];
     if (descriptor & 0x7C != 0) return error.UnsupportedException;
     const has_checksums = (descriptor & 0x80) != 0;
-    // The frame count comes off the wire, so the table arithmetic runs in u64:
-    // on 32-bit targets a hostile count would otherwise wrap the entry product
-    // or the length sum before the checks below can reject the input.
+    // The wire frame count forces u64 arithmetic; a hostile count would
+    // wrap a 32-bit product before rejection.
     const entry_bytes: u64 = @as(u64, frame_count) * (entry_size + @as(u64, if (has_checksums) 4 else 0));
     if (@as(u64, input.len) < 8 + entry_bytes + footer_size) return error.DataException;
     const table_start: usize = @intCast(@as(u64, input.len) - footer_size - entry_bytes);
@@ -97,11 +97,14 @@ pub fn decodedSize(input: []const u8, history: []u8, options: Options) Exception
 pub const FrameEntry = struct { compressed_size: u32, decompressed_size: u32 };
 
 pub fn frameCountFor(input_len: usize, options: Options) usize {
-    return input_len / options.frame_size + 1;
+    // Clamping sub-minimum frame sizes keeps the count an upper bound
+    // instead of dividing by zero.
+    return input_len / @max(options.frame_size, frame_size_min) + 1;
 }
 
 pub fn encodeToWriter(input: []const u8, output: *std.Io.Writer, history: []u8, workspace: []u32, entries: []FrameEntry, options: Options) Exception!void {
     if (options.frame_size < frame_size_min or options.frame_size > frame_size_max) return error.CallException;
+    if (options.hash_bits > std.math.maxInt(u5)) return error.CallException;
     if (entries.len < frameCountFor(input.len, options)) return error.CapacityException;
     const frame_options = frameOptions(options);
     const needed_history = @as(usize, frame_options.window_size) + zstd.block_size_max;
@@ -151,21 +154,23 @@ pub fn decode(input: []const u8, output: *std.Io.Writer, history: []u8, options:
         _ = zstd.decodeStream(&source, output, history, frame_options) catch |err| return err;
         return;
     }
-    // With checksums, decode frame by frame so each entry's output is hashed
-    // and compared against its stored low 32 bits of XXH64 (the format's
-    // integrity contract; the reference decoder verifies the same field). A
-    // mismatch fails the whole decode before later frames are touched.
+    // Each frame must match its stored low 32 bits of XXH64, the field the
+    // reference decoder verifies.
     const stride = entry_size + 4;
     const table_start = input.len - footer_size - @as(usize, info.frame_count) * stride;
     var offset: usize = 0;
     for (0..info.frame_count) |index| {
         const entry = input[table_start + index * stride ..][0 .. entry_size + 4];
         const compressed_size = std.mem.readInt(u32, entry[0..4], .little);
-        const expected = std.mem.readInt(u32, entry[entry_size..][0..4], .little);
+        const expected_size = std.mem.readInt(u32, entry[4..8], .little);
+        const expected_hash = std.mem.readInt(u32, entry[entry_size..][0..4], .little);
         var frame_tee = tee.CountingTee(.{ .xxh64 = true }).init(output);
         var frame_source = std.Io.Reader.fixed(input[offset .. offset + compressed_size]);
         _ = zstd.decodeStream(&frame_source, &frame_tee.writer, history, frame_options) catch |err| return err;
-        if (@as(u32, @truncate(frame_tee.xxh64Value())) != expected) return error.DataException;
+        // Either a size or hash disagreement is corruption, not a format
+        // error.
+        if (frame_tee.size != expected_size) return error.IntegrityException;
+        if (@as(u32, @truncate(frame_tee.xxh64Value())) != expected_hash) return error.IntegrityException;
         offset += compressed_size;
     }
 }
@@ -247,8 +252,8 @@ test "seek table checksums verify each frame" {
     const table_start = input.len - footer_size - payloads.len * (entry_size + 4);
     input[table_start + entry_size] ^= 0xff;
     var corrupt_sink = std.Io.Writer.fixed(&decoded);
-    try std.testing.expectError(error.DataException, decode(input, &corrupt_sink, history, options));
-    try std.testing.expectError(error.DataException, decodedSize(input, history, options));
+    try std.testing.expectError(error.IntegrityException, decode(input, &corrupt_sink, history, options));
+    try std.testing.expectError(error.IntegrityException, decodedSize(input, history, options));
     input[table_start + entry_size] ^= 0xff;
     // Reserved descriptor bits are refused; unused bits are ignored.
     input[input.len - 5] = 0x84;
@@ -261,9 +266,8 @@ test "seek table checksums verify each frame" {
 }
 
 test "hostile seek footer frame counts are rejected without overflow" {
-    // A saturated frame count with checksums: the entry product alone is
-    // 48 GiB, far past any 17-byte input, and must be refused by the u64
-    // length check instead of wrapping a usize.
+    // A saturated count makes the entry product 48 GiB; the u64
+    // length check must refuse it, not wrap.
     var hostile: [17]u8 = @splat(0);
     std.mem.writeInt(u32, hostile[8..12], 0xFFFFFFFF, .little);
     hostile[12] = 0x80;
@@ -275,4 +279,19 @@ test "hostile seek footer frame counts are rejected without overflow" {
     std.mem.writeInt(u32, wrapping[8..12], 0x20000000, .little);
     std.mem.writeInt(u32, wrapping[13..17], seekable_magic, .little);
     try std.testing.expectError(error.DataException, inspect(&wrapping));
+}
+
+test "seekable sizing survives a zero frame size and a wide hash width" {
+    // Both are caller parameters: sizing must stay a bound, not trap on
+    // division by zero or a narrowing cast.
+    const options: Options = .{ .frame_size = 0, .hash_bits = 64 };
+    _ = encodedSizeBound(1 << 20, options);
+    try std.testing.expectEqual(@as(usize, (1 << 20) / frame_size_min + 1), frameCountFor(1 << 20, options));
+    var buffer: [64]u8 = undefined;
+    var sink = std.Io.Writer.fixed(&buffer);
+    var history: [1]u8 = undefined;
+    var workspace: [1]u32 = undefined;
+    var entries: [1]FrameEntry = undefined;
+    try std.testing.expectError(error.CallException, encodeToWriter("x", &sink, &history, &workspace, &entries, options));
+    try std.testing.expectError(error.CallException, encodeToWriter("x", &sink, &history, &workspace, &entries, .{ .hash_bits = 64 }));
 }

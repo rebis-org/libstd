@@ -13,8 +13,8 @@ pub const Kind = enum(u8) {
 
 pub const Direction = enum { encode, decode };
 
-// The filter ids are this leaf's wire vocabulary, so a wrapper that has to map
-// between them reads them here rather than restating the table.
+// The filter ids are the wire vocabulary; wrappers map through here instead
+// of restating the table.
 pub fn fromId(id: u8) ?Kind {
     return std.enums.fromInt(Kind, id);
 }
@@ -32,8 +32,8 @@ pub fn alignment(kind: Kind) u32 {
     };
 }
 
-// RISC-V is the only filter whose reference spells its two directions as
-// separate routines, so its arm cannot follow the shared name.
+// RISC-V's reference spells its two directions as separate routines, so its
+// arm cannot follow the shared name.
 fn apply(kind: Kind, start_offset: u32, code_bytes: []u8, comptime direction: Direction) void {
     switch (kind) {
         .x86 => x86Code(code_bytes, start_offset, direction),
@@ -105,9 +105,8 @@ fn x86Code(code_bytes: []u8, start_offset: u32, comptime direction: Direction) v
                 const bit = mask_to_bit_number[prev_mask >> 1];
                 ms_byte = @truncate(dest >> @as(u5, @intCast(24 - bit * 8)));
                 if (!test86MsByte(ms_byte)) break;
-                // bit == 0 restores no byte: the mask is zero and src keeps
-                // dest, matching the reference's shift-count-modulo behavior
-                // without a u5 cast of 32.
+                // A zero bit restores no byte; the zero mask mirrors the
+                // reference's shift-modulo-32 behavior without a u5 cast of 32.
                 const restore_mask: u32 = if (bit == 0) 0 else (@as(u32, 1) << @as(u5, @intCast(32 - bit * 8))) -% 1;
                 src = dest ^ restore_mask;
             }
@@ -347,8 +346,8 @@ fn riscvDecode(code_bytes: []u8, start_offset: u32) void {
         var inst: u32 = code_bytes[index];
         if (inst == 0xEF) {
             const b1 = code_bytes[index + 1];
-            // The encoder skips these JAL forms; decoding must skip the same
-            // shapes or it converts bytes the encode pass left untouched.
+            // The encoder skips these JAL forms; decoding must skip them too,
+            // or it converts bytes the encoder left untouched.
             if ((b1 & 0x0D) != 0) continue;
             const b2 = code_bytes[index + 2];
             const b3 = code_bytes[index + 3];
@@ -423,7 +422,7 @@ fn write32be(bytes: *[4]u8, value: u32) void {
 
 test "riscv decode skips the jal forms the encoder skips" {
     // A skipped-form JAL (b1 & 0x0D != 0) must survive the round trip
-    // unchanged; converting it would desync the reference interop.
+    // unchanged; converting it would break reference interop.
     var data = [_]u8{ 0xEF, 0x0D, 0x22, 0x11, 0xEF, 0x00, 0x00, 0x00 };
     const saved = data;
     encode(.riscv, 0, &data);

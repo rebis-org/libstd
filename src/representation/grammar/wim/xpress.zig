@@ -7,6 +7,7 @@ const Exception = exception_prim.Exception;
 
 // WIM XPRESS codec, ported from wimlib src/xpress_decompress.c.
 // Nibble header carries canonical Huffman lengths for 512 symbols.
+//
 // Symbols 0..255 are literals; 256..511 are matches.
 // Length bytes after a 0xff marker come from the raw cursor.
 
@@ -19,16 +20,13 @@ const max_match_len: usize = 65538;
 
 const Code = bits.Code(max_codeword_len, num_symbols);
 
-// Encoder workspace: hash heads (u16[1<<14]) plus a u16 chain per input
-// byte, plus the parse item list (8 bytes per input position).
+// Hash heads, a chain entry per input byte, and the parse item list.
 pub fn encodeWorkspaceSize(input_len: usize) usize {
     return (1 << 14) * 2 + input_len * 2 + (input_len + 8) * @sizeOf(Item) + 4096;
 }
 
-// Length-limited canonical Huffman code, ported from wimlib's
-// make_canonical_huffman_code() in compress_common.c. Leaves-first tie
-// breaking matches the LZMS adaptive-code contract; lengths clamp to the
-// maximum the same way wimlib's compute_length_counts() does.
+// Ported from wimlib's make_canonical_huffman_code(): leaf-first ties
+// match the LZMS adaptive-code contract.
 fn makeCanonicalCode(num_syms: usize, max_len: usize, freqs: []const u32, lens: []u8, codewords: []u32) void {
     const num_symbol_bits: u5 = 10;
     const symbol_mask: u32 = (1 << num_symbol_bits) - 1;
@@ -137,9 +135,8 @@ fn makeCanonicalCode(num_syms: usize, max_len: usize, freqs: []const u32, lens: 
     }
 }
 
-// XPRESS output bitstream, ported from wimlib's xpress_output_bitstream.
-// Words flush at the oldest pending slot; extra length bytes interleave at
-// the raw cursor, which trails two words ahead.
+// Ported from wimlib's xpress_output_bitstream; raw length bytes interleave
+// at a cursor two words ahead of the flush point.
 const OutBits = struct {
     data: []u8,
     bitbuf: u32 = 0,
@@ -155,9 +152,8 @@ const OutBits = struct {
         if (self.bitcount > 16) {
             self.bitcount -= 16;
             if (self.next_byte + 2 <= self.data.len) {
-                // The low 16 bits are the flushed word; older flushed bits
-                // still sitting above the pending bits are shifted out and
-                // discarded, exactly as wimlib's put_unaligned_le16 does.
+                // The low 16 bits are the flushed word; stale high bits
+                // drop, as in wimlib's put_unaligned_le16.
                 const flushed: u16 = @truncate(self.bitbuf >> @as(u5, @intCast(self.bitcount)));
                 std.mem.writeInt(u16, self.data[self.next_bits..][0..2], flushed, .little);
                 self.next_bits = self.next_bits2;
@@ -189,8 +185,8 @@ const OutBits = struct {
 
     fn flush(self: *OutBits) Exception!usize {
         if (self.next_byte + 2 > self.data.len) return error.CapacityException;
-        // Left-justify the pending bits in the final word; the low 16 bits
-        // are written, so stale high bits truncate away like put_le16.
+        // Left-justify the pending bits; truncation to u16 drops stale
+        // high bits like put_le16.
         const last: u16 = @truncate(self.bitbuf << @as(u5, @intCast(16 - self.bitcount)));
         std.mem.writeInt(u16, self.data[self.next_bits..][0..2], last, .little);
         std.mem.writeInt(u16, self.data[self.next_bits2..][0..2], 0, .little);
@@ -275,7 +271,7 @@ fn parse(input: []const u8, items: []Item, head: []u16, chain: []u16, freqs: []u
             continue;
         }
         const m = here.?;
-        // Lazy step: does the next position start a longer match?
+        // Lazy step: defer when the next position starts a longer match.
         if (i + 1 < len) {
             const next = finder.find(i + 1, @min(len - (i + 1), max_match_len));
             if (next != null and next.?.match.len > m.match.len + 1) {

@@ -15,12 +15,11 @@ pub const block_size_max: u32 = 4 * 1024 * 1024;
 pub const block_size_default: u32 = block_size_max;
 
 const magic: u32 = 0x184D2204;
-// The pre-1.8 legacy format: one magic (the low nibble carried a version
-// digit), then independent raw LZ4 blocks, no header descriptor at all.
+// The pre-1.8 legacy format: magic (low nibble carried a version digit),
+// then independent raw LZ4 blocks, no header descriptor.
 const legacy_magic: u32 = 0x184C2102;
-// Legacy blocks decode up to 8 MiB each; a size word beyond the largest
-// valid compressed block is the next frame's magic, so the bound doubles
-// as the stream's end marker.
+// No valid block's size word exceeds 8 MiB, so a larger word can only
+// be the next frame's magic.
 const legacy_block_size: usize = 8 * 1024 * 1024;
 const version_bits: u8 = 0x40; // LZ4 frame spec fixes the version field at 01.
 const flag_block_independence: u8 = 0x20;
@@ -63,13 +62,13 @@ pub const Options = struct {
     // Hash-chain search attempt budget per position, LZ4HC searchNum semantics
     // (0 keeps the default greedy parser).
     search_depth: u32 = 0,
-    // Decode work ceiling charged as input plus produced bytes, mirroring the
-    // adapter's bound so a one-pass read and the measured route agree.
+    // Decode work ceiling, charged as input plus produced bytes, mirrors
+    // the adapter's bound so both routes agree.
     max_work: u64 = std.math.maxInt(u64),
 };
 
-// LZ4 length extension: a length at or above the 15 nibble cap emits 255
-// bytes per the block format until the remainder fits one byte.
+// The block format extends a saturated 15 length nibble with 255 bytes
+// until the remainder fits one byte.
 fn writeLengthExtension(output: []u8, op: *usize, length: usize) void {
     var rest = length;
     while (rest >= 255) : (rest -= 255) {
@@ -100,8 +99,8 @@ pub fn decodeWorkspaceSize() usize {
     return block_size_max + window_size;
 }
 
-// Worst case: every block stores raw plus its size word. Compressed blocks stay
-// under compressBound (n + n/255 + 16), so the stored path sets this bound.
+// Worst case: every block stores raw plus its size word; compressed
+// blocks stay under compressBound (n + n/255 + 16).
 pub fn encodedSizeBound(input_len: usize) usize {
     const blocks = input_len / block_size_max + 1;
     return header_size_max + 4 + input_len + input_len / 255 + blocks * 20 + checksum_length;
@@ -154,7 +153,7 @@ const FrameDescriptor = struct {
     linked: bool,
     max_block: usize,
     content_size: ?u64,
-    offset: usize, // first block-size field
+    offset: usize, // First block-size field.
 };
 
 // FLG/BD validation, optional content size and dictionary ID, and the header
@@ -177,9 +176,8 @@ fn readFrameDescriptor(input: []const u8, provider: checksum.Provider) Exception
         content_size = std.mem.readInt(u64, input[offset..][0..8], .little);
         offset += 8;
     }
-    // A dictionary ID declares an external dictionary the frame may
-    // reference; without it, matches reaching before the frame start still
-    // fail as invalid data in the block decode.
+    // The dictionary is external and stays unresolved; matches reaching
+    // before the frame start fail in the block decode.
     if (flags & flag_dict_id != 0) offset += 4;
     if (input.len <= offset) return error.DataException;
     // Header_Checksum: the high byte of xxh32 over FLG..end-of-header.
@@ -262,12 +260,8 @@ fn decodeBlocksInto(input: []const u8, output: []u8, options: Options) Exception
     return total;
 }
 
-// Legacy frames (pre-1.8 interop): independent raw LZ4 blocks decoding up to
-// 8 MiB each, no BD byte, no checksums. The stream ends at the last block
-// (EOF), at a four-zero size word (the kernel variant), or before a size word
-// too large for a valid block, which is the next frame's magic. The reference
-// decodes each block into a fresh buffer, so no history crosses a block
-// boundary. Decode-only, as the modern encoder never produces them.
+// Pre-1.8 interop: raw blocks up to 8 MiB, no descriptor, no checksums,
+// fresh history per block. Decode-only.
 fn decodeLegacyBlocksInto(input: []const u8, output: []u8, options: Options) Exception!usize {
     var offset: usize = 4;
     var total: usize = 0;
@@ -352,9 +346,8 @@ pub fn decodeToWriter(input: []const u8, output: *std.Io.Writer, scratch: []u8, 
     _ = try decodeBlocks(input, output, scratch, options.provider, options.max_work);
 }
 
-// Modern frames only: legacy blocks would need their own 8 MiB staging on
-// this route, so legacy input answers DataException here and callers use
-// decode/decodeInPlace instead.
+// Modern frames only: this route lacks the 8 MiB legacy staging, so
+// callers use decode or decodeInPlace.
 fn decodeBlocks(input: []const u8, output: *std.Io.Writer, scratch: []u8, provider: checksum.Provider, max_work: u64) Exception!usize {
     if (scratch.len < decodeWorkspaceSize()) return error.CapacityException;
     const header = try readFrameDescriptor(input, provider);
@@ -430,10 +423,11 @@ fn hash4(value: u32) usize {
     return (value *% hash_prime) >> @intCast(32 - hash_log);
 }
 
-// Mirrors LZ4_compress_generic_validated: the carried hash keeps fresh searches from self-matching.
-// A self-match would emit the corrupt offset 0 the reference never produces.
+// Mirrors LZ4_compress_generic_validated: the carried hash prevents a
+// self-match; the reference never emits offset 0.
+//
 // Exposed for the session boundary's stepped encode: compresses one
-// independent block; the caller owns the frame framing.
+// independent block; the caller owns the framing.
 pub fn compressBlock(input: []const u8, output: []u8, hash_table: []u32, acceleration: u32) usize {
     @memset(hash_table, 0);
     var op: usize = 0;
@@ -498,9 +492,7 @@ pub fn compressBlock(input: []const u8, output: []u8, hash_table: []u32, acceler
         while (true) {
             std.mem.writeInt(u16, output[op..][0..2], @intCast(ip - match), .little);
             op += 2;
-            // The match must end by match_limit so the last 5 bytes stay
-            // literals; the compared span starts past the 4-byte prefix, so
-            // the cap is match_limit - ip - min_match.
+            // The match must end by match_limit so the last 5 bytes stay literals.
             const match_len = kernels.matchLen8(input, match + min_match, ip + min_match, match_limit - ip - min_match);
             ip += match_len + min_match;
             if (match_len >= match_len_mask) {
@@ -634,11 +626,10 @@ fn emitLastLiterals(literals: []const u8, output: []u8, op_start: usize) usize {
     return op + lit_len;
 }
 
-// Decompresses one block. `prefix` is up to 64 KiB of already-decoded
-// history (empty for independent blocks or the first block of a dependent
-// frame); matches may reach into it when the frame links blocks.
-// Exposed for the session boundary's stepped decode: decodes one block with
-// `prefix` as up-to-64 KiB of linked-block history.
+// The prefix is up to 64 KiB of decoded history; matches may reach
+// into it when the frame links blocks.
+//
+// Exposed for the session boundary's stepped decode.
 pub fn decompressBlock(input: []const u8, output: []u8, prefix: []const u8) error{ DataException, OutputTooSmall }!usize {
     var ip: usize = 0;
     var op: usize = 0;
@@ -660,8 +651,7 @@ pub fn decompressBlock(input: []const u8, output: []u8, prefix: []const u8) erro
         if (input.len - ip < lit_len) return error.DataException;
         if (output.len - op < lit_len) return error.OutputTooSmall;
         if (lit_len <= 16 and input.len - ip >= 16 and output.len - op >= 16) {
-            // Short literal runs dominate, so the reference copies 16 bytes unconditionally
-            // behind an end guard rather than call memcpy per sequence.
+            // Short literal runs dominate, so one guarded 16-byte copy replaces memcpy per sequence.
             output[op..][0..16].* = input[ip..][0..16].*;
         } else {
             @memcpy(output[op .. op + lit_len], input[ip .. ip + lit_len]);
@@ -702,9 +692,8 @@ pub fn decompressBlock(input: []const u8, output: []u8, prefix: []const u8) erro
                     src_pos += n;
                     remaining -= n;
                 } else {
-                    // The source crossed into this block; the offset against
-                    // freshly written bytes stays constant, and chunking at
-                    // the current distance keeps overlapping copies correct.
+                    // The source crossed into this block; chunking at the
+                    // current distance keeps overlapping copies correct.
                     const rel = src_pos - prefix.len;
                     const n = @min(remaining, dst - rel);
                     @memcpy(output[dst..][0..n], output[rel..][0..n]);
@@ -780,8 +769,8 @@ test "lz4 corrupt blocks rejected" {
     if (result) |produced| {
         try std.testing.expect(!std.mem.eql(u8, input, output[0..produced]));
     } else |err| {
-        // A corrupted block either fails its input-side checks or overruns the span,
-        // which the leaf reports as insufficient_capacity and the adapter resolves.
+        // A corrupted block either fails its input-side checks or overruns
+        // the span, which surfaces as CapacityException.
         try std.testing.expect(err == error.DataException or err == error.IntegrityException or err == error.CapacityException);
     }
 }
@@ -880,10 +869,8 @@ test "lz4 frame verifies content size and header checksum" {
 
 test "lz4 dependent blocks reach into the previous block" {
     const allocator = std.testing.allocator;
-    // Frame: 64 KiB block size, linked blocks, content size present.
-    // Block 0 is stored (64 bytes of 0x11). Block 1 is compressed: four
-    // literals then an 8-byte match whose 68-byte offset reaches back into
-    // block 0's history.
+    // Frame: linked blocks.
+    // Block 0 is stored; block 1 is compressed.
     var frame: [256]u8 = undefined;
     var len: usize = 0;
     std.mem.writeInt(u32, frame[len..][0..4], magic, .little);
@@ -891,7 +878,7 @@ test "lz4 dependent blocks reach into the previous block" {
     const flags: u8 = version_bits | flag_content_size;
     frame[len] = flags;
     len += 1;
-    frame[len] = 4 << 4; // BD: 64 KiB max block
+    frame[len] = 4 << 4; // BD: 64 KiB max block.
     len += 1;
     std.mem.writeInt(u64, frame[len..][0..8], 77, .little);
     len += 8;
@@ -901,8 +888,8 @@ test "lz4 dependent blocks reach into the previous block" {
     len += 4;
     @memset(frame[len..][0..64], 0x11);
     len += 64;
-    // Sequence 1: four literals then an 8-byte match reaching 68 back into
-    // block 0. Sequence 2 (final): one literal, as the block format requires.
+    // Sequence 1: an 8-byte match reaching 68 back into block 0.
+    // Sequence 2 (final): one literal, as the format requires.
     const block1 = [_]u8{ 0x44, 'a', 'b', 'c', 'd', 68, 0, 0x10, 'z' };
     std.mem.writeInt(u32, frame[len..][0..4], block1.len, .little);
     len += 4;
@@ -925,7 +912,7 @@ test "lz4 dependent blocks reach into the previous block" {
     // A match reaching before the frame start (no history there) is invalid.
     var bad = frame;
     const block1_at = 4 + 1 + 1 + 8 + 1 + 4 + 64 + 4;
-    bad[block1_at + 5] = 200; // offset 200 > 4 + 64 of available history
+    bad[block1_at + 5] = 200; // Offset 200 > 4 + 64 of available history.
     try std.testing.expectError(error.DataException, decode(bad[0..len], &output, decode_scratch, .{}));
 }
 
@@ -938,11 +925,11 @@ test "lz4 dictionary id flag parses and skips" {
     const flags: u8 = version_bits | flag_content_size | flag_dict_id;
     frame[len] = flags;
     len += 1;
-    frame[len] = 7 << 4; // BD: 4 MiB max block
+    frame[len] = 7 << 4; // BD: 4 MiB max block.
     len += 1;
     std.mem.writeInt(u64, frame[len..][0..8], 5, .little);
     len += 8;
-    std.mem.writeInt(u32, frame[len..][0..4], 0xDEADBEEF, .little); // dictionary ID
+    std.mem.writeInt(u32, frame[len..][0..4], 0xDEADBEEF, .little); // Dictionary ID.
     len += 4;
     frame[len] = @truncate(checksum.xxh32With(checksum.default_provider, frame[4..len]) >> 8);
     len += 1;
@@ -1008,9 +995,8 @@ test "lz4 legacy frame decodes eof-terminated blocks" {
 }
 
 test "lz4 legacy blocks are independent" {
-    // Block 0 decodes to "12345678"; block 1 hand-crafts a match whose
-    // 8-byte offset reaches into block 0's content. The reference decodes
-    // legacy blocks into a fresh buffer, so the crossing must be rejected.
+    // Block 1's match reaches 8 bytes into block 0's content; the
+    // reference decodes legacy blocks independently and rejects it.
     const block0 = "12345678";
     const hash_table = try std.testing.allocator.alloc(u32, hash_size);
     defer std.testing.allocator.free(hash_table);
@@ -1080,8 +1066,7 @@ test "lz4 frame rejects reserved descriptor bits" {
     var output: [64]u8 = undefined;
 
     // Header layout: magic(4) FLG(1) BD(1) Content_Size(8) Header_Checksum(1).
-    // Each corruption re-seals the header checksum so only the reserved bit
-    // can fail the decode.
+    // Each corruption re-seals the checksum so only the reserved bits can fail.
     {
         var frame = try allocator.dupe(u8, encoded[0..encoded_len]);
         defer allocator.free(frame);

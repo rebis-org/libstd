@@ -7,8 +7,8 @@ const Exception = exception.Exception;
 
 pub const Counter = tee.CountingTee(.{});
 
-// A measured byte count as an addressable length, so no decoder repeats the
-// narrowing and its resource-limit policy.
+// Narrows a measured count to usize once; every decoder shares the
+// resource-limit policy.
 pub fn measuredLength(counter: *const Counter) Exception!usize {
     return std.math.cast(usize, counter.written()) orelse error.ResourceException;
 }

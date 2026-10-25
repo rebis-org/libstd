@@ -1,11 +1,7 @@
 const std = @import("std");
 
-// The naming rule: `libstd` names the C ABI library archives; `stdk` names
-// bundles. Segments are the std.Target tag names, hyphen-separated; the abi
-// segment drops only when the form has one legal value (none), and the arch
-// segment never drops — `universal` names every architecture of a form.
-// `darwin` is the one family name: an XCFramework spans macos, ios, and
-// maccatalyst, which no single Os.Tag names.
+// The `libstd` stem names C ABI archives, `stdk` names bundles; segments
+// follow std.Target tags; `darwin` spans what no Os.Tag names.
 pub const Layout = enum { pe, elf, dylib, wasi, aar, cjpm, apple };
 
 pub const FormSpec = struct {
@@ -91,8 +87,8 @@ pub fn sliceFor(comptime arch: []const u8) *const TargetSlice {
     }
 }
 
-// android's zip paths follow NDK branding; the library targets use the strict
-// abi tags (32-bit arm rides softfp).
+// The android zip paths follow NDK branding; the library targets use the
+// strict abi tags (32-bit arm rides softfp).
 pub const AndroidAbi = struct { zip_path: []const u8, slice: *const TargetSlice, abi: std.Target.Abi };
 pub const android_abis = [_]AndroidAbi{
     .{ .zip_path = "jni/arm64-v8a/libstd.so", .slice = sliceFor("aarch64"), .abi = .android },

@@ -47,31 +47,29 @@ pub const Options = struct {
     dictionary_size: u32,
     check: CheckType,
     filters: FilterChoice = .none,
-    // True delta distance 1..256, matching liblzma's dist option; the wire
-    // carries distance - 1 per spec 5.3.3, so 1 maps to props byte 0x00.
+    // True distance 1..256, like liblzma's dist; the wire carries
+    // distance - 1 (spec 5.3.3), so 1 maps to props 0x00.
     delta_distance: u16 = 1,
     match_finder_depth: u32 = 32,
     lazy: bool = false,
     nice_len: u32 = 273,
     match_finder: lzma.MatchFinder = .bt4,
-    // 0 writes one block; otherwise the input splits into independent blocks
-    // of this size, each with header, check, and index records.
+    // 0 writes one block; otherwise the input splits into independent
+    // blocks of this size.
     block_size: u32 = 0,
     provider: checksum.Provider = checksum.default_provider,
 };
 
-// Record scratch the multi-block index needs: one 16-byte (unpadded,
-// uncompressed) pair per block. Callers add this to the encode workspace
-// when Options.block_size is nonzero.
+// Index record scratch: one 16-byte (unpadded, uncompressed) pair per
+// block. Add to the encode workspace when Options.block_size is nonzero.
 pub fn blockRecordScratchSize(input_len: usize, block_size: u32) usize {
     if (block_size == 0) return 0;
     const blocks = (input_len + block_size - 1) / block_size;
     return @max(1, blocks) * 16;
 }
 
-// One stream and one block fit the constant, and 1:1 filters add no bytes.
-// Every additional block adds a bounded header, padding, check, and index
-// record; 192 bytes covers the worst case with margin.
+// Each extra block adds a bounded header, padding, check, and index
+// record; 192 bytes covers the worst case.
 pub fn encodedSizeBound(input_len: usize, block_size: u32) usize {
     const base = lzma2.encodedSizeBound(input_len) +| 128;
     if (block_size == 0) return base;
@@ -193,10 +191,8 @@ const Sink = struct {
     }
 };
 
-// Measurement-path writer: forwards to the downstream writer and hashes
-// whatever passes through, so single-filter SHA-256 blocks verify on the
-// streaming path instead of skipping their check. The digest state lives
-// behind a pointer to keep this struct's layout writer-friendly.
+// Forwards and hashes so single-filter SHA-256 blocks verify on the
+// streaming path; the pointer keeps the layout writer-friendly.
 const Sha256Tee = struct {
     writer: std.Io.Writer,
     downstream: *std.Io.Writer,
@@ -344,8 +340,8 @@ fn decodeBlock(cursor: *binary.ReadCursor, sink: *Sink, scratch: []u8, check: Ch
     var compressed_size: usize = undefined;
     var uncompressed_size: usize = undefined;
     var decode_tee: ?tee.Tee = null;
-    // Set only by the single-filter SHA-256 streaming branch, compared in
-    // the shared tail once padding positions the cursor on the check.
+    // Set only by the single-filter SHA-256 streaming branch; the shared
+    // tail compares it after padding.
     var sha_digest: ?[32]u8 = null;
     if (sink.buffer != null) {
         const block_output = if (block_header.uncompressed_size) |size|
@@ -373,10 +369,8 @@ fn decodeBlock(cursor: *binary.ReadCursor, sink: *Sink, scratch: []u8, check: Ch
     } else {
         var chunk_reader = std.Io.Reader.fixed(if (compressed_data) |data| data else cursor.remainingSlice());
         if (check == .sha256 and block_header.filter_count == 1) {
-            // Single-filter SHA-256 blocks verify fully on the streaming path:
-            // the check covers exactly the bytes observed here, with no filter
-            // between decode and check. The digest is compared in the shared
-            // tail, after padding advance positions the cursor on the check.
+            // No filter sits between decode and check, so the check covers
+            // exactly the bytes observed here.
             var sha256 = crypto.Sha256.bind(provider, .{});
             var hash_tee = Sha256Tee.init(sink.writer.?, &sha256);
             try lzma2_seam.decodeStream(provider, &chunk_reader, &hash_tee.writer, scratch[0..lzma_scratch_size], options);
@@ -407,11 +401,8 @@ fn decodeBlock(cursor: *binary.ReadCursor, sink: *Sink, scratch: []u8, check: Ch
         if (sha_digest) |digest| {
             if (!std.mem.eql(u8, &digest, check_bytes)) return error.IntegrityException;
         } else if (decode_tee) |*dt| {
-            // Multi-filter streaming blocks cannot be verified without staging:
-            // the check covers filtered bytes this path never materializes, and
-            // staging would defeat the bounded memory the measurement oracle
-            // exists for. Only decodedSize streams; every decode entry point
-            // stages the block and verifies it above.
+            // The check covers filtered bytes never materialized here;
+            // staging would defeat bounded memory, so decode entry points verify.
             if (block_header.filter_count == 1 and check != .sha256) {
                 try verifyCheck(check, dt.crc32Value(), dt.crc64Value(), check_bytes);
             }
@@ -631,8 +622,8 @@ fn encodeStream(writer: *std.Io.Writer, input: []const u8, scratch: []u8, option
     const dictionary_props = lzma2.propertiesFromDictionarySize(options.dictionary_size);
     const dictionary_size = lzma2.dictionarySizeFromProperties(dictionary_props);
     const lzma_scratch_size = if (options.match_finder == .bt4) lzma2.encodeWorkspaceSizeBt(dictionary_size) else lzma2.encodeWorkspaceSize(dictionary_size);
-    // The index needs one (unpadded, uncompressed) pair per block even for
-    // the single-block default, so the record carve is never empty.
+    // The index needs one (unpadded, uncompressed) pair even for the
+    // single-block default, so the carve is never empty.
     const record_size = @max(16, blockRecordScratchSize(input.len, options.block_size));
     if (scratch.len < lzma_scratch_size + record_size) return error.CapacityException;
     const lzma_scratch = scratch[0..lzma_scratch_size];
@@ -661,9 +652,8 @@ fn encodeStream(writer: *std.Io.Writer, input: []const u8, scratch: []u8, option
     for (0..chunk_count) |chunk_index| {
         const chunk_end = if (options.block_size == 0) input.len else @min(input.len, chunk_start + options.block_size);
         const chunk = if (options.filters != .none) filtered[chunk_start..chunk_end] else input[chunk_start..chunk_end];
-        // Each block is an independent filter unit (spec 5.3): the decoder
-        // resets filter state per block, so the transform must never run
-        // across a block seam.
+        // Each block is an independent filter unit (spec 5.3); the
+        // transform must never cross a block seam.
         if (filter_buffer) |buffer| try applyEncodeFilter(options.filters, options.delta_distance, buffer[chunk_start..chunk_end]);
         const plain_chunk = input[chunk_start..chunk_end];
         const block_header = try buildBlockHeader(plain_chunk.len, dictionary_props, options.filters, options.delta_distance, options.provider);
@@ -705,8 +695,8 @@ fn applyEncodeFilter(filter: FilterChoice, delta_distance: u16, buffer: []u8) Ex
 }
 
 fn bcjKindFromChoice(filter: FilterChoice) bcj.Kind {
-    // The choice enum is dense and the wire ids are not, so the delta id anchors
-    // the offset and the leaf owns the other end of it.
+    // The choice enum is dense and the wire ids are not; the delta id
+    // anchors the offset.
     return bcj.fromId(@intCast(@backingInt(filter) + delta_filter_id - @backingInt(FilterChoice.delta))).?;
 }
 
@@ -859,8 +849,8 @@ fn checkSize(check: CheckType) usize {
 }
 
 test "xz delta filter honors the requested distance" {
-    // A mixed provider build serves no single tag for both the checksum
-    // and codec arms; run where the default tag serves the codec.
+    // A mixed provider build serves no single tag for both arms; run
+    // only where the default tag serves them.
     if (!deflate_seam.decodeServed(checksum.default_provider)) return;
     const allocator = std.testing.allocator;
     var input: [512]u8 = undefined;
@@ -886,8 +876,8 @@ test "xz delta filter honors the requested distance" {
     const decoded = try decode(encoded[0..encoded_len], output, decode_scratch, checksum.default_provider);
     try std.testing.expectEqualSlices(u8, &input, output[0..decoded]);
 
-    // The delta distance is carried in the block header, not hardcoded to 1.
-    // Distance 4 rides the wire as props byte 3 (spec 5.3.3 stores distance-1).
+    // The distance rides the header, not a hardcoded 1: distance 4
+    // becomes props byte 3 (spec 5.3.3 stores distance-1).
     const header = findBlockHeader(encoded[0..encoded_len]) orelse return error.TestUnexpectedError;
     try std.testing.expectEqual(@as(u8, 3), header);
 }
@@ -905,8 +895,8 @@ test "xz delta filter rejects zero distance" {
     try std.testing.expectError(error.CallException, encode(&input, &output, &scratch, options));
 }
 
-// Encodes, asserts the delta props byte rides the first block header as
-// distance - 1, then decodes and byte-compares the roundtrip.
+// Encodes, checks the delta props byte rides the first block header as
+// distance - 1, then compares the roundtrip.
 fn expectFilterRoundtrip(input: []const u8, options: Options) !void {
     const allocator = std.testing.allocator;
     const scratch_size = encodeWorkspaceSizeBt(options.dictionary_size) +
@@ -985,8 +975,8 @@ test "xz multi block bcj filter resets per block" {
     try expectFilterRoundtrip(&input, options);
 }
 
-// The delta filter props byte lives in the first block header, after the
-// ULEB128 uncompressed size and the filter id / props-size bytes.
+// The delta props byte sits in the first block header, after the ULEB128
+// size and filter id / props-size bytes.
 fn findBlockHeader(stream: []const u8) ?u8 {
     if (stream.len < 16) return null;
     const header_size = @as(usize, stream[12]) * 4;
@@ -994,15 +984,15 @@ fn findBlockHeader(stream: []const u8) ?u8 {
     if (stream.len < end) return null;
     var i: usize = 13;
     while (i < end and (stream[i] & 0x80) != 0) i += 1;
-    i += 1; // final ULEB size byte
+    i += 1; // Skips the final byte of the ULEB size.
     if (i + 2 >= end) return null;
     if (stream[i] != 0x03 or stream[i + 1] != 1) return null;
     return stream[i + 2];
 }
 
 test "xz multi-block output roundtrips through our decoder and the index" {
-    // A mixed provider build serves no single tag for both the checksum
-    // and codec arms; run where the default tag serves the codec.
+    // A mixed provider build serves no single tag for both arms; run
+    // only where the default tag serves them.
     if (!deflate_seam.decodeServed(checksum.default_provider)) return;
     const allocator = std.testing.allocator;
     var input: [100 * 1024]u8 = undefined;
@@ -1046,8 +1036,8 @@ pub const BlockRecord = struct {
     uncompressed_size: u64,
 };
 
-// Blocks decode into a discard sink — headerless streams still walk;
-// `records` bounds the count, overflow answers resource_limit.
+// Blocks decode into a discard sink, so the stream still walks;
+// records bounds the count and overflow returns ResourceException.
 pub fn inspectBlocks(input: []const u8, records: []BlockRecord, scratch: []u8, provider: checksum.Provider) Exception!usize {
     var cursor = binary.ReadCursor.init(input);
     const check = try decodeStreamHeader(&cursor, provider);
@@ -1065,8 +1055,8 @@ pub fn inspectBlocks(input: []const u8, records: []BlockRecord, scratch: []u8, p
 }
 
 test "inspectBlocks enumerates a multi-block stream" {
-    // A mixed provider build serves no single tag for both the checksum
-    // and codec arms; run where the default tag serves the codec.
+    // A mixed provider build serves no single tag for both arms; run
+    // only where the default tag serves them.
     if (!deflate_seam.decodeServed(checksum.default_provider)) return;
     const allocator = std.testing.allocator;
     var input: [100 * 1024]u8 = undefined;

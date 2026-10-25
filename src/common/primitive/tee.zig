@@ -4,8 +4,7 @@ const seam = @import("seam");
 
 const checksum = @import("checksum.zig");
 
-// Selecting checksums through a comptime packed struct means a new checksum
-// adds one field here and one field on the tee, not a bool parameter at every
+// A new checksum adds one field here and one on the tee, not a bool per
 // call site.
 pub const Kinds = packed struct {
     crc32: bool = false,

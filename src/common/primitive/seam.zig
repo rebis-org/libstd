@@ -4,9 +4,8 @@ const options = @import("options");
 
 pub const Provider = enum { onprem, offprem };
 
-// Non-envelope consumers bind the boundary default: the fixed provider in
-// onprem or offprem builds, onprem in mergeable builds. Session drivers inherit
-// it because the stepped C boundary carries no provider parameter.
+// The boundary default for non-envelope consumers; the stepped C boundary
+// carries no provider parameter.
 pub const default_provider: Provider = switch (options.primitives_impl) {
     .onprem, .mergeable => .onprem,
     .offprem => .offprem,
@@ -20,8 +19,8 @@ const capability_impls = .{
     options.crc32_impl,   options.crc64xz_impl, options.bzip2crc32_impl,
 };
 
-// A fixed capability keeps its own provider regardless of the tag, so the
-// boundary rejects a tag only when no capability can serve it at all.
+// A fixed capability keeps its own provider, so the boundary rejects a tag
+// only when nothing serves it.
 const served = blk: {
     var offprem_served = false;
     var onprem_served = false;
@@ -46,9 +45,8 @@ pub fn Pair(comptime On: type, comptime Off: type) type {
     };
 }
 
-// The four capability families differ only in construction arguments and the
-// final shape; one comptime core carries the implementation, and each family
-// wrapper below pins its own interface.
+// The four families differ only in construction and final shape; one
+// comptime core carries the implementation.
 const Family = enum { digest, mac, hash, checksum };
 
 fn hashSeed(comptime Impl: type) type {
@@ -59,8 +57,8 @@ fn hashFinal(comptime Impl: type) type {
     return @typeInfo(@TypeOf(Impl.final)).@"fn".return_type.?;
 }
 
-// A mutable copy keeps `final` pure for the value families and matches the
-// stdlib digest signature without forwarding the wrapper's constness.
+// A mutable copy keeps `final` pure and matches the stdlib signature
+// without forwarding the wrapper's constness.
 fn finish(comptime family: Family, inner: anytype, args: anytype) hashFinal(@TypeOf(inner.*)) {
     var copy = inner.*;
     return switch (family) {
@@ -303,7 +301,8 @@ pub fn defaultProvider(comptime impl: anytype) Provider {
 }
 
 pub fn dispatchOnprem(comptime impl: anytype, provider: Provider, comptime on: anytype, args: anytype) @typeInfo(@TypeOf(on)).@"fn".return_type.? {
-    // No stdlib container exists; the offprem arm stays explicit UnsupportedException.
+    // No stdlib container exists; the offprem arm returns an explicit
+    // UnsupportedException.
     return switch (impl) {
         .onprem => blk: {
             try requireServed(provider, .onprem);
@@ -320,8 +319,8 @@ pub fn dispatchOnprem(comptime impl: anytype, provider: Provider, comptime on: a
     };
 }
 
-// The differential contract the seam stitches together: sweep every input
-// width against the paired stdlib implementation, splitting updates at each size.
+// Sweep every input width against the paired stdlib implementation,
+// splitting updates at each size.
 pub fn expectAgreement(pristine_ours: anytype, pristine_theirs: anytype, seed: u64, comptime digest: bool, comptime theirs_field: ?[]const u8) !void {
     var rng = std.Random.DefaultPrng.init(seed);
     var size: usize = 0;

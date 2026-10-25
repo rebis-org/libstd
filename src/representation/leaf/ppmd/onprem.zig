@@ -1103,7 +1103,7 @@ const Model = struct {
             try range_coder.normalize();
             var mc = self.ctx(self.min_context);
             const num_masked: u32 = mc.num_stats;
-            // Assigned at loop top before the break check, so `undefined` is safe.
+            // Assigned just before the break check, so `undefined` is safe.
             var i: u32 = undefined;
             while (true) {
                 self.order_fall += 1;
@@ -1196,7 +1196,7 @@ test "ppmd leaf roundtrip allocator stress glue and large indexes" {
             else => @truncate(i / 61),
         };
     }
-    // Small memory forces unit exhaustion, GlueFreeBlocks, model restarts,
+    // Small memory forces unit exhaustion, glueFreeBlocks, model restarts,
     // and multi-unit stat blocks mapped to allocator indexes above 11.
     const mem = 1 << 14;
     const backing = try testing.allocator.alloc(u8, decodeWorkspaceSize(mem));

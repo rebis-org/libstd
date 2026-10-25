@@ -21,8 +21,8 @@ pub fn decodeWorkspaceSize(max_block: u32) usize {
     var plan = io.WorkspacePlan.init(null);
     // RLE1 can expand a nominal block to at most 1.25x plus the run-count byte.
     plan.take(u8, max_block + max_block / 4 + 8) catch return 0;
-    // The inverse-BWT traversal packs the successor position and byte into one
-    // u32 so the pointer chase costs a single load per output byte.
+    // The inverse-BWT traversal packs successor position and byte into one
+    // u32: one load per output byte.
     plan.take(u32, max_block) catch return 0;
     return plan.required();
 }
@@ -38,7 +38,7 @@ pub fn decodeWorkspaceSizeFor(input: []const u8) Exception!usize {
 
 pub fn encodeWorkspaceSize(max_block: u32) usize {
     var plan = io.WorkspacePlan.init(null);
-    // RLE expansion of length-4 runs needs a headroom over the decoded block size.
+    // RLE expansion of length-4 runs needs headroom over the decoded block size.
     plan.take(u8, max_block + max_block / 4 + 8) catch return 0;
     const doubled = @as(usize, max_block) * 2 + 1;
     plan.take(u16, doubled) catch return 0;
@@ -87,8 +87,8 @@ pub fn encode(input: []const u8, output: []u8, scratch: []u8, options: Options) 
     return fixed_writer.end;
 }
 
-// No stored fallback: RLE1 expands at most 5/4 and symbols cost at most 20 bits.
-// 13/4 covers symbols plus per-block tables. Loose by design.
+// No stored fallback: RLE1 expands at most 5/4, symbols cost at most 20 bits;
+// 13/4 covers symbols plus per-block tables.
 pub fn encodedSizeBound(input_len: usize) usize {
     return (input_len *| 13) / 4 +| 16384;
 }
@@ -96,7 +96,7 @@ pub fn encodedSizeBound(input_len: usize) usize {
 fn decodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, provider: checksum.Provider) Exception!void {
     var cursor: []const u8 = input;
     // Concatenated streams (cat a.bz2 b.bz2) decode back to back; each outer
-    // pass consumes exactly one BZh stream through its EOS magic.
+    // pass consumes one BZh stream through its EOS magic.
     while (true) {
         if (cursor.len < 4) return error.DataException;
         if (cursor[0] != 'B' or cursor[1] != 'Z' or cursor[2] != 'h') return error.DataException;
@@ -261,7 +261,7 @@ fn decodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, provide
                     occ[b] += 1;
                 }
             }
-            // Packed successor gives one load per output byte. RLE rides the traversal.
+            // RLE decode rides the inverse-BWT traversal.
             var block_crc = Bzip2Crc32.bind(provider);
             var out_buf: [4096]u8 = undefined;
             var out_len: usize = 0;
@@ -269,9 +269,8 @@ fn decodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, provide
             var last: u8 = 0;
             var run: u32 = 0;
             var emitted: u32 = 0;
-            // libbzip2's randomisation state, reset per block: the mask
-            // updates first, then the inverse-BWT byte is XORed with 1 while
-            // the countdown sits at 1 (vendor/bzip2 bzlib_private.h).
+            // libbzip2 randomisation, reset per block: update the countdown
+            // first, then XOR the byte while it sits at 1 (vendor/bzip2 bzlib_private.h).
             var rand_to_go: u32 = 0;
             var rand_pos: usize = 0;
             while (emitted < nblock) {
@@ -337,9 +336,8 @@ fn decodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, provide
         // The bit stream ends with zero padding to the next byte boundary;
         // anything nonzero there is corruption.
         if (br.bits != 0) return error.DataException;
-        // Trailing zero bytes are padding (7z pads encrypted pack streams to
-        // the 16-byte boundary with zeros); only nonzero tail bytes must form
-        // another complete BZh stream.
+        // Trailing zeros are padding (7z pads encrypted pack streams to the
+        // 16-byte boundary); nonzero tail bytes must form another stream.
         var remaining = br.bytes[br.byte_pos..];
         while (remaining.len > 0 and remaining[0] == 0) remaining = remaining[1..];
         if (remaining.len == 0) return;
@@ -434,8 +432,8 @@ fn appendRun(buffer: []u8, len: *usize, byte: u8, count: usize) Exception!void {
 const sais_empty = std.math.maxInt(u32);
 const sais_type_s: u8 = 1;
 
-// SA-IS sort requires the unique smallest trailing symbol. Levels share workspace
-// via disjoint `types` regions while pname/hist/bptr are dead in the parent.
+// SA-IS needs a unique smallest trailing symbol; recursion reuses the
+// parent's dead pname/hist/bptr and a disjoint `types` region.
 fn saisIsLms(types: []const u8, i: usize) bool {
     return i > 0 and types[i] == sais_type_s and types[i - 1] != sais_type_s;
 }
@@ -525,7 +523,7 @@ fn sais(comptime T: type, text: []const T, sa: []u32, alphabet: u32, types: []u8
         }
     }
     saisInduce(T, text, sa, alphabet, types, hist, bptr);
-    // pname[p/2] cannot collide: LMS positions are never adjacent.
+    // Two LMS positions are never adjacent, so pname[p/2] cannot collide.
     var name: u32 = 0;
     var prev: u32 = sais_empty;
     for (sa) |p| {
@@ -609,7 +607,8 @@ fn encodeBlock(block: []const u8, block_crc: u32, bit_writer: *BitWriter, worksp
     if (n_in_use == 0) return error.InternalException;
     const alpha_size = n_in_use + 2;
     const eob = alpha_size - 1;
-    // Doubled block plus sentinel makes sub-nblock suffixes exactly the rotations. L is tie-order independent.
+    // Doubled block plus sentinel makes sub-nblock suffixes exactly the rotations.
+    // L is tie-order independent.
     const doubled: usize = 2 * nblock + 1;
     const t16 = try workspace.take(u16, doubled);
     const sa = try workspace.take(u32, doubled);
@@ -771,7 +770,7 @@ fn buildHuffmanGroups(mtfv: []const u16, n_mtf: usize, alpha_size: u32, group_le
         }
         for (0..n_selectors) |s| {
             const chunk = mtfv[s * group_size .. @min((s + 1) * group_size, n_mtf)];
-            // One pass with independent accumulators. Separate passes serialize on one register.
+            // One pass with independent accumulators; separate passes serialize on one register.
             var costs: [max_groups]u32 = @splat(0);
             if (n_groups == max_groups and chunk.len == group_size) {
                 // A half sums at most 50 lengths of 20 bits, so no half carries into its neighbor.
@@ -1037,8 +1036,8 @@ const BitReader = struct {
 
 const BitWriter = struct {
     writer: *std.Io.Writer,
-    // MSB-first stream packed from the low end of the container: the oldest bits sit
-    // at the top of the valid region, so a whole drain is one big-endian store.
+    // MSB-first stream packed from the low end: the oldest bits reach the
+    // top, so a drain is one big-endian store.
     buffer: u64 = 0,
     bits: u7 = 0,
     // Batched locally so the writer vtable fires once per buffer, not per byte.
@@ -1075,8 +1074,7 @@ const BitWriter = struct {
     }
 
     fn writeBits(self: *BitWriter, n: u6, value: u64) Exception!void {
-        // Callers write at most 24 bits, so the container never fills in one call and
-        // the drain below leaves fewer than 8 bits behind.
+        // Callers write at most 24 bits, so the container never fills in one call.
         self.buffer = (self.buffer << @intCast(n)) | (value & ((@as(u64, 1) << n) - 1));
         self.bits += n;
         if (self.bits < 32) return;
@@ -1093,8 +1091,8 @@ const BitWriter = struct {
     }
 
     fn flush(self: *BitWriter) Exception!void {
-        // Batched calls leave up to 31 bits behind, so the tail drains whole bytes
-        // first and the final partial byte shifts the remainder to the top.
+        // Batched calls leave up to 31 bits behind; the partial final
+        // byte shifts the remainder to the top.
         while (self.bits >= 8) {
             self.bits -= 8;
             try self.emit(@truncate(self.buffer >> @as(u6, @intCast(self.bits))));
@@ -1115,8 +1113,8 @@ const BitWriter = struct {
 
 const huff_root_bits = 10;
 const huff_root_size = 1 << huff_root_bits;
-// Entry: (len << 10) | symbol, 0 = no code with this root prefix (walk the
-// legacy limit/base path, which stays exact for codes over root bits).
+// Entry: (len << 10) | symbol; 0 = no code with this root prefix;
+// decode walks the exact limit/base path.
 const huff_len_shift = 10;
 const huff_sym_mask = (1 << huff_len_shift) - 1;
 
@@ -1189,8 +1187,8 @@ fn buildHuffTable(lens: []const u8, alpha_size: u32) Exception!HuffTable {
     while (len <= table.max_len) : (len += 1) {
         table.base[len] = ((table.limit[len - 1] + 1) << 1) - table.base[len];
     }
-    // Root table over the next root_bits stream bits: canonical codes in
-    // symbol order within each length, exactly the perm assignment above.
+    // Root table over the next root_bits bits: canonical codes in symbol
+    // order, matching the perm assignment.
     @memset(&table.root, 0);
     {
         var codes: [max_alpha_size]u32 = undefined;
@@ -1209,9 +1207,8 @@ fn buildHuffTable(lens: []const u8, alpha_size: u32) Exception!HuffTable {
         sym = 0;
         while (sym < alpha_size) : (sym += 1) {
             const code = codes[sym];
-            // Over-subscribed length sets (corrupt streams) overflow the
-            // canonical walk; the legacy limit/base path rejects them at
-            // decode time, so the root only fills provably-valid prefixes.
+            // Over-subscribed length sets overflow the walk; the limit/base
+            // path rejects them, so the root fills only valid prefixes.
             if (code >= (@as(u32, 1) << @intCast(lens[sym]))) continue;
             const entry: u16 = (@as(u16, @intCast(lens[sym])) << huff_len_shift) | @as(u16, @intCast(sym));
             if (lens[sym] <= huff_root_bits) {
@@ -1231,9 +1228,8 @@ fn buildHuffTable(lens: []const u8, alpha_size: u32) Exception!HuffTable {
 }
 
 fn decodeHuffman(br: *BitReader, table: *const HuffTable) Exception!u32 {
-    // Root lookup first: one table load resolves every code up to root bits,
-    // which is the overwhelmingly common shape. Longer codes and the exact
-    // legacy error behavior fall through to the limit/base walk below.
+    // One root load resolves codes up to root bits; longer codes and
+    // exact legacy errors fall to the limit/base walk.
     while (br.bit_count < huff_root_bits and br.byte_pos < br.bytes.len) try br.refill();
     if (br.bit_count >= huff_root_bits) {
         const peek: u32 = @intCast((br.bits >> @intCast(br.bit_count - huff_root_bits)) & (huff_root_size - 1));
@@ -1244,9 +1240,8 @@ fn decodeHuffman(br: *BitReader, table: *const HuffTable) Exception!u32 {
         }
     }
     while (br.bit_count < 15 and br.byte_pos < br.bytes.len) try br.refill();
-    // The 15-bit fast path indexes lengths up to 15; tables whose shortest
-    // code is longer (legal: headers accept lengths up to 20) take the exact
-    // walk below, which handles any length.
+    // The 15-bit fast path needs min_len at most 15; longer shortest
+    // codes (legal to 20) take the exact walk.
     if (br.bit_count >= 15 and table.min_len <= 15) {
         const z15: u32 = @intCast((br.bits >> @intCast(br.bit_count - 15)) & 0x7FFF);
         var zn: u6 = @intCast(table.min_len);
@@ -1359,9 +1354,8 @@ const randomisation_counts = [512]u32{
     203, 50,  668, 108, 645, 990, 626, 197, 510, 357, 358, 850, 858, 364, 936, 638,
 };
 
-// Corpus-scale cover for the suffix sort. The default 900k block drives the
-// doubled SA-IS through its recursive path on random data. The planted
-// repeats keep the tie handling honest.
+// The default 900k random block drives the doubled SA-IS through its
+// recursive path; planted repeats keep ties honest.
 test "bzip2 full-block encode roundtrips" {
     const allocator = std.testing.allocator;
     var input: [1 << 20]u8 = undefined;
@@ -1400,9 +1394,8 @@ fn testReadBitsMsb(bytes: []const u8, bit_off: usize, comptime count: usize) u64
     return value;
 }
 
-// Randomised blocks store the mask-applied BWT input; the decoder XORs the
-// schedule back out (vendor decompress.c). The encoder never sets the bit,
-// so the fixture pre-masks, flips bit 112, and re-seals both CRCs.
+// Randomised blocks store the mask-applied BWT input; the decoder unmasks
+// them (vendor decompress.c). Our encoder never sets the randomised bit.
 test "bzip2 decodes a randomised block" {
     const allocator = std.testing.allocator;
     const phrase = "the quick brown fox jumps over the lazy dog";
@@ -1421,8 +1414,8 @@ test "bzip2 decodes a randomised block" {
             out.* = in.* ^ @as(u8, if (r_to_go == 1) 1 else 0);
         }
     }
-    // The construction needs RLE1-inert bytes on both sides of the mask: the
-    // phrase cycle has no adjacent equal bytes, so no run reaches four.
+    // Both data and mask must be RLE1-inert: the phrase cycle has no
+    // adjacent equal bytes, so no run reaches four.
     var i: usize = 3;
     while (i < data.len) : (i += 1) {
         try std.testing.expect(data[i] != data[i - 1] or data[i - 1] != data[i - 2] or data[i - 2] != data[i - 3]);
@@ -1435,17 +1428,16 @@ test "bzip2 decodes a randomised block" {
     defer allocator.free(encoded);
     const len = try encode(&masked, encoded, scratch, .{ .block_size = 100_000 });
 
-    // Bits 80..112 hold the block CRC (4-byte header, 6-byte magic) and bit
-    // 112 is the randomised flag; both sit in the fixed byte-aligned header.
+    // Bits 80..112 hold the block CRC (4-byte header, 6-byte magic); bit
+    // 112 is the randomised flag, all byte-aligned.
     var crc = Bzip2Crc32.bind(checksum.default_provider);
     crc.update(&data);
     const data_crc = crc.final();
     std.mem.writeInt(u32, encoded[10..][0..4], data_crc, .big);
     encoded[14] |= 0x80;
 
-    // The EOS magic and combined CRC land at an arbitrary bit offset; find
-    // the trailing EOS and rewrite the 32 combined bits after it. A single
-    // block folds combined = rotate(0) xor block_crc = block_crc.
+    // EOS and combined CRC sit at an arbitrary bit offset; a single block
+    // folds combined = block_crc.
     var eos_bit: usize = len * 8 - 48;
     while (testReadBitsMsb(encoded[0..len], eos_bit, 48) != 0x177245385090) eos_bit -= 1;
     const combined_bit = eos_bit + 48;

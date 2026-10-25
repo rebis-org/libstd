@@ -6,10 +6,8 @@ const window_mod = @import("window.zig");
 
 const Exception = exception.Exception;
 
-// The window must keep the RAW LZ bytes, because later solid entries match back
-// into earlier window regions, so apply each filter to a staged copy instead.
-// Filter starts are window-absolute; start_base converts them into the
-// span-relative coordinate system the emit ranges use.
+// The window must keep raw LZ bytes for later solid matches, so filters
+// apply to a staged copy.
 pub fn emitSpan(
     window: *window_mod.Window,
     out: sink.Sink,

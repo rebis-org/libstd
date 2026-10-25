@@ -15,8 +15,8 @@ const LzToken = finder_mod.LzToken;
 const MatchFinder = finder_mod.MatchFinder;
 const dc: u16 = unpack50.dc_rar5;
 const ldc: u16 = unpack50.ldc;
-// Nothing allocates. Staging needs 2x the input plus slack because the worst case is
-// ~8 bits per symbol plus the tables, and matches only shrink it.
+// Nothing allocates. Staging needs 2x input plus slack: worst case
+// ~8 bits per symbol plus tables; matches only shrink it.
 const nc: u16 = unpack50.nc;
 const rc: u16 = unpack50.rc;
 
@@ -76,6 +76,7 @@ pub fn compressBlock(
 
     // The decoder adds the distance-dependent bonus back, so an adjusted length
     // below 2 has no slot.
+    //
     // An in-place pre-pass is unsafe: a demotion can expand past the
     // not-yet-read tail of the token buffer.
     var ld_freq: [nc]u32 = @splat(0);
@@ -102,8 +103,8 @@ pub fn compressBlock(
                     continue;
                 }
                 if (findRepeatDistance(prev_distances, match.distance)) |repeat_index| {
-                    // The repeat path adds no distance bonus, so the raw length goes to
-                    // the RD table, and the repeat-distance symbol is 258 + repeat_index.
+                    // The repeat path adds no distance bonus, so the raw length
+                    // feeds the RD table.
                     ld_freq[258 + repeat_index] += 1;
                     rotatePrevDistances(&prev_distances, repeat_index);
                     const length_encoding = slots.encodeLengthSlot(match.length);
@@ -173,8 +174,8 @@ pub fn compressBlock(
     computeCanonicalCodes(&cl_lengths, &cl_codes);
 
     // Stage 1 writes the 20 CL lengths in 4 bits each.
-    // A 15 escape is followed by 0 for a real length of 15, or by a zero-run
-    // count of value + 2.
+    //
+    // A 15 escape takes 0 for a real 15, or a zero-run count of value + 2.
     {
         var i: usize = 0;
         while (i < code_length_symbols) {
@@ -462,8 +463,8 @@ test "compress block round-trips through the unpack50 decoder" {
     };
     const written = try compressBlock(data, 3, true, ws, &compressed);
 
-    // Decode through the real engine. The scratch mirrors the compose layout:
-    // window bytes, then filter_scratch_extra of working space sliced at max_filter_block.
+    // Decode through the real engine. The scratch mirrors the compose
+    // layout: window bytes, then working space at max_filter_block.
     var window_buf: [4096]u8 = undefined;
     var pool: [unpack50.table_pool_words * 4]u16 = undefined;
     var pending: [unpack50.max_pending_filters]filters50.Filter = undefined;

@@ -100,8 +100,8 @@ pub const catalog_json = blk: {
 };
 
 comptime {
-    // Released identities are a fixed 120-bit prefix plus a per-component
-    // ordinal byte; renaming or re-iding a released profile breaks the ABI.
+    // Released identities are a fixed 120-bit prefix plus an ordinal byte;
+    // renaming or re-iding breaks the ABI.
     const frozen = [_]struct { name: []const u8, ordinal: u8 }{
         .{ .name = "bzip2", .ordinal = 0x09 },
         .{ .name = "deflate", .ordinal = 0x03 },

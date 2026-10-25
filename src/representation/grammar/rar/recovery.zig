@@ -5,18 +5,11 @@ const exception = @import("../../../common/primitive/exception.zig");
 
 const Exception = exception.Exception;
 
-// RAR5 recovery-record (RR) encoder. The wire form was recovered from
-// archives produced by official RAR 7.23 and cross-checked against unrar's
-// rs16 Reed-Solomon code: ECC words are 16-bit little-endian values over
-// GF(2^16), the encoder matrix is rs16's inverse (Cauchy-style) matrix, and
-// every sub-block carries a CRC-64/XZ checksum in the clear. The ECC data is
-// a sequence of units; each unit holds one sub-block per 64 KiB slice of the
-// protected region, and every sub-block can rebuild one missing chunk of that
-// slice on its own.
+// RAR5 recovery record per unrar's rs16: 16-bit little-endian ECC words
+// over GF(2^16) with CRC-64/XZ sub-block checksums.
 
-// The exp table is double-width so gfMul needs no modular reduction, and the
-// log table stores rs16's sentinel 131070 for element 0, which neither fits
-// u16 nor should branch gfMul.
+// The exp table is double-width so gfMul needs no modular reduction;
+// log[0] holds rs16's sentinel 131070.
 pub const gf_exp_len: usize = 262141;
 pub const gf_log_len: usize = 65536;
 
@@ -35,14 +28,12 @@ pub const Layout = struct {
     }
 };
 
-// Mirrors rs16SetupData: nd is ceil(p / 1024) capped at 200, u derives from
-// the recovery percentage, and chunk sizes round up to even so every ECC
-// word covers two whole bytes.
+// Mirrors rs16SetupData: nd is ceil(p/1024) capped at 200; chunks
+// round up to even so ECC words cover two bytes.
 pub fn layoutFor(p: usize, percent: usize) Exception!Layout {
     if (p == 0) return error.InternalException;
-    // The explicit usize matters: @min narrows the result type to the
-    // smallest type holding a comptime-known bound (u8 for 200), which would
-    // overflow the moment the layout arithmetic scales nd back up.
+    // The explicit usize matters: @min would narrow to u8 (the comptime
+    // bound 200) and overflow the later layout arithmetic.
     const nd: usize = @min(@as(usize, 200), p / 1024 + @intFromBool(p % 1024 != 0));
     const u_prod = std.math.mul(usize, percent, 2 * nd) catch return error.InternalException;
     const u: usize = @max(@as(usize, 1), u_prod / 200);
@@ -58,11 +49,8 @@ pub fn layoutFor(p: usize, percent: usize) Exception!Layout {
     return .{ .p = p, .nd = nd, .ch = ch, .u = u, .nsub = nsub, .poff = poff, .unit_size = unit_size, .last_chunk = last_chunk };
 }
 
-// Builds rs16's tables: exp is written double-width (l and l + 65535 both
-// point at the same element), log[0] gets rs16's sentinel, and the tail of
-// exp beyond the highest written index stays zero so gfMul(0, x) reads a
-// zero. Length checks run before any mutation, so a rejected call leaves the
-// caller's buffers untouched.
+// The exp table stays zero past its last written index, so gfMul(0, x)
+// reads zero; length checks precede any mutation.
 pub fn initTables(exp: []u16, log: []u32) Exception!void {
     if (exp.len < gf_exp_len) return error.InternalException;
     if (log.len < gf_log_len) return error.InternalException;
@@ -91,8 +79,7 @@ fn gfInv(a: u16, exp: []const u16, log: []const u32) u16 {
     return exp[65535 - @as(usize, log[a])];
 }
 
-// RAR's header checksums are CRC-64/XZ with init 0 and no xorout, i.e. the
-// plain reflected table polynomial without the wrapper's masking.
+// RAR header checksums are CRC-64/XZ with init 0 and no xorout.
 const crc64_raw_table = blk: {
     @setEvalBranchQuota(1 << 14);
     var table: [256]u64 = undefined;
@@ -118,8 +105,8 @@ pub fn crc64Raw(input: []const u8) u64 {
     return crc;
 }
 
-// One 16-bit ECC word: column `col` of chunk k, zero-padded past the end of
-// the chunk and of the protected region.
+// One 16-bit ECC word: column `col` of chunk k, zero-padded past the
+// chunk and region ends.
 fn chunkWord(protected: []const u8, layout: Layout, k: usize, col: usize) u16 {
     const clen = if (k == layout.nd - 1) layout.last_chunk else layout.ch;
     const off = col * 2;
@@ -129,9 +116,8 @@ fn chunkWord(protected: []const u8, layout: Layout, k: usize, col: usize) u16 {
     return lo | (hi << 8);
 }
 
-// Writes one sub-block: fixed header, per-chunk CRC entries, the slot, and
-// the parity words for slice j of unit m. The trailing checksum covers
-// everything except itself, so it is written last.
+// The trailing checksum covers everything except itself, so it is
+// written last.
 fn writeSubBlock(
     protected: []const u8,
     layout: Layout,
@@ -185,9 +171,8 @@ fn writeSubBlock(
     std.mem.writeInt(u64, sb[4..12], crc.final(), .little);
 }
 
-// Encodes the protected region into `u` units of ECC data. `slot` is the
-// per-archive random value every sub-block carries; it must be identical
-// across calls for the same archive.
+// Each sub-block carries the per-archive `slot`; it must match across
+// calls for one archive.
 pub fn encodeUnits(
     protected: []const u8,
     layout: Layout,
@@ -369,8 +354,8 @@ test "fabricated multi-slice encode pins the sub-block wire form" {
         }
     }
 
-    // Parity words at slice boundaries and interior columns, plus the round
-    // trip back to the first chunk through each unit's matrix row.
+    // Parity words at slice boundaries and interior columns, plus the
+    // round trip through each matrix row.
     const Pin = struct { col: usize, words: [3]u16, p0: u16, p1: u16 };
     const pins = [_]Pin{
         .{ .col = 5, .words = .{ 0x4d46, 0xe5de, 0x7e77 }, .p0 = 0xc7a3, .p1 = 0x922f },

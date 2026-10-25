@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const entry_prim = @import("../../../common/entry.zig");
 const bounds = @import("../../../common/primitive/bounds.zig");
 const exception_prim = @import("../../../common/primitive/exception.zig");
 const io = @import("../../../common/primitive/io.zig");
@@ -7,6 +8,8 @@ const lzms = @import("lzms.zig");
 const lzx = @import("lzx.zig");
 const xpress = @import("xpress.zig");
 
+const isComponent = entry_prim.isComponent;
+const leafName = entry_prim.leafName;
 const Exception = exception_prim.Exception;
 
 // Layout follows wimlib's on-disk headers.
@@ -128,80 +131,251 @@ fn dentryWireLen(name_units: usize) usize {
     return (raw + 7) & ~@as(usize, 7);
 }
 
-fn metadataLen(entries: []const Entry) Exception!u64 {
-    var total: u64 = 8 + 104; // empty security data, root dentry, children
-    for (entries) |entry| {
-        const units = try utf16Len(entry.name);
-        if (units == 0) return error.CallException;
-        total = try bounds.addU64(total, dentryWireLen(units) + stream_disk_size);
+// Dentry names are single components: each directory dentry carries its
+// child-list offset, and a zero-length record ends a list.
+
+const security_len = 8;
+const root_record_len = dentryWireLen(0);
+
+const Node = struct {
+    name: []const u8,
+    hash: [sha1_len]u8 = @splat(0),
+    first_child: u32 = none,
+    last_child: u32 = none,
+    next_sibling: u32 = none,
+    list_off: u64 = 0,
+    is_dir: bool = false,
+
+    const none = std.math.maxInt(u32);
+};
+
+fn recordLen(name: []const u8) Exception!u64 {
+    return dentryWireLen(try utf16Len(name));
+}
+
+// The tree lives in the caller's scratch tail, behind the metadata image,
+// so nothing here allocates.
+const Tree = struct {
+    nodes: []Node,
+    entry_nodes: []u32,
+    queue: []u32,
+    pieces: []Piece,
+    front: usize,
+    used: usize = 1,
+
+    // Each region starts on its element type's alignment; the node count may be odd.
+    const Regions = struct {
+        entry_nodes: usize,
+        queue: usize,
+        pieces: usize,
+        total: usize,
+
+        fn of(entry_count: usize) Regions {
+            const node_count = entry_count *| 2 + 1;
+            const nodes_bytes = node_count * @sizeOf(Node);
+            const queue = alignForward(nodes_bytes +| entry_count * @sizeOf(u32), 8);
+            const pieces = alignForward(queue +| node_count * @sizeOf(u32), 8);
+            return .{
+                .entry_nodes = nodes_bytes,
+                .queue = queue,
+                .pieces = pieces,
+                .total = pieces +| (entry_count + 1) * @sizeOf(Piece),
+            };
+        }
+    };
+
+    fn init(scratch: []u8, entry_count: usize) Exception!Tree {
+        const regions = Regions.of(entry_count);
+        const area = try alignedTail(scratch, regions.total, @alignOf(Node));
+        const count = entry_count;
+        const node_count = count *| 2 + 1;
+        return .{
+            .nodes = @alignCast(std.mem.bytesAsSlice(Node, area[0 .. node_count * @sizeOf(Node)])),
+            .entry_nodes = @alignCast(std.mem.bytesAsSlice(u32, area[regions.entry_nodes..][0 .. count * @sizeOf(u32)])),
+            .queue = @alignCast(std.mem.bytesAsSlice(u32, area[regions.queue..][0 .. node_count * @sizeOf(u32)])),
+            .pieces = @alignCast(std.mem.bytesAsSlice(Piece, area[regions.pieces..][0 .. (count + 1) * @sizeOf(Piece)])),
+            .front = @intFromPtr(area.ptr) - @intFromPtr(scratch.ptr),
+        };
     }
-    return bounds.addU64(total, 8); // end-of-siblings marker
+
+    fn build(self: *Tree, entries: []const Entry) Exception!void {
+        self.nodes[0] = .{ .name = "", .is_dir = true };
+        // Parents resolve first, so an entry naming a directory states the
+        // directory, not a file.
+        for (entries, 0..) |entry, index| {
+            self.entry_nodes[index] = try self.resolveParent(entry.name);
+        }
+        for (entries, 0..) |entry, index| {
+            const parent = self.entry_nodes[index];
+            const leaf = leafName(entry.name) orelse return error.CallException;
+            if (self.find(parent, leaf)) |existing| {
+                if (!self.nodes[existing].is_dir or entry.data.len != 0) return error.CallException;
+                self.entry_nodes[index] = existing;
+                continue;
+            }
+            const node = try self.add(parent, leaf, false);
+            std.crypto.hash.Sha1.hash(entry.data, &self.nodes[node].hash, .{});
+            self.entry_nodes[index] = node;
+        }
+    }
+
+    fn resolveParent(self: *Tree, name: []const u8) Exception!u32 {
+        var parent: u32 = 0;
+        var components = std.mem.splitScalar(u8, name, '/');
+        var current = components.next() orelse return error.CallException;
+        while (components.next()) |next| {
+            if (!isComponent(current)) return error.CallException;
+            parent = try self.directory(parent, current);
+            current = next;
+        }
+        if (!isComponent(current)) return error.CallException;
+        return parent;
+    }
+
+    fn add(self: *Tree, parent: u32, name: []const u8, is_dir: bool) Exception!u32 {
+        if (self.used == self.nodes.len) return error.ResourceException;
+        const index: u32 = @intCast(self.used);
+        self.used += 1;
+        self.nodes[index] = .{ .name = name, .is_dir = is_dir };
+        const holder = &self.nodes[parent];
+        if (holder.last_child == Node.none) holder.first_child = index else self.nodes[holder.last_child].next_sibling = index;
+        holder.last_child = index;
+        return index;
+    }
+
+    fn find(self: *const Tree, parent: u32, name: []const u8) ?u32 {
+        var cursor = self.nodes[parent].first_child;
+        while (cursor != Node.none) : (cursor = self.nodes[cursor].next_sibling) {
+            if (std.mem.eql(u8, self.nodes[cursor].name, name)) return cursor;
+        }
+        return null;
+    }
+
+    fn directory(self: *Tree, parent: u32, name: []const u8) Exception!u32 {
+        if (self.find(parent, name)) |existing| {
+            if (!self.nodes[existing].is_dir) return error.CallException;
+            return existing;
+        }
+        return self.add(parent, name, true);
+    }
+
+    fn listLen(self: *const Tree, dir: u32) Exception!u64 {
+        var total: u64 = 8;
+        var cursor = self.nodes[dir].first_child;
+        while (cursor != Node.none) : (cursor = self.nodes[cursor].next_sibling) {
+            total = try bounds.addU64(total, try recordLen(self.nodes[cursor].name));
+        }
+        return total;
+    }
+
+    // Breadth-first order makes each list offset a sum of already-known
+    // lengths, without recursion.
+    fn layout(self: *Tree) Exception!u64 {
+        var cursor = try bounds.addU64(security_len + root_record_len, 8);
+        self.nodes[0].list_off = cursor;
+        cursor = try bounds.addU64(cursor, try self.listLen(0));
+        var head: usize = 0;
+        var tail: usize = 0;
+        self.queue[tail] = 0;
+        tail += 1;
+        while (head < tail) : (head += 1) {
+            var child = self.nodes[self.queue[head]].first_child;
+            while (child != Node.none) : (child = self.nodes[child].next_sibling) {
+                if (!self.nodes[child].is_dir) continue;
+                if (tail == self.queue.len) return error.ResourceException;
+                self.nodes[child].list_off = cursor;
+                cursor = try bounds.addU64(cursor, try self.listLen(child));
+                self.queue[tail] = child;
+                tail += 1;
+            }
+        }
+        return cursor;
+    }
+
+    fn write(self: *const Tree, metadata: []u8) Exception!void {
+        @memset(metadata, 0);
+        // The security block opens with its own total length; an empty
+        // table is that length alone.
+        std.mem.writeInt(u32, metadata[0..4], security_len, .little);
+        const no_hash: [sha1_len]u8 = @splat(0);
+        _ = try writeDentry(metadata[security_len..], "", &no_hash, self.nodes[0].list_off, true);
+        var index: u32 = 0;
+        while (index < self.used) : (index += 1) {
+            if (!self.nodes[index].is_dir) continue;
+            var at: usize = std.math.cast(usize, self.nodes[index].list_off) orelse return error.ResourceException;
+            var child = self.nodes[index].first_child;
+            while (child != Node.none) : (child = self.nodes[child].next_sibling) {
+                const node = self.nodes[child];
+                at += try writeDentry(metadata[at..], node.name, &node.hash, if (node.is_dir) node.list_off else 0, node.is_dir);
+            }
+        }
+    }
+
+    fn fileCount(self: *const Tree) usize {
+        var count: usize = 0;
+        var index: u32 = 0;
+        while (index < self.used) : (index += 1) {
+            if (!self.nodes[index].is_dir) count += 1;
+        }
+        return count;
+    }
+};
+
+fn alignForward(value: usize, alignment: usize) usize {
+    return (value + alignment - 1) & ~(alignment - 1);
 }
 
-fn blobTableLen(entries: []const Entry) u64 {
-    // One entry per file, one for the image metadata resource, then the
-    // zero terminator.
-    return @as(u64, (entries.len + 2) * blob_disk_size + 7) & ~@as(u64, 7);
+fn alignedTail(scratch: []u8, bytes: usize, alignment: usize) Exception![]u8 {
+    if (bytes > scratch.len) return error.ResourceException;
+    const base = @intFromPtr(scratch.ptr);
+    const start = ((base + scratch.len - bytes) & ~(alignment - 1));
+    if (start < base) return error.ResourceException;
+    return scratch[start - base ..][0..bytes];
 }
 
-fn xmlLen(entries: []const Entry) Exception!u64 {
-    // TOTALBYTES needs the archive size, which depends on the XML length.
-    // Iterate until the digit count stops moving.
-    var total: u64 = 0;
+fn blobTableLen(file_count: usize) u64 {
+    // The two extra entries are the metadata entry and the zero terminator.
+    return @as(u64, file_count + 2) * blob_disk_size;
+}
+
+fn xmlLen(file_count: usize, base: u64) Exception!u64 {
+    // TOTALBYTES includes the XML length itself; iterate until the digit
+    // count stabilizes.
+    var total = base;
     var iter: usize = 0;
     while (iter < 8) : (iter += 1) {
         var counter = CountSink{};
-        try writeTocXml(&counter, entries, total);
-        var size: u64 = header_disk_size + blobTableLen(entries) + counter.pos + (try metadataLen(entries));
-        for (entries) |entry| size = try bounds.addU64(size, entry.data.len);
-        if (size == total) break;
-        total = size;
+        try writeTocXml(&counter, file_count, total);
+        const next = try bounds.addU64(base, counter.pos);
+        if (next == total) return counter.pos;
+        total = next;
     }
     var counter = CountSink{};
-    try writeTocXml(&counter, entries, total);
+    try writeTocXml(&counter, file_count, total);
     return counter.pos;
 }
 
-pub fn archiveSize(entries: []const Entry) Exception!u64 {
-    const xml = try xmlLen(entries);
-    var total: u64 = header_disk_size;
-    total = try bounds.addU64(total, blobTableLen(entries));
-    total = try bounds.addU64(total, xml);
-    total = try bounds.addU64(total, try metadataLen(entries));
-    for (entries) |entry| total = try bounds.addU64(total, entry.data.len);
-    return total;
-}
-
-fn writeDentry(out: []u8, name: []const u8, hash: *const [sha1_len]u8, subdir_offset: u64) Exception!usize {
+fn writeDentry(out: []u8, name: []const u8, hash: *const [sha1_len]u8, subdir_offset: u64, is_dir: bool) Exception!usize {
     const units = try utf16Len(name);
     const wire_len = dentryWireLen(units);
     @memset(out[0..wire_len], 0);
     std.mem.writeInt(u64, out[0..8], wire_len, .little);
-    std.mem.writeInt(u32, out[8..12], 0x000000A0, .little); // archive | normal
-    std.mem.writeInt(u32, out[12..16], 0xFFFFFFFF, .little); // no security descriptor
+    std.mem.writeInt(u32, out[8..12], if (is_dir) 0x00000010 else 0x000000A0, .little); // FILE_ATTRIBUTE_DIRECTORY or FILE_ATTRIBUTE_ARCHIVE | FILE_ATTRIBUTE_NORMAL.
+    std.mem.writeInt(u32, out[12..16], 0xFFFFFFFF, .little); // No security descriptor.
     std.mem.writeInt(u64, out[16..24], subdir_offset, .little);
-    std.mem.writeInt(u64, out[40..48], 0, .little); // creation
-    std.mem.writeInt(u64, out[48..56], 0, .little); // access
-    std.mem.writeInt(u64, out[56..64], 0, .little); // write
     @memcpy(out[64..84], hash);
-    std.mem.writeInt(u32, out[84..88], 0, .little); // unknown_0x54
-    std.mem.writeInt(u64, out[88..96], 0, .little); // hard link group
-    std.mem.writeInt(u16, out[96..98], 1, .little); // one stream (the unnamed data)
-    std.mem.writeInt(u16, out[98..100], 0, .little); // no short name
+    // The count covers only additional streams; the unnamed data stream
+    // lives in the dentry hash.
+    std.mem.writeInt(u16, out[96..98], 0, .little);
+    std.mem.writeInt(u16, out[98..100], 0, .little); // No short name.
     std.mem.writeInt(u16, out[100..102], @intCast(units * 2), .little);
-    var pos: usize = dentry_disk_size;
     if (units != 0) {
+        var pos: usize = dentry_disk_size;
         pos += writeUtf16Le(out[pos..], name) catch return error.DataException;
-        pos += 2; // NUL terminator
+        // ImageX writes the terminator, DISM does not; a reader accepts both.
+        std.mem.writeInt(u16, out[pos..][0..2], 0, .little);
     }
-    // Extra stream entry for the unnamed data stream, on the 8-byte
-    // boundary following the dentry proper.
-    var stream: [stream_disk_size]u8 = @splat(0);
-    std.mem.writeInt(u64, stream[0..8], stream_disk_size, .little);
-    @memcpy(stream[16..36], hash);
-    std.mem.writeInt(u16, stream[36..38], 0, .little);
-    @memcpy(out[wire_len..][0..stream_disk_size], &stream);
-    return wire_len + stream_disk_size;
+    return wire_len;
 }
 
 fn writeBlobEntry(blob: *[blob_disk_size]u8, res: Reshdr, hash: *const [sha1_len]u8) void {
@@ -216,7 +390,7 @@ fn writeAscii16(sink: anytype, byte: u8) Exception!void {
     try sink.write(&pair);
 }
 
-fn writeTocXml(sink: anytype, entries: []const Entry, total: u64) Exception!void {
+fn writeTocXml(sink: anytype, file_count: usize, total: u64) Exception!void {
     const text_parts = [_][]const u8{
         "<WIM><IMAGE INDEX=\"1\"><NAME>image</NAME><DIRCOUNT>0</DIRCOUNT><FILECOUNT>",
         "</FILECOUNT><TOTALBYTES>",
@@ -226,7 +400,7 @@ fn writeTocXml(sink: anytype, entries: []const Entry, total: u64) Exception!void
     var total_buf: [24]u8 = undefined;
     var file_buf: [24]u8 = undefined;
     const total_text = std.mem.print(&total_buf, "{d}", .{total}) catch return error.CapacityException;
-    const file_text = std.mem.print(&file_buf, "{d}", .{entries.len}) catch return error.CapacityException;
+    const file_text = std.mem.print(&file_buf, "{d}", .{file_count}) catch return error.CapacityException;
     try sink.write(&[_]u8{ 0xFF, 0xFE });
     for (text_parts[0]) |byte| try writeAscii16(sink, byte);
     for (file_text) |byte| try writeAscii16(sink, byte);
@@ -256,78 +430,125 @@ const RealSink = struct {
     }
 };
 
-pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Exception!usize {
-    const metadata_len = try metadataLen(entries);
-    if (scratch.len < metadata_len + 4096) return error.ResourceException;
+// A blob-table entry, plus its payload when it has one; writers differ
+// only in payload production.
+const Piece = struct {
+    hash: [sha1_len]u8,
+    table_flags: u8,
+    size: u64,
+    unpacked: u64,
+    offset: ?u64 = null, // Null means the payload follows the previous piece.
+    payload: []const u8 = &.{},
+};
 
-    var sink = io.Sink{ .bytes = output };
-    const blob_table_len = blobTableLen(entries);
-    const xml_len = try xmlLen(entries);
-    const blob_off: u64 = header_disk_size;
-    const xml_off = try bounds.addU64(blob_off, blob_table_len);
-    const metadata_off = try bounds.addU64(xml_off, xml_len);
-    var data_off = try bounds.addU64(metadata_off, metadata_len);
+const HeaderSpec = struct {
+    version: u32 = wim_version,
+    flags: u32 = 0,
+    chunk_size: u32 = 0,
+};
 
-    // Build the metadata resource first; the blob table carries its digest.
-    @memset(scratch[0..@intCast(metadata_len)], 0);
-    // Empty security data (total length 8), then the root.
-    std.mem.writeInt(u32, scratch[0..4], 8, .little);
-    std.mem.writeInt(u64, scratch[8..16], 104, .little);
-    std.mem.writeInt(u32, scratch[16..20], 0x10, .little); // directory
-    std.mem.writeInt(u32, scratch[20..24], 0xFFFFFFFF, .little);
-    std.mem.writeInt(u64, scratch[24..32], 8 + 104, .little); // children at offset 112
-    var md_pos: usize = 8 + 104;
-    for (entries) |entry| {
-        var hash: [sha1_len]u8 = undefined;
-        std.crypto.hash.Sha1.hash(entry.data, &hash, .{});
-        md_pos += try writeDentry(scratch[md_pos..], entry.name, &hash, 0);
-    }
-    var metadata_hash: [sha1_len]u8 = undefined;
-    std.crypto.hash.Sha1.hash(scratch[0..@intCast(metadata_len)], &metadata_hash, .{});
+const Layout = struct {
+    blob_off: u64,
+    xml_off: u64,
+    xml_len: u64,
+    total: u64,
+};
+
+fn layoutFor(file_count: usize, metadata_len: u64, piece_count: usize, payload_len: u64) Exception!Layout {
+    const table_len = blobTableLen(piece_count);
+    const blob_off = try bounds.addU64(try bounds.addU64(header_disk_size, metadata_len), payload_len);
+    const xml_off = try bounds.addU64(blob_off, table_len);
+    const xml_len = try xmlLen(file_count, xml_off);
+    return .{
+        .blob_off = blob_off,
+        .xml_off = xml_off,
+        .xml_len = xml_len,
+        .total = try bounds.addU64(xml_off, xml_len),
+    };
+}
+
+fn emit(file_count: usize, metadata: []const u8, pieces: []const Piece, output: []u8, spec: HeaderSpec) Exception!usize {
+    var payload_len: u64 = 0;
+    for (pieces) |piece| payload_len = try bounds.addU64(payload_len, piece.payload.len);
+    const layout = try layoutFor(file_count, metadata.len, pieces.len, payload_len);
+    const table_len = blobTableLen(pieces.len);
 
     var header: [header_disk_size]u8 = @splat(0);
     std.mem.writeInt(u64, header[0..8], wim_magic, .little);
     std.mem.writeInt(u32, header[8..12], header_disk_size, .little);
-    std.mem.writeInt(u32, header[12..16], wim_version, .little);
-    std.mem.writeInt(u32, header[16..20], 0, .little); // flags: uncompressed
-    std.mem.writeInt(u32, header[20..24], 0, .little); // chunk size: none for uncompressed
+    std.mem.writeInt(u32, header[12..16], spec.version, .little);
+    std.mem.writeInt(u32, header[16..20], spec.flags, .little);
+    std.mem.writeInt(u32, header[20..24], spec.chunk_size, .little);
     for (header[24..40], 0..) |*byte, i| byte.* = @intCast(0x5A + i);
-    std.mem.writeInt(u16, header[40..42], 1, .little); // part number.
-    std.mem.writeInt(u16, header[42..44], 1, .little); // total parts.
-    std.mem.writeInt(u32, header[44..48], 1, .little); // one image.
-    writeReshdr(header[48..72], .{ .size_in_wim = blob_table_len, .flags = 0, .offset = blob_off, .uncompressed_size = blob_table_len });
-    writeReshdr(header[72..96], .{ .size_in_wim = xml_len, .flags = 0, .offset = xml_off, .uncompressed_size = xml_len });
-    writeReshdr(header[96..120], .{ .size_in_wim = 0, .flags = reshdr_flag_metadata, .offset = 0, .uncompressed_size = 0 });
-    std.mem.writeInt(u32, header[120..124], 0, .little); // boot index
-    writeReshdr(header[124..148], .{ .size_in_wim = 0, .flags = 0, .offset = 0, .uncompressed_size = 0 }); // no integrity table
+    std.mem.writeInt(u16, header[40..42], 1, .little); // Part number.
+    std.mem.writeInt(u16, header[42..44], 1, .little); // Total parts.
+    std.mem.writeInt(u32, header[44..48], 1, .little); // Image count.
+    writeReshdr(header[48..72], .{ .size_in_wim = table_len, .flags = reshdr_flag_metadata, .offset = layout.blob_off, .uncompressed_size = table_len });
+    writeReshdr(header[72..96], .{ .size_in_wim = layout.xml_len, .flags = reshdr_flag_metadata, .offset = layout.xml_off, .uncompressed_size = layout.xml_len });
+    // The boot slot stays empty; a filled slot requires the boot index
+    // to agree.
+    writeReshdr(header[96..120], .{ .size_in_wim = 0, .flags = 0, .offset = 0, .uncompressed_size = 0 });
+    writeReshdr(header[124..148], .{ .size_in_wim = 0, .flags = 0, .offset = 0, .uncompressed_size = 0 });
+
+    var sink = io.Sink{ .bytes = output };
     sink.write(&header) catch return error.CapacityException;
+    sink.write(metadata) catch return error.CapacityException;
+    // Payload, then table, then XML: the reference layout, so a
+    // header-derived end lands on the last byte.
+    for (pieces) |piece| sink.write(piece.payload) catch return error.CapacityException;
 
     var blob: [blob_disk_size]u8 = undefined;
-    for (entries) |entry| {
-        var hash: [sha1_len]u8 = undefined;
-        std.crypto.hash.Sha1.hash(entry.data, &hash, .{});
-        writeBlobEntry(&blob, .{ .size_in_wim = entry.data.len, .flags = 0, .offset = data_off, .uncompressed_size = entry.data.len }, &hash);
+    var cursor = try bounds.addU64(header_disk_size, metadata.len);
+    for (pieces) |piece| {
+        writeBlobEntry(&blob, .{ .size_in_wim = piece.size, .flags = piece.table_flags, .offset = piece.offset orelse cursor, .uncompressed_size = piece.unpacked }, &piece.hash);
         sink.write(&blob) catch return error.CapacityException;
-        data_off = try bounds.addU64(data_off, entry.data.len);
+        cursor = try bounds.addU64(cursor, piece.payload.len);
     }
-    writeBlobEntry(&blob, .{ .size_in_wim = metadata_len, .flags = reshdr_flag_metadata, .offset = metadata_off, .uncompressed_size = metadata_len }, &metadata_hash);
+    var metadata_hash: [sha1_len]u8 = undefined;
+    std.crypto.hash.Sha1.hash(metadata, &metadata_hash, .{});
+    writeBlobEntry(&blob, .{ .size_in_wim = metadata.len, .flags = reshdr_flag_metadata, .offset = header_disk_size, .uncompressed_size = metadata.len }, &metadata_hash);
     sink.write(&blob) catch return error.CapacityException;
-    const zeros: [50]u8 = @splat(0);
+    const zeros: [blob_disk_size]u8 = @splat(0);
     sink.write(&zeros) catch return error.CapacityException;
-    var pad: [8]u8 = @splat(0);
-    const blob_pad = blob_table_len - @as(u64, (entries.len + 2) * blob_disk_size);
-    if (blob_pad > 0) sink.write(pad[0..@as(usize, @intCast(blob_pad))]) catch return error.CapacityException;
 
-    var xml_sink = RealSink{ .bytes = scratch[@intCast(metadata_len)..@intCast(try bounds.addU64(metadata_len, xml_len))] };
-    try writeTocXml(&xml_sink, entries, try archiveSize(entries));
-    sink.write(scratch[@intCast(metadata_len)..][0..xml_sink.pos]) catch return error.CapacityException;
-
-    sink.write(scratch[0..@intCast(metadata_len)]) catch return error.CapacityException;
-
-    for (entries) |entry| {
-        sink.write(entry.data) catch return error.CapacityException;
-    }
+    try writeTocXml(&sink, file_count, layout.total);
     return sink.offset;
+}
+
+fn storedPieces(entries: []const Entry, tree: *const Tree, out: []Piece) usize {
+    var count: usize = 0;
+    for (entries, 0..) |entry, index| {
+        const node = tree.nodes[tree.entry_nodes[index]];
+        if (node.is_dir) continue;
+        out[count] = .{ .hash = node.hash, .table_flags = 0, .size = entry.data.len, .unpacked = entry.data.len, .payload = entry.data };
+        count += 1;
+    }
+    return count;
+}
+
+pub fn archiveSize(entries: []const Entry, scratch: []u8) Exception!u64 {
+    var tree = try Tree.init(scratch, entries.len);
+    try tree.build(entries);
+    const metadata_len = try tree.layout();
+    var payload_len: u64 = 0;
+    var file_count: usize = 0;
+    for (entries, 0..) |entry, index| {
+        if (tree.nodes[tree.entry_nodes[index]].is_dir) continue;
+        payload_len = try bounds.addU64(payload_len, entry.data.len);
+        file_count += 1;
+    }
+    return (try layoutFor(file_count, metadata_len, file_count, payload_len)).total;
+}
+
+pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Exception!usize {
+    var tree = try Tree.init(scratch, entries.len);
+    try tree.build(entries);
+    const metadata_len = try tree.layout();
+    if (metadata_len > tree.front) return error.ResourceException;
+    const metadata = scratch[0..@intCast(metadata_len)];
+    try tree.write(metadata);
+    const count = storedPieces(entries, &tree, tree.pieces);
+    return emit(tree.fileCount(), metadata, tree.pieces[0..count], output, .{});
 }
 
 const Codec = enum { store, xpress, lzx, lzms, unsupported };
@@ -342,13 +563,13 @@ fn headerCodec(archive: []const u8) Exception!Codec {
     return .unsupported;
 }
 
-// wimlib names two table shapes: end-offsets with a derived last chunk, and
-// solid tables of sizes under a 16-byte header with a ignored last entry.
+// Two shapes, per wimlib: end-offset tables derive the last chunk; solid
+// size tables ignore the last entry.
 const ChunkLoc = struct {
     offset: u64, // File offset of the compressed chunk bytes.
     start: u64, // Uncompressed offset of the chunk.
-    csize: u64, // Compressed size.
-    usize: u64, // Uncompressed size.
+    csize: u64,
+    usize: u64,
 };
 
 const ChunkedResource = struct {
@@ -504,8 +725,7 @@ fn loadSolidRes(archive: []const u8, res: Reshdr) Exception!SolidRes {
     };
 }
 
-// Reads [blob_offset, blob_offset + out.len) from the uncompressed image of
-// a solid resource, decoding only the chunks the range touches.
+// Decodes only the chunks the requested range touches.
 fn readSolidRange(archive: []const u8, sr: SolidRes, blob_offset: u64, out: []u8, temp: []u8) Exception!void {
     const out_len: u64 = std.math.cast(u64, out.len) orelse return error.ResourceException;
     const end = blob_offset +% out_len;
@@ -557,7 +777,6 @@ const BlobDisk = struct {
     hash: [sha1_len]u8,
 };
 
-// On-disk blob entry: reshdr, part number, reference count, SHA-1.
 fn readBlobEntry(table: []const u8, at: usize) Exception!BlobDisk {
     if (at + blob_disk_size > table.len) return error.DataException;
     return .{
@@ -580,9 +799,8 @@ const SolidFit = struct {
     offset: u64,
 };
 
-// Locates the solid resource holding a member and the member's offset
-// inside it. The member's reshdr offset addresses the concatenated
-// uncompressed data of the run; a member may not span two resources.
+// The reshdr offset addresses the run's concatenated uncompressed data;
+// a member may not span two resources.
 fn assignSolid(run: []const SolidRes, res: Reshdr) Exception!SolidFit {
     const size = res.size_in_wim;
     var off = res.offset;
@@ -614,6 +832,13 @@ fn appendBlob(blobs: []BlobEntry, filled: *usize, hash: *const [sha1_len]u8, siz
     filled.* += 1;
 }
 
+// Directories and empty files carry no stream; the format states that
+// with a zero hash.
+fn entrySize(blobs: []const BlobEntry, hash: [sha1_len]u8) Exception!u64 {
+    if (isZeroHash(&hash)) return 0;
+    return (try blobLookup(blobs, hash)).size;
+}
+
 fn blobLookup(blobs: []const BlobEntry, hash: [sha1_len]u8) Exception!BlobEntry {
     for (blobs) |entry| {
         if (std.mem.eql(u8, &entry.hash, &hash)) return entry;
@@ -634,8 +859,7 @@ fn metadataVerdict(refcnt: u32, entry_solid: bool, wim_part: u16, image_count: u
     return .take;
 }
 
-// Loads the solid resources of one run: consecutive SOLID table strides
-// led by a magic entry. Returns the number of resources loaded.
+// One run is consecutive SOLID table strides led by a magic entry.
 fn loadSolidRun(archive: []const u8, table: []const u8, start: usize, out: []SolidRes) Exception!usize {
     var count: usize = 0;
     var at = start;
@@ -672,7 +896,7 @@ const Parsed = struct {
 fn parse(archive: []const u8, scratch: []u8) Exception!Parsed {
     if (archive.len < header_disk_size) return error.DataException;
     if (std.mem.readInt(u64, archive[0..8], .little) != wim_magic) return error.DataException;
-    // wimlib stamps LZMS captures with the solid variant 0xE00.
+    // Solid-compressed WIMs carry version 0xE00, the value wimlib stamps.
     const version = std.mem.readInt(u32, archive[12..16], .little);
     if (version != wim_version and version != wim_version_solid) return error.DataException;
     const solid_wim = version == wim_version_solid;
@@ -681,13 +905,12 @@ fn parse(archive: []const u8, scratch: []u8) Exception!Parsed {
     // Split-WIM identity: this part's 1-based number at 0x28, total parts at 0x2A.
     const wim_part = std.mem.readInt(u16, archive[40..42], .little);
     const image_count = std.mem.readInt(u32, archive[44..48], .little);
+    if (image_count == 0) return error.DataException;
     const blobs_hdr = try readReshdr(archive, 48);
     const table_usize = std.math.cast(usize, blobs_hdr.uncompressed_size) orelse return error.ResourceException;
     if (table_usize > scratch.len) return error.ResourceException;
-    // The workspace scratch may start at any byte offset, so rebase to an
-    // aligned sub-slice before carving typed arrays out of it. Rounding the
-    // offsets alone cannot fix a misaligned base: a round-up is itself always
-    // aligned, which would just reproduce the base's misalignment.
+    // Scratch may start misaligned, so rebase to an aligned sub-slice;
+    // rounded offsets would stay misaligned.
     const carve_align = @max(@alignOf(BlobEntry), @alignOf(SolidRes));
     const misalign = @intFromPtr(scratch.ptr) & (carve_align - 1);
     const align_pad = (carve_align - misalign) & (carve_align - 1);
@@ -719,11 +942,13 @@ fn parse(archive: []const u8, scratch: []u8) Exception!Parsed {
             }
         } else num_blobs += 1;
     }
-    // The metadata resource: the taken table entry, else the boot slot.
     var md_res: Reshdr = undefined;
     if (candidate) |c| {
         md_res = c;
     } else {
+        // The header slot names the metadata resource for the first part;
+        // a later part of a split WIM carries none.
+        if (wim_part != 1) return error.DataException;
         md_res = try readReshdr(archive, 96);
         if (md_res.size_in_wim == 0) return error.DataException;
     }
@@ -817,43 +1042,65 @@ fn securityDataLen(metadata: []const u8) Exception!usize {
     return total;
 }
 
+const max_walk_depth = 64;
+
+// A WIM links children through the parent's subdir offset, so open
+// levels keep sibling cursors on a stack.
 fn walk(metadata: []const u8, ctx: anytype, comptime visit: anytype) Exception!void {
     const root_at = try securityDataLen(metadata);
     if (root_at + dentry_disk_size > metadata.len) return error.DataException;
-    // Children live at the root's subdir offset.
-    // Tagged metadata may sit between the root dentry and the first child.
-    const subdir = std.mem.readInt(u64, metadata[root_at + 16 ..][0..8], .little);
-    if (subdir == 0) return;
-    var pos: usize = @intCast(subdir);
-    if (pos > metadata.len) return error.DataException;
+    const root_subdir = std.mem.readInt(u64, metadata[root_at + 16 ..][0..8], .little);
+    if (root_subdir == 0) return;
+    var stack: [max_walk_depth]usize = undefined;
+    // Start of each open level's joined path; a child's name is relative
+    // to its owning directory.
+    var prefix: [max_walk_depth]usize = @splat(0);
+    var path: [4096]u8 = undefined;
+    var depth: usize = 0;
+    stack[0] = std.math.cast(usize, root_subdir) orelse return error.DataException;
     while (true) {
+        const pos = stack[depth];
         if (pos + 8 > metadata.len) return error.DataException;
         const length = std.mem.readInt(u64, metadata[pos..][0..8], .little);
         const aligned = (length + 7) & ~@as(u64, 7);
-        if (aligned <= 8) return; // end of siblings
+        if (aligned <= 8) {
+            if (depth == 0) return;
+            depth -= 1;
+            continue;
+        }
         if (pos + aligned > metadata.len or aligned < dentry_disk_size) return error.DataException;
-        const name_nbytes = std.mem.readInt(u16, metadata[pos + 100 ..][0..2], .little);
         const stream_count = std.mem.readInt(u16, metadata[pos + 96 ..][0..2], .little);
+        const name_nbytes = std.mem.readInt(u16, metadata[pos + 100 ..][0..2], .little);
         var name_buf: [1024]u8 = undefined;
         var name: []const u8 = &.{};
         if (name_nbytes != 0) {
             if (pos + dentry_disk_size + name_nbytes > metadata.len) return error.DataException;
             name = try utf16NameInto(&name_buf, metadata[pos + dentry_disk_size ..][0..name_nbytes]);
         }
-        const hash_off = pos + 64;
         var hash: [sha1_len]u8 = undefined;
-        @memcpy(&hash, metadata[hash_off..][0..sha1_len]);
-        if (pos + 16 > metadata.len) return error.DataException;
-        // Sizes come from the blob table.
-        _ = std.mem.readInt(u64, metadata[pos + 8 ..][0..8], .little);
-        try visit(ctx, name, &hash);
-        pos += @intCast(aligned);
+        @memcpy(&hash, metadata[pos + 64 ..][0..sha1_len]);
+        const base = prefix[depth];
+        if (base + name.len > path.len) return error.ResourceException;
+        @memcpy(path[base..][0..name.len], name);
+        const name_end = base + name.len;
+        try visit(ctx, path[0..name_end], &hash);
+        var next = pos + @as(usize, @intCast(aligned));
         for (0..stream_count) |_| {
-            if (pos + 8 > metadata.len) return error.DataException;
-            const stream_len = std.mem.readInt(u64, metadata[pos..][0..8], .little);
+            if (next + 8 > metadata.len) return error.DataException;
+            const stream_len = std.mem.readInt(u64, metadata[next..][0..8], .little);
             const stream_aligned = (stream_len + 7) & ~@as(u64, 7);
-            if (stream_len < stream_disk_size or pos + stream_aligned > metadata.len) return error.DataException;
-            pos += @intCast(stream_aligned);
+            if (stream_len < stream_disk_size or next + stream_aligned > metadata.len) return error.DataException;
+            next += @intCast(stream_aligned);
+        }
+        stack[depth] = next;
+        const subdir = std.mem.readInt(u64, metadata[pos + 16 ..][0..8], .little);
+        if (subdir != 0) {
+            if (depth + 1 == max_walk_depth) return error.DataException;
+            if (name_end + 1 > path.len) return error.ResourceException;
+            path[name_end] = '/';
+            depth += 1;
+            prefix[depth] = name_end + 1;
+            stack[depth] = std.math.cast(usize, subdir) orelse return error.DataException;
         }
     }
 }
@@ -898,7 +1145,7 @@ pub fn inspectOrdinal(archive: []const u8, ordinal: u64, scratch: []u8) Exceptio
     if (scratch.len < 2048) return error.ResourceException;
     const parsed = try parse(archive, scratch[0 .. scratch.len - 1024]);
     var found = (try findEntry(parsed, ordinal, scratch[scratch.len - 1024 ..])) orelse return error.DataException;
-    found.size = (try blobLookup(parsed.blobs, found.hash)).size;
+    found.size = try entrySize(parsed.blobs, found.hash);
     return found;
 }
 
@@ -906,6 +1153,7 @@ pub fn decodeOrdinal(archive: []const u8, ordinal: u64, output: []u8, scratch: [
     if (scratch.len < 2048) return error.ResourceException;
     const parsed = try parse(archive, scratch[0 .. scratch.len - 1024]);
     const found = (try findEntry(parsed, ordinal, scratch[scratch.len - 1024 ..])) orelse return error.DataException;
+    if (isZeroHash(&found.hash)) return 0;
     const blob = try blobLookup(parsed.blobs, found.hash);
     const size = std.math.cast(usize, blob.size) orelse return error.ResourceException;
     if (output.len < size) return error.CapacityException;
@@ -929,7 +1177,7 @@ test "wim store roundtrips flat files" {
     var archive: [8192]u8 = undefined;
     var scratch: [8192]u8 = undefined;
     const written = try encode(&entries, &archive, &scratch);
-    try testing.expectEqual(written, try archiveSize(&entries));
+    try testing.expectEqual(written, try archiveSize(&entries, &scratch));
     try testing.expectEqual(@as(u64, 2), try inspectCount(archive[0..written], &scratch));
     const first = try inspectOrdinal(archive[0..written], 0, &scratch);
     try testing.expectEqualSlices(u8, "hello.txt", first.name);
@@ -1022,7 +1270,7 @@ test "wim solid chunk table iteration" {
     std.mem.writeInt(u32, buf[12..16], 1, .little);
     std.mem.writeInt(u32, buf[16..20], 8, .little);
     std.mem.writeInt(u32, buf[20..24], 8, .little);
-    std.mem.writeInt(u32, buf[24..28], 99, .little); // last entry is ignored.
+    std.mem.writeInt(u32, buf[24..28], 99, .little); // The last entry is ignored.
     const res = try ChunkedResource.init(buf[0..52], 0, 52, 24, 8, true);
     try testing.expectEqual(@as(u64, 3), res.num_chunks);
     try testing.expectEqual(@as(u64, 4), res.entry_size);
@@ -1082,9 +1330,8 @@ test "wim solid member placement" {
     try testing.expectError(error.DataException, assignSolid(&run, .{ .size_in_wim = 4, .flags = 0, .offset = 22, .uncompressed_size = 0 }));
 }
 
-// Comptime hex decode for embedded vendor fixture bytes (test-only). Zig 0.17
-// multiline literals append a newline between consecutive \\ lines, so any
-// non-hex character (the line separators) is skipped here.
+// Zig 0.17 multiline literals join \\ lines with newlines, so the decoder
+// skips non-hex bytes.
 fn hexNibble(comptime c: u8) u8 {
     return switch (c) {
         '0'...'9' => c - '0',
@@ -1134,12 +1381,8 @@ fn unhex(comptime s: []const u8) [hexCount(s) / 2]u8 {
 
 test "wim vendor solid and chunked fixtures" {
     const testing = std.testing;
-    // Captured with wimlib-imagex 1.14 (vendor) from a directory holding
-    // big.txt (35000 bytes of a repeating sentence, spanning two chunks) and
-    // small.txt (b"hello"). solid.wim was captured with --solid
-    // --solid-compress=LZX --solid-chunk-size=32768; chunked.wim with
-    // --compress=LZX --chunk-size=32768. Both decode byte-exact against
-    // wimlib-imagex extract.
+    // Captured and byte-exact-validated with wimlib-imagex 1.14: solid with
+    // --solid-compress=LZX --solid-chunk-size=32768; chunked with --compress=LZX --chunk-size=32768.
     const solid_wim = unhex(
         \\4d5357494d000000d0000000000e0000820008000000020014ec30fb1f12a5514cd7c2968e3cebdf0100010001000000
         \\c8000000000000023802000000000000c800000000000000fe020000000000020003000000000000fe02000000000000
@@ -1236,10 +1479,7 @@ test "wim vendor solid and chunked fixtures" {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Compressed write side. encode() above remains the store-only path;
-// encodeEx() routes through the XPRESS/LZX/LZMS encoders, chunking each blob
-// (or one shared solid resource) exactly as the reader expects.
+// Compressed write side: the same emitter, fed by the XPRESS/LZX/LZMS encoders.
 
 pub const Compression = enum { store, xpress, lzx, lzms };
 
@@ -1247,9 +1487,8 @@ pub const EncodeOptions = struct {
     compression: Compression = .store,
     chunk_size: u32 = 0, // 0 selects the codec default.
     solid: bool = false,
-    // Delta WIM: entries whose SHA1 matches a delta_base entry are emitted
-    // as unbacked blob-table entries (wimlib's wire shape: real hash,
-    // uncompressed_size 0) resolved by hash against a referenced base WIM.
+    // Entries matching a base hash stay unbacked: no blob-table entry;
+    // readers resolve against the referenced base.
     delta_base: ?[]const Entry = null,
 };
 
@@ -1273,14 +1512,14 @@ fn codecFlag(compression: Compression) u32 {
 
 fn codecDefaultChunk(compression: Compression) u32 {
     return switch (compression) {
-        .store => 0,
-        .xpress => 65536,
-        .lzx => 32768,
-        .lzms => 1 << 22,
+        .store, .xpress => @intCast(xpress_chunk_max),
+        .lzx => @intCast(lzx_chunk_max),
+        .lzms => 1 << 26,
     };
 }
 
 fn codecFormatNumber(compression: Compression) u32 {
+    // Coder numbers for the solid resource header, matching wimlib.
     return switch (compression) {
         .store => 0,
         .xpress => 1,
@@ -1294,14 +1533,11 @@ fn numChunks(len: u64, chunk_size: u64) u64 {
     return len / chunk_size + @intFromBool(len % chunk_size != 0);
 }
 
-// Scratch for encodeEx: metadata image, blob descriptors, staged compressed
-// bytes (tables plus raw fallback), then the codec workspace at the tail.
 pub fn encodeWorkspaceSize(entries: []const Entry, options: EncodeOptions) Exception!usize {
     if (options.compression == .store and !options.solid) return 0;
     const cs: u64 = if (options.chunk_size == 0) codecDefaultChunk(options.compression) else options.chunk_size;
     try validateChunking(codecOf(options.compression), cs);
-    const metadata_len = try metadataLen(entries);
-    var staged: u64 = @as(u64, entries.len + 1) * @sizeOf(StagedBlob);
+    var staged: u64 = 0;
     var total: u64 = 0;
     for (entries) |entry| {
         const chunks = numChunks(entry.data.len, cs);
@@ -1318,45 +1554,51 @@ pub fn encodeWorkspaceSize(entries: []const Entry, options: EncodeOptions) Excep
         .lzms => lzms.encodeWorkspaceSize(@intCast(cs)),
         .store => 0,
     };
-    var need = try bounds.addU64(metadata_len, staged);
-    need = try bounds.addU64(need, codec_ws);
-    need = try bounds.addU64(need, 2 * (cs + 16)); // chunk staging + compression region
-    return std.math.cast(usize, need) orelse return error.ResourceException;
+    const room = try bounds.addU64(try metadataUpperBound(entries), codec_ws + 3 * (cs + 16));
+    return std.math.cast(usize, try bounds.addU64(room, try bounds.addU64(staged, try bounds.addU64(Tree.Regions.of(entries.len).total, @alignOf(Node))))) orelse error.ResourceException;
 }
 
-// Compress one chunk, falling back to raw bytes when the codec expands it.
-fn compressChunk(compression: Compression, chunk_size: u32, chunk: []const u8, out: []u8, ws: []u8) Exception!usize {
-    switch (compression) {
-        .store => {
-            @memcpy(out[0..chunk.len], chunk);
-            return chunk.len;
-        },
-        .xpress, .lzx, .lzms => {
-            const n = switch (compression) {
-                .xpress => xpress.xpressEncode(chunk, out, ws),
-                .lzx => lzx.lzxEncode(chunk_size, chunk, out, ws),
-                .lzms => lzms.lzmsEncode(chunk, out, ws),
-                else => unreachable,
-            } catch |err| switch (err) {
-                error.CapacityException => chunk.len,
-                else => return err,
-            };
-            if (n >= chunk.len) {
-                @memcpy(out[0..chunk.len], chunk);
-                return chunk.len;
-            }
-            return n;
-        },
+// An upper bound: each separator may open a list and cost a terminator.
+fn metadataUpperBound(entries: []const Entry) Exception!u64 {
+    var total: u64 = security_len + root_record_len + 16;
+    for (entries) |entry| {
+        total = try bounds.addU64(total, try recordLen(entry.name));
+        for (entry.name) |byte| {
+            if (byte == '/') total = try bounds.addU64(total, 8);
+        }
     }
+    return total;
 }
 
-const StagedBlob = struct {
-    offset: usize, // In the staging area.
-    len: usize, // Wire bytes.
-    hash: [sha1_len]u8,
-    size: u64, // Uncompressed bytes.
-    resource_off: u64, // Solid: uncompressed offset in the shared resource.
-};
+// A chunk that does not shrink is stored raw; the format marks that by
+// equal sizes.
+fn storeChunk(compression: Compression, chunk_size: u32, input: []const u8, out: []u8, ws: []u8, dest: []u8) Exception!usize {
+    const packed_len = compressChunk(compression, chunk_size, input, out, ws) catch |err| switch (err) {
+        error.CapacityException => {
+            @memcpy(dest[0..input.len], input);
+            return input.len;
+        },
+        else => return err,
+    };
+    if (packed_len >= input.len) {
+        @memcpy(dest[0..input.len], input);
+        return input.len;
+    }
+    @memcpy(dest[0..packed_len], out[0..packed_len]);
+    return packed_len;
+}
+
+fn compressChunk(compression: Compression, chunk_size: u32, chunk: []const u8, out: []u8, ws: []u8) Exception!usize {
+    return switch (compression) {
+        .store => blk: {
+            @memcpy(out[0..chunk.len], chunk);
+            break :blk chunk.len;
+        },
+        .xpress => xpress.xpressEncode(chunk, out, ws),
+        .lzx => lzx.lzxEncode(chunk_size, chunk, out, ws),
+        .lzms => lzms.lzmsEncode(chunk, out, ws),
+    };
+}
 
 pub fn encodeEx(entries: []const Entry, output: []u8, scratch: []u8, options: EncodeOptions) Exception!usize {
     if (options.compression == .store and !options.solid) return encode(entries, output, scratch);
@@ -1365,62 +1607,54 @@ pub fn encodeEx(entries: []const Entry, output: []u8, scratch: []u8, options: En
     const cs: u32 = if (options.chunk_size == 0) codecDefaultChunk(options.compression) else options.chunk_size;
     try validateChunking(codec, cs);
     const cs64: u64 = cs;
-    const metadata_len = try metadataLen(entries);
     const codec_ws: usize = switch (options.compression) {
         .xpress => xpress.encodeWorkspaceSize(cs),
         .lzx => lzx.encodeWorkspaceSize(cs),
         .lzms => lzms.encodeWorkspaceSize(cs),
         .store => 0,
     };
-    if (scratch.len < metadata_len + (entries.len + 1) * @sizeOf(StagedBlob)) return error.ResourceException;
 
-    // Metadata image (the blob table carries its digest).
-    @memset(scratch[0..@intCast(metadata_len)], 0);
-    std.mem.writeInt(u32, scratch[0..4], 8, .little);
-    std.mem.writeInt(u64, scratch[8..16], 104, .little);
-    std.mem.writeInt(u32, scratch[16..20], 0x10, .little);
-    std.mem.writeInt(u32, scratch[20..24], 0xFFFFFFFF, .little);
-    std.mem.writeInt(u64, scratch[24..32], 8 + 104, .little);
-    var md_pos: usize = 8 + 104;
-    for (entries) |entry| {
-        var hash: [sha1_len]u8 = undefined;
-        std.crypto.hash.Sha1.hash(entry.data, &hash, .{});
-        md_pos += try writeDentry(scratch[md_pos..], entry.name, &hash, 0);
-    }
-    var metadata_hash: [sha1_len]u8 = undefined;
-    std.crypto.hash.Sha1.hash(scratch[0..@intCast(metadata_len)], &metadata_hash, .{});
+    var tree = try Tree.init(scratch, entries.len);
+    try tree.build(entries);
+    const metadata_len = try tree.layout();
+    if (metadata_len > tree.front) return error.ResourceException;
+    const metadata = scratch[0..@intCast(metadata_len)];
+    try tree.write(metadata);
 
-    // Scratch carve: descriptors, staging, chunk buffer, codec workspace.
-    const desc_bytes = (entries.len + 1) * @sizeOf(StagedBlob);
-    const desc: []StagedBlob = @alignCast(std.mem.bytesAsSlice(StagedBlob, scratch[@intCast(metadata_len)..][0..desc_bytes]));
-    var stage_off: usize = @intCast(metadata_len + desc_bytes);
-    stage_off = (stage_off + 7) & ~@as(usize, 7);
-    if (scratch.len < stage_off + codec_ws + 2 * (cs + 16)) return error.ResourceException;
-    const chunk_buf = scratch[scratch.len - codec_ws - 2 * (cs + 16) ..][0 .. 2 * (cs + 16)];
-    const ws = scratch[scratch.len - codec_ws ..];
-    const stage = scratch[stage_off .. scratch.len - codec_ws - 2 * (cs + 16)];
+    // A compressed chunk may grow, so the output buffer is twice the chunk size.
+    const input_room = @as(usize, cs) + 16;
+    const out_room = 2 * (@as(usize, cs) + 16);
+    const chunk_room = input_room + out_room;
+    const room = codec_ws + chunk_room;
+    if (tree.front < metadata_len + room) return error.ResourceException;
+    // Buffers and workspace take the free-space end; staging takes what
+    // alignment leaves.
+    const stage_end = tree.front - room;
+    const chunk_buf = scratch[tree.front - chunk_room .. tree.front];
+    const gather = chunk_buf[0..input_room];
+    const out_buf = chunk_buf[input_room..];
+    const ws = scratch[stage_end..][0..codec_ws];
+    const stage = scratch[@intCast(metadata_len)..stage_end];
     var staged_len: usize = 0;
-    var blob_count: usize = 0;
+    var count: usize = 0;
 
     if (!options.solid) {
-        for (entries) |entry| {
-            var hash: [sha1_len]u8 = undefined;
-            std.crypto.hash.Sha1.hash(entry.data, &hash, .{});
+        for (entries, 0..) |entry, index| {
+            const node = tree.nodes[tree.entry_nodes[index]];
+            if (node.is_dir) continue;
             if (options.delta_base) |base| {
                 var matched = false;
                 for (base) |base_entry| {
                     var base_hash: [sha1_len]u8 = undefined;
                     std.crypto.hash.Sha1.hash(base_entry.data, &base_hash, .{});
-                    if (std.mem.eql(u8, &hash, &base_hash)) {
+                    if (std.mem.eql(u8, &node.hash, &base_hash)) {
                         matched = true;
                         break;
                     }
                 }
-                if (matched) {
-                    // Unbacked: delta WIMs omit the blob-table entry; the
-                    // dentry hash resolves against the referenced base.
-                    continue;
-                }
+                // Unbacked: a delta WIM omits the blob-table entry; the dentry
+                // hash resolves against the referenced base instead.
+                if (matched) continue;
             }
             const chunks = numChunks(entry.data.len, cs64);
             const table_bytes: usize = @intCast((chunks -| 1) * 4);
@@ -1432,16 +1666,21 @@ pub fn encodeEx(entries: []const Entry, output: []u8, scratch: []u8, options: En
             while (i < chunks) : (i += 1) {
                 const start: usize = @intCast(i * cs64);
                 const take: usize = @intCast(@min(cs64, entry.data.len - start));
-                const n = try compressChunk(options.compression, cs, entry.data[start..][0..take], chunk_buf[0 .. take + 16], ws);
-                @memcpy(blob[cursor..][0..n], chunk_buf[0..n]);
+                const n = try storeChunk(options.compression, cs, entry.data[start..][0..take], out_buf, ws, blob[cursor..]);
                 if (i + 1 != chunks) {
                     end = std.math.add(u32, end, std.math.cast(u32, n) orelse return error.ResourceException) catch return error.ResourceException;
                     std.mem.writeInt(u32, blob[@intCast(i * 4)..][0..4], end, .little);
                 }
                 cursor += n;
             }
-            desc[blob_count] = .{ .offset = staged_len, .len = cursor, .hash = hash, .size = entry.data.len, .resource_off = 0 };
-            blob_count += 1;
+            tree.pieces[count] = .{
+                .hash = node.hash,
+                .table_flags = reshdr_flag_compressed,
+                .size = cursor,
+                .unpacked = entry.data.len,
+                .payload = blob[0..cursor],
+            };
+            count += 1;
             staged_len += cursor;
         }
     } else {
@@ -1450,10 +1689,9 @@ pub fn encodeEx(entries: []const Entry, output: []u8, scratch: []u8, options: En
         for (entries) |entry| total = try bounds.addU64(total, entry.data.len);
         const chunks = numChunks(total, cs64);
         const table_bytes: u64 = chunks * 4;
-        const need: u64 = 16 + table_bytes + total;
-        const need_usize = std.math.cast(usize, need) orelse return error.ResourceException;
-        if (staged_len + need_usize > stage.len) return error.ResourceException;
-        const blob = stage[staged_len .. staged_len + @as(usize, @intCast(need))];
+        const need: u64 = try bounds.addU64(try bounds.addU64(16, table_bytes), total);
+        if (staged_len + @as(usize, @intCast(need)) > stage.len) return error.ResourceException;
+        const blob = stage[staged_len..][0..@intCast(need)];
         std.mem.writeInt(u64, blob[0..8], total, .little);
         std.mem.writeInt(u32, blob[8..12], cs, .little);
         std.mem.writeInt(u32, blob[12..16], codecFormatNumber(options.compression), .little);
@@ -1462,7 +1700,7 @@ pub fn encodeEx(entries: []const Entry, output: []u8, scratch: []u8, options: En
         var i: u64 = 0;
         while (i < chunks) : (i += 1) {
             const want: usize = @intCast(@min(cs64, total - uoff));
-            // Gather the chunk's bytes (it may span entries).
+            // A chunk may span entries, so it is gathered first.
             var gathered: usize = 0;
             var src_off: u64 = uoff;
             while (gathered < want) {
@@ -1475,98 +1713,49 @@ pub fn encodeEx(entries: []const Entry, output: []u8, scratch: []u8, options: En
                 }
                 const avail: usize = @intCast(try bounds.addU64(base, entries[e].data.len) - src_off);
                 const take = @min(avail, want - gathered);
-                @memcpy(chunk_buf[gathered..][0..take], entries[e].data[@intCast(src_off - base)..][0..take]);
+                @memcpy(gather[gathered..][0..take], entries[e].data[@intCast(src_off - base)..][0..take]);
                 gathered += take;
                 src_off = try bounds.addU64(src_off, take);
             }
-            const n = try compressChunk(options.compression, cs, chunk_buf[0..want], chunk_buf[cs + 16 ..][0 .. want + 16], ws);
-            @memcpy(blob[cursor..][0..n], chunk_buf[cs + 16 ..][0..n]);
+            const n = try storeChunk(options.compression, cs, gather[0..want], out_buf, ws, blob[cursor..]);
             std.mem.writeInt(u32, blob[16 + @as(usize, @intCast(i * 4)) ..][0..4], std.math.cast(u32, n) orelse return error.ResourceException, .little);
             cursor += n;
             uoff += want;
         }
-        desc[blob_count] = .{ .offset = staged_len, .len = cursor, .hash = undefined, .size = total, .resource_off = 0 };
-        blob_count += 1;
-        staged_len += cursor;
+        // The run leader states the resource; each member states only its
+        // offset inside the decompressed run.
+        tree.pieces[count] = .{
+            .hash = zero_hash,
+            .table_flags = reshdr_flag_solid | reshdr_flag_compressed,
+            .size = cursor,
+            .unpacked = solid_resource_magic,
+            .payload = blob[0..cursor],
+        };
+        count += 1;
         var run_off: u64 = 0;
-        for (entries) |entry| {
-            var hash: [sha1_len]u8 = undefined;
-            std.crypto.hash.Sha1.hash(entry.data, &hash, .{});
-            desc[blob_count] = .{ .offset = staged_len, .len = 0, .hash = hash, .size = entry.data.len, .resource_off = run_off };
-            blob_count += 1;
+        for (entries, 0..) |entry, index| {
+            const node = tree.nodes[tree.entry_nodes[index]];
+            if (node.is_dir) continue;
+            tree.pieces[count] = .{
+                .hash = node.hash,
+                .table_flags = reshdr_flag_solid,
+                .size = entry.data.len,
+                .unpacked = entry.data.len,
+                .offset = run_off,
+            };
+            count += 1;
             run_off = try bounds.addU64(run_off, entry.data.len);
         }
     }
 
-    // Emit: header, blob table, xml, metadata, staged data.
-    const blob_table_len = blobTableLen(entries);
-    const xml_len = try xmlLen(entries);
-    const blob_off: u64 = header_disk_size;
-    const xml_off = try bounds.addU64(blob_off, blob_table_len);
-    const metadata_off = try bounds.addU64(xml_off, xml_len);
-    const data_off = try bounds.addU64(metadata_off, metadata_len);
-
-    var header: [header_disk_size]u8 = @splat(0);
-    std.mem.writeInt(u64, header[0..8], wim_magic, .little);
-    std.mem.writeInt(u32, header[8..12], header_disk_size, .little);
-    std.mem.writeInt(u32, header[12..16], if (options.solid) wim_version_solid else wim_version, .little);
-    std.mem.writeInt(u32, header[16..20], flag_compression | codecFlag(options.compression), .little);
-    std.mem.writeInt(u32, header[20..24], cs, .little);
-    for (header[24..40], 0..) |*byte, i| byte.* = @intCast(0x5A + i);
-    std.mem.writeInt(u16, header[40..42], 1, .little);
-    std.mem.writeInt(u16, header[42..44], 1, .little);
-    std.mem.writeInt(u32, header[44..48], 1, .little);
-    writeReshdr(header[48..72], .{ .size_in_wim = blob_table_len, .flags = 0, .offset = blob_off, .uncompressed_size = blob_table_len });
-    writeReshdr(header[72..96], .{ .size_in_wim = xml_len, .flags = 0, .offset = xml_off, .uncompressed_size = xml_len });
-    writeReshdr(header[96..120], .{ .size_in_wim = 0, .flags = reshdr_flag_metadata, .offset = 0, .uncompressed_size = 0 });
-    std.mem.writeInt(u32, header[120..124], 0, .little);
-    writeReshdr(header[124..148], .{ .size_in_wim = 0, .flags = 0, .offset = 0, .uncompressed_size = 0 });
-
-    var sink = io.Sink{ .bytes = output };
-    sink.write(&header) catch return error.CapacityException;
-
-    var running_off: u64 = data_off;
-    if (!options.solid) {
-        for (desc[0..blob_count]) |blob| {
-            try emitBlobEntry(&sink, .{ .size_in_wim = blob.len, .flags = reshdr_flag_compressed, .offset = running_off, .uncompressed_size = blob.size }, &blob.hash);
-            running_off = try bounds.addU64(running_off, blob.len);
-        }
-    } else {
-        // Run leader: the solid resource itself.
-        try emitBlobEntry(&sink, .{ .size_in_wim = desc[0].len, .flags = reshdr_flag_solid | reshdr_flag_compressed, .offset = running_off, .uncompressed_size = solid_resource_magic }, &zero_hash);
-        running_off = try bounds.addU64(running_off, desc[0].len);
-        for (desc[1..blob_count]) |blob| {
-            try emitBlobEntry(&sink, .{ .size_in_wim = blob.size, .flags = reshdr_flag_solid, .offset = blob.resource_off, .uncompressed_size = blob.size }, &blob.hash);
-        }
-    }
-    emitBlobEntry(&sink, .{ .size_in_wim = metadata_len, .flags = reshdr_flag_metadata, .offset = metadata_off, .uncompressed_size = metadata_len }, &metadata_hash) catch return error.CapacityException;
-    while (@as(u64, sink.offset) < xml_off) {
-        sink.write(&[_]u8{0}) catch return error.CapacityException;
-    }
-
-    try writeTocXml(&sink, entries, try archiveSize(entries));
-    sink.write(scratch[0..@intCast(metadata_len)]) catch return error.CapacityException;
-
-    if (!options.solid) {
-        for (desc[0..blob_count]) |blob| {
-            sink.write(stage[blob.offset..][0..blob.len]) catch return error.CapacityException;
-        }
-    } else {
-        sink.write(stage[desc[0].offset..][0..desc[0].len]) catch return error.CapacityException;
-    }
-    return sink.offset;
+    return emit(tree.fileCount(), metadata, tree.pieces[0..count], output, .{
+        .version = if (options.solid) wim_version_solid else wim_version,
+        .flags = flag_compression | codecFlag(options.compression),
+        .chunk_size = cs,
+    });
 }
 
 const zero_hash: [sha1_len]u8 = @splat(0);
-
-fn emitBlobEntry(sink: *io.Sink, res: Reshdr, hash: *const [sha1_len]u8) Exception!void {
-    var blob: [blob_disk_size]u8 = undefined;
-    writeReshdr(blob[0..24], res);
-    std.mem.writeInt(u16, blob[24..26], 1, .little);
-    std.mem.writeInt(u32, blob[26..30], 1, .little);
-    @memcpy(blob[30..50], hash);
-    sink.write(&blob) catch return error.CapacityException;
-}
 
 test "wim encodeEx compressed roundtrip" {
     const allocator = std.testing.allocator;
@@ -1611,7 +1800,7 @@ test "wim encodeEx compressed roundtrip" {
 
 test "wim delta write roundtrip shape" {
     const allocator = std.testing.allocator;
-    // Base has two blobs; the delta reuses one and adds one.
+    // The delta reuses the base blob and adds one new blob.
     var rng: u64 = 0x5DEECE66D3D2A1B3;
     const base_payload = try allocator.alloc(u8, 60000);
     defer allocator.free(base_payload);

@@ -1,10 +1,8 @@
 package dev.stdk;
 
 /**
- * Raw JNI bindings for the libstd C session boundary. The native library is {@code libstd.so}
- * inside the AAR, loaded once on class init. Every entry point validates its arguments before
- * touching native memory: negative lengths, lengths past the array extent, and undersized count
- * arrays throw {@link IllegalArgumentException} instead of faulting in JNI.
+ * Raw JNI bindings for the libstd C session boundary. Every entry point validates arguments before
+ * touching native memory.
  */
 public final class StdK {
     public static final int ABI_EPOCH = 8;
@@ -41,9 +39,8 @@ public final class StdK {
             long maxEntries);
 
     /**
-     * Runs one step. {@code counts} must hold at least 3 elements and receives consumed, produced,
-     * and state (0 open, 1 done, -1 failed). {@code inputLen} and {@code outputLen} must be
-     * non-negative and no larger than their arrays.
+     * Runs one step. {@code counts} holds consumed, produced, and state (0 open, 1 done, -1
+     * failed); lengths stay within their arrays.
      */
     public static int sessionStep(
             long session,
@@ -90,9 +87,8 @@ public final class StdK {
     private static native int nativeSessionFailure(long session, long[] statusAndDetail);
 
     /**
-     * Destroys a live session. The handle stays owned by the caller; pair every non-zero handle
-     * from {@link #sessionCreate} with exactly one destroy, then release its storage with {@link
-     * #sessionFree}.
+     * Destroys a live session. Pair each non-zero handle with exactly one destroy, then release
+     * storage with {@link #sessionFree}.
      */
     public static int sessionDestroy(long session) {
         requireHandle(session, "session");

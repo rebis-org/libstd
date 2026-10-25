@@ -1,9 +1,12 @@
 const std = @import("std");
 
+const entry_prim = @import("../../../common/entry.zig");
 const bounds = @import("../../../common/primitive/bounds.zig");
 const exception_prim = @import("../../../common/primitive/exception.zig");
 const tree_order = @import("../../../common/primitive/order.zig");
 
+pub const Entry = entry_prim.Entry;
+pub const EntryInfo = entry_prim.Sized;
 const Exception = exception_prim.Exception;
 
 // ISO 9660 slice: one root directory of regular files.
@@ -31,16 +34,6 @@ const joliet_escape_3 = [3]u8{ '%', '/', 'E' };
 const max_entries = 256;
 const path_table_lba: u32 = 18;
 const dir_lba: u32 = 20;
-
-pub const Entry = struct {
-    name: []const u8,
-    data: []const u8,
-};
-
-pub const EntryInfo = struct {
-    size: u64,
-    ordinal: u64,
-};
 
 const Descriptor = struct {
     block_size: u32,
@@ -128,56 +121,57 @@ fn parseRecord(dir: []const u8, at: usize) Exception!?Record {
 
 const Target = union(enum) {
     count,
-    resolve: struct { ordinal: u64, info: *EntryInfo, output: ?[]u8, found: *bool = undefined },
+    resolve: struct { ordinal: u64, info: *EntryInfo, output: ?[]u8 },
 };
 
 const WalkState = struct { ordinal: u64 = 0 };
 
-fn walkRoot(archive: []const u8, desc: Descriptor, target: Target) Exception!u64 {
-    var state = WalkState{};
-    var found = false;
-    const resolved = switch (target) {
-        .count => target,
-        .resolve => |res| Target{ .resolve = .{ .ordinal = res.ordinal, .info = res.info, .output = res.output, .found = &found } },
-    };
-    try walkIsoDir(archive, desc.root_extent, desc.root_size, resolved, &state, 0);
-    return switch (target) {
-        .count => state.ordinal,
-        .resolve => if (found) state.ordinal else error.DataException,
-    };
-}
+const Frame = struct { dir: []const u8, pos: usize };
 
-fn walkIsoDir(archive: []const u8, extent: u32, size: u32, target: Target, state: *WalkState, depth: u32) Exception!void {
-    if (depth > max_dir_depth) return error.DataException;
-    const dir = try bounds.slice(archive, std.math.mul(u64, extent, sector_size) catch return error.DataException, size);
+fn openDir(archive: []const u8, extent: u32, size: u32) Exception!Frame {
+    const offset = std.math.mul(u64, extent, sector_size) catch return error.DataException;
+    const dir = try bounds.slice(archive, offset, size);
     const dot = (try parseRecord(dir, 0)) orelse return error.DataException;
     if (!dot.is_dot) return error.DataException;
     const dotdot = (try parseRecord(dir, dot.skip)) orelse return error.DataException;
     if (!dotdot.is_dotdot) return error.DataException;
-    var pos: usize = dot.skip + dotdot.skip;
-    const found_ptr = switch (target) {
-        .resolve => |res| res.found,
-        .count => null,
-    };
-    while (pos < dir.len) {
-        if (found_ptr) |fp| {
-            if (fp.*) return;
-        }
-        // Records never cross sector boundaries: a zero length byte or an
-        // over-long record pads the sector, and records resume at the next.
-        const remain = sector_size - (pos % sector_size);
-        if (dir[pos] == 0 or dir[pos] > remain) {
-            pos += remain;
+    return .{ .dir = dir, .pos = dot.skip + dotdot.skip };
+}
+
+// An explicit frame stack, not recursion: a hostile tree
+// cannot exhaust the call stack.
+fn walkTree(archive: []const u8, desc: Descriptor, target: Target, state: *WalkState) Exception!bool {
+    var stack: [max_dir_depth + 1]Frame = undefined;
+    var depth: usize = 0;
+    stack[0] = try openDir(archive, desc.root_extent, desc.root_size);
+    while (true) {
+        const frame = &stack[depth];
+        if (frame.pos >= frame.dir.len) {
+            if (depth == 0) return false;
+            depth -= 1;
             continue;
         }
-        const rec = (try parseRecord(dir, pos)) orelse break;
-        pos += rec.skip;
+        // Records never cross sector boundaries: a zero length or over-long
+        // record pads the sector, and records resume at the next.
+        const remain = sector_size - (frame.pos % sector_size);
+        if (frame.dir[frame.pos] == 0 or frame.dir[frame.pos] > remain) {
+            frame.pos += remain;
+            continue;
+        }
+        const rec = (try parseRecord(frame.dir, frame.pos)) orelse {
+            if (depth == 0) return false;
+            depth -= 1;
+            continue;
+        };
+        frame.pos += rec.skip;
         if (rec.is_dot or rec.is_dotdot) continue;
         // Multi-extent and interleaved records change the data layout; the
         // slice covers contiguous single-extent regular files.
         if (rec.flags & ((1 << 7) | (1 << 2)) != 0) return error.UnsupportedException;
         if (rec.flags & flag_directory != 0) {
-            try walkIsoDir(archive, rec.extent, rec.size, target, state, depth + 1);
+            if (depth == max_dir_depth) return error.DataException;
+            depth += 1;
+            stack[depth] = try openDir(archive, rec.extent, rec.size);
             continue;
         }
         switch (target) {
@@ -188,16 +182,25 @@ fn walkIsoDir(archive: []const u8, extent: u32, size: u32, target: Target, state
                     res.info.ordinal = state.ordinal;
                     if (res.output) |out| {
                         if (out.len < rec.size) return error.CapacityException;
-                        const data = try bounds.slice(archive, std.math.mul(u64, rec.extent, sector_size) catch return error.DataException, rec.size);
+                        const offset = std.math.mul(u64, rec.extent, sector_size) catch return error.DataException;
+                        const data = try bounds.slice(archive, offset, rec.size);
                         @memcpy(out[0..rec.size], data);
                     }
-                    res.found.* = true;
-                    return;
+                    return true;
                 }
             },
         }
         state.ordinal += 1;
     }
+}
+
+fn walkRoot(archive: []const u8, desc: Descriptor, target: Target) Exception!u64 {
+    var state = WalkState{};
+    const found = try walkTree(archive, desc, target, &state);
+    return switch (target) {
+        .count => state.ordinal,
+        .resolve => if (found) state.ordinal else error.DataException,
+    };
 }
 
 fn walkChosen(archive: []const u8, target: Target) Exception!u64 {
@@ -315,8 +318,8 @@ fn buildIsoPlan(entries: []const Entry, alloc: std.mem.Allocator) Exception!IsoP
     const dir_content = alloc.alloc(u32, dir_order.items.len) catch return error.ResourceException;
     for (dir_order.items, 0..) |ni, di| {
         const node = &nodes.items[ni];
-        var size: u32 = 33 + 1; // dot record
-        size += if (di == 0) 33 + 1 + rr_size_dot_sua else 33 + 1; // dotdot record
+        var size: u32 = 33 + 1; // Dot record.
+        size += if (di == 0) 33 + 1 + rr_size_dot_sua else 33 + 1; // Dotdot record.
         for (kids[node.first_child .. node.first_child + node.child_count]) |ci| {
             const child = &nodes.items[ci];
             // Planning and encoding must reject the same record sets.
@@ -325,7 +328,7 @@ fn buildIsoPlan(entries: []const Entry, alloc: std.mem.Allocator) Exception!IsoP
             size += @intCast(rec_len);
         }
         if (size > sector_size) return error.UnsupportedException;
-        // Directory data lengths are multiples of the block size.
+        // Directory data lengths are multiples of the sector size.
         dir_content[di] = @intCast(std.mem.alignForward(usize, size, sector_size));
     }
 
@@ -357,7 +360,8 @@ fn buildIsoPlan(entries: []const Entry, alloc: std.mem.Allocator) Exception!IsoP
         .dir_lba_of = dir_lba_of,
         .file_lba_of = file_lba_of,
         .path_table_size = path_table_size,
-        // libarchive's bid reads the reserved area plus eight descriptor sectors.
+        // The libarchive bid reads the reserved area plus eight descriptor sectors.
+        //
         // Shorter images never reach the parser; pad to 32 sectors.
         .total = @as(u64, @max(lba, 32)) * sector_size,
     };
@@ -564,8 +568,8 @@ fn writeDirRecord(
 ) Exception!void {
     var sua: [320]u8 = undefined;
     var sua_len: usize = 0;
-    // A PX mode there would override the directory mode and hide every child.
-    // The root dot record alone carries SUSP and ER.
+    // A PX on the dot records would override the directory mode;
+    // the root dot record alone carries SUSP and ER.
     if (directory and stored_name_len == 1 and stored_name[0] == 0 and serial == 0) {
         sua_len += writeRrSp(&sua);
         sua_len += writeRrEr(sua[sua_len..]);
@@ -595,8 +599,7 @@ fn writeDirRecord(
 }
 
 pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Exception!usize {
-    // The plan lives in caller scratch; archiveSize accepts exactly the
-    // sets this budget holds.
+    // The plan lives in caller scratch; it must hold every set archiveSize accepts.
     var fba = std.heap.FixedBufferAllocator.init(scratch);
     const plan = try buildIsoPlan(entries, fba.allocator());
     if (output.len < plan.total) return error.CapacityException;
@@ -727,8 +730,8 @@ test "iso directory records resume at sector boundaries" {
     var archive: [64 * sector_size]u8 = undefined;
     var scratch: [scratch_size]u8 = undefined;
     const written = try encode(&entries, &archive, &scratch);
-    // Move the second file's record into the second sector of the root
-    // directory: zero padding ends the first sector, records resume at 2048.
+    // Move the second record into the second sector: zero padding
+    // ends the first, records resume at 2048.
     const pvd = archive[16 * sector_size ..][0..sector_size];
     const root = archive[dir_lba * sector_size ..][0 .. 2 * sector_size];
     var pos: usize = 0;
@@ -766,7 +769,7 @@ test "iso rejects multi-extent and interleaved records" {
     var scratch: [scratch_size]u8 = undefined;
     const written = try encode(&entries, &archive, &scratch);
     const root = archive[dir_lba * sector_size ..][0..sector_size];
-    const first_at = 226 + 34; // dot record then dotdot record.
+    const first_at = 226 + 34; // Dot record then dotdot record.
     try testing.expect(root[first_at] != 0);
     for ([_]u8{ 1 << 7, 1 << 2 }) |flag| {
         root[first_at + 25] |= flag;
@@ -810,8 +813,8 @@ test "iso rejects oversized directory records at planning time" {
     var name_buf: [90]u8 = undefined;
     @memset(&name_buf, 'n');
     const entries = [_]Entry{.{ .name = name_buf[0..], .data = "x" }};
-    // The 33-byte header, name area, PX and NM exceed the 255-byte record
-    // limit; sizing and encoding must agree on the rejection.
+    // The 33-byte header, name area, PX and NM exceed the 255-byte
+    // record limit; sizing and encoding must agree.
     try testing.expectError(error.UnsupportedException, archiveSize(&entries));
     var archive: [64 * sector_size]u8 = undefined;
     var scratch: [scratch_size]u8 = undefined;

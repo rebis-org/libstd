@@ -32,9 +32,8 @@ pub const ReadCursor = struct {
         return std.mem.readInt(u32, &raw, .little);
     }
 
-    // The shift bound is what terminates a maximally long encoding: a tenth
-    // byte would push the value past 64 bits, so it is a resource limit
-    // rather than malformed input.
+    // A tenth byte would push the value past 64 bits: a resource limit,
+    // not malformed input.
     pub fn readUleb128(self: *ReadCursor) error{ DataException, ResourceException }!u64 {
         var decoded: u64 = 0;
         var shift: u6 = 0;

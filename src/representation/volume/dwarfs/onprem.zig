@@ -1,11 +1,14 @@
 const std = @import("std");
 
+const entry_prim = @import("../../../common/entry.zig");
 const bounds = @import("../../../common/primitive/bounds.zig");
 const exception_prim = @import("../../../common/primitive/exception.zig");
 const tree_order = @import("../../../common/primitive/order.zig");
 const lz4_leaf = @import("../../leaf/lz4/onprem.zig");
 const zstd_leaf = @import("../../leaf/zstd/onprem.zig");
 
+pub const Entry = entry_prim.Entry;
+pub const EntryInfo = entry_prim.Sized;
 const Exception = exception_prim.Exception;
 
 // DwarFS v2 slice: one root directory of regular files.
@@ -24,16 +27,6 @@ const section_magic = "DWARFS";
 
 const zstd_window: u32 = 256 * 1024;
 const zstd_history: usize = zstd_window + zstd_leaf.block_size_max;
-
-pub const Entry = struct {
-    name: []const u8,
-    data: []const u8,
-};
-
-pub const EntryInfo = struct {
-    size: u64,
-    ordinal: u64,
-};
 
 const BlockRef = struct {
     at: u64,
@@ -134,9 +127,8 @@ const BlockStore = struct {
             store.cached = raw;
             return raw;
         }
-        // Size the decode buffer by the chunk-reachable tail of this block,
-        // not the declared block size: mkdwarfs writes a 16 MiB default that
-        // would swamp the scratch for a mostly-empty block.
+        // Size the buffer by the chunk-reachable tail, not block size;
+        // the mkdwarfs 16 MiB default would swamp scratch.
         var max_end: u64 = 0;
         for (store.chunks) |chunk| {
             if (chunk.block != index) continue;
@@ -155,8 +147,8 @@ const BlockStore = struct {
             compression_zstd => {
                 var reader = std.Io.Reader.fixed(raw);
                 _ = zstd_leaf.decodeStream(&reader, &writer, store.history, .{ .window_size = zstd_window }) catch {
-                    // The buffer spans every chunk range of this block, so a
-                    // full writer means surplus output no chunk can reach.
+                    // The buffer spans every chunk range, so a full writer
+                    // means surplus output no chunk reaches.
                     if (writer.end != buf.len) return error.DataException;
                 };
             },
@@ -173,7 +165,7 @@ const BlockStore = struct {
     }
 };
 
-// Dwarfs thrift dialect: map size precedes the key/value type byte.
+// DwarFS thrift dialect: map size precedes the key/value type byte.
 // Booleans ride inline in field headers.
 const Compact = struct {
     data: []const u8,
@@ -531,8 +523,8 @@ fn decodeMetadata(meta_raw: []const u8, schema: Schema, arena: std.mem.Allocator
             // Plain symlinks: any entry puts a symlink inode in the tree.
             11 => if ((try dec.vectorHead(f.layout, pos)).count > 0) return error.UnsupportedException,
             15 => md.block_size = try dec.u32At(f.layout, pos),
-            // Packed forms: record the fs_options flags; the running-sum
-            // unpacks below run only when the flags are set.
+            // Record the fs_options flags; the running-sum unpacks below
+            // run only when the flags are set.
             18 => {
                 const p = try dec.presence(f.layout, pos);
                 if (p.present) {
@@ -566,9 +558,8 @@ fn decodeMetadata(meta_raw: []const u8, schema: Schema, arena: std.mem.Allocator
                     }
                 }
             },
-            // FSST-compressed symlinks. Vendor string_table::unpack yields
-            // index.size() - 1 strings (index carries a trailing sentinel),
-            // so more than one index entry means at least one symlink.
+            // FSST symlinks: the vendor index carries a trailing sentinel,
+            // so more than one entry means a symlink.
             25 => {
                 const p = try dec.presence(f.layout, pos);
                 if (p.present) {
@@ -582,8 +573,8 @@ fn decodeMetadata(meta_raw: []const u8, schema: Schema, arena: std.mem.Allocator
                 }
             },
             27 => {},
-            // Sparse files: tolerate both a presence wrapper and a direct
-            // scalar; either shape set means hole chunks exist.
+            // Sparse files: parse both a presence wrapper and a direct
+            // scalar; a set value means hole chunks exist.
             34 => {
                 const l = dec.layouts[@intCast(f.layout)];
                 if (Decoder.find(l, 1)) |pf| {
@@ -621,9 +612,8 @@ fn runTarget(archive: []const u8, scratch: []u8, target: Target) Exception!u64 {
     if (scratch.len < scratch_size) return error.CapacityException;
     var fba = std.heap.FixedBufferAllocator.init(scratch);
     const arena = fba.allocator();
-    // One zstd history buffer is shared by every stream decompression
-    // (schema, metadata, blocks); the calls are sequential so the reuse
-    // is safe and keeps peak scratch at one window instead of three.
+    // One zstd history buffer serves every sequential stream decode
+    // (schema, metadata, blocks); peak scratch stays at one window.
     const history = arena.alloc(u8, zstd_history) catch return error.ResourceException;
     const sections = try parseSections(archive, arena);
     const schema_raw = try sectionPayload(archive, sections.schema_at, sections.schema_len, sections.schema_compression, arena, history);
@@ -633,8 +623,7 @@ fn runTarget(archive: []const u8, scratch: []u8, target: Target) Exception!u64 {
     if (md.block_size == 0 or md.names_index.len == 0) return error.DataException;
     // Vendor requires a power-of-two block size.
     if (!std.math.isPowerOfTwo(md.block_size)) return error.DataException;
-    // Every chunk must name an existing block and fit inside it; the
-    // check runs up front so count mode never loads block payloads.
+    // Validate chunks up front so count mode never loads block payloads.
     for (md.chunks) |chunk| {
         if (chunk.block >= sections.blocks.len) return error.DataException;
         if (chunk.offset >= md.block_size) return error.DataException;
@@ -683,8 +672,8 @@ fn walkDwarfsDir(md: Metadata, store: *BlockStore, dir_index: usize, file_off: u
         if (idx + 1 >= md.chunk_table.len) return error.DataException;
         const c0 = md.chunk_table[idx];
         const c1 = md.chunk_table[idx + 1];
-        // A file may span consecutive chunks in any blocks; an empty
-        // range decodes as a zero-length file.
+        // A file may span chunks across any blocks; an empty range
+        // decodes as a zero-length file.
         if (c1 < c0 or c1 > md.chunks.len) return error.DataException;
         var total: u64 = 0;
         var ci: usize = c0;
@@ -907,14 +896,51 @@ const DwNode = struct {
 
 const max_tree_nodes = 512;
 
-fn dwFindOrCreateDir(nodes: *std.ArrayList(DwNode), alloc: std.mem.Allocator, parent: u32, name: []const u8) Exception!u32 {
+fn dwFindChild(nodes: *std.ArrayList(DwNode), parent: u32, name: []const u8) ?u32 {
     for (nodes.items, 0..) |node, i| {
-        if (node.kind == .dir and node.parent == parent and std.mem.eql(u8, node.name, name)) return @intCast(i);
+        if (node.parent == parent and std.mem.eql(u8, node.name, name)) return @intCast(i);
+    }
+    return null;
+}
+
+fn dwFindOrCreateDir(nodes: *std.ArrayList(DwNode), alloc: std.mem.Allocator, parent: u32, name: []const u8) Exception!u32 {
+    if (dwFindChild(nodes, parent, name)) |existing| {
+        if (nodes.items[existing].kind != .dir) return error.CallException;
+        return existing;
     }
     const idx: u32 = @intCast(nodes.items.len);
     nodes.append(alloc, .{ .kind = .dir, .name = name, .parent = parent }) catch return error.ResourceException;
     nodes.items[parent].child_count += 1;
     return idx;
+}
+
+// Directories resolve first, so an entry naming an implied directory
+// finds it rather than duplicating it.
+fn dwBuildNodes(nodes: *std.ArrayList(DwNode), alloc: std.mem.Allocator, entries: []const Entry) Exception!void {
+    nodes.append(alloc, .{ .kind = .dir, .name = "", .parent = 0 }) catch return error.ResourceException;
+    const parents = alloc.alloc(u32, entries.len) catch return error.ResourceException;
+    for (entries, 0..) |entry, index| {
+        try dwValidate(entry.name);
+        if (entry.data.len > write_block_size) return error.UnsupportedException;
+        var parent: u32 = 0;
+        var it = std.mem.splitScalar(u8, entry.name, '/');
+        var comp = it.next().?;
+        while (it.next()) |next| {
+            parent = try dwFindOrCreateDir(nodes, alloc, parent, comp);
+            comp = next;
+        }
+        parents[index] = parent;
+    }
+    for (entries, 0..) |entry, index| {
+        const parent = parents[index];
+        const comp = entry_prim.leafName(entry.name) orelse return error.CallException;
+        if (dwFindChild(nodes, parent, comp)) |existing| {
+            if (nodes.items[existing].kind != .dir or entry.data.len != 0) return error.CallException;
+            continue;
+        }
+        nodes.append(alloc, .{ .kind = .file, .name = comp, .parent = parent, .data = entry.data }) catch return error.ResourceException;
+        nodes.items[parent].child_count += 1;
+    }
 }
 
 fn dwValidate(name: []const u8) Exception!void {
@@ -935,20 +961,7 @@ pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Exception!usi
 
     // Tree build: nodes[0] roots the directory tree.
     var nodes: std.ArrayList(DwNode) = .empty;
-    nodes.append(alloc, .{ .kind = .dir, .name = "", .parent = 0 }) catch return error.ResourceException;
-    for (entries) |entry| {
-        try dwValidate(entry.name);
-        if (entry.data.len > write_block_size) return error.UnsupportedException;
-        var parent: u32 = 0;
-        var it = std.mem.splitScalar(u8, entry.name, '/');
-        var comp = it.next().?;
-        while (it.next()) |next| {
-            parent = try dwFindOrCreateDir(&nodes, alloc, parent, comp);
-            comp = next;
-        }
-        nodes.append(alloc, .{ .kind = .file, .name = comp, .parent = parent, .data = entry.data }) catch return error.ResourceException;
-        nodes.items[parent].child_count += 1;
-    }
+    try dwBuildNodes(&nodes, alloc, entries);
     if (nodes.items.len > max_tree_nodes) return error.UnsupportedException;
 
     // Per-directory child lists in name order.
@@ -981,8 +994,8 @@ pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Exception!usi
         }.less);
     }
 
-    // Number directories first (dwarfs numbers directories before files),
-    // each group in DFS order.
+    // Number directories before files, each group in DFS order,
+    // as DwarFS requires.
     var dir_order: std.ArrayList(u32) = .empty;
     var file_order: std.ArrayList(u32) = .empty;
     try tree_order.orderTree(DwNode, &nodes, kids, 0, &dir_order, &file_order, alloc);
@@ -994,7 +1007,6 @@ pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Exception!usi
         nodes.items[ni].number = dir_count + @as(u32, @intCast(i));
     }
 
-    // Metadata vectors.
     var chunks: std.ArrayList(u8) = .empty;
     var chunk_table: std.ArrayList(u32) = .empty;
     var inodes: std.ArrayList(u32) = .empty;
@@ -1029,8 +1041,8 @@ pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Exception!usi
             inodes.append(alloc, v) catch return error.ResourceException;
         }
     }
-    // Directory records plus a sentinel, emitted directory by directory,
-    // so every record index computes up front.
+    // Directory records plus a sentinel, emitted per directory,
+    // so every record index is known up front.
     dir_entries.appendSlice(alloc, &.{ 0, 0 }) catch return error.ResourceException;
     const first_entry_of = alloc.alloc(u32, dir_order.items.len) catch return error.ResourceException;
     const record_of = alloc.alloc(u32, nodes.items.len) catch return error.ResourceException;
@@ -1110,13 +1122,13 @@ pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Exception!usi
     bw.write(gids_at, 32);
     bw.write(@intCast(modes.len), 32);
     bw.write(modes_at, 32);
-    bw.write(0, 64); // timestamp_base
-    bw.write(write_block_size, 32); // block_size
-    bw.write(total_size, 64); // total_fs_size
-    bw.write(1, 1); // dir_entries present
+    bw.write(0, 64); // timestamp_base.
+    bw.write(write_block_size, 32); // block_size.
+    bw.write(total_size, 64); // total_fs_size.
+    bw.write(1, 1); // dir_entries present.
     bw.write(@intCast(dir_entries.items.len / 2), 32);
     bw.write(dir_entries_at, 32);
-    bw.write(1, 1); // names present
+    bw.write(1, 1); // Names present.
     bw.write(names_at, 32);
     bw.write(names.items.len, 32);
     bw.write(@intCast(names_index.items.len), 32);
@@ -1175,20 +1187,7 @@ pub fn archiveSize(entries: []const Entry) Exception!u64 {
     var fba = std.heap.FixedBufferAllocator.init(&stack);
     const alloc = fba.allocator();
     var nodes: std.ArrayList(DwNode) = .empty;
-    nodes.append(alloc, .{ .kind = .dir, .name = "", .parent = 0 }) catch return error.ResourceException;
-    for (entries) |entry| {
-        try dwValidate(entry.name);
-        if (entry.data.len > write_block_size) return error.UnsupportedException;
-        var parent: u32 = 0;
-        var it = std.mem.splitScalar(u8, entry.name, '/');
-        var comp = it.next().?;
-        while (it.next()) |next| {
-            parent = try dwFindOrCreateDir(&nodes, alloc, parent, comp);
-            comp = next;
-        }
-        nodes.append(alloc, .{ .kind = .file, .name = comp, .parent = parent, .data = entry.data }) catch return error.ResourceException;
-        nodes.items[parent].child_count += 1;
-    }
+    try dwBuildNodes(&nodes, alloc, entries);
     if (nodes.items.len > max_tree_nodes) return error.UnsupportedException;
     var dirs: u64 = 0;
     var files: u64 = 0;
@@ -1204,7 +1203,7 @@ pub fn archiveSize(entries: []const Entry) Exception!u64 {
         }
     }
     if (data_len > write_data_cap) return error.UnsupportedException;
-    const records: u64 = files + dirs; // root self + every child record
+    const records: u64 = files + dirs; // Root self + every child record.
     var schema_buf: [2048]u8 = undefined;
     var sfba = std.heap.FixedBufferAllocator.init(&schema_buf);
     var schema_bytes: std.ArrayList(u8) = .empty;
@@ -1364,10 +1363,8 @@ test "dwarfs decodes a multi-block image" {
     var archive: [4096]u8 = undefined;
     var scratch: [scratch_size]u8 = undefined;
     const written = try encode(&entries, &archive, &scratch);
-    // Splice a second, zstd-compressed BLOCK section in after the first
-    // block's payload; a 16 MiB declared block size over a tiny compressed
-    // block mirrors the mkdwarfs default that must not size the decode
-    // buffer by block_size.
+    // Splice a zstd-compressed BLOCK section after the first block; its
+    // 16 MiB declared size must not drive decode buffer sizing.
     var fba = std.heap.FixedBufferAllocator.init(&scratch);
     const sections = try parseSections(archive[0..written], fba.allocator());
     const insert_at: usize = @intCast(sections.blocks[0].at + sections.blocks[0].len);
@@ -1413,7 +1410,7 @@ test "dwarfs decodes multi-chunk and empty files" {
     var scratch: [scratch_size]u8 = undefined;
     const written = try encode(&entries, &archive, &scratch);
     const view = archive[0..written];
-    // Shift chunk_table[2] so b.txt spans two chunks and c.txt empties.
+    // Shift chunk_table[2] so b.txt spans two chunks and c.txt becomes empty.
     var fba = std.heap.FixedBufferAllocator.init(&scratch);
     const sections = try parseSections(view, fba.allocator());
     const meta_at: usize = @intCast(sections.metadata_at);

@@ -336,8 +336,7 @@ fn runFilters(r: *Runner) anyerror!void {
     setup7z(r, harness.ids.sevenzip);
     corpus.fillTiled(r.corpus_index, &sz_filter_payload);
     // Filter + LZMA1 folders (x86/delta under legacy LZMA) plus the modern
-    // LZMA2 pairing. Every archive round-trips through our reader and the
-    // libarchive oracle where it can express the folder chain.
+    // LZMA2 pairing.
     const combos = [_]struct { filter: u64, method: u64 }{
         .{ .filter = 6, .method = 3 },
         .{ .filter = 5, .method = 3 },
@@ -475,9 +474,8 @@ fn runEncrypted(r: *Runner) anyerror!void {
     if (r.response.byte_length != 53) return error.Copy53FixtureMismatch;
 }
 
-// Encoded headers ride in a packed stream: -mhe inspect needs the password
-// channel, and the header bytes vanish.
-// Fixtures pin the decoder against official-CLI archives.
+// Encoded headers ride in a packed stream: -mhe inspect needs the password,
+// and the header bytes vanish.
 fn runEncodedHeaders(r: *Runner) anyerror!void {
     setup7z(r, harness.ids.sevenzip);
     corpus.fillTiled(r.corpus_index, &sz_enc_data);
@@ -529,8 +527,7 @@ fn runEncodedHeaders(r: *Runner) anyerror!void {
     if (!harness.allBytesEqual(&sz_enc_output, 0xa5)) return error.EncodedHeaderWrongPasswordWroteSink;
 
     // 7-Zip-CLI fixtures pin the decoder against the reference byte shape;
-    // their content is a fixed pattern, so only the length is asserted (the
-    // corpus fill varies by runner index, as in the encrypted fixtures above).
+    // content is fixed, so only the length is asserted.
     @memset(&sz_enc_output, 0xa5);
     _ = try sevenZipRead(r, &fixtures.sz_encoded_header_fixture, 0, &sz_enc_output, &.{});
     try harness.requireStatus(r, abi.Status.ok);
@@ -554,7 +551,7 @@ fn skipped(comptime label: []const u8) fn (*Runner) anyerror!void {
 var sz_ppmd_data: [600]u8 = undefined;
 
 // PPMd solid: consecutive same-method entries pack into one folder with a
-// single continuous PPMd stream, and every substream decodes back exactly.
+// single continuous PPMd stream.
 fn runPpmd(r: *Runner) anyerror!void {
     setup7z(r, harness.ids.sevenzip);
     corpus.fillTiled(r.corpus_index, &sz_ppmd_data);

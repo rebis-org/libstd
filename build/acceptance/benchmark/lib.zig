@@ -19,10 +19,8 @@ extern fn lzma_stream_buffer_decode(memlimit: ?*u64, flags: u32, allocator: ?*an
 extern fn FL2_compress(destination: [*]u8, destination_capacity: usize, source: [*]const u8, source_size: usize, compressionLevel: c_int) usize;
 extern fn FL2_decompress(destination: [*]u8, destination_capacity: usize, source: [*]const u8, source_size: usize) usize;
 extern fn FL2_isError(code: usize) c_uint;
-// zlib sizes its length parameters with uLong (unsigned long), 8 bytes on
-// every LP64 target.
-// A narrower declared type lets zlib's 64-bit store spill past the caller's
-// slot.
+// The zlib uLong length parameters are 8 bytes on LP64 targets.
+// A narrower type would write past the caller's slot.
 extern fn compress2(destination: [*]u8, dest_len: *usize, source: [*]const u8, source_len: usize, level: c_int) c_int;
 extern fn uncompress(destination: [*]u8, dest_len: *usize, source: [*]const u8, source_len: usize) c_int;
 extern fn LZ4F_compressFrameBound(src_size: usize, preferences: ?*const anyopaque) usize;

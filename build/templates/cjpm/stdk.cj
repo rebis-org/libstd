@@ -1,6 +1,5 @@
-// FFI bindings for the libstd C ABI (stdk.h, STDK_ABI_EPOCH 9).
-// Foreign declarations are package-private in Cangjie; the public wrappers
-// below are the importable surface and encapsulate the unsafe calls.
+// FFI bindings for the libstd C ABI (stdk.h). Foreign declarations are
+// package-private; public wrappers encapsulate the unsafe calls.
 package stdk
 
 // Status codes (stdk.h STDK_STATUS_*).
@@ -51,16 +50,15 @@ public struct CallEnvelope {
     var diagnostic: CPointer<Node> = CPointer<Node>()
     var workspace: CPointer<UInt8> = CPointer<UInt8>()
     var workspace_capacity: UInt64 = 0
-    // The header types this as stdk_callback (a function pointer). It stays
-    // opaque here because hosts that wire callback resources build it from a
-    // CFunc with an unsafe cast.
+    // The header types this as a stdk_callback; it stays opaque because
+    // hosts build it from a CFunc via unsafe cast.
     var callback: CPointer<Unit> = CPointer<Unit>()
     var callback_context: CPointer<Unit> = CPointer<Unit>()
     var reserved: VArray<UInt64, $4> = [0, 0, 0, 0]
 }
 
-// The parameter counts below are fixed by the C ABI, so the style rule that
-// caps parameter lists does not apply to this block.
+// The C ABI fixes these parameter counts, so the parameter-list style
+// rule does not apply here.
 // cjlint-ignore -start !G.FUN.01
 foreign func stdk_call(call: CPointer<CallEnvelope>): UInt32
 

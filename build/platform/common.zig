@@ -15,10 +15,8 @@ pub fn refTarget(b: *std.Build, target: std.Build.ResolvedTarget) std.Build.Reso
 // Each descriptor is a file argument, because a directory argument is unfingerprinted.
 pub fn descriptorPaths(b: *std.Build) [][]const u8 {
     var list: std.ArrayList([]const u8) = .empty;
-    // The enumeration observes configuration-time state; any descriptor change
-    // must invalidate the configure cache.
-    // dependOnDirectoryContents is not recursive: the top-level directory catches
-    // new subdirectories, each parent catches entry changes one level down.
+    // The scan observes configuration-time state, so descriptor changes must
+    // invalidate the configure cache; dependOnDirectoryContents is not recursive.
     b.dependOnDirectoryContents(b.path("src"));
     var dir = b.root.openDir(b.graph.io, "src", .{ .iterate = true }) catch @panic("the component scan cannot open src.");
     defer dir.close(b.graph.io);
@@ -29,9 +27,8 @@ pub fn descriptorPaths(b: *std.Build) [][]const u8 {
         const rel_path = b.allocator.print("src/{s}", .{entry.path}) catch @panic("the component scan is out of memory.");
         list.append(b.allocator, rel_path) catch @panic("the component scan is out of memory.");
         b.dependOnFileContents(b.path(rel_path));
-        // Watch every ancestor, not just the direct parent. A new component
-        // directory two levels down (src/<layer>/<name>/) changes no watched
-        // directory otherwise. The cached configure keeps missing it.
+        // Watch every ancestor: a new component directory two levels down
+        // otherwise changes no watched directory.
         var slash_at = std.mem.findScalar(u8, rel_path, '/');
         while (slash_at) |at| : (slash_at = std.mem.findScalarPos(u8, rel_path, at + 1, '/')) {
             b.dependOnDirectoryContents(b.path(rel_path[0 .. at + 1]));
@@ -70,11 +67,8 @@ pub const HostLibraries = struct {
 pub const Implementation = enum { onprem, offprem, mergeable };
 pub const capabilities = .{ "sha256", "sha1", "hmac", "pbkdf2", "adler32", "xxh32", "xxh64", "aes", "crc32", "crc64xz", "bzip2crc32" };
 
-// Hardware ISA the crc kernels may assume. 'detected' compiles them for the
-// resolved target's own cpu features, so a baseline x86_64 artifact never
-// carries instructions the triple does not promise. 'extended' adds
-// sha/avx2/aes on x86_64 and crc/crypto on aarch64 and hard-requires those
-// extensions at runtime; it exists for measured native-hardware runs only.
+// The 'detected' mode keeps a baseline artifact inside what its triple
+// promises; 'extended' hard-requires extra ISAs for measured native runs.
 pub const KernelIsa = enum { detected, extended };
 
 pub fn KindedUnit(comptime Kind: type) type {
@@ -93,9 +87,8 @@ pub fn putCapability(options: *std.Build.Step.Options, comptime capability: []co
     options.addOption(bool, capability ++ "_portable", portable_flag);
 }
 
-// Every options key resolves somewhere in the tree.
-// A build compiling against a second options module must declare the whole
-// surface, so the list lives here.
+// Every key resolves somewhere in the tree, so a second options module
+// must declare the whole surface here.
 pub fn putUniformOptions(options: *std.Build.Step.Options, impl: Implementation, portable_flag: bool) void {
     options.addOption(bool, "portable", portable_flag);
     options.addOption(Implementation, "primitives_impl", impl);
@@ -235,10 +228,8 @@ pub fn installGenerated(b: *std.Build, generated: Generated) void {
     b.getInstallStep().dependOn(&b.addInstallFile(generated.module_map, "module.modulemap").step);
 }
 
-// pkg-config is the Linux integration currency; the .pc is relocatable via
-// pcfiledir so the archive unpacks anywhere.
-// Every libstd form opens with the same four files; the builders add their
-// architecture payloads on top.
+// The pkg-config file is the Linux integration currency; the .pc relocates
+// via pcfiledir so the archive unpacks anywhere.
 pub fn beginLibstdStage(b: *std.Build, ctx: *const Settings, distribution: manifest.Distribution) *std.Build.Step.WriteFile {
     const stage = b.addWriteFiles();
     stageHeaderCatalog(stage, ctx, distribution);

@@ -7,8 +7,8 @@ const linux = @import("platform/linux.zig");
 const manifest = @import("platform/manifest.zig");
 const windows = @import("platform/windows.zig");
 
-// Kinds name the artifact shape, which is what actually routes to a
-// builder: one ELF engine serves macos, linux, the BSDs, and WASI.
+// Kinds name the artifact shape that routes to a builder: one ELF
+// engine serves macos, linux, the BSDs, and WASI.
 pub const Kind = enum { elf, pe, xcframework, aar, cjpm };
 
 pub const Unit = common.KindedUnit(Kind);

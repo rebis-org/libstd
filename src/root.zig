@@ -5,15 +5,15 @@ const diagnostic = @import("interface").diagnostic;
 const invoke = @import("compose/call.zig").invoke;
 const Call = @import("kernel/envelope.zig").Call;
 
-// Keep panics off std.debug's default handler: its debug_io instantiates
-// std.Io.Threaded, which fails to compile for the Apple embedded targets.
-// Upstream tracked as ziglang/zig#37061, fixed on master but unreleased.
+// Keep panics off std.debug's handler: debug_io instantiates std.Io.Threaded,
+// failing to compile for Apple embedded targets (ziglang/zig#37061; fixed upstream, unreleased).
+//
 // The library traps like every other contract violation.
 pub const panic = std.debug.FullPanic(struct {
     fn panicFn(msg: []const u8, first_trace_addr: ?usize) noreturn {
         _ = first_trace_addr;
-        // The write is per-OS (kernel32 on Windows, the syscall on linux
-        // ABIs without libc); only the abort needs a C runtime.
+        // The write is per-OS (kernel32 on Windows, syscalls on libc-less
+        // linux ABIs); only the abort needs a C runtime.
         diagnostic.writeStderr(msg);
         diagnostic.writeStderr("\n");
         if (comptime diagnostic.has_libc) {

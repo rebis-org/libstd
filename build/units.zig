@@ -97,9 +97,8 @@ pub fn addListingStep(b: *std.Build) *std.Build.Step {
     return step;
 }
 
-// CI suite jobs restore no benchmark cache, so the Silesia corpus the
-// brotli round-trip needs must be materialized on demand. The download is
-// pinned by content exactly as the benchmark harness pins it.
+// CI suite jobs restore no benchmark cache, so this step materializes
+// the Silesia corpus on demand, content-pinned like the harness.
 fn addCorpusStep(b: *std.Build) void {
     const root_entry = bench_env.paths.corpus_dir ++ "/mozilla";
     const nested_entry = bench_env.paths.corpus_dir ++ "/silesia/mozilla";

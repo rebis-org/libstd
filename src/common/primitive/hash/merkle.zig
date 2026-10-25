@@ -68,11 +68,8 @@ pub fn Digest(
     };
 }
 
-// The hardware-versus-scalar differential every accelerated digest reuses:
-// misaligned inputs across a spread of split points, since both ends of a
-// pipeline crossing must agree on every tail residue. Callers guard with a
-// comptime `if (!hw) return error.SkipZigTest` so the foreign-arch asm stays
-// unreferenced on targets that lack it.
+// Tail residues must match across pipeline crossings, hence the misaligned and
+// split sweeps. Callers' comptime SkipZigTest keeps foreign-arch asm unreferenced.
 fn checkHwScalar(rng: *std.Random.DefaultPrng, comptime Hw: type, comptime Sw: type, size: usize) !void {
     const buf = try std.testing.allocator.alloc(u8, size + 8);
     defer std.testing.allocator.free(buf);

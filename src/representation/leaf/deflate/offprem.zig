@@ -5,8 +5,8 @@ const std = @import("std");
 
 pub const Decompress = struct {
     inner: std.compress.flate.Decompress,
-    // Owns the fixed reader slice constructions bind stdlib flate to: a
-    // constructor-local reader would dangle the moment init returned.
+    // Owns the fixed reader stdlib flate binds to; a constructor-local
+    // reader would dangle once init returns.
     fixed_input: std.Io.Reader,
     slice_bound: bool,
 
@@ -27,32 +27,29 @@ pub const Decompress = struct {
         self.initSliceInPlace(data, history);
     }
 
-    // The fixed reader's seek is the consumed byte position; the stream
-    // bits consumed inside the current byte ride in consumed_bits. Valid
-    // only for initSlice constructions: streaming callers measure
-    // consumption from their own source reader (e.g. source.seek).
+    // The seek field counts consumed bytes; the current byte's bits ride
+    // in consumed_bits. Streaming callers measure consumption from their source.
     pub fn inputBitsConsumed(self: *const @This()) usize {
         std.debug.assert(self.slice_bound);
         return self.inner.input.seek * 8 + self.inner.consumed_bits;
     }
 
-    // Seam binding points: the tag binds at construction and the decode
-    // loop never dispatches. A mismatched tag is unsupported, never a
-    // silent fallback. `anytype` keeps the arm free of module imports.
+    // Seam binding points: the tag binds at construction, the decode loop
+    // never dispatches; `anytype` avoids module imports.
     pub fn initBound(provider: anytype, input: *std.Io.Reader, history: []u8) error{UnsupportedException}!@This() {
         if (provider != .offprem) return error.UnsupportedException;
         return init(input, history);
     }
 
-    // Resume a fresh member at a byte position the framing already read
+    // Resume a fresh member at a byte position the framing read
     // ahead to (session drivers). Both fields are fresh-construction state.
     pub fn setFramePos(self: *@This(), pos: usize) void {
         self.inner.input.seek = pos;
         self.inner.consumed_bits = 0;
     }
 
-    // Session-driver surface: same pokes the onprem arm exposes,
-    // over the fixed reader stdlib flate keeps its input in.
+    // Session-driver surface mirroring the onprem arm, over the fixed
+    // reader stdlib flate reads from.
     pub fn streamPosition(self: *const @This()) usize {
         return self.inner.input.seek;
     }
@@ -83,8 +80,8 @@ pub const Decompress = struct {
         return err != error.EndOfStream;
     }
 
-    // stdlib flate reports input exhaustion as `ReadFailed` with `EndOfStream`
-    // recorded on the decompressor; a rolled-back fill keys off this.
+    // The stdlib flate reports input exhaustion as `ReadFailed` with
+    // `EndOfStream` recorded on the decompressor; a rolled-back fill keys off this.
     fn starved(self: *const @This()) bool {
         const err = self.inner.err orelse return false;
         return err == error.EndOfStream;
@@ -94,20 +91,16 @@ pub const Decompress = struct {
         return &self.inner.reader;
     }
 
-    // stdlib flate cannot suspend mid-block: its state machine only persists where
-    // it assigns `state`, so a starved fill would resume from stale state.
-    // Fills are therefore transactional: snapshot, restore on starvation, re-parse.
+    // The stdlib flate cannot suspend mid-block: state persists only at
+    // `state` assignments. Fills are transactional: snapshot, restore on starvation, re-parse.
     pub fn streamTo(self: *@This(), writer: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
         const reader = &self.inner.reader;
         var produced: usize = 0;
         while (true) {
             const fill = reader.seek >= reader.end;
             if (fill) {
-                // Collapse the window before the fill, mirroring stdlib's
-                // own rebase condition: with nothing left to serve the
-                // keep-set is exactly the trailing window, and a collapsed
-                // fill never re-moves history mid-round, so a rollback
-                // restores buffer-consistent state.
+                // Collapse the window before filling, mirroring stdlib's rebase: the
+                // fill never re-moves history mid-round, so rollback is buffer-consistent.
                 const window = std.compress.flate.history_len;
                 if (reader.buffer.len - reader.end < window) {
                     @memmove(reader.buffer[0..window], reader.buffer[reader.end - window .. reader.end]);
@@ -144,7 +137,7 @@ test "offprem arm decodes byte-identical to onprem across shapes" {
     var prng = std.Random.DefaultPrng.init(0x9e3779b97f4a7c15);
     prng.random().bytes(input);
     // Zeros beside the random stretch force stored blocks next to dynamic
-    // ones; sizes below sweep empty, tails, one window, and multi-block.
+    // ones; sizes below sweep empty, tails, one window, multi-block.
     @memset(input[30000..65000], 0);
 
     const compressed = try alloc.alloc(u8, 80000);
@@ -190,11 +183,8 @@ test "offprem arm decodes byte-identical to onprem across shapes" {
     }
 }
 
-// Regression: stdlib flate cannot be suspended mid-block, so a starved fill
-// must roll back to the round's start and re-parse after a restage. Feeding
-// the same stream in every chunk size must stay byte-identical to the
-// one-shot decode, including multi-window sizes that force the pre-fill
-// window collapse and its rollback.
+// Regression: starved fills roll back and re-parse; every chunk size
+// must stay byte-identical to one-shot, including window collapses.
 test "offprem arm restaged chunk feeds decode byte-identical to one-shot" {
     const onprem = @import("onprem.zig");
     const alloc = std.testing.allocator;

@@ -23,9 +23,8 @@ pub const Strategy = enum(u8) {
     huffman_only,
     // Matches are limited to distance one (run-length encoding).
     rle,
-    // zlib's filtered profile: tuned for mostly-small, weakly-correlated
-    // values, forcing more Huffman coding and less string matching by
-    // clamping the search knobs at init, as zlib's configuration table does.
+    // Filtered profile from zlib: tuned for small, weakly correlated
+    // values; clamping the search knobs at init favors Huffman over matching.
     filtered,
 };
 
@@ -36,10 +35,8 @@ pub const Options = struct {
     chain: u16,
     optimal: bool = false,
     strategy: Strategy = .default,
-    // Optimal-parse cost-model iterations. 1 is the single frozen-price
-    // pass; >1 re-gathers symbol statistics from each parse and re-prices
-    // (the zopfli outer loop) until the cost stops improving or the budget
-    // runs out. Only meaningful with optimal = true.
+    // Optimal-parse passes: 1 is the frozen-price pass; further passes
+    // re-price from each parse's statistics (Zopfli) until the cost stops dropping.
     iterations: u16 = 1,
 };
 
@@ -60,8 +57,8 @@ const too_far = 4096;
 const no_position = std.math.maxInt(u32);
 const token_literal: u64 = 1 << 63;
 
-// Optimal parse: one forward pass plus frozen-price backward DP. No second price
-// iteration (costs ~30% speed for ~0.3% ratio). Span cap preserves the reread invariant.
+// A second price pass costs ~30% speed for ~0.3% ratio. The span cap
+// preserves the reread invariant.
 const optimal_span = window_size - min_lookahead;
 const optimal_stride = 4;
 const optimal_price_shift = 6;
@@ -71,7 +68,7 @@ const hash3_size = 1 << hash3_bits;
 
 const OptimalScratch = struct {
     tokens: [optimal_span]u64,
-    // The best parse so far survives a non-improving re-plan, which would
+    // The best parse survives a non-improving re-plan that would
     // otherwise overwrite `tokens` in place.
     tokens_best: [optimal_span]u64,
     cost: [optimal_span + 1]u32,
@@ -349,8 +346,8 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
             if (options.iterations > 1 and !options.optimal) return error.CallException;
             var effective = options;
             if (options.strategy == .filtered) {
-                // zlib's filtered configuration: good 4, lazy 4, nice 16,
-                // chain 8 — the search gives up sooner so literals dominate.
+                // Filtered configuration from zlib: good 4, lazy 4, nice 16,
+                // chain 8; the search gives up sooner so literals dominate.
                 effective.good = @min(options.good, 4);
                 effective.lazy = @min(options.lazy, 4);
                 effective.nice = @min(options.nice, 16);
@@ -608,10 +605,8 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
                 stats_tokens += 1;
             }
             var token_count = c.planBlock(span, &lit_freq, &dist_freq, stats_tokens);
-            // Zopfli-style outer loop: each pass re-gathers the symbol
-            // statistics from the parse it just produced, rebuilds the
-            // Huffman prices, and re-runs the DP. The parse is kept only
-            // while its self-consistent cost keeps dropping.
+            // Zopfli outer loop: every pass re-gathers the parse's statistics,
+            // re-prices, and re-runs the DP while the cost keeps dropping.
             if (c.options.iterations > 1) {
                 @memcpy(scratch.tokens_best[0..token_count], scratch.tokens[0..token_count]);
                 var best_cost = scratch.cost[0];
@@ -633,19 +628,18 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
             c.cursor = span_end;
             c.finalized = span_end;
             if (finishing and span_end == c.end) {
-                // Final flag belongs to finish(). Block waits tallied.
+                // The final flag belongs to finish(); the tallied block waits.
                 c.opt_pending_len = token_count;
                 return;
             }
             try c.emitBlock(false, scratch.tokens[0..token_count]);
         }
 
-        // Counts the literal/length/distance symbols a token stream would
-        // emit, feeding the next cost-model iteration.
+        // Symbol counts from a token stream feed the next cost-model iteration.
         fn countTokenStats(tokens: []const u64, lit_freq: *[lit_alphabet]u32, dist_freq: *[dist_alphabet]u32) u64 {
             lit_freq.* = @splat(0);
             dist_freq.* = @splat(0);
-            lit_freq[256] = 1; // end-of-block
+            lit_freq[256] = 1; // End-of-block.
             var count: u64 = 0;
             for (tokens) |token| {
                 if (token & token_literal != 0) {
@@ -668,7 +662,8 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
             huffman.limitedLengths(dist_freq, &dist_lengths, max_code_bits);
             completeTree(lit_freq, &lit_lengths);
             completeTree(dist_freq, &dist_lengths);
-            // Header cost spreads over tokens, so a match is charged one share per replaced literal.
+            // Header cost amortizes over tokens: a match pays one share,
+            // not one per covered literal.
             const header_bits = dynamicHeaderBits(&lit_lengths, &dist_lengths);
             const overhead: u32 = @intCast((header_bits << optimal_price_shift) / @max(1, stats_tokens));
             var lit_price: [256]u32 = undefined;
@@ -678,8 +673,8 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
 
         const Improving = struct { count: u8, length: usize, distance: u32 };
 
-        // Ascending improving pairs let the DP price against the cheapest covering distance.
-        // Budget collapses past good length: the chain tail dominates encode cost.
+        // Ascending pairs let the DP price against the cheapest covering distance.
+        // Budget collapses past good length: chain tails dominate cost.
         fn searchImproving(c: *@This(), pos: usize, head_candidate: u32, span_end: usize, output: []u32) Improving {
             const position: u32 = @truncate(c.base + pos);
             const available = @min(config.max_match, c.end - pos);
@@ -950,12 +945,11 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
             for (0..dist_alphabet) |symbol| dynamic_bits += dist_freq[symbol] * dist_lengths[symbol];
             for (0..cl_alphabet) |symbol| dynamic_bits += cl_freq[symbol] * cl_lengths[symbol];
             const stored_bits = 3 + (8 - (c.bit_count + 3) % 8) % 8 + 32 + 8 * span;
-            // Strategy overrides: stored emits verbatim blocks; fixed bars
-            // dynamic Huffman codes (stored still wins when smaller).
-            // Stored LEN is a 16-bit field. Deflate spans stay under the cap,
-            // but deflate64 spans can reach the window size, so a long span
-            // emits as consecutive stored blocks with the final flag on the
-            // last; single-chunk output is byte-identical to the one-block form.
+            // Strategy overrides: stored forces verbatim blocks; fixed
+            // excludes dynamic Huffman (stored still wins when smaller).
+            //
+            // Stored LEN is 16 bits; deflate64 spans can exceed it.
+            // Consecutive stored chunks stay byte-identical to a single block.
             if (c.options.strategy == .stored or (stored_bits < fixed_bits and stored_bits < dynamic_bits)) {
                 var stored_off = c.block_start;
                 const stored_end = c.finalized;
@@ -1053,9 +1047,8 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
 
 pub const Compress = CompressOf(.deflate);
 
-// The one feed loop every gzip and zlib frame encodes through: the source is
-// batched into chunks so the compressor and the frame's checksum each see a
-// whole chunk, and the fed byte count comes back for the frame trailer.
+// Feed loop shared by gzip and zlib frames: each chunk feeds
+// checksum and compressor; the total fills the frame trailer.
 pub fn feed(comptime Checksum: type, source: *std.Io.Reader, compressor: *Compress, checksum: *Checksum) Exception!u64 {
     var buffer: [4096]u8 = undefined;
     var total: u64 = 0;
@@ -1089,7 +1082,8 @@ fn hash3(bytes: []const u8) u32 {
     return h & (hash3_size - 1);
 }
 
-// Keep ascending order with nearer distance on ties. Over capacity keep ends for cheap shorts and coverage.
+// Keep ascending order, nearer distance on ties. Over capacity, keep
+// the ends: cheap shorts and long coverage.
 fn mergeCandidates(output: []u32, chain: []const u32, side_length: usize, side_distance: u32) u8 {
     if (side_length < min_match) {
         @memcpy(output[0..chain.len], chain);
@@ -1447,9 +1441,8 @@ pub fn DecompressOf(comptime variant: enum { deflate, deflate64 }) type {
             self.failed = false;
         }
 
-        // A starved slice parse stays resumable: the step rolled back and
-        // this stays false so the session driver can tell starvation from
-        // corruption.
+        // A starved slice parse stays resumable: the step rolled back, so
+        // the session driver can tell starvation from corruption.
         pub fn isFailed(self: *const @This()) bool {
             return self.failed;
         }
@@ -1488,11 +1481,8 @@ pub fn DecompressOf(comptime variant: enum { deflate, deflate64 }) type {
                 }
                 if (r.end == r.buffer.len) break;
                 decompressor.step() catch |step_err| {
-                    // A truncated slice is a suspension, not corruption: the
-                    // step rolled its parse back, so the session restages
-                    // more input and retries from the same bits. A truncated
-                    // reader is a genuinely short stream, like every other
-                    // parse error.
+                    // Slice truncation is a resumable suspension; reader
+                    // truncation is a short stream and marks the inflater failed.
                     if (step_err != error.Truncated or decompressor.input == .reader) {
                         decompressor.failed = true;
                     }
@@ -1531,12 +1521,8 @@ pub fn DecompressOf(comptime variant: enum { deflate, deflate64 }) type {
             if (capacity > r.buffer.len - r.end) return error.EndOfStream;
         }
 
-        // zlib inf_leave pattern: a parse step can abort mid-way with
-        // structure-partial bit state consumed. Snapshot the resumable
-        // position and restore it on truncation so the retry re-parses from
-        // the same bits once more input arrives. Stored copies commit per
-        // byte instead, so they are excluded: a rollback would
-        // double-consume committed bytes.
+        // The zlib inf_leave pattern: steps snapshot and restore on truncation.
+        // Stored copies commit per byte; rollback would double-consume them.
         fn step(d: *@This()) InflateError!void {
             if (d.state == .stored_copy) return d.copyStored();
             const saved_bits = d.bits;
@@ -1862,8 +1848,8 @@ test "deflate strategies roundtrip and shape blocks" {
         try std_testing.expectEqual(@as(u8, 0), encoded[0] & 0x06);
     }
 
-    // Fixed strategy on skewed data: dynamic would win by default, so this
-    // proves the override. First block header carries BTYPE 01.
+    // Fixed strategy on skewed data: dynamic would win by default; this
+    // proves the override. The block header carries BTYPE 01.
     {
         var history: [history_size]u8 = undefined;
         var encoded: [256]u8 = undefined;
@@ -1988,7 +1974,7 @@ test "deflate optimal iterations improve or hold the parse cost" {
     _ = inflater.reader.streamRemaining(&dest) catch return error.InflateStream;
     try std.testing.expectEqualSlices(u8, &input, &decoded);
 
-    // iterations > 1 without the optimal parser is a caller error.
+    // Iterations > 1 without the optimal parser is a caller error.
     {
         var sink_buf: [8]u8 = undefined;
         var sink = std.Io.Writer.fixed(&sink_buf);

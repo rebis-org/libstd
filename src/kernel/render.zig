@@ -6,8 +6,8 @@ const abi = @import("envelope.zig");
 
 pub const header = renderHeader();
 pub const module_map = renderModuleMap();
-// A module map sealed in a framework bundle's Modules/ directory must declare
-// a framework module or clang skips the umbrella header.
+// A Modules/ module map must declare a framework module, or clang skips
+// the umbrella header.
 pub const framework_module_map = renderFrameworkModuleMap();
 
 fn renderHeader() []const u8 {

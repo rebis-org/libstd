@@ -58,15 +58,13 @@ pub const Session = struct {
     // Sticky failure state machine: once a step fails, later steps fail with
     // CallException instead of depending on per-driver recovery conventions.
     failed: bool = false,
-    // Handle identity: set by the boundary on create, cleared on destroy, so a
-    // failed-create or never-created storage can never dispatch through a
-    // garbage ops pointer.
+    // The boundary sets the cookie on create and clears it on destroy,
+    // so garbage ops pointers never dispatch.
     cookie: u64 = 0,
     // The caller-declared storage extent, for overlap validation at step time.
     storage_len: u64 = 0,
-    // The last step's failure in envelope status vocabulary, plus the driver
-    // detail. Written by the boundary on exception. Hosts read them through
-    // `stdk_session_failure` while the storage is alive.
+    // The boundary records the last failure's envelope status and driver
+    // detail; hosts read them through `stdk_session_failure` while the storage lives.
     failure_status: u32 = 0,
     failure_detail: u64 = 0,
 

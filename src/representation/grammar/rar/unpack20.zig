@@ -12,14 +12,14 @@ const BitReader = bits.BitReader;
 const DecodeTable = huffman.DecodeTable;
 const Window = window_mod.Window;
 
-// RAR 2.x (v20/v26) code length tables must stay literal, because no closed form reproduces DBits saturating at 16.
-// Every match pushes its distance at the write cursor, so the old-distance ring must stay circular.
+// RAR 2.x (v20/v26) code length tables must stay literal, because no closed
+// form reproduces DBits saturating at 16.
 
 const nc20: u16 = 298;
 const mc20: u16 = 257; // Audio alphabet: 256 deltas plus the table-refresh code.
 const dc20: u16 = 48;
 const rc20: u16 = 28;
-const bc20: u16 = 19; // Not 20, because v29's BC30 is 20, and a 20th length desynchronises every table read.
+const bc20: u16 = 19; // Not 20, because v29's BC30 is 20, and a 20th length desynchronizes every table read.
 
 const max_audio_channels: u8 = 4;
 
@@ -32,7 +32,7 @@ pub const table_pool_words: usize = @as(usize, nc20) + dc20 + rc20 + @as(usize, 
 const short_distances = [8]u32{ 0, 4, 8, 16, 32, 64, 128, 192 };
 const short_distance_bits = [8]u5{ 2, 2, 3, 4, 5, 6, 6, 6 };
 
-// The caller adds +3 for a new match (symbol 270 or above) or +2 for a rep-distance match (symbols 257 to 260).
+// The caller adds +3 for a new match (270 up) or +2 for a rep-distance match (257 to 260).
 const length_bases = [rc20]u32{
     0,   1,   2,   3,   4,  5,  6,  7,
     8,   10,  12,  14,  16, 20, 24, 28,
@@ -80,10 +80,8 @@ fn decodeDistance(slot: u32, br: *BitReader) Exception!u32 {
     return distance;
 }
 
-// The predictor adapts every 32 samples, nudging one coefficient toward
-// the bucket with the smallest accumulated difference.
-// The clamp is asymmetric, [-17, 16], because each guard tests `>= -16`
-// before the decrement.
+// The predictor adapts every 32 samples toward the smallest-difference
+// bucket; the [-17, 16] clamp mirrors the `>= -16` guards.
 const AudioChannel = struct {
     k1: i32 = 0,
     k2: i32 = 0,
@@ -178,7 +176,8 @@ const AudioChannel = struct {
 };
 
 pub const Decoder = struct {
-    // A solid session outlives a single file, and bit input restarts for every entry, so the reader is stored by value.
+    // A solid session outlives a single file and bit input restarts per entry,
+    // so the reader is stored by value.
     br: BitReader,
     window: Window,
     literal_table: DecodeTable,
@@ -200,7 +199,6 @@ pub const Decoder = struct {
     cur_channel: u8,
     // Each block encodes its lengths as a 4-bit delta against the previous block, so these lengths must persist.
     old_table: [old_table_size]u8,
-    // The prediction delta is shared across all channels.
     channel_delta: i32,
     tables_loaded: bool,
     audio_state: [max_audio_channels]AudioChannel,
@@ -264,11 +262,11 @@ fn tablePoolSlice(st: *Decoder, index: usize, comptime size: usize) []u16 {
 fn readTables(st: *Decoder) Exception!void {
     const br = &st.br;
 
-    // V20 reads tables without byte alignment, because aligning discards up to 7 bits.
-    // The loss stays invisible until a table refresh (symbol 269) needs an entry that spans two blocks.
+    // V20 reads tables unaligned; aligning would discard up to 7 bits and break a
+    // refresh entry spanning two blocks.
 
-    // One peeked word holds the flag bits: 0x8000 marks an audio block and 0x4000 clear zeroes the old table.
-    // Two more bits give the channel count of an audio block, so the table size is MC20 * channels.
+    // Peeked flags: 0x8000 marks an audio block, a clear 0x4000 zeroes the old
+    // table; two bits give the channel count.
     const bit_field = try br.peekBits(16);
     st.audio_block = (bit_field & 0x8000) != 0;
 
@@ -290,8 +288,8 @@ fn readTables(st: *Decoder) Exception!void {
     // The code-length alphabet has no length-15 escape here, unlike the v29 one.
     var code_length_table = try huffman.readCodeLengthTable(br, bc20, false, tablePoolSlice(st, 0, bc20));
 
-    // Lengths are 4-bit deltas against the previous block, so symbol 16 repeats 3 + read(2).
-    // Symbols 17 to 19 zero 3 + read(3) or 11 + read(7), which is the v20 mapping, not the v29 one.
+    // Lengths are 4-bit deltas against the previous block; the repeat and
+    // zero-run counts follow the v20 mapping, not v29.
     var code_lengths: [old_table_size]u8 = @splat(0);
     var i: u16 = 0;
     while (i < table_size) {
@@ -347,8 +345,8 @@ fn decodeLength(br: *BitReader, length_table: *const DecodeTable) Exception!u32 
     return base;
 }
 
-// V20 has no VM filters and its multimedia mode decodes inline, so nothing reaches backwards and no reserve is held back.
-// Decoded bytes must be emitted before the circular window overwrites them.
+// V20 has no VM filters and decodes multimedia inline, so nothing reaches
+// backwards and no reserve is held.
 fn flushDecoded(st: *Decoder, keep: usize) Exception!void {
     const out = st.stream_out orelse return;
     const produced = st.window.write_pos - st.entry_start;
@@ -428,7 +426,8 @@ fn unpackLzBlock(st: *Decoder) Exception!void {
             if (st.last_distance == 0 or st.last_length == 0) {
                 continue;
             }
-            // A rep match pushes its distance and advances the cursor, because a missing push makes every later rep match read a stale slot.
+            // A rep match pushes its distance; a missing push makes every later
+            // rep match read a stale slot.
             st.old_dist[st.old_dist_ptr] = st.last_distance;
             st.old_dist_ptr = (st.old_dist_ptr +% 1) & 3;
             st.window.copyMatch(st.last_distance, st.last_length);
@@ -507,9 +506,8 @@ fn unpackLzBlock(st: *Decoder) Exception!void {
     }
 }
 
-// A solid successor never re-reads tables, so a refresh may end the previous
-// stream; the reference consumes it here rather than stranding it.
-// Errors are swallowed like the reference: best effort once the byte count completes.
+// A solid successor never re-reads tables, so a refresh is consumed here;
+// errors are swallowed, matching the reference's best effort.
 fn readLastTables(st: *Decoder) void {
     if (st.br.remainingBits() < 40) return;
 
@@ -576,8 +574,8 @@ pub const Session = struct {
 
         const start_pos = st.window.write_pos;
 
-        // An entry larger than the window must stream out as it decodes, because a window-held entry loses its opening bytes.
-        // A RAR 2.x dictionary ranges from 64 KB to 1 MB, so an ordinary file can exceed the window.
+        // An entry larger than the window must stream out as it decodes, because a
+        // window-held entry loses its opening bytes.
         st.entry_start = start_pos;
         st.flushed = 0;
         st.stream_out = if (unpacked_size > st.window.buffer.len) out else null;
@@ -589,7 +587,7 @@ pub const Session = struct {
         };
 
         // A trailing refresh must be consumed before a solid successor continues
-        // on the carried tables, because the successor never re-reads them.
+        // on the carried tables, which it never re-reads.
         readLastTables(st);
 
         if (st.stream_out != null) {
@@ -676,8 +674,8 @@ test "v20 readLastTables feeds a trailing refresh to the solid successor" {
     var pool: [table_pool_words]u16 = undefined;
     var session = try Session.init(&st, &window_buf, &pool);
 
-    // The code-length alphabet carries only symbol 1 (a +1 length delta) and
-    // symbol 18 (a zero run of 11 plus seven extra bits), one bit each.
+    // The code-length alphabet carries only symbols 1 (+1 delta) and 18
+    // (zero run, 11 + 7 bits), one bit each.
     const bd_lengths = [bc20]u8{ 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
 
     var packed1: [64]u8 = undefined;
@@ -700,8 +698,8 @@ test "v20 readLastTables feeds a trailing refresh to the solid successor" {
     // Four literals through LD, where literal 65 takes the single-bit code 0.
     for (0..4) |_| try w.writeBit(0);
 
-    // The trailing refresh symbol 269 (code 1) and the tables it announces:
-    // LD = {66: 1 bit}, so a solid successor must decode literal 66 instead.
+    // Trailing refresh symbol 269 (code 1) announces LD = {66: 1 bit}, so a
+    // solid successor decodes literal 66.
     try w.writeBit(1);
     try w.writeBits(0b01, 2);
     for (bd_lengths) |len| try w.writeBits(len, 4);
@@ -722,8 +720,8 @@ test "v20 readLastTables feeds a trailing refresh to the solid successor" {
     try session.decodeFile(packed1[0..len1], 4, false, out1.sink());
     try std.testing.expectEqualSlices(u8, "AAAA", out1_buf[0..out1.len]);
 
-    // The solid file skips its table read, so it decodes through the refreshed LD.
-    // Without the trailing refresh consumption it would emit "AAA" through the old one.
+    // The solid file skips its table read; without the consumed refresh it
+    // would emit "AAA" through the old LD.
     const packed2 = [_]u8{0x00};
     var out2_buf: [16]u8 = undefined;
     var out2 = sink.BufferSink.init(&out2_buf);

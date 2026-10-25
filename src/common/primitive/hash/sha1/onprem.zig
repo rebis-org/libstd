@@ -11,9 +11,11 @@ const merkle = @import("../merkle.zig");
 //
 // OpenSSL, crypto/sha/asm.
 //
-// Each sha1c, sha1p, and sha1m instruction runs four FIPS rounds, one message word per Vm lane.
-// The e operand is the v1 scalar view.
+// Each sha1c, sha1p, and sha1m instruction runs four FIPS rounds, one
+// message word per Vm lane.
+//
 // The sha1h instruction (ror2 of lane 0) regenerates each group's e.
+//
 // The e for group g is rol30 of the a leaving group g-1.
 
 const initial_state: [5]u32 = .{ 0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0 };
@@ -32,11 +34,14 @@ fn compressSha1(state: *align(16) [5]u32, block: *const [64]u8) void {
 }
 
 // Twenty groups, not eighty rounds: one group covers four rounds with K pre-added to the schedule.
+//
 // Zig cannot name the 32-bit S register views, so a/b/c/d stay pinned in v0 and e uses v2 and v3.
+//
 // The schedule and W+K vectors stay in free "w" registers.
 //
 // Each group's sha1h runs before its rounds, on the not-yet-updated abcd.
 // Group g consumes the sha1h computed before group g-1.
+//
 // The sha1h before the final group is the terminal e, per Polyakov's tail add.
 fn compressAarch64(state: *align(16) [5]u32, block: *const [64]u8) void {
     const V4u32 = @Vector(4, u32);
@@ -54,8 +59,8 @@ fn compressAarch64(state: *align(16) [5]u32, block: *const [64]u8) void {
     }
 
     var abcd: V4u32 = state[0..4].*;
-    // The e operand is the v1 scalar view.
-    // The sha1h destination zeroes lanes 1-3, so e lanes 1-3 are never read.
+    // The e operand is the v1 scalar view; sha1h zeroes lanes 1-3,
+    // so e lanes 1-3 are never read.
     const e1: V4u32 = .{ state[4], 0, 0, 0 };
     var e2: V4u32 = undefined;
     var e3: V4u32 = undefined;

@@ -41,8 +41,8 @@ fn report(call: *Call, exception: Exception) u32 {
     return mapped.status;
 }
 
-// An unsupported request usually names the id it could not place, and that id
-// is more actionable than the generic diagnostic the status would otherwise carry.
+// The unplaced id an unsupported request usually names is more
+// actionable than the generic diagnostic.
 fn fail(call: *Call, exception: Exception) u32 {
     if (exception == error.UnsupportedException) if (unknownRequiredId(call.request)) |id| common.writeDiagnosticId(call, ids.diagnostic_subject, id);
     return report(call, exception);
@@ -67,8 +67,8 @@ pub fn invoke(call: ?*Call) u32 {
 }
 
 fn writeCatalog(call: *Call, response: *Node) u32 {
-    // The length answers before the capacity check so a host that sized its
-    // buffer from this call can retry without reading the diagnostics.
+    // The length answers before the capacity check, so hosts can size a
+    // retry buffer without reading diagnostics.
     response.byte_length = catalog_json.len;
     if (response.byte_capacity < catalog_json.len) {
         common.writeCapacityDiagnostic(call, catalog_json.len, response.byte_capacity);
@@ -145,8 +145,8 @@ fn dispatch(envelope: *Call, response: *Node) Exception!void {
     try hooks.dispatchToProfileHook(profile.id, &plan, &source, if (sink) |*sink_resource| sink_resource else null, envelope, response, effective_sizing, commit, limits, direction);
 }
 
-// A query names the direction it measures, so the direction is resolved from
-// the request before any policy or capability question is asked.
+// A query names the direction it measures; resolution precedes
+// every policy or capability check.
 fn queryDirection(request: ?*Node) Exception!u32 {
     const direction = commandMaskForId(nodeId(try requireParameter(request, ids.target_command)));
     if (direction != command_mask_read and direction != command_mask_write) return error.CallException;

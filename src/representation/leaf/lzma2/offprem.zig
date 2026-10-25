@@ -6,22 +6,18 @@ const onprem = @import("onprem.zig");
 const std_lzma2 = std.compress.lzma2;
 pub const Exception = exception.Exception;
 pub const InPlaceResult = onprem.InPlaceResult;
-// stdlib lzma2's AccumBuffer grows with the decoded size; a stream that
-// outgrows the scratch answers CapacityException — the accepted incompleteness.
-// Encode resolves to onprem under any tag.
+// The stdlib's buffer grows with the decoded stream; outgrowing the scratch
+// answers CapacityException, the accepted incompleteness. Encode always uses onprem.
 pub const Options = onprem.Options;
 
-// The scratch the arm asks for: stdlib's probability tables plus the
-// AccumBuffer's start. The buffer grows with the decoded stream until the
-// scratch ends; callers that cannot size for a stream pick onprem.
+// The stdlib's probability tables plus the AccumBuffer's start; the buffer
+// grows with the decoded stream until the scratch ends.
 pub fn scratchNeed(dictionary_size: u32) usize {
     const literal = @as(usize, 0x300) * 16 * @sizeOf(u16);
     const state: usize = 8192;
     return std.mem.alignForward(usize, literal + state + @max(dictionary_size, 4096), @alignOf(u64)) + @alignOf(u64);
 }
 
-// drive decodes one lzma2 stream from reader into output, returning the
-// compressed bytes consumed.
 fn drive(reader: *std.Io.Reader, output: []u8, scratch: []u8) Exception!struct { produced: usize, consumed: u64 } {
     var fba = std.heap.FixedBufferAllocator.init(scratch);
     const allocator = fba.allocator();
@@ -46,9 +42,8 @@ pub fn decodeInPlace(input: []const u8, output: []u8, scratch: []u8) Exception!I
     return .{ .produced = result.produced, .consumed = @intCast(result.consumed) };
 }
 
-// decodeStream stages through the scratch: the caller's writer shape has
-// no stdlib Allocating equivalent. Streams that do not fit the scratch answer
-// insufficient_capacity.
+// decodeStream stages through the scratch: the caller's writer shape has no stdlib
+// Allocating equivalent. Streams beyond the scratch answer CapacityException.
 pub fn decodeStream(reader: *std.Io.Reader, writer: *std.Io.Writer, scratch: []u8) Exception!void {
     var fba = std.heap.FixedBufferAllocator.init(scratch);
     const allocator = fba.allocator();

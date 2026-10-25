@@ -185,8 +185,8 @@ pub const protocol_rows = [_]Descriptor{
     .{ .id = ids.workspace_available_capacity, .name = "workspace_available_capacity", .kind = .diagnostic, .representation = .node_chain },
 };
 
-// How a profile answers one direction: the three facts the boundary needs, and
-// nothing that restates the command that selected them.
+// How a profile answers one direction: the three facts the boundary needs,
+// nothing that restates the selecting command.
 pub const CommandPolicy = struct {
     capabilities: u32,
     sizing: SizingMode,

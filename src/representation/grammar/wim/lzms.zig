@@ -7,6 +7,7 @@ const Exception = exception_prim.Exception;
 
 // WIM LZMS codec, ported from wimlib src/lzms_decompress.c.
 // Range coder reads forwards; Huffman codes read backwards.
+//
 // Codes rebuild on fixed budgets with halved frequencies.
 // Ties break leaf-first, matching wimlib's tree construction.
 
@@ -218,7 +219,7 @@ fn readMatchLen(length: *AdaptiveCode, stream: *BackBits) Exception!u32 {
     return match_len;
 }
 
-// Ties break toward leaves, then canonical lengths assign in
+// Ties break leaf-first, then canonical lengths assign in
 // (frequency, symbol) order.
 fn makeCanonicalCode(freqs: []const u32, lens: []u8) void {
     var sorted: [max_num_syms]u32 = undefined;
@@ -339,9 +340,8 @@ fn numOffsetSlots(uncompressed_size: usize) usize {
     return 1 + getSlot(@intCast(uncompressed_size - 1), &offset_slot_base);
 }
 
-// x86 CALL-target retranslation; see wimlib's lzms_x86_filter.
-// The usages table is stack-resident, mirroring wimlib's per-resource
-// temporary.
+// x86 CALL-target retranslation; see wimlib's lzms_x86_filter. The usages
+// table is stack-resident, mirroring wimlib's per-resource temporary.
 fn x86Filter(data: []u8, last_target_usages: *[65536]i32) void {
     x86FilterDirected(data, last_target_usages, true);
 }
@@ -737,13 +737,11 @@ pub const extra_length_bits = [54]u8{
     7, 8, 9, 10, 16, 30,
 };
 
-// ---------------------------------------------------------------------------
-// Encoder, ported from wimlib src/lzms_compress.c.
-// Decision bits go to a forwards range encoder; Huffman codewords and extra
-// bits go to a backwards bitstream sharing one buffer. Only literals and
-// explicit-offset LZ matches are emitted; the rep and delta paths exist in
-// the format but are optional, and skipping them keeps both sides' adaptive
-// states in lockstep.
+// Decision bits feed a forwards range encoder; Huffman codewords and extra
+// bits feed a backwards bitstream in one shared buffer.
+//
+// Only literals and explicit-offset LZ matches are emitted; skipping rep and
+// delta keeps encoder and decoder states in lockstep.
 
 const lzms_window_bits: u5 = 21;
 const lzms_window: usize = 1 << lzms_window_bits;

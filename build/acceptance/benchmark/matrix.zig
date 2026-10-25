@@ -1,6 +1,6 @@
 const std = @import("std");
 
-// Rows derive from descriptors, so removing one removes its rows with no central edits.
+// Rows derive from descriptors; deleting a descriptor drops its rows with no central edits.
 const generated = @import("components");
 
 // Format uses the released profile stem (seven_zip); Cmd mirrors the

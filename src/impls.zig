@@ -1,8 +1,5 @@
-// Unit-test entry for every implementation above the kernel.
-// The src/ root keeps `../common` imports inside the module path.
 test {
     _ = @import("representation/grammar/rar/onprem.zig");
-    // Writer tests cover create→inspect→decode round trips the facade alone never runs.
     _ = @import("representation/grammar/rar/writer.zig");
     _ = @import("representation/grammar/zlib/onprem.zig");
     _ = @import("representation/grammar/lzma/onprem.zig");

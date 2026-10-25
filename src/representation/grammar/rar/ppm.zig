@@ -6,8 +6,7 @@ const bits = @import("bits.zig");
 const Exception = exception.Exception;
 const BitReader = bits.BitReader;
 
-// PPMd variant H: pointers are u32 offsets into a caller-provided heap slice. Offset 0 is
-// unreachable, so it serves as NULL and the reference's `ptr <= pText` guards work on offsets.
+// PPMd variant H: pointers are u32 heap offsets; offset 0 is unreachable, so it serves as NULL.
 
 const int_bits: u5 = 7;
 const period_bits: u5 = 7;
@@ -35,8 +34,7 @@ const OccurrenceView = extern struct {
     succ_lo: u16,
     succ_hi: u16,
 
-    // The successor is one u32 in the wire layout. The view splits it into
-    // two u16 halves to keep the packed struct at the 6-byte PPMd stride.
+    // The successor is one u32 on the wire, split into u16 halves to keep the 6-byte stride.
     inline fn succ(self: *const OccurrenceView) u32 {
         return @as(u32, self.succ_hi) << 16 | self.succ_lo;
     }
@@ -65,7 +63,7 @@ inline fn freeBlockAt(heap: []u8, off: u32) *FreeBlock {
     return @ptrCast(@alignCast(heap[off..][0..@sizeOf(FreeBlock)]));
 }
 
-// A binary context stores its single state behind its 12-byte header, so the state offset is the context offset plus 2.
+// A binary context stores its single state behind its 12-byte header, at offset plus 2.
 inline fn ctxOneState(ctx_off: u32) u32 {
     return ctx_off + 2;
 }
@@ -185,8 +183,7 @@ const SubAllocator = struct {
         self.pool_bytes = 0;
     }
 
-    // The heap must hold at least (sa_size_mb << 20) bytes, and the pool is 4-byte aligned inside the
-    // slice so u32 fields load directly. A stream larger than the provisioned pool is refused here.
+    // The pool sits 4-byte aligned inside the heap, so u32 fields load directly.
     fn start(self: *SubAllocator, heap: []u8, sa_size_mb: u32) bool {
         const pool_bytes: u32 = sa_size_mb << 20;
         if (self.pool_bytes == pool_bytes) return true;
@@ -205,8 +202,8 @@ const SubAllocator = struct {
         self.ptext = 0;
 
         const pool_bytes = self.pool_bytes;
-        // The pool splits 7/8 for units and 1/8 for the text area. Because UNIT_SIZE equals FIXED_UNIT_SIZE,
-        // only the +UNIT_SIZE remainder compensation of the split remains.
+        // The pool splits 7/8 for units and 1/8 for text; UNIT_SIZE equals FIXED_UNIT_SIZE,
+        // leaving only the remainder compensation.
         const size2: u32 = unit_size * (pool_bytes / 8 / unit_size * 7);
         const size1: u32 = pool_bytes - size2;
         const real_size1: u32 = size1 / unit_size * unit_size + unit_size;
@@ -275,8 +272,8 @@ const SubAllocator = struct {
         self.insertNode(p, self.units2indx[udiff - 1]);
     }
 
-    // The sentinel link value for the doubly-linked free block list. Its own links live in locals, so
-    // every access compares against this value.
+    // Doubly-linked free-list sentinel: its links live in locals, so every access compares
+    // against this value.
     const sentinel: u32 = 0xFFFFFFFF;
 
     fn glueFreeBlocks(self: *SubAllocator) void {
@@ -524,8 +521,8 @@ pub const PpmModel = struct {
         self.dummy_see2 = .{ .summ = 0, .shift = period_bits, .count = 64 };
     }
 
-    // ModelPPM::DecodeInit. The first byte read must stay bit-aligned with the PPM-block flag, because
-    // consuming one flag bit desynchronises the whole stream.
+    // ModelPPM::DecodeInit. The first byte must stay bit-aligned with the PPM-block flag,
+    // or the stream desynchronizes.
     pub fn decodeInit(self: *Self, br: *BitReader, heap: []u8, esc_char: *u8) Exception!bool {
         var max_order: u32 = RangeCoder.getByte(br);
         const reset = (max_order & 0x20) != 0;
@@ -635,10 +632,13 @@ pub const PpmModel = struct {
         }
     }
 
-    // Restores a minimal model so the caller can resume the next block after a data error.
-    pub fn cleanUp(self: *Self, heap: []u8) void {
+    // Restores a minimal model so the caller can resume the next block
+    // after a data error.
+    // A failed restart propagates: a swallowed failure would leave the next
+    // block decoding against a stopped allocator.
+    pub fn cleanUp(self: *Self, heap: []u8) Exception!void {
         self.sub.stop();
-        self.startModel(heap, 2, 1) catch {};
+        try self.startModel(heap, 2, 1);
     }
 
     fn createChild(self: *Self, ctx_off: u32, parent_state_off: u32, initial_state: Occurrence) u32 {
@@ -796,10 +796,8 @@ pub const PpmModel = struct {
                     if (stAt(heap, pp).sym == up.sym) break;
                 }
             }
-            // Vendor computes `uint cf = Freq - 1`, so a zero-frequency state (which valid
-            // streams contain after rescale) wraps to 0xFFFFFFFF and every product after it
-            // wraps too; mirror the wraparound instead of panicking, and truncate the final
-            // uint-to-byte assignment like the vendor struct field write does.
+            // Vendor's `uint cf = Freq - 1` wraps on zero frequency; mirror the wrap, truncate the
+            // final assignment.
             const cf: u32 = @as(u32, stAt(heap, pp).freq) -% 1;
             const escape_sum: u32 = @as(u32, ctxAt(heap, pc).summ_freq) -% ctxAt(heap, pc).num_stats -% cf;
             up.freq = blk: {
@@ -960,8 +958,8 @@ pub const PpmModel = struct {
         self.hi_bits_flag = self.hb2flag[stAt(heap, self.found_state).sym];
         const cctx = ctxAt(heap, c);
         const suffix_ns: usize = ctxAt(heap, cctx.suffix).num_stats;
-        // A corrupt heap can hold a zero frequency or a zero-stats suffix, so the indexes saturate and the
-        // escape path lets the guards and the CRC surface the corruption.
+        // A corrupt heap can hold a zero frequency or zero-stats suffix; the escape path lets
+        // guards and CRC surface it.
         const freq_idx: usize = @as(usize, rs_state.freq) -| 1;
         if (suffix_ns == 0) {
             self.found_state = null_off;
@@ -1097,10 +1095,8 @@ pub const PpmModel = struct {
         if (num_stats != 256) {
             const suffix_ns: u32 = ctxAt(heap, cctx.suffix).num_stats;
             const ns_idx: usize = self.ns2indx[unmasked_count - 1];
-            // Vendor compares `Diff < Suffix->NumStats - NumStats` with ushort-to-int
-            // promotion, i.e. a signed compare that is false when the suffix context
-            // holds fewer stats than this one (valid streams reach this after rescale);
-            // the rearranged unsigned form below is identical without underflowing.
+            // Vendor's `Diff < Suffix->NumStats - NumStats` promotes to signed; the rearranged
+            // unsigned form below is identical without underflow.
             const cond_idx: usize = @as(usize, @intFromBool(unmasked_count + num_stats < suffix_ns)) +
                 2 * @as(usize, @intFromBool(cctx.summ_freq < 11 * num_stats)) +
                 4 * @as(usize, @intFromBool(self.num_masked > unmasked_count)) +
@@ -1281,8 +1277,8 @@ test "createSuccessors wraps the reference arithmetic around a zero-frequency st
     try m.startModel(&heap, 4, 1);
     const h = m.sub.heap;
 
-    // Craft the found state, its suffix-less context, and the matching stats inside the
-    // virgin unit space above lo_unit; createChild only allocates from the hi_unit side.
+    // Crafted objects sit above lo_unit; createChild allocates only from the hi_unit side,
+    // so they stay intact.
     const pc: u32 = m.sub.lo_unit + 4;
     const stats: u32 = pc + 12;
     const fs: u32 = pc + 24;
@@ -1301,9 +1297,7 @@ test "createSuccessors wraps the reference arithmetic around a zero-frequency st
     m.min_context = pc;
     m.found_state = fs;
 
-    // The vendor's `uint cf = Freq - 1` wraps a zero frequency to 0xFFFFFFFF and the
-    // wrapped products yield an UpState frequency of 2 where a straight u32 subtraction
-    // would overflow.
+    // The wrap yields an UpState frequency of 2; a straight u32 subtraction would overflow.
     const child = m.createSuccessors(false, null_off);
     try std.testing.expect(child != null_off);
     const one = stAt(h, ctxOneState(child));
@@ -1331,9 +1325,8 @@ test "makeEscFreq2 compares the suffix stats through the reference's signed prom
     try m.startModel(&heap, 4, 1);
     const h = m.sub.heap;
 
-    // A suffix context holding fewer stats than the current one turns the vendor's
-    // `Diff < Suffix->NumStats - NumStats` into a signed compare against a negative
-    // value; a straight unsigned subtraction would underflow instead.
+    // Fewer suffix stats make the vendor's compare signed against a negative; a straight
+    // unsigned subtraction would underflow.
     const c_off: u32 = m.sub.lo_unit + 4;
     const s_off: u32 = c_off + 12;
     const cctx = ctxAt(h, c_off);

@@ -16,7 +16,7 @@ const Buffer = struct {
     entry: harness.ArchiveEntryNodes,
 };
 
-// Filled by the query and entry builders before either is read.
+// The query and entry builders fill all fields before any read.
 fn freshBuffer() Buffer {
     return .{ .nodes = undefined, .entry = undefined };
 }
@@ -121,7 +121,8 @@ pub fn transform(env: *env_mod.Env, row: matrix.BenchmarkRow, input: []const u8,
     return .{ .encode_ns = write_result.ns, .decode_ns = read_result.decode_ns, .encoded = write_result.len, .ok = read_result.ok };
 }
 
-// Bypass row caller-wires the zstd leaf with no kernel in the loop. The untimed kernel transform proves byte-identity.
+// A bypass row caller-wires the zstd leaf, with no kernel in the loop.
+// The untimed kernel transform proves byte-identity.
 fn castOrFallback(comptime T: type, value: u64, fallback: T) T {
     return std.math.cast(T, value) orelse fallback;
 }
@@ -187,7 +188,7 @@ fn bypassTransform(env: *env_mod.Env, row: matrix.BenchmarkRow, input: []const u
     return .{ .encode_ns = t1 - t0, .decode_ns = t2 - t1, .encoded = encoded_size, .ok = identical };
 }
 
-// Buffer carries the analytic bound: the bzip2 bound alone exceeds the 1.5x heuristic.
+// The bzip2 analytic bound alone exceeds the 1.5x heuristic.
 pub fn encodedBound(row: matrix.BenchmarkRow, input: []const u8, workspace: []u8) !usize {
     var buffer = freshBuffer();
     buffer.len = 0;
