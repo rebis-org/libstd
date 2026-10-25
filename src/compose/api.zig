@@ -241,6 +241,8 @@ pub const Completion = extern struct {
 
     pub const in_progress: u32 = 0;
     pub const done: u32 = 1;
+    // Transient: a cancel request landed; the task observes it at its start.
+    pub const cancelling: u32 = 2;
 
     pub const pending: u32 = std.math.maxInt(u32);
 
@@ -255,7 +257,7 @@ pub const Completion = extern struct {
 
     fn isValid(self: *const Completion) bool {
         return self.structure_size >= @sizeOf(Completion) and self.reserved == 0 and
-            (self.state == in_progress or self.state == done);
+            (self.state == in_progress or self.state == done or self.state == cancelling);
     }
 };
 
@@ -269,6 +271,12 @@ pub const Submission = extern struct {
 fn submitTask(context: *anyopaque) callconv(.c) u32 {
     const submission: *Submission = @ptrCast(@alignCast(context));
     const completion = submission.completion orelse return envelope.Status.invalid_call;
+    // Cancellation is honored at the task boundary: a record already marked
+    // cancelling skips the envelope and completes as cancelled.
+    if (@atomicLoad(u32, &completion.state, .seq_cst) == Completion.cancelling) {
+        complete(completion, envelope.Status.cancelled);
+        return envelope.Status.cancelled;
+    }
     const status = if (submission.call) |handle|
         call.run(handle, executor.inline_executor)
     else
@@ -315,8 +323,8 @@ export fn stdk_group(
 }
 
 fn complete(completion: *Completion, status: u32) void {
-    completion.status = status;
-    completion.state = Completion.done;
+    @atomicStore(u32, &completion.status, status, .seq_cst);
+    @atomicStore(u32, &completion.state, Completion.done, .seq_cst);
 }
 
 // Idempotent and non-blocking: the envelope status once done, pending
@@ -329,13 +337,22 @@ export fn stdk_poll(record: ?*Completion) callconv(.c) u32 {
     return Completion.pending;
 }
 
-// Idempotent like poll. Cancellation needs an executor that honors requests;
-// with the inline executor a submitted call has already completed.
+// Idempotent like poll. A pending cancel plants a request the task honors at
+// its start boundary; a running envelope always completes with its real
+// status, and a done record accepts cancel as a no-op.
 export fn stdk_cancel(record: ?*Completion) callconv(.c) u32 {
     const completion = record orelse return envelope.Status.invalid_call;
     if (!completion.isValid()) return envelope.Status.invalid_call;
-    if (completion.state == Completion.done) return envelope.Status.ok;
-    return envelope.Status.unsupported;
+    while (true) {
+        const state = @atomicLoad(u32, &completion.state, .seq_cst);
+        switch (state) {
+            Completion.done, Completion.cancelling => return envelope.Status.ok,
+            Completion.in_progress => {
+                if (@cmpxchgStrong(u32, &completion.state, Completion.in_progress, Completion.cancelling, .seq_cst, .seq_cst) == null) return envelope.Status.ok;
+            },
+            else => return envelope.Status.invalid_call,
+        }
+    }
 }
 
 const session_catalog_text: [:0]const u8 = blk: {

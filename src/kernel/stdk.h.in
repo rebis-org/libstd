@@ -58,8 +58,10 @@ struct stdk_call_envelope {
 /* Asynchronous submission, symmetric to stdk_call: submit keeps control.
  * The completion record is caller-owned storage; the ticket is its pointer.
  * With the inline executor the call completes before stdk_submit returns.
- * stdk_poll is idempotent and non-blocking; cancel is idempotent like poll.
  * A malformed envelope surfaces as an invalid_call record status.
+ * stdk_poll is idempotent and non-blocking; cancel is idempotent like poll.
+ * A pending cancel plants a request the task honors at its start boundary.
+ * A running envelope always completes; the record then reports cancelled.
  * stdk_group takes caller-owned submission descriptors plus an executor.
  * A null executor selects the inline default.
  * The executor vtable is C-shaped: run schedules task.invoke(context)

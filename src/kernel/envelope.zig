@@ -14,6 +14,7 @@ pub const Status = struct {
     pub const io_failure: u32 = 6;
     pub const resource_limit: u32 = 7;
     pub const internal_failure: u32 = 8;
+    pub const cancelled: u32 = 9;
 
     pub const definitions = [_]struct { name: []const u8, value: u32 }{
         .{ .name = "OK", .value = ok },
@@ -25,6 +26,7 @@ pub const Status = struct {
         .{ .name = "IO_FAILURE", .value = io_failure },
         .{ .name = "RESOURCE_LIMIT", .value = resource_limit },
         .{ .name = "INTERNAL_FAILURE", .value = internal_failure },
+        .{ .name = "CANCELLED", .value = cancelled },
     };
 };
 

@@ -15,6 +15,7 @@ pub const Status = struct {
     pub const io_failure: u32 = 6;
     pub const resource_limit: u32 = 7;
     pub const internal_failure: u32 = 8;
+    pub const cancelled: u32 = 9;
 };
 
 pub const node_flag_optional: u32 = 1;

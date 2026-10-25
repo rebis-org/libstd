@@ -317,11 +317,10 @@ fn runSubmission(r: *harness.Runner) anyerror!void {
     envelope.workspace = r.workspace.ptr;
     envelope.workspace_capacity = r.workspace.len;
 
-    // A fresh record is pending, and cancellation of a pending record needs
-    // an executor that honors cancellation requests.
+    // A fresh record is pending; the cancellation boundary scenario owns
+    // the cancel contract.
     var completion = abi.Completion.init();
     if (abi.stdk_poll(&completion) != abi.Completion.pending) return error.PollFreshNotPending;
-    if (abi.stdk_cancel(&completion) != abi.Status.unsupported) return error.CancelFreshNotUnsupported;
     if (abi.stdk_submit(&envelope, &completion) != abi.Status.ok) return error.SubmitFailed;
     if (completion.state != abi.Completion.done) return error.SubmitNotDone;
     if (abi.stdk_poll(&completion) != abi.Status.ok) return error.PollSubmitNotOk;
@@ -397,7 +396,69 @@ fn oracleRunInline(_: *anyopaque, task: abi.Task) callconv(.c) u32 {
     return task.invoke(task.context);
 }
 
+// A deferred executor arm: run stores the task and returns, so a record
+// stays pending until the oracle drains the queue by hand.
+var deferred_task: ?abi.Task = null;
+
+fn oracleRunDeferred(_: *anyopaque, task: abi.Task) callconv(.c) u32 {
+    deferred_task = task;
+    return abi.Status.ok;
+}
+
+fn runCancel(r: *harness.Runner) anyerror!void {
+    harness.setup(r, harness.ids.gzip, harness.mode_stream);
+    corpus.fillTiled(r.corpus_index, r.corpus_buffer[0..]);
+    r.input = r.corpus_buffer[0..];
+
+    var nodes: [6]harness.Node = undefined;
+    nodes[0] = harness.paramProfile(r.profile_id);
+    nodes[1] = harness.sourceSpan(r.input);
+    nodes[2] = harness.sinkSpan(r.encoded);
+    nodes[3] = harness.capabilityParam(r.caps_io);
+    nodes[4] = harness.sizingModeParam(r.sizing);
+    nodes[5] = harness.commitModeParam(r.commit_write);
+    harness.linkNodes(&nodes);
+    var envelope = abi.Call.init();
+    envelope.operation = harness.ids.write;
+    envelope.request = &nodes[0];
+    envelope.response = &r.response;
+    envelope.workspace = r.workspace.ptr;
+    envelope.workspace_capacity = r.workspace.len;
+
+    const deferred_vtable: abi.ExecutorVtable = .{ .run = oracleRunDeferred };
+    const deferred_executor: abi.Executor = .{ .ptr = @constCast(&deferred_vtable), .vtable = &deferred_vtable };
+
+    // Drained without a cancel, the deferred task completes normally.
+    var plain_record = abi.Completion.init();
+    var plain_sub: [1]abi.Submission = .{.{ .call = &envelope, .completion = &plain_record }};
+    if (abi.stdk_group(&plain_sub, 1, &deferred_executor) != abi.Status.ok) return error.DeferredSubmitFailed;
+    if (plain_record.state != abi.Completion.in_progress) return error.DeferredRanEarly;
+    if (deferred_task) |task| _ = task.invoke(task.context) else return error.DeferredTaskLost;
+    if (plain_record.state != abi.Completion.done or plain_record.status != abi.Status.ok) return error.DeferredNotCompleted;
+
+    // A cancel that lands before the task runs is honored at the boundary:
+    // the envelope never executes and the record completes as cancelled.
+    var pending_record = abi.Completion.init();
+    var pending_sub: [1]abi.Submission = .{.{ .call = &envelope, .completion = &pending_record }};
+    if (abi.stdk_group(&pending_sub, 1, &deferred_executor) != abi.Status.ok) return error.CancelSubmitFailed;
+    if (abi.stdk_poll(&pending_record) != abi.Completion.pending) return error.CancelNotPending;
+    if (abi.stdk_cancel(&pending_record) != abi.Status.ok) return error.CancelRequestFailed;
+    if (abi.stdk_cancel(&pending_record) != abi.Status.ok) return error.CancelNotIdempotent;
+    if (deferred_task) |task| _ = task.invoke(task.context) else return error.CancelTaskLost;
+    if (pending_record.state != abi.Completion.done or pending_record.status != abi.Status.cancelled) return error.CancelNotHonored;
+
+    // A late cancel finds the record done and is a no-op.
+    if (abi.stdk_cancel(&plain_record) != abi.Status.ok) return error.LateCancelRejected;
+}
+
 pub const scenarios = harness.scenarios("api", &.{}, &.{
+    .{
+        .name = "submission cancellation boundary",
+        .run = runCancel,
+        .workspace_size = 1 << 20,
+        .output_size = 64,
+        .encoded_size = 4096,
+    },
     .{
         .name = "submission api boundary",
         .run = runSubmission,
