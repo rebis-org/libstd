@@ -405,6 +405,21 @@ fn oracleRunDeferred(_: *anyopaque, task: abi.Task) callconv(.c) u32 {
     return abi.Status.ok;
 }
 
+// A withdrawing executor arm: a queued task cancelled before it starts is
+// discarded; the executor flips the host-owned record itself, and the
+// library never invokes the withdrawn task.
+fn oracleRunWithdrawing(_: *anyopaque, task: abi.Task) callconv(.c) u32 {
+    const submission: *abi.Submission = @ptrCast(@alignCast(task.context));
+    const completion = submission.completion orelse return abi.Status.invalid_call;
+    if (@atomicLoad(u32, &completion.state, .seq_cst) == abi.Completion.cancelling) {
+        completion.status = abi.Status.cancelled;
+        @atomicStore(u32, &completion.state, abi.Completion.done, .seq_cst);
+        return abi.Status.ok;
+    }
+    deferred_task = task;
+    return abi.Status.ok;
+}
+
 fn runCancel(r: *harness.Runner) anyerror!void {
     harness.setup(r, harness.ids.gzip, harness.mode_stream);
     corpus.fillTiled(r.corpus_index, r.corpus_buffer[0..]);
@@ -446,6 +461,19 @@ fn runCancel(r: *harness.Runner) anyerror!void {
     if (abi.stdk_cancel(&pending_record) != abi.Status.ok) return error.CancelNotIdempotent;
     if (deferred_task) |task| _ = task.invoke(task.context) else return error.CancelTaskLost;
     if (pending_record.state != abi.Completion.done or pending_record.status != abi.Status.cancelled) return error.CancelNotHonored;
+
+    // Withdrawal: the executor's queue pump discards a cancelled queued
+    // task and flips the host-owned record itself; the task never runs.
+    const withdrawing_vtable: abi.ExecutorVtable = .{ .run = oracleRunDeferred };
+    const withdrawing_executor: abi.Executor = .{ .ptr = @constCast(&withdrawing_vtable), .vtable = &withdrawing_vtable };
+    var withdrawn_record = abi.Completion.init();
+    var withdrawn_sub: [1]abi.Submission = .{.{ .call = &envelope, .completion = &withdrawn_record }};
+    if (abi.stdk_group(&withdrawn_sub, 1, &withdrawing_executor) != abi.Status.ok) return error.WithdrawSubmitFailed;
+    if (abi.stdk_cancel(&withdrawn_record) != abi.Status.ok) return error.WithdrawCancelFailed;
+    const queued = deferred_task orelse return error.WithdrawTaskLost;
+    if (oracleRunWithdrawing(@constCast(&withdrawing_vtable), queued) != abi.Status.ok) return error.WithdrawPumpFailed;
+    if (withdrawn_record.state != abi.Completion.done or withdrawn_record.status != abi.Status.cancelled) return error.WithdrawNotFlipped;
+    if (abi.stdk_poll(&withdrawn_record) != abi.Status.cancelled) return error.WithdrawPollMismatch;
 
     // A late cancel finds the record done and is a no-op.
     if (abi.stdk_cancel(&plain_record) != abi.Status.ok) return error.LateCancelRejected;

@@ -96,6 +96,7 @@ pub const Completion = extern struct {
 
     pub const in_progress: u32 = 0;
     pub const done: u32 = 1;
+    pub const cancelling: u32 = 2;
     pub const pending: u32 = std.math.maxInt(u32);
 
     pub fn init() Completion {
