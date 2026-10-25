@@ -154,8 +154,8 @@ pub fn gzipDecodeInit(storage: []u8, budgets: sessions.Budgets) error{ CapacityE
         .pending = undefined,
         .fixed = undefined,
         .hcrc = undefined,
-        .header_crc = checksum.Crc32.init(),
-        .member_crc = checksum.Crc32.init(),
+        .header_crc = checksum.Crc32.init({}),
+        .member_crc = checksum.Crc32.init({}),
         .trailer = undefined,
         .budgets = budgets,
     };
@@ -286,7 +286,7 @@ pub fn gzipDecodeStep(state: *GzipDecode, input: []const u8, output: []u8, end_o
                         state.fixed[0] = byte;
                         state.fixed_len = 1;
                         state.hcrc_len = 0;
-                        state.header_crc = checksum.Crc32.init();
+                        state.header_crc = checksum.Crc32.init({});
                         state.header_crc.update(&.{byte});
                         state.phase = .fixed;
                     },
@@ -301,7 +301,7 @@ pub fn gzipDecodeStep(state: *GzipDecode, input: []const u8, output: []u8, end_o
                         if (fixed[0] != id1 or fixed[1] != id2) return framingFailed(&result, state.frame_pos, error.DataException);
                         if (fixed[2] != method_deflate) return framingFailed(&result, state.frame_pos, error.UnsupportedException);
                         if (fixed[3] & reserved_flags != 0) return framingFailed(&result, state.frame_pos, error.DataException);
-                        state.member_crc = checksum.Crc32.init();
+                        state.member_crc = checksum.Crc32.init({});
                         state.member_size = 0;
                         selectPostHeaderPhase(state) catch |exception| return framingFailed(&result, state.frame_pos, exception);
                     },
@@ -357,7 +357,7 @@ pub fn gzipDecodeStep(state: *GzipDecode, input: []const u8, output: []u8, end_o
                             state.hcrc_len += 1;
                         }
                         const expected = std.mem.readInt(u16, &state.hcrc, .little);
-                        if (expected != @as(u16, @truncate(state.header_crc.final()))) return framingFailed(&result, state.frame_pos, error.IntegrityException);
+                        if (expected != @as(u16, @truncate(state.header_crc.final({})))) return framingFailed(&result, state.frame_pos, error.IntegrityException);
                         enterDeflate(state) catch |exception| return framingFailed(&result, state.frame_pos, exception);
                     },
                     .deflate => break :framing,
@@ -369,7 +369,7 @@ pub fn gzipDecodeStep(state: *GzipDecode, input: []const u8, output: []u8, end_o
                         }
                         const stored_crc = std.mem.readInt(u32, state.trailer[0..4], .little);
                         const stored_size = std.mem.readInt(u32, state.trailer[4..8], .little);
-                        if (stored_crc != state.member_crc.final()) return framingFailed(&result, state.frame_pos, error.IntegrityException);
+                        if (stored_crc != state.member_crc.final({})) return framingFailed(&result, state.frame_pos, error.IntegrityException);
                         if (stored_size != @as(u32, @truncate(state.member_size))) return framingFailed(&result, state.frame_pos, error.IntegrityException);
                         state.phase = .idle;
                     },
@@ -588,7 +588,7 @@ pub fn zlibDecodeInit(storage: []u8, budgets: sessions.Budgets) error{ CapacityE
         .inflater = undefined,
         .history = history,
         .pending = undefined,
-        .adler = checksum.Adler32.init(),
+        .adler = checksum.Adler32.init({}),
         .budgets = budgets,
     };
     state.inflater.initSliceBoundInPlace(deflate_seam.default_provider, &.{}, history) catch return error.UnsupportedException;
@@ -620,7 +620,7 @@ pub fn zlibDecodeStep(state: *ZlibDecode, input: []const u8, output: []u8, end_o
         if ((cmf >> 4) > zlib_cinfo_max) return framingFailed(&result, input.len, error.UnsupportedException);
         if ((@as(u32, cmf) * 256 + @as(u32, flg)) % 31 != 0) return framingFailed(&result, input.len, error.DataException);
         if (flg & zlib_flag_dictionary != 0) return framingFailed(&result, input.len, error.UnsupportedException);
-        state.adler = checksum.Adler32.init();
+        state.adler = checksum.Adler32.init({});
         state.inflater.initSliceBoundInPlace(deflate_seam.default_provider, state.pending[0..state.pending_len], state.history) catch |exception| return framingFailed(&result, input.len, exception);
         state.inflater.setFramePos(zlib_header_size);
         state.started = true;
@@ -646,7 +646,7 @@ pub fn zlibDecodeStep(state: *ZlibDecode, input: []const u8, output: []u8, end_o
             return result;
         }
         const stored_adler = std.mem.readInt(u32, state.pending[trailer_pos..][0..4], .big);
-        if (stored_adler != state.adler.final()) return framingFailed(&result, input.len, error.IntegrityException);
+        if (stored_adler != state.adler.final({})) return framingFailed(&result, input.len, error.IntegrityException);
         const total = trailer_pos + zlib_trailer_size;
         if (total != state.pending_len) return framingFailed(&result, input.len, error.DataException);
         result.consumed = input.len;
@@ -713,7 +713,7 @@ fn writePrologue(comptime wrap: EncodeWrap, state: *DeflateEncode) Exception!voi
             const header = [10]u8{ 0x1F, 0x8B, 8, 0, 0, 0, 0, 0, 0, 255 };
             @memcpy(state.pending[state.pending_len..][0..10], &header);
             state.pending_len += 10;
-            state.hasher = checksum.Crc32.init();
+            state.hasher = checksum.Crc32.init({});
         },
         .zlib => {
             if (state.room() < 2) return error.CapacityException;
@@ -721,7 +721,7 @@ fn writePrologue(comptime wrap: EncodeWrap, state: *DeflateEncode) Exception!voi
             const header = [2]u8{ 0x78, 0x9C };
             @memcpy(state.pending[state.pending_len..][0..2], &header);
             state.pending_len += 2;
-            state.adler = checksum.Adler32.init();
+            state.adler = checksum.Adler32.init({});
         },
     }
     state.header_written = true;
@@ -733,7 +733,7 @@ fn writeEpilogue(comptime wrap: EncodeWrap, state: *DeflateEncode) Exception!voi
         .gzip => {
             if (state.room() < 8) return error.CapacityException;
             var trailer: [8]u8 = undefined;
-            std.mem.writeInt(u32, trailer[0..4], state.hasher.final(), .little);
+            std.mem.writeInt(u32, trailer[0..4], state.hasher.final({}), .little);
             std.mem.writeInt(u32, trailer[4..8], @truncate(state.size), .little);
             @memcpy(state.pending[state.pending_len..][0..8], &trailer);
             state.pending_len += 8;
@@ -741,7 +741,7 @@ fn writeEpilogue(comptime wrap: EncodeWrap, state: *DeflateEncode) Exception!voi
         .zlib => {
             if (state.room() < 4) return error.CapacityException;
             var trailer: [4]u8 = undefined;
-            std.mem.writeInt(u32, &trailer, state.adler.final(), .big);
+            std.mem.writeInt(u32, &trailer, state.adler.final({}), .big);
             @memcpy(state.pending[state.pending_len..][0..4], &trailer);
             state.pending_len += 4;
         },
@@ -764,8 +764,8 @@ fn deflateEncodeInitImpl(storage: []u8, budgets: sessions.Budgets) error{Capacit
         .history = history,
         .pending = undefined,
         .downstream = undefined,
-        .hasher = checksum.Crc32.init(),
-        .adler = checksum.Adler32.init(),
+        .hasher = checksum.Crc32.init({}),
+        .adler = checksum.Adler32.init({}),
         .budgets = budgets,
     };
     state.downstream = std.Io.Writer.fixed(&state.pending);
@@ -1111,7 +1111,7 @@ pub fn lz4DecodeStep(state: *Lz4Decode, input: []const u8, output: []u8, end_of_
                     continue;
                 }
                 const stored_sum = std.mem.readInt(u32, avail[0..4], .little);
-                if (stored_sum != state.content_hasher.final()) return framingFailed(&result, input.len, error.IntegrityException);
+                if (stored_sum != state.content_hasher.final({})) return framingFailed(&result, input.len, error.IntegrityException);
                 state.pending_read += 4;
                 if (state.content_size) |expected| {
                     if (expected != state.total) return framingFailed(&result, input.len, error.IntegrityException);
@@ -1180,7 +1180,7 @@ pub fn lz4EncodeInit(storage: []u8, budgets: sessions.Budgets) error{CapacityExc
     state.content_hasher = checksum.XxHash32.init(0);
     var crc_state = checksum.XxHash32.init(0);
     crc_state.update(&.{ flags, 7 << 4 });
-    fixed.writeByte(@truncate(crc_state.final() >> 8)) catch return error.CapacityException;
+    fixed.writeByte(@truncate(crc_state.final({}) >> 8)) catch return error.CapacityException;
     state.pending_len = fixed.end;
     return state;
 }
@@ -1235,7 +1235,7 @@ pub fn lz4EncodeStep(state: *Lz4Encode, input: []const u8, output: []u8, end_of_
         }
         var fixed = std.Io.Writer.fixed(state.pending[state.pending_len..]);
         fixed.writeInt(u32, 0, .little) catch return encodeFailed(&result, error.InternalException);
-        fixed.writeInt(u32, state.content_hasher.final(), .little) catch return encodeFailed(&result, error.InternalException);
+        fixed.writeInt(u32, state.content_hasher.final({}), .little) catch return encodeFailed(&result, error.InternalException);
         state.pending_len += fixed.end;
         state.finished = true;
     }

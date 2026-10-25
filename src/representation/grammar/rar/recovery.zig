@@ -166,9 +166,9 @@ fn writeSubBlock(
         }
         std.mem.writeInt(u16, sb[layout.poff + w * 2 ..][0..2], acc, .little);
     }
-    var crc = checksum.XzCrc64.init();
+    var crc = checksum.XzCrc64.init({});
     crc.update(sb[12..sub_size]);
-    std.mem.writeInt(u64, sb[4..12], crc.final(), .little);
+    std.mem.writeInt(u64, sb[4..12], crc.final({}), .little);
 }
 
 // Each sub-block carries the per-archive `slot`; it must match across
@@ -234,9 +234,9 @@ test "gf and crc64 pins" {
     try initTables(exp, log);
     try std.testing.expectEqual(@as(u64, 0), crc64Raw(""));
     try std.testing.expectEqual(@as(u64, 0x50fa083a35fad784), crc64Raw("hello"));
-    var crc = checksum.XzCrc64.init();
+    var crc = checksum.XzCrc64.init({});
     crc.update("123456789");
-    try std.testing.expectEqual(@as(u64, 0x995dc9bbdf1939fa), crc.final());
+    try std.testing.expectEqual(@as(u64, 0x995dc9bbdf1939fa), crc.final({}));
     // Short table surfaces are rejected before any mutation.
     try std.testing.expectError(error.InternalException, initTables(exp[0..10], log));
     try std.testing.expectError(error.InternalException, initTables(exp, log[0..10]));

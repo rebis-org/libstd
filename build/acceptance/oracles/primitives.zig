@@ -22,7 +22,7 @@ fn hexEncode(digest: anytype) [digest.len * 2]u8 {
 fn xxh64(input: []const u8) u64 {
     var hasher = checksum.XxHash64.init(0);
     hasher.update(input);
-    return hasher.final();
+    return hasher.final({});
 }
 
 fn sha256Hex(input: []const u8) [64]u8 {
@@ -102,7 +102,7 @@ fn runChecksums() !void {
             hasher.update(buffer[offset..end]);
             offset = end;
         }
-        try require(hasher.final() == entry.expected);
+        try require(hasher.final({}) == entry.expected);
     }
 }
 

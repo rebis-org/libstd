@@ -89,10 +89,10 @@ pub fn encodeStream(source: *std.Io.Reader, output: *std.Io.Writer, history: []u
     if (history.len < deflate_history_size) return error.CapacityException;
     try writeHeader(output);
     var compressor = try deflate.Compress.init(output, history, options.deflate);
-    var adler32 = checksum.Adler32.bind(options.provider);
+    var adler32 = checksum.Adler32.bind(options.provider, {});
     _ = try deflate.feed(checksum.Adler32, source, &compressor, &adler32);
     compressor.finish() catch return error.IoException;
-    output.writeInt(u32, adler32.final(), .big) catch return error.IoException;
+    output.writeInt(u32, adler32.final({}), .big) catch return error.IoException;
 }
 
 fn writeHeader(writer: *std.Io.Writer) Exception!void {

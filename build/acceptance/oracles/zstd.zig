@@ -1,7 +1,5 @@
 const std = @import("std");
 
-const ab_variant = @import("ab_variant");
-
 const abi = @import("abi.zig");
 const corpus = @import("corpus.zig");
 const harness = @import("harness.zig");
@@ -29,7 +27,7 @@ fn zstdRowParams(_: *Runner, out: *[steps.max_extra]harness.Node) usize {
 }
 
 // A/B dump path: these bytes diff between builds, covering record layout,
-// parser tier, and entropy heuristic. Mirrors abEncodeAndWrite in lzma.zig.
+// parser tier, and entropy heuristic. Shared dump in harness.zig.
 fn abEncodeAndWrite(r: *Runner, comptime params: steps.Params, input: []const u8, label: []const u8) !void {
     harness.setup(r, harness.ids.zstd, harness.mode_xz);
     r.input = input;
@@ -42,19 +40,7 @@ fn abEncodeAndWrite(r: *Runner, comptime params: steps.Params, input: []const u8
         std.debug.print("abEncodeAndWrite write failed: {s}, status {d}.\n", .{ label, r.status });
         return err;
     };
-    const dir = try std.Io.Dir.path.join(r.gpa, &.{
-        "zig-out", "oracles", "ab", ab_variant.name, r.scenario_name,
-    });
-    defer r.gpa.free(dir);
-    const path = try std.Io.Dir.path.join(r.gpa, &.{ dir, label });
-    defer r.gpa.free(path);
-    if (std.Io.Dir.path.dirname(path)) |parent| {
-        try std.Io.Dir.cwd().createDirPath(harness.oracle_io, parent);
-    }
-    try std.Io.Dir.cwd().writeFile(harness.oracle_io, .{
-        .sub_path = path,
-        .data = r.encoded[0..r.encoded_len],
-    });
+    try harness.abDumpEncoded(r, label);
 }
 
 fn zstdFastParams(_: *Runner, out: *[steps.max_extra]harness.Node) usize {

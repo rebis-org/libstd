@@ -146,7 +146,7 @@ const block_writer = struct {
         var size_buf: [10]u8 = undefined;
         const size_len = writeVint(contents.len, &size_buf);
         // The CRC range must match the reader, which checksums from the size field through the body end.
-        var crc_state = checksum.Crc32.init();
+        var crc_state = checksum.Crc32.init({});
         crc_state.update(size_buf[0..size_len]);
         crc_state.update(contents);
         const plain_len = 4 + size_len + contents.len;
@@ -157,7 +157,7 @@ const block_writer = struct {
             try crypto.fillRandom(&iv);
             @memcpy(out[pos..][0..16], &iv);
             const region = out[pos + 16 ..][0..padded];
-            std.mem.writeInt(u32, region[0..4], crc_state.final(), .little);
+            std.mem.writeInt(u32, region[0..4], crc_state.final({}), .little);
             @memcpy(region[4..][0..size_len], size_buf[0..size_len]);
             @memcpy(region[4 + size_len ..][0..contents.len], contents);
             @memset(region[plain_len..], 0);
@@ -165,7 +165,7 @@ const block_writer = struct {
             return pos + 16 + padded;
         }
         if (out.len < pos + plain_len) return error.CapacityException;
-        std.mem.writeInt(u32, out[pos..][0..4], crc_state.final(), .little);
+        std.mem.writeInt(u32, out[pos..][0..4], crc_state.final({}), .little);
         var cursor = pos + 4;
         @memcpy(out[cursor..][0..size_len], size_buf[0..size_len]);
         cursor += size_len;
@@ -1640,9 +1640,9 @@ test "recovery record round-trips and pins the r1 wire form" {
         const clen: usize = if (k < 4) 832 else 829;
         try testing.expectEqual(recovery.crc64Raw(archive[k * 832 .. k * 832 + clen]), std.mem.readInt(u64, unit0[64 + k * 8 ..][0..8], .little));
     }
-    var c1c2 = checksum.XzCrc64.init();
+    var c1c2 = checksum.XzCrc64.init({});
     c1c2.update(unit0[12..944]);
-    try testing.expectEqual(c1c2.final(), std.mem.readInt(u64, unit0[4..12], .little));
+    try testing.expectEqual(c1c2.final({}), std.mem.readInt(u64, unit0[4..12], .little));
 
     // The end block closes the archive.
     try testing.expectEqualSlices(u8, &[_]u8{ 0x03, 0x05, 0x00, 0x00 }, archive[5127..5131]);

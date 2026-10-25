@@ -25,8 +25,7 @@ const default_max_work: u64 = 4 << 30;
 const default_max_entries: u64 = 1 << 20;
 
 fn exceptionStatus(exception: Exception) u32 {
-    inline for (vocabulary.error_map) |entry| if (exception == entry.exception) return entry.status;
-    return envelope.Status.internal_failure;
+    return vocabulary.statusFor(exception);
 }
 
 // Single-sourced surface for matching, sizing, and the catalog projection.

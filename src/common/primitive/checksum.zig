@@ -340,7 +340,7 @@ pub const Bzip2Crc32 = seam.Checksum(options.bzip2crc32_impl, OnpremBzip2Crc32, 
 fn seal(comptime H: type, bound: H, input: []const u8) @typeInfo(@TypeOf(H.final)).@"fn".return_type.? {
     var hash = bound;
     hash.update(input);
-    return hash.final();
+    return hash.final({});
 }
 
 pub fn crc32(input: []const u8) u32 {
@@ -348,7 +348,7 @@ pub fn crc32(input: []const u8) u32 {
 }
 
 pub fn crc32With(provider: seam.Provider, input: []const u8) u32 {
-    return seal(Crc32, Crc32.bind(provider), input);
+    return seal(Crc32, Crc32.bind(provider, {}), input);
 }
 
 pub fn xxh64(input: []const u8) u64 {
@@ -364,7 +364,7 @@ pub fn adler32(input: []const u8) u32 {
 }
 
 pub fn adler32With(provider: seam.Provider, input: []const u8) u32 {
-    return seal(Adler32, Adler32.bind(provider), input);
+    return seal(Adler32, Adler32.bind(provider, {}), input);
 }
 
 pub fn xxh32(input: []const u8) u32 {
@@ -482,24 +482,7 @@ fn TableCrc(comptime T: type, comptime poly: T, comptime reflected: bool) type {
             return ~self.state;
         }
 
-        const table: [256]T = blk: {
-            @setEvalBranchQuota(10000);
-            var t: [256]T = undefined;
-            for (0..256) |i| {
-                var crc: T = if (reflected) @intCast(i) else @as(T, @intCast(i)) << @intCast(bits - 8);
-                var j: u32 = 0;
-                while (j < 8) : (j += 1) {
-                    if (reflected) {
-                        crc = if (crc & 1 != 0) (crc >> 1) ^ poly else crc >> 1;
-                    } else {
-                        const high: T = @as(T, 1) << @intCast(bits - 1);
-                        crc = if (crc & high != 0) (crc << 1) ^ poly else crc << 1;
-                    }
-                }
-                t[i] = crc;
-            }
-            break :blk t;
-        };
+        const table = seam.byteTable(T, poly, reflected);
 
         const tables: [8][256]T = blk: {
             @setEvalBranchQuota(20000);
@@ -538,19 +521,19 @@ test "adler32 matches the published vectors" {
     try std.testing.expectEqual(@as(u32, 0x00000001), adler32(""));
     try std.testing.expectEqual(@as(u32, 0x091E01DE), adler32("123456789"));
     try std.testing.expectEqual(@as(u32, 0x11E60398), adler32("Wikipedia"));
-    var hasher = Adler32.init();
+    var hasher = Adler32.init({});
     hasher.update("1234");
     hasher.update("56789");
-    try std.testing.expectEqual(@as(u32, 0x091E01DE), hasher.final());
+    try std.testing.expectEqual(@as(u32, 0x091E01DE), hasher.final({}));
 }
 
 test "crc32 matches the published vectors" {
     try std.testing.expectEqual(@as(u32, 0x00000000), crc32(""));
     try std.testing.expectEqual(@as(u32, 0xCBF43926), crc32("123456789"));
-    var hash = Crc32.init();
+    var hash = Crc32.init({});
     hash.update("1234");
     hash.update("56789");
-    try std.testing.expectEqual(crc32("123456789"), hash.final());
+    try std.testing.expectEqual(crc32("123456789"), hash.final({}));
 }
 
 test "crc32 matches std.hash.Crc32 across sizes" {
@@ -570,10 +553,10 @@ test "crc32 matches std.hash.Crc32 across sizes" {
         const buf = try allocator.alloc(u8, big);
         rng.random().bytes(buf);
         try std.testing.expectEqual(std.hash.Crc32.hash(buf), crc32(buf));
-        var hash = Crc32.init();
+        var hash = Crc32.init({});
         hash.update(buf[0 .. big / 3]);
         hash.update(buf[big / 3 ..]);
-        try std.testing.expectEqual(std.hash.Crc32.hash(buf), hash.final());
+        try std.testing.expectEqual(std.hash.Crc32.hash(buf), hash.final({}));
         allocator.free(buf);
     }
 }
@@ -584,66 +567,55 @@ test "xxh64 matches the published vectors" {
     var hasher = XxHash64.init(0);
     hasher.update("hello ");
     hasher.update("world");
-    try std.testing.expectEqual(xxh64("hello world"), hasher.final());
+    try std.testing.expectEqual(xxh64("hello world"), hasher.final({}));
 }
 
 test "crc64 xz matches the reference vectors" {
-    var hash = XzCrc64.init();
+    var hash = XzCrc64.init({});
     hash.update("123456789");
-    try std.testing.expectEqual(@as(u64, 0x995DC9BBDF1939FA), hash.final());
-    var hasher = XzCrc64.init();
+    try std.testing.expectEqual(@as(u64, 0x995DC9BBDF1939FA), hash.final({}));
+    var hasher = XzCrc64.init({});
     hasher.update("1234");
     hasher.update("56789");
-    try std.testing.expectEqual(@as(u64, 0x995DC9BBDF1939FA), hasher.final());
+    try std.testing.expectEqual(@as(u64, 0x995DC9BBDF1939FA), hasher.final({}));
 }
 
 test "bzip2 crc32 matches the published check value" {
-    var hash = Bzip2Crc32.init();
+    var hash = Bzip2Crc32.init({});
     hash.update("123456789");
-    try std.testing.expectEqual(@as(u32, 0xFC891918), hash.final());
-    var hasher = Bzip2Crc32.init();
+    try std.testing.expectEqual(@as(u32, 0xFC891918), hash.final({}));
+    var hasher = Bzip2Crc32.init({});
     hasher.update("1234");
     hasher.update("56789");
-    try std.testing.expectEqual(@as(u32, 0xFC891918), hasher.final());
+    try std.testing.expectEqual(@as(u32, 0xFC891918), hasher.final({}));
 }
 
 test "crc64 xz fold matches the byte table across sizes" {
     // The portable byte table is the target-independent reference.
     var rng = std.Random.DefaultPrng.init(0xC64C);
     const allocator = std.testing.allocator;
-    const table = comptime blk: {
-        @setEvalBranchQuota(10000);
-        var t: [256]u64 = undefined;
-        for (0..256) |i| {
-            var crc: u64 = @intCast(i);
-            for (0..8) |_| {
-                crc = if (crc & 1 != 0) (crc >> 1) ^ 0xC96C5795D7870F42 else crc >> 1;
-            }
-            t[i] = crc;
-        }
-        break :blk t;
-    };
+    const table = comptime seam.byteTable(u64, crc64_poly, true);
     var size: usize = 0;
     while (size <= 2048) : (size += 1) {
         const buf = try allocator.alloc(u8, size);
         rng.random().bytes(buf);
-        var fast = XzCrc64.init();
+        var fast = XzCrc64.init({});
         fast.update(buf);
         var raw: u64 = ~@as(u64, 0);
         for (buf) |b| raw = (raw >> 8) ^ table[(raw ^ b) & 0xff];
-        try std.testing.expectEqual(~raw, fast.final());
+        try std.testing.expectEqual(~raw, fast.final({}));
         allocator.free(buf);
     }
     var big: usize = 4096;
     while (big <= 1 << 20) : (big += 65521) {
         const buf = try allocator.alloc(u8, big);
         rng.random().bytes(buf);
-        var fast = XzCrc64.init();
+        var fast = XzCrc64.init({});
         fast.update(buf[0 .. big / 3]);
         fast.update(buf[big / 3 ..]);
         var raw: u64 = ~@as(u64, 0);
         for (buf) |b| raw = (raw >> 8) ^ table[(raw ^ b) & 0xff];
-        try std.testing.expectEqual(~raw, fast.final());
+        try std.testing.expectEqual(~raw, fast.final({}));
         allocator.free(buf);
     }
 }
@@ -663,37 +635,37 @@ test "checksum capabilities agree across providers when mergeable" {
         const buf = try allocator.alloc(u8, size);
         defer allocator.free(buf);
         rng.random().bytes(buf);
-        var crc_on = Crc32.bind(.onprem);
+        var crc_on = Crc32.bind(.onprem, {});
         crc_on.update(buf);
-        var crc_off = Crc32.bind(.offprem);
+        var crc_off = Crc32.bind(.offprem, {});
         crc_off.update(buf);
-        try std.testing.expectEqual(crc_on.final(), crc_off.final());
-        var xz_on = XzCrc64.bind(.onprem);
+        try std.testing.expectEqual(crc_on.final({}), crc_off.final({}));
+        var xz_on = XzCrc64.bind(.onprem, {});
         xz_on.update(buf[0 .. buf.len / 2]);
         xz_on.update(buf[buf.len / 2 ..]);
-        var xz_off = XzCrc64.bind(.offprem);
+        var xz_off = XzCrc64.bind(.offprem, {});
         xz_off.update(buf);
-        try std.testing.expectEqual(xz_on.final(), xz_off.final());
-        var bz_on = Bzip2Crc32.bind(.onprem);
+        try std.testing.expectEqual(xz_on.final({}), xz_off.final({}));
+        var bz_on = Bzip2Crc32.bind(.onprem, {});
         bz_on.update(buf);
-        var bz_off = Bzip2Crc32.bind(.offprem);
+        var bz_off = Bzip2Crc32.bind(.offprem, {});
         bz_off.update(buf);
-        try std.testing.expectEqual(bz_on.final(), bz_off.final());
+        try std.testing.expectEqual(bz_on.final({}), bz_off.final({}));
         var x32_on = XxHash32.bind(.onprem, 0);
         x32_on.update(buf);
         var x32_off = XxHash32.bind(.offprem, 0);
         x32_off.update(buf);
-        try std.testing.expectEqual(x32_on.final(), x32_off.final());
+        try std.testing.expectEqual(x32_on.final({}), x32_off.final({}));
         var x64_on = XxHash64.bind(.onprem, 0);
         x64_on.update(buf[0 .. buf.len / 3]);
         x64_on.update(buf[buf.len / 3 ..]);
         var x64_off = XxHash64.bind(.offprem, 0);
         x64_off.update(buf);
-        try std.testing.expectEqual(x64_on.final(), x64_off.final());
-        var ad_on = Adler32.bind(.onprem);
+        try std.testing.expectEqual(x64_on.final({}), x64_off.final({}));
+        var ad_on = Adler32.bind(.onprem, {});
         ad_on.update(buf);
-        var ad_off = Adler32.bind(.offprem);
+        var ad_off = Adler32.bind(.offprem, {});
         ad_off.update(buf);
-        try std.testing.expectEqual(ad_on.final(), ad_off.final());
+        try std.testing.expectEqual(ad_on.final({}), ad_off.final({}));
     }
 }

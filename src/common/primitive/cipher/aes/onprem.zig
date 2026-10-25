@@ -236,29 +236,27 @@ fn KeySchedule(comptime Aes: type) type {
         fn expand128(first: *Block) Self {
             if (comptime !has_arm8 and !has_aesni) return expandScalar(first, null);
             var round_keys: [11]Block = undefined;
-            const rcs = [_]u8{ 1, 2, 4, 8, 16, 32, 64, 128, 27, 54 };
-            inline for (rcs, 0..) |rc, round| {
+            inline for (rcon, 0..) |rc, round| {
                 round_keys[round] = first.*;
                 first.repr = nextKey128(rc, first.repr);
             }
-            round_keys[rcs.len] = first.*;
+            round_keys[rcon.len] = first.*;
             return .{ .round_keys = round_keys };
         }
 
         fn expand256(first: *Block, second: *Block) Self {
             if (comptime !has_arm8 and !has_aesni) return expandScalar(first, second);
             var round_keys: [15]Block = undefined;
-            const rcs = [_]u8{ 1, 2, 4, 8, 16, 32 };
             round_keys[0] = first.*;
-            inline for (rcs, 0..) |rc, round| {
+            inline for (rcon[0..6], 0..) |rc, round| {
                 round_keys[round * 2 + 1] = second.*;
                 first.repr = nextKey256(false, rc, second.repr, first.repr);
                 round_keys[round * 2 + 2] = first.*;
                 second.repr = nextKey256(true, rc, first.repr, second.repr);
             }
-            round_keys[rcs.len * 2 + 1] = second.*;
+            round_keys[rcon[0..6].len * 2 + 1] = second.*;
             first.repr = nextKey256(false, 64, second.repr, first.repr);
-            round_keys[rcs.len * 2 + 2] = first.*;
+            round_keys[rcon[0..6].len * 2 + 2] = first.*;
             return .{ .round_keys = round_keys };
         }
 
@@ -420,6 +418,25 @@ fn KeySchedule(comptime Aes: type) type {
     };
 }
 
+const Direction = enum { encrypt, decrypt };
+
+// One walk serves every context shape; direction is comptime, so the round
+// instruction monomorphizes exactly like the per-context inline original.
+fn runBlock(comptime direction: Direction, round_keys: anytype, dst: *[16]u8, src: *const [16]u8) void {
+    var t = Block.fromBytes(src).xorBlocks(round_keys[0]);
+    inline for (1..round_keys.len - 1) |index| {
+        t = switch (direction) {
+            .encrypt => t.encrypt(round_keys[index]),
+            .decrypt => t.decrypt(round_keys[index]),
+        };
+    }
+    t = switch (direction) {
+        .encrypt => t.encryptLast(round_keys[round_keys.len - 1]),
+        .decrypt => t.decryptLast(round_keys[round_keys.len - 1]),
+    };
+    dst.* = t.toBytes();
+}
+
 // Four live blocks hide the aes round-instruction latency (std modes parallel shape).
 fn wide4(
     round_keys: anytype,
@@ -464,13 +481,7 @@ pub fn AesEncryptCtx(comptime Aes: type) type {
         }
 
         pub fn encrypt(ctx: Self, dst: *[16]u8, src: *const [16]u8) void {
-            const round_keys = ctx.key_schedule.round_keys;
-            var t = Block.fromBytes(src).xorBlocks(round_keys[0]);
-            inline for (1..rounds) |index| {
-                t = t.encrypt(round_keys[index]);
-            }
-            t = t.encryptLast(round_keys[rounds]);
-            dst.* = t.toBytes();
+            runBlock(.encrypt, &ctx.key_schedule.round_keys, dst, src);
         }
 
         pub fn encryptWide4(ctx: Self, dst: *[64]u8, src: *const [64]u8) void {
@@ -492,13 +503,7 @@ pub fn AesDecryptCtx(comptime Aes: type) type {
         }
 
         pub fn decrypt(ctx: Self, dst: *[16]u8, src: *const [16]u8) void {
-            const round_keys = ctx.key_schedule.round_keys;
-            var t = Block.fromBytes(src).xorBlocks(round_keys[0]);
-            inline for (1..rounds) |index| {
-                t = t.decrypt(round_keys[index]);
-            }
-            t = t.decryptLast(round_keys[rounds]);
-            dst.* = t.toBytes();
+            runBlock(.decrypt, &ctx.key_schedule.round_keys, dst, src);
         }
 
         pub fn decryptWide4(ctx: Self, dst: *[64]u8, src: *const [64]u8) void {
@@ -553,25 +558,8 @@ pub const Aes192 = struct {
         return .{ .round_keys = round_keys };
     }
 
-    const BlockDirection = enum { encrypt, decrypt };
-
-    fn cryptBlock(self: Aes192, dst: *[block_length]u8, src: *const [block_length]u8, comptime direction: BlockDirection) void {
-        var t = Block.fromBytes(src).xorBlocks(self.round_keys[0]);
-        inline for (1..rounds) |index| {
-            t = switch (direction) {
-                .encrypt => t.encrypt(self.round_keys[index]),
-                .decrypt => t.decrypt(self.round_keys[index]),
-            };
-        }
-        t = switch (direction) {
-            .encrypt => t.encryptLast(self.round_keys[rounds]),
-            .decrypt => t.decryptLast(self.round_keys[rounds]),
-        };
-        dst.* = t.toBytes();
-    }
-
     pub fn encrypt(self: Aes192, dst: *[block_length]u8, src: *const [block_length]u8) void {
-        cryptBlock(self, dst, src, .encrypt);
+        runBlock(.encrypt, &self.round_keys, dst, src);
     }
 
     pub fn encryptWide4(self: Aes192, dst: *[64]u8, src: *const [64]u8) void {
@@ -579,7 +567,7 @@ pub const Aes192 = struct {
     }
 
     pub fn decrypt(self: Aes192, dst: *[block_length]u8, src: *const [block_length]u8) void {
-        cryptBlock(self, dst, src, .decrypt);
+        runBlock(.decrypt, &self.round_keys, dst, src);
     }
 
     pub fn decryptWide4(self: Aes192, dst: *[64]u8, src: *const [64]u8) void {
@@ -592,7 +580,7 @@ fn expandWordLoop(words: []u32, nk: usize) void {
     while (index < words.len) : (index += 1) {
         var temp = words[index - 1];
         if (index % nk == 0) {
-            temp = subWord(std.math.rotl(u32, temp, 8)) ^ (rcon[index / nk - 1] << 24);
+            temp = subWord(std.math.rotl(u32, temp, 8)) ^ (@as(u32, rcon[index / nk - 1]) << 24);
         } else if (nk == 8 and index % nk == 4) {
             temp = subWord(temp);
         }
@@ -619,7 +607,7 @@ fn invertSchedule(round_keys: []const Block, inverted: []Block) void {
     inverted[rounds] = round_keys[0];
 }
 
-const rcon = [_]u32{ 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36 };
+const rcon = [_]u8{ 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36 };
 
 fn subWord(word: u32) u32 {
     var result: u32 = 0;

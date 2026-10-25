@@ -1,7 +1,5 @@
 const std = @import("std");
 
-const ab_variant = @import("ab_variant");
-
 const abi = @import("abi.zig");
 const catalog = @import("catalog.zig");
 const corpus = @import("corpus.zig");
@@ -931,21 +929,7 @@ fn abEncodeAndWrite(r: *Runner, profile_id: harness.Id, dictionary: u64, finder:
         std.debug.print("abEncodeAndWrite write failed: {s}, status {d}.\n", .{ label, r.status });
         return err;
     };
-    const encoded_len: usize = r.encoded_len;
-
-    const dir = try std.Io.Dir.path.join(r.gpa, &.{
-        "zig-out", "oracles", "ab", ab_variant.name, r.scenario_name,
-    });
-    defer r.gpa.free(dir);
-    const path = try std.Io.Dir.path.join(r.gpa, &.{ dir, label });
-    defer r.gpa.free(path);
-    if (std.Io.Dir.path.dirname(path)) |parent| {
-        try std.Io.Dir.cwd().createDirPath(harness.oracle_io, parent);
-    }
-    try std.Io.Dir.cwd().writeFile(harness.oracle_io, .{
-        .sub_path = path,
-        .data = r.encoded[0..encoded_len],
-    });
+    try harness.abDumpEncoded(r, label);
 }
 
 fn runLzmaAbCorpus(r: *Runner) !void {

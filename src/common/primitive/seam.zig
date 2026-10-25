@@ -6,10 +6,7 @@ pub const Provider = enum { onprem, offprem };
 
 // The boundary default for non-envelope consumers; the stepped C boundary
 // carries no provider parameter.
-pub const default_provider: Provider = switch (options.primitives_impl) {
-    .onprem, .mergeable => .onprem,
-    .offprem => .offprem,
-};
+pub const default_provider: Provider = defaultProvider(options.primitives_impl);
 
 const Mode = @TypeOf(options.primitives_impl);
 
@@ -177,115 +174,72 @@ fn Mergeable(comptime family: Family, comptime On: type, comptime Off: type) typ
     };
 }
 
-pub fn Digest(comptime mode: Mode, comptime On: type, comptime Off: type) type {
-    const CoreImpl = Core(mode, .digest, On, Off);
+// One facade carries every family: the family fixes the construction and
+// final argument types, and lazy decl analysis drops unused constants.
+pub fn Facade(comptime family: Family, comptime mode: Mode, comptime On: type, comptime Off: type) type {
+    const CoreImpl = Core(mode, family, On, Off);
+    const Args = switch (family) {
+        .digest => CoreImpl.Options,
+        .mac => []const u8,
+        .hash => CoreImpl.Seed,
+        .checksum => void,
+    };
+    const FinalArgs = switch (family) {
+        .digest => *[CoreImpl.digest_length]u8,
+        .mac => *[CoreImpl.mac_length]u8,
+        .hash, .checksum => void,
+    };
     return struct {
         inner: CoreImpl,
 
         pub const digest_length = CoreImpl.digest_length;
         pub const block_length = CoreImpl.block_length;
+        pub const mac_length = CoreImpl.mac_length;
         pub const Options = CoreImpl.Options;
-
-        pub fn init(opts: Options) @This() {
-            return .{ .inner = CoreImpl.init(opts) };
-        }
-
-        pub fn bind(provider: Provider, opts: Options) @This() {
-            return .{ .inner = CoreImpl.bind(provider, opts) };
-        }
-
-        pub fn update(self: *@This(), input: []const u8) void {
-            self.inner.update(input);
-        }
-
-        pub fn final(self: *@This(), out: *[digest_length]u8) void {
-            self.inner.final(out);
-        }
-
-        pub fn finalResult(self: *@This()) [digest_length]u8 {
-            return self.inner.finalResult();
-        }
-    };
-}
-
-pub fn Hash(comptime mode: Mode, comptime On: type, comptime Off: type) type {
-    const CoreImpl = Core(mode, .hash, On, Off);
-    return struct {
-        inner: CoreImpl,
-
         pub const Seed = CoreImpl.Seed;
         pub const Final = CoreImpl.Final;
 
-        pub fn init(seed: Seed) @This() {
-            return .{ .inner = CoreImpl.init(seed) };
+        pub fn init(args: Args) @This() {
+            return .{ .inner = CoreImpl.init(args) };
         }
 
-        pub fn bind(provider: Provider, seed: Seed) @This() {
-            return .{ .inner = CoreImpl.bind(provider, seed) };
-        }
-
-        pub fn update(self: *@This(), input: []const u8) void {
-            self.inner.update(input);
-        }
-
-        pub fn final(self: *@This()) Final {
-            return self.inner.final({});
-        }
-    };
-}
-
-pub fn Checksum(comptime mode: Mode, comptime On: type, comptime Off: type) type {
-    const CoreImpl = Core(mode, .checksum, On, Off);
-    return struct {
-        inner: CoreImpl,
-
-        pub const Final = CoreImpl.Final;
-
-        pub fn init() @This() {
-            return .{ .inner = CoreImpl.init({}) };
-        }
-
-        pub fn bind(provider: Provider) @This() {
-            return .{ .inner = CoreImpl.bind(provider, {}) };
+        pub fn bind(provider: Provider, args: Args) @This() {
+            return .{ .inner = CoreImpl.bind(provider, args) };
         }
 
         pub fn update(self: *@This(), input: []const u8) void {
             self.inner.update(input);
         }
 
-        pub fn final(self: *const @This()) Final {
-            return self.inner.final({});
-        }
-    };
-}
-
-pub fn Mac(comptime mode: Mode, comptime On: type, comptime Off: type) type {
-    const CoreImpl = Core(mode, .mac, On, Off);
-    return struct {
-        inner: CoreImpl,
-
-        pub const mac_length = CoreImpl.mac_length;
-
-        pub fn init(key: []const u8) @This() {
-            return .{ .inner = CoreImpl.init(key) };
+        pub fn final(self: *const @This(), args: FinalArgs) Final {
+            return self.inner.final(args);
         }
 
-        pub fn bind(provider: Provider, key: []const u8) @This() {
-            return .{ .inner = CoreImpl.bind(provider, key) };
-        }
-
-        pub fn update(self: *@This(), input: []const u8) void {
-            self.inner.update(input);
-        }
-
-        pub fn final(self: *@This(), out: *[mac_length]u8) void {
-            self.inner.final(out);
-        }
-
-        pub fn finalResult(self: *@This()) [mac_length]u8 {
+        // Value families finish with final; referencing finalResult is a compile error.
+        pub fn finalResult(self: *const @This()) switch (family) {
+            .digest => [CoreImpl.digest_length]u8,
+            .mac => [CoreImpl.mac_length]u8,
+            .hash, .checksum => @compileError("hash and checksum finish with final, not finalResult"),
+        } {
             return self.inner.finalResult();
         }
     };
+}
+
+pub fn Digest(comptime mode: Mode, comptime On: type, comptime Off: type) type {
+    return Facade(.digest, mode, On, Off);
+}
+
+pub fn Hash(comptime mode: Mode, comptime On: type, comptime Off: type) type {
+    return Facade(.hash, mode, On, Off);
+}
+
+pub fn Checksum(comptime mode: Mode, comptime On: type, comptime Off: type) type {
+    return Facade(.checksum, mode, On, Off);
+}
+
+pub fn Mac(comptime mode: Mode, comptime On: type, comptime Off: type) type {
+    return Facade(.mac, mode, On, Off);
 }
 
 // Fixed builds reject the foreign tag; mergeable binds per call.
@@ -317,6 +271,45 @@ pub fn dispatchOnprem(comptime impl: anytype, provider: Provider, comptime on: a
             .offprem => error.UnsupportedException,
         },
     };
+}
+
+// Both arms exist; a fixed build rejects the foreign tag loudly.
+pub fn dispatch(comptime impl: anytype, provider: Provider, comptime on: anytype, comptime off: anytype, args: anytype) @typeInfo(@TypeOf(on)).@"fn".return_type.? {
+    return switch (impl) {
+        .onprem => blk: {
+            try requireServed(provider, .onprem);
+            break :blk @call(.auto, on, args);
+        },
+        .offprem => blk: {
+            try requireServed(provider, .offprem);
+            break :blk @call(.auto, off, args);
+        },
+        .mergeable => switch (provider) {
+            .onprem => @call(.auto, on, args),
+            .offprem => @call(.auto, off, args),
+        },
+    };
+}
+
+// One generator serves every CRC table in the tree, on-prem and test reference alike.
+pub fn byteTable(comptime T: type, comptime poly: T, comptime reflected: bool) [256]T {
+    @setEvalBranchQuota(10000);
+    const bits = @bitSizeOf(T);
+    var table: [256]T = undefined;
+    for (0..256) |i| {
+        var crc: T = if (reflected) @intCast(i) else @as(T, @intCast(i)) << @intCast(bits - 8);
+        var j: u32 = 0;
+        while (j < 8) : (j += 1) {
+            if (reflected) {
+                crc = if (crc & 1 != 0) (crc >> 1) ^ poly else crc >> 1;
+            } else {
+                const high: T = @as(T, 1) << @intCast(bits - 1);
+                crc = if (crc & high != 0) (crc << 1) ^ poly else crc << 1;
+            }
+        }
+        table[i] = crc;
+    }
+    return table;
 }
 
 // Sweep every input width against the paired stdlib implementation,

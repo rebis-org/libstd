@@ -17,13 +17,13 @@ fn HashCase(comptime Hash: type, comptime mode: enum { simple, seeded, crypto })
         pub fn run(self: *const @This(), allocator: std.mem.Allocator) void {
             _ = allocator;
             var hash = switch (mode) {
-                .simple => Hash.bind(checksum.default_provider),
+                .simple => Hash.bind(checksum.default_provider, {}),
                 .seeded => Hash.bind(checksum.default_provider, 0),
                 .crypto => Hash.bind(crypto.default_provider, .{}),
             };
             hash.update(self.input);
             std.mem.doNotOptimizeAway(switch (mode) {
-                .simple, .seeded => hash.final(),
+                .simple, .seeded => hash.final({}),
                 .crypto => hash.finalResult(),
             });
         }

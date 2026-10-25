@@ -46,18 +46,18 @@ fn runSplitUpdates(chunk_size: usize) !void {
     const data = try fillPage(gpa, 1048576);
     defer gpa.free(data);
 
-    var split = checksum.Crc32.init();
+    var split = checksum.Crc32.init({});
     var offset: usize = 0;
     while (offset < data.len) {
         const end = @min(offset + chunk_size, data.len);
         split.update(data[offset..end]);
         offset = end;
     }
-    const split_digest = split.final();
+    const split_digest = split.final({});
 
-    var whole = checksum.Crc32.init();
+    var whole = checksum.Crc32.init({});
     whole.update(data);
-    const whole_digest = whole.final();
+    const whole_digest = whole.final({});
 
     if (split_digest != whole_digest or split_digest != crc32Ref(data)) {
         std.debug.print("split/whole mismatch: chunk {d}: split {x:0>8}, whole {x:0>8}, reference {x:0>8}.\n", .{ chunk_size, split_digest, whole_digest, crc32Ref(data) });

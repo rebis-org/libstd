@@ -159,10 +159,10 @@ pub fn encodeStream(source: *std.Io.Reader, output: *std.Io.Writer, history: []u
     try writeHeader(output, options);
     // Optimal mode carves scratch past deflate_history_size, so the full slice is required.
     var compressor = try deflate.Compress.init(output, history, options.deflate);
-    var crc32 = checksum.Crc32.bind(options.provider);
+    var crc32 = checksum.Crc32.bind(options.provider, {});
     const total = try deflate.feed(checksum.Crc32, source, &compressor, &crc32);
     compressor.finish() catch return error.IoException;
-    try writeTrailer(output, crc32.final(), total);
+    try writeTrailer(output, crc32.final({}), total);
 }
 
 fn parseHeader(input: []const u8, provider: checksum.Provider) Exception!HeaderTail {
@@ -172,7 +172,7 @@ fn parseHeader(input: []const u8, provider: checksum.Provider) Exception!HeaderT
     if (fixed[2] != cm_deflate) return error.UnsupportedException;
     const flags = fixed[3];
     if (flags & reserved_flags != 0) return error.DataException;
-    var hasher = checksum.Crc32.bind(provider);
+    var hasher = checksum.Crc32.bind(provider, {});
     hasher.update(fixed);
     var cursor: usize = fixed.len;
     var extra: []const u8 = &.{};
@@ -203,7 +203,7 @@ fn parseHeader(input: []const u8, provider: checksum.Provider) Exception!HeaderT
     if (flags & flag_header_crc != 0) {
         if (input.len - cursor < 2) return error.DataException;
         const stored_crc = (@as(u16, input[cursor + 1]) << 8) | input[cursor];
-        if (stored_crc != @as(u16, @truncate(hasher.final()))) return error.IntegrityException;
+        if (stored_crc != @as(u16, @truncate(hasher.final({})))) return error.IntegrityException;
         cursor += 2;
     }
     return .{ .extra = extra, .name = name, .comment = comment, .len = cursor };
@@ -237,7 +237,7 @@ fn writeHeader(writer: *std.Io.Writer, options: Options) Exception!void {
     if (options.extra.len != 0) flags |= flag_extra;
     if (options.name.len != 0) flags |= flag_name;
     if (options.comment.len != 0) flags |= flag_comment;
-    var hasher = checksum.Crc32.bind(options.provider);
+    var hasher = checksum.Crc32.bind(options.provider, {});
     var fixed_header: [10]u8 = undefined;
     fixed_header[0] = magic_1;
     fixed_header[1] = magic_2;
@@ -266,7 +266,7 @@ fn writeHeader(writer: *std.Io.Writer, options: Options) Exception!void {
     }
     if (options.header_crc) {
         var bytes: [2]u8 = undefined;
-        std.mem.writeInt(u16, &bytes, @truncate(hasher.final()), .little);
+        std.mem.writeInt(u16, &bytes, @truncate(hasher.final({})), .little);
         try io.writeBytes(writer, &bytes);
     }
 }

@@ -250,7 +250,7 @@ fn decodeBlocksInto(input: []const u8, output: []u8, options: Options) Exception
     if (flags & flag_content_checksum != 0) {
         if (input.len < offset + 4) return error.DataException;
         const stored_sum = std.mem.readInt(u32, input[offset..][0..4], .little);
-        if (stored_sum != content_hasher.final()) return error.IntegrityException;
+        if (stored_sum != content_hasher.final({})) return error.IntegrityException;
         offset += 4;
     }
     if (offset != input.len) return error.DataException;
@@ -310,7 +310,7 @@ pub fn encodeToWriter(input: []const u8, output: *std.Io.Writer, scratch: []u8, 
     std.mem.writeInt(u64, &size_bytes, input.len, .little);
     output.writeAll(&size_bytes) catch return error.IoException;
     header_hasher.update(&size_bytes);
-    output.writeByte(@truncate(header_hasher.final() >> 8)) catch return error.IoException;
+    output.writeByte(@truncate(header_hasher.final({}) >> 8)) catch return error.IoException;
     const hash_table: []u32 = @alignCast(std.mem.bytesAsSlice(u32, scratch[0 .. hash_size * @sizeOf(u32)]));
     const hc_tables: []u32 = @alignCast(std.mem.bytesAsSlice(u32, scratch[hash_size * @sizeOf(u32) .. (hash_size + 2 * hc_hash_size) * @sizeOf(u32)]));
     const block_buffer = scratch[(hash_size + 2 * hc_hash_size) * @sizeOf(u32) ..];
@@ -409,7 +409,7 @@ fn decodeBlocks(input: []const u8, output: *std.Io.Writer, scratch: []u8, provid
     if (flags & flag_content_checksum != 0) {
         if (input.len < offset + 4) return error.DataException;
         const stored_sum = std.mem.readInt(u32, input[offset..][0..4], .little);
-        if (stored_sum != content_hasher.final()) return error.IntegrityException;
+        if (stored_sum != content_hasher.final({})) return error.IntegrityException;
         offset += 4;
     }
     if (offset != input.len) return error.DataException;
