@@ -14,12 +14,13 @@ const lzo_leaf = @import("../../leaf/lzo/onprem.zig");
 const zstd_leaf = @import("../../leaf/zstd/onprem.zig");
 
 pub const Entry = entry_prim.Entry;
+const Exception = exception_prim.Exception;
+
 pub const EntryInfo = struct {
     name: []const u8,
     size: u64,
     ordinal: u64,
 };
-const Exception = exception_prim.Exception;
 
 // SquashFS 4.0 slice: one root directory of regular files.
 // Read covers every compressor for data and metadata alike.
