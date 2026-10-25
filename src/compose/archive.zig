@@ -208,6 +208,64 @@ fn projectedEntrySize(request: ?*Node) Exception!?u64 {
     return node_graph.parseU64(ordinal_node);
 }
 
+// Inspect metadata projection: `entry` plus `ordinal` on a sink-less read
+// publishes the entry fields into the response child graph. Null when absent.
+fn projectedEntryMetadata(request: ?*Node) Exception!?u64 {
+    const entry = comptime discovery.parameter("tar", "entry");
+    if (node_graph.findSelector(request, entry.family, entry.ordinal) == null) return null;
+    const ordinal_sel = comptime discovery.parameter("tar", "ordinal");
+    const ordinal_node = node_graph.findSelector(request, ordinal_sel.family, ordinal_sel.ordinal) orelse return error.CallException;
+    return node_graph.parseU64(ordinal_node);
+}
+
+const EntryMetadata = struct {
+    name: ?[]const u8 = null,
+    size: ?u64 = null,
+    mtime: ?u64 = null,
+    uid: ?u64 = null,
+    typeflag: ?u64 = null,
+    link_name: ?[]const u8 = null,
+};
+
+// Fills whichever response child nodes the host chained; fields the format
+// does not carry stay zero, and a short name buffer reports capacity.
+fn publishEntryMetadata(call: *Call, response: *Node, meta: EntryMetadata) Exception!void {
+    const name_sel = comptime discovery.parameter("tar", "entry_name");
+    const size_sel = comptime discovery.parameter("tar", "entry_size");
+    const mtime_sel = comptime discovery.parameter("tar", "entry_mtime");
+    const uid_sel = comptime discovery.parameter("tar", "entry_uid");
+    const typeflag_sel = comptime discovery.parameter("tar", "entry_typeflag");
+    const link_sel = comptime discovery.parameter("tar", "entry_link_name");
+    var cursor = response.child;
+    while (cursor) |node| : (cursor = node.next) {
+        if (!vocabulary.eql(node.id, vocabulary.ids.parameter)) continue;
+        const selector = vocabulary.selectorOf(node.value_high);
+        if (selector.family != name_sel.family) continue;
+        if (selector.ordinal == name_sel.ordinal or selector.ordinal == link_sel.ordinal) {
+            const bytes = if (selector.ordinal == name_sel.ordinal) meta.name else meta.link_name;
+            if (bytes) |text| {
+                if (node.byte_capacity < text.len) {
+                    common.writeCapacityDiagnostic(call, text.len, node.byte_capacity);
+                    return error.CapacityException;
+                }
+                const output = node.bytes orelse return error.CallException;
+                @memcpy(output[0..text.len], text);
+                node.byte_length = text.len;
+            }
+        } else {
+            const value: ?u64 = switch (selector.ordinal) {
+                size_sel.ordinal => meta.size,
+                mtime_sel.ordinal => meta.mtime,
+                uid_sel.ordinal => meta.uid,
+                typeflag_sel.ordinal => meta.typeflag,
+                else => null,
+            };
+            if (value) |scalar| node.value_low = scalar;
+        }
+    }
+    if (meta.size) |size| response.byte_length = size;
+}
+
 pub fn tarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
     _ = sizing;
     const source_resource = source orelse return error.CallException;
@@ -218,6 +276,18 @@ pub fn tarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
             if (try projectedEntrySize(call.request)) |ordinal| {
                 const entry = try tar_seam.inspectOrdinal(plan.provider, archive, ordinal);
                 response.byte_length = entry.size;
+                return;
+            }
+            if (try projectedEntryMetadata(call.request)) |ordinal| {
+                const entry = try tar_seam.inspectOrdinal(plan.provider, archive, ordinal);
+                try publishEntryMetadata(call, response, .{
+                    .name = entry.name,
+                    .size = entry.size,
+                    .mtime = entry.modification_time,
+                    .uid = entry.uid,
+                    .typeflag = entry.typeflag,
+                    .link_name = entry.link_name,
+                });
                 return;
             }
             const count = try tar_seam.inspectCount(plan.provider, archive);
@@ -282,6 +352,16 @@ pub fn xarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
             if (try projectedEntrySize(call.request)) |ordinal| {
                 const entry = try xar_seam.inspectOrdinal(plan.provider, archive, ordinal, scratch);
                 response.byte_length = entry.size;
+                return;
+            }
+            if (try projectedEntryMetadata(call.request)) |ordinal| {
+                const entry = try xar_seam.inspectOrdinal(plan.provider, archive, ordinal, scratch);
+                try publishEntryMetadata(call, response, .{
+                    .name = entry.name,
+                    .size = entry.size,
+                    .mtime = entry.modification_time,
+                    .uid = entry.uid,
+                });
                 return;
             }
             const count = try xar_seam.inspectCount(plan.provider, archive, scratch);
@@ -354,6 +434,11 @@ pub fn dwarfsHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resou
                 response.byte_length = entry.size;
                 return;
             }
+            if (try projectedEntryMetadata(call.request)) |ordinal| {
+                const entry = try dwarfs_seam.inspectOrdinal(plan.provider, archive, ordinal, scratch);
+                try publishEntryMetadata(call, response, .{ .size = entry.size });
+                return;
+            }
             const count = try dwarfs_seam.inspectCount(plan.provider, archive, scratch);
             response.byte_length = count;
             return;
@@ -403,6 +488,11 @@ pub fn apfsHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resourc
             if (try projectedEntrySize(call.request)) |ordinal| {
                 const entry = try apfs_seam.inspectOrdinal(plan.provider, archive, ordinal, scratch);
                 response.byte_length = entry.size;
+                return;
+            }
+            if (try projectedEntryMetadata(call.request)) |ordinal| {
+                const entry = try apfs_seam.inspectOrdinal(plan.provider, archive, ordinal, scratch);
+                try publishEntryMetadata(call, response, .{ .size = entry.size });
                 return;
             }
             const count = try apfs_seam.inspectCount(plan.provider, archive, scratch);
@@ -489,6 +579,14 @@ pub fn ageHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
                 response.byte_length = info.size;
                 return;
             }
+            if (try projectedEntryMetadata(call.request)) |ordinal| {
+                const info = age_seam.inspectOrdinal(plan.provider, archive, ordinal, options, scratch) catch |err| {
+                    writeCryptoFailure(call, .wrong_password);
+                    return err;
+                };
+                try publishEntryMetadata(call, response, .{ .size = info.size });
+                return;
+            }
             _ = age_seam.inspectCount(plan.provider, archive, scratch) catch |err| switch (err) {
                 error.UnsupportedException => return error.UnsupportedException,
                 else => return error.DataException,
@@ -559,6 +657,11 @@ pub fn isoHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
                 response.byte_length = entry.size;
                 return;
             }
+            if (try projectedEntryMetadata(call.request)) |ordinal| {
+                const entry = try iso_seam.inspectOrdinal(plan.provider, archive, ordinal, scratch);
+                try publishEntryMetadata(call, response, .{ .size = entry.size });
+                return;
+            }
             const count = try iso_seam.inspectCount(plan.provider, archive, scratch);
             response.byte_length = count;
             return;
@@ -608,6 +711,11 @@ pub fn squashfsHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Res
                 response.byte_length = entry.size;
                 return;
             }
+            if (try projectedEntryMetadata(call.request)) |ordinal| {
+                const entry = try squashfs_seam.inspectOrdinal(plan.provider, archive, ordinal, scratch);
+                try publishEntryMetadata(call, response, .{ .size = entry.size });
+                return;
+            }
             const count = try squashfs_seam.inspectCount(plan.provider, archive, scratch);
             response.byte_length = count;
             return;
@@ -655,6 +763,11 @@ pub fn wimHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
             if (try projectedEntrySize(call.request)) |ordinal| {
                 const entry = try wim_seam.inspectOrdinal(plan.provider, archive, ordinal, scratch);
                 response.byte_length = entry.size;
+                return;
+            }
+            if (try projectedEntryMetadata(call.request)) |ordinal| {
+                const entry = try wim_seam.inspectOrdinal(plan.provider, archive, ordinal, scratch);
+                try publishEntryMetadata(call, response, .{ .name = entry.name, .size = entry.size });
                 return;
             }
             const count = try wim_seam.inspectCount(plan.provider, archive, scratch);
@@ -718,6 +831,16 @@ pub fn cpioHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resourc
                 response.byte_length = entry.size;
                 return;
             }
+            if (try projectedEntryMetadata(call.request)) |ordinal| {
+                const entry = try cpio_seam.inspectOrdinal(plan.provider, archive, ordinal);
+                try publishEntryMetadata(call, response, .{
+                    .name = entry.name,
+                    .size = entry.size,
+                    .mtime = entry.modification_time,
+                    .uid = entry.uid,
+                });
+                return;
+            }
             const count = try cpio_seam.inspectCount(plan.provider, archive);
             response.byte_length = count;
             return;
@@ -769,6 +892,11 @@ pub fn zipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
             if (try projectedEntrySize(call.request)) |ordinal| {
                 const entry = try zip.zipInspectOrdinalEx(archive, std.math.cast(usize, ordinal) orelse return error.CallException, limits);
                 response.byte_length = entry.uncompressed_size;
+                return;
+            }
+            if (try projectedEntryMetadata(call.request)) |ordinal| {
+                const entry = try zip.zipInspectOrdinalEx(archive, std.math.cast(usize, ordinal) orelse return error.CallException, limits);
+                try publishEntryMetadata(call, response, .{ .name = entry.name, .size = entry.uncompressed_size });
                 return;
             }
             const count = try zip.zipInspectCountEx(archive, limits);
@@ -886,6 +1014,14 @@ fn sevenZipGeneric(comptime coded: bool, plan: *common.ExecutionPlan, source: ?*
                     return err;
                 };
                 response.byte_length = entry.size;
+                return;
+            }
+            if (try projectedEntryMetadata(call.request)) |ordinal| {
+                const entry = seven_zip.sevenZipInspectOrdinalEx(archive, &workspace, limits, ordinal, &load_options) catch |err| {
+                    writeCryptoFailure(call, crypto_cause);
+                    return err;
+                };
+                try publishEntryMetadata(call, response, .{ .name = entry.name, .size = entry.size });
                 return;
             }
             const count = seven_zip.sevenZipInspectCountEx(archive, &workspace, limits, &load_options) catch |err| {
@@ -1082,6 +1218,14 @@ pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
                     return err;
                 };
                 response.byte_length = entry.size;
+                return;
+            }
+            if (try projectedEntryMetadata(call.request)) |ordinal| {
+                const entry = rar.rarInspectOrdinalOpts(archive, std.math.cast(usize, ordinal) orelse return error.ResourceException, limits.entries, inspect_opts) catch |err| {
+                    writeCryptoFailure(call, failure_cause);
+                    return err;
+                };
+                try publishEntryMetadata(call, response, .{ .name = entry.name, .size = entry.size, .mtime = entry.mtime });
                 return;
             }
             const count = rar.rarInspectCountOpts(archive, limits.entries, inspect_opts) catch |err| {

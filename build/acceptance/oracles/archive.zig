@@ -232,6 +232,79 @@ pub fn runCpio(r: *Runner) anyerror!void {
     try runArchive(r, harness.ids.cpio);
 }
 
+pub fn runInspectMetadata(r: *Runner) anyerror!void {
+    if (isOffpremUnsupported()) return;
+    // The metadata projection answers an ordinal query with the entry fields
+    // published into the response child graph; name bytes land in host memory.
+    inline for (.{ .{ harness.ids.xar, false }, .{ harness.ids.tar, true } }) |pair| {
+        const profile_id = pair[0];
+        const is_tar = pair[1];
+        setupArchive(r, profile_id);
+        var typeflag_node: harness.Node = undefined;
+        var mtime_node: harness.Node = undefined;
+        if (is_tar) {
+            typeflag_node = harness.paramScalar(harness.param_family_archive, harness.archive_entry_typeflag, harness.cmd_query_write, '0');
+            mtime_node = harness.paramScalar(harness.param_family_archive, harness.archive_entry_mtime, harness.cmd_query_write, 1000000000);
+            var tail = arc_state.entry1.child;
+            while (tail.?.next) |next| tail = next;
+            tail.?.next = &typeflag_node;
+            typeflag_node.next = &mtime_node;
+        }
+        try arcQueryWrite(r);
+        try arcWrite(r);
+        const archive = arc_state.archive[0..arc_state.archive_size];
+
+        var name_buffer: [64]u8 = undefined;
+        var out_nodes: [4]harness.Node = undefined;
+        out_nodes[0] = harness.node(&name_buffer, name_buffer.len);
+        out_nodes[0].id = harness.ids.parameter;
+        out_nodes[0].value_high = harness.paramSelector(harness.param_family_archive, harness.archive_entry_name, 0x22, 0);
+        out_nodes[1] = harness.scalarNode(harness.ids.parameter);
+        out_nodes[1].value_high = harness.paramSelector(harness.param_family_archive, harness.archive_entry_size, 0x21, 0);
+        out_nodes[2] = harness.scalarNode(harness.ids.parameter);
+        out_nodes[2].value_high = harness.paramSelector(harness.param_family_archive, if (is_tar) harness.archive_entry_typeflag else harness.archive_entry_uid, 0x21, 0);
+        out_nodes[3] = harness.scalarNode(harness.ids.parameter);
+        out_nodes[3].value_high = harness.paramSelector(harness.param_family_archive, harness.archive_entry_mtime, 0x21, 0);
+        harness.linkNodes(&out_nodes);
+
+        var response = abi.Node.init();
+        response.child = &out_nodes[0];
+
+        var req_nodes: [8]harness.Node = undefined;
+        req_nodes[0] = harness.paramProfile(profile_id);
+        req_nodes[1] = harness.paramTargetCommand(harness.ids.read);
+        req_nodes[2] = harness.sourceSpan(archive);
+        req_nodes[3] = harness.capabilityParam(r.caps_query);
+        req_nodes[4] = harness.sizingModeParam(r.sizing);
+        req_nodes[5] = harness.commitModeParam(r.commit_read);
+        req_nodes[6] = harness.paramScalar(harness.param_family_archive, harness.archive_ordinal, harness.cmd_query, 0);
+        req_nodes[7] = harness.scalarNode(harness.ids.parameter);
+        req_nodes[7].value_high = harness.paramSelector(harness.param_family_archive, harness.archive_entry, 0x13, harness.cmd_query);
+        harness.linkNodes(&req_nodes);
+
+        const status = harness.invoke(harness.ids.query, &req_nodes[0], &response, r.workspace.ptr, r.workspace.len, null, null, null);
+        if (status != abi.Status.ok) {
+            std.debug.print("metadata status {d} tar={}\n", .{ status, is_tar });
+            return error.MetadataQueryFailed;
+        }
+        if (response.byte_length != arc_state.data1.len or out_nodes[1].value_low != arc_state.data1.len) return error.MetadataSizeMismatch;
+        if (out_nodes[0].byte_length != 6 or !std.mem.eql(u8, name_buffer[0..6], "m1.txt")) return error.MetadataNameMismatch;
+        if (is_tar) {
+            if (out_nodes[2].value_low != '0' or out_nodes[3].value_low != 1000000000) return error.MetadataTarMismatch;
+        } else {
+            if (out_nodes[2].value_low != 0 or out_nodes[3].value_low != 0) return error.MetadataXarMismatch;
+        }
+
+        // A short name buffer reports capacity instead of truncating.
+        var tiny: [2]u8 = undefined;
+        out_nodes[0].bytes = &tiny;
+        out_nodes[0].byte_capacity = tiny.len;
+        out_nodes[0].byte_length = 0;
+        const cramped = harness.invoke(harness.ids.query, &req_nodes[0], &response, r.workspace.ptr, r.workspace.len, null, null, null);
+        if (cramped != abi.Status.insufficient_capacity) return error.MetadataCapacityAccepted;
+    }
+}
+
 pub fn runXar(r: *Runner) anyerror!void {
     if (isOffpremUnsupported()) return;
     try runArchive(r, harness.ids.xar);
@@ -1408,6 +1481,7 @@ pub const scenarios = harness.scenarios("archive", &.{
     .{ .label = "archive cpio", .run = runCpio, .workspace_size = 65536, .output_size = 512, .encoded_size = 4096 },
     .{ .label = "archive cpio foreign newc", .run = runCpioForeign(.cpio_newc), .workspace_size = 65536, .output_size = 512, .encoded_size = 4096 },
     .{ .label = "archive cpio foreign odc", .run = runCpioForeign(.cpio_odc), .workspace_size = 65536, .output_size = 512, .encoded_size = 4096 },
+    .{ .label = "archive inspect metadata", .run = runInspectMetadata, .workspace_size = 3 * 1024 * 1024, .output_size = 512, .encoded_size = 4096 },
     .{ .label = "archive xar", .run = runXar, .workspace_size = 3 * 1024 * 1024, .output_size = 512, .encoded_size = 4096 },
     .{ .label = "archive xar foreign", .run = runXarForeign(.xar), .workspace_size = 3 * 1024 * 1024, .output_size = 512, .encoded_size = 4096 },
     .{ .label = "archive wim", .run = runWim, .workspace_size = 128 * 1024, .output_size = 512, .encoded_size = 4096 },
