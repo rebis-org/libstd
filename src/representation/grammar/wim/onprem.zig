@@ -160,6 +160,7 @@ const Tree = struct {
     entry_nodes: []u32,
     queue: []u32,
     pieces: []Piece,
+    backed: []bool,
     front: usize,
     used: usize = 1,
 
@@ -168,6 +169,7 @@ const Tree = struct {
         entry_nodes: usize,
         queue: usize,
         pieces: usize,
+        backed: usize,
         total: usize,
 
         fn of(entry_count: usize) Regions {
@@ -175,11 +177,13 @@ const Tree = struct {
             const nodes_bytes = node_count * @sizeOf(Node);
             const queue = alignForward(nodes_bytes +| entry_count * @sizeOf(u32), 8);
             const pieces = alignForward(queue +| node_count * @sizeOf(u32), 8);
+            const backed = alignForward(pieces +| (entry_count + 1) * @sizeOf(Piece), 8);
             return .{
                 .entry_nodes = nodes_bytes,
                 .queue = queue,
                 .pieces = pieces,
-                .total = pieces +| (entry_count + 1) * @sizeOf(Piece),
+                .backed = backed,
+                .total = backed +| entry_count,
             };
         }
     };
@@ -194,12 +198,14 @@ const Tree = struct {
             .entry_nodes = @alignCast(std.mem.bytesAsSlice(u32, area[regions.entry_nodes..][0 .. count * @sizeOf(u32)])),
             .queue = @alignCast(std.mem.bytesAsSlice(u32, area[regions.queue..][0 .. node_count * @sizeOf(u32)])),
             .pieces = @alignCast(std.mem.bytesAsSlice(Piece, area[regions.pieces..][0 .. (count + 1) * @sizeOf(Piece)])),
+            .backed = @alignCast(std.mem.bytesAsSlice(bool, area[regions.backed..][0..count])),
             .front = @intFromPtr(area.ptr) - @intFromPtr(scratch.ptr),
         };
     }
 
     fn build(self: *Tree, entries: []const Entry) Exception!void {
         self.nodes[0] = .{ .name = "", .is_dir = true };
+        @memset(self.backed, false);
         // Parents resolve first, so an entry naming a directory states the
         // directory, not a file.
         for (entries, 0..) |entry, index| {
@@ -216,6 +222,19 @@ const Tree = struct {
             const node = try self.add(parent, leaf, false);
             std.crypto.hash.Sha1.hash(entry.data, &self.nodes[node].hash, .{});
             self.entry_nodes[index] = node;
+        }
+    }
+
+    // Delta WIM write, as wimlib's SKIP_EXTERNAL_WIMS: a blob whose SHA-1
+    // already exists in a reference WIM stays unbacked.
+    fn markBacked(self: *Tree, refs: []const []const u8, region: []u8) Exception!void {
+        for (refs) |ref| {
+            const table = try decodedTable(ref, region);
+            for (self.entry_nodes, 0..) |node_index, index| {
+                if (self.backed[index]) continue;
+                if (self.nodes[node_index].is_dir) continue;
+                if (tableHas(table, &self.nodes[node_index].hash)) self.backed[index] = true;
+            }
         }
     }
 
@@ -520,6 +539,7 @@ fn storedPieces(entries: []const Entry, tree: *const Tree, out: []Piece) usize {
     for (entries, 0..) |entry, index| {
         const node = tree.nodes[tree.entry_nodes[index]];
         if (node.is_dir) continue;
+        if (tree.backed[index]) continue;
         out[count] = .{ .hash = node.hash, .table_flags = 0, .size = entry.data.len, .unpacked = entry.data.len, .payload = entry.data };
         count += 1;
     }
@@ -541,8 +561,15 @@ pub fn archiveSize(entries: []const Entry, scratch: []u8) Exception!u64 {
 }
 
 pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Exception!usize {
+    return encodeStored(entries, output, scratch, &.{});
+}
+
+// The store path, shared by the plain encode and the delta (reference)
+// variants; refs stay empty for a standalone WIM.
+fn encodeStored(entries: []const Entry, output: []u8, scratch: []u8, refs: []const []const u8) Exception!usize {
     var tree = try Tree.init(scratch, entries.len);
     try tree.build(entries);
+    if (refs.len != 0) try tree.markBacked(refs, scratch[0..tree.front]);
     const metadata_len = try tree.layout();
     if (metadata_len > tree.front) return error.ResourceException;
     const metadata = scratch[0..@intCast(metadata_len)];
@@ -794,6 +821,28 @@ fn isZeroHash(hash: *const [sha1_len]u8) bool {
     return true;
 }
 
+// A reference WIM's lookup table, decoded into the caller's region; the
+// region must hold the declared uncompressed size.
+fn decodedTable(archive: []const u8, region: []u8) Exception![]const u8 {
+    if (archive.len < header_disk_size) return error.DataException;
+    if (std.mem.readInt(u64, archive[0..8], .little) != wim_magic) return error.DataException;
+    const table_hdr = try readReshdr(archive, 48);
+    const table_len = std.math.cast(usize, table_hdr.uncompressed_size) orelse return error.ResourceException;
+    if (region.len < table_len) return error.ResourceException;
+    const chunk_size = std.mem.readInt(u32, archive[20..24], .little);
+    const table = region[0..table_len];
+    try readResource(archive, table_hdr, chunk_size, try headerCodec(archive), table);
+    return table;
+}
+
+fn tableHas(table: []const u8, hash: *const [sha1_len]u8) bool {
+    var at: usize = 0;
+    while (at + blob_disk_size <= table.len) : (at += blob_disk_size) {
+        if (std.mem.eql(u8, table[at + 30 ..][0..sha1_len], hash)) return true;
+    }
+    return false;
+}
+
 const SolidFit = struct {
     index: u64,
     offset: u64,
@@ -832,16 +881,38 @@ fn appendBlob(blobs: []BlobEntry, filled: *usize, hash: *const [sha1_len]u8, siz
     filled.* += 1;
 }
 
-// Directories and empty files carry no stream; the format states that
-// with a zero hash.
-fn entrySize(blobs: []const BlobEntry, hash: [sha1_len]u8) Exception!u64 {
-    if (isZeroHash(&hash)) return 0;
-    return (try blobLookup(blobs, hash)).size;
-}
-
 fn blobLookup(blobs: []const BlobEntry, hash: [sha1_len]u8) Exception!BlobEntry {
     for (blobs) |entry| {
         if (std.mem.eql(u8, &entry.hash, &hash)) return entry;
+    }
+    return error.DataException;
+}
+
+fn readBlob(archive: []const u8, parsed: Parsed, blob: BlobEntry, output: []u8) Exception!usize {
+    const size = std.math.cast(usize, blob.size) orelse return error.ResourceException;
+    if (output.len < size) return error.CapacityException;
+    if (blob.solid) {
+        const sr = parsed.solid_reses[@intCast(blob.solid_index)];
+        try readSolidRange(archive, sr, blob.solid_offset, output[0..size], parsed.temp);
+    } else {
+        const codec = try headerCodec(archive);
+        const chunk_size = std.mem.readInt(u32, archive[20..24], .little);
+        try readResource(archive, blob.res, chunk_size, codec, output[0..size]);
+    }
+    return size;
+}
+
+// Where a delta WIM resolves an unbacked blob, as
+// wimlib_reference_resource_files() merges referenced blob tables.
+pub const DecodeOptions = struct {
+    references: []const []const u8 = &.{},
+};
+
+fn entrySizeEx(parsed: Parsed, hash: [sha1_len]u8, options: DecodeOptions, carve: []u8) Exception!u64 {
+    if (blobLookup(parsed.blobs, hash) catch null) |blob| return blob.size;
+    for (options.references) |ref| {
+        const rp = try parse(ref, carve);
+        if (blobLookup(rp.blobs, hash) catch null) |blob| return blob.size;
     }
     return error.DataException;
 }
@@ -1142,30 +1213,44 @@ fn findEntry(parsed: Parsed, ordinal: u64, name_buf: []u8) Exception!?EntryInfo 
 }
 
 pub fn inspectOrdinal(archive: []const u8, ordinal: u64, scratch: []u8) Exception!EntryInfo {
+    return inspectOrdinalEx(archive, ordinal, scratch, .{});
+}
+
+pub fn inspectOrdinalEx(archive: []const u8, ordinal: u64, scratch: []u8, options: DecodeOptions) Exception!EntryInfo {
     if (scratch.len < 2048) return error.ResourceException;
-    const parsed = try parse(archive, scratch[0 .. scratch.len - 1024]);
+    const carve = scratch[0 .. scratch.len - 1024];
+    const parsed = try parse(archive, carve);
     var found = (try findEntry(parsed, ordinal, scratch[scratch.len - 1024 ..])) orelse return error.DataException;
-    found.size = try entrySize(parsed.blobs, found.hash);
+    if (isZeroHash(&found.hash)) {
+        found.size = 0;
+    } else {
+        found.size = try entrySizeEx(parsed, found.hash, options, carve);
+    }
     return found;
 }
 
 pub fn decodeOrdinal(archive: []const u8, ordinal: u64, output: []u8, scratch: []u8) Exception!usize {
+    return decodeOrdinalEx(archive, ordinal, output, scratch, .{});
+}
+
+pub fn decodeOrdinalEx(archive: []const u8, ordinal: u64, output: []u8, scratch: []u8, options: DecodeOptions) Exception!usize {
     if (scratch.len < 2048) return error.ResourceException;
-    const parsed = try parse(archive, scratch[0 .. scratch.len - 1024]);
+    const carve = scratch[0 .. scratch.len - 1024];
+    const parsed = try parse(archive, carve);
     const found = (try findEntry(parsed, ordinal, scratch[scratch.len - 1024 ..])) orelse return error.DataException;
     if (isZeroHash(&found.hash)) return 0;
-    const blob = try blobLookup(parsed.blobs, found.hash);
-    const size = std.math.cast(usize, blob.size) orelse return error.ResourceException;
-    if (output.len < size) return error.CapacityException;
-    if (blob.solid) {
-        const sr = parsed.solid_reses[@intCast(blob.solid_index)];
-        try readSolidRange(archive, sr, blob.solid_offset, output[0..size], parsed.temp);
-    } else {
-        const codec = try headerCodec(archive);
-        const chunk_size = std.mem.readInt(u32, archive[20..24], .little);
-        try readResource(archive, blob.res, chunk_size, codec, output[0..size]);
+    if (blobLookup(parsed.blobs, found.hash) catch null) |blob| {
+        return readBlob(archive, parsed, blob, output);
     }
-    return size;
+    // Unbacked in a delta WIM: resolve from the referenced WIMs, in order.
+    // Each reparse clobbers the carve; the delta's data is no longer needed.
+    for (options.references) |ref| {
+        const rp = try parse(ref, carve);
+        if (blobLookup(rp.blobs, found.hash) catch null) |blob| {
+            return readBlob(ref, rp, blob, output);
+        }
+    }
+    return error.DataException;
 }
 
 test "wim store roundtrips flat files" {
@@ -1487,9 +1572,11 @@ pub const EncodeOptions = struct {
     compression: Compression = .store,
     chunk_size: u32 = 0, // 0 selects the codec default.
     solid: bool = false,
-    // Entries matching a base hash stay unbacked: no blob-table entry;
-    // readers resolve against the referenced base.
-    delta_base: ?[]const Entry = null,
+    // Reference WIM archives, as wimlib_reference_resource_files() takes
+    // them: a blob whose SHA-1 exists in a reference stays unbacked, the
+    // delta-WIM shape. Each reference's lookup table must decode within
+    // the encode workspace.
+    references: []const []const u8 = &.{},
 };
 
 fn codecOf(compression: Compression) Codec {
@@ -1601,8 +1688,10 @@ fn compressChunk(compression: Compression, chunk_size: u32, chunk: []const u8, o
 }
 
 pub fn encodeEx(entries: []const Entry, output: []u8, scratch: []u8, options: EncodeOptions) Exception!usize {
-    if (options.compression == .store and !options.solid) return encode(entries, output, scratch);
-    if (options.solid and options.delta_base != null) return error.UnsupportedException;
+    if (options.compression == .store and !options.solid) {
+        return encodeStored(entries, output, scratch, options.references);
+    }
+    if (options.solid and options.references.len != 0) return error.UnsupportedException;
     const codec = codecOf(options.compression);
     const cs: u32 = if (options.chunk_size == 0) codecDefaultChunk(options.compression) else options.chunk_size;
     try validateChunking(codec, cs);
@@ -1616,6 +1705,7 @@ pub fn encodeEx(entries: []const Entry, output: []u8, scratch: []u8, options: En
 
     var tree = try Tree.init(scratch, entries.len);
     try tree.build(entries);
+    if (options.references.len != 0) try tree.markBacked(options.references, scratch[0..tree.front]);
     const metadata_len = try tree.layout();
     if (metadata_len > tree.front) return error.ResourceException;
     const metadata = scratch[0..@intCast(metadata_len)];
@@ -1642,20 +1732,9 @@ pub fn encodeEx(entries: []const Entry, output: []u8, scratch: []u8, options: En
         for (entries, 0..) |entry, index| {
             const node = tree.nodes[tree.entry_nodes[index]];
             if (node.is_dir) continue;
-            if (options.delta_base) |base| {
-                var matched = false;
-                for (base) |base_entry| {
-                    var base_hash: [sha1_len]u8 = undefined;
-                    std.crypto.hash.Sha1.hash(base_entry.data, &base_hash, .{});
-                    if (std.mem.eql(u8, &node.hash, &base_hash)) {
-                        matched = true;
-                        break;
-                    }
-                }
-                // Unbacked: a delta WIM omits the blob-table entry; the dentry
-                // hash resolves against the referenced base instead.
-                if (matched) continue;
-            }
+            // Unbacked: a delta WIM omits the blob-table entry; the dentry
+            // hash resolves against the referenced WIM instead.
+            if (tree.backed[index]) continue;
             const chunks = numChunks(entry.data.len, cs64);
             const table_bytes: usize = @intCast((chunks -| 1) * 4);
             if (staged_len + table_bytes + entry.data.len > stage.len) return error.ResourceException;
@@ -1800,7 +1879,6 @@ test "wim encodeEx compressed roundtrip" {
 
 test "wim delta write roundtrip shape" {
     const allocator = std.testing.allocator;
-    // The delta reuses the base blob and adds one new blob.
     var rng: u64 = 0x5DEECE66D3D2A1B3;
     const base_payload = try allocator.alloc(u8, 60000);
     defer allocator.free(base_payload);
@@ -1818,24 +1896,67 @@ test "wim delta write roundtrip shape" {
         rng ^= rng << 17;
         b.* = @truncate(rng >> 24);
     }
-    const base = [_]Entry{.{ .name = "old.bin", .data = base_payload }};
+    // The base is a real reference WIM, as wimlib_reference_resource_files
+    // consumes it; the delta omits the blob it already holds.
+    const base_entries = [_]Entry{.{ .name = "old.bin", .data = base_payload }};
+    var base_scratch: [1 << 20]u8 = undefined;
+    var base_archive: [1 << 20]u8 = undefined;
+    const base_written = try encode(&base_entries, &base_archive, &base_scratch);
+    const references = [_][]const u8{base_archive[0..base_written]};
     const delta_entries = [_]Entry{
         .{ .name = "old.bin", .data = base_payload },
         .{ .name = "new.bin", .data = new_payload },
     };
-    const options: EncodeOptions = .{ .compression = .lzx, .delta_base = &base };
+    const options: EncodeOptions = .{ .compression = .lzx, .references = &references };
+    const full_options: EncodeOptions = .{ .compression = .lzx };
     const scratch = try allocator.alignedAlloc(u8, .@"8", try encodeWorkspaceSize(&delta_entries, options));
     defer allocator.free(scratch);
-    const archive = try allocator.alloc(u8, 1 << 20);
+    const archive = try allocator.alloc(u8, 4 << 20);
     defer allocator.free(archive);
     const written = try encodeEx(&delta_entries, archive, scratch, options);
-    // The delta file itself must carry only the new blob's bytes.
-    const count = try inspectCount(archive[0..written], scratch);
-    try std.testing.expectEqual(@as(u64, 2), count);
+    const full_scratch = try allocator.alignedAlloc(u8, .@"8", try encodeWorkspaceSize(&delta_entries, full_options));
+    defer allocator.free(full_scratch);
+    const full_archive = try allocator.alloc(u8, 4 << 20);
+    defer allocator.free(full_archive);
+    const full_written = try encodeEx(&delta_entries, full_archive, full_scratch, full_options);
+    // The delta must be smaller: the base blob stays unbacked.
+    try std.testing.expect(written < full_written);
+    try std.testing.expectEqual(@as(u64, 2), try inspectCount(archive[0..written], scratch));
+    // The new blob resolves inside the delta.
     const info = try inspectOrdinal(archive[0..written], 1, scratch);
     try std.testing.expectEqual(new_payload.len, info.size);
     const out = try allocator.alloc(u8, new_payload.len);
     defer allocator.free(out);
     const n = try decodeOrdinal(archive[0..written], 1, out, scratch);
     try std.testing.expectEqualSlices(u8, new_payload, out[0..n]);
+    // The backed blob is absent from the delta: the RESOURCE_NOT_FOUND
+    // shape, until the reference resolves it.
+    try std.testing.expectError(error.DataException, decodeOrdinal(archive[0..written], 0, out, scratch));
+    var decode_scratch: [1 << 20]u8 = undefined;
+    const sized = try inspectOrdinalEx(archive[0..written], 0, &decode_scratch, .{ .references = &references });
+    try std.testing.expectEqual(base_payload.len, sized.size);
+    const base_out = try allocator.alloc(u8, base_payload.len);
+    defer allocator.free(base_out);
+    const m = try decodeOrdinalEx(archive[0..written], 0, base_out, &decode_scratch, .{ .references = &references });
+    try std.testing.expectEqualSlices(u8, base_payload, base_out[0..m]);
+}
+
+test "wim delta store mode skips backed blobs" {
+    const testing = std.testing;
+    const base_entries = [_]Entry{.{ .name = "old.txt", .data = "shared payload bytes" }};
+    var base_scratch: [64 * 1024]u8 = undefined;
+    var base_archive: [64 * 1024]u8 = undefined;
+    const base_written = try encode(&base_entries, &base_archive, &base_scratch);
+    const references = [_][]const u8{base_archive[0..base_written]};
+    const delta_entries = [_]Entry{
+        .{ .name = "old.txt", .data = "shared payload bytes" },
+        .{ .name = "added.txt", .data = "brand new content" },
+    };
+    var scratch: [64 * 1024]u8 = undefined;
+    var archive: [64 * 1024]u8 = undefined;
+    const written = try encodeEx(&delta_entries, &archive, &scratch, .{ .references = &references });
+    try std.testing.expectEqual(@as(u64, 2), try inspectCount(archive[0..written], &scratch));
+    var out: [32]u8 = undefined;
+    const n = try decodeOrdinalEx(archive[0..written], 0, &out, &scratch, .{ .references = &references });
+    try testing.expectEqualSlices(u8, "shared payload bytes", out[0..n]);
 }
