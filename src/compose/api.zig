@@ -294,7 +294,7 @@ export fn stdk_submit(call_handle: ?*envelope.Call, record: ?*Completion) callco
 
 // The general form: N caller-owned submissions through a caller-selected
 // executor; a null executor selects the inline default. One malformed
-// record fails the batch before any task is scheduled.
+// record fails the group before any task is scheduled.
 export fn stdk_group(
     submissions: ?[*]Submission,
     count: u64,
@@ -307,7 +307,7 @@ export fn stdk_group(
         const completion = submission.completion orelse return envelope.Status.invalid_call;
         if (!completion.isValid() or completion.state != Completion.in_progress) return envelope.Status.invalid_call;
     }
-    const selected = if (exec) |*e| e.* else executor.inline_executor;
+    const selected = if (exec) |e| e.* else executor.inline_executor;
     for (0..total) |index| {
         _ = selected.run(.{ .context = &subs[index], .invoke = submitTask });
     }
