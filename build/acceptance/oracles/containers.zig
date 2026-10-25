@@ -105,7 +105,7 @@ fn runZdict(r: *Runner) anyerror!void {
     }, .{});
     try harness.requireStatus(r, abi.Status.ok);
     const dictionary = r.encoded[0..@intCast(r.response.byte_length)];
-    const dictionary_header_size = 28; // magic/id(8) + huffman(2) + 3 FSE tables(6) + rep offsets(12)
+    const dictionary_header_size = 28; // Magic/id (8), huffman (2), 3 FSE tables (6), rep offsets (12).
     if (dictionary.len <= dictionary_header_size or std.mem.readInt(u32, dictionary[0..4], .little) != 0xEC30A437) return error.DictionaryShapeInvalid;
     // Reading the dictionary extracts its content (the window bytes).
     var content_out: [8 * 2048]u8 = undefined;
@@ -114,10 +114,8 @@ fn runZdict(r: *Runner) anyerror!void {
         harness.sinkSpan(&content_out),
     }, .{ .ctx = true });
     try harness.requireStatus(r, abi.Status.ok);
-    // Fastcover content: selected 50-byte windows of the samples, in a
-    // deterministic order. The content length must match the header math,
-    // every window must occur in the training data, and a second training
-    // run must produce byte-identical output.
+    // Fastcover content: 50-byte windows of the samples, in deterministic
+    // order.
     const content = content_out[0..r.response.byte_length];
     if (r.response.byte_length != dictionary.len - dictionary_header_size) return error.DictionaryShapeInvalid;
     var offset: usize = 0;

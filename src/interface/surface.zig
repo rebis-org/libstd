@@ -13,9 +13,8 @@ pub const ConstSurface = extern struct {
     len: u64,
 };
 
-// A crossing that fails reports the boundary's own vocabulary.
-// The interface sits below the kernel owning those values; restating them
-// would drift from the frozen wire numbers.
+// A failed crossing reports the boundary's own vocabulary; the kernel above
+// owns those frozen values, so restating them here drifts.
 pub const status_ok: u32 = 0;
 pub const status_invalid_call: u32 = 1;
 pub const status_resource_limit: u32 = 7;

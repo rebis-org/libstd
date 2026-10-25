@@ -28,8 +28,7 @@ fn zstdRowParams(_: *Runner, out: *[steps.max_extra]harness.Node) usize {
     return count + 1;
 }
 
-// The encode A/B dump path: every encoder evaluation diffs these bytes
-// between the baseline and variant builds. That covers the record layout,
+// A/B dump path: these bytes diff between builds, covering record layout,
 // parser tier, and entropy heuristic. Mirrors abEncodeAndWrite in lzma.zig.
 fn abEncodeAndWrite(r: *Runner, comptime params: steps.Params, input: []const u8, label: []const u8) !void {
     harness.setup(r, harness.ids.zstd, harness.mode_xz);
@@ -59,8 +58,8 @@ fn abEncodeAndWrite(r: *Runner, comptime params: steps.Params, input: []const u8
 }
 
 fn zstdFastParams(_: *Runner, out: *[steps.max_extra]harness.Node) usize {
-    // The true chain parser: dfast stays off (double_hash = 0). The tier
-    // dump then reflects the hash-chain walk, not the double-fast shortcut.
+    // The true chain parser: dfast stays off (double_hash = 0), so the
+    // dump reflects the hash-chain walk.
     const count = baseParams(out);
     out[count] = harness.paramScalar(harness.param_family_zstd, harness.zstd_double_hash, harness.cmds, 0);
     return count + 1;
@@ -121,11 +120,8 @@ fn runZstdAbDumps(r: *Runner) !void {
     try abEncodeAndWrite(r, zstdGreedyParams, &large_input, "greedy_large.bin");
     try abEncodeAndWrite(r, zstdLazy2Params, &large_input, "lazy2_large.bin");
     try abEncodeAndWrite(r, zstdDpParams, &large_input, "dp_large.bin");
-    // The tiled corpora are periodic enough to collapse every finder onto
-    // the repeat-offset paths. That is the no-ship lesson of the row-match
-    // campaign. Tier quality needs a non-periodic 8-symbol stream instead,
-    // deterministic in both builds so the A/B byte-identity gate stays
-    // meaningful.
+    // Tiled corpora collapse every finder onto repeat-offset paths (the
+    // row-match lesson); tier quality needs a deterministic, non-periodic 8-symbol stream.
     var mixed: [1 << 20]u8 = undefined;
     var state: u64 = 0x9E3779B97F4A7C15;
     for (&mixed) |*b| {
@@ -140,9 +136,8 @@ fn runZstdAbDumps(r: *Runner) !void {
     try abEncodeAndWrite(r, zstdGreedyParams, &mixed, "greedy_mixed.bin");
     try abEncodeAndWrite(r, zstdLazy2Params, &mixed, "lazy2_mixed.bin");
     try abEncodeAndWrite(r, zstdDpParams, &mixed, "dp_mixed.bin");
-    // Natural text separates the deferral tiers where synthetic streams tie:
-    // real matches at varied distances, real literal runs. COPYING is tracked
-    // and static, so both A/B builds encode the same bytes.
+    // Natural text separates deferral tiers where synthetic streams tie.
+    // COPYING is static and tracked, so both builds encode identical bytes.
     const copying = try std.Io.Dir.cwd().readFileAlloc(harness.oracle_io, "COPYING", r.gpa, .limited(1 << 20));
     defer r.gpa.free(copying);
     try abEncodeAndWrite(r, zstdParams, copying, "dfast_text.bin");
@@ -151,10 +146,8 @@ fn runZstdAbDumps(r: *Runner) !void {
     try abEncodeAndWrite(r, zstdGreedyParams, copying, "greedy_text.bin");
     try abEncodeAndWrite(r, zstdLazy2Params, copying, "lazy2_text.bin");
     try abEncodeAndWrite(r, zstdDpParams, copying, "dp_text.bin");
-    // Collision-heavy structure: repeated segments at varying distances with
-    // single-byte mutations. Same-length matches at different offsets
-    // separate the search and deferral tiers. The plain xorshift stream is
-    // too homogeneous for that.
+    // Collision-heavy structure: repeated segments at varying distances with single-byte
+    // mutations; same-length matches at different offsets separate search and deferral tiers.
     var collide: [1 << 20]u8 = undefined;
     for (&collide) |*b| {
         state ^= state << 13;
@@ -235,9 +228,8 @@ fn large(comptime params: steps.Params) fn (*Runner) anyerror!void {
     }.run;
 }
 
-// A new parser tier must both round-trip through the envelope and decode
-// under the reference library. The reference check decodes into a 64 KiB
-// window (lib.zig's zstdValid), so the input stays at that scale.
+// A new parser tier must round-trip and decode under the reference library;
+// zstdValid's 64 KiB window bounds the input.
 fn strategyInterop(comptime params: steps.Params) fn (*Runner) anyerror!void {
     return struct {
         fn run(r: *Runner) anyerror!void {

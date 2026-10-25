@@ -1,29 +1,14 @@
 const std = @import("std");
 
+const entry_prim = @import("../../../common/entry.zig");
 const bounds = @import("../../../common/primitive/bounds.zig");
 const exception_prim = @import("../../../common/primitive/exception.zig");
 const io = @import("../../../common/primitive/io.zig");
 
+pub const Entry = entry_prim.Entry;
 const Exception = exception_prim.Exception;
 
-pub const scratch_size: usize = 256;
-
 pub const Format = enum { bin_le, bin_be, odc, newc, crc };
-
-pub const Entry = struct {
-    name: []const u8,
-    data: []const u8,
-    mode: u32 = 0o100644,
-    uid: u32 = 0,
-    gid: u32 = 0,
-    modification_time: u64 = 0,
-    ino: u32 = 0,
-    nlink: u32 = 1,
-    devmajor: u32 = 0,
-    devminor: u32 = 0,
-    rdevmajor: u32 = 0,
-    rdevminor: u32 = 0,
-};
 
 pub const EntryInfo = struct {
     name: []const u8,
@@ -67,10 +52,8 @@ fn archiveSizeWith(comptime format: Format, entries: []const Entry) Exception!u6
         .odc => 76,
         else => return error.UnsupportedException,
     };
-    // Mirror the encoder byte for byte: alignment applies to the running
-    // offset (the 110-byte newc header leaves it at 2 mod 4), not to the
-    // field length in isolation, and the final 512 pad is a no-op when the
-    // total already lands on the boundary.
+    // Alignment applies to the running offset, not a field; the 110-byte
+    // newc header leaves it at 2 mod 4.
     var total: u64 = 0;
     for (entries) |entry| {
         try validateEntry(entry);
@@ -95,21 +78,21 @@ fn alignUp(value: u64, alignment: u64) Exception!u64 {
 }
 
 fn validateEntry(entry: Entry) Exception!void {
-    if (entry.name.len == 0 or entry.name.len > 0xFFFF) return error.CallException;
+    // The odc name field is six octal digits wide; nothing longer can be written.
+    if (entry.name.len > 0xFFFF) return error.CallException;
     if (std.mem.eql(u8, entry.name, trailer_name)) return error.CallException;
-    if (bounds.isAbsoluteOrTraversal(entry.name) or std.mem.findScalar(u8, entry.name, 0) != null) return error.CallException;
+    try entry_prim.validateName(entry.name);
 }
 
-pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Exception!usize {
-    return encodeWith(.newc, entries, output, scratch);
+pub fn encode(entries: []const Entry, output: []u8) Exception!usize {
+    return encodeWith(.newc, entries, output);
 }
 
-pub fn encodeOdc(entries: []const Entry, output: []u8, scratch: []u8) Exception!usize {
-    return encodeWith(.odc, entries, output, scratch);
+pub fn encodeOdc(entries: []const Entry, output: []u8) Exception!usize {
+    return encodeWith(.odc, entries, output);
 }
 
-fn encodeWith(comptime format: Format, entries: []const Entry, output: []u8, scratch: []u8) Exception!usize {
-    if (scratch.len < scratch_size) return error.CapacityException;
+fn encodeWith(comptime format: Format, entries: []const Entry, output: []u8) Exception!usize {
     var sink = io.Sink{ .bytes = output };
     for (entries, 0..) |entry, index| {
         try validateEntry(entry);
@@ -153,27 +136,17 @@ fn writePad(sink: *io.Sink, offset: u64, alignment: u64) Exception!void {
     sink.write(zeros[0..@as(usize, @intCast(alignment - rem))]) catch return error.CapacityException;
 }
 
-fn writeHex8(sink: *io.Sink, value: u64) Exception!void {
-    var buf: [8]u8 = undefined;
-    const digits = "0123456789abcdef";
+// A value that does not fit the width is a caller error; a truncated
+// header would disagree with the data.
+fn writeDigits(sink: *io.Sink, comptime base: u8, width: usize, value: u64) Exception!void {
+    const digits: []const u8 = if (base == 16) "0123456789abcdef" else "01234567";
+    var buf: [11]u8 = undefined;
     var v = value;
-    var i: usize = 8;
+    var i = width;
     while (i > 0) {
         i -= 1;
-        buf[i] = digits[@as(usize, @intCast(v & 0xF))];
-        v >>= 4;
-    }
-    sink.write(&buf) catch return error.CapacityException;
-}
-
-fn writeOctal(sink: *io.Sink, width: usize, value: u64) Exception!void {
-    var buf: [11]u8 = @splat(0);
-    var v = value;
-    var i: usize = width;
-    while (i > 0) {
-        i -= 1;
-        buf[i] = '0' + @as(u8, @truncate(v & 7));
-        v >>= 3;
+        buf[i] = digits[@intCast(v % base)];
+        v /= base;
     }
     if (v != 0) return error.UnsupportedException;
     sink.write(buf[0..width]) catch return error.CapacityException;
@@ -181,33 +154,39 @@ fn writeOctal(sink: *io.Sink, width: usize, value: u64) Exception!void {
 
 fn writeNewcHeader(sink: *io.Sink, entry: Entry, ino: u32, comptime magic: []const u8, check: u32) Exception!void {
     sink.write(magic) catch return error.CapacityException;
-    try writeHex8(sink, ino);
-    try writeHex8(sink, entryMode(entry));
-    try writeHex8(sink, entry.uid);
-    try writeHex8(sink, entry.gid);
-    try writeHex8(sink, entry.nlink);
-    try writeHex8(sink, entry.modification_time);
-    try writeHex8(sink, entry.data.len);
-    try writeHex8(sink, entry.devmajor);
-    try writeHex8(sink, entry.devminor);
-    try writeHex8(sink, entry.rdevmajor);
-    try writeHex8(sink, entry.rdevminor);
-    try writeHex8(sink, nameZ(entry));
-    try writeHex8(sink, check);
+    const fields = [13]u64{
+        ino,
+        entryMode(entry),
+        entry.uid,
+        entry.gid,
+        entry.nlink,
+        entry.modification_time,
+        entry.data.len,
+        entry.devmajor,
+        entry.devminor,
+        entry.rdevmajor,
+        entry.rdevminor,
+        nameZ(entry),
+        check,
+    };
+    for (fields) |field| try writeDigits(sink, 16, 8, field);
 }
 
 fn writeOdcHeader(sink: *io.Sink, entry: Entry, ino: u32) Exception!void {
     sink.write("070707") catch return error.CapacityException;
-    try writeOctal(sink, 6, 0);
-    try writeOctal(sink, 6, ino);
-    try writeOctal(sink, 6, entryMode(entry));
-    try writeOctal(sink, 6, entry.uid);
-    try writeOctal(sink, 6, entry.gid);
-    try writeOctal(sink, 6, entry.nlink);
-    try writeOctal(sink, 6, 0);
-    try writeOctal(sink, 11, entry.modification_time);
-    try writeOctal(sink, 6, nameZ(entry));
-    try writeOctal(sink, 11, entry.data.len);
+    const fields = .{
+        .{ 6, @as(u64, 0) },
+        .{ 6, ino },
+        .{ 6, entryMode(entry) },
+        .{ 6, entry.uid },
+        .{ 6, entry.gid },
+        .{ 6, entry.nlink },
+        .{ 6, @as(u64, 0) },
+        .{ 11, entry.modification_time },
+        .{ 6, nameZ(entry) },
+        .{ 11, entry.data.len },
+    };
+    inline for (fields) |field| try writeDigits(sink, 8, field[0], field[1]);
 }
 
 fn parseDigits(field: []const u8, comptime base: u64, to_digit: *const fn (u8) Exception!u64) Exception!u64 {
@@ -385,8 +364,7 @@ test "cpio newc roundtrips entries and metadata" {
         .{ .name = "dir/nested.bin", .data = "payload", .mode = 0o100755, .ino = 42 },
     };
     var archive: [4096]u8 = undefined;
-    var scratch: [scratch_size]u8 = undefined;
-    const written = try encode(&entries, &archive, &scratch);
+    const written = try encode(&entries, &archive);
     try testing.expectEqual(written, try archiveSize(&entries));
     try testing.expectEqualSlices(u8, "070701", archive[0..6]);
     const count = try inspectCount(archive[0..written]);
@@ -408,8 +386,7 @@ test "cpio odc roundtrips" {
         .{ .name = "a", .data = "odd" },
     };
     var archive: [1024]u8 = undefined;
-    var scratch: [scratch_size]u8 = undefined;
-    const written = try encodeOdc(&entries, &archive, &scratch);
+    const written = try encodeOdc(&entries, &archive);
     try testing.expectEqualSlices(u8, "070707", archive[0..6]);
     try testing.expectEqual(@as(u64, 1), try inspectCount(archive[0..written]));
     var out: [8]u8 = undefined;
@@ -449,7 +426,6 @@ test "cpio reads little-endian binary archives" {
 test "cpio sizing matches encoder across alignment and 512 boundaries" {
     const testing = std.testing;
     var archive: [4096]u8 = undefined;
-    var scratch: [scratch_size]u8 = undefined;
     var name_buf: [9]u8 = undefined;
     var data_buf: [600]u8 = undefined;
     @memset(&data_buf, 0x61);
@@ -457,12 +433,20 @@ test "cpio sizing matches encoder across alignment and 512 boundaries" {
         @memset(name_buf[0..name_len], 'n');
         for (0..601) |data_len| {
             const entries = [_]Entry{.{ .name = name_buf[0..name_len], .data = data_buf[0..data_len] }};
-            const written = try encode(&entries, &archive, &scratch);
+            const written = try encode(&entries, &archive);
             try testing.expectEqual(try archiveSize(&entries), written);
-            const written_odc = try encodeOdc(&entries, &archive, &scratch);
+            const written_odc = try encodeOdc(&entries, &archive);
             try testing.expectEqual(try archiveSizeOdc(&entries), written_odc);
         }
     }
+}
+
+test "cpio rejects a header field that does not fit its width" {
+    // A newc number field carries 32 bits; an odc date field carries 33.
+    const entries = [_]Entry{.{ .name = "f", .data = "x", .modification_time = 1 << 36 }};
+    var archive: [512]u8 = undefined;
+    try std.testing.expectError(error.UnsupportedException, encode(&entries, &archive));
+    try std.testing.expectError(error.UnsupportedException, encodeOdc(&entries, &archive));
 }
 
 test "cpio crc format validates checksum over file data" {

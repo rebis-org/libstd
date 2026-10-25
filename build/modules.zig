@@ -51,7 +51,13 @@ pub const trap = Module{
         .{ .name = "interface", .module = "interface" },
     },
 };
-pub const component = Module{ .name = "component", .root = "build/component.zig" };
+pub const component = Module{
+    .name = "component",
+    .root = "build/component.zig",
+    .imports = &.{
+        .{ .name = "interface", .module = "interface" },
+    },
+};
 pub const benchmark = Module{
     .name = "benchmark",
     .root = "build/acceptance/benchmark/benchmark.zig",
@@ -123,9 +129,8 @@ pub fn withKernelFeatures(target: std.Build.ResolvedTarget, kernel_isa: common.K
         adjusted.query.cpu_features_add.addFeature(bit);
         adjusted.result.cpu.features.addFeature(bit);
     };
-    // 'extended' builds hard-require SHA-NI, AVX2, and AES-NI on x86_64 and
-    // crc+crypto on aarch64 at runtime; 'detected' keeps whatever the
-    // resolved target already carries.
+    // The 'extended' mode hard-requires sha/avx2/aes on x86_64 and crc/crypto
+    // on aarch64 at runtime; 'detected' keeps the resolved target's features.
     return adjusted;
 }
 
@@ -149,8 +154,8 @@ pub fn createFor(
     return module;
 }
 
-// crc_kernel specs ask for the hardware feature set the optimized paths need.
-// Portable builds stay on the unadjusted target with software arms only.
+// crc_kernel specs get the hardware features the optimized paths need;
+// portable builds keep software arms only.
 pub fn kernelAdjustedTarget(comptime module_spec: Module, target: std.Build.ResolvedTarget, portable: bool, kernel_isa: common.KernelIsa) std.Build.ResolvedTarget {
     if (!portable and kernel_isa == .extended and module_spec.crc_kernel and (target.result.cpu.arch == .aarch64 or target.result.cpu.arch == .x86_64)) {
         return withKernelFeatures(target, kernel_isa);
@@ -158,8 +163,8 @@ pub fn kernelAdjustedTarget(comptime module_spec: Module, target: std.Build.Reso
     return target;
 }
 
-// Imported modules stay single instances per (name, target, optimize).
-// The compiler rejects a file rooted in two instances of one module.
+// Imported modules stay single instances per (name, target, optimize):
+// the compiler rejects a file rooted in two module instances.
 var shared_modules: ?std.StringHashMap(*std.Build.Module) = null;
 
 pub fn createShared(

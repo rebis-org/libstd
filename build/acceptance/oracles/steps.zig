@@ -111,11 +111,8 @@ pub fn limitReject(comptime extra: Params, r: *Runner) !void {
     try harness.reject(r, harness.ids.read, nodes.items[0..nodes.len], .{ .ctx = true }, abi.Status.resource_limit, r.output);
 }
 
-// An encode source that spans the decoded limit must be rejected, not
-// truncated to the cap and reported as a complete encode. The probe input is
-// compressible so the encoded-size check cannot mask the source overage, and
-// the source is declared replay-only so the size path cannot see it either:
-// the bounded replay path must probe one byte past its cap.
+// A source past the decoded limit must be rejected; the compressible,
+// replay-only input forces the replay path past its cap.
 pub fn writeLimitReject(comptime extra: Params, r: *Runner) !void {
     var input: [128]u8 = undefined;
     @memset(&input, 'A');

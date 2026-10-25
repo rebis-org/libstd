@@ -21,8 +21,8 @@ pub fn inspectOrdinal(provider: Provider, archive: []const u8, ordinal: u64, scr
 pub fn decodeOrdinal(provider: Provider, archive: []const u8, ordinal: u64, output: []u8, scratch: []u8) Exception!usize {
     return seam.dispatchOnprem(impl, provider, onprem.decodeOrdinal, .{ archive, ordinal, output, scratch });
 }
-pub fn archiveSize(provider: Provider, entries: []const Entry) Exception!u64 {
-    return seam.dispatchOnprem(impl, provider, onprem.archiveSize, .{entries});
+pub fn archiveSize(provider: Provider, entries: []const Entry, scratch: []u8) Exception!u64 {
+    return seam.dispatchOnprem(impl, provider, onprem.archiveSize, .{ entries, scratch });
 }
 pub fn encode(provider: Provider, entries: []const Entry, output: []u8, scratch: []u8) Exception!usize {
     return seam.dispatchOnprem(impl, provider, onprem.encode, .{ entries, output, scratch });

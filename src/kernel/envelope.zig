@@ -1,7 +1,7 @@
 const std = @import("std");
 
-// The C ABI fixes 16 bytes at 8-byte alignment; the explicit field alignment
-// holds that on 32-bit targets too, where u64 aligns to 4.
+// The C ABI fixes 16 bytes at 8-byte alignment; explicit alignment holds
+// it where u64 aligns to 4.
 pub const Id = extern struct { low: u64 align(8), high: u64 align(8) };
 
 pub const Status = struct {

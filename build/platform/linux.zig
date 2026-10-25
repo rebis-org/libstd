@@ -72,7 +72,7 @@ pub fn addAar(
     return common.addZipArchive(b, distribution, stage, output_name);
 }
 
-// [ffi.c] entries name the native library each target links.
+// The [ffi.c] entries name the native library each target links.
 pub fn addArchive(
     b: *std.Build,
     ctx: *const common.Settings,

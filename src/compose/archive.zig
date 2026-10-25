@@ -37,9 +37,12 @@ const Status = abi.Status;
 const Limits = resource.Limits;
 const Resource = resource.Resource;
 const Exception = vocabulary.Exception;
+// A format produces bytes into a buffer, then hands them to the sink;
+// common.SinkTarget owns that protocol for every hook.
+const SinkTarget = common.SinkTarget;
 
-// Eight bytes with forced 8-byte alignment: the carve idiom for buffers that
-// are re-read as u64 words or as whole structs, since u64 aligns to 4 on x86.
+// Eight bytes at forced 8-byte alignment; u64 aligns to 4 on x86, so
+// re-read buffers carve with it.
 
 const StateOctet = extern struct { bytes: [8]u8 align(8) };
 
@@ -50,7 +53,7 @@ fn requireCommit(commit: vocabulary.CommitMode, expected: vocabulary.CommitMode)
 const ReadHead = struct { sink: *Resource, ordinal: u64 };
 
 // Tentative commit, sink presence, and the entry ordinal resolve identically
-// for every archive read; formats with extra checks run them after this.
+// for every archive read; extra format checks follow.
 fn readHead(sink: ?*Resource, call: *Call, commit: vocabulary.CommitMode) Exception!ReadHead {
     try requireTentative(commit);
     return .{ .sink = sink.?, .ordinal = archiveOrdinal(call.request) };
@@ -94,6 +97,16 @@ fn materializeArchive(source: *Resource, workspace: *resource.Workspace, limits:
     return common.materializeSource(.size_or_budget, source, workspace, limits.encoded_bytes);
 }
 
+// Bytes in hand need no staging: a callback sink publishes them as they
+// are; a direct sink receives its copy.
+fn publishReady(sink: *Resource, call: *Call, bytes: []const u8) Exception!usize {
+    switch (sink.kind) {
+        .direct_write => @memcpy(try common.sinkDirectBuffer(sink, bytes.len), bytes),
+        else => try common.commitBytesToSink(sink, call, bytes),
+    }
+    return bytes.len;
+}
+
 fn writeCryptoFailure(call: *Call, cause: crypto.FailureCause) void {
     const entry: struct { id: Id, status: u32 } = switch (cause) {
         .none => return,
@@ -112,9 +125,8 @@ const CryptoParams = struct {
     password_lifetime: u64 = 0,
 };
 
-// A selector arrives on the wire as a u64, so narrowing it to the field width
-// is a checked conversion: a value the field cannot hold is a malformed
-// request, not a number to wrap.
+// A selector arrives as a u64; narrowing is checked, so an
+// unrepresentable value is a malformed request.
 fn narrow(comptime T: type, value: u64) Exception!T {
     return std.math.cast(T, value) orelse error.CallException;
 }
@@ -160,9 +172,8 @@ fn parseCryptoParams(comptime component: []const u8, request: ?*Node, failure_ca
         comptime discovery.parameter(component, "algorithm").family,
         comptime discovery.parameter(component, "algorithm").ordinal,
     )) |node| blk: {
-        // Truncating a wide selector would answer a request for a stronger
-        // algorithm with a weaker one, so an unrepresentable value is refused
-        // alongside an out-of-range one.
+        // Truncation would answer a request for a stronger algorithm with a
+        // weaker one, so unrepresentable values are refused too.
         const value = narrow(u8, node.value_low) catch {
             failure_cause.* = .unsupported_algorithm;
             return error.UnsupportedException;
@@ -189,9 +200,8 @@ fn parseCryptoParams(comptime component: []const u8, request: ?*Node, failure_ca
     };
 }
 
-// Structured inspect projection, phase one: the entry_size selector (family
-// 2, ordinal 4) with an explicit ordinal asks for the entry's uncompressed
-// size without decoding its data. Returns null when the selector is absent.
+// Inspect projection: the entry_size selector with an explicit ordinal
+// asks for the uncompressed size without decoding. Null when absent.
 fn projectedEntrySize(request: ?*Node) Exception!?u64 {
     if (node_graph.findSelector(request, comptime discovery.parameter("rar", "entry_size").family, comptime discovery.parameter("rar", "entry_size").ordinal) == null) return null;
     const ordinal_node = node_graph.findSelector(request, comptime discovery.parameter("rar", "ordinal").family, comptime discovery.parameter("rar", "ordinal").ordinal) orelse return error.CallException;
@@ -222,18 +232,15 @@ pub fn tarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
         const size = std.math.cast(usize, entry.size) orelse return error.ResourceException;
         if (size > limits.decoded_bytes) return error.ResourceException;
         try common.requireSinkCapacity(sink_resource, call, size);
-        if (sink_resource.kind == .direct_write) {
-            const output = try common.sinkDirectBuffer(sink_resource, std.math.cast(usize, size) orelse return error.ResourceException);
-            _ = try tar_seam.decodeOrdinal(plan.provider, archive, ordinal, output);
+        // A stored entry is published straight from the archive; a sparse entry
+        // must be materialized through a target.
+        if (entry.sparse != null) {
+            const target = try SinkTarget.open(sink_resource, &workspace, size);
+            _ = try tar_seam.decodeOrdinal(plan.provider, archive, ordinal, target.output);
+            _ = try target.publish(sink_resource, call, size);
         } else {
-            if (entry.sparse != null) {
-                const staged = try workspace.take(u8, size);
-                _ = try tar_seam.decodeOrdinal(plan.provider, archive, ordinal, staged);
-                try common.commitBytesToSink(sink_resource, call, staged);
-            } else {
-                const data = try bounds.slice(archive, entry.data_offset, entry.size);
-                try common.commitBytesToSink(sink_resource, call, data);
-            }
+            const data = try bounds.slice(archive, entry.data_offset, entry.size);
+            _ = try publishReady(sink_resource, call, data);
         }
         response.byte_length = size;
     } else if (command_mask == vocabulary.command_mask_write) {
@@ -247,16 +254,9 @@ pub fn tarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
         const sink_resource = sink.?;
         try common.requireSinkCapacity(sink_resource, call, required);
         const scratch = try workspace.take(u8, tar.scratch_size);
-        if (sink_resource.kind == .direct_write) {
-            const output = try common.sinkDirectBuffer(sink_resource, std.math.cast(usize, required) orelse return error.ResourceException);
-            const written = try tar_seam.encode(plan.provider, entries, output, scratch);
-            response.byte_length = written;
-        } else {
-            const staging = try workspace.take(u8, std.math.cast(usize, required) orelse return error.ResourceException);
-            const written = try tar_seam.encode(plan.provider, entries, staging, scratch);
-            try common.commitBytesToSink(sink_resource, call, staging[0..written]);
-            response.byte_length = written;
-        }
+        const target = try SinkTarget.open(sink_resource, &workspace, required);
+        const written = try tar_seam.encode(plan.provider, entries, target.output, scratch);
+        response.byte_length = try target.publish(sink_resource, call, written);
     } else {
         return error.UnsupportedException;
     }
@@ -298,36 +298,24 @@ pub fn xarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
         if (size > limits.decoded_bytes) return error.ResourceException;
         try common.requireSinkCapacity(sink_resource, call, size);
         const decode_scratch = try workspace.take(u8, xar_seam.scratch_size);
-        if (sink_resource.kind == .direct_write) {
-            const output = try common.sinkDirectBuffer(sink_resource, std.math.cast(usize, size) orelse return error.ResourceException);
-            _ = try xar_seam.decodeOrdinal(plan.provider, archive, ordinal, output, decode_scratch);
-        } else {
-            const staged = try workspace.take(u8, size);
-            _ = try xar_seam.decodeOrdinal(plan.provider, archive, ordinal, staged, decode_scratch);
-            try common.commitBytesToSink(sink_resource, call, staged);
-        }
+        const target = try SinkTarget.open(sink_resource, &workspace, size);
+        _ = try xar_seam.decodeOrdinal(plan.provider, archive, ordinal, target.output, decode_scratch);
+        _ = try target.publish(sink_resource, call, size);
         response.byte_length = size;
     } else if (command_mask == vocabulary.command_mask_write) {
         try requireVerified(commit);
         const entries = try collectEntries(xar.Entry, call.request, &workspace, NoCtx{}, fillXarEntry);
-        const required = try xar_seam.archiveSize(plan.provider, entries);
+        const scratch = try workspace.take(u8, xar_seam.scratch_size);
+        const required = try xar_seam.archiveSize(plan.provider, entries, scratch);
         if (sink == null) {
             response.byte_length = required;
             return;
         }
         const sink_resource = sink.?;
         try common.requireSinkCapacity(sink_resource, call, required);
-        const scratch = try workspace.take(u8, xar_seam.scratch_size);
-        if (sink_resource.kind == .direct_write) {
-            const output = try common.sinkDirectBuffer(sink_resource, std.math.cast(usize, required) orelse return error.ResourceException);
-            const written = try xar_seam.encode(plan.provider, entries, output, scratch);
-            response.byte_length = written;
-        } else {
-            const staging = try workspace.take(u8, std.math.cast(usize, required) orelse return error.ResourceException);
-            const written = try xar_seam.encode(plan.provider, entries, staging, scratch);
-            try common.commitBytesToSink(sink_resource, call, staging[0..written]);
-            response.byte_length = written;
-        }
+        const target = try SinkTarget.open(sink_resource, &workspace, required);
+        const written = try xar_seam.encode(plan.provider, entries, target.output, scratch);
+        response.byte_length = try target.publish(sink_resource, call, written);
     } else {
         return error.UnsupportedException;
     }
@@ -379,14 +367,9 @@ pub fn dwarfsHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resou
         const size = std.math.cast(usize, entry.size) orelse return error.ResourceException;
         if (size > limits.decoded_bytes) return error.ResourceException;
         try common.requireSinkCapacity(sink_resource, call, size);
-        if (sink_resource.kind == .direct_write) {
-            const output = try common.sinkDirectBuffer(sink_resource, std.math.cast(usize, size) orelse return error.ResourceException);
-            _ = try dwarfs_seam.decodeOrdinal(plan.provider, archive, ordinal, output, scratch);
-        } else {
-            const staged = try workspace.take(u8, size);
-            _ = try dwarfs_seam.decodeOrdinal(plan.provider, archive, ordinal, staged, scratch);
-            try common.commitBytesToSink(sink_resource, call, staged);
-        }
+        const target = try SinkTarget.open(sink_resource, &workspace, size);
+        _ = try dwarfs_seam.decodeOrdinal(plan.provider, archive, ordinal, target.output, scratch);
+        _ = try target.publish(sink_resource, call, size);
         response.byte_length = size;
     } else if (command_mask == vocabulary.command_mask_write) {
         try requireVerified(commit);
@@ -399,16 +382,9 @@ pub fn dwarfsHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resou
         const sink_resource = sink.?;
         try common.requireSinkCapacity(sink_resource, call, required);
         const scratch = try workspace.take(u8, dwarfs_seam.scratch_size);
-        if (sink_resource.kind == .direct_write) {
-            const output = try common.sinkDirectBuffer(sink_resource, std.math.cast(usize, required) orelse return error.ResourceException);
-            const written = try dwarfs_seam.encode(plan.provider, entries, output, scratch);
-            response.byte_length = written;
-        } else {
-            const staging = try workspace.take(u8, std.math.cast(usize, required) orelse return error.ResourceException);
-            const written = try dwarfs_seam.encode(plan.provider, entries, staging, scratch);
-            try common.commitBytesToSink(sink_resource, call, staging[0..written]);
-            response.byte_length = written;
-        }
+        const target = try SinkTarget.open(sink_resource, &workspace, required);
+        const written = try dwarfs_seam.encode(plan.provider, entries, target.output, scratch);
+        response.byte_length = try target.publish(sink_resource, call, written);
     } else {
         return error.UnsupportedException;
     }
@@ -442,14 +418,9 @@ pub fn apfsHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resourc
         const size = std.math.cast(usize, entry.size) orelse return error.ResourceException;
         if (size > limits.decoded_bytes) return error.ResourceException;
         try common.requireSinkCapacity(sink_resource, call, size);
-        if (sink_resource.kind == .direct_write) {
-            const output = try common.sinkDirectBuffer(sink_resource, std.math.cast(usize, size) orelse return error.ResourceException);
-            _ = try apfs_seam.decodeOrdinal(plan.provider, archive, ordinal, output, scratch);
-        } else {
-            const staged = try workspace.take(u8, size);
-            _ = try apfs_seam.decodeOrdinal(plan.provider, archive, ordinal, staged, scratch);
-            try common.commitBytesToSink(sink_resource, call, staged);
-        }
+        const target = try SinkTarget.open(sink_resource, &workspace, size);
+        _ = try apfs_seam.decodeOrdinal(plan.provider, archive, ordinal, target.output, scratch);
+        _ = try target.publish(sink_resource, call, size);
         response.byte_length = size;
     } else if (command_mask == vocabulary.command_mask_write) {
         try requireVerified(commit);
@@ -462,24 +433,16 @@ pub fn apfsHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resourc
         }
         const sink_resource = sink.?;
         try common.requireSinkCapacity(sink_resource, call, required);
-        if (sink_resource.kind == .direct_write) {
-            const output = try common.sinkDirectBuffer(sink_resource, std.math.cast(usize, required) orelse return error.ResourceException);
-            const written = try apfs_seam.encode(plan.provider, entries, output, scratch);
-            response.byte_length = written;
-        } else {
-            const staging = try workspace.take(u8, std.math.cast(usize, required) orelse return error.ResourceException);
-            const written = try apfs_seam.encode(plan.provider, entries, staging, scratch);
-            try common.commitBytesToSink(sink_resource, call, staging[0..written]);
-            response.byte_length = written;
-        }
+        const target = try SinkTarget.open(sink_resource, &workspace, required);
+        const written = try apfs_seam.encode(plan.provider, entries, target.output, scratch);
+        response.byte_length = try target.publish(sink_resource, call, written);
     } else {
         return error.UnsupportedException;
     }
 }
 
-// age is a single-entry store: the whole payload is one unnamed entry, and
-// the family-1 parameters carry the recipient material (password for scrypt,
-// identity/recipient for X25519).
+// The age store takes one entry; the parameters carry the recipient
+// material: password for scrypt, identity or recipient for X25519.
 fn ageOptions(crypto_params: ?CryptoParams, request: ?*Node) Exception!age_seam.Options {
     var options = age_seam.Options{ .password = cryptoPasswordOrEmpty(crypto_params) };
     if (node_graph.findSelector(request, comptime discovery.parameter("age", "identity").family, comptime discovery.parameter("age", "identity").ordinal)) |node| {
@@ -498,8 +461,8 @@ fn ageOptions(crypto_params: ?CryptoParams, request: ?*Node) Exception!age_seam.
 }
 
 fn ageScratch(workspace: *resource.Workspace, options: age_seam.Options) Exception![]u8 {
-    // scrypt peaks at 1024 * N bytes inside the back half the codec splits
-    // off; size the take for the worst arm actually in play.
+    // The take is doubled: the codec splits it, and scrypt peaks
+    // at 1024 * N bytes in the back half.
     const peak = if (options.password.len != 0) @as(usize, 4096) + (@as(usize, 1024) << @intCast(options.work_factor)) else 0;
     return workspace.take(u8, @max(age_seam.scratch_size, peak) * 2);
 }
@@ -544,20 +507,12 @@ pub fn ageHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
         const size = std.math.cast(usize, info.size) orelse return error.ResourceException;
         if (size > limits.decoded_bytes) return error.ResourceException;
         try common.requireSinkCapacity(sink_resource, call, size);
-        if (sink_resource.kind == .direct_write) {
-            const output = try common.sinkDirectBuffer(sink_resource, std.math.cast(usize, size) orelse return error.ResourceException);
-            _ = age_seam.decodeOrdinal(plan.provider, archive, head.ordinal, output, scratch, options) catch |err| {
-                writeCryptoFailure(call, .wrong_password);
-                return err;
-            };
-        } else {
-            const staged = try workspace.take(u8, size);
-            _ = age_seam.decodeOrdinal(plan.provider, archive, head.ordinal, staged, scratch, options) catch |err| {
-                writeCryptoFailure(call, .wrong_password);
-                return err;
-            };
-            try common.commitBytesToSink(sink_resource, call, staged);
-        }
+        const target = try SinkTarget.open(sink_resource, &workspace, size);
+        _ = age_seam.decodeOrdinal(plan.provider, archive, head.ordinal, target.output, scratch, options) catch |err| {
+            writeCryptoFailure(call, .wrong_password);
+            return err;
+        };
+        _ = try target.publish(sink_resource, call, size);
         response.byte_length = size;
     } else if (command_mask == vocabulary.command_mask_write) {
         try requireVerified(commit);
@@ -570,22 +525,12 @@ pub fn ageHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
         }
         const sink_resource = sink.?;
         try common.requireSinkCapacity(sink_resource, call, required);
-        if (sink_resource.kind == .direct_write) {
-            const output = try common.sinkDirectBuffer(sink_resource, std.math.cast(usize, required) orelse return error.ResourceException);
-            const written = age_seam.encode(plan.provider, entries, output, scratch, options) catch |err| {
-                writeCryptoFailure(call, crypto_cause);
-                return err;
-            };
-            response.byte_length = written;
-        } else {
-            const staging = try workspace.take(u8, std.math.cast(usize, required) orelse return error.ResourceException);
-            const written = age_seam.encode(plan.provider, entries, staging, scratch, options) catch |err| {
-                writeCryptoFailure(call, crypto_cause);
-                return err;
-            };
-            try common.commitBytesToSink(sink_resource, call, staging[0..written]);
-            response.byte_length = written;
-        }
+        const target = try SinkTarget.open(sink_resource, &workspace, required);
+        const written = age_seam.encode(plan.provider, entries, target.output, scratch, options) catch |err| {
+            writeCryptoFailure(call, crypto_cause);
+            return err;
+        };
+        response.byte_length = try target.publish(sink_resource, call, written);
     } else {
         return error.UnsupportedException;
     }
@@ -627,14 +572,9 @@ pub fn isoHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
         const size = std.math.cast(usize, entry.size) orelse return error.ResourceException;
         if (size > limits.decoded_bytes) return error.ResourceException;
         try common.requireSinkCapacity(sink_resource, call, size);
-        if (sink_resource.kind == .direct_write) {
-            const output = try common.sinkDirectBuffer(sink_resource, std.math.cast(usize, size) orelse return error.ResourceException);
-            _ = try iso_seam.decodeOrdinal(plan.provider, archive, ordinal, output, scratch);
-        } else {
-            const staged = try workspace.take(u8, size);
-            _ = try iso_seam.decodeOrdinal(plan.provider, archive, ordinal, staged, scratch);
-            try common.commitBytesToSink(sink_resource, call, staged);
-        }
+        const target = try SinkTarget.open(sink_resource, &workspace, size);
+        _ = try iso_seam.decodeOrdinal(plan.provider, archive, ordinal, target.output, scratch);
+        _ = try target.publish(sink_resource, call, size);
         response.byte_length = size;
     } else if (command_mask == vocabulary.command_mask_write) {
         try requireVerified(commit);
@@ -647,16 +587,9 @@ pub fn isoHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
         const sink_resource = sink.?;
         try common.requireSinkCapacity(sink_resource, call, required);
         const scratch = try workspace.take(u8, iso_seam.scratch_size);
-        if (sink_resource.kind == .direct_write) {
-            const output = try common.sinkDirectBuffer(sink_resource, std.math.cast(usize, required) orelse return error.ResourceException);
-            const written = try iso_seam.encode(plan.provider, entries, output, scratch);
-            response.byte_length = written;
-        } else {
-            const staging = try workspace.take(u8, std.math.cast(usize, required) orelse return error.ResourceException);
-            const written = try iso_seam.encode(plan.provider, entries, staging, scratch);
-            try common.commitBytesToSink(sink_resource, call, staging[0..written]);
-            response.byte_length = written;
-        }
+        const target = try SinkTarget.open(sink_resource, &workspace, required);
+        const written = try iso_seam.encode(plan.provider, entries, target.output, scratch);
+        response.byte_length = try target.publish(sink_resource, call, written);
     } else {
         return error.UnsupportedException;
     }
@@ -688,14 +621,9 @@ pub fn squashfsHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Res
         const size = std.math.cast(usize, entry.size) orelse return error.ResourceException;
         if (size > limits.decoded_bytes) return error.ResourceException;
         try common.requireSinkCapacity(sink_resource, call, size);
-        if (sink_resource.kind == .direct_write) {
-            const output = try common.sinkDirectBuffer(sink_resource, std.math.cast(usize, size) orelse return error.ResourceException);
-            _ = try squashfs_seam.decodeOrdinal(plan.provider, archive, ordinal, output, scratch);
-        } else {
-            const staged = try workspace.take(u8, size);
-            _ = try squashfs_seam.decodeOrdinal(plan.provider, archive, ordinal, staged, scratch);
-            try common.commitBytesToSink(sink_resource, call, staged);
-        }
+        const target = try SinkTarget.open(sink_resource, &workspace, size);
+        _ = try squashfs_seam.decodeOrdinal(plan.provider, archive, ordinal, target.output, scratch);
+        _ = try target.publish(sink_resource, call, size);
         response.byte_length = size;
     } else if (command_mask == vocabulary.command_mask_write) {
         try requireVerified(commit);
@@ -708,16 +636,9 @@ pub fn squashfsHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Res
         }
         const sink_resource = sink.?;
         try common.requireSinkCapacity(sink_resource, call, required);
-        if (sink_resource.kind == .direct_write) {
-            const output = try common.sinkDirectBuffer(sink_resource, std.math.cast(usize, required) orelse return error.ResourceException);
-            const written = try squashfs_seam.encode(plan.provider, entries, output, scratch);
-            response.byte_length = written;
-        } else {
-            const staging = try workspace.take(u8, std.math.cast(usize, required) orelse return error.ResourceException);
-            const written = try squashfs_seam.encode(plan.provider, entries, staging, scratch);
-            try common.commitBytesToSink(sink_resource, call, staging[0..written]);
-            response.byte_length = written;
-        }
+        const target = try SinkTarget.open(sink_resource, &workspace, required);
+        const written = try squashfs_seam.encode(plan.provider, entries, target.output, scratch);
+        response.byte_length = try target.publish(sink_resource, call, written);
     } else {
         return error.UnsupportedException;
     }
@@ -749,36 +670,24 @@ pub fn wimHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
         const size = std.math.cast(usize, entry.size) orelse return error.ResourceException;
         if (size > limits.decoded_bytes) return error.ResourceException;
         try common.requireSinkCapacity(sink_resource, call, size);
-        if (sink_resource.kind == .direct_write) {
-            const output = try common.sinkDirectBuffer(sink_resource, std.math.cast(usize, size) orelse return error.ResourceException);
-            _ = try wim_seam.decodeOrdinal(plan.provider, archive, ordinal, output, scratch);
-        } else {
-            const staged = try workspace.take(u8, size);
-            _ = try wim_seam.decodeOrdinal(plan.provider, archive, ordinal, staged, scratch);
-            try common.commitBytesToSink(sink_resource, call, staged);
-        }
+        const target = try SinkTarget.open(sink_resource, &workspace, size);
+        _ = try wim_seam.decodeOrdinal(plan.provider, archive, ordinal, target.output, scratch);
+        _ = try target.publish(sink_resource, call, size);
         response.byte_length = size;
     } else if (command_mask == vocabulary.command_mask_write) {
         try requireVerified(commit);
         const entries = try collectEntries(wim.Entry, call.request, &workspace, NoCtx{}, fillWimEntry);
-        const required = try wim_seam.archiveSize(plan.provider, entries);
+        const scratch = try workspace.take(u8, wim_seam.scratch_size);
+        const required = try wim_seam.archiveSize(plan.provider, entries, scratch);
         if (sink == null) {
             response.byte_length = required;
             return;
         }
         const sink_resource = sink.?;
         try common.requireSinkCapacity(sink_resource, call, required);
-        const scratch = try workspace.take(u8, wim_seam.scratch_size);
-        if (sink_resource.kind == .direct_write) {
-            const output = try common.sinkDirectBuffer(sink_resource, std.math.cast(usize, required) orelse return error.ResourceException);
-            const written = try wim_seam.encode(plan.provider, entries, output, scratch);
-            response.byte_length = written;
-        } else {
-            const staging = try workspace.take(u8, std.math.cast(usize, required) orelse return error.ResourceException);
-            const written = try wim_seam.encode(plan.provider, entries, staging, scratch);
-            try common.commitBytesToSink(sink_resource, call, staging[0..written]);
-            response.byte_length = written;
-        }
+        const target = try SinkTarget.open(sink_resource, &workspace, required);
+        const written = try wim_seam.encode(plan.provider, entries, target.output, scratch);
+        response.byte_length = try target.publish(sink_resource, call, written);
     } else {
         return error.UnsupportedException;
     }
@@ -821,14 +730,9 @@ pub fn cpioHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resourc
         const size = std.math.cast(usize, entry.size) orelse return error.ResourceException;
         if (size > limits.decoded_bytes) return error.ResourceException;
         try common.requireSinkCapacity(sink_resource, call, size);
-        if (sink_resource.kind == .direct_write) {
-            const output = try common.sinkDirectBuffer(sink_resource, std.math.cast(usize, size) orelse return error.ResourceException);
-            _ = try cpio_seam.decodeOrdinal(plan.provider, archive, ordinal, output);
-        } else {
-            const staged = try workspace.take(u8, size);
-            _ = try cpio_seam.decodeOrdinal(plan.provider, archive, ordinal, staged);
-            try common.commitBytesToSink(sink_resource, call, staged);
-        }
+        const target = try SinkTarget.open(sink_resource, &workspace, size);
+        _ = try cpio_seam.decodeOrdinal(plan.provider, archive, ordinal, target.output);
+        _ = try target.publish(sink_resource, call, size);
         response.byte_length = size;
     } else if (command_mask == vocabulary.command_mask_write) {
         try requireVerified(commit);
@@ -840,17 +744,9 @@ pub fn cpioHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resourc
         }
         const sink_resource = sink.?;
         try common.requireSinkCapacity(sink_resource, call, required);
-        const scratch = try workspace.take(u8, cpio.scratch_size);
-        if (sink_resource.kind == .direct_write) {
-            const output = try common.sinkDirectBuffer(sink_resource, std.math.cast(usize, required) orelse return error.ResourceException);
-            const written = try cpio_seam.encode(plan.provider, entries, output, scratch);
-            response.byte_length = written;
-        } else {
-            const staging = try workspace.take(u8, std.math.cast(usize, required) orelse return error.ResourceException);
-            const written = try cpio_seam.encode(plan.provider, entries, staging, scratch);
-            try common.commitBytesToSink(sink_resource, call, staging[0..written]);
-            response.byte_length = written;
-        }
+        const target = try SinkTarget.open(sink_resource, &workspace, required);
+        const written = try cpio_seam.encode(plan.provider, entries, target.output);
+        response.byte_length = try target.publish(sink_resource, call, written);
     } else {
         return error.UnsupportedException;
     }
@@ -889,7 +785,9 @@ pub fn zipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
         if (size > limits.decoded_bytes) return error.ResourceException;
         try common.requireSinkCapacity(sink_resource, call, size);
         const decrypt_staging = if (entry.encrypted) try workspace.take(u8, entry.compressed_size) else @as([]u8, &.{});
-        const callback_staging = if (sink_resource.kind == .callback_write) try workspace.take(u8, size) else @as([]u8, &.{});
+        // The decode target opens before the scratch carve: a staged sink needs
+        // its buffer ahead of the decoder's claim.
+        const target = try SinkTarget.open(sink_resource, &workspace, size);
         const scratch = try workspace.take(u8, workspace.remaining());
         const decode_options: zip.ZipDecodeOptions = .{
             .password = cryptoPassword(crypto_params),
@@ -901,19 +799,11 @@ pub fn zipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
             .history = history,
             .provider = plan.provider,
         };
-        if (sink_resource.kind == .direct_write) {
-            const output = try common.sinkDirectBuffer(sink_resource, std.math.cast(usize, size) orelse return error.ResourceException);
-            _ = zip.zipDecodeOrdinal(archive, std.math.cast(usize, ordinal) orelse return error.ResourceException, output, decode_options) catch |err| {
-                writeCryptoFailure(call, crypto_cause);
-                return err;
-            };
-        } else {
-            _ = zip.zipDecodeOrdinal(archive, std.math.cast(usize, ordinal) orelse return error.ResourceException, callback_staging, decode_options) catch |err| {
-                writeCryptoFailure(call, crypto_cause);
-                return err;
-            };
-            try common.commitBytesToSink(sink_resource, call, callback_staging);
-        }
+        _ = zip.zipDecodeOrdinal(archive, std.math.cast(usize, ordinal) orelse return error.ResourceException, target.output, decode_options) catch |err| {
+            writeCryptoFailure(call, crypto_cause);
+            return err;
+        };
+        _ = try target.publish(sink_resource, call, size);
         response.byte_length = size;
     } else if (command_mask == vocabulary.command_mask_write) {
         try requireVerified(commit);
@@ -951,29 +841,20 @@ pub fn zipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
         }
         const sink_resource = sink.?;
         try common.requireSinkCapacity(sink_resource, call, required);
-        if (sink_resource.kind == .direct_write) {
-            const output = try common.sinkDirectBuffer(sink_resource, std.math.cast(usize, required) orelse return error.ResourceException);
-            const written = zip.encode(entries, comment, output, plan.provider, history, measurement_buffer, crypto_staging, scratch, &crypto_cause) catch |err| {
-                writeCryptoFailure(call, crypto_cause);
-                return err;
-            };
-            response.byte_length = written;
-        } else {
-            const staging = try workspace.take(u8, std.math.cast(usize, required) orelse return error.ResourceException);
-            const written = zip.encode(entries, comment, staging, plan.provider, history, measurement_buffer, crypto_staging, scratch, &crypto_cause) catch |err| {
-                writeCryptoFailure(call, crypto_cause);
-                return err;
-            };
-            try common.commitBytesToSink(sink_resource, call, staging[0..written]);
-            response.byte_length = written;
-        }
+        const target = try SinkTarget.open(sink_resource, &workspace, required);
+        const written = zip.encode(entries, comment, target.output, plan.provider, history, measurement_buffer, crypto_staging, scratch, &crypto_cause) catch |err| {
+            writeCryptoFailure(call, crypto_cause);
+            return err;
+        };
+        response.byte_length = try target.publish(sink_resource, call, written);
     } else {
         return error.UnsupportedException;
     }
 }
 
 pub fn sevenzipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
-    // Single sevenzip profile unions decoded/coded sides: reads accept every method, writes pack. Queries follow their target.
+    // Single sevenzip profile unions decoded/coded sides: reads accept every method, writes pack.
+    // Queries follow their target.
     return sevenZipGeneric(true, plan, source, sink, call, response, sizing, commit, limits, command_mask);
 }
 
@@ -1034,20 +915,12 @@ fn sevenZipGeneric(comptime coded: bool, plan: *common.ExecutionPlan, source: ?*
             .failure_cause = &crypto_cause,
             .provider = plan.provider,
         };
-        if (sink_resource.kind == .direct_write) {
-            const output = try common.sinkDirectBuffer(sink_resource, std.math.cast(usize, size) orelse return error.ResourceException);
-            _ = seven_zip.sevenZipDecodeOrdinal(archive, &workspace, limits, ordinal, output, decode_options) catch |err| {
-                writeCryptoFailure(call, crypto_cause);
-                return err;
-            };
-        } else {
-            const staging = try workspace.take(u8, size);
-            _ = seven_zip.sevenZipDecodeOrdinal(archive, &workspace, limits, ordinal, staging, decode_options) catch |err| {
-                writeCryptoFailure(call, crypto_cause);
-                return err;
-            };
-            try common.commitBytesToSink(sink_resource, call, staging);
-        }
+        const target = try SinkTarget.open(sink_resource, &workspace, size);
+        _ = seven_zip.sevenZipDecodeOrdinal(archive, &workspace, limits, ordinal, target.output, decode_options) catch |err| {
+            writeCryptoFailure(call, crypto_cause);
+            return err;
+        };
+        _ = try target.publish(sink_resource, call, size);
         response.byte_length = size;
     } else if (command_mask == vocabulary.command_mask_write) {
         try requireVerified(commit);
@@ -1076,16 +949,9 @@ fn sevenZipGeneric(comptime coded: bool, plan: *common.ExecutionPlan, source: ?*
         const sink_resource = sink.?;
         try common.checkWorkspaceOverlap(call, source_resource, sink_resource);
         try common.requireSinkCapacity(sink_resource, call, required);
-        if (sink_resource.kind == .direct_write) {
-            const output = try common.sinkDirectBuffer(sink_resource, std.math.cast(usize, required) orelse return error.ResourceException);
-            const written = try seven_zip.sevenZipWritePacked(entries, packed_entries, output, &workspace, plan.provider, limits, header_options);
-            response.byte_length = written;
-        } else {
-            const staging = try workspace.take(u8, std.math.cast(usize, required) orelse return error.ResourceException);
-            const written = try seven_zip.sevenZipWritePacked(entries, packed_entries, staging, &workspace, plan.provider, limits, header_options);
-            try common.commitBytesToSink(sink_resource, call, staging[0..written]);
-            response.byte_length = written;
-        }
+        const target = try SinkTarget.open(sink_resource, &workspace, required);
+        const written = try seven_zip.sevenZipWritePacked(entries, packed_entries, target.output, &workspace, plan.provider, limits, header_options);
+        response.byte_length = try target.publish(sink_resource, call, written);
     } else {
         return error.UnsupportedException;
     }
@@ -1182,8 +1048,8 @@ fn parseSevenZipMethod(node: *Node) Exception!seven_zip.CoderMethod {
     };
 }
 
-// Largest decrypted-header staging either RAR family can need: RAR5 caps a
-// header at 2 MiB, RAR4 headers are u16-sized aligned to the 16-byte block.
+// Largest decrypted-header staging either RAR family needs: RAR5 caps a
+// header at 2 MiB; RAR4 headers are u16-sized, 16-byte aligned.
 const rar_header_scratch_size = 2 * 1024 * 1024 + 16;
 
 pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
@@ -1232,10 +1098,8 @@ pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
         try common.checkWorkspaceOverlap(call, source_resource, sink_resource);
         const ordinal = archiveOrdinal(call.request);
         const archive = try materializeArchive(source_resource, &workspace, limits);
-        // Decryption needs a mutable copy of the packed data and, for -hp
-        // archives, staging for the decrypted headers; both are capped by the
-        // archive size. Plaintext reads carve nothing, keeping workspace
-        // sizing byte-identical to before.
+        // Decryption stages a mutable packed copy and, for -hp, decrypted
+        // headers, both capped by the archive size. Plaintext carves nothing.
         const packed_stage = if (decrypting) try workspace.take(u8, @min(limits.encoded_bytes, archive.len)) else try workspace.take(u8, 0);
         const header_scratch = if (decrypting) try workspace.take(u8, @min(@as(usize, rar_header_scratch_size), archive.len + 16)) else try workspace.take(u8, 0);
         const decode_opts: rar.DecodeOptions = .{
@@ -1254,14 +1118,10 @@ pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
         if (size > limits.decoded_bytes) return error.ResourceException;
         try common.requireSinkCapacity(sink_resource, call, size);
 
-        // The walk resolved the entry's declared needs into RarInfo. Store
-        // entries carve nothing. The PPMd heap is whatever workspace remains:
-        // the stream names its model size at decode time and is refused
-        // cleanly if the pool cannot hold it. A staged (callback) sink takes
-        // its output staging BEFORE the heap grab, or the heap would consume
-        // the space staging needs.
+        // Store entries carve nothing. The PPMd heap takes the remainder;
+        // the stream bounds the model, so the target opens first.
         const window_len = std.math.cast(usize, entry.window_bytes) orelse return error.ResourceException;
-        const staged_output = if (sink_resource.kind == .callback_write) try workspace.take(u8, size) else @as([]u8, &.{});
+        const target = try SinkTarget.open(sink_resource, &workspace, size);
         var bufs: rar.DecodeBuffers = .{
             .state = &.{},
             .window = &.{},
@@ -1273,8 +1133,8 @@ pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
             .packed_stage = packed_stage,
         };
         if (entry.method != 0) {
-            // The unpacker states are re-read as u64 words and as whole structs;
-            // u64 aligns to 4 on x86, so the carve uses an explicitly aligned unit.
+            // Unpacker states are re-read as u64 words and structs; u64 aligns to
+            // 4 on x86, so the carve uses StateOctet.
             const state_octets = try workspace.take(StateOctet, (rar.max_unpacker_bytes + 7) / 8);
             const window_buf = try workspace.take(u8, window_len);
             const table_pool = try workspace.take(u16, rar.table_pool_words);
@@ -1294,19 +1154,11 @@ pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
             };
         }
 
-        if (sink_resource.kind == .direct_write) {
-            const output = try common.sinkDirectBuffer(sink_resource, std.math.cast(usize, size) orelse return error.ResourceException);
-            _ = rar.rarDecodeOrdinal(archive, std.math.cast(usize, ordinal) orelse return error.ResourceException, output, &bufs, decode_opts) catch |err| {
-                writeCryptoFailure(call, failure_cause);
-                return err;
-            };
-        } else {
-            _ = rar.rarDecodeOrdinal(archive, std.math.cast(usize, ordinal) orelse return error.ResourceException, staged_output, &bufs, decode_opts) catch |err| {
-                writeCryptoFailure(call, failure_cause);
-                return err;
-            };
-            try common.commitBytesToSink(sink_resource, call, staged_output);
-        }
+        _ = rar.rarDecodeOrdinal(archive, std.math.cast(usize, ordinal) orelse return error.ResourceException, target.output, &bufs, decode_opts) catch |err| {
+            writeCryptoFailure(call, failure_cause);
+            return err;
+        };
+        _ = try target.publish(sink_resource, call, size);
         response.byte_length = size;
     } else if (command_mask == vocabulary.command_mask_write) {
         try requireVerified(commit);
@@ -1367,16 +1219,9 @@ pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
         const sink_resource = sink.?;
         try common.checkWorkspaceOverlap(call, source_resource, sink_resource);
         try common.requireSinkCapacity(sink_resource, call, required);
-        if (sink_resource.kind == .direct_write) {
-            const output = try common.sinkDirectBuffer(sink_resource, std.math.cast(usize, required) orelse return error.ResourceException);
-            const written = try rar_writer.rarEncodeEx(entries, output, &ws, plan.provider, write_options);
-            response.byte_length = written;
-        } else {
-            const staging_out = try workspace.take(u8, required);
-            const written = try rar_writer.rarEncodeEx(entries, staging_out, &ws, plan.provider, write_options);
-            try common.commitBytesToSink(sink_resource, call, staging_out[0..written]);
-            response.byte_length = written;
-        }
+        const target = try SinkTarget.open(sink_resource, &workspace, required);
+        const written = try rar_writer.rarEncodeEx(entries, target.output, &ws, plan.provider, write_options);
+        response.byte_length = try target.publish(sink_resource, call, written);
     } else {
         return error.UnsupportedException;
     }

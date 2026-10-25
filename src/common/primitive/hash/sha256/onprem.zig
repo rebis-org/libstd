@@ -9,8 +9,8 @@ const merkle = @import("../merkle.zig");
 // FIPS 180-4.
 // The scalar arm serves featureless targets and the portable flag.
 
-// x86_64 macOS survives only under Rosetta, which reports SHA-NI in CPUID
-// but raises #UD on sha256rnds2; no Intel Mac shipped the extension.
+// x86_64 macOS runs under Rosetta, which reports SHA-NI in CPUID but
+// raises #UD on sha256rnds2; no Intel Mac shipped it.
 const has_x86sha = !options.sha256_portable and builtin.target.cpu.arch == .x86_64 and
     builtin.os.tag != .macos and builtin.zig_backend != .stage2_c and builtin.target.cpu.hasAll(.x86, &.{ .sha, .avx2 });
 const has_arm8sha256 = !options.sha256_portable and builtin.target.cpu.arch == .aarch64 and
@@ -122,8 +122,7 @@ fn compressAarch64(state: *align(16) [8]u32, block: *const [64]u8) void {
 }
 
 // FIPS 180-4 section 6.2.2 with SHA-NI rounds over an AVX2 message
-// schedule (std crypto/sha2.zig). Dormant unless the target carries
-// both extensions; portable and featureless builds keep the scalar arm.
+// schedule (std crypto/sha2.zig).
 fn compressX8664(state: *align(16) [8]u32, block: *const [64]u8) void {
     const V4u32 = @Vector(4, u32);
     var s: [64]u32 align(16) = undefined;

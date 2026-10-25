@@ -4,11 +4,11 @@
 const std = @import("std");
 
 const kernels = @import("../../../common/kernels.zig");
-// Complex prefix codes transmit lengths directly.
-// That is larger but always valid.
 const huffman = @import("../../../common/primitive/huffman.zig");
 const dictionary = @import("dictionary.zig");
 
+// Complex prefix codes transmit lengths directly.
+// That is larger but always valid.
 pub const DecodeError = error{ UnsupportedException, DataException, ResourceException, CapacityException, InternalException, IoException };
 pub const EncodeError = error{ UnsupportedException, DataException, ResourceException, CapacityException, InternalException };
 
@@ -16,12 +16,10 @@ pub const Options = struct {
     quality: u32 = 5,
     max_decoded_bytes: u64 = std.math.maxInt(u64),
     // RFC 7932 large-window extension (vendor BROTLI_PARAM_LARGE_WINDOW):
-    // decode accepts the reserved WBITS form; encode may emit windows past
-    // 2^24 when the input needs one.
+    // decode accepts the reserved WBITS form; encode may emit past 2^24.
     large_window: bool = false,
-    // Shared-dictionary raw LZ77 prefix (vendor
-    // BrotliDecoderAttachDictionary RAW type): bytes are addressable as
-    // history before the first stream position.
+    // Raw LZ77 shared-dictionary prefix (vendor BrotliDecoderAttachDictionary):
+    // bytes are addressable history before the first stream position.
     custom_dictionary: ?[]const u8 = null,
     // Encode-side window cap in bytes; zero picks the smallest window that
     // covers the input (and dictionary), clamped by large_window.
@@ -50,9 +48,8 @@ pub fn decodedSize(input: []const u8, scratch: []u8, options: Options) DecodeErr
     }
 }
 
-// One-shot slice decode workspace: tables, symbols, context maps. The
-// writer-staging lower bound is gone; the windowed incremental decode
-// below needs only its own ring.
+// One-shot decode workspace: tables, symbols, context maps; the windowed
+// incremental decode sizes its ring separately.
 pub const decode_workspace_size: usize = blk: {
     const tables = max_trees * @sizeOf(HufTable);
     const symbols = max_trees * max_alphabet * @sizeOf(u16);
@@ -68,7 +65,7 @@ fn alignedSlice(scratch_buffer: []u8, comptime size: usize) error{ResourceExcept
 
 fn alignedWorkspace(scratch_buffer: []u8) DecodeError!struct { buf: []u8 } {
     // The adapter hands over a []u8 from a sequentially-taken workspace;
-    // the table records need natural alignment, so start past the padding.
+    // the table records need natural alignment.
     return .{ .buf = try alignedSlice(scratch_buffer, decode_workspace_size) };
 }
 
@@ -99,10 +96,8 @@ fn hash4At(src: []const u8, pos: usize) usize {
 
 fn parseCommands(src: []const u8, dict: []const u8, commands: []Command, head: []u32, ring: *[4]u32, dist_cap: u32) usize {
     @memset(head, 0);
-    // The dictionary is the virtual prefix of the stream: byte j sits at
-    // position j - dict.len. Hash-chain entries store the position shifted
-    // up by dict.len + 1 so zero stays the empty sentinel; a raw value below
-    // dict.len is a dictionary position.
+    // Hash entries store virtual position + dict.len + 1; zero is the
+    // empty sentinel, raw < dict.len a dictionary position.
     for (0..dict.len -| 3) |j| {
         head[hash4At(dict, j)] = @intCast(j + 1);
     }
@@ -121,8 +116,7 @@ fn parseCommands(src: []const u8, dict: []const u8, commands: []Command, head: [
                 var len: usize = 0;
                 if (raw < dict.len) {
                     // A dictionary candidate compares through the
-                    // dictionary/stream boundary: virtual bytes after the
-                    // dictionary tail continue at src[0].
+                    // dictionary/stream boundary: bytes past the tail wrap to src[0].
                     while (len < src.len - pos) {
                         const cb = if (cand + len < dict.len) dict[cand + len] else src[cand + len - dict.len];
                         if (cb != src[pos + len]) break;
@@ -207,17 +201,15 @@ fn parseCommands(src: []const u8, dict: []const u8, commands: []Command, head: [
     return count;
 }
 
-const max_alphabet = 704; // insert-and-copy alphabet
+const max_alphabet = 704; // Insert-and-copy alphabet.
 const ring_slot = [16]u8{ 0, 1, 2, 3, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1 };
 const ring_off = [16]i8{ 0, 0, 0, 0, -1, 1, -2, 2, -3, 3, -1, 1, -2, 2, -3, 3 };
 const max_trees = 256 * 3 + 16;
 
-// ---------------------------------------------------------------- bit io
-
 const BitReader = struct {
     data: []const u8,
     pos: usize = 0,
-    mask: u8 = 0, // consumed-bit mask within data[pos]; 0 = fresh byte
+    mask: u8 = 0, // Mask of the next bit in data[pos]; zero means load a new byte.
 
     fn readBit(self: *BitReader) DecodeError!u32 {
         if (self.mask == 0) {
@@ -262,8 +254,6 @@ const BitReader = struct {
     }
 };
 
-// ---------------------------------------------------------------- huffman
-
 // Canonical prefix code (RFC 3.2/3.5), decoded bit-by-bit.
 const HufTable = struct {
     count: [16]u32 = @splat(0),
@@ -298,11 +288,8 @@ const Scratch = struct {
     trees_used: usize = 0,
     cmapl: []u8,
     cmapd: []u8,
-    // The code-length-code tree is transient (only live while one complex
-    // prefix code reads its lengths), so a single dedicated table serves
-    // every tree; the scratch pool budget then never charges the 18-symbol
-    // code-length code against the 784-tree pool. Both decoders share this
-    // storage.
+    // Transient: live only while one complex code reads its lengths, so
+    // one table serves every tree.
     cl_table: HufTable = .{},
     cl_symbols: [18]u16 = undefined,
 
@@ -326,8 +313,7 @@ fn canonicalOffsets(counts: [16]u32) [16]u32 {
 }
 
 fn buildCodeLengthCode(br: *BitReader, hskip: u32, sc: *Scratch) DecodeError!*HufTable {
-    // RFC 3.5: the 18 code-length symbols arrive in a fixed order. The
-    // order table and the 2..4-bit prefix code come from the spec.
+    // RFC 3.5: the 18 code-length symbols arrive in the spec's fixed order.
     var lengths: [18]u8 = @splat(0);
     const order = [18]u8{ 1, 2, 3, 4, 0, 5, 17, 6, 16, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
     // HSKIP arrived with the 2-bit simple/complex selector; value 1 means a
@@ -338,10 +324,8 @@ fn buildCodeLengthCode(br: *BitReader, hskip: u32, sc: *Scratch) DecodeError!*Hu
     var num_codes: u32 = 0;
     while (i < 18 and space > 0) : (i += 1) {
         const sym = order[i];
-        // Code-length-symbol bit lengths use the spec's prefix code
-        // (RFC 3.5), parsed one bit at a time. The bit patterns: 0->00,
-        // 3->10, 4->01, 2->011, 1->0111, 5->1111 (stream order is
-        // rightmost first).
+        // Length patterns (RFC 3.5): 0->00, 3->10, 4->01, 2->011,
+        // 1->0111, 5->1111; rightmost bit arrives first.
         var len: u8 = undefined;
         if (try br.readBit() == 0) {
             len = if (try br.readBit() == 0) 0 else 3;
@@ -360,13 +344,11 @@ fn buildCodeLengthCode(br: *BitReader, hskip: u32, sc: *Scratch) DecodeError!*Hu
             num_codes += 1;
         }
     }
-    // RFC 3.5: either the lengths sum to a complete code (space drains to
-    // zero) or exactly one code-length symbol is nonzero; a single symbol
-    // decodes with zero bits consumed (vendor huffman.c single-code case).
+    // RFC 3.5: either space drains to zero (complete code) or one symbol
+    // decodes in zero bits (vendor huffman.c).
     if (space != 0 and num_codes != 1) return error.DataException;
-    // The 18-symbol code-length code lives in dedicated scratch storage, not
-    // the tree pool: a header can carry up to 768 prefix codes, and a pool
-    // slot per code-length code would overflow the 784-tree budget.
+    // Dedicated storage, not a pool slot: 768 prefix codes per header
+    // would overflow the 784-tree budget.
     const table = &sc.cl_table;
     table.* = .{ .symbols = &sc.cl_symbols };
     if (num_codes == 1) {
@@ -390,9 +372,8 @@ fn buildCodeLengthCode(br: *BitReader, hskip: u32, sc: *Scratch) DecodeError!*Hu
     return table;
 }
 
-// Symbol width comes from alphabet_size_max; symbol validation and the
-// complex-code loop bound use alphabet_size_limit. The two differ only for
-// the large-window distance code (vendor ReadHuffmanCode).
+// Symbol width uses alphabet, validation and loop bound use alphabet_limit;
+// they differ only for large-window distance codes (vendor ReadHuffmanCode).
 fn readPrefixCode(br: *BitReader, sc: *Scratch, alphabet: usize, alphabet_limit: usize) DecodeError!*HufTable {
     const hskip_bits = try br.readBits(2);
     if (hskip_bits == 1) {
@@ -400,10 +381,8 @@ fn readPrefixCode(br: *BitReader, sc: *Scratch, alphabet: usize, alphabet_limit:
         const nsym = (try br.readBits(2)) + 1;
         const abits: u5 = @intCast(std.math.log2_int(usize, std.math.ceilPowerOfTwoAssert(usize, alphabet)));
         var lens: [4]u8 = @splat(0);
-        // Allocate by the limit, not the max: the large-window distance
-        // alphabet max reaches 1128 symbols (past the 704-symbol pool
-        // stride) while the limit stays <= 544 (vendor decode.c validates
-        // symbols against alphabet_size_limit).
+        // The large-window max (1128 symbols) overruns the 704-symbol
+        // pool stride; allocate by the limit, which never exceeds 544.
         const tree = try sc.allocTree(alphabet_limit);
         var last: [4]u16 = undefined;
         for (0..nsym) |i| {
@@ -437,9 +416,8 @@ fn readPrefixCode(br: *BitReader, sc: *Scratch, alphabet: usize, alphabet_limit:
             else => return error.DataException,
         }
         for (0..nsym) |i| tree.table.count[lens[i]] += 1;
-        // For NSYM > 1 the codes inside one length group are assigned in
-        // symbol VALUE order (vendor BrotliBuildSimpleHuffmanTable), not
-        // stream order: sort the (len, symbol) pairs canonically.
+        // NSYM > 1: within a length group, codes follow symbol value
+        // order, not stream order (vendor BrotliBuildSimpleHuffmanTable).
         if (nsym > 1) {
             var saved: [4]u16 = undefined;
             @memcpy(saved[0..nsym], tree.table.symbols[0..nsym]);
@@ -478,20 +456,15 @@ fn readPrefixCode(br: *BitReader, sc: *Scratch, alphabet: usize, alphabet_limit:
             repeat_len = 0;
             if (sym != 0) {
                 prev_len = @intCast(sym);
-                // Guarded subtraction: the vendor relies on u32 wraparound
-                // here and fails later on `space != 0`; the wrapped value
-                // can never return to zero (drain bounded by 704*32768),
-                // so failing early is equivalent.
+                // Guarded subtraction: the vendor wraps u32 and fails on
+                // space later; a wrap never reaches zero (drain <= 704*32768).
                 const weight = @as(u32, 32768) >> @intCast(sym);
                 if (weight > space) return error.DataException;
                 space -= weight;
             }
         } else if (sym == 16 or sym == 17) {
-            // Repeat codes (RFC 3.5): the running `repeat` holds the TOTAL
-            // count of the current run. A consecutive same-type repeat
-            // replaces the count via repeat = ((repeat - 2) << extra) + 3+.
-            // Only the DELTA over the old total appends new symbols. This
-            // is the vendor's ProcessRepeatedCodeLength semantics.
+            // Repeat codes (RFC 3.5, vendor ProcessRepeatedCodeLength): repeat
+            // holds the total run; a consecutive repeat replaces it; only the delta appends.
             const new_len: u32 = if (sym == 16) prev_len else 0;
             const extra_bits: u5 = if (sym == 16) 2 else 3;
             const extra = try br.readBits(extra_bits);
@@ -503,9 +476,8 @@ fn readPrefixCode(br: *BitReader, sc: *Scratch, alphabet: usize, alphabet_limit:
             if (repeat > 0) repeat = (repeat - 2) << extra_bits;
             repeat += 3 + extra;
             const delta = repeat - old_repeat;
-            // The vendor checks repeat overshoot against the limit and lets
-            // the final space check reject; an early check on the same
-            // boundary is equivalent and keeps every write in bounds.
+            // The vendor defers repeat overshoot to the final space check;
+            // checking that boundary early is equivalent and bounds writes.
             if (symbol_count + delta > alphabet_limit) return error.DataException;
             if (new_len != 0) {
                 const per = @as(u32, 32768) >> @as(u5, @intCast(new_len));
@@ -548,8 +520,6 @@ fn readPrefixCode(br: *BitReader, sc: *Scratch, alphabet: usize, alphabet_limit:
     lengths.table.count = counts;
     return lengths.table;
 }
-
-// ---------------------------------------------------------------- tables
 
 // RFC 5: insert-and-copy length code split into insert and copy codes.
 const insert_base = [24]u32{ 0, 1, 2, 3, 4, 5, 6, 8, 10, 14, 18, 26, 34, 50, 66, 98, 130, 194, 322, 578, 1090, 2114, 6210, 22594 };
@@ -644,8 +614,6 @@ fn readBlockCount(br: *BitReader) DecodeError!u32 {
     return (@as(u32, 1) << @intCast(n)) + 1 + (try br.readBits(@intCast(n)));
 }
 
-// ------------------------------------------------------------ block switch
-
 const BlockCategory = struct {
     num_types: u32 = 1,
     type_tree: ?*HufTable = null,
@@ -679,8 +647,6 @@ const BlockCategory = struct {
         self.count = block_count_base[sym] + (try br.readBits(block_count_extra[sym]));
     }
 };
-
-// ------------------------------------------------------------- context map
 
 fn readContextMap(br: *BitReader, sc: *Scratch, size: usize, num_trees: u32, map: []u8) DecodeError!void {
     var rlemax: u32 = 0;
@@ -721,17 +687,14 @@ fn readContextMap(br: *BitReader, sc: *Scratch, size: usize, num_trees: u32, map
     }
 }
 
-// ------------------------------------------------------------- meta-block
-
 // RFC 4: the last distance starts at 4.
 // The earlier slots start at 11, 15, and 16.
 const distance_ring_init = [4]u32{ 4, 11, 15, 16 };
 
 const DistanceCodeLimit = struct { max_alphabet_size: usize, max_distance: u32 };
 
-// Vendor common/constants.h BrotliCalculateDistanceCodeLimit: the largest
-// complete distance-code group that cannot represent distances beyond
-// max_distance. Only max_alphabet_size is needed here.
+// Vendor BrotliCalculateDistanceCodeLimit: the largest complete group whose
+// distances stay within max_distance; only max_alphabet_size is used.
 fn distanceCodeLimit(max_distance: u32, npostfix: u5, ndirect: u32) DistanceCodeLimit {
     const short_codes: usize = 16;
     if (max_distance <= ndirect) {
@@ -775,9 +738,8 @@ fn decodeMetaBlock(
     empty_end: *bool,
 ) DecodeError!void {
     empty_end.* = false;
-    // Prefix code tables are per-metablock state (RFC 7932 section 6): a
-    // fresh set of trees begins here, so the scratch pool resets even though
-    // the surrounding stream scratch outlives the metablock.
+    // Prefix codes are per-metablock (RFC 7932 section 6): the tree pool
+    // resets here though the stream scratch outlives the metablock.
     sc.trees_used = 0;
     is_last.* = (try br.readBit()) != 0;
     if (is_last.* and (try br.readBit()) != 0) {
@@ -794,8 +756,8 @@ fn decodeMetaBlock(
         var skiplen: usize = 0;
         if (mskipbytes > 0) {
             const v = try br.readBits(@intCast(mskipbytes * 8));
-            // RFC 9.2: the top byte of MSKIPLEN must be nonzero whenever
-            // the length spans more than one byte (vendor decode.c 340-344).
+            // RFC 9.2: MSKIPLEN's top byte must be nonzero when the
+            // length spans more than one byte (vendor decode.c 340-344).
             if (mskipbytes > 1 and (v >> @intCast((mskipbytes - 1) * 8)) == 0) return error.DataException;
             skiplen = @intCast(v + 1);
         }
@@ -839,11 +801,8 @@ fn decodeMetaBlock(
     const ndirect: u32 = (try br.readBits(4)) << npostfix;
     const postfix_mask: u32 = (@as(u32, 1) << npostfix) - 1;
 
-    // Distance code alphabet. The large-window extension widens the symbol
-    // pool so distances up to BROTLI_MAX_ALLOWED_DISTANCE stay
-    // representable: symbol width comes from the max size, validation and
-    // the complex-code bound from the limit (vendor decode.c CONTEXT_MAP_2 /
-    // BrotliCalculateDistanceCodeLimit in common/constants.h).
+    // Large window widens the alphabet max so distances up to
+    // BROTLI_MAX_ALLOWED_DISTANCE stay representable (vendor decode.c CONTEXT_MAP_2).
     var dist_alphabet_max: usize = 16 + ndirect + (@as(usize, 48) << npostfix);
     var dist_alphabet_limit: usize = dist_alphabet_max;
     if (large_window) {
@@ -960,11 +919,10 @@ fn decodeMetaBlock(
             p1.* = byte;
             pos += 1;
         }
-        if (pos == mlen) break; // trailing copy length is ignored
+        if (pos == mlen) break; // Trailing copy length is ignored.
 
-        // Distance. The ring push waits until the reference proves to be a
-        // real backward copy: distances beyond max_backward are static
-        // dictionary references and never enter the ring (RFC 4 and 8).
+        // Ring pushes wait for real backward copies; static dictionary
+        // references never enter the ring (RFC 4, 8).
         var distance: u32 = 0;
         var push_ring = false;
         if (implicit_dist0) {
@@ -991,7 +949,9 @@ fn decodeMetaBlock(
                 push_ring = true;
             } else {
                 const dc: u32 = dcode - ndirect - 16;
-                const ndistbits: u5 = @intCast(1 + (dc >> (npostfix + 1)));
+                // The extra-bit count is wire-derived; a code the window
+                // cannot reach fails the u5 cast instead of overrunning readBits.
+                const ndistbits: u5 = std.math.cast(u5, 1 + (dc >> (npostfix + 1))) orelse return error.DataException;
                 const dextra = try br.readBits(ndistbits);
                 const hcode = dc >> npostfix;
                 const lcode = dc & postfix_mask;
@@ -1002,10 +962,8 @@ fn decodeMetaBlock(
         }
         const max_backward = @min(window_size, (produced.* - stream_base) + dict.len);
         if (distance > max_backward) {
-            // RFC 8: a static dictionary reference. Implicit dist0 at a
-            // position shorter than the initial ring value (4) is a valid
-            // dictionary reference too (vendor decode.c 2202): the ring is
-            // left untouched in either case.
+            // RFC 8 static dictionary reference. Implicit dist0 before
+            // four produced bytes lands here too (vendor decode.c 2202).
             const dict_len = try copyDictionaryWord(output, produced, copy_len, distance, max_backward, p1, p2);
             if (pos + dict_len > mlen) return error.DataException;
             pos += dict_len;
@@ -1021,11 +979,8 @@ fn decodeMetaBlock(
         if (produced.* + copy_len > output.len) return error.CapacityException;
         const in_stream = produced.* - stream_base;
         if (distance > in_stream) {
-            // The match reaches into the custom-dictionary prefix: the first
-            // bytes come from the dictionary tail, the rest continue as an
-            // ordinary (possibly overlapping) copy from produced output. The
-            // equivalent distance stays valid because
-            // distance == in_stream + (dict bytes sourced).
+            // Dictionary-prefix match: the dictionary tail is emitted first,
+            // so the remaining copy at the same distance stays within produced output.
             const from_dict = distance - in_stream;
             const dict_part = @min(copy_len, from_dict);
             @memcpy(output[produced.*..][0..dict_part], dict[dict.len - from_dict ..][0..dict_part]);
@@ -1044,24 +999,17 @@ fn decodeMetaBlock(
     }
 }
 
-// ---------------------------------------------------------------- decode
-
 fn readWbits(br: *BitReader, large_window: bool) DecodeError!u32 {
-    // RFC 9.1 / vendor DecodeWindowBits: one leading 0 bit means 16;
-    // otherwise a 3-bit value n selects 17+n, and when n is zero a second
-    // 3-bit value m selects 17 (m == 0), a large-window stream (m == 1), or
-    // 8+m. The large-window extension then reads one zero bit (a one bit is
-    // invalid) and a 6-bit window size in [10, 30]
-    // (vendor decode.c DecodeWindowBits / LARGE_WINDOW_BITS).
+    // WBITS per RFC 9.1; the reserved m == 1 form is claimed by the
+    // large-window extension (vendor decode.c DecodeWindowBits).
     if (try br.readBit() == 0) return 16;
     const n = try br.readBits(3);
     if (n != 0) return 17 + n;
     const m = try br.readBits(3);
     if (m == 1) {
         if (!large_window) return error.DataException;
-        // Vendor DecodeWindowBits: one reserved bit (must be zero), then
-        // the LARGE_WINDOW_BITS state reads a 6-bit window size in
-        // [BROTLI_LARGE_MIN_WBITS, BROTLI_LARGE_MAX_WBITS] = [10, 30].
+        // Vendor DecodeWindowBits: one reserved zero bit, then a 6-bit
+        // window size in [10, 30].
         if (try br.readBit() != 0) return error.DataException;
         const wbits = try br.readBits(6);
         if (wbits < 10 or wbits > 30) return error.DataException;
@@ -1092,18 +1040,12 @@ pub fn decode(input: []const u8, output: []u8, scratch_buffer: []u8, options: Op
     var ring = distance_ring_init;
     const dict = options.custom_dictionary orelse &.{};
     // Concatenated streams (gzip-style): each stream carries its own WBITS
-    // header. The ring and context bytes reset per stream (RFC 4, 7.1);
-    // the custom dictionary stays attached across the concatenation.
+    // header; the custom dictionary stays attached across streams.
     while (true) {
         const wbits = try readWbits(&br, options.large_window);
-        // window_size saturates: the 13-bit large-window form can carry
-        // values past 31 (the system CLI writes 60 for --large_window=30);
-        // distances are validated against produced output, which never
-        // approaches the saturation point in practice.
         const window_size: u32 = if (wbits >= 31) std.math.maxInt(u32) else (@as(u32, 1) << @intCast(wbits)) - 16;
-        // RFC 4 and 7.1: the distance ring, the literal context bytes, and
-        // the addressable history reset at the beginning of every stream in
-        // a concatenation.
+        // RFC 4, 7.1: ring, context bytes, and addressable history reset
+        // at every stream start.
         ring = distance_ring_init;
         p1 = 0;
         p2 = 0;
@@ -1121,8 +1063,8 @@ pub fn decode(input: []const u8, output: []u8, scratch_buffer: []u8, options: Op
             if (produced > options.max_decoded_bytes) return error.ResourceException;
             if (is_last) break;
         }
-        // The last meta-block may end mid-byte; the fill must be zero and
-        // a concatenated stream starts at the next byte boundary.
+        // The stream may end mid-byte; the fill must be zero, and a
+        // concatenated stream resumes at the next byte.
         try br.alignToByte();
         if (br.atEnd()) break;
     }
@@ -1138,8 +1080,7 @@ fn pseudoText() [4096]u8 {
 const pseudo_text_br = [_]u8{ 0x1f, 0xff, 0x0f, 0x00, 0x8c, 0xd4, 0x48, 0x4d, 0x73, 0xbb, 0x81, 0x71, 0x3a, 0x93, 0x67, 0x8a, 0x53, 0x8e, 0xaf, 0xae, 0xb3, 0x6f, 0x0f, 0xcc, 0x33, 0x94, 0xb8, 0x83, 0x60, 0x13, 0x61, 0x75, 0x91, 0x37, 0x7b, 0xb2, 0xe8, 0xc7, 0x3e, 0xf5, 0xc2, 0x1a, 0x71, 0x79, 0xa6, 0x83, 0x31, 0x4b, 0xb5, 0xfd, 0x6f, 0x2d, 0xe0, 0xa8, 0x64, 0xbe, 0xaf, 0x12, 0x44, 0xe3, 0xc8, 0x01, 0xf1, 0x6e, 0x8e, 0x02, 0x67, 0x65, 0xcb, 0x43, 0x8d, 0x28, 0x9e, 0x44, 0x0f, 0x49, 0x0f, 0x4b, 0x0c, 0x34, 0xaf, 0x58, 0x1f, 0xeb, 0x24, 0xc9, 0x34, 0x06, 0x22, 0x3f, 0xad, 0x71, 0xf0, 0xa2, 0x6a, 0x7b, 0x6a, 0x90, 0xa5, 0xb3, 0x38, 0x98, 0xf2, 0xb2, 0x25, 0x20, 0xcb, 0x9a, 0xfd, 0xb9, 0x49, 0x91, 0xcd, 0x13, 0x10, 0xda, 0xdb, 0x9e, 0x84, 0xae, 0x65, 0x8e, 0x97, 0x16, 0x4d, 0xbe, 0x48, 0x42, 0xe9, 0x75, 0x47, 0x0a, 0xb6, 0x91, 0x3b, 0x5f, 0xdb, 0x74, 0xc5, 0x32, 0x05, 0x63, 0x34, 0x9c, 0x69, 0xf8, 0x56, 0xe1, 0x7a, 0xeb, 0x30, 0x94, 0xab, 0x34, 0x9c, 0xd9, 0x74, 0x65, 0x10, 0x3b, 0xa5, 0xfb, 0xbd, 0xcb, 0x54, 0xad, 0x33, 0x08, 0x56, 0xcb, 0x9d, 0x45, 0x9e, 0xa8, 0x3c, 0x1f, 0x3d, 0x96, 0x66, 0x93, 0x45, 0xb2, 0x3b, 0x9e, 0x1c, 0xea, 0x54, 0xe3, 0xfd, 0xec, 0xb3, 0xb5, 0xdb, 0x1c, 0x8a, 0xd3, 0xf5, 0xe6, 0xd1, 0x47, 0xad, 0xef, 0x6b, 0xc0, 0xd1, 0x5d, 0xe6, 0xd1, 0xdc, 0xaf, 0xaf, 0x80, 0x39, 0xe9, 0xfc, 0xdf, 0x43, 0xae, 0xfe, 0xaa, 0x80, 0xe1, 0xfd, 0xfc, 0x45, 0xec, 0x85, 0x3e, 0xf0, 0x33, 0xe2, 0x19, 0xae, 0x8b, 0x58, 0xfe, 0x3f, 0xb0, 0x83, 0xbb, 0x18, 0x42, 0xbf, 0x63, 0xbe, 0xf1, 0xb6, 0x84, 0x13, 0x0c, 0x43, 0xbb, 0xf8, 0xab, 0x31, 0xfc, 0x37, 0x11, 0x98, 0xee, 0xca, 0x78, 0xe1, 0x28, 0xbc, 0x47, 0xb8, 0x99, 0x22, 0xff, 0x53, 0xa1, 0xf9, 0xbe, 0x42, 0x10, 0x8d, 0x23, 0xfb, 0xc4, 0xbb, 0x39, 0x0a, 0x98, 0x95, 0x2d, 0x0f, 0x55, 0xa2, 0x78, 0x12, 0x3d, 0x20, 0x3d, 0x2c, 0x31, 0xe0, 0xbc, 0x62, 0x7d, 0xac, 0xfd, 0x8d, 0x6a, 0x85, 0x8a, 0x66, 0x8d, 0x86, 0x9e, 0x6e, 0xa8, 0xb5, 0xa9, 0x69, 0x74, 0x68, 0x2a, 0x5a, 0x41, 0x37, 0x82, 0x42, 0x6e, 0x85, 0x2a, 0x61, 0x00, 0x90, 0x3a, 0x10, 0xb0, 0x46, 0x05, 0x8c, 0x8e, 0x61, 0x8b, 0x81, 0xe9, 0x38, 0x65, 0xfa, 0xd0, 0xd2, 0xf9, 0xd2, 0xd1, 0xfb, 0xa5, 0x7a, 0x77, 0xc2, 0x22, 0xee, 0x45, 0x44, 0x2b, 0x0f, 0x20, 0x9a, 0x20, 0xa0, 0x5a, 0xa0, 0x15, 0x18, 0x96, 0x13, 0x2c, 0x6c, 0x07, 0xec, 0x0a, 0x87, 0xc1, 0x80, 0x81, 0xd1, 0x90, 0x31, 0x35, 0x89, 0x8a, 0x79, 0x14, 0x13, 0xf7, 0x24, 0x9e, 0x26, 0xb4, 0xc1, 0xc0, 0x75, 0xc0, 0x21, 0x2a, 0x5d, 0x47, 0x1c, 0x5c, 0xe7, 0xb8, 0x78, 0x95, 0xb3, 0x11, 0x13, 0xb3, 0x31, 0x33, 0x4b, 0x65, 0xe2, 0x59, 0x42, 0xd2, 0x8b, 0xa4, 0x54, 0xfa, 0x0a, 0x01, 0xa9, 0x07, 0x09, 0xa5, 0x0f, 0x95, 0xa2, 0xf1, 0xf0, 0x5d, 0xf0, 0x09, 0x5c, 0x2b, 0x02, 0x16, 0x56, 0x53, 0x56, 0x36, 0xb3, 0x8a, 0x4d, 0x4a, 0xda, 0x9b, 0xb4, 0x8c, 0xf7, 0x4a, 0xc6, 0x00, 0x1a, 0xc6, 0x10, 0x06, 0x36, 0x1d, 0x11, 0xba, 0x29, 0x11, 0xb9, 0x2b, 0x13, 0xa7, 0x0f, 0x76, 0x73, 0x76, 0x0e, 0x0b, 0x8e, 0x8a, 0x53, 0xd6, 0x87, 0xac, 0x9c, 0x4f, 0xb9, 0x4a, 0x1e, 0x16, 0xce, 0x18, 0x0e, 0xde, 0xa4, 0x82, 0x57, 0x21, 0xf1, 0x54, 0x25, 0xf5, 0x4a, 0xa5, 0x96, 0x9c, 0x5c, 0x56, 0x5c, 0xdc, 0xd6, 0xa9, 0xdb, 0x97, 0xbc, 0x82, 0x6f, 0x05, 0xc5, 0xca, 0x0f, 0xc2, 0x61, 0xa6, 0x9c, 0xbb, 0x76, 0xee, 0xda, 0xa5, 0xaf, 0x34, 0xf8, 0xe3, 0x69, 0x36, 0x40, 0x35, 0xa0, 0x36, 0x10, 0x34, 0x50, 0xf7, 0x76, 0x3b, 0xa0, 0x33, 0x10, 0x31, 0x00, 0x31, 0xc0, 0xf2, 0xd6, 0x30, 0xf0, 0x68, 0x00, 0x6e, 0x80, 0x6b, 0xc0, 0xec, 0x6d, 0x72, 0xa0, 0x67, 0xe0, 0x62, 0x60, 0x6a, 0xe0, 0xcd, 0x5b, 0xcc, 0x80, 0xd0, 0x80, 0xdd, 0xed, 0x00 };
 
 // Reference-encoder vectors (brotli CLI, quality 5). The random vector
-// reproduces the generator inline; the concatenated pair checks the
-// multi-stream loop.
+// reproduces the generator inline; the concatenated pair checks the multi-stream loop.
 test "brotli decodes reference vectors" {
     const allocator = std.testing.allocator;
     const text = pseudoText();
@@ -1184,8 +1125,8 @@ fn checkVector(allocator: std.mem.Allocator, encoded: []const u8, expected: []co
     try std.testing.expectEqualSlices(u8, expected, output[0..n]);
 }
 
-// The adapter asks decodedSize first and then decodes into the exact sink;
-// the two runs share a scratch and must both succeed.
+// The adapter asks decodedSize first and then decodes into the exact
+// sink; both runs share one scratch.
 test "brotli decodedSize then exact decode" {
     const allocator = std.testing.allocator;
     const text = pseudoText();
@@ -1260,8 +1201,6 @@ test "brotli decode exact-size output" {
     try std.testing.expectEqualSlices(u8, &text, output);
 }
 
-// ---------------------------------------------------- static dictionary (RFC 8)
-
 fn ferment(word: []u8, pos: usize) usize {
     // RFC 8 Ferment: UTF-8 aware case toggle.
     if (word[pos] < 192) {
@@ -1286,9 +1225,8 @@ fn fermentAll(word: []u8) void {
 }
 
 fn poolString(offset: usize) []const u8 {
-    // The pool is the vendor length-prefixed pool verbatim: map[offset]
-    // points at a length byte, followed by that many string bytes
-    // (transform.c kPrefixSuffix; entry 49 is the trailing 0x00 = empty).
+    // Vendor length-prefixed pool verbatim (transform.c kPrefixSuffix):
+    // a length byte, then that many string bytes; entry 49 is empty.
     const start: usize = dictionary.prefix_suffix_map[offset];
     const len: usize = dictionary.prefix_suffix[start];
     return dictionary.prefix_suffix[start + 1 ..][0..len];
@@ -1362,12 +1300,8 @@ fn copyDictionaryWord(
     return total;
 }
 
-// ---------------------------------------------------------------- incremental
-
-// Refillable LSB-first bit reader over the caller's input window. The
-// accumulator keeps live bits across step boundaries; when it cannot supply
-// the requested width the decoder reports need_input and resumes from the
-// same bit position once more input arrives.
+// Refillable LSB-first reader; live accumulator bits survive runs;
+// starvation returns NeedInput and resumes at the same bit position.
 const RefillReader = struct {
     data: []const u8 = &.{},
     pos: usize = 0,
@@ -1423,9 +1357,8 @@ const RefillReader = struct {
         return @intCast(try self.readBits(1));
     }
 
-    // RFC 9.2: fill bits to the next byte boundary must be zero. Only the
-    // bits already accumulated are checked; an empty accumulator has no
-    // fill bits to validate.
+    // RFC 9.2: fill bits must be zero; an empty accumulator has none to
+    // check yet.
     fn alignToByte(self: *RefillReader) Status!void {
         const rem: u6 = self.nbits & 7;
         if (rem != 0) {
@@ -1556,10 +1489,8 @@ pub const IncRunResult = struct {
     status: enum { open, done } = .open,
 };
 
-// Windowed streaming brotli decode. History lives in a power-of-two ring
-// (so distance lookups never cross the stream boundary), output drains
-// through a caller-provided span, and every phase can suspend on input
-// starvation or a full output span and resume transparently.
+// Streaming decode over a power-of-two history ring; every phase
+// suspends on input starvation or a full output span and resumes.
 pub const Incremental = struct {
     br: RefillReader = .{},
     sc: Scratch = undefined,
@@ -1653,9 +1584,8 @@ pub const Incremental = struct {
         self.out = output;
         self.out_len = 0;
         self.end_of_input = end_of_input;
-        // Leftover accumulator bits from the previous window stay live in
-        // the reader; the caller drops every byte the reader loaded this
-        // run (consumed == pos) and feeds only fresh bytes next call.
+        // Accumulator bits from the previous run stay live; consumed ==
+        // pos, so the next run feeds only fresh bytes.
         self.br.data = input;
         self.br.pos = 0;
 
@@ -1696,9 +1626,7 @@ pub const Incremental = struct {
     }
 
     fn stWbits(self: *Incremental) Status!void {
-        // Large-window and standard forms share the leading bit grammar;
-        // the incremental form mirrors readWbits exactly. Each step is a
-        // separate suspension point.
+        // Mirrors readWbits; each step is its own suspension point.
         var wbits: u32 = 16;
         switch (self.wb_step) {
             0 => {
@@ -1761,9 +1689,8 @@ pub const Incremental = struct {
     }
 
     fn stMetablockHeader(self: *Incremental) Status!void {
-        // Stepwise so a starved run resumes mid-header: 0 = ISLAST,
-        // 1 = ISLASTEMPTY (only when ISLAST), 2 = MNIB, 3.. = metadata
-        // sub-reads, 6 = MLEN, 7 = ISUNCOMPRESSED.
+        // mb_step: 0 = ISLAST, 1 = ISLASTEMPTY, 2 = MNIBBLES, 3..5 =
+        // metadata, 6 = MLEN, 7 = ISUNCOMPRESSED.
         switch (self.mb_step) {
             0 => {
                 self.sc.trees_used = 0;
@@ -2000,8 +1927,8 @@ pub const Incremental = struct {
         self.state = .context_maps;
     }
 
-    // cm_stage: 0 = context modes, 1 = NTREESL + literal map,
-    // 2 = NTREESD + distance map.
+    // cm_stage: 0 = context modes, 1 = NTREESL, 2 = literal map,
+    // 3 = NTREESD, 4 = distance map.
     fn stContextMaps(self: *Incremental) Status!void {
         if (self.cm_stage == 0) {
             while (self.ctx_i < self.cats[0].num_types) {
@@ -2010,7 +1937,7 @@ pub const Incremental = struct {
             }
             self.cm_stage = 1;
         }
-        // ntreesl / cmapl / ntreesd / cmapd are separate stages so a
+        // The ntreesl, cmapl, ntreesd and cmapd stages stay separate so a
         // suspended context map never re-reads the tree count.
         if (self.cm_stage == 1) {
             self.ntreesl = try self.readBlockCountInc();
@@ -2019,7 +1946,7 @@ pub const Incremental = struct {
         if (self.cm_stage == 2) {
             if (self.ntreesl >= 2) {
                 try self.readContextMapInc(self.sc.cmapl[0 .. 64 * @as(usize, self.cats[0].num_types)], self.ntreesl);
-                if (self.cm.phase != .done) return; // suspended mid-map
+                if (self.cm.phase != .done) return; // Suspended mid-map.
             } else {
                 @memset(self.sc.cmapl[0 .. 64 * @as(usize, self.cats[0].num_types)], 0);
             }
@@ -2104,16 +2031,12 @@ pub const Incremental = struct {
     // Resumable prefix-code reader; mirrors readPrefixCode. Callers leave
     // self.tr.phase != .idle to resume a suspended read.
     fn readTree(self: *Incremental, alphabet: usize, limit: usize) Status!*HufTable {
-        // A completed tree leaves .done; the next read starts fresh. The
-        // result table is allocated exactly once per tree, up front, so
-        // suspension resumes never double-advance the scratch pool.
-        // init_step splits the selector reads so a starved run never
-        // re-reads an already-consumed selector.
+        // Allocate the result table once, up front: resumes never
+        // double-advance the scratch pool or re-read a selector.
         if (self.tr.phase == .done) self.tr = .{};
         if (self.tr.init_step == 0 and self.tr.phase == .idle) {
-            // Allocate by the limit, not the max: the large-window distance
-            // alphabet max reaches 1128 symbols (past the 704-symbol pool
-            // stride) while the limit stays <= 544.
+            // The large-window max (1128 symbols) overruns the 704-symbol
+            // pool stride; allocate by the limit, which never exceeds 544.
             const rt = try self.sc.allocTree(limit);
             self.tr = .{
                 .alphabet = alphabet,
@@ -2151,7 +2074,7 @@ pub const Incremental = struct {
             .done => return self.tr.result.?,
         }
         if (self.tr.phase == .done) return self.tr.result.?;
-        return error.NeedInput; // a sub-phase suspended
+        return error.NeedInput; // A sub-phase suspended.
     }
 
     fn treeClCode(self: *Incremental) Status!void {
@@ -2453,8 +2376,7 @@ pub const Incremental = struct {
                     while (self.cmd.lits_done < self.cmd.ins_len) {
                         if (self.cmd.lit_pending == null) {
                             // Starting a new literal: block switch, context
-                            // id and the tree walk all complete before the
-                            // emit can suspend.
+                            // ID and tree walk complete before the emit suspends.
                             if (lit.num_types >= 2) {
                                 if (!self.cmd.lit_sw_pending and lit.count == 0) {
                                     try self.readTypeInc(lit);
@@ -2524,7 +2446,10 @@ pub const Incremental = struct {
                             push_ring = true;
                         } else {
                             const dc: u32 = dcode - self.ndirect - 16;
-                            const ndistbits: u6 = @intCast(1 + (dc >> (self.npostfix + 1)));
+                            // Same wire-derived width guard as the one-shot
+                            // decoder: beyond 31 bits no distance exists.
+                            const ndistbits: u6 = std.math.cast(u6, 1 + (dc >> (self.npostfix + 1))) orelse return error.DataException;
+                            if (ndistbits > 31) return error.DataException;
                             const dextra = try self.br.readBits(ndistbits);
                             self.cmd.dcode_pending = null;
                             const hcode = dc >> self.npostfix;
@@ -2541,9 +2466,8 @@ pub const Incremental = struct {
                 .dist_extra => {
                     const max_backward = @min(self.window_size, self.stream_produced + self.dict.len);
                     if (self.cmd.distance > max_backward) {
-                        // Static dictionary reference. Build the transformed
-                        // word first (no input consumed), bound-check, then
-                        // emit with drain suspension.
+                        // Static dictionary reference: build and bound-check the
+                        // word first (no input consumed), then emit with drain suspension.
                         self.cmd.word_len = try self.buildDictionaryWord(self.cmd.copy_len, self.cmd.distance, max_backward);
                         if (self.mb_pos + self.cmd.word_len > self.mlen) return error.DataException;
                         self.cmd.word_off = 0;
@@ -2564,15 +2488,8 @@ pub const Incremental = struct {
                             self.cmd.copy_from_dict = 0;
                         }
                         self.cmd.copy_remaining = self.cmd.copy_len - self.cmd.copy_from_dict;
-                        // Guarded source position. A pure-dictionary copy
-                        // (copy_remaining == 0) never reads the ring, so no
-                        // source is computed: ring_pos - distance would
-                        // underflow at the stream start (ring_pos <
-                        // distance). A spanning copy starts reading where
-                        // the stream begins, ring_pos - in_stream, which the
-                        // guarded form yields exactly:
-                        // ring_pos + copy_from_dict - distance with
-                        // copy_from_dict == distance - in_stream.
+                        // Pure-dictionary copies skip the ring source
+                        // (ring_pos - distance underflows); spanning copies start at ring_pos - in_stream.
                         if (self.cmd.copy_remaining > 0) {
                             self.cmd.copy_src_pos = self.ring_pos + self.cmd.copy_from_dict - self.cmd.distance;
                         } else {
@@ -2681,10 +2598,8 @@ pub const Incremental = struct {
             // concatenated stream may still arrive.
             return error.NeedInput;
         }
-        // Match the one-shot loop: another stream header is attempted
-        // immediately; garbage fails there per the format rules. This also
-        // keeps run boundaries making progress when the accumulator is
-        // full, since stream-end yields would otherwise spin.
+        // Attempt the next stream header immediately, as the one-shot
+        // loop does; garbage fails per the format rules.
         self.wb_step = 0;
         self.mb_step = 0;
         self.state = .wbits;
@@ -2776,7 +2691,7 @@ const Command = struct {
     ins_bits: u8,
     copy_extra: u32,
     copy_bits: u8,
-    dcode: u16, // 0xFFFF = implicit distance 0 (no distance symbol emitted)
+    dcode: u16, // 0xFFFF = implicit distance 0 (no distance symbol emitted).
     dextra: u32,
     d_bits: u8,
     lit_start: u32,
@@ -2929,7 +2844,6 @@ fn writePrefixCode(bw: *BitWriter, lens: []u8, alphabet: usize) EncodeError!bool
     // Complex form.
     if (lens[alphabet - 1] == lens[0]) {
         // One-length alphabets fail the Kraft check in the cl code.
-        // One symbol moves up a level; two move down.
         const l0 = lens[0];
         const all_equal = for (lens[0..alphabet]) |l| {
             if (l != l0) break false;
@@ -2946,7 +2860,7 @@ fn writePrefixCode(bw: *BitWriter, lens: []u8, alphabet: usize) EncodeError!bool
     huffman.limitedLengths(cl_freq[0..18], cl_lens[0..18], 5);
     var cl_codes: [18]u16 = undefined;
     canonicalCodes(cl_lens[0..18], cl_codes[0..18]);
-    try bw.writeBits(0, 2); // HSKIP 0
+    try bw.writeBits(0, 2); // HSKIP 0.
     var last_order: usize = 17;
     while (last_order > 0 and cl_lens[code_order[last_order]] == 0) last_order -= 1;
     for (0..last_order + 1) |i| try writeCodeLengthLen(bw, cl_lens[code_order[i]]);
@@ -2963,10 +2877,8 @@ fn encodeMetaBlock(bw: *BitWriter, src: []const u8, is_last: bool, ring: *[4]u32
 
     var lit_lens: [256]u8 = undefined;
     var icode_lens: [704]u8 = undefined;
-    // The large-window decoder reads distance simple symbols with the wide
-    // alphabet (BROTLI_DISTANCE_ALPHABET_SIZE with LARGE_MAX_DISTANCE_BITS),
-    // so the emitted tree must use the same width; codes beyond 63 stay
-    // unused (the encoder never emits them).
+    // Distance simple symbols are read at the large-window alphabet
+    // width (vendor LARGE_MAX_DISTANCE_BITS); the emitted tree must match.
     var dcode_lens: [140]u8 = @splat(0);
     var lit_freq: [256]u32 = @splat(0);
     var icode_freq: [704]u32 = @splat(0);
@@ -3001,11 +2913,11 @@ fn encodeMetaBlock(bw: *BitWriter, src: []const u8, is_last: bool, ring: *[4]u32
     try bw.writeBit(0);
     try bw.writeBit(0);
     try bw.writeBit(0);
-    try bw.writeBits(0, 2); // NPOSTFIX
-    try bw.writeBits(0, 4); // NDIRECT
-    try bw.writeBits(0, 2); // context mode LSB6 for the single literal type
-    try bw.writeBit(0); // NTREESL = 1
-    try bw.writeBit(0); // NTREESD = 1
+    try bw.writeBits(0, 2); // NPOSTFIX.
+    try bw.writeBits(0, 4); // NDIRECT.
+    try bw.writeBits(0, 2); // Context mode LSB6 for the single literal type.
+    try bw.writeBit(0); // NTREESL = 1.
+    try bw.writeBit(0); // NTREESD = 1.
     const lit_single = try writePrefixCode(bw, lit_lens[0..256], 256);
     const icode_single = try writePrefixCode(bw, icode_lens[0..704], 704);
     const dcode_single = try writePrefixCode(bw, dcode_lens[0..dist_alphabet], dist_alphabet);
@@ -3033,7 +2945,7 @@ fn encodeMetaBlock(bw: *BitWriter, src: []const u8, is_last: bool, ring: *[4]u32
 fn writeWindowBits(bw: *BitWriter, wbits: u5, large_window: bool) EncodeError!void {
     // Vendor EncodeWindowBits (enc/encode.c), LSB-first.
     if (large_window) {
-        try bw.writeBits(0x11, 8); // 1, n=0, m=1, zero bit
+        try bw.writeBits(0x11, 8); // 1, n=0, m=1, zero bit.
         try bw.writeBits(wbits, 6);
     } else if (wbits == 16) {
         try bw.writeBits(0, 1);
@@ -3070,8 +2982,8 @@ fn encodeBits(input: []const u8, bw: *BitWriter, ws: []u8, options: Options) Enc
     try writeWindowBits(bw, window.wbits, window.large);
     var ring = distance_ring_init;
     if (input.len == 0) {
-        try bw.writeBit(1); // ISLAST
-        try bw.writeBit(1); // ISLASTEMPTY
+        try bw.writeBit(1); // ISLAST.
+        try bw.writeBit(1); // ISLASTEMPTY.
         return;
     }
     var offset: usize = 0;
@@ -3225,9 +3137,8 @@ test "brotli encode roundtrips" {
     try std.testing.expectEqualSlices(u8, &big, output[0..n]);
 }
 
-// Streams hand-assembled bit by bit, then cross-validated against the
-// system brotli CLI before embedding: each one pins a decode path that a
-// round trip through our own encoder cannot reach.
+// Hand-assembled streams cross-validated against the system brotli CLI;
+// each pins a decode path our encoder cannot reach.
 test "brotli decode hand-built vendor validated streams" {
     const allocator = std.testing.allocator;
     const scratch = try allocator.alloc(u8, decode_workspace_size);
@@ -3268,9 +3179,8 @@ test "brotli decode hand-built vendor validated streams" {
     }
 }
 
-// WBITS edge encodings produced by the system brotli CLI: 10 and 17 use
-// the long forms, 16 the single zero bit, and --large_window sets the
-// reserved flag that only the large-window opt-in accepts.
+// CLI-produced WBITS edges: 10 and 17 use long forms, 16 the single zero
+// bit, --large_window the opt-in-only reserved form.
 test "brotli decode wbits acceptance and rejection" {
     const allocator = std.testing.allocator;
     const scratch = try allocator.alloc(u8, decode_workspace_size);
@@ -3305,7 +3215,7 @@ test "brotli large window encode roundtrip" {
     const scratch = try allocator.alloc(u8, encode_workspace_size + decode_workspace_size);
     defer allocator.free(scratch);
     // The window option is a cap: an empty input still picks the smallest
-    // legal window (WBITS 10 in the long form).
+    // legal window (WBITS 10).
     const encoded = try allocator.alloc(u8, 64);
     defer allocator.free(encoded);
     const enc_len = try encode("", encoded, scratch[0..encode_workspace_size], .{ .large_window = true, .window_size = 1 << 25 });
@@ -3314,7 +3224,7 @@ test "brotli large window encode roundtrip" {
     try std.testing.expectEqual(0, try decode(encoded[0..enc_len], encoded[30..50], scratch[encode_workspace_size..], .{}));
 
     // A payload past the 2^24 RFC window forces the large-window header
-    // (marker + reserved zero + 6-bit window size 25) and round-trips.
+    // (window size 25) and round-trips.
     const size = (1 << 24) + 1;
     const big = try allocator.alloc(u8, size);
     defer allocator.free(big);
@@ -3346,8 +3256,8 @@ test "brotli custom dictionary roundtrip and spanning copy" {
     const scratch = try allocator.alloc(u8, encode_workspace_size + decode_workspace_size);
     defer allocator.free(scratch);
     const dict = "0123456789abcdef the quick brown fox jumps over the lazy dog";
-    // The payload begins with a repeat of the dictionary tail and then
-    // crosses into newly produced output: one match spans the boundary.
+    // The payload repeats the dictionary tail, then crosses into new
+    // output: one match spans the boundary.
     const input = "jumps over the lazy dog and jumps over the lazy dog again";
     const bound = encodedSizeBound(input.len);
     const encoded = try allocator.alloc(u8, bound);
@@ -3359,8 +3269,8 @@ test "brotli custom dictionary roundtrip and spanning copy" {
     const n = try decode(encoded[0..enc_len], output, scratch[encode_workspace_size..], .{ .custom_dictionary = dict });
     try std.testing.expectEqual(input.len, n);
     try std.testing.expectEqualSlices(u8, input, output[0..n]);
-    // Without the dictionary the distances reach before position zero and
-    // either mis-decode or fail; they must never read out of bounds.
+    // Without the dictionary the distances reach before position zero;
+    // they must mis-decode or fail, never read out of bounds.
     if (decode(encoded[0..enc_len], output, scratch[encode_workspace_size..], .{})) |m| {
         try std.testing.expect(m != n or !std.mem.eql(u8, input, output[0..m]));
     } else |err| {
@@ -3377,13 +3287,8 @@ test "brotli custom dictionary roundtrip and spanning copy" {
     try std.testing.expectEqualSlices(u8, input2, output[0..n2]);
 }
 
-// Incremental custom-dictionary fixtures. A pure dictionary copy at the
-// stream start has copy_remaining == 0 (the ring source must not be
-// computed: ring_pos - distance underflows), a spanning copy starts reading
-// where the stream begins (ring_pos + copy_from_dict - distance), and a
-// repeated pattern crosses the boundary over and over. Each fixture reuses
-// one workspace across every incrementalInit, the 1-byte-sink counting
-// decode, and the writer path.
+// Fixtures cover pure dictionary copies, spanning copies, and repeated crossings;
+// one workspace serves every incrementalInit, counting decode, and writer path.
 test "brotli incremental custom dictionary fixtures" {
     const allocator = std.testing.allocator;
     const inc_scratch = try allocator.alloc(u8, incrementalWorkspaceSize(.{}));
@@ -3452,10 +3357,8 @@ test "brotli incremental custom dictionary fixtures" {
     }
 }
 
-// Static-dictionary transforms, exercised directly: copy_len 5 words all
-// start at dictionary index 3 ("world"), and word_id / 1024 selects the
-// transform row. Prefixes and suffixes come from the vendor
-// length-prefixed pool, so entry 49 is the empty string.
+// copy_len-5 words all start at dictionary index 3; word_id / 1024
+// selects the transform row; pool entry 49 is empty.
 test "brotli copy dictionary word transforms" {
     var p1: u8 = 0;
     var p2: u8 = 0;
@@ -3507,9 +3410,8 @@ test "brotli incremental matches one-shot across chunkings" {
         try std.testing.expectEqualSlices(u8, oracle[0..n], out[0..res.produced]);
     }
 
-    // A multi-block stream plus a concatenated second stream, exercised
-    // with adversarial (input chunk, output span) combinations including
-    // 1-byte drains, which stress NeedDrain suspension on every emit.
+    // A multi-block stream plus a concatenated second stream, under
+    // adversarial chunk/span grids including 1-byte drains.
     var big: [1 << 17]u8 = undefined;
     var state: u64 = 0x243F6A8885A308D3;
     for (&big) |*b| {
@@ -3569,20 +3471,16 @@ test "brotli incremental matches one-shot across chunkings" {
     try std.testing.expectEqualSlices(u8, oracle[0..n], out_buf[0..produced_final]);
 }
 
-// The large-window NPOSTFIX=3/NDIRECT=120 distance alphabet reaches 1128
-// symbols (past the 704-symbol pool stride) while the valid-symbol limit is
-// 544: vendor BrotliCalculateDistanceCodeLimit(0x7FFFFFFC, 3, 120). Trees
-// are allocated by the limit, symbols are validated against it, and the
-// code-length code must not consume a tree-pool slot.
+// Large-window NPOSTFIX=3/NDIRECT=120: alphabet 1128, valid-symbol limit 544
+// (vendor BrotliCalculateDistanceCodeLimit); the code-length code takes no pool slot.
 test "brotli large window distance code limit" {
     const allocator = std.testing.allocator;
 
     const limit = distanceCodeLimit(0x7FFFFFFC, 3, 120);
     try std.testing.expectEqual(@as(usize, 544), limit.max_alphabet_size);
     try std.testing.expect(limit.max_distance <= 0x7FFFFFFC);
-    // The ndirect=112 neighbour pins the table walk: the last permitted
-    // distance group is fixed by the forbidden distance, while the alphabet
-    // bound tracks ndirect.
+    // The ndirect=112 neighbor pins the table walk: the last group depends
+    // on the forbidden distance, the alphabet bound on ndirect.
     const limit112 = distanceCodeLimit(0x7FFFFFFC, 3, 112);
     try std.testing.expectEqual(@as(usize, 536), limit112.max_alphabet_size);
     const dist_alphabet_max = 16 + 120 + (@as(usize, 124) << 3);
@@ -3593,9 +3491,8 @@ test "brotli large window distance code limit" {
     const last_valid = [_]u8{ 0xF1, 0x21 };
     // Symbol 544, one past the limit.
     const first_invalid = [_]u8{ 0x01, 0x22 };
-    // HSKIP 00, two len-1 code-length-code entries (bits 1110 1110), then
-    // four 1-bit code-length symbols selecting length 2: a complete
-    // 4-symbol complex code.
+    // HSKIP 00, two len-1 code-length-code entries, then four 1-bit
+    // symbols selecting length 2: a complete 4-symbol complex code.
     const complex_bits = [_]u8{ 0xDC, 0x3D };
 
     const one_shot_scratch = try allocator.alloc(u8, decode_workspace_size);
@@ -3626,8 +3523,8 @@ test "brotli large window distance code limit" {
         try std.testing.expectEqual(@as(u32, 4), t.count[2]);
         const want_syms = [_]u16{ 0, 1, 2, 3 };
         try std.testing.expectEqualSlices(u16, &want_syms, t.symbols[0..4]);
-        // One pool tree for each simple code plus one for this complex
-        // result: the code-length code must not consume a pool slot.
+        // One pool tree per simple code plus this complex result: the
+        // code-length code consumes no pool slot.
         try std.testing.expectEqual(@as(usize, 3), sc.trees_used);
     }
 

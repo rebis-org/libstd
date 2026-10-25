@@ -25,9 +25,8 @@ fn zipReadOrdinal0(r: *Runner, archive: []const u8, output: []u8, expected: []co
     }
 }
 
-// The entry's check value, not the CRC, detects a wrong password. A wrong
-// password clears that value once in 65536 attempts for WinZip AES and once
-// in 256 for ZipCrypto, and the CRC then rejects the stream instead.
+// The entry's check value, not the CRC, catches a wrong password.
+// Miss rates: 1/65536 WinZip AES, 1/256 ZipCrypto.
 fn expectWrongPasswordRejected(r: *Runner, diag: *harness.CryptoDiag) !void {
     if (r.status == abi.Status.integrity_failure) {
         if (diag.wrong_password.value_low != 0) return error.WrongPasswordDiagnosticMismatch;
@@ -343,8 +342,8 @@ fn runEncrypted(r: *Runner) anyerror!void {
     var diag3: harness.CryptoDiag = undefined;
     harness.cryptoDiag(&diag3);
     try expectCryptoRejection(r, &sink_buffer, password, harness.cryptoPasswordLifetimeParam(1), entries[0], abi.Status.resource_limit, &diag3, &diag3.password_lifetime);
-    // AES-128 write is a supported mode: the archive must carry strength 1 in
-    // the AE record and round-trip through the decoder.
+    // AES-128 write is a supported mode: the archive must carry strength 1
+    // in the AE record and round-trip.
     var aes128_archive: [4096]u8 = undefined;
     const aes128_size = try zipWriteWithCrypto(r, entries[0], &aes128_archive, password, 1, null, null);
     const aes128_extra = aes128_archive[30 + 5 ..];
@@ -676,8 +675,7 @@ fn runRobust(r: *Runner) anyerror!void {
 }
 
 // The data-descriptor (streaming) shape: bit 3 in both headers, zeroed
-// local sizes, signature plus CRC and sizes after the entry data, and the
-// reference reader agrees on the content.
+// local sizes, a trailing signature plus CRC and sizes.
 fn runDataDescriptor(r: *Runner) anyerror!void {
     setupZip(r);
     corpus.fillTiled(r.corpus_index, &zip_large);

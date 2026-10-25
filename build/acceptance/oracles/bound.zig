@@ -195,9 +195,8 @@ fn runLimitRejects(r: *Runner) anyerror!void {
         if (bound > r.encoded.len) return error.BoundRange;
         const produced = try writeSpan(r, case, input, r.encoded[0..bound], true);
         if (produced > bound) return error.BoundViolated;
-        // A decoded limit between the encoded and decoded sizes must be
-        // rejected before the first decoded byte reaches the sink, whatever
-        // route the hook picks, so the sentinel survives intact.
+        // A decoded limit between the encoded and decoded sizes must reject
+        // before any byte reaches the sink.
         var nodes: [12]harness.Node = undefined;
         var list = harness.NodeList{ .nodes = &nodes };
         list.push(harness.sourceSpan(r.encoded[0..produced]));
@@ -205,9 +204,8 @@ fn runLimitRejects(r: *Runner) anyerror!void {
         list.push(harness.resourceLimitParam(input.len / 2));
         addParams(&list, case);
         try harness.reject(r, harness.ids.read, list.items(), .{ .ctx = true }, abi.Status.resource_limit, r.output);
-        // A limit below the encoded length must classify the read as
-        // resource_limit too: a truncated planning pass answering invalid_data
-        // confuses an over-budget caller with corrupt data.
+        // A limit below the encoded length is resource_limit too;
+        // invalid_data would conflate over-budget with corrupt data.
         if (produced > 1) {
             var over_nodes: [12]harness.Node = undefined;
             var over_list = harness.NodeList{ .nodes = &over_nodes };
@@ -224,7 +222,8 @@ var path_random: [1 << 20]u8 = undefined;
 var path_same: [1 << 20]u8 = undefined;
 var path_period: [1 << 20]u8 = undefined;
 var path_mixed: [8 << 20]u8 = undefined;
-// Debug oracles pay ~1000x on incompressible megabytes (greedy probe plus full DP encode), so the lzma family stays at 64 KiB here.
+// Debug oracles pay ~1000x on incompressible megabytes (greedy probe, full
+// DP encode); lzma stays at 64 KiB here.
 var path_mixed_small: [(1 << 20) + 3 * 64 * 1024]u8 = undefined;
 var zstd_dict: [64 * 1024]u8 = undefined;
 var dict_text: [1 << 20]u8 = undefined;

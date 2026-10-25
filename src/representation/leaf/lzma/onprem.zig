@@ -26,8 +26,8 @@ pub const Properties = struct {
         const packed_pb_lp = properties_byte / 9;
         const pb: u4 = @intCast(packed_pb_lp / 5);
         const lp: u4 = @intCast(packed_pb_lp % 5);
-        // The SDK constraint, enforced at the leaf so direct leaf users are
-        // covered too: larger lc+lp would overflow the probability tables.
+        // The SDK constraint, enforced at the leaf for direct users too:
+        // larger lc+lp would overflow the probability tables.
         if (lc + lp > 4) return error.UnsupportedException;
         return .{
             .lc = lc,
@@ -82,14 +82,14 @@ const pos_decoders_count = 1 + num_full_distances - end_pos_model_index;
 const low_coder_count = 1 << num_pos_bits_max;
 const mid_coder_count = 1 << num_pos_bits_max;
 const literal_probs_count = 0x300;
-// Tables are sized for the lc+lp ceiling, not the opening properties:
-// LZMA2 chunks may switch to a larger lc+lp mid-stream, and the decoder
-// reuses the same carve without reallocating (the SDK reallocates; the
-// ceiling shape avoids that entirely while staying within the lc+lp<=4 bound).
+// Sized for the lc+lp ceiling: LZMA2 chunks may switch to a larger lc+lp
+// mid-stream; the shared carve is never reallocated.
 const max_literal_context_count = 1 << 4;
 
-// No copy fallback: 10 bits per byte covers converged cost plus transient wrongness.
-// Constant absorbs the cache byte, the flush, and the end marker.
+// No copy fallback: 10 bits per byte covers converged cost plus
+// transient wrongness.
+//
+// The constant absorbs the cache byte, the flush, and the end marker.
 pub fn encodedSizeBound(input_len: usize) usize {
     return input_len +| (input_len / 4) +| 64;
 }
@@ -114,7 +114,7 @@ const opt_window = 8192;
 
 const distance_literal: u32 = 0xFFFFFFFF;
 const distance_short_rep: u32 = 0xFFFFFFFE;
-const distance_rep_base: u32 = 0xF0000000; // | rep index. Distance-1 never reaches 2^30.
+const distance_rep_base: u32 = 0xF0000000; // The base ORs with the rep index; distance-1 never reaches 2^30.
 
 const Opt = struct {
     price: u32,
@@ -166,8 +166,8 @@ const ProbTables = struct {
 };
 
 fn probCount(comptime name: []const u8, properties: Properties) usize {
-    // Only the literal table ever depended on properties, and it now always
-    // carries the lc+lp ceiling so mid-stream property changes stay in bounds.
+    // Only the literal table depends on properties; it always carries the
+    // lc+lp ceiling so mid-stream property changes stay in bounds.
     _ = properties;
     if (std.mem.eql(u8, name, "literal_probs")) return literal_probs_count * max_literal_context_count;
     if (std.mem.eql(u8, name, "is_match")) return is_match_count;
@@ -663,8 +663,8 @@ pub fn DecoderOf(comptime slice_input: bool) type {
         dictionary_full: bool,
         // A reset cannot rewind in-place output, so it acts as a distance validation floor.
         dictionary_floor: u32,
-        // Position within the stream, mod 2^32 per the format; decoded is the
-        // exact output count so sizes survive 4 GiB without wrap.
+        // Position within the stream, mod 2^32 per the format; decoded counts
+        // exactly so sizes survive 4 GiB.
         total_pos: u32,
         decoded: u64,
         range_coder: RC,
@@ -849,9 +849,8 @@ pub fn DecoderOf(comptime slice_input: bool) type {
         }
 
         pub fn feedByte(self: *Self, byte: u8) Exception!void {
-            // In-place output is the caller's buffer and does not wrap: the
-            // LZMA2 copy-block path can outrun it across chunks, so the
-            // capacity check putByte carries applies here too.
+            // In-place output is the caller's buffer and must not wrap; the
+            // LZMA2 copy block can outrun it, so check capacity.
             if (!self.clear_dictionary and self.dictionary_pos >= self.dictionary.len) return error.CapacityException;
             self.dictionary[self.dictionary_pos] = byte;
             self.dictionary_pos += 1;
@@ -881,8 +880,7 @@ pub fn DecoderOf(comptime slice_input: bool) type {
                         if (remaining_count.* == 0) {
                             if (!marker_required) {
                                 // Size-only commit: the declared unpack size is
-                                // the authority; the coder's finish state adds no
-                                // signal, so both former arms collapsed here.
+                                // the authority; the coder's finish state adds no signal.
                                 try self.finishOutput();
                                 return;
                             }
@@ -894,9 +892,8 @@ pub fn DecoderOf(comptime slice_input: bool) type {
                         prev_byte = try self.decodeLiteral(&range_coder, prev_byte);
                         self.state = updateStateLiteral(self.state);
                         if (remaining) |*remaining_count| {
-                            // With a marker required, a literal past the
-                            // declared size is corruption, and decrementing
-                            // past zero would wrap the counter.
+                            // With a marker required, a literal past the declared size is corruption, and
+                            // decrementing past zero would wrap the counter.
                             if (remaining_count.* == 0) return error.DataException;
                             remaining_count.* -= 1;
                         }
@@ -927,8 +924,7 @@ pub fn DecoderOf(comptime slice_input: bool) type {
                                 if (!self.isDistanceValid(self.rep0)) return error.DataException;
                                 if (remaining) |*remaining_count| {
                                     // A short rep past the declared size is corruption
-                                    // for the same reason as a literal: the decrement
-                                    // would wrap the counter.
+                                    // like a literal: the decrement would wrap the counter.
                                     if (remaining_count.* == 0) return error.DataException;
                                     remaining_count.* -= 1;
                                 }
@@ -982,8 +978,7 @@ pub fn DecoderOf(comptime slice_input: bool) type {
                         if (remaining_count.* == 0) {
                             if (!marker_required) {
                                 // Size-only commit: the declared unpack size is
-                                // the authority; the coder's finish state adds no
-                                // signal, so both former arms collapsed here.
+                                // the authority; the coder's finish state adds no signal.
                                 try self.finishOutput();
                                 return;
                             }
@@ -995,9 +990,8 @@ pub fn DecoderOf(comptime slice_input: bool) type {
                         prev_byte = try self.decodeLiteral(&self.range_coder, prev_byte);
                         self.state = updateStateLiteral(self.state);
                         if (remaining) |*remaining_count| {
-                            // With a marker required, a literal past the
-                            // declared size is corruption, and decrementing
-                            // past zero would wrap the counter.
+                            // With a marker required, a literal past the declared size is corruption, and
+                            // decrementing past zero would wrap the counter.
                             if (remaining_count.* == 0) return error.DataException;
                             remaining_count.* -= 1;
                         }
@@ -1028,8 +1022,7 @@ pub fn DecoderOf(comptime slice_input: bool) type {
                                 if (!self.isDistanceValid(self.rep0)) return error.DataException;
                                 if (remaining) |*remaining_count| {
                                     // A short rep past the declared size is corruption
-                                    // for the same reason as a literal: the decrement
-                                    // would wrap the counter.
+                                    // like a literal: the decrement would wrap the counter.
                                     if (remaining_count.* == 0) return error.DataException;
                                     remaining_count.* -= 1;
                                 }
@@ -1208,9 +1201,8 @@ pub fn DecoderOf(comptime slice_input: bool) type {
             self.total_pos +%= 1;
             self.decoded += 1;
             if (self.dictionary_pos == self.dictionary.len) {
-                // Only the ring buffer wraps. In-place output is the caller's
-                // buffer: wrapping would rewind onto decoded bytes and let
-                // distances reach before the buffer, so it must not.
+                // Only the ring buffer wraps; wrapping in-place output would
+                // rewind onto decoded bytes and admit distances before the buffer.
                 if (self.clear_dictionary) {
                     self.dictionary_pos = 0;
                     self.dictionary_full = true;
@@ -1250,8 +1242,7 @@ pub fn DecoderOf(comptime slice_input: bool) type {
             // A 0-based distance reaches distance + 1 bytes back. An in-place match must not cross the reset floor.
             if (!self.clear_dictionary) {
                 // Short-circuit before the subtraction: a mid-stream reset can
-                // leave the floor above the position, and the wrapping
-                // subtraction would pass every distance.
+                // leave the floor above the position; the wrap would pass every distance.
                 return self.dictionary_pos > self.dictionary_floor and distance < self.dictionary_pos - self.dictionary_floor;
             }
             return distance < self.dictionary_pos or self.dictionary_full;
@@ -1396,8 +1387,8 @@ pub fn requiredSize(input: []const u8, scratch: []u8, options: Options) Exceptio
     return measurement.measuredLength(&counter);
 }
 
-// Greedy live-model pass for the LZMA2 probe. The dictionary clamps to the chunk size so clears scale with the chunk.
-// Calibration is documented at the lzma2 probe.
+// Greedy live-model pass; the lzma2 probe documents its calibration.
+// The dictionary clamps to the chunk size so clears scale.
 pub fn estimatedSize(input: []const u8, scratch: []u8, options: Options) Exception!usize {
     var properties = options.properties;
     if (input.len < properties.dictionary_size) {
@@ -1785,9 +1776,8 @@ pub const Encoder = struct {
         return price + lengthLivePrice(self.rep_len_choice, self.rep_len_low, self.rep_len_mid, self.rep_len_high, position_state, raw_length);
     }
 
-    // Insert-only: covered positions feed the tables without a chain walk, so
-    // later walks can still offer them. Mirrors the insert side of
-    // btFindMatches plus the hash2/hash3 upkeep in shortMatches.
+    // Insert-only: covered positions feed the tables without a chain walk,
+    // so later walks still offer them.
     fn insertSkipped(self: *Encoder, position: usize, length: usize) void {
         var cursor = position + 1;
         const span_end = position + length;
@@ -1813,10 +1803,8 @@ pub const Encoder = struct {
         }
     }
 
-    // Tree-only descent for a covered position: links it into left/right so
-    // future btFindMatches walks can descend through it. Depth-bounded like
-    // the search; a cut just leaf-splices the subtree, which only forfeits
-    // some future candidates, never correctness.
+    // Tree-only descent for a covered position: links it into left/right
+    // for future walks; a cut only forfeits candidates, never correctness.
     fn btInsert(self: *Encoder, position: usize) void {
         const abs_pos = self.input_base + position;
         if (abs_pos >= std.math.maxInt(u32)) return;
@@ -2097,7 +2085,7 @@ pub const Encoder = struct {
                 for (matches[0..count]) |match_pair| {
                     const clipped_length = @min(@as(usize, match_pair.length), window_length - i);
                     // A tail scan can lead with a length-1 entry; skipping it keeps
-                    // the strictly-increasing break valid for the entries behind it.
+                    // the strictly-increasing break valid behind it.
                     if (clipped_length < match_min_len) continue;
                     if (clipped_length <= previous_length) break;
                     var next_distances: [4]u32 = .{ match_pair.distance - 1, node.rep_distances[0], node.rep_distances[1], node.rep_distances[2] };
@@ -2322,8 +2310,8 @@ pub const Encoder = struct {
         return self.hcFindMatches(position, matches);
     }
 
-    // A walk records only byte-compared lengths, so the entries need no re-verification.
-    // The side tables cover the sub-4-byte matches the main index cannot pair.
+    // A walk records byte-compared lengths, so entries need no re-verification;
+    // side tables cover sub-4-byte matches the main index cannot pair.
     fn shortMatches(self: *Encoder, position: usize, matches: []MatchPair) usize {
         const abs_pos = self.input_base + position;
         if (abs_pos >= std.math.maxInt(u32)) return 0;
@@ -2633,9 +2621,8 @@ test "lzma bt4 honors nice_len and still roundtrips" {
 }
 
 test "lzma short rep past declared size is a data error" {
-    // A stream that emits one literal and then a short rep at the size
-    // boundary must report corruption, not wrap the unpack-size counter
-    // into a capacity error or a silent overrun.
+    // A stream emitting a literal then a short rep at the size boundary
+    // must report corruption, not wrap the counter.
     var crafted: [32]u8 = undefined;
     var dest = std.Io.Writer.fixed(&crafted);
     var range_coder = RangeEncoder.init(&dest);

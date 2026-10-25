@@ -144,10 +144,8 @@ fn decodeInner(input: []const u8, output: []u8, count_only: bool) Exception!usiz
     var t: usize = try takeToken(input, &ip);
     var phase: Phase = .literal;
 
-    // A first token above 17 opens a literal run without the usual length
-    // encoding. Runs of one to three literals join the match chain directly
-    // (the reference decoder's match_next path); longer runs take the
-    // after-literal M1 instead.
+    // A first token above 17 opens an implicit-length literal run; short runs
+    // join the match chain, longer ones take M1.
     if (t > 17) {
         const short_run = t < 21;
         t -= 17;
@@ -207,7 +205,7 @@ fn decodeInner(input: []const u8, output: []u8, count_only: bool) Exception!usiz
             try copyMatch(output, &op, op - off, len + 2, count_only);
             t = input[ip - 2] & 3;
         } else if (t >= 16) {
-            // M4 widens the offset by 8 KiB via the third token bit.
+            // M4 widens the offset by 16 KiB via the third token bit.
             // A computed offset of zero terminates the stream.
             var len = t & 7;
             if (len == 0) len = try readExtended(input, &ip, 7);
@@ -262,10 +260,7 @@ test "lzo1x decompresses reference fixtures" {
 }
 
 // LZO1X-1, ported from the reference greedy matcher in vendor/lzo
-// (src/lzo1x_c.ch). A 14-bit hash over little-endian words feeds a u16
-// offset dictionary. Matches encode as M2 short forms, M3 within 0x4000,
-// or M4 with the 0x4000 bias. Chunks cap at 49152 bytes so every offset
-// stays encodable.
+// (src/lzo1x_c.ch). Chunks cap at 49152 bytes so every offset stays encodable.
 
 const m2_max_len: usize = 8;
 const m3_max_offset: usize = 0x4000;
@@ -382,7 +377,7 @@ fn compressChunk(e: *Encoder, input: []const u8, start: usize, len: usize, carry
         e.dict[dindex] = @intCast(ip - start);
         const m_pos = start + prev_off;
         if (prev_off == 0 or dv != load32(input, m_pos) or ip - m_pos > 0xBFFF) {
-            // Acceleration: advance one extra position per literal step.
+            // Acceleration: advance one extra position per 32 bytes without a match.
             ip += 1 + ((ip - ii) >> 5);
             continue;
         }
@@ -457,9 +452,8 @@ test "lzo1x roundtrips reference fixtures" {
 }
 
 test "lzo1x decodes reference short literal runs" {
-    // Streams opening with 18..20 hold one to three literals, then join the
-    // match chain directly (the reference decoder's match_next path). The
-    // expected outputs are pinned by vendor/lzo minilzo behavior.
+    // Streams opening with 18..20 join the match chain after up to three
+    // literals; outputs are pinned by vendor/lzo minilzo behavior.
     const cases = [_]struct { stream: []const u8, plain: []const u8 }{
         .{ .stream = &.{ 0x12, 'X', 0x00, 0x00, 0x11, 0x00, 0x00 }, .plain = "XXX" },
         .{ .stream = &.{ 0x13, 'X', 'Y', 0x00, 0x00, 0x11, 0x00, 0x00 }, .plain = "XYYY" },

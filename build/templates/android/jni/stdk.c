@@ -1,6 +1,7 @@
 /* JNI bridge for the dev.stdk.StdK bindings. */
 /* Kept out of the host library so the export surface stays enumerated. */
-/* The session handle is caller-owned storage; the bridge frees it on destroy. */
+/* The session handle is caller-owned storage; the bridge frees it only */
+/* on the explicit free call. */
 #include <jni.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -39,7 +40,6 @@ static void releaseUtf8(JNIEnv *env, jstring value, const char *chars)
 		(*env)->ReleaseStringUTFChars(env, value, chars);
 	}
 }
-/* Throws IllegalArgumentException with the given message. */
 static void throwIllegalArg(JNIEnv *env, const char *message)
 {
 	(*env)->ThrowNew(
@@ -48,9 +48,8 @@ static void throwIllegalArg(JNIEnv *env, const char *message)
 		message);
 }
 
-/* Rejects negative lengths and lengths past the real array extent before any */
-/* pointer is handed to the native engine: a negative jint widens to a huge */
-/* u64 in the engine and would read or write out of bounds. */
+/* Rejects negative lengths: a negative jint widens to a huge u64 in */
+/* the engine and accesses out of bounds. */
 static jint checkedLen(JNIEnv *env, jbyteArray array, jint len,
 		       const char *what)
 {
@@ -219,8 +218,8 @@ JNIEXPORT jint JNICALL Java_dev_stdk_StdK_nativeSessionDestroy(JNIEnv *env,
 	return (jint)stdk_session_destroy(session_ptr);
 }
 
-/* Frees storage obtained from sessionCreate. Java must never pass a foreign or */
-/* already-freed pointer; the class tracks live handles and nulls them on free. */
+/* Frees storage from sessionCreate; a foreign or already-freed pointer */
+/* corrupts the heap. */
 JNIEXPORT void JNICALL Java_dev_stdk_StdK_nativeSessionFree(JNIEnv *env,
 							    jclass cls,
 							    jlong storage)

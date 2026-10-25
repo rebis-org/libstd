@@ -25,6 +25,7 @@ const zstd = @import("zstd.zig");
 
 // Suites derive from the component table; removing a descriptor removes
 // its suite with no central edits.
+//
 // Harness constants duplicate the table for build-side convenience;
 // descriptors stay authoritative, drift fails the build.
 comptime {
@@ -91,9 +92,8 @@ const format_groups = format_block: {
         components: []const []const u8,
         scenarios: []const harness.Scenario,
     };
-    // Component keys use frozen descriptor identity ("lzma-file", "sevenzip").
-    // profiles, benchmark rows, and suite labels use the released stems
-    // ("lzma_file", "seven_zip"). Do not unify the spellings.
+    // Component keys use frozen descriptor identity; profiles, benchmark
+    // rows, and suite labels use released stems. Do not unify.
     const mapping = [_]Group{
         .{ .components = &.{ "deflate", "gzip", "bzip2" }, .scenarios = &transform.scenarios },
         .{ .components = &.{"deflate"}, .scenarios = &inflate.scenarios },

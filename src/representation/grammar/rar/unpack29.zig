@@ -53,8 +53,7 @@ const short_distance_bits = [8]u5{ 2, 2, 3, 4, 5, 6, 6, 6 };
 // How many times a repeated low distance may be reused (LOW_DIST_REP_COUNT).
 const low_dist_rep_count: u32 = 16;
 
-// DDecode/DBits: the width keeps growing through the last group, so the top
-// slots carry 17-18 extra bits. Saturate the width at 16 and they decode wrong.
+// DDecode/DBits: widths keep growing through the last group, so saturation at 16 breaks the top slots.
 const d_bit_length_counts = [_]u32{ 4, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 14, 0, 12 };
 
 const dist_tables = blk: {
@@ -78,8 +77,7 @@ const dist_tables = blk: {
 const dist_decode = dist_tables.decode;
 const dist_bits = dist_tables.bits;
 
-// LDecode holds no folded constant: a new match (symbol >= 271) adds +3 and a
-// rep-distance match (259..262) adds +2, so callers add their own base.
+// LDecode holds no folded constant: new matches add +3, rep matches +2.
 const length_bases = [rc]u32{
     0,   1,   2,   3,   4,  5,  6,  7,
     8,   10,  12,  14,  16, 20, 24, 28,
@@ -100,8 +98,7 @@ const length_extra_bits = [rc]u5{
 const BlockMode = enum { lz, ppm_mode };
 
 pub const Unpacker = struct {
-    // By value: bit input restarts per entry, including for solid entries, so a
-    // pointer would have to stay parked between files.
+    // By value: bit input restarts per entry, solid ones included, so a pointer would park between files.
     provider: checksum.Provider,
     br: BitReader,
     window: Window,
@@ -115,33 +112,30 @@ pub const Unpacker = struct {
     written_size: u64,
     block_mode: BlockMode,
     tables_loaded: bool,
-    // Each block encodes code lengths as a 4-bit DELTA against this table, so it must
-    // persist across readTables calls; bit 0x4000 keeps it, otherwise it is zeroed.
+    // Each block encodes code lengths as a 4-bit delta against this table, so it must
+    // persist across readTables calls.
     old_table: [total_code_lengths]u8,
     // Set when a filter program matched one of the six standard filters.
     filter_seen: rarvm.StandardFilter,
-    // Set when a filter program is not one of the six: the transform cannot be
-    // reproduced, so report the output unverifiable instead of unfiltered.
+    // Set when a filter program is not one of the six, so the output is unverifiable.
     unsupported_filter_seen: bool,
     // PrevLowDist / LowDistRepCount: reset at each table read.
     prev_low_dist: u32,
     low_dist_rep_count: u32,
-    // A program is transmitted only on a position's first use, so the identified
-    // type must persist across later invocations of that position.
+    // A program is transmitted only on a position's first use, so its type must persist.
     filter_types: [max_filters]rarvm.StandardFilter,
     filter_count: u32,
     last_filter: u32,
     old_filter_lengths: [max_filters]u32,
     pending: []PendingFilter,
     pending_count: usize,
-    // Holding an entry entirely in the window caps it at the dictionary size, so
-    // entries larger than the window must flush continuously.
+    // An entry held entirely in the window is capped at the dictionary size, so larger
+    // entries flush continuously.
     stream_out: ?Sink,
     entry_start: usize,
     flushed: usize,
     flush_threshold: usize,
-    // The model persists across blocks and solid files, and only the reset bit
-    // rebuilds it. The escape byte resets to 2 at each entry start.
+    // The model persists across blocks and solid files; only the reset bit rebuilds it.
     ppm_model: ?PpmModel,
     ppm_heap: []u8,
     ppm_esc_char: u8,
@@ -195,8 +189,8 @@ pub const Unpacker = struct {
         };
     }
 
-    // A non-solid entry discards inherited tables without tearing down the window
-    // or the PPM model, so the table release stays separate from the full reset.
+    // A non-solid entry discards inherited tables but keeps the window and PPM model,
+    // so this stays separate from reset.
     pub fn freeTables(st: *Unpacker) void {
         st.mc = .{};
         st.dc_t = .{};
@@ -210,12 +204,11 @@ pub const Unpacker = struct {
 
         st.br.alignByte();
 
-        // Peek 16 bits but consume 2, because a peek that consumes fewer bits shifts
-        // the rest of the stream and every later symbol decodes as garbage.
+        // Peek 16 bits but consume 2, or the stream shifts and every later symbol decodes as garbage.
         const bit_field = try st.br.peekBits(16);
         if (bit_field & 0x8000 != 0) {
-            // Consume nothing, because the first model character reads the same
-            // byte, so any bit consumed here desynchronises the PPM stream.
+            // Consume nothing, because the first model character reads the same byte; any bit
+            // consumed here desynchronizes the PPM stream.
             st.block_mode = .ppm_mode;
             if (st.ppm_model == null) {
                 st.ppm_model = PpmModel.init();
@@ -308,8 +301,8 @@ pub const Unpacker = struct {
     }
 
     fn addVMCode(st: *Unpacker, first_byte: u32, code: []const u8) Exception!void {
-        // RarVM::ReadData peeks 16 bits and consumes as few as 6, so a 7-byte
-        // record overruns the buffer mid-read; zero padding makes that harmless.
+        // RarVM::ReadData peeks 16 bits but consumes as few as 6, so padding absorbs the
+        // lookahead past the code.
         var padded: [max_vm_code_size + 8]u8 = undefined;
         @memcpy(padded[0..code.len], code);
         @memset(padded[code.len .. code.len + 8], 0);
@@ -348,8 +341,8 @@ pub const Unpacker = struct {
         }
         const block_length = st.old_filter_lengths[filt_pos];
 
-        // R[4] carries the block length and R[0] the channel count for the delta and
-        // audio filters; both come from the optional-parameter block.
+        // R[4] carries the block length and R[0] the channel count; both come from the
+        // optional-parameter block.
         var init_r: [7]u32 = @splat(0);
         init_r[4] = block_length;
         if (first_byte & 0x10 != 0) {
@@ -413,8 +406,8 @@ pub const Unpacker = struct {
 
         if (table_bits > 0) {
             if (slot > 9) {
-                // A wide distance takes its high part from the bitstream and its low 4
-                // bits from the LDC table, because consecutive matches share them.
+                // A wide distance takes high bits from the stream and low 4 from the LDC table,
+                // which consecutive matches share.
                 if (table_bits > 4) {
                     const high = try st.br.readBits(table_bits - 4);
                     distance += high << 4;
@@ -461,16 +454,14 @@ pub const Unpacker = struct {
         }
 
         if (symbol == 256) {
-            // End-of-block marker: "1" means a new table here, "00" a new file without a
-            // fresh table, "01" a new file with one; the first case consumes 1 bit, the others 2.
+            // End-of-block marker: "1" reads new tables here, "00" a new file without one, "01" with one.
             const bit_field = try st.br.peekBits(16);
             if (bit_field & 0x8000 != 0) {
                 st.br.skipBits(1);
                 _ = try st.readTables();
                 return true;
             }
-            // The second bit records TablesRead3 = !NewTable for the next entry, and a solid
-            // entry consults it without re-reading tables, so it must be consumed.
+            // The second bit records TablesRead3 = !NewTable for the next entry, so it must be consumed.
             const new_table = (bit_field & 0x4000) != 0;
             st.br.skipBits(2);
             st.tables_loaded = !new_table;
@@ -538,8 +529,7 @@ pub const Unpacker = struct {
 
             const distance = try st.decodeDistance();
 
-            // Distance-dependent length bonus: the encoder cannot emit a 2-byte match at
-            // a large distance, so it reuses those lengths and the decoder adds the bonus back.
+            // The encoder cannot emit a 2-byte match at a large distance, so the decoder adds the bonus back.
             if (distance >= 0x2000) {
                 length += 1;
                 if (distance >= 0x40000) length += 1;
@@ -560,8 +550,7 @@ pub const Unpacker = struct {
         return error.DataException;
     }
 
-    // PPMEscChar selects the in-band escape: 0 ends the PPM encoding, 1 is the escape
-    // byte, 2 ends the entry, 3 is a VM filter program, 4 an LZ match, and 5 an RLE run.
+    // PPMEscChar: 0 ends PPM, 1 an escape, 2 the entry, 3 a VM program, 4 a match, 5 a run.
     fn processPpmSymbol(st: *Unpacker) Exception!bool {
         if (st.ppm_model == null) return error.UnsupportedException;
         var model = &st.ppm_model.?;
@@ -629,8 +618,7 @@ pub const Unpacker = struct {
         return true;
     }
 
-    // The `keep` bytes stay unemitted so a filter recorded just after its data was
-    // decoded still covers its region; a filter reaching further back is refused.
+    // The `keep` bytes stay unemitted so a late-recorded filter still covers its region.
     fn flushDecoded(st: *Unpacker, keep: usize, limit: u64) Exception!void {
         const out = st.stream_out orelse return;
         const produced = st.window.write_pos - st.entry_start;
@@ -659,15 +647,14 @@ pub const Unpacker = struct {
         st.flushed += count;
     }
 
-    // Run to the end-of-block marker, not to unpacked_size: the marker carries the
-    // "new table" bit the next solid entry needs, and a trailing match may overshoot.
+    // Run to the end-of-block marker, not unpacked_size: the marker carries the bit a
+    // solid successor needs.
     pub fn decompressLoop(st: *Unpacker, unpacked_size: u64) Exception!void {
         if (!st.tables_loaded) {
             _ = try st.readTables();
         }
 
-        // The encoder emits the marker where the entry ends, so a legitimate
-        // overshoot is at most one match; without a bound a crafted archive could spin here.
+        // A legitimate overshoot is at most one match; without a bound a crafted archive could loop forever.
         const overshoot_limit = unpacked_size +| st.window.buffer.len;
 
         while (true) {
@@ -722,8 +709,7 @@ pub const Session = struct {
         st.freeTables();
         st.old_table = @splat(0);
         st.block_mode = .lz;
-        // This reset does not destroy the PPM model, because only DecodeInit's reset bit
-        // rebuilds it and a non-solid file with that bit clear would then fail.
+        // The PPM model survives this reset: only DecodeInit's reset bit rebuilds it.
         st.ppm_esc_char = 2;
         st.filter_types = @splat(.none);
         st.filter_count = 0;
@@ -751,8 +737,7 @@ pub const Session = struct {
         st.filter_seen = .none;
         st.unsupported_filter_seen = false;
 
-        // The end-of-block marker peeks 16 bits but consumes 1 or 2, so the reader needs
-        // slack; the reference uses the same border (ReadBorder = ReadTop - 30).
+        // The marker peeks 16 bits but consumes 1 or 2, so the reader needs slack (ReadBorder = ReadTop - 30).
         st.br = BitReader.initPadded(packed_data, bits.default_pad_bytes);
         st.written_size = 0;
 
@@ -775,8 +760,8 @@ pub const Session = struct {
 
         try st.decompressLoop(unpacked_size);
 
-        // An unidentified or unimplemented filter program makes the LZ output
-        // incomplete, and incomplete output is the worst outcome for an integrity tool.
+        // An unidentified or unimplemented filter program makes the output incomplete,
+        // the worst outcome for an integrity tool.
         if (st.unsupported_filter_seen) return error.UnsupportedException;
 
         if (st.stream_out != null) {
@@ -787,8 +772,8 @@ pub const Session = struct {
         const out_size: usize = @intCast(@min(st.written_size, unpacked_size));
         const consumed = st.window.write_pos - start_pos;
 
-        // Filters must be staged, never applied in the window, because a later solid
-        // entry matches back into an earlier entry's window region.
+        // Filters must be staged, never applied in the window: a later solid entry matches
+        // back into this region.
         try emit.emitSpan(
             &st.window,
             out,
@@ -857,8 +842,8 @@ test "distance table slots 0-3 carry no extra bits" {
 }
 
 test "v29 filter position zero resets lengths and pending invocations" {
-    // A filter program identifies by length, CRC32, and the leading XOR byte, so
-    // these bytes carry the delta filter's CRC 0x0e06077d at length 29.
+    // A filter program identifies by length, CRC32, and leading XOR byte; these carry
+    // the delta filter's CRC 0x0e06077d.
     const delta_prog = [29]u8{
         0xeb, 0x03, 0x0a, 0x11, 0x18, 0x1f, 0x26, 0x2d, 0x34, 0x3b, 0x42, 0x49,
         0x50, 0x57, 0x5e, 0x65, 0x6c, 0x73, 0x7a, 0x81, 0x88, 0x8f, 0x96, 0x9d,
@@ -889,8 +874,8 @@ test "v29 filter position zero resets lengths and pending invocations" {
     try std.testing.expectEqual(@as(u64, 0), st.pending[0].start);
     try std.testing.expectEqual(@as(u32, 16), st.pending[0].length);
 
-    // Second invocation: position zero resets the filter set, so the new filter
-    // reads a zero remembered length and the first invocation is dropped.
+    // Second invocation: position zero resets the filter set, dropping the first
+    // invocation and the remembered length.
     var code2: [64]u8 = undefined;
     w = bits.BitWriter.init(&code2);
     try w.writeBits(0, 6); // Filter position zero: reset.

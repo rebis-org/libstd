@@ -7,6 +7,7 @@ const Exception = exception_prim.Exception;
 
 // WIM LZX codec, ported from wimlib src/lzx_decompress.c.
 // Blocks carry precode-encoded lens for the main and length codes.
+//
 // Three recent offsets and delta-coded lens persist across blocks.
 // Decoded data passes through the E8 CALL-target filter.
 
@@ -70,8 +71,8 @@ const LenCode = bits.Code(max_len_codeword_len, num_len_syms + len_overrun);
 const PreCode = bits.Code(max_pre_codeword_len, precode_num_symbols);
 const AlignedCode = bits.Code(max_aligned_codeword_len, aligned_num_symbols);
 
-// wimlib derives the window order from the decompressor's max_block_size
-// (the WIM chunk size), never from the actual uncompressed output length.
+// In wimlib the window order derives from max_block_size (the WIM chunk
+// size), never the actual uncompressed output length.
 fn windowOrder(chunk_size: usize) Exception!u5 {
     if (chunk_size == 0 or chunk_size > (1 << 21)) return error.DataException;
     var order: u5 = 15;
@@ -92,9 +93,8 @@ fn deltaLen(prev: u8, presym: u16) u8 {
     return @intCast(len);
 }
 
-// Reads one precode-encoded run of codeword lens; the precode itself is sent
-// as 20 explicit 4-bit lengths. Runs may write up to len_overrun slots past
-// num_lens, so the backing array must carry that slack, as wimlib's does.
+// The precode arrives as 20 explicit 4-bit lengths; runs may write
+// len_overrun slots past num_lens.
 fn readCodewordLens(stream: *bits.Bits, lens: []u8, num_lens: usize, pre_lens: *[precode_num_symbols]u8) Exception!void {
     for (0..precode_num_symbols) |i| {
         pre_lens[i] = @intCast(stream.readBits(precode_element_size));
@@ -258,10 +258,7 @@ pub fn lzxDecode(chunk_size: usize, input: []const u8, output: []u8) Exception!v
     if (may_have_e8_byte) e8Postprocess(output);
 }
 
-// ---------------------------------------------------------------------------
-// Encoder. Verbatim blocks only (the aligned-offset variant is optional in
-// the format), greedy/lazy parsing over a hash chain, E8 preprocessing on a
-// staged copy, per-block precode-encoded lens with cross-block deltas.
+// Encoder: verbatim blocks only; the format makes aligned-offset blocks optional.
 
 const enc_min_match: usize = 2;
 const enc_max_match: usize = 257;
@@ -385,7 +382,7 @@ const EncFinder = struct {
 };
 
 // Length-limited canonical Huffman code; identical construction to the
-// decoder-side requirement (leaves first on ties).
+// decoder-side requirement (leaf-first on ties).
 fn makeEncCode(num_syms: usize, max_len: usize, freqs: []const u32, lens: []u8, codes: []u32) void {
     const num_symbol_bits: u5 = 10;
     const symbol_mask: u32 = (1 << num_symbol_bits) - 1;
@@ -473,9 +470,8 @@ fn makeEncCode(num_syms: usize, max_len: usize, freqs: []const u32, lens: []u8, 
     bits.canonicalCodewords(max_len, num_syms, lens, codes);
 }
 
-// One lens section: tally presyms, build the precode, emit the 20 nibble
-// lens, then the presym stream. `prev` carries the previous block's lens
-// forward (the decoder deltas against them) and is updated in place.
+// The decoder deltas against the previous block's lens, so `prev`
+// updates in place.
 fn writeLensSection(out: *EncOut, lens: []const u8, prev: []u8) void {
     var pre_freqs: [precode_num_symbols]u32 = @splat(0);
     var pre_lens: [precode_num_symbols]u8 = @splat(0);

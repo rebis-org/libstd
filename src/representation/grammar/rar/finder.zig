@@ -223,8 +223,8 @@ pub const MatchFinder = struct {
             }
         }
 
-        // Adaptive depth: a deep BT4 walk finds nothing useful on incompressible
-        // data, so use a shallow walk when neither hash found a 3-byte match.
+        // A deep BT4 walk finds nothing useful on incompressible data, so a
+        // missing 3-byte match uses a shallow walk.
         const effective_depth: u32 = if (best_len < 3) @min(self.bt_depth, 2) else self.bt_depth;
 
         const h = hash4(bytes, pos);
@@ -322,8 +322,8 @@ pub const MatchFinder = struct {
                             continue;
                         }
                     }
-                    // Position pos is already in the tree from findBT4Match, and
-                    // pos + 1 from the lazy check above, so the loop starts at 2.
+                    // findBT4Match already inserted pos, and the lazy check
+                    // pos + 1, so the loop starts at 2.
                     if (count >= tokens.len) return error.CapacityException;
                     tokens[count] = .{ .match = .{ .length = m.length, .distance = m.distance } };
                     count += 1;

@@ -26,7 +26,8 @@ const flag_name: u8 = 0x08;
 const flag_comment: u8 = 0x10;
 const reserved_flags: u8 = 0xe0;
 
-// Framing reads ahead of the inflater via shared pending with per-step compaction for bounded memory. Step chunks must satisfy chunk_len <= pending_cap - 8.
+// Framing reads ahead through shared pending; per-step compaction bounds it.
+// Step chunks must satisfy chunk_len <= pending_cap - 8.
 pub const pending_cap: usize = 131072;
 
 pub const Phase = enum { idle, fixed, extra_len, extra_skip, extra_field, name, comment, hcrc, deflate, trailer, done };
@@ -66,14 +67,14 @@ pub const GzipDecode = struct {
     // The leftover snapshot records its length before this step appends, so consumed reporting covers only this step's bytes.
     fn restage(self: *GzipDecode, input: []const u8, result: *StepResult) Exception!void {
         const consumed = self.inflater.streamPosition();
-        // Deflate compacts by the logical floor like restageInflated: bytes
-        // backing live accumulator bits survive the staging boundary. The
-        // framing phases read pending directly, so their floor is frame_pos.
+        // Deflate keeps bytes backing live accumulator bits; framing phases
+        // read pending directly, so their floor is frame_pos.
         const floor = if (self.phase == .deflate) self.inflater.inputBitsConsumed() / 8 else self.frame_pos;
         try compactPending(self.pending[0..], &self.pending_len, floor);
         if (floor > 0) {
             if (self.phase == .deflate) {
-                // frame_pos is stale while the inflater owns the stream. Re-established from slice.pos at member end.
+                // frame_pos is stale while the inflater owns the stream.
+                // Re-established from slice.pos at member end.
                 self.frame_pos = 0;
             } else {
                 self.frame_pos -= floor;
@@ -87,7 +88,8 @@ pub const GzipDecode = struct {
         }
     }
 
-    // Each step's whole chunk is accepted into pending. Consumed is the accepted length and bytes are never re-sent.
+    // Each step's whole chunk is accepted into pending.
+    // Consumed is the accepted length and bytes are never re-sent.
     fn streamPosition(self: *const GzipDecode) usize {
         return if (self.phase == .deflate) self.inflater.streamPosition() else self.frame_pos;
     }
@@ -126,9 +128,11 @@ fn carveHistory(comptime T: type, storage: []u8, comptime history_len: usize) er
 
 fn restageInflated(inflater: *deflate_seam.Decode, pending: []u8, pending_len: *usize, leftover: *usize, input: []const u8, result: *StepResult) Exception!void {
     const consumed = inflater.streamPosition();
-    // Word-granular refill over-reads past the logical floor; those bytes back live
-    // accumulator bits and must survive compaction, or the deferred end-of-stream
-    // conversion underflows across the staging boundary.
+    // Word-granular refill over-reads past the logical floor; those bytes
+    // back live accumulator bits and must survive compaction.
+    //
+    // Otherwise the deferred end-of-stream conversion underflows across
+    // the staging boundary.
     const floor = inflater.inputBitsConsumed() / 8;
     try compactPending(pending, pending_len, floor);
     try appendStaged(pending, pending_len, leftover, input, result);
@@ -143,7 +147,7 @@ pub fn gzipDecodeInit(storage: []u8, budgets: sessions.Budgets) error{ CapacityE
     const carved = try carveHistory(GzipDecode, storage, deflate.history_size);
     const state = carved.state;
     const history = carved.history;
-    // pending/fixed/trailer stay undefined until the header/trailer parse writes them before any read.
+    // The pending/fixed/trailer fields stay undefined until the header/trailer parse writes them before any read.
     state.* = .{
         .inflater = undefined,
         .history = history,
@@ -159,7 +163,7 @@ pub fn gzipDecodeInit(storage: []u8, budgets: sessions.Budgets) error{ CapacityE
     return state;
 }
 
-// Each member needs a fresh deflate stream resuming at frame_pos, where framing read ahead to.
+// Each member starts a fresh deflate stream at frame_pos, where framing last read.
 fn enterDeflate(state: *GzipDecode) error{UnsupportedException}!void {
     try state.inflater.initSliceBoundInPlace(deflate_seam.default_provider, state.pending[0..state.pending_len], state.history);
     state.inflater.setFramePos(state.frame_pos);
@@ -194,10 +198,8 @@ fn framingFailed(result: *StepResult, consumed: usize, exception: Exception) Ste
     return result.*;
 }
 
-// Stream one inflater step into the remaining output.
-// Suspension vs corruption is distinguishable only by position; flushed
-// partials are real output and count first.
-// A non-null return is terminal: the caller returns it as the step result.
+// Suspension versus corruption is distinguishable only by position; flushed
+// partials count first. A non-null return is terminal for the step.
 fn pumpInflated(
     state: anytype,
     result: *StepResult,
@@ -220,10 +222,8 @@ fn pumpInflated(
         }
         // Both arms report a finished member as end-of-stream; the caller reads atEnd() for the boundary.
         if (err == error.EndOfStream and state.inflater.atEnd()) return null;
-        // Starvation is a clean suspension, not corruption: the leaf rolled
-        // its parse back and stays resumable, waiting on more input. A
-        // failed leaf is corruption, and starving after the input end is a
-        // short stream.
+        // Starvation suspends cleanly with the leaf resumable; a failed leaf is
+        // corruption; starvation at input end is a short stream.
         if (err == error.ReadFailed and !state.inflater.isFailed() and !end_of_input) {
             state.inflater.clearFailure();
             result.consumed = input_len;
@@ -322,7 +322,8 @@ pub fn gzipDecodeStep(state: *GzipDecode, input: []const u8, output: []u8, end_o
                             const byte = state.nextByte() orelse break :framing;
                             state.header_crc.update(&.{byte});
                         }
-                        // XLEN is consumed once. Later fields chain from name.
+                        // XLEN is consumed once.
+                        // Later fields chain from name.
                         if (state.fixed[3] & flag_name != 0) {
                             state.phase = .name;
                         } else if (state.fixed[3] & flag_comment != 0) {
@@ -348,9 +349,8 @@ pub fn gzipDecodeStep(state: *GzipDecode, input: []const u8, output: []u8, end_o
                         }
                     },
                     .hcrc => {
-                        // The two HCRC16 bytes persist across suspension like
-                        // the fixed header and trailer: a local buffer would
-                        // drop a byte already consumed at the staging boundary.
+                        // HCRC16 persists across suspension like the fixed header: a local
+                        // buffer would drop a byte consumed at the staging boundary.
                         while (state.hcrc_len < state.hcrc.len) {
                             const byte = state.nextByte() orelse break :framing;
                             state.hcrc[state.hcrc_len] = byte;
@@ -400,7 +400,7 @@ pub fn gzipDecodeStep(state: *GzipDecode, input: []const u8, output: []u8, end_o
             return result;
         }
 
-        // Slice input suspends atomically with state written back, so refill and re-step resumes mid-symbol.
+        // Slice input suspends atomically with state written back, so refill and re-step resume mid-symbol.
         if (result.produced < output.len) {
             if (pumpInflated(state, &result, output, input.len, end_of_input, noteGzipDecoded)) |terminal| return terminal;
             if (state.inflater.atEnd()) {
@@ -408,8 +408,8 @@ pub fn gzipDecodeStep(state: *GzipDecode, input: []const u8, output: []u8, end_o
                     if (result.produced < output.len) continue;
                     break;
                 }
-                // Member ends at consumed bits, not buffered bytes: word-granular refill over-reads up to seven bytes past the final block.
-                // Epoch-relative: compaction retained the partial byte, so this is the trailer offset within the compacted pending.
+                // The member ends at consumed bits: word-granular refill over-reads past
+                // the final block; the trailer offset is epoch-relative.
                 const consumed_bits = state.inflater.inputBitsConsumed();
                 state.frame_pos = (consumed_bits + 7) / 8;
                 state.inflater.setFramePos(state.frame_pos);
@@ -419,7 +419,8 @@ pub fn gzipDecodeStep(state: *GzipDecode, input: []const u8, output: []u8, end_o
             }
             break;
         } else {
-            // Output full (or empty): suspend mid-deflate with progress preserved. The caller resumes with a fresh buffer.
+            // Output full (or empty): suspend mid-deflate with progress preserved.
+            // The caller resumes with a fresh buffer.
             break;
         }
     }
@@ -429,7 +430,8 @@ pub fn gzipDecodeStep(state: *GzipDecode, input: []const u8, output: []u8, end_o
     return result;
 }
 
-// Bounded checks capacity against the analytic bound and encodes once. Measured sizes exactly first. Output bytes identical either way.
+// Bounded encodes once against the analytic bound; measured sizes
+// exactly first. Output bytes are identical.
 pub const GzipEncodeSizing = enum { measured, bounded };
 
 pub const default_encode_options: gzip.Options = .{
@@ -475,8 +477,8 @@ pub fn gzipEncode(output: []u8, input: []const u8, history: []u8, options: gzip.
     }
 }
 
-// Raw DEFLATE decode session: the gzip driver minus framing. One stream ends
-// at the final block, trailing bytes are an error.
+// Raw DEFLATE decode session: the gzip driver minus framing.
+// Trailing bytes after the final block are an error.
 pub const DeflateDecode = struct {
     inflater: deflate_seam.Decode,
     history: []u8 = &.{},
@@ -534,11 +536,8 @@ pub fn deflateDecodeStep(state: *DeflateDecode, input: []const u8, output: []u8,
             result.status = .open;
             return result;
         }
-        // The stream ends at consumed bits, not buffered bytes: word-granular
-        // refill over-reads up to seven bytes past the final block. Epoch-
-        // relative: compaction retained the partial byte, so this is the
-        // logical end offset within the compacted pending. Trailing bytes
-        // after it are an error.
+        // The stream ends at consumed bits: word-granular refill over-reads
+        // past the final block; the end offset is epoch-relative.
         const consumed_bits = state.inflater.inputBitsConsumed();
         const stream_end = (consumed_bits + 7) / 8;
         if (stream_end != state.pending_len) {
@@ -635,9 +634,8 @@ pub fn zlibDecodeStep(state: *ZlibDecode, input: []const u8, output: []u8, end_o
             result.status = .open;
             return result;
         }
-        // Epoch-relative like the raw deflate session: compaction retained
-        // the partial byte, so this is the trailer offset within the
-        // compacted pending.
+        // Epoch-relative like the raw deflate session: the trailer offset
+        // within the compacted pending.
         const consumed_bits = state.inflater.inputBitsConsumed();
         const stream_end = (consumed_bits + 7) / 8;
         const trailer_pos = stream_end;
@@ -663,8 +661,8 @@ pub fn zlibDecodeStep(state: *ZlibDecode, input: []const u8, output: []u8, end_o
     return result;
 }
 
-// Pending output must absorb one step's worst case: the deflate bound plus
-// the staging flush granularity and one block's table overhead.
+// Pending output must absorb the worst case: the deflate bound plus
+// staging flush granularity and one block's table overhead.
 pub const encode_pending_len: usize = pending_cap + 32768;
 
 fn drainPending(pending: []u8, pending_len: *usize, pending_read: *usize, output: []u8, result: *StepResult) void {
@@ -719,7 +717,7 @@ fn writePrologue(comptime wrap: EncodeWrap, state: *DeflateEncode) Exception!voi
         },
         .zlib => {
             if (state.room() < 2) return error.CapacityException;
-            // cinfo 7 (32 KiB window) with a valid fcheck: 0x78 0x9C.
+            // The cinfo 7 (32 KiB window) with a valid fcheck: 0x78 0x9C.
             const header = [2]u8{ 0x78, 0x9C };
             @memcpy(state.pending[state.pending_len..][0..2], &header);
             state.pending_len += 2;
@@ -824,8 +822,8 @@ fn deflateEncodeStep(comptime wrap: EncodeWrap, state: *DeflateEncode, input: []
             state.budgets.addDecoded(input.len) catch |exception| return encodeFailed(&result, exception);
             result.consumed = input.len;
         } else {
-            // The mirror case on the decode side is an error, so dropping input
-            // handed in after the final block must be one too.
+            // The decode side errors on trailing input, so input after the
+            // final block must be an error here too.
             return encodeFailed(&result, error.CallException);
         }
     }
@@ -888,15 +886,12 @@ pub fn zlibEncodeSession(storage: []u8, budgets: sessions.Budgets) error{ Capaci
     return deflateEncodeSessionImpl(.zlib, storage, budgets);
 }
 
-// Stepped frames mirror the leaf's shape: the walker stages one block's
-// bytes, decodes into a staging span, drains it across steps, and keeps the
-// 64 KiB linked-block history in the state. Session storage is a fixed,
-// Session storage is fixed: 4 MiB input staging, 4 MiB output staging, plus
-// the 64 KiB window.
+// Stepped frames mirror the leaf: stage one block, decode into staging,
+// drain across steps, keep the 64 KiB linked-block history.
 pub const lz4_pending_len: usize = lz4.block_size_max + 64;
 const lz4_magic_value: u32 = 0x184D2204;
 const lz4_window_len: usize = 64 * 1024;
-// hash_log from the leaf (17): the greedy table words.
+// hash_log from the leaf (12): the greedy table words.
 const lz4_hash_words: usize = 1 << 12;
 // blockCompressBound from the leaf: worst-case compressed block.
 fn lz4BlockCompressBound(block_len: usize) usize {
@@ -1051,10 +1046,8 @@ pub fn lz4DecodeStep(state: *Lz4Decode, input: []const u8, output: []u8, end_of_
                     @memcpy(state.staging[0..block_data.len], block_data);
                     break :blk block_data.len;
                 } else lz4.decompressBlock(block_data, state.staging, state.window[0..state.window_len]) catch {
-                    // A corrupt block answers DataException; an overrun of the
-                    // staging buffer sized to the largest decompressed block
-                    // the format allows is equally invalid data, not an
-                    // internal fault.
+                    // A corrupt block answers DataException; so does an overrun of the
+                    // staging buffer: invalid data, not an internal fault.
                     return framingFailed(&result, input.len, error.DataException);
                 };
                 state.content_hasher.update(state.staging[0..produced]);
@@ -1177,9 +1170,8 @@ pub fn lz4EncodeInit(storage: []u8, budgets: sessions.Budgets) error{CapacityExc
         .content_hasher = checksum.XxHash32.init(0),
         .budgets = budgets,
     };
-    // Write the frame header: independent blocks, 4 MiB max, content size
-    // omitted (a stream's total is not knowable at the first step), content
-    // checksum on.
+    // Frame header: independent blocks, 4 MiB max, content checksum on; the
+    // content size is unknowable at the first step.
     var fixed = std.Io.Writer.fixed(state.pending[0..]);
     fixed.writeInt(u32, lz4_magic_value, .little) catch return error.CapacityException;
     const flags: u8 = 0x40 | 0x20 | 0x04;
@@ -1204,8 +1196,8 @@ pub fn lz4EncodeStep(state: *Lz4Encode, input: []const u8, output: []u8, end_of_
     var result = StepResult{};
     state.drain(output, &result);
     if (input.len > 0 and !state.finished) {
-        // Compress this step's input as one or more blocks; each block's
-        // bound plus its size words must fit the pending tail.
+        // Compress this step's input as blocks; each block's bound plus
+        // size words must fit the pending tail.
         var rest = input;
         while (rest.len > 0) {
             const take = @min(rest.len, lz4.block_size_max);
@@ -1256,9 +1248,8 @@ pub fn lz4EncodeStep(state: *Lz4Encode, input: []const u8, output: []u8, end_of_
     return result;
 }
 
-// Deterministic, compressible, non-periodic text: the deflate frame decodes in
-// one history fill, so end-of-stream lands inside a step with buffered output
-// left over, which is the boundary the chunked decode must survive.
+// Deterministic, compressible, non-periodic text: end-of-stream lands inside
+// a step with buffered output left over, the boundary chunked decode must survive.
 fn fillPayload(payload: []u8) void {
     var state: u32 = 0x1234567;
     for (payload, 0..) |*slot, index| {
@@ -1313,12 +1304,8 @@ fn expectChunkedDecode(
     try testing.expectEqualSlices(u8, expected, decoded.items);
 }
 
-// ------------------------------------------------------------ lz4 legacy
-// The pre-1.8 legacy frame (magic 0x184C2102 + version nibble) carries
-// independent raw LZ4 blocks of at most 8 MiB, with no descriptor, no
-// checksums, and EOF termination. Blocks stage compressed (bound-sized) and
-// decompress into an 8 MiB staging span that drains across steps; the modern
-// lz4 session keeps rejecting the legacy magic.
+// Pre-1.8 legacy frame (magic 0x184C2102 plus version nibble): raw LZ4
+// blocks up to 8 MiB, no descriptor or checksums, EOF-terminated.
 const lz4_legacy_block_size: usize = 8 * 1024 * 1024;
 const lz4_legacy_bound: usize = lz4BlockCompressBound(lz4_legacy_block_size);
 const lz4_legacy_magic: u32 = 0x184C2102;
@@ -1471,13 +1458,8 @@ fn lz4LegacyDecodeStep(state: *Lz4LegacyDecode, input: []const u8, output: []u8,
     return result;
 }
 
-// ---------------------------------------------------------------- tar
-// Stepped streaming tar writer. The caller streams, per entry, the
-// 512-byte header block (from tar.formatHeaderBlock) followed by the raw
-// data bytes; the driver pads each entry to the 512-block grid and closes
-// with the two zero blocks the slice encoder emits. GNU/pax long-name spill
-// entries are ordinary size-carrying entries, so they pass through
-// unchanged.
+// Stepped tar writer: per entry the caller streams a 512-byte header then
+// raw data. Pax spill entries pass through unchanged.
 const TarEncodePhase = enum { header, data, pad, trailer, done };
 
 pub const TarEncode = struct {
@@ -1631,10 +1613,8 @@ fn tarEncodeStep(state: *TarEncode, input: []const u8, output: []u8, end_of_inpu
     return result;
 }
 
-// ---------------------------------------------------------------- brotli
-// The windowed incremental decode drives the session: the state owns the
-// 16 MiB history ring, input is staged (4 MiB), output drains through a 1 MiB
-// staging span, and every phase suspends on starvation or a full span.
+// Incremental decode owns the history ring; the session stages input, drains
+// output, and suspends on starvation or a full span.
 const brotli_in_staging_len: usize = 4 << 20;
 const brotli_out_staging_len: usize = 1 << 20;
 
@@ -1645,8 +1625,8 @@ pub const BrotliDecode = struct {
     pending_read: usize = 0,
     out: []u8 = &.{},
     out_read: usize = 0,
-    // The decoder reports done while its staging still holds undrained
-    // output; the session may only answer done once the staging is empty.
+    // The decoder reports done while staging still holds undrained output;
+    // answer done only once the staging is empty.
     finishing: bool = false,
     budgets: sessions.Budgets,
 };
@@ -1717,9 +1697,9 @@ fn brotliDecodeStep(state: *BrotliDecode, input: []const u8, output: []u8, end_o
             result.status = .done;
             return result;
         }
-        if (state.out_read > 0) return result; // caller's output is full
-        if (accepted < input.len) return result; // staging full; caller re-feeds
-        if (res.consumed == 0 and res.produced == 0) return result; // starved, awaiting input
+        if (state.out_read > 0) return result; // Caller's output is full.
+        if (accepted < input.len) return result; // Staging is full; the caller re-feeds.
+        if (res.consumed == 0 and res.produced == 0) return result; // Starved, awaiting input.
     }
 }
 
@@ -1835,15 +1815,15 @@ test "gzip header crc field survives a mid-field suspension" {
     defer allocator.free(hcrc_frame);
     const hcrc_len = try gzipEncode(hcrc_frame, &payload, history, hcrc_options, .bounded);
 
-    // The option must engage: FLG carries FHCRC and the header extends past
-    // the fixed ten bytes, or the sweep below stops exercising the phase.
+    // The option must engage: FLG carries FHCRC and the header passes ten
+    // bytes, or the sweep stops exercising the phase.
     try testing.expect(hcrc_frame[3] & flag_hcrc != 0);
     try testing.expect(hcrc_len > 12);
 
     const holder = try allocStateStorage(GzipDecode, gzipDecodeStorage(), allocator);
     defer allocator.free(holder.raw);
-    // Every split of the twelve-byte header region, including the two bytes
-    // between HCRC16 halves (chunk 11) and the deflate start (chunk 12).
+    // Every split of the twelve-byte header region, including between
+    // the HCRC16 halves and the deflate start.
     inline for (1..17) |chunk| {
         try expectChunkedDecode(GzipDecode, gzipDecodeInit, gzipDecodeStep, holder.aligned, hcrc_frame[0..hcrc_len], &payload, chunk, 4096);
     }
@@ -1885,9 +1865,8 @@ test "lz4 sessions roundtrip and reject reserved header bits" {
         try expectChunkedDecode(Lz4Decode, lz4DecodeInit, lz4DecodeStep, dec_holder.aligned, frame.items, &payload, chunk, 4096);
     }
 
-    // Reserved FLG bit 1 and BD bits 7..4-beyond-code plus the low nibble are
-    // invalid however the header checksum reads, so each mutation gets a
-    // recomputed HC: only the reserved bit may vary.
+    // Reserved FLG and BD bits stay invalid under any header checksum,
+    // so each mutation recomputes HC.
     const mutations = [_]struct { offset: usize, mask: u8 }{
         .{ .offset = 4, .mask = 0x02 },
         .{ .offset = 5, .mask = 0x80 },
@@ -2040,8 +2019,8 @@ test "lz4 legacy session decodes chunked frames" {
         try expectChunkedDecode(Lz4LegacyDecode, lz4LegacyDecodeInit, lz4LegacyDecodeStep, holder.aligned, frame_c, payload_c, chunk, 1 << 20);
     }
 
-    // The kernel zero terminator ends the frame; trailing bytes are a
-    // format error, as is a block past the 8 MiB bound.
+    // The kernel zero terminator ends the frame; trailing bytes and
+    // oversize blocks are format errors.
     var terminated: [8]u8 = undefined;
     std.mem.writeInt(u32, terminated[0..4], 0x184C2106, .little);
     std.mem.writeInt(u32, terminated[4..8], 0, .little);
@@ -2077,8 +2056,8 @@ test "tar encode session frames like the slice encoder" {
         .{ .name = "dir/nested.bin", .data = &binary, .mode = 0o600, .uid = 7, .gid = 8 },
         .{ .name = "five", .data = "12345" },
     };
-    // No pax fields: the slice encoder emits exactly one header per entry,
-    // so its output is the framing oracle for the same logical stream.
+    // No pax fields: the slice encoder emits one header per entry, so
+    // its output is the framing oracle.
     const oracle = try allocator.alloc(u8, try tar.archiveSize(&entries));
     defer allocator.free(oracle);
     const oracle_scratch = try allocator.alloc(u8, tar.scratch_size);
@@ -2127,8 +2106,8 @@ test "tar encode session frames like the slice encoder" {
         try testing.expectEqualSlices(u8, oracle[0..oracle_len], produced_all[0..out_pos]);
     }
 
-    // A pax-style spill entry (an 'x' header whose data carries the pax
-    // records) frames through the driver like any size-carrying entry.
+    // A pax spill entry (an 'x' header carrying pax records) frames
+    // through the driver like any size-carrying entry.
     const pax_data = "20 mtime=1700000000\n";
     var pax_header: [512]u8 = undefined;
     try tar.formatHeaderBlock(.posix, "././@PaxHeader", &.{}, &.{}, 0o644, 0, 0, 0, 'x', pax_data.len, 0, 0, &pax_header);

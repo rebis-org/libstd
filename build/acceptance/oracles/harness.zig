@@ -12,8 +12,8 @@ pub const Node = abi.Node;
 pub const Status = abi.Status;
 pub const isIdEqual = abi.isIdEqual;
 
-// Node-array construction without hand-counted indices; scenario code reads as
-// the envelope it builds. The count stays visible for arrays a scenario reuses.
+// Scenario code reads as the envelope it builds; no hand-counted indices,
+// and the count stays visible.
 
 pub const NodeList = struct {
     nodes: []Node,
@@ -67,8 +67,8 @@ pub const protocol_sizing_mode: u32 = 4;
 pub const protocol_commit_mode: u32 = 5;
 pub const protocol_provider: u32 = 6;
 
-// False only in a uniform onprem build: no capability can serve the offprem
-// tag, so provider-selection scenarios step aside for the rejection scenario.
+// False only in a uniform onprem build; provider-selection scenarios then
+// step aside for the rejection scenario.
 pub const offprem_servable = blk: {
     for (.{
         options.sha256_impl,  options.sha1_impl,       options.hmac_impl,

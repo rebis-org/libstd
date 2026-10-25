@@ -93,8 +93,7 @@ const BlockArm8 = struct {
 };
 
 // The software round mirrors the hardware one so both schedule walkers stay
-// identical; the tables and the GF(2^8) ladder below are checked exhaustively
-// at comptime.
+// identical; comptime checks cover the tables and ladder.
 const BlockSoft = struct {
     repr: Repr,
 
@@ -130,11 +129,8 @@ const BlockSoft = struct {
     }
 
     pub fn decrypt(block: BlockSoft, inv_round_key: BlockSoft) BlockSoft {
-        // Mirrors the hardware round's net function exactly: InvSubBytes,
-        // InvShiftRows, InvMixColumns, then AddRoundKey. InvMixColumns
-        // commutes with the XOR up to the key transform the inverted
-        // schedule already applies, and this boundary order is what chains
-        // correctly between rounds.
+        // Mirrors the hardware round: InvSubBytes, InvShiftRows, InvMixColumns,
+        // AddRoundKey; the inverted schedule supplies the transformed keys this order requires.
         var bytes = block.toBytes();
         invSubBytes(&bytes);
         invShiftRows(&bytes);
@@ -367,9 +363,8 @@ fn KeySchedule(comptime Aes: type) type {
             return nkFirst(rc, t, tx);
         }
 
-        // AES-NI assist expansion (Intel AES-NI whitepaper 128-bit
-        // sequence). The shift cascade accumulates: each stage folds the
-        // previous shift further, matching the VEX schedule term by term.
+        // AES-NI assist expansion (Intel AES-NI whitepaper 128-bit sequence);
+        // the pslldq cascade re-shifts one operand to 4, 8, 12 bytes.
         fn nkFirst(comptime rc: u8, t: Repr, tx: Repr) Repr {
             var s: Repr = undefined;
             var s2: Repr = undefined;
@@ -530,8 +525,8 @@ fn AesParams(comptime bits: u16) type {
 pub const Aes128 = AesParams(128);
 pub const Aes256 = AesParams(256);
 
-// AES-192 fills the same round-key walker from the word expansion; no
-// 16-byte key groups exist, so the vectorized schedule cannot apply.
+// AES-192 feeds the same walker via word expansion; no 16-byte key groups
+// exist for the vectorized schedule.
 pub const Aes192 = struct {
     const rounds = 12;
 

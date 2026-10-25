@@ -28,8 +28,8 @@ pub const DecodeTable = struct {
     valid: bool = false,
 };
 
-// With `escapes` (v29), a length of 15 is an ESCAPE and the next 4 bits give a
-// zero-run count, where 0 means the length is 15 and an overrun truncates.
+// With `escapes` (v29), 15 is an escape: the next 4 bits give a zero-run
+// count; 0 means 15.
 pub fn readCodeLengthTable(br: *BitReader, count: usize, comptime escapes: bool, storage: []u16) Exception!DecodeTable {
     var lengths: [64]u8 = @splat(0);
     var i: usize = 0;
@@ -40,8 +40,8 @@ pub fn readCodeLengthTable(br: *BitReader, count: usize, comptime escapes: bool,
             if (zero_count == 0) {
                 lengths[i] = 15;
             } else {
-                // The escape means ZeroCount + 2 zeros, and `i -|= 1` returns
-                // the step that the loop increment below takes after the run.
+                // The escape means ZeroCount + 2 zeros; `i -|= 1` undoes the
+                // loop increment after the run.
                 var remaining: u32 = @as(u32, zero_count) + 2;
                 while (remaining > 0 and i < count) : (remaining -= 1) {
                     lengths[i] = 0;
@@ -92,8 +92,8 @@ pub fn makeDecodeTables(code_lengths: []const u8, storage: []u16) Exception!Deco
         }
     }
 
-    // Large alphabets (v20/v29/v50 main tables) peek wider so short codes stay
-    // on the single-lookup path. Small ones keep a compact table.
+    // Large alphabets (v20/v29/v50 main tables) peek wider so short codes
+    // stay single-lookup; small ones stay compact.
     const size = code_lengths.len;
     table.quick_bits = if (size == 306 or size == 298 or size == 299)
         max_quick_bits

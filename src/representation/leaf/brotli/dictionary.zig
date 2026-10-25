@@ -1,9 +1,5 @@
-// RFC 7932 static dictionary data (Appendix A) and word transformations
-// (Appendix B). DICT is the normative dictionary byte array from the brotli
-// reference implementation. It matches vendor/brotli c/common/dictionary.bin
-// and the RFC's Appendix A listing. NDBITS is the RFC's bit-depth array;
-// prefix/suffix/transform tables follow vendor/brotli c/common/transform.c.
-// Generated once from those sources; do not edit by hand.
+// RFC 7932 Appendix A/B data generated from vendor/brotli
+// c/common/dictionary.bin and transform.c; do not edit by hand.
 
 pub const dict_size = 122784;
 pub const min_word_length = 4;
@@ -7712,7 +7708,8 @@ pub const prefix_suffix = [217]u8{
     0x20, 0x74, 0x68, 0x65, 0x20, 0x02, 0x65, 0x20, 0x00,
 };
 
-// Maps a prefix/suffix table offset into prefix_suffix (kPrefixSuffixMap).
+// Maps a transform record's prefix/suffix index to a prefix_suffix
+// pool offset (kPrefixSuffixMap).
 pub const prefix_suffix_map = [50]u8{
     0x00, 0x02, 0x05, 0x0e, 0x13, 0x16, 0x18, 0x1e, 0x23, 0x25, 0x2a, 0x2d, 0x2f, 0x32, 0x34, 0x3a,
     0x3e, 0x45, 0x47, 0x4e, 0x55, 0x5a, 0x5c, 0x63, 0x68, 0x6d, 0x72, 0x77, 0x7a, 0x7c, 0x80, 0x83,
@@ -7720,9 +7717,8 @@ pub const prefix_suffix_map = [50]u8{
     0xd5, 0xd8,
 };
 
-// 121 transform records: prefix offset, elementary op, suffix offset
-// (kTransformsData). Ops: 0 Identity, 1 FermentFirst, 2 FermentAll,
-// 3..11 OmitFirst1..9, 12..20 OmitLast1..9 (RFC 8).
+// 121 records of prefix index, op, suffix index (kTransformsData);
+// RFC 8 ops: Identity, FermentFirst, FermentAll, OmitFirst/Last1..9.
 pub const transforms = [transform_count * 3]u8{
     0x31, 0x00, 0x31, 0x31, 0x00, 0x00, 0x00, 0x00, 0x00, 0x31, 0x03, 0x31, 0x31, 0x01, 0x00, 0x31,
     0x00, 0x2f, 0x00, 0x00, 0x31, 0x04, 0x00, 0x00, 0x31, 0x00, 0x03, 0x31, 0x01, 0x31, 0x31, 0x00,

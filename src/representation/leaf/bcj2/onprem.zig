@@ -4,8 +4,8 @@ const exception_prim = @import("../../../common/primitive/exception.zig");
 
 const Exception = exception_prim.Exception;
 
-// BCJ2 (branch/call/jump filter, version 2), method ID 0x03 0x03 0x01 0x1B. The encoder
-// splits x86 code into a main stream, a call stream, a jump stream, and a range-coded bitmap.
+// BCJ2 branch converter (0x03 0x03 0x01 0x1B): x86 code splits into main, call,
+// and jump streams plus a range-coded bitmap.
 
 const num_probs = 258; // The E8 context comes from the previous byte, and E9 and Jcc need one each.
 const bit_model_total: u16 = 1 << 11;
@@ -50,8 +50,8 @@ pub fn decode(main_stream: []const u8, call_stream: []const u8, jump_stream: []c
         if (prob_index) |index| {
             const bit = rangeDecode(&probs[index], &range, &code, rc_stream, &rc_pos);
             if (bit == 1) {
-                // The call and jump streams store the target big-endian; the decoded
-                // value subtracts the address of the byte after the operand.
+                // The call and jump streams store the target address big-endian; the
+                // decode subtracts the byte-after-operand address.
                 var address: u32 = undefined;
                 if (use_call_stream) {
                     if (call_pos + 4 > call_stream.len) return error.DataException;
@@ -106,9 +106,9 @@ fn rangeDecode(prob: *u16, range: *u32, code: *u32, stream: []const u8, pos: *us
 
 pub const EncodedSizes = struct { main: usize, call: usize, jump: usize, rc: usize };
 
-// Caller-buffer upper bounds: the main stream is a subsequence of the
-// input, each call/jump entry consumes five input bytes to write four,
-// and one range-code bit per candidate marker costs at most 1.25 bytes.
+// Main, call, and jump never exceed the input.
+//
+// Each rc bit at worst halves the range, so a byte costs eight bits.
 pub fn encodeSizesBound(input_len: usize) EncodedSizes {
     return .{
         .main = input_len,
@@ -120,10 +120,8 @@ pub fn encodeSizesBound(input_len: usize) EncodedSizes {
 
 const relat_limit: u32 = @as(u32, 0x0f) << 24;
 
-// Carry-aware range encoder, the exact Subbotin scheme the vendor encoder
-// uses: pending 0xFF bytes ride in (cache, cacheSize) until a carry or the
-// stream end resolves them. The first emitted byte is the discarded
-// initialization byte the decoder skips.
+// The vendor's carry-aware Subbotin range encoder: pending 0xFF bytes ride in
+// (cache, cache_size); the first byte is the discarded init.
 const RangeEncoder = struct {
     low: u64 = 0,
     range: u32 = 0xFFFFFFFF,
@@ -173,11 +171,8 @@ const RangeEncoder = struct {
     }
 };
 
-// Splits x86 code into the four BCJ2 streams. Conversion decisions match
-// vendor Bcj2Enc.c: fileIp 0, unlimited size, the default relative limit,
-// and the multi-block overlap guard. The probability table layout follows
-// this decoder (any bijective layout interoperates, since the probability
-// state is per-symbol on both sides).
+// Conversion decisions match vendor Bcj2Enc.c (fileIp 0, default relative
+// limit, multi-block overlap guard); the probability layout is not wire format.
 pub fn encode(input: []const u8, main_out: []u8, call_out: []u8, jump_out: []u8, rc_out: []u8) Exception!EncodedSizes {
     var probs: [num_probs]u16 = undefined;
     for (&probs) |*prob| prob.* = bit_model_total / 2;
@@ -246,8 +241,8 @@ test "bcj2 no-branch passthrough" {
 }
 
 test "bcj2 single E8 call branch" {
-    // The main stream is NOP*10, E8, NOP*17, the call stream carries the absolute target
-    // 0x64 (= 0x55 relative + opcode position 15), and the range coder encodes a set bit.
+    // NOP*10, E8, NOP*17; the call stream's absolute target address 0x64 decodes
+    // to relative 0x55 at opcode position 15.
     var main_buf: [28]u8 = undefined;
     for (main_buf[0..10]) |*b| b.* = 0x90;
     main_buf[10] = 0xE8;
@@ -274,7 +269,7 @@ test "bcj2 single E9 jump branch" {
     for (main_buf[0..4]) |*b| b.* = 0x90;
     main_buf[4] = 0xE9;
     for (main_buf[5..8]) |*b| b.* = 0x90;
-    const jump_buf = [_]u8{ 0, 0, 0, 0x0C }; // The absolute target 12 becomes 3, since 12 - (5 + 4).
+    const jump_buf = [_]u8{ 0, 0, 0, 0x0C }; // The absolute target address 12 becomes 3, since 12 - (5 + 4).
     const rc_buf = [_]u8{ 0, 0xFF, 0xFF, 0xFF, 0xFF };
 
     var out: [12]u8 = undefined;
@@ -294,7 +289,7 @@ test "bcj2 single E9 jump branch" {
 test "bcj2 single 0F 8x conditional jump" {
     // A Jcc (0x0F 0x85) draws from the jump stream through context 257.
     const main_buf = [_]u8{ 0x0F, 0x85 };
-    const jump_buf = [_]u8{ 0, 0, 0, 0x0B }; // The absolute target 11 becomes 5, since 11 - (2 + 4).
+    const jump_buf = [_]u8{ 0, 0, 0, 0x0B }; // The absolute target address 11 becomes 5, since 11 - (2 + 4).
     const rc_buf = [_]u8{ 0, 0xFF, 0xFF, 0xFF, 0xFF };
 
     var out: [6]u8 = undefined;
@@ -329,14 +324,14 @@ test "bcj2 truncations are errors" {
 }
 
 test "bcj2 call then jump through one range-code word" {
-    // One rc word drives both branch bits without a normalization pull, so both
-    // prob contexts (E8, then E9) decode a set bit from it.
+    // One rc word drives both branch bits without normalization, so both
+    // probability contexts (E8, then E9) decode a set bit.
     var main_buf: [10]u8 = undefined;
     for (&main_buf) |*b| b.* = 0x90;
     main_buf[0] = 0xE8;
     main_buf[5] = 0xE9;
-    const call_buf = [_]u8{ 0, 0, 0, 0x10 }; // The absolute target 0x10 becomes 0x0B.
-    const jump_buf = [_]u8{ 0, 0, 0, 0x20 }; // The absolute target 0x20 becomes 0x12.
+    const call_buf = [_]u8{ 0, 0, 0, 0x10 }; // The absolute target address 0x10 becomes 0x0B.
+    const jump_buf = [_]u8{ 0, 0, 0, 0x20 }; // The absolute target address 0x20 becomes 0x12.
     const rc_buf = [_]u8{ 0, 0xFF, 0xFF, 0xFF, 0xFF };
 
     var out: [18]u8 = undefined;
@@ -418,7 +413,7 @@ test "bcj2 encode stream sizes respect their bounds" {
     var jump: [64]u8 = undefined;
     var rc: [16 + 64]u8 = undefined;
     const sizes = try encode(&input, &main, &call, &jump, &rc);
-    // E8 at position 0 cannot convert (the ip guard requires ip > 0), and
-    // the relative-limit check rejects the zero-paged offsets here.
+    // E8 at position 0 cannot convert (the ip guard requires ip > 0); the
+    // relative limit rejects the zero-paged offsets.
     try std.testing.expect(sizes.main == 64);
 }

@@ -15,8 +15,7 @@ const Limits = resource.Limits;
 const Resource = resource.Resource;
 const Exception = vocabulary.Exception;
 
-// A sink must accept writes and have the capacity before any byte is
-// produced; every transform and archive hook states this pair first.
+// Every hook needs a writable sink with room before producing a single byte.
 pub fn requireSink(sink: *Resource, call: *Call, required: usize) Exception!void {
     if (!sink.hasCapability(resource.capability_bit_write)) return error.UnsupportedException;
     return requireSinkCapacity(sink, call, required);
@@ -28,18 +27,6 @@ pub fn requireSinkCapacity(sink: *Resource, call: *Call, required: u64) Exceptio
         writeCapacityDiagnostic(call, required, capacity);
         return error.CapacityException;
     }
-}
-
-// Verified commit: a bounded write reports the produced length, and an
-// overrun of the analytic bound is a correctness defect, never a silent truncation.
-pub fn verifiedCommitLength(sink: *Resource, call: *Call, sizing: vocabulary.SizingMode, staged: []const u8, planned: usize, produced: usize) Exception!?usize {
-    if (sizing == .bounded) {
-        if (produced > planned) return error.InternalException;
-        try commitBytesToSink(sink, call, staged[0..produced]);
-        return produced;
-    }
-    try commitBytesToSink(sink, call, staged);
-    return null;
 }
 
 pub fn commitBytesToSink(sink: *Resource, call: *Call, chunk: []const u8) Exception!void {
@@ -114,10 +101,8 @@ pub fn materializeSource(comptime sizing: SourceSizing, source: *Resource, works
     };
 }
 
-// A bounded reader stops at its cap without reading past it, so a source that
-// spans the cap is indistinguishable from an exact fit until one byte is read
-// past it. The caller reports `at_cap` after draining and re-rewinds on
-// success; over-limit input is a resource failure, never a truncation.
+// A bounded reader hides spanning at the cap, so one probe byte decides;
+// callers re-rewind. Over-limit input fails, never truncates.
 pub fn rejectOverLimit(source: *Resource, at_cap: bool) Exception!void {
     if (!at_cap) return;
     var extra: [1]u8 = undefined;
@@ -279,7 +264,7 @@ pub fn validateBoundary(call: *Call, plan: *const ExecutionPlan, source_node: ?*
     }
 }
 
-// Interior checks report overflow, so the fallible form stands apart.
+// The end computations can overflow, so this overlap check is fallible.
 pub fn spanOverlap(first_ptr: usize, first_len: usize, second_ptr: usize, second_len: usize) Exception!bool {
     if (first_len == 0 or second_len == 0) return false;
     const first_end = std.math.add(usize, first_ptr, first_len) catch return error.ResourceException;
@@ -311,14 +296,43 @@ pub fn sinkDirectBuffer(sink: *Resource, required: usize) Exception![]u8 {
     };
 }
 
+// A direct sink already holds the output buffer; a callback sink publishes
+// a staged copy. Hooks never branch on this.
+pub const SinkTarget = struct {
+    output: []u8,
+    staged: bool,
+
+    pub fn open(sink: *Resource, workspace: *resource.Workspace, byte_length: u64) Exception!SinkTarget {
+        const len = std.math.cast(usize, byte_length) orelse return error.ResourceException;
+        return switch (sink.kind) {
+            .direct_write => .{ .output = try sinkDirectBuffer(sink, len), .staged = false },
+            else => .{ .output = try workspace.take(u8, len), .staged = true },
+        };
+    }
+
+    pub fn publish(self: SinkTarget, sink: *Resource, call: *Call, produced: usize) Exception!usize {
+        if (self.staged) try commitBytesToSink(sink, call, self.output[0..produced]);
+        return produced;
+    }
+
+    // Bounded writes report produced length; overrunning the plan is a defect,
+    // never a truncation. Measured writes use the plan.
+    pub fn publishSized(self: SinkTarget, sink: *Resource, call: *Call, sizing: vocabulary.SizingMode, planned: usize, produced: usize) Exception!usize {
+        if (sizing == .bounded) {
+            if (produced > planned) return error.InternalException;
+            return self.publish(sink, call, produced);
+        }
+        return self.publish(sink, call, planned);
+    }
+};
+
 pub fn mapSinkError(exception: Exception, call: *Call, sink: *Resource) Exception {
     if (sink.downstream_status != 0) writeDownstreamDiagnostic(call, sink.downstream_status);
     return exception;
 }
 
-// Bound plan must never truncate. Overrun past it is an internal defect.
-// Bounded writes report produced bytes; the plan stands for measured writes.
-// True means the response is final and the caller returns.
+// True finalizes the response: bounded writes report produced bytes and
+// never truncate; measured writes stand on the plan.
 pub fn respondWrite(response: *Node, sizing: vocabulary.SizingMode, produced: anytype, limit: u64, planned: usize) Exception!bool {
     if (sizing == .bounded) {
         response.byte_length = try boundedProduced(produced, limit, planned);

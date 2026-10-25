@@ -146,10 +146,8 @@ fn installOut(b: *std.Build, dep: *std.Build.Step, source: []const u8, name: []c
 }
 
 fn gnu(b: *std.Build, cwd: []const u8, argv: []const []const u8, dummy_dir: std.Build.LazyPath) *std.Build.Step.Run {
-    // The vendor autotools builds only probe $MAKEINFO/$TEXI2PDF for --version;
-    // the dummy scripts answer that.
-    // Paths must be absolute single words: gnulib's get_version splits unquoted,
-    // and recursive makes resolve MAKEINFO from subdirs.
+    // The vendor builds probe $MAKEINFO/$TEXI2PDF only for --version.
+    // Absolute single-word paths: gnulib's get_version splits unquoted; recursive makes resolve from subdirs.
     const step = b.addSystemCommand(&.{
         "sh", "-c",
         \\dummy="$(cd "$1" && pwd)"
@@ -222,10 +220,8 @@ fn addBinaryRefs(b: *std.Build, ctx: *const common.Settings) struct { sevenzz: *
 }
 
 fn addSevenZz(b: *std.Build) struct { sevenzz: *std.Build.Step.InstallFile, lzma: *std.Build.Step.InstallFile } {
-    // vendor/7zip 26.03 trips clang/LLVM 22's lifetime-safety suggestions under the
-    // makefile's -Weverything -Werror: the intra-TU one on MyStpCpy and, on newer
-    // clang builds, the cross-TU one on IntToString.h. The makefile composes flags
-    // from CFLAGS_WARN_WALL, so both warnings are disabled there.
+    // The vendor/7zip 26.03 source trips clang/LLVM 22's -Weverything -Werror
+    // lifetime-safety suggestions (MyStpCpy intra-TU, IntToString.h cross-TU); CFLAGS_WARN_WALL disables them.
     const make_7zz = make(b, "vendor/7zip/CPP/7zip/Bundles/Alone2", &.{ "make", "-f", "../../cmpl_mac_arm64.mak", "DISABLE_RAR_COMPRESS=1", "CFLAGS_WARN_WALL=-Werror -Wall -Wextra -Wno-lifetime-safety-intra-tu-suggestions -Wno-lifetime-safety-cross-tu-suggestions" });
     const make_lzma = make(b, "vendor/7zip/CPP/7zip/Bundles/LzmaCon", &.{ "make", "-f", "makefile.gcc", "-j4" });
     return .{
@@ -281,8 +277,8 @@ fn addBzip2(b: *std.Build) struct { cmd: *std.Build.Step.InstallFile, lib: std.B
 }
 
 fn addTexinfoDummy(b: *std.Build) std.Build.LazyPath {
-    // Texinfo doc tools are only version-probed by the vendor autotools builds;
-    // dummy scripts answer --version and the real doc work stays disabled.
+    // Vendor autotools builds probe the texinfo tools only for --version;
+    // real doc generation stays disabled.
     const texinfo = b.addSystemCommand(&.{
         "sh", "-c",
         \\set -eu
@@ -355,7 +351,7 @@ fn addFastLzma2(b: *std.Build) struct { lib: std.Build.LazyPath, test_run: *std.
 
 fn addWimlib(b: *std.Build, dummy_dir: std.Build.LazyPath) *std.Build.Step.InstallFile {
     // The CLI is the oracle; wimlib is the format's reference implementation.
-    // autoreconf needs the Homebrew libtool name.
+    // Autoreconf needs the Homebrew libtool name.
     const make_wimlib = gnuChain(
         b,
         "vendor/wimlib",
@@ -392,9 +388,8 @@ fn addDwarfsTools(b: *std.Build) struct { mkdwarfs: *std.Build.Step.InstallFile,
     // Homebrew supplies boost, utf8cpp, nlohmann-json, and fmt.
     // Keg-only libarchive needs PKG_CONFIG_PATH.
 
-    // range-v3 must postdate 0.12.0; CI pins 5ba3911.
-    // Its meta.hpp collides with Xcode 27 libc++.
-    // date.h covers the missing from_stream; CI pins date 43d052d.
+    // The range-v3 checkout must postdate 0.12.0: its meta.hpp collides with
+    // Xcode 27 libc++. CI pins 5ba3911; date 43d052d supplies from_stream.
     var cfg = std.ArrayList([]const u8).empty;
     cfg.appendSlice(b.allocator, &.{
         "-DCMAKE_BUILD_TYPE=Release",

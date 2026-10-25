@@ -1,7 +1,7 @@
 // Deflate tops out at 288 symbols; the RAR5 writer reaches 306.
 const std = @import("std");
 
-const max_alphabet = 704; // brotli command alphabet; rar uses 512, deflate/zstd 288
+const max_alphabet = 704; // Sized for the brotli command alphabet; rar uses 512, deflate/zstd 288.
 const max_nodes = 2 * max_alphabet;
 const max_code_len = 15;
 
@@ -49,8 +49,8 @@ pub fn limitedLengths(freqs: []const u32, lengths: []u8, limit: u8) void {
         depth[node] = depth[parent[node]] + 1;
     }
     var bl_count: [max_code_len + 2]u16 = @splat(0);
-    // An odd count underflows to -1 in the reference and ends the loop there,
-    // so an unsigned counter has to stop on the same boundary.
+    // The reference underflows an odd count to -1, ending its loop there;
+    // the unsigned loop must stop on that boundary.
     var overflow: i32 = 0;
     for (0..2 * count - 1) |node_index| overflow += @intFromBool(depth[node_index] > limit);
     for (0..count) |i| bl_count[@min(depth[i], limit)] += 1;

@@ -27,8 +27,8 @@ pub fn decodeOptions(input: []const u8) Exception!lzma.Options {
     };
 }
 
-// A declared size accompanies a markerless stream. A caller that sizes later
-// passes unpack_size = null and gets the end marker.
+// A declared size means a markerless stream; a caller sizing later
+// passes null and gets the end marker.
 pub fn encodeOptions(dictionary: u32) Exception!lzma.Options {
     if (dictionary < lzma.dictionary_min or dictionary > lzma.dictionary_max) return error.CallException;
     return .{
@@ -67,8 +67,7 @@ pub fn encodedSizeBound(input_len: usize) usize {
     return lzma.encodedSizeBound(input_len) +| header_size;
 }
 
-// The lzma-alone properties byte (lc + 9 * lp + 45 * pb) for the read-side
-// inspect projection, parsed without decoding.
+// The lzma-alone properties byte is lc + 9 * lp + 45 * pb.
 pub fn inspectProperties(input: []const u8) Exception!u8 {
     if (input.len < header_size) return error.DataException;
     if (input[0] >= 9 * 5 * 5) return error.DataException;
@@ -124,7 +123,7 @@ test "lzma file container round trip restores the original input" {
 pub const HeaderInfo = struct {
     properties: lzma.Properties,
     dictionary_size: u32,
-    // null when the header declares the maximum u64, the marker form.
+    // The maximum u64 declares the marker form, leaving this null.
     unpack_size: ?u64,
     has_marker: bool,
 };

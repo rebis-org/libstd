@@ -3,8 +3,8 @@ const std = @import("std");
 const math = std.math;
 const mem = std.mem;
 
-// BLAKE2sp is the RAR5 optional file checksum. The stdlib Blake2s exposes no tree
-// parameters, so this implementation follows the spec directly.
+// BLAKE2sp is the RAR5 optional checksum; stdlib Blake2s lacks tree
+// parameters, so this follows the spec.
 
 const iv = [8]u32{
     0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,

@@ -197,13 +197,8 @@ pub const SpannedResult = struct { total_len: usize, volumes: u64 };
 
 const spanning_signature: u32 = 0x0807_4b50;
 
-// Split/spanned writer (Info-ZIP "zip -s" conventions, verified against
-// the system zip and 7zz): the byte stream stays contiguous; disk 1 opens
-// with the 4-byte spanning signature, record headers never straddle a disk
-// boundary (file data may), the central directory and EOCD live on the
-// last disk, the EOCD's central offset is relative to that disk's start,
-// and each central record names its local header's disk with an offset
-// relative to that disk's start.
+// Info-ZIP "zip -s" conventions, verified against system zip and 7zz:
+// record headers never straddle disk boundaries; all offsets are disk-relative.
 pub fn encodeSpanned(entries: []const Entry, archive_comment: []const u8, output: []u8, volume_size: u64, provider: crypto.Provider, history: []u8, measurement_buffer: []u8, staging: []u8, scratch: []u8, failure_cause: *crypto.FailureCause, plan_scratch: []usize) Exception!SpannedResult {
     if (volume_size < 4096) return error.CallException;
     const vs: usize = std.math.cast(usize, volume_size) orelse return error.ResourceException;
@@ -211,12 +206,12 @@ pub fn encodeSpanned(entries: []const Entry, archive_comment: []const u8, output
     const total = try bounds.addUsize(required, 4);
     if (output.len < total) return error.CapacityException;
 
-    // Plan the disks: walk the logical records, filling each disk up to
-    // its capacity and splitting only inside file data regions.
+    // Plan the disks: fill each to capacity, splitting only inside file
+    // data regions.
     if (plan_scratch.len < entries.len * 2 + 8) return error.CapacityException;
     const boundaries = plan_scratch;
     var boundary_count: usize = 0;
-    var pos: usize = 0; // logical position, signature excluded
+    var pos: usize = 0; // Logical position, signature excluded.
     var remaining: usize = vs - 4;
     var central_disk_start: usize = 0;
     var central_total: usize = 0;
@@ -261,7 +256,7 @@ pub fn encodeSpanned(entries: []const Entry, archive_comment: []const u8, output
             remaining -= record_len;
             continue;
         }
-        return error.ResourceException; // one record larger than a whole disk
+        return error.ResourceException; // One record larger than a whole disk.
     }
     const eocd_len = 22 + archive_comment.len + blk: {
         const needs_zip64 = entries.len >= std.math.maxInt(u16) or central_total >= std.math.maxInt(u32) or pos >= std.math.maxInt(u32);
@@ -278,12 +273,8 @@ pub fn encodeSpanned(entries: []const Entry, archive_comment: []const u8, output
     const written = try encode(entries, archive_comment, output[4..], provider, history, measurement_buffer, staging, scratch, failure_cause);
     if (written != required) return error.InternalException;
 
-    // Local header offsets in the central directory were written relative
-    // to the shifted base (signature excluded). The spanning convention
-    // (verified against Info-ZIP): the record's disk number names the disk
-    // holding the local header, and the offset is relative to that disk's
-    // first byte. Disk 0 starts at archive offset 0 (signature included);
-    // disk d starts right after the signature plus the preceding boundaries.
+    // Central offsets were written against the shifted base; patch them to
+    // the Info-ZIP convention: relative to each disk's first byte.
     {
         var cursor: usize = 4 + pos;
         for (entries) |_| {
@@ -305,8 +296,8 @@ pub fn encodeSpanned(entries: []const Entry, archive_comment: []const u8, output
                     if (field + 4 + size > extra_end) break;
                     if (tag == 0x0001) {
                         var value_offset = field + 4;
-                        if (readU32(output, cursor + 20) == std.math.maxInt(u32)) value_offset += 8; // uncompressed
-                        if (readU32(output, cursor + 24) == std.math.maxInt(u32)) value_offset += 8; // compressed
+                        if (readU32(output, cursor + 20) == std.math.maxInt(u32)) value_offset += 8; // Uncompressed.
+                        if (readU32(output, cursor + 24) == std.math.maxInt(u32)) value_offset += 8; // Compressed.
                         if (value_offset + 8 > field + 4 + size) return error.InternalException;
                         wide = value_offset;
                         found = true;
@@ -340,8 +331,8 @@ pub fn encodeSpanned(entries: []const Entry, archive_comment: []const u8, output
                     if (field + 4 + size > extra_end) break;
                     if (tag == 0x0001) {
                         var value_offset = field + 4;
-                        if (readU32(output, cursor + 20) == std.math.maxInt(u32)) value_offset += 8; // uncompressed
-                        if (readU32(output, cursor + 24) == std.math.maxInt(u32)) value_offset += 8; // compressed
+                        if (readU32(output, cursor + 20) == std.math.maxInt(u32)) value_offset += 8; // Uncompressed.
+                        if (readU32(output, cursor + 24) == std.math.maxInt(u32)) value_offset += 8; // Compressed.
                         if (value_offset + 8 > field + 4 + size) return error.InternalException;
                         std.mem.writeInt(u64, output[value_offset..][0..8], relative, .little);
                         patched = true;
@@ -358,7 +349,7 @@ pub fn encodeSpanned(entries: []const Entry, archive_comment: []const u8, output
     // Patch the EOCD (and zip64 EOCD when present) disk fields.
     const disks: u64 = boundary_count + 1;
     const eocd_pos = total - 22 - archive_comment.len;
-    const end_pos = eocd_pos - eocd_len + 22; // start of EOCD (zip64 records precede)
+    const end_pos = eocd_pos - eocd_len + 22; // Start of EOCD (zip64 records precede).
     if (readU32(output, eocd_pos) != end_signature) return error.InternalException;
     const needs_zip64 = eocd_len != 22;
     if (entries.len >= std.math.maxInt(u16) or disks > std.math.maxInt(u16)) return error.UnsupportedException;
@@ -397,11 +388,8 @@ pub fn spannedVolumeExtents(total_len: usize, volume_size: u64) Exception!Volume
 
 pub const VolumePlan = struct { volumes: u64 };
 
-// Reads a spanned archive given its disks. The disks concatenate into the
-// caller's join buffer; the EOCD's central offset is resolved relative to
-// the disk holding the central directory, and each record's local header
-// offset is resolved relative to the disk named by its disk-number field
-// (the Info-ZIP convention, verified against the system zip and 7zz).
+// Offsets resolve relative to the disk named in each field, per the
+// Info-ZIP convention verified against system zip and 7zz.
 pub fn zipDecodeOrdinalSpanned(volumes: []const []const u8, ordinal: usize, output: []u8, join: []u8, disk_starts_scratch: []usize, options: ZipDecodeOptions) Exception!usize {
     options.failure_cause.* = .none;
     if (volumes.len == 0) return error.DataException;
@@ -471,8 +459,8 @@ pub fn zipDecodeOrdinalSpanned(volumes: []const []const u8, ordinal: usize, outp
         entry = try zipNext(archive, directory, &cursor, index);
         if (index == ordinal) break;
     }
-    // The central records may declare a smaller byte size than the scan:
-    // re-derive the record walk exactly like the single-volume decoder.
+    // The records may declare a smaller size than the scan; re-derive the
+    // walk like the single-volume decoder.
     var spanned_options = options;
     spanned_options.disk_starts = disk_starts;
     return try zipDecodeEntry(archive, entry, output, spanned_options);
@@ -480,11 +468,8 @@ pub fn zipDecodeOrdinalSpanned(volumes: []const []const u8, ordinal: usize, outp
 
 fn validateEntry(entry: Entry) Exception!void {
     if (entry.name.len == 0 or entry.name.len > std.math.maxInt(u16) or entry.extra.len > std.math.maxInt(u16) or entry.comment.len > std.math.maxInt(u16)) return error.CallException;
-    // The writable flag set: UTF-8 names (0x0800), the data-descriptor
-    // marker (0x0008), and the compression-level hint (0x0002, honored as a
-    // hint only — the encoder runs its tuned configuration regardless, and
-    // the LZMA path already forces the bit for interop). Everything else
-    // names a feature the writer does not emit, so it stays rejected.
+    // Only UTF-8 names (0x0800), the descriptor marker (0x0008), and the
+    // level hint (0x0002, advisory) are writable; all else stays rejected.
     if (entry.flags & ~@as(u16, 0x0800 | 0x0008 | 0x0002) != 0 or (entry.flags & 0x0800 != 0 and !std.unicode.utf8ValidateSlice(entry.name))) return error.UnsupportedException;
     try validatePath(entry.name, entry.flags);
     switch (entry.method) {
@@ -504,10 +489,8 @@ fn validateEntry(entry: Entry) Exception!void {
     }
 }
 
-// WinZip AES entries never carry a trailing descriptor: the CRC field is
-// repurposed for the encrypted-data marker, so bit 3 must not be set even
-// when the caller requested the streaming shape. ZipCrypto keeps bit 3: a
-// descriptor is written and the check byte switches to the time byte.
+// WinZip AES reuses the CRC field, so bit 3 must clear; ZipCrypto keeps
+// the descriptor and checks the time byte.
 fn effectiveFlags(entry: Entry) u16 {
     var flags = entry.flags;
     if (entry.method == 14) flags |= 0x0002;
@@ -600,9 +583,8 @@ fn zipValidateExtra(extra: []const u8) Exception!void {
 }
 
 fn localZip64Length(compressed: usize, uncompressed: usize, descriptor: bool) usize {
-    // With bit 3 set the local header carries no sizes at all, so the zip64
-    // extra stays out of the local record; the central directory is
-    // authoritative for every reader.
+    // With bit 3 set the local header carries no sizes, so no local zip64
+    // extra; the central directory is authoritative.
     if (descriptor) return 0;
     return if (compressed >= std.math.maxInt(u32) or uncompressed >= std.math.maxInt(u32)) 20 else 0;
 }
@@ -723,8 +705,8 @@ fn writeData(sink: *io.Sink, entry: Entry, provider: crypto.Provider, history: [
         var keys = crypto.ZipCryptoKeys.init(entry.password);
         var header: [12]u8 = undefined;
         try crypto.fillRandom(header[0..11]);
-        // With the descriptor flag set the CRC is not yet written, so the
-        // spec check byte is the high byte of the file time instead.
+        // With bit 3 set the CRC is unknown, so the check byte is the
+        // high time byte.
         header[11] = if (entry.flags & 0x0008 != 0) @truncate(entry.dos_time >> 8) else @truncate(checksum.crc32With(provider, entry.data) >> 24);
         keys.encrypt(&header, &header);
         try sink.write(&header);
@@ -873,8 +855,8 @@ pub const ZipDecodeOptions = struct {
     scratch: []u8 = &.{},
     history: []u8 = &.{},
     provider: crypto.Provider = crypto.default_provider,
-    // Spanned reads: absolute stream offset of each disk's first byte. When
-    // empty, the archive must be single-volume (every disk number is 0).
+    // Spanned reads: absolute offset of each disk's first byte; empty
+    // means single-volume (every disk number is 0).
     disk_starts: []const usize = &.{},
 };
 
@@ -922,8 +904,8 @@ fn zipDecodeEntry(archive: []const u8, entry: Info, output: []u8, options: ZipDe
     const encrypted = entry.flags & 1 != 0;
     if (encrypted and entry.method != winzip_aes_method and !zipMethodSupported(entry.method)) return error.UnsupportedException;
     if (!encrypted and entry.method == winzip_aes_method) return error.DataException;
-    // The central record's offset is relative to the disk that holds the
-    // local header; single-volume archives have one disk starting at 0.
+    // The local offset is relative to the disk holding the local header;
+    // single-volume archives start at 0.
     const local_offset = if (options.disk_starts.len > 0) blk: {
         if (entry.disk_number >= options.disk_starts.len) return error.DataException;
         break :blk try bounds.addUsize(options.disk_starts[entry.disk_number], entry.local_relative);
@@ -1268,9 +1250,8 @@ fn parseWinzipAesExtra(extra: []const u8, strength: *u8, version: *u16, actual_m
             const parsed_strength = payload[4];
             if (parsed_strength < 1 or parsed_strength > 3) return error.UnsupportedException;
             const parsed_method = readU16(payload, 5);
-            // The compressed stream inside AES is any supported method;
-            // WinZip ships AES with bzip2, LZMA, and PPMd alongside the
-            // classic deflate and store pair.
+            // The stream inside AES is any supported method; WinZip pairs
+            // AES with bzip2, LZMA, and PPMd.
             if (!zipMethodSupported(parsed_method)) return error.UnsupportedException;
             strength.* = parsed_strength;
             version.* = readU16(payload, 0);
@@ -1378,8 +1359,8 @@ test "zip wrong password reports wrong_password cause" {
         })) |_| {
             try testing.expect(false);
         } else |err| {
-            // The PKWARE check byte is one byte wide, so a wrong password clears
-            // it once in every 256 attempts, and past that only the CRC rejects.
+            // A wrong password clears the one-byte PKWARE check once in 256
+            // attempts; only the CRC rejects the rest.
             try testing.expect(err == error.DataException or err == error.IntegrityException);
             if (err == error.DataException) try testing.expectEqual(crypto.FailureCause.wrong_password, cause);
         }
@@ -1397,8 +1378,8 @@ test "zip kdf_rounds_limit gates winzip aes" {
 }
 
 test "zip aes128 single entry fits a 512-byte buffer" {
-    // See the decode gate above: a mixed build cannot serve one call with
-    // both arms, and an offprem tag has no encoder at all.
+    // A mixed provider build serves no single tag for both arms; an
+    // offprem tag has no encoder.
     if (!deflate_seam.encodeServed(checksum.default_provider) or !deflate_seam.decodeServed(checksum.default_provider)) return;
 
     const testing = std.testing;
@@ -1421,11 +1402,11 @@ test "zip aes128 single entry fits a 512-byte buffer" {
 }
 
 test "zip winzip aes clears the data descriptor flag" {
-    // A descriptor cannot follow WinZip AES data: the CRC field carries the
-    // encrypted marker instead, so bit 3 must be dropped from both headers
-    // even when the caller asked for the streaming shape.
-    // See the decode gate above: a mixed build cannot serve one call with
-    // both arms.
+    // A descriptor cannot follow WinZip AES data, so bit 3 drops from both
+    // headers regardless of the caller's request.
+    //
+    // A mixed provider build serves no single tag for both arms; run
+    // only where the default tag serves them.
     if (!deflate_seam.encodeServed(checksum.default_provider) or !deflate_seam.decodeServed(checksum.default_provider)) return;
     const testing = std.testing;
     const data = "aes entry that requested the streaming shape";
@@ -1452,8 +1433,8 @@ test "zip winzip aes clears the data descriptor flag" {
 }
 
 test "zip zipcrypto data descriptor uses the time check byte" {
-    // With bit 3 set the zipcrypto check byte is the high byte of the file
-    // time, not the CRC: the CRC only arrives in the trailing descriptor.
+    // With bit 3 set the zipcrypto check byte is the high time byte; the
+    // CRC only arrives in the descriptor.
     const testing = std.testing;
     const data = "streamed zipcrypto payload for the time check byte";
     const crc = checksum.crc32With(crypto.default_provider, data);
@@ -1477,9 +1458,8 @@ test "zip zipcrypto data descriptor uses the time check byte" {
 }
 
 test "zip winzip aes accepts every supported compression method" {
-    // The AES extra field records the real method: WinZip pairs AES with
-    // bzip2 and deflate64 alongside the classic deflate and store pair, so
-    // the decoder must accept the full supported set the encoder emits.
+    // The AES extra field names the real method; the decoder must accept
+    // the full supported set the encoder emits.
     const testing = std.testing;
     const chunk = "actual compression method inside the aes envelope ";
     const data = chunk ++ chunk ++ chunk ++ chunk ++ chunk ++ chunk ++ chunk ++ chunk;

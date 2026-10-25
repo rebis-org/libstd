@@ -6,8 +6,8 @@ const onprem = @import("onprem.zig");
 const std_lzma = std.compress.lzma;
 pub const Exception = exception.Exception;
 pub const Options = onprem.Options;
-// stdlib's tables and window carve from the caller's scratch; growth beyond it
-// answers CapacityException — the accepted incompleteness of choosing std.
+// The stdlib's tables and window carve from the caller's scratch; growth
+// beyond it answers CapacityException, the accepted std incompleteness.
 pub const Properties = onprem.Properties;
 
 fn mapStreamError(err: std.Io.Reader.StreamError) Exception {
@@ -29,21 +29,22 @@ fn stdProperties(properties: Properties) std_lzma.Decode.Properties {
     return .{ .lc = @intCast(properties.lc), .lp = @intCast(properties.lp), .pb = @intCast(properties.pb) };
 }
 
-// stdlib fuses the stop rule and the length assertion, reporting an early end marker as a size mismatch.
+// The stdlib fuses the stop rule and the length assertion, reporting an
+// early end marker as a size mismatch.
 fn endedShortOfDeclared(decoder: *const std_lzma.Decompress, options: Options) bool {
     const declared = options.unpack_size orelse return false;
     const mismatch = decoder.err orelse return false;
     return mismatch == error.DecompressedSizeMismatch and decoder.buffer.len < declared;
 }
 
-// stdlib flushes the window's tail only on the success path, so a short run leaves it unflushed.
+// The stdlib flushes the window's tail only on the success path, so a
+// short run leaves it unflushed.
 fn drainShortRun(decoder: *std_lzma.Decompress, writer: *std.Io.Writer) Exception!void {
     writer.writeAll(decoder.reader.buffer[decoder.reader.seek..decoder.reader.end]) catch return error.CapacityException;
     decoder.buffer.finish(writer) catch return error.CapacityException;
 }
 
-// drive decodes the raw LZMA payload (after the 13-byte .lzma header, or an
-// lzma2 chunk body) into output through the caller-provided reader.
+// Decodes the raw payload after the 13-byte .lzma header, or an lzma2 chunk body.
 pub fn drive(reader: *std.Io.Reader, output: []u8, scratch: []u8, options: Options) Exception!usize {
     var fba = std.heap.FixedBufferAllocator.init(scratch);
     const allocator = fba.allocator();

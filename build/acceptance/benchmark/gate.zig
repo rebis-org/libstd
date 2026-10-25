@@ -88,7 +88,7 @@ pub fn classify(candidate: matrix.BenchmarkRow, totals: metric.Totals, available
         if (gap_value) |value| result.worst_gap = @max(result.worst_gap orelse value, value);
     }
     if (ref_failed) {
-        // Broken references must not mask a regression, outranking never-fatal store rows.
+        // A broken reference must stay fatal, not fall into the never-fatal noisy class.
         result.class = .unhealthy;
     } else if (candidate.archive and !candidate.decode_only) {
         result.class = .noisy;

@@ -5,8 +5,8 @@ const sink = @import("../../../common/sink.zig");
 
 const Sink = sink.Sink;
 
-// Distances are validated against total_written, so reset must not re-zero the
-// buffer, because a window-sized memset per entry dwarfs decoding on small files.
+// Distances are checked against total_written, so reset need not re-zero
+// the window; that memset would dwarf decoding.
 
 pub const Window = struct {
     buffer: []u8,
@@ -30,8 +30,8 @@ pub const Window = struct {
         self.total_written += 1;
     }
 
-    // An impossible distance zero-fills instead of reading stale slots, so a corrupt
-    // stream must not produce plausible bytes. Segments split only at the wrap points.
+    // An impossible distance zero-fills rather than read stale slots, so
+    // corrupt input never yields plausible bytes.
     pub fn copyMatch(self: *Window, distance: usize, length: usize) void {
         if (length == 0) return;
 
@@ -59,10 +59,8 @@ pub const Window = struct {
         while (remaining > 0) {
             const seg = @min(remaining, @min(buf_len - dst, buf_len - src));
             if (src > dst) {
-                // The source wrapped past the destination, so the kernel's flat
-                // recomputation (out_off - distance) would underflow. The segment
-                // length is at most distance here, so the logical ranges do not
-                // overlap and a forward copy reads each byte before writing it.
+                // The wrapped source would underflow the kernel's flat
+                // recomputation; segments here never overlap, so copyForwards is safe.
                 std.mem.copyForwards(u8, self.buffer[dst..][0..seg], self.buffer[src..][0..seg]);
             } else {
                 kernels.copyMatch(self.buffer, dst, @intCast(distance), @intCast(seg));
@@ -92,8 +90,8 @@ pub const Window = struct {
         return self.buffer[pos & self.mask];
     }
 
-    // False means the requested bytes were overwritten, and returning the current
-    // slots would be a wrong answer in a right answer's shape, so callers must refuse.
+    // False means the requested bytes were overwritten; the current slots
+    // would look valid but be wrong.
     pub fn emitTo(self: *const Window, out: Sink, start_offset: usize, count: usize) bool {
         if (start_offset > self.buffer.len) return false;
         if (count > start_offset) return false;
@@ -141,9 +139,9 @@ test "window emit refuses overwritten history" {
 }
 
 test "window copy match crosses the physical wrap" {
-    // 24 bytes into a 16-byte window: write_pos wraps, so a match whose
-    // distance exceeds the masked destination offset takes the forward-copy
-    // path instead of the kernel's flat recomputation (which underflows).
+    // 24 bytes into a 16-byte window: the wrapped source takes the
+    // forward-copy path because the kernel's recomputation would underflow.
+    //
     // Bytes 16..24 overwrite buffer[0..8], so the raw window reads
     // QRSTUVWX MNOP before the match runs.
     var buf: [16]u8 = undefined;

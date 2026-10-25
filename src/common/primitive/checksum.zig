@@ -79,8 +79,8 @@ inline fn pmull2(a: crc_lane, b: crc_lane) crc_lane {
     );
 }
 
-// PCLMULQDQ counterpart of the PMULL pair; the early-clobber output copies first because
-// the instruction cannot write a tied operand. Encoding per Chromium zlib crc32_simd.c.
+// The leading copy works around the early clobber: PCLMULQDQ cannot write
+// a tied operand. Encoding per Chromium zlib crc32_simd.c.
 inline fn clmul1(a: crc_lane, b: crc_lane) crc_lane {
     return asm (
         \\ movdqa     %[a], %[ret]
@@ -109,17 +109,15 @@ inline fn foldLane(lane: crc_lane, input: crc_lane, k: crc_lane) crc_lane {
     }
 }
 
-// One 16-byte load per lane. The helper must inline: a call in the fold loop
-// costs more than the load itself, because no q register survives a call.
+// Must inline: a call in the fold loop costs more than the load, and no
+// q register survives a call.
 inline fn loadLane(bytes: *const [16]u8) crc_lane {
     const lane: *align(1) const crc_lane = @ptrCast(bytes);
     return lane.*;
 }
 
-// CRC-32/BZIP2 is the bit reflection of CRC-32/ZIP: rev32(zipStep(rev32(R), rbit8(b)))
-// equals the bzip2 step for every register and byte, so the bzip2 state rides the
-// reflected fold in the zip domain with per-byte bit-reversed data and one rev32
-// at each boundary. RBIT reverses the bits of every byte in one instruction.
+// CRC-32/BZIP2 is the bit reflection of CRC-32/ZIP: rev32(zipStep(rev32(R),
+// rbit8(b))) equals the bzip2 step for every register and byte.
 inline fn loadLaneRbit(bytes: *const [16]u8) crc_lane {
     const lane: *align(1) const crc_lane = @ptrCast(bytes);
     return asm ("rbit %[ret].16b, %[a].16b"
@@ -157,9 +155,8 @@ const Crc32Aarch64Tail = struct {
     const data_word = word;
 };
 
-// CRC-32/BZIP2 rides the reflected fold in the zip domain: original data is
-// bit-reversed per byte on the way in (lanes and data words), while the fold's
-// drained state is raw and stays plain.
+// CRC-32/BZIP2 rides the zip fold: lanes and data words enter bit-reversed
+// per byte; the drained state stays plain.
 const Bzip2Aarch64Tail = struct {
     const folds_16_byte_lanes = true;
 
@@ -176,20 +173,16 @@ const Bzip2Aarch64Tail = struct {
     }
 };
 
-// The fold needs PMULL (aes) and the tail drains through the crc32
-// instructions, so both features must be present; iOS baseline (apple_a7)
-// carries aes without crc.
+// The fold needs PMULL (aes); the tail drains via crc32 instructions.
+// iOS baseline (apple_a7) carries aes without crc.
 const has_bzip2_pmull = builtin.target.cpu.arch == .aarch64 and
     builtin.target.cpu.has(.aarch64, .crc) and
     builtin.target.cpu.has(.aarch64, .aes) and !options.bzip2crc32_portable;
 
 const FoldK = struct { k0: crc_lane, k1: crc_lane, k2: crc_lane, k3: crc_lane };
 
-// Carry-less fold state (PMULL or PCLMULQDQ) shared by every width; the
-// caller routes only inputs at or above crc_pmull_threshold, because folding
-// costs a fixed setup that short inputs never repay. The tail re-enters the
-// folded state and drains the remainder: hardware CRC steps on aarch64,
-// table steps where no such instruction exists.
+// Carry-less fold (PMULL or PCLMULQDQ); the caller enforces
+// crc_pmull_threshold because the fixed setup outweighs short inputs.
 fn crcFold(comptime T: type, comptime K: FoldK, crc_in: T, input: []const u8, comptime Tail: type, comptime reversed_loads: bool) T {
     const load = if (reversed_loads) loadLaneRbit else loadLane;
     var crc = crc_in;
@@ -261,10 +254,8 @@ fn crcFold(comptime T: type, comptime K: FoldK, crc_in: T, input: []const u8, co
     return crc;
 }
 
-// A chain of 16-byte lanes ending in table steps loses to slicing-by-8, so
-// the table tail never folds here; it drains whole words instead.
-// The slicing-by-8 tail shared by the reflected widths: whole words down to
-// the four-byte fold, then single table steps for the byte remainder.
+// Sixteen-byte lanes ending in table steps lose to slicing-by-8, so this
+// tail drains whole words instead of folding.
 fn drainReflected(comptime T: type, comptime tables: *const [8][256]T, crc_in: T, input: []const u8) T {
     var crc = crc_in;
     var i: usize = 0;
@@ -313,8 +304,8 @@ fn Crc64Tail(comptime tables: *const [8][256]u64) type {
     };
 }
 
-// CRC-64/XZ (reflected ECMA polynomial) fold constants. A fold by shift s pairs x^s with
-// x^(s-64), and deriving them at comptime from the recurrence keeps them in step with the table.
+// CRC-64/XZ constants: a fold by shift s pairs x^s with x^(s-64);
+// comptime derivation from the recurrence keeps them in step.
 const crc64_poly: u64 = 0xC96C5795D7870F42;
 
 fn crc64Xpow(comptime n: u16) u64 {
@@ -384,9 +375,8 @@ pub fn xxh32With(provider: seam.Provider, input: []const u8) u32 {
     return seal(XxHash32, XxHash32.bind(provider, 0), input);
 }
 
-// One slicing-by-8 step over eight input bytes; the table index order is
-// the reflected xz layout (crc32_fast.c / crc64_fast.c) and the big-endian
-// braid (crc32_table_be.h), selected by comptime direction.
+// Table index order follows the reflected xz layout (crc32_fast.c /
+// crc64_fast.c) or the big-endian braid (crc32_table_be.h).
 inline fn fold8(comptime T: type, comptime tables: *const [8][256]T, comptime reflected: bool, crc: T, chunk: *const [8]u8) T {
     if (comptime reflected) {
         const bytes_per_word = @bitSizeOf(T) / 8;
@@ -618,7 +608,7 @@ test "bzip2 crc32 matches the published check value" {
 }
 
 test "crc64 xz fold matches the byte table across sizes" {
-    // The portable byte table is the reference, because that is the only path a non-aarch64 target runs.
+    // The portable byte table is the target-independent reference.
     var rng = std.Random.DefaultPrng.init(0xC64C);
     const allocator = std.testing.allocator;
     const table = comptime blk: {

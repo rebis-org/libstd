@@ -3,8 +3,8 @@ const std = @import("std");
 const common = @import("common.zig");
 const manifest = @import("manifest.zig");
 
-// One engine serves every form whose per-arch content is a static/dynamic
-// pair under libstd/lib/<arch>/; only the target query and extensions vary.
+// One engine serves every form with a static/dynamic pair under
+// libstd/lib/<arch>/; only the target query and extensions vary.
 pub fn addArchive(
     b: *std.Build,
     ctx: *const common.Settings,

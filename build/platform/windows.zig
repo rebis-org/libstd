@@ -3,8 +3,8 @@ const std = @import("std");
 const common = @import("common.zig");
 const manifest = @import("manifest.zig");
 
-// The gnu flavor links the MinGW-w64 libc Zig ships; the msvc flavor stays
-// free of any C runtime so consumers bring their own. Both build on any host.
+// The gnu abi links the MinGW-w64 libc Zig ships; msvc leaves
+// the CRT to consumers. Both build on any host.
 pub fn addArchive(
     b: *std.Build,
     ctx: *const common.Settings,

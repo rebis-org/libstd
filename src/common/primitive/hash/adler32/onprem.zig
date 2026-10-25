@@ -4,11 +4,8 @@ const std = @import("std");
 const options = @import("options");
 const seam = @import("seam");
 
-// RFC 1950. The wide path follows the Chromium zlib scheme (adler32_simd.c),
-// shared with zlib-ng's NEON and AVX2 arms: plain byte sums in u16 columns
-// and u32 lanes, position weighting deferred to one multiply-accumulate
-// pass, one modulo per NMAX window. L is 16 on aarch64 and 32 on x86 with
-// AVX2; the portable flag turns the wide path off on both.
+// RFC 1950. The wide path follows Chromium zlib's adler32_simd.c, shared
+// with zlib-ng's NEON and AVX2 arms.
 
 const lane_len: usize = blk: {
     if (options.adler32_portable) break :blk 0;
@@ -67,9 +64,8 @@ pub const Adler32 = struct {
         return m;
     }
 
-    // 2L bytes per block; each u16 column lane accumulates one byte position
-    // and each u32 lane accumulates eight, so the bounds hold for any L
-    // because the NMAX window shrinks the block count in step.
+    // The NMAX window caps the block count at every L, so no u16 column
+    // or u32 lane overflows.
     fn foldBlocks(comptime l: usize, s1: *u32, s2: *u32, data: []const u8) void {
         const Lane = @Vector(l, u8);
         const Half = @Vector(l / 2, u16);
@@ -94,11 +90,8 @@ pub const Adler32 = struct {
                 col3 = col3 +% @as(Half, @intCast(@shuffle(u8, bytes2, undefined, iota(l / 2, 0))));
                 col4 = col4 +% @as(Half, @intCast(@shuffle(u8, bytes2, undefined, iota(l / 2, l / 2))));
             }
-            // Every lane of b_v counts whole 2L-byte blocks behind the current
-            // one, so one shift restores the block weights; the multiply pass
-            // then adds the byte weights inside one block. Column c covers
-            // byte positions c*(l/2).. of the block, so position j of column
-            // c carries weight 2l - c*(l/2) - j.
+            // b_v lanes count whole blocks behind the current one; one shift
+            // restores block weights, weightPass adds byte weights.
             b_v *%= @as(Words, @splat(@intCast(2 * l)));
             inline for (0..4) |c| {
                 const col = switch (c) {

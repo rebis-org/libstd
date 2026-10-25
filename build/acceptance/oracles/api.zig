@@ -7,6 +7,7 @@ const steps = @import("steps.zig");
 
 // Exercises the session boundary through its C exports with caller-owned
 // storage and no envelope.
+//
 // The contract: byte-identity with the kernel-mediated decode, idempotent
 // destroy, invalid_call after destroy.
 
@@ -42,8 +43,8 @@ fn run(r: *harness.Runner) anyerror!void {
     r.input = r.corpus_buffer[0..];
     try steps.writeSpan(&steps.noParams, r);
 
-    // Control: the envelope's own readback must accept the same frame. If
-    // this fails the frame (not the session boundary) is at fault.
+    // Control: the envelope's readback must accept the same frame; failure
+    // here blames the frame, not the boundary.
     try steps.queryRead(&steps.noParams, r);
     try steps.readSpan(&steps.noParams, r);
 
@@ -80,8 +81,8 @@ fn run(r: *harness.Runner) anyerror!void {
     var state: c_int = 0;
     if (stdk_session_step(storage, null, 0, null, 0, 1, &counts, &state) != abi.Status.invalid_call) return error.StepAfterDestroy;
 
-    // Discovery: the versioned catalog names the session-able pairs. The
-    // removed tar/write pair stays out (retirement is part of the contract).
+    // Discovery: the versioned catalog lists session pairs; the retired
+    // tar/write pair stays out.
     const catalog = std.mem.span(stdk_session_catalog());
     if (!std.mem.startsWith(u8, catalog, "v1:")) return error.CatalogVersion;
     if (std.mem.find(u8, catalog, "gzip/decode") == null) return error.CatalogMissingGzip;
@@ -141,8 +142,8 @@ fn run(r: *harness.Runner) anyerror!void {
     if (detail_status != abi.Status.resource_limit) return error.BudgetDetail;
     if (stdk_session_destroy(storage) != abi.Status.ok) return error.DestroyFailed;
 
-    // Raw DEFLATE session: a stream produced by the deflate profile decodes
-    // chunked through the same boundary, and the pair is discoverable.
+    // Raw DEFLATE session: a deflate-profile stream decodes chunked through
+    // the same boundary, and the pair is discoverable.
     harness.setup(r, harness.ids.deflate, harness.mode_stream);
     r.input = r.corpus_buffer[0..];
     try steps.writeSpan(&steps.noParams, r);
@@ -171,13 +172,14 @@ fn run(r: *harness.Runner) anyerror!void {
     if (std.mem.find(u8, catalog_check, "deflate/decode") == null) return error.CatalogMissingDeflate;
 }
 
-// Encode sessions pump the corpus through in chunks and the envelope reads
-// the frame back; the zlib decode session walks an envelope-made frame.
+// Encode sessions pump the corpus chunked; the envelope reads each frame
+// back. The zlib decode session walks an envelope-made frame.
 fn runExtended(r: *harness.Runner) anyerror!void {
     var counts: [2]u64 = undefined;
     var state: c_int = 0;
 
-    // zlib decode: the envelope's zlib frame decodes chunked through the boundary.
+    // The zlib decode path: the envelope's zlib frame decodes chunked
+    // through the boundary.
     harness.setup(r, harness.ids.zlib, harness.mode_stream);
     corpus.fillTiled(r.corpus_index, r.corpus_buffer[0..]);
     r.input = r.corpus_buffer[0..];

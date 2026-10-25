@@ -1,33 +1,23 @@
 const std = @import("std");
 
+const entry_prim = @import("../../../common/entry.zig");
 const crypto_prim = @import("../../../common/primitive/crypto.zig");
 const exception_prim = @import("../../../common/primitive/exception.zig");
 
 const b64_pad = std.base64.standard;
 const b64 = std.base64.standard_no_pad;
 const ChaCha20Poly1305 = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
-const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const X25519 = std.crypto.dh.X25519;
-const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
 const scrypt = std.crypto.pwhash.scrypt;
 const testing = std.testing;
+pub const Entry = entry_prim.Entry;
+pub const EntryInfo = entry_prim.Sized;
 pub const Exception = exception_prim.Exception;
 
-// age v1 file encryption per C2SP age.md; vectors from the CCTV age testkit
-// and the reference Go implementation in vendor/age. The v1.1 hardware
-// recipient types are out of scope.
+// Implements age v1 per C2SP age.md; vectors from the CCTV testkit and vendor/age.
+// v1.1 hardware recipients are out of scope.
 
 pub const scratch_size: usize = 64 * 1024;
-
-pub const Entry = struct {
-    name: []const u8,
-    data: []const u8,
-};
-
-pub const EntryInfo = struct {
-    size: u64,
-    ordinal: u64,
-};
 
 pub const Options = struct {
     password: []const u8 = &.{},
@@ -167,8 +157,8 @@ fn bech32Encode(hrp: []const u8, data: []const u8, out: []u8) Exception![]const 
         out[hrp.len + 1 + data5_slice.len + i] = bech32_charset[value];
     }
     const encoded = out[0 .. hrp.len + 1 + data5_slice.len + 6];
-    // BIP 173 strings are either all lowercase or all uppercase; an uppercase
-    // HRP (age identity convention) forces the data part uppercase too.
+    // BIP 173 strings are all lowercase or all uppercase; an uppercase HRP
+    // (age identity convention) forces the data part uppercase.
     if (hrp.len != 0 and hrp[0] >= 'A' and hrp[0] <= 'Z') {
         return std.ascii.upperString(encoded[0..encoded.len], encoded);
     }
@@ -313,10 +303,24 @@ fn parseHeader(input: []const u8, alloc: std.mem.Allocator) Exception!Header {
     }
 }
 
+// HMAC comes from the capability seam, not stdlib, so the provider axis
+// covers every keyed hash age derives.
+fn hmacSha256(out: *[32]u8, message: []const u8, key: []const u8) void {
+    var mac = crypto_prim.HmacSha256.bind(crypto_prim.default_provider, key);
+    mac.update(message);
+    mac.final(out);
+}
+
+// RFC 5869 with a 32-byte output, which is one expand block: every age
+// derivation below asks for exactly one.
 fn hkdfSha256(ikm: []const u8, salt: []const u8, info: []const u8) [32]u8 {
-    const prk = HkdfSha256.extract(salt, ikm);
+    var prk: [32]u8 = undefined;
+    hmacSha256(&prk, ikm, salt);
     var out: [32]u8 = undefined;
-    HkdfSha256.expand(&out, info, prk);
+    var mac = crypto_prim.HmacSha256.bind(crypto_prim.default_provider, &prk);
+    mac.update(info);
+    mac.update(&.{1});
+    mac.final(&out);
     return out;
 }
 
@@ -461,7 +465,7 @@ fn writeHeader(file_key: [file_key_len]u8, stanzas: []const Stanza, dest: []u8) 
     try c.write("---");
     const mac_key = headerMacKey(file_key);
     var mac: [32]u8 = undefined;
-    HmacSha256.create(&mac, c.buf[0..c.pos], &mac_key);
+    hmacSha256(&mac, c.buf[0..c.pos], &mac_key);
     try c.byte(' ');
     var mac_b64: [mac_encoded_len]u8 = undefined;
     try c.write(b64.Encoder.encode(&mac_b64, &mac));
@@ -472,7 +476,7 @@ fn writeHeader(file_key: [file_key_len]u8, stanzas: []const Stanza, dest: []u8) 
 fn verifyHeaderMac(input: []const u8, header: Header, file_key: [file_key_len]u8) Exception!void {
     const mac_key = headerMacKey(file_key);
     var mac: [32]u8 = undefined;
-    HmacSha256.create(&mac, input[0 .. header.mac_line_start + 3], &mac_key);
+    hmacSha256(&mac, input[0 .. header.mac_line_start + 3], &mac_key);
     const line = input[header.mac_line_start .. header.payload_offset - 1];
     if (line.len != 4 + mac_encoded_len or line[3] != ' ') return error.DataException;
     var expected: [32]u8 = undefined;
@@ -514,8 +518,8 @@ fn encryptPayload(file_key: [file_key_len]u8, source: []const u8, dest: []u8) Ex
     }
 }
 
-// Framing is derivable from the total length because only the final chunk
-// may be short (or empty, when the plaintext is empty).
+// Framing follows from the total length: only the final chunk may be
+// short (empty when the plaintext is empty).
 fn chunkCount(ciphertext_payload: usize) Exception!usize {
     if (ciphertext_payload < 16) return error.DataException;
     if (ciphertext_payload == 16) return 1;
@@ -609,8 +613,8 @@ fn dearmor(input: []const u8, alloc: std.mem.Allocator) Exception![]const u8 {
     return input;
 }
 
-// Parse-time allocations live in an arena over the front half of the caller
-// scratch; the scrypt KDF carves its peak memory from the back half.
+// Parse-time allocations take an arena over the front half of the caller
+// scratch.
 fn peelAndParse(input: []const u8, scratch: []u8) Exception!struct { binary: []const u8, header: Header, scrypt_scratch: []u8 } {
     const split = scratch.len / 2;
     var fba = std.heap.FixedBufferAllocator.init(scratch[0..split]);
@@ -641,8 +645,8 @@ pub fn archiveSize(entries: []const Entry, options: Options, scratch: []u8) Exce
 
 pub fn encode(entries: []const Entry, output: []u8, scratch: []u8, options: Options) Exception!usize {
     if (entries.len != 1) return error.CallException;
-    // The plan allocator and the scrypt scratch must not overlap: scrypt's
-    // peak memory (128 * r * N) is carved from the back half.
+    // The plan allocator and the scrypt scratch must not overlap; scrypt's
+    // peak memory is carved from the back half.
     const split = scratch.len / 2;
     var fba = std.heap.FixedBufferAllocator.init(scratch[0..split]);
     var file_key: [file_key_len]u8 = undefined;
@@ -909,8 +913,8 @@ test "CCTV armor x25519 vector decrypts" {
 }
 
 test "CCTV scrypt vector decrypts" {
-    // The reference vector uses work factor 18: 128 * 8 * 2^18 = 256 MiB of
-    // scrypt scratch, so this test allocates instead of using the stack.
+    // The reference vector uses work factor 18: 256 MiB of scrypt scratch,
+    // so the test heap-allocates it.
     const scratch = try testing.allocator.alloc(u8, 260 * 1024 * 1024);
     defer testing.allocator.free(scratch);
     var out: [64]u8 = undefined;
@@ -936,8 +940,8 @@ test "base64 raw round trip and canonical rejection" {
     var decoded: [plain.len]u8 = undefined;
     try decodeB64(&decoded, &encoded);
     try testing.expectEqualStrings(plain, &decoded);
-    // Non-canonical trailing bits in a partial group: "TW" keeps 4 bits that
-    // must be zero in canonical encoding; padding is never legal unpadded.
+    // Non-canonical trailing bits: "TW" keeps 4 bits that must be zero;
+    // padding is never legal unpadded.
     var one: [1]u8 = undefined;
     try testing.expectError(error.DataException, decodeB64(&one, "TW"));
     var two: [2]u8 = undefined;

@@ -1,9 +1,7 @@
 const std = @import("std");
 
-// LLVM pattern-matches this to a single ror; std.math.rotl emitted an
-// out-of-line call per round in the xxHash stripe loops. Shared by the
-// xxh32 and xxh64 onprem implementations, which cannot import checksum.zig
-// without a seam cycle.
+// LLVM lowers this to one ror; std.math.rotl emitted out-of-line calls per
+// stripe round. Checksum.zig would form a seam cycle.
 pub inline fn rotl(x: anytype, comptime n: std.math.Log2Int(@TypeOf(x))) @TypeOf(x) {
     comptime std.debug.assert(n != 0);
     const T = @TypeOf(x);

@@ -48,15 +48,15 @@ fn addAcceptanceApp(
     exe.root_module.linkLibrary(host.dynamic_library);
     const run = b.addRunArtifact(exe);
     // Forward `--` args so suite and scenario filters reach the app:
-    // `zig build oracles -- --suite zstd` runs one suite instead of all.
+    // `zig build oracles -- --suite zstd` runs one suite.
     run.addPassthruArgs();
     b.step(step_name, step_description).dependOn(&run.step);
     return .{ .exe = exe, .run = run };
 }
 
 fn translateCModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) *std.Build.Module {
-    // C translation moved out of the toolchain in 0.17.0: the ZSF translate-c
-    // package is the same implementation with an independent release cadence.
+    // Zig 0.17.0 moved translate-c out of the toolchain; the ZSF package
+    // is the same implementation, released separately.
     const translate_c = b.dependency("translate_c", .{});
     const translator: Translator = .init(translate_c, .{
         .c_source_file = b.path("build/acceptance/oracles/c/c.h"),
@@ -173,8 +173,8 @@ const OracleApp = struct {
     run_ctx: common.Settings,
 };
 
-// The baseline oracle app assembly both entry points share: sanitized ctx
-// variant, translated C module, tool/archive dependency wiring.
+// The baseline assembly both entry points share: sanitized context,
+// translated C, and trap and contract wiring.
 fn baselineOracle(
     b: *std.Build,
     ctx: *common.Settings,
@@ -196,12 +196,12 @@ fn baselineOracle(
     const c_module = translateCModule(b, ctx.target, ctx.optimize);
     const app = addOracleApp(b, &run_ctx, refs, exe_name, "baseline", modules_pair, c_module, run_ctx.host, step_name, step_description);
 
-    // Foreign scenarios shell out to the reference CLIs at run time, so the
-    // oracles step installs them even when the benchmark never runs.
+    // Foreign scenarios shell out to the reference CLIs at run time, so
+    // oracles installs them even without the benchmark.
     refs.dependOnTools(&app.run.step);
 
-    // Each scenario runs in its own process: a contract violation traps, so
-    // the driver and the scenarios cannot share one address space.
+    // A contract violation traps, so the driver and each scenario
+    // cannot share one address space.
     app.run.step.dependOn(&addTrapRun(b, &run_ctx, ctx.target, ctx.optimize, trap_name).step);
     app.run.step.dependOn(&addContractCheck(b, modules_pair.interface, modules_pair.components, ctx.target, ctx.optimize, sanitize_c, contract_name, ctx.generated.catalog).step);
 
@@ -228,6 +228,11 @@ fn addOracles(b: *std.Build, ctx: *common.Settings, refs: reference.Refs) void {
     const compose_ab_exe = b.addExecutable(.{ .name = "compose_ab", .root_module = compose_ab_module });
     const compose_ab_run = b.addRunArtifact(compose_ab_exe);
     app.run.step.dependOn(&compose_ab_run.step);
+
+    // The app without the run step, for hosts that cannot rebuild the
+    // reference CLIs; `--suite` still drives one suite.
+    const build_only = b.addInstallArtifact(app.exe, .{ .dest_sub_path = "oracles" });
+    b.step("oracles_build", "Build the oracle app without running it").dependOn(&build_only.step);
 }
 
 fn addOraclesUbsan(b: *std.Build, ctx: *common.Settings, refs: reference.Refs) void {
@@ -237,8 +242,8 @@ fn addOraclesUbsan(b: *std.Build, ctx: *common.Settings, refs: reference.Refs) v
         oracle.app.run.addArg(suite);
     }
 
-    // compose_ab is a throughput gate that flakes under contention, and the
-    // sanitizer slowdown would fault it, so this step leaves it out.
+    // compose_ab is a throughput gate; contention plus sanitizer slowdown
+    // would trip it, so ubsan leaves it out.
     b.step("oracles_san", "Run all sanitizer suites (ASan is absent: Zig ships no ASan runtime)").dependOn(&oracle.app.run.step);
 }
 

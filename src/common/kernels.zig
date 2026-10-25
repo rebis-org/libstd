@@ -3,12 +3,11 @@ const std = @import("std");
 
 const build_options = @import("options");
 
-// NEON is baseline on aarch64, so the wide match-copy path needs no extra
-// target feature there. x86_64 keeps the portable path: the 16-byte vector
-// ladder measured slower than the word-at-a-time copy under x86_64_v2.
+// NEON is baseline on aarch64; the x86_64 vector ladder measured slower
+// than word-at-a-time copy under x86_64_v2.
 pub const vector_match_copy = !build_options.portable and builtin.target.cpu.arch == .aarch64;
 
-// One short-run copy per codec, one answer for whether the wide path applies.
+// One shared short-run copy, one comptime answer for the wide path.
 pub inline fn splatShort(dst: []u8, byte: u8) void {
     if (dst.len < 16) {
         for (dst) |*out| out.* = byte;
@@ -135,8 +134,8 @@ pub inline fn copyShort16(dst: []u8, src: []const u8) void {
     }
 }
 
-// Small-offset overlap copy: byte-widen the period to at least one word, then
-// finish with word-at-a-time copies that read only finalized bytes.
+// Widen the period to at least one word, then copy word-at-a-time over
+// finalized bytes.
 fn copyMatchPeriodWiden(window: []u8, out_off: usize, distance: usize, copy_len: usize) void {
     var done: usize = 0;
     var period: usize = distance;

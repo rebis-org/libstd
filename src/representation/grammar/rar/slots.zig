@@ -1,7 +1,7 @@
 const std = @import("std");
 
-// Inverse of the unpack50 slot tables. Subtract the distance-dependent length
-// bonus first, because a match with an adjusted length below 2 cannot be encoded.
+// Encoder inverses of the unpack50 slot tables; a match with adjusted
+// length below 2 cannot be encoded.
 
 pub const LengthSlotResult = struct {
     slot: u32, // The range is 0..43 and maps to the LD symbol 262+slot.
@@ -39,8 +39,7 @@ pub fn encodeLengthSlot(length: u32) LengthSlotResult {
     return .{ .slot = 43, .extra = 0, .extra_bits = 0 };
 }
 
-// Subtract the distance-dependent length bonus that the decoder adds back: 1 for a
-// distance above 0x100, 2 above 0x2000, and 3 above 0x40000.
+// Subtract the distance-dependent length bonus that the decoder adds back.
 pub fn adjustLengthForDistance(length: u32, distance: u32) u32 {
     var adj = length;
     if (distance > 0x100) {
@@ -125,8 +124,8 @@ test "encodeDistanceSlot direct distances and split extras" {
     try std.testing.expectEqual(@as(u32, 4), r5.dd_slot);
     try std.testing.expectEqual(@as(u5, 1), r5.dd_extra_bits);
     try std.testing.expect(!r5.use_ldd);
-    // Distance 65536 gives dist_base 65535 in slot 31 (base 49152, 14 extra bits),
-    // so extra_value 16383 splits into 1023 high bits and a low nibble of 15.
+    // Distance 65536 gives dist_base 65535 in slot 31: 16383 splits into
+    // 1023 high bits and nibble 15.
     const wide = encodeDistanceSlot(65536);
     try std.testing.expectEqual(@as(u32, 31), wide.dd_slot);
     try std.testing.expect(wide.use_ldd);

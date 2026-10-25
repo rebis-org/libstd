@@ -67,8 +67,8 @@ pub const Options = struct {
     match_finder: lzma.MatchFinder = .bt4,
 };
 
-// A chunk halves to the 2 KiB floor before it goes out as a copy, so the chunk count is
-// bounded by input_len/2048 + 1 with the copy and compressed headers covered.
+// Chunks halve to the 2 KiB floor before copying, so the per-chunk term covers
+// the worst count and every header.
 pub fn encodedSizeBound(input_len: usize) usize {
     const chunks = input_len / (chunk_min_unpacked / 2) + 1;
     return input_len +| (input_len / 4) +| 72 *| chunks +| 8;
@@ -193,8 +193,8 @@ fn readCopyUnpackSize(reader: *std.Io.Reader) Exception!usize {
 }
 
 fn readLzmaUnpackSize(reader: *std.Io.Reader, control: u8) Exception!usize {
-    // Five control bits carry the size high bits, matching the SDK; four
-    // bits would cap chunks at 1 MiB and reject SDK-produced 1..2 MiB blocks.
+    // Five control bits carry the unpacked size high bits; four bits would
+    // reject SDK-produced 1..2 MiB chunks.
     const high = @as(usize, control & 0x1F) << 16;
     const mid = try io.readByte(reader);
     const low = try io.readByte(reader);
@@ -339,8 +339,8 @@ fn encodeStreamInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, o
             const snap_rep3 = encoder.rep3;
             encoder.snapshotModel(model_snapshot);
             encoder.setRangeEncoder(lzma.RangeEncoder.init(&pack_writer));
-            // The first compressed chunk after a copy must send the properties with a reset (0xC0).
-            // The snapshot holds the model from before the reset for the oversize restore.
+            // The first compressed chunk after a copy sends properties with
+            // 0xC0; the snapshot preserves the pre-reset model for oversize restore.
             const send_props = !props_sent;
             if (send_props and !is_first_chunk) encoder.resetModelKeepDictionary();
             try encoder.encodeInput(chunk, false);
@@ -393,8 +393,8 @@ fn writeCopyChunk(writer: *std.Io.Writer, chunk: []const u8, reset_dictionary: b
     }
 }
 
-// A multithreaded encoder shape: every group starts from an empty dictionary,
-// a fresh model, and position zero, announced with a dict-reset chunk.
+// A multithreaded encoder shape: each group starts a fresh model at position
+// zero, announced with a dict-reset chunk.
 fn appendResetChunk(stream: *std.Io.Writer, props: lzma.Properties, input: []const u8, encoder_scratch: []u8) Exception!void {
     var pack_buffer: [max_pack_size]u8 = undefined;
     var pack_writer = std.Io.Writer.fixed(&pack_buffer);
@@ -454,10 +454,8 @@ test "lzma2 decodes a mid-stream dictionary reset stream" {
     @memcpy(expected[0..input_a.len], input_a);
     @memcpy(expected[input_a.len..], input_b);
 
-    // The stdlib decoder cross-validates the crafted two-group stream before
-    // the onprem decode checks bit-exact agreement. A constant position-state
-    // offset is decode-invariant in LZMA, so this covers the multithreaded
-    // reset path and its stdlib parity, not an observable restart.
+    // The stdlib decoder cross-validates the crafted stream first; a constant
+    // position-state offset is decode-invariant, so this checks reset-path parity.
     var std_reader = std.Io.Reader.fixed(stream[0..sink.end]);
     var std_decoder = std.compress.lzma2.Decode.init(alloc) catch return error.TestUnexpectedResult;
     defer std_decoder.deinit(alloc);

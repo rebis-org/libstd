@@ -68,7 +68,7 @@ fn runSplitUpdates(chunk_size: usize) !void {
 pub fn run(_: *harness.Runner) anyerror!void {
     try runSizes();
     // Sub-threshold chunks stay on the serial path, while the larger size
-    // straddles the 256 byte threshold and exercises continuation.
+    // straddles the 256-byte threshold and exercises continuation.
     try runSplitUpdates(123);
     try runSplitUpdates(300);
 }

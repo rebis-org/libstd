@@ -194,8 +194,8 @@ pub const BoundedReader = struct {
     resource: *Resource,
     limit: u64,
     reader: std.Io.Reader,
-    // The reader's own fill buffer. The stream vtable stages through a separate
-    // local buffer because stdlib hands it a writer over exactly this memory.
+    // The reader's own fill buffer; the stream vtable stages separately,
+    // since stdlib hands it a writer over this memory.
     staging: [4096]u8,
 
     pub fn init(self: *BoundedReader, resource: *Resource, limit: u64) void {
@@ -265,8 +265,8 @@ fn boundedWriterDrain(writer: *std.Io.Writer, chunks: []const []const u8, splat:
     if (total == 0) return 0;
     if (total > self.limit) return error.WriteFailed;
     var cursor: usize = 0;
-    // The budget is charged on every path, so a short write costs what it wrote
-    // instead of leaving the ceiling untouched for the next drain to spend.
+    // The budget is charged on every path, so a short write spends only
+    // what it wrote.
     defer self.limit -= cursor;
     for (chunks[0 .. chunks.len - 1]) |part| {
         const bytes_written = self.resource.write(part) catch return error.WriteFailed;

@@ -174,8 +174,8 @@ pub const Benchmark = struct {
         defer if (shuffler) |*pool| pool.deinit();
         const bench_alloc = if (shuffler) |*pool| pool.allocator() else counting.allocator();
 
-        // Calibration spends the budget on single iterations.
-        // Scales the count to fill a budget's worth of wall time.
+        // Calibration times single iterations; the run count scales to fill
+        // the time budget.
         var loops: u64 = 0;
         var elapsed: u64 = 0;
         while (elapsed < self.config.time_budget_ns and loops < self.config.max_iterations) {

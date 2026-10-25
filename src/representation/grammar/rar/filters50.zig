@@ -6,8 +6,8 @@ const bits = @import("bits.zig");
 const Exception = exception.Exception;
 const BitReader = bits.BitReader;
 
-// The E8 and Arm transforms relocate against true file positions, so
-// `file_offset` counts from the start of the file and not from the region.
+// E8 and Arm relocate against true file positions, so `file_offset`
+// counts from the file start, not the region.
 
 pub const FilterType = enum(u3) {
     delta = 0,
@@ -36,8 +36,8 @@ pub fn filterTypeFromRaw(filter_code: u3) ?FilterType {
 // Largest region one RAR5 filter may cover (reference MAX_FILTER_BLOCK_SIZE).
 pub const max_filter_block: usize = 0x400000;
 
-// The E8 and E8E9 filters relocate against a FIXED 16 MB wrap constant
-// (E8_WRAP), not the file size, and the wrap constant is not the file offset.
+// E8 and E8E9 relocate against the fixed 16 MB wrap constant, not the
+// file size or offset.
 const e8_wrap: u32 = 0x1000000;
 
 pub fn applyFilter(data: []u8, filter: Filter, file_offset: u64, scratch: []u8) Exception!void {
@@ -51,8 +51,8 @@ pub fn applyFilter(data: []u8, filter: Filter, file_offset: u64, scratch: []u8) 
     }
 }
 
-// A channel-sequential delta inverts to a per-channel prefix sum. Source and
-// destination overlap, so the transform writes to the scratch copy.
+// A channel-sequential delta inverts to a per-channel prefix sum;
+// source and destination overlap, so write via scratch.
 fn applyDelta(data: []u8, channels: u8, scratch: []u8) Exception!void {
     if (channels == 0 or data.len == 0) return;
     if (scratch.len < data.len) return error.CapacityException;
@@ -103,16 +103,15 @@ pub fn applyArm(data: []u8, file_offset: u64) void {
     var i: usize = 0;
     while (i + 3 < data.len) : (i += 4) {
         if (data[i + 3] == 0xEB) {
-            // The Arm BL offset is unsigned, occupies the low three bytes, and
-            // counts instruction units, so the code must not sign extend it.
+            // The Arm BL offset is unsigned, spans the low three bytes, and
+            // counts instruction units.
             const low_byte: u32 = data[i];
             const mid_byte: u32 = data[i + 1];
             const high_byte: u32 = data[i + 2];
             var offset: u32 = (high_byte << 16) | (mid_byte << 8) | low_byte;
 
-            // The reference truncates the file offset to 32 bits before the
-            // wrapping addition and the shift, so entries beyond 4 GiB keep
-            // byte-exact behavior (unpack50.cpp FILTER_ARM).
+            // The reference truncates the file offset to 32 bits
+            // (unpack50.cpp FILTER_ARM), keeping entries beyond 4 GiB byte-exact.
             const file_offset32: u32 = @truncate(file_offset);
             offset -%= (file_offset32 +% @as(u32, @truncate(i))) / 4;
 
@@ -123,8 +122,8 @@ pub fn applyArm(data: []u8, file_offset: u64) void {
     }
 }
 
-// The wire size field (ReadFilterData) uses a 2-bit prefix for a byte count of
-// 1 to 4, then assembles the value little-endian.
+// The wire size field (ReadFilterData) encodes a 2-bit byte-count prefix
+// (1 to 4), then the value little-endian.
 pub fn readFilterSize(br: *BitReader) Exception!usize {
     const byte_count: u3 = @intCast((try br.readBits(2)) + 1);
     var size: usize = 0;
@@ -183,8 +182,8 @@ test "arm filter subtracts the instruction offset" {
 }
 
 test "arm filter truncates the file offset to 32 bits" {
-    // A 4 GiB file offset must wrap like the reference's 32-bit addition:
-    // the old 64-bit path subtracted 2^30 here and flipped the high byte.
+    // A 4 GiB offset must wrap like the reference's 32-bit addition; the
+    // old 64-bit path flipped the high byte.
     var data = [_]u8{ 0x00, 0x00, 0x00, 0xEB };
     applyArm(&data, 1 << 32);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0x00, 0x00, 0x00, 0xEB }, &data);
