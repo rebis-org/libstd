@@ -14,6 +14,14 @@ const tar = @import("../../representation/grammar/tar/onprem.zig");
 const xz = @import("../../representation/grammar/xz/onprem.zig");
 const zip = @import("../../representation/grammar/zip/onprem.zig");
 const zlib = @import("../../representation/grammar/zlib/onprem.zig");
+const age = @import("../../representation/grammar/age/onprem.zig");
+const cpio = @import("../../representation/grammar/cpio/onprem.zig");
+const wim = @import("../../representation/grammar/wim/onprem.zig");
+const xar = @import("../../representation/grammar/xar/onprem.zig");
+const apfs = @import("../../representation/volume/apfs/onprem.zig");
+const dwarfs = @import("../../representation/volume/dwarfs/onprem.zig");
+const iso = @import("../../representation/volume/iso/onprem.zig");
+const squashfs = @import("../../representation/volume/squashfs/onprem.zig");
 const bzip2 = @import("../../representation/leaf/bzip2/onprem.zig");
 const deflate = @import("../../representation/leaf/deflate/onprem.zig");
 const lz4 = @import("../../representation/leaf/lz4/onprem.zig");
@@ -242,4 +250,154 @@ test "fuzz tar decode" {
             try drive(smith, runTar);
         }
     }.f, .{ .corpus = &.{corpus.tar_one_file[0..]} });
+}
+
+fn runCpio(data: []const u8) anyerror!void {
+    const count = cpio.inspectCount(data) catch return;
+    if (count == 0) return;
+    const info = cpio.inspectOrdinal(data, 0) catch return;
+    const size: usize = @intCast(@min(info.size, max_output));
+    var out: [max_output]u8 = undefined;
+    _ = cpio.decodeOrdinal(data, 0, out[0..size]) catch {};
+}
+
+test "fuzz cpio decode" {
+    try testing.fuzz({}, struct {
+        fn f(_: void, smith: *testing.Smith) anyerror!void {
+            try drive(smith, runCpio);
+        }
+    }.f, .{ .corpus = &.{} });
+}
+
+fn runWim(data: []const u8) anyerror!void {
+    const scratch = try testing.allocator.alloc(u8, wim.scratch_size);
+    defer testing.allocator.free(scratch);
+    const count = wim.inspectCount(data, scratch) catch return;
+    if (count == 0) return;
+    const info = wim.inspectOrdinal(data, 0, scratch) catch return;
+    const size: usize = @intCast(@min(info.size, max_output));
+    var out: [max_output]u8 = undefined;
+    _ = wim.decodeOrdinal(data, 0, out[0..size], scratch) catch {};
+}
+
+test "fuzz wim decode" {
+    try testing.fuzz({}, struct {
+        fn f(_: void, smith: *testing.Smith) anyerror!void {
+            try drive(smith, runWim);
+        }
+    }.f, .{ .corpus = &.{} });
+}
+
+fn runXar(data: []const u8) anyerror!void {
+    const scratch = try testing.allocator.alloc(u8, xar.scratch_size);
+    defer testing.allocator.free(scratch);
+    const count = xar.inspectCount(data, scratch) catch return;
+    if (count == 0) return;
+    const info = xar.inspectOrdinal(data, 0, scratch) catch return;
+    const size: usize = @intCast(@min(info.size, max_output));
+    var out: [max_output]u8 = undefined;
+    _ = xar.decodeOrdinal(data, 0, out[0..size], scratch) catch {};
+}
+
+test "fuzz xar decode" {
+    try testing.fuzz({}, struct {
+        fn f(_: void, smith: *testing.Smith) anyerror!void {
+            try drive(smith, runXar);
+        }
+    }.f, .{ .corpus = &.{} });
+}
+
+fn runAge(data: []const u8) anyerror!void {
+    const scratch = try testing.allocator.alloc(u8, age.scratch_size);
+    defer testing.allocator.free(scratch);
+    const count = age.inspectCount(data, scratch) catch return;
+    if (count == 0) return;
+    const info = age.inspectOrdinal(data, 0, .{}, scratch) catch return;
+    const size: usize = @intCast(@min(info.size, max_output));
+    var out: [max_output]u8 = undefined;
+    _ = age.decodeOrdinal(data, 0, out[0..size], scratch, .{}) catch {};
+}
+
+test "fuzz age decode" {
+    try testing.fuzz({}, struct {
+        fn f(_: void, smith: *testing.Smith) anyerror!void {
+            try drive(smith, runAge);
+        }
+    }.f, .{ .corpus = &.{} });
+}
+
+fn runIso(data: []const u8) anyerror!void {
+    const scratch = try testing.allocator.alloc(u8, iso.scratch_size);
+    defer testing.allocator.free(scratch);
+    const count = iso.inspectCount(data, scratch) catch return;
+    if (count == 0) return;
+    const info = iso.inspectOrdinal(data, 0, scratch) catch return;
+    const size: usize = @intCast(@min(info.size, max_output));
+    var out: [max_output]u8 = undefined;
+    _ = iso.decodeOrdinal(data, 0, out[0..size], scratch) catch {};
+}
+
+test "fuzz iso decode" {
+    try testing.fuzz({}, struct {
+        fn f(_: void, smith: *testing.Smith) anyerror!void {
+            try drive(smith, runIso);
+        }
+    }.f, .{ .corpus = &.{} });
+}
+
+fn runSquashfs(data: []const u8) anyerror!void {
+    const scratch = try testing.allocator.alloc(u8, squashfs.scratch_size);
+    defer testing.allocator.free(scratch);
+    const count = squashfs.inspectCount(data, scratch) catch return;
+    if (count == 0) return;
+    const info = squashfs.inspectOrdinal(data, 0, scratch) catch return;
+    const size: usize = @intCast(@min(info.size, max_output));
+    var out: [max_output]u8 = undefined;
+    _ = squashfs.decodeOrdinal(data, 0, out[0..size], scratch) catch {};
+}
+
+test "fuzz squashfs decode" {
+    try testing.fuzz({}, struct {
+        fn f(_: void, smith: *testing.Smith) anyerror!void {
+            try drive(smith, runSquashfs);
+        }
+    }.f, .{ .corpus = &.{} });
+}
+
+fn runDwarfs(data: []const u8) anyerror!void {
+    const scratch = try testing.allocator.alloc(u8, dwarfs.scratch_size);
+    defer testing.allocator.free(scratch);
+    const count = dwarfs.inspectCount(data, scratch) catch return;
+    if (count == 0) return;
+    const info = dwarfs.inspectOrdinal(data, 0, scratch) catch return;
+    const size: usize = @intCast(@min(info.size, max_output));
+    var out: [max_output]u8 = undefined;
+    _ = dwarfs.decodeOrdinal(data, 0, out[0..size], scratch) catch {};
+}
+
+test "fuzz dwarfs decode" {
+    try testing.fuzz({}, struct {
+        fn f(_: void, smith: *testing.Smith) anyerror!void {
+            try drive(smith, runDwarfs);
+        }
+    }.f, .{ .corpus = &.{} });
+}
+
+fn runApfs(data: []const u8) anyerror!void {
+    const scratch = try testing.allocator.alloc(u8, apfs.scratch_size);
+    defer testing.allocator.free(scratch);
+    const count = apfs.inspectCount(data, scratch) catch return;
+    if (count == 0) return;
+    const info = apfs.inspectOrdinal(data, 0, scratch) catch return;
+    const size: usize = @intCast(@min(info.size, max_output));
+    var out: [max_output]u8 = undefined;
+    _ = apfs.decodeOrdinal(data, 0, out[0..size], scratch) catch {};
+}
+
+test "fuzz apfs decode" {
+    try testing.fuzz({}, struct {
+        fn f(_: void, smith: *testing.Smith) anyerror!void {
+            try drive(smith, runApfs);
+        }
+    }.f, .{ .corpus = &.{} });
 }
