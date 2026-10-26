@@ -107,6 +107,18 @@ pub fn build(b: *std.Build) void {
         const micro_tests = b.addTest(.{ .root_module = modules.createFor(b, modules.micro, ctx.target, .debug, &ctx) });
         unit_step.dependOn(&b.addRunArtifact(micro_tests).step);
     }
+    // Package consumers see only the libstd module; the acceptance test
+    // proves real operations run through that one import.
+    if (test_filter == null or std.mem.indexOf(u8, "consumer", test_filter.?) != null) {
+        const consumer_module = b.createModule(.{
+            .root_source_file = b.path("build/acceptance/consumer.zig"),
+            .target = modules.kernelAdjustedTarget(modules.package_entry, target, portable, kernel_isa),
+            .optimize = optimize,
+        });
+        consumer_module.addImport("libstd", package_module);
+        const consumer_tests = b.addTest(.{ .root_module = consumer_module });
+        unit_step.dependOn(&b.addRunArtifact(consumer_tests).step);
+    }
 
     // The module roots at src/fuzz.zig so cross-directory imports stay
     // legal; the step is a smoke gate, not a campaign.
