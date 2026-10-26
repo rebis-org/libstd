@@ -20,6 +20,8 @@ typedef struct stdk_id {
 typedef struct stdk_node stdk_node;
 typedef struct stdk_call_envelope stdk_call_envelope;
 typedef uint32_t (*stdk_callback)(stdk_call_envelope *call);
+/* child and next end with NULL: NULL closes the child list and the */
+/* sibling chain. */
 struct stdk_node {
 	uint32_t structure_size;
 	uint32_t flags;
@@ -33,6 +35,9 @@ struct stdk_node {
 	stdk_node *next;
 	uint64_t reserved[2];
 };
+/* request, diagnostic, workspace, callback, and callback_context may be */
+/* NULL; response must not. A NULL callback fails only nodes flagged as */
+/* callback resources. A NULL workspace runs without one. */
 struct stdk_call_envelope {
 	uint32_t structure_size;
 	uint32_t flags;
@@ -123,7 +128,12 @@ uint32_t stdk_cancel(struct stdk_completion *completion);
  * successfully created is refused rather than dispatched through
  * garbage. stdk_session_failure reads back the failing status and detail.
  * stdk_session_catalog carries the versioned pair list so hosts discover
- * streamable codecs without hardcoding them.
+ * streamable codecs without hardcoding them. stdk_session_storage returns
+ * 0 for an unknown pair; a real requirement is never 0. input and output
+ * may be NULL only with a length of 0. stdk_session_step requires
+ * counts_out; state_out may be NULL to skip the readback, and reports
+ * 0 open, 1 done, -1 failed. stdk_session_failure skips a NULL status_out
+ * or detail_out the same way. stdk_session_catalog never returns NULL.
  */
 uint64_t stdk_session_storage(const char *component, const char *verb);
 uint32_t stdk_session_create(const char *component, const char *verb,

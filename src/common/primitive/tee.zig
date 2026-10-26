@@ -31,9 +31,9 @@ pub fn CountingTee(comptime kinds: Kinds) type {
             return .{
                 .writer = .{ .vtable = &vtable, .buffer = &.{}, .end = 0 },
                 .downstream = downstream,
-                .crc32 = checksum.Crc32.bind(provider),
-                .crc64 = checksum.XzCrc64.bind(provider),
-                .adler32 = checksum.Adler32.bind(provider),
+                .crc32 = checksum.Crc32.bind(provider, {}),
+                .crc64 = checksum.XzCrc64.bind(provider, {}),
+                .adler32 = checksum.Adler32.bind(provider, {}),
                 .xxh64 = checksum.XxHash64.bind(provider, 0),
                 .size = 0,
             };
@@ -44,19 +44,19 @@ pub fn CountingTee(comptime kinds: Kinds) type {
         }
 
         pub fn crc32Value(self: *const @This()) u32 {
-            return self.crc32.final();
+            return self.crc32.final({});
         }
 
         pub fn adler32Value(self: *const @This()) u32 {
-            return self.adler32.final();
+            return self.adler32.final({});
         }
 
         pub fn crc64Value(self: *const @This()) u64 {
-            return self.crc64.final();
+            return self.crc64.final({});
         }
 
         pub fn xxh64Value(self: *@This()) u64 {
-            return self.xxh64.final();
+            return self.xxh64.final({});
         }
 
         fn feed(self: *@This(), part: []const u8) std.Io.Writer.Error!void {

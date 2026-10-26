@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const ab_variant = @import("ab_variant");
 const options = @import("options");
 
 const abi = @import("abi.zig");
@@ -69,25 +70,22 @@ pub const protocol_provider: u32 = 6;
 
 // False only in a uniform onprem build; provider-selection scenarios then
 // step aside for the rejection scenario.
+const capability_impls = .{
+    options.sha256_impl,  options.sha1_impl,       options.hmac_impl,
+    options.pbkdf2_impl,  options.adler32_impl,    options.xxh32_impl,
+    options.xxh64_impl,   options.aes_impl,        options.crc32_impl,
+    options.crc64xz_impl, options.bzip2crc32_impl,
+};
+
 pub const offprem_servable = blk: {
-    for (.{
-        options.sha256_impl,  options.sha1_impl,       options.hmac_impl,
-        options.pbkdf2_impl,  options.adler32_impl,    options.xxh32_impl,
-        options.xxh64_impl,   options.aes_impl,        options.crc32_impl,
-        options.crc64xz_impl, options.bzip2crc32_impl,
-    }) |impl| {
+    for (capability_impls) |impl| {
         if (impl != .onprem) break :blk true;
     }
     break :blk false;
 };
 
 pub const onprem_servable = blk: {
-    for (.{
-        options.sha256_impl,  options.sha1_impl,       options.hmac_impl,
-        options.pbkdf2_impl,  options.adler32_impl,    options.xxh32_impl,
-        options.xxh64_impl,   options.aes_impl,        options.crc32_impl,
-        options.crc64xz_impl, options.bzip2crc32_impl,
-    }) |impl| {
+    for (capability_impls) |impl| {
         if (impl != .offprem) break :blk true;
     }
     break :blk false;
@@ -730,6 +728,24 @@ pub fn xorshiftFill(buffer: []u8, seed_base: u64) void {
         byte.* = @truncate(seed >> 56);
         seed = seed *% 0x9e3779b97f4a7c15 +% 0x70d5e2f72d5a9c0b;
     }
+}
+
+// A/B dump path: these bytes diff between builds, covering record layout,
+// parser tier, and entropy heuristic. The caller encodes; this writes.
+pub fn abDumpEncoded(r: *Runner, label: []const u8) !void {
+    const dir = try std.Io.Dir.path.join(r.gpa, &.{
+        "zig-out", "oracles", "ab", ab_variant.name, r.scenario_name,
+    });
+    defer r.gpa.free(dir);
+    const path = try std.Io.Dir.path.join(r.gpa, &.{ dir, label });
+    defer r.gpa.free(path);
+    if (std.Io.Dir.path.dirname(path)) |parent| {
+        try std.Io.Dir.cwd().createDirPath(oracle_io, parent);
+    }
+    try std.Io.Dir.cwd().writeFile(oracle_io, .{
+        .sub_path = path,
+        .data = r.encoded[0..r.encoded_len],
+    });
 }
 
 pub fn oracleFixture(

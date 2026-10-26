@@ -148,6 +148,22 @@ JNIEXPORT jint JNICALL Java_dev_stdk_StdK_nativeSessionStep(
 				      (uint8_t *)(*env)->GetByteArrayElements(
 					      env, output, NULL) :
 				      NULL;
+	/* GetByteArrayElements returns NULL on JVM out-of-memory; an */
+	/* unchecked NULL would step as if the buffer were empty. */
+	if (input != NULL && input_ptr == NULL) {
+		if (output_ptr != NULL) {
+			(*env)->ReleaseByteArrayElements(
+				env, output, (jbyte *)output_ptr, JNI_ABORT);
+		}
+		return STDK_STATUS_INVALID_CALL;
+	}
+	if (output != NULL && output_ptr == NULL) {
+		if (input_ptr != NULL) {
+			(*env)->ReleaseByteArrayElements(
+				env, input, (jbyte *)input_ptr, JNI_ABORT);
+		}
+		return STDK_STATUS_INVALID_CALL;
+	}
 	jlong *counts_ptr = (*env)->GetLongArrayElements(env, counts, NULL);
 	if (counts_ptr == NULL) {
 		/* JVM out-of-memory while materializing the counts array. */

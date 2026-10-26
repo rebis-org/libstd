@@ -240,13 +240,13 @@ pub fn trainWorkspaceSize() usize {
 fn trainHash(provider: checksum.Provider, bytes: *const [train_d]u8) u32 {
     var hasher = checksum.XxHash64.bind(provider, 0);
     hasher.update(bytes);
-    return @truncate(hasher.final() >> @as(u6, @intCast(64 - train_f)));
+    return @truncate(hasher.final({}) >> @as(u6, @intCast(64 - train_f)));
 }
 
 fn trainHashD(provider: checksum.Provider, bytes: []const u8, f: usize) u32 {
     var hasher = checksum.XxHash64.bind(provider, 0);
     hasher.update(bytes);
-    return @truncate(hasher.final() >> @as(u6, @intCast(64 - f)));
+    return @truncate(hasher.final({}) >> @as(u6, @intCast(64 - f)));
 }
 
 // Generalized fastcover core with runtime parameters. The content-building
@@ -353,7 +353,7 @@ fn writeDictionaryHeader(samples: []const []const u8, output: []u8, content_len:
     var hasher = checksum.XxHash64.bind(provider, 0);
     for (samples) |sample| hasher.update(sample);
     const span: u64 = dictionary_id_max - dictionary_id_min;
-    const dict_id: u32 = dictionary_id_min + @as(u32, @truncate(hasher.final() % span));
+    const dict_id: u32 = dictionary_id_min + @as(u32, @truncate(hasher.final({}) % span));
     std.mem.writeInt(u32, output[0..4], dictionary_magic, .little);
     std.mem.writeInt(u32, output[4..8], dict_id, .little);
     // Smallest tree libzstd's HUF_readStats accepts: the construction check demands
@@ -564,7 +564,7 @@ pub fn encodeFrame(output: *std.Io.Writer, content: []const u8, workspace: []u32
     try writeFrameHeader(&counted.writer, frame_len, options.window_size, dictionary_id);
     var hasher = checksum.XxHash64.bind(options.provider, 0);
     try encodeBlocks(&counted.writer, content, content_start, workspace, options, &hasher);
-    try writeU32le(&counted.writer, @truncate(hasher.final()));
+    try writeU32le(&counted.writer, @truncate(hasher.final({})));
     return std.math.cast(usize, counted.written()) orelse error.ResourceException;
 }
 
@@ -3072,7 +3072,7 @@ const Decoder = struct {
         }
         if (d.has_checksum) {
             const stored = try d.readU32Le();
-            const actual: u32 = @truncate(d.checksummer.final());
+            const actual: u32 = @truncate(d.checksummer.final({}));
             if (stored != actual) return error.IntegrityException;
         }
         d.total_output = std.math.add(u64, d.total_output, d.frame_output) catch return error.ResourceException;

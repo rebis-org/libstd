@@ -25,8 +25,7 @@ const default_max_work: u64 = 4 << 30;
 const default_max_entries: u64 = 1 << 20;
 
 fn exceptionStatus(exception: Exception) u32 {
-    inline for (vocabulary.error_map) |entry| if (exception == entry.exception) return entry.status;
-    return envelope.Status.internal_failure;
+    return vocabulary.statusFor(exception);
 }
 
 // Single-sourced surface for matching, sizing, and the catalog projection.
@@ -184,6 +183,10 @@ export fn stdk_session_step(
 ) callconv(.c) u32 {
     const session = checkAlive(handle) orelse return envelope.Status.invalid_call;
     const counts = counts_out orelse return envelope.Status.invalid_call;
+    // A NULL buffer with a nonzero length is a caller defect; treating it
+    // as an empty buffer would silently misreport the transfer.
+    if (input == null and input_len != 0) return envelope.Status.invalid_call;
+    if (output == null and output_len != 0) return envelope.Status.invalid_call;
     // Aliasing input, output, or the session's own storage silently corrupts
     // state mid-copy, so refuse overlapping ranges up front.
     const storage_start: ?[*]const u8 = @ptrCast(handle.?);

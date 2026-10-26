@@ -37,6 +37,27 @@ extern fn stdk_session_failure(session: ?*anyopaque, status_out: ?*u32, detail_o
 extern fn stdk_session_catalog() [*:0]const u8;
 extern fn stdk_session_destroy(session: ?*anyopaque) u32;
 
+// Pumps a decode session chunk by chunk to its done state and pins the bytes.
+fn pumpDecode(r: *harness.Runner, storage: ?*anyopaque, encoded: []const u8, decoded: []u8) !void {
+    var counts: [2]u64 = undefined;
+    var state: c_int = 0;
+    var pos: usize = 0;
+    var out_pos: usize = 0;
+    var guard: usize = 0;
+    while (guard < 64) : (guard += 1) {
+        const take = @min(65536, encoded.len - pos);
+        const chunk = encoded[pos..][0..take];
+        const end = pos + take == encoded.len;
+        const status = stdk_session_step(storage, chunk.ptr, chunk.len, decoded[out_pos..].ptr, decoded.len - out_pos, @intFromBool(end), &counts, &state);
+        if (status != abi.Status.ok) return error.SessionStepFailed;
+        pos += @intCast(counts[0]);
+        out_pos += @intCast(counts[1]);
+        if (state == 1) break;
+        if (state < 0) return error.SessionStepCorrupt;
+    }
+    if (out_pos != r.input.len or !std.mem.eql(u8, decoded[0..out_pos], r.input)) return error.SessionDecodeMismatch;
+}
+
 fn run(r: *harness.Runner) anyerror!void {
     harness.setup(r, harness.ids.gzip, harness.mode_stream);
     corpus.fillTiled(r.corpus_index, r.corpus_buffer[0..]);
@@ -57,23 +78,7 @@ fn run(r: *harness.Runner) anyerror!void {
     if (stdk_session_create("gzip", "decode", storage, storage_len) != abi.Status.ok) return error.CreateFailed;
 
     var decoded: [64]u8 = undefined;
-    var pos: usize = 0;
-    var out_pos: usize = 0;
-    var guard: usize = 0;
-    while (guard < 64) : (guard += 1) {
-        const take = @min(65536, r.encoded_len - pos);
-        const chunk = r.encoded[pos..][0..take];
-        const end = pos + take == r.encoded_len;
-        var counts: [2]u64 = undefined;
-        var state: c_int = 0;
-        const status = stdk_session_step(storage, chunk.ptr, chunk.len, decoded[out_pos..].ptr, decoded.len - out_pos, @intFromBool(end), &counts, &state);
-        if (status != abi.Status.ok) return error.StepFailed;
-        pos += @intCast(counts[0]);
-        out_pos += @intCast(counts[1]);
-        if (state == 1) break;
-        if (state < 0) return error.StepCorrupt;
-    }
-    if (out_pos != r.input.len or !std.mem.eql(u8, decoded[0..out_pos], r.input)) return error.SessionMismatch;
+    try pumpDecode(r, storage, r.encoded[0..r.encoded_len], &decoded);
 
     if (stdk_session_destroy(storage) != abi.Status.ok) return error.DestroyFailed;
     if (stdk_session_destroy(storage) != abi.Status.ok) return error.DestroyNotIdempotent;
@@ -113,7 +118,7 @@ fn run(r: *harness.Runner) anyerror!void {
         std.math.maxInt(u64),
     ) != abi.Status.ok) return error.BoundedCreateFailed;
     var bounded_failed = false;
-    pos = 0;
+    var pos: usize = 0;
     while (pos < r.encoded_len) {
         const take = @min(4096, r.encoded_len - pos);
         const chunk2 = r.encoded[pos..][0..take];
@@ -152,21 +157,7 @@ fn run(r: *harness.Runner) anyerror!void {
     const deflate_storage = r.workspace.ptr;
     if (stdk_session_create("deflate", "decode", deflate_storage, deflate_storage_len) != abi.Status.ok) return error.DeflateCreateFailed;
     @memset(&decoded, 0);
-    pos = 0;
-    out_pos = 0;
-    guard = 0;
-    while (guard < 64) : (guard += 1) {
-        const take = @min(65536, r.encoded_len - pos);
-        const chunk = r.encoded[pos..][0..take];
-        const end = pos + take == r.encoded_len;
-        const status = stdk_session_step(deflate_storage, chunk.ptr, chunk.len, decoded[out_pos..].ptr, decoded.len - out_pos, @intFromBool(end), &counts, &state);
-        if (status != abi.Status.ok) return error.DeflateStepFailed;
-        pos += @intCast(counts[0]);
-        out_pos += @intCast(counts[1]);
-        if (state == 1) break;
-        if (state < 0) return error.DeflateStepCorrupt;
-    }
-    if (out_pos != r.input.len or !std.mem.eql(u8, decoded[0..out_pos], r.input)) return error.DeflateSessionMismatch;
+    try pumpDecode(r, deflate_storage, r.encoded[0..r.encoded_len], &decoded);
     if (stdk_session_destroy(deflate_storage) != abi.Status.ok) return error.DestroyFailed;
     const catalog_check = std.mem.span(stdk_session_catalog());
     if (std.mem.find(u8, catalog_check, "deflate/decode") == null) return error.CatalogMissingDeflate;
@@ -191,21 +182,7 @@ fn runExtended(r: *harness.Runner) anyerror!void {
     const zlib_storage = r.workspace.ptr;
     if (stdk_session_create("zlib", "decode", zlib_storage, zlib_storage_len) != abi.Status.ok) return error.ZlibCreateFailed;
     var decoded: [64]u8 = undefined;
-    var pos: usize = 0;
-    var out_pos: usize = 0;
-    var guard: usize = 0;
-    while (guard < 64) : (guard += 1) {
-        const take = @min(65536, r.encoded_len - pos);
-        const chunk = r.encoded[pos..][0..take];
-        const end = pos + take == r.encoded_len;
-        const status = stdk_session_step(zlib_storage, chunk.ptr, chunk.len, decoded[out_pos..].ptr, decoded.len - out_pos, @intFromBool(end), &counts, &state);
-        if (status != abi.Status.ok) return error.ZlibStepFailed;
-        pos += @intCast(counts[0]);
-        out_pos += @intCast(counts[1]);
-        if (state == 1) break;
-        if (state < 0) return error.ZlibStepCorrupt;
-    }
-    if (out_pos != r.input.len or !std.mem.eql(u8, decoded[0..out_pos], r.input)) return error.ZlibSessionMismatch;
+    try pumpDecode(r, zlib_storage, r.encoded[0..r.encoded_len], &decoded);
     if (stdk_session_destroy(zlib_storage) != abi.Status.ok) return error.DestroyFailed;
     // A corrupted adler trailer fails as an integrity failure.
     if (stdk_session_create("zlib", "decode", zlib_storage, zlib_storage_len) != abi.Status.ok) return error.ZlibCreateFailed;
@@ -229,8 +206,8 @@ fn runExtended(r: *harness.Runner) anyerror!void {
         const storage = r.workspace.ptr;
         if (stdk_session_create(case.component, "encode", storage, storage_len) != abi.Status.ok) return error.EncodeCreateFailed;
         var produced: usize = 0;
-        pos = 0;
-        guard = 0;
+        var pos: usize = 0;
+        var guard: usize = 0;
         var failed = false;
         while (guard < 64) : (guard += 1) {
             const take = @min(4096, r.input.len - pos);
@@ -267,21 +244,7 @@ fn runExtended(r: *harness.Runner) anyerror!void {
     const lz4_storage = r.workspace.ptr;
     if (stdk_session_create("lz4", "decode", lz4_storage, lz4_storage_len) != abi.Status.ok) return error.Lz4CreateFailed;
     @memset(&decoded, 0);
-    pos = 0;
-    out_pos = 0;
-    guard = 0;
-    while (guard < 64) : (guard += 1) {
-        const take = @min(65536, r.encoded_len - pos);
-        const chunk = r.encoded[pos..][0..take];
-        const end = pos + take == r.encoded_len;
-        const status = stdk_session_step(lz4_storage, chunk.ptr, chunk.len, decoded[out_pos..].ptr, decoded.len - out_pos, @intFromBool(end), &counts, &state);
-        if (status != abi.Status.ok) return error.Lz4StepFailed;
-        pos += @intCast(counts[0]);
-        out_pos += @intCast(counts[1]);
-        if (state == 1) break;
-        if (state < 0) return error.Lz4StepCorrupt;
-    }
-    if (out_pos != r.input.len or !std.mem.eql(u8, decoded[0..out_pos], r.input)) return error.Lz4SessionMismatch;
+    try pumpDecode(r, lz4_storage, r.encoded[0..r.encoded_len], &decoded);
     if (stdk_session_destroy(lz4_storage) != abi.Status.ok) return error.DestroyFailed;
     if (stdk_session_create("lz4", "decode", lz4_storage, lz4_storage_len) != abi.Status.ok) return error.Lz4CreateFailed;
     r.encoded[r.encoded_len - 1] ^= 0xFF;

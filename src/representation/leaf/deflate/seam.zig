@@ -62,44 +62,38 @@ const Mergeable = union(Provider) {
 
     pub fn inputBitsConsumed(self: *const @This()) usize {
         return switch (self.*) {
-            .onprem => |*inner| inner.inputBitsConsumed(),
-            .offprem => |*inner| inner.inputBitsConsumed(),
+            inline else => |*inner| inner.inputBitsConsumed(),
         };
     }
 
     pub fn setFramePos(self: *@This(), pos: usize) void {
         switch (self.*) {
-            .onprem => |*inner| inner.setFramePos(pos),
-            .offprem => |*inner| inner.setFramePos(pos),
+            inline else => |*inner| inner.setFramePos(pos),
         }
     }
 
     // Session-driver surface: framing pokes between steps, dispatched once.
     pub fn streamPosition(self: *const @This()) usize {
         return switch (self.*) {
-            .onprem => |*inner| inner.streamPosition(),
-            .offprem => |*inner| inner.streamPosition(),
+            inline else => |*inner| inner.streamPosition(),
         };
     }
 
     pub fn restage(self: *@This(), data: []const u8, pos: usize) void {
         switch (self.*) {
-            .onprem => |*inner| inner.restage(data, pos),
-            .offprem => |*inner| inner.restage(data, pos),
+            inline else => |*inner| inner.restage(data, pos),
         }
     }
 
     pub fn atEnd(self: *const @This()) bool {
         return switch (self.*) {
-            .onprem => |*inner| inner.atEnd(),
-            .offprem => |*inner| inner.atEnd(),
+            inline else => |*inner| inner.atEnd(),
         };
     }
 
     pub fn clearFailure(self: *@This()) void {
         switch (self.*) {
-            .onprem => |*inner| inner.clearFailure(),
-            .offprem => |*inner| inner.clearFailure(),
+            inline else => |*inner| inner.clearFailure(),
         }
     }
 
@@ -107,23 +101,20 @@ const Mergeable = union(Provider) {
     // a starved parse stays resumable, a failed one is terminal.
     pub fn isFailed(self: *const @This()) bool {
         return switch (self.*) {
-            .onprem => |*inner| inner.isFailed(),
-            .offprem => |*inner| inner.isFailed(),
+            inline else => |*inner| inner.isFailed(),
         };
     }
 
     pub fn readerPtr(self: *@This()) *std.Io.Reader {
         return switch (self.*) {
-            .onprem => |*inner| inner.readerPtr(),
-            .offprem => |*inner| inner.readerPtr(),
+            inline else => |*inner| inner.readerPtr(),
         };
     }
 
     // Each arm owns how its decoded bytes reach a writer, so this dispatches once.
     pub fn streamTo(self: *@This(), writer: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
         return switch (self.*) {
-            .onprem => |*inner| inner.streamTo(writer, limit),
-            .offprem => |*inner| inner.streamTo(writer, limit),
+            inline else => |*inner| inner.streamTo(writer, limit),
         };
     }
 };

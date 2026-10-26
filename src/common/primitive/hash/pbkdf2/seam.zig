@@ -11,18 +11,14 @@ pub const WeakParametersError = onprem.WeakParametersError;
 // The PRF pair travels with the provider, so the rounds loop never dispatches
 // per iteration.
 pub fn pbkdf2(comptime PrfOnprem: type, comptime PrfOffprem: type, provider: seam.Provider, dk: []u8, password: []const u8, salt: []const u8, rounds: u32) (WeakParametersError || OutputTooLongError)!void {
-    switch (options.pbkdf2_impl) {
-        .onprem => {
-            std.debug.assert(provider == seam.default_provider);
-            return onprem.pbkdf2(dk, password, salt, rounds, PrfOnprem);
-        },
-        .offprem => {
-            std.debug.assert(provider == seam.default_provider);
-            return std.crypto.pwhash.pbkdf2(dk, password, salt, rounds, PrfOffprem);
-        },
+    // A fixed build serves one arm; the tag must match the build's default.
+    if (options.pbkdf2_impl != .mergeable) std.debug.assert(provider == seam.default_provider);
+    return switch (options.pbkdf2_impl) {
+        .onprem => onprem.pbkdf2(dk, password, salt, rounds, PrfOnprem),
+        .offprem => std.crypto.pwhash.pbkdf2(dk, password, salt, rounds, PrfOffprem),
         .mergeable => switch (provider) {
-            .onprem => return onprem.pbkdf2(dk, password, salt, rounds, PrfOnprem),
-            .offprem => return std.crypto.pwhash.pbkdf2(dk, password, salt, rounds, PrfOffprem),
+            .onprem => onprem.pbkdf2(dk, password, salt, rounds, PrfOnprem),
+            .offprem => std.crypto.pwhash.pbkdf2(dk, password, salt, rounds, PrfOffprem),
         },
-    }
+    };
 }

@@ -193,49 +193,60 @@ pub const CommandPolicy = struct {
     commit: CommitMode,
 };
 
+// Released ids pair a category nibble with an ordinal byte; the high word
+// interleaves the same two fields for every row, so one builder carries it.
+fn releasedId(comptime low_suffix: u16) Id {
+    const category: u64 = low_suffix >> 8;
+    const ordinal: u64 = low_suffix & 0xff;
+    return .{
+        .low = 0x6e6b_82f0_8d91_0000 | category << 8 | ordinal,
+        .high = 0xa7a3_5105_3d6d_0000 | category << 12 | ordinal,
+    };
+}
+
 pub const ids = struct {
-    pub const query = Id{ .low = 0x6e6b_82f0_8d91_0101, .high = 0xa7a3_5105_3d6d_1001 };
-    pub const read = Id{ .low = 0x6e6b_82f0_8d91_0102, .high = 0xa7a3_5105_3d6d_1002 };
-    pub const write = Id{ .low = 0x6e6b_82f0_8d91_0103, .high = 0xa7a3_5105_3d6d_1003 };
-    pub const diagnostic_required_capacity = Id{ .low = 0x6e6b_82f0_8d91_0200, .high = 0xa7a3_5105_3d6d_2000 };
-    pub const diagnostic_available_capacity = Id{ .low = 0x6e6b_82f0_8d91_0201, .high = 0xa7a3_5105_3d6d_2001 };
-    pub const diagnostic_downstream_status = Id{ .low = 0x6e6b_82f0_8d91_0202, .high = 0xa7a3_5105_3d6d_2002 };
-    pub const diagnostic_subject = Id{ .low = 0x6e6b_82f0_8d91_0203, .high = 0xa7a3_5105_3d6d_2003 };
-    pub const source = Id{ .low = 0x6e6b_82f0_8d91_0210, .high = 0xa7a3_5105_3d6d_2010 };
-    pub const sink = Id{ .low = 0x6e6b_82f0_8d91_0211, .high = 0xa7a3_5105_3d6d_2011 };
-    pub const profile = Id{ .low = 0x6e6b_82f0_8d91_0212, .high = 0xa7a3_5105_3d6d_2012 };
-    pub const target_command = Id{ .low = 0x6e6b_82f0_8d91_0218, .high = 0xa7a3_5105_3d6d_2018 };
-    pub const size_bound = Id{ .low = 0x6e6b_82f0_8d91_0219, .high = 0xa7a3_5105_3d6d_2019 };
-    pub const parameter = Id{ .low = 0x6e6b_82f0_8d91_0240, .high = 0xa7a3_5105_3d6d_2040 };
-    pub const crypto_profile = Id{ .low = 0x6e6b_82f0_8d91_0236, .high = 0xa7a3_5105_3d6d_2036 };
-    pub const resource_read = Id{ .low = 0x6e6b_82f0_8d91_0301, .high = 0xa7a3_5105_3d6d_3001 };
-    pub const resource_write = Id{ .low = 0x6e6b_82f0_8d91_0302, .high = 0xa7a3_5105_3d6d_3002 };
-    pub const resource_size = Id{ .low = 0x6e6b_82f0_8d91_0303, .high = 0xa7a3_5105_3d6d_3003 };
-    pub const resource_replay = Id{ .low = 0x6e6b_82f0_8d91_0304, .high = 0xa7a3_5105_3d6d_3004 };
-    pub const resource_seek = Id{ .low = 0x6e6b_82f0_8d91_0305, .high = 0xa7a3_5105_3d6d_3005 };
-    pub const resource_range = Id{ .low = 0x6e6b_82f0_8d91_0306, .high = 0xa7a3_5105_3d6d_3006 };
-    pub const test_echo = Id{ .low = 0x6e6b_82f0_8d91_0401, .high = 0xa7a3_5105_3d6d_4001 };
-    pub const test_read = Id{ .low = 0x6e6b_82f0_8d91_0402, .high = 0xa7a3_5105_3d6d_4002 };
-    pub const crypto = Id{ .low = 0x6e6b_82f0_8d91_0410, .high = 0xa7a3_5105_3d6d_4010 };
-    pub const callback_size = Id{ .low = 0x6e6b_82f0_8d91_0a01, .high = 0xa7a3_5105_3d6d_a001 };
-    pub const callback_read = Id{ .low = 0x6e6b_82f0_8d91_0a02, .high = 0xa7a3_5105_3d6d_a002 };
-    pub const callback_write = Id{ .low = 0x6e6b_82f0_8d91_0a03, .high = 0xa7a3_5105_3d6d_a003 };
-    pub const callback_rewind = Id{ .low = 0x6e6b_82f0_8d91_0a04, .high = 0xa7a3_5105_3d6d_a004 };
-    pub const callback_seek = Id{ .low = 0x6e6b_82f0_8d91_0a05, .high = 0xa7a3_5105_3d6d_a005 };
-    pub const invalid_call = Id{ .low = 0x6e6b_82f0_8d91_0501, .high = 0xa7a3_5105_3d6d_5001 };
-    pub const unsupported = Id{ .low = 0x6e6b_82f0_8d91_0502, .high = 0xa7a3_5105_3d6d_5002 };
-    pub const internal_failure = Id{ .low = 0x6e6b_82f0_8d91_0503, .high = 0xa7a3_5105_3d6d_5003 };
-    pub const diagnostic_resource_limit = Id{ .low = 0x6e6b_82f0_8d91_0504, .high = 0xa7a3_5105_3d6d_5004 };
-    pub const insufficient_capacity = Id{ .low = 0x6e6b_82f0_8d91_0505, .high = 0xa7a3_5105_3d6d_5005 };
-    pub const invalid_data = Id{ .low = 0x6e6b_82f0_8d91_0506, .high = 0xa7a3_5105_3d6d_5006 };
-    pub const integrity_failure = Id{ .low = 0x6e6b_82f0_8d91_0507, .high = 0xa7a3_5105_3d6d_5007 };
-    pub const io_failure = Id{ .low = 0x6e6b_82f0_8d91_0508, .high = 0xa7a3_5105_3d6d_5008 };
-    pub const crypto_wrong_password = Id{ .low = 0x6e6b_82f0_8d91_0509, .high = 0xa7a3_5105_3d6d_5009 };
-    pub const crypto_kdf_limit = Id{ .low = 0x6e6b_82f0_8d91_050a, .high = 0xa7a3_5105_3d6d_500a };
-    pub const crypto_password_lifetime = Id{ .low = 0x6e6b_82f0_8d91_050b, .high = 0xa7a3_5105_3d6d_500b };
-    pub const crypto_unsupported_algorithm = Id{ .low = 0x6e6b_82f0_8d91_050c, .high = 0xa7a3_5105_3d6d_500c };
-    pub const workspace_required_capacity = Id{ .low = 0x6e6b_82f0_8d91_050d, .high = 0xa7a3_5105_3d6d_500d };
-    pub const workspace_available_capacity = Id{ .low = 0x6e6b_82f0_8d91_050e, .high = 0xa7a3_5105_3d6d_500e };
+    pub const query = releasedId(0x0101);
+    pub const read = releasedId(0x0102);
+    pub const write = releasedId(0x0103);
+    pub const diagnostic_required_capacity = releasedId(0x0200);
+    pub const diagnostic_available_capacity = releasedId(0x0201);
+    pub const diagnostic_downstream_status = releasedId(0x0202);
+    pub const diagnostic_subject = releasedId(0x0203);
+    pub const source = releasedId(0x0210);
+    pub const sink = releasedId(0x0211);
+    pub const profile = releasedId(0x0212);
+    pub const target_command = releasedId(0x0218);
+    pub const size_bound = releasedId(0x0219);
+    pub const parameter = releasedId(0x0240);
+    pub const crypto_profile = releasedId(0x0236);
+    pub const resource_read = releasedId(0x0301);
+    pub const resource_write = releasedId(0x0302);
+    pub const resource_size = releasedId(0x0303);
+    pub const resource_replay = releasedId(0x0304);
+    pub const resource_seek = releasedId(0x0305);
+    pub const resource_range = releasedId(0x0306);
+    pub const test_echo = releasedId(0x0401);
+    pub const test_read = releasedId(0x0402);
+    pub const crypto = releasedId(0x0410);
+    pub const callback_size = releasedId(0x0a01);
+    pub const callback_read = releasedId(0x0a02);
+    pub const callback_write = releasedId(0x0a03);
+    pub const callback_rewind = releasedId(0x0a04);
+    pub const callback_seek = releasedId(0x0a05);
+    pub const invalid_call = releasedId(0x0501);
+    pub const unsupported = releasedId(0x0502);
+    pub const internal_failure = releasedId(0x0503);
+    pub const diagnostic_resource_limit = releasedId(0x0504);
+    pub const insufficient_capacity = releasedId(0x0505);
+    pub const invalid_data = releasedId(0x0506);
+    pub const integrity_failure = releasedId(0x0507);
+    pub const io_failure = releasedId(0x0508);
+    pub const crypto_wrong_password = releasedId(0x0509);
+    pub const crypto_kdf_limit = releasedId(0x050a);
+    pub const crypto_password_lifetime = releasedId(0x050b);
+    pub const crypto_unsupported_algorithm = releasedId(0x050c);
+    pub const workspace_required_capacity = releasedId(0x050d);
+    pub const workspace_available_capacity = releasedId(0x050e);
 };
 
 pub const error_map = [_]ErrorMap{
@@ -248,6 +259,12 @@ pub const error_map = [_]ErrorMap{
     .{ .exception = error.IntegrityException, .name = "integrity_failure", .status = Status.integrity_failure, .diagnostic = ids.integrity_failure },
     .{ .exception = error.IoException, .name = "io_failure", .status = Status.io_failure, .diagnostic = ids.io_failure },
 };
+
+// The wire status for an exception; the map owns the only translation.
+pub fn statusFor(failure: Exception) u32 {
+    inline for (error_map) |entry| if (failure == entry.exception) return entry.status;
+    return Status.internal_failure;
+}
 
 pub fn eql(left: Id, right: Id) bool {
     return left.low == right.low and left.high == right.high;

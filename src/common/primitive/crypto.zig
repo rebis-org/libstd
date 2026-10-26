@@ -372,20 +372,8 @@ test "fill random accepts every length class" {
 }
 
 // ZipCrypto (PKWARE traditional cipher): the CRC-32-based key ladder has no
-// stdlib equivalent, so the table lives here.
-const zip_crc_table: [256]u32 = blk: {
-    @setEvalBranchQuota(10_000);
-    var table: [256]u32 = undefined;
-    for (0..256) |i| {
-        var crc: u32 = @intCast(i);
-        var bit: u32 = 0;
-        while (bit < 8) : (bit += 1) {
-            crc = if (crc & 1 != 0) (crc >> 1) ^ 0xEDB8_8320 else crc >> 1;
-        }
-        table[i] = crc;
-    }
-    break :blk table;
-};
+// stdlib equivalent; it reuses the shared reflected CRC-32 table.
+const zip_crc_table = seam.byteTable(u32, 0xEDB8_8320, true);
 
 fn zipCrcByte(crc: u32, byte: u8) u32 {
     return (crc >> 8) ^ zip_crc_table[(crc ^ byte) & 0xFF];

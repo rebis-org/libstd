@@ -233,7 +233,7 @@ test "seek table checksums verify each frame" {
         hasher.update(payload);
         try writer.writeInt(u32, compressed_sizes[index], .little);
         try writer.writeInt(u32, @intCast(payload.len), .little);
-        try writer.writeInt(u32, @truncate(hasher.final()), .little);
+        try writer.writeInt(u32, @truncate(hasher.final({})), .little);
     }
     try writer.writeInt(u32, payloads.len, .little);
     try writer.writeByte(0x80);

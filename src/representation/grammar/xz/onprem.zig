@@ -280,9 +280,9 @@ fn checkTypeFromInt(value: u8) Exception!CheckType {
 }
 
 fn verifyCrc32(bytes: []const u8, expected: u32, provider: checksum.Provider) Exception!void {
-    var crc = checksum.Crc32.bind(provider);
+    var crc = checksum.Crc32.bind(provider, {});
     crc.update(bytes);
-    if (crc.final() != expected) return error.IntegrityException;
+    if (crc.final({}) != expected) return error.IntegrityException;
 }
 
 const IndexRecord = struct {
@@ -512,16 +512,16 @@ fn verifyFilteredCheck(check: CheckType, block: []const u8, expected: []const u8
     switch (check) {
         .none => {},
         .crc32 => {
-            var crc = checksum.Crc32.bind(provider);
+            var crc = checksum.Crc32.bind(provider, {});
             crc.update(block);
-            const actual: u32 = crc.final();
+            const actual: u32 = crc.final({});
             const stored = std.mem.readInt(u32, expected[0..4], .little);
             if (actual != stored) return error.IntegrityException;
         },
         .crc64 => {
-            var crc = checksum.XzCrc64.bind(provider);
+            var crc = checksum.XzCrc64.bind(provider, {});
             crc.update(block);
-            const actual: u64 = crc.final();
+            const actual: u64 = crc.final({});
             const stored = std.mem.readInt(u64, expected[0..8], .little);
             if (actual != stored) return error.IntegrityException;
         },
@@ -702,12 +702,12 @@ fn bcjKindFromChoice(filter: FilterChoice) bcj.Kind {
 
 fn writeStreamHeader(writer: *std.Io.Writer, check: CheckType, provider: checksum.Provider) Exception!void {
     const flags_bytes = [_]u8{ 0x00, @backingInt(check) };
-    var crc = checksum.Crc32.bind(provider);
+    var crc = checksum.Crc32.bind(provider, {});
     crc.update(&flags_bytes);
     try io.writeBytes(writer, &header_magic);
     try io.writeBytes(writer, &flags_bytes);
     var crc_bytes: [4]u8 = undefined;
-    std.mem.writeInt(u32, &crc_bytes, crc.final(), .little);
+    std.mem.writeInt(u32, &crc_bytes, crc.final({}), .little);
     try io.writeBytes(writer, &crc_bytes);
 }
 
@@ -745,9 +745,9 @@ fn buildBlockHeader(uncompressed_size: usize, dictionary_props: u8, filters: Fil
         header.bytes[index] = 0;
         index += 1;
     }
-    var crc = checksum.Crc32.bind(provider);
+    var crc = checksum.Crc32.bind(provider, {});
     crc.update(header.bytes[0..index]);
-    std.mem.writeInt(u32, header.bytes[index..][0..4], crc.final(), .little);
+    std.mem.writeInt(u32, header.bytes[index..][0..4], crc.final({}), .little);
     return header;
 }
 
@@ -771,7 +771,7 @@ fn blockPadding(data_size: usize) usize {
 }
 
 fn writeIndex(writer: *std.Io.Writer, records: []const u8, provider: checksum.Provider) Exception!usize {
-    var crc = checksum.Crc32.bind(provider);
+    var crc = checksum.Crc32.bind(provider, {});
     var content_size: usize = 0;
     var indicator = [_]u8{0x00};
     try io.writeBytes(writer, &indicator);
@@ -802,7 +802,7 @@ fn writeIndex(writer: *std.Io.Writer, records: []const u8, provider: checksum.Pr
         crc.update(zeroes[0..padding]);
     }
     var crc_bytes: [4]u8 = undefined;
-    std.mem.writeInt(u32, &crc_bytes, crc.final(), .little);
+    std.mem.writeInt(u32, &crc_bytes, crc.final({}), .little);
     try io.writeBytes(writer, &crc_bytes);
     return content_size + padding + 4;
 }
@@ -831,10 +831,10 @@ fn writeStreamFooter(writer: *std.Io.Writer, check: CheckType, index_size: usize
     footer_tail[5] = @backingInt(check);
     footer_tail[6] = footer_magic[0];
     footer_tail[7] = footer_magic[1];
-    var crc = checksum.Crc32.bind(provider);
+    var crc = checksum.Crc32.bind(provider, {});
     crc.update(footer_tail[0..6]);
     var footer: [12]u8 = undefined;
-    std.mem.writeInt(u32, footer[0..4], crc.final(), .little);
+    std.mem.writeInt(u32, footer[0..4], crc.final({}), .little);
     @memcpy(footer[4..12], &footer_tail);
     try io.writeBytes(writer, &footer);
 }

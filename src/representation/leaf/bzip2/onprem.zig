@@ -262,7 +262,7 @@ fn decodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, provide
                 }
             }
             // RLE decode rides the inverse-BWT traversal.
-            var block_crc = Bzip2Crc32.bind(provider);
+            var block_crc = Bzip2Crc32.bind(provider, {});
             var out_buf: [4096]u8 = undefined;
             var out_len: usize = 0;
             var cur: u32 = orig_ptr;
@@ -327,7 +327,7 @@ fn decodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, provide
                 try io.writeBytes(writer, out_buf[0..out_len]);
                 block_crc.update(out_buf[0..out_len]);
             }
-            if (block_crc.final() != stored_crc) {
+            if (block_crc.final({}) != stored_crc) {
                 return error.IntegrityException;
             }
             combined_crc = (combined_crc << 1) | (combined_crc >> 31);
@@ -393,13 +393,13 @@ fn encodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options
             }
         }
         // Block CRC covers raw input, so batch it over the consumed range.
-        var block_crc = Bzip2Crc32.bind(options.provider);
+        var block_crc = Bzip2Crc32.bind(options.provider, {});
         block_crc.update(chunk_input[0..consumed]);
         if (rle_len == 0) break;
         offset += consumed;
-        try encodeBlock(rle_buffer[0..rle_len], block_crc.final(), &bit_writer, &workspace, options);
+        try encodeBlock(rle_buffer[0..rle_len], block_crc.final({}), &bit_writer, &workspace, options);
         combined_crc = (combined_crc << 1) | (combined_crc >> 31);
-        combined_crc ^= block_crc.final();
+        combined_crc ^= block_crc.final({});
         if (!full and offset < input.len) return error.InternalException;
     }
     for (eos_magic) |b| try bit_writer.writeByte(b);
@@ -1430,9 +1430,9 @@ test "bzip2 decodes a randomised block" {
 
     // Bits 80..112 hold the block CRC (4-byte header, 6-byte magic); bit
     // 112 is the randomised flag, all byte-aligned.
-    var crc = Bzip2Crc32.bind(checksum.default_provider);
+    var crc = Bzip2Crc32.bind(checksum.default_provider, {});
     crc.update(&data);
-    const data_crc = crc.final();
+    const data_crc = crc.final({});
     std.mem.writeInt(u32, encoded[10..][0..4], data_crc, .big);
     encoded[14] |= 0x80;
 
