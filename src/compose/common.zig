@@ -38,6 +38,9 @@ pub const SourceSizing = enum { budget, require_size, size_or_budget, replay };
 pub const ExecutionPlan = struct {
     profile_id: Id,
     policy: vocabulary.CommandPolicy,
+    sizing: vocabulary.SizingMode,
+    commit: vocabulary.CommitMode,
+    command_mask: u32,
     limits: Limits,
     capabilities: u32,
     provider: seam.Provider = seam.default_provider,
@@ -45,6 +48,17 @@ pub const ExecutionPlan = struct {
     workspace_plan: resource.WorkspacePlan,
     workspace_required: usize = 0,
     workspace_available: usize = 0,
+};
+
+// One invocation owns every piece of a single envelope call: the plan
+// with its resolved policy, the source, the optional sink, the envelope,
+// and the response. Hooks and shared helpers receive nothing twice.
+pub const Invocation = struct {
+    plan: ExecutionPlan,
+    source: *Resource,
+    sink: ?*Resource,
+    call: *Call,
+    response: *Node,
 };
 
 fn budgetRequest(workspace: *resource.Workspace, limit: u64) usize {
@@ -235,8 +249,7 @@ pub fn checkSourceWorkspaceOverlap(call: *Call, source: *Resource) Exception!voi
     try overlapsWorkspace(range.ptr, range.len, @intFromPtr(source.kind.direct_read.ptr), source.kind.direct_read.len);
 }
 
-pub fn validateBoundary(call: *Call, plan: *const ExecutionPlan, source_node: ?*Node, sink_node: ?*Node) Exception!void {
-    _ = plan;
+pub fn validateBoundary(call: *Call, source_node: ?*Node, sink_node: ?*Node) Exception!void {
     if (call.workspace) |workspace| {
         const workspace_ptr = @intFromPtr(workspace);
         const workspace_len = std.math.cast(usize, call.workspace_capacity) orelse return error.CallException;

@@ -266,9 +266,17 @@ fn publishEntryMetadata(call: *Call, response: *Node, meta: EntryMetadata) Excep
     if (meta.size) |size| response.byte_length = size;
 }
 
-pub fn tarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
+pub fn tarHook(invocation: *common.Invocation) Exception!void {
+    const plan = &invocation.plan;
+    const call = invocation.call;
+    const response = invocation.response;
+    const source_resource = invocation.source;
+    const sink = invocation.sink;
+    const sizing = plan.sizing;
+    const commit = plan.commit;
+    const limits = plan.limits;
+    const command_mask = plan.command_mask;
     _ = sizing;
-    const source_resource = source orelse return error.CallException;
     var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
     if (command_mask == vocabulary.command_mask_read) {
         if (sink == null) {
@@ -341,9 +349,17 @@ fn fillXarEntry(entry: *xar.Entry, node: *Node, _: NoCtx) Exception!void {
     entry.* = .{ .name = parts.name, .data = parts.data, .uid = uid, .modification_time = mtime };
 }
 
-pub fn xarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
+pub fn xarHook(invocation: *common.Invocation) Exception!void {
+    const plan = &invocation.plan;
+    const call = invocation.call;
+    const response = invocation.response;
+    const source_resource = invocation.source;
+    const sink = invocation.sink;
+    const sizing = plan.sizing;
+    const commit = plan.commit;
+    const limits = plan.limits;
+    const command_mask = plan.command_mask;
     _ = sizing;
-    const source_resource = source orelse return error.CallException;
     var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
     if (command_mask == vocabulary.command_mask_read) {
         if (sink == null) {
@@ -421,9 +437,17 @@ fn fillIsoEntry(entry: *iso.Entry, node: *Node, _: NoCtx) Exception!void {
     entry.* = .{ .name = parts.name, .data = parts.data };
 }
 
-pub fn dwarfsHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
+pub fn dwarfsHook(invocation: *common.Invocation) Exception!void {
+    const plan = &invocation.plan;
+    const call = invocation.call;
+    const response = invocation.response;
+    const source_resource = invocation.source;
+    const sink = invocation.sink;
+    const sizing = plan.sizing;
+    const commit = plan.commit;
+    const limits = plan.limits;
+    const command_mask = plan.command_mask;
     _ = sizing;
-    const source_resource = source orelse return error.CallException;
     var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
     if (command_mask == vocabulary.command_mask_read) {
         if (sink == null) {
@@ -477,9 +501,17 @@ pub fn dwarfsHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resou
 
 // APFS writes are mkfs-shaped: a fresh single-volume image from the entry
 // list, read back through the same ordinal surface.
-pub fn apfsHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
+pub fn apfsHook(invocation: *common.Invocation) Exception!void {
+    const plan = &invocation.plan;
+    const call = invocation.call;
+    const response = invocation.response;
+    const source_resource = invocation.source;
+    const sink = invocation.sink;
+    const sizing = plan.sizing;
+    const commit = plan.commit;
+    const limits = plan.limits;
+    const command_mask = plan.command_mask;
     _ = sizing;
-    const source_resource = source orelse return error.CallException;
     var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
     if (command_mask == vocabulary.command_mask_read) {
         if (sink == null) {
@@ -557,9 +589,17 @@ fn ageScratch(workspace: *resource.Workspace, options: age_seam.Options) Excepti
     return workspace.take(u8, @max(age_seam.scratch_size, peak) * 2);
 }
 
-pub fn ageHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
+pub fn ageHook(invocation: *common.Invocation) Exception!void {
+    const plan = &invocation.plan;
+    const call = invocation.call;
+    const response = invocation.response;
+    const source_resource = invocation.source;
+    const sink = invocation.sink;
+    const sizing = plan.sizing;
+    const commit = plan.commit;
+    const limits = plan.limits;
+    const command_mask = plan.command_mask;
     _ = sizing;
-    const source_resource = source orelse return error.CallException;
     var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
     var crypto_cause: crypto.FailureCause = .none;
     const crypto_params = parseCryptoParams("age", call.request, &crypto_cause) catch |err| {
@@ -644,9 +684,17 @@ fn fillApfsEntry(entry: *apfs_seam.Entry, node: *Node, _: NoCtx) Exception!void 
     entry.* = .{ .name = parts.name, .data = parts.data };
 }
 
-pub fn isoHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
+pub fn isoHook(invocation: *common.Invocation) Exception!void {
+    const plan = &invocation.plan;
+    const call = invocation.call;
+    const response = invocation.response;
+    const source_resource = invocation.source;
+    const sink = invocation.sink;
+    const sizing = plan.sizing;
+    const commit = plan.commit;
+    const limits = plan.limits;
+    const command_mask = plan.command_mask;
     _ = sizing;
-    const source_resource = source orelse return error.CallException;
     var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
     if (command_mask == vocabulary.command_mask_read) {
         if (sink == null) {
@@ -698,9 +746,17 @@ pub fn isoHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
     }
 }
 
-pub fn squashfsHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
+pub fn squashfsHook(invocation: *common.Invocation) Exception!void {
+    const plan = &invocation.plan;
+    const call = invocation.call;
+    const response = invocation.response;
+    const source_resource = invocation.source;
+    const sink = invocation.sink;
+    const sizing = plan.sizing;
+    const commit = plan.commit;
+    const limits = plan.limits;
+    const command_mask = plan.command_mask;
     _ = sizing;
-    const source_resource = source orelse return error.CallException;
     var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
     if (command_mask == vocabulary.command_mask_read) {
         if (sink == null) {
@@ -752,9 +808,17 @@ pub fn squashfsHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Res
     }
 }
 
-pub fn wimHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
+pub fn wimHook(invocation: *common.Invocation) Exception!void {
+    const plan = &invocation.plan;
+    const call = invocation.call;
+    const response = invocation.response;
+    const source_resource = invocation.source;
+    const sink = invocation.sink;
+    const sizing = plan.sizing;
+    const commit = plan.commit;
+    const limits = plan.limits;
+    const command_mask = plan.command_mask;
     _ = sizing;
-    const source_resource = source orelse return error.CallException;
     var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
     if (command_mask == vocabulary.command_mask_read) {
         if (sink == null) {
@@ -819,9 +883,17 @@ fn fillCpioEntry(entry: *cpio.Entry, node: *Node, _: NoCtx) Exception!void {
     entry.* = .{ .name = parts.name, .data = parts.data, .uid = uid, .modification_time = mtime };
 }
 
-pub fn cpioHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
+pub fn cpioHook(invocation: *common.Invocation) Exception!void {
+    const plan = &invocation.plan;
+    const call = invocation.call;
+    const response = invocation.response;
+    const source_resource = invocation.source;
+    const sink = invocation.sink;
+    const sizing = plan.sizing;
+    const commit = plan.commit;
+    const limits = plan.limits;
+    const command_mask = plan.command_mask;
     _ = sizing;
-    const source_resource = source orelse return error.CallException;
     var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
     if (command_mask == vocabulary.command_mask_read) {
         if (sink == null) {
@@ -875,9 +947,17 @@ pub fn cpioHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resourc
     }
 }
 
-pub fn zipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
+pub fn zipHook(invocation: *common.Invocation) Exception!void {
+    const plan = &invocation.plan;
+    const call = invocation.call;
+    const response = invocation.response;
+    const source_resource = invocation.source;
+    const sink = invocation.sink;
+    const sizing = plan.sizing;
+    const commit = plan.commit;
+    const limits = plan.limits;
+    const command_mask = plan.command_mask;
     _ = sizing;
-    const source_resource = source orelse return error.CallException;
     var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
     var crypto_cause: crypto.FailureCause = .none;
     const crypto_params = parseCryptoParams("zip", call.request, &crypto_cause) catch |err| {
@@ -980,15 +1060,23 @@ pub fn zipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource
     }
 }
 
-pub fn sevenzipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
+pub fn sevenzipHook(invocation: *common.Invocation) Exception!void {
     // Single sevenzip profile unions decoded/coded sides: reads accept every method, writes pack.
     // Queries follow their target.
-    return sevenZipGeneric(true, plan, source, sink, call, response, sizing, commit, limits, command_mask);
+    return sevenZipGeneric(true, invocation);
 }
 
-fn sevenZipGeneric(comptime coded: bool, plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
+fn sevenZipGeneric(comptime coded: bool, invocation: *common.Invocation) Exception!void {
+    const plan = &invocation.plan;
+    const call = invocation.call;
+    const response = invocation.response;
+    const source_resource = invocation.source;
+    const sink = invocation.sink;
+    const sizing = plan.sizing;
+    const commit = plan.commit;
+    const limits = plan.limits;
+    const command_mask = plan.command_mask;
     _ = sizing;
-    const source_resource = source orelse return error.CallException;
     var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
     var crypto_cause: crypto.FailureCause = .none;
     const crypto_params = parseCryptoParams("sevenzip", call.request, &crypto_cause) catch |err| {
@@ -1188,8 +1276,16 @@ fn parseSevenZipMethod(node: *Node) Exception!seven_zip.CoderMethod {
 // header at 2 MiB; RAR4 headers are u16-sized, 16-byte aligned.
 const rar_header_scratch_size = 2 * 1024 * 1024 + 16;
 
-pub fn rarHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
-    const source_resource = source orelse return error.CallException;
+pub fn rarHook(invocation: *common.Invocation) Exception!void {
+    const plan = &invocation.plan;
+    const call = invocation.call;
+    const response = invocation.response;
+    const source_resource = invocation.source;
+    const sink = invocation.sink;
+    const sizing = plan.sizing;
+    const commit = plan.commit;
+    const limits = plan.limits;
+    const command_mask = plan.command_mask;
     if (sizing != .metadata_exact) return error.UnsupportedException;
     var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
     if (command_mask == vocabulary.command_mask_read) {

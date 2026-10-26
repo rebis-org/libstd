@@ -3,33 +3,20 @@ const std = @import("std");
 const components = @import("components");
 
 const abi = @import("../kernel/envelope.zig");
-const resource = @import("../kernel/resource.zig");
 const vocabulary = @import("../kernel/vocabulary.zig");
 const archive = @import("archive.zig");
 const catalog = @import("catalog.zig");
 const common = @import("common.zig");
 const transform = @import("transform.zig");
 
-const Call = abi.Call;
 const Id = abi.Id;
-const Node = abi.Node;
-const Limits = resource.Limits;
-const Resource = resource.Resource;
 const Exception = vocabulary.Exception;
 
-const ProfileHook = *const fn (plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void;
+const ProfileHook = *const fn (invocation: *common.Invocation) Exception!void;
 
 // Convention dispatch: the hook for a tag lives as `<tag>Hook`.
-fn unsupportedHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
-    _ = plan;
-    _ = source;
-    _ = sink;
-    _ = call;
-    _ = response;
-    _ = sizing;
-    _ = commit;
-    _ = limits;
-    _ = command_mask;
+fn unsupportedHook(invocation: *common.Invocation) Exception!void {
+    _ = invocation;
     return error.UnsupportedException;
 }
 
@@ -55,8 +42,8 @@ const handler_map = blk: {
     break :blk std.StaticStringMap(ProfileHook).initComptime(entries);
 };
 
-pub fn dispatchToProfileHook(profile_id: Id, plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
+pub fn dispatchToProfileHook(profile_id: Id, invocation: *common.Invocation) Exception!void {
     const tag = catalog.profileTagForId(profile_id) orelse return error.UnsupportedException;
     const hook = handler_map.get(@tagName(tag)) orelse return error.UnsupportedException;
-    return hook(plan, source, sink, call, response, sizing, commit, limits, command_mask);
+    return hook(invocation);
 }

@@ -133,9 +133,12 @@ fn dispatch(envelope: *Call, response: *Node) Exception!void {
     ));
     const source_node = try requireParameter(envelope.request, ids.source);
     const sink_node = if (is_query) null else try requireParameter(envelope.request, ids.sink);
-    var plan = common.ExecutionPlan{
+    const plan = common.ExecutionPlan{
         .profile_id = profile_id,
         .policy = policy,
+        .sizing = effective_sizing,
+        .commit = commit,
+        .command_mask = direction,
         .limits = limits,
         .capabilities = capabilities,
         .provider = try parseProvider(protocolParam(
@@ -149,16 +152,23 @@ fn dispatch(envelope: *Call, response: *Node) Exception!void {
         .workspace_plan = resource.WorkspacePlan.init(envelope.workspace),
         .workspace_available = std.math.cast(usize, envelope.workspace_capacity) orelse std.math.maxInt(usize),
     };
-    try common.validateBoundary(envelope, &plan, source_node, sink_node);
+    try common.validateBoundary(envelope, source_node, sink_node);
     var source = try Resource.sourceFromNode(envelope, source_node, capabilities);
     var sink: ?Resource = if (sink_node) |node| try Resource.sinkFromNode(envelope, node, capabilities) else null;
     const selected = if (is_query) &source else if (direction == command_mask_read) &source else if (sink) |*sink_resource| sink_resource else return error.CallException;
     if ((selected.capabilities & policy.capabilities) != policy.capabilities) return error.UnsupportedException;
     if (effective_sizing == .unavailable) return error.UnsupportedException;
+    var invocation = common.Invocation{
+        .plan = plan,
+        .source = &source,
+        .sink = if (sink) |*sink_resource| sink_resource else null,
+        .call = envelope,
+        .response = response,
+    };
     // Workspace requirement must be reported on every exit path, success or exception.
-    defer if (plan.workspace_required != 0)
-        common.writeWorkspaceCapacityDiagnostic(envelope, plan.workspace_required, plan.workspace_available);
-    try hooks.dispatchToProfileHook(profile.id, &plan, &source, if (sink) |*sink_resource| sink_resource else null, envelope, response, effective_sizing, commit, limits, direction);
+    defer if (invocation.plan.workspace_required != 0)
+        common.writeWorkspaceCapacityDiagnostic(envelope, invocation.plan.workspace_required, invocation.plan.workspace_available);
+    try hooks.dispatchToProfileHook(profile.id, &invocation);
 }
 
 // A query names the direction it measures; resolution precedes

@@ -70,9 +70,17 @@ fn optBytes(request: ?*Node, comptime component: []const u8, comptime name: []co
     return try resource.checkedConstBytes(node.bytes, node.byte_length);
 }
 
-pub fn testHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
+pub fn testHook(invocation: *common.Invocation) Exception!void {
+    const plan = &invocation.plan;
+    const call = invocation.call;
+    const response = invocation.response;
+    const source_resource = invocation.source;
+    const sink = invocation.sink;
+    const sizing = plan.sizing;
+    const commit = plan.commit;
+    const limits = plan.limits;
+    const command_mask = plan.command_mask;
     _ = command_mask;
-    const source_resource = source orelse return error.CallException;
     const sink_resource = sink orelse return error.CallException;
     var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
     const output_size = try common.planOutputSize(source_resource, sizing, limits, &workspace);
@@ -106,8 +114,16 @@ pub fn testHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resourc
     response.byte_length = output_size;
 }
 
-pub fn deflateHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
-    const source_resource = source orelse return error.CallException;
+pub fn deflateHook(invocation: *common.Invocation) Exception!void {
+    const plan = &invocation.plan;
+    const call = invocation.call;
+    const response = invocation.response;
+    const source_resource = invocation.source;
+    const sink = invocation.sink;
+    const sizing = plan.sizing;
+    const commit = plan.commit;
+    const limits = plan.limits;
+    const command_mask = plan.command_mask;
     try requireReplay(source_resource, sizing, commit, false);
     const deflate_opts = try parseDeflateOptions(call.request, command_mask);
     var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
@@ -152,8 +168,16 @@ pub fn deflateHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Reso
     }
 }
 
-pub fn gzipHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
-    const source_resource = source orelse return error.CallException;
+pub fn gzipHook(invocation: *common.Invocation) Exception!void {
+    const plan = &invocation.plan;
+    const call = invocation.call;
+    const response = invocation.response;
+    const source_resource = invocation.source;
+    const sink = invocation.sink;
+    const sizing = plan.sizing;
+    const commit = plan.commit;
+    const limits = plan.limits;
+    const command_mask = plan.command_mask;
     try requireReplay(source_resource, sizing, commit, false);
     var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
     const options = blk: {
@@ -328,8 +352,16 @@ fn planDeflateDecode(source: *Resource, history: []u8, encoded_limit: u64, decod
     return std.math.cast(usize, output_size) orelse error.ResourceException;
 }
 
-pub fn zlibHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
-    const source_resource = source orelse return error.CallException;
+pub fn zlibHook(invocation: *common.Invocation) Exception!void {
+    const plan = &invocation.plan;
+    const call = invocation.call;
+    const response = invocation.response;
+    const source_resource = invocation.source;
+    const sink = invocation.sink;
+    const sizing = plan.sizing;
+    const commit = plan.commit;
+    const limits = plan.limits;
+    const command_mask = plan.command_mask;
     try requireReplay(source_resource, sizing, commit, false);
     var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
     const options = zlib.Options{ .deflate = try parseDeflateOptions(call.request, command_mask), .provider = plan.provider };
@@ -375,15 +407,16 @@ pub fn zlibHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resourc
     }
 }
 
-pub fn lzoHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
-    return bufferCodecHook(lzo, plan, source, sink, call, response, sizing, commit, limits, command_mask, lzo.decodeWorkspaceSize(), lzo.encodeWorkspaceSize(), .{});
+pub fn lzoHook(invocation: *common.Invocation) Exception!void {
+    return bufferCodecHook(lzo, invocation, lzo.decodeWorkspaceSize(), lzo.encodeWorkspaceSize(), .{});
 }
 
-pub fn lz4Hook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
-    var options = try parseLz4Options(call.request, command_mask);
+pub fn lz4Hook(invocation: *common.Invocation) Exception!void {
+    const plan = &invocation.plan;
+    var options = try parseLz4Options(invocation.call.request, plan.command_mask);
     options.provider = plan.provider;
-    options.max_work = limits.codec_work;
-    return bufferCodecHook(lz4, plan, source, sink, call, response, sizing, commit, limits, command_mask, lz4.decodeWorkspaceSize(), lz4.encodeWorkspaceSize(), options);
+    options.max_work = plan.limits.codec_work;
+    return bufferCodecHook(lz4, invocation, lz4.decodeWorkspaceSize(), lz4.encodeWorkspaceSize(), options);
 }
 
 fn parseLz4Options(request: ?*Node, command_mask: u32) Exception!lz4.Options {
@@ -397,8 +430,16 @@ fn parseLz4Options(request: ?*Node, command_mask: u32) Exception!lz4.Options {
     return options;
 }
 
-pub fn zstd_seekableHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
-    const source_resource = source orelse return error.CallException;
+pub fn zstd_seekableHook(invocation: *common.Invocation) Exception!void {
+    const plan = &invocation.plan;
+    const call = invocation.call;
+    const response = invocation.response;
+    const source_resource = invocation.source;
+    const sink = invocation.sink;
+    const sizing = plan.sizing;
+    const commit = plan.commit;
+    const limits = plan.limits;
+    const command_mask = plan.command_mask;
     try requireReplay(source_resource, sizing, commit, false);
     var options = zstd_seekable.Options{ .provider = plan.provider };
     if (command_mask == vocabulary.command_mask_write or command_mask == vocabulary.command_mask_query) {
@@ -457,8 +498,16 @@ pub fn zstd_seekableHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: 
     }
 }
 
-pub fn zdictHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
-    const source_resource = source orelse return error.CallException;
+pub fn zdictHook(invocation: *common.Invocation) Exception!void {
+    const plan = &invocation.plan;
+    const call = invocation.call;
+    const response = invocation.response;
+    const source_resource = invocation.source;
+    const sink = invocation.sink;
+    const sizing = plan.sizing;
+    const commit = plan.commit;
+    const limits = plan.limits;
+    const command_mask = plan.command_mask;
     try requireReplay(source_resource, sizing, commit, false);
     if (command_mask == vocabulary.command_mask_read) {
         if (sink) |sink_resource| try common.checkWorkspaceOverlap(call, source_resource, sink_resource);
@@ -505,8 +554,16 @@ pub fn zdictHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resour
     response.byte_length = produced;
 }
 
-pub fn zstdHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
-    const source_resource = source orelse return error.CallException;
+pub fn zstdHook(invocation: *common.Invocation) Exception!void {
+    const plan = &invocation.plan;
+    const call = invocation.call;
+    const response = invocation.response;
+    const source_resource = invocation.source;
+    const sink = invocation.sink;
+    const sizing = plan.sizing;
+    const commit = plan.commit;
+    const limits = plan.limits;
+    const command_mask = plan.command_mask;
     try requireReplay(source_resource, sizing, commit, true);
     const options = blk: {
         var parsed = try parseZstdOptions(call.request, command_mask);
@@ -650,17 +707,18 @@ fn parseZstdDictionary(node: ?*Node) Exception!?[]const u8 {
     return @as(?[]const u8, try resource.checkedConstBytes(n.bytes, n.byte_length));
 }
 
-pub fn bzip2Hook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
-    var options = try parseBzip2Options(call.request, command_mask);
-    options.max_work = limits.codec_work;
+pub fn bzip2Hook(invocation: *common.Invocation) Exception!void {
+    const plan = &invocation.plan;
+    var options = try parseBzip2Options(invocation.call.request, plan.command_mask);
+    options.max_work = plan.limits.codec_work;
     options.provider = plan.provider;
-    return bufferCodecHook(bzip2, plan, source, sink, call, response, sizing, commit, limits, command_mask, bzip2.decodeWorkspaceSize(bzip2.block_size_max), bzip2.encodeWorkspaceSize(options.block_size), options);
+    return bufferCodecHook(bzip2, invocation, bzip2.decodeWorkspaceSize(bzip2.block_size_max), bzip2.encodeWorkspaceSize(options.block_size), options);
 }
 
-pub fn brotliHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
-    const options = try parseBrotliOptions(call.request, command_mask);
+pub fn brotliHook(invocation: *common.Invocation) Exception!void {
+    const options = try parseBrotliOptions(invocation.call.request, invocation.plan.command_mask);
     // The encoder lands with the dictionary support; read serves now.
-    return bufferCodecHook(brotli, plan, source, sink, call, response, sizing, commit, limits, command_mask, brotli.decodeWorkspaceSize(options), brotli.encodeWorkspaceSize(options), options);
+    return bufferCodecHook(brotli, invocation, brotli.decodeWorkspaceSize(options), brotli.encodeWorkspaceSize(options), options);
 }
 
 fn parseBrotliOptions(request: ?*Node, command_mask: u32) Exception!brotli.Options {
@@ -735,13 +793,16 @@ fn parseLzmaMatchParams(request: ?*Node, command_mask: u32) Exception!LzmaMatchP
     return params;
 }
 
-fn lzmaFamilyHook(comptime Codec: type, plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
+fn lzmaFamilyHook(comptime Codec: type, invocation: *common.Invocation) Exception!void {
+    const plan = &invocation.plan;
+    const call = invocation.call;
+    const limits = plan.limits;
     const dictionary_size = try parseLzmaDictionary(call.request);
     const properties = lzma2.defaultProperties(dictionary_size);
-    const params = try parseLzmaMatchParams(call.request, command_mask);
+    const params = try parseLzmaMatchParams(call.request, plan.command_mask);
     if (Codec == lzma) {
         const encode_workspace = if (params.match_finder == .bt4) lzma.encodeWorkspaceSizeBt(properties) else lzma.encodeWorkspaceSize(properties);
-        return bufferCodecHook(lzma, plan, source, sink, call, response, sizing, commit, limits, command_mask, lzma.decodeWorkspaceSize(properties), encode_workspace, .{
+        return bufferCodecHook(lzma, invocation, lzma.decodeWorkspaceSize(properties), encode_workspace, .{
             .properties = properties,
             .unpack_size = null,
             .marker_required = true,
@@ -753,7 +814,7 @@ fn lzmaFamilyHook(comptime Codec: type, plan: *common.ExecutionPlan, source: ?*R
         });
     }
     const encode_workspace = if (params.match_finder == .bt4) lzma2.encodeWorkspaceSizeBt(dictionary_size) else lzma2.encodeWorkspaceSize(dictionary_size);
-    return bufferCodecHook(lzma2, plan, source, sink, call, response, sizing, commit, limits, command_mask, lzma2.decodeWorkspaceSize(dictionary_size), encode_workspace, .{
+    return bufferCodecHook(lzma2, invocation, lzma2.decodeWorkspaceSize(dictionary_size), encode_workspace, .{
         .dictionary_size = dictionary_size,
         .properties = properties,
         .max_work = limits.codec_work,
@@ -764,16 +825,24 @@ fn lzmaFamilyHook(comptime Codec: type, plan: *common.ExecutionPlan, source: ?*R
     });
 }
 
-pub fn lzmaHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
-    return lzmaFamilyHook(lzma, plan, source, sink, call, response, sizing, commit, limits, command_mask);
+pub fn lzmaHook(invocation: *common.Invocation) Exception!void {
+    return lzmaFamilyHook(lzma, invocation);
 }
 
-pub fn lzma2Hook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
-    return lzmaFamilyHook(lzma2, plan, source, sink, call, response, sizing, commit, limits, command_mask);
+pub fn lzma2Hook(invocation: *common.Invocation) Exception!void {
+    return lzmaFamilyHook(lzma2, invocation);
 }
 
-fn bufferCodecHook(comptime Codec: type, plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32, decode_workspace: usize, encode_workspace: usize, options: Codec.Options) Exception!void {
-    const source_resource = source orelse return error.CallException;
+fn bufferCodecHook(comptime Codec: type, invocation: *common.Invocation, decode_workspace: usize, encode_workspace: usize, options: Codec.Options) Exception!void {
+    const plan = &invocation.plan;
+    const call = invocation.call;
+    const response = invocation.response;
+    const source_resource = invocation.source;
+    const sink = invocation.sink;
+    const sizing = plan.sizing;
+    const commit = plan.commit;
+    const limits = plan.limits;
+    const command_mask = plan.command_mask;
     try requireReplay(source_resource, sizing, commit, false);
     if (sink == null) try common.checkSourceWorkspaceOverlap(call, source_resource);
     if (command_mask == vocabulary.command_mask_read) {
@@ -893,8 +962,16 @@ fn codecDecodeDirectInPlace(comptime Codec: type, input: []const u8, output: []u
     return if (Codec == lzma2) result.produced else result;
 }
 
-pub fn lzma_fileHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
-    const source_resource = source orelse return error.CallException;
+pub fn lzma_fileHook(invocation: *common.Invocation) Exception!void {
+    const plan = &invocation.plan;
+    const call = invocation.call;
+    const response = invocation.response;
+    const source_resource = invocation.source;
+    const sink = invocation.sink;
+    const sizing = plan.sizing;
+    const commit = plan.commit;
+    const limits = plan.limits;
+    const command_mask = plan.command_mask;
     try requireReplay(source_resource, sizing, commit, false);
     if (sink == null) try common.checkSourceWorkspaceOverlap(call, source_resource);
     if (command_mask == vocabulary.command_mask_read) {
@@ -957,8 +1034,16 @@ fn parseLzmaFileDictionary(request: ?*Node) Exception!u32 {
     return parseDictionary("lzma-file", request, lzma_file.default_dictionary);
 }
 
-pub fn xzHook(plan: *common.ExecutionPlan, source: ?*Resource, sink: ?*Resource, call: *Call, response: *Node, sizing: vocabulary.SizingMode, commit: vocabulary.CommitMode, limits: Limits, command_mask: u32) Exception!void {
-    const source_resource = source orelse return error.CallException;
+pub fn xzHook(invocation: *common.Invocation) Exception!void {
+    const plan = &invocation.plan;
+    const call = invocation.call;
+    const response = invocation.response;
+    const source_resource = invocation.source;
+    const sink = invocation.sink;
+    const sizing = plan.sizing;
+    const commit = plan.commit;
+    const limits = plan.limits;
+    const command_mask = plan.command_mask;
     try requireReplay(source_resource, sizing, commit, true);
     if (sink) |sink_resource| try common.checkWorkspaceOverlap(call, source_resource, sink_resource);
     const dictionary_size = try parseLzmaDictionary(call.request);
