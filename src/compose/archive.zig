@@ -20,6 +20,8 @@ const wim = @import("../representation/grammar/wim/onprem.zig");
 const wim_seam = @import("../representation/grammar/wim/seam.zig");
 const xar = @import("../representation/grammar/xar/onprem.zig");
 const xar_seam = @import("../representation/grammar/xar/seam.zig");
+const xip = @import("../representation/grammar/xip/onprem.zig");
+const xip_seam = @import("../representation/grammar/xip/seam.zig");
 const zip = @import("../representation/grammar/zip/onprem.zig");
 const apfs_seam = @import("../representation/volume/apfs/seam.zig");
 const dwarfs = @import("../representation/volume/dwarfs/onprem.zig");
@@ -411,6 +413,81 @@ pub fn xarHook(invocation: *common.Invocation) Exception!void {
         try common.requireSinkCapacity(sink_resource, call, required);
         const target = try SinkTarget.open(sink_resource, &workspace, required);
         const written = try xar_seam.encode(plan.provider, entries, target.output, scratch);
+        response.byte_length = try target.publish(sink_resource, call, written);
+    } else {
+        return error.UnsupportedException;
+    }
+}
+
+fn fillXipEntry(entry: *xip.Entry, node: *Node, _: NoCtx) Exception!void {
+    const parts = try entryNameData(node.child);
+    const uid: u32 = if (cpioSelector("entry_uid", node.child)) |n| blk: {
+        break :blk try narrow(u32, n.value_low);
+    } else 0;
+    const mtime = node_graph.parseU64(cpioSelector("entry_mtime", node.child));
+    entry.* = .{ .name = parts.name, .data = parts.data, .uid = uid, .modification_time = mtime };
+}
+
+pub fn xipHook(invocation: *common.Invocation) Exception!void {
+    const plan = &invocation.plan;
+    const call = invocation.call;
+    const response = invocation.response;
+    const source_resource = invocation.source;
+    const sink = invocation.sink;
+    const sizing = plan.sizing;
+    const commit = plan.commit;
+    const limits = plan.limits;
+    const command_mask = plan.command_mask;
+    _ = sizing;
+    var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
+    if (command_mask == vocabulary.command_mask_read) {
+        const archive = try materializeArchive(source_resource, &workspace, limits);
+        if (sink == null) {
+            const scratch = try workspace.take(u8, xip_seam.scratch_size);
+            if (try projectedEntrySize(call.request)) |ordinal| {
+                const entry = try xip_seam.inspectOrdinal(plan.provider, archive, ordinal, scratch);
+                response.byte_length = entry.size;
+                return;
+            }
+            if (try projectedEntryMetadata(call.request)) |ordinal| {
+                const entry = try xip_seam.inspectOrdinal(plan.provider, archive, ordinal, scratch);
+                try publishEntryMetadata(call, response, .{
+                    .name = entry.name,
+                    .size = entry.size,
+                    .mtime = entry.modification_time,
+                    .uid = entry.uid,
+                });
+                return;
+            }
+            const count = try xip_seam.inspectCount(plan.provider, archive, scratch);
+            response.byte_length = count;
+            return;
+        }
+        const head = try readHead(sink, call, commit);
+        const sink_resource = head.sink;
+        const ordinal = head.ordinal;
+        const scratch = try workspace.take(u8, xip_seam.scratch_size);
+        const entry = try xip_seam.inspectOrdinal(plan.provider, archive, ordinal, scratch);
+        const size = std.math.cast(usize, entry.size) orelse return error.ResourceException;
+        if (size > limits.decoded_bytes) return error.ResourceException;
+        try common.requireSinkCapacity(sink_resource, call, size);
+        const target = try SinkTarget.open(sink_resource, &workspace, size);
+        _ = try xip_seam.decodeOrdinal(plan.provider, archive, ordinal, target.output, scratch);
+        _ = try target.publish(sink_resource, call, size);
+        response.byte_length = size;
+    } else if (command_mask == vocabulary.command_mask_write) {
+        try requireVerified(commit);
+        const entries = try collectEntries(xip.Entry, call.request, &workspace, NoCtx{}, fillXipEntry);
+        const scratch = try workspace.take(u8, xip_seam.scratch_size);
+        const required = try xip_seam.archiveSize(plan.provider, entries, scratch);
+        if (sink == null) {
+            response.byte_length = required;
+            return;
+        }
+        const sink_resource = sink.?;
+        try common.requireSinkCapacity(sink_resource, call, required);
+        const target = try SinkTarget.open(sink_resource, &workspace, required);
+        const written = try xip_seam.encode(plan.provider, entries, target.output, scratch);
         response.byte_length = try target.publish(sink_resource, call, written);
     } else {
         return error.UnsupportedException;

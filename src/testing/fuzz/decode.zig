@@ -16,6 +16,7 @@ const sevenzip = @import("../../representation/grammar/sevenzip/onprem.zig");
 const tar = @import("../../representation/grammar/tar/onprem.zig");
 const wim = @import("../../representation/grammar/wim/onprem.zig");
 const xar = @import("../../representation/grammar/xar/onprem.zig");
+const xip = @import("../../representation/grammar/xip/onprem.zig");
 const xz = @import("../../representation/grammar/xz/onprem.zig");
 const zip = @import("../../representation/grammar/zip/onprem.zig");
 const zlib = @import("../../representation/grammar/zlib/onprem.zig");
@@ -308,6 +309,25 @@ test "fuzz xar decode" {
     }.f, .{ .corpus = &.{} });
 }
 
+fn runXip(data: []const u8) anyerror!void {
+    const scratch = try testing.allocator.alloc(u8, xip.scratch_size);
+    defer testing.allocator.free(scratch);
+    const count = xip.inspectCount(data, scratch) catch return;
+    if (count == 0) return;
+    const info = xip.inspectOrdinal(data, 0, scratch) catch return;
+    const size: usize = @intCast(@min(info.size, max_output));
+    var out: [max_output]u8 = undefined;
+    _ = xip.decodeOrdinal(data, 0, out[0..size], scratch) catch {};
+}
+
+test "fuzz xip decode" {
+    try testing.fuzz({}, struct {
+        fn f(_: void, smith: *testing.Smith) anyerror!void {
+            try drive(smith, runXip);
+        }
+    }.f, .{ .corpus = &.{} });
+}
+
 fn runAge(data: []const u8) anyerror!void {
     const scratch = try testing.allocator.alloc(u8, age.scratch_size);
     defer testing.allocator.free(scratch);
@@ -513,6 +533,10 @@ test "mutation campaign wim" {
 
 test "mutation campaign xar" {
     try campaignLoop("xar", xar_magic_seed, runXar);
+}
+
+test "mutation campaign xip" {
+    try campaignLoop("xip", xar_magic_seed, runXip);
 }
 
 test "mutation campaign age" {

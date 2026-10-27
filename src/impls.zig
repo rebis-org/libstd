@@ -14,6 +14,8 @@ test {
     _ = @import("representation/grammar/wim/onprem.zig");
     _ = @import("representation/grammar/xar/offprem.zig");
     _ = @import("representation/grammar/xar/onprem.zig");
+    _ = @import("representation/grammar/xip/offprem.zig");
+    _ = @import("representation/grammar/xip/onprem.zig");
     _ = @import("representation/grammar/age/onprem.zig");
     _ = @import("representation/grammar/xz/onprem.zig");
     _ = @import("representation/leaf/bcj/onprem.zig");
