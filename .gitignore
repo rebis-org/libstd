@@ -308,3 +308,4 @@ docgen_tmp/
 zig-pkg/
 !src/testing/
 .cache/
+tools/

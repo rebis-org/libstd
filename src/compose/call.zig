@@ -157,6 +157,13 @@ fn dispatch(envelope: *Call, response: *Node) Exception!void {
     var sink: ?Resource = if (sink_node) |node| try Resource.sinkFromNode(envelope, node, capabilities) else null;
     const selected = if (is_query) &source else if (direction == command_mask_read) &source else if (sink) |*sink_resource| sink_resource else return error.CallException;
     if ((selected.capabilities & policy.capabilities) != policy.capabilities) return error.UnsupportedException;
+    if (direction == command_mask_read) {
+        // Read verbs publish into the sink; a sink without the write bit
+        // would fail mid-call, so reject it at the boundary.
+        if (sink) |*sink_resource| {
+            if ((sink_resource.capabilities & resource.capability_bit_write) == 0) return error.UnsupportedException;
+        }
+    }
     if (effective_sizing == .unavailable) return error.UnsupportedException;
     var invocation = common.Invocation{
         .plan = plan,

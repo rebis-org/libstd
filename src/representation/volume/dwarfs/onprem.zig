@@ -192,6 +192,7 @@ const Compact = struct {
             if (shift > 63) return error.DataException;
             result |= @as(u64, b & 0x7f) << shift;
             if (b & 0x80 == 0) return result;
+            if (shift == 63) return error.DataException;
             shift += 7;
         }
     }
@@ -276,9 +277,9 @@ const Compact = struct {
             if (t == 0) return error.DataException;
             const d = h >> 4;
             if (d != 0) {
-                last += @intCast(d);
+                last = std.math.cast(i16, @as(i64, last) + d) orelse return error.DataException;
             } else {
-                last = @intCast(try c.zigzag());
+                last = std.math.cast(i16, try c.zigzag()) orelse return error.DataException;
             }
             if (count >= fields.len) return error.UnsupportedException;
             fields[count] = .{ .id = last, .val = try c.value(arena, t) };
@@ -292,6 +293,14 @@ const Compact = struct {
 
 fn castUsize(v: u64) Exception!usize {
     return std.math.cast(usize, v) orelse error.DataException;
+}
+
+// Vector element positions multiply hostile distances by 8 and stride;
+// overflow must fail closed, not wrap into a wrong in-bounds read.
+fn elementPos(dist: usize, index: usize, stride: usize) Exception!usize {
+    const base = std.math.mul(usize, dist, 8) catch return error.DataException;
+    const step = std.math.mul(usize, index, stride) catch return error.DataException;
+    return std.math.add(usize, base, step) catch return error.DataException;
 }
 
 const Field = struct {
@@ -330,9 +339,11 @@ fn parseSchema(raw: []const u8, arena: std.mem.Allocator) Exception!Schema {
     const layouts = arena.alloc(Layout, layouts_val.map.len) catch return error.ResourceException;
     for (layouts_val.map, 0..) |entry, i| {
         const ls = entry.val.structure;
+        const layout_size = std.math.cast(u32, fieldInt(ls, 1)) orelse return error.DataException;
+        const layout_bits = std.math.cast(u16, fieldInt(ls, 2)) orelse return error.DataException;
         var layout = Layout{
-            .size = @intCast(fieldInt(ls, 1)),
-            .bits = @intCast(fieldInt(ls, 2)),
+            .size = layout_size,
+            .bits = layout_bits,
             .fields = &.{},
         };
         if (structField(ls, 3)) |fv| {
@@ -340,8 +351,8 @@ fn parseSchema(raw: []const u8, arena: std.mem.Allocator) Exception!Schema {
             for (fv.map, 0..) |fe, j| {
                 const f2 = fe.val.structure;
                 fs[j] = .{
-                    .id = @intCast(fe.key.int),
-                    .layout = @intCast(fieldInt(f2, 1)),
+                    .id = std.math.cast(i16, fe.key.int) orelse return error.DataException,
+                    .layout = std.math.cast(i16, fieldInt(f2, 1)) orelse return error.DataException,
                     .offset = @as(i16, @truncate(@as(i64, @bitCast(fieldInt(f2, 2))))),
                 };
             }
@@ -354,7 +365,8 @@ fn parseSchema(raw: []const u8, arena: std.mem.Allocator) Exception!Schema {
         }
         layouts[i] = layout;
     }
-    return .{ .layouts = layouts, .root = @intCast(root_id.int) };
+    const root = std.math.cast(i16, root_id.int) orelse return error.DataException;
+    return .{ .layouts = layouts, .root = root };
 }
 
 // The schema alone fixes widths and offsets; bits pack LSB-first.
@@ -399,6 +411,13 @@ const Decoder = struct {
     layouts: []Layout,
     arena: std.mem.Allocator,
 
+    fn layoutAt(d: *Decoder, lid: i16) Exception!Layout {
+        if (lid < 0) return error.DataException;
+        const index: usize = @intCast(lid);
+        if (index >= d.layouts.len) return error.DataException;
+        return d.layouts[index];
+    }
+
     fn find(l: Layout, id: i16) ?Field {
         for (l.fields) |f| {
             if (f.id == id) return f;
@@ -407,7 +426,7 @@ const Decoder = struct {
     }
 
     fn integral(d: *Decoder, lid: i16, pos: usize) Exception!u64 {
-        return d.bits.read(pos, d.layouts[@intCast(lid)].bits);
+        return d.bits.read(pos, (try d.layoutAt(lid)).bits);
     }
 
     fn u32At(d: *Decoder, lid: i16, pos: usize) Exception!u32 {
@@ -416,7 +435,7 @@ const Decoder = struct {
 
     // Vector headers: field 2 is the count, field 1 a blob-relative byte address.
     fn vectorHead(d: *Decoder, lid: i16, pos: usize) Exception!struct { count: usize, dist: usize, item: ?Field } {
-        const l = d.layouts[@intCast(lid)];
+        const l = try d.layoutAt(lid);
         const cf = find(l, 2) orelse return error.DataException;
         const count = try castUsize(try d.integral(cf.layout, fpos(pos, cf.offset)));
         var dist: usize = 0;
@@ -426,15 +445,18 @@ const Decoder = struct {
 
     fn u32Vector(d: *Decoder, count: usize, layout: i16, start: usize, stride: u16) Exception![]u32 {
         const out = d.arena.alloc(u32, count) catch return error.ResourceException;
-        for (out, 0..) |*o, i| o.* = try d.u32At(layout, start + i * stride);
+        for (out, 0..) |*o, i| {
+            const at = std.math.add(usize, start, std.math.mul(usize, i, stride) catch return error.DataException) catch return error.DataException;
+            o.* = try d.u32At(layout, at);
+        }
         return out;
     }
 
     fn scalarVector(d: *Decoder, lid: i16, pos: usize) Exception![]u32 {
         const head = try d.vectorHead(lid, pos);
         if (head.item) |item| {
-            const stride = d.layouts[@intCast(item.layout)].bits;
-            return d.u32Vector(head.count, item.layout, head.dist * 8, stride);
+            const stride = (try d.layoutAt(item.layout)).bits;
+            return d.u32Vector(head.count, item.layout, try elementPos(head.dist, 0, 0), stride);
         } else {
             const out = d.arena.alloc(u32, head.count) catch return error.ResourceException;
             @memset(out, 0);
@@ -445,23 +467,21 @@ const Decoder = struct {
     fn structFieldVector(d: *Decoder, lid: i16, pos: usize, field_id: i16) Exception![]u32 {
         const head = try d.vectorHead(lid, pos);
         const item = head.item orelse return error.DataException;
-        const stride = d.layouts[@intCast(item.layout)].bits;
-        const inner = d.layouts[@intCast(item.layout)];
+        const inner = try d.layoutAt(item.layout);
         const inner_field = find(inner, field_id) orelse return error.DataException;
-        return d.u32Vector(head.count, inner_field.layout, fpos(head.dist * 8, inner_field.offset), stride);
+        return d.u32Vector(head.count, inner_field.layout, fpos(try elementPos(head.dist, 0, 0), inner_field.offset), inner.bits);
     }
 
     fn pairVector(d: *Decoder, comptime T: type, lid: i16, pos: usize, comptime ida: i16, comptime ma: []const u8, comptime idb: i16, comptime mb: []const u8) Exception![]T {
         const head = try d.vectorHead(lid, pos);
         const item = head.item orelse return error.DataException;
-        const stride = d.layouts[@intCast(item.layout)].bits;
-        const start = head.dist * 8;
+        const inner = try d.layoutAt(item.layout);
         const out = d.arena.alloc(T, head.count) catch return error.ResourceException;
         for (out, 0..) |*o, i| {
-            const at = start + i * stride;
+            const at = try elementPos(head.dist, i, inner.bits);
             o.* = std.mem.zeroes(T);
-            if (find(d.layouts[@intCast(item.layout)], ida)) |f| @field(o, ma) = try d.u32At(f.layout, fpos(at, f.offset));
-            if (find(d.layouts[@intCast(item.layout)], idb)) |f| @field(o, mb) = try d.u32At(f.layout, fpos(at, f.offset));
+            if (find(inner, ida)) |f| @field(o, ma) = try d.u32At(f.layout, fpos(at, f.offset));
+            if (find(inner, idb)) |f| @field(o, mb) = try d.u32At(f.layout, fpos(at, f.offset));
         }
         return out;
     }
@@ -470,11 +490,10 @@ const Decoder = struct {
     fn chunkVector(d: *Decoder, lid: i16, pos: usize) Exception![]Chunk {
         const head = try d.vectorHead(lid, pos);
         const item = head.item orelse return error.DataException;
-        const stride = d.layouts[@intCast(item.layout)].bits;
+        const inner = try d.layoutAt(item.layout);
         const out = d.arena.alloc(Chunk, head.count) catch return error.ResourceException;
         for (out, 0..) |*o, i| {
-            const at = head.dist * 8 + i * stride;
-            const inner = d.layouts[@intCast(item.layout)];
+            const at = try elementPos(head.dist, i, inner.bits);
             o.* = .{ .block = 0, .offset = 0, .size = 0 };
             if (find(inner, 1)) |cf| o.block = try d.u32At(cf.layout, fpos(at, cf.offset));
             if (find(inner, 2)) |cf| o.offset = try d.u32At(cf.layout, fpos(at, cf.offset));
@@ -488,24 +507,23 @@ const Decoder = struct {
     }
 
     fn frozenString(d: *Decoder, lid: i16, pos: usize) Exception![]const u8 {
-        const l = d.layouts[@intCast(lid)];
+        const l = try d.layoutAt(lid);
         const df = find(l, 1) orelse return error.DataException;
         const cf = find(l, 2) orelse return error.DataException;
         const dist = try castUsize(try d.integral(df.layout, fpos(pos, df.offset)));
         const count = try castUsize(try d.integral(cf.layout, fpos(pos, cf.offset)));
-        if (dist + count > d.bits.data.len) return error.DataException;
-        return d.bits.data[dist .. dist + count];
+        return try bounds.slice(d.bits.data, dist, count);
     }
 
     fn presence(d: *Decoder, lid: i16, pos: usize) Exception!struct { present: bool, value_field: ?Field } {
-        const l = d.layouts[@intCast(lid)];
+        const l = try d.layoutAt(lid);
         const pf = find(l, 1) orelse return error.DataException;
         const present = (try d.integral(pf.layout, fpos(pos, pf.offset))) != 0;
         return .{ .present = present, .value_field = find(l, 2) };
     }
 
     fn flagAt(d: *Decoder, lid: i16, pos: usize, field_id: i16) Exception!bool {
-        const l = d.layouts[@intCast(lid)];
+        const l = try d.layoutAt(lid);
         const f = find(l, field_id) orelse return false;
         return (try d.integral(f.layout, fpos(pos, f.offset))) != 0;
     }
@@ -513,7 +531,7 @@ const Decoder = struct {
 
 fn decodeMetadata(meta_raw: []const u8, schema: Schema, arena: std.mem.Allocator) Exception!Metadata {
     var dec = Decoder{ .bits = .{ .data = meta_raw }, .layouts = schema.layouts, .arena = arena };
-    const root = schema.layouts[@intCast(schema.root)];
+    const root = try dec.layoutAt(schema.root);
     var md: Metadata = .{};
     for (root.fields) |f| {
         const pos = fpos(0, f.offset);
@@ -692,7 +710,7 @@ const WalkState = struct {
 fn dirEntryName(md: Metadata, entry_index: usize) Exception![]const u8 {
     if (entry_index >= md.dir_entries.len) return error.DataException;
     const name_index = md.dir_entries[entry_index].name_index;
-    if (name_index + 1 >= md.names_index.len) return error.DataException;
+    if (@as(u64, name_index) + 1 >= md.names_index.len) return error.DataException;
     const start = md.names_index[name_index];
     const end = md.names_index[name_index + 1];
     if (end < start or end > md.names_buffer.len) return error.DataException;
@@ -1645,4 +1663,42 @@ test "dwarfs crafted metadata gates" {
     try testing.expectError(error.UnsupportedException, decodeMetadata(&blob34, .{ .layouts = &layouts, .root = 16 }, arena));
     blob34[0] = 0;
     _ = try decodeMetadata(&blob34, .{ .layouts = &layouts, .root = 16 }, arena);
+}
+
+test "dwarfs decoder rejects layout ids outside the schema" {
+    var fd_root = [_]Field{.{ .id = 1, .layout = 5, .offset = 0 }};
+    var layouts = [_]Layout{.{ .size = 0, .bits = 0, .fields = &fd_root }};
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var blob: [8]u8 = @splat(0);
+    try std.testing.expectError(error.DataException, decodeMetadata(&blob, .{ .layouts = &layouts, .root = 0 }, arena_state.allocator()));
+}
+
+test "dwarfs frozen string rejects wrapped extents" {
+    var fd_str = [_]Field{
+        .{ .id = 1, .layout = 1, .offset = 0 },
+        .{ .id = 2, .layout = 1, .offset = 8 },
+    };
+    var layouts = [_]Layout{
+        .{ .size = 0, .bits = 0, .fields = &fd_str },
+        .{ .size = 0, .bits = 64, .fields = &.{} },
+    };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var data: [24]u8 = @splat(0);
+    std.mem.writeInt(u64, data[0..8], std.math.maxInt(u64), .little);
+    std.mem.writeInt(u64, data[8..16], 2, .little);
+    var dec = Decoder{ .bits = .{ .data = &data }, .layouts = &layouts, .arena = arena_state.allocator() };
+    try std.testing.expectError(error.DataException, dec.frozenString(0, 0));
+}
+
+test "dwarfs dir entry name rejects wrapped name index" {
+    var dir_entries = [_]DirEntry{.{ .name_index = std.math.maxInt(u32), .inode_num = 0 }};
+    var names_index = [_]u32{ 0, 1 };
+    const md: Metadata = .{
+        .dir_entries = &dir_entries,
+        .names_index = &names_index,
+        .names_buffer = "x",
+    };
+    try std.testing.expectError(error.DataException, dirEntryName(md, 0));
 }

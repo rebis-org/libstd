@@ -1181,11 +1181,17 @@ fn parseStreamsInfo(cursor: *binary.ReadCursor, workspace: *Workspace, comptime 
     var folders: []Folder = &.{};
     var has_pack = false;
     var has_unpack = false;
+    // Vendor 7zIn.cpp reads PackInfo, then UnpackInfo, then at most one
+    // SubStreamsInfo; anything else is a corrupt header.
+    const Section = enum { start, pack, unpack, substreams };
+    var section: Section = .start;
     while (cursor.remaining() > 0) {
         const id = try cursor.readU8();
         if (id == 0x00) break;
         switch (id) {
             0x06 => {
+                if (section != .start) return error.DataException;
+                section = .pack;
                 has_pack = true;
                 pack_pos = try readUint64(cursor);
                 const num_pack_streams = try readUint64(cursor);
@@ -1210,10 +1216,14 @@ fn parseStreamsInfo(cursor: *binary.ReadCursor, workspace: *Workspace, comptime 
                 pack_sizes = sizes;
             },
             0x07 => {
+                if (section != .pack) return error.DataException;
+                section = .unpack;
                 has_unpack = true;
                 folders = try parseFolders(cursor, workspace, aes_only_folders);
             },
             0x08 => {
+                if (section != .unpack) return error.DataException;
+                section = .substreams;
                 try parseSubStreamsInfo(cursor, workspace, folders);
             },
             else => return error.UnsupportedException,
@@ -2346,6 +2356,19 @@ fn writeUint64(writer: *std.Io.Writer, value: u64) Exception!void {
     var bytes: [8]u8 = undefined;
     std.mem.writeInt(u64, &bytes, remainder, .little);
     try io.writeBytes(writer, bytes[0..extra]);
+}
+
+test "sevenzip StreamsInfo enforces vendor section order" {
+    var backing: [4096]u8 = undefined;
+    var workspace = try Workspace.init(backing[0..].ptr, backing.len);
+    // Vendor 7zIn.cpp reads PackInfo, then UnpackInfo, then at most one
+    // SubStreamsInfo; a SubStreamsInfo before UnpackInfo must not parse.
+    const misordered = [_]u8{ 0x06, 0x00, 0x01, 0x09, 0x00, 0x00, 0x08, 0x00, 0x07, 0x0B, 0x01, 0x00, 0x01, 0x01, 0x00, 0x0C, 0x00, 0x00, 0x00 };
+    var bad = binary.ReadCursor.init(&misordered);
+    try std.testing.expectError(error.DataException, parseStreamsInfo(&bad, &workspace, false));
+    const ordered = [_]u8{ 0x06, 0x00, 0x01, 0x09, 0x00, 0x00, 0x07, 0x0B, 0x01, 0x00, 0x01, 0x01, 0x00, 0x0C, 0x00, 0x00, 0x00 };
+    var good = binary.ReadCursor.init(&ordered);
+    _ = try parseStreamsInfo(&good, &workspace, false);
 }
 
 test "sevenzip ppmd solid grouping roundtrip" {

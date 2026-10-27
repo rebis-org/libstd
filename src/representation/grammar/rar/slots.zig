@@ -43,11 +43,11 @@ pub fn encodeLengthSlot(length: u32) LengthSlotResult {
 pub fn adjustLengthForDistance(length: u32, distance: u32) u32 {
     var adj = length;
     if (distance > 0x100) {
-        adj -= 1;
+        adj -|= 1;
         if (distance > 0x2000) {
-            adj -= 1;
+            adj -|= 1;
             if (distance > 0x40000) {
-                adj -= 1;
+                adj -|= 1;
             }
         }
     }

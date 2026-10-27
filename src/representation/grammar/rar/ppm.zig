@@ -632,15 +632,6 @@ pub const PpmModel = struct {
         }
     }
 
-    // Restores a minimal model so the caller can resume the next block
-    // after a data error.
-    // A failed restart propagates: a swallowed failure would leave the next
-    // block decoding against a stopped allocator.
-    pub fn cleanUp(self: *Self, heap: []u8) Exception!void {
-        self.sub.stop();
-        try self.startModel(heap, 2, 1);
-    }
-
     fn createChild(self: *Self, ctx_off: u32, parent_state_off: u32, initial_state: Occurrence) u32 {
         const child_off = self.sub.allocContext();
         if (child_off != null_off) {

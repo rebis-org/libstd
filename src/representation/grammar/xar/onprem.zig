@@ -404,16 +404,6 @@ const XmlCursor = struct {
         const text = (try self.tagContent(tag)) orelse return null;
         return try parseNumber(std.mem.trim(u8, text, " \t\r\n"));
     }
-
-    fn modeAfter(self: *XmlCursor, tag: []const u8) Exception!?u32 {
-        const text = (try self.tagContent(tag)) orelse return null;
-        return try parseMode(std.mem.trim(u8, text, " \t\r\n"));
-    }
-
-    fn timeAfter(self: *XmlCursor, tag: []const u8) Exception!?u64 {
-        const text = (try self.tagContent(tag)) orelse return null;
-        return parseTimeValue(std.mem.trim(u8, text, " \t\r\n"));
-    }
 };
 
 fn unescapeXmlInPlace(name: []u8) Exception![]const u8 {

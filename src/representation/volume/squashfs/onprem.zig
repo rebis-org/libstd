@@ -423,7 +423,7 @@ fn walkInodeDir(archive: []const u8, super: Super, scratch: *Scratch, ref: u64, 
     var names: [max_entries][]const u8 = undefined;
     var count: usize = 0;
     var remaining: u64 = content_len;
-    var entries_in_header: u32 = 0;
+    var entries_in_header: u64 = 0;
     var header_block: u64 = 0;
     var prev_inode: u32 = 0;
     var cursor: usize = 0;
@@ -435,7 +435,7 @@ fn walkInodeDir(archive: []const u8, super: Super, scratch: *Scratch, ref: u64, 
             @memcpy(&head, scratch.frag[cursor..][0..12]);
             cursor += 12;
             remaining -= 12;
-            entries_in_header = std.mem.readInt(u32, head[0..4], .little) + 1;
+            entries_in_header = @as(u64, std.mem.readInt(u32, head[0..4], .little)) + 1;
             header_block = std.mem.readInt(u32, head[4..8], .little);
             prev_inode = std.mem.readInt(u32, head[8..12], .little);
             if (entries_in_header > max_entries) return error.DataException;
@@ -765,7 +765,7 @@ fn buildInodeTableRaw(plan: *const Plan, buf: []u8, spans: []Span) Exception!usi
         if (node.kind == .file) {
             std.mem.writeInt(u16, raw[0..2], inode_type_reg, .little);
             std.mem.writeInt(u16, raw[2..4], mode_file, .little);
-            std.mem.writeInt(u32, raw[16..20], @intCast(node.data_off), .little);
+            std.mem.writeInt(u32, raw[16..20], std.math.cast(u32, node.data_off) orelse return error.UnsupportedException, .little);
             std.mem.writeInt(u32, raw[20..24], invalid_fragment, .little);
             std.mem.writeInt(u32, raw[28..32], @intCast(node.data.len), .little);
         } else {

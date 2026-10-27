@@ -1337,7 +1337,15 @@ fn initProbs(probs: []Prob) void {
     for (probs) |*prob_entry| prob_entry.* = prob_init;
 }
 
+// Direct callers can construct Properties without Properties.decode; the
+// grammar paths validate there, so the leaf re-checks its own contract.
+fn checkProperties(properties: Properties) Exception!void {
+    if (properties.lc + properties.lp > 4) return error.UnsupportedException;
+    if (properties.dictionary_size < dictionary_min or properties.dictionary_size > dictionary_max) return error.UnsupportedException;
+}
+
 pub fn decode(input: []const u8, output: []u8, scratch: []u8, options: Options) Exception!usize {
+    try checkProperties(options.properties);
     const needed = decodeWorkspaceSize(options.properties);
     if (scratch.len < needed) return error.CapacityException;
     if (input.len + output.len > options.max_work) return error.ResourceException;
@@ -1349,6 +1357,7 @@ pub fn decode(input: []const u8, output: []u8, scratch: []u8, options: Options) 
 }
 
 pub fn decodeInPlace(input: []const u8, output: []u8, scratch: []u8, options: Options) Exception!usize {
+    try checkProperties(options.properties);
     const needed = decodeInPlaceWorkspaceSize(options.properties);
     if (scratch.len < needed) return error.CapacityException;
     if (input.len + output.len > options.max_work) return error.ResourceException;
@@ -1359,6 +1368,7 @@ pub fn decodeInPlace(input: []const u8, output: []u8, scratch: []u8, options: Op
 }
 
 pub fn decodedSize(input: []const u8, scratch: []u8, options: Options) Exception!usize {
+    try checkProperties(options.properties);
     const needed = decodeWorkspaceSize(options.properties);
     if (scratch.len < needed) return error.CapacityException;
     if (input.len > options.max_work) return error.ResourceException;
@@ -1369,11 +1379,13 @@ pub fn decodedSize(input: []const u8, scratch: []u8, options: Options) Exception
 }
 
 pub fn decodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options: Options) Exception!void {
+    try checkProperties(options.properties);
     var source = std.Io.Reader.fixed(input);
     try decodeStream(&source, writer, scratch, options);
 }
 
 pub fn decodeStream(reader: *std.Io.Reader, writer: *std.Io.Writer, scratch: []u8, options: Options) Exception!void {
+    try checkProperties(options.properties);
     const needed = decodeWorkspaceSize(options.properties);
     if (scratch.len < needed) return error.CapacityException;
     var decoder = try Decoder.init(options.properties, reader, scratch);
@@ -1382,6 +1394,7 @@ pub fn decodeStream(reader: *std.Io.Reader, writer: *std.Io.Writer, scratch: []u
 }
 
 pub fn requiredSize(input: []const u8, scratch: []u8, options: Options) Exception!usize {
+    try checkProperties(options.properties);
     var counter = measurement.Counter.init(null);
     try encodeInner(input, &counter.writer, scratch, options);
     return measurement.measuredLength(&counter);
@@ -1390,6 +1403,7 @@ pub fn requiredSize(input: []const u8, scratch: []u8, options: Options) Exceptio
 // Greedy live-model pass; the lzma2 probe documents its calibration.
 // The dictionary clamps to the chunk size so clears scale.
 pub fn estimatedSize(input: []const u8, scratch: []u8, options: Options) Exception!usize {
+    try checkProperties(options.properties);
     var properties = options.properties;
     if (input.len < properties.dictionary_size) {
         var clamp: u32 = dictionary_min;
@@ -1409,6 +1423,7 @@ pub fn estimatedSize(input: []const u8, scratch: []u8, options: Options) Excepti
 }
 
 pub fn encode(input: []const u8, output: []u8, scratch: []u8, options: Options) Exception!usize {
+    try checkProperties(options.properties);
     if (input.len + output.len > options.max_work) return error.ResourceException;
     var dest = std.Io.Writer.fixed(output);
     try encodeInner(input, &dest, scratch, options);
@@ -1416,6 +1431,7 @@ pub fn encode(input: []const u8, output: []u8, scratch: []u8, options: Options) 
 }
 
 pub fn encodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options: Options) Exception!void {
+    try checkProperties(options.properties);
     if (input.len > options.max_work) return error.ResourceException;
     try encodeInner(input, writer, scratch, options);
 }
@@ -1469,6 +1485,7 @@ pub const Encoder = struct {
     literal_prices: []u32,
 
     pub fn init(properties: Properties, writer: *std.Io.Writer, scratch: []u8, options: Options) Exception!Encoder {
+        try checkProperties(properties);
         var workspace = try io.Workspace.init(scratch.ptr, scratch.len);
         const dictionary = try workspace.take(u8, properties.dictionary_size);
         const chain = try workspace.take(u32, matchFinderChainSize(properties.dictionary_size));

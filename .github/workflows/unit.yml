@@ -23,7 +23,11 @@ jobs:
         with:
           submodules: recursive
       - uses: ./.github/actions/toolchain
+      - name: Check formatting and the AST
+        run: zig fmt --check --ast-check build.zig build src main.zig
       - name: Run the unit suite natively
         run: zig build unit
+      - name: Run the decode-surface fuzz smoke pass
+        run: zig build fuzz
       - name: Build the host libraries
         run: zig build exe -Doptimize=safe

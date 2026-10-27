@@ -296,6 +296,7 @@ fn computeLengthCounts(a: []u32, len_counts: *[max_codeword_len + 1]u32) void {
         a[n] = (a[n] & symbol_mask) | (depth << num_symbol_bits);
         if (len >= max_codeword_len) {
             len = max_codeword_len;
+            len -= 1;
             while (len_counts[len] == 0) len -= 1;
         }
         len_counts[len] -= 1;
@@ -423,10 +424,6 @@ fn translateIfNeededDirected(data: []u8, pos: usize, last_x86_pos: *i32, last_ta
     }
     last_target_usages[target16] = done;
     return target + 4;
-}
-
-fn translateIfNeeded(data: []u8, pos: usize, last_x86_pos: *i32, last_target_usages: *[65536]i32) usize {
-    return translateIfNeededDirected(data, pos, last_x86_pos, last_target_usages, true);
 }
 
 pub fn lzmsDecode(input: []const u8, output: []u8) Exception!void {
@@ -1062,4 +1059,23 @@ test "lzms encode roundtrip" {
         try lzmsDecode(compressed[0..written], back);
         try std.testing.expectEqualSlices(u8, input, back);
     }
+}
+
+test "lzms canonical code clamps depth 15 tree" {
+    // Fibonacci-like literal frequencies force the unclamped Huffman tree
+    // past depth 15; length limiting must not write past len_counts.
+    var freqs: [256]u32 = @splat(0);
+    const skew = [_]u32{ 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610, 987, 1597 };
+    for (skew, 0..) |f, i| freqs[i] = f;
+    var lens: [256]u8 = @splat(0);
+    makeCanonicalCode(&freqs, &lens);
+    var max_len: u8 = 0;
+    for (lens[0..skew.len]) |l| {
+        try std.testing.expect(l >= 1 and l <= max_codeword_len);
+        max_len = @max(max_len, l);
+    }
+    try std.testing.expectEqual(@as(u8, max_codeword_len), max_len);
+    var kraft: u64 = 0;
+    for (lens[0..skew.len]) |l| kraft += @as(u64, 1) << @intCast(max_codeword_len - l);
+    try std.testing.expectEqual(@as(u64, 1) << @intCast(max_codeword_len), kraft);
 }

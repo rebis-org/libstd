@@ -72,8 +72,11 @@ pub fn CountingTee(comptime kinds: Kinds) type {
             const self: *@This() = @alignCast(@fieldParentPtr("writer", writer));
             if (chunks.len == 0) return 0;
             var total: usize = 0;
-            for (chunks[0 .. chunks.len - 1]) |part| total += part.len;
-            total += chunks[chunks.len - 1].len * splat;
+            for (chunks[0 .. chunks.len - 1]) |part| {
+                total = std.math.add(usize, total, part.len) catch return error.WriteFailed;
+            }
+            const tail = std.math.mul(usize, chunks[chunks.len - 1].len, splat) catch return error.WriteFailed;
+            total = std.math.add(usize, total, tail) catch return error.WriteFailed;
             if (total == 0) return 0;
             for (chunks[0 .. chunks.len - 1]) |part| try self.feed(part);
             const last = chunks[chunks.len - 1];

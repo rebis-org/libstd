@@ -259,8 +259,9 @@ pub const Completion = extern struct {
     }
 
     fn isValid(self: *const Completion) bool {
+        const state = @atomicLoad(u32, &self.state, .seq_cst);
         return self.structure_size >= @sizeOf(Completion) and self.reserved == 0 and
-            (self.state == in_progress or self.state == done or self.state == cancelling);
+            (state == in_progress or state == done or state == cancelling);
     }
 };
 
@@ -293,7 +294,7 @@ fn submitTask(context: *anyopaque) callconv(.c) u32 {
 export fn stdk_submit(call_handle: ?*envelope.Call, record: ?*Completion) callconv(.c) u32 {
     const completion = record orelse return envelope.Status.invalid_call;
     if (!completion.isValid()) return envelope.Status.invalid_call;
-    if (completion.state != Completion.in_progress) return envelope.Status.invalid_call;
+    if (@atomicLoad(u32, &completion.state, .seq_cst) != Completion.in_progress) return envelope.Status.invalid_call;
     if (call_handle == null) {
         complete(completion, envelope.Status.invalid_call);
         return envelope.Status.invalid_call;
@@ -336,7 +337,7 @@ fn complete(completion: *Completion, status: u32) void {
 export fn stdk_poll(record: ?*Completion) callconv(.c) u32 {
     const completion = record orelse return envelope.Status.invalid_call;
     if (!completion.isValid()) return envelope.Status.invalid_call;
-    if (completion.state == Completion.done) return completion.status;
+    if (@atomicLoad(u32, &completion.state, .seq_cst) == Completion.done) return @atomicLoad(u32, &completion.status, .seq_cst);
     return Completion.pending;
 }
 

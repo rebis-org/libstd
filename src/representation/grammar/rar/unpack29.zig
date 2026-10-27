@@ -750,7 +750,7 @@ pub const Session = struct {
         st.entry_start = start_pos;
         st.flushed = 0;
         const window_len = st.window.buffer.len;
-        if (unpacked_size > window_len and window_len > max_filter_block * 2) {
+        if (unpacked_size > window_len and window_len >= max_filter_block * 2) {
             st.stream_out = out;
             st.flush_threshold = window_len - max_filter_block;
         } else {

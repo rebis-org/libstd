@@ -1,6 +1,7 @@
 // Every decoder must survive arbitrary input without trapping;
 // coverage-guided runs live under the toolchain fuzzer.
 
+const builtin = @import("builtin");
 const std = @import("std");
 
 const checksum = @import("../../common/primitive/checksum.zig");
@@ -400,4 +401,132 @@ test "fuzz apfs decode" {
             try drive(smith, runApfs);
         }
     }.f, .{ .corpus = &.{} });
+}
+
+// Time-boxed mutation fallback for hosts where the coverage-guided campaign
+// server is unavailable: corpus seeds plus random byte edits, decoded in
+// process. Iteration count comes from STDK_FUZZ_CAMPAIGN_ITERATIONS so the
+// smoke gate stays cheap; a trap aborts the run with the last checkpoint.
+fn campaignIterations() u64 {
+    // Unset means skip: campaigns are evidence sessions (operator-set
+    // iteration count), never gate work. A silent default keeps every unit
+    // binary fast and quiet under the build runner's listen protocol.
+    if (!builtin.link_libc) return 0;
+    const env = std.c.environ;
+    var i: usize = 0;
+    while (env[i]) |entry| : (i += 1) {
+        const line = std.mem.span(entry);
+        if (std.mem.startsWith(u8, line, "STDK_FUZZ_CAMPAIGN_ITERATIONS=")) {
+            return std.fmt.parseInt(u64, line["STDK_FUZZ_CAMPAIGN_ITERATIONS=".len..], 10) catch 0;
+        }
+    }
+    return 0;
+}
+
+fn mutate(rng: *u64, comptime seed_bytes: []const u8, buf: *[max_input]u8) []const u8 {
+    @memcpy(buf[0..seed_bytes.len], seed_bytes);
+    const len = seed_bytes.len;
+    var edits: u64 = 1 + (rng.* >> 33) % 8;
+    while (edits > 0) : (edits -= 1) {
+        rng.* = rng.* *% 6364136223846793005 +% 1442695040888963407;
+        const pos = (rng.* >> 16) % len;
+        buf[pos] = @truncate(rng.* >> 40);
+    }
+    return buf[0..len];
+}
+
+fn campaignLoop(comptime name: []const u8, comptime seed_bytes: []const u8, comptime run: fn (data: []const u8) anyerror!void) !void {
+    const total = campaignIterations();
+    if (total == 0) {
+        std.debug.print("{s} campaign skipped (set STDK_FUZZ_CAMPAIGN_ITERATIONS)\n", .{name});
+        return;
+    }
+    var rng: u64 = 0x243F6A8885A308D3;
+    var buf: [max_input]u8 = undefined;
+    var i: u64 = 0;
+    while (i < total) : (i += 1) {
+        if (i % 50000 == 0) std.debug.print("{s} checkpoint {d}/{d}\n", .{ name, i, total });
+        run(mutate(&rng, seed_bytes, &buf)) catch {};
+    }
+}
+
+test "mutation campaign sevenzip" {
+    try campaignLoop("sevenzip", &corpus.ppmd_sevenzip, runSevenZip);
+}
+
+test "mutation campaign zip" {
+    try campaignLoop("zip", &corpus.zip_one_file, runZip);
+}
+
+test "mutation campaign xz" {
+    try campaignLoop("xz", &corpus.xz_stream, runXz);
+}
+
+test "mutation campaign zstd" {
+    try campaignLoop("zstd", &corpus.zstd_frame, runZstd);
+}
+
+test "mutation campaign bzip2" {
+    try campaignLoop("bzip2", &corpus.bzip2_stream, runBzip2);
+}
+// Formats whose survival harness seeds an empty corpus get a signature stub
+// so the mutations exercise the header walk, not just rejection at byte zero.
+const cpio_magic_seed = "070701";
+const wim_magic_seed = "MSWIM\x00\x00\x00";
+const xar_magic_seed = "xar!";
+const age_magic_seed = "age-encryption.org/v1\n";
+const iso_magic_seed = "\x01CD001\x01\x00";
+const squashfs_magic_seed = "hsqs";
+const dwarfs_magic_seed = "DWARE01";
+
+test "mutation campaign gzip" {
+    try campaignLoop("gzip", &corpus.gzip_empty, runGzip);
+}
+
+test "mutation campaign zlib" {
+    try campaignLoop("zlib", &corpus.zlib_empty, runZlib);
+}
+
+test "mutation campaign deflate" {
+    try campaignLoop("deflate", &corpus.deflate_small, runDeflate);
+}
+
+test "mutation campaign lz4" {
+    try campaignLoop("lz4", &corpus.lz4_frame, runLz4);
+}
+
+test "mutation campaign lzma alone" {
+    try campaignLoop("lzma-alone", &corpus.lzma_alone, runLzmaAlone);
+}
+
+test "mutation campaign tar" {
+    try campaignLoop("tar", &corpus.tar_one_file, runTar);
+}
+
+test "mutation campaign cpio" {
+    try campaignLoop("cpio", cpio_magic_seed, runCpio);
+}
+
+test "mutation campaign wim" {
+    try campaignLoop("wim", wim_magic_seed, runWim);
+}
+
+test "mutation campaign xar" {
+    try campaignLoop("xar", xar_magic_seed, runXar);
+}
+
+test "mutation campaign age" {
+    try campaignLoop("age", age_magic_seed, runAge);
+}
+
+test "mutation campaign iso" {
+    try campaignLoop("iso", iso_magic_seed, runIso);
+}
+
+test "mutation campaign squashfs" {
+    try campaignLoop("squashfs", squashfs_magic_seed, runSquashfs);
+}
+
+test "mutation campaign dwarfs" {
+    try campaignLoop("dwarfs", dwarfs_magic_seed, runDwarfs);
 }

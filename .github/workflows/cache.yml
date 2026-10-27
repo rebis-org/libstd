@@ -189,6 +189,9 @@ jobs:
           esac
           zig build unit -Dprimitives_impl=${{ inputs.impl }} -Dportable=${{ inputs.portable }}
           zig build oracles -Dprimitives_impl=${{ inputs.impl }} -Dportable=${{ inputs.portable }} -Doptimize=safe
+          brew list --versions llvm >/dev/null 2>&1 || brew install llvm
+          llvm_bin="$(brew --prefix llvm)/bin"
+          export PATH="$llvm_bin:$PATH"
       - id: ubsan
         name: Restore the UBSan cache
         if: inputs.profile == 'suite' && inputs.sanitizer == 'ubsan'

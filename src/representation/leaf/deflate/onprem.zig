@@ -432,7 +432,7 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
             const last = data[data.len - 1];
             for (0..splat) |_| try compressor.consume(last);
             w.end = compressor.end;
-            return last.len * splat;
+            return std.math.mul(usize, last.len, splat) catch return error.WriteFailed;
         }
 
         fn flush(w: *std.Io.Writer) std.Io.Writer.Error!void {

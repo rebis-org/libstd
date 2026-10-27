@@ -371,7 +371,7 @@ fn scryptWrapKey(password: []const u8, salt: [16]u8, work_factor: u8, scratch: [
 }
 
 fn decimalWorkFactor(text: []const u8) Exception!u8 {
-    if (text.len == 0 or text[0] == '0') return error.DataException;
+    if (text.len == 0 or text[0] == '0' or text[0] == '+') return error.DataException;
     return std.fmt.parseInt(u8, text, 10) catch return error.DataException;
 }
 
@@ -481,7 +481,7 @@ fn verifyHeaderMac(input: []const u8, header: Header, file_key: [file_key_len]u8
     if (line.len != 4 + mac_encoded_len or line[3] != ' ') return error.DataException;
     var expected: [32]u8 = undefined;
     try decodeB64(&expected, line[4..]);
-    if (!std.mem.eql(u8, &mac, &expected)) return error.IntegrityException;
+    if (!crypto_prim.constantTimeEql(&mac, &expected)) return error.IntegrityException;
 }
 
 fn payloadCiphertextLen(plain_len: u64) u64 {
@@ -518,33 +518,38 @@ fn encryptPayload(file_key: [file_key_len]u8, source: []const u8, dest: []u8) Ex
     }
 }
 
-// Framing follows from the total length: only the final chunk may be
-// short (empty when the plaintext is empty).
+// Invert P = plain + 16n with plain <= chunk_size * n: P tiles as
+// [65552(n-1) + 17, 65552n]; gaps between the tiles are invalid streams.
 fn chunkCount(ciphertext_payload: usize) Exception!usize {
     if (ciphertext_payload < 16) return error.DataException;
     if (ciphertext_payload == 16) return 1;
-    const n = (ciphertext_payload - 16 + chunk_size - 1) / chunk_size;
-    const plain = ciphertext_payload - n * 16;
-    if (n != (plain + chunk_size - 1) / chunk_size) return error.DataException;
+    const n = (ciphertext_payload - 17) / 65552 + 1;
+    if (ciphertext_payload - (n - 1) * 65552 > 65552) return error.DataException;
     return n;
 }
 
 fn decryptPayload(file_key: [file_key_len]u8, source: []const u8, dest: []u8) Exception!usize {
-    if (source.len < 16) return error.DataException;
+    if (source.len < 32) return error.DataException;
     const nonce: [16]u8 = source[0..16].*;
     const key = payloadKey(file_key, nonce);
-    const n = try chunkCount(source.len - 16);
     var offset: usize = 16;
     var out: usize = 0;
-    for (0..n) |i| {
+    var counter: u64 = 0;
+    while (true) {
         const remaining = source.len - offset;
-        const take = @min(chunk_size, remaining - 16);
-        const final = i == n - 1;
+        if (remaining < 16) return error.DataException;
+        // A short trailing chunk is final; exactly-sized final chunks stay full.
+        const final = remaining - 16 <= chunk_size;
+        const take = if (final) remaining - 16 else chunk_size;
         if (dest.len < out + take) return error.CapacityException;
-        ChaCha20Poly1305.decrypt(dest[out..][0..take], source[offset..][0..take], source[offset + take ..][0..16].*, "", chunkNonce(@intCast(i), final), key) catch return error.IntegrityException;
+        ChaCha20Poly1305.decrypt(dest[out..][0..take], source[offset..][0..take], source[offset + take ..][0..16].*, "", chunkNonce(counter, final), key) catch return error.IntegrityException;
         offset += take + 16;
         out += take;
-        if (final and offset != source.len) return error.DataException;
+        counter += 1;
+        if (final) {
+            if (offset != source.len) return error.DataException;
+            break;
+        }
     }
     return out;
 }
@@ -569,10 +574,6 @@ fn armorEncode(binary: []const u8, dest: []u8) Exception!usize {
     }
     try c.write(armor_end ++ "\n");
     return c.pos;
-}
-
-fn isArmorSpace(c: u8) bool {
-    return c == ' ' or c == '\t' or c == '\n' or c == '\r';
 }
 
 // Whitespace (LF/CRLF/space/tab) may surround the PEM block; nothing else.
@@ -679,6 +680,7 @@ pub fn decodedSize(input: []const u8, options: Options, scratch: []u8) Exception
     const file_key = try unwrapFileKey(parsed.header.stanzas, options, parsed.scrypt_scratch);
     try verifyHeaderMac(parsed.binary, parsed.header, file_key);
     const payload = parsed.binary[parsed.header.payload_offset..];
+    if (payload.len < 16) return error.DataException;
     const n = try chunkCount(payload.len - 16);
     return payload.len - 16 - n * 16;
 }
@@ -713,7 +715,6 @@ const vec_x25519 = [_]u8{
 };
 const meta_x25519_identity = "AGE-SECRET-KEY-1EGTZVFFV20835NWYV6270LXYVK2VKNX2MMDKWYKLMGR48UAWX40Q2P2LM0";
 const meta_x25519_payload = "013f54400c82da08037759ada907a8b864e97de81c088a182062c4b5622fd2ab";
-const meta_x25519_file_key = "59454c4c4f57205355424d4152494e45";
 // CCTV age testdata/armor_x25519: expect success, payload 013f54400c82da08037759ada907a8b8...
 const vec_armor_x25519 = [_]u8{
     0x2d, 0x2d, 0x2d, 0x2d, 0x2d, 0x42, 0x45, 0x47, 0x49, 0x4e, 0x20, 0x41, 0x47, 0x45, 0x20, 0x45,
@@ -740,7 +741,6 @@ const vec_armor_x25519 = [_]u8{
     0x49, 0x4c, 0x45, 0x2d, 0x2d, 0x2d, 0x2d, 0x2d, 0x0a,
 };
 const meta_armor_x25519_identity = "AGE-SECRET-KEY-1EGTZVFFV20835NWYV6270LXYVK2VKNX2MMDKWYKLMGR48UAWX40Q2P2LM0";
-const meta_armor_x25519_file_key = "59454c4c4f57205355424d4152494e45";
 // CCTV age testdata/scrypt: expect success, payload 013f54400c82da08037759ada907a8b8...
 const vec_scrypt = [_]u8{
     0x61, 0x67, 0x65, 0x2d, 0x65, 0x6e, 0x63, 0x72, 0x79, 0x70, 0x74, 0x69, 0x6f, 0x6e, 0x2e, 0x6f,
@@ -757,7 +757,6 @@ const vec_scrypt = [_]u8{
     0xac, 0x6a, 0x9a, 0x50, 0x12, 0x4d, 0xb8, 0x66, 0xd8,
 };
 const meta_scrypt_passphrase = "password";
-const meta_scrypt_file_key = "59454c4c4f57205355424d4152494e45";
 // CCTV age testdata/x25519_no_match: expect no match.
 const vec_x25519_no_match = [_]u8{
     0x61, 0x67, 0x65, 0x2d, 0x65, 0x6e, 0x63, 0x72, 0x79, 0x70, 0x74, 0x69, 0x6f, 0x6e, 0x2e, 0x6f,
@@ -854,32 +853,6 @@ const vec_scrypt_work_factor_23 = [_]u8{
 const meta_scrypt_work_factor_23_passphrase = "password";
 // CCTV age testdata/empty; expect header failure.
 const vec_empty = [_]u8{};
-// CCTV age testdata/stream_trailing_garbage_short: expect payload failure.
-const vec_stream_trailing_garbage_short = [_]u8{
-    0x78, 0xda, 0xec, 0xc0, 0xb1, 0x6e, 0x12, 0x01, 0x00, 0x00, 0x50, 0x66, 0xd2, 0xb8, 0x18, 0x13,
-    0x1d, 0x9a, 0x90, 0x38, 0x38, 0x34, 0xd7, 0xca, 0x61, 0x8b, 0x2c, 0x0e, 0xad, 0x9c, 0x14, 0x2f,
-    0x47, 0x09, 0x0d, 0x45, 0x9d, 0x7a, 0x07, 0xde, 0x61, 0x4c, 0x7b, 0xa0, 0xe5, 0xc2, 0xe2, 0xec,
-    0xa8, 0x1f, 0xe1, 0x1f, 0xb8, 0x3a, 0xeb, 0xa4, 0x31, 0xba, 0x9a, 0x38, 0x19, 0x17, 0x1d, 0xdc,
-    0xdc, 0xfa, 0x23, 0xef, 0x9d, 0xe6, 0xb3, 0x60, 0x76, 0x96, 0x2d, 0xd7, 0xe5, 0xcb, 0xf9, 0xf9,
-    0xd9, 0xf6, 0xf9, 0x32, 0xdf, 0x59, 0x35, 0xeb, 0xc1, 0xbd, 0xc6, 0x24, 0xdc, 0xdd, 0x6d, 0x76,
-    0x1a, 0xc7, 0xdd, 0x79, 0x74, 0x7b, 0x5d, 0x2e, 0x96, 0x5b, 0x69, 0xb9, 0xca, 0x16, 0x93, 0x64,
-    0x7d, 0x30, 0xee, 0x97, 0x71, 0x7b, 0x70, 0x51, 0x1d, 0x4d, 0xc7, 0xd5, 0x51, 0xdc, 0x7e, 0x38,
-    0xec, 0xa6, 0xd1, 0xfd, 0xc1, 0x41, 0x56, 0x2f, 0x9e, 0x9d, 0xa6, 0x0f, 0x26, 0xd5, 0x28, 0x1e,
-    0x76, 0xb2, 0xd6, 0x68, 0x2f, 0xae, 0xc2, 0xf9, 0xd6, 0x28, 0x3c, 0xbe, 0x08, 0x9f, 0xce, 0xab,
-    0x61, 0xaf, 0xf7, 0xe2, 0x79, 0xba, 0x9f, 0xec, 0xed, 0xdf, 0x69, 0x46, 0x71, 0xb7, 0x1e, 0x04,
-    0x41, 0xe3, 0x64, 0xdd, 0x2f, 0x3b, 0xd1, 0x4e, 0x27, 0x1a, 0x3c, 0x2e, 0xda, 0x79, 0x7f, 0x5a,
-    0xcc, 0x16, 0xe1, 0xc9, 0x61, 0x3f, 0xab, 0x7a, 0xf9, 0xa3, 0xec, 0x6e, 0x72, 0x38, 0x2e, 0x5a,
-    0xd3, 0x69, 0x55, 0x2c, 0xb3, 0x24, 0xaf, 0xff, 0xfd, 0x92, 0x7e, 0xfc, 0xfc, 0xf6, 0x7d, 0xeb,
-    0x56, 0x52, 0x7c, 0xff, 0xf7, 0xff, 0x6a, 0x5c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x5a, 0xad, 0xf6, 0xae, 0xda, 0x78, 0x73, 0xe3,
-    0xf5, 0xb5, 0x1f, 0x7f, 0xbe, 0x86, 0xaf, 0x36, 0x83, 0x9f, 0xd7, 0x9f, 0x6c, 0xfe, 0xfa, 0xbd,
-    0x7d, 0x65, 0xe3, 0xc3, 0xb7, 0x9b, 0x9f, 0xaa, 0xcb, 0x00, 0x00, 0x00, 0xff, 0xff, 0xfe, 0xbd,
-    0x4b, 0x89,
-};
-const meta_stream_trailing_garbage_short_identity = "AGE-SECRET-KEY-1EGTZVFFV20835NWYV6270LXYVK2VKNX2MMDKWYKLMGR48UAWX40Q2P2LM0";
 
 fn hexToBytes(comptime hex: []const u8) [hex.len / 2]u8 {
     var out: [hex.len / 2]u8 = undefined;
@@ -1033,6 +1006,25 @@ test "multi chunk payload round trip" {
     // Tampering with a middle chunk fails authentication.
     out[written / 2] ^= 0x01;
     try testing.expectError(error.IntegrityException, decodeOrdinal(out[0..written], 0, &plain, &scratch, .{ .identity = try id.toString(&id_buf) }));
+}
+
+test "full chunk payload round trip" {
+    var payload: [128 * 1024]u8 = undefined;
+    for (&payload, 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
+    const entries = [_]Entry{.{ .name = "payload", .data = &payload }};
+    var scratch: [256 * 1024]u8 = undefined;
+    var out: [160 * 1024]u8 = undefined;
+    const id = randomIdentity();
+    var id_buf: [80]u8 = undefined;
+    var rec_buf: [100]u8 = undefined;
+    const options = Options{ .recipient = try id.recipientString(&rec_buf) };
+    const written = try encode(&entries, &out, &scratch, options);
+    const info = try inspectOrdinal(out[0..written], 0, .{ .identity = try id.toString(&id_buf) }, &scratch);
+    try testing.expectEqual(@as(u64, payload.len), info.size);
+    var plain: [128 * 1024]u8 = undefined;
+    const n = try decodeOrdinal(out[0..written], 0, &plain, &scratch, .{ .identity = try id.toString(&id_buf) });
+    try testing.expectEqual(payload.len, n);
+    try testing.expectEqualSlices(u8, &payload, &plain);
 }
 
 test "empty payload round trip" {

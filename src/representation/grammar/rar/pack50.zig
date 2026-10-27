@@ -483,6 +483,65 @@ test "compress block round-trips through the unpack50 decoder" {
     try std.testing.expectEqualSlices(u8, data, out[0..data.len]);
 }
 
+test "compress block demotes two-byte matches beyond 256KiB" {
+    // A length-2 match at distance > 0x40000 subtracts three distance
+    // bonuses; the encoder must demote it to literals, not underflow.
+    const allocator = std.heap.page_allocator;
+    const input_len = 0x40006;
+    const input = try allocator.alloc(u8, input_len);
+    defer allocator.free(input);
+    @memset(input, 'B');
+    input[0] = 'A';
+    input[1] = 'A';
+    input[input_len - 5] = 'A';
+    input[input_len - 4] = 'A';
+    input[input_len - 3] = 'C';
+
+    const sizes = workspacesFor(input_len);
+    const hash = try allocator.alloc(u32, sizes.hash_words);
+    defer allocator.free(hash);
+    const hash2 = try allocator.alloc(u32, sizes.hash2_words);
+    defer allocator.free(hash2);
+    const hash3 = try allocator.alloc(u32, sizes.hash3_words);
+    defer allocator.free(hash3);
+    const bt_left = try allocator.alloc(u32, sizes.bt_words);
+    defer allocator.free(bt_left);
+    const bt_right = try allocator.alloc(u32, sizes.bt_words);
+    defer allocator.free(bt_right);
+    const tokens = try allocator.alloc(LzToken, sizes.token_count);
+    defer allocator.free(tokens);
+    const staging = try allocator.alloc(u8, sizes.staging_bytes);
+    defer allocator.free(staging);
+    const compressed = try allocator.alloc(u8, sizes.staging_bytes + 64);
+    defer allocator.free(compressed);
+    const ws = Workspaces{
+        .hash = hash,
+        .hash2 = hash2,
+        .hash3 = hash3,
+        .bt_left = bt_left,
+        .bt_right = bt_right,
+        .tokens = tokens,
+        .staging = staging,
+    };
+    const written = try compressBlock(input, 3, true, ws, compressed);
+
+    const window_buf = try allocator.alloc(u8, 1 << 20);
+    defer allocator.free(window_buf);
+    var pool: [unpack50.table_pool_words * 4]u16 = undefined;
+    var pending: [unpack50.max_pending_filters]filters50.Filter = undefined;
+    const filter_scratch = try allocator.alloc(u8, window_buf.len + filters50.max_filter_block);
+    defer allocator.free(filter_scratch);
+    var st: unpack50.Unpacker = undefined;
+    var session = try unpack50.Session.init(&st, window_buf, &pool, &pending, filter_scratch, false);
+
+    const out = try allocator.alloc(u8, input_len);
+    defer allocator.free(out);
+    var bs = common_sink.BufferSink.init(out);
+    try session.decodeFile(compressed[0..written], input_len, false, bs.sink());
+    try std.testing.expect(!bs.overflowed);
+    try std.testing.expectEqualSlices(u8, input, out[0..input_len]);
+}
+
 test "block header checksum matches the flags and size bytes xor" {
     const block_data = [_]u8{ 0x12, 0x34, 0x56 };
     var out: [16]u8 = undefined;

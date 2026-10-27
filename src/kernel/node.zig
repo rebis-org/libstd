@@ -107,7 +107,12 @@ const SiblingKey = struct {
 };
 
 fn siblingKey(node: *abi.Node) SiblingKey {
-    if (vocabulary.eql(node.id, vocabulary.ids.parameter)) return .{ .id = node.id, .selector = node.value_high };
+    // Duplicate detection must match findSelector: family and ordinal, with
+    // flags ignored, or two same-selector parameters evade the singleton rule.
+    if (vocabulary.eql(node.id, vocabulary.ids.parameter)) {
+        const selector = vocabulary.selectorOf(node.value_high);
+        return .{ .id = node.id, .selector = (@as(u64, selector.family) << 32) | selector.ordinal };
+    }
     return .{ .id = node.id, .selector = 0 };
 }
 

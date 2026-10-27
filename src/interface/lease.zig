@@ -41,8 +41,13 @@ pub const Registry = struct {
             if (self.used == self.slots.len) return error.ResourceException;
             self.used += 1;
         }
-        const token = self.next_token;
+        // A wrapped token must not resurrect a live slot's binding.
+        var token = self.next_token;
         self.next_token +%= 1;
+        while (findSlotIndex(self, .{ .token = token }) != null) {
+            token = self.next_token;
+            self.next_token +%= 1;
+        }
         self.slots[index] = .{
             .base = @intFromPtr(memory.ptr),
             .len = memory.len,

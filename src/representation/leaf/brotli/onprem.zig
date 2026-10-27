@@ -1323,10 +1323,6 @@ const RefillReader = struct {
         return advanced;
     }
 
-    fn have(self: *const RefillReader, n: u6) bool {
-        return self.nbits >= n;
-    }
-
     fn peek(self: *RefillReader, n: u6) u64 {
         return self.acc & ((@as(u64, 1) << n) - 1);
     }
@@ -1366,14 +1362,6 @@ const RefillReader = struct {
             if (fill != 0) return error.DataException;
             self.drop(rem);
         }
-    }
-
-    fn bytePos(self: *const RefillReader) usize {
-        return self.pos - self.nbits / 8;
-    }
-
-    fn bitCount(self: *const RefillReader) u64 {
-        return self.loaded_bytes * 8 - self.nbits;
     }
 };
 

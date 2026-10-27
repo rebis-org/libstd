@@ -229,18 +229,11 @@ const train_d: usize = 8;
 const train_k: usize = 50;
 const train_f: usize = 17;
 const train_buckets = 1 << train_f;
-const train_dmers_in_k = train_k - train_d + 1;
 const train_split_numerator: usize = 3; // First 3/4 of the samples train.
 const train_split_denominator: usize = 4;
 
 pub fn trainWorkspaceSize() usize {
     return 2 * train_buckets * @sizeOf(u32);
-}
-
-fn trainHash(provider: checksum.Provider, bytes: *const [train_d]u8) u32 {
-    var hasher = checksum.XxHash64.bind(provider, 0);
-    hasher.update(bytes);
-    return @truncate(hasher.final({}) >> @as(u6, @intCast(64 - train_f)));
 }
 
 fn trainHashD(provider: checksum.Provider, bytes: []const u8, f: usize) u32 {
@@ -1354,8 +1347,8 @@ fn encodeBlockDfast(output: *std.Io.Writer, content: []const u8, block_start: us
                         var after_abs = block_start + ip;
                         const insert_abs = curr + 2;
                         head[hash8At(content, @intCast(insert_abs), long_bits)] = insert_abs;
-                        head[hash8At(content, after_abs - 2, long_bits)] = @intCast(after_abs - 2);
                         chain[hash5At(content, @intCast(insert_abs), short_bits)] = insert_abs;
+                        head[hash8At(content, after_abs - 2, long_bits)] = @intCast(after_abs - 2);
                         chain[hash5At(content, after_abs - 1, short_bits)] = @intCast(after_abs - 1);
                         while (ip <= ilimit and repeat_offsets[1] != 0 and after_abs >= repeat_offsets[1] and after_abs - repeat_offsets[1] >= min_abs and readU32At(content, after_abs - repeat_offsets[1]) == readU32At(content, after_abs)) {
                             const rlen = 4 + countMatchLen(content, after_abs + 4 - repeat_offsets[1], after_abs + 4, block_end);

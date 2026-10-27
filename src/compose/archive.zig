@@ -1360,7 +1360,14 @@ pub fn rarHook(invocation: *common.Invocation) Exception!void {
 
         // Store entries carve nothing. The PPMd heap takes the remainder;
         // the stream bounds the model, so the target opens first.
-        const window_len = std.math.cast(usize, entry.window_bytes) orelse return error.ResourceException;
+        // Vendor unrar floors the v29/36 window at 0x40000 so any unpacked
+        // size can stream; a smaller dictionary would decode into the ring
+        // and then fail the oversized final emit.
+        const declared_window = std.math.cast(usize, entry.window_bytes) orelse return error.ResourceException;
+        const window_len = if (entry.family == .rar4 and (entry.unpack_version == 29 or entry.unpack_version == 36))
+            @max(declared_window, rar.unpack29_min_window)
+        else
+            declared_window;
         const target = try SinkTarget.open(sink_resource, &workspace, size);
         var bufs: rar.DecodeBuffers = .{
             .state = &.{},

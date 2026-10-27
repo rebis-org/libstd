@@ -117,9 +117,10 @@ fn scanStreamSize(input: []const u8, provider: checksum.Provider) Exception!?usi
         while (cursor.remaining() > 0 and cursor.buffer[cursor.pos] != 0x00) {
             const block_header = try decodeBlockHeader(&cursor, provider);
             const uncompressed_size = block_header.uncompressed_size orelse return null;
-            const compressed_size = if (block_header.compressed_size) |size|
-                size
-            else blk: {
+            const compressed_size = if (block_header.compressed_size) |size| blk: {
+                try cursor.advance(size);
+                break :blk size;
+            } else blk: {
                 const data_start = cursor.pos;
                 while (true) {
                     const control = try cursor.readU8();
@@ -218,8 +219,11 @@ const Sha256Tee = struct {
         const self: *Sha256Tee = @alignCast(@fieldParentPtr("writer", writer));
         if (chunks.len == 0) return 0;
         var total: usize = 0;
-        for (chunks[0 .. chunks.len - 1]) |part| total += part.len;
-        total += chunks[chunks.len - 1].len * splat;
+        for (chunks[0 .. chunks.len - 1]) |part| {
+            total = std.math.add(usize, total, part.len) catch return error.WriteFailed;
+        }
+        const tail = std.math.mul(usize, chunks[chunks.len - 1].len, splat) catch return error.WriteFailed;
+        total = std.math.add(usize, total, tail) catch return error.WriteFailed;
         if (total == 0) return 0;
         for (chunks[0 .. chunks.len - 1]) |part| try self.feed(part);
         const last = chunks[chunks.len - 1];
@@ -240,6 +244,7 @@ fn decodeOutOfPlace(input: []const u8, sink: *Sink, scratch: []u8, provider: che
 }
 
 fn decodeStreams(input: []const u8, sink: *Sink, scratch: []u8, in_place: bool, provider: checksum.Provider) Exception!void {
+    if (input.len == 0) return error.DataException;
     var cursor = binary.ReadCursor.init(input);
     while (cursor.remaining() > 0) {
         const check = try decodeStreamHeader(&cursor, provider);
@@ -1052,6 +1057,21 @@ pub fn inspectBlocks(input: []const u8, records: []BlockRecord, scratch: []u8, p
         count += 1;
     }
     return count;
+}
+
+test "decodedSize handles block headers with declared compressed sizes" {
+    // xz -T2 --block-size=64 emits headers carrying the compressed size;
+    // the scanner must skip each payload, not only padding and check.
+    const fixture = [_]u8{ 0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00, 0x00, 0x04, 0xe6, 0xd6, 0xb4, 0x46, 0x02, 0xc0, 0x44, 0x40, 0x21, 0x01, 0x16, 0x00, 0x17, 0x40, 0xf4, 0x22, 0x01, 0x00, 0x3f, 0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x20, 0x78, 0x7a, 0x20, 0x77, 0x6f, 0x72, 0x6c, 0x64, 0x2c, 0x20, 0x74, 0x68, 0x69, 0x73, 0x20, 0x69, 0x73, 0x20, 0x61, 0x20, 0x6d, 0x6f, 0x64, 0x65, 0x72, 0x61, 0x74, 0x65, 0x6c, 0x79, 0x20, 0x73, 0x69, 0x7a, 0x65, 0x64, 0x20, 0x70, 0x61, 0x79, 0x6c, 0x6f, 0x61, 0x64, 0x20, 0x66, 0x6f, 0x72, 0x20, 0x74, 0x65, 0x73, 0x74, 0x69, 0x6e, 0x67, 0x20, 0x64, 0x00, 0x3a, 0x2b, 0x30, 0x1c, 0xed, 0x19, 0x74, 0xd0, 0x02, 0xc0, 0x2e, 0x2a, 0x21, 0x01, 0x16, 0x00, 0xc7, 0x03, 0x19, 0x58, 0x01, 0x00, 0x29, 0x65, 0x63, 0x6c, 0x61, 0x72, 0x65, 0x64, 0x20, 0x63, 0x6f, 0x6d, 0x70, 0x72, 0x65, 0x73, 0x73, 0x65, 0x64, 0x20, 0x73, 0x69, 0x7a, 0x65, 0x73, 0x20, 0x69, 0x6e, 0x20, 0x62, 0x6c, 0x6f, 0x63, 0x6b, 0x20, 0x68, 0x65, 0x61, 0x64, 0x65, 0x72, 0x73, 0x2e, 0x00, 0x00, 0x00, 0xeb, 0xd4, 0x4e, 0xd3, 0x3d, 0x3d, 0x22, 0x57, 0x00, 0x02, 0x58, 0x40, 0x42, 0x2a, 0x00, 0x00, 0x13, 0x4f, 0x54, 0x4e, 0xb1, 0xc4, 0x67, 0xfb, 0x02, 0x00, 0x00, 0x00, 0x00, 0x04, 0x59, 0x5a };
+    const expected = "hello xz world, this is a moderately sized payload for testing declared compressed sizes in block headers.";
+    var scratch: [4096]u8 = undefined;
+    const size = try decodedSize(&fixture, &scratch, checksum.default_provider);
+    try std.testing.expectEqual(expected.len, size);
+    const decode_scratch = try std.testing.allocator.alloc(u8, 16 * 1024 * 1024);
+    defer std.testing.allocator.free(decode_scratch);
+    var out: [256]u8 = undefined;
+    const n = try decode(&fixture, &out, decode_scratch, checksum.default_provider);
+    try std.testing.expectEqualSlices(u8, expected, out[0..n]);
 }
 
 test "inspectBlocks enumerates a multi-block stream" {

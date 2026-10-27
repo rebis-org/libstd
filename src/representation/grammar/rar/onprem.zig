@@ -19,6 +19,11 @@ pub const PendingFilter29 = unpack29.PendingFilter;
 pub const max_pending29 = unpack29.max_pending_filters;
 pub const max_pending50 = unpack50.max_pending_filters;
 
+// Vendor unrar floors the v29/36 window at twice the max filter block so
+// any unpacked size can stream (unpack.cpp MinAllocSize).
+
+pub const unpack29_min_window = unpack29.max_filter_block * 2;
+
 // Every buffer comes from the caller, so the decode path allocates nothing.
 
 pub const Family = enum { rar4, rar5 };
@@ -436,15 +441,18 @@ const Rar29Sha1 = struct {
 // SetKey30: 0x40000 rar29 rounds over RawPsw||round-le24, an IV byte per
 // 0x4000th fork, UTF-16LE password with salt (vendor crypt3.cpp).
 fn rar4Kdf(password_utf16le: []const u8, salt: ?[]const u8, opts: DecodeOptions) Exception!Rar4Keys {
+    // Vendor truncates at MAXPASSWORD_RAR = 127 UTF-16 chars (crypt3.cpp);
+    // hashing more would derive keys no vendor build reproduces.
+    const password = if (password_utf16le.len > 254) password_utf16le[0..254] else password_utf16le;
     const hash_rounds: u32 = 0x40000;
     if (opts.kdf_rounds_limit != 0 and hash_rounds > opts.kdf_rounds_limit) {
         if (opts.failure_cause) |cause| cause.* = .kdf_limit;
         return error.ResourceException;
     }
     var raw: [2 * 512 + 8]u8 = undefined;
-    if (password_utf16le.len > raw.len - 8) return error.UnsupportedException;
-    @memcpy(raw[0..password_utf16le.len], password_utf16le);
-    var raw_len = password_utf16le.len;
+    if (password.len > raw.len - 8) return error.UnsupportedException;
+    @memcpy(raw[0..password.len], password);
+    var raw_len = password.len;
     if (salt) |salt_bytes| {
         @memcpy(raw[raw_len..][0..salt_bytes.len], salt_bytes);
         raw_len += salt_bytes.len;

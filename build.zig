@@ -107,6 +107,28 @@ pub fn build(b: *std.Build) void {
         const micro_tests = b.addTest(.{ .root_module = modules.createFor(b, modules.micro, ctx.target, .debug, &ctx) });
         unit_step.dependOn(&b.addRunArtifact(micro_tests).step);
     }
+    {
+        const dudect_module = b.createModule(.{
+            .root_source_file = b.path("src/dudect.zig"),
+            .target = modules.kernelAdjustedTarget(modules.package_entry, ctx.target, portable, ctx.kernel_isa),
+            .optimize = optimize,
+        });
+        dudect_module.addImport("options", ctx.options);
+        dudect_module.addImport("seam", modules.createShared(b, modules.seam, ctx.target, optimize, &ctx));
+        const dudect_exe = b.addExecutable(.{ .name = "dudect", .root_module = dudect_module });
+        const dudect_step = b.step("dudect", "Run the constant-time timing evidence session");
+        dudect_step.dependOn(&b.addRunArtifact(dudect_exe).step);
+    }
+    if (test_filter == null or std.mem.indexOf(u8, "force", test_filter.?) != null) {
+        const force_module = b.createModule(.{
+            .root_source_file = b.path("src/analysis.zig"),
+            .target = modules.kernelAdjustedTarget(modules.package_entry, ctx.target, ctx.portable, ctx.kernel_isa),
+            .optimize = optimize,
+        });
+        common.attachPackageImports(b, force_module, ctx.target, optimize, &ctx);
+        const force_tests = b.addTest(.{ .root_module = force_module });
+        unit_step.dependOn(&b.addRunArtifact(force_tests).step);
+    }
     // Package consumers see only the libstd module; the acceptance test
     // proves real operations run through that one import.
     if (test_filter == null or std.mem.indexOf(u8, "consumer", test_filter.?) != null) {

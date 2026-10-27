@@ -68,9 +68,20 @@ jobs:
   targets:
     name: Support matrix
     if: github.event_name != 'workflow_dispatch' || inputs.scope == 'ALL' || inputs.scope == 'targets'
-    uses: ./.github/workflows/unit.yml
-    with:
-      runner: ubuntu-slim
+    runs-on: ubuntu-slim
+    env:
+      GIT_CONFIG_COUNT: "2"
+      GIT_CONFIG_KEY_0: url.https://github.com/rebis-org/.insteadof
+      GIT_CONFIG_VALUE_0: https://git.savannah.gnu.org/git/
+      GIT_CONFIG_KEY_1: url.https://github.com/rebis-org/.insteadof
+      GIT_CONFIG_VALUE_1: git://git.sv.gnu.org/
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+      - uses: ./.github/actions/toolchain
+      - name: Compile the support matrix
+        run: zig build targets
 
   runtime:
     if: github.event_name != 'workflow_dispatch' || inputs.scope == 'ALL' || inputs.scope == 'runtime'

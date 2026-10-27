@@ -858,7 +858,7 @@ fn bufferCodecHook(comptime Codec: type, invocation: *common.Invocation, decode_
                 // read leaves the sink untouched, like the counted route.
                 if (try lz4.frameContentSize(input)) |declared| {
                     const size = std.math.cast(usize, declared) orelse return error.ResourceException;
-                    if (size <= limits.decoded_bytes and input.len + size <= limits.codec_work) {
+                    if (size <= limits.decoded_bytes and input.len + size <= limits.codec_work and size <= workspace.remaining()) {
                         const staging = try workspace.take(u8, size);
                         if (codecDecodeDirectInPlace(Codec, input, staging, scratch, options)) |produced| {
                             if (produced > limits.decoded_bytes) return error.ResourceException;

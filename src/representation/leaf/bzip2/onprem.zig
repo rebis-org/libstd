@@ -831,14 +831,14 @@ fn buildLengthLimitedCode(freq: []const u32, alpha_size: u32, lens: []u8, codes:
     var weight: [max_alpha_size * 2]u32 = undefined;
     var parent: [max_alpha_size * 2]i32 = undefined;
     var heap: [max_alpha_size + 2]u32 = undefined;
+    for (freq[0..alpha_size], 0..) |f, i| {
+        weight[i + 1] = (if (f == 0) 1 else f) << 8;
+    }
     var n_nodes: u32 = 0;
     while (true) {
         weight[0] = 0;
         parent[0] = -2;
         heap[0] = 0;
-        for (freq[0..alpha_size], 0..) |f, i| {
-            weight[i + 1] = (if (f == 0) 1 else f) << 8;
-        }
         var n_heap: u32 = 0;
         for (1..alpha_size + 1) |i| {
             parent[i] = -1;
@@ -1396,6 +1396,24 @@ fn testReadBitsMsb(bytes: []const u8, bit_off: usize, comptime count: usize) u64
 
 // Randomised blocks store the mask-applied BWT input; the decoder unmasks
 // them (vendor decompress.c). Our encoder never sets the randomised bit.
+test "length limited code terminates on deep skewed frequencies" {
+    // A Fibonacci frequency tail drives the optimal tree past 20 levels;
+    // the limiter halves weights until the tree fits.
+    var freq: [max_alpha_size]u32 = @splat(0);
+    var a: u32 = 1;
+    var b: u32 = 1;
+    for (0..22) |i| {
+        freq[i] = a;
+        const next = a + b;
+        a = b;
+        b = next;
+    }
+    var lens: [max_alpha_size]u8 = undefined;
+    var codes: [max_alpha_size]u32 = undefined;
+    buildLengthLimitedCode(&freq, 22, &lens, &codes);
+    for (lens[0..22]) |l| try std.testing.expect(l >= 1 and l <= max_code_len);
+}
+
 test "bzip2 decodes a randomised block" {
     const allocator = std.testing.allocator;
     const phrase = "the quick brown fox jumps over the lazy dog";

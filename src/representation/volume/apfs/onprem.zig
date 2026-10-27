@@ -171,7 +171,7 @@ const Node = struct {
         if ((flags & btn_flag_leaf != 0) != (level == 0)) return error.DataException;
         const table_off = le16(bytes[40..42]);
         const table_len = le16(bytes[42..44]);
-        const key_area = btree_node_header_size + table_off + table_len;
+        const key_area = @as(usize, btree_node_header_size) + table_off + table_len;
         if (key_area > bytes.len) return error.DataException;
         return .{
             .bytes = bytes,
@@ -589,7 +589,8 @@ fn fsKey(node: Node, index: u32, footer: Footer) Exception![]const u8 {
 fn fsScanNode(ctx: *ScanCtx, paddr: u64, depth: u32) Exception!void {
     if (depth >= max_tree_depth) return error.DataException;
     const node = try Node.parse(try ctx.mount.image.block(paddr), obj_subtype_fs_tree);
-    const footer = if (node.isRoot()) try node.footer() else ctx.footer;
+    // A rootless fs-tree root would read ctx.footer before it is set.
+    const footer = if (node.isRoot()) try node.footer() else if (depth == 0) return error.DataException else ctx.footer;
     ctx.footer = footer;
     var i: u32 = 0;
     if (node.isLeaf()) {

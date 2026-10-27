@@ -37,7 +37,6 @@ pub const GzipDecode = struct {
     history: []u8 = &.{},
     pending: [pending_cap]u8,
     pending_len: usize = 0,
-    leftover: usize = 0,
     frame_pos: usize = 0,
     phase: Phase = .idle,
     fixed: [10]u8,
@@ -64,7 +63,6 @@ pub const GzipDecode = struct {
         return self.pending[self.frame_pos..self.pending_len];
     }
 
-    // The leftover snapshot records its length before this step appends, so consumed reporting covers only this step's bytes.
     fn restage(self: *GzipDecode, input: []const u8, result: *StepResult) Exception!void {
         const consumed = self.inflater.streamPosition();
         // Deflate keeps bytes backing live accumulator bits; framing phases
@@ -80,7 +78,7 @@ pub const GzipDecode = struct {
                 self.frame_pos -= floor;
             }
         }
-        try appendStaged(self.pending[0..], &self.pending_len, &self.leftover, input, result);
+        try appendStaged(self.pending[0..], &self.pending_len, input, result);
         if (self.phase == .deflate) {
             self.inflater.restage(self.pending[0..self.pending_len], consumed - floor);
         } else {
@@ -103,8 +101,7 @@ fn compactPending(pending: []u8, pending_len: *usize, floor: usize) Exception!vo
     }
 }
 
-fn appendStaged(pending: []u8, pending_len: *usize, leftover: *usize, input: []const u8, result: *StepResult) Exception!void {
-    leftover.* = pending_len.*;
+fn appendStaged(pending: []u8, pending_len: *usize, input: []const u8, result: *StepResult) Exception!void {
     if (input.len > pending.len - pending_len.*) {
         result.required_capacity = input.len - (pending.len - pending_len.*);
         return error.CapacityException;
@@ -126,7 +123,7 @@ fn carveHistory(comptime T: type, storage: []u8, comptime history_len: usize) er
     };
 }
 
-fn restageInflated(inflater: *deflate_seam.Decode, pending: []u8, pending_len: *usize, leftover: *usize, input: []const u8, result: *StepResult) Exception!void {
+fn restageInflated(inflater: *deflate_seam.Decode, pending: []u8, pending_len: *usize, input: []const u8, result: *StepResult) Exception!void {
     const consumed = inflater.streamPosition();
     // Word-granular refill over-reads past the logical floor; those bytes
     // back live accumulator bits and must survive compaction.
@@ -135,7 +132,7 @@ fn restageInflated(inflater: *deflate_seam.Decode, pending: []u8, pending_len: *
     // the staging boundary.
     const floor = inflater.inputBitsConsumed() / 8;
     try compactPending(pending, pending_len, floor);
-    try appendStaged(pending, pending_len, leftover, input, result);
+    try appendStaged(pending, pending_len, input, result);
     inflater.restage(pending[0..pending_len.*], consumed - floor);
 }
 
@@ -272,6 +269,11 @@ fn selectPostHeaderPhase(state: *GzipDecode) error{UnsupportedException}!void {
 pub fn gzipDecodeStep(state: *GzipDecode, input: []const u8, output: []u8, end_of_input: bool) StepResult {
     var result = StepResult{};
     state.restage(input, &result) catch |exception| {
+        return framingFailed(&result, 0, exception);
+    };
+    // The whole step input is staged into pending (consumed reports input.len
+    // on every exit), so the encoded side is charged once here.
+    state.budgets.addEncoded(input.len) catch |exception| {
         return framingFailed(&result, 0, exception);
     };
 
@@ -484,12 +486,11 @@ pub const DeflateDecode = struct {
     history: []u8 = &.{},
     pending: [pending_cap]u8,
     pending_len: usize = 0,
-    leftover: usize = 0,
     started: bool = false,
     budgets: sessions.Budgets,
 
     fn restage(self: *DeflateDecode, input: []const u8, result: *StepResult) Exception!void {
-        return restageInflated(&self.inflater, self.pending[0..], &self.pending_len, &self.leftover, input, result);
+        return restageInflated(&self.inflater, self.pending[0..], &self.pending_len, input, result);
     }
 };
 
@@ -521,6 +522,11 @@ pub fn deflateDecodeSession(storage: []u8, budgets: sessions.Budgets) error{ Cap
 pub fn deflateDecodeStep(state: *DeflateDecode, input: []const u8, output: []u8, end_of_input: bool) StepResult {
     var result = StepResult{};
     state.restage(input, &result) catch |exception| {
+        return framingFailed(&result, 0, exception);
+    };
+    // The whole step input is staged into pending (consumed reports input.len
+    // on every exit), so the encoded side is charged once here.
+    state.budgets.addEncoded(input.len) catch |exception| {
         return framingFailed(&result, 0, exception);
     };
     if (!state.started) {
@@ -568,11 +574,10 @@ pub const ZlibDecode = struct {
     pending_len: usize = 0,
     started: bool = false,
     adler: checksum.Adler32,
-    leftover: usize = 0,
     budgets: sessions.Budgets,
 
     fn restage(self: *ZlibDecode, input: []const u8, result: *StepResult) Exception!void {
-        return restageInflated(&self.inflater, self.pending[0..], &self.pending_len, &self.leftover, input, result);
+        return restageInflated(&self.inflater, self.pending[0..], &self.pending_len, input, result);
     }
 };
 
@@ -605,6 +610,11 @@ pub fn zlibDecodeSession(storage: []u8, budgets: sessions.Budgets) error{ Capaci
 pub fn zlibDecodeStep(state: *ZlibDecode, input: []const u8, output: []u8, end_of_input: bool) StepResult {
     var result = StepResult{};
     state.restage(input, &result) catch |exception| {
+        return framingFailed(&result, 0, exception);
+    };
+    // The whole step input is staged into pending (consumed reports input.len
+    // on every exit), so the encoded side is charged once here.
+    state.budgets.addEncoded(input.len) catch |exception| {
         return framingFailed(&result, 0, exception);
     };
     if (!state.started) {
@@ -840,6 +850,7 @@ fn deflateEncodeStep(comptime wrap: EncodeWrap, state: *DeflateEncode, input: []
         state.finished = true;
     }
     state.drain(output, &result);
+    state.budgets.addEncoded(result.produced) catch |exception| return encodeFailed(&result, exception);
     if (state.finished and state.pending_read == 0 and state.pending_len == 0) {
         result.status = .done;
         return result;
@@ -918,13 +929,12 @@ pub const Lz4Decode = struct {
     content_hasher: checksum.XxHash32,
     block_checksum: u32 = 0,
     total: usize = 0,
-    leftover: usize = 0,
     budgets: sessions.Budgets,
 
     fn restage(self: *Lz4Decode, input: []const u8, result: *StepResult) Exception!void {
         try compactPending(self.pending[0..], &self.pending_len, self.pending_read);
         self.pending_read = 0;
-        try appendStaged(self.pending[0..], &self.pending_len, &self.leftover, input, result);
+        try appendStaged(self.pending[0..], &self.pending_len, input, result);
     }
 };
 
@@ -959,6 +969,11 @@ fn lz4Available(state: *Lz4Decode) []const u8 {
 pub fn lz4DecodeStep(state: *Lz4Decode, input: []const u8, output: []u8, end_of_input: bool) StepResult {
     var result = StepResult{};
     state.restage(input, &result) catch |exception| {
+        return framingFailed(&result, 0, exception);
+    };
+    // The whole step input is staged into pending (consumed reports input.len
+    // on every exit), so the encoded side is charged once here.
+    state.budgets.addEncoded(input.len) catch |exception| {
         return framingFailed(&result, 0, exception);
     };
     var stalled = false;
@@ -1240,6 +1255,7 @@ pub fn lz4EncodeStep(state: *Lz4Encode, input: []const u8, output: []u8, end_of_
         state.finished = true;
     }
     state.drain(output, &result);
+    state.budgets.addEncoded(result.produced) catch |exception| return encodeFailed(&result, exception);
     if (state.finished and state.pending_read == 0 and state.pending_len == 0) {
         result.status = .done;
         return result;
@@ -1369,6 +1385,9 @@ fn lz4LegacyDecodeStep(state: *Lz4LegacyDecode, input: []const u8, output: []u8,
         accepted += 1;
     }
     result.consumed = accepted;
+    state.budgets.addEncoded(accepted) catch |exception| {
+        return framingFailed(&result, accepted, exception);
+    };
     var stalled = false;
     while (!stalled) {
         const avail = state.pending[state.pending_read..state.pending_len];
@@ -1604,10 +1623,10 @@ fn tarEncodeStep(state: *TarEncode, input: []const u8, output: []u8, end_of_inpu
     }
     result.consumed = in_off;
     result.produced = out_off;
-    state.budgets.addEncoded(in_off) catch |exception| {
+    state.budgets.addDecoded(in_off) catch |exception| {
         return framingFailed(&result, in_off, exception);
     };
-    state.budgets.addDecoded(out_off) catch |exception| {
+    state.budgets.addEncoded(out_off) catch |exception| {
         return framingFailed(&result, in_off, exception);
     };
     return result;
@@ -1701,6 +1720,87 @@ fn brotliDecodeStep(state: *BrotliDecode, input: []const u8, output: []u8, end_o
         if (accepted < input.len) return result; // Staging is full; the caller re-feeds.
         if (res.consumed == 0 and res.produced == 0) return result; // Starved, awaiting input.
     }
+}
+
+test "decode sessions charge the encoded input side" {
+    const allocator = testing.allocator;
+    var payload: [600]u8 = undefined;
+    fillPayload(&payload);
+    const history = try allocator.alloc(u8, gzip.deflate_history_size);
+    defer allocator.free(history);
+    const gzip_frame = try allocator.alloc(u8, gzipEncodedSizeBound(payload.len));
+    defer allocator.free(gzip_frame);
+    const gzip_len = try gzipEncode(gzip_frame, &payload, history, default_encode_options, .bounded);
+
+    const holder = try allocStateStorage(GzipDecode, gzipDecodeStorage(), allocator);
+    defer allocator.free(holder.raw);
+    const state = try gzipDecodeInit(holder.aligned, .{ .max_encoded = 128 });
+    var out: [64]u8 = undefined;
+    var pos: usize = 0;
+    var tripped = false;
+    var guard: usize = 0;
+    while (guard < 100) : (guard += 1) {
+        const take = @min(64, gzip_len - pos);
+        const result = gzipDecodeStep(state, gzip_frame[pos..][0..take], &out, pos + take == gzip_len);
+        pos += result.consumed;
+        if (result.status == .failed) {
+            try testing.expectEqual(error.ResourceException, result.exception.?);
+            tripped = true;
+            break;
+        }
+        if (result.status == .done) break;
+    }
+    try testing.expect(tripped);
+}
+
+test "encode sessions charge the encoded output side" {
+    const allocator = testing.allocator;
+    var payload: [600]u8 = undefined;
+    fillPayload(&payload);
+    const holder = try allocStateStorage(DeflateEncode, gzipEncodeStorage(), allocator);
+    defer allocator.free(holder.raw);
+    const state = try gzipEncodeInit(holder.aligned, .{ .max_encoded = 64 });
+    var out: [256]u8 = undefined;
+    var pos: usize = 0;
+    var tripped = false;
+    var guard: usize = 0;
+    while (guard < 100) : (guard += 1) {
+        const take = @min(128, payload.len - pos);
+        const result = deflateEncodeStep(.gzip, state, payload[pos..][0..take], &out, pos + take == payload.len);
+        pos += result.consumed;
+        if (result.status == .failed) {
+            try testing.expectEqual(error.ResourceException, result.exception.?);
+            tripped = true;
+            break;
+        }
+        if (result.status == .done) break;
+    }
+    try testing.expect(tripped);
+}
+
+test "tar encode charges plaintext to the decoded side" {
+    const allocator = testing.allocator;
+    var payload: [512]u8 = undefined;
+    fillPayload(&payload);
+    const holder = try allocStateStorage(TarEncode, tarEncodeStorage(), allocator);
+    defer allocator.free(holder.raw);
+    const state = try tarEncodeInit(holder.aligned, .{ .max_decoded = 32 });
+    var out: [512]u8 = undefined;
+    var pos: usize = 0;
+    var tripped = false;
+    var guard: usize = 0;
+    while (guard < 100) : (guard += 1) {
+        const take = @min(128, payload.len - pos);
+        const result = tarEncodeStep(state, payload[pos..][0..take], &out, pos + take == payload.len);
+        pos += result.consumed;
+        if (result.status == .failed) {
+            try testing.expectEqual(error.ResourceException, result.exception.?);
+            tripped = true;
+            break;
+        }
+        if (result.status == .done) break;
+    }
+    try testing.expect(tripped);
 }
 
 test "decode sessions drain the final block across output boundaries" {
