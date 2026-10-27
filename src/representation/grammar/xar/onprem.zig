@@ -20,9 +20,9 @@ const Exception = exception_prim.Exception;
 
 pub const scratch_size: usize = 1 << 20;
 
-const header_size = 28;
-const cksum_sha1 = 1;
-const sha1_len = 20;
+pub const header_size = 28;
+pub const cksum_sha1 = 1;
+pub const sha1_len = 20;
 
 // Last epoch second representable in the 20-character ISO 8601 form
 // (9999-12-31T23:59:59Z).
@@ -48,8 +48,8 @@ fn validateEntry(entry: Entry) Exception!void {
     }
 }
 
-const xml_prolog = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<xar>\n <toc>\n  <checksum style=\"sha1\">\n   <offset>0</offset>\n   <size>20</size>\n  </checksum>\n";
-const xml_epilog = " </toc>\n</xar>\n";
+pub const xml_prolog = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<xar>\n <toc>\n  <checksum style=\"sha1\">\n   <offset>0</offset>\n   <size>20</size>\n  </checksum>\n";
+pub const xml_epilog = " </toc>\n</xar>\n";
 
 const CountSink = struct {
     offset: u64 = 0,
@@ -59,7 +59,7 @@ const CountSink = struct {
     }
 };
 
-fn writeNum(sink: anytype, comptime fmt: []const u8, value: anytype) Exception!void {
+pub fn writeNum(sink: anytype, comptime fmt: []const u8, value: anytype) Exception!void {
     var buf: [24]u8 = undefined;
     const text = std.mem.print(&buf, fmt, .{value}) catch return error.CapacityException;
     sink.write(text) catch return error.CapacityException;
@@ -184,7 +184,7 @@ fn writeTocXml(sink: anytype, entries: []const Entry, order: []const u32) Except
     sink.write(xml_epilog) catch return error.CapacityException;
 }
 
-fn zlibStoredLen(src_len: u64) Exception!u64 {
+pub fn zlibStoredLen(src_len: u64) Exception!u64 {
     const blocks = src_len / 65535 + 1;
     return bounds.addU64(6 + src_len + 5 * blocks, 0);
 }
@@ -207,7 +207,7 @@ pub fn archiveSize(entries: []const Entry, scratch: []u8) Exception!u64 {
     return total;
 }
 
-fn writeZlibStored(sink: *io.Sink, src: []const u8, adler: u32) Exception!void {
+pub fn writeZlibStored(sink: *io.Sink, src: []const u8, adler: u32) Exception!void {
     sink.write(&[_]u8{ 0x78, 0x01 }) catch return error.CapacityException;
     var pos: usize = 0;
     while (true) {
@@ -229,7 +229,7 @@ fn writeZlibStored(sink: *io.Sink, src: []const u8, adler: u32) Exception!void {
 
 // Both digests the container needs come from the tree's own primitives: the
 // stdlib versions would bypass the capability provider axis.
-fn sha1Digest(out: *[sha1_len]u8, data: []const u8) void {
+pub fn sha1Digest(out: *[sha1_len]u8, data: []const u8) void {
     var hasher = crypto.Sha1.bind(crypto.default_provider, .{});
     hasher.update(data);
     hasher.final(out);
@@ -243,6 +243,19 @@ fn sha1Hex(out: *[sha1_len * 2]u8, data: []const u8) void {
         out[i * 2] = digits[byte >> 4];
         out[i * 2 + 1] = digits[byte & 0xF];
     }
+}
+
+// Header version 1: 16-bit version, then 64-bit TOC lengths, matching
+// the libarchive reference layout.
+pub fn writeHeader(sink: *io.Sink, toc_compressed: u64, toc_uncompressed: u64) Exception!void {
+    var header: [header_size]u8 = undefined;
+    @memcpy(header[0..4], "xar!");
+    std.mem.writeInt(u16, header[4..6], header_size, .big);
+    std.mem.writeInt(u16, header[6..8], 1, .big);
+    std.mem.writeInt(u64, header[8..16], toc_compressed, .big);
+    std.mem.writeInt(u64, header[16..24], toc_uncompressed, .big);
+    std.mem.writeInt(u32, header[24..28], cksum_sha1, .big);
+    sink.write(&header) catch return error.CapacityException;
 }
 
 pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Exception!usize {
@@ -259,16 +272,7 @@ pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Exception!usi
 
     var sink = io.Sink{ .bytes = output };
     const compressed_len = try zlibStoredLen(xml.len);
-    var header: [header_size]u8 = undefined;
-    @memcpy(header[0..4], "xar!");
-    std.mem.writeInt(u16, header[4..6], header_size, .big);
-    // Header version 1: 16-bit version, then 64-bit TOC lengths, matching
-    // the libarchive reference layout.
-    std.mem.writeInt(u16, header[6..8], 1, .big);
-    std.mem.writeInt(u64, header[8..16], compressed_len, .big);
-    std.mem.writeInt(u64, header[16..24], xml.len, .big);
-    std.mem.writeInt(u32, header[24..28], cksum_sha1, .big);
-    sink.write(&header) catch return error.CapacityException;
+    try writeHeader(&sink, compressed_len, xml.len);
     const toc_start = sink.offset;
     try writeZlibStored(&sink, xml, checksum.adler32With(checksum.default_provider, xml));
     // The TOC checksum covers the compressed bytes.
@@ -564,6 +568,7 @@ fn fieldText(xml: []const u8, from: usize, limit: usize, comptime tag: []const u
 const ScanState = struct {
     xml: []const u8,
     want: ?u64,
+    want_name: ?[]const u8,
     name_buf: ?[]u8,
     count: u64 = 0,
     found: ?EntryInfo = null,
@@ -643,6 +648,15 @@ const ScanState = struct {
             self.found = info;
             return;
         }
+        // A named lookup costs one join per entry; ordinals stay lazy.
+        if (self.want_name) |want_name| {
+            const joined = try self.joinName(name_raw);
+            if (std.mem.eql(u8, joined, want_name)) {
+                info.name = joined;
+                self.found = info;
+                return;
+            }
+        }
         if (field_limit == file_end) return;
         // Children nest inside the parent element in xar; walk them
         // with this file's name as the next path segment.
@@ -671,8 +685,8 @@ const ScanState = struct {
     }
 };
 
-fn scanEntries(xml: []const u8, want: ?u64, name_buf: ?[]u8) Exception!ScanResult {
-    var state = ScanState{ .xml = xml, .want = want, .name_buf = name_buf };
+fn scanEntries(xml: []const u8, want: ?u64, want_name: ?[]const u8, name_buf: ?[]u8) Exception!ScanResult {
+    var state = ScanState{ .xml = xml, .want = want, .want_name = want_name, .name_buf = name_buf };
     var cursor = XmlCursor{ .data = xml, .limit = xml.len };
     _ = try cursor.find("<toc>");
     try state.walk(cursor.pos, cursor.limit);
@@ -695,14 +709,14 @@ fn splitScratch(scratch: []u8) Exception!struct { history: []u8, toc: []u8, name
 pub fn inspectCount(archive: []const u8, scratch: []u8) Exception!u64 {
     const parts = try splitScratch(scratch);
     const toc = try inflateToc(archive, parts.toc, parts.history);
-    const result = try scanEntries(toc.xml, null, null);
+    const result = try scanEntries(toc.xml, null, null, null);
     return result.count;
 }
 
 pub fn inspectOrdinal(archive: []const u8, ordinal: u64, scratch: []u8) Exception!EntryInfo {
     const parts = try splitScratch(scratch);
     const toc = try inflateToc(archive, parts.toc, parts.history);
-    const result = try scanEntries(toc.xml, ordinal, parts.name);
+    const result = try scanEntries(toc.xml, ordinal, null, parts.name);
     if (result.found) |info| return info;
     return error.DataException;
 }
@@ -710,7 +724,7 @@ pub fn inspectOrdinal(archive: []const u8, ordinal: u64, scratch: []u8) Exceptio
 pub fn decodeOrdinal(archive: []const u8, ordinal: u64, output: []u8, scratch: []u8) Exception!usize {
     const parts = try splitScratch(scratch);
     const toc = try inflateToc(archive, parts.toc, parts.history);
-    const result = try scanEntries(toc.xml, ordinal, parts.name);
+    const result = try scanEntries(toc.xml, ordinal, null, parts.name);
     const info = result.found orelse return error.DataException;
     const size = std.math.cast(usize, info.size) orelse return error.ResourceException;
     if (output.len < size) return error.CapacityException;
@@ -723,6 +737,23 @@ pub fn decodeOrdinal(archive: []const u8, ordinal: u64, output: []u8, scratch: [
     const written = try inflateInto(payload, output[0..size], parts.history);
     if (written != size) return error.DataException;
     return written;
+}
+
+pub const DataRange = struct { offset: u64, length: u64 };
+
+// The absolute byte range of a named member: what a container that wraps
+// another container needs to find its payload without reading the heap.
+pub fn findDataRange(archive: []const u8, name: []const u8, scratch: []u8) Exception!DataRange {
+    const parts = try splitScratch(scratch);
+    const toc = try inflateToc(archive, parts.toc, parts.history);
+    const result = try scanEntries(toc.xml, null, name, parts.name);
+    const info = result.found orelse return error.DataException;
+    // A nested container is stored verbatim; an encoded member is not one.
+    if (!info.stored) return error.UnsupportedException;
+    const heap_start = archive.len - toc.heap.len;
+    const offset = try bounds.addU64(heap_start, info.data_offset);
+    _ = try bounds.slice(archive, offset, info.data_length);
+    return .{ .offset = offset, .length = info.data_length };
 }
 
 test "xar roundtrips entries through the envelope layout" {

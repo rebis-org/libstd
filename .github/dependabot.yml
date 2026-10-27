@@ -13,7 +13,7 @@ updates:
     open-pull-requests-limit: 3
     rebase-strategy: "auto"
     commit-message:
-      prefix: "ci(actions)"
+      prefix: "ci"
     groups:
       github-actions:
         patterns:
@@ -31,4 +31,4 @@ updates:
     open-pull-requests-limit: 3
     rebase-strategy: "auto"
     commit-message:
-      prefix: "chore(vendor)"
+      prefix: "vendor"

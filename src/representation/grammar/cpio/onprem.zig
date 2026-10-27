@@ -27,7 +27,86 @@ pub const EntryInfo = struct {
     data_offset: u64,
 };
 
-const trailer_name = "TRAILER!!!";
+pub const trailer_name = "TRAILER!!!";
+
+pub const record_header_size: usize = 110;
+
+// The fixed newc header, shared by this reader and the xip member walk:
+// both decode the same 13 hex fields from the same offsets.
+pub const NewcHeader = struct {
+    ino: u32,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    nlink: u32,
+    modification_time: u64,
+    data_size: u64,
+    check: u32,
+    namesize: u64,
+    is_crc: bool,
+};
+
+pub fn parseNewcHeader(bytes: []const u8) Exception!NewcHeader {
+    if (bytes.len < record_header_size) return error.DataException;
+    if (!std.mem.eql(u8, bytes[0..6], "070701") and !std.mem.eql(u8, bytes[0..6], "070702")) return error.DataException;
+    return .{
+        .ino = @intCast(try parseHex(bytes[6..14])),
+        .mode = @intCast(try parseHex(bytes[14..22])),
+        .uid = @intCast(try parseHex(bytes[22..30])),
+        .gid = @intCast(try parseHex(bytes[30..38])),
+        .nlink = @intCast(try parseHex(bytes[38..46])),
+        .modification_time = try parseHex(bytes[46..54]),
+        .data_size = try parseHex(bytes[54..62]),
+        .check = @intCast(try parseHex(bytes[102..110])),
+        .namesize = try parseHex(bytes[94..102]),
+        .is_crc = bytes[5] == '2',
+    };
+}
+
+// A record name carries its NUL terminator on the wire; nothing else may
+// appear before it. Newc and odc use the same name convention.
+pub fn parseRecordName(bytes: []const u8) Exception![]const u8 {
+    if (bytes.len == 0) return error.DataException;
+    const name = bytes[0 .. bytes.len - 1];
+    if (std.mem.findScalar(u8, name, 0) != null) return error.DataException;
+    try entry_prim.validateName(name);
+    return name;
+}
+
+pub const odc_header_size: usize = 76;
+
+pub const OdcHeader = struct {
+    ino: u32,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    nlink: u32,
+    modification_time: u64,
+    data_size: u64,
+    namesize: u64,
+};
+
+// The portable ASCII header. The xip reader accepts it as well as newc,
+// because a payload may carry either.
+pub fn parseOdcHeader(bytes: []const u8) Exception!OdcHeader {
+    if (bytes.len < odc_header_size) return error.DataException;
+    if (!std.mem.eql(u8, bytes[0..6], "070707")) return error.DataException;
+    var mode: u32 = @intCast(try parseOctal(bytes[18..24]));
+    // PWB archives leave inode bits above the mode field. Keep every bit
+    // a mode can hold: 0o67777 clears the type and turns symlinks into files.
+    mode &= 0o177777;
+    if (mode & 0o170000 == 0) mode |= 0o100000;
+    return .{
+        .ino = @intCast(try parseOctal(bytes[12..18])),
+        .mode = mode,
+        .uid = @intCast(try parseOctal(bytes[24..30])),
+        .gid = @intCast(try parseOctal(bytes[30..36])),
+        .nlink = @intCast(try parseOctal(bytes[36..42])),
+        .modification_time = try parseOctal(bytes[48..59]),
+        .namesize = try parseOctal(bytes[59..65]),
+        .data_size = try parseOctal(bytes[65..76]),
+    };
+}
 
 fn entryMode(entry: Entry) u32 {
     return if (entry.mode & 0o170000 == 0) entry.mode | 0o100000 else entry.mode;
@@ -95,29 +174,22 @@ pub fn encodeOdc(entries: []const Entry, output: []u8) Exception!usize {
 fn encodeWith(comptime format: Format, entries: []const Entry, output: []u8) Exception!usize {
     var sink = io.Sink{ .bytes = output };
     for (entries, 0..) |entry, index| {
-        try validateEntry(entry);
         const ino: u32 = if (entry.ino == 0) @intCast(index + 1) else entry.ino;
         switch (format) {
-            .newc => try writeNewcHeader(&sink, entry, ino, "070701", 0),
-            .odc => try writeOdcHeader(&sink, entry, ino),
+            .newc => try writeNewcRecord(&sink, entry, ino, 0),
+            .odc => {
+                try validateEntry(entry);
+                try writeOdcHeader(&sink, entry, ino);
+                try sink.write(entry.name);
+                try sink.write("\x00");
+                try sink.write(entry.data);
+            },
             else => return error.UnsupportedException,
         }
-        try sink.write(entry.name);
-        try sink.write("\x00");
-        if (format != .odc) try writePad(&sink, sink.offset, 4);
-        try sink.write(entry.data);
-        if (format != .odc) try writePad(&sink, sink.offset, 4);
     }
     // Newc archives close on a 512 multiple.
     switch (format) {
-        .newc => {
-            const zero = Entry{ .name = trailer_name, .data = &.{} };
-            try writeNewcHeader(&sink, zero, 0, "070701", 0);
-            try sink.write(trailer_name);
-            try sink.write("\x00");
-            try writePad(&sink, sink.offset, 4);
-            try writePad(&sink, sink.offset, 512);
-        },
+        .newc => try writeNewcTrailer(&sink),
         .odc => {
             const zero = Entry{ .name = trailer_name, .data = &.{} };
             try writeOdcHeader(&sink, zero, 0);
@@ -129,7 +201,7 @@ fn encodeWith(comptime format: Format, entries: []const Entry, output: []u8) Exc
     return sink.offset;
 }
 
-fn writePad(sink: *io.Sink, offset: u64, alignment: u64) Exception!void {
+fn writePad(sink: anytype, offset: u64, alignment: u64) Exception!void {
     const rem = offset % alignment;
     if (rem == 0) return;
     const zeros: [512]u8 = @splat(0);
@@ -138,7 +210,7 @@ fn writePad(sink: *io.Sink, offset: u64, alignment: u64) Exception!void {
 
 // A value that does not fit the width is a caller error; a truncated
 // header would disagree with the data.
-fn writeDigits(sink: *io.Sink, comptime base: u8, width: usize, value: u64) Exception!void {
+fn writeDigits(sink: anytype, comptime base: u8, width: usize, value: u64) Exception!void {
     const digits: []const u8 = if (base == 16) "0123456789abcdef" else "01234567";
     var buf: [11]u8 = undefined;
     var v = value;
@@ -152,7 +224,7 @@ fn writeDigits(sink: *io.Sink, comptime base: u8, width: usize, value: u64) Exce
     sink.write(buf[0..width]) catch return error.CapacityException;
 }
 
-fn writeNewcHeader(sink: *io.Sink, entry: Entry, ino: u32, comptime magic: []const u8, check: u32) Exception!void {
+fn writeNewcHeader(sink: anytype, entry: Entry, ino: u32, comptime magic: []const u8, check: u32) Exception!void {
     sink.write(magic) catch return error.CapacityException;
     const fields = [13]u64{
         ino,
@@ -172,7 +244,28 @@ fn writeNewcHeader(sink: *io.Sink, entry: Entry, ino: u32, comptime magic: []con
     for (fields) |field| try writeDigits(sink, 16, 8, field);
 }
 
-fn writeOdcHeader(sink: *io.Sink, entry: Entry, ino: u32) Exception!void {
+// One complete newc record: the fixed header, the name, and the data.
+// The xip writer streams these straight into its chunk framing.
+pub fn writeNewcRecord(sink: anytype, entry: Entry, ino: u32, check: u32) Exception!void {
+    try validateEntry(entry);
+    try writeNewcHeader(sink, entry, ino, "070701", check);
+    try sink.write(entry.name);
+    try sink.write("\x00");
+    try writePad(sink, sink.offset, 4);
+    try sink.write(entry.data);
+    try writePad(sink, sink.offset, 4);
+}
+
+pub fn writeNewcTrailer(sink: anytype) Exception!void {
+    const zero = Entry{ .name = trailer_name, .data = &.{} };
+    try writeNewcHeader(sink, zero, 0, "070701", 0);
+    try sink.write(trailer_name);
+    try sink.write("\x00");
+    try writePad(sink, sink.offset, 4);
+    try writePad(sink, sink.offset, 512);
+}
+
+fn writeOdcHeader(sink: anytype, entry: Entry, ino: u32) Exception!void {
     sink.write("070707") catch return error.CapacityException;
     const fields = .{
         .{ 6, @as(u64, 0) },
@@ -248,39 +341,36 @@ const Reader = struct {
         var name_align: u64 = 2;
         var data_align: u64 = 2;
         if (rest.len >= 6 and std.mem.eql(u8, rest[0..6], "070707")) {
-            if (rest.len < 76) return error.DataException;
+            const header = try parseOdcHeader(rest);
             info.format = .odc;
-            info.mode = @intCast(try parseOctal(rest[18..24]));
-            // PWB archives leave inode bits in the type field.
-            info.mode &= 0o67777;
-            if (info.mode & 0o170000 == 0) info.mode |= 0o100000;
-            info.uid = @intCast(try parseOctal(rest[24..30]));
-            info.gid = @intCast(try parseOctal(rest[30..36]));
-            info.nlink = @intCast(try parseOctal(rest[36..42]));
-            info.modification_time = try parseOctal(rest[48..59]);
-            namesize = try parseOctal(rest[59..65]);
-            data_size = try parseOctal(rest[65..76]);
-            info.ino = @intCast(try parseOctal(rest[12..18]));
+            info.ino = header.ino;
+            info.mode = header.mode;
+            info.uid = header.uid;
+            info.gid = header.gid;
+            info.nlink = header.nlink;
+            info.modification_time = header.modification_time;
+            namesize = header.namesize;
+            data_size = header.data_size;
             info.devmajor = 0;
             info.devminor = 0;
             name_align = 1;
             data_align = 1;
-            self.offset = try bounds.addU64(self.offset, 76);
+            self.offset = try bounds.addU64(self.offset, odc_header_size);
         } else if (rest.len >= 6 and (std.mem.eql(u8, rest[0..6], "070701") or std.mem.eql(u8, rest[0..6], "070702"))) {
-            if (rest.len < 110) return error.DataException;
-            info.format = if (rest[5] == '2') .crc else .newc;
-            info.ino = @intCast(try parseHex(rest[6..14]));
-            info.mode = @intCast(try parseHex(rest[14..22]));
-            info.uid = @intCast(try parseHex(rest[22..30]));
-            info.gid = @intCast(try parseHex(rest[30..38]));
-            info.nlink = @intCast(try parseHex(rest[38..46]));
-            info.modification_time = try parseHex(rest[46..54]);
-            data_size = try parseHex(rest[54..62]);
+            const header = try parseNewcHeader(rest);
+            info.format = if (header.is_crc) .crc else .newc;
+            info.ino = header.ino;
+            info.mode = header.mode;
+            info.uid = header.uid;
+            info.gid = header.gid;
+            info.nlink = header.nlink;
+            info.modification_time = header.modification_time;
+            data_size = header.data_size;
             info.devmajor = @intCast(try parseHex(rest[62..70]));
             info.devminor = @intCast(try parseHex(rest[70..78]));
-            namesize = try parseHex(rest[94..102]);
-            check = try parseHex(rest[102..110]);
-            self.offset = try bounds.addU64(self.offset, 110);
+            namesize = header.namesize;
+            check = header.check;
+            self.offset = try bounds.addU64(self.offset, record_header_size);
             name_align = 4;
             data_align = 4;
         } else {
@@ -290,7 +380,7 @@ const Reader = struct {
             if (rest.len < 26) return error.DataException;
             info.format = if (big) .bin_be else .bin_le;
             info.ino = readU16(rest, 4, big);
-            info.mode = readU16(rest, 6, big) & 0o67777;
+            info.mode = readU16(rest, 6, big) & 0o177777;
             if (info.mode & 0o170000 == 0) info.mode |= 0o100000;
             info.uid = readU16(rest, 8, big);
             info.gid = readU16(rest, 10, big);
@@ -447,6 +537,33 @@ test "cpio rejects a header field that does not fit its width" {
     var archive: [512]u8 = undefined;
     try std.testing.expectError(error.UnsupportedException, encode(&entries, &archive));
     try std.testing.expectError(error.UnsupportedException, encodeOdc(&entries, &archive));
+}
+
+test "cpio keeps non-regular type bits in odc and binary records" {
+    const testing = std.testing;
+    const entries = [_]Entry{
+        .{ .name = "link", .data = "target", .mode = 0o120755 },
+        .{ .name = "fifo", .data = &.{}, .mode = 0o010644 },
+    };
+    var archive: [1024]u8 = undefined;
+    const written = try encodeOdc(&entries, &archive);
+    try testing.expectEqual(@as(u32, 0o120755), (try inspectOrdinal(archive[0..written], 0)).mode);
+    try testing.expectEqual(@as(u32, 0o010644), (try inspectOrdinal(archive[0..written], 1)).mode);
+
+    // The binary reader carried the same mask, so it broke symlinks too.
+    var binary_archive: [128]u8 = @splat(0);
+    std.mem.writeInt(u16, binary_archive[0..2], 0o070707, .little);
+    std.mem.writeInt(u16, binary_archive[4..6], 9, .little);
+    std.mem.writeInt(u16, binary_archive[6..8], 0o120755, .little);
+    std.mem.writeInt(u16, binary_archive[12..14], 1, .little);
+    std.mem.writeInt(u16, binary_archive[20..22], 5, .little);
+    std.mem.writeInt(u32, binary_archive[22..26], 6, .little);
+    @memcpy(binary_archive[26..31], "link\x00");
+    @memcpy(binary_archive[32..38], "target");
+    const count = try inspectCount(binary_archive[0..38]);
+    try testing.expectEqual(@as(u64, 1), count);
+    const info = try inspectOrdinal(binary_archive[0..38], 0);
+    try testing.expectEqual(@as(u32, 0o120755), info.mode);
 }
 
 test "cpio crc format validates checksum over file data" {

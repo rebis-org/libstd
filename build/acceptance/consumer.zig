@@ -10,7 +10,7 @@ const bypass = libstd.bypass;
 
 test "assembly descriptor projection covers every representation descriptor" {
     // The projection excludes exactly the three protocol fixtures.
-    try std.testing.expectEqual(@as(usize, 30), assembly.descriptors.len);
+    try std.testing.expectEqual(@as(usize, 31), assembly.descriptors.len);
     try std.testing.expect(!@hasDecl(assembly.leaf, "test_echo"));
     try std.testing.expect(!@hasDecl(assembly.leaf, "test_read"));
     try std.testing.expect(!@hasDecl(assembly.grammar, "crypto"));
@@ -34,6 +34,28 @@ test "assembly descriptor projection covers every representation descriptor" {
     try std.testing.expect(@hasDecl(assembly.grammar.zstd_seekable, "encode"));
     try std.testing.expect(@hasDecl(assembly.grammar.rar.onprem, "rarInspectCountOpts"));
     try std.testing.expect(@hasDecl(assembly.grammar.rar.writer, "rarEncodeEx"));
+}
+
+test "xip roundtrip through assembly" {
+    const xip = assembly.grammar.xip;
+    const entries = [_]xip.Entry{
+        .{ .name = "Xcode.app/Contents/Info.plist", .data = "plist bytes" },
+        .{ .name = "Xcode.app/MacOS/Xcode", .data = "mach-o bytes" },
+    };
+    const scratch = try std.testing.allocator.alloc(u8, xip.scratch_size);
+    defer std.testing.allocator.free(scratch);
+    const planned = try xip.archiveSize(&entries, scratch);
+    const archive = try std.testing.allocator.alloc(u8, planned);
+    defer std.testing.allocator.free(archive);
+    const written = try xip.encode(&entries, archive, scratch);
+    try std.testing.expectEqual(planned, written);
+    try std.testing.expectEqualSlices(u8, "xar!", archive[0..4]);
+    try std.testing.expectEqual(@as(u64, 2), try xip.inspectCount(archive[0..written], scratch));
+    const first = try xip.inspectOrdinal(archive[0..written], 0, scratch);
+    try std.testing.expectEqualSlices(u8, "Xcode.app/Contents/Info.plist", first.name);
+    var out: [16]u8 = undefined;
+    const size = try xip.decodeOrdinal(archive[0..written], 1, &out, scratch);
+    try std.testing.expectEqualSlices(u8, "mach-o bytes", out[0..size]);
 }
 
 test "zstd bypass round trip through assembly types" {
