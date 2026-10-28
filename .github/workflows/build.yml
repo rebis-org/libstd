@@ -68,7 +68,7 @@ jobs:
   targets:
     name: Support matrix
     if: github.event_name != 'workflow_dispatch' || inputs.scope == 'ALL' || inputs.scope == 'targets'
-    runs-on: ubuntu-slim
+    runs-on: ubuntu-latest
     env:
       GIT_CONFIG_COUNT: "2"
       GIT_CONFIG_KEY_0: url.https://github.com/rebis-org/.insteadof
