@@ -39,4 +39,5 @@ test {
     _ = @import("compose/executor.zig");
     _ = @import("compose/machines.zig");
     _ = @import("common/primitive/hash/sha256_mb/seam.zig");
+    _ = @import("common/session.zig");
 }
