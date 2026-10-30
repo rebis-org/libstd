@@ -89,7 +89,7 @@ pub fn requireDisjoint(first: ConstSpan, second: ConstSpan, context: []const u8)
     if (hasOverlap(@intFromPtr(first.ptr), first.len, @intFromPtr(second.ptr), second.len)) trap(.overlap, context);
 }
 
-test "span algebra: read, write, and sub round trip" {
+test "span algebra reads, writes, and subs round trip" {
     var backing: [16]u8 = .{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
     const span: Span = .{ .ptr = &backing, .len = backing.len };
     try std.testing.expectEqual(@as(usize, 16), span.len);

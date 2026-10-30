@@ -383,7 +383,7 @@ fn runEncrypted(r: *Runner) anyerror!void {
     };
     const oracle = lib.archiveReadMatches(zip_enc_archive[0..zip_enc_archive_size], &expected);
     if (oracle == .mismatch) return error.EncryptedOracleRejected;
-    if (oracle == .unsupported) std.debug.print("zip encrypted oracle: unsupported (libarchive cannot read AES zip).\n", .{});
+    if (oracle == .unsupported) harness.unverified(r, "libarchive cannot read AES zip.");
     const fixture_data = [_][]const u8{ &fixtures.zip_aes128_fixture, &fixtures.zip_aes192_fixture, &fixtures.zip_aes256_fixture };
     const fixture_expected = "encrypted\n";
     for (fixture_data) |fixture_bytes| {
@@ -594,7 +594,7 @@ fn runEncodeMethods(r: *Runner) anyerror!void {
             };
             const oracle = lib.archiveReadMatches(archive[0..size], &expected);
             if (oracle == .mismatch) return error.EncmethodsOracleRejected;
-            if (oracle == .unsupported) std.debug.print("zip method {d} oracle: unsupported (libarchive cannot read).\n", .{method});
+            if (oracle == .unsupported) harness.unverifiedPrint(r, "libarchive cannot read method {d}.", .{method});
         }
     }
     const empty_methods = [_]u16{ 14, 98 };

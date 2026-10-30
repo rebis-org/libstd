@@ -46,7 +46,7 @@ pub fn MachineFor(comptime Event: type, comptime Action: type) type {
 
 // A toy machine pins the shape: a counter that terminates after a budget of
 // `increment` events.
-test "machine shape: stepping consumes events and emits actions" {
+test "machine stepping consumes events and emits actions" {
     const Event = enum { increment, reset };
     const Action = enum { notify, halted };
     const Machine = MachineFor(Event, Action);
@@ -70,7 +70,9 @@ test "machine shape: stepping consumes events and emits actions" {
             return .running;
         }
 
-        fn destroy(_: *anyopaque) void {}
+        fn destroy(_: *anyopaque) void {
+            // No per-state resource to release.
+        }
     };
 
     var state: State = .{ .count = 0, .budget = 3 };

@@ -164,7 +164,7 @@ test "e8 filter relocates against the wrap constant and the file offset" {
     try std.testing.expectEqual(@as(u32, 0x0BFF), at_offset);
 }
 
-test "e8 filter: negative address crossing zero gets the wrap constant" {
+test "e8 filter wraps a negative address that crosses zero" {
     var data = [_]u8{ 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0xE8, 0xFB, 0xFF, 0xFF, 0xFF, 0x90 };
     applyE8E9(&data, 0, false);
     try std.testing.expectEqual(@as(u32, 0x00FFFFFB), std.mem.readInt(u32, data[11..15], .little));

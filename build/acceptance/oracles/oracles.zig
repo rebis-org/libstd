@@ -149,11 +149,16 @@ pub fn main(init: std.process.Init) !void {
     var filter_suite: ?[]const u8 = null;
     var filter_scenario: ?[]const u8 = null;
     var catalog_path: ?[]const u8 = null;
+    var strict = false;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--suite")) {
             filter_suite = args.next() orelse return error.MissingSuiteArgument;
         } else if (std.mem.eql(u8, arg, "--scenario")) {
             filter_scenario = args.next() orelse return error.MissingScenarioArgument;
+        } else if (std.mem.eql(u8, arg, "--strict")) {
+            // CI sets this where every reference tool is installed, so an
+            // unverified or skipped scenario fails the run instead of hiding.
+            strict = true;
         } else if (catalog_path == null) {
             catalog_path = arg;
         } else {
@@ -168,6 +173,9 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("oracle lib {s}: available\n", .{entry.name});
     }
     std.debug.print("SCENARIO_BLOCK\n", .{});
+    var verified: usize = 0;
+    var unverified: usize = 0;
+    var skipped: usize = 0;
     for (scenarios) |scenario| {
         if (filter_suite) |name| {
             if (!std.mem.eql(u8, scenario.suite, name)) continue;
@@ -175,16 +183,27 @@ pub fn main(init: std.process.Init) !void {
         if (filter_scenario) |name| {
             if (!std.mem.eql(u8, scenario.name, name)) continue;
         }
-        runScenario(scenario) catch |err| {
+        const partial = runScenario(scenario) catch |err| {
             // A missing reference tool skips the scenario, matching the
             // missing-library convention; everything else fails the run.
             if (err == error.ReferenceToolUnavailable) {
+                skipped += 1;
                 std.debug.print("Scenario \"{s}\" skipped: reference tool unavailable.\n", .{scenario.name});
                 continue;
             }
             std.debug.print("Scenario \"{s}\" failed: {s}.\n", .{ scenario.name, @errorName(err) });
             std.process.exit(1);
         };
+        if (partial) {
+            unverified += 1;
+        } else {
+            verified += 1;
+        }
+    }
+    std.debug.print("ORACLES_END verified={d} unverified={d} skipped={d}\n", .{ verified, unverified, skipped });
+    if (strict and (unverified != 0 or skipped != 0)) {
+        std.debug.print("strict run: {d} unverified and {d} skipped scenarios.\n", .{ unverified, skipped });
+        std.process.exit(1);
     }
     if (filter_suite) |name| {
         if (!hasScenario("suite", name)) return error.UnknownSuiteFilter;
@@ -201,7 +220,7 @@ fn hasScenario(comptime field: []const u8, name: []const u8) bool {
     return false;
 }
 
-fn runScenario(scenario: harness.Scenario) !void {
+fn runScenario(scenario: harness.Scenario) !bool {
     const allocator = std.heap.page_allocator;
     var runner = harness.Runner{
         .gpa = allocator,
@@ -219,5 +238,10 @@ fn runScenario(scenario: harness.Scenario) !void {
     defer allocator.free(owned_output);
     defer allocator.free(owned_encoded);
     try scenario.run(&runner);
+    if (runner.unverified) |reason| {
+        std.debug.print("{s} unverified: {s}\n", .{ scenario.name, reason });
+        return true;
+    }
     std.debug.print("{s} done\n", .{scenario.name});
+    return false;
 }

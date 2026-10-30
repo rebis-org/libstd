@@ -356,7 +356,7 @@ fn itaniumSetBits(bundle: []u8, value: u32, bit_pos: usize, bit_count: u5) void 
     }
 }
 
-test "identifyFilter: rejects a bad xor byte, length, or crc" {
+test "filter identification rejects a bad xor byte, length, or crc" {
     var code = [_]u8{ 0xFF, 0x01, 0x02 };
     try std.testing.expectEqual(StandardFilter.none, identifyFilter(checksum.default_provider, &code));
     code[0] = 0x01 ^ 0x02;
@@ -364,7 +364,7 @@ test "identifyFilter: rejects a bad xor byte, length, or crc" {
     try std.testing.expectEqual(StandardFilter.none, identifyFilter(checksum.default_provider, &[_]u8{}));
 }
 
-test "readData: 4-bit and 16-bit forms consume the reference widths" {
+test "read data consumes the reference widths of the 4-bit and 16-bit forms" {
     {
         var buf = [_]u8{ 0b0010_1100, 0x00, 0x00, 0x00 };
         var br = BitReader.init(&buf);
@@ -381,7 +381,7 @@ test "readData: 4-bit and 16-bit forms consume the reference widths" {
     }
 }
 
-test "readData: 8-bit form sign-extends a small negative value" {
+test "read data sign-extends a small negative value in the 8-bit form" {
     {
         var buf = [_]u8{ 0x7C, 0xC0, 0x00, 0x00 };
         var br = BitReader.init(&buf);

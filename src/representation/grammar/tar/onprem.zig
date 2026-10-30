@@ -1044,7 +1044,7 @@ test "tar posix prefix split stays inside the ustar header" {
     var scratch: [4096]u8 = undefined;
     const written = try encode(&entries, &archive, &scratch);
     try testing.expectEqual(@as(u64, written), try archiveSize(&entries));
-    try testing.expect(std.mem.indexOf(u8, archive[0..written], "path=") == null);
+    try testing.expect(std.mem.find(u8, archive[0..written], "path=") == null);
     const info = try inspectOrdinal(archive[0..written], 0);
     try testing.expectEqualSlices(u8, long_name[0..130], info.prefix);
     try testing.expectEqualSlices(u8, long_name[131..], info.name);

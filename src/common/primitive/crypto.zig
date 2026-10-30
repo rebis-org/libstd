@@ -369,6 +369,10 @@ test "fill random accepts every length class" {
     var buf: [65]u8 = undefined;
     for (0..buf.len + 1) |len| try fillRandom(buf[0..len]);
     try fillRandom(&buf);
+    // A stubbed or repeated fill repeats; real entropy does not.
+    var again: [65]u8 = undefined;
+    try fillRandom(&again);
+    try std.testing.expect(!std.mem.eql(u8, &buf, &again));
 }
 
 // ZipCrypto (PKWARE traditional cipher): the CRC-32-based key ladder has no

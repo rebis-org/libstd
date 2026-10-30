@@ -177,7 +177,7 @@ fn bech32Decode(encoded: []const u8, hrp_out: []u8, data_out: []u8) Exception!st
     if (lower and upper) return error.DataException;
     var buf: [1024]u8 = undefined;
     const text = std.ascii.lowerString(&buf, encoded);
-    const sep = std.mem.lastIndexOfScalar(u8, text, '1') orelse return error.DataException;
+    const sep = std.mem.findScalarLast(u8, text, '1') orelse return error.DataException;
     if (sep == 0 or sep + 7 > text.len) return error.DataException;
     const hrp = text[0..sep];
     if (hrp.len > hrp_out.len) return error.DataException;
@@ -185,7 +185,7 @@ fn bech32Decode(encoded: []const u8, hrp_out: []u8, data_out: []u8) Exception!st
     const value_len = text.len - sep - 1;
     var values: [1024]u5 = undefined;
     for (text[sep + 1 ..], 0..) |c, i| {
-        const idx = std.mem.indexOfScalar(u8, bech32_charset, c) orelse return error.DataException;
+        const idx = std.mem.findScalar(u8, bech32_charset, c) orelse return error.DataException;
         values[i] = @intCast(idx);
     }
     var expanded: [2 * 1024 + 1]u5 = undefined;
@@ -264,16 +264,16 @@ const Header = struct {
 };
 
 fn parseHeader(input: []const u8, alloc: std.mem.Allocator) Exception!Header {
-    const first_eol = std.mem.indexOfScalar(u8, input, '\n') orelse return error.DataException;
+    const first_eol = std.mem.findScalar(u8, input, '\n') orelse return error.DataException;
     const version = input[0..first_eol];
     if (!std.mem.eql(u8, version, version_line)) {
         if (std.mem.startsWith(u8, version, "age-encryption.org/")) return error.UnsupportedException;
         return error.DataException;
     }
     var pos: usize = first_eol + 1;
-    var stanzas: std.ArrayListUnmanaged(Stanza) = .empty;
+    var stanzas: std.ArrayList(Stanza) = .empty;
     while (true) {
-        const eol = std.mem.indexOfScalarPos(u8, input, pos, '\n') orelse return error.DataException;
+        const eol = std.mem.findScalarPos(u8, input, pos, '\n') orelse return error.DataException;
         const line = input[pos..eol];
         if (std.mem.startsWith(u8, line, "---")) {
             if (line.len != 4 + mac_encoded_len or line[3] != ' ') return error.DataException;
@@ -282,15 +282,15 @@ fn parseHeader(input: []const u8, alloc: std.mem.Allocator) Exception!Header {
             return .{ .stanzas = stanzas.items, .mac_line_start = pos, .payload_offset = eol + 1 };
         }
         if (!std.mem.startsWith(u8, line, "-> ") or line.len == 3) return error.DataException;
-        var args: std.ArrayListUnmanaged([]const u8) = .empty;
+        var args: std.ArrayList([]const u8) = .empty;
         var it = std.mem.tokenizeScalar(u8, line[3..], ' ');
         while (it.next()) |arg| {
             args.append(alloc, arg) catch return error.ResourceException;
         }
-        var body: std.ArrayListUnmanaged(u8) = .empty;
+        var body: std.ArrayList(u8) = .empty;
         var body_pos = eol + 1;
         while (true) {
-            const end = std.mem.indexOfScalarPos(u8, input, body_pos, '\n') orelse return error.DataException;
+            const end = std.mem.findScalarPos(u8, input, body_pos, '\n') orelse return error.DataException;
             const part = input[body_pos..end];
             if (part.len > 64) return error.DataException;
             body.appendSlice(alloc, part) catch return error.ResourceException;
@@ -378,7 +378,7 @@ fn decimalWorkFactor(text: []const u8) Exception!u8 {
 fn wrapStanzas(file_key: [file_key_len]u8, options: Options, alloc: std.mem.Allocator, scratch: []u8) Exception![]Stanza {
     if (options.password.len != 0 and options.recipient.len != 0) return error.CallException;
     if (options.password.len == 0 and options.recipient.len == 0) return error.CallException;
-    var list: std.ArrayListUnmanaged(Stanza) = .empty;
+    var list: std.ArrayList(Stanza) = .empty;
     if (options.password.len != 0) {
         if (options.work_factor < 1 or options.work_factor > scrypt_work_factor_max) return error.UnsupportedException;
         var salt: [16]u8 = undefined;
@@ -388,7 +388,7 @@ fn wrapStanzas(file_key: [file_key_len]u8, options: Options, alloc: std.mem.Allo
         const args = alloc.alloc([]const u8, 3) catch return error.ResourceException;
         args[0] = "scrypt";
         args[1] = alloc.dupe(u8, b64.Encoder.encode(&salt_b64, &salt)) catch return error.ResourceException;
-        args[2] = std.fmt.allocPrint(alloc, "{d}", .{options.work_factor}) catch return error.ResourceException;
+        args[2] = alloc.print("{d}", .{options.work_factor}) catch return error.ResourceException;
         const body = alloc.dupe(u8, &sealFileKey(file_key, wrap_key)) catch return error.ResourceException;
         list.append(alloc, .{ .args = args, .body = body }) catch return error.ResourceException;
         return list.items;
@@ -585,7 +585,7 @@ fn armorDecode(text: []const u8, alloc: std.mem.Allocator) Exception![]const u8 
         if (!std.mem.startsWith(u8, inner, "\n")) return error.DataException;
         break :blk inner[1..];
     };
-    const close = std.mem.lastIndexOf(u8, after_begin, armor_end) orelse return error.DataException;
+    const close = std.mem.findLast(u8, after_begin, armor_end) orelse return error.DataException;
     const payload = after_begin[0..close];
     if (payload.len == 0 or payload[payload.len - 1] != '\n') return error.DataException;
     const b64_text = payload[0 .. payload.len - 1];
@@ -593,7 +593,7 @@ fn armorDecode(text: []const u8, alloc: std.mem.Allocator) Exception![]const u8 
     var n: usize = 0;
     var line_start: usize = 0;
     while (line_start < b64_text.len) {
-        const eol = std.mem.indexOfScalarPos(u8, b64_text, line_start, '\n') orelse b64_text.len;
+        const eol = std.mem.findScalarPos(u8, b64_text, line_start, '\n') orelse b64_text.len;
         var line = b64_text[line_start..eol];
         if (line.len != 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
         if (line.len > 64) return error.DataException;
@@ -610,7 +610,7 @@ fn armorDecode(text: []const u8, alloc: std.mem.Allocator) Exception![]const u8 
 fn dearmor(input: []const u8, alloc: std.mem.Allocator) Exception![]const u8 {
     const trimmed = std.mem.trim(u8, input, " \t\n\r");
     if (std.mem.startsWith(u8, trimmed, armor_begin)) return armorDecode(input, alloc);
-    if (std.mem.indexOf(u8, trimmed, armor_begin) != null) return error.DataException;
+    if (std.mem.find(u8, trimmed, armor_begin) != null) return error.DataException;
     return input;
 }
 
@@ -869,7 +869,7 @@ fn expectPayloadHash(out: []const u8, comptime hex: []const u8) !void {
     try testing.expectEqualSlices(u8, &expected, &digest);
 }
 
-test "CCTV x25519 vector decrypts" {
+test "cctv x25519 vector decrypts" {
     var scratch: [256 * 1024]u8 = undefined;
     var out: [64]u8 = undefined;
     const n = try decodeOrdinal(&vec_x25519, 0, &out, &scratch, .{ .identity = meta_x25519_identity });
@@ -878,14 +878,14 @@ test "CCTV x25519 vector decrypts" {
     try testing.expectEqual(@as(u64, n), size);
 }
 
-test "CCTV armor x25519 vector decrypts" {
+test "cctv armor x25519 vector decrypts" {
     var scratch: [256 * 1024]u8 = undefined;
     var out: [64]u8 = undefined;
     const n = try decodeOrdinal(&vec_armor_x25519, 0, &out, &scratch, .{ .identity = meta_armor_x25519_identity });
     try expectPayloadHash(out[0..n], "013f54400c82da08037759ada907a8b864e97de81c088a182062c4b5622fd2ab");
 }
 
-test "CCTV scrypt vector decrypts" {
+test "cctv scrypt vector decrypts" {
     // The reference vector uses work factor 18: 256 MiB of scrypt scratch,
     // so the test heap-allocates it.
     const scratch = try testing.allocator.alloc(u8, 260 * 1024 * 1024);
@@ -895,7 +895,7 @@ test "CCTV scrypt vector decrypts" {
     try expectPayloadHash(out[0..n], "013f54400c82da08037759ada907a8b864e97de81c088a182062c4b5622fd2ab");
 }
 
-test "CCTV negative vectors reject" {
+test "cctv negative vectors reject" {
     var scratch: [256 * 1024]u8 = undefined;
     var out: [64]u8 = undefined;
     try testing.expectError(error.IntegrityException, decodeOrdinal(&vec_x25519_no_match, 0, &out, &scratch, .{ .identity = meta_x25519_no_match_identity }));

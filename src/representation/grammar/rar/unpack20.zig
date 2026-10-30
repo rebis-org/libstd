@@ -652,7 +652,7 @@ test "audio adaptation fires every 32 samples and clamps at [-17, 16]" {
     try std.testing.expect(moved);
 }
 
-test "old-distance ring: rep matches count back and every match pushes" {
+test "old-distance ring counts back repeats and pushes every match" {
     var st: Decoder = undefined;
     var window_buf: [64]u8 = undefined;
     var pool: [table_pool_words]u16 = undefined;

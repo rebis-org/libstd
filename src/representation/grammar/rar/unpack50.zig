@@ -537,7 +537,7 @@ test "length table slots match the rar5 mapping" {
     try std.testing.expectEqual(@as(u5, 3), length_table[16].extra);
 }
 
-test "decodeLengthSlot: direct and extra-bit slots" {
+test "length slot decoding covers direct and extra-bit slots" {
     var data = [_]u8{0x00};
     var br = BitReader.init(&data);
     try std.testing.expectEqual(@as(u32, 2), try decodeLengthSlot(&br, 0));
@@ -545,7 +545,7 @@ test "decodeLengthSlot: direct and extra-bit slots" {
     try std.testing.expectError(error.DataException, decodeLengthSlot(&br, 44));
 }
 
-test "decodeDistance: slot 0 returns 1" {
+test "distance decoding returns one for slot zero" {
     var dd_lengths: [dc_rar5]u8 = @splat(0);
     dd_lengths[0] = 1;
     var pool: [table_pool_words * 4]u16 = undefined;

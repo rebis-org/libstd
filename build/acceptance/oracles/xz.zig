@@ -266,7 +266,7 @@ fn runFilterCases(r: *Runner) !void {
     };
     for (cases) |item| {
         const ref_size = xzMakeReference(item.data[0..item.len], 4, item.delta, item.bcj, &filter_xz) orelse {
-            std.debug.print("xz filter case unsupported (system liblzma does not support filter 0x{x}).\n", .{item.bcj orelse 0});
+            harness.unverifiedPrint(r, "system liblzma lacks filter 0x{x}.", .{item.bcj orelse 0});
             continue;
         };
         @memset(&output, 0xa5);

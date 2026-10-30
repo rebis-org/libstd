@@ -94,7 +94,7 @@ pub fn build(b: *std.Build) void {
     const test_filter = b.option([]const u8, "test_filter", "Only run unit test binaries whose module name contains the substring");
     const unit_step = b.step("unit", "Run unit-level test blocks");
     inline for ([_]modules.Module{ modules.interface, modules.checksum, modules.implementations }) |spec| {
-        const selected = test_filter == null or std.mem.indexOf(u8, spec.name, test_filter.?) != null;
+        const selected = test_filter == null or std.mem.find(u8, spec.name, test_filter.?) != null;
         if (selected) {
             const test_module = modules.createFor(b, spec, ctx.target, ctx.optimize, &ctx);
             const unit_tests = b.addTest(.{ .root_module = test_module });
@@ -103,7 +103,7 @@ pub fn build(b: *std.Build) void {
         }
     }
     // Runner invariants ride the unit step with library blocks.
-    if (test_filter == null or std.mem.indexOf(u8, modules.micro.name, test_filter.?) != null) {
+    if (test_filter == null or std.mem.find(u8, modules.micro.name, test_filter.?) != null) {
         const micro_tests = b.addTest(.{ .root_module = modules.createFor(b, modules.micro, ctx.target, .debug, &ctx) });
         unit_step.dependOn(&b.addRunArtifact(micro_tests).step);
     }
@@ -119,19 +119,19 @@ pub fn build(b: *std.Build) void {
         const dudect_step = b.step("dudect", "Run the constant-time timing evidence session");
         dudect_step.dependOn(&b.addRunArtifact(dudect_exe).step);
     }
-    if (test_filter == null or std.mem.indexOf(u8, "force", test_filter.?) != null) {
-        const force_module = b.createModule(.{
+    {
+        const analyze_module = b.createModule(.{
             .root_source_file = b.path("src/analysis.zig"),
             .target = modules.kernelAdjustedTarget(modules.package_entry, ctx.target, ctx.portable, ctx.kernel_isa),
             .optimize = optimize,
         });
-        common.attachPackageImports(b, force_module, ctx.target, optimize, &ctx);
-        const force_tests = b.addTest(.{ .root_module = force_module });
-        unit_step.dependOn(&b.addRunArtifact(force_tests).step);
+        common.attachPackageImports(b, analyze_module, ctx.target, optimize, &ctx);
+        const analyze_exe = b.addExecutable(.{ .name = "analyze", .root_module = analyze_module });
+        b.step("analyze", "Compile-check the audit-touched modules").dependOn(&b.addRunArtifact(analyze_exe).step);
     }
     // Package consumers see only the libstd module; the acceptance test
     // proves real operations run through that one import.
-    if (test_filter == null or std.mem.indexOf(u8, "consumer", test_filter.?) != null) {
+    if (test_filter == null or std.mem.find(u8, "consumer", test_filter.?) != null) {
         const consumer_module = b.createModule(.{
             .root_source_file = b.path("build/acceptance/consumer.zig"),
             .target = modules.kernelAdjustedTarget(modules.package_entry, target, portable, kernel_isa),
@@ -148,6 +148,14 @@ pub fn build(b: *std.Build) void {
     const fuzz_tests = b.addTest(.{ .root_module = fuzz_module });
     const fuzz_step = b.step("fuzz", "Build the decode-surface fuzz harness and run its non-campaign pass");
     fuzz_step.dependOn(&b.addRunArtifact(fuzz_tests).step);
+
+    // Campaigns are evidence sessions with an operator-set budget; keeping
+    // them out of `unit` stops an unbudgeted run from reading as a pass.
+    const campaign_module = modules.createFor(b, modules.fuzz_campaign, ctx.target, ctx.optimize, &ctx);
+    const campaign_exe = b.addExecutable(.{ .name = "campaign", .root_module = campaign_module });
+    const run_campaign = b.addRunArtifact(campaign_exe);
+    run_campaign.addPassthruArgs();
+    b.step("campaign", "Run mutation campaigns (--iterations N, --format name)").dependOn(&run_campaign.step);
 
     // Debug numbers carry no evidence, so micro defaults to fast.
     const micro_optimize = b.option(std.lang.Optimize, "micro_optimize", "Optimization mode for zig build micro") orelse .fast;

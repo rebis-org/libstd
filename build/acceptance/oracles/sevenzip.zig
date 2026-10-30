@@ -192,7 +192,7 @@ fn runDecoded(r: *Runner) anyerror!void {
     };
     const oracle = lib.archiveReadMatches(sz_dec_archive[0..sz_dec_archive_size], &expected);
     if (oracle == .mismatch) return error.DecodedOracleRejected;
-    if (oracle == .unsupported) std.debug.print("seven_zip decoded oracle: unsupported (libarchive cannot read).\n", .{});
+    if (oracle == .unsupported) harness.unverified(r, "libarchive cannot read this archive.");
 }
 
 fn runCoded(r: *Runner) anyerror!void {
@@ -226,7 +226,7 @@ fn runCoded(r: *Runner) anyerror!void {
         };
         const oracle = lib.archiveReadMatches(sz_coded_archive[0..sz_coded_archive_size], &expected);
         if (oracle == .mismatch) return error.CodedOracleRejected;
-        if (oracle == .unsupported) std.debug.print("seven_zip coded oracle method {d}: unsupported (libarchive cannot read).\n", .{method});
+        if (oracle == .unsupported) harness.unverifiedPrint(r, "libarchive cannot read method {d}.", .{method});
     }
     var store1: EntryNodes = undefined;
     var store2: EntryNodes = undefined;
@@ -253,7 +253,7 @@ fn runCoded(r: *Runner) anyerror!void {
         };
         const external_oracle = lib.archiveReadMatches(external_bytes, &external_expected);
         if (external_oracle == .mismatch) return error.CodedExternalReferenceRoundtripMismatch;
-        if (external_oracle == .unsupported) std.debug.print("seven_zip coded external reference: skipped (libarchive cannot read its own 7z output).\n", .{});
+        if (external_oracle == .unsupported) harness.unverified(r, "libarchive cannot read its own 7z output.");
         _ = harness.call(r, harness.ids.query, &.{
             harness.paramTargetCommand(harness.ids.read),
             harness.sourceSpan(external_bytes),
@@ -262,7 +262,7 @@ fn runCoded(r: *Runner) anyerror!void {
             harness.commitModeParam(harness.commit_tentative),
         }, .{});
         if (r.status == abi.Status.unsupported) {
-            std.debug.print("seven_zip coded external: unsupported (libarchive 7z encoding unsupported by decoder).\n", .{});
+            harness.unverified(r, "decoder rejects libarchive 7z encoding.");
         } else {
             try harness.requireStatus(r, abi.Status.ok);
             if (r.response.byte_length != 2) return error.CodedExternalCountMismatch;
@@ -271,7 +271,7 @@ fn runCoded(r: *Runner) anyerror!void {
                 @memset(&sz_coded_output, 0xa5);
                 _ = try sevenZipRead(r, external_bytes, i, &sz_coded_output, &.{});
                 if (r.status == abi.Status.unsupported) {
-                    std.debug.print("seven_zip coded external: unsupported (libarchive 7z encoding unsupported by decoder).\n", .{});
+                    harness.unverified(r, "decoder rejects libarchive 7z encoding.");
                     break;
                 }
                 try harness.requireStatus(r, abi.Status.ok);
@@ -282,7 +282,7 @@ fn runCoded(r: *Runner) anyerror!void {
         }
         std.heap.page_allocator.free(external_bytes);
     } else {
-        std.debug.print("seven_zip coded external: unsupported (libarchive cannot write 7z).\n", .{});
+        harness.unverified(r, "libarchive cannot write 7z.");
     }
 }
 
@@ -302,7 +302,7 @@ fn runEncodeAdvanced(r: *Runner) anyerror!void {
         };
         const oracle = lib.archiveReadMatches(sz_adv_archive[0..sz_adv_archive_size], &expected);
         if (oracle == .mismatch) return error.AdvMethodsOracleRejected;
-        if (oracle == .unsupported) std.debug.print("seven_zip encode advanced oracle method {d}: unsupported (libarchive cannot read).\n", .{method});
+        if (oracle == .unsupported) harness.unverifiedPrint(r, "libarchive cannot read method {d}.", .{method});
     }
     const solids = [_][]const u8{ sz_solid_data[0..160], sz_solid_data[160..320], sz_solid_data[320..480] };
     var solid_stores: [3]EntryNodes = undefined;
@@ -352,7 +352,7 @@ fn runFilters(r: *Runner) anyerror!void {
         };
         const oracle = lib.archiveReadMatches(sz_adv_archive[0..sz_adv_archive_size], &expected);
         if (oracle == .mismatch) return error.FilterOracleRejected;
-        if (oracle == .unsupported) std.debug.print("seven_zip filters oracle method {d}+{d}: unsupported (libarchive cannot read).\n", .{ combo.filter, combo.method });
+        if (oracle == .unsupported) harness.unverifiedPrint(r, "libarchive cannot read filter {d} with method {d}.", .{ combo.filter, combo.method });
     }
 }
 
@@ -488,7 +488,7 @@ fn runEncodedHeaders(r: *Runner) anyerror!void {
     const expected = [_]lib.ExpectedEntry{.{ .name = "m.txt", .data = &sz_enc_data }};
     const oracle = lib.archiveReadMatches(sz_enc_archive[0..mhc_size], &expected);
     if (oracle == .mismatch) return error.EncodedHeaderOracleRejected;
-    if (oracle == .unsupported) std.debug.print("seven_zip encoded header: skipped (libarchive cannot read encoded headers).\n", .{});
+    if (oracle == .unsupported) harness.unverified(r, "libarchive cannot read encoded headers.");
 
     const mhe_write_nodes = [_]harness.Node{
         harness.cryptoProfile(),
@@ -538,14 +538,43 @@ fn runEncodedHeaders(r: *Runner) anyerror!void {
     if (r.response.byte_length != 97) return error.EncryptedHeaderFixtureMismatch;
 }
 
-// No system library covers these interops: report skip and pass.
-fn skipped(comptime label: []const u8) fn (*Runner) anyerror!void {
-    return struct {
-        fn run(r: *Runner) anyerror!void {
-            _ = r;
-            std.debug.print("{s}: unsupported (no system library supports this interop).\n", .{label});
-        }
-    }.run;
+// Three entries of one method pack into a single folder: every ordinal must
+// read its own bytes back through the shared stream, and the entry count
+// stays visible to a query.
+fn runSolid(r: *Runner) anyerror!void {
+    setup7z(r, harness.ids.sevenzip);
+    corpus.fillTiled(r.corpus_index, &sz_solid_data);
+    const parts = [_][]const u8{ sz_solid_data[0..200], sz_solid_data[200..400], sz_solid_data[400..600] };
+    var stores: [3]PlainNodes = undefined;
+    var nodes: [3]harness.Node = undefined;
+    var name_buffers: [3][16]u8 = undefined;
+    for (0..3) |index| {
+        var name_writer: std.Io.Writer = std.Io.Writer.fixed(&name_buffers[index]);
+        name_writer.print("s{d}.bin", .{index}) catch return error.NameFormat;
+        nodes[index] = entryPlain(&stores[index], name_writer.buffered(), parts[index]);
+        if (index > 0) nodes[index - 1].next = &nodes[index];
+    }
+    const archive_size = try sevenZipWrite(r, nodes[0], &sz_coded_archive, &.{});
+    try sevenZipEntryCount(r, sz_coded_archive[0..archive_size], 3);
+    for (0..3) |index| {
+        try sevenZipReadExpected(r, sz_coded_archive[0..archive_size], @intCast(index), &sz_coded_output, parts[index], &.{});
+    }
+}
+
+// An entry larger than the sink must fail instead of truncating, and the
+// sink must keep every byte it held.
+fn runPpmdErrors(r: *Runner) anyerror!void {
+    setup7z(r, harness.ids.sevenzip);
+    corpus.fillTiled(r.corpus_index, &sz_ppmd_data);
+    var store: EntryNodes = undefined;
+    const entry = entryWithMethod(&store, "p0.bin", &sz_ppmd_data, 14);
+    const archive_size = try sevenZipWrite(r, entry, &sz_coded_archive, &.{});
+    var empty: [0]u8 = .{};
+    try harness.rejectAny(r, harness.ids.read, &.{
+        harness.archiveOrdinalParam(0),
+        harness.sourceSpan(sz_coded_archive[0..archive_size]),
+        harness.sinkSpan(&empty),
+    }, .{}, &empty);
 }
 
 var sz_ppmd_data: [600]u8 = undefined;
@@ -578,7 +607,7 @@ fn runPpmd(r: *Runner) anyerror!void {
     }
     const oracle = lib.archiveReadMatches(sz_coded_archive[0..archive_size], &expected);
     if (oracle == .mismatch) return error.PpmdSolidOracleRejected;
-    if (oracle == .unsupported) std.debug.print("seven_zip ppmd: skipped (libarchive's 7z reader lacks solid PPMd; the archive validates with the 7-Zip CLI).\n", .{});
+    if (oracle == .unsupported) harness.unverified(r, "libarchive lacks solid PPMd; readback covers the archive.");
 }
 
 pub const scenarios = harness.scenarios("seven_zip", &.{
@@ -589,8 +618,8 @@ pub const scenarios = harness.scenarios("seven_zip", &.{
     .{ .label = "seven_zip encrypted provider", .run = runEncryptedProvider, .workspace_size = 64 * 1024 * 1024, .output_size = 1024, .encoded_size = 65536 },
     .{ .label = "seven_zip encoded headers", .run = runEncodedHeaders, .workspace_size = 64 * 1024 * 1024, .output_size = 1024, .encoded_size = 65536 },
     .{ .label = "seven_zip filters", .run = runFilters, .workspace_size = 48 * 1024 * 1024, .output_size = 1024, .encoded_size = 65536 },
-    .{ .label = "seven_zip solid", .run = skipped("seven_zip solid"), .workspace_size = 8 * 1024 * 1024, .output_size = 1024, .encoded_size = 65536 },
+    .{ .label = "seven_zip solid", .run = runSolid, .workspace_size = 32 * 1024 * 1024, .output_size = 1024, .encoded_size = 65536 },
     .{ .label = "seven_zip ppmd", .run = runPpmd, .workspace_size = 32 * 1024 * 1024, .output_size = 1024, .encoded_size = 65536 },
 }, &.{
-    .{ .name = "seven_zip ppmd errors", .run = skipped("seven_zip ppmd errors"), .workspace_size = 32 * 1024 * 1024, .output_size = 2048, .encoded_size = 16384 },
+    .{ .name = "seven_zip ppmd errors", .run = runPpmdErrors, .workspace_size = 32 * 1024 * 1024, .output_size = 2048, .encoded_size = 16384 },
 });

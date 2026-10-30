@@ -2179,8 +2179,8 @@ test "tar encode session frames like the slice encoder" {
     // bytes for the same entry.
     var probe: [512]u8 = undefined;
     try tar.formatHeaderBlock(.posix, entries[2].name, &.{}, entries[2].link_name, entries[2].mode, entries[2].uid, entries[2].gid, entries[2].modification_time, entries[2].typeflag, entries[2].data.len, 0, 0, &probe);
-    // Entry 3 begins at 1024 + 512: entry 1 aligned to 1024, entry 2
-    // has no data.
+    // The third entry begins at 1024 + 512: the first is aligned to
+    // 1024, the second has no data.
     try testing.expectEqualSlices(u8, oracle[1536 .. 1536 + 512], &probe);
 
     for ([_]usize{ 1, 7, 511, 512, 513, 4096, logical_len }) |chunk| {

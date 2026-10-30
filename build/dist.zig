@@ -39,7 +39,7 @@ pub const units = blk: {
 fn archFilter(id: []const u8) ?[]const u8 {
     // Per-arch ids carry the arch in the last segment; `windows.gnu` and
     // `windows.msvc` are universal forms, not arch names.
-    if (std.mem.lastIndexOfScalar(u8, id, '.')) |last| {
+    if (std.mem.findScalarLast(u8, id, '.')) |last| {
         const segment = id[last + 1 ..];
         const non_arches = [_][]const u8{ "gnu", "msvc", "musl", "android", "ohos", "universal" };
         for (non_arches) |name| if (std.mem.eql(u8, segment, name)) return null;

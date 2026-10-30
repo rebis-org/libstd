@@ -298,7 +298,25 @@ pub const Runner = struct {
     invalid_status: u32 = 0,
     corrupt_status: u32 = 0,
     write_exact: bool = false,
+    // A scenario that verified only part of its property names what it could
+    // not check here; the runner reports it apart from a pass.
+    unverified: ?[]const u8 = null,
+    unverified_storage: [192]u8 = undefined,
 };
+
+// A reference oracle that cannot read a format leaves the scenario with the
+// status assertion alone. Say so where it happens so the report can count it.
+pub fn unverified(r: *Runner, reason: []const u8) void {
+    const length = @min(reason.len, r.unverified_storage.len);
+    @memcpy(r.unverified_storage[0..length], reason[0..length]);
+    r.unverified = r.unverified_storage[0..length];
+}
+
+pub fn unverifiedPrint(r: *Runner, comptime format: []const u8, args: anytype) void {
+    var writer: std.Io.Writer = std.Io.Writer.fixed(&r.unverified_storage);
+    writer.print(format, args) catch {};
+    r.unverified = writer.buffered();
+}
 
 pub fn node(bytes: ?[*]u8, capacity: u64) Node {
     var value = Node.init();

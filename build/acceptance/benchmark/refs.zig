@@ -233,6 +233,9 @@ fn addSevenZz(b: *std.Build) struct { sevenzz: *std.Build.Step.InstallFile, lzma
 fn addMakePair(b: *std.Build, cwd: []const u8, cmd_arg: []const u8, cmd_src: []const u8, cmd_name: []const u8, lib_arg: []const u8, lib_src: []const u8, lib_name: []const u8) MakePair {
     const make_cmd = make(b, cwd, &.{ "make", cmd_arg });
     const make_lib = make(b, cwd, &.{ "make", lib_arg });
+    // Both targets write one source tree, so they run in order: two parallel
+    // makes collided on the same object directory.
+    make_lib.step.dependOn(&make_cmd.step);
     return .{
         .cmd = installOut(b, &make_cmd.step, cmd_src, cmd_name),
         .lib = copyOut(b, &make_lib.step, lib_src, lib_name),
@@ -394,6 +397,11 @@ fn addDwarfsTools(b: *std.Build) struct { mkdwarfs: *std.Build.Step.InstallFile,
     cfg.appendSlice(b.allocator, &.{
         "-DCMAKE_BUILD_TYPE=Release",
         "-DNIXPKGS_DWARFS_VERSION_OVERRIDE=v0.11.3",
+        // A restored build tree caches libcrypto's Homebrew prefix, which a
+        // keg upgrade deletes; unset it so pkg-config answers again. The
+        // resolved library lives under its own prefix, not LIBCRYPTO_*.
+        "-ULIBCRYPTO*",
+        "-Upkgcfg_lib_LIBCRYPTO*",
         "-DWITH_FUSE_DRIVER=OFF",
         "-DWITH_TESTS=OFF",
         "-DWITH_BENCHMARKS=OFF",

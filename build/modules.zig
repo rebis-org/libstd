@@ -45,6 +45,7 @@ pub const oracles = Module{
 pub const interface = Module{ .name = "interface", .root = "src/interface/root.zig" };
 // The module root must sit at src/ for cross-directory imports; see fuzz.zig.
 pub const fuzz = Module{ .name = "fuzz", .root = "src/fuzz.zig", .imports = &.{.{ .name = "seam", .module = "seam" }}, .crc_kernel = true };
+pub const fuzz_campaign = Module{ .name = "fuzz_campaign", .root = "src/campaign.zig", .imports = &.{.{ .name = "seam", .module = "seam" }}, .crc_kernel = true };
 pub const implementations = Module{ .name = "implementations", .root = "src/impls.zig", .imports = &.{.{ .name = "seam", .module = "seam" }}, .crc_kernel = true };
 pub const trap = Module{
     .name = "trap",

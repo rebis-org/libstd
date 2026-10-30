@@ -65,12 +65,17 @@ jobs:
           # when the runner image's Homebrew packages change.
           formulae="autoconf automake bison libtool gettext pkg-config cmake boost fmt utf8cpp nlohmann-json libarchive xxhash zstd lz4 lzo xz brotli openssl@3"
           brew="$(brew list --versions $formulae 2>/dev/null | sort | sha256sum | cut -d' ' -f1 || true)"
+          # libcrypto is the dependency the keg list cannot name: Homebrew
+          # ships it as openssl@N and N moves with the runner image, so the
+          # restored CMake tree keeps an include path the upgrade deletes.
+          pkg="$(pkg-config --modversion libcrypto libarchive xxhash zstd 2>/dev/null | sha256sum | cut -d' ' -f1 || true)"
           {
             echo "zig=$zig"
             echo "vendor=$vendor"
             echo "source=$SOURCE_HASH"
             echo "cache=$cache"
             echo "brew=$brew"
+            echo "pkg=$pkg"
             echo "formulae=$formulae"
           } >> "$GITHUB_OUTPUT"
       - id: global
@@ -135,7 +140,7 @@ jobs:
         uses: ./.github/actions/restore
         with:
           path: zig-out/benchmark/build
-          key: vendor-build-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-${{ steps.keys.outputs.vendor }}-${{ steps.keys.outputs.brew }}-${{ hashFiles('build/vendor.zig', 'build/acceptance/benchmark/refs.zig') }}-${{ inputs.impl }}-${{ inputs.portable }}-${{ inputs.sanitizer }}${{ inputs.ubsan_shard }}
+          key: vendor-build-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-${{ steps.keys.outputs.vendor }}-${{ steps.keys.outputs.brew }}-${{ steps.keys.outputs.pkg }}-${{ hashFiles('build/vendor.zig', 'build/acceptance/benchmark/refs.zig') }}-${{ inputs.impl }}-${{ inputs.portable }}-${{ inputs.sanitizer }}${{ inputs.ubsan_shard }}
       - name: Provision the reference toolchains
         run: |
           missing=()
@@ -235,7 +240,7 @@ jobs:
         uses: ./.github/actions/save
         with:
           path: zig-out/benchmark/build
-          key: vendor-build-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-${{ steps.keys.outputs.vendor }}-${{ steps.keys.outputs.brew }}-${{ hashFiles('build/vendor.zig', 'build/acceptance/benchmark/refs.zig') }}-${{ inputs.impl }}-${{ inputs.portable }}-${{ inputs.sanitizer }}${{ inputs.ubsan_shard }}
+          key: vendor-build-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-${{ steps.keys.outputs.vendor }}-${{ steps.keys.outputs.brew }}-${{ steps.keys.outputs.pkg }}-${{ hashFiles('build/vendor.zig', 'build/acceptance/benchmark/refs.zig') }}-${{ inputs.impl }}-${{ inputs.portable }}-${{ inputs.sanitizer }}${{ inputs.ubsan_shard }}
           enabled: ${{ steps.vendor_build.outcome == 'success' && steps.vendor_build.outputs.cache-hit != 'true' }}
       - name: Save the benchmark cache
         uses: ./.github/actions/save

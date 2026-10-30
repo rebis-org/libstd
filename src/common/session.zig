@@ -1528,7 +1528,7 @@ fn fixedTableSweepReader(bytes: []const u8) Exception!void {
 
 const window_fixture = "0123456789abcdefghijklmn";
 
-test "SliceSource: bounded window, canary, parent stays valid" {
+test "slice source bounds its window and keeps the parent valid" {
     var src = SliceSource.init(window_fixture);
 
     var w = try src.slice(8, 8);
@@ -1550,7 +1550,7 @@ test "SliceSource: bounded window, canary, parent stays valid" {
     try testing.expectEqualStrings("0123", &buf);
 }
 
-test "SliceSource: discard positions, seekTo rewinds, end is exact" {
+test "slice source discard and seekTo keep the position exact" {
     var src = SliceSource.init(window_fixture);
 
     var buf: [3]u8 = undefined;
@@ -1572,7 +1572,7 @@ test "SliceSource: discard positions, seekTo rewinds, end is exact" {
     try testing.expectError(error.DataException, src.seekTo(window_fixture.len + 1));
 }
 
-test "SliceSource: out-of-bounds slice rejected at creation" {
+test "slice source rejects an out-of-bounds slice at creation" {
     var src = SliceSource.init(window_fixture);
     try testing.expectError(error.DataException, src.slice(17, 8));
     try testing.expectError(error.DataException, src.slice(25, 0));
@@ -1584,7 +1584,7 @@ test "SliceSource: out-of-bounds slice rejected at creation" {
     try testing.expectError(error.DataException, empty.discard(1));
 }
 
-test "ReaderSource: slice discards forward, canary stays unread" {
+test "reader source discards forward and leaves the canary unread" {
     var fixed: std.Io.Reader = .fixed(window_fixture);
     var src = ReaderSource.init(&fixed, window_fixture.len);
 
@@ -1608,7 +1608,7 @@ test "ReaderSource: slice discards forward, canary stays unread" {
     try testing.expectEqualStrings("ghijklmn", &tail);
 }
 
-test "ReaderSource: window exclusivity invalidates the parent" {
+test "reader source window invalidates its parent" {
     var fixed: std.Io.Reader = .fixed(window_fixture);
     var src = ReaderSource.init(&fixed, window_fixture.len);
 
@@ -1624,7 +1624,7 @@ test "ReaderSource: window exclusivity invalidates the parent" {
     try testing.expectEqualStrings("cdef", &buf);
 }
 
-test "ReaderSource: backward and out-of-bounds slice rejected" {
+test "reader source rejects a backward or out-of-bounds slice" {
     var fixed: std.Io.Reader = .fixed(window_fixture);
     var src = ReaderSource.init(&fixed, window_fixture.len);
 
@@ -1639,7 +1639,7 @@ test "ReaderSource: backward and out-of-bounds slice rejected" {
     try testing.expectError(error.DataException, src.slice(4, 4));
 }
 
-test "ReaderSource: declared window over truncated underlying fails on read" {
+test "reader source fails on read when its window exceeds the underlying" {
     var fixed: std.Io.Reader = .fixed(window_fixture[0..16]);
     var src = ReaderSource.init(&fixed, window_fixture.len);
 
@@ -1663,7 +1663,7 @@ test "source capabilities are declared by existence" {
     try testing.expect(Window.seek_cost == .none);
 }
 
-test "cursor: entry order and data are correct" {
+test "cursor yields entries in order with their data" {
     const fixture = comptime recordBytes(4, &fixed_table_records);
     var src = SliceSource.init(&fixture);
     var scratch: [16]u8 = undefined;
@@ -1690,7 +1690,7 @@ test "cursor: entry order and data are correct" {
     try testing.expect((try cursor.next()) == null);
 }
 
-test "cursor: readData and skipData consume the same region" {
+test "cursor read and skip consume the same region" {
     const fixture = comptime recordBytes(4, &fixed_table_records);
     var src_read = SliceSource.init(&fixture);
     var src_skip = SliceSource.init(&fixture);
@@ -1725,7 +1725,7 @@ test "cursor: readData and skipData consume the same region" {
     try testing.expectEqual(src_read.pos, src_skip.pos);
 }
 
-test "cursor: skipData sinks to Source.discard, not read-then-drop" {
+test "cursor skip sinks to the source discard path" {
     const fixture = comptime recordBytes(4, &fixed_table_records);
     var src = CountingSource(SliceSource){ .inner = SliceSource.init(&fixture) };
     var scratch: [16]u8 = undefined;
@@ -1739,7 +1739,7 @@ test "cursor: skipData sinks to Source.discard, not read-then-drop" {
     try testing.expectEqual(@as(usize, 1), src.discards);
 }
 
-test "cursor: name lifetime ends at next (scratch reuse observed)" {
+test "cursor name lifetime ends at the next entry" {
     const fixture = comptime recordBytes(4, &fixed_table_records);
     var src = SliceSource.init(&fixture);
     var scratch: [16]u8 = undefined;
@@ -1752,7 +1752,7 @@ test "cursor: name lifetime ends at next (scratch reuse observed)" {
     try testing.expectEqualStrings("gamma", second.name);
 }
 
-test "cursor: name capacity boundary, exact fit legal, overflow capacity" {
+test "cursor name capacity accepts an exact fit and reports overload" {
     const records = [_]Record{
         .{ .name = "abcd", .data = "xx" },
         .{ .name = "abcde", .data = "xx" },
@@ -1771,7 +1771,7 @@ test "cursor: name capacity boundary, exact fit legal, overflow capacity" {
     try testing.expectError(error.CapacityException, cursor.next());
 }
 
-test "cursor: truncation at every record boundary" {
+test "cursor reports truncation at every record boundary" {
     const full = comptime recordBytes(4, &fixed_table_records);
 
     // Inside the length field and inside the name: next() itself fails.
@@ -1801,7 +1801,7 @@ test "cursor: truncation at every record boundary" {
     }
 }
 
-test "Nested: fixed-table composition matches direct traversal" {
+test "nested fixed table matches direct traversal" {
     const N = Nested(TableOuter(SliceSource, &fixed_table_members), Identity, FixedRecords4);
 
     // Comptime wiring is witnessed by type identity:
@@ -1857,7 +1857,7 @@ test "Nested: fixed-table composition matches direct traversal" {
 
 // Every battery helper is exercised here first,
 // so a battery failure points at the property.
-test "assertions: infrastructure mechanics (tally, canary, cut matrix, mirrors)" {
+test "harness mechanics cover the tally, canary, cut matrix, and mirrors" {
     // The tally forwards through std.testing.allocator,
     // so leak checking stays armed while counters move.
     const Tally = struct {
@@ -1961,7 +1961,7 @@ test "assertions: infrastructure mechanics (tally, canary, cut matrix, mirrors)"
     );
 }
 
-test "fixed-table format: eight-property battery over both sources" {
+test "fixed-table format passes the eight-property battery over both sources" {
     // Local to the test block: the Allocator symbol never appears in non-test code.
     const Tally = struct {
         const Self = @This();
@@ -2012,7 +2012,7 @@ test "fixed-table format: eight-property battery over both sources" {
     try fixedTableProperties(&reader_base, &tally);
 }
 
-test "fixed-table format: skip mirrors read in the source counters" {
+test "fixed-table format skip mirrors read in the source counters" {
     // Slice side: each path gets its own base over the same fixture.
     {
         var read_cs = CountingSource(SliceSource){ .inner = SliceSource.init(&fixed_table_bytes) };
@@ -2032,7 +2032,7 @@ test "fixed-table format: skip mirrors read in the source counters" {
     }
 }
 
-test "chunked length-prefixed format: eight-property battery over both sources" {
+test "chunked length-prefixed format passes the eight-property battery over both sources" {
     // Local to the test block: the Allocator symbol never appears in non-test code.
     const Tally = struct {
         const Self = @This();
@@ -2083,7 +2083,7 @@ test "chunked length-prefixed format: eight-property battery over both sources" 
     try chunkedLpProperties(&reader_base, &tally);
 }
 
-test "chunked length-prefixed format: skip mirrors read and never decodes dropped payload" {
+test "chunked length-prefixed format skip mirrors read and never decodes the dropped payload" {
     // Slice side: each path gets its own base over the same wire.
     {
         var read_base = SliceSource.init(&chunked_lp_wire);
@@ -2101,12 +2101,12 @@ test "chunked length-prefixed format: skip mirrors read and never decodes droppe
     }
 }
 
-test "chunked length-prefixed format: truncation at every wire cut, both sources" {
+test "chunked length-prefixed format truncates at every wire cut for both sources" {
     try truncationSweep(&chunked_lp_wire, &chunked_lp_clean, chunkedLpSweepSlice);
     try truncationSweep(&chunked_lp_wire, &chunked_lp_clean, chunkedLpSweepReader);
 }
 
-test "chunked length-prefixed format: linear seek replays blocks and reopens cleanly" {
+test "chunked length-prefixed format linear seek replays blocks and reopens cleanly" {
     // The replay span and its wire cost derive from the record list.
     const record1_decoded = comptime lpBytesSize(chunked_lp_records[0..1]);
     const record1_wire = comptime chunkedBytesSize(lpBytesSize(chunked_lp_records[0..1]));
@@ -2157,7 +2157,7 @@ test "chunked length-prefixed format: linear seek replays blocks and reopens cle
     try testing.expectEqual(@as(u64, chunked_lp_decoded.len - record1_decoded), ts.decoded_bytes);
 }
 
-test "double-nested format: whole-stack battery over both sources" {
+test "double-nested format passes the whole-stack battery over both sources" {
     // Local to the test block: the Allocator symbol never appears in non-test code.
     const Tally = struct {
         const Self = @This();
@@ -2208,7 +2208,7 @@ test "double-nested format: whole-stack battery over both sources" {
     try doubleNestedProperties(&reader_base, &tally);
 }
 
-test "double-nested format: skip mirrors read through the whole stack" {
+test "double-nested format skip mirrors read through the whole stack" {
     // Slice side: each path gets its own base over the same bytes.
     {
         var read_base = SliceSource.init(&double_nested_base);
@@ -2226,7 +2226,7 @@ test "double-nested format: skip mirrors read through the whole stack" {
     }
 }
 
-test "double-nested format: per-layer truncation at every base cut, both sources" {
+test "double-nested format truncates at every base cut per layer for both sources" {
     // Any cut short of the full base fails,
     // at the outer location or inside the inner walk.
     try truncationSweep(&double_nested_base, &.{double_nested_base.len}, doubleNestedPayloadSweepSlice);
@@ -2245,7 +2245,7 @@ test "double-nested format: per-layer truncation at every base cut, both sources
     }
 }
 
-test "double-nested format: inner chain over the manually located source" {
+test "double-nested format inner chain follows the manually located source" {
     {
         var base = SliceSource.init(&double_nested_base);
         try doubleNestedManualOuterRun(SliceSource, &base);
@@ -2257,7 +2257,7 @@ test "double-nested format: inner chain over the manually located source" {
     }
 }
 
-test "double-nested format: inner-layer rejection with outer windows intact" {
+test "double-nested format rejects an inner layer with the outer windows intact" {
     // Slice side: value semantics keep the base untouched,
     // so the manifest still opens after the rejection.
     {
@@ -2317,7 +2317,7 @@ test "double-nested format: inner-layer rejection with outer windows intact" {
     }
 }
 
-test "boundary list: window end exact, one byte past is refused" {
+test "boundary list keeps the window end exact and refuses one byte past" {
     // Slice face: the window drains to its last byte and refuses the next;
     // the parent never moved.
     {
@@ -2368,7 +2368,7 @@ test "boundary list: window end exact, one byte past is refused" {
     }
 }
 
-test "boundary list: truncation at each layer boundary, both sources" {
+test "boundary list truncates at each layer boundary for both sources" {
     // Every cut of the plain-record member: record boundaries are clean,
     // everything else answers DataException.
     try truncationSweep(&fixed_table_bytes, &fixed_table_clean, fixedTableSweepSlice);
@@ -2407,7 +2407,7 @@ test "boundary list: truncation at each layer boundary, both sources" {
     try doubleNestedManifestSweepReader(double_nested_base[0..payload_offset]);
 }
 
-test "boundary list: zero-length and exactly-full names are legal" {
+test "boundary list accepts zero-length and exactly-full names" {
     // The legal pair: exact-fit, then zero-length. Slice face first.
     {
         var base = SliceSource.init(&name_fit_bytes);
@@ -2467,7 +2467,7 @@ test "boundary list: zero-length and exactly-full names are legal" {
     }
 }
 
-test "boundary list: cast paths map out-of-range u64 to DataException" {
+test "boundary list maps an out-of-range u64 cast to DataException" {
     // The exact conversion the protocol uses refuses out-of-range values;
     // the 32-bit rows run the same sites at real widths.
     try testing.expect(std.math.cast(u32, @as(u64, 1) << 40) == null);
@@ -2501,7 +2501,7 @@ test "boundary list: cast paths map out-of-range u64 to DataException" {
     }
 }
 
-test "boundary list: one transform, two sources, distinct types and capabilities" {
+test "boundary list keeps distinct types and capabilities for one transform over two sources" {
     comptime {
         // The base picks the policy, the transform derives its own answer,
         // the wrapper forwards.
@@ -2654,7 +2654,7 @@ fn InodeRecords(comptime Source: type, comptime data_len: usize) type {
     };
 }
 
-test "collapse: three-entry group folds repeats through the sink" {
+test "collapse folds a three-entry group through the sink" {
     // The counting wrapper observes the fold's routing:
     // taken proves repeats never left through take, discarded proves the sink.
     var src = CountingSource(SliceSource){ .inner = SliceSource.init(&inode_repeat_bytes) };
@@ -2700,7 +2700,7 @@ test "collapse: three-entry group folds repeats through the sink" {
     try testing.expectEqual(inode_repeat_records.len - 1, src.discards);
 }
 
-test "collapse: distinct inos match the bare cursor field by field" {
+test "collapse distinct inodes match the bare cursor field by field" {
     var src = SliceSource.init(&inode_distinct_bytes);
     const Inner = InodeRecords(SliceSource, 4);
     var scratch: [Inner.scratch_size]u8 = undefined;
@@ -2742,7 +2742,7 @@ test "collapse: distinct inos match the bare cursor field by field" {
     }
 }
 
-test "collapse: table exhaustion and bad table sizes are capacity answers" {
+test "collapse answers table exhaustion and bad sizes with capacity" {
     // One slot, two distinct groups: the second insert breaches the caller's bound.
     {
         var src = SliceSource.init(&inode_distinct_bytes);

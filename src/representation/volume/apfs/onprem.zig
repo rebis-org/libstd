@@ -818,7 +818,7 @@ const PlanNode = struct {
     ino: u64 = 0,
     data: []const u8 = &.{},
     parent: *PlanNode,
-    kids: std.ArrayListUnmanaged(*PlanNode) = .empty,
+    kids: std.ArrayList(*PlanNode) = .empty,
     rank: usize = 0,
 };
 
@@ -852,7 +852,7 @@ const WriterPlan = struct {
 fn componentValid(name: []const u8) bool {
     return name.len != 0 and name.len <= max_component_len and
         !std.mem.eql(u8, name, ".") and !std.mem.eql(u8, name, "..") and
-        std.mem.indexOfScalar(u8, name, 0) == null;
+        std.mem.findScalar(u8, name, 0) == null;
 }
 
 // The tree derives from the names, so entry order does not matter:
@@ -863,7 +863,7 @@ fn buildTree(entries: []const Entry, alloc: std.mem.Allocator) Exception!*PlanNo
     const parents = alloc.alloc(*PlanNode, entries.len) catch return error.ResourceException;
     for (entries, 0..) |entry, index| {
         if (entry.name.len == 0 or entry.name[0] == '/' or
-            std.mem.indexOfScalar(u8, entry.name, 0) != null) return error.UnsupportedException;
+            std.mem.findScalar(u8, entry.name, 0) != null) return error.UnsupportedException;
         var parent = root;
         var it = std.mem.splitScalar(u8, entry.name, '/');
         var depth: u32 = 1;
@@ -939,9 +939,9 @@ fn rankNode(node: *PlanNode, next_ino: *u64, is_root: bool) void {
 // so records need no sort. `files` parallels `extent_idx`.
 fn emitNodeRecords(
     node: *PlanNode,
-    records: *std.ArrayListUnmanaged(FsRec),
-    files: *std.ArrayListUnmanaged(*PlanNode),
-    extent_idx: *std.ArrayListUnmanaged(usize),
+    records: *std.ArrayList(FsRec),
+    files: *std.ArrayList(*PlanNode),
+    extent_idx: *std.ArrayList(usize),
     alloc: std.mem.Allocator,
 ) Exception!void {
     if (node.is_dir) {
@@ -965,7 +965,7 @@ fn emitNodeRecords(
 // Callers reserve the b-tree footer in the capacity because packNodes
 // cannot tell which span becomes the root.
 fn packNodes(costs: []const usize, capacity: usize, alloc: std.mem.Allocator) Exception![]LevelSpan {
-    var spans: std.ArrayListUnmanaged(LevelSpan) = .empty;
+    var spans: std.ArrayList(LevelSpan) = .empty;
     var start: u32 = 0;
     var used: usize = 0;
     for (costs, 0..) |cost, i| {
@@ -981,7 +981,7 @@ fn packNodes(costs: []const usize, capacity: usize, alloc: std.mem.Allocator) Ex
 }
 
 fn buildOmapLevels(first_keys: []const []const u8, alloc: std.mem.Allocator) Exception![]TreeLevel {
-    var levels: std.ArrayListUnmanaged(TreeLevel) = .empty;
+    var levels: std.ArrayList(TreeLevel) = .empty;
     const leaf_costs = alloc.alloc(usize, first_keys.len) catch return error.ResourceException;
     for (leaf_costs) |*cost| cost.* = 4 + 16 + 16;
     const capacity = writer_block_size - btree_node_header_size - btree_info_size;
@@ -1001,9 +1001,9 @@ fn buildOmapLevels(first_keys: []const []const u8, alloc: std.mem.Allocator) Exc
 
 fn makePlan(entries: []const Entry, alloc: std.mem.Allocator) Exception!WriterPlan {
     const root = try buildTree(entries, alloc);
-    var records_list: std.ArrayListUnmanaged(FsRec) = .empty;
-    var files: std.ArrayListUnmanaged(*PlanNode) = .empty;
-    var extent_idx: std.ArrayListUnmanaged(usize) = .empty;
+    var records_list: std.ArrayList(FsRec) = .empty;
+    var files: std.ArrayList(*PlanNode) = .empty;
+    var extent_idx: std.ArrayList(usize) = .empty;
     try emitNodeRecords(root, &records_list, &files, &extent_idx, alloc);
     const records = records_list.items;
 
@@ -1023,7 +1023,7 @@ fn makePlan(entries: []const Entry, alloc: std.mem.Allocator) Exception!WriterPl
     const leaf_capacity = writer_block_size - btree_node_header_size - btree_info_size;
     const leaf_spans = try packNodes(rec_costs, leaf_capacity, alloc);
 
-    var levels: std.ArrayListUnmanaged(TreeLevel) = .empty;
+    var levels: std.ArrayList(TreeLevel) = .empty;
     levels.append(alloc, .{ .first_keys = keys, .spans = leaf_spans }) catch return error.ResourceException;
 
     // Internal levels, bottom-up, until one node remains (the root).
@@ -1331,8 +1331,8 @@ test "apfs write roundtrips a multi-level tree" {
     var payloads: [150][12]u8 = undefined;
     var entries: [150]Entry = undefined;
     for (&names, &payloads, &entries, 0..) |*name, *payload, *entry, i| {
-        const text = std.fmt.bufPrint(name, "f{d:0>3}.txt", .{i}) catch unreachable;
-        const body = std.fmt.bufPrint(payload, "payload {d:0>3}", .{i}) catch unreachable;
+        const text = std.mem.print(name, "f{d:0>3}.txt", .{i}) catch unreachable;
+        const body = std.mem.print(payload, "payload {d:0>3}", .{i}) catch unreachable;
         entry.* = .{ .name = text, .data = body };
     }
     var scratch: [scratch_size]u8 = undefined;

@@ -1215,14 +1215,13 @@ fn runRarEncrypted(r: *Runner) anyerror!void {
 }
 
 fn rarToolOracle(r: *Runner) !void {
-    _ = r;
     const expected = [_]lib.ExpectedEntry{
         .{ .name = "test.txt", .data = rar_expected },
     };
     const result = lib.archiveReadMatches(&rar_fixture, &expected);
     if (result == .mismatch) return error.RarOracleMismatch;
     if (result == .unsupported) {
-        std.debug.print("rar tool oracle: unsupported (libarchive cannot read this rar fixture)\n", .{});
+        harness.unverified(r, "libarchive cannot read this rar fixture.");
     }
 }
 

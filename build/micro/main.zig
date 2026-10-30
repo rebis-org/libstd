@@ -179,6 +179,7 @@ test "micro cases stay runnable without runner" {
     var random = std.Random.DefaultPrng.init(0x5eed);
     var scratch: [4096]u8 = undefined;
     random.random().bytes(&scratch);
+    const original = scratch;
 
     const adler32_case: Adler32Case = .{ .input = &scratch };
     const crc32_case: Crc32Case = .{ .input = &scratch };
@@ -199,10 +200,12 @@ test "micro cases stay runnable without runner" {
     sha1_case.run(std.testing.allocator);
     sha256_case.run(std.testing.allocator);
     copy_match_case.run(std.testing.allocator);
+    // The copy ladder must have written matches into the window.
+    try std.testing.expect(!std.mem.eql(u8, &scratch, &original));
 
     const fixture = try std.testing.allocator.alloc(u8, 4096);
     defer std.testing.allocator.free(fixture);
-    @memcpy(fixture, &scratch);
+    @memcpy(fixture, &original);
     const enc_ws = try std.testing.allocator.alloc(u8, brotli.encode_workspace_size);
     defer std.testing.allocator.free(enc_ws);
     const compressed = try std.testing.allocator.alloc(u8, brotli.encodedSizeBound(fixture.len));
@@ -218,4 +221,6 @@ test "micro cases stay runnable without runner" {
         .scratch = dec_ws,
     };
     brotli_decode_case.run(std.testing.allocator);
+    // The case decodes what the encoder produced, byte for byte.
+    try std.testing.expectEqualSlices(u8, fixture, out);
 }

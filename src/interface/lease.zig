@@ -1,3 +1,5 @@
+const std = @import("std");
+
 const span_module = @import("span.zig");
 
 const ConstSpan = span_module.ConstSpan;
@@ -81,7 +83,7 @@ fn findSlotIndex(self: *Registry, leased: Lease) ?usize {
     return null;
 }
 
-test "a revoked slot is reusable" {
+test "lease reuse reclaims a revoked slot instead of appending" {
     var storage: [2]Registry.Slot = undefined;
     var registry = Registry.init(&storage);
     var memory: [8]u8 = undefined;
@@ -90,10 +92,58 @@ test "a revoked slot is reusable" {
         const held = try registry.lease(.{ .ptr = &memory, .len = memory.len });
         registry.revoke(held);
     }
-    // Two live leases still fit, and a third fails on capacity.
-    const first = try registry.lease(.{ .ptr = &memory, .len = memory.len });
-    var other: [8]u8 = undefined;
-    _ = try registry.lease(.{ .ptr = &other, .len = other.len });
-    registry.revoke(first);
-    _ = try registry.lease(.{ .ptr = &memory, .len = memory.len });
+    try std.testing.expectEqual(@as(usize, 1), registry.used);
+    try std.testing.expect(!registry.slots[0].live);
+}
+
+test "lease refuses a third live slot" {
+    var storage: [2]Registry.Slot = undefined;
+    var registry = Registry.init(&storage);
+    var first: [8]u8 = undefined;
+    var second: [8]u8 = undefined;
+    var third: [8]u8 = undefined;
+    _ = try registry.lease(.{ .ptr = &first, .len = first.len });
+    _ = try registry.lease(.{ .ptr = &second, .len = second.len });
+    try std.testing.expectError(error.ResourceException, registry.lease(.{ .ptr = &third, .len = third.len }));
+    try std.testing.expectEqual(@as(usize, 2), registry.used);
+}
+
+test "lease rejects empty memory and a live overlap, then accepts the range after revoke" {
+    var storage: [2]Registry.Slot = undefined;
+    var registry = Registry.init(&storage);
+    var memory: [8]u8 = undefined;
+    try std.testing.expectError(error.CallException, registry.lease(.{ .ptr = &memory, .len = 0 }));
+    const held = try registry.lease(.{ .ptr = &memory, .len = memory.len });
+    try std.testing.expectError(error.CallException, registry.lease(.{ .ptr = memory[4..].ptr, .len = 4 }));
+    registry.revoke(held);
+    const reused = try registry.lease(.{ .ptr = memory[4..].ptr, .len = 4 });
+    try std.testing.expect(reused.token != held.token);
+}
+
+test "lease tokens stay distinct when the counter wraps" {
+    var storage: [3]Registry.Slot = undefined;
+    var registry = Registry.init(&storage);
+    registry.next_token = std.math.maxInt(u64);
+    var memory: [3][8]u8 = undefined;
+    var tokens: [3]u64 = undefined;
+    for (0..3) |index| {
+        const held = try registry.lease(.{ .ptr = &memory[index], .len = memory[index].len });
+        tokens[index] = held.token;
+    }
+    for (tokens, 0..) |token, index| {
+        for (tokens[0..index]) |earlier| try std.testing.expect(token != earlier);
+    }
+}
+
+test "lease span and constSpan view the leased range" {
+    var storage: [1]Registry.Slot = undefined;
+    var registry = Registry.init(&storage);
+    var memory: [8]u8 = .{ 0, 1, 2, 3, 4, 5, 6, 7 };
+    const held = try registry.lease(.{ .ptr = &memory, .len = memory.len });
+    const view = registry.span(held, 2, 3);
+    try std.testing.expectEqual(@as(usize, 3), view.len);
+    try std.testing.expectEqual(@as(usize, @intFromPtr(&memory[2])), @intFromPtr(view.ptr));
+    try std.testing.expectEqualSlices(u8, &.{ 2, 3, 4 }, view.bytes());
+    const frozen = registry.constSpan(held, 6, 2);
+    try std.testing.expectEqualSlices(u8, &.{ 6, 7 }, frozen.bytes());
 }

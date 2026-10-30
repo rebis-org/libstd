@@ -48,7 +48,7 @@ fn checkForm(init: std.process.Init, archive: []const u8, comptime form: manifes
     const id = form.id;
     if (std.mem.startsWith(u8, id, "windows")) {
         for (form.entries) |entry| {
-            if (std.mem.indexOf(u8, entry, "/bin/") == null) continue;
+            if (std.mem.find(u8, entry, "/bin/") == null) continue;
             const arch = entry["libstd/bin/".len .. entry.len - "/std.dll".len];
             try requirePeMachine(init, archive, entry, machineOf(arch, true), error.invalid_windows_library);
         }
@@ -58,8 +58,8 @@ fn checkForm(init: std.process.Init, archive: []const u8, comptime form: manifes
         std.mem.startsWith(u8, id, "linux.musl"))
     {
         for (form.entries) |entry| {
-            if (std.mem.indexOf(u8, entry, "/libstd.so") == null and std.mem.indexOf(u8, entry, "/libstd.dylib") == null) continue;
-            const basename = if (std.mem.indexOf(u8, entry, "/libstd.so") != null) "/libstd.so" else "/libstd.dylib";
+            if (std.mem.find(u8, entry, "/libstd.so") == null and std.mem.find(u8, entry, "/libstd.dylib") == null) continue;
+            const basename = if (std.mem.find(u8, entry, "/libstd.so") != null) "/libstd.so" else "/libstd.dylib";
             const arch = entry["libstd/lib/".len .. entry.len - basename.len];
             try requireElfMachine(init, archive, entry, machineOf(arch, false), error.invalid_elf_library);
         }

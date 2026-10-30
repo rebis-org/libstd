@@ -47,7 +47,7 @@ fn report(subject: Subject, noise_t: f64, io: std.Io, pool: []u64, random: std.R
     const mr = mean(subject.random_ns);
     const verdict = if (@abs(t) > threshold or max_partition > threshold) "SUSPECTED LEAK" else "constant-time (no leak detected)";
     var buf: [256]u8 = undefined;
-    const line = std.fmt.bufPrint(&buf, "{s}: fixed {d:.1} ns, random {d:.1} ns, delta {d:.2} ns, t {d:.2}, partition max-t {d:.2}, noise-floor t {d:.2} -> {s}\n", .{
+    const line = std.mem.print(&buf, "{s}: fixed {d:.1} ns, random {d:.1} ns, delta {d:.2} ns, t {d:.2}, partition max-t {d:.2}, noise-floor t {d:.2} -> {s}\n", .{
         subject.name, mf, mr, mf - mr, t, max_partition, noise_t, verdict,
     }) catch unreachable;
     try std.Io.File.stdout().writeStreamingAll(io, line);
