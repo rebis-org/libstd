@@ -11,6 +11,7 @@ const vocabulary = @import("../kernel/vocabulary.zig");
 const age_seam = @import("../representation/grammar/age/seam.zig");
 const cpio = @import("../representation/grammar/cpio/onprem.zig");
 const cpio_seam = @import("../representation/grammar/cpio/seam.zig");
+const pkg = @import("../representation/grammar/pkg/onprem.zig");
 const rar = @import("../representation/grammar/rar/onprem.zig");
 const rar_writer = @import("../representation/grammar/rar/writer.zig");
 const seven_zip = @import("../representation/grammar/sevenzip/onprem.zig");
@@ -488,6 +489,86 @@ pub fn xipHook(invocation: *common.Invocation) Exception!void {
         try common.requireSinkCapacity(sink_resource, call, required);
         const target = try SinkTarget.open(sink_resource, &workspace, required);
         const written = try xip_seam.encode(plan.provider, entries, target.output, scratch);
+        response.byte_length = try target.publish(sink_resource, call, written);
+    } else {
+        return error.UnsupportedException;
+    }
+}
+
+fn fillPkgEntry(entry: *pkg.Entry, node: *Node, _: NoCtx) Exception!void {
+    const parts = try entryNameData(node.child);
+    const uid: u32 = if (cpioSelector("entry_uid", node.child)) |n| blk: {
+        break :blk try narrow(u32, n.value_low);
+    } else 0;
+    const mtime = node_graph.parseU64(cpioSelector("entry_mtime", node.child));
+    entry.* = .{ .name = parts.name, .data = parts.data, .uid = uid, .modification_time = mtime };
+}
+
+// The write path emits deterministic gzip; the read side sniffs,
+// so every archive reads back.
+const pkg_write_compression: pkg.Compression = .gzip;
+
+pub fn pkgHook(invocation: *common.Invocation) Exception!void {
+    const plan = &invocation.plan;
+    const call = invocation.call;
+    const response = invocation.response;
+    const source_resource = invocation.source;
+    const sink = invocation.sink;
+    const sizing = plan.sizing;
+    const commit = plan.commit;
+    const limits = plan.limits;
+    const command_mask = plan.command_mask;
+    _ = sizing;
+    var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
+    if (command_mask == vocabulary.command_mask_read) {
+        const archive = try materializeArchive(source_resource, &workspace, limits);
+        if (sink == null) {
+            const scratch = try workspace.take(u8, pkg.scratch_size);
+            if (try projectedEntrySize(call.request)) |ordinal| {
+                const entry = try pkg.inspectOrdinal(archive, ordinal, scratch);
+                response.byte_length = entry.size;
+                return;
+            }
+            if (try projectedEntryMetadata(call.request)) |ordinal| {
+                const entry = try pkg.inspectOrdinal(archive, ordinal, scratch);
+                try publishEntryMetadata(call, response, .{
+                    .name = entry.name,
+                    .size = entry.size,
+                    .mtime = entry.modification_time,
+                    .uid = entry.uid,
+                });
+                return;
+            }
+            const count = try pkg.inspectCount(archive, scratch);
+            response.byte_length = count;
+            return;
+        }
+        const head = try readHead(sink, call, commit);
+        const sink_resource = head.sink;
+        const ordinal = head.ordinal;
+        const scratch = try workspace.take(u8, pkg.scratch_size);
+        const entry = try pkg.inspectOrdinal(archive, ordinal, scratch);
+        const size = std.math.cast(usize, entry.size) orelse return error.ResourceException;
+        if (size > limits.decoded_bytes) return error.ResourceException;
+        try common.requireSinkCapacity(sink_resource, call, size);
+        const target = try SinkTarget.open(sink_resource, &workspace, size);
+        _ = try pkg.decodeOrdinal(archive, ordinal, target.output, scratch);
+        _ = try target.publish(sink_resource, call, size);
+        response.byte_length = size;
+    } else if (command_mask == vocabulary.command_mask_write) {
+        try requireVerified(commit);
+        const entries = try collectEntries(pkg.Entry, call.request, &workspace, NoCtx{}, fillPkgEntry);
+        const content_len = std.math.cast(usize, try cpio.archiveSize(entries)) orelse return error.ResourceException;
+        const scratch = try workspace.take(u8, pkg.writeScratchSize(content_len, pkg_write_compression));
+        const required = try pkg.archiveSize(entries, scratch, pkg_write_compression);
+        if (sink == null) {
+            response.byte_length = required;
+            return;
+        }
+        const sink_resource = sink.?;
+        try common.requireSinkCapacity(sink_resource, call, required);
+        const target = try SinkTarget.open(sink_resource, &workspace, required);
+        const written = try pkg.encode(entries, target.output, scratch, pkg_write_compression);
         response.byte_length = try target.publish(sink_resource, call, written);
     } else {
         return error.UnsupportedException;
