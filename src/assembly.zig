@@ -68,6 +68,7 @@ pub const grammar = struct {
     // The generated tag keeps the wire name's hyphen; the module keeps the
     // existing directory name.
     pub const lzma_file = @import("representation/grammar/lzma/onprem.zig");
+    pub const pkg = @import("representation/grammar/pkg/onprem.zig");
     pub const rar = struct {
         pub const onprem = @import("representation/grammar/rar/onprem.zig");
         pub const writer = @import("representation/grammar/rar/writer.zig");
@@ -131,6 +132,7 @@ pub fn namespaceFor(comptime tag: components.ProfileTag) ?type {
         .lzma2 => leaf.lzma2,
         .lzo => leaf.lzo,
         .ppmd => leaf.ppmd,
+        .pkg => grammar.pkg,
         .rar => grammar.rar,
         .sevenzip => grammar.sevenzip,
         .squashfs => volume.squashfs,

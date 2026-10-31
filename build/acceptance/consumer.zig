@@ -10,7 +10,7 @@ const bypass = libstd.bypass;
 
 test "assembly descriptor projection covers every representation descriptor" {
     // The projection excludes exactly the three protocol fixtures.
-    try std.testing.expectEqual(@as(usize, 31), assembly.descriptors.len);
+    try std.testing.expectEqual(@as(usize, 32), assembly.descriptors.len);
     try std.testing.expect(!@hasDecl(assembly.leaf, "test_echo"));
     try std.testing.expect(!@hasDecl(assembly.leaf, "test_read"));
     try std.testing.expect(!@hasDecl(assembly.grammar, "crypto"));
@@ -55,6 +55,31 @@ test "xip roundtrip through assembly" {
     try std.testing.expectEqualSlices(u8, "Xcode.app/Contents/Info.plist", first.name);
     var out: [16]u8 = undefined;
     const size = try xip.decodeOrdinal(archive[0..written], 1, &out, scratch);
+    try std.testing.expectEqualSlices(u8, "mach-o bytes", out[0..size]);
+}
+
+test "pkg roundtrip through assembly" {
+    const pkg = assembly.grammar.pkg;
+    const entries = [_]pkg.Entry{
+        .{ .name = "Applications/Tool.app/Contents/Info.plist", .data = "plist bytes" },
+        .{ .name = "Applications/Tool.app/Contents/MacOS/Tool", .data = "mach-o bytes" },
+    };
+    const content_len: usize = @intCast(try assembly.grammar.cpio.archiveSize(&entries));
+    const write_scratch = try std.testing.allocator.alloc(u8, pkg.writeScratchSize(content_len, .gzip));
+    defer std.testing.allocator.free(write_scratch);
+    const read_scratch = try std.testing.allocator.alloc(u8, pkg.scratch_size);
+    defer std.testing.allocator.free(read_scratch);
+    const planned = try pkg.archiveSize(&entries, write_scratch, .gzip);
+    const archive = try std.testing.allocator.alloc(u8, planned);
+    defer std.testing.allocator.free(archive);
+    const written = try pkg.encode(&entries, archive, write_scratch, .gzip);
+    try std.testing.expectEqual(planned, written);
+    try std.testing.expectEqualSlices(u8, "xar!", archive[0..4]);
+    try std.testing.expectEqual(@as(u64, 2), try pkg.inspectCount(archive[0..written], read_scratch));
+    const first = try pkg.inspectOrdinal(archive[0..written], 0, read_scratch);
+    try std.testing.expectEqualSlices(u8, "Applications/Tool.app/Contents/Info.plist", first.name);
+    var out: [16]u8 = undefined;
+    const size = try pkg.decodeOrdinal(archive[0..written], 1, &out, read_scratch);
     try std.testing.expectEqualSlices(u8, "mach-o bytes", out[0..size]);
 }
 

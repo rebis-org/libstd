@@ -11,6 +11,7 @@ const age = @import("../../representation/grammar/age/onprem.zig");
 const cpio = @import("../../representation/grammar/cpio/onprem.zig");
 const gzip = @import("../../representation/grammar/gzip/onprem.zig");
 const lzma_alone = @import("../../representation/grammar/lzma/onprem.zig");
+const pkg = @import("../../representation/grammar/pkg/onprem.zig");
 const rar = @import("../../representation/grammar/rar/onprem.zig");
 const sevenzip = @import("../../representation/grammar/sevenzip/onprem.zig");
 const tar = @import("../../representation/grammar/tar/onprem.zig");
@@ -192,6 +193,17 @@ pub fn runXip(data: []const u8) anyerror!void {
     _ = xip.decodeOrdinal(data, 0, out[0..size], scratch) catch {};
 }
 
+pub fn runPkg(data: []const u8) anyerror!void {
+    const scratch = try std.heap.page_allocator.alloc(u8, pkg.scratch_size);
+    defer std.heap.page_allocator.free(scratch);
+    const count = pkg.inspectCount(data, scratch) catch return;
+    if (count == 0) return;
+    const info = pkg.inspectOrdinal(data, 0, scratch) catch return;
+    const size: usize = @intCast(@min(info.size, max_output));
+    var out: [max_output]u8 = undefined;
+    _ = pkg.decodeOrdinal(data, 0, out[0..size], scratch) catch {};
+}
+
 pub fn runAge(data: []const u8) anyerror!void {
     const scratch = try std.heap.page_allocator.alloc(u8, age.scratch_size);
     defer std.heap.page_allocator.free(scratch);
@@ -282,6 +294,7 @@ pub const targets = [_]Target{
     .{ .name = "wim", .seed = wim_magic_seed, .run = runWim },
     .{ .name = "xar", .seed = xar_magic_seed, .run = runXar },
     .{ .name = "xip", .seed = xar_magic_seed, .run = runXip },
+    .{ .name = "pkg", .seed = xar_magic_seed, .run = runPkg },
     .{ .name = "age", .seed = age_magic_seed, .run = runAge },
     .{ .name = "iso", .seed = iso_magic_seed, .run = runIso },
     .{ .name = "squashfs", .seed = squashfs_magic_seed, .run = runSquashfs },

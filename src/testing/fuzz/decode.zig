@@ -143,6 +143,14 @@ test "fuzz xip decode" {
     }.f, .{ .corpus = &.{} });
 }
 
+test "fuzz pkg decode" {
+    try testing.fuzz({}, struct {
+        fn f(_: void, smith: *testing.Smith) anyerror!void {
+            try drive(smith, targets.runPkg);
+        }
+    }.f, .{ .corpus = &.{} });
+}
+
 test "fuzz age decode" {
     try testing.fuzz({}, struct {
         fn f(_: void, smith: *testing.Smith) anyerror!void {
