@@ -447,6 +447,206 @@ pub fn decodeOrdinal(archive: []const u8, ordinal: u64, output: []u8) Exception!
     return size;
 }
 
+// Fields a forward walk can state; EntryInfo keeps the offsets.
+pub const RecordInfo = struct {
+    name: []const u8,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    size: u64,
+    modification_time: u64,
+    ordinal: u64,
+    ino: u32,
+    nlink: u32,
+};
+
+fn paddingTo(offset: u64, alignment: u64) u64 {
+    const rem = offset % alignment;
+    return if (rem == 0) 0 else alignment - rem;
+}
+
+const RecordHeader = struct {
+    ino: u32,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    modification_time: u64,
+    data_size: u64,
+    namesize: u64,
+    nlink: u32,
+    name_align: u64,
+    data_align: u64,
+    check: u32,
+    is_crc: bool,
+};
+
+// The session Inner role: a forward-only cursor over any source.
+// Skipped records sink through discard, never through a decode.
+pub fn Inner(comptime Source: type) type {
+    return struct {
+        const Self = @This();
+
+        // The name buffer: the size a nested container must accept.
+        pub const scratch_size: usize = 4096;
+
+        source: *Source,
+        name_buf: []u8,
+        ordinal: u64 = 0,
+        // The decoded-stream position drives the padding arithmetic.
+        stream_pos: u64 = 0,
+        pending: bool = false,
+        data_size: u64 = 0,
+        data_align: u64 = 0,
+        check: u32 = 0,
+        is_crc: bool = false,
+        done: bool = false,
+
+        pub fn open(source: *Source, scratch: []u8) Exception!Self {
+            if (scratch.len < scratch_size) return error.CapacityException;
+            return .{ .source = source, .name_buf = scratch[0..scratch_size] };
+        }
+
+        pub fn next(self: *Self) Exception!?RecordInfo {
+            // A stream ends at its trailer; a later call stays ended.
+            if (self.done) return null;
+            // An unconsumed record is finished here so every next() starts
+            // at a record boundary.
+            if (self.pending) _ = try self.skipData();
+            var magic: [6]u8 = undefined;
+            try self.readExact(&magic);
+            const header = try self.readHeader(magic);
+            if (header.namesize == 0 or header.namesize > self.name_buf.len) return error.DataException;
+            const name_bytes = self.name_buf[0..@intCast(header.namesize)];
+            try self.readExact(name_bytes);
+            if (name_bytes[name_bytes.len - 1] != 0) return error.DataException;
+            const name = try parseRecordName(name_bytes);
+            try self.discardPadding(header.name_align);
+            if (std.mem.eql(u8, name, trailer_name)) {
+                if (header.data_size != 0) return error.DataException;
+                self.done = true;
+                return null;
+            }
+            const info = RecordInfo{
+                .name = name,
+                .mode = header.mode,
+                .uid = header.uid,
+                .gid = header.gid,
+                .size = header.data_size,
+                .modification_time = header.modification_time,
+                .ordinal = self.ordinal,
+                .ino = header.ino,
+                .nlink = header.nlink,
+            };
+            self.ordinal = try bounds.addU64(self.ordinal, 1);
+            self.pending = true;
+            self.data_size = header.data_size;
+            self.data_align = header.data_align;
+            self.check = header.check;
+            self.is_crc = header.is_crc;
+            return info;
+        }
+
+        pub fn readData(self: *Self, writer: *std.Io.Writer) Exception!usize {
+            if (!self.pending) return error.CallException;
+            const budget: usize = std.math.cast(usize, self.data_size) orelse return error.ResourceException;
+            var staged: [512]u8 = undefined;
+            var total: usize = 0;
+            var sum: u32 = 0;
+            while (total < budget) {
+                const want = @min(budget - total, staged.len);
+                const got = try self.source.take(staged[0..want]);
+                // A source that stops inside the record is truncated.
+                if (got == 0) return error.DataException;
+                if (self.is_crc) {
+                    for (staged[0..got]) |byte| sum +%= byte;
+                }
+                writer.writeAll(staged[0..got]) catch |err| switch (err) {
+                    error.WriteFailed => return error.IoException,
+                };
+                total += got;
+                self.stream_pos += got;
+            }
+            self.pending = false;
+            if (self.is_crc and sum != self.check) return error.IntegrityException;
+            try self.discardPadding(self.data_align);
+            return total;
+        }
+
+        // The sink is Source.discard, never pull-and-drop; a skipped
+        // record carries no checksum.
+        pub fn skipData(self: *Self) Exception!usize {
+            if (!self.pending) return 0;
+            const n: usize = std.math.cast(usize, self.data_size) orelse return error.ResourceException;
+            try self.source.discard(n);
+            self.stream_pos = try bounds.addU64(self.stream_pos, n);
+            self.pending = false;
+            try self.discardPadding(self.data_align);
+            return n;
+        }
+
+        // Both ASCII headers: a payload may carry newc or the portable odc.
+        fn readHeader(self: *Self, magic: [6]u8) Exception!RecordHeader {
+            if (std.mem.eql(u8, &magic, "070707")) {
+                var bytes: [odc_header_size]u8 = undefined;
+                @memcpy(bytes[0..6], &magic);
+                try self.readExact(bytes[6..]);
+                const header = try parseOdcHeader(&bytes);
+                return .{
+                    .ino = header.ino,
+                    .mode = header.mode,
+                    .uid = header.uid,
+                    .gid = header.gid,
+                    .modification_time = header.modification_time,
+                    .data_size = header.data_size,
+                    .namesize = header.namesize,
+                    .nlink = header.nlink,
+                    .name_align = 1,
+                    .data_align = 1,
+                    .check = 0,
+                    .is_crc = false,
+                };
+            }
+            if (!std.mem.eql(u8, &magic, "070701") and !std.mem.eql(u8, &magic, "070702")) return error.DataException;
+            var bytes: [record_header_size]u8 = undefined;
+            @memcpy(bytes[0..6], &magic);
+            try self.readExact(bytes[6..]);
+            const header = try parseNewcHeader(&bytes);
+            return .{
+                .ino = header.ino,
+                .mode = header.mode,
+                .uid = header.uid,
+                .gid = header.gid,
+                .modification_time = header.modification_time,
+                .data_size = header.data_size,
+                .namesize = header.namesize,
+                .nlink = header.nlink,
+                .name_align = 4,
+                .data_align = 4,
+                .check = header.check,
+                .is_crc = header.is_crc,
+            };
+        }
+
+        fn readExact(self: *Self, destination: []u8) Exception!void {
+            var written: usize = 0;
+            while (written < destination.len) {
+                const got = try self.source.take(destination[written..]);
+                // A source that stops inside a fixed field is truncated.
+                if (got == 0) return error.DataException;
+                written += got;
+                self.stream_pos += got;
+            }
+        }
+
+        fn discardPadding(self: *Self, alignment: u64) Exception!void {
+            const pad = paddingTo(self.stream_pos, alignment);
+            if (pad == 0) return;
+            try self.source.discard(pad);
+            self.stream_pos += pad;
+        }
+    };
+}
+
 test "cpio newc roundtrips entries and metadata" {
     const testing = std.testing;
     const entries = [_]Entry{
@@ -606,4 +806,107 @@ test "cpio crc format validates checksum over file data" {
     const n = try decodeOrdinal(&archive, 0, &out);
     try testing.expectEqualSlices(u8, "data", out[0..n]);
     try testing.expectError(error.DataException, inspectCount(&bad));
+}
+
+// A test source whose take and discard counters prove where a skip sinks.
+const TestSource = struct {
+    bytes: []const u8,
+    pos: usize = 0,
+    takes: usize = 0,
+    discards: usize = 0,
+
+    fn take(self: *TestSource, buf: []u8) Exception!usize {
+        self.takes += 1;
+        const n = @min(self.bytes.len - self.pos, buf.len);
+        @memcpy(buf[0..n], self.bytes[self.pos..][0..n]);
+        self.pos += n;
+        return n;
+    }
+
+    fn discard(self: *TestSource, n: u64) Exception!void {
+        self.discards += 1;
+        const count = std.math.cast(usize, n) orelse return error.DataException;
+        if (count > self.bytes.len - self.pos) return error.DataException;
+        self.pos += count;
+    }
+};
+
+test "cpio Inner walks a newc stream to its trailer" {
+    const testing = std.testing;
+    const entries = [_]Entry{
+        .{ .name = "first.txt", .data = "one", .uid = 3 },
+        .{ .name = "second.bin", .data = "two two", .mode = 0o100755 },
+    };
+    var archive: [4096]u8 = undefined;
+    const written = try encode(&entries, &archive);
+    var source = TestSource{ .bytes = archive[0..written] };
+    var scratch: [Inner(TestSource).scratch_size]u8 = undefined;
+    var cursor = try Inner(TestSource).open(&source, &scratch);
+
+    const first = (try cursor.next()) orelse return error.UnexpectedEnd;
+    try testing.expectEqualSlices(u8, "first.txt", first.name);
+    try testing.expectEqual(@as(u64, 3), first.size);
+    try testing.expectEqual(@as(u32, 3), first.uid);
+    var decoded: [16]u8 = undefined;
+    var sink = std.Io.Writer.fixed(&decoded);
+    try testing.expectEqual(@as(usize, 3), try cursor.readData(&sink));
+    try testing.expectEqualSlices(u8, "one", decoded[0..3]);
+
+    // A skip sinks through discard, never pull-and-drop.
+    const second = (try cursor.next()) orelse return error.UnexpectedEnd;
+    try testing.expectEqualSlices(u8, "second.bin", second.name);
+    try testing.expectEqual(@as(u64, 7), second.size);
+    const takes_before = source.takes;
+    try testing.expectEqual(@as(usize, 7), try cursor.skipData());
+    try testing.expectEqual(takes_before, source.takes);
+    try testing.expect(source.discards > 0);
+
+    // The trailer ends the stream, and a later call stays ended.
+    try testing.expect(try cursor.next() == null);
+    try testing.expect(try cursor.next() == null);
+}
+
+test "cpio Inner walks an odc stream" {
+    const testing = std.testing;
+    const entries = [_]Entry{.{ .name = "odc/entry", .data = "odd" }};
+    var archive: [1024]u8 = undefined;
+    const written = try encodeOdc(&entries, &archive);
+    var source = TestSource{ .bytes = archive[0..written] };
+    var scratch: [Inner(TestSource).scratch_size]u8 = undefined;
+    var cursor = try Inner(TestSource).open(&source, &scratch);
+    const info = (try cursor.next()) orelse return error.UnexpectedEnd;
+    try testing.expectEqualSlices(u8, "odc/entry", info.name);
+    try testing.expectEqual(@as(u64, 3), info.size);
+    var decoded: [8]u8 = undefined;
+    var sink = std.Io.Writer.fixed(&decoded);
+    try testing.expectEqual(@as(usize, 3), try cursor.readData(&sink));
+    try testing.expectEqualSlices(u8, "odd", decoded[0..3]);
+    try testing.expect(try cursor.next() == null);
+}
+
+test "cpio Inner rejects a stream that ends without a trailer" {
+    const testing = std.testing;
+    const entries = [_]Entry{.{ .name = "a", .data = "data" }};
+    var archive: [1024]u8 = undefined;
+    const written = try encode(&entries, &archive);
+    // The cuts land before the trailer, inside its header, and inside its name.
+    const info = try inspectOrdinal(archive[0..written], 0);
+    const record_end = std.mem.alignForward(u64, info.data_offset + info.size, 4);
+    for ([_]u64{ record_end, record_end + 50, record_end + 113 }) |cut| {
+        var source = TestSource{ .bytes = archive[0..@intCast(cut)] };
+        var scratch: [Inner(TestSource).scratch_size]u8 = undefined;
+        var cursor = try Inner(TestSource).open(&source, &scratch);
+        _ = try cursor.next();
+        try testing.expectError(error.DataException, cursor.next());
+    }
+}
+
+test "cpio Inner rejects a short scratch" {
+    const testing = std.testing;
+    const entries = [_]Entry{.{ .name = "a", .data = "b" }};
+    var archive: [1024]u8 = undefined;
+    const written = try encode(&entries, &archive);
+    var source = TestSource{ .bytes = archive[0..written] };
+    var short: [16]u8 = undefined;
+    try testing.expectError(error.CapacityException, Inner(TestSource).open(&source, &short));
 }

@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const entry_prim = @import("../../../common/entry.zig");
+const session = @import("../../../common/session.zig");
 const bounds = @import("../../../common/primitive/bounds.zig");
 const checksum = @import("../../../common/primitive/checksum.zig");
 const exception_prim = @import("../../../common/primitive/exception.zig");
@@ -8,6 +9,7 @@ const io = @import("../../../common/primitive/io.zig");
 const cpio = @import("../cpio/onprem.zig");
 const xar = @import("../xar/onprem.zig");
 const xz = @import("../xz/onprem.zig");
+const pbzx = @import("pbzx.zig");
 
 pub const Entry = entry_prim.Entry;
 const Exception = exception_prim.Exception;
@@ -21,14 +23,29 @@ pub const block_size_max: usize = 16 << 20;
 pub const block_size_write: u64 = 1 << 20;
 // An in-place decode keeps no dictionary mirror, so this only seeds the
 // workspace formula; the value is what pkgbuild writes.
-const dictionary_seed: u32 = 8 << 20;
+pub const dictionary_seed: u32 = 8 << 20;
 const name_max: usize = 4096;
-const chunk_header_size: u64 = 16;
-const pbzx_header_size: u64 = 12;
+pub const chunk_header_size: u64 = 16;
+pub const pbzx_header_size: u64 = 12;
 const member_name = "Content";
-const xz_magic = [6]u8{ 0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00 };
+pub const xz_magic = [6]u8{ 0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00 };
 
 pub const scratch_size: usize = xar.scratch_size + block_size_max + xz.decodeInPlaceWorkspaceSize(dictionary_seed) + name_max;
+
+// The read side is one session chain: XAR locates Content,
+// pbzx decodes the chunks, cpio walks the records.
+const Chain = session.Nested(xar.Outer, pbzx.Pbzx, cpio.Inner);
+
+comptime {
+    if (Chain.scratch_size != scratch_size) @compileError("xip: the session chain no longer matches the frozen scratch budget");
+}
+
+// The write side needs only the XML staging area; the check keeps the
+// old whole-budget answer for a short buffer.
+fn tocArea(scratch: []u8) Exception![]u8 {
+    if (scratch.len < scratch_size) return error.ResourceException;
+    return scratch[0..xar.scratch_size];
+}
 
 pub const EntryInfo = struct {
     name: []const u8,
@@ -44,259 +61,6 @@ pub const EntryInfo = struct {
     link_ordinal: ?u64 = null,
 };
 
-const Parts = struct {
-    toc: []u8,
-    chunk: []u8,
-    workspace: []u8,
-    name: []u8,
-};
-
-// One caller slice carries four regions: the XAR scratch, the chunk the
-// cursor decodes, the xz window, and the reported name.
-fn splitScratch(scratch: []u8) Exception!Parts {
-    if (scratch.len < scratch_size) return error.ResourceException;
-    const workspace_size = xz.decodeInPlaceWorkspaceSize(dictionary_seed);
-    const chunk_start = xar.scratch_size;
-    const workspace_start = chunk_start + block_size_max;
-    const name_start = workspace_start + workspace_size;
-    return .{
-        .toc = scratch[0..chunk_start],
-        .chunk = scratch[chunk_start..workspace_start],
-        .workspace = scratch[workspace_start..name_start],
-        .name = scratch[name_start..][0..name_max],
-    };
-}
-
-fn paddingTo(offset: u64, alignment: u64) u64 {
-    const rem = offset % alignment;
-    return if (rem == 0) 0 else alignment - rem;
-}
-
-// The pbzx chunk cursor. Reads run forward only, so a chunk the reader
-// never touches drops on its declared size without a decode.
-const Content = struct {
-    pbzx: []const u8,
-    block_size: u64,
-    buffer: []u8,
-    workspace: []u8,
-    cursor: u64 = pbzx_header_size,
-    chunk_start: u64 = 0,
-    chunk_len: u64 = 0,
-    payload_start: u64 = 0,
-    payload_len: u64 = 0,
-    loaded: bool = false,
-    byte_pos: u64 = 0,
-    ordinal: u64 = 0,
-    // Tests read these to prove that a skip decodes nothing.
-    decoded_chunks: u64 = 0,
-    decoded_bytes: u64 = 0,
-
-    fn init(pbzx: []const u8, buffer: []u8, workspace: []u8) Exception!Content {
-        if (pbzx.len < pbzx_header_size) return error.DataException;
-        if (!std.mem.eql(u8, pbzx[0..4], "pbzx")) return error.UnsupportedException;
-        const block_size = std.mem.readInt(u64, pbzx[4..12], .big);
-        if (block_size == 0) return error.DataException;
-        return .{ .pbzx = pbzx, .block_size = block_size, .buffer = buffer, .workspace = workspace };
-    }
-
-    fn nextChunk(self: *Content) Exception!bool {
-        if (self.cursor == self.pbzx.len) return false;
-        const header = try bounds.slice(self.pbzx, self.cursor, chunk_header_size);
-        const decoded_size = std.mem.readInt(u64, header[0..8], .big);
-        const stored_size = std.mem.readInt(u64, header[8..16], .big);
-        if (decoded_size == 0 or decoded_size > self.block_size) return error.DataException;
-        if (decoded_size > self.buffer.len) return error.ResourceException;
-        const payload_start = try bounds.addU64(self.cursor, chunk_header_size);
-        _ = try bounds.slice(self.pbzx, payload_start, stored_size);
-        // Chunks arrive in order, so the previous end starts the next one.
-        self.chunk_start = try bounds.addU64(self.chunk_start, self.chunk_len);
-        self.chunk_len = decoded_size;
-        self.payload_start = payload_start;
-        self.payload_len = stored_size;
-        self.loaded = false;
-        self.cursor = try bounds.addU64(payload_start, stored_size);
-        return true;
-    }
-
-    fn decodeChunk(self: *Content) Exception!void {
-        const payload = try bounds.slice(self.pbzx, self.payload_start, self.payload_len);
-        const output = self.buffer[0..@intCast(self.chunk_len)];
-        if (self.payload_len == self.chunk_len) {
-            @memcpy(output, payload);
-        } else {
-            if (payload.len < xz_magic.len or !std.mem.eql(u8, payload[0..xz_magic.len], &xz_magic)) return error.UnsupportedException;
-            const written = try xz.decodeInPlace(payload, output, self.workspace, checksum.default_provider);
-            if (written != output.len) return error.IntegrityException;
-        }
-        self.decoded_chunks = try bounds.addU64(self.decoded_chunks, 1);
-        self.decoded_bytes = try bounds.addU64(self.decoded_bytes, self.chunk_len);
-        self.loaded = true;
-    }
-
-    fn load(self: *Content) Exception!void {
-        while (!(self.loaded and self.byte_pos < self.chunk_start + self.chunk_len)) {
-            if (!try self.nextChunk()) return error.DataException;
-            try self.decodeChunk();
-        }
-    }
-
-    fn readExact(self: *Content, destination: []u8) Exception!void {
-        var written: usize = 0;
-        while (written < destination.len) {
-            try self.load();
-            const offset: usize = @intCast(self.byte_pos - self.chunk_start);
-            const available: usize = @as(usize, @intCast(self.chunk_len)) - offset;
-            const step = @min(available, destination.len - written);
-            @memcpy(destination[written..][0..step], self.buffer[offset..][0..step]);
-            self.byte_pos += step;
-            written += step;
-        }
-    }
-
-    fn skip(self: *Content, count: u64) Exception!void {
-        var remaining = count;
-        while (remaining > 0) {
-            if (self.loaded and self.byte_pos < self.chunk_start + self.chunk_len) {
-                const available = self.chunk_start + self.chunk_len - self.byte_pos;
-                const step = @min(available, remaining);
-                self.byte_pos += step;
-                remaining -= step;
-                continue;
-            }
-            if (!try self.nextChunk()) return error.DataException;
-            // A chunk no read touches needs no decode, only its size.
-            if (remaining >= self.chunk_len) {
-                self.byte_pos = self.chunk_start + self.chunk_len;
-                remaining -= self.chunk_len;
-                continue;
-            }
-            try self.decodeChunk();
-        }
-    }
-
-    // Both ASCII headers: a payload may carry newc or the portable odc.
-    fn readHeader(self: *Content, magic: [6]u8) Exception!RecordHeader {
-        if (std.mem.eql(u8, &magic, "070707")) {
-            var bytes: [cpio.odc_header_size]u8 = undefined;
-            @memcpy(bytes[0..6], &magic);
-            try self.readExact(bytes[6..]);
-            const header = try cpio.parseOdcHeader(&bytes);
-            return .{
-                .ino = header.ino,
-                .mode = header.mode,
-                .uid = header.uid,
-                .gid = header.gid,
-                .modification_time = header.modification_time,
-                .data_size = header.data_size,
-                .namesize = header.namesize,
-                .nlink = header.nlink,
-                .name_align = 1,
-                .data_align = 1,
-                .check = 0,
-                .is_crc = false,
-            };
-        }
-        if (!std.mem.eql(u8, &magic, "070701") and !std.mem.eql(u8, &magic, "070702")) return error.DataException;
-        var bytes: [cpio.record_header_size]u8 = undefined;
-        @memcpy(bytes[0..6], &magic);
-        try self.readExact(bytes[6..]);
-        const header = try cpio.parseNewcHeader(&bytes);
-        return .{
-            .ino = header.ino,
-            .mode = header.mode,
-            .uid = header.uid,
-            .gid = header.gid,
-            .modification_time = header.modification_time,
-            .data_size = header.data_size,
-            .namesize = header.namesize,
-            .nlink = header.nlink,
-            .name_align = 4,
-            .data_align = 4,
-            .check = header.check,
-            .is_crc = header.is_crc,
-        };
-    }
-
-    fn nextRecord(self: *Content, name_buf: []u8) Exception!?Record {
-        var magic: [6]u8 = undefined;
-        try self.readExact(&magic);
-        const header = try self.readHeader(magic);
-        if (header.namesize == 0 or header.namesize > name_buf.len) return error.DataException;
-        const name_bytes = name_buf[0..@intCast(header.namesize)];
-        try self.readExact(name_bytes);
-        if (name_bytes[name_bytes.len - 1] != 0) return error.DataException;
-        const name = try cpio.parseRecordName(name_bytes);
-        try self.skip(paddingTo(self.byte_pos, header.name_align));
-        if (std.mem.eql(u8, name, cpio.trailer_name)) {
-            if (header.data_size != 0) return error.DataException;
-            return null;
-        }
-        const info = EntryInfo{
-            .name = name,
-            .mode = header.mode,
-            .uid = header.uid,
-            .gid = header.gid,
-            .size = header.data_size,
-            .modification_time = header.modification_time,
-            .ordinal = self.ordinal,
-            .ino = header.ino,
-            .nlink = header.nlink,
-        };
-        self.ordinal = try bounds.addU64(self.ordinal, 1);
-        return .{
-            .info = info,
-            .data_size = header.data_size,
-            .data_align = header.data_align,
-            .check = header.check,
-            .is_crc = header.is_crc,
-        };
-    }
-
-    // A skipped record drops whole chunks; a read record decodes them.
-    fn consume(self: *Content, record: Record, output: ?[]u8) Exception!void {
-        if (output) |destination| {
-            try self.readExact(destination);
-            if (record.is_crc) {
-                var sum: u32 = 0;
-                for (destination) |byte| sum +%= byte;
-                if (sum != record.check) return error.IntegrityException;
-            }
-        } else {
-            try self.skip(record.data_size);
-        }
-        try self.skip(paddingTo(self.byte_pos, record.data_align));
-    }
-};
-
-const RecordHeader = struct {
-    ino: u32,
-    mode: u32,
-    uid: u32,
-    gid: u32,
-    modification_time: u64,
-    data_size: u64,
-    namesize: u64,
-    nlink: u32,
-    name_align: u64,
-    data_align: u64,
-    check: u32,
-    is_crc: bool,
-};
-
-const Record = struct {
-    info: EntryInfo,
-    data_size: u64,
-    data_align: u64,
-    check: u32,
-    is_crc: bool,
-};
-
-fn open(archive: []const u8, parts: Parts) Exception!Content {
-    const range = try xar.findDataRange(archive, member_name, parts.toc);
-    const pbzx = try bounds.slice(archive, range.offset, range.length);
-    return Content.init(pbzx, parts.chunk, parts.workspace);
-}
-
 pub const LinkMode = enum { records, collapse };
 
 // Open-addressed group table: a zero `ordinal_plus_one` marks a free slot.
@@ -309,9 +73,8 @@ pub const Link = struct {
 // single decode instead of one call per ordinal, which would rescan the
 // payload each time. The reported name stays valid until the next call.
 pub const Cursor = struct {
-    parts: Parts,
-    content: Content,
-    record: ?Record = null,
+    inner: Chain.InnerCursor,
+    pending: ?cpio.RecordInfo = null,
     mode: LinkMode = .records,
     links: []Link = &.{},
     link_count: usize = 0,
@@ -327,10 +90,8 @@ pub const Cursor = struct {
         if (mode == .collapse) {
             for (links) |*entry| entry.* = .{ .ino = 0, .ordinal_plus_one = 0 };
         }
-        const parts = try splitScratch(scratch);
         return .{
-            .parts = parts,
-            .content = try open(archive, parts),
+            .inner = try Chain.open(archive, member_name, scratch),
             .mode = mode,
             .links = links,
         };
@@ -338,36 +99,56 @@ pub const Cursor = struct {
 
     // An unread member is skipped here, so a caller may walk names only.
     pub fn next(self: *Cursor) Exception!?EntryInfo {
-        try self.finish();
-        var record = try self.content.nextRecord(self.parts.name) orelse return null;
-        if (self.mode == .collapse and isLinkName(record.info)) {
-            if (self.findLink(record.info.ino)) |owner| {
+        const record = (try self.inner.next()) orelse return null;
+        var info = recordInfo(record);
+        if (self.mode == .collapse and isLinkName(info)) {
+            if (self.findLink(info.ino)) |owner| {
                 // The group's first record owns the payload; this name links.
-                try self.content.consume(record, null);
-                record.info.link_ordinal = owner;
-                return record.info;
+                _ = try self.inner.skipData();
+                info.link_ordinal = owner;
+                return info;
             }
-            try self.insertLink(record.info.ino, record.info.ordinal);
+            try self.insertLink(info.ino, info.ordinal);
         }
-        self.record = record;
-        return record.info;
+        self.pending = record;
+        return info;
     }
 
     pub fn readData(self: *Cursor, destination: []u8) Exception!void {
-        const record = self.record orelse return error.CallException;
-        if (destination.len < record.data_size) return error.CapacityException;
-        const size: usize = @intCast(record.data_size);
-        try self.content.consume(record, destination[0..size]);
-        self.record = null;
+        const record = self.pending orelse return error.CallException;
+        if (destination.len < record.size) return error.CapacityException;
+        const size: usize = std.math.cast(usize, record.size) orelse return error.ResourceException;
+        var sink = std.Io.Writer.fixed(destination[0..size]);
+        _ = try self.inner.readData(&sink);
+        self.pending = null;
     }
 
     pub fn skipData(self: *Cursor) Exception!void {
-        try self.finish();
+        self.pending = null;
+        _ = try self.inner.skipData();
     }
 
-    fn finish(self: *Cursor) Exception!void {
-        if (self.record) |record| try self.content.consume(record, null);
-        self.record = null;
+    // The observability counters prove what a walk decoded.
+    pub fn decodedChunks(self: *Cursor) u64 {
+        return self.inner.source.decodedChunks();
+    }
+
+    pub fn decodedBytes(self: *Cursor) u64 {
+        return self.inner.source.decodedBytes();
+    }
+
+    fn recordInfo(record: cpio.RecordInfo) EntryInfo {
+        return .{
+            .name = record.name,
+            .mode = record.mode,
+            .uid = record.uid,
+            .gid = record.gid,
+            .size = record.size,
+            .modification_time = record.modification_time,
+            .ordinal = record.ordinal,
+            .ino = record.ino,
+            .nlink = record.nlink,
+        };
     }
 
     fn slot(self: *Cursor, ino: u32) usize {
@@ -529,8 +310,7 @@ pub fn archiveSize(entries: []const Entry, scratch: []u8) Exception!u64 {
 }
 
 fn archiveSizeFor(entries: []const Entry, scratch: []u8, block_size: u64) Exception!u64 {
-    const parts = try splitScratch(scratch);
-    const layout = try layoutFor(entries, parts.toc, block_size);
+    const layout = try layoutFor(entries, try tocArea(scratch), block_size);
     return layout.total;
 }
 
@@ -539,8 +319,7 @@ pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Exception!usi
 }
 
 fn encodeFor(entries: []const Entry, output: []u8, scratch: []u8, block_size: u64) Exception!usize {
-    const parts = try splitScratch(scratch);
-    const layout = try layoutFor(entries, parts.toc, block_size);
+    const layout = try layoutFor(entries, try tocArea(scratch), block_size);
     if (output.len < layout.total) return error.CapacityException;
     const block: usize = std.math.cast(usize, block_size) orelse return error.ResourceException;
 
@@ -616,9 +395,9 @@ test "xip reads xz chunks the reference writer emits" {
 
     // pbzx: 4 KiB blocks, each an xz stream with a CRC32 check.
     const block_size: usize = 4096;
-    var pbzx: [32768]u8 = undefined;
-    @memcpy(pbzx[0..4], "pbzx");
-    std.mem.writeInt(u64, pbzx[4..12], block_size, .big);
+    var pbzx_stream: [32768]u8 = undefined;
+    @memcpy(pbzx_stream[0..4], "pbzx");
+    std.mem.writeInt(u64, pbzx_stream[4..12], block_size, .big);
     var pbzx_len: usize = 12;
     const encode_scratch = try testing.allocator.alloc(u8, xz.encodeWorkspaceSizeBt(1 << 20) + 64);
     defer testing.allocator.free(encode_scratch);
@@ -631,14 +410,14 @@ test "xip reads xz chunks the reference writer emits" {
             .dictionary_size = 1 << 20,
             .check = .crc32,
         });
-        std.mem.writeInt(u64, pbzx[pbzx_len..][0..8], block_len, .big);
-        std.mem.writeInt(u64, pbzx[pbzx_len..][8..16], compressed_len, .big);
-        @memcpy(pbzx[pbzx_len + 16 ..][0..compressed_len], compressed[0..compressed_len]);
+        std.mem.writeInt(u64, pbzx_stream[pbzx_len..][0..8], block_len, .big);
+        std.mem.writeInt(u64, pbzx_stream[pbzx_len..][8..16], compressed_len, .big);
+        @memcpy(pbzx_stream[pbzx_len + 16 ..][0..compressed_len], compressed[0..compressed_len]);
         pbzx_len += 16 + compressed_len;
         position += block_len;
     }
 
-    const xip_entries = [_]Entry{.{ .name = "Content", .data = pbzx[0..pbzx_len] }};
+    const xip_entries = [_]Entry{.{ .name = "Content", .data = pbzx_stream[0..pbzx_len] }};
     var output: [64 * 1024]u8 = undefined;
     var container_scratch: [96 * 1024]u8 = undefined;
     const written = try xar.encode(&xip_entries, &output, &container_scratch);
@@ -692,23 +471,23 @@ test "xip reads a portable odc payload" {
     const content_len = try cpio.encodeOdc(&entries, &content);
 
     // Stored chunks: one per 1 KiB of the payload, no padding.
-    var pbzx: [8192]u8 = undefined;
-    @memcpy(pbzx[0..4], "pbzx");
-    std.mem.writeInt(u64, pbzx[4..12], 1024, .big);
+    var pbzx_stream: [8192]u8 = undefined;
+    @memcpy(pbzx_stream[0..4], "pbzx");
+    std.mem.writeInt(u64, pbzx_stream[4..12], 1024, .big);
     var pbzx_len: usize = 12;
     var position: usize = 0;
     while (position < content_len) {
         const chunk = content[position..][0..@min(1024, content_len - position)];
-        std.mem.writeInt(u64, pbzx[pbzx_len..][0..8], chunk.len, .big);
-        std.mem.writeInt(u64, pbzx[pbzx_len..][8..16], chunk.len, .big);
-        @memcpy(pbzx[pbzx_len + 16 ..][0..chunk.len], chunk);
+        std.mem.writeInt(u64, pbzx_stream[pbzx_len..][0..8], chunk.len, .big);
+        std.mem.writeInt(u64, pbzx_stream[pbzx_len..][8..16], chunk.len, .big);
+        @memcpy(pbzx_stream[pbzx_len + 16 ..][0..chunk.len], chunk);
         pbzx_len += 16 + chunk.len;
         position += chunk.len;
     }
 
     var output: [16 * 1024]u8 = undefined;
     var container_scratch: [96 * 1024]u8 = undefined;
-    const written = try xar.encode(&.{.{ .name = "Content", .data = pbzx[0..pbzx_len] }}, &output, &container_scratch);
+    const written = try xar.encode(&.{.{ .name = "Content", .data = pbzx_stream[0..pbzx_len] }}, &output, &container_scratch);
     const scratch = try testing.allocator.alloc(u8, scratch_size);
     defer testing.allocator.free(scratch);
 
@@ -737,44 +516,38 @@ test "xip decodes only the chunks a read needs" {
     defer testing.allocator.free(scratch);
     const written = try encodeFor(&entries, output, scratch, 1 << 20);
 
-    const parts = try splitScratch(scratch);
-    var content = try open(output[0..written], parts);
-    while (try content.nextRecord(parts.name)) |record| {
-        try content.consume(record, null);
-        if (record.info.ordinal == 2) break;
-    }
-    // The payload spans nine chunks; walking to the last record's header
-    // decodes the two that carry headers and skips the rest.
-    try testing.expect(content.decoded_chunks <= 3);
-    try testing.expect(content.decoded_bytes <= 3 << 20);
+    // Nine chunks, but a name walk decodes only the two with headers.
+    var walker = try Cursor.init(output[0..written], scratch);
+    var names: usize = 0;
+    while (try walker.next()) |_| names += 1;
+    try testing.expectEqual(@as(usize, 3), names);
+    try testing.expect(walker.decodedChunks() <= 3);
+    try testing.expect(walker.decodedBytes() <= 3 << 20);
 
     // Reading the big entry proves the other side: its bytes are decoded.
     const destination = try testing.allocator.alloc(u8, 8 << 20);
     defer testing.allocator.free(destination);
-    var reader = try open(output[0..written], parts);
-    while (try reader.nextRecord(parts.name)) |record| {
-        if (record.info.ordinal != 0) {
-            try reader.consume(record, null);
-            continue;
-        }
-        try reader.consume(record, destination);
-        break;
-    }
-    try testing.expect(reader.decoded_bytes >= 8 << 20);
+    var reader = try Cursor.init(output[0..written], scratch);
+    const big = try reader.next() orelse return error.UnexpectedEnd;
+    try testing.expectEqual(@as(u64, 8 << 20), big.size);
+    try reader.readData(destination);
+    try testing.expect(reader.decodedBytes() >= 8 << 20);
+    try testing.expectEqual(@as(u8, 0x5A), destination[0]);
+    try testing.expectEqual(@as(u8, 0x5A), destination[destination.len - 1]);
 
     // The same pass through the public cursor: names only, and a read of
     // the one member whose bytes the caller wants.
     var cursor = try Cursor.init(output[0..written], scratch);
-    var names: usize = 0;
+    var seen: usize = 0;
     while (try cursor.next()) |info| {
-        names += 1;
+        seen += 1;
         if (std.mem.eql(u8, info.name, "s2")) {
             var data: [8]u8 = undefined;
             try cursor.readData(data[0..info.size]);
             try testing.expectEqualSlices(u8, "two", data[0..info.size]);
         }
     }
-    try testing.expectEqual(@as(usize, 3), names);
+    try testing.expectEqual(@as(usize, 3), seen);
 
     const total = try inspectCount(output[0..written], scratch);
     try testing.expectEqual(@as(u64, 3), total);
@@ -849,4 +622,100 @@ test "xip reports ino and nlink and folds groups only on request" {
 
     // A table that is not a power of two cannot serve as the group index.
     try testing.expectError(error.CallException, Cursor.initWithLinks(output[0..written], scratch, .collapse, links[0..3]));
+}
+
+test "xip opens only with a full scratch budget" {
+    const testing = std.testing;
+    const entries = [_]Entry{.{ .name = "a.txt", .data = "data" }};
+    var output: [64 * 1024]u8 = undefined;
+    const scratch = try testing.allocator.alloc(u8, scratch_size);
+    defer testing.allocator.free(scratch);
+    const written = try encodeFor(&entries, &output, scratch, 4096);
+
+    // One byte short is a capacity failure, never a data error.
+    try testing.expectError(error.CapacityException, Cursor.init(output[0..written], scratch[0 .. scratch.len - 1]));
+    try testing.expectError(error.CapacityException, inspectCount(output[0..written], scratch[0 .. scratch.len - 1]));
+}
+
+test "xip rejects a stream truncated at every chunk boundary" {
+    const testing = std.testing;
+    var payload: [10 * 1024]u8 = undefined;
+    @memset(&payload, 0x6C);
+    const entries = [_]Entry{
+        .{ .name = "mid.bin", .data = &payload },
+        .{ .name = "tail.txt", .data = "tail" },
+    };
+    var output: [128 * 1024]u8 = undefined;
+    const scratch = try testing.allocator.alloc(u8, scratch_size);
+    defer testing.allocator.free(scratch);
+    const written = try encodeFor(&entries, &output, scratch, 4096);
+
+    // The TOC states the member length, so every cut is a data failure.
+    const range = try xar.findDataRange(output[0..written], "Content", scratch[0..xar.scratch_size]);
+    try testing.expectError(error.DataException, inspectCount(output[0..@intCast(range.offset)], scratch));
+    var cut: usize = @intCast(range.offset + pbzx_header_size);
+    const stride: usize = @as(usize, @intCast(chunk_header_size)) + 4096;
+    while (cut < written) : (cut += stride) {
+        try testing.expectError(error.DataException, inspectCount(output[0..cut], scratch));
+    }
+    try testing.expectError(error.DataException, inspectCount(output[0 .. written - 1], scratch));
+    // The intact archive still reads.
+    try testing.expectEqual(@as(u64, 2), try inspectCount(output[0..written], scratch));
+}
+
+test "xip rejects a corrupted record header in a chunk" {
+    const testing = std.testing;
+    const entries = [_]Entry{
+        .{ .name = "first.txt", .data = "alpha" },
+        .{ .name = "second.txt", .data = "beta" },
+    };
+    var output: [64 * 1024]u8 = undefined;
+    const scratch = try testing.allocator.alloc(u8, scratch_size);
+    defer testing.allocator.free(scratch);
+    const written = try encodeFor(&entries, &output, scratch, 4096);
+
+    // The first chunk opens with the cpio record magic; one wrong byte
+    // there fails the parse as damaged data.
+    const range = try xar.findDataRange(output[0..written], "Content", scratch[0..xar.scratch_size]);
+    const record_magic: usize = @intCast(range.offset + pbzx_header_size + chunk_header_size);
+    output[record_magic] ^= 0xFF;
+    try testing.expectError(error.DataException, inspectCount(output[0..written], scratch));
+}
+
+test "xip keeps the stored and compressed chunk distinction" {
+    const testing = std.testing;
+    const entries = [_]Entry{.{ .name = "only.txt", .data = "only" }};
+    var output: [64 * 1024]u8 = undefined;
+    const scratch = try testing.allocator.alloc(u8, scratch_size);
+    defer testing.allocator.free(scratch);
+    const written = try encodeFor(&entries, &output, scratch, 4096);
+
+    // A compressed chunk without the xz magic is unsupported, not damaged.
+    const range = try xar.findDataRange(output[0..written], "Content", scratch[0..xar.scratch_size]);
+    const stored_field: usize = @intCast(range.offset + pbzx_header_size + 8);
+    const stored = std.mem.readInt(u64, output[stored_field..][0..8], .big);
+    std.mem.writeInt(u64, output[stored_field..][0..8], stored - 1, .big);
+    try testing.expectError(error.UnsupportedException, inspectCount(output[0..written], scratch));
+}
+
+test "xip ends cleanly at the last chunk" {
+    const testing = std.testing;
+    const entries = [_]Entry{
+        .{ .name = "one", .data = "one" },
+        .{ .name = "two", .data = "two" },
+    };
+    var output: [64 * 1024]u8 = undefined;
+    const scratch = try testing.allocator.alloc(u8, scratch_size);
+    defer testing.allocator.free(scratch);
+    const written = try encodeFor(&entries, &output, scratch, 4096);
+
+    var cursor = try Cursor.init(output[0..written], scratch);
+    try testing.expect((try cursor.next()) != null);
+    try testing.expect((try cursor.next()) != null);
+    // The trailer ends the walk, and the call after stays ended.
+    try testing.expect((try cursor.next()) == null);
+    try testing.expect((try cursor.next()) == null);
+    // The last chunk is short and padded; the walk decoded it once.
+    try testing.expectEqual(@as(u64, 1), cursor.decodedChunks());
+    try testing.expectEqual(@as(u64, 4096), cursor.decodedBytes());
 }

@@ -739,6 +739,37 @@ pub fn decodeOrdinal(archive: []const u8, ordinal: u64, output: []u8, scratch: [
     return written;
 }
 
+// A decl cannot reference itself; the Outer value needs a second name.
+const outer_scratch_size: usize = scratch_size;
+
+// The Outer role: one archive, one member.
+// init verifies the TOC once; scratch must outlive returned values.
+pub const Outer = struct {
+    const Self = @This();
+
+    pub const scratch_size: usize = outer_scratch_size;
+
+    archive: []const u8,
+    toc: Toc,
+    name_buf: []u8,
+
+    pub fn init(archive: []const u8, scratch: []u8) Exception!Self {
+        const parts = try splitScratch(scratch);
+        const toc = try inflateToc(archive, parts.toc, parts.history);
+        return .{ .archive = archive, .toc = toc, .name_buf = parts.name };
+    }
+
+    pub fn member(self: *Self, name: []const u8) Exception![]const u8 {
+        const result = try scanEntries(self.toc.xml, null, name, self.name_buf);
+        const info = result.found orelse return error.DataException;
+        // A nested container is stored verbatim; an encoded member is not one.
+        if (!info.stored) return error.UnsupportedException;
+        const heap_start = self.archive.len - self.toc.heap.len;
+        const offset = try bounds.addU64(heap_start, info.data_offset);
+        return bounds.slice(self.archive, offset, info.data_length);
+    }
+};
+
 pub const DataRange = struct { offset: u64, length: u64 };
 
 // The absolute byte range of a named member: what a container that wraps
@@ -967,4 +998,27 @@ test "xar decodes libarchive-style nested and empty-file tocs" {
     var out: [8]u8 = undefined;
     try testing.expectEqual(@as(usize, 0), try decodeOrdinal(archive[0..total], 1, &out, &scratch));
     try testing.expectEqualSlices(u8, "data", out[0..try decodeOrdinal(archive[0..total], 2, &out, &scratch)]);
+}
+
+test "xar Outer locates members without reading across them" {
+    const testing = std.testing;
+    const entries = [_]Entry{
+        .{ .name = "Content", .data = "payload bytes" },
+        .{ .name = "dir/nested.bin", .data = "other bytes" },
+    };
+    var archive: [8192]u8 = undefined;
+    var container_scratch: [96 * 1024]u8 = undefined;
+    const written = try encode(&entries, &archive, &container_scratch);
+    var scratch: [96 * 1024]u8 = undefined;
+
+    var outer = try Outer.init(archive[0..written], &scratch);
+    const located = try outer.member("Content");
+    try testing.expectEqualSlices(u8, "payload bytes", located);
+    // A nested path joins through the shared name buffer.
+    const nested = try outer.member("dir/nested.bin");
+    try testing.expectEqualSlices(u8, "other bytes", nested);
+    // The earlier slice still names its own member: no cross-member read.
+    try testing.expectEqualSlices(u8, "payload bytes", located);
+    // A missing member is a data failure.
+    try testing.expectError(error.DataException, outer.member("missing"));
 }
