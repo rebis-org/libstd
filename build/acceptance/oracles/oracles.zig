@@ -124,6 +124,7 @@ const scenarios = scenario_block: {
         &api.scenarios,
         &interop.scenarios,
         &.{primitives.scenario},
+        &primitives.api_scenarios,
         &checksum.scenarios,
         &provider.scenarios,
         format_groups,

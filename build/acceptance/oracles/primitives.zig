@@ -211,3 +211,302 @@ pub const scenario = harness.Scenario{
     .output_size = 64,
     .encoded_size = 64,
 };
+
+// Primitive profiles pin measured sizing and confirmed commit; the
+// capability pair grants replay and write.
+const mode_primitive = harness.Mode{
+    .sizing = harness.size_measured,
+    .commit_write = harness.commit_confirmed,
+    .commit_read = harness.commit_confirmed,
+    .caps_query = harness.cap_read | harness.cap_size | harness.cap_replay,
+    .caps_io = harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay,
+};
+
+fn be32(value: u32) [4]u8 {
+    var encoded: [4]u8 = undefined;
+    std.mem.writeInt(u32, &encoded, value, .big);
+    return encoded;
+}
+
+fn be64(value: u64) [8]u8 {
+    var encoded: [8]u8 = undefined;
+    std.mem.writeInt(u64, &encoded, value, .big);
+    return encoded;
+}
+
+fn hexDecode(comptime hex: []const u8) [hex.len / 2]u8 {
+    var decoded: [hex.len / 2]u8 = undefined;
+    for (0..decoded.len) |index| {
+        decoded[index] = std.fmt.parseInt(u8, hex[2 * index .. 2 * index + 2], 16) catch unreachable; // Pinned hex literals only.
+    }
+    return decoded;
+}
+
+fn cryptoParamBytes(ordinal: u32, bytes: []const u8) harness.Node {
+    return harness.paramBytes(harness.param_family_crypto, ordinal, harness.cmds, bytes);
+}
+
+fn cryptoParamScalar(ordinal: u32, value: u64) harness.Node {
+    return harness.paramScalar(harness.param_family_crypto, ordinal, harness.cmds, value);
+}
+
+fn expectWrite(r: *harness.Runner, input: []const u8, sink: []u8, params: []const harness.Node) !void {
+    var nodes: [5]harness.Node = @splat(harness.Node.init());
+    nodes[0] = harness.sourceSpan(input);
+    nodes[1] = harness.sinkSpan(sink);
+    for (params, 0..) |param, index| nodes[2 + index] = param;
+    try harness.expect(r, harness.ids.write, nodes[0 .. 2 + params.len], .{ .ctx = true }, harness.Status.ok);
+}
+
+fn expectDigest(r: *harness.Runner, profile: harness.Id, input: []const u8, params: []const harness.Node, expected: []const u8) !void {
+    harness.setup(r, profile, mode_primitive);
+    var sink: [64]u8 = @splat(0xa5);
+    try expectWrite(r, input, &sink, params);
+    try require(r.response.byte_length == expected.len);
+    try require(std.mem.eql(u8, sink[0..expected.len], expected));
+    try require(harness.allBytesEqual(sink[expected.len..], 0xa5));
+}
+
+fn expectQuerySize(r: *harness.Runner, profile: harness.Id, input: []const u8, params: []const harness.Node, expected: u64) !void {
+    harness.setup(r, profile, mode_primitive);
+    var nodes: [5]harness.Node = @splat(harness.Node.init());
+    nodes[0] = harness.paramTargetCommand(harness.ids.write);
+    nodes[1] = harness.sourceSpan(input);
+    for (params, 0..) |param, index| nodes[2 + index] = param;
+    try harness.expect(r, harness.ids.query, nodes[0 .. 2 + params.len], .{ .ctx = true }, harness.Status.ok);
+    try require(r.response.byte_length == expected);
+}
+
+fn expectAesRoundtrip(r: *harness.Runner, key: []const u8, plaintext: []const u8, ciphertext: []const u8) !void {
+    harness.setup(r, harness.ids.aes, mode_primitive);
+    var encrypted: [32]u8 = @splat(0xa5);
+    try expectWrite(r, plaintext, &encrypted, &.{cryptoParamBytes(1, key)});
+    try require(std.mem.eql(u8, encrypted[0..ciphertext.len], ciphertext));
+    try require(harness.allBytesEqual(encrypted[ciphertext.len..], 0xa5));
+    var decrypted: [32]u8 = @splat(0xa5);
+    var nodes: [5]harness.Node = @splat(harness.Node.init());
+    nodes[0] = harness.sourceSpan(encrypted[0..ciphertext.len]);
+    nodes[1] = harness.sinkSpan(&decrypted);
+    nodes[2] = cryptoParamBytes(1, key);
+    try harness.expect(r, harness.ids.read, nodes[0..3], .{ .ctx = true }, harness.Status.ok);
+    try require(std.mem.eql(u8, decrypted[0..plaintext.len], plaintext));
+    try require(harness.allBytesEqual(decrypted[plaintext.len..], 0xa5));
+}
+
+fn runDigestBoundary(r: *harness.Runner) anyerror!void {
+    const crc32_answer = be32(0xcbf43926);
+    try expectDigest(r, harness.ids.crc32, "123456789", &.{}, &crc32_answer);
+    const adler32_answer = be32(0x11e60398);
+    try expectDigest(r, harness.ids.adler32, "Wikipedia", &.{}, &adler32_answer);
+    const xxh32_answer = be32(0x02cc5d05);
+    try expectDigest(r, harness.ids.xxh32, "", &.{}, &xxh32_answer);
+    const xxh64_answer = be64(0xef46db3751d8e999);
+    try expectDigest(r, harness.ids.xxh64, "", &.{}, &xxh64_answer);
+    const sha1_answer = hexDecode("a9993e364706816aba3e25717850c26c9cd0d89d");
+    try expectDigest(r, harness.ids.sha1, "abc", &.{}, &sha1_answer);
+    const sha256_answer = hexDecode("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    try expectDigest(r, harness.ids.sha256, "abc", &.{}, &sha256_answer);
+    const hmac_sha1_answer = hexDecode("effcdf6ae5eb2fa2d27416d5f184df9c259a7c79");
+    try expectDigest(r, harness.ids.hmac_sha1, "what do ya want for nothing?", &.{cryptoParamBytes(1, "Jefe")}, &hmac_sha1_answer);
+    const hmac_sha256_answer = hexDecode("5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
+    try expectDigest(r, harness.ids.hmac_sha256, "what do ya want for nothing?", &.{cryptoParamBytes(1, "Jefe")}, &hmac_sha256_answer);
+    const pbkdf2_answer = hexDecode("0c60c80f961f0e71f3a9b524af6012062fe037a6");
+    try expectDigest(r, harness.ids.pbkdf2, "password", &.{
+        cryptoParamBytes(1, "salt"),
+        cryptoParamScalar(2, 1),
+        cryptoParamScalar(3, 20),
+    }, &pbkdf2_answer);
+
+    // The module surface keeps the boundary honest on shared input.
+    const buffer = sanityBuffer();
+    const input = buffer[0..97];
+    const crc32_cross = be32(checksum.crc32(input));
+    try expectDigest(r, harness.ids.crc32, input, &.{}, &crc32_cross);
+    const adler32_cross = be32(checksum.adler32(input));
+    try expectDigest(r, harness.ids.adler32, input, &.{}, &adler32_cross);
+    const xxh32_cross = be32(checksum.xxh32(input));
+    try expectDigest(r, harness.ids.xxh32, input, &.{}, &xxh32_cross);
+    const xxh64_cross = be64(checksum.xxh64(input));
+    try expectDigest(r, harness.ids.xxh64, input, &.{}, &xxh64_cross);
+    const seed: u64 = 0x1234_5678;
+    var seeded = checksum.XxHash64.init(seed);
+    seeded.update(input);
+    const seeded_cross = be64(seeded.final({}));
+    try expectDigest(r, harness.ids.xxh64, input, &.{cryptoParamScalar(1, seed)}, &seeded_cross);
+    var sha1_cross: [20]u8 = undefined;
+    var sha1_state = crypto.Sha1.init(.{});
+    sha1_state.update(input);
+    sha1_state.final(&sha1_cross);
+    try expectDigest(r, harness.ids.sha1, input, &.{}, &sha1_cross);
+    var sha256_cross: [32]u8 = undefined;
+    var sha256_state = crypto.Sha256.init(.{});
+    sha256_state.update(input);
+    sha256_state.final(&sha256_cross);
+    try expectDigest(r, harness.ids.sha256, input, &.{}, &sha256_cross);
+    const mac_key: [20]u8 = @splat(0x0b);
+    var hmac_cross: [20]u8 = undefined;
+    crypto.hmacSha1(crypto.default_provider, &hmac_cross, input, &mac_key);
+    try expectDigest(r, harness.ids.hmac_sha1, input, &.{cryptoParamBytes(1, &mac_key)}, &hmac_cross);
+
+    // A write-target query answers the fixed digest length.
+    try expectQuerySize(r, harness.ids.crc32, input, &.{}, 4);
+    try expectQuerySize(r, harness.ids.xxh64, input, &.{}, 8);
+    try expectQuerySize(r, harness.ids.sha256, input, &.{}, 32);
+    try expectQuerySize(r, harness.ids.hmac_sha1, input, &.{cryptoParamBytes(1, &mac_key)}, 20);
+    try expectQuerySize(r, harness.ids.pbkdf2, "password", &.{
+        cryptoParamBytes(1, "salt"),
+        cryptoParamScalar(2, 1),
+        cryptoParamScalar(3, 20),
+    }, 20);
+}
+
+fn runAesBoundary(r: *harness.Runner) anyerror!void {
+    const fips_cipher_128 = hexDecode("69c4e0d86a7b0430d8cdb78070b4c55a");
+    const fips_cipher_256 = hexDecode("8ea2b7ca516745bfeafc49904b496089");
+    try expectAesRoundtrip(r, &fips_128_key, &fips_plaintext, &fips_cipher_128);
+    try expectAesRoundtrip(r, &fips_256_key, &fips_plaintext, &fips_cipher_256);
+    // ECB chains nothing: block results concatenate.
+    const double_plain = fips_plaintext ++ fips_plaintext;
+    const double_cipher = fips_cipher_256 ++ fips_cipher_256;
+    try expectAesRoundtrip(r, &fips_256_key, &double_plain, &double_cipher);
+    try expectQuerySize(r, harness.ids.aes, &fips_plaintext, &.{cryptoParamBytes(1, &fips_128_key)}, 16);
+}
+
+fn runRejectBoundary(r: *harness.Runner) anyerror!void {
+    const buffer = sanityBuffer();
+    const input = buffer[0..97];
+    var sink: [64]u8 = undefined;
+
+    // Digest profiles carry no read bit, so read verbs stop at dispatch.
+    harness.setup(r, harness.ids.crc32, mode_primitive);
+    try harness.expect(r, harness.ids.read, &.{ harness.sourceSpan(input), harness.sinkSpan(&sink) }, .{ .ctx = true }, harness.Status.unsupported);
+
+    // A read-target query reaches the hook, which answers write-only.
+    harness.setup(r, harness.ids.crc32, mode_primitive);
+    try harness.expect(r, harness.ids.query, &.{ harness.paramTargetCommand(harness.ids.read), harness.sourceSpan(input) }, .{ .ctx = true }, harness.Status.unsupported);
+
+    // A query must name the direction it measures.
+    harness.setup(r, harness.ids.crc32, mode_primitive);
+    try harness.expect(r, harness.ids.query, &.{harness.sourceSpan(input)}, .{ .ctx = true }, harness.Status.invalid_call);
+
+    // Without the capability param the sink grants no replay.
+    harness.setup(r, harness.ids.crc32, mode_primitive);
+    try harness.expect(r, harness.ids.write, &.{ harness.sourceSpan(input), harness.sinkSpan(&sink) }, .{}, harness.Status.unsupported);
+
+    // Released profiles pin sizing and commit; mismatches are unsupported.
+    var mode_nodes: [5]harness.Node = @splat(harness.Node.init());
+    mode_nodes[0] = harness.sourceSpan(input);
+    mode_nodes[1] = harness.sinkSpan(&sink);
+    mode_nodes[2] = harness.capabilityParam(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay);
+    mode_nodes[3] = harness.sizingModeParam(harness.size_measured);
+    mode_nodes[4] = harness.commitModeParam(harness.commit_tentative);
+    harness.setup(r, harness.ids.crc32, mode_primitive);
+    try harness.expect(r, harness.ids.write, mode_nodes[0..5], .{}, harness.Status.unsupported);
+
+    mode_nodes[3] = harness.sizingModeParam(harness.size_metadata_exact);
+    mode_nodes[4] = harness.commitModeParam(harness.commit_confirmed);
+    harness.setup(r, harness.ids.crc32, mode_primitive);
+    try harness.expect(r, harness.ids.write, mode_nodes[0..5], .{}, harness.Status.unsupported);
+
+    // Sinks smaller than the digest answer with a capacity pair.
+    var small: [3]u8 = undefined;
+    harness.setup(r, harness.ids.crc32, mode_primitive);
+    try harness.expectCapacity(r, harness.ids.write, &.{ harness.sourceSpan(input), harness.sinkSpan(&small) }, .{ .ctx = true }, 4, 3, &small);
+
+    // MACs require their key.
+    harness.setup(r, harness.ids.hmac_sha1, mode_primitive);
+    try harness.reject(r, harness.ids.write, &.{ harness.sourceSpan(input), harness.sinkSpan(&sink) }, .{ .ctx = true }, harness.Status.invalid_call, &sink);
+
+    // The KDF requires salt, rounds, and dk_len.
+    harness.setup(r, harness.ids.pbkdf2, mode_primitive);
+    try harness.reject(r, harness.ids.write, &.{
+        harness.sourceSpan("password"),
+        harness.sinkSpan(&sink),
+        cryptoParamBytes(1, "salt"),
+        cryptoParamScalar(2, 1),
+    }, .{ .ctx = true }, harness.Status.invalid_call, &sink);
+
+    harness.setup(r, harness.ids.pbkdf2, mode_primitive);
+    try harness.reject(r, harness.ids.write, &.{
+        harness.sourceSpan("password"),
+        harness.sinkSpan(&sink),
+        cryptoParamBytes(1, "salt"),
+        cryptoParamScalar(2, 0),
+        cryptoParamScalar(3, 20),
+    }, .{ .ctx = true }, harness.Status.invalid_call, &sink);
+
+    var derived: [19]u8 = undefined;
+    harness.setup(r, harness.ids.pbkdf2, mode_primitive);
+    try harness.expectCapacity(r, harness.ids.write, &.{
+        harness.sourceSpan("password"),
+        harness.sinkSpan(&derived),
+        cryptoParamBytes(1, "salt"),
+        cryptoParamScalar(2, 1),
+        cryptoParamScalar(3, 20),
+    }, .{ .ctx = true }, 20, 19, &derived);
+
+    // The stack cap keeps derived keys bounded.
+    harness.setup(r, harness.ids.pbkdf2, mode_primitive);
+    try harness.reject(r, harness.ids.write, &.{
+        harness.sourceSpan("password"),
+        harness.sinkSpan(&sink),
+        cryptoParamBytes(1, "salt"),
+        cryptoParamScalar(2, 1),
+        cryptoParamScalar(3, 4097),
+    }, .{ .ctx = true }, harness.Status.resource_limit, &sink);
+
+    // Raw AES takes 128- or 256-bit keys and block-multiple input.
+    harness.setup(r, harness.ids.aes, mode_primitive);
+    try harness.reject(r, harness.ids.write, &.{
+        harness.sourceSpan(&fips_plaintext),
+        harness.sinkSpan(&sink),
+        cryptoParamBytes(1, &fips_192_key),
+    }, .{ .ctx = true }, harness.Status.invalid_call, &sink);
+
+    const odd_input = fips_plaintext ++ [1]u8{0};
+    harness.setup(r, harness.ids.aes, mode_primitive);
+    try harness.reject(r, harness.ids.write, &.{
+        harness.sourceSpan(&odd_input),
+        harness.sinkSpan(&sink),
+        cryptoParamBytes(1, &fips_128_key),
+    }, .{ .ctx = true }, harness.Status.invalid_call, &sink);
+
+    harness.setup(r, harness.ids.aes, mode_primitive);
+    try harness.reject(r, harness.ids.read, &.{
+        harness.sourceSpan(&odd_input),
+        harness.sinkSpan(&sink),
+        cryptoParamBytes(1, &fips_128_key),
+    }, .{ .ctx = true }, harness.Status.invalid_call, &sink);
+
+    var tiny: [15]u8 = undefined;
+    harness.setup(r, harness.ids.aes, mode_primitive);
+    try harness.expectCapacity(r, harness.ids.write, &.{
+        harness.sourceSpan(&fips_plaintext),
+        harness.sinkSpan(&tiny),
+        cryptoParamBytes(1, &fips_128_key),
+    }, .{ .ctx = true }, 16, 15, &tiny);
+}
+
+pub const api_scenarios = harness.scenarios("primitives", &.{}, &.{
+    .{
+        .name = "primitive digest boundary",
+        .run = runDigestBoundary,
+        .workspace_size = 4096,
+        .output_size = 64,
+        .encoded_size = 64,
+    },
+    .{
+        .name = "primitive aes boundary",
+        .run = runAesBoundary,
+        .workspace_size = 4096,
+        .output_size = 64,
+        .encoded_size = 64,
+    },
+    .{
+        .name = "primitive rejection boundary",
+        .run = runRejectBoundary,
+        .workspace_size = 4096,
+        .output_size = 64,
+        .encoded_size = 64,
+    },
+});

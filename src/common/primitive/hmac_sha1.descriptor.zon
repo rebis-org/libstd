@@ -1,0 +1,13 @@
+.{
+    .id = .{ .low = "0x6e6b82f08d91041f", .high = "0xa7a351053d6d401f" },
+    .name = "hmac_sha1",
+    .class = "digest",
+    .verbs = .{ "required_size", "encoded_size_bound", "encode" },
+    .parameters = .{
+        .{ .name = "key", .family = 1, .ordinal = 1, .representation = "bytes" },
+    },
+    .capabilities = .{ "read", "replay" },
+    .sizing = "measured",
+    .commit = "confirmed",
+    .limits = .{ .window = 0, .block = 0, .history = 0 },
+}

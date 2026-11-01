@@ -1,0 +1,15 @@
+.{
+    .id = .{ .low = "0x6e6b82f08d910422", .high = "0xa7a351053d6d4022" },
+    .name = "pbkdf2",
+    .class = "digest",
+    .verbs = .{ "required_size", "encoded_size_bound", "encode" },
+    .parameters = .{
+        .{ .name = "salt", .family = 1, .ordinal = 1, .representation = "bytes" },
+        .{ .name = "rounds", .family = 1, .ordinal = 2, .representation = "scalar_words" },
+        .{ .name = "dk_len", .family = 1, .ordinal = 3, .representation = "scalar_words" },
+    },
+    .capabilities = .{ "read", "replay" },
+    .sizing = "measured",
+    .commit = "confirmed",
+    .limits = .{ .window = 0, .block = 4096, .history = 0 },
+}

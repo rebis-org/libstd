@@ -7,6 +7,7 @@ const vocabulary = @import("../kernel/vocabulary.zig");
 const archive = @import("archive.zig");
 const catalog = @import("catalog.zig");
 const common = @import("common.zig");
+const primitives = @import("primitives.zig");
 const transform = @import("transform.zig");
 
 const Id = abi.Id;
@@ -35,6 +36,8 @@ const handler_map = blk: {
             entries[index] = .{ field_name, @field(transform, hook_name) };
         } else if (@hasDecl(archive, hook_name)) {
             entries[index] = .{ field_name, @field(archive, hook_name) };
+        } else if (@hasDecl(primitives, hook_name)) {
+            entries[index] = .{ field_name, @field(primitives, hook_name) };
         } else {
             entries[index] = .{ field_name, unsupportedHook };
         }

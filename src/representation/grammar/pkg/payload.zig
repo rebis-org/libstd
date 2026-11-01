@@ -13,11 +13,14 @@ const lzma2 = @import("../../leaf/lzma2/onprem.zig");
 const xz = @import("../xz/onprem.zig");
 
 const Exception = exception_prim.Exception;
+// The decode window: one xz chunk or the gzip history plus stage.
+const window_size: usize = lzma2.chunk_max_unpacked;
 
 // A located member of gzip, xz, or stored bytes over cpio.
 // Engines live in stable slots; pointers never move.
 
 // The gzip member header and trailer.
+
 const gzip_magic_1 = 0x1f;
 const gzip_magic_2 = 0x8b;
 const gzip_header_size = 10;
@@ -41,9 +44,6 @@ const max_pack_size = 1 << 16;
 
 // The lzma2 filter id.
 const filter_id_lzma2 = 0x21;
-
-// The decode window: one xz chunk or the gzip history plus stage.
-const window_size: usize = lzma2.chunk_max_unpacked;
 
 // The xz dictionary the transform budgets for; the value is what
 // pkgbuild writes.

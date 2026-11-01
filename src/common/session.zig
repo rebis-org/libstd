@@ -250,11 +250,19 @@ pub fn Nested(comptime Outer: type, comptime Transform: anytype, comptime Inner:
         pub const TransformedSource = @typeInfo(@typeInfo(@TypeOf(TransformState.reader)).@"fn".return_type.?).pointer.child;
         pub const InnerCursor = Inner(TransformedSource);
 
-        pub const scratch_size: usize = Outer.scratch_size + TransformState.scratch_size + InnerCursor.scratch_size;
+        // Each member segment starts at its declared alignment;
+        // the max aligns the one segment that sits at offset zero.
+        const outer_alignment: usize = if (@hasDecl(Outer, "scratch_alignment")) Outer.scratch_alignment else 1;
+        const transform_alignment: usize = @alignOf(TransformState);
+        const inner_alignment: usize = if (@hasDecl(InnerCursor, "scratch_alignment")) InnerCursor.scratch_alignment else 1;
 
-        // The transform instance sits in scratch, so the whole scratch carries
-        // its alignment; Inner's folds in through the max.
-        pub const scratch_alignment: usize = @max(@alignOf(TransformState), if (@hasDecl(InnerCursor, "scratch_alignment")) InnerCursor.scratch_alignment else 1);
+        pub const scratch_alignment: usize = @max(outer_alignment, transform_alignment, inner_alignment);
+
+        // A boundary can gain padding, so the total exceeds the bare sum.
+        const transform_offset: usize = std.mem.alignForward(usize, Outer.scratch_size, transform_alignment);
+        const inner_offset: usize = std.mem.alignForward(usize, transform_offset + TransformState.scratch_size, inner_alignment);
+
+        pub const scratch_size: usize = inner_offset + InnerCursor.scratch_size;
 
         pub fn scratchSize() usize {
             return scratch_size;
@@ -265,8 +273,8 @@ pub fn Nested(comptime Outer: type, comptime Transform: anytype, comptime Inner:
             if (scratch.len < scratch_size) return error.CapacityException;
             // Segment boundaries are comptime; runtime cost is three pointer adjustments.
             const outer_scratch = scratch[0..Outer.scratch_size];
-            const ts_scratch = scratch[Outer.scratch_size..][0..TransformState.scratch_size];
-            const is_scratch = scratch[Outer.scratch_size + TransformState.scratch_size ..][0..InnerCursor.scratch_size];
+            const ts_scratch = scratch[transform_offset..][0..TransformState.scratch_size];
+            const is_scratch = scratch[inner_offset..][0..InnerCursor.scratch_size];
 
             var outer = try Outer.init(base, outer_scratch);
             const located = try outer.member(name);
@@ -556,6 +564,76 @@ fn Identity(comptime Source: type) type {
 
         pub fn reader(self: *Self) *Source {
             return &self.source;
+        }
+    };
+}
+
+// A transform whose declared scratch exceeds its instance:
+// an odd segment end no later member can assume is aligned.
+fn OddSized(comptime Source: type) type {
+    return struct {
+        const Self = @This();
+
+        pub const scratch_size: usize = 25;
+
+        source: Source,
+
+        pub fn wrap(source: Source, scratch: []u8) Exception!*Self {
+            if (scratch.len < scratch_size) return error.CapacityException;
+            const self: *Self = @ptrCast(@alignCast(scratch.ptr));
+            self.source = source;
+            return self;
+        }
+
+        pub fn reader(self: *Self) *Source {
+            return &self.source;
+        }
+    };
+}
+
+// The outer with a tiny but strictly aligned scratch:
+// the chain must raise the buffer for its offset-zero segment.
+fn OddOuter(comptime Base: type) type {
+    return struct {
+        const Self = @This();
+
+        pub const scratch_size: usize = 3;
+        pub const scratch_alignment: usize = 16;
+
+        base: *Base,
+
+        pub fn init(base: *Base, scratch: []u8) Exception!Self {
+            scratch[0] = 0;
+            return .{ .base = base };
+        }
+
+        pub fn member(self: *Self, name: []const u8) Exception!Base {
+            _ = name;
+            return self.base.slice(0, self.base.bytes.len);
+        }
+    };
+}
+
+// The inner stores through a raised scratch alignment,
+// so a misaligned carve traps at open.
+fn AlignedCell(comptime Source: type) type {
+    return struct {
+        const Self = @This();
+
+        pub const scratch_size: usize = 5;
+        pub const scratch_alignment: usize = 4;
+
+        source: *Source,
+        cell: *u32,
+
+        pub fn open(source: *Source, scratch: []u8) Exception!Self {
+            const cell: *u32 = @ptrCast(@alignCast(scratch.ptr));
+            cell.* = 0x5A5A_5A5A;
+            return .{ .source = source, .cell = cell };
+        }
+
+        pub fn stored(self: *Self) u32 {
+            return self.cell.*;
         }
     };
 }
@@ -1853,6 +1931,30 @@ test "nested fixed table matches direct traversal" {
 
     // An unknown member is the Outer's capability answer.
     try testing.expectError(error.UnsupportedException, N.open(&base, "nope", &scratch));
+}
+
+test "nested scratch carves each member segment at its declared alignment" {
+    const Mixed = Nested(OddOuter(SliceSource), OddSized, AlignedCell);
+
+    // The raised outer alignment enters the buffer max,
+    // and both interior boundaries gain padding.
+    comptime {
+        std.debug.assert(Mixed.scratch_alignment == 16);
+        std.debug.assert(Mixed.transform_offset == 8);
+        std.debug.assert(Mixed.inner_offset == 36);
+        // Only boundaries align: the inner's odd tail keeps the total odd.
+        std.debug.assert(Mixed.scratch_size == 41);
+    }
+
+    const fixture = comptime recordBytes(4, &fixed_table_records);
+    var base = SliceSource.init(&fixture);
+
+    var scratch: [Mixed.scratch_size]u8 align(Mixed.scratch_alignment) = undefined;
+    var opened = try Mixed.open(&base, "records", &scratch);
+
+    // Both aligned stores landed through their padded segments.
+    try testing.expectEqual(@as(u32, 0x5A5A_5A5A), opened.stored());
+    try testing.expectEqual(@as(usize, 0), opened.source.pos);
 }
 
 // Every battery helper is exercised here first,

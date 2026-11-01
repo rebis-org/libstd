@@ -112,7 +112,12 @@ fn Fixed(comptime tag: Provider, comptime family: Family, comptime Impl: type) t
             return finish(family, &self.inner, args);
         }
 
-        pub fn finalResult(self: *const @This()) [digest_length]u8 {
+        // MAC results use mac_length; Hmac exposes no digest_length constant.
+        pub fn finalResult(self: *const @This()) switch (family) {
+            .digest => [Impl.digest_length]u8,
+            .mac => [Impl.mac_length]u8,
+            .hash, .checksum => @compileError("hash and checksum finish with final, not finalResult"),
+        } {
             var copy = self.inner;
             return copy.finalResult();
         }
@@ -163,7 +168,12 @@ fn Mergeable(comptime family: Family, comptime On: type, comptime Off: type) typ
             }
         }
 
-        pub fn finalResult(self: *const @This()) [digest_length]u8 {
+        // MAC results use mac_length; Hmac exposes no digest_length constant.
+        pub fn finalResult(self: *const @This()) switch (family) {
+            .digest => [On.digest_length]u8,
+            .mac => [On.mac_length]u8,
+            .hash, .checksum => @compileError("hash and checksum finish with final, not finalResult"),
+        } {
             switch (self.state) {
                 inline else => |*inner| {
                     var copy = inner.*;

@@ -7,14 +7,12 @@ const xz = @import("../xz/onprem.zig");
 const onprem = @import("onprem.zig");
 
 const Exception = exception_prim.Exception;
-
 // A located member of sized chunks, each stored or one xz stream.
 // Untouched chunks drop on their declared size.
-
 const block_size_max = onprem.block_size_max;
 const chunk_header_size = onprem.chunk_header_size;
-const pbzx_header_size = onprem.pbzx_header_size;
 const dictionary_seed = onprem.dictionary_seed;
+const pbzx_header_size = onprem.pbzx_header_size;
 const xz_magic = onprem.xz_magic;
 
 // The chunk state: what the pre-session cursor owned beside its records.

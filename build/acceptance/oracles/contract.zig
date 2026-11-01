@@ -53,6 +53,16 @@ pub fn main(init: std.process.Init) !void {
         .{ .profile = "lz4", .component = "lz4" },
         .{ .profile = "zstd_seekable", .component = "zstd-seekable" },
         .{ .profile = "zdict", .component = "zdict" },
+        .{ .profile = "crc32", .component = "crc32" },
+        .{ .profile = "adler32", .component = "adler32" },
+        .{ .profile = "xxh32", .component = "xxh32" },
+        .{ .profile = "xxh64", .component = "xxh64" },
+        .{ .profile = "sha1", .component = "sha1" },
+        .{ .profile = "sha256", .component = "sha256" },
+        .{ .profile = "hmac_sha1", .component = "hmac_sha1" },
+        .{ .profile = "hmac_sha256", .component = "hmac_sha256" },
+        .{ .profile = "pbkdf2", .component = "pbkdf2" },
+        .{ .profile = "aes", .component = "aes" },
     };
 
     var catalog_profiles: usize = 0;
@@ -68,7 +78,7 @@ pub fn main(init: std.process.Init) !void {
     // One profile row per component plus descriptor-less protocol fixtures.
     const all = kernel.discovery.enumerate();
     check(catalog_profiles == all.len, "catalog profile count");
-    check(all.len == 35, "descriptor count");
+    check(all.len == 45, "descriptor count");
     for (all) |*descriptor| {
         check(kernel.discovery.findById(descriptor.id) == descriptor, "id lookup round trip");
     }

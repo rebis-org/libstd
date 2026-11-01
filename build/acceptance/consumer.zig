@@ -10,13 +10,14 @@ const bypass = libstd.bypass;
 
 test "assembly descriptor projection covers every representation descriptor" {
     // The projection excludes exactly the three protocol fixtures.
-    try std.testing.expectEqual(@as(usize, 32), assembly.descriptors.len);
+    try std.testing.expectEqual(@as(usize, 42), assembly.descriptors.len);
     try std.testing.expect(!@hasDecl(assembly.leaf, "test_echo"));
     try std.testing.expect(!@hasDecl(assembly.leaf, "test_read"));
     try std.testing.expect(!@hasDecl(assembly.grammar, "crypto"));
     // Every projected descriptor resolves to a public namespace with a real
     // implementation entry; the compile-time check in assembly backs this.
     comptime {
+        @setEvalBranchQuota(50_000);
         for (assembly.descriptors) |descriptor| {
             const tag = assembly.tagForName(descriptor.name) orelse
                 @compileError("descriptor without a tag: " ++ descriptor.name);

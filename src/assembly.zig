@@ -91,6 +91,13 @@ pub const volume = struct {
     pub const squashfs = @import("representation/volume/squashfs/onprem.zig");
 };
 
+// The primitive digests behind the catalog profiles. The existing facades
+// stay the surface; nothing is re-wrapped.
+pub const primitive = struct {
+    pub const checksum = @import("common/primitive/checksum.zig");
+    pub const crypto = @import("common/primitive/crypto.zig");
+};
+
 // Provider-parameterized variants, only where a format already has one.
 pub const seam = struct {
     pub const zstd = @import("representation/leaf/zstd/seam.zig");
@@ -146,6 +153,8 @@ pub fn namespaceFor(comptime tag: components.ProfileTag) ?type {
         .zlib => grammar.zlib,
         .zstd => leaf.zstd,
         .zstd_seekable => grammar.zstd_seekable,
+        .crc32, .adler32, .xxh32, .xxh64 => primitive.checksum,
+        .aes, .hmac_sha1, .hmac_sha256, .pbkdf2, .sha1, .sha256 => primitive.crypto,
         .test_echo, .test_read, .crypto => null,
     };
 }
