@@ -8,6 +8,9 @@ const runner = @import("runner.zig");
 
 const brotli = bench_shim.brotli;
 const kernels = bench_shim.kernels;
+const delta = bench_shim.delta;
+const bcj = bench_shim.bcj;
+const Sha256Mb = crypto.Sha256Mb;
 
 const buffer_len_bytes = 1 << 20;
 
@@ -77,6 +80,48 @@ const BrotliDecodeCase = struct {
     }
 };
 
+// Encode plus decode is an in-place involution, so one iteration restores the
+// fixture and every iteration sees identical bytes.
+const DeltaCase = struct {
+    work: []u8,
+    distance: u8,
+    pub fn run(self: *const @This(), allocator: std.mem.Allocator) void {
+        _ = allocator;
+        delta.encode(self.work, self.distance);
+        delta.decode(self.work, self.distance);
+        std.mem.doNotOptimizeAway(self.work[self.work.len - 1]);
+    }
+};
+
+// The arm64 filter is also an encode/decode involution over word-aligned data.
+const BcjArm64Case = struct {
+    work: []u8,
+    pub fn run(self: *const @This(), allocator: std.mem.Allocator) void {
+        _ = allocator;
+        bcj.encode(.arm64, 0, self.work);
+        bcj.decode(.arm64, 0, self.work);
+        std.mem.doNotOptimizeAway(self.work[self.work.len - 1]);
+    }
+};
+
+// Four independent one-megabyte lanes advanced in lockstep, the driving
+// pattern the multi-buffer shape exists for.
+const Sha256Mb4Case = struct {
+    inputs: [4][]const u8,
+    digests: [4][32]u8 = undefined,
+    pub fn run(self: *@This(), allocator: std.mem.Allocator) void {
+        _ = allocator;
+        var lanes = Sha256Mb(4).init();
+        inline for (0..4) |lane| lanes.update(lane, self.inputs[lane]);
+        var mix: u32 = 0;
+        inline for (0..4) |lane| {
+            lanes.final(lane, &self.digests[lane]);
+            mix ^= std.mem.readInt(u32, self.digests[lane][0..4], .little);
+        }
+        std.mem.doNotOptimizeAway(mix);
+    }
+};
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
 
@@ -137,6 +182,32 @@ pub fn main(init: std.process.Init) !void {
         @memcpy(compressible[filled + 32768 ..][0..8192], input[filled .. filled + 8192]);
     }
     @memcpy(compressible[filled..], input[filled..]);
+
+    // bcj fixture: random words with a realistic BL/ADRP density so both
+    // filter branches carry weight.
+    const bcj_work = try allocator.alloc(u8, buffer_len_bytes);
+    defer allocator.free(bcj_work);
+    {
+        var word_index: usize = 0;
+        while (word_index + 4 <= bcj_work.len) : (word_index += 4) {
+            const word: u32 = switch (word_index % 16) {
+                0 => 0x94000000 | (random.random().int(u32) & 0x03FFFFFF),
+                8 => 0x90000000 | (random.random().int(u32) & 0x00FFFFFF),
+                else => random.random().int(u32),
+            };
+            std.mem.writeInt(u32, bcj_work[word_index..][0..4], word, .little);
+        }
+    }
+    const delta_work = try allocator.alloc(u8, buffer_len_bytes);
+    defer allocator.free(delta_work);
+    @memcpy(delta_work, input);
+
+    const delta_d1_case: DeltaCase = .{ .work = delta_work, .distance = 0 };
+    const delta_d4_case: DeltaCase = .{ .work = delta_work, .distance = 3 };
+    const delta_d32_case: DeltaCase = .{ .work = delta_work, .distance = 31 };
+    const bcj_arm64_case: BcjArm64Case = .{ .work = bcj_work };
+    var sha256_mb4_case: Sha256Mb4Case = .{ .inputs = .{ input, window, compressible, input } };
+
     const compressed = try allocator.alloc(u8, brotli.encodedSizeBound(compressible.len));
     defer allocator.free(compressed);
     const enc_ws = try allocator.alloc(u8, brotli.encode_workspace_size);
@@ -163,6 +234,11 @@ pub fn main(init: std.process.Init) !void {
         .{ "crypto.sha256", &sha256_case },
         .{ "kernels.copy_match", &copy_match_case },
         .{ "brotli.decode", &brotli_decode_case },
+        .{ "leaf.delta_d1", &delta_d1_case },
+        .{ "leaf.delta_d4", &delta_d4_case },
+        .{ "leaf.delta_d32", &delta_d32_case },
+        .{ "leaf.bcj_arm64", &bcj_arm64_case },
+        .{ "crypto.sha256_mb4", &sha256_mb4_case },
     };
     inline for (registry) |entry| {
         if (name_filter == null or std.mem.find(u8, entry[0], name_filter.?) != null) {
@@ -197,6 +273,22 @@ test "micro cases stay runnable without runner" {
     inline for (cases) |case_item| case_item.run(std.testing.allocator);
     // The copy ladder must have written matches into the window.
     try std.testing.expect(!std.mem.eql(u8, &scratch, &original));
+
+    // The delta and bcj cases are encode/decode involutions on a fresh
+    // snapshot, since the copy ladder above mutated the scratch.
+    var filter_scratch: [4096]u8 = undefined;
+    @memcpy(&filter_scratch, &scratch);
+    const before_filters = filter_scratch;
+    inline for (.{ DeltaCase{ .work = &filter_scratch, .distance = 0 }, BcjArm64Case{ .work = &filter_scratch } }) |case_item| {
+        case_item.run(std.testing.allocator);
+    }
+    try std.testing.expectEqualSlices(u8, &before_filters, &filter_scratch);
+
+    var mb4_scratch: [4096]u8 = undefined;
+    @memcpy(&mb4_scratch, &original);
+    var mb4_case: Sha256Mb4Case = .{ .inputs = .{ &mb4_scratch, &original, &mb4_scratch, &original } };
+    mb4_case.run(std.testing.allocator);
+    try std.testing.expect(!std.mem.eql(u32, &.{ 0, 0 }, &.{ std.mem.readInt(u32, mb4_case.digests[0][0..4], .little), std.mem.readInt(u32, mb4_case.digests[1][0..4], .little) }));
 
     const fixture = try std.testing.allocator.alloc(u8, 4096);
     defer std.testing.allocator.free(fixture);

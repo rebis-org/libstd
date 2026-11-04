@@ -9,6 +9,7 @@ const hmac_seam = @import("hash/hmac/seam.zig");
 const pbkdf2_seam = @import("hash/pbkdf2/seam.zig");
 const sha1_seam = @import("hash/sha1/seam.zig");
 const sha256_seam = @import("hash/sha256/seam.zig");
+const sha256_mb_seam = @import("hash/sha256_mb/seam.zig");
 const Exception = @import("exception.zig").Exception;
 
 pub const Provider = seam.Provider;
@@ -16,6 +17,7 @@ pub const default_provider = seam.default_provider;
 pub const HmacSha1 = hmac_seam.HmacSha1;
 pub const HmacSha256 = hmac_seam.HmacSha256;
 pub const Sha1 = sha1_seam.Sha1;
+pub const Sha256Mb = sha256_mb_seam.Sha256Mb;
 // Capability seams keep every block primitive swappable; this glue never
 // names an implementation directly.
 pub const Sha256 = sha256_seam.Sha256;
