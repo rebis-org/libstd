@@ -1,4 +1,11 @@
 const std = @import("std");
+const builtin = @import("builtin");
+
+// Whole-word filters convert four instructions per vector on little-endian
+// 32-bit-vector targets; aarch64_be is a different arch tag, so no endian
+// check is needed.
+const vector_words = if ((builtin.target.cpu.arch == .aarch64 or
+    builtin.target.cpu.arch == .x86_64) and builtin.zig_backend != .stage2_c) 4 else 0;
 
 pub const Kind = enum(u8) {
     x86 = 0x04,
@@ -254,6 +261,53 @@ fn sparcCode(code_bytes: []u8, start_offset: u32, comptime direction: Direction)
 }
 
 fn arm64Code(code_bytes: []u8, start_offset: u32, comptime direction: Direction) void {
+    if (comptime vector_words > 0) {
+        arm64CodeVector(code_bytes, start_offset, direction);
+        return;
+    }
+    arm64CodeScalar(code_bytes, start_offset, direction);
+}
+
+// The filter is word-local, so whole 16-byte blocks convert as one vector and
+// the tail words fall back to the scalar reference.
+fn arm64CodeVector(code_bytes: []u8, start_offset: u32, comptime direction: Direction) void {
+    const V = @Vector(4, u32);
+    const size = code_bytes.len & ~@as(usize, 3);
+    var index: usize = 0;
+    while (index + 16 <= size) : (index += 16) {
+        const instr: V = @bitCast(code_bytes[index..][0..16].*);
+        // Per-lane pc reproduces the scalar truncate: the wrapping u32 add of
+        // the truncated base and the lane offsets is the truncated sum.
+        const pc = @as(V, @splat(@as(u32, @truncate(index)))) +% @as(V, @bitCast([4]u32{
+            start_offset, start_offset +% 4, start_offset +% 8, start_offset +% 12,
+        }));
+
+        const is_bl = (instr >> @splat(26)) == @as(V, @splat(0x25));
+        var converted_pc = pc >> @splat(2);
+        if (direction == .decode) converted_pc = @as(V, @splat(0)) -% converted_pc;
+        const bl_out = ((instr +% converted_pc) & @as(V, @splat(0x03FFFFFF))) |
+            @as(V, @splat(0x94000000));
+
+        const src = ((instr >> @splat(29)) & @as(V, @splat(3))) |
+            ((instr >> @splat(3)) & @as(V, @splat(0x001FFFFC)));
+        const adrp_active = ((instr & @as(V, @splat(0x9F000000))) == @as(V, @splat(0x90000000))) &
+            (((src +% @as(V, @splat(0x00020000))) & @as(V, @splat(0x001C0000))) == @as(V, @splat(0)));
+        converted_pc = pc >> @splat(12);
+        if (direction == .decode) converted_pc = @as(V, @splat(0)) -% converted_pc;
+        const dest = src +% converted_pc;
+        const adrp_out = (instr & @as(V, @splat(0x9000001F))) |
+            ((dest & @as(V, @splat(3))) << @splat(29)) |
+            ((dest & @as(V, @splat(0x0003FFFC))) << @splat(3)) |
+            ((@as(V, @splat(0)) -% (dest & @as(V, @splat(0x00020000)))) & @as(V, @splat(0x00E00000)));
+
+        const adrp_result = @select(u32, adrp_active, adrp_out, instr);
+        const result = @select(u32, is_bl, bl_out, adrp_result);
+        code_bytes[index..][0..16].* = @bitCast(result);
+    }
+    if (index < size) arm64CodeScalar(code_bytes[index..size], start_offset +% @as(u32, @truncate(index)), direction);
+}
+
+fn arm64CodeScalar(code_bytes: []u8, start_offset: u32, comptime direction: Direction) void {
     const size = code_bytes.len & ~@as(usize, 3);
     var index: usize = 0;
     while (index < size) : (index += 4) {
@@ -444,5 +498,35 @@ test "bcj filters round-trip at aligned offsets" {
         encode(kind, 0, &copy);
         decode(kind, 0, &copy);
         try std.testing.expectEqualSlices(u8, &data, &copy);
+    }
+}
+
+test "arm64 vector arm matches the scalar arm" {
+    if (comptime vector_words == 0) return error.SkipZigTest;
+    var rng = std.Random.DefaultPrng.init(0xB8);
+    const random = rng.random();
+    // BL and ADRP words at a realistic density plus stray partial words.
+    var data: [8256]u8 = undefined;
+    var word_index: usize = 0;
+    while (word_index + 4 <= data.len) : (word_index += 4) {
+        const word: u32 = switch (word_index % 8) {
+            0 => 0x94000000 | (random.int(u32) & 0x03FFFFFF),
+            4 => 0x90000000 | (random.int(u32) & 0x00FFFFFF),
+            else => random.int(u32),
+        };
+        std.mem.writeInt(u32, data[word_index..][0..4], word, .little);
+    }
+    for ([_]usize{ 0, 3, 15, 16, 17, 64, 8192, data.len - 4, data.len }) |size| {
+        for ([_]u32{ 0, 4, 8, 0x0000FFF0, 0xFFFFFFFC }) |start_offset| {
+            var vector_work: [data.len]u8 = undefined;
+            var scalar_work: [data.len]u8 = undefined;
+            inline for ([_]Direction{ .encode, .decode }) |direction| {
+                @memcpy(vector_work[0..size], data[0..size]);
+                @memcpy(scalar_work[0..size], data[0..size]);
+                arm64CodeVector(vector_work[0..size], start_offset, direction);
+                arm64CodeScalar(scalar_work[0..size], start_offset, direction);
+                try std.testing.expectEqualSlices(u8, scalar_work[0..size], vector_work[0..size]);
+            }
+        }
     }
 }
