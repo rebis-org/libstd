@@ -6,10 +6,10 @@ const crypto = @import("crypto");
 
 const runner = @import("runner.zig");
 
-const brotli = bench_shim.brotli;
-const kernels = bench_shim.kernels;
-const delta = bench_shim.delta;
 const bcj = bench_shim.bcj;
+const brotli = bench_shim.brotli;
+const delta = bench_shim.delta;
+const kernels = bench_shim.kernels;
 const Sha256Mb = crypto.Sha256Mb;
 
 const buffer_len_bytes = 1 << 20;

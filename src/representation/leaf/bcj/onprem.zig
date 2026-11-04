@@ -1,5 +1,5 @@
-const std = @import("std");
 const builtin = @import("builtin");
+const std = @import("std");
 
 // Whole-word filters convert four instructions per vector on little-endian
 // 32-bit-vector targets; aarch64_be is a different arch tag, so no endian

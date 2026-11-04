@@ -333,6 +333,7 @@ const archive_volume_size: u32 = 15;
 // granularity and reports each volume's bytes in the response children,
 // and the read rides the parts back in volume order.
 pub fn runTarVolumeSet(r: *Runner) anyerror!void {
+    if (isOffpremUnsupported()) return;
     setupArchive(r, harness.ids.tar);
     const volume_size: u64 = 1024;
     // The selector carries the command scope: the granularity rides the

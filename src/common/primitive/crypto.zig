@@ -17,10 +17,10 @@ pub const default_provider = seam.default_provider;
 pub const HmacSha1 = hmac_seam.HmacSha1;
 pub const HmacSha256 = hmac_seam.HmacSha256;
 pub const Sha1 = sha1_seam.Sha1;
-pub const Sha256Mb = sha256_mb_seam.Sha256Mb;
 // Capability seams keep every block primitive swappable; this glue never
 // names an implementation directly.
 pub const Sha256 = sha256_seam.Sha256;
+pub const Sha256Mb = sha256_mb_seam.Sha256Mb;
 
 pub const block_length = 16;
 pub const hmac_sha1_length = 20;
