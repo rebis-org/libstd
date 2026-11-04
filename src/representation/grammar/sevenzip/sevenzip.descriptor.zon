@@ -14,6 +14,9 @@
         .{ .name = "entry_size", .family = 2, .ordinal = 4, .representation = "scalar_words" },
     },
     .capabilities = .{ "read", "write", "size", "replay" },
+    // 7z volume sets split at the requested granularity after the start
+    // header; reads join the payloads behind volume 1.
+    .volumes = .{ "read", "write" },
     .sizing = "metadata_exact",
     .commit = "tentative",
     .limits = .{ .window = 0, .block = 0, .history = 0 },

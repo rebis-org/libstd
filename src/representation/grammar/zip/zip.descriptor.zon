@@ -14,6 +14,9 @@
         .{ .name = "entry_size", .family = 2, .ordinal = 4, .representation = "scalar_words" },
     },
     .capabilities = .{ "read", "write", "size", "replay" },
+    // APPNOTE spanned sets: parts arrive in volume order on reads and
+    // leave cut at the requested granularity on writes.
+    .volumes = .{ "read", "write" },
     .sizing = "metadata_exact",
     .commit = "tentative",
     .limits = .{ .window = 0, .block = 0, .history = 0 },

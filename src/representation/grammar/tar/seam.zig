@@ -33,3 +33,25 @@ pub fn inspectOrdinal(provider: Provider, archive: []const u8, ordinal: u64) Exc
     _ = provider;
     return onprem.inspectOrdinal(archive, ordinal);
 }
+
+// Volume sets resolve to onprem everywhere: the offprem arm has no
+// multi-volume reader, and the split write is the first-party GNU layout.
+pub fn volumeInspectCount(provider: Provider, volumes: []const []const u8) Exception!u64 {
+    return seam.dispatchOnprem(impl, provider, onprem.volumeInspectCount, .{volumes});
+}
+
+pub fn volumeInspectOrdinal(provider: Provider, volumes: []const []const u8, ordinal: u64) Exception!EntryInfo {
+    return seam.dispatchOnprem(impl, provider, onprem.volumeInspectOrdinal, .{ volumes, ordinal });
+}
+
+pub fn volumeDecodeOrdinal(provider: Provider, volumes: []const []const u8, ordinal: u64, output: []u8, segments: []onprem.VolumeSegment) Exception!usize {
+    return seam.dispatchOnprem(impl, provider, onprem.volumeDecodeOrdinal, .{ volumes, ordinal, output, segments });
+}
+
+pub fn volumeSizeGnu(provider: Provider, entries: []const Entry, volume_size: u64) Exception!onprem.VolumePlan {
+    return seam.dispatchOnprem(impl, provider, onprem.volumeSizeGnu, .{ entries, volume_size });
+}
+
+pub fn volumeEncodeGnu(provider: Provider, entries: []const Entry, output: []u8, lengths: []u64, volume_size: u64, scratch: []u8) Exception!onprem.VolumePlan {
+    return seam.dispatchOnprem(impl, provider, onprem.volumeEncodeGnu, .{ entries, output, lengths, volume_size, scratch });
+}

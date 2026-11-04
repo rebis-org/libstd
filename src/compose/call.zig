@@ -111,10 +111,17 @@ fn dispatch(envelope: *Call, response: *Node) Exception!void {
     const policy = compose_catalog.commandPolicyFor(profile_id, direction) orelse return error.UnsupportedException;
     // Volume sets ride the shared archive_volumes parameter; a format
     // answers it only where its descriptor opts in for the direction, so
-    // an unimplemented split set never reads as a partial answer.
+    // an unimplemented split set never reads as a partial answer. The
+    // parts name a read's input shape: a write carrying them is misuse.
+    // The write granularity names a split on a write and is misuse
+    // anywhere else, so both answer unsupported outside their shape.
     const volumes_selector = comptime discovery.parameter("tar", "archive_volumes");
     if (node_graph.findSelector(envelope.request, volumes_selector.family, volumes_selector.ordinal) != null and
-        (profile.volumes & direction) == 0)
+        ((direction & command_mask_read) == 0 or (profile.volumes & command_mask_read) == 0))
+        return error.UnsupportedException;
+    const volume_size_selector = comptime discovery.parameter("tar", "archive_volume_size");
+    if (node_graph.findSelector(envelope.request, volume_size_selector.family, volume_size_selector.ordinal) != null and
+        ((direction & command_mask_write) == 0 or (profile.volumes & command_mask_write) == 0))
         return error.UnsupportedException;
     const sizing = try parseSizingMode(
         protocolParam(envelope.request, vocabulary.protocol_parameter.sizing_mode),

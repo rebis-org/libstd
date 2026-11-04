@@ -392,9 +392,11 @@ pub fn spannedVolumeExtents(total_len: usize, volume_size: u64) Exception!Volume
 pub const VolumePlan = struct { volumes: u64 };
 
 // Offsets resolve relative to the disk named in each field, per the
-// Info-ZIP convention verified against system zip and 7zz.
-pub fn zipDecodeOrdinalSpanned(volumes: []const []const u8, ordinal: usize, output: []u8, join: []u8, disk_starts_scratch: []usize, options: ZipDecodeOptions) Exception!usize {
-    options.failure_cause.* = .none;
+// Info-ZIP convention verified against system zip and 7zz. The spanned
+// inspect and decode share one join-and-resolve pass.
+const SpannedSet = struct { archive: []const u8, directory: ZipDirectory, disk_starts: []const usize };
+
+fn zipSpannedSet(volumes: []const []const u8, join: []u8, disk_starts_scratch: []usize) Exception!SpannedSet {
     if (volumes.len == 0) return error.DataException;
     var total: usize = 0;
     for (volumes) |v| total = try bounds.addUsize(total, v.len);
@@ -429,7 +431,6 @@ pub fn zipDecodeOrdinalSpanned(volumes: []const []const u8, ordinal: usize, outp
     const eocd = eocd_pos orelse return error.DataException;
     const disk_count_total = readU16(archive, eocd + 4);
     const central_disk = readU16(archive, eocd + 6);
-    const size: usize = std.math.cast(usize, readU32(archive, eocd + 12)) orelse return error.ResourceException;
     const offset: usize = std.math.cast(usize, readU32(archive, eocd + 16)) orelse return error.ResourceException;
     var central_abs: usize = undefined;
     var count: usize = std.math.cast(usize, readU16(archive, eocd + 10)) orelse return error.ResourceException;
@@ -442,32 +443,58 @@ pub fn zipDecodeOrdinalSpanned(volumes: []const []const u8, ordinal: usize, outp
         const record = try bounds.slice(archive, locator - 12 - record_rel, 56);
         if (readU32(record, 0) != zip64_end_signature) return error.DataException;
         const cd64 = std.math.cast(usize, readU32(record, 20)) orelse return error.ResourceException;
-        const size64 = std.math.cast(usize, readU64(record, 40)) orelse return error.ResourceException;
         const off64 = std.math.cast(usize, readU64(record, 48)) orelse return error.ResourceException;
         if (cd64 >= disk_starts.len) return error.DataException;
         central_abs = try bounds.addUsize(disk_starts[cd64], off64);
         count = std.math.cast(usize, readU64(record, 32)) orelse return error.ResourceException;
-        _ = size64;
     } else {
         if (central_disk >= disk_starts.len) return error.DataException;
         central_abs = try bounds.addUsize(disk_starts[central_disk], offset);
-        _ = size;
     }
     if (central_abs > eocd) return error.DataException;
     const directory: ZipDirectory = .{ .offset = central_abs, .size = eocd - central_abs, .count = count, .base = 0 };
-    if (ordinal >= directory.count) return error.DataException;
-    var cursor = directory.offset;
+    return .{ .archive = archive, .directory = directory, .disk_starts = disk_starts };
+}
+
+pub fn zipInspectCountSpanned(volumes: []const []const u8, join: []u8, disk_starts_scratch: []usize, limits: Limits) Exception!usize {
+    const set = try zipSpannedSet(volumes, join, disk_starts_scratch);
+    if (set.directory.count > limits.entries) return error.ResourceException;
+    var cursor = set.directory.offset;
+    var index: usize = 0;
+    while (index < set.directory.count) : (index += 1) _ = try zipNext(set.archive, set.directory, &cursor, index);
+    if (cursor != try bounds.addUsize(set.directory.offset, set.directory.size)) return error.DataException;
+    return set.directory.count;
+}
+
+pub fn zipInspectOrdinalSpanned(volumes: []const []const u8, ordinal: usize, join: []u8, disk_starts_scratch: []usize, limits: Limits) Exception!Info {
+    const set = try zipSpannedSet(volumes, join, disk_starts_scratch);
+    if (set.directory.count > limits.entries) return error.ResourceException;
+    if (ordinal >= set.directory.count) return error.DataException;
+    var cursor = set.directory.offset;
+    var index: usize = 0;
+    while (index < set.directory.count) : (index += 1) {
+        const entry = try zipNext(set.archive, set.directory, &cursor, index);
+        if (index == ordinal) return entry;
+    }
+    return error.DataException;
+}
+
+pub fn zipDecodeOrdinalSpanned(volumes: []const []const u8, ordinal: usize, output: []u8, join: []u8, disk_starts_scratch: []usize, options: ZipDecodeOptions) Exception!usize {
+    options.failure_cause.* = .none;
+    const set = try zipSpannedSet(volumes, join, disk_starts_scratch);
+    if (ordinal >= set.directory.count) return error.DataException;
+    var cursor = set.directory.offset;
     var index: usize = 0;
     var entry: Info = undefined;
-    while (index < directory.count) : (index += 1) {
-        entry = try zipNext(archive, directory, &cursor, index);
+    while (index < set.directory.count) : (index += 1) {
+        entry = try zipNext(set.archive, set.directory, &cursor, index);
         if (index == ordinal) break;
     }
     // The records may declare a smaller size than the scan; re-derive the
     // walk like the single-volume decoder.
     var spanned_options = options;
-    spanned_options.disk_starts = disk_starts;
-    return try zipDecodeEntry(archive, entry, output, spanned_options);
+    spanned_options.disk_starts = set.disk_starts;
+    return try zipDecodeEntry(set.archive, entry, output, spanned_options);
 }
 
 fn validateEntry(entry: Entry) Exception!void {

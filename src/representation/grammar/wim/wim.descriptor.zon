@@ -12,6 +12,9 @@
         .{ .name = "entry_data", .family = 2, .ordinal = 6, .representation = "bytes" },
     },
     .capabilities = .{ "read", "write", "size", "replay" },
+    // Split WIM (.swm) sets: reads join the parts through part 1's table;
+    // writes cut whole resources into header-plus-payload parts.
+    .volumes = .{ "read", "write" },
     .sizing = "metadata_exact",
     .commit = "tentative",
     .limits = .{ .window = 0, .block = 0, .history = 0 },

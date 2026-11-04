@@ -282,8 +282,33 @@ pub fn tarHook(invocation: *common.Invocation) Exception!void {
     _ = sizing;
     var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
     if (command_mask == vocabulary.command_mask_read) {
+        const volume_tail = try collectVolumeParts(call.request, limits, &workspace);
         if (sink == null) {
             const archive = try materializeArchive(source_resource, &workspace, limits);
+            if (volume_tail.len > 0) {
+                try checkVolumePartOverlap(&workspace, null, volume_tail);
+                const volumes = try volumePartList(archive, volume_tail, &workspace);
+                if (try projectedEntrySize(call.request)) |ordinal| {
+                    const entry = try tar_seam.volumeInspectOrdinal(plan.provider, volumes, ordinal);
+                    response.byte_length = entry.size;
+                    return;
+                }
+                if (try projectedEntryMetadata(call.request)) |ordinal| {
+                    const entry = try tar_seam.volumeInspectOrdinal(plan.provider, volumes, ordinal);
+                    try publishEntryMetadata(call, response, .{
+                        .name = entry.name,
+                        .size = entry.size,
+                        .mtime = entry.modification_time,
+                        .uid = entry.uid,
+                        .typeflag = entry.typeflag,
+                        .link_name = entry.link_name,
+                    });
+                    return;
+                }
+                const count = try tar_seam.volumeInspectCount(plan.provider, volumes);
+                response.byte_length = count;
+                return;
+            }
             if (try projectedEntrySize(call.request)) |ordinal| {
                 const entry = try tar_seam.inspectOrdinal(plan.provider, archive, ordinal);
                 response.byte_length = entry.size;
@@ -309,6 +334,22 @@ pub fn tarHook(invocation: *common.Invocation) Exception!void {
         const sink_resource = head.sink;
         const ordinal = head.ordinal;
         const archive = try materializeArchive(source_resource, &workspace, limits);
+        if (volume_tail.len > 0) {
+            try checkVolumePartOverlap(&workspace, sink_resource, volume_tail);
+            const volumes = try volumePartList(archive, volume_tail, &workspace);
+            const entry = try tar_seam.volumeInspectOrdinal(plan.provider, volumes, ordinal);
+            const size = std.math.cast(usize, entry.size) orelse return error.ResourceException;
+            if (size > limits.decoded_bytes) return error.ResourceException;
+            try common.requireSinkCapacity(sink_resource, call, size);
+            // One slot per volume: a member holds at most one segment per
+            // volume.
+            const segments = try workspace.take(tar.VolumeSegment, volumes.len);
+            const target = try SinkTarget.open(sink_resource, &workspace, size);
+            _ = try tar_seam.volumeDecodeOrdinal(plan.provider, volumes, ordinal, target.output, segments);
+            _ = try target.publish(sink_resource, call, size);
+            response.byte_length = size;
+            return;
+        }
         const entry = try tar_seam.inspectOrdinal(plan.provider, archive, ordinal);
         const size = std.math.cast(usize, entry.size) orelse return error.ResourceException;
         if (size > limits.decoded_bytes) return error.ResourceException;
@@ -327,6 +368,27 @@ pub fn tarHook(invocation: *common.Invocation) Exception!void {
     } else if (command_mask == vocabulary.command_mask_write) {
         try requireVerified(commit);
         const entries = try collectEntries(tar.Entry, call.request, &workspace, NoCtx{}, fillTarEntry);
+        const volume_size = try writeVolumeSize(call.request);
+        if (volume_size != 0) {
+            // The GNU multi-volume layout plans exactly, then replays.
+            const volume_plan = try tar_seam.volumeSizeGnu(plan.provider, entries, volume_size);
+            if (sink == null) {
+                response.byte_length = volume_plan.total;
+                return;
+            }
+            const total_len = std.math.cast(usize, volume_plan.total) orelse return error.ResourceException;
+            const sink_resource = sink.?;
+            try common.requireSinkCapacity(sink_resource, call, total_len);
+            const lengths = try workspace.take(u64, volume_plan.count);
+            const scratch = try workspace.take(u8, tar.scratch_size);
+            const target = try SinkTarget.open(sink_resource, &workspace, total_len);
+            const emitted = try tar_seam.volumeEncodeGnu(plan.provider, entries, target.output, lengths, volume_size, scratch);
+            if (emitted.total != volume_plan.total or emitted.count != volume_plan.count) return error.InternalException;
+            const slices = try lengthVolumeSlices(target.output[0..total_len], lengths[0..emitted.count], &workspace);
+            response.byte_length = try target.publish(sink_resource, call, total_len);
+            try publishVolumeParts(call, response, slices[1..]);
+            return;
+        }
         const required = try tar_seam.archiveSize(plan.provider, entries);
         if (sink == null) {
             response.byte_length = required;
@@ -975,9 +1037,27 @@ pub fn wimHook(invocation: *common.Invocation) Exception!void {
     _ = sizing;
     var workspace = try resource.Workspace.initTracked(call.workspace, call.workspace_capacity, &plan.workspace_required);
     if (command_mask == vocabulary.command_mask_read) {
+        const volume_tail = try collectVolumeParts(call.request, limits, &workspace);
         if (sink == null) {
             const archive = try materializeArchive(source_resource, &workspace, limits);
             const scratch = try workspace.take(u8, wim_seam.scratch_size);
+            if (volume_tail.len > 0) {
+                try checkVolumePartOverlap(&workspace, null, volume_tail);
+                const volumes = try volumePartList(archive, volume_tail, &workspace);
+                if (try projectedEntrySize(call.request)) |ordinal| {
+                    const entry = try wim_seam.volumeInspectOrdinal(plan.provider, volumes, ordinal, scratch);
+                    response.byte_length = entry.size;
+                    return;
+                }
+                if (try projectedEntryMetadata(call.request)) |ordinal| {
+                    const entry = try wim_seam.volumeInspectOrdinal(plan.provider, volumes, ordinal, scratch);
+                    try publishEntryMetadata(call, response, .{ .name = entry.name, .size = entry.size });
+                    return;
+                }
+                const count = try wim_seam.volumeInspectCount(plan.provider, volumes, scratch);
+                response.byte_length = count;
+                return;
+            }
             if (try projectedEntrySize(call.request)) |ordinal| {
                 const entry = try wim_seam.inspectOrdinal(plan.provider, archive, ordinal, scratch);
                 response.byte_length = entry.size;
@@ -997,6 +1077,19 @@ pub fn wimHook(invocation: *common.Invocation) Exception!void {
         const ordinal = head.ordinal;
         const archive = try materializeArchive(source_resource, &workspace, limits);
         const scratch = try workspace.take(u8, wim_seam.scratch_size);
+        if (volume_tail.len > 0) {
+            try checkVolumePartOverlap(&workspace, sink_resource, volume_tail);
+            const volumes = try volumePartList(archive, volume_tail, &workspace);
+            const entry = try wim_seam.volumeInspectOrdinal(plan.provider, volumes, ordinal, scratch);
+            const size = std.math.cast(usize, entry.size) orelse return error.ResourceException;
+            if (size > limits.decoded_bytes) return error.ResourceException;
+            try common.requireSinkCapacity(sink_resource, call, size);
+            const target = try SinkTarget.open(sink_resource, &workspace, size);
+            _ = try wim_seam.volumeDecodeOrdinal(plan.provider, volumes, ordinal, target.output, scratch);
+            _ = try target.publish(sink_resource, call, size);
+            response.byte_length = size;
+            return;
+        }
         const entry = try wim_seam.inspectOrdinal(plan.provider, archive, ordinal, scratch);
         const size = std.math.cast(usize, entry.size) orelse return error.ResourceException;
         if (size > limits.decoded_bytes) return error.ResourceException;
@@ -1010,6 +1103,37 @@ pub fn wimHook(invocation: *common.Invocation) Exception!void {
         const entries = try collectEntries(wim.Entry, call.request, &workspace, NoCtx{}, fillWimEntry);
         const scratch = try workspace.take(u8, wim_seam.scratch_size);
         const required = try wim_seam.archiveSize(plan.provider, entries, scratch);
+        const volume_size = try writeVolumeSize(call.request);
+        if (volume_size != 0) {
+            // The split plans over an encoded archive, so the write stages
+            // the single WIM in the workspace first.
+            const encoded_len = std.math.cast(usize, required) orelse return error.ResourceException;
+            const encoded = try workspace.take(u8, encoded_len);
+            const written = try wim_seam.encode(plan.provider, entries, encoded, scratch);
+            if (written != encoded_len) return error.InternalException;
+            const volume_plan = try wim_seam.splitPlan(plan.provider, encoded, volume_size, scratch);
+            if (sink == null) {
+                response.byte_length = volume_plan.total;
+                return;
+            }
+            const total_len = std.math.cast(usize, volume_plan.total) orelse return error.ResourceException;
+            const sink_resource = sink.?;
+            try common.requireSinkCapacity(sink_resource, call, total_len);
+            const lengths = try workspace.take(u64, volume_plan.count);
+            const target = try SinkTarget.open(sink_resource, &workspace, total_len);
+            const emitted = try wim_seam.splitEmit(plan.provider, encoded, volume_size, target.output, lengths, scratch);
+            if (emitted.total != volume_plan.total or emitted.count != volume_plan.count) return error.InternalException;
+            const slices = try workspace.take([]const u8, emitted.count);
+            var at: usize = 0;
+            for (0..emitted.count) |index| {
+                const len = std.math.cast(usize, lengths[index]) orelse return error.ResourceException;
+                slices[index] = target.output[at..][0..len];
+                at += len;
+            }
+            response.byte_length = try target.publish(sink_resource, call, total_len);
+            try publishVolumeParts(call, response, slices[1..]);
+            return;
+        }
         if (sink == null) {
             response.byte_length = required;
             return;
@@ -1096,6 +1220,23 @@ pub fn cpioHook(invocation: *common.Invocation) Exception!void {
     }
 }
 
+// A zip spanned set is not a valid single archive when concatenated (the
+// directory offsets are disk-relative), so the joined bytes and the per-disk
+// starts travel together through the spanned leaf calls.
+const SpannedZip = struct {
+    volumes: []const []const u8,
+    join: []u8,
+    disk_starts: []usize,
+};
+
+fn openSpannedZip(head: []const u8, tail: []const []const u8, workspace: *resource.Workspace) Exception!SpannedZip {
+    const volumes = try volumePartList(head, tail, workspace);
+    const total = try volumeSetBytes(head, tail);
+    const join = try workspace.take(u8, total);
+    const disk_starts = try workspace.take(usize, volumes.len);
+    return .{ .volumes = volumes, .join = join, .disk_starts = disk_starts };
+}
+
 pub fn zipHook(invocation: *common.Invocation) Exception!void {
     const plan = &invocation.plan;
     const call = invocation.call;
@@ -1116,8 +1257,26 @@ pub fn zipHook(invocation: *common.Invocation) Exception!void {
         return err;
     };
     if (command_mask == vocabulary.command_mask_read) {
+        const volume_tail = try collectVolumeParts(call.request, limits, &workspace);
         if (sink == null) {
             const archive = try materializeArchive(source_resource, &workspace, limits);
+            if (volume_tail.len > 0) {
+                try checkVolumePartOverlap(&workspace, null, volume_tail);
+                const spanned = try openSpannedZip(archive, volume_tail, &workspace);
+                if (try projectedEntrySize(call.request)) |ordinal| {
+                    const entry = try zip.zipInspectOrdinalSpanned(spanned.volumes, std.math.cast(usize, ordinal) orelse return error.CallException, spanned.join, spanned.disk_starts, limits);
+                    response.byte_length = entry.uncompressed_size;
+                    return;
+                }
+                if (try projectedEntryMetadata(call.request)) |ordinal| {
+                    const entry = try zip.zipInspectOrdinalSpanned(spanned.volumes, std.math.cast(usize, ordinal) orelse return error.CallException, spanned.join, spanned.disk_starts, limits);
+                    try publishEntryMetadata(call, response, .{ .name = entry.name, .size = entry.uncompressed_size });
+                    return;
+                }
+                const count = try zip.zipInspectCountSpanned(spanned.volumes, spanned.join, spanned.disk_starts, limits);
+                response.byte_length = count;
+                return;
+            }
             if (try projectedEntrySize(call.request)) |ordinal| {
                 const entry = try zip.zipInspectOrdinalEx(archive, std.math.cast(usize, ordinal) orelse return error.CallException, limits);
                 response.byte_length = entry.uncompressed_size;
@@ -1136,6 +1295,37 @@ pub fn zipHook(invocation: *common.Invocation) Exception!void {
         const sink_resource = head.sink;
         const ordinal = head.ordinal;
         const archive = try materializeArchive(source_resource, &workspace, limits);
+        if (volume_tail.len > 0) {
+            try checkVolumePartOverlap(&workspace, sink_resource, volume_tail);
+            const spanned = try openSpannedZip(archive, volume_tail, &workspace);
+            const spanned_entry = try zip.zipInspectOrdinalSpanned(spanned.volumes, std.math.cast(usize, ordinal) orelse return error.ResourceException, spanned.join, spanned.disk_starts, limits);
+            const history = try workspace.take(u8, if (spanned_entry.actual_method == 9) zip.deflate64_decode_history_size else zip.deflate_history_size);
+            const size = spanned_entry.uncompressed_size;
+            if (size > limits.decoded_bytes) return error.ResourceException;
+            try common.requireSinkCapacity(sink_resource, call, size);
+            const decrypt_staging = if (spanned_entry.encrypted) try workspace.take(u8, spanned_entry.compressed_size) else @as([]u8, &.{});
+            // The decode target opens before the scratch carve: a staged sink needs
+            // its buffer ahead of the decoder's claim.
+            const target = try SinkTarget.open(sink_resource, &workspace, size);
+            const scratch = try workspace.take(u8, workspace.remaining());
+            const decode_options: zip.ZipDecodeOptions = .{
+                .password = cryptoPassword(crypto_params),
+                .kdf_rounds_limit = cryptoKdfLimit(crypto_params),
+                .password_lifetime = cryptoLifetime(crypto_params),
+                .failure_cause = &crypto_cause,
+                .staging = decrypt_staging,
+                .scratch = scratch,
+                .history = history,
+                .provider = plan.provider,
+            };
+            _ = zip.zipDecodeOrdinalSpanned(spanned.volumes, std.math.cast(usize, ordinal) orelse return error.ResourceException, target.output, spanned.join, spanned.disk_starts, decode_options) catch |err| {
+                writeCryptoFailure(call, crypto_cause);
+                return err;
+            };
+            _ = try target.publish(sink_resource, call, size);
+            response.byte_length = size;
+            return;
+        }
         const entry = try zip.zipInspectOrdinalEx(archive, std.math.cast(usize, ordinal) orelse return error.ResourceException, limits);
         const history = try workspace.take(u8, if (entry.actual_method == 9) zip.deflate64_decode_history_size else zip.deflate_history_size);
         const size = entry.uncompressed_size;
@@ -1188,6 +1378,34 @@ pub fn zipHook(invocation: *common.Invocation) Exception!void {
             max_compressed = @max(max_compressed, compressed);
         }
         const crypto_staging = if (max_compressed != 0) try workspace.take(u8, @max(max_compressed, zip.deflate_measurement_buffer_size)) else @as([]u8, &.{});
+        const volume_size = try writeVolumeSize(call.request);
+        if (volume_size != 0) {
+            const vs = std.math.cast(usize, volume_size) orelse return error.ResourceException;
+            const required = zip.requiredSize(entries, comment, history, measurement_buffer, scratch, &crypto_cause) catch |err| {
+                writeCryptoFailure(call, crypto_cause);
+                return err;
+            };
+            const total = try bounds.addUsize(required, 4);
+            // One plan slot per crossed disk plus the per-entry record slots.
+            const plan_scratch = try workspace.take(usize, entries.len * 2 + total / vs + 8);
+            if (sink == null) {
+                response.byte_length = total;
+                return;
+            }
+            const sink_resource = sink.?;
+            try common.requireSinkCapacity(sink_resource, call, total);
+            const target = try SinkTarget.open(sink_resource, &workspace, total);
+            const result = zip.encodeSpanned(entries, comment, target.output, volume_size, plan.provider, history, measurement_buffer, crypto_staging, scratch, &crypto_cause, plan_scratch) catch |err| {
+                writeCryptoFailure(call, crypto_cause);
+                return err;
+            };
+            if (result.total_len != total) return error.InternalException;
+            const slices = try chunkVolumeSlices(target.output[0..result.total_len], volume_size, &workspace);
+            if (slices.len != result.volumes) return error.InternalException;
+            response.byte_length = try target.publish(sink_resource, call, result.total_len);
+            try publishVolumeParts(call, response, slices[1..]);
+            return;
+        }
         const required = zip.requiredSize(entries, comment, history, measurement_buffer, scratch, &crypto_cause) catch |err| {
             writeCryptoFailure(call, crypto_cause);
             return err;
@@ -1235,6 +1453,7 @@ fn sevenZipGeneric(comptime coded: bool, invocation: *common.Invocation) Excepti
         return err;
     };
     if (command_mask == vocabulary.command_mask_read) {
+        const volume_tail = try collectVolumeParts(call.request, limits, &workspace);
         const load_options: seven_zip.SevenZipLoadOptions = .{
             .password = cryptoPassword(crypto_params),
             .kdf_rounds_limit = cryptoKdfLimit(crypto_params),
@@ -1244,7 +1463,13 @@ fn sevenZipGeneric(comptime coded: bool, invocation: *common.Invocation) Excepti
         };
         if (sink == null) {
             try common.checkSourceWorkspaceOverlap(call, source_resource);
-            const archive = try common.materializeSource(.replay, source_resource, &workspace, limits.encoded_bytes);
+            const materialized = try common.materializeSource(.replay, source_resource, &workspace, limits.encoded_bytes);
+            // A volume set joins into the equivalent single archive; every
+            // inspect path then runs unchanged.
+            const archive = if (volume_tail.len > 0) blk: {
+                try checkVolumePartOverlap(&workspace, null, volume_tail);
+                break :blk try seven_zip.sevenZipJoinVolumes(try volumePartList(materialized, volume_tail, &workspace), &workspace, limits);
+            } else materialized;
             if (try projectedEntrySize(call.request)) |ordinal| {
                 const entry = seven_zip.sevenZipInspectOrdinalEx(archive, &workspace, limits, ordinal, &load_options) catch |err| {
                     writeCryptoFailure(call, crypto_cause);
@@ -1272,7 +1497,11 @@ fn sevenZipGeneric(comptime coded: bool, invocation: *common.Invocation) Excepti
         const sink_resource = sink.?;
         try common.checkWorkspaceOverlap(call, source_resource, sink_resource);
         const ordinal = archiveOrdinal(call.request);
-        const archive = try common.materializeSource(.replay, source_resource, &workspace, limits.encoded_bytes);
+        const materialized = try common.materializeSource(.replay, source_resource, &workspace, limits.encoded_bytes);
+        const archive = if (volume_tail.len > 0) blk: {
+            try checkVolumePartOverlap(&workspace, sink_resource, volume_tail);
+            break :blk try seven_zip.sevenZipJoinVolumes(try volumePartList(materialized, volume_tail, &workspace), &workspace, limits);
+        } else materialized;
         const entry = seven_zip.sevenZipInspectOrdinalEx(archive, &workspace, limits, ordinal, &load_options) catch |err| {
             writeCryptoFailure(call, crypto_cause);
             return err;
@@ -1315,6 +1544,25 @@ fn sevenZipGeneric(comptime coded: bool, invocation: *common.Invocation) Excepti
             return err;
         };
         const required = try seven_zip.sevenZipPackedSize(entries, packed_entries, &workspace, plan.provider, limits, header_options);
+        const volume_size = try writeVolumeSize(call.request);
+        if (volume_size != 0) {
+            const layout = try seven_zip.sevenZipVolumeExtents(required, volume_size);
+            if (sink == null) {
+                response.byte_length = required;
+                return;
+            }
+            const sink_resource = sink.?;
+            try common.checkWorkspaceOverlap(call, source_resource, sink_resource);
+            try common.requireSinkCapacity(sink_resource, call, layout.total_len);
+            const target = try SinkTarget.open(sink_resource, &workspace, layout.total_len);
+            const written_layout = try seven_zip.sevenZipWritePackedVolumes(entries, packed_entries, target.output, volume_size, &workspace, plan.provider, limits, header_options);
+            if (written_layout.total_len != layout.total_len or written_layout.volumes != layout.volumes) return error.InternalException;
+            const slices = try chunkVolumeSlices(target.output[0..written_layout.total_len], volume_size, &workspace);
+            if (slices.len != written_layout.volumes) return error.InternalException;
+            response.byte_length = try target.publish(sink_resource, call, written_layout.total_len);
+            try publishVolumeParts(call, response, slices[1..]);
+            return;
+        }
         if (sink == null) {
             response.byte_length = required;
             return;
@@ -1516,6 +1764,73 @@ fn checkVolumePartOverlap(workspace: *resource.Workspace, sink: ?*Resource, part
     }
 }
 
+// A split write carries the shared volume granularity; the parameter's
+// presence names the split shape, so a zero value is a malformed request
+// rather than a plain single-archive write.
+fn writeVolumeSize(request: ?*Node) Exception!u64 {
+    const selector = comptime discovery.parameter("tar", "archive_volume_size");
+    const node = node_graph.findSelector(request, selector.family, selector.ordinal) orelse return 0;
+    const value = node_graph.parseU64(node);
+    if (value == 0) return error.CallException;
+    return value;
+}
+
+// A split set leaves as one contiguous sink stream; the response children
+// named archive_volumes report each volume's bytes in order, so a host can
+// cut the stream without re-deriving the layout. Fewer chained nodes than
+// tail volumes is a capacity answer, never a truncation.
+fn publishVolumeParts(call: *Call, response: *Node, tail: []const []const u8) Exception!void {
+    var cursor = response.child;
+    var index: usize = 0;
+    while (cursor) |node| : (cursor = node.next) {
+        if (index >= tail.len) return;
+        if (!isVolumePartNode(node)) continue;
+        const part = tail[index];
+        if (node.byte_capacity < part.len) {
+            common.writeCapacityDiagnostic(call, part.len, node.byte_capacity);
+            return error.CapacityException;
+        }
+        const output = node.bytes orelse return error.CallException;
+        @memcpy(output[0..part.len], part);
+        node.byte_length = part.len;
+        index += 1;
+    }
+    if (index < tail.len) {
+        common.writeCapacityDiagnostic(call, tail.len, index);
+        return error.CapacityException;
+    }
+}
+
+// Cuts a contiguous set into plain volume-size chunks: every volume but the
+// last is exactly volume_size bytes (the zip and 7z extent conventions).
+fn chunkVolumeSlices(set: []const u8, volume_size: u64, workspace: *resource.Workspace) Exception![]const []const u8 {
+    const vs = std.math.cast(usize, volume_size) orelse return error.ResourceException;
+    const count = if (set.len == 0) 1 else (set.len + vs - 1) / vs;
+    const slices = try workspace.take([]const u8, count);
+    var at: usize = 0;
+    for (0..count) |index| {
+        const take = @min(vs, set.len - at);
+        slices[index] = set[at..][0..take];
+        at += take;
+    }
+    return slices;
+}
+
+// Cuts a contiguous set by per-volume lengths, as GNU tar's volumes vary
+// with the members they hold.
+fn lengthVolumeSlices(set: []const u8, lengths: []const u64, workspace: *resource.Workspace) Exception![]const []const u8 {
+    const slices = try workspace.take([]const u8, lengths.len);
+    var at: usize = 0;
+    for (lengths, 0..) |len, index| {
+        const take = std.math.cast(usize, len) orelse return error.ResourceException;
+        if (at + take > set.len) return error.InternalException;
+        slices[index] = set[at..][0..take];
+        at += take;
+    }
+    if (at != set.len) return error.InternalException;
+    return slices;
+}
+
 pub fn rarHook(invocation: *common.Invocation) Exception!void {
     const plan = &invocation.plan;
     const call = invocation.call;
@@ -1693,8 +2008,6 @@ pub fn rarHook(invocation: *common.Invocation) Exception!void {
         response.byte_length = size;
     } else if (command_mask == vocabulary.command_mask_write) {
         try requireVerified(commit);
-        // Volume writing is refused at dispatch: the descriptor opts the
-        // split-set shape into the read direction only.
         var crypto_cause: crypto.FailureCause = .none;
         const crypto_params = parseCryptoParams("rar", call.request, &crypto_cause) catch |err| {
             writeCryptoFailure(call, crypto_cause);
@@ -1703,12 +2016,16 @@ pub fn rarHook(invocation: *common.Invocation) Exception!void {
         const header_encode = try parseHeaderEncode(call.request, "rar");
         // 1 encrypts file data, 2 also encrypts headers.
         const entries = try collectEntries(rar_writer.RarEntry, call.request, &workspace, NoCtx{}, fillRarEntry);
-        const write_options: rar_writer.WriteOptions = .{
+        var write_options: rar_writer.WriteOptions = .{
             .password = cryptoPasswordOrEmpty(crypto_params),
             .encrypt_headers = header_encode == 2,
             .kdf_rounds_limit = cryptoKdfLimit(crypto_params),
             .failure_cause = &crypto_cause,
         };
+        // The split granularity opts the RAR5 volume writer in; the
+        // single-volume entry points still refuse a nonzero size.
+        const volume_size_raw = try writeVolumeSize(call.request);
+        if (volume_size_raw != 0) write_options.volume_size = std.math.cast(usize, volume_size_raw) orelse return error.ResourceException;
         if (write_options.encrypt_headers and write_options.password.len == 0) return error.CallException;
         var max_input: usize = 0;
         var packed_total: usize = 0;
@@ -1741,6 +2058,36 @@ pub fn rarHook(invocation: *common.Invocation) Exception!void {
             .crypt_salts = crypt_salts,
             .crypt_ivs = crypt_ivs,
         };
+        if (volume_size_raw != 0) {
+            const volume_plan = rar_writer.rarVolumeSize(entries, &ws, write_options) catch |err| {
+                writeCryptoFailure(call, crypto_cause);
+                return err;
+            };
+            if (sink == null) {
+                response.byte_length = volume_plan.total;
+                return;
+            }
+            const sink_resource = sink.?;
+            try common.checkWorkspaceOverlap(call, source_resource, sink_resource);
+            try common.requireSinkCapacity(sink_resource, call, volume_plan.total);
+            const volume_scratch = try workspace.take([]u8, volume_plan.count);
+            const target = try SinkTarget.open(sink_resource, &workspace, volume_plan.total);
+            const volume_count = rar_writer.rarEncodeVolumes(entries, target.output, volume_scratch, &ws, plan.provider, write_options) catch |err| {
+                writeCryptoFailure(call, crypto_cause);
+                return err;
+            };
+            if (volume_count != volume_plan.count) return error.InternalException;
+            const slices = try workspace.take([]const u8, volume_count);
+            var set_bytes: usize = 0;
+            for (volume_scratch[0..volume_count], 0..) |slice, index| {
+                slices[index] = slice;
+                set_bytes = try bounds.addUsize(set_bytes, slice.len);
+            }
+            if (set_bytes != volume_plan.total) return error.InternalException;
+            response.byte_length = try target.publish(sink_resource, call, set_bytes);
+            try publishVolumeParts(call, response, slices[1..]);
+            return;
+        }
         const required = rar_writer.rarWriteSizeEx(entries, &ws, write_options) catch |err| {
             writeCryptoFailure(call, crypto_cause);
             return err;

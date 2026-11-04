@@ -14,9 +14,15 @@ pub const typeflag_regular: u8 = '0';
 const typeflag_gnu_long_name: u8 = 'L';
 const typeflag_gnu_long_link: u8 = 'K';
 const typeflag_gnu_sparse: u8 = 'S';
+const typeflag_gnu_multivol: u8 = 'M';
+const typeflag_gnu_volume_label: u8 = 'V';
 const typeflag_pax: u8 = 'x';
 const typeflag_global_pax: u8 = 'g';
 const max_sparse_segments = 1024;
+// The GNU multi-volume header states the continuation in the old-GNU
+// offset slot (vendor/tar buffer.c gnu_add_multi_volume_header).
+const gnu_offset_field = 345;
+const max_name_field = 100;
 
 pub const SparseSegment = struct {
     offset: u64,
@@ -1076,4 +1082,495 @@ test "tar rejects unsafe ustar prefix fields" {
     var out: [4]u8 = undefined;
     const size = try decodeOrdinal(&archive, 0, &out);
     try testing.expectEqualStrings("abc", out[0..size]);
+}
+
+// ---------------------------------------------------------------------------
+// GNU multi-volume sets. A volume ends where its bytes end: tar cuts a
+// member's data at the volume boundary and opens the next volume with an
+// 'M' header carrying the member name (truncated to the name field), the
+// remaining size, and the offset already written; intermediate volumes
+// carry no EOF blocks, only the final one does (vendor/tar buffer.c).
+
+pub const VolumeSegment = struct { volume: u16, offset: u64, len: u64 };
+
+pub const VolumePlan = struct { count: usize, total: u64 };
+
+const VolumeReader = struct {
+    volumes: []const []const u8,
+    inner: Reader,
+    vi: usize = 0,
+    ordinal: u64 = 0,
+    segments: ?[]VolumeSegment,
+    // When set, only the named member's segments are recorded; a decode
+    // walks past earlier members whose bytes it must not gather.
+    target: ?u64 = null,
+    segment_count: usize = 0,
+    cont_size: u64 = 0,
+    cont_written: u64 = 0,
+    cont_name: []const u8 = &.{},
+
+    fn recordSegment(self: *VolumeReader, offset: u64, len: u64) Exception!void {
+        if (len == 0) return;
+        if (self.segments) |s| {
+            if (self.target) |t| {
+                if (self.ordinal != t) return;
+            }
+            if (self.segment_count >= s.len) return error.CapacityException;
+            s[self.segment_count] = .{ .volume = @intCast(self.vi), .offset = offset, .len = len };
+        }
+        self.segment_count += 1;
+    }
+
+    fn advanceVolume(self: *VolumeReader) Exception!void {
+        if (self.vi + 1 >= self.volumes.len) return error.DataException;
+        self.vi += 1;
+        self.inner.archive = self.volumes[self.vi];
+        self.inner.offset = 0;
+    }
+
+    // One continuation volume: the 'M' header names the cut member, states
+    // its remaining size and the offset already written, and the member
+    // data follows.
+    fn consumeContinuation(self: *VolumeReader, vol: []const u8) Exception!void {
+        if (self.inner.offset + block_size > vol.len) return error.DataException;
+        const entry = try self.inner.readHeader();
+        if (entry.typeflag != typeflag_gnu_multivol) return error.DataException;
+        if (entry.size != self.cont_size - self.cont_written) return error.DataException;
+        const block = try bounds.slice(vol, entry.header_offset, block_size);
+        const already = try tarNumber(block[gnu_offset_field..][0..12]);
+        if (already != self.cont_written) return error.DataException;
+        const shown = tarField(block[0..max_name_field]);
+        const expected = self.cont_name[0..@min(self.cont_name.len, max_name_field)];
+        if (!std.mem.eql(u8, shown, expected)) return error.DataException;
+        const taken = @min(entry.size, vol.len - entry.data_offset);
+        if (taken == 0) return error.DataException;
+        try self.recordSegment(entry.data_offset, taken);
+        self.cont_written += taken;
+        if (self.cont_written == self.cont_size) {
+            self.inner.offset = try bounds.addU64(entry.data_offset, try tarAligned(entry.size));
+            if (self.inner.offset > vol.len) return error.DataException;
+        } else {
+            self.inner.offset = vol.len;
+        }
+    }
+
+    fn next(self: *VolumeReader) Exception!?EntryInfo {
+        while (true) {
+            const vol = self.inner.archive;
+            if (self.inner.offset + block_size > vol.len) {
+                try self.advanceVolume();
+                continue;
+            }
+            const block = try bounds.slice(vol, self.inner.offset, block_size);
+            if (isZeroBlock(block)) {
+                // Only the final volume carries the EOF blocks.
+                if (self.vi + 1 != self.volumes.len) return error.DataException;
+                const remaining = vol[@intCast(self.inner.offset)..];
+                if (remaining.len < 2 * block_size or !isZeroBlock(remaining[0 .. 2 * @as(usize, @intCast(block_size))])) return error.DataException;
+                return null;
+            }
+            var entry = try self.inner.readHeader();
+            const data_end = try bounds.addU64(entry.data_offset, try tarAligned(entry.size));
+            switch (entry.typeflag) {
+                typeflag_gnu_volume_label => {
+                    // A volume label carries no data; anything else in the
+                    // size field is not a label shape.
+                    if (entry.size != 0) return error.DataException;
+                    try self.inner.advance(0);
+                },
+                typeflag_gnu_long_name, typeflag_gnu_long_link, typeflag_pax, typeflag_global_pax => {
+                    if (data_end > vol.len) return error.DataException;
+                    const data = try bounds.slice(vol, entry.data_offset, entry.size);
+                    switch (entry.typeflag) {
+                        typeflag_gnu_long_name => {
+                            if (self.inner.long_name != null) return error.DataException;
+                            self.inner.long_name = tarField(data);
+                        },
+                        typeflag_gnu_long_link => {
+                            if (self.inner.long_link != null) return error.DataException;
+                            self.inner.long_link = tarField(data);
+                        },
+                        typeflag_pax => {
+                            if (!tarPaxEmpty(self.inner.local_pax)) return error.DataException;
+                            self.inner.local_pax = try tarParsePax(data);
+                        },
+                        else => tarMergePax(&self.inner.global_pax, try tarParsePax(data)),
+                    }
+                    try self.inner.advance(entry.size);
+                },
+                typeflag_gnu_multivol => return error.DataException,
+                else => {
+                    try tarValidateType(entry.typeflag);
+                    // The physical size decides the on-volume advance; pax
+                    // and sparse rewrites concern the logical size only.
+                    const physical_size = entry.size;
+                    try tarApplyPax(&entry, self.inner.global_pax);
+                    try tarApplyPax(&entry, self.inner.local_pax);
+                    const sparse_wanted = self.inner.local_pax.sparse_major != null or self.inner.local_pax.sparse_size != null or self.inner.local_pax.sparse_realsize != null or self.inner.local_pax.sparse_map != null or self.inner.local_pax.sparse_pax != null;
+                    // A sparse member must sit whole inside one volume; the
+                    // walk has no continuation shape for it.
+                    if (sparse_wanted or entry.typeflag == typeflag_gnu_sparse) {
+                        if (data_end > vol.len) return error.UnsupportedException;
+                    }
+                    var stored_size = physical_size;
+                    var self_advanced = false;
+                    if (entry.typeflag == typeflag_gnu_sparse) {
+                        // parseOldGnuSparse moves the reader itself.
+                        const sparse = try self.inner.parseOldGnuSparse(&entry);
+                        entry.size = sparse.realsize;
+                        entry.sparse = sparse;
+                        self_advanced = true;
+                    } else if (sparse_wanted) {
+                        if (try self.inner.sparseFromPax(&entry, self.inner.local_pax)) |info| {
+                            entry.sparse = info;
+                            entry.size = info.realsize;
+                        }
+                    } else if (self.inner.local_pax.size != null or self.inner.global_pax.size != null) {
+                        // A pax size record states the stored length, as the
+                        // single-volume walk advances by it.
+                        stored_size = entry.size;
+                        _ = try bounds.slice(vol, entry.data_offset, stored_size);
+                    }
+                    if (self.inner.long_name) |name| {
+                        entry.name = name;
+                        entry.prefix = &.{};
+                    }
+                    if (self.inner.long_link) |link_name| entry.link_name = link_name;
+                    try tarValidateEntryName(entry);
+                    entry.ordinal = self.ordinal;
+                    if (!self_advanced and data_end > vol.len) {
+                        // The member is cut: record this volume's share, then
+                        // consume every continuation volume before returning,
+                        // so the member's segments are complete on return.
+                        // The continuation names the real member name
+                        // truncated to the field, as GNU writes it.
+                        self.cont_name = entry.name[0..@min(entry.name.len, max_name_field)];
+                        self.cont_size = entry.size;
+                        self.cont_written = vol.len - entry.data_offset;
+                        try self.recordSegment(entry.data_offset, self.cont_written);
+                        while (self.cont_written < self.cont_size) {
+                            try self.advanceVolume();
+                            try self.consumeContinuation(self.volumes[self.vi]);
+                        }
+                        self.inner.long_name = null;
+                        self.inner.long_link = null;
+                        self.inner.local_pax = .{};
+                        self.ordinal = try bounds.addU64(self.ordinal, 1);
+                        return entry;
+                    }
+                    try self.recordSegment(entry.data_offset, stored_size);
+                    self.ordinal = try bounds.addU64(self.ordinal, 1);
+                    if (!self_advanced) try self.inner.advance(stored_size);
+                    self.inner.long_name = null;
+                    self.inner.long_link = null;
+                    self.inner.local_pax = .{};
+                    return entry;
+                },
+            }
+        }
+    }
+};
+
+pub fn volumeInspectCount(volumes: []const []const u8) Exception!u64 {
+    if (volumes.len == 0) return error.DataException;
+    var reader = VolumeReader{
+        .volumes = volumes,
+        .inner = Reader{ .archive = volumes[0] },
+        .segments = null,
+    };
+    var count: u64 = 0;
+    while (try reader.next()) |_| count = try bounds.addU64(count, 1);
+    return count;
+}
+
+pub fn volumeInspectOrdinal(volumes: []const []const u8, ordinal: u64) Exception!EntryInfo {
+    if (volumes.len == 0) return error.DataException;
+    var reader = VolumeReader{
+        .volumes = volumes,
+        .inner = Reader{ .archive = volumes[0] },
+        .segments = null,
+    };
+    while (try reader.next()) |entry| {
+        if (entry.ordinal == ordinal) return entry;
+    }
+    return error.DataException;
+}
+
+// One slot per volume: a member holds at most one segment per volume.
+pub fn volumeDecodeOrdinal(volumes: []const []const u8, ordinal: u64, output: []u8, segments: []VolumeSegment) Exception!usize {
+    if (volumes.len == 0) return error.DataException;
+    if (segments.len < volumes.len) return error.CapacityException;
+    var reader = VolumeReader{
+        .volumes = volumes,
+        .inner = Reader{ .archive = volumes[0] },
+        .segments = segments,
+        .target = ordinal,
+        .segment_count = 0,
+    };
+    while (try reader.next()) |entry| {
+        if (entry.ordinal != ordinal) continue;
+        if (entry.sparse != null) return error.UnsupportedException;
+        const size = std.math.cast(usize, entry.size) orelse return error.ResourceException;
+        if (output.len < size) return error.CapacityException;
+        var filled: usize = 0;
+        for (reader.segments.?[0..reader.segment_count]) |segment| {
+            const src = try bounds.slice(volumes[segment.volume], segment.offset, segment.len);
+            const take = std.math.cast(usize, segment.len) orelse return error.ResourceException;
+            if (filled + take > size) return error.DataException;
+            @memcpy(output[filled..][0..take], src);
+            filled += take;
+        }
+        if (filled != size) return error.DataException;
+        return size;
+    }
+    return error.DataException;
+}
+
+// Writes one 512-byte block into the current volume; the layout keeps
+// every write a block multiple, so a full volume lands on the boundary.
+const SplitEmitter = struct {
+    out: ?[]u8,
+    scratch: []u8,
+    volume_size: u64,
+    lengths: ?[]u64,
+    pos: u64 = 0,
+    cursor: u64 = 0,
+    index: u64 = 0,
+    count: u64 = 1,
+    total: u64 = 0,
+
+    fn write(self: *SplitEmitter, bytes: []const u8) Exception!void {
+        if (self.cursor + bytes.len > self.volume_size) return error.InternalException;
+        if (self.out) |out| @memcpy(out[@intCast(self.pos)..][0..bytes.len], bytes);
+        self.pos += bytes.len;
+        self.cursor += bytes.len;
+        self.total += bytes.len;
+    }
+
+    fn free(self: *SplitEmitter) u64 {
+        return self.volume_size - self.cursor;
+    }
+
+    fn closeVolume(self: *SplitEmitter) Exception!void {
+        if (self.lengths) |l| {
+            if (self.index >= l.len) return error.CapacityException;
+            l[@intCast(self.index)] = self.cursor;
+        }
+        self.index += 1;
+        self.cursor = 0;
+    }
+
+    fn openVolume(self: *SplitEmitter) Exception!void {
+        self.count += 1;
+        if (self.count > std.math.maxInt(u32)) return error.ResourceException;
+    }
+
+    fn pad(self: *SplitEmitter, size: u64) Exception!void {
+        const padding = (block_size - size % block_size) % block_size;
+        if (padding == 0) return;
+        if (self.scratch.len < scratch_size) return error.CapacityException;
+        @memset(self.scratch[0..@intCast(padding)], 0);
+        try self.write(self.scratch[0..@intCast(padding)]);
+    }
+
+    // The continuation header: the member name truncated to the name
+    // field, the remaining size, and the offset already written.
+    fn writeMultivolHeader(self: *SplitEmitter, name: []const u8, remaining: u64, written: u64) Exception!void {
+        var block: [512]u8 = undefined;
+        var sink = io.Sink{ .bytes = &block };
+        const shown = name[0..@min(name.len, max_name_field)];
+        try tarWriteHeader(.gnu, &sink, self.scratch, shown, &.{}, &.{}, 0o644, 0, 0, 0, typeflag_gnu_multivol, remaining, 0, 0);
+        tarWriteNumber(block[gnu_offset_field..][0..12], written);
+        // The offset lands after the seal, so the checksum is recomputed
+        // over the patched block.
+        tarSealHeader(&block);
+        try self.write(&block);
+    }
+};
+
+// One traversal decides sizes and bytes; the emit pass replays the same
+// layout, so a plan and its set cannot disagree.
+fn splitLayout(entries: []const Entry, volume_size: u64, lengths: ?[]u64, scratch: []u8, output: ?[]u8) Exception!VolumePlan {
+    if (volume_size == 0 or volume_size % block_size != 0 or volume_size < 2 * block_size) return error.CallException;
+    if (scratch.len < scratch_size) return error.CapacityException;
+    var em = SplitEmitter{ .out = output, .scratch = scratch, .volume_size = volume_size, .lengths = lengths };
+    for (entries) |entry| {
+        const parts = try tarNameParts(entry.name);
+        if (std.mem.findScalar(u8, entry.link_name, 0) != null) return error.CallException;
+        if ((entry.typeflag == '1' or entry.typeflag == '2') and entry.link_name.len == 0) return error.CallException;
+        const data_size = try tarDataSize(entry.typeflag, entry.data);
+        // Header units never split: they either fit whole or the member
+        // opens the next volume. Each long-name unit carries its own
+        // header block plus the padded name bytes.
+        var header_bytes: u64 = block_size;
+        if (entry.name.len > max_name_field) header_bytes = try bounds.addU64(header_bytes, try bounds.addU64(block_size, try tarAligned(entry.name.len + 1)));
+        if (entry.link_name.len > max_name_field) header_bytes = try bounds.addU64(header_bytes, try bounds.addU64(block_size, try tarAligned(entry.link_name.len + 1)));
+        if (em.cursor + header_bytes > volume_size) {
+            try em.closeVolume();
+            try em.openVolume();
+            // A fresh volume is the widest fit; a header unit wider than
+            // any volume has no layout.
+            if (em.cursor + header_bytes > volume_size) return error.ResourceException;
+        }
+        if (entry.name.len > max_name_field) {
+            const long_size: usize = entry.name.len + 1;
+            try tarWriteHeader(.gnu, &em, scratch, "././@LongLink", &.{}, &.{}, 0o644, 0, 0, 0, typeflag_gnu_long_name, long_size, 0, 0);
+            var staged: [512]u8 = undefined;
+            var written: usize = 0;
+            while (written < long_size) {
+                const take: usize = @intCast(@min(@as(u64, staged.len), long_size - written));
+                const from = if (written < entry.name.len) entry.name[written..] else &.{};
+                for (staged[0..take], 0..) |*b, i| {
+                    b.* = if (i < from.len) from[i] else 0;
+                }
+                try em.write(staged[0..take]);
+                written += take;
+            }
+            try em.pad(long_size);
+        }
+        if (entry.link_name.len > max_name_field) {
+            const long_size: usize = entry.link_name.len + 1;
+            try tarWriteHeader(.gnu, &em, scratch, "././@LongLink", &.{}, &.{}, 0o644, 0, 0, 0, typeflag_gnu_long_link, long_size, 0, 0);
+            var staged: [512]u8 = undefined;
+            var written: usize = 0;
+            while (written < long_size) {
+                const take: usize = @intCast(@min(@as(u64, staged.len), long_size - written));
+                const from = if (written < entry.link_name.len) entry.link_name[written..] else &.{};
+                for (staged[0..take], 0..) |*b, i| {
+                    b.* = if (i < from.len) from[i] else 0;
+                }
+                try em.write(staged[0..take]);
+                written += take;
+            }
+            try em.pad(long_size);
+        }
+        try tarWriteHeader(.gnu, &em, scratch, parts.name, &.{}, if (entry.link_name.len > max_name_field) &.{} else entry.link_name, entry.mode, entry.uid, entry.gid, entry.modification_time, entry.typeflag, data_size, entry.devmajor, entry.devminor);
+        // The member data fills volumes whole-block at a time; a cut
+        // member continues under an 'M' header on the next volume.
+        var written: usize = 0;
+        while (written < data_size) {
+            const remaining: usize = @intCast(data_size - written);
+            const room = em.free();
+            if ((try tarAligned(remaining)) <= room) {
+                try em.write(entry.data[written..]);
+                written = @intCast(data_size);
+                try em.pad(remaining);
+                break;
+            }
+            var take: usize = @intCast(@min(room, remaining));
+            take -= take % @as(usize, @intCast(block_size));
+            if (take > 0) {
+                try em.write(entry.data[written..][0..take]);
+                written += take;
+            }
+            // The continuation header opens the next volume; a fresh one is
+            // the widest fit, so the 'M' always lands inside it.
+            try em.closeVolume();
+            try em.openVolume();
+            try em.writeMultivolHeader(entry.name, data_size - written, written);
+        }
+    }
+    // The final volume carries the EOF blocks; a full one closes first.
+    if (em.free() < 2 * block_size) {
+        try em.closeVolume();
+        try em.openVolume();
+    }
+    if (em.scratch.len < scratch_size) return error.CapacityException;
+    @memset(em.scratch[0..scratch_size], 0);
+    try em.write(em.scratch[0..scratch_size]);
+    try em.write(em.scratch[0..scratch_size]);
+    try em.closeVolume();
+    return .{ .count = @intCast(em.count), .total = em.total };
+}
+
+pub fn volumeSizeGnu(entries: []const Entry, volume_size: u64) Exception!VolumePlan {
+    var scratch: [scratch_size]u8 = undefined;
+    return splitLayout(entries, volume_size, null, &scratch, null);
+}
+
+// The set leaves contiguously; `lengths` reports each volume's byte
+// length in volume order so a caller can cut the stream.
+pub fn volumeEncodeGnu(entries: []const Entry, output: []u8, lengths: []u64, volume_size: u64, scratch: []u8) Exception!VolumePlan {
+    return splitLayout(entries, volume_size, lengths, scratch, output);
+}
+
+test "tar volume set roundtrips a cut member" {
+    const testing = std.testing;
+    var payload: [3000]u8 = undefined;
+    for (&payload, 0..) |*b, i| b.* = @truncate(i * 11 + 5);
+    const entries = [_]Entry{
+        .{ .name = "small.txt", .data = "tiny" },
+        .{ .name = "big.bin", .data = &payload },
+        .{ .name = "after.txt", .data = "tail entry" },
+    };
+    var lengths: [8]u64 = @splat(0);
+    var set: [16384]u8 = undefined;
+    var scratch: [4096]u8 = undefined;
+    const plan = try volumeSizeGnu(&entries, 2048);
+    try testing.expect(plan.count > 1);
+    const emitted = try volumeEncodeGnu(&entries, &set, &lengths, 2048, &scratch);
+    try testing.expectEqual(plan.count, emitted.count);
+    try testing.expectEqual(plan.total, emitted.total);
+    var volumes: [8][]const u8 = undefined;
+    var at: usize = 0;
+    for (0..emitted.count) |index| {
+        volumes[index] = set[at..][0..@intCast(lengths[index])];
+        at += @intCast(lengths[index]);
+    }
+    const parts = volumes[0..emitted.count];
+    try testing.expectEqual(@as(u64, 3), try volumeInspectCount(parts));
+    const info = try volumeInspectOrdinal(parts, 1);
+    try testing.expectEqualSlices(u8, "big.bin", info.name);
+    try testing.expectEqual(payload.len, info.size);
+    var segments: [8]VolumeSegment = undefined;
+    var out: [4096]u8 = undefined;
+    const n = try volumeDecodeOrdinal(parts, 1, &out, &segments);
+    try testing.expectEqual(payload.len, n);
+    try testing.expectEqualSlices(u8, &payload, out[0..n]);
+    const first = try volumeDecodeOrdinal(parts, 0, &out, &segments);
+    try testing.expectEqualSlices(u8, "tiny", out[0..first]);
+    const last = try volumeDecodeOrdinal(parts, 2, &out, &segments);
+    try testing.expectEqualSlices(u8, "tail entry", out[0..last]);
+    // A broken chain is a data answer, never a partial decode.
+    try testing.expectError(error.DataException, volumeInspectOrdinal(parts[0 .. parts.len - 1], 2));
+}
+
+test "tar volume set reassembles a cut member with a long name" {
+    const testing = std.testing;
+    // The name forces an 'L' entry, and the member data crosses volumes;
+    // the continuation header names the real member name truncated.
+    var long_name: [130]u8 = undefined;
+    @memset(&long_name, 'n');
+    @memcpy(long_name[126..130], ".txt");
+    var payload: [1500]u8 = undefined;
+    for (&payload, 0..) |*b, i| b.* = @truncate(i * 3 + 1);
+    const entries = [_]Entry{
+        .{ .name = &long_name, .data = &payload },
+        .{ .name = "final.txt", .data = "end" },
+    };
+    var lengths: [8]u64 = @splat(0);
+    var set: [16384]u8 = undefined;
+    var scratch: [4096]u8 = undefined;
+    // The long-name unit plus the member header need 1536 bytes, so the
+    // volume carries them and cuts the data.
+    const emitted = try volumeEncodeGnu(&entries, &set, &lengths, 2048, &scratch);
+    try testing.expect(emitted.count > 1);
+    var volumes: [8][]const u8 = undefined;
+    var at: usize = 0;
+    for (0..emitted.count) |index| {
+        volumes[index] = set[at..][0..@intCast(lengths[index])];
+        at += @intCast(lengths[index]);
+    }
+    const parts = volumes[0..emitted.count];
+    try testing.expectEqual(@as(u64, 2), try volumeInspectCount(parts));
+    const info = try volumeInspectOrdinal(parts, 0);
+    try testing.expectEqualSlices(u8, &long_name, info.name);
+    try testing.expectEqual(payload.len, info.size);
+    var segments: [8]VolumeSegment = undefined;
+    var out: [4096]u8 = undefined;
+    const n = try volumeDecodeOrdinal(parts, 0, &out, &segments);
+    try testing.expectEqual(payload.len, n);
+    try testing.expectEqualSlices(u8, &payload, out[0..n]);
+    const last = try volumeDecodeOrdinal(parts, 1, &out, &segments);
+    try testing.expectEqualSlices(u8, "end", out[0..last]);
 }

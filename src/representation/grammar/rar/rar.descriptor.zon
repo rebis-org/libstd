@@ -16,9 +16,10 @@
         .{ .name = "entry_size", .family = 2, .ordinal = 4, .representation = "scalar_words" },
     },
     .capabilities = .{ "read", "write", "size", "replay" },
-    // The RAR specification defines split sets on the read side, for both
-    // RAR4 and RAR5; volume writing is a separate operation.
-    .volumes = .{"read"},
+    // The RAR specification defines split sets on the read side for both
+    // families; the volume writer is the first-party RAR5 packer, so the
+    // write direction answers RAR5 sets and RAR4 stays read-only.
+    .volumes = .{ "read", "write" },
     .sizing = "metadata_exact",
     .commit = "tentative",
     .limits = .{ .window = 0, .block = 0, .history = 0 },

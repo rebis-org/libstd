@@ -631,11 +631,11 @@ pub fn sevenZipWritePackedVolumes(entries: []const Entry, packed_entries: []cons
     return try sevenZipVolumeExtents(total, volume_size);
 }
 
-// Concatenates the volume payloads behind volume 1's start header, then runs
-// the single-volume loader over the result.
-pub fn sevenZipDecodeVolumes(volumes: []const []const u8, workspace: *Workspace, limits: Limits, ordinal: u64, output: []u8, decode_options: SevenZipDecodeOptions) Exception!usize {
+// Concatenates the volume payloads behind volume 1's start header into the
+// equivalent single archive; the loader and the inspect surface run over the
+// result, so a volume set needs no separate inspect path.
+pub fn sevenZipJoinVolumes(volumes: []const []const u8, workspace: *Workspace, limits: Limits) Exception![]const u8 {
     if (volumes.len == 0) return error.DataException;
-    decode_options.failure_cause.* = .none;
     var total: usize = 0;
     for (volumes, 0..) |volume, i| {
         if (volume.len < start_header_size and i == 0) return error.DataException;
@@ -654,6 +654,14 @@ pub fn sevenZipDecodeVolumes(volumes: []const []const u8, workspace: *Workspace,
         @memcpy(full[at..][0..payload.len], payload);
         at += payload.len;
     }
+    return full[0 .. start_header_size + total];
+}
+
+// Concatenates the volume payloads behind volume 1's start header, then runs
+// the single-volume loader over the result.
+pub fn sevenZipDecodeVolumes(volumes: []const []const u8, workspace: *Workspace, limits: Limits, ordinal: u64, output: []u8, decode_options: SevenZipDecodeOptions) Exception!usize {
+    decode_options.failure_cause.* = .none;
+    const full = try sevenZipJoinVolumes(volumes, workspace, limits);
     return try sevenZipDecodeOrdinal(full, workspace, limits, ordinal, output, decode_options);
 }
 

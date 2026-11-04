@@ -20,8 +20,14 @@
         // A split set arrives as repeated bytes parameters in volume order;
         // the source stays the first part, and these carry the tail.
         .{ .name = "archive_volumes", .family = 2, .ordinal = 14, .representation = "bytes" },
+        // A split write carries the volume granularity; the set leaves as
+        // one sink stream cut at the produced volume boundaries.
+        .{ .name = "archive_volume_size", .family = 2, .ordinal = 15, .representation = "scalar_words" },
     },
     .capabilities = .{ "read", "write", "size", "replay" },
+    // GNU multi-volume sets: members cut at the volume boundary continue
+    // under 'M' headers; reads walk the chain and reassemble the member.
+    .volumes = .{ "read", "write" },
     .sizing = "metadata_exact",
     .commit = "tentative",
     .limits = .{ .window = 0, .block = 0, .history = 0 },

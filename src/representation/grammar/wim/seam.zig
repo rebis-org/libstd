@@ -27,3 +27,18 @@ pub fn archiveSize(provider: Provider, entries: []const Entry, scratch: []u8) Ex
 pub fn encode(provider: Provider, entries: []const Entry, output: []u8, scratch: []u8) Exception!usize {
     return seam.dispatchOnprem(impl, provider, onprem.encode, .{ entries, output, scratch });
 }
+pub fn volumeInspectCount(provider: Provider, parts: []const []const u8, scratch: []u8) Exception!u64 {
+    return seam.dispatchOnprem(impl, provider, onprem.volumeInspectCount, .{ parts, scratch });
+}
+pub fn volumeInspectOrdinal(provider: Provider, parts: []const []const u8, ordinal: u64, scratch: []u8) Exception!onprem.EntryInfo {
+    return seam.dispatchOnprem(impl, provider, onprem.volumeInspectOrdinal, .{ parts, ordinal, scratch, onprem.DecodeOptions{} });
+}
+pub fn volumeDecodeOrdinal(provider: Provider, parts: []const []const u8, ordinal: u64, output: []u8, scratch: []u8) Exception!usize {
+    return seam.dispatchOnprem(impl, provider, onprem.volumeDecodeOrdinal, .{ parts, ordinal, output, scratch, onprem.DecodeOptions{} });
+}
+pub fn splitPlan(provider: Provider, archive: []const u8, volume_size: u64, scratch: []u8) Exception!onprem.SplitPlan {
+    return seam.dispatchOnprem(impl, provider, onprem.wimSplitPlan, .{ archive, volume_size, scratch });
+}
+pub fn splitEmit(provider: Provider, archive: []const u8, volume_size: u64, output: []u8, lengths: []u64, scratch: []u8) Exception!onprem.SplitPlan {
+    return seam.dispatchOnprem(impl, provider, onprem.wimSplitEmit, .{ archive, volume_size, output, lengths, scratch });
+}

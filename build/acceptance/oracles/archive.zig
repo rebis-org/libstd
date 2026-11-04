@@ -324,6 +324,127 @@ pub fn runInspectMetadata(r: *Runner) anyerror!void {
     }
 }
 
+// Ordinals 14 and 15 of the archive family: the volume tail parts and the
+// write-side split granularity.
+const archive_volumes: u32 = 14;
+const archive_volume_size: u32 = 15;
+
+// A tar split set crosses the boundary twice: the write carries the
+// granularity and reports each volume's bytes in the response children,
+// and the read rides the parts back in volume order.
+pub fn runTarVolumeSet(r: *Runner) anyerror!void {
+    setupArchive(r, harness.ids.tar);
+    const volume_size: u64 = 1024;
+    // The selector carries the command scope: the granularity rides the
+    // write sizing query as well as the write itself, so the mask spans
+    // both directions.
+    const gran = harness.paramScalar(harness.param_family_archive, archive_volume_size, harness.cmds, volume_size);
+
+    // The size pass answers the set total; the plain size would answer the
+    // single-archive length instead.
+    _ = harness.call(r, harness.ids.query, &.{
+        harness.paramTargetCommand(harness.ids.write),
+        harness.scalarNode(harness.ids.source),
+        harness.capabilityParam(arc_caps),
+        harness.sizingModeParam(harness.size_metadata_exact),
+        harness.commitModeParam(harness.commit_confirmed),
+        arc_state.entry1,
+        gran,
+    }, .{});
+    try harness.requireStatus(r, abi.Status.ok);
+    const total: usize = @intCast(r.response.byte_length);
+    if (total == 0 or total > arc_state.archive.len) return error.ArchiveQueryCapacity;
+    r.required = total;
+
+    // The write leaves the set contiguous in the sink; the response
+    // children carry the tail volumes as bytes.
+    var tail_buffers: [8][4096]u8 = undefined;
+    var tail_nodes: [8]harness.Node = undefined;
+    for (&tail_nodes, &tail_buffers) |*t, *buf| {
+        t.* = harness.node(buf, buf.len);
+        t.*.id = harness.ids.parameter;
+        // Repeated out-bytes selector: the response carries one node per
+        // tail volume under the same ordinal.
+        t.*.value_high = harness.paramSelector(harness.param_family_archive, archive_volumes, 0x26, 0);
+    }
+    harness.linkNodes(&tail_nodes);
+    var response = abi.Node.init();
+    response.child = &tail_nodes[0];
+
+    var req: [8]harness.Node = undefined;
+    req[0] = harness.paramProfile(harness.ids.tar);
+    req[1] = harness.scalarNode(harness.ids.source);
+    req[2] = harness.sinkSpan(arc_state.archive[0..total]);
+    req[3] = harness.capabilityParam(arc_caps);
+    req[4] = harness.sizingModeParam(harness.size_metadata_exact);
+    req[5] = harness.commitModeParam(r.commit_write);
+    req[6] = arc_state.entry1;
+    req[7] = gran;
+    harness.linkNodes(&req);
+    const status = harness.invoke(harness.ids.write, &req[0], &response, r.workspace.ptr, r.workspace.len, null, null, null);
+    if (status != abi.Status.ok) return error.VolumeWriteFailed;
+    if (response.byte_length != total) return error.VolumeWriteLengthMismatch;
+
+    var parts: [9][]const u8 = undefined;
+    var tails: usize = 0;
+    var tail_bytes: usize = 0;
+    for (tail_nodes) |t| {
+        if (t.byte_length == 0) break;
+        parts[1 + tails] = t.bytes.?[0..@intCast(t.byte_length)];
+        tail_bytes += @intCast(t.byte_length);
+        tails += 1;
+    }
+    if (tails == 0 or total <= tail_bytes) return error.VolumeShapeMismatch;
+    parts[0] = arc_state.archive[0 .. total - tail_bytes];
+
+    // The read rides the tail parts back in volume order and decodes the
+    // first entry exactly as the single-archive path would.
+    var volume_nodes: [8]harness.Node = undefined;
+    for (0..tails) |index| {
+        // Repeated in-bytes selector: one parameter per tail volume.
+        volume_nodes[index] = harness.paramBytesWithAttributes(harness.param_family_archive, archive_volumes, 0x16, harness.cmd_read, parts[1 + index]);
+    }
+    var read_req: [16]harness.Node = @splat(abi.Node.init());
+    var count: usize = 0;
+    read_req[count] = harness.archiveOrdinalParam(0);
+    count += 1;
+    read_req[count] = harness.sourceSpan(parts[0]);
+    count += 1;
+    for (0..tails) |index| {
+        read_req[count] = volume_nodes[index];
+        count += 1;
+    }
+    read_req[count] = harness.sinkSpan(r.output);
+    count += 1;
+    _ = harness.call(r, harness.ids.read, read_req[0..count], .{ .ctx = true });
+    try harness.requireStatus(r, abi.Status.ok);
+    if (r.response.byte_length != arc_state.data1.len or !std.mem.eql(u8, r.output[0..arc_state.data1.len], &arc_state.data1)) {
+        return error.VolumeReadMismatch;
+    }
+
+    // The write granularity on a read is misuse, whatever the profile
+    // opts in for.
+    const read_gran = harness.paramScalar(harness.param_family_archive, archive_volume_size, harness.cmd_write, volume_size);
+    var rejected: [64]u8 = undefined;
+    try harness.reject(r, harness.ids.read, &.{
+        harness.archiveOrdinalParam(0),
+        harness.sourceSpan(parts[0]),
+        read_gran,
+        harness.sinkSpan(&rejected),
+    }, .{ .ctx = true }, abi.Status.unsupported, &rejected);
+
+    // Volume parts on a write are the read shape riding the wrong
+    // direction; a format answers neither.
+    const stray_part = harness.paramBytesWithAttributes(harness.param_family_archive, archive_volumes, 0x16, harness.cmd_write, parts[1]);
+    var rejected_write: [64]u8 = undefined;
+    try harness.reject(r, harness.ids.write, &.{
+        harness.scalarNode(harness.ids.source),
+        harness.sinkSpan(&rejected_write),
+        stray_part,
+        arc_state.entry1,
+    }, .{ .ctx = true }, abi.Status.unsupported, &rejected_write);
+}
+
 pub fn runXar(r: *Runner) anyerror!void {
     if (isOffpremUnsupported()) return;
     try runArchive(r, harness.ids.xar);
@@ -1500,6 +1621,7 @@ pub const scenarios = harness.scenarios("archive", &.{
     .{ .label = "archive cpio foreign newc", .run = runCpioForeign(.cpio_newc), .workspace_size = 65536, .output_size = 512, .encoded_size = 4096 },
     .{ .label = "archive cpio foreign odc", .run = runCpioForeign(.cpio_odc), .workspace_size = 65536, .output_size = 512, .encoded_size = 4096 },
     .{ .label = "archive inspect metadata", .run = runInspectMetadata, .workspace_size = 8 * 1024 * 1024, .output_size = 512, .encoded_size = 4096 },
+    .{ .label = "archive tar volume set", .run = runTarVolumeSet, .workspace_size = 65536, .output_size = 512, .encoded_size = 8192 },
     .{ .label = "archive xar", .run = runXar, .workspace_size = 3 * 1024 * 1024, .output_size = 512, .encoded_size = 4096 },
     .{ .label = "archive xar foreign", .run = runXarForeign(.xar), .workspace_size = 3 * 1024 * 1024, .output_size = 512, .encoded_size = 4096 },
     .{ .label = "archive wim", .run = runWim, .workspace_size = 128 * 1024, .output_size = 512, .encoded_size = 4096 },

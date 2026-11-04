@@ -694,7 +694,19 @@ fn decodeChunk(codec: Codec, chunk_size: u64, payload: []const u8, out: []u8) Ex
     }
 }
 
-fn readResource(archive: []const u8, res: Reshdr, chunk_size: u32, codec: Codec, out: []u8) Exception!void {
+// A volume set reads resources from the part each blob-table entry names;
+// a single archive is a one-part set, so every read routes through here.
+const Parts = struct {
+    slices: []const []const u8,
+
+    fn bytes(self: Parts, part: u16) Exception![]const u8 {
+        if (part == 0 or part > self.slices.len) return error.DataException;
+        return self.slices[part - 1];
+    }
+};
+
+fn readResource(parts: Parts, part: u16, res: Reshdr, chunk_size: u32, codec: Codec, out: []u8) Exception!void {
+    const archive = try parts.bytes(part);
     if (res.flags & reshdr_flag_solid != 0) return error.DataException;
     if (res.flags & reshdr_flag_compressed == 0) {
         const data = try bounds.slice(archive, res.offset, res.size_in_wim);
@@ -725,12 +737,13 @@ const SolidRes = struct {
     uncompressed_size: u64,
     chunk_size: u64,
     codec: Codec,
+    part: u16 = 1,
 };
 
 // A solid resource begins with a 16-byte alternate header: uncompressed
 // size, chunk size, and compression format (wimlib resource.h).
-fn loadSolidRes(archive: []const u8, res: Reshdr) Exception!SolidRes {
-    const header = try bounds.slice(archive, res.offset, 16);
+fn loadSolidRes(parts: Parts, part: u16, res: Reshdr) Exception!SolidRes {
+    const header = try bounds.slice(try parts.bytes(part), res.offset, 16);
     const format = std.mem.readInt(u32, header[12..16], .little);
     const codec: Codec = switch (format) {
         0 => .store,
@@ -745,11 +758,13 @@ fn loadSolidRes(archive: []const u8, res: Reshdr) Exception!SolidRes {
         .uncompressed_size = std.mem.readInt(u64, header[0..8], .little),
         .chunk_size = std.mem.readInt(u32, header[8..12], .little),
         .codec = codec,
+        .part = part,
     };
 }
 
 // Decodes only the chunks the requested range touches.
-fn readSolidRange(archive: []const u8, sr: SolidRes, blob_offset: u64, out: []u8, temp: []u8) Exception!void {
+fn readSolidRange(parts: Parts, sr: SolidRes, blob_offset: u64, out: []u8, temp: []u8) Exception!void {
+    const archive = try parts.bytes(sr.part);
     const out_len: u64 = std.math.cast(u64, out.len) orelse return error.ResourceException;
     const end = blob_offset +% out_len;
     if (end < out_len or end > sr.uncompressed_size) return error.DataException;
@@ -788,6 +803,7 @@ const BlobEntry = struct {
     hash: [sha1_len]u8,
     size: u64,
     res: Reshdr,
+    part: u16,
     solid: bool = false,
     solid_index: u64 = 0,
     solid_offset: u64 = 0,
@@ -827,7 +843,8 @@ fn decodedTable(archive: []const u8, region: []u8) Exception![]const u8 {
     if (region.len < table_len) return error.ResourceException;
     const chunk_size = std.mem.readInt(u32, archive[20..24], .little);
     const table = region[0..table_len];
-    try readResource(archive, table_hdr, chunk_size, try headerCodec(archive), table);
+    var one = [_][]const u8{archive};
+    try readResource(.{ .slices = &one }, 1, table_hdr, chunk_size, try headerCodec(archive), table);
     return table;
 }
 
@@ -865,11 +882,12 @@ fn isDuplicate(blobs: []const BlobEntry, hash: *const [sha1_len]u8) bool {
     return false;
 }
 
-fn appendBlob(blobs: []BlobEntry, filled: *usize, hash: *const [sha1_len]u8, size: u64, res: Reshdr, fit: ?SolidFit) void {
+fn appendBlob(blobs: []BlobEntry, filled: *usize, hash: *const [sha1_len]u8, size: u64, res: Reshdr, part: u16, fit: ?SolidFit) void {
     blobs[filled.*] = .{
         .hash = hash.*,
         .size = size,
         .res = res,
+        .part = part,
         .solid = fit != null,
         .solid_index = if (fit) |f| f.index else 0,
         .solid_offset = if (fit) |f| f.offset else 0,
@@ -884,16 +902,19 @@ fn blobLookup(blobs: []const BlobEntry, hash: [sha1_len]u8) Exception!BlobEntry 
     return error.DataException;
 }
 
-fn readBlob(archive: []const u8, parsed: Parsed, blob: BlobEntry, output: []u8) Exception!usize {
+fn readBlob(parts: Parts, parsed: Parsed, blob: BlobEntry, output: []u8) Exception!usize {
     const size = std.math.cast(usize, blob.size) orelse return error.ResourceException;
     if (output.len < size) return error.CapacityException;
     if (blob.solid) {
         const sr = parsed.solid_reses[@intCast(blob.solid_index)];
-        try readSolidRange(archive, sr, blob.solid_offset, output[0..size], parsed.temp);
+        try readSolidRange(parts, sr, blob.solid_offset, output[0..size], parsed.temp);
     } else {
-        const codec = try headerCodec(archive);
-        const chunk_size = std.mem.readInt(u32, archive[20..24], .little);
-        try readResource(archive, blob.res, chunk_size, codec, output[0..size]);
+        // Each part repeats the header fields, so the codec and chunking
+        // come from the part that holds the resource.
+        const part_bytes = try parts.bytes(blob.part);
+        const codec = try headerCodec(part_bytes);
+        const chunk_size = std.mem.readInt(u32, part_bytes[20..24], .little);
+        try readResource(parts, blob.part, blob.res, chunk_size, codec, output[0..size]);
     }
     return size;
 }
@@ -907,7 +928,8 @@ pub const DecodeOptions = struct {
 fn entrySizeEx(parsed: Parsed, hash: [sha1_len]u8, options: DecodeOptions, carve: []u8) Exception!u64 {
     if (blobLookup(parsed.blobs, hash) catch null) |blob| return blob.size;
     for (options.references) |ref| {
-        const rp = try parse(ref, carve);
+        var ref_parts = [_][]const u8{ref};
+        const rp = try parse(.{ .slices = &ref_parts }, carve);
         if (blobLookup(rp.blobs, hash) catch null) |blob| return blob.size;
     }
     return error.DataException;
@@ -927,7 +949,7 @@ fn metadataVerdict(refcnt: u32, entry_solid: bool, wim_part: u16, image_count: u
 }
 
 // One run is consecutive SOLID table strides led by a magic entry.
-fn loadSolidRun(archive: []const u8, table: []const u8, start: usize, out: []SolidRes) Exception!usize {
+fn loadSolidRun(parts: Parts, table: []const u8, start: usize, out: []SolidRes) Exception!usize {
     var count: usize = 0;
     var at = start;
     while (at + blob_disk_size <= table.len) : (at += blob_disk_size) {
@@ -945,7 +967,7 @@ fn loadSolidRun(archive: []const u8, table: []const u8, start: usize, out: []Sol
         const disk = try readBlobEntry(table, at);
         if (disk.res.flags & reshdr_flag_solid == 0) break;
         if (disk.res.uncompressed_size != solid_resource_magic) continue;
-        out[filled] = try loadSolidRes(archive, disk.res);
+        out[filled] = try loadSolidRes(parts, disk.part, disk.res);
         filled += 1;
         if (filled == count) break;
     }
@@ -957,10 +979,13 @@ const Parsed = struct {
     blobs: []BlobEntry,
     solid_reses: []SolidRes,
     metadata: []const u8,
+    md_res: Reshdr = .{ .size_in_wim = 0, .flags = 0, .offset = 0, .uncompressed_size = 0 },
+    md_hash: [sha1_len]u8 = @splat(0),
     temp: []u8,
 };
 
-fn parse(archive: []const u8, scratch: []u8) Exception!Parsed {
+fn parse(parts: Parts, scratch: []u8) Exception!Parsed {
+    const archive = parts.slices[0];
     if (archive.len < header_disk_size) return error.DataException;
     if (std.mem.readInt(u64, archive[0..8], .little) != wim_magic) return error.DataException;
     // Solid-compressed WIMs carry version 0xE00, the value wimlib stamps.
@@ -971,6 +996,9 @@ fn parse(archive: []const u8, scratch: []u8) Exception!Parsed {
     const chunk_size = std.mem.readInt(u32, archive[20..24], .little);
     // Split-WIM identity: this part's 1-based number at 0x28, total parts at 0x2A.
     const wim_part = std.mem.readInt(u16, archive[40..42], .little);
+    // The head of a set (or a lone archive) is part 1; a later part alone
+    // carries no metadata and owns nothing by itself.
+    if (wim_part != 1) return error.DataException;
     const image_count = std.mem.readInt(u32, archive[44..48], .little);
     if (image_count == 0) return error.DataException;
     const blobs_hdr = try readReshdr(archive, 48);
@@ -984,7 +1012,7 @@ fn parse(archive: []const u8, scratch: []u8) Exception!Parsed {
     if (scratch.len < align_pad + table_usize) return error.ResourceException;
     const buf = scratch[align_pad..];
     const table = buf[0..table_usize];
-    try readResource(archive, blobs_hdr, chunk_size, codec, table);
+    try readResource(parts, 1, blobs_hdr, chunk_size, codec, table);
     // Pass 1 sizes the scratch carve and finds the first metadata image.
     var num_blobs: usize = 0;
     var num_solid_res: usize = 0;
@@ -1001,9 +1029,11 @@ fn parse(archive: []const u8, scratch: []u8) Exception!Parsed {
         if (isZeroHash(&disk.hash)) continue;
         const blob_size: u64 = if (disk.res.flags & reshdr_flag_solid != 0) disk.res.size_in_wim else disk.res.uncompressed_size;
         if (blob_size == 0) continue;
-        if (disk.part != wim_part) continue;
+        // A joined set keeps every blob the set carries; parts beyond the
+        // set are unreadable and drop.
+        if (disk.part == 0 or disk.part > parts.slices.len) continue;
         if (disk.res.flags & reshdr_flag_metadata != 0) {
-            if (candidate == null and metadataVerdict(disk.refcnt, disk.res.flags & reshdr_flag_solid != 0, wim_part, image_count, image_index) == .take) {
+            if (candidate == null and metadataVerdict(disk.refcnt, disk.res.flags & reshdr_flag_solid != 0, disk.part, image_count, image_index) == .take) {
                 candidate = disk.res;
                 image_index += 1;
             }
@@ -1036,6 +1066,7 @@ fn parse(archive: []const u8, scratch: []u8) Exception!Parsed {
     var run_base: usize = 0;
     var run: []const SolidRes = &.{};
     var in_run = false;
+    var md_hash: [sha1_len]u8 = @splat(0);
     image_index = 0;
     at = 0;
     while (at + blob_disk_size <= table.len) : (at += blob_disk_size) {
@@ -1044,7 +1075,7 @@ fn parse(archive: []const u8, scratch: []u8) Exception!Parsed {
         const entry_solid = disk.res.flags & reshdr_flag_solid != 0;
         if (entry_solid and !in_run) {
             run_base = res_filled;
-            res_filled += try loadSolidRun(archive, table, at, solid_reses[res_filled..]);
+            res_filled += try loadSolidRun(parts, table, at, solid_reses[res_filled..]);
             run = solid_reses[run_base..res_filled];
             in_run = true;
         }
@@ -1061,24 +1092,32 @@ fn parse(archive: []const u8, scratch: []u8) Exception!Parsed {
         if (isZeroHash(&disk.hash)) continue;
         const blob_size: u64 = if (entry_solid) disk.res.size_in_wim else disk.res.uncompressed_size;
         if (blob_size == 0) continue;
-        if (disk.part != wim_part) continue;
+        if (disk.part == 0 or disk.part > parts.slices.len) continue;
         if (disk.res.flags & reshdr_flag_metadata != 0) {
-            switch (metadataVerdict(disk.refcnt, entry_solid, wim_part, image_count, image_index)) {
-                .take => image_index += 1,
+            switch (metadataVerdict(disk.refcnt, entry_solid, disk.part, image_count, image_index)) {
+                .take => {
+                    if (image_index == 0) {
+                        md_res = disk.res;
+                        md_hash = disk.hash;
+                    }
+                    image_index += 1;
+                },
                 .err => return error.DataException,
                 .drop => {},
             }
             continue;
         }
         if (isDuplicate(blobs[0..filled], &disk.hash)) continue;
-        appendBlob(blobs, &filled, &disk.hash, blob_size, disk.res, fit);
+        appendBlob(blobs, &filled, &disk.hash, blob_size, disk.res, disk.part, fit);
     }
     const md_buf = buf[md_off..][0..md_size];
-    try readResource(archive, md_res, chunk_size, codec, md_buf);
+    try readResource(parts, 1, md_res, chunk_size, codec, md_buf);
     return .{
         .blobs = blobs[0..filled],
         .solid_reses = solid_reses[0..res_filled],
         .metadata = md_buf,
+        .md_res = md_res,
+        .md_hash = md_hash,
         .temp = buf[temp_off..],
     };
 }
@@ -1182,7 +1221,12 @@ fn recordOrdinal(ctx: anytype, name: []const u8, hash: *const [sha1_len]u8) Exce
 }
 
 pub fn inspectCount(archive: []const u8, scratch: []u8) Exception!u64 {
-    const parsed = try parse(archive, scratch);
+    var one = [_][]const u8{archive};
+    return inspectCountParts(.{ .slices = &one }, scratch);
+}
+
+fn inspectCountParts(parts: Parts, scratch: []u8) Exception!u64 {
+    const parsed = try parse(parts, scratch);
     var count: u64 = 0;
     const Ctx = struct { count: *u64 };
     var ctx = Ctx{ .count = &count };
@@ -1192,6 +1236,32 @@ pub fn inspectCount(archive: []const u8, scratch: []u8) Exception!u64 {
         }
     }.visit);
     return count;
+}
+
+// Split-set identity per wimlib's join: every part carries the same image
+// GUID, the part numbers run 1..N in order, and each header's total names
+// the whole set.
+pub fn volumeSetChecks(parts: []const []const u8) Exception!void {
+    if (parts.len == 0) return error.DataException;
+    if (parts.len > std.math.maxInt(u16)) return error.ResourceException;
+    const head = parts[0];
+    if (head.len < header_disk_size) return error.DataException;
+    if (std.mem.readInt(u64, head[0..8], .little) != wim_magic) return error.DataException;
+    const guid = head[24..40].*;
+    const total = std.mem.readInt(u16, head[42..44], .little);
+    if (total != parts.len) return error.DataException;
+    for (parts, 0..) |part, index| {
+        if (part.len < header_disk_size) return error.DataException;
+        if (std.mem.readInt(u64, part[0..8], .little) != wim_magic) return error.DataException;
+        if (!std.mem.eql(u8, part[24..40], &guid)) return error.DataException;
+        if (std.mem.readInt(u16, part[40..42], .little) != index + 1) return error.DataException;
+        if (std.mem.readInt(u16, part[42..44], .little) != total) return error.DataException;
+    }
+}
+
+pub fn volumeInspectCount(parts: []const []const u8, scratch: []u8) Exception!u64 {
+    try volumeSetChecks(parts);
+    return inspectCountParts(.{ .slices = parts }, scratch);
 }
 
 // Ordinal lookup parses with the name staging carved off the scratch tail.
@@ -1213,9 +1283,14 @@ pub fn inspectOrdinal(archive: []const u8, ordinal: u64, scratch: []u8) Exceptio
 }
 
 pub fn inspectOrdinalEx(archive: []const u8, ordinal: u64, scratch: []u8, options: DecodeOptions) Exception!EntryInfo {
+    var one = [_][]const u8{archive};
+    return inspectOrdinalExParts(.{ .slices = &one }, ordinal, scratch, options);
+}
+
+fn inspectOrdinalExParts(parts: Parts, ordinal: u64, scratch: []u8, options: DecodeOptions) Exception!EntryInfo {
     if (scratch.len < 2048) return error.ResourceException;
     const carve = scratch[0 .. scratch.len - 1024];
-    const parsed = try parse(archive, carve);
+    const parsed = try parse(parts, carve);
     var found = (try findEntry(parsed, ordinal, scratch[scratch.len - 1024 ..])) orelse return error.DataException;
     if (isZeroHash(&found.hash)) {
         found.size = 0;
@@ -1225,28 +1300,44 @@ pub fn inspectOrdinalEx(archive: []const u8, ordinal: u64, scratch: []u8, option
     return found;
 }
 
+pub fn volumeInspectOrdinal(parts: []const []const u8, ordinal: u64, scratch: []u8, options: DecodeOptions) Exception!EntryInfo {
+    try volumeSetChecks(parts);
+    return inspectOrdinalExParts(.{ .slices = parts }, ordinal, scratch, options);
+}
+
 pub fn decodeOrdinal(archive: []const u8, ordinal: u64, output: []u8, scratch: []u8) Exception!usize {
     return decodeOrdinalEx(archive, ordinal, output, scratch, .{});
 }
 
 pub fn decodeOrdinalEx(archive: []const u8, ordinal: u64, output: []u8, scratch: []u8, options: DecodeOptions) Exception!usize {
+    var one = [_][]const u8{archive};
+    return decodeOrdinalExParts(.{ .slices = &one }, ordinal, output, scratch, options);
+}
+
+fn decodeOrdinalExParts(parts: Parts, ordinal: u64, output: []u8, scratch: []u8, options: DecodeOptions) Exception!usize {
     if (scratch.len < 2048) return error.ResourceException;
     const carve = scratch[0 .. scratch.len - 1024];
-    const parsed = try parse(archive, carve);
+    const parsed = try parse(parts, carve);
     const found = (try findEntry(parsed, ordinal, scratch[scratch.len - 1024 ..])) orelse return error.DataException;
     if (isZeroHash(&found.hash)) return 0;
     if (blobLookup(parsed.blobs, found.hash) catch null) |blob| {
-        return readBlob(archive, parsed, blob, output);
+        return readBlob(parts, parsed, blob, output);
     }
     // Unbacked in a delta WIM: resolve from the referenced WIMs, in order.
     // Each reparse clobbers the carve; the delta's data is no longer needed.
     for (options.references) |ref| {
-        const rp = try parse(ref, carve);
+        var ref_parts = [_][]const u8{ref};
+        const rp = try parse(.{ .slices = &ref_parts }, carve);
         if (blobLookup(rp.blobs, found.hash) catch null) |blob| {
-            return readBlob(ref, rp, blob, output);
+            return readBlob(.{ .slices = &ref_parts }, rp, blob, output);
         }
     }
     return error.DataException;
+}
+
+pub fn volumeDecodeOrdinal(parts: []const []const u8, ordinal: u64, output: []u8, scratch: []u8, options: DecodeOptions) Exception!usize {
+    try volumeSetChecks(parts);
+    return decodeOrdinalExParts(.{ .slices = parts }, ordinal, output, scratch, options);
 }
 
 test "wim store roundtrips flat files" {
@@ -1375,7 +1466,8 @@ test "wim raw chunk read resource" {
     std.mem.writeInt(u32, buf[0..4], 16, .little);
     const res = Reshdr{ .size_in_wim = 36, .flags = reshdr_flag_compressed, .offset = 0, .uncompressed_size = 32 };
     var out: [32]u8 = undefined;
-    try readResource(&buf, res, 16, .lzx, &out);
+    var one = [_][]const u8{buf[0..]};
+    try readResource(.{ .slices = &one }, 1, res, 16, .lzx, &out);
     try testing.expectEqualSlices(u8, buf[4..36], &out);
 }
 
@@ -1388,10 +1480,11 @@ test "wim solid range read spans raw chunks" {
     std.mem.writeInt(u32, buf[12..16], 1, .little);
     std.mem.writeInt(u32, buf[16..20], 8, .little);
     std.mem.writeInt(u32, buf[20..24], 8, .little);
-    const sr = SolidRes{ .offset = 0, .size_in_wim = 52, .uncompressed_size = 24, .chunk_size = 8, .codec = .xpress };
+    const sr = SolidRes{ .offset = 0, .size_in_wim = 52, .uncompressed_size = 24, .chunk_size = 8, .codec = .xpress, .part = 1 };
     var out: [8]u8 = undefined;
     var temp: [16]u8 = undefined;
-    try readSolidRange(&buf, sr, 4, &out, &temp);
+    var one = [_][]const u8{buf[0..]};
+    try readSolidRange(.{ .slices = &one }, sr, 4, &out, &temp);
     try testing.expectEqualSlices(u8, buf[32..40], &out);
 }
 
@@ -1832,6 +1925,211 @@ pub fn encodeEx(entries: []const Entry, output: []u8, scratch: []u8, options: En
 
 const zero_hash: [sha1_len]u8 = @splat(0);
 
+// ---------------------------------------------------------------------------
+// Split-set write, with wimlib's split semantics: part 1 keeps the metadata,
+// lookup table, and XML; each later part is a bare header followed by whole
+// resources. A resource never straddles a part, so the set joins, and the
+// read side needs no part-2 table.
+
+pub const SplitPlan = struct { count: usize, total: u64 };
+
+const SplitSpan = struct {
+    start: u64,
+    len: u64,
+    part: u64 = 0,
+    new_offset: u64 = 0,
+};
+
+fn writeSplitBlobEntry(out: []u8, res: Reshdr, part: u16, hash: *const [sha1_len]u8) void {
+    writeReshdr(out[0..24], res);
+    std.mem.writeInt(u16, out[24..26], part, .little);
+    std.mem.writeInt(u32, out[26..30], 1, .little);
+    @memcpy(out[30..50], hash);
+}
+
+fn writeSplitHeader(out: []u8, head: []const u8, part: u16, total: u16, zero_tables: bool) void {
+    @memcpy(out[0..header_disk_size], head[0..header_disk_size]);
+    std.mem.writeInt(u16, out[40..42], part, .little);
+    std.mem.writeInt(u16, out[42..44], total, .little);
+    if (zero_tables) {
+        writeReshdr(out[48..72], .{ .size_in_wim = 0, .flags = 0, .offset = 0, .uncompressed_size = 0 });
+        writeReshdr(out[72..96], .{ .size_in_wim = 0, .flags = 0, .offset = 0, .uncompressed_size = 0 });
+    }
+}
+
+// Plans the split of an already-encoded WIM into volume_size parts, and
+// writes the contiguous set when `output` is given; part lengths land in
+// `lengths` when provided. Span list rows index-pair with parsed.blobs.
+fn splitCore(archive: []const u8, volume_size: u64, output: ?[]u8, lengths: ?[]u64, scratch: []u8) Exception!SplitPlan {
+    if (volume_size <= header_disk_size) return error.CallException;
+    if (archive.len < header_disk_size) return error.DataException;
+    // Solid WIMs route chunks through a run header the split does not
+    // rewrite; the compose write path is store-only, so refuse them. The
+    // split rewrites a single-image part-1 table, so other shapes refuse
+    // rather than lose their extra images or foreign part ownership.
+    if (std.mem.readInt(u32, archive[12..16], .little) == wim_version_solid) return error.UnsupportedException;
+    if (std.mem.readInt(u32, archive[44..48], .little) != 1) return error.UnsupportedException;
+    if (std.mem.readInt(u16, archive[42..44], .little) != 1) return error.UnsupportedException;
+    const table_len = std.math.cast(usize, (try readReshdr(archive, 48)).uncompressed_size) orelse return error.ResourceException;
+    const xml = try readReshdr(archive, 72);
+    if (xml.flags & reshdr_flag_compressed != 0) return error.UnsupportedException;
+    const xml_len = xml.size_in_wim;
+    const xml_end = bounds.addU64(xml.offset, xml_len) catch return error.DataException;
+    if (xml_end > archive.len) return error.DataException;
+    // The span carve takes the scratch tail before parse runs; parse's
+    // leftover temp overlaps it, and the solid refusal above keeps the
+    // temp region unread.
+    const span_room = @max(table_len / blob_disk_size, 2);
+    const span_bytes = std.math.mul(usize, span_room, @sizeOf(SplitSpan)) catch return error.ResourceException;
+    const spans = try alignedTail(scratch, span_bytes, @alignOf(SplitSpan));
+    const span_list: []SplitSpan = @alignCast(std.mem.bytesAsSlice(SplitSpan, spans[0..span_bytes]));
+    var parts_one = [_][]const u8{archive};
+    const parsed = try parse(.{ .slices = &parts_one }, scratch);
+    if (parsed.solid_reses.len != 0) return error.UnsupportedException;
+    if (span_list.len < parsed.blobs.len) return error.ResourceException;
+    const md_len: u64 = parsed.metadata.len;
+    const payload_start: u64 = header_disk_size + md_len;
+    for (parsed.blobs, 0..) |blob, index| {
+        if (blob.res.flags & reshdr_flag_metadata != 0) return error.DataException;
+        if (blob.res.offset < payload_start) return error.DataException;
+        // Every span must sit inside the source archive: the emit copies
+        // it, and a forged size must fail as data before any arithmetic.
+        const span_end = bounds.addU64(blob.res.offset, blob.res.size_in_wim) catch return error.DataException;
+        if (span_end > archive.len) return error.DataException;
+        span_list[index] = .{ .start = blob.res.offset, .len = blob.res.size_in_wim };
+    }
+    const used_spans = span_list[0..parsed.blobs.len];
+    // The table walks in resource order, so the spans are ascending and
+    // disjoint; anything else is not a layout this split rewrites.
+    var previous_end: u64 = payload_start;
+    for (used_spans) |*span| {
+        if (span.start < previous_end) return error.DataException;
+        previous_end = span.start + span.len;
+    }
+    // Part 1 carries the fixed overhead plus its payload share; later parts
+    // are a bare header plus payload. The table shrinks to the kept blobs,
+    // so the fixed side re-derives from this split's own table.
+    const new_table_len: u64 = (@as(u64, parsed.blobs.len) + 2) * blob_disk_size;
+    const part1_fixed: u64 = header_disk_size + md_len + new_table_len + xml_len;
+    if (volume_size <= part1_fixed) return error.CallException;
+    const cap1: u64 = volume_size - part1_fixed;
+    const capk: u64 = volume_size - header_disk_size;
+    var count: u64 = 1;
+    var used: u64 = 0;
+    var cap: u64 = cap1;
+    var total: u64 = part1_fixed;
+    for (used_spans) |*span| {
+        // used never exceeds cap, so the subtraction cannot underflow.
+        if (span.len > cap - used) {
+            count += 1;
+            if (count > std.math.maxInt(u16)) return error.ResourceException;
+            used = 0;
+            cap = capk;
+            total += header_disk_size;
+        }
+        // A fresh part is the widest fit; even it cannot be exceeded.
+        if (span.len > cap) return error.ResourceException;
+        span.part = count;
+        used += span.len;
+        total = try bounds.addU64(total, span.len);
+    }
+    if (lengths) |l| {
+        if (l.len < count) return error.CapacityException;
+    }
+    // Virtual layout: every span takes its part-relative offset before any
+    // byte moves, so the part-1 table can be written after all payloads.
+    var part1_payload: u64 = 0;
+    var cursor: u64 = header_disk_size + md_len;
+    for (used_spans) |*span| {
+        if (span.part != 1) continue;
+        span.new_offset = cursor;
+        cursor += span.len;
+        part1_payload += span.len;
+    }
+    const table_off: u64 = cursor;
+    const xml_off: u64 = table_off + new_table_len;
+    const part1_len: u64 = xml_off + xml_len;
+    if (lengths) |l| l[0] = part1_len;
+    var part_at: u64 = part1_len;
+    var part: usize = 2;
+    while (part <= count) : (part += 1) {
+        var inner: u64 = header_disk_size;
+        for (used_spans) |*span| {
+            if (span.part != part) continue;
+            span.new_offset = inner;
+            inner += span.len;
+        }
+        // The walk leaves inner at the part's full length.
+        if (lengths) |l| l[part - 1] = inner;
+        part_at += inner;
+    }
+    const out = output orelse return .{ .count = @intCast(count), .total = total };
+    // The emit replays the same layout the plan walked; a divergence is a
+    // defect in the walker, never a caller capacity problem.
+    if (out.len < total) return error.CapacityException;
+    if (total != part_at) return error.InternalException;
+    // Emit part 1: head header, metadata, its payload share, the fresh
+    // table, and the XML as written (it still describes the source set).
+    writeSplitHeader(out[0..header_disk_size], archive, 1, @intCast(count), false);
+    // The lookup and XML slots point at this split's own table and XML.
+    writeReshdr(out[48..72], .{ .size_in_wim = new_table_len, .flags = (try readReshdr(archive, 48)).flags, .offset = table_off, .uncompressed_size = new_table_len });
+    writeReshdr(out[72..96], .{ .size_in_wim = xml_len, .flags = xml.flags, .offset = xml_off, .uncompressed_size = xml_len });
+    @memcpy(out[@intCast(header_disk_size)..][0..@intCast(md_len)], parsed.metadata);
+    var emit_cursor: u64 = payload_start;
+    for (used_spans) |span| {
+        if (span.part != 1) continue;
+        const take: usize = @intCast(span.len);
+        const src = try bounds.slice(archive, span.start, span.len);
+        @memcpy(out[@intCast(emit_cursor)..][0..take], src);
+        emit_cursor += span.len;
+    }
+    var entry: [blob_disk_size]u8 = undefined;
+    for (parsed.blobs, 0..) |blob, index| {
+        writeSplitBlobEntry(&entry, .{
+            .size_in_wim = blob.res.size_in_wim,
+            .flags = blob.res.flags,
+            .offset = used_spans[index].new_offset,
+            .uncompressed_size = blob.res.uncompressed_size,
+        }, @intCast(used_spans[index].part), &blob.hash);
+        const at = table_off + @as(u64, index) * blob_disk_size;
+        @memcpy(out[@intCast(at)..][0..blob_disk_size], &entry);
+    }
+    writeSplitBlobEntry(&entry, parsed.md_res, 1, &parsed.md_hash);
+    const md_at = table_off + @as(u64, parsed.blobs.len) * blob_disk_size;
+    @memcpy(out[@intCast(md_at)..][0..blob_disk_size], &entry);
+    const zeros: [blob_disk_size]u8 = @splat(0);
+    const zero_at = table_off + @as(u64, parsed.blobs.len + 1) * blob_disk_size;
+    @memcpy(out[@intCast(zero_at)..][0..blob_disk_size], &zeros);
+    const xml_bytes = try bounds.slice(archive, xml.offset, xml_len);
+    @memcpy(out[@intCast(xml_off)..][0..@intCast(xml_len)], xml_bytes);
+    // Parts 2..N: a bare header (lookup and XML slots zeroed) plus payload.
+    part_at = part1_len;
+    part = 2;
+    while (part <= count) : (part += 1) {
+        writeSplitHeader(out[@intCast(part_at)..][0..header_disk_size], archive, @intCast(part), @intCast(count), true);
+        emit_cursor = part_at + header_disk_size;
+        for (used_spans) |span| {
+            if (span.part != part) continue;
+            const take: usize = @intCast(span.len);
+            const src = try bounds.slice(archive, span.start, span.len);
+            @memcpy(out[@intCast(emit_cursor)..][0..take], src);
+            emit_cursor += span.len;
+        }
+        part_at = emit_cursor;
+    }
+    return .{ .count = @intCast(count), .total = total };
+}
+
+pub fn wimSplitPlan(archive: []const u8, volume_size: u64, scratch: []u8) Exception!SplitPlan {
+    return splitCore(archive, volume_size, null, null, scratch);
+}
+
+// The set leaves contiguously; `lengths` reports each part's byte length in
+// volume order so a caller can cut the stream without re-deriving the plan.
+pub fn wimSplitEmit(archive: []const u8, volume_size: u64, output: []u8, lengths: []u64, scratch: []u8) Exception!SplitPlan {
+    return splitCore(archive, volume_size, output, lengths, scratch);
+}
+
 test "wim encodeEx compressed roundtrip" {
     const allocator = std.testing.allocator;
     var rng: u64 = 0x2C179AC1A428B5F1;
@@ -1955,4 +2253,97 @@ test "wim delta store mode skips backed blobs" {
     var out: [32]u8 = undefined;
     const n = try decodeOrdinalEx(archive[0..written], 0, &out, &scratch, .{ .references = &references });
     try testing.expectEqualSlices(u8, "shared payload bytes", out[0..n]);
+}
+
+test "wim split set roundtrips through the volume reader" {
+    const testing = std.testing;
+    var payload: [1600]u8 = undefined;
+    for (&payload, 0..) |*b, i| b.* = @truncate(i * 7 + 3);
+    var mid: [800]u8 = @splat(0xAB);
+    const entries = [_]Entry{
+        .{ .name = "big.bin", .data = &payload },
+        .{ .name = "mid.bin", .data = &mid },
+        .{ .name = "nested/last.bin", .data = "tail payload" },
+    };
+    var archive: [16 * 1024]u8 = undefined;
+    var scratch: [64 * 1024]u8 = undefined;
+    const written = try encode(&entries, &archive, &scratch);
+    const source = archive[0..written];
+
+    // The plan is exact and the emit reproduces it.
+    const plan = try wimSplitPlan(source, 2048, &scratch);
+    try testing.expect(plan.count > 1);
+    var lengths: [8]u64 = @splat(0);
+    var set: [32 * 1024]u8 = undefined;
+    const emitted = try wimSplitEmit(source, 2048, &set, &lengths, &scratch);
+    try testing.expectEqual(plan.count, emitted.count);
+    try testing.expectEqual(plan.total, emitted.total);
+
+    var parts: [8][]const u8 = undefined;
+    var at: usize = 0;
+    for (0..emitted.count) |index| {
+        parts[index] = set[at..][0..@intCast(lengths[index])];
+        at += @intCast(lengths[index]);
+    }
+    const volumes = parts[0..emitted.count];
+    try volumeSetChecks(volumes);
+    // The walk counts directory dentries too; locate the file ordinals by
+    // name instead of assuming the walk order.
+    var big_ordinal: ?u64 = null;
+    var last_ordinal: ?u64 = null;
+    const count = try volumeInspectCount(volumes, &scratch);
+    var index: u64 = 0;
+    while (index < count) : (index += 1) {
+        const probe = try volumeInspectOrdinal(volumes, index, &scratch, .{});
+        if (std.mem.eql(u8, probe.name, "big.bin")) big_ordinal = index;
+        if (std.mem.eql(u8, probe.name, "nested/last.bin")) last_ordinal = index;
+    }
+    const info = try volumeInspectOrdinal(volumes, big_ordinal.?, &scratch, .{});
+    try testing.expectEqual(payload.len, info.size);
+    var out: [4096]u8 = undefined;
+    const n = try volumeDecodeOrdinal(volumes, big_ordinal.?, &out, &scratch, .{});
+    try testing.expectEqual(payload.len, n);
+    try testing.expectEqualSlices(u8, &payload, out[0..n]);
+    const last = try volumeDecodeOrdinal(volumes, last_ordinal.?, &out, &scratch, .{});
+    try testing.expectEqualSlices(u8, "tail payload", out[0..last]);
+
+    // A short chain is not a set.
+    try testing.expectError(error.DataException, volumeSetChecks(volumes[0 .. volumes.len - 1]));
+}
+
+test "wim split refuses a blob larger than a whole volume" {
+    const testing = std.testing;
+    var huge: [4096]u8 = @splat(0x11);
+    const entries = [_]Entry{.{ .name = "huge.bin", .data = &huge }};
+    var archive: [16 * 1024]u8 = undefined;
+    var scratch: [64 * 1024]u8 = undefined;
+    const written = try encode(&entries, &archive, &scratch);
+    try testing.expectError(error.ResourceException, wimSplitPlan(archive[0..written], 2048, &scratch));
+}
+
+test "wim split refuses a forged xml resource" {
+    const testing = std.testing;
+    const entries = [_]Entry{.{ .name = "a.txt", .data = "payload" }};
+    var archive: [16 * 1024]u8 = undefined;
+    var scratch: [64 * 1024]u8 = undefined;
+    const written = try encode(&entries, &archive, &scratch);
+    // The XML slot's offset is forged beyond the archive; the plan must
+    // answer data, never arithmetic on a hostile reshdr.
+    std.mem.writeInt(u64, archive[80..88], 0x0000_FFFF_FFFF_F000, .little);
+    try testing.expectError(error.DataException, wimSplitPlan(archive[0..written], 2048, &scratch));
+}
+
+test "wim split refuses a forged blob span" {
+    const testing = std.testing;
+    const entries = [_]Entry{.{ .name = "a.txt", .data = "payload bytes" }};
+    var archive: [16 * 1024]u8 = undefined;
+    var scratch: [64 * 1024]u8 = undefined;
+    const written = try encode(&entries, &archive, &scratch);
+    // The first table row's stored size is forged beyond the archive; the
+    // span bound must fail as data before any layout arithmetic.
+    const table_off = std.mem.readInt(u64, archive[56..64], .little);
+    const huge: u64 = 0x0000_FFFF_FFFF_F000;
+    std.mem.writeInt(u64, archive[@intCast(table_off)..][0..8], huge, .little);
+    std.mem.writeInt(u64, archive[@intCast(table_off + 16)..][0..8], huge, .little);
+    try testing.expectError(error.DataException, wimSplitPlan(archive[0..written], 4096, &scratch));
 }
