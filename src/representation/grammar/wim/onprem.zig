@@ -175,9 +175,9 @@ const Tree = struct {
         fn of(entry_count: usize) Regions {
             const node_count = entry_count *| 2 + 1;
             const nodes_bytes = node_count * @sizeOf(Node);
-            const queue = alignForward(nodes_bytes +| entry_count * @sizeOf(u32), 8);
-            const pieces = alignForward(queue +| node_count * @sizeOf(u32), 8);
-            const backed = alignForward(pieces +| (entry_count + 1) * @sizeOf(Piece), 8);
+            const queue = std.mem.alignForward(usize, nodes_bytes +| entry_count * @sizeOf(u32), 8);
+            const pieces = std.mem.alignForward(usize, queue +| node_count * @sizeOf(u32), 8);
+            const backed = std.mem.alignForward(usize, pieces +| (entry_count + 1) * @sizeOf(Piece), 8);
             return .{
                 .entry_nodes = nodes_bytes,
                 .queue = queue,
@@ -339,10 +339,6 @@ const Tree = struct {
         return count;
     }
 };
-
-fn alignForward(value: usize, alignment: usize) usize {
-    return (value + alignment - 1) & ~(alignment - 1);
-}
 
 fn alignedTail(scratch: []u8, bytes: usize, alignment: usize) Exception![]u8 {
     if (bytes > scratch.len) return error.ResourceException;

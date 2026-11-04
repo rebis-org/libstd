@@ -518,9 +518,12 @@ pub fn runEncode(r: *Runner) anyerror!void {
     try runEncodeMultistream(r);
 }
 
-pub const scenarios = harness.scenarios("xz", &.{
-    .{ .label = "xz roundtrip", .run = runRoundtrip, .workspace_size = 8 * 1024 * 1024, .output_size = 4096, .encoded_size = 16384 },
-    .{ .label = "xz filters", .run = runFilters, .workspace_size = 8 * 1024 * 1024, .output_size = 4096, .encoded_size = 16384 },
-    .{ .label = "xz optional", .run = runOptional, .workspace_size = 8 * 1024 * 1024, .output_size = 4096, .encoded_size = 16384 },
-    .{ .label = "xz encode advanced", .run = runEncode, .workspace_size = 12 * 1024 * 1024, .output_size = 4096, .encoded_size = 16384 },
-}, &.{});
+// Output and encoded sizes repeat across every row; workspace stays per row.
+const xz_base: harness.Spec = .{ .label = "", .run = undefined, .workspace_size = undefined, .output_size = 4096, .encoded_size = 16384 };
+
+pub const scenarios = harness.scenarios("xz", harness.specRows(xz_base, &.{
+    .{ .label = "xz roundtrip", .run = runRoundtrip, .workspace_size = 8 * 1024 * 1024 },
+    .{ .label = "xz filters", .run = runFilters, .workspace_size = 8 * 1024 * 1024 },
+    .{ .label = "xz optional", .run = runOptional, .workspace_size = 8 * 1024 * 1024 },
+    .{ .label = "xz encode advanced", .run = runEncode, .workspace_size = 12 * 1024 * 1024 },
+}), &.{});

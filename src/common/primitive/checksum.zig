@@ -336,44 +336,29 @@ pub const Crc32 = seam.Checksum(options.crc32_impl, OnpremCrc32, std.hash.Crc32)
 pub const XzCrc64 = seam.Checksum(options.crc64xz_impl, OnpremXzCrc64, std.hash.crc.@"CRC-64/XZ");
 pub const Bzip2Crc32 = seam.Checksum(options.bzip2crc32_impl, OnpremBzip2Crc32, std.hash.crc.@"CRC-32/BZIP2");
 
-// A one-shot over any bound checksum: bind, feed the whole input, finish.
-fn seal(comptime H: type, bound: H, input: []const u8) @typeInfo(@TypeOf(H.final)).@"fn".return_type.? {
-    var hash = bound;
-    hash.update(input);
-    return hash.final({});
+// One shape carries every one-shot: bind, feed the whole input, finish.
+fn OneShot(comptime H: type, comptime seed: anytype) type {
+    const Result = @typeInfo(@TypeOf(H.final)).@"fn".return_type.?;
+    return struct {
+        fn withProvider(provider: seam.Provider, input: []const u8) Result {
+            var hash = H.bind(provider, seed);
+            hash.update(input);
+            return hash.final({});
+        }
+        fn withDefault(input: []const u8) Result {
+            return withProvider(default_provider, input);
+        }
+    };
 }
 
-pub fn crc32(input: []const u8) u32 {
-    return crc32With(default_provider, input);
-}
-
-pub fn crc32With(provider: seam.Provider, input: []const u8) u32 {
-    return seal(Crc32, Crc32.bind(provider, {}), input);
-}
-
-pub fn xxh64(input: []const u8) u64 {
-    return xxh64With(default_provider, input);
-}
-
-pub fn xxh64With(provider: seam.Provider, input: []const u8) u64 {
-    return seal(XxHash64, XxHash64.bind(provider, 0), input);
-}
-
-pub fn adler32(input: []const u8) u32 {
-    return adler32With(default_provider, input);
-}
-
-pub fn adler32With(provider: seam.Provider, input: []const u8) u32 {
-    return seal(Adler32, Adler32.bind(provider, {}), input);
-}
-
-pub fn xxh32(input: []const u8) u32 {
-    return xxh32With(default_provider, input);
-}
-
-pub fn xxh32With(provider: seam.Provider, input: []const u8) u32 {
-    return seal(XxHash32, XxHash32.bind(provider, 0), input);
-}
+pub const crc32 = OneShot(Crc32, {}).withDefault;
+pub const crc32With = OneShot(Crc32, {}).withProvider;
+pub const xxh64 = OneShot(XxHash64, 0).withDefault;
+pub const xxh64With = OneShot(XxHash64, 0).withProvider;
+pub const adler32 = OneShot(Adler32, {}).withDefault;
+pub const adler32With = OneShot(Adler32, {}).withProvider;
+pub const xxh32 = OneShot(XxHash32, 0).withDefault;
+pub const xxh32With = OneShot(XxHash32, 0).withProvider;
 
 // Table index order follows the reflected xz layout (crc32_fast.c /
 // crc64_fast.c) or the big-endian braid (crc32_table_be.h).
@@ -630,42 +615,27 @@ test "checksum capabilities agree across providers when mergeable" {
     if (!all_mergeable) return error.SkipZigTest;
     var rng = std.Random.DefaultPrng.init(0xCC4C);
     const allocator = std.testing.allocator;
+    const pairs = .{
+        .{ Crc32, {} },
+        .{ XzCrc64, {} },
+        .{ Bzip2Crc32, {} },
+        .{ XxHash32, 0 },
+        .{ XxHash64, 0 },
+        .{ Adler32, {} },
+    };
     var size: usize = 0;
     while (size <= 512) : (size += 13) {
         const buf = try allocator.alloc(u8, size);
         defer allocator.free(buf);
         rng.random().bytes(buf);
-        var crc_on = Crc32.bind(.onprem, {});
-        crc_on.update(buf);
-        var crc_off = Crc32.bind(.offprem, {});
-        crc_off.update(buf);
-        try std.testing.expectEqual(crc_on.final({}), crc_off.final({}));
-        var xz_on = XzCrc64.bind(.onprem, {});
-        xz_on.update(buf[0 .. buf.len / 2]);
-        xz_on.update(buf[buf.len / 2 ..]);
-        var xz_off = XzCrc64.bind(.offprem, {});
-        xz_off.update(buf);
-        try std.testing.expectEqual(xz_on.final({}), xz_off.final({}));
-        var bz_on = Bzip2Crc32.bind(.onprem, {});
-        bz_on.update(buf);
-        var bz_off = Bzip2Crc32.bind(.offprem, {});
-        bz_off.update(buf);
-        try std.testing.expectEqual(bz_on.final({}), bz_off.final({}));
-        var x32_on = XxHash32.bind(.onprem, 0);
-        x32_on.update(buf);
-        var x32_off = XxHash32.bind(.offprem, 0);
-        x32_off.update(buf);
-        try std.testing.expectEqual(x32_on.final({}), x32_off.final({}));
-        var x64_on = XxHash64.bind(.onprem, 0);
-        x64_on.update(buf[0 .. buf.len / 3]);
-        x64_on.update(buf[buf.len / 3 ..]);
-        var x64_off = XxHash64.bind(.offprem, 0);
-        x64_off.update(buf);
-        try std.testing.expectEqual(x64_on.final({}), x64_off.final({}));
-        var ad_on = Adler32.bind(.onprem, {});
-        ad_on.update(buf);
-        var ad_off = Adler32.bind(.offprem, {});
-        ad_off.update(buf);
-        try std.testing.expectEqual(ad_on.final({}), ad_off.final({}));
+        // The split feed exercises streaming state; the unsplit arm is the control.
+        inline for (pairs) |pair| {
+            var on = pair[0].bind(.onprem, pair[1]);
+            on.update(buf[0 .. buf.len / 2]);
+            on.update(buf[buf.len / 2 ..]);
+            var off = pair[0].bind(.offprem, pair[1]);
+            off.update(buf);
+            try std.testing.expectEqual(on.final({}), off.final({}));
+        }
     }
 }

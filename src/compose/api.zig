@@ -78,15 +78,26 @@ fn markDead(bytes: [*]u8, storage_len: u64) void {
     };
 }
 
-fn checkAlive(handle: ?*anyopaque) ?*Session {
-    const raw = handle orelse return null;
+// One classifier owns handle-state knowledge: never-created or misaligned
+// storage is invalid, destroyed storage reports dead, the rest is live.
+const Classified = union(enum) { invalid, dead, live: *Session };
+
+fn classifyHandle(handle: ?*anyopaque) Classified {
+    const raw = handle orelse return .invalid;
     // Create checks alignment, but step and destroy take opaque handles;
     // refuse a misaligned pointer before the cast.
-    if (@intFromPtr(raw) % @alignOf(Session) != 0) return null;
+    if (@intFromPtr(raw) % @alignOf(Session) != 0) return .invalid;
     const session: *Session = @ptrCast(@alignCast(raw));
-    if (session.cookie != alive_cookie) return null;
-    if (session.ops == &destroyed_ops) return null;
-    return session;
+    if (session.cookie == dead_cookie or session.ops == &destroyed_ops) return .dead;
+    if (session.cookie != alive_cookie) return .invalid;
+    return .{ .live = session };
+}
+
+fn checkAlive(handle: ?*anyopaque) ?*Session {
+    return switch (classifyHandle(handle)) {
+        .live => |session| session,
+        else => null,
+    };
 }
 
 export fn stdk_session_storage(component: ?[*:0]const u8, verb: ?[*:0]const u8) callconv(.c) u64 {
@@ -289,11 +300,17 @@ fn submitTask(context: *anyopaque) callconv(.c) u32 {
     return status;
 }
 
+// A malformed record is refused before any scheduling or state read.
+fn readyRecord(record: ?*Completion) ?*Completion {
+    const completion = record orelse return null;
+    if (!completion.isValid()) return null;
+    return completion;
+}
+
 // Returns the submission verdict; the call's own status lands in the record.
 // The inline executor completes before this returns; threaded arms flip it later.
 export fn stdk_submit(call_handle: ?*envelope.Call, record: ?*Completion) callconv(.c) u32 {
-    const completion = record orelse return envelope.Status.invalid_call;
-    if (!completion.isValid()) return envelope.Status.invalid_call;
+    const completion = readyRecord(record) orelse return envelope.Status.invalid_call;
     if (@atomicLoad(u32, &completion.state, .seq_cst) != Completion.in_progress) return envelope.Status.invalid_call;
     if (call_handle == null) {
         complete(completion, envelope.Status.invalid_call);
@@ -316,8 +333,8 @@ export fn stdk_group(
     const total = std.math.cast(usize, count) orelse return envelope.Status.invalid_call;
     if (total == 0) return envelope.Status.invalid_call;
     for (subs[0..total]) |*submission| {
-        const completion = submission.completion orelse return envelope.Status.invalid_call;
-        if (!completion.isValid() or completion.state != Completion.in_progress) return envelope.Status.invalid_call;
+        const completion = readyRecord(submission.completion) orelse return envelope.Status.invalid_call;
+        if (completion.state != Completion.in_progress) return envelope.Status.invalid_call;
     }
     const selected = if (exec) |e| e.* else executor.inline_executor;
     for (0..total) |index| {
@@ -335,8 +352,7 @@ fn complete(completion: *Completion, status: u32) void {
 // while a threaded executor still holds the call, invalid_call for a
 // malformed record.
 export fn stdk_poll(record: ?*Completion) callconv(.c) u32 {
-    const completion = record orelse return envelope.Status.invalid_call;
-    if (!completion.isValid()) return envelope.Status.invalid_call;
+    const completion = readyRecord(record) orelse return envelope.Status.invalid_call;
     if (@atomicLoad(u32, &completion.state, .seq_cst) == Completion.done) return @atomicLoad(u32, &completion.status, .seq_cst);
     return Completion.pending;
 }
@@ -345,8 +361,7 @@ export fn stdk_poll(record: ?*Completion) callconv(.c) u32 {
 // its start boundary; a running envelope always completes with its real
 // status, and a done record accepts cancel as a no-op.
 export fn stdk_cancel(record: ?*Completion) callconv(.c) u32 {
-    const completion = record orelse return envelope.Status.invalid_call;
-    if (!completion.isValid()) return envelope.Status.invalid_call;
+    const completion = readyRecord(record) orelse return envelope.Status.invalid_call;
     while (true) {
         const state = @atomicLoad(u32, &completion.state, .seq_cst);
         switch (state) {
@@ -371,15 +386,16 @@ const session_catalog_text: [:0]const u8 = blk: {
 // Destroy is idempotent and total: live sessions are destroyed, dead ones
 // report ok, and never-created storage is refused, never dispatched.
 export fn stdk_session_destroy(handle: ?*anyopaque) callconv(.c) u32 {
-    const raw = handle orelse return envelope.Status.invalid_call;
-    if (@intFromPtr(raw) % @alignOf(Session) != 0) return envelope.Status.invalid_call;
-    const session: *Session = @ptrCast(@alignCast(raw));
-    if (session.cookie == dead_cookie or session.ops == &destroyed_ops) return envelope.Status.ok;
-    if (session.cookie != alive_cookie) return envelope.Status.invalid_call;
-    session.destroy();
-    session.cookie = dead_cookie;
-    session.ops = &destroyed_ops;
-    return envelope.Status.ok;
+    switch (classifyHandle(handle)) {
+        .invalid => return envelope.Status.invalid_call,
+        .dead => return envelope.Status.ok,
+        .live => |session| {
+            session.destroy();
+            session.cookie = dead_cookie;
+            session.ops = &destroyed_ops;
+            return envelope.Status.ok;
+        },
+    }
 }
 
 // Sentinel ops for destroyed sessions. Function pointers are never called since callers check first.

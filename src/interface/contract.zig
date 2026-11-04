@@ -34,12 +34,7 @@ pub fn verbsFor(class: Class) []const Verb {
             .decoded_size,
             .encoded_size_bound,
         },
-        .grammar => &.{
-            .inspect,
-            .decode_ordinal,
-            .encode_ordinal,
-        },
-        .volume => &.{
+        .grammar, .volume => &.{
             .inspect,
             .decode_ordinal,
             .encode_ordinal,
@@ -100,6 +95,13 @@ pub const Descriptor = struct {
     sizing: SizingMode = .unavailable,
     commit: CommitMode = .tentative,
     limits: Limits = .{},
+    // Volume-set support per command direction, as command-mask bits
+    // (read 2, write 4). A format declares it only where its official
+    // specification defines a split-set shape and the reader implements
+    // it; dispatch refuses the archive_volumes parameter to every other
+    // format and direction, so an unimplemented set never reads as a
+    // silently partial answer.
+    volumes: u32 = 0,
     benchmark: ?Benchmark = null,
 };
 

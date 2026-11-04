@@ -54,6 +54,11 @@ pub const RarInfo = struct {
     // replay from their group start.
     mtime: u64 = 0,
     solid: bool = false,
+    // The largest dictionary the entry's solid group needs, with the v29/36
+    // streaming floor already applied per member, so one window serves the
+    // whole replay; a predecessor may exceed this entry's own declaration.
+    // Equals the floored window_bytes outside a solid chain.
+    group_window_bytes: u64 = 0,
 };
 
 pub const Entry = struct {
@@ -801,6 +806,18 @@ fn rar5FileEntry(header: Rar5Block, ordinal: usize, packed_total: u64, crypt: ?C
     return entry;
 }
 
+// A locate-style context that already holds its answer ends the walk:
+// later headers cannot change that answer, and stopping keeps every view
+// the visit retained valid. An -hp header name is one such view - each
+// encrypted parse re-decrypts into the shared scratch, so a name stored
+// before later parses would read the wrong entry (unrar hands each header
+// its own allocation). Counting walks keep parsing to the last block.
+fn walkComplete(ctx: anytype) bool {
+    const Ctx = @typeInfo(@TypeOf(ctx)).pointer.child;
+    if (comptime !std.meta.hasFn(Ctx, "complete")) return false;
+    return ctx.complete();
+}
+
 // Walk the archive, verifying each header CRC; `visit` sees files in
 // archive order, and HEAD_CRYPT decrypts the rest.
 fn walkRar5(archive: []const u8, offset: usize, opts: DecodeOptions, ctx: anytype, comptime visit: fn (@TypeOf(ctx), Entry) Exception!void) Exception!void {
@@ -859,6 +876,7 @@ fn walkRar5(archive: []const u8, offset: usize, opts: DecodeOptions, ctx: anytyp
                 if (!entry.is_directory) {
                     ordinal = try bounds.addUsize(ordinal, 1);
                     try visit(ctx, entry);
+                    if (walkComplete(ctx)) return;
                 }
             },
             else => {},
@@ -1058,6 +1076,63 @@ const Rar4HeaderCrypt = struct {
     keys: Rar4Keys = undefined,
 };
 
+// The entry's data-crypt record, shared by the single and volume walks:
+// LHD_PASSWORD with the versions 13, 15, and 20 refused, which use the
+// retired proprietary ciphers.
+fn rar4DataCrypt(file: Rar4File) Exception!?Crypt {
+    if (file.header.flags & rar4_lhd_password == 0) return null;
+    if (file.unpack_version != 29 and file.unpack_version != 36) return error.UnsupportedException;
+    const salt = file.salt orelse return error.DataException;
+    return Crypt{ .rar4 = .{ .salt = salt } };
+}
+
+// File-entry construction shared by the single and volume walks; the
+// caller supplies the packed total and the entry's data offset.
+fn rar4FileEntry(file: Rar4File, ordinal: usize, packed_total: u64, data_offset: u64) Exception!Entry {
+    const header = file.header;
+    var entry: Entry = .{
+        .info = .{
+            .name = file.name,
+            .size = file.unpacked_size,
+            .data_offset = data_offset,
+            .packed_size = packed_total,
+            .crc = file.file_crc,
+            .ordinal = ordinal,
+            .mtime = if (file.host_os == rar4_host_unix) file.mtime else 0,
+        },
+        .family = .rar4,
+        .is_directory = file.is_directory,
+        .method = 0,
+        .unpack_version = file.unpack_version,
+        .solid = false,
+        .file_flags = header.flags,
+        .dict_bits = 0,
+        .blake2 = null,
+        .crypt = try rar4DataCrypt(file),
+    };
+    if (!file.is_directory) {
+        if (file.method > 5) return error.UnsupportedException;
+        if (file.unpack_version != 20 and file.unpack_version != 26 and
+            file.unpack_version != 29 and file.unpack_version != 36)
+            return error.UnsupportedException; // Version 15 and unknown future versions.
+        // A 0xffffffff unpacked size marks an unknown size (unrar
+        // INT64NDF), which this facade cannot size ahead of the read.
+        const unknown_size = if (header.flags & rar4_lhd_large != 0)
+            file.unpacked_size == std.math.maxInt(u64)
+        else
+            file.unpacked_size == 0xffffffff;
+        if (unknown_size) return error.UnsupportedException;
+        entry.method = file.method;
+        entry.solid = header.flags & rar4_lhd_solid != 0;
+    }
+    entry.info.family = .rar4;
+    entry.info.method = entry.method;
+    entry.info.unpack_version = entry.unpack_version;
+    entry.info.window_bytes = if (entry.method == 0) 0 else @as(u64, 1) << dictBitsRar4(entry.file_flags);
+    entry.info.solid = entry.solid;
+    return entry;
+}
+
 // Each -hp block salts and re-keys independently (vendor SetCryptKeys);
 // the 7-byte fixed header decrypts alone.
 fn parseRar4HeaderEncrypted(
@@ -1146,51 +1221,7 @@ fn walkRar4(archive: []const u8, opts: DecodeOptions, ctx: anytype, comptime vis
                 if (header.flags & (rar4_lhd_split_before | rar4_lhd_split_after) != 0)
                     return error.UnsupportedException;
                 const file = try parseRar4File(header_source, header);
-                var entry: Entry = .{
-                    .info = .{
-                        .name = file.name,
-                        .size = file.unpacked_size,
-                        .data_offset = @intCast(cursor + header.enc_len),
-                        .packed_size = file.packed_size,
-                        .crc = file.file_crc,
-                        .ordinal = ordinal,
-                        .mtime = if (file.host_os == rar4_host_unix) file.mtime else 0,
-                    },
-                    .family = .rar4,
-                    .is_directory = file.is_directory,
-                    .method = 0,
-                    .unpack_version = file.unpack_version,
-                    .solid = false,
-                    .file_flags = header.flags,
-                    .dict_bits = 0,
-                    .blake2 = null,
-                    .crypt = if (header.flags & rar4_lhd_password != 0) blk: {
-                        // The versions 13, 15, and 20 use the retired proprietary ciphers.
-                        if (file.unpack_version != 29 and file.unpack_version != 36) return error.UnsupportedException;
-                        const salt = file.salt orelse return error.DataException;
-                        break :blk Crypt{ .rar4 = .{ .salt = salt } };
-                    } else null,
-                };
-                if (!file.is_directory) {
-                    if (file.method > 5) return error.UnsupportedException;
-                    if (file.unpack_version != 20 and file.unpack_version != 26 and
-                        file.unpack_version != 29 and file.unpack_version != 36)
-                        return error.UnsupportedException; // Version 15 and unknown future versions.
-                    // A 0xffffffff unpacked size marks an unknown size (unrar
-                    // INT64NDF), which this facade cannot size ahead of the read.
-                    const unknown_size = if (header.flags & rar4_lhd_large != 0)
-                        file.unpacked_size == std.math.maxInt(u64)
-                    else
-                        file.unpacked_size == 0xffffffff;
-                    if (unknown_size) return error.UnsupportedException;
-                    entry.method = file.method;
-                    entry.solid = header.flags & rar4_lhd_solid != 0;
-                }
-                entry.info.family = .rar4;
-                entry.info.method = entry.method;
-                entry.info.unpack_version = entry.unpack_version;
-                entry.info.window_bytes = if (entry.method == 0) 0 else @as(u64, 1) << dictBitsRar4(entry.file_flags);
-                entry.info.solid = entry.solid;
+                const entry = try rar4FileEntry(file, ordinal, file.packed_size, @intCast(cursor + header.enc_len));
                 // See the RAR5 walk: directories are never exposed and do not
                 // consume ordinals.
                 if (!entry.is_directory) {
@@ -1202,6 +1233,9 @@ fn walkRar4(archive: []const u8, opts: DecodeOptions, ctx: anytype, comptime vis
                 const payload_end = try bounds.addUsize(cursor + header.enc_len, std.math.cast(usize, file.packed_size) orelse return error.ResourceException);
                 if (payload_end > archive.len) return error.DataException;
                 cursor = payload_end;
+                // The stop waits until the target's payload extent is
+                // validated, so an early end never skips its own bounds.
+                if (walkComplete(ctx)) return;
                 continue;
             },
             rar4_end => return,
@@ -1250,13 +1284,38 @@ const FindCtx = struct {
     ordinal: usize = 0,
     found: ?RarInfo = null,
     max_entries: u64,
+    // The same group bookkeeping the replay locate keeps, so the answer
+    // sizes one window for the whole solid chain.
+    last_group_start: usize = 0,
+    group_max_window: u64 = 0,
+
+    // The walk ends once the target is held: entries past it cannot change
+    // the answer, and an -hp name the answer carries stays the one its own
+    // parse staged. Pub so the walk probe can see the declaration.
+    pub fn complete(self: *const FindCtx) bool {
+        return self.found != null;
+    }
 };
 
 fn findVisit(ctx: *FindCtx, entry: Entry) Exception!void {
     if (entry.is_directory) return;
     if (ctx.ordinal >= ctx.max_entries) return error.ResourceException;
+    // Entries past the target cannot affect its group; the ceiling still
+    // counts them, so the budget holds over the whole walk.
+    if (ctx.ordinal <= ctx.target) {
+        if (!entry.solid) {
+            ctx.last_group_start = ctx.ordinal;
+            ctx.group_max_window = 0;
+        }
+        if (ctx.ordinal >= ctx.last_group_start) {
+            const window = replayWindowBytes(entry);
+            if (window > ctx.group_max_window) ctx.group_max_window = window;
+        }
+    }
     if (ctx.found == null and ctx.ordinal == ctx.target) {
-        ctx.found = entry.info;
+        var info = entry.info;
+        info.group_window_bytes = ctx.group_max_window;
+        ctx.found = info;
     }
     ctx.ordinal = try bounds.addUsize(ctx.ordinal, 1);
 }
@@ -1284,6 +1343,16 @@ const LocateCtx = struct {
     group_start: usize = 0,
 };
 
+// The replay window one entry needs. Vendor unrar floors the v29/36
+// dictionary at twice the max filter block so any unpacked size can stream
+// (unpack.cpp MinAllocSize); the group maximum inherits that floor so one
+// session window serves every member, not only the target.
+fn replayWindowBytes(entry: Entry) u64 {
+    if (entry.family == .rar4 and (entry.unpack_version == 29 or entry.unpack_version == 36))
+        return @max(entry.info.window_bytes, unpack29_min_window);
+    return entry.info.window_bytes;
+}
+
 fn locateVisit(ctx: *LocateCtx, entry: Entry) Exception!void {
     if (entry.is_directory) return;
     // Entries past the target cannot affect its group: a later non-solid
@@ -1299,7 +1368,8 @@ fn locateVisit(ctx: *LocateCtx, entry: Entry) Exception!void {
         ctx.group_start = if (entry.solid) ctx.last_group_start else ctx.ordinal;
     }
     if (ctx.ordinal >= ctx.last_group_start) {
-        if (entry.info.window_bytes > ctx.group_max_window) ctx.group_max_window = entry.info.window_bytes;
+        const window = replayWindowBytes(entry);
+        if (window > ctx.group_max_window) ctx.group_max_window = window;
         if (entry.method != 0) {
             const pool: usize = if (entry.family == .rar4 and (entry.unpack_version == 20 or entry.unpack_version == 26))
                 unpack20.table_pool_words
@@ -1558,7 +1628,8 @@ fn walkRar5Volumes(
         if (archive.len < rar5_signature.len or
             !std.mem.eql(u8, archive[0..rar5_signature.len], &rar5_signature))
         {
-            // A RAR4 volume would need the legacy walk, which this path never drives.
+            // A RAR4 volume belongs to the legacy walk, which the family
+            // dispatch routes before this walk ever runs.
             if (archive.len >= rar4_signature.len and
                 std.mem.eql(u8, archive[0..rar4_signature.len], &rar4_signature))
                 return error.UnsupportedException;
@@ -1652,12 +1723,14 @@ fn walkRar5Volumes(
                         if (chain.?.first_crypt == null) chain.?.first_crypt = header.crypt;
                     }
                     const part_packed = std.math.cast(usize, header.data_size) orelse return error.ResourceException;
+                    // The offset narrows like the packed size beside it.
+                    const part_offset = std.math.cast(usize, header.data_offset) orelse return error.ResourceException;
                     chain.?.total_packed = try bounds.addUsize(chain.?.total_packed, part_packed);
                     if (parts_scratch.len > 0) {
                         if (chain.?.part_count >= parts_scratch.len) return error.InternalException;
                         parts_scratch[chain.?.part_count] = .{
                             .volume = volume_index,
-                            .offset = header.data_offset,
+                            .offset = part_offset,
                             .packed_size = part_packed,
                         };
                     }
@@ -1672,6 +1745,10 @@ fn walkRar5Volumes(
                         chain = null;
                         ordinal = try bounds.addUsize(ordinal, 1);
                         try visit(ctx, entry);
+                        // The part that completed this entry was already
+                        // bounds-checked by its parse, so stopping here
+                        // skips only volumes past the answer.
+                        if (walkComplete(ctx)) return;
                     }
                 },
                 else => {},
@@ -1690,9 +1767,253 @@ fn walkRar5Volumes(
     return error.DataException;
 }
 
+// The legacy split chain's head identity. A continuation repeats its head's
+// name and coding fields; the split bits differ per part and stay out of
+// the comparison, and the unpacked size rides the head because unrar sizes
+// the destination from the first part's header (extract.cpp SetDestSize).
+const Rar4VolumeChain = struct {
+    name_hash: u32,
+    name_len: usize,
+    method: u8,
+    unpack_version: u8,
+    identity_flags: u16,
+    last_volume: usize,
+    first_unpacked: u64,
+    part_count: usize = 0,
+    total_packed: usize = 0,
+};
+
+// Walk an ordered RAR4 volume set. The legacy format stores no volume
+// number and no per-volume end marker (unrar orders parts by file name),
+// so the set is the request order and the only in-archive identity is the
+// chain itself. Each part's header carries that part's packed size, and
+// the completing part's CRC covers the unpacked data: vendor MergeArchive
+// compares the packed hash only for parts still split after, so a final
+// part carries the file hash like a whole archive does.
+fn walkRar4Volumes(
+    volumes: []const []const u8,
+    parts_scratch: []SplitPart,
+    opts: DecodeOptions,
+    ctx: anytype,
+    comptime visit: fn (@TypeOf(ctx), Entry) Exception!void,
+) Exception!void {
+    if (volumes.len == 0) return error.DataException;
+    var ordinal: usize = 0;
+    var chain: ?Rar4VolumeChain = null;
+    // Hoisted across volumes so the repeated -hp main header pays the KDF
+    // once; the salt memo inside rejects a changed salt.
+    var header_crypt: ?Rar4HeaderCrypt = null;
+    for (volumes, 0..) |archive, volume_index| {
+        if (archive.len < rar4_signature.len or
+            !std.mem.eql(u8, archive[0..rar4_signature.len], &rar4_signature))
+        {
+            // A RAR5 volume belongs to the RAR5 walk, which the family
+            // dispatch routes before this walk ever runs.
+            if (archive.len >= rar5_signature.len and
+                std.mem.eql(u8, archive[0..rar5_signature.len], &rar5_signature))
+                return error.UnsupportedException;
+            return error.DataException;
+        }
+        var cursor = rar4_signature.len;
+        var seen_main = false;
+        while (cursor < archive.len) {
+            if (archive.len - cursor < 7) return error.DataException;
+            var header: Rar4Header = undefined;
+            var header_source: []const u8 = archive;
+            if (header_crypt) |*crypt| {
+                header = try parseRar4HeaderEncrypted(archive, cursor, crypt, opts, opts.scratch);
+                header_source = header.enc_source.?;
+            } else {
+                header = try parseRar4Header(archive, cursor, opts.provider);
+            }
+            switch (header.header_type) {
+                rar4_mark => {},
+                rar4_main => {
+                    // Every volume of a multi-part set carries MHD_VOLUME;
+                    // a lone archive without it is still a valid one-part
+                    // set. Encryption flags every volume or none.
+                    if (header.flags & rar4_mhd_password != 0) {
+                        const password = opts.password orelse return error.UnsupportedException;
+                        if (header_crypt == null) {
+                            var utf16_buffer: [2 * 512]u8 = undefined;
+                            const utf16 = try passwordToUtf16Le(password, &utf16_buffer);
+                            header_crypt = .{ .utf16 = utf16_buffer, .utf16_len = utf16.len };
+                        }
+                    } else if (header_crypt != null) {
+                        return error.DataException;
+                    }
+                    if (volumes.len > 1 and header.flags & rar4_mhd_volume == 0)
+                        return error.DataException;
+                    seen_main = true;
+                },
+                rar4_end => {
+                    if (!seen_main) return error.DataException;
+                    // The end block closes the set: no volume may follow.
+                    if (volume_index + 1 != volumes.len) return error.DataException;
+                    if (chain != null) return error.DataException;
+                    return;
+                },
+                rar4_file => {
+                    if (!seen_main) return error.DataException;
+                    const split_before = header.flags & rar4_lhd_split_before != 0;
+                    const split_after = header.flags & rar4_lhd_split_after != 0;
+                    const file = try parseRar4File(header_source, header);
+                    // A directory is walked but never split: a producer that
+                    // marks one is reporting a layout this reader cannot name.
+                    if (file.is_directory and (split_before or split_after))
+                        return error.DataException;
+                    if (!file.is_directory) {
+                        const identity_flags = header.flags & ~(rar4_lhd_split_before | rar4_lhd_split_after);
+                        if (chain == null) {
+                            // A chain opens only at a part-0 header.
+                            if (split_before) return error.DataException;
+                            chain = .{
+                                .name_hash = checksum.crc32With(opts.provider, file.name),
+                                .name_len = file.name.len,
+                                .method = file.method,
+                                .unpack_version = file.unpack_version,
+                                .identity_flags = identity_flags,
+                                .last_volume = volume_index,
+                                .first_unpacked = file.unpacked_size,
+                            };
+                        } else {
+                            // A continuation must match its head's identity
+                            // and arrive from a strictly later volume.
+                            if (!split_before) return error.DataException;
+                            if (checksum.crc32With(opts.provider, file.name) != chain.?.name_hash or
+                                file.name.len != chain.?.name_len or
+                                file.method != chain.?.method or
+                                file.unpack_version != chain.?.unpack_version or
+                                identity_flags != chain.?.identity_flags)
+                                return error.DataException;
+                            if (volume_index <= chain.?.last_volume) return error.DataException;
+                            chain.?.last_volume = volume_index;
+                        }
+                        const part_packed = std.math.cast(usize, file.packed_size) orelse return error.ResourceException;
+                        // The part's own extent validates before anything
+                        // retains it, so an early stop never skips bounds.
+                        const part_end = try bounds.addUsize(cursor + header.enc_len, part_packed);
+                        if (part_end > archive.len) return error.DataException;
+                        chain.?.total_packed = try bounds.addUsize(chain.?.total_packed, part_packed);
+                        if (parts_scratch.len > 0) {
+                            if (chain.?.part_count >= parts_scratch.len) return error.InternalException;
+                            parts_scratch[chain.?.part_count] = .{
+                                .volume = volume_index,
+                                .offset = cursor + header.enc_len,
+                                .packed_size = part_packed,
+                            };
+                        }
+                        chain.?.part_count = try bounds.addUsize(chain.?.part_count, 1);
+                        if (!split_after) {
+                            const head = chain.?;
+                            var entry = try rar4FileEntry(file, ordinal, head.total_packed, @intCast(cursor + header.enc_len));
+                            // The head part carries the full unpacked size.
+                            entry.info.size = head.first_unpacked;
+                            if (parts_scratch.len > 0) {
+                                entry.parts = parts_scratch[0..head.part_count];
+                                entry.info.data_offset = parts_scratch[0].offset;
+                            }
+                            chain = null;
+                            ordinal = try bounds.addUsize(ordinal, 1);
+                            try visit(ctx, entry);
+                            // The part that completed this entry was already
+                            // bounds-checked above, so stopping here skips
+                            // only volumes past the answer.
+                            if (walkComplete(ctx)) return;
+                        }
+                    }
+                },
+                else => {},
+            }
+            const data_end = try bounds.addUsize(cursor + header.enc_len, std.math.cast(usize, header.data_size) orelse return error.ResourceException);
+            if (data_end > archive.len) return error.DataException;
+            cursor = data_end;
+        }
+        if (!seen_main) return error.DataException;
+        // A chain may continue past an EOF, which is the legacy format's
+        // only end-of-volume shape; the final volume must complete it.
+        if (volume_index + 1 == volumes.len and chain != null) return error.DataException;
+    }
+}
+
 // Gather a split entry's parts; encrypted chains decrypt as one CBC
-// stream across parts (unrar extract.cpp).
+// stream across parts (unrar extract.cpp). The entry's family routes the
+// part layout: the legacy set stores the same part shape with the crypt
+// stream continued across parts the same way.
 fn volumeGather(
+    entry: Entry,
+    volumes: []const []const u8,
+    opts: DecodeOptions,
+    bufs: *DecodeBuffers,
+) Exception![]const u8 {
+    return switch (entry.family) {
+        .rar4 => volumeGatherRar4(entry, volumes, opts, bufs),
+        .rar5 => volumeGatherRar5(entry, volumes, opts, bufs),
+    };
+}
+
+// The legacy gather: parts concatenate, and an encrypted chain continues
+// the KDF key's CBC stream across parts, each part a whole block multiple
+// (vendor rdwrfn.cpp aligns volume ends to CRYPT_BLOCK_SIZE).
+fn volumeGatherRar4(
+    entry: Entry,
+    volumes: []const []const u8,
+    opts: DecodeOptions,
+    bufs: *DecodeBuffers,
+) Exception![]const u8 {
+    if (entry.parts.len == 0) return error.InternalException;
+    var total: usize = 0;
+    for (entry.parts) |part| total = try bounds.addUsize(total, part.packed_size);
+    const crypt = entry.crypt orelse {
+        if (entry.parts.len == 1) {
+            const part = entry.parts[0];
+            return bounds.slice(volumes[part.volume], part.offset, part.packed_size);
+        }
+        if (bufs.packed_stage.len < total) return error.InternalException;
+        var staged: usize = 0;
+        for (entry.parts) |part| {
+            const src = try bounds.slice(volumes[part.volume], part.offset, part.packed_size);
+            @memcpy(bufs.packed_stage[staged..][0..src.len], src);
+            staged += src.len;
+        }
+        if (staged != total) return error.InternalException;
+        return bufs.packed_stage[0..total];
+    };
+    switch (crypt) {
+        // The family routes the gather, so a legacy entry never carries a
+        // RAR5 crypt record.
+        .rar5 => return error.InternalException,
+        .rar4 => |c| {
+            const password = opts.password orelse return error.UnsupportedException;
+            if (opts.password_lifetime != 0 and total > opts.password_lifetime) {
+                if (opts.failure_cause) |cause| cause.* = .password_lifetime;
+                return error.ResourceException;
+            }
+            var utf16_buffer: [2 * 512]u8 = undefined;
+            const utf16 = try passwordToUtf16Le(password, &utf16_buffer);
+            const keys = try rar4Kdf(utf16, &c.salt, opts);
+            if (bufs.packed_stage.len < total) return error.InternalException;
+            var chain_iv: [16]u8 = undefined;
+            var staged: usize = 0;
+            for (entry.parts, 0..) |part, i| {
+                const src = try bounds.slice(volumes[part.volume], part.offset, part.packed_size);
+                // Every part with data is a whole number of AES blocks; the
+                // final part carries the stream's padding.
+                if (total != 0 and (src.len < crypto.block_length or src.len % crypto.block_length != 0))
+                    return error.DataException;
+                const iv: *const [16]u8 = if (i == 0) &keys.iv else &chain_iv;
+                const dst = bufs.packed_stage[staged..][0..src.len];
+                crypto.aesCbcDecrypt(opts.provider, keys.key[0..], iv.*, dst, src) catch return error.DataException;
+                staged += src.len;
+                if (i + 1 < entry.parts.len) @memcpy(&chain_iv, src[src.len - 16 ..][0..16]);
+            }
+            if (staged != total) return error.InternalException;
+            return bufs.packed_stage[0..total];
+        },
+    }
+}
+
+fn volumeGatherRar5(
     entry: Entry,
     volumes: []const []const u8,
     opts: DecodeOptions,
@@ -1776,36 +2097,39 @@ const VolumeStoreCtx = struct {
 };
 
 // Compressed replay of a volume set: parts are gathered at each entry's
-// own visit, before the scratch is reused.
-const VolumeReplayCtx = struct {
-    session: *unpack50.Session,
-    volumes: []const []const u8,
-    locate: *const LocateCtx,
-    output: []u8,
-    opts: DecodeOptions,
-    bufs: *DecodeBuffers,
-    target_version: u8,
+// own visit, before the scratch is reused. The session type follows the
+// target's family; the gather routes by entry family.
+fn VolumeReplayCtx(comptime Session: type) type {
+    return struct {
+        session: *Session,
+        volumes: []const []const u8,
+        locate: *const LocateCtx,
+        output: []u8,
+        opts: DecodeOptions,
+        bufs: *DecodeBuffers,
+        target_version: u8,
 
-    fn visit(ctx: *VolumeReplayCtx, entry: Entry) Exception!void {
-        if (entry.info.ordinal > ctx.locate.target) return;
-        if (entry.info.ordinal < ctx.locate.group_start) return;
-        // A store entry never joins a compressed stream, so it never reaches the session.
-        if (entry.method == 0) return;
-        // The session's tables come from the target's version, so a mixed
-        // chain would use wrong table sizes.
-        if (versionClass(entry.unpack_version) != versionClass(ctx.target_version)) return error.UnsupportedException;
-        const payload = try volumeGather(entry, ctx.volumes, ctx.opts, ctx.bufs);
-        if (entry.info.ordinal == ctx.locate.target) {
-            const size = std.math.cast(usize, entry.info.size) orelse return error.ResourceException;
-            var bs = sink.BufferSink.init(ctx.output[0..size]);
-            try ctx.session.decodeFile(payload, entry.info.size, entry.solid, bs.sink());
-            if (bs.overflowed) return error.DataException;
-        } else {
-            var discard = sink.DiscardSink{};
-            try ctx.session.decodeFile(payload, entry.info.size, entry.solid, discard.sink());
+        fn visit(ctx: *@This(), entry: Entry) Exception!void {
+            if (entry.info.ordinal > ctx.locate.target) return;
+            if (entry.info.ordinal < ctx.locate.group_start) return;
+            // A store entry never joins a compressed stream, so it never reaches the session.
+            if (entry.method == 0) return;
+            // The session's tables come from the target's version, so a mixed
+            // chain would use wrong table sizes.
+            if (versionClass(entry.unpack_version) != versionClass(ctx.target_version)) return error.UnsupportedException;
+            const payload = try volumeGather(entry, ctx.volumes, ctx.opts, ctx.bufs);
+            if (entry.info.ordinal == ctx.locate.target) {
+                const size = std.math.cast(usize, entry.info.size) orelse return error.ResourceException;
+                var bs = sink.BufferSink.init(ctx.output[0..size]);
+                try ctx.session.decodeFile(payload, entry.info.size, entry.solid, bs.sink());
+                if (bs.overflowed) return error.DataException;
+            } else {
+                var discard = sink.DiscardSink{};
+                try ctx.session.decodeFile(payload, entry.info.size, entry.solid, discard.sink());
+            }
         }
-    }
-};
+    };
+}
 
 fn replayVolumesCompressed(
     volumes: []const []const u8,
@@ -1829,7 +2153,7 @@ fn replayVolumesCompressed(
         bufs.filter_scratch,
         target.unpack_version == 70,
     );
-    var replay: VolumeReplayCtx = .{
+    var replay: VolumeReplayCtx(unpack50.Session) = .{
         .session = &session,
         .volumes = volumes,
         .locate = locate,
@@ -1838,18 +2162,110 @@ fn replayVolumesCompressed(
         .bufs = bufs,
         .target_version = target.unpack_version,
     };
-    try walkRar5Volumes(volumes, bufs.split_parts, opts, &replay, VolumeReplayCtx.visit);
+    try walkRar5Volumes(volumes, bufs.split_parts, opts, &replay, VolumeReplayCtx(unpack50.Session).visit);
 }
 
-// Counts the readable entries of an ordered multi-volume RAR5 set.
+// Compressed replay of a legacy volume set: the same gather, with the
+// session class the target's unpack version selects.
+fn replayRar4VolumesCompressed(
+    volumes: []const []const u8,
+    opts: DecodeOptions,
+    locate: *const LocateCtx,
+    target: Entry,
+    output: []u8,
+    bufs: *DecodeBuffers,
+    window_len: usize,
+) Exception!void {
+    if (bufs.window.len < window_len) return error.InternalException;
+    if (bufs.filter_scratch.len < window_len + filter_scratch_extra) return error.InternalException;
+    switch (target.unpack_version) {
+        29, 36 => {
+            if (bufs.table_pool.len < unpack29.table_pool_words * 4) return error.InternalException;
+            if (bufs.pending29.len < unpack29.max_pending_filters) return error.InternalException;
+            const st = try bufs.state29();
+            var session = try unpack29.Session.init(
+                st,
+                bufs.window[0..window_len],
+                bufs.table_pool[0 .. unpack29.table_pool_words * 4],
+                bufs.pending29,
+                bufs.filter_scratch,
+                bufs.ppm_heap,
+                opts.provider,
+            );
+            var replay: VolumeReplayCtx(unpack29.Session) = .{
+                .session = &session,
+                .volumes = volumes,
+                .locate = locate,
+                .output = output,
+                .opts = opts,
+                .bufs = bufs,
+                .target_version = target.unpack_version,
+            };
+            try walkRar4Volumes(volumes, bufs.split_parts, opts, &replay, VolumeReplayCtx(unpack29.Session).visit);
+        },
+        20, 26 => {
+            if (bufs.table_pool.len < unpack20.table_pool_words) return error.InternalException;
+            const st = try bufs.state20();
+            var session = try unpack20.Session.init(
+                st,
+                bufs.window[0..window_len],
+                bufs.table_pool[0..unpack20.table_pool_words],
+            );
+            var replay: VolumeReplayCtx(unpack20.Session) = .{
+                .session = &session,
+                .volumes = volumes,
+                .locate = locate,
+                .output = output,
+                .opts = opts,
+                .bufs = bufs,
+                .target_version = target.unpack_version,
+            };
+            try walkRar4Volumes(volumes, bufs.split_parts, opts, &replay, VolumeReplayCtx(unpack20.Session).visit);
+        },
+        else => return error.UnsupportedException,
+    }
+}
+
+// The volume walks dispatch on the head's family, like the single-archive
+// walk dispatches on the detected one.
+fn walkVolumes(
+    volumes: []const []const u8,
+    parts_scratch: []SplitPart,
+    opts: DecodeOptions,
+    ctx: anytype,
+    comptime visit: fn (@TypeOf(ctx), Entry) Exception!void,
+) Exception!void {
+    if (volumes.len == 0) return error.DataException;
+    switch ((try detectFamily(volumes[0], opts.provider)).family) {
+        .rar4 => try walkRar4Volumes(volumes, parts_scratch, opts, ctx, visit),
+        .rar5 => try walkRar5Volumes(volumes, parts_scratch, opts, ctx, visit),
+    }
+}
+
+// Counts the readable entries of an ordered multi-volume set, RAR4 or RAR5.
 pub fn rarVolumeCount(volumes: []const []const u8, max_entries: u64, opts: DecodeOptions) Exception!usize {
     var ctx: CountCtx = .{ .max_entries = max_entries };
-    try walkRar5Volumes(volumes, &.{}, opts, &ctx, countVisit);
+    try walkVolumes(volumes, &.{}, opts, &ctx, countVisit);
     return ctx.count;
 }
 
-// Decode one entry of a RAR5 volume set; the locate pass needs no parts,
-// and the integrity tail matches rarDecodeOrdinal.
+// Inspect one entry of an ordered multi-volume set. The locate pass needs
+// no parts, and the ceiling and not-found classes mirror
+// rarInspectOrdinalOpts: a set with more readable entries than the budget
+// fails per entry, and an ordinal past the set is data, not resource.
+pub fn rarVolumeInspectOrdinal(
+    volumes: []const []const u8,
+    ordinal: usize,
+    max_entries: u64,
+    opts: DecodeOptions,
+) Exception!RarInfo {
+    var ctx: FindCtx = .{ .target = ordinal, .max_entries = max_entries };
+    try walkVolumes(volumes, &.{}, opts, &ctx, findVisit);
+    return ctx.found orelse error.DataException;
+}
+
+// Decode one entry of an ordered multi-volume set; the locate pass needs
+// no parts, and the integrity tail matches rarDecodeOrdinal.
 pub fn rarVolumeDecodeOrdinal(
     volumes: []const []const u8,
     ordinal: usize,
@@ -1861,7 +2277,7 @@ pub fn rarVolumeDecodeOrdinal(
     var memo_opts = opts;
     memo_opts.kdf_memo = &kdf_memo;
     var locate: LocateCtx = .{ .target = ordinal };
-    try walkRar5Volumes(volumes, &.{}, memo_opts, &locate, locateVisit);
+    try walkVolumes(volumes, &.{}, memo_opts, &locate, locateVisit);
     const entry = locate.target_entry orelse return error.DataException;
     if (entry.is_directory) return error.DataException;
 
@@ -1876,11 +2292,14 @@ pub fn rarVolumeDecodeOrdinal(
             .opts = memo_opts,
             .bufs = bufs,
         };
-        try walkRar5Volumes(volumes, bufs.split_parts, memo_opts, &store, VolumeStoreCtx.visit);
+        try walkVolumes(volumes, bufs.split_parts, memo_opts, &store, VolumeStoreCtx.visit);
         if (!store.done) return error.DataException;
     } else {
         const window_len = std.math.cast(usize, locate.group_max_window) orelse return error.ResourceException;
-        try replayVolumesCompressed(volumes, memo_opts, &locate, entry, output[0..size], bufs, window_len);
+        switch (entry.family) {
+            .rar4 => try replayRar4VolumesCompressed(volumes, memo_opts, &locate, entry, output[0..size], bufs, window_len),
+            .rar5 => try replayVolumesCompressed(volumes, memo_opts, &locate, entry, output[0..size], bufs, window_len),
+        }
     }
 
     var hash_key: ?[32]u8 = null;
@@ -2347,6 +2766,76 @@ test "rar5 rar7 window fraction and compat mask" {
     );
 }
 
+test "replay window floors the v29 dictionary and reports the group maximum" {
+    const testing = std.testing;
+    var entry: Entry = .{
+        .info = .{ .name = "a", .size = 1, .data_offset = 0, .packed_size = 1, .crc = 0, .ordinal = 0 },
+        .family = .rar4,
+        .is_directory = false,
+        .method = 3,
+        .unpack_version = 29,
+        .solid = false,
+        .file_flags = 0,
+        .dict_bits = 0,
+        .blake2 = null,
+    };
+    entry.info.window_bytes = 1 << 16;
+    // The v29/36 streaming floor applies per member, so a small declared
+    // dictionary still streams any unpacked size.
+    try testing.expectEqual(unpack29_min_window, replayWindowBytes(entry));
+    // The floor is a v29/36 concern: v20/26 and RAR5 keep declarations.
+    entry.unpack_version = 20;
+    try testing.expectEqual(@as(u64, 1 << 16), replayWindowBytes(entry));
+    entry.family = .rar5;
+    entry.unpack_version = 50;
+    try testing.expectEqual(@as(u64, 1 << 16), replayWindowBytes(entry));
+
+    // A solid pair where the predecessor declares a larger dictionary: both
+    // ordinals report the group maximum, which the replay window must cover.
+    // compression = solid bit | method 1 | window bits 3, then window bits 0.
+    var archive: [96]u8 = @splat(0);
+    var body: [32]u8 = undefined;
+    var at: usize = 0;
+    @memcpy(archive[0..8], &rar5_signature);
+    at = 8;
+    at += (try rar5FixtureBlock(archive[at..], try rar5FixtureSimpleBody(&body, rar5_type_main))).len;
+    at += (try rar5FixtureBlock(archive[at..], try rar5FixtureFileBody(
+        &body,
+        rar5_type_file,
+        rar5_flag_data,
+        1,
+        rar5_file_crc32,
+        1,
+        0x40 | 0x80 | (3 << 10),
+        "A",
+        0,
+        &.{},
+    ))).len;
+    @memcpy(archive[at..][0..1], "A");
+    at += 1;
+    at += (try rar5FixtureBlock(archive[at..], try rar5FixtureFileBody(
+        &body,
+        rar5_type_file,
+        rar5_flag_data,
+        1,
+        rar5_file_crc32,
+        1,
+        0x40 | 0x80,
+        "B",
+        0,
+        &.{},
+    ))).len;
+    @memcpy(archive[at..][0..1], "B");
+    at += 1;
+    at += (try rar5FixtureBlock(archive[at..], try rar5FixtureSimpleBody(&body, rar5_type_end))).len;
+
+    const first = try rarInspectOrdinalOpts(archive[0..at], 0, 128, .{});
+    try testing.expectEqual(@as(u64, 0x20000 << 3), first.group_window_bytes);
+    const second = try rarInspectOrdinalOpts(archive[0..at], 1, 128, .{});
+    try testing.expectEqual(@as(u64, 0x20000 << 3), second.group_window_bytes);
+    try testing.expectEqual(@as(u64, 0x20000), second.window_bytes);
+}
+
 test "rar5 solid chains refuse to mix unpack versions" {
     // Vendor switches ExtraDist per file; this single-session replay refuses
     // mixed chains. The payloads stay opaque; the guard fires first.
@@ -2659,4 +3148,224 @@ test "rar5 file crypt record keeps the pswcheck only on a valid csum" {
     try walkEntriesOpts(archive[0..len], .{}, &damaged_entries, testEntryVisit);
     try std.testing.expectEqual(@as(usize, 1), damaged_entries.count);
     try std.testing.expectEqual(@as(?[8]u8, null), damaged_entries.pswchecks[0]);
+}
+
+// RAR4 volume-set fixtures: a main head with chosen flags and a file head
+// with the fields a volume layout varies, both fully CRC-covered like a
+// real producer.
+fn rar4VolumeMainHead(out: []u8, flags: u16) []u8 {
+    @memset(out[0..13], 0);
+    out[2] = rar4_main;
+    std.mem.writeInt(u16, out[3..5], flags, .little);
+    std.mem.writeInt(u16, out[5..7], 13, .little);
+    const crc: u16 = @truncate(checksum.crc32With(crypto.default_provider, out[2..13]));
+    std.mem.writeInt(u16, out[0..2], crc, .little);
+    return out[0..13];
+}
+
+fn rar4VolumeFileHead(out: []u8, flags: u16, packed_size: u32, unpacked: u32, name: []const u8, salt: ?[8]u8, file_crc: u32) []u8 {
+    const head_size = 32 + name.len + (if (salt != null) @as(usize, 8) else 0);
+    @memset(out[0..head_size], 0);
+    out[2] = rar4_file;
+    std.mem.writeInt(u16, out[3..5], flags, .little);
+    std.mem.writeInt(u16, out[5..7], @intCast(head_size), .little);
+    std.mem.writeInt(u32, out[7..11], packed_size, .little);
+    std.mem.writeInt(u32, out[11..15], unpacked, .little);
+    out[15] = rar4_host_unix;
+    std.mem.writeInt(u32, out[16..20], file_crc, .little);
+    std.mem.writeInt(u32, out[20..24], 123456789, .little);
+    out[24] = 29;
+    out[25] = 0x30;
+    std.mem.writeInt(u16, out[26..28], @intCast(name.len), .little);
+    std.mem.writeInt(u32, out[28..32], 0x81A4, .little);
+    @memcpy(out[32..][0..name.len], name);
+    if (salt) |value| @memcpy(out[32 + name.len ..][0..8], &value);
+    const crc: u16 = @truncate(checksum.crc32With(crypto.default_provider, out[2..head_size]));
+    std.mem.writeInt(u16, out[0..2], crc, .little);
+    return out[0..head_size];
+}
+
+fn rar4VolumeBuffers(split_parts: []SplitPart, packed_stage: []u8) DecodeBuffers {
+    return .{
+        .state = &.{},
+        .window = &.{},
+        .table_pool = &.{},
+        .pending50 = &.{},
+        .pending29 = &.{},
+        .filter_scratch = &.{},
+        .ppm_heap = &.{},
+        .split_parts = split_parts,
+        .packed_stage = packed_stage,
+    };
+}
+
+test "rar4 volume set walks and decodes a split store entry" {
+    const testing = std.testing;
+    // 89 bytes, split 60/29 across the volumes.
+    const data = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmn";
+    const part1_len = 60;
+
+    var volume1: [256]u8 = @splat(0);
+    var at: usize = 0;
+    @memcpy(volume1[0..rar4_signature.len], &rar4_signature);
+    at = rar4_signature.len;
+    at += (rar4VolumeMainHead(volume1[at..], rar4_mhd_volume)).len;
+    at += (rar4VolumeFileHead(volume1[at..], rar4_lhd_split_after, part1_len, data.len, "big.bin", null, checksum.crc32With(crypto.default_provider, data[0..part1_len]))).len;
+    @memcpy(volume1[at..][0..part1_len], data[0..part1_len]);
+    at += part1_len;
+    const part1 = volume1[0..at];
+
+    var volume2: [256]u8 = @splat(0);
+    at = 0;
+    @memcpy(volume2[0..rar4_signature.len], &rar4_signature);
+    at = rar4_signature.len;
+    at += (rar4VolumeMainHead(volume2[at..], rar4_mhd_volume)).len;
+    at += (rar4VolumeFileHead(volume2[at..], rar4_lhd_split_before, data.len - part1_len, data.len, "big.bin", null, checksum.crc32With(crypto.default_provider, data))).len;
+    @memcpy(volume2[at..][0 .. data.len - part1_len], data[part1_len..]);
+    at += data.len - part1_len;
+    const part2 = volume2[0..at];
+
+    const set = [_][]const u8{ part1, part2 };
+    try testing.expectEqual(@as(usize, 1), try rarVolumeCount(&set, 128, .{}));
+    const info = try rarVolumeInspectOrdinal(&set, 0, 128, .{});
+    try testing.expectEqualStrings("big.bin", info.name);
+    try testing.expectEqual(@as(u64, data.len), info.size);
+    try testing.expectEqual(@as(u64, data.len), info.packed_size);
+
+    var split_parts: [8]SplitPart = undefined;
+    var packed_stage: [256]u8 = undefined;
+    var bufs = rar4VolumeBuffers(&split_parts, &packed_stage);
+    var out: [128]u8 = undefined;
+    try testing.expectEqual(data.len, try rarVolumeDecodeOrdinal(&set, 0, &out, &bufs, .{}));
+    try testing.expectEqualSlices(u8, data, out[0..data.len]);
+    // The part scratch records one slot per volume, in order.
+    try testing.expectEqual(@as(usize, 0), split_parts[0].volume);
+    try testing.expectEqual(@as(usize, 1), split_parts[1].volume);
+}
+
+test "rar4 volume set decodes an encrypted split store entry" {
+    const testing = std.testing;
+    const password = "vol-pw";
+    var data: [96]u8 = undefined;
+    for (&data, 0..) |*byte, i| byte.* = @truncate(i *% 31 +% 7);
+    const part1_len = 64; // AES-block aligned, like a real producer pads.
+
+    const salt = [8]u8{ 0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE };
+    var utf16: [2 * 512]u8 = undefined;
+    const keys = try rar4Kdf(try passwordToUtf16Le(password, &utf16), &salt, .{});
+
+    var volume1: [256]u8 = @splat(0);
+    var at: usize = 0;
+    @memcpy(volume1[0..rar4_signature.len], &rar4_signature);
+    at = rar4_signature.len;
+    at += (rar4VolumeMainHead(volume1[at..], rar4_mhd_volume)).len;
+    at += (rar4VolumeFileHead(volume1[at..], rar4_lhd_password | rar4_lhd_salt | rar4_lhd_split_after, part1_len, data.len, "sec.bin", salt, checksum.crc32With(crypto.default_provider, data[0..part1_len]))).len;
+    try crypto.aesCbcEncrypt(crypto.default_provider, keys.key[0..], keys.iv, volume1[at..][0..part1_len], data[0..part1_len]);
+    at += part1_len;
+    const part1 = volume1[0..at];
+
+    // The CBC stream continues across the parts: the second part's IV is
+    // the first part's final ciphertext block.
+    var chain_iv: [16]u8 = undefined;
+    @memcpy(&chain_iv, part1[part1.len - 16 ..][0..16]);
+    var volume2: [256]u8 = @splat(0);
+    at = 0;
+    @memcpy(volume2[0..rar4_signature.len], &rar4_signature);
+    at = rar4_signature.len;
+    at += (rar4VolumeMainHead(volume2[at..], rar4_mhd_volume)).len;
+    at += (rar4VolumeFileHead(volume2[at..], rar4_lhd_password | rar4_lhd_salt | rar4_lhd_split_before, data.len - part1_len, data.len, "sec.bin", salt, checksum.crc32With(crypto.default_provider, &data))).len;
+    try crypto.aesCbcEncrypt(crypto.default_provider, keys.key[0..], chain_iv, volume2[at..][0 .. data.len - part1_len], data[part1_len..]);
+    at += data.len - part1_len;
+    const part2 = volume2[0..at];
+
+    const set = [_][]const u8{ part1, part2 };
+    var split_parts: [8]SplitPart = undefined;
+    var packed_stage: [256]u8 = undefined;
+    var bufs = rar4VolumeBuffers(&split_parts, &packed_stage);
+    var out: [128]u8 = undefined;
+    const decode_opts: DecodeOptions = .{ .password = password };
+    try testing.expectEqual(data.len, try rarVolumeDecodeOrdinal(&set, 0, &out, &bufs, decode_opts));
+    try testing.expectEqualSlices(u8, &data, out[0..data.len]);
+
+    // The wrong password decrypts to garbage and fails the integrity tail.
+    var cause: crypto.FailureCause = .none;
+    const wrong_opts: DecodeOptions = .{ .password = "wrong", .failure_cause = &cause };
+    try testing.expectError(error.IntegrityException, rarVolumeDecodeOrdinal(&set, 0, &out, &bufs, wrong_opts));
+}
+
+test "rar4 volume set orders entries across volumes and rejects broken chains" {
+    const testing = std.testing;
+    const data_a = "aaaa";
+    const data_b = "bbbbbbbb";
+
+    var volume1: [256]u8 = @splat(0);
+    var at: usize = 0;
+    @memcpy(volume1[0..rar4_signature.len], &rar4_signature);
+    at = rar4_signature.len;
+    at += (rar4VolumeMainHead(volume1[at..], rar4_mhd_volume)).len;
+    // Entry A completes in the first volume; entry B splits.
+    at += (rar4VolumeFileHead(volume1[at..], 0, data_a.len, data_a.len, "a.txt", null, checksum.crc32With(crypto.default_provider, data_a))).len;
+    @memcpy(volume1[at..][0..data_a.len], data_a);
+    at += data_a.len;
+    at += (rar4VolumeFileHead(volume1[at..], rar4_lhd_split_after, 3, data_b.len, "b.txt", null, checksum.crc32With(crypto.default_provider, data_b[0..3]))).len;
+    @memcpy(volume1[at..][0..3], data_b[0..3]);
+    at += 3;
+    const part1 = volume1[0..at];
+
+    var volume2: [256]u8 = @splat(0);
+    at = 0;
+    @memcpy(volume2[0..rar4_signature.len], &rar4_signature);
+    at = rar4_signature.len;
+    at += (rar4VolumeMainHead(volume2[at..], rar4_mhd_volume)).len;
+    at += (rar4VolumeFileHead(volume2[at..], rar4_lhd_split_before, data_b.len - 3, data_b.len, "b.txt", null, checksum.crc32With(crypto.default_provider, data_b))).len;
+    @memcpy(volume2[at..][0 .. data_b.len - 3], data_b[3..]);
+    at += data_b.len - 3;
+    const part2 = volume2[0..at];
+
+    const set = [_][]const u8{ part1, part2 };
+    try testing.expectEqual(@as(usize, 2), try rarVolumeCount(&set, 128, .{}));
+    var split_parts: [8]SplitPart = undefined;
+    var packed_stage: [128]u8 = undefined;
+    var bufs = rar4VolumeBuffers(&split_parts, &packed_stage);
+    var out: [64]u8 = undefined;
+    try testing.expectEqual(data_a.len, try rarVolumeDecodeOrdinal(&set, 0, &out, &bufs, .{}));
+    try testing.expectEqualSlices(u8, data_a, out[0..data_a.len]);
+    try testing.expectEqual(data_b.len, try rarVolumeDecodeOrdinal(&set, 1, &out, &bufs, .{}));
+    try testing.expectEqualSlices(u8, data_b, out[0..data_b.len]);
+
+    // A continuation naming a different file is data, not a chain.
+    var stray: [256]u8 = @splat(0);
+    at = 0;
+    @memcpy(stray[0..rar4_signature.len], &rar4_signature);
+    at = rar4_signature.len;
+    at += (rar4VolumeMainHead(stray[at..], rar4_mhd_volume)).len;
+    at += (rar4VolumeFileHead(stray[at..], rar4_lhd_split_before, 5, 8, "other.txt", null, 0)).len;
+    const broken_set = [_][]const u8{ part1, stray[0..at] };
+    try testing.expectError(error.DataException, rarVolumeCount(&broken_set, 128, .{}));
+
+    // A set that ends mid-chain is data, too.
+    const dangling = [_][]const u8{part1};
+    try testing.expectError(error.DataException, rarVolumeCount(&dangling, 128, .{}));
+
+    // A multi-part set whose second volume drops MHD_VOLUME is data.
+    var plain: [256]u8 = @splat(0);
+    at = 0;
+    @memcpy(plain[0..rar4_signature.len], &rar4_signature);
+    at = rar4_signature.len;
+    at += (rar4VolumeMainHead(plain[at..], 0)).len;
+    at += (rar4VolumeFileHead(plain[at..], rar4_lhd_split_before, 5, 8, "b.txt", null, 0)).len;
+    const unmarked = [_][]const u8{ part1, plain[0..at] };
+    try testing.expectError(error.DataException, rarVolumeCount(&unmarked, 128, .{}));
+
+    // A continuation without the split-before flag is data, not a chain.
+    var late: [256]u8 = @splat(0);
+    at = 0;
+    @memcpy(late[0..rar4_signature.len], &rar4_signature);
+    at = rar4_signature.len;
+    at += (rar4VolumeMainHead(late[at..], rar4_mhd_volume)).len;
+    at += (rar4VolumeFileHead(late[at..], rar4_lhd_split_after, 3, 8, "b.txt", null, 0)).len;
+    @memcpy(late[at..][0..3], data_b[0..3]);
+    at += 3;
+    const late_set = [_][]const u8{ part1, late[0..at] };
+    try testing.expectError(error.DataException, rarVolumeCount(&late_set, 128, .{}));
 }

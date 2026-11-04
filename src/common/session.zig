@@ -408,6 +408,55 @@ fn recordBytes(comptime data_len: usize, comptime records: []const Record) [reco
     return out;
 }
 
+// The tally forwards through std.testing.allocator, so leak checking
+// stays armed while counters move.
+const Tally = struct {
+    const Self = @This();
+    allocs: usize = 0,
+    frees: usize = 0,
+
+    fn allocator(self: *Self) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = std.mem.Allocator.VTable{
+        .alloc = allocFn,
+        .resize = resizeFn,
+        .remap = remapFn,
+        .free = freeFn,
+    };
+
+    fn allocFn(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.allocs += 1;
+        return std.testing.allocator.vtable.alloc(std.testing.allocator.ptr, len, alignment, ret_addr);
+    }
+
+    fn resizeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        _ = ctx;
+        return std.testing.allocator.vtable.resize(std.testing.allocator.ptr, memory, alignment, new_len, ret_addr);
+    }
+
+    fn remapFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        _ = ctx;
+        return std.testing.allocator.vtable.remap(std.testing.allocator.ptr, memory, alignment, new_len, ret_addr);
+    }
+
+    fn freeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.frees += 1;
+        std.testing.allocator.vtable.free(std.testing.allocator.ptr, memory, alignment, ret_addr);
+    }
+};
+
+// Draining reads every payload; batteries, mirrors, and sweeps share the loop.
+fn drain(cursor: anytype, w: *std.Io.Writer) Exception!void {
+    while (try cursor.next()) |_| {
+        w.end = 0;
+        _ = try cursor.readData(w);
+    }
+}
+
 // Counts verb calls so the skip sink is proven by observation.
 fn CountingSource(comptime Source: type) type {
     return struct {
@@ -1188,10 +1237,7 @@ fn chunkedLpMirrorPair(comptime Base: type, read_base: *Base, skip_base: *Base) 
     var read_cursor = try N.open(read_base, "payload", &read_scratch);
     var data: [16]u8 = undefined;
     var w = std.Io.Writer.fixed(&data);
-    while (try read_cursor.next()) |_| {
-        w.end = 0;
-        _ = try read_cursor.readData(&w);
-    }
+    try drain(&read_cursor, &w);
 
     var skip_scratch: [N.scratch_size]u8 align(N.scratch_alignment) = undefined;
     var skip_cursor = try N.open(skip_base, "payload", &skip_scratch);
@@ -1227,10 +1273,7 @@ fn chunkedLpSweepBody(comptime B: type, base: B) Exception!void {
     var cursor = try InnerCursor.open(ts.reader(), &is_scratch);
     var data: [16]u8 = undefined;
     var w = std.Io.Writer.fixed(&data);
-    while (try cursor.next()) |_| {
-        w.end = 0;
-        _ = try cursor.readData(&w);
-    }
+    try drain(&cursor, &w);
 }
 
 fn chunkedLpSweepSlice(bytes: []const u8) Exception!void {
@@ -1436,10 +1479,7 @@ fn doubleNestedMirrorPair(comptime Base: type, read_base: *Base, skip_base: *Bas
     var read_cursor = try N1.open(read_base, "payload", &read_scratch);
     var data: [16]u8 = undefined;
     var w = std.Io.Writer.fixed(&data);
-    while (try read_cursor.next()) |_| {
-        w.end = 0;
-        _ = try read_cursor.readData(&w);
-    }
+    try drain(&read_cursor, &w);
 
     var skip_scratch: [N1.scratch_size]u8 align(N1.scratch_alignment) = undefined;
     var skip_cursor = try N1.open(skip_base, "payload", &skip_scratch);
@@ -1471,10 +1511,7 @@ fn doubleNestedRun(comptime Base: type, base: *Base, name: []const u8) Exception
     var cursor = try N1.open(base, name, &scratch);
     var data: [24]u8 = undefined;
     var w = std.Io.Writer.fixed(&data);
-    while (try cursor.next()) |_| {
-        w.end = 0;
-        _ = try cursor.readData(&w);
-    }
+    try drain(&cursor, &w);
 }
 
 fn doubleNestedPayloadSweepSlice(bytes: []const u8) Exception!void {
@@ -1586,10 +1623,7 @@ fn fixedTableSweepBody(comptime S: type, source: *S) Exception!void {
     var cursor = try InnerCursor.open(source, &scratch);
     var data: [4]u8 = undefined;
     var w = std.Io.Writer.fixed(&data);
-    while (try cursor.next()) |_| {
-        w.end = 0;
-        _ = try cursor.readData(&w);
-    }
+    try drain(&cursor, &w);
 }
 
 fn fixedTableSweepSlice(bytes: []const u8) Exception!void {
@@ -1960,47 +1994,6 @@ test "nested scratch carves each member segment at its declared alignment" {
 // Every battery helper is exercised here first,
 // so a battery failure points at the property.
 test "harness mechanics cover the tally, canary, cut matrix, and mirrors" {
-    // The tally forwards through std.testing.allocator,
-    // so leak checking stays armed while counters move.
-    const Tally = struct {
-        const Self = @This();
-        allocs: usize = 0,
-        frees: usize = 0,
-
-        fn allocator(self: *Self) std.mem.Allocator {
-            return .{ .ptr = self, .vtable = &vtable };
-        }
-
-        const vtable = std.mem.Allocator.VTable{
-            .alloc = allocFn,
-            .resize = resizeFn,
-            .remap = remapFn,
-            .free = freeFn,
-        };
-
-        fn allocFn(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
-            const self: *Self = @ptrCast(@alignCast(ctx));
-            self.allocs += 1;
-            return std.testing.allocator.vtable.alloc(std.testing.allocator.ptr, len, alignment, ret_addr);
-        }
-
-        fn resizeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
-            _ = ctx;
-            return std.testing.allocator.vtable.resize(std.testing.allocator.ptr, memory, alignment, new_len, ret_addr);
-        }
-
-        fn remapFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
-            _ = ctx;
-            return std.testing.allocator.vtable.remap(std.testing.allocator.ptr, memory, alignment, new_len, ret_addr);
-        }
-
-        fn freeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
-            const self: *Self = @ptrCast(@alignCast(ctx));
-            self.frees += 1;
-            std.testing.allocator.vtable.free(std.testing.allocator.ptr, memory, alignment, ret_addr);
-        }
-    };
-
     const t0: Tally = .{};
     try testing.expectEqual(@as(usize, 0), t0.allocs);
     try testing.expectEqual(@as(usize, 0), t0.frees);
@@ -2064,46 +2057,6 @@ test "harness mechanics cover the tally, canary, cut matrix, and mirrors" {
 }
 
 test "fixed-table format passes the eight-property battery over both sources" {
-    // Local to the test block: the Allocator symbol never appears in non-test code.
-    const Tally = struct {
-        const Self = @This();
-        allocs: usize = 0,
-        frees: usize = 0,
-
-        fn allocator(self: *Self) std.mem.Allocator {
-            return .{ .ptr = self, .vtable = &vtable };
-        }
-
-        const vtable = std.mem.Allocator.VTable{
-            .alloc = allocFn,
-            .resize = resizeFn,
-            .remap = remapFn,
-            .free = freeFn,
-        };
-
-        fn allocFn(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
-            const self: *Self = @ptrCast(@alignCast(ctx));
-            self.allocs += 1;
-            return std.testing.allocator.vtable.alloc(std.testing.allocator.ptr, len, alignment, ret_addr);
-        }
-
-        fn resizeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
-            _ = ctx;
-            return std.testing.allocator.vtable.resize(std.testing.allocator.ptr, memory, alignment, new_len, ret_addr);
-        }
-
-        fn remapFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
-            _ = ctx;
-            return std.testing.allocator.vtable.remap(std.testing.allocator.ptr, memory, alignment, new_len, ret_addr);
-        }
-
-        fn freeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
-            const self: *Self = @ptrCast(@alignCast(ctx));
-            self.frees += 1;
-            std.testing.allocator.vtable.free(std.testing.allocator.ptr, memory, alignment, ret_addr);
-        }
-    };
-
     var tally: Tally = .{};
 
     var slice_base = SliceSource.init(&fixed_table_canary_buffer);
@@ -2135,46 +2088,6 @@ test "fixed-table format skip mirrors read in the source counters" {
 }
 
 test "chunked length-prefixed format passes the eight-property battery over both sources" {
-    // Local to the test block: the Allocator symbol never appears in non-test code.
-    const Tally = struct {
-        const Self = @This();
-        allocs: usize = 0,
-        frees: usize = 0,
-
-        fn allocator(self: *Self) std.mem.Allocator {
-            return .{ .ptr = self, .vtable = &vtable };
-        }
-
-        const vtable = std.mem.Allocator.VTable{
-            .alloc = allocFn,
-            .resize = resizeFn,
-            .remap = remapFn,
-            .free = freeFn,
-        };
-
-        fn allocFn(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
-            const self: *Self = @ptrCast(@alignCast(ctx));
-            self.allocs += 1;
-            return std.testing.allocator.vtable.alloc(std.testing.allocator.ptr, len, alignment, ret_addr);
-        }
-
-        fn resizeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
-            _ = ctx;
-            return std.testing.allocator.vtable.resize(std.testing.allocator.ptr, memory, alignment, new_len, ret_addr);
-        }
-
-        fn remapFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
-            _ = ctx;
-            return std.testing.allocator.vtable.remap(std.testing.allocator.ptr, memory, alignment, new_len, ret_addr);
-        }
-
-        fn freeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
-            const self: *Self = @ptrCast(@alignCast(ctx));
-            self.frees += 1;
-            std.testing.allocator.vtable.free(std.testing.allocator.ptr, memory, alignment, ret_addr);
-        }
-    };
-
     var tally: Tally = .{};
 
     var slice_base = SliceSource.init(&chunked_lp_canary_buffer);
@@ -2260,46 +2173,6 @@ test "chunked length-prefixed format linear seek replays blocks and reopens clea
 }
 
 test "double-nested format passes the whole-stack battery over both sources" {
-    // Local to the test block: the Allocator symbol never appears in non-test code.
-    const Tally = struct {
-        const Self = @This();
-        allocs: usize = 0,
-        frees: usize = 0,
-
-        fn allocator(self: *Self) std.mem.Allocator {
-            return .{ .ptr = self, .vtable = &vtable };
-        }
-
-        const vtable = std.mem.Allocator.VTable{
-            .alloc = allocFn,
-            .resize = resizeFn,
-            .remap = remapFn,
-            .free = freeFn,
-        };
-
-        fn allocFn(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
-            const self: *Self = @ptrCast(@alignCast(ctx));
-            self.allocs += 1;
-            return std.testing.allocator.vtable.alloc(std.testing.allocator.ptr, len, alignment, ret_addr);
-        }
-
-        fn resizeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
-            _ = ctx;
-            return std.testing.allocator.vtable.resize(std.testing.allocator.ptr, memory, alignment, new_len, ret_addr);
-        }
-
-        fn remapFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
-            _ = ctx;
-            return std.testing.allocator.vtable.remap(std.testing.allocator.ptr, memory, alignment, new_len, ret_addr);
-        }
-
-        fn freeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
-            const self: *Self = @ptrCast(@alignCast(ctx));
-            self.frees += 1;
-            std.testing.allocator.vtable.free(std.testing.allocator.ptr, memory, alignment, ret_addr);
-        }
-    };
-
     var tally: Tally = .{};
 
     var slice_base = SliceSource.init(&double_nested_canary_buffer);

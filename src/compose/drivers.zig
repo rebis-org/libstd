@@ -181,12 +181,20 @@ fn StepOps(comptime Driver: type, comptime step: fn (*Driver, []const u8, []u8, 
     return .{ .step = S.call, .destroy = destroyNoop };
 }
 
-const decode_ops = StepOps(GzipDecode, gzipDecodeStep);
-
-pub fn gzipDecodeSession(storage: []u8, budgets: sessions.Budgets) error{ CapacityException, UnsupportedException }!sessions.Session {
-    const state = try gzipDecodeInit(storage, budgets);
-    return .{ .state = state, .ops = &decode_ops };
+// One builder binds a driver's init and step into the executor's session;
+// the error set derives from the init itself.
+fn SessionOf(comptime Driver: type, comptime init_fn: anytype, comptime step: fn (*Driver, []const u8, []u8, bool) StepResult) type {
+    const ops = StepOps(Driver, step);
+    const init_return = @typeInfo(@TypeOf(init_fn)).@"fn".return_type.?;
+    return struct {
+        fn open(storage: []u8, budgets: sessions.Budgets) @typeInfo(init_return).error_union.error_set!sessions.Session {
+            const state = try @call(.auto, init_fn, .{ storage, budgets });
+            return .{ .state = state, .ops = &ops };
+        }
+    };
 }
+
+pub const gzipDecodeSession = SessionOf(GzipDecode, gzipDecodeInit, gzipDecodeStep).open;
 
 fn framingFailed(result: *StepResult, consumed: usize, exception: Exception) StepResult {
     result.consumed = consumed;
@@ -512,12 +520,7 @@ pub fn deflateDecodeInit(storage: []u8, budgets: sessions.Budgets) error{ Capaci
     return state;
 }
 
-const deflate_decode_ops = StepOps(DeflateDecode, deflateDecodeStep);
-
-pub fn deflateDecodeSession(storage: []u8, budgets: sessions.Budgets) error{ CapacityException, UnsupportedException }!sessions.Session {
-    const state = try deflateDecodeInit(storage, budgets);
-    return .{ .state = state, .ops = &deflate_decode_ops };
-}
+pub const deflateDecodeSession = SessionOf(DeflateDecode, deflateDecodeInit, deflateDecodeStep).open;
 
 pub fn deflateDecodeStep(state: *DeflateDecode, input: []const u8, output: []u8, end_of_input: bool) StepResult {
     var result = StepResult{};
@@ -600,12 +603,7 @@ pub fn zlibDecodeInit(storage: []u8, budgets: sessions.Budgets) error{ CapacityE
     return state;
 }
 
-const zlib_decode_ops = StepOps(ZlibDecode, zlibDecodeStep);
-
-pub fn zlibDecodeSession(storage: []u8, budgets: sessions.Budgets) error{ CapacityException, UnsupportedException }!sessions.Session {
-    const state = try zlibDecodeInit(storage, budgets);
-    return .{ .state = state, .ops = &zlib_decode_ops };
-}
+pub const zlibDecodeSession = SessionOf(ZlibDecode, zlibDecodeInit, zlibDecodeStep).open;
 
 pub fn zlibDecodeStep(state: *ZlibDecode, input: []const u8, output: []u8, end_of_input: bool) StepResult {
     var result = StepResult{};
@@ -955,12 +953,7 @@ pub fn lz4DecodeInit(storage: []u8, budgets: sessions.Budgets) error{CapacityExc
     return state;
 }
 
-const lz4_decode_ops = StepOps(Lz4Decode, lz4DecodeStep);
-
-pub fn lz4DecodeSession(storage: []u8, budgets: sessions.Budgets) error{ CapacityException, UnsupportedException }!sessions.Session {
-    const state = try lz4DecodeInit(storage, budgets);
-    return .{ .state = state, .ops = &lz4_decode_ops };
-}
+pub const lz4DecodeSession = SessionOf(Lz4Decode, lz4DecodeInit, lz4DecodeStep).open;
 
 fn lz4Available(state: *Lz4Decode) []const u8 {
     return state.pending[state.pending_read..state.pending_len];
@@ -1200,12 +1193,7 @@ pub fn lz4EncodeInit(storage: []u8, budgets: sessions.Budgets) error{CapacityExc
     return state;
 }
 
-const lz4_encode_ops = StepOps(Lz4Encode, lz4EncodeStep);
-
-pub fn lz4EncodeSession(storage: []u8, budgets: sessions.Budgets) error{ CapacityException, UnsupportedException }!sessions.Session {
-    const state = try lz4EncodeInit(storage, budgets);
-    return .{ .state = state, .ops = &lz4_encode_ops };
-}
+pub const lz4EncodeSession = SessionOf(Lz4Encode, lz4EncodeInit, lz4EncodeStep).open;
 
 pub fn lz4EncodeStep(state: *Lz4Encode, input: []const u8, output: []u8, end_of_input: bool) StepResult {
     var result = StepResult{};
@@ -1358,12 +1346,7 @@ pub fn lz4LegacyDecodeInit(storage: []u8, budgets: sessions.Budgets) error{Capac
     return state;
 }
 
-const lz4_legacy_decode_ops = StepOps(Lz4LegacyDecode, lz4LegacyDecodeStep);
-
-pub fn lz4LegacyDecodeSession(storage: []u8, budgets: sessions.Budgets) error{ CapacityException, UnsupportedException }!sessions.Session {
-    const state = try lz4LegacyDecodeInit(storage, budgets);
-    return .{ .state = state, .ops = &lz4_legacy_decode_ops };
-}
+pub const lz4LegacyDecodeSession = SessionOf(Lz4LegacyDecode, lz4LegacyDecodeInit, lz4LegacyDecodeStep).open;
 
 fn lz4LegacyDecodeStep(state: *Lz4LegacyDecode, input: []const u8, output: []u8, end_of_input: bool) StepResult {
     var result = StepResult{};
@@ -1503,12 +1486,7 @@ pub fn tarEncodeInit(storage: []u8, budgets: sessions.Budgets) error{CapacityExc
     return state;
 }
 
-const tar_encode_ops = StepOps(TarEncode, tarEncodeStep);
-
-pub fn tarEncodeSession(storage: []u8, budgets: sessions.Budgets) error{ CapacityException, UnsupportedException }!sessions.Session {
-    const state = try tarEncodeInit(storage, budgets);
-    return .{ .state = state, .ops = &tar_encode_ops };
-}
+pub const tarEncodeSession = SessionOf(TarEncode, tarEncodeInit, tarEncodeStep).open;
 
 fn tarEncodeStep(state: *TarEncode, input: []const u8, output: []u8, end_of_input: bool) StepResult {
     var result = StepResult{};
@@ -1669,12 +1647,7 @@ pub fn brotliDecodeInit(storage: []u8, budgets: sessions.Budgets) error{ Capacit
     return state;
 }
 
-const brotli_decode_ops = StepOps(BrotliDecode, brotliDecodeStep);
-
-pub fn brotliDecodeSession(storage: []u8, budgets: sessions.Budgets) error{ CapacityException, UnsupportedException }!sessions.Session {
-    const state = try brotliDecodeInit(storage, budgets);
-    return .{ .state = state, .ops = &brotli_decode_ops };
-}
+pub const brotliDecodeSession = SessionOf(BrotliDecode, brotliDecodeInit, brotliDecodeStep).open;
 
 fn brotliDecodeStep(state: *BrotliDecode, input: []const u8, output: []u8, end_of_input: bool) StepResult {
     var result = StepResult{};

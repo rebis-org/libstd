@@ -181,25 +181,20 @@ test "micro cases stay runnable without runner" {
     random.random().bytes(&scratch);
     const original = scratch;
 
-    const adler32_case: Adler32Case = .{ .input = &scratch };
-    const crc32_case: Crc32Case = .{ .input = &scratch };
-    const xz_crc64_case: XzCrc64Case = .{ .input = &scratch };
-    const bzip2_crc32_case: Bzip2Crc32Case = .{ .input = &scratch };
-    const xxhash64_case: XxHash64Case = .{ .input = &scratch };
-    const xxh32_case: XxHash32Case = .{ .input = &scratch };
-    const sha1_case: Sha1Case = .{ .input = &scratch };
-    const sha256_case: Sha256Case = .{ .input = &scratch };
-    const copy_match_case: CopyMatchCase = .{ .window = &scratch };
-
-    adler32_case.run(std.testing.allocator);
-    crc32_case.run(std.testing.allocator);
-    xz_crc64_case.run(std.testing.allocator);
-    bzip2_crc32_case.run(std.testing.allocator);
-    xxh32_case.run(std.testing.allocator);
-    xxhash64_case.run(std.testing.allocator);
-    sha1_case.run(std.testing.allocator);
-    sha256_case.run(std.testing.allocator);
-    copy_match_case.run(std.testing.allocator);
+    // One list drives instantiation and execution; brotli stays separate for
+    // its encoder fixture below.
+    const cases = .{
+        Adler32Case{ .input = &scratch },
+        Crc32Case{ .input = &scratch },
+        XzCrc64Case{ .input = &scratch },
+        Bzip2Crc32Case{ .input = &scratch },
+        XxHash32Case{ .input = &scratch },
+        XxHash64Case{ .input = &scratch },
+        Sha1Case{ .input = &scratch },
+        Sha256Case{ .input = &scratch },
+        CopyMatchCase{ .window = &scratch },
+    };
+    inline for (cases) |case_item| case_item.run(std.testing.allocator);
     // The copy ladder must have written matches into the window.
     try std.testing.expect(!std.mem.eql(u8, &scratch, &original));
 

@@ -44,10 +44,22 @@ fn feedHasher(source: *Resource, hasher: anytype, limit: u64) Exception!void {
     }
 }
 
+// One publish protocol serves every digest: an absent sink answers the
+// length, a real sink commits the bytes.
+fn publishDigest(invocation: *common.Invocation, sink: *Resource, bytes: []const u8) Exception!void {
+    try common.requireSink(sink, invocation.call, bytes.len);
+    try common.commitBytesToSink(sink, invocation.call, bytes);
+    invocation.response.byte_length = bytes.len;
+}
+
+fn requireWriteDirection(plan: *const common.ExecutionPlan) Exception!void {
+    if (plan.command_mask != vocabulary.command_mask_write) return error.UnsupportedException;
+}
+
 // Value families (crc32, adler32, xxh32, xxh64) answer in one scalar word.
 fn valueDigest(comptime Facade: type, comptime Value: type, invocation: *common.Invocation, args: anytype) Exception!void {
     const plan = &invocation.plan;
-    if (plan.command_mask != vocabulary.command_mask_write) return error.UnsupportedException;
+    try requireWriteDirection(plan);
     const sink = invocation.sink orelse {
         invocation.response.byte_length = @sizeOf(Value);
         return;
@@ -57,16 +69,14 @@ fn valueDigest(comptime Facade: type, comptime Value: type, invocation: *common.
     const value = hasher.final({});
     var encoded: [@sizeOf(Value)]u8 = undefined;
     std.mem.writeInt(Value, &encoded, value, .big);
-    try common.requireSink(sink, invocation.call, encoded.len);
-    try common.commitBytesToSink(sink, invocation.call, &encoded);
-    invocation.response.byte_length = encoded.len;
+    try publishDigest(invocation, sink, &encoded);
 }
 
 // Byte digests publish a fixed-width array; the comptime length keeps the
 // facade's own constants out of the shared signature.
 fn byteDigest(comptime Facade: type, comptime output_length: usize, invocation: *common.Invocation, args: anytype) Exception!void {
     const plan = &invocation.plan;
-    if (plan.command_mask != vocabulary.command_mask_write) return error.UnsupportedException;
+    try requireWriteDirection(plan);
     const sink = invocation.sink orelse {
         invocation.response.byte_length = output_length;
         return;
@@ -75,9 +85,7 @@ fn byteDigest(comptime Facade: type, comptime output_length: usize, invocation: 
     try feedHasher(invocation.source, &hasher, plan.limits.decoded_bytes);
     const digest = hasher.finalResult();
     if (digest.len != output_length) return error.InternalException;
-    try common.requireSink(sink, invocation.call, digest.len);
-    try common.commitBytesToSink(sink, invocation.call, &digest);
-    invocation.response.byte_length = digest.len;
+    try publishDigest(invocation, sink, &digest);
 }
 
 pub fn crc32Hook(invocation: *common.Invocation) Exception!void {
@@ -123,7 +131,7 @@ const max_derived_length: usize = 4096;
 
 pub fn pbkdf2Hook(invocation: *common.Invocation) Exception!void {
     const plan = &invocation.plan;
-    if (plan.command_mask != vocabulary.command_mask_write) return error.UnsupportedException;
+    try requireWriteDirection(plan);
     const salt = (try optBytes(invocation.call.request, "pbkdf2", "salt")) orelse return error.CallException;
     const rounds = (try optScalar(invocation.call.request, "pbkdf2", "rounds")) orelse return error.CallException;
     const dk_len = (try optScalar(invocation.call.request, "pbkdf2", "dk_len")) orelse return error.CallException;

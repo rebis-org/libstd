@@ -56,6 +56,10 @@ const ZonDescriptor = struct {
     verbs: []const []const u8,
     parameters: []const ZonParameter = &.{},
     capabilities: []const []const u8 = &.{},
+    // Command directions the format's volume-set shape serves: "read",
+    // "write". Empty means the official specification has no split set,
+    // and dispatch refuses the archive_volumes parameter.
+    volumes: []const []const u8 = &.{},
     sizing: []const u8 = "unavailable",
     commit: []const u8 = "tentative",
     limits: ZonLimits = .{},
@@ -65,6 +69,10 @@ const ZonDescriptor = struct {
 // Descriptor values come from the contract enums; capability names follow
 // kernel/vocabulary.zig's `resource_capability_bit_*` bit order.
 const known_capabilities = [_][]const u8{ "read", "write", "size", "replay", "seek", "range" };
+
+// Volume directions carry the command-mask bits (read 2, write 4), the
+// same values the generated command_mask uses.
+const known_volume_directions = [_][]const u8{ "read", "write" };
 
 fn isKnown(comptime Enum: type, text: []const u8) bool {
     inline for (@typeInfo(Enum).@"enum".field_names) |name| {
@@ -171,6 +179,7 @@ pub fn main(init: std.process.Init) !void {
             if (!isSafeText(parameter.name)) return error.unsafe_text;
         }
         for (descriptor.capabilities) |capability| if (!containsString(&known_capabilities, capability)) return error.unknown_capability;
+        for (descriptor.volumes) |direction| if (!containsString(&known_volume_directions, direction)) return error.unknown_volume_direction;
         if (!isKnown(contract.SizingMode, descriptor.sizing)) return error.unknown_sizing;
         if (!isKnown(contract.CommitMode, descriptor.commit)) return error.unknown_commit;
         if (!isSafeText(descriptor.name) or !isSafeTag(descriptor.name)) return error.unsafe_text;
@@ -220,7 +229,11 @@ pub fn main(init: std.process.Init) !void {
         for (descriptor.verbs) |verb| {
             command_mask |= commandBitForVerb(verb) orelse return error.unknown_verb;
         }
-        try output.print(allocator, "{d}, .command_mask = {d}, .sizing = .{s}, .commit = .{s}, .limits = .{{ .window = {d}, .block = {d}, .history = {d} }}", .{ capability_bits, command_mask, descriptor.sizing, descriptor.commit, descriptor.limits.window, descriptor.limits.block, descriptor.limits.history });
+        var volume_bits: u32 = 0;
+        for (descriptor.volumes) |direction| {
+            volume_bits |= if (std.mem.eql(u8, direction, "read")) 2 else 4;
+        }
+        try output.print(allocator, "{d}, .command_mask = {d}, .volumes = {d}, .sizing = .{s}, .commit = .{s}, .limits = .{{ .window = {d}, .block = {d}, .history = {d} }}", .{ capability_bits, command_mask, volume_bits, descriptor.sizing, descriptor.commit, descriptor.limits.window, descriptor.limits.block, descriptor.limits.history });
         if (descriptor.benchmark) |benchmark| {
             try output.print(allocator, ", .benchmark = .{{ .row = \"{s}\", .params = \"{s}\" }}", .{ benchmark.row, benchmark.params });
         }

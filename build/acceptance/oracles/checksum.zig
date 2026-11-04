@@ -6,10 +6,6 @@ const harness = @import("harness.zig");
 
 const seed: u64 = 0x9e3779b97f4a7c15;
 
-fn crc32Ref(input: []const u8) u32 {
-    return harness.crc32Ieee(input);
-}
-
 fn fillPage(gpa: std.mem.Allocator, len: usize) ![]u8 {
     const page = try gpa.alloc(u8, len);
     harness.xorshiftFill(page, seed);
@@ -31,7 +27,7 @@ fn runSizes() !void {
         for (alignments) |off| {
             if (off + size > page.len) continue;
             const input = page[off..][0..size];
-            const expected = crc32Ref(input);
+            const expected = harness.crc32Ieee(input);
             const got = checksum.crc32(input);
             if (got != expected) {
                 std.debug.print("checksum mismatch: size {d}, offset {d}: got {x:0>8}, want {x:0>8}.\n", .{ size, off, got, expected });
@@ -59,8 +55,8 @@ fn runSplitUpdates(chunk_size: usize) !void {
     whole.update(data);
     const whole_digest = whole.final({});
 
-    if (split_digest != whole_digest or split_digest != crc32Ref(data)) {
-        std.debug.print("split/whole mismatch: chunk {d}: split {x:0>8}, whole {x:0>8}, reference {x:0>8}.\n", .{ chunk_size, split_digest, whole_digest, crc32Ref(data) });
+    if (split_digest != whole_digest or split_digest != harness.crc32Ieee(data)) {
+        std.debug.print("split/whole mismatch: chunk {d}: split {x:0>8}, whole {x:0>8}, reference {x:0>8}.\n", .{ chunk_size, split_digest, whole_digest, harness.crc32Ieee(data) });
         return error.split_mismatch;
     }
 }

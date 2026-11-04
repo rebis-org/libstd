@@ -81,15 +81,11 @@ pub fn materializeSource(comptime sizing: SourceSizing, source: *Resource, works
                 },
                 .require_size => request_block: {
                     try source.requireCapability(resource.capability_bit_size);
-                    const total = try source.size();
-                    if (total > limit) return error.ResourceException;
-                    break :request_block std.math.cast(usize, total) orelse return error.ResourceException;
+                    break :request_block try sizeWithin(source, limit);
                 },
                 .size_or_budget => request_block: {
                     if (source.hasCapability(resource.capability_bit_size)) {
-                        const total = try source.size();
-                        if (total > limit) return error.ResourceException;
-                        break :request_block std.math.cast(usize, total) orelse return error.ResourceException;
+                        break :request_block try sizeWithin(source, limit);
                     }
                     break :request_block budgetRequest(workspace, limit);
                 },
@@ -115,6 +111,13 @@ pub fn materializeSource(comptime sizing: SourceSizing, source: *Resource, works
     };
 }
 
+// A declared size under a limit: over-limit is a resource answer.
+fn sizeWithin(source: *Resource, limit: u64) Exception!usize {
+    const total = try source.size();
+    if (total > limit) return error.ResourceException;
+    return std.math.cast(usize, total) orelse error.ResourceException;
+}
+
 // A bounded reader hides spanning at the cap, so one probe byte decides;
 // callers re-rewind. Over-limit input fails, never truncates.
 pub fn rejectOverLimit(source: *Resource, at_cap: bool) Exception!void {
@@ -125,11 +128,7 @@ pub fn rejectOverLimit(source: *Resource, at_cap: bool) Exception!void {
 }
 
 pub fn measureSource(source: *Resource, limit: u64) Exception!usize {
-    if (source.hasCapability(resource.capability_bit_size)) {
-        const total = try source.size();
-        if (total > limit) return error.ResourceException;
-        return std.math.cast(usize, total) orelse error.ResourceException;
-    }
+    if (source.hasCapability(resource.capability_bit_size)) return sizeWithin(source, limit);
     if (!source.hasCapability(resource.capability_bit_replay)) return error.UnsupportedException;
     var counter = measurement.Counter.init(null);
     var bounded_source: resource.BoundedReader = undefined;
@@ -159,9 +158,7 @@ pub fn planOutputSize(source: *Resource, sizing: vocabulary.SizingMode, limits: 
         .unavailable => return error.UnsupportedException,
         .metadata_exact => {
             try source.requireCapability(resource.capability_bit_size);
-            const total = try source.size();
-            if (total > limits.encoded_bytes) return error.ResourceException;
-            return std.math.cast(usize, total) orelse error.ResourceException;
+            return sizeWithin(source, limits.encoded_bytes);
         },
         .measured => {
             try source.requireCapability(resource.capability_bit_replay);
@@ -234,10 +231,8 @@ fn workspaceRange(call: *Call) ?struct { ptr: usize, len: usize } {
 }
 
 pub fn checkWorkspaceOverlap(call: *Call, source: *Resource, sink: *Resource) Exception!void {
+    try checkSourceWorkspaceOverlap(call, source);
     const range = workspaceRange(call) orelse return;
-    if (source.kind == .direct_read) {
-        try overlapsWorkspace(range.ptr, range.len, @intFromPtr(source.kind.direct_read.ptr), source.kind.direct_read.len);
-    }
     if (sink.kind == .direct_write) {
         try overlapsWorkspace(range.ptr, range.len, @intFromPtr(sink.kind.direct_write.ptr), sink.kind.direct_write.len);
     }

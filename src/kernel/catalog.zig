@@ -34,6 +34,7 @@ const profile_descriptors = blk: {
             .capability_mask = component.capabilities,
             .sizing = component.sizing,
             .commit = component.commit,
+            .volumes = component.volumes,
         };
     }
     break :blk list;

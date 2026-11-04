@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const binary = @import("../../../common/primitive/binary.zig");
 const bounds = @import("../../../common/primitive/bounds.zig");
 const checksum = @import("../../../common/primitive/checksum.zig");
 const crypto = @import("../../../common/primitive/crypto.zig");
@@ -68,19 +69,12 @@ pub fn packedBoundEx(entry: RarEntry, encrypted: bool) usize {
     return entry.data.len * pack50.max_expansion + pack50.output_slack + slack;
 }
 
+// The shared LEB128 cursor encodes; callers size the buffer with vintSize,
+// so the capacity path is unreachable.
 fn writeVint(value: u64, out: []u8) usize {
-    var v = value;
-    var i: usize = 0;
-    while (true) {
-        out[i] = @intCast(v & 0x7F);
-        v >>= 7;
-        if (v != 0) {
-            out[i] |= 0x80;
-            i += 1;
-        } else {
-            return i + 1;
-        }
-    }
+    var cursor = binary.WriteCursor.init(out);
+    cursor.writeUleb128(value) catch unreachable;
+    return cursor.pos;
 }
 
 fn vintSize(value: u64) usize {
@@ -1343,6 +1337,42 @@ test "multi-volume archives round-trip through the volume reader" {
     try testing.expectEqual(@as(usize, 0), try rar.rarVolumeDecodeOrdinal(w.view, 2, &.{}, @constCast(&bufs), .{}));
 }
 
+test "multi-volume inspect matches the single-volume shape" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    var data2: [600]u8 = undefined;
+    var seed: u32 = 0x9E3779B9;
+    for (&data2) |*byte| {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        byte.* = @truncate(seed);
+    }
+    const entries = [_]RarEntry{
+        .{ .name = "i1.txt", .data = "hello rar5 stored", .method = 0 },
+        .{ .name = "i2.bin", .data = &data2, .method = 3 },
+        .{ .name = "sub", .data = &.{}, .is_directory = true },
+    };
+
+    var w = try VolumeTestWrite.init(allocator, &entries, .{ .volume_size = 200 });
+    defer w.deinit(allocator);
+    try testing.expect(w.plan.count >= 3);
+
+    // The listing of a set rides the volume walk, so the inspected shape
+    // must match what a single-volume reader reports.
+    const first = try rar.rarVolumeInspectOrdinal(w.view, 0, 128, .{});
+    try testing.expectEqualSlices(u8, "i1.txt", first.name);
+    try testing.expectEqual(@as(u64, "hello rar5 stored".len), first.size);
+    const second = try rar.rarVolumeInspectOrdinal(w.view, 1, 128, .{});
+    try testing.expectEqualSlices(u8, "i2.bin", second.name);
+    try testing.expectEqual(@as(u64, data2.len), second.size);
+    // Both failure classes mirror the single-volume inspect: an ordinal
+    // inside a set over the entry budget is a resource refusal, and an
+    // ordinal past the set is data.
+    try testing.expectError(error.ResourceException, rar.rarVolumeInspectOrdinal(w.view, 1, 1, .{}));
+    try testing.expectError(error.DataException, rar.rarVolumeInspectOrdinal(w.view, 2, 128, .{}));
+}
+
 test "multi-volume encrypted splits round-trip and reject wrong passwords" {
     const testing = std.testing;
     const allocator = testing.allocator;
@@ -1388,6 +1418,13 @@ test "multi-volume encrypted splits round-trip and reject wrong passwords" {
         };
         const bufs = d.buffers(&split_parts, &packed_stage);
         try testing.expectEqual(@as(usize, 2), try rar.rarVolumeCount(w.view, 128, decode_opts));
+        // The inspect answer carries the located entry's own name; -hp
+        // re-decrypts every header into the shared scratch, so a name held
+        // across later parses would come back as a later entry's.
+        const inspected = try rar.rarVolumeInspectOrdinal(w.view, 0, 128, decode_opts);
+        try testing.expectEqualSlices(u8, "e1.txt", inspected.name);
+        const inspected1 = try rar.rarVolumeInspectOrdinal(w.view, 1, 128, decode_opts);
+        try testing.expectEqualSlices(u8, "e2.bin", inspected1.name);
         try testing.expectEqual(out1.len, try rar.rarVolumeDecodeOrdinal(w.view, 0, out1, @constCast(&bufs), decode_opts));
         try testing.expectEqualSlices(u8, "hello encrypted rar5 stored", out1);
         try testing.expectEqual(out2.len, try rar.rarVolumeDecodeOrdinal(w.view, 1, out2, @constCast(&bufs), decode_opts));
@@ -1656,4 +1693,61 @@ test "recovery record round-trips and pins the r1 wire form" {
     defer allocator.free(out);
     try testing.expectEqual(source.len, try rar.rarDecodeOrdinal(archive, 0, out, @constCast(&bufs), .{}));
     try testing.expectEqualSlices(u8, &source, out);
+}
+
+test "encrypted-header inspect keeps the located name" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const password = "inspect-pw";
+    const entries = [_]RarEntry{
+        .{ .name = "first-name.txt", .data = "aaa", .method = 0 },
+        .{ .name = "second-name.bin", .data = "bbb", .method = 0 },
+    };
+    const sizes = pack50.workspacesFor(0);
+    const hash = try allocator.alloc(u32, sizes.hash_words);
+    defer allocator.free(hash);
+    const hash2 = try allocator.alloc(u32, sizes.hash2_words);
+    defer allocator.free(hash2);
+    const hash3 = try allocator.alloc(u32, sizes.hash3_words);
+    defer allocator.free(hash3);
+    const bt_left = try allocator.alloc(u32, sizes.bt_words);
+    defer allocator.free(bt_left);
+    const bt_right = try allocator.alloc(u32, sizes.bt_words);
+    defer allocator.free(bt_right);
+    const tokens = try allocator.alloc(finder.LzToken, sizes.token_count);
+    defer allocator.free(tokens);
+    const staging = try allocator.alloc(u8, sizes.staging_bytes);
+    defer allocator.free(staging);
+    const packed_buf = try allocator.alloc(u8, 4096);
+    defer allocator.free(packed_buf);
+    const packed_sizes = try allocator.alloc(usize, entries.len);
+    defer allocator.free(packed_sizes);
+    const crypt_salts = try allocator.alloc([16]u8, entries.len);
+    defer allocator.free(crypt_salts);
+    const crypt_ivs = try allocator.alloc([16]u8, entries.len);
+    defer allocator.free(crypt_ivs);
+    var ws = WriteBuffers{
+        .hash = hash,
+        .hash2 = hash2,
+        .hash3 = hash3,
+        .bt_left = bt_left,
+        .bt_right = bt_right,
+        .tokens = tokens,
+        .staging = staging,
+        .packed_buf = packed_buf,
+        .packed_sizes = packed_sizes,
+        .crypt_salts = crypt_salts,
+        .crypt_ivs = crypt_ivs,
+    };
+    const options = WriteOptions{ .password = password, .encrypt_headers = true };
+    const required = try rarWriteSizeEx(&entries, &ws, options);
+    const archive = try allocator.alloc(u8, required);
+    defer allocator.free(archive);
+    _ = try rarEncodeEx(&entries, archive, &ws, crypto.default_provider, options);
+    var header_scratch: [4096]u8 = undefined;
+    const opts: rar.DecodeOptions = .{ .password = password, .scratch = &header_scratch };
+    const info = try rar.rarInspectOrdinalOpts(archive, 0, 128, opts);
+    try testing.expectEqualSlices(u8, "first-name.txt", info.name);
+    const info1 = try rar.rarInspectOrdinalOpts(archive, 1, 128, opts);
+    try testing.expectEqualSlices(u8, "second-name.bin", info1.name);
 }

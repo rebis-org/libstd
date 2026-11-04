@@ -36,18 +36,6 @@ pub const units = blk: {
     break :blk list;
 };
 
-fn archFilter(id: []const u8) ?[]const u8 {
-    // Per-arch ids carry the arch in the last segment; `windows.gnu` and
-    // `windows.msvc` are universal forms, not arch names.
-    if (std.mem.findScalarLast(u8, id, '.')) |last| {
-        const segment = id[last + 1 ..];
-        const non_arches = [_][]const u8{ "gnu", "msvc", "musl", "android", "ohos", "universal" };
-        for (non_arches) |name| if (std.mem.eql(u8, segment, name)) return null;
-        return segment;
-    }
-    return null;
-}
-
 pub fn expand(b: *std.Build, ctx: *common.Settings) void {
     if (ctx.dist_providers.len != manifest.providers.len) @panic("the distribution needs one provider context per manifest provider.");
     const dist = b.step("dist", "Build distribution archives");
@@ -61,9 +49,9 @@ pub fn expand(b: *std.Build, ctx: *common.Settings) void {
         inline for (comptime manifest.forms(provider)) |form| {
             const file_name = b.fmt("{s}-{s}.{s}", .{ form.archive, ctx.dist_tag, if (comptime kindFor(form.id) == .aar) "aar" else "zip" });
             const archive = switch (comptime kindFor(form.id)) {
-                .elf => elf.addArchive(b, &provider_ctx, form, file_name, comptime osTag(form.id), comptime abiTag(form.id), comptime archFilter(form.id)),
-                .pe => windows.addArchive(b, &provider_ctx, form, file_name, if (std.mem.startsWith(u8, form.id, "windows.msvc")) .msvc else .gnu, comptime archFilter(form.id)),
-                .xcframework => darwin.addArchive(b, &provider_ctx, form, file_name, comptime archFilter(form.id)),
+                .elf => elf.addArchive(b, &provider_ctx, form, file_name, comptime osTag(form.id), comptime abiTag(form.id), comptime form.arch),
+                .pe => windows.addArchive(b, &provider_ctx, form, file_name, if (std.mem.startsWith(u8, form.id, "windows.msvc")) .msvc else .gnu, comptime form.arch),
+                .xcframework => darwin.addArchive(b, &provider_ctx, form, file_name, comptime form.arch),
                 .aar => linux.addAar(b, &provider_ctx, form, file_name),
                 .cjpm => linux.addArchive(b, &provider_ctx, form, file_name),
             };

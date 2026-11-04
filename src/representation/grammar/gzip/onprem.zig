@@ -165,7 +165,7 @@ pub fn encodeStream(source: *std.Io.Reader, output: *std.Io.Writer, history: []u
     try writeTrailer(output, crc32.final({}), total);
 }
 
-fn parseHeader(input: []const u8, provider: checksum.Provider) Exception!HeaderTail {
+pub fn parseHeader(input: []const u8, provider: checksum.Provider) Exception!HeaderTail {
     if (input.len < 10) return error.DataException;
     const fixed = input[0..10];
     if (fixed[0] != magic_1 or fixed[1] != magic_2) return error.DataException;

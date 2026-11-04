@@ -10,26 +10,20 @@ const deflate = @import("../../leaf/deflate/onprem.zig");
 const deflate_seam = @import("../../leaf/deflate/seam.zig");
 const lzma = @import("../../leaf/lzma/onprem.zig");
 const lzma2 = @import("../../leaf/lzma2/onprem.zig");
+const gzip = @import("../gzip/onprem.zig");
 const xz = @import("../xz/onprem.zig");
 
 const Exception = exception_prim.Exception;
 // The decode window: one xz chunk or the gzip history plus stage.
 const window_size: usize = lzma2.chunk_max_unpacked;
+const IndexRecord = xz.IndexRecord;
+const IndexRecordList = xz.IndexRecordList;
 
 // A located member of gzip, xz, or stored bytes over cpio.
 // Engines live in stable slots; pointers never move.
 
 // The gzip member header and trailer.
 
-const gzip_magic_1 = 0x1f;
-const gzip_magic_2 = 0x8b;
-const gzip_header_size = 10;
-const gzip_cm_deflate = 8;
-const gzip_flag_header_crc = 0x02;
-const gzip_flag_extra = 0x04;
-const gzip_flag_name = 0x08;
-const gzip_flag_comment = 0x10;
-const gzip_reserved_flags = 0xe0;
 const gzip_trailer_len = 8;
 
 // The lzma2 chunk controls and bounds.
@@ -53,96 +47,15 @@ const xz_workspace_size: usize = blk: {
     break :blk lzma.decodeWorkspaceSize(lzma2.defaultProperties(dictionary_seed));
 };
 
-fn checkSize(check: xz.CheckType) usize {
-    return switch (check) {
-        .none => 0,
-        .crc32 => 4,
-        .crc64 => 8,
-        .sha256 => 32,
-    };
-}
-
-fn checkTypeFromInt(value: u8) Exception!xz.CheckType {
-    return switch (value) {
-        0 => .none,
-        1 => .crc32,
-        4 => .crc64,
-        0x0A => .sha256,
-        else => error.UnsupportedException,
-    };
-}
-
 fn blockPadding(data_size: u64) u64 {
     const rem = data_size % 4;
     return if (rem == 0) 0 else 4 - rem;
 }
 
-fn verifyCrc32(bytes: []const u8, expected: u32) Exception!void {
-    var crc = checksum.Crc32.bind(checksum.default_provider, {});
-    crc.update(bytes);
-    if (crc.final({}) != expected) return error.IntegrityException;
-}
-
-const IndexRecord = struct {
-    unpadded_size: u64,
-    uncompressed_size: u64,
-};
-
-const max_index_records = 1024;
-
-const IndexRecordList = struct {
-    records: [max_index_records]IndexRecord,
-    len: usize = 0,
-
-    fn append(self: *align(1) IndexRecordList, record: IndexRecord) Exception!void {
-        if (self.len >= self.records.len) return error.ResourceException;
-        self.records[self.len] = record;
-        self.len += 1;
-    }
-
-    fn slice(self: *align(1) const IndexRecordList) []align(1) const IndexRecord {
-        return self.records[0..self.len];
-    }
-};
-
-// A read stops only when the destination fills; a payload that ends
-// early is truncated.
+// The member header walk is the gzip format's own; a short payload is
+// truncation, not the end.
 fn parseGzipHeader(input: []const u8, at: usize) Exception!usize {
-    if (input.len - at < gzip_header_size) return error.DataException;
-    const fixed = input[at..][0..gzip_header_size];
-    if (fixed[0] != gzip_magic_1 or fixed[1] != gzip_magic_2) return error.DataException;
-    if (fixed[2] != gzip_cm_deflate) return error.UnsupportedException;
-    const flags = fixed[3];
-    if (flags & gzip_reserved_flags != 0) return error.DataException;
-    var hasher = checksum.Crc32.bind(checksum.default_provider, {});
-    hasher.update(fixed);
-    var cursor = at + gzip_header_size;
-    if (flags & gzip_flag_extra != 0) {
-        if (input.len - cursor < 2) return error.DataException;
-        const extra_len: usize = (@as(usize, input[cursor + 1]) << 8) | input[cursor];
-        hasher.update(input[cursor..][0..2]);
-        cursor += 2;
-        if (input.len - cursor < extra_len) return error.DataException;
-        hasher.update(input[cursor..][0..extra_len]);
-        cursor += extra_len;
-    }
-    if (flags & gzip_flag_name != 0) {
-        const end = std.mem.findScalarPos(u8, input, cursor, 0) orelse return error.DataException;
-        hasher.update(input[cursor .. end + 1]);
-        cursor = end + 1;
-    }
-    if (flags & gzip_flag_comment != 0) {
-        const end = std.mem.findScalarPos(u8, input, cursor, 0) orelse return error.DataException;
-        hasher.update(input[cursor .. end + 1]);
-        cursor = end + 1;
-    }
-    if (flags & gzip_flag_header_crc != 0) {
-        if (input.len - cursor < 2) return error.DataException;
-        const stored_crc = (@as(u16, input[cursor + 1]) << 8) | input[cursor];
-        if (stored_crc != @as(u16, @truncate(hasher.final({})))) return error.IntegrityException;
-        cursor += 2;
-    }
-    return cursor;
+    return at + (try gzip.parseHeader(input[at..], checksum.default_provider)).len;
 }
 
 const GzipState = struct {
@@ -330,11 +243,11 @@ const XzState = struct {
         const header = self.input[self.pos..][0..xz.stream_header_size];
         if (!std.mem.eql(u8, header[0..6], &xz.header_magic)) return error.DataException;
         const flags_crc = std.mem.readInt(u32, header[8..12], .little);
-        try verifyCrc32(header[6..8], flags_crc);
+        try xz.verifyCrc32(header[6..8], flags_crc, checksum.default_provider);
         if (header[6] != 0x00) return error.DataException;
         const check_type = header[7];
         if (check_type & 0xF0 != 0) return error.DataException;
-        self.check = try checkTypeFromInt(check_type);
+        self.check = try xz.checkTypeFromInt(check_type);
         self.records = .{ .records = undefined };
         self.pos += xz.stream_header_size;
     }
@@ -356,7 +269,7 @@ const XzState = struct {
         const has_compressed_size = (flags_byte & 0x40) != 0;
         const has_uncompressed_size = (flags_byte & 0x80) != 0;
         const header_crc = std.mem.readInt(u32, header_bytes[header_size - 4 ..][0..4], .little);
-        try verifyCrc32(header_bytes[0 .. header_size - 4], header_crc);
+        try xz.verifyCrc32(header_bytes[0 .. header_size - 4], header_crc, checksum.default_provider);
         var sub = binary.ReadCursor.init(header_bytes[2 .. header_size - 4]);
         const compressed_bound: ?usize = if (has_compressed_size) blk: {
             const value = try sub.readUleb128();
@@ -503,7 +416,7 @@ const XzState = struct {
         const padding: usize = @intCast(blockPadding(effective));
         _ = try bounds.slice(self.input, self.pos, padding);
         self.pos += padding;
-        const check_len = checkSize(self.check);
+        const check_len = xz.checkSize(self.check);
         const check_bytes = try bounds.slice(self.input, self.pos, check_len);
         self.pos += check_len;
         switch (self.check) {
@@ -552,12 +465,12 @@ const XzState = struct {
         const index_end = try bounds.addUsize(cursor.pos, 4);
         if (index_end > cursor.buffer.len) return error.DataException;
         const index_crc = std.mem.readInt(u32, cursor.buffer[cursor.pos..][0..4], .little);
-        try verifyCrc32(cursor.buffer[0..cursor.pos], index_crc);
+        try xz.verifyCrc32(cursor.buffer[0..cursor.pos], index_crc, checksum.default_provider);
         cursor.pos = index_end;
         const index_size = cursor.pos;
         const footer = try cursor.readSlice(xz.stream_footer_size);
         const footer_crc = std.mem.readInt(u32, footer[0..4], .little);
-        try verifyCrc32(footer[4..10], footer_crc);
+        try xz.verifyCrc32(footer[4..10], footer_crc, checksum.default_provider);
         const backward_size: usize = std.mem.readInt(u32, footer[4..8], .little);
         if (index_size < 4 or index_size % 4 != 0) return error.IntegrityException;
         if (@as(u64, backward_size) + 1 != index_size / 4) return error.IntegrityException;
@@ -678,7 +591,8 @@ const State = struct {
             const leg = try XzState.init(input, decoder, crc32s, crc64s, sha256s, window, block_workspace);
             return .{ .kind = .xz, .leg = .{ .xz = leg } };
         }
-        if (input.len >= 2 and input[0] == gzip_magic_1 and input[1] == gzip_magic_2) {
+        // The sniff reads only the magic; the header walk stays in gzip.
+        if (input.len >= 2 and input[0] == 0x1f and input[1] == 0x8b) {
             const leg = try GzipState.init(input, inflater, crc32s, window);
             return .{ .kind = .gzip, .leg = .{ .gzip = leg } };
         }

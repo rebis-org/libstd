@@ -3,42 +3,32 @@ const std = @import("std");
 const exception_prim = @import("../../../common/primitive/exception.zig");
 const io = @import("../../../common/primitive/io.zig");
 const measurement = @import("../../../common/primitive/measurement.zig");
+const shared = @import("model.zig");
 
 const Exception = exception_prim.Exception;
+const Occurrence = shared.Occurrence;
+const See = shared.See;
+const bin_scale = shared.bin_scale;
+const bin_shift = shared.bin_shift;
+const exp_escape = shared.exp_escape;
+const init_bin_esc = shared.init_bin_esc;
+const int_bits = shared.int_bits;
+const max_freq = shared.max_freq;
+const num_indexes = shared.num_indexes;
+const period_bits = shared.period_bits;
+const top_value = shared.top_value;
+const unit_size = shared.unit_size;
 
 pub const order_min = 2;
 pub const order_max = 64;
 pub const mem_min = 1 << 11;
 pub const mem_max = 0x7FFFFFFF;
-const unit_size = 12;
-const num_indexes = 38;
-const int_bits = 7;
-const period_bits = 7;
-const bin_scale = 1 << (int_bits + period_bits);
-const top_value = 1 << 24;
-const max_freq = 124;
-const bin_shift = 14;
-const init_bin_esc = [_]u16{ 0x3CDD, 0x1F3F, 0x59BF, 0x48F3, 0x64A1, 0x5ABC, 0x6632, 0x6051 };
-const exp_escape = [_]u8{ 25, 14, 9, 7, 5, 5, 4, 4, 4, 3, 3, 3, 2, 2, 2, 2 };
-
-const Occurrence = extern struct {
-    symbol: u8,
-    freq: u8,
-    successor_low: u16,
-    successor_high: u16,
-};
 
 const Subrange = extern struct {
     num_stats: u16,
     summ_freq: u16,
     stats: u32,
     suffix: u32,
-};
-
-const See = extern struct {
-    summ: u16,
-    shift: u8,
-    count: u8,
 };
 
 const Node = extern struct {
@@ -324,14 +314,8 @@ const Model = struct {
         return self.ctx(c.suffix);
     }
 
-    inline fn successor(s: *const Occurrence) u32 {
-        return @as(u32, s.successor_low) | (@as(u32, s.successor_high) << 16);
-    }
-
-    inline fn setSuccessor(s: *Occurrence, succ_off: u32) void {
-        s.successor_low = @truncate(succ_off);
-        s.successor_high = @truncate(succ_off >> 16);
-    }
+    const successor = shared.successor;
+    const setSuccessor = shared.setSuccessor;
 
     fn construct(self: *Model) void {
         var i: usize = 0;
@@ -364,40 +348,27 @@ const Model = struct {
         @memset(self.tables.hb2_flag[0x40..], 8);
     }
 
-    fn insertNode(self: *Model, node_off: u32, indx: usize) void {
+    pub fn insertNode(self: *Model, node_off: u32, indx: usize) void {
         const link: *u32 = @ptrFromInt(@intFromPtr(self.base) + node_off);
         link.* = self.tables.free_list[indx];
         self.tables.free_list[indx] = node_off;
     }
 
-    fn removeNode(self: *Model, indx: usize) u32 {
+    pub fn removeNode(self: *Model, indx: usize) u32 {
         const node_off = self.tables.free_list[indx];
         const link: *u32 = @ptrFromInt(@intFromPtr(self.base) + node_off);
         self.tables.free_list[indx] = link.*;
         return node_off;
     }
 
-    inline fn i2u(self: *const Model, indx: usize) u32 {
-        return self.tables.indx2_units[indx];
-    }
+    const Allocator = shared.Allocator(@This());
+    const i2u = Allocator.i2u;
+    const u2i = Allocator.u2i;
+    const splitBlock = Allocator.splitBlock;
+    const allocUnitsRare = Allocator.allocUnitsRare;
+    const allocUnits = Allocator.allocUnits;
 
-    inline fn u2i(self: *const Model, nu: u32) usize {
-        return self.tables.units2_indx[nu - 1];
-    }
-
-    fn splitBlock(self: *Model, ptr_off: u32, old_indx: usize, new_indx: usize) void {
-        const nu = self.i2u(old_indx) - self.i2u(new_indx);
-        const start = ptr_off + self.i2u(new_indx) * unit_size;
-        var i = self.u2i(nu);
-        if (self.i2u(i) != nu) {
-            i -= 1;
-            const k = self.i2u(i);
-            self.insertNode(start + k * unit_size, nu - k - 1);
-        }
-        self.insertNode(start, i);
-    }
-
-    fn glueFreeBlocks(self: *Model) void {
+    pub fn glueFreeBlocks(self: *Model) void {
         const head: u32 = self.size;
         var n: u32 = head;
         self.glue_count = 255;
@@ -453,41 +424,6 @@ const Model = struct {
             self.insertNode(off, idx2);
             n = next;
         }
-    }
-
-    fn allocUnitsRare(self: *Model, indx: usize) ?u32 {
-        if (self.glue_count == 0) {
-            self.glueFreeBlocks();
-            if (self.tables.free_list[indx] != 0) return self.removeNode(indx);
-        }
-        var i = indx;
-        while (true) {
-            i += 1;
-            if (i == num_indexes) {
-                const num_bytes = self.i2u(indx) * unit_size;
-                self.glue_count -= 1;
-                if (self.units_start - self.text > num_bytes) {
-                    self.units_start -= num_bytes;
-                    return self.units_start;
-                }
-                return null;
-            }
-            if (self.tables.free_list[i] != 0) break;
-        }
-        const ret = self.removeNode(i);
-        self.splitBlock(ret, i, indx);
-        return ret;
-    }
-
-    fn allocUnits(self: *Model, indx: usize) ?u32 {
-        if (self.tables.free_list[indx] != 0) return self.removeNode(indx);
-        const num_bytes = self.i2u(indx) * unit_size;
-        if (num_bytes <= self.hi_unit - self.lo_unit) {
-            const ret = self.lo_unit;
-            self.lo_unit += num_bytes;
-            return ret;
-        }
-        return self.allocUnitsRare(indx);
     }
 
     fn shrinkUnits(self: *Model, old_off: u32, old_nu: u32, new_nu: u32) u32 {

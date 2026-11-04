@@ -1019,17 +1019,7 @@ test "tar pax records keep embedded newlines and equals signs in long names" {
     try testing.expectEqualStrings("payload", out[0..size]);
 }
 
-fn tarSealTestHeader(block: *[512]u8) void {
-    var checksum = tarChecksum(block);
-    var index: usize = 154;
-    while (index > 148) {
-        index -= 1;
-        block[index] = '0' + @as(u8, @truncate(checksum & 7));
-        checksum >>= 3;
-    }
-    block[154] = 0;
-    block[155] = ' ';
-}
+const tarSealTestHeader = tarSealHeader;
 
 test "tar posix prefix split stays inside the ustar header" {
     const testing = std.testing;

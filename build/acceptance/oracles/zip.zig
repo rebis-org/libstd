@@ -706,12 +706,15 @@ fn runDataDescriptor(r: *Runner) anyerror!void {
     if (oracle != .ok) return error.DescriptorOracleRejected;
 }
 
-pub const scenarios = harness.scenarios("zip", &.{
-    .{ .label = "zip encrypted", .run = runEncrypted, .workspace_size = 65536 + 4096, .output_size = 1024, .encoded_size = 65536 },
-    .{ .label = "zip data descriptor", .run = runDataDescriptor, .workspace_size = 65536 + 4096, .output_size = 1024, .encoded_size = 4096 },
-    .{ .label = "zip encrypted provider", .run = runProviderSelection, .workspace_size = 65536 + 4096, .output_size = 1024, .encoded_size = 65536 },
-    .{ .label = "zip traditional", .run = runTraditional, .workspace_size = 65536 + 4096, .output_size = 1024, .encoded_size = 65536 },
-    .{ .label = "zip methods", .run = runMethods, .workspace_size = 48 * 1024 * 1024, .output_size = 1024, .encoded_size = 65536 },
-    .{ .label = "zip encode methods", .run = runEncodeMethods, .workspace_size = 48 * 1024 * 1024, .output_size = 1024, .encoded_size = 65536 },
-    .{ .label = "zip robustness", .run = runRobust, .workspace_size = 32 * 1024 * 1024, .output_size = 1024, .encoded_size = 65536 },
-}, &.{});
+// Only output_size repeats across every row; workspace and encoded stay per row.
+const zip_base: harness.Spec = .{ .label = "", .run = undefined, .workspace_size = undefined, .output_size = 1024, .encoded_size = undefined };
+
+pub const scenarios = harness.scenarios("zip", harness.specRows(zip_base, &.{
+    .{ .label = "zip encrypted", .run = runEncrypted, .workspace_size = 65536 + 4096, .encoded_size = 65536 },
+    .{ .label = "zip data descriptor", .run = runDataDescriptor, .workspace_size = 65536 + 4096, .encoded_size = 4096 },
+    .{ .label = "zip encrypted provider", .run = runProviderSelection, .workspace_size = 65536 + 4096, .encoded_size = 65536 },
+    .{ .label = "zip traditional", .run = runTraditional, .workspace_size = 65536 + 4096, .encoded_size = 65536 },
+    .{ .label = "zip methods", .run = runMethods, .workspace_size = 48 * 1024 * 1024, .encoded_size = 65536 },
+    .{ .label = "zip encode methods", .run = runEncodeMethods, .workspace_size = 48 * 1024 * 1024, .encoded_size = 65536 },
+    .{ .label = "zip robustness", .run = runRobust, .workspace_size = 32 * 1024 * 1024, .encoded_size = 65536 },
+}), &.{});

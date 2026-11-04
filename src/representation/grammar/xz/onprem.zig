@@ -274,7 +274,7 @@ fn decodeStreamHeader(cursor: *binary.ReadCursor, provider: checksum.Provider) E
     return checkTypeFromInt(check_type);
 }
 
-fn checkTypeFromInt(value: u8) Exception!CheckType {
+pub fn checkTypeFromInt(value: u8) Exception!CheckType {
     return switch (value) {
         0 => .none,
         1 => .crc32,
@@ -284,30 +284,30 @@ fn checkTypeFromInt(value: u8) Exception!CheckType {
     };
 }
 
-fn verifyCrc32(bytes: []const u8, expected: u32, provider: checksum.Provider) Exception!void {
+pub fn verifyCrc32(bytes: []const u8, expected: u32, provider: checksum.Provider) Exception!void {
     var crc = checksum.Crc32.bind(provider, {});
     crc.update(bytes);
     if (crc.final({}) != expected) return error.IntegrityException;
 }
 
-const IndexRecord = struct {
+pub const IndexRecord = struct {
     unpadded_size: u64,
     uncompressed_size: u64,
 };
 
 const max_index_records = 1024;
 
-const IndexRecordList = struct {
+pub const IndexRecordList = struct {
     records: [max_index_records]IndexRecord,
     len: usize = 0,
 
-    fn append(self: *IndexRecordList, record: IndexRecord) Exception!void {
+    pub fn append(self: *align(1) IndexRecordList, record: IndexRecord) Exception!void {
         if (self.len >= self.records.len) return error.ResourceException;
         self.records[self.len] = record;
         self.len += 1;
     }
 
-    fn slice(self: *const IndexRecordList) []const IndexRecord {
+    pub fn slice(self: *align(1) const IndexRecordList) []align(1) const IndexRecord {
         return self.records[0..self.len];
     }
 };
@@ -844,7 +844,7 @@ fn writeStreamFooter(writer: *std.Io.Writer, check: CheckType, index_size: usize
     try io.writeBytes(writer, &footer);
 }
 
-fn checkSize(check: CheckType) usize {
+pub fn checkSize(check: CheckType) usize {
     return switch (check) {
         .none => 0,
         .crc32 => 4,

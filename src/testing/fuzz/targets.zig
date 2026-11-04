@@ -160,49 +160,27 @@ pub fn runCpio(data: []const u8) anyerror!void {
     _ = cpio.decodeOrdinal(data, 0, out[0..size]) catch {};
 }
 
-pub fn runWim(data: []const u8) anyerror!void {
-    const scratch = try std.heap.page_allocator.alloc(u8, wim.scratch_size);
-    defer std.heap.page_allocator.free(scratch);
-    const count = wim.inspectCount(data, scratch) catch return;
-    if (count == 0) return;
-    const info = wim.inspectOrdinal(data, 0, scratch) catch return;
-    const size: usize = @intCast(@min(info.size, max_output));
-    var out: [max_output]u8 = undefined;
-    _ = wim.decodeOrdinal(data, 0, out[0..size], scratch) catch {};
+// The volume and apple-archive formats share one inspect/decode pipeline;
+// age stays a hand runner for its extra options arguments.
+fn makeRunner(comptime mod: type) fn ([]const u8) anyerror!void {
+    return struct {
+        fn run(data: []const u8) anyerror!void {
+            const scratch = try std.heap.page_allocator.alloc(u8, mod.scratch_size);
+            defer std.heap.page_allocator.free(scratch);
+            const count = mod.inspectCount(data, scratch) catch return;
+            if (count == 0) return;
+            const info = mod.inspectOrdinal(data, 0, scratch) catch return;
+            const size: usize = @intCast(@min(info.size, max_output));
+            var out: [max_output]u8 = undefined;
+            _ = mod.decodeOrdinal(data, 0, out[0..size], scratch) catch {};
+        }
+    }.run;
 }
 
-pub fn runXar(data: []const u8) anyerror!void {
-    const scratch = try std.heap.page_allocator.alloc(u8, xar.scratch_size);
-    defer std.heap.page_allocator.free(scratch);
-    const count = xar.inspectCount(data, scratch) catch return;
-    if (count == 0) return;
-    const info = xar.inspectOrdinal(data, 0, scratch) catch return;
-    const size: usize = @intCast(@min(info.size, max_output));
-    var out: [max_output]u8 = undefined;
-    _ = xar.decodeOrdinal(data, 0, out[0..size], scratch) catch {};
-}
-
-pub fn runXip(data: []const u8) anyerror!void {
-    const scratch = try std.heap.page_allocator.alloc(u8, xip.scratch_size);
-    defer std.heap.page_allocator.free(scratch);
-    const count = xip.inspectCount(data, scratch) catch return;
-    if (count == 0) return;
-    const info = xip.inspectOrdinal(data, 0, scratch) catch return;
-    const size: usize = @intCast(@min(info.size, max_output));
-    var out: [max_output]u8 = undefined;
-    _ = xip.decodeOrdinal(data, 0, out[0..size], scratch) catch {};
-}
-
-pub fn runPkg(data: []const u8) anyerror!void {
-    const scratch = try std.heap.page_allocator.alloc(u8, pkg.scratch_size);
-    defer std.heap.page_allocator.free(scratch);
-    const count = pkg.inspectCount(data, scratch) catch return;
-    if (count == 0) return;
-    const info = pkg.inspectOrdinal(data, 0, scratch) catch return;
-    const size: usize = @intCast(@min(info.size, max_output));
-    var out: [max_output]u8 = undefined;
-    _ = pkg.decodeOrdinal(data, 0, out[0..size], scratch) catch {};
-}
+pub const runWim = makeRunner(wim);
+pub const runXar = makeRunner(xar);
+pub const runXip = makeRunner(xip);
+pub const runPkg = makeRunner(pkg);
 
 pub fn runAge(data: []const u8) anyerror!void {
     const scratch = try std.heap.page_allocator.alloc(u8, age.scratch_size);
@@ -215,49 +193,10 @@ pub fn runAge(data: []const u8) anyerror!void {
     _ = age.decodeOrdinal(data, 0, out[0..size], scratch, .{}) catch {};
 }
 
-pub fn runIso(data: []const u8) anyerror!void {
-    const scratch = try std.heap.page_allocator.alloc(u8, iso.scratch_size);
-    defer std.heap.page_allocator.free(scratch);
-    const count = iso.inspectCount(data, scratch) catch return;
-    if (count == 0) return;
-    const info = iso.inspectOrdinal(data, 0, scratch) catch return;
-    const size: usize = @intCast(@min(info.size, max_output));
-    var out: [max_output]u8 = undefined;
-    _ = iso.decodeOrdinal(data, 0, out[0..size], scratch) catch {};
-}
-
-pub fn runSquashfs(data: []const u8) anyerror!void {
-    const scratch = try std.heap.page_allocator.alloc(u8, squashfs.scratch_size);
-    defer std.heap.page_allocator.free(scratch);
-    const count = squashfs.inspectCount(data, scratch) catch return;
-    if (count == 0) return;
-    const info = squashfs.inspectOrdinal(data, 0, scratch) catch return;
-    const size: usize = @intCast(@min(info.size, max_output));
-    var out: [max_output]u8 = undefined;
-    _ = squashfs.decodeOrdinal(data, 0, out[0..size], scratch) catch {};
-}
-
-pub fn runDwarfs(data: []const u8) anyerror!void {
-    const scratch = try std.heap.page_allocator.alloc(u8, dwarfs.scratch_size);
-    defer std.heap.page_allocator.free(scratch);
-    const count = dwarfs.inspectCount(data, scratch) catch return;
-    if (count == 0) return;
-    const info = dwarfs.inspectOrdinal(data, 0, scratch) catch return;
-    const size: usize = @intCast(@min(info.size, max_output));
-    var out: [max_output]u8 = undefined;
-    _ = dwarfs.decodeOrdinal(data, 0, out[0..size], scratch) catch {};
-}
-
-pub fn runApfs(data: []const u8) anyerror!void {
-    const scratch = try std.heap.page_allocator.alloc(u8, apfs.scratch_size);
-    defer std.heap.page_allocator.free(scratch);
-    const count = apfs.inspectCount(data, scratch) catch return;
-    if (count == 0) return;
-    const info = apfs.inspectOrdinal(data, 0, scratch) catch return;
-    const size: usize = @intCast(@min(info.size, max_output));
-    var out: [max_output]u8 = undefined;
-    _ = apfs.decodeOrdinal(data, 0, out[0..size], scratch) catch {};
-}
+pub const runIso = makeRunner(iso);
+pub const runSquashfs = makeRunner(squashfs);
+pub const runDwarfs = makeRunner(dwarfs);
+pub const runApfs = makeRunner(apfs);
 
 // One table drives the evidence campaign so a codec cannot be added to the
 // smoke pass and forgotten there. Empty-corpus formats seed a signature stub,

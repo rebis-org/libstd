@@ -15,178 +15,100 @@ fn drive(smith: *testing.Smith, comptime run: fn (data: []const u8) anyerror!voi
     try run(input[0..len]);
 }
 
-test "fuzz gzip decode" {
+// One wrapper keeps the smoke blocks to their runner and seed choice alone.
+fn smoke(comptime run: fn (data: []const u8) anyerror!void, comptime seed: ?[]const u8) !void {
+    const seeds: []const []const u8 = if (seed) |s| &.{s} else &.{};
     try testing.fuzz({}, struct {
         fn f(_: void, smith: *testing.Smith) anyerror!void {
-            try drive(smith, targets.runGzip);
+            try drive(smith, run);
         }
-    }.f, .{ .corpus = &.{corpus.gzip_empty[0..]} });
+    }.f, .{ .corpus = seeds });
+}
+
+test "fuzz gzip decode" {
+    try smoke(targets.runGzip, corpus.gzip_empty[0..]);
 }
 
 test "fuzz zlib decode" {
-    try testing.fuzz({}, struct {
-        fn f(_: void, smith: *testing.Smith) anyerror!void {
-            try drive(smith, targets.runZlib);
-        }
-    }.f, .{ .corpus = &.{corpus.zlib_empty[0..]} });
+    try smoke(targets.runZlib, corpus.zlib_empty[0..]);
 }
 
 test "fuzz deflate decode" {
-    try testing.fuzz({}, struct {
-        fn f(_: void, smith: *testing.Smith) anyerror!void {
-            try drive(smith, targets.runDeflate);
-        }
-    }.f, .{ .corpus = &.{corpus.deflate_small[0..]} });
+    try smoke(targets.runDeflate, corpus.deflate_small[0..]);
 }
 
 test "fuzz zstd decode" {
-    try testing.fuzz({}, struct {
-        fn f(_: void, smith: *testing.Smith) anyerror!void {
-            try drive(smith, targets.runZstd);
-        }
-    }.f, .{ .corpus = &.{corpus.zstd_frame[0..]} });
+    try smoke(targets.runZstd, corpus.zstd_frame[0..]);
 }
 
 test "fuzz lz4 decode" {
-    try testing.fuzz({}, struct {
-        fn f(_: void, smith: *testing.Smith) anyerror!void {
-            try drive(smith, targets.runLz4);
-        }
-    }.f, .{ .corpus = &.{corpus.lz4_frame[0..]} });
+    try smoke(targets.runLz4, corpus.lz4_frame[0..]);
 }
 
 test "fuzz xz decode" {
-    try testing.fuzz({}, struct {
-        fn f(_: void, smith: *testing.Smith) anyerror!void {
-            try drive(smith, targets.runXz);
-        }
-    }.f, .{ .corpus = &.{corpus.xz_stream[0..]} });
+    try smoke(targets.runXz, corpus.xz_stream[0..]);
 }
 
 test "fuzz lzma alone decode" {
-    try testing.fuzz({}, struct {
-        fn f(_: void, smith: *testing.Smith) anyerror!void {
-            try drive(smith, targets.runLzmaAlone);
-        }
-    }.f, .{ .corpus = &.{corpus.lzma_alone[0..]} });
+    try smoke(targets.runLzmaAlone, corpus.lzma_alone[0..]);
 }
 
 test "fuzz bzip2 decode" {
-    try testing.fuzz({}, struct {
-        fn f(_: void, smith: *testing.Smith) anyerror!void {
-            try drive(smith, targets.runBzip2);
-        }
-    }.f, .{ .corpus = &.{corpus.bzip2_stream[0..]} });
+    try smoke(targets.runBzip2, corpus.bzip2_stream[0..]);
 }
 
 test "fuzz sevenzip header walk" {
-    try testing.fuzz({}, struct {
-        fn f(_: void, smith: *testing.Smith) anyerror!void {
-            try drive(smith, targets.runSevenZip);
-        }
-    }.f, .{ .corpus = &.{corpus.ppmd_sevenzip[0..]} });
+    try smoke(targets.runSevenZip, corpus.ppmd_sevenzip[0..]);
 }
 
 test "fuzz zip decode" {
-    try testing.fuzz({}, struct {
-        fn f(_: void, smith: *testing.Smith) anyerror!void {
-            try drive(smith, targets.runZip);
-        }
-    }.f, .{ .corpus = &.{corpus.zip_one_file[0..]} });
+    try smoke(targets.runZip, corpus.zip_one_file[0..]);
 }
 
 test "fuzz rar decode" {
-    try testing.fuzz({}, struct {
-        fn f(_: void, smith: *testing.Smith) anyerror!void {
-            try drive(smith, targets.runRar);
-        }
-    }.f, .{ .corpus = &.{} });
+    try smoke(targets.runRar, null);
 }
 
 test "fuzz tar decode" {
-    try testing.fuzz({}, struct {
-        fn f(_: void, smith: *testing.Smith) anyerror!void {
-            try drive(smith, targets.runTar);
-        }
-    }.f, .{ .corpus = &.{corpus.tar_one_file[0..]} });
+    try smoke(targets.runTar, corpus.tar_one_file[0..]);
 }
 
 test "fuzz cpio decode" {
-    try testing.fuzz({}, struct {
-        fn f(_: void, smith: *testing.Smith) anyerror!void {
-            try drive(smith, targets.runCpio);
-        }
-    }.f, .{ .corpus = &.{} });
+    try smoke(targets.runCpio, null);
 }
 
 test "fuzz wim decode" {
-    try testing.fuzz({}, struct {
-        fn f(_: void, smith: *testing.Smith) anyerror!void {
-            try drive(smith, targets.runWim);
-        }
-    }.f, .{ .corpus = &.{} });
+    try smoke(targets.runWim, null);
 }
 
 test "fuzz xar decode" {
-    try testing.fuzz({}, struct {
-        fn f(_: void, smith: *testing.Smith) anyerror!void {
-            try drive(smith, targets.runXar);
-        }
-    }.f, .{ .corpus = &.{} });
+    try smoke(targets.runXar, null);
 }
 
 test "fuzz xip decode" {
-    try testing.fuzz({}, struct {
-        fn f(_: void, smith: *testing.Smith) anyerror!void {
-            try drive(smith, targets.runXip);
-        }
-    }.f, .{ .corpus = &.{} });
+    try smoke(targets.runXip, null);
 }
 
 test "fuzz pkg decode" {
-    try testing.fuzz({}, struct {
-        fn f(_: void, smith: *testing.Smith) anyerror!void {
-            try drive(smith, targets.runPkg);
-        }
-    }.f, .{ .corpus = &.{} });
+    try smoke(targets.runPkg, null);
 }
 
 test "fuzz age decode" {
-    try testing.fuzz({}, struct {
-        fn f(_: void, smith: *testing.Smith) anyerror!void {
-            try drive(smith, targets.runAge);
-        }
-    }.f, .{ .corpus = &.{} });
+    try smoke(targets.runAge, null);
 }
 
 test "fuzz iso decode" {
-    try testing.fuzz({}, struct {
-        fn f(_: void, smith: *testing.Smith) anyerror!void {
-            try drive(smith, targets.runIso);
-        }
-    }.f, .{ .corpus = &.{} });
+    try smoke(targets.runIso, null);
 }
 
 test "fuzz squashfs decode" {
-    try testing.fuzz({}, struct {
-        fn f(_: void, smith: *testing.Smith) anyerror!void {
-            try drive(smith, targets.runSquashfs);
-        }
-    }.f, .{ .corpus = &.{} });
+    try smoke(targets.runSquashfs, null);
 }
 
 test "fuzz dwarfs decode" {
-    try testing.fuzz({}, struct {
-        fn f(_: void, smith: *testing.Smith) anyerror!void {
-            try drive(smith, targets.runDwarfs);
-        }
-    }.f, .{ .corpus = &.{} });
+    try smoke(targets.runDwarfs, null);
 }
 
 test "fuzz apfs decode" {
-    try testing.fuzz({}, struct {
-        fn f(_: void, smith: *testing.Smith) anyerror!void {
-            try drive(smith, targets.runApfs);
-        }
-    }.f, .{ .corpus = &.{} });
+    try smoke(targets.runApfs, null);
 }

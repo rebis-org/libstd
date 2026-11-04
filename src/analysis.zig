@@ -6,23 +6,21 @@ fn forceAllDecls(comptime module: type) void {
     }
 }
 
-const forced_modules = [_][]const u8{
-    "compose/api.zig",
-    "compose/archive.zig",
-    "compose/call.zig",
-    "compose/drivers.zig",
-    "compose/transform.zig",
-    "kernel/node.zig",
+// Module types, not path strings: @import takes literals only, so the
+// list drives both the comptime forcing and the printed count. interface.lease
+// stays forced separately, outside the counted set.
+const forced_modules = .{
+    @import("compose/api.zig"),
+    @import("compose/archive.zig"),
+    @import("compose/call.zig"),
+    @import("compose/drivers.zig"),
+    @import("compose/transform.zig"),
+    @import("kernel/node.zig"),
 };
 
 comptime {
-    forceAllDecls(@import("compose/api.zig"));
-    forceAllDecls(@import("compose/archive.zig"));
-    forceAllDecls(@import("compose/call.zig"));
-    forceAllDecls(@import("compose/drivers.zig"));
-    forceAllDecls(@import("compose/transform.zig"));
+    for (forced_modules) |module| forceAllDecls(module);
     forceAllDecls(@import("interface").lease);
-    forceAllDecls(@import("kernel/node.zig"));
 }
 
 pub fn main(init: std.process.Init) !void {

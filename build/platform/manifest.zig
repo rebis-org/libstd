@@ -13,16 +13,25 @@ pub const FormSpec = struct {
     arches: []const []const u8 = &.{},
 };
 
+// One arch table feeds both the archive specs and the slice picker, so a
+// new arch cannot drift between them. The darwin order is arm-first.
+pub const desktop_arches = [_][]const u8{ "x86_64", "aarch64" };
+pub const apple_arches = [_][]const u8{ "aarch64", "x86_64" };
+pub const linux_arches = [_][]const u8{ "x86_64", "aarch64", "riscv64", "loongarch64" };
+pub const linux_musl_arches = [_][]const u8{ "x86_64", "aarch64", "riscv64" };
+pub const ohos_arches = [_][]const u8{ "x86_64", "aarch64" };
+pub const wasm_arches = [_][]const u8{"wasm32"};
+
 pub const specs = [_]FormSpec{
-    .{ .stem = "libstd", .os = "macos", .layout = .dylib, .arches = &.{ "aarch64", "x86_64" } },
-    .{ .stem = "libstd", .os = "linux", .abi = "gnu", .layout = .elf, .arches = &.{ "x86_64", "aarch64", "riscv64", "loongarch64" } },
-    .{ .stem = "libstd", .os = "linux", .abi = "musl", .layout = .elf, .arches = &.{ "x86_64", "aarch64", "riscv64" } },
-    .{ .stem = "libstd", .os = "windows", .abi = "gnu", .layout = .pe, .arches = &.{ "x86_64", "aarch64" } },
-    .{ .stem = "libstd", .os = "windows", .abi = "msvc", .layout = .pe, .arches = &.{ "x86_64", "aarch64" } },
-    .{ .stem = "libstd", .os = "freebsd", .layout = .elf, .arches = &.{ "x86_64", "aarch64" } },
-    .{ .stem = "libstd", .os = "openbsd", .layout = .elf, .arches = &.{ "x86_64", "aarch64" } },
-    .{ .stem = "libstd", .os = "wasi", .layout = .wasi, .arches = &.{"wasm32"} },
-    .{ .stem = "stdk", .os = "darwin", .layout = .apple, .arches = &.{ "aarch64", "x86_64" } },
+    .{ .stem = "libstd", .os = "macos", .layout = .dylib, .arches = &apple_arches },
+    .{ .stem = "libstd", .os = "linux", .abi = "gnu", .layout = .elf, .arches = &linux_arches },
+    .{ .stem = "libstd", .os = "linux", .abi = "musl", .layout = .elf, .arches = &linux_musl_arches },
+    .{ .stem = "libstd", .os = "windows", .abi = "gnu", .layout = .pe, .arches = &desktop_arches },
+    .{ .stem = "libstd", .os = "windows", .abi = "msvc", .layout = .pe, .arches = &desktop_arches },
+    .{ .stem = "libstd", .os = "freebsd", .layout = .elf, .arches = &desktop_arches },
+    .{ .stem = "libstd", .os = "openbsd", .layout = .elf, .arches = &desktop_arches },
+    .{ .stem = "libstd", .os = "wasi", .layout = .wasi, .arches = &wasm_arches },
+    .{ .stem = "stdk", .os = "darwin", .layout = .apple, .arches = &apple_arches },
     .{ .stem = "stdk", .os = "linux", .abi = "android", .layout = .aar },
     .{ .stem = "stdk", .os = "linux", .abi = "ohos", .layout = .cjpm },
 };
@@ -53,9 +62,9 @@ pub const slices = [_]TargetSlice{
 pub fn pickSlices(comptime os_tag: std.Target.Os.Tag, comptime abi: ?std.Target.Abi, comptime arch: ?[]const u8) []const TargetSlice {
     comptime {
         const os_arches: []const []const u8 = switch (os_tag) {
-            .linux => if (abi == .musl) &.{ "x86_64", "aarch64", "riscv64" } else if (abi == .ohos) &.{ "x86_64", "aarch64" } else &.{ "x86_64", "aarch64", "riscv64", "loongarch64" },
-            .windows, .freebsd, .openbsd, .macos => &.{ "x86_64", "aarch64" },
-            .wasi => &.{"wasm32"},
+            .linux => if (abi == .musl) &linux_musl_arches else if (abi == .ohos) &ohos_arches else &linux_arches,
+            .windows, .freebsd, .openbsd, .macos => &desktop_arches,
+            .wasi => &wasm_arches,
             else => @compileError("no slice table for " ++ @tagName(os_tag)),
         };
         var chosen: [slices.len]TargetSlice = undefined;
@@ -194,6 +203,8 @@ pub const Distribution = struct {
     catalog: []const u8,
     entries: []const []const u8,
     apple: ?[]const AppleSlice = null,
+    // The per-arch form carries the arch; universal and zero-arch forms are null.
+    arch: ?[]const u8 = null,
 };
 
 pub const providers = [_][]const u8{ "onprem", "offprem", "mergeable" };
@@ -263,6 +274,7 @@ fn makeForm(comptime provider: []const u8, comptime spec: *const FormSpec, compt
         },
         .entries = makeEntries(spec, arch),
         .apple = if (spec.layout == .apple) (if (arch) |a| archSlices(a) else &apple_slices) else null,
+        .arch = arch,
     };
 }
 

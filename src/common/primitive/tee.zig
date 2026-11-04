@@ -55,7 +55,7 @@ pub fn CountingTee(comptime kinds: Kinds) type {
             return self.crc64.final({});
         }
 
-        pub fn xxh64Value(self: *@This()) u64 {
+        pub fn xxh64Value(self: *const @This()) u64 {
             return self.xxh64.final({});
         }
 

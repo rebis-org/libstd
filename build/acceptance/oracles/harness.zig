@@ -180,6 +180,34 @@ pub const Spec = struct {
     encoded_size: usize,
 };
 
+// Per-row sizes; a null falls back to the base Spec so only values shared by
+// every row leave the row.
+pub const SpecRow = struct {
+    label: []const u8,
+    run: *const fn (r: *Runner) anyerror!void,
+    workspace_size: ?usize = null,
+    output_size: ?usize = null,
+    encoded_size: ?usize = null,
+};
+
+pub fn specRows(comptime base: Spec, comptime rows: []const SpecRow) []const Spec {
+    const built = comptime blk: {
+        @setEvalBranchQuota(10_000);
+        var list: [rows.len]Spec = undefined;
+        for (rows, 0..) |row, i| {
+            list[i] = .{
+                .label = row.label,
+                .run = row.run,
+                .workspace_size = row.workspace_size orelse base.workspace_size,
+                .output_size = row.output_size orelse base.output_size,
+                .encoded_size = row.encoded_size orelse base.encoded_size,
+            };
+        }
+        break :blk list;
+    };
+    return &built;
+}
+
 pub const Single = struct {
     name: []const u8,
     run: *const fn (r: *Runner) anyerror!void,
@@ -557,9 +585,12 @@ pub fn archiveEntryWithMethod(
 }
 
 pub const ArchiveEntryNodes = struct {
-    name: Node,
-    data: Node,
-    method: Node,
+    name: Node = undefined,
+    data: Node = undefined,
+    method: Node = undefined,
+    type: Node = undefined,
+    link: Node = undefined,
+    uid: Node = undefined,
 };
 
 pub fn archiveEntryMethod(nodes: *ArchiveEntryNodes, name: []const u8, data: []const u8, method: u64) Node {

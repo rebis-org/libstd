@@ -343,13 +343,19 @@ pub fn tarHook(invocation: *common.Invocation) Exception!void {
     }
 }
 
-fn fillXarEntry(entry: *xar.Entry, node: *Node, _: NoCtx) Exception!void {
+// One cpio-style mapping serves every format whose entry carries exactly
+// these four fields; each fill wraps it per entry type.
+fn cpioStyleFields(comptime Entry: type, entry: *Entry, node: *Node) Exception!void {
     const parts = try entryNameData(node.child);
     const uid: u32 = if (cpioSelector("entry_uid", node.child)) |n| blk: {
         break :blk try narrow(u32, n.value_low);
     } else 0;
     const mtime = node_graph.parseU64(cpioSelector("entry_mtime", node.child));
     entry.* = .{ .name = parts.name, .data = parts.data, .uid = uid, .modification_time = mtime };
+}
+
+fn fillXarEntry(entry: *xar.Entry, node: *Node, _: NoCtx) Exception!void {
+    return cpioStyleFields(xar.Entry, entry, node);
 }
 
 pub fn xarHook(invocation: *common.Invocation) Exception!void {
@@ -421,12 +427,7 @@ pub fn xarHook(invocation: *common.Invocation) Exception!void {
 }
 
 fn fillXipEntry(entry: *xip.Entry, node: *Node, _: NoCtx) Exception!void {
-    const parts = try entryNameData(node.child);
-    const uid: u32 = if (cpioSelector("entry_uid", node.child)) |n| blk: {
-        break :blk try narrow(u32, n.value_low);
-    } else 0;
-    const mtime = node_graph.parseU64(cpioSelector("entry_mtime", node.child));
-    entry.* = .{ .name = parts.name, .data = parts.data, .uid = uid, .modification_time = mtime };
+    return cpioStyleFields(xip.Entry, entry, node);
 }
 
 pub fn xipHook(invocation: *common.Invocation) Exception!void {
@@ -496,12 +497,7 @@ pub fn xipHook(invocation: *common.Invocation) Exception!void {
 }
 
 fn fillPkgEntry(entry: *pkg.Entry, node: *Node, _: NoCtx) Exception!void {
-    const parts = try entryNameData(node.child);
-    const uid: u32 = if (cpioSelector("entry_uid", node.child)) |n| blk: {
-        break :blk try narrow(u32, n.value_low);
-    } else 0;
-    const mtime = node_graph.parseU64(cpioSelector("entry_mtime", node.child));
-    entry.* = .{ .name = parts.name, .data = parts.data, .uid = uid, .modification_time = mtime };
+    return cpioStyleFields(pkg.Entry, entry, node);
 }
 
 // The write path emits deterministic gzip; the read side sniffs,
@@ -1033,12 +1029,7 @@ fn cpioSelector(comptime name: []const u8, child: ?*Node) ?*Node {
 }
 
 fn fillCpioEntry(entry: *cpio.Entry, node: *Node, _: NoCtx) Exception!void {
-    const parts = try entryNameData(node.child);
-    const uid: u32 = if (cpioSelector("entry_uid", node.child)) |n| blk: {
-        break :blk try narrow(u32, n.value_low);
-    } else 0;
-    const mtime = node_graph.parseU64(cpioSelector("entry_mtime", node.child));
-    entry.* = .{ .name = parts.name, .data = parts.data, .uid = uid, .modification_time = mtime };
+    return cpioStyleFields(cpio.Entry, entry, node);
 }
 
 pub fn cpioHook(invocation: *common.Invocation) Exception!void {
@@ -1434,6 +1425,97 @@ fn parseSevenZipMethod(node: *Node) Exception!seven_zip.CoderMethod {
 // header at 2 MiB; RAR4 headers are u16-sized, 16-byte aligned.
 const rar_header_scratch_size = 2 * 1024 * 1024 + 16;
 
+// A split set is bounded the way a single archive is: every part obeys the
+// encoded budget and the count obeys the walk's part scratch.
+const max_volume_parts = 64;
+
+// The volume tail is a shared archive-family parameter: repeated bytes
+// siblings name the parts after the source, in volume order.
+fn isVolumePartNode(node: *Node) bool {
+    if (!vocabulary.eql(node.id, vocabulary.ids.parameter)) return false;
+    const selector = comptime discovery.parameter("tar", "archive_volumes");
+    const found = vocabulary.selectorOf(node.value_high);
+    return found.family == selector.family and found.ordinal == selector.ordinal;
+}
+
+// Collects the tail of a split set, parts 2..N in volume order; the source
+// stays part 1 so the resource checks and the encoded budget hold per part.
+fn collectVolumeParts(
+    request: ?*Node,
+    limits: Limits,
+    workspace: *resource.Workspace,
+) Exception![]const []const u8 {
+    var count: usize = 0;
+    var cursor = request;
+    while (cursor) |node| : (cursor = node.next) {
+        if (isVolumePartNode(node)) count += 1;
+    }
+    if (count == 0) return &.{};
+    if (count > max_volume_parts) return error.ResourceException;
+    const list = try workspace.take([]const u8, count);
+    var index: usize = 0;
+    cursor = request;
+    while (cursor) |node| : (cursor = node.next) {
+        if (!isVolumePartNode(node)) continue;
+        const part = try resource.checkedConstBytes(node.bytes, node.byte_length);
+        // The budget holds per part; a part too small to carry a signature
+        // (including an empty one) fails in the walk as data, not resource.
+        if (part.len > limits.encoded_bytes) return error.ResourceException;
+        list[index] = part;
+        index += 1;
+    }
+    return list;
+}
+
+// One list in volume order: the materialized head plus the parameter tail.
+fn volumePartList(
+    head: []const u8,
+    tail: []const []const u8,
+    workspace: *resource.Workspace,
+) Exception![]const []const u8 {
+    const list = try workspace.take([]const u8, 1 + tail.len);
+    list[0] = head;
+    for (tail, 0..) |part, index| list[1 + index] = part;
+    return list;
+}
+
+// Decrypted-header staging is capped by the part that could hold the largest
+// header, which for a set is the largest part.
+fn largestPart(head: []const u8, tail: []const []const u8) usize {
+    var largest = head.len;
+    for (tail) |part| {
+        if (part.len > largest) largest = part.len;
+    }
+    return largest;
+}
+
+// Total bytes of a split set. The decode gather concatenates one entry's
+// parts into a single payload, and parts are disjoint slices of the set, so
+// no gather can exceed the set.
+fn volumeSetBytes(head: []const u8, tail: []const []const u8) Exception!usize {
+    var total = head.len;
+    for (tail) |part| total = try bounds.addUsize(total, part.len);
+    return total;
+}
+
+// Volume parts ride request nodes, so the source and sink boundary checks
+// never see them; the walk reads them across every pass, so they join the
+// same discipline: no overlap with the workspace this hook carves, or with
+// a direct sink it writes into.
+fn checkVolumePartOverlap(workspace: *resource.Workspace, sink: ?*Resource, parts: []const []const u8) Exception!void {
+    for (parts) |part| {
+        if (part.len == 0) continue;
+        if (try common.spanOverlap(@intFromPtr(workspace.bytes.ptr), workspace.bytes.len, @intFromPtr(part.ptr), part.len)) return error.CallException;
+        const sink_resource = sink orelse continue;
+        switch (sink_resource.kind) {
+            .direct_write => |destination| {
+                if (try common.spanOverlap(@intFromPtr(destination.ptr), destination.len, @intFromPtr(part.ptr), part.len)) return error.CallException;
+            },
+            else => {},
+        }
+    }
+}
+
 pub fn rarHook(invocation: *common.Invocation) Exception!void {
     const plan = &invocation.plan;
     const call = invocation.call;
@@ -1453,11 +1535,19 @@ pub fn rarHook(invocation: *common.Invocation) Exception!void {
             return err;
         };
         const decrypting = crypto_params != null;
+        const volume_tail = try collectVolumeParts(call.request, limits, &workspace);
         if (sink == null) {
             try common.checkSourceWorkspaceOverlap(call, source_resource);
+            try checkVolumePartOverlap(&workspace, null, volume_tail);
             const archive = try materializeArchive(source_resource, &workspace, limits);
-            // Archives with encrypted headers (-hp) need decrypted-header staging, capped by the archive size.
-            const header_scratch = if (decrypting) try workspace.take(u8, @min(@as(usize, rar_header_scratch_size), archive.len + 16)) else try workspace.take(u8, 0);
+            // A split set's head is the source and the tail rides parameters.
+            const volumes = if (volume_tail.len > 0)
+                try volumePartList(archive, volume_tail, &workspace)
+            else
+                &[_][]const u8{};
+            // Archives with encrypted headers (-hp) need decrypted-header staging, capped by the largest part.
+            const staging_cap = largestPart(archive, volume_tail);
+            const header_scratch = if (decrypting) try workspace.take(u8, @min(@as(usize, rar_header_scratch_size), staging_cap + 16)) else try workspace.take(u8, 0);
             const inspect_opts: rar.DecodeOptions = .{
                 .password = cryptoPassword(crypto_params),
                 .scratch = header_scratch,
@@ -1467,7 +1557,11 @@ pub fn rarHook(invocation: *common.Invocation) Exception!void {
                 .provider = plan.provider,
             };
             if (try projectedEntrySize(call.request)) |ordinal| {
-                const entry = rar.rarInspectOrdinalOpts(archive, std.math.cast(usize, ordinal) orelse return error.ResourceException, limits.entries, inspect_opts) catch |err| {
+                const ordinal_value = std.math.cast(usize, ordinal) orelse return error.ResourceException;
+                const entry = (if (volumes.len > 0)
+                    rar.rarVolumeInspectOrdinal(volumes, ordinal_value, limits.entries, inspect_opts)
+                else
+                    rar.rarInspectOrdinalOpts(archive, ordinal_value, limits.entries, inspect_opts)) catch |err| {
                     writeCryptoFailure(call, failure_cause);
                     return err;
                 };
@@ -1475,14 +1569,21 @@ pub fn rarHook(invocation: *common.Invocation) Exception!void {
                 return;
             }
             if (try projectedEntryMetadata(call.request)) |ordinal| {
-                const entry = rar.rarInspectOrdinalOpts(archive, std.math.cast(usize, ordinal) orelse return error.ResourceException, limits.entries, inspect_opts) catch |err| {
+                const ordinal_value = std.math.cast(usize, ordinal) orelse return error.ResourceException;
+                const entry = (if (volumes.len > 0)
+                    rar.rarVolumeInspectOrdinal(volumes, ordinal_value, limits.entries, inspect_opts)
+                else
+                    rar.rarInspectOrdinalOpts(archive, ordinal_value, limits.entries, inspect_opts)) catch |err| {
                     writeCryptoFailure(call, failure_cause);
                     return err;
                 };
                 try publishEntryMetadata(call, response, .{ .name = entry.name, .size = entry.size, .mtime = entry.mtime });
                 return;
             }
-            const count = rar.rarInspectCountOpts(archive, limits.entries, inspect_opts) catch |err| {
+            const count = (if (volumes.len > 0)
+                rar.rarVolumeCount(volumes, limits.entries, inspect_opts)
+            else
+                rar.rarInspectCountOpts(archive, limits.entries, inspect_opts)) catch |err| {
                 writeCryptoFailure(call, failure_cause);
                 return err;
             };
@@ -1494,12 +1595,28 @@ pub fn rarHook(invocation: *common.Invocation) Exception!void {
         try sink_resource.requireCapability(resource.capability_bit_write);
         try common.checkSourceSinkOverlap(source_resource, sink_resource);
         try common.checkWorkspaceOverlap(call, source_resource, sink_resource);
+        try checkVolumePartOverlap(&workspace, sink_resource, volume_tail);
         const ordinal = archiveOrdinal(call.request);
+        const ordinal_value = std.math.cast(usize, ordinal) orelse return error.ResourceException;
         const archive = try materializeArchive(source_resource, &workspace, limits);
+        // A split set decodes as one walk: the head from the source, the tail
+        // from the parameters, and the parts scratch sized by the set.
+        const volumes = if (volume_tail.len > 0)
+            try volumePartList(archive, volume_tail, &workspace)
+        else
+            &[_][]const u8{};
         // Decryption stages a mutable packed copy and, for -hp, decrypted
-        // headers, both capped by the archive size. Plaintext carves nothing.
-        const packed_stage = if (decrypting) try workspace.take(u8, @min(limits.encoded_bytes, archive.len)) else try workspace.take(u8, 0);
-        const header_scratch = if (decrypting) try workspace.take(u8, @min(@as(usize, rar_header_scratch_size), archive.len + 16)) else try workspace.take(u8, 0);
+        // headers, both capped by the archive size. A split set gathers each
+        // multi-part entry into one payload even in plaintext, so its stage
+        // covers the whole set. A plaintext single archive carves nothing.
+        const packed_stage = if (volume_tail.len > 0)
+            try workspace.take(u8, try volumeSetBytes(archive, volume_tail))
+        else if (decrypting)
+            try workspace.take(u8, @min(limits.encoded_bytes, archive.len))
+        else
+            try workspace.take(u8, 0);
+        const staging_cap = largestPart(archive, volume_tail);
+        const header_scratch = if (decrypting) try workspace.take(u8, @min(@as(usize, rar_header_scratch_size), staging_cap + 16)) else try workspace.take(u8, 0);
         const decode_opts: rar.DecodeOptions = .{
             .password = cryptoPassword(crypto_params),
             .scratch = header_scratch,
@@ -1508,7 +1625,10 @@ pub fn rarHook(invocation: *common.Invocation) Exception!void {
             .failure_cause = &failure_cause,
             .provider = plan.provider,
         };
-        const entry = rar.rarInspectOrdinalOpts(archive, std.math.cast(usize, ordinal) orelse return error.ResourceException, limits.entries, decode_opts) catch |err| {
+        const entry = (if (volumes.len > 0)
+            rar.rarVolumeInspectOrdinal(volumes, ordinal_value, limits.entries, decode_opts)
+        else
+            rar.rarInspectOrdinalOpts(archive, ordinal_value, limits.entries, decode_opts)) catch |err| {
             writeCryptoFailure(call, failure_cause);
             return err;
         };
@@ -1518,15 +1638,16 @@ pub fn rarHook(invocation: *common.Invocation) Exception!void {
 
         // Store entries carve nothing. The PPMd heap takes the remainder;
         // the stream bounds the model, so the target opens first.
-        // Vendor unrar floors the v29/36 window at 0x40000 so any unpacked
-        // size can stream; a smaller dictionary would decode into the ring
-        // and then fail the oversized final emit.
-        const declared_window = std.math.cast(usize, entry.window_bytes) orelse return error.ResourceException;
-        const window_len = if (entry.family == .rar4 and (entry.unpack_version == 29 or entry.unpack_version == 36))
-            @max(declared_window, rar.unpack29_min_window)
-        else
-            declared_window;
+        // One window serves the whole solid replay: the inspect carries the
+        // group's largest dictionary, already floored at the v29/36
+        // streaming minimum, so a predecessor may exceed the target's own
+        // declaration (a smaller dictionary would decode into the ring and
+        // then fail the oversized final emit).
+        const window_len = std.math.cast(usize, @max(entry.window_bytes, entry.group_window_bytes)) orelse return error.ResourceException;
         const target = try SinkTarget.open(sink_resource, &workspace, size);
+        // The volume walk records each entry's data parts as it passes, so a
+        // set carves one slot per volume; a single archive walks no parts.
+        const split_scratch = try workspace.take(rar.SplitPart, volumes.len);
         var bufs: rar.DecodeBuffers = .{
             .state = &.{},
             .window = &.{},
@@ -1536,6 +1657,7 @@ pub fn rarHook(invocation: *common.Invocation) Exception!void {
             .filter_scratch = &.{},
             .ppm_heap = &.{},
             .packed_stage = packed_stage,
+            .split_parts = split_scratch,
         };
         if (entry.method != 0) {
             // Unpacker states are re-read as u64 words and structs; u64 aligns to
@@ -1556,10 +1678,14 @@ pub fn rarHook(invocation: *common.Invocation) Exception!void {
                 .filter_scratch = filter_scratch,
                 .ppm_heap = ppm_heap,
                 .packed_stage = packed_stage,
+                .split_parts = split_scratch,
             };
         }
 
-        _ = rar.rarDecodeOrdinal(archive, std.math.cast(usize, ordinal) orelse return error.ResourceException, target.output, &bufs, decode_opts) catch |err| {
+        _ = (if (volumes.len > 0)
+            rar.rarVolumeDecodeOrdinal(volumes, ordinal_value, target.output, &bufs, decode_opts)
+        else
+            rar.rarDecodeOrdinal(archive, ordinal_value, target.output, &bufs, decode_opts)) catch |err| {
             writeCryptoFailure(call, failure_cause);
             return err;
         };
@@ -1567,6 +1693,8 @@ pub fn rarHook(invocation: *common.Invocation) Exception!void {
         response.byte_length = size;
     } else if (command_mask == vocabulary.command_mask_write) {
         try requireVerified(commit);
+        // Volume writing is refused at dispatch: the descriptor opts the
+        // split-set shape into the read direction only.
         var crypto_cause: crypto.FailureCause = .none;
         const crypto_params = parseCryptoParams("rar", call.request, &crypto_cause) catch |err| {
             writeCryptoFailure(call, crypto_cause);

@@ -219,6 +219,10 @@ inline fn isOffpremUnsupported() bool {
     return harness.grammar_offprem_default;
 }
 
+fn requireTool(path: []const u8) error{ReferenceToolUnavailable}!void {
+    std.Io.Dir.cwd().access(harness.oracle_io, path, .{}) catch return error.ReferenceToolUnavailable;
+}
+
 pub fn runTar(r: *Runner) anyerror!void {
     try runArchive(r, harness.ids.tar);
 }
@@ -336,7 +340,7 @@ fn runWimForeignCodec(r: *Runner, comptime tag: []const u8, comptime codec: []co
     if (isOffpremUnsupported()) return;
     setupArchive(r, harness.ids.wim);
     const bin = wimlib_path;
-    std.Io.Dir.cwd().access(harness.oracle_io, bin, .{}) catch return error.ReferenceToolUnavailable;
+    try requireTool(bin);
     const oracle_io = harness.oracle_io;
     const dir_path = try r.gpa.print("zig-out/oracles/wim-src-{s}-{d}", .{ tag, r.corpus_index });
     defer r.gpa.free(dir_path);
@@ -379,7 +383,7 @@ fn runWimForeign(r: *Runner) anyerror!void {
     if (isOffpremUnsupported()) return;
     setupArchive(r, harness.ids.wim);
     const bin = wimlib_path;
-    std.Io.Dir.cwd().access(harness.oracle_io, bin, .{}) catch return error.ReferenceToolUnavailable;
+    try requireTool(bin);
     // The wimlib oracle captures the corpus directory uncompressed;
     // the envelope reads its image.
     const oracle_io = harness.oracle_io;
@@ -431,7 +435,7 @@ fn runIsoTree(r: *Runner) anyerror!void {
     try arcReadOrdinal(r, 1, &arc_state.data2);
     // The bsdtar oracle must reconstruct the subdirectory from our image.
     const bin = "/usr/bin/bsdtar";
-    std.Io.Dir.cwd().access(harness.oracle_io, bin, .{}) catch return error.ReferenceToolUnavailable;
+    try requireTool(bin);
     const oracle_io = harness.oracle_io;
     const image_path = try r.gpa.print("zig-out/oracles/iso-tree-{d}.iso", .{r.corpus_index});
     defer r.gpa.free(image_path);
@@ -462,7 +466,7 @@ fn runApfs(r: *Runner) anyerror!void {
     try arcReadOrdinal(r, 1, &arc_state.data2);
     // 7-Zip must read our image back: extract and compare both payloads.
     const bin = squashfs_bin_dir ++ "/7zz";
-    std.Io.Dir.cwd().access(harness.oracle_io, bin, .{}) catch return error.ReferenceToolUnavailable;
+    try requireTool(bin);
     const oracle_io = harness.oracle_io;
     const image_path = try r.gpa.print("zig-out/oracles/apfs-ours-{d}.img", .{r.corpus_index});
     defer r.gpa.free(image_path);
@@ -624,7 +628,7 @@ fn ageReadBack(r: *Runner, size: usize, expected: []const u8, extra: []const har
 fn runAgeInterop(r: *Runner) anyerror!void {
     if (isOffpremUnsupported()) return;
     const oracle_io = harness.oracle_io;
-    std.Io.Dir.cwd().access(oracle_io, "/tmp/age_ref", .{}) catch return error.ReferenceToolUnavailable;
+    try requireTool("/tmp/age_ref");
     harness.setup(r, harness.ids.age, harness.mode_archive);
     var payload: [445]u8 = undefined;
     corpus.fillTiled(r.corpus_index, &payload);
@@ -678,7 +682,7 @@ pub fn runIso(r: *Runner) anyerror!void {
     arc_state.corrupt_offset = 0;
     // Reference extraction: bsdtar must read our encoded image back.
     const bin = "/usr/bin/bsdtar";
-    std.Io.Dir.cwd().access(harness.oracle_io, bin, .{}) catch return error.ReferenceToolUnavailable;
+    try requireTool(bin);
     const oracle_io = harness.oracle_io;
     const image_path = try r.gpa.print("zig-out/oracles/iso-ours-{d}.iso", .{r.corpus_index});
     defer r.gpa.free(image_path);
@@ -709,7 +713,7 @@ pub fn runDwarfs(r: *Runner) anyerror!void {
     const oracle_io = harness.oracle_io;
     // The dwarfsck tool must accept our image; dwarfsextract must round-trip it.
     const ck = squashfs_bin_dir ++ "/dwarfsck";
-    std.Io.Dir.cwd().access(oracle_io, ck, .{}) catch return error.ReferenceToolUnavailable;
+    try requireTool(ck);
     const image_path = try r.gpa.print("zig-out/oracles/dwarfs-ours-{d}.dwarfs", .{r.corpus_index});
     defer r.gpa.free(image_path);
     try std.Io.Dir.cwd().writeFile(oracle_io, .{ .sub_path = image_path, .data = arc_state.archive[0..arc_state.archive_size] });
@@ -717,7 +721,7 @@ pub fn runDwarfs(r: *Runner) anyerror!void {
     var term = try child.wait(oracle_io);
     if (term != .exited or term.exited != 0) return error.ReferenceToolCheckFailed;
     const ex = squashfs_bin_dir ++ "/dwarfsextract";
-    std.Io.Dir.cwd().access(oracle_io, ex, .{}) catch return error.ReferenceToolUnavailable;
+    try requireTool(ex);
     const out_path = try r.gpa.print("zig-out/oracles/dwarfs-out-{d}", .{r.corpus_index});
     defer r.gpa.free(out_path);
     try std.Io.Dir.cwd().createDirPath(oracle_io, out_path);
@@ -760,7 +764,7 @@ fn runDwarfsTree(r: *Runner) anyerror!void {
     // The dwarfsck tool must accept the image; dwarfsextract must rebuild the tree.
     const oracle_io = harness.oracle_io;
     const ck = squashfs_bin_dir ++ "/dwarfsck";
-    std.Io.Dir.cwd().access(oracle_io, ck, .{}) catch return error.ReferenceToolUnavailable;
+    try requireTool(ck);
     const image_path = try r.gpa.print("zig-out/oracles/dwarfs-tree-{d}.dwarfs", .{r.corpus_index});
     defer r.gpa.free(image_path);
     try std.Io.Dir.cwd().writeFile(oracle_io, .{ .sub_path = image_path, .data = arc_state.archive[0..arc_state.archive_size] });
@@ -768,7 +772,7 @@ fn runDwarfsTree(r: *Runner) anyerror!void {
     var term = try child.wait(oracle_io);
     if (term != .exited or term.exited != 0) return error.ReferenceToolCheckFailed;
     const ex = squashfs_bin_dir ++ "/dwarfsextract";
-    std.Io.Dir.cwd().access(oracle_io, ex, .{}) catch return error.ReferenceToolUnavailable;
+    try requireTool(ex);
     const out_path = try r.gpa.print("zig-out/oracles/dwarfs-tree-out-{d}", .{r.corpus_index});
     defer r.gpa.free(out_path);
     _ = std.Io.Dir.cwd().deleteTree(oracle_io, out_path) catch {};
@@ -789,7 +793,7 @@ fn runDwarfsForeign(r: *Runner) anyerror!void {
     if (isOffpremUnsupported()) return;
     setupArchive(r, harness.ids.dwarfs);
     const bin = squashfs_bin_dir ++ "/mkdwarfs";
-    std.Io.Dir.cwd().access(harness.oracle_io, bin, .{}) catch return error.ReferenceToolUnavailable;
+    try requireTool(bin);
     const oracle_io = harness.oracle_io;
     const dir_path = try r.gpa.print("zig-out/oracles/dwarfs-src-{d}", .{r.corpus_index});
     defer r.gpa.free(dir_path);
@@ -869,7 +873,7 @@ fn runSquashfsTree(r: *Runner) anyerror!void {
     try arcReadOrdinal(r, 1, &arc_state.data2);
     // The unsquashfs tool must reconstruct the subdirectory.
     const bin = squashfs_bin_dir ++ "/unsquashfs";
-    std.Io.Dir.cwd().access(harness.oracle_io, bin, .{}) catch return error.ReferenceToolUnavailable;
+    try requireTool(bin);
     const oracle_io = harness.oracle_io;
     const image_path = try r.gpa.print("zig-out/oracles/squashfs-tree-{d}.sqfs", .{r.corpus_index});
     defer r.gpa.free(image_path);
@@ -894,7 +898,7 @@ pub fn runSquashfs(r: *Runner) anyerror!void {
     try runArchive(r, harness.ids.squashfs);
     // Reference extraction: unsquashfs must read our encoded image back.
     const bin = squashfs_bin_dir ++ "/unsquashfs";
-    std.Io.Dir.cwd().access(harness.oracle_io, bin, .{}) catch return error.ReferenceToolUnavailable;
+    try requireTool(bin);
     const oracle_io = harness.oracle_io;
     const image_path = try r.gpa.print("zig-out/oracles/squashfs-ours-{d}.sqfs", .{r.corpus_index});
     defer r.gpa.free(image_path);
@@ -934,7 +938,7 @@ fn runSquashfsForeignWith(r: *Runner, compressor: []const u8, extra_args: []cons
     if (isOffpremUnsupported()) return;
     setupArchive(r, harness.ids.squashfs);
     const bin = squashfs_bin_dir ++ "/mksquashfs";
-    std.Io.Dir.cwd().access(harness.oracle_io, bin, .{}) catch return error.ReferenceToolUnavailable;
+    try requireTool(bin);
     const oracle_io = harness.oracle_io;
     const dir_path = try r.gpa.print("zig-out/oracles/squashfs-src-{d}", .{r.corpus_index});
     defer r.gpa.free(dir_path);

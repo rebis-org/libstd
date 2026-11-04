@@ -2,24 +2,6 @@ const std = @import("std");
 
 const run = @import("run");
 
-fn hexValueForNibble(character: u8) ?u8 {
-    return switch (character) {
-        '0'...'9' => character - '0',
-        'a'...'f' => character - 'a' + 10,
-        'A'...'F' => character - 'A' + 10,
-        else => null,
-    };
-}
-
-fn parseHex(hex: []const u8, digest_out: []u8) !void {
-    if (hex.len != digest_out.len * 2) return error.bad_sha256_length;
-    for (digest_out, 0..) |*byte, index| {
-        const high = hexValueForNibble(hex[index * 2]) orelse return error.bad_sha256_hex;
-        const low = hexValueForNibble(hex[index * 2 + 1]) orelse return error.bad_sha256_hex;
-        byte.* = (high << 4) | low;
-    }
-}
-
 fn sha256File(io: std.Io, archive_path: []const u8) ![32]u8 {
     const data = try std.Io.Dir.cwd().readFileAlloc(io, archive_path, std.heap.page_allocator, .limited(1 << 31));
     defer std.heap.page_allocator.free(data);
@@ -125,7 +107,7 @@ pub fn main(init: std.process.Init) !void {
     defer std.heap.page_allocator.free(archive_path);
 
     var expected: [32]u8 = undefined;
-    try parseHex(sha256_hex, &expected);
+    _ = std.fmt.hexToBytes(&expected, sha256_hex) catch return error.bad_sha256_hex;
     var confirmed = false;
     if (std.Io.Dir.cwd().access(io, archive_path, .{})) |_| {
         const digest = try sha256File(io, archive_path);

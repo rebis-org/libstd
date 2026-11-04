@@ -3,6 +3,7 @@ const std = @import("std");
 const seam = @import("seam");
 
 const kernel_catalog = @import("../kernel/catalog.zig");
+const discovery = @import("../kernel/discovery.zig");
 const abi = @import("../kernel/envelope.zig");
 const node_graph = @import("../kernel/node.zig");
 const resource = @import("../kernel/resource.zig");
@@ -31,9 +32,9 @@ const isZero = vocabulary.isZero;
 
 const MappedException = struct { status: u32, id: Id };
 
+// The vocabulary map owns the translation; this only pairs its two answers.
 fn mapException(exception: Exception) MappedException {
-    inline for (vocabulary.error_map) |entry| if (exception == entry.exception) return .{ .status = entry.status, .id = entry.diagnostic };
-    return .{ .status = Status.internal_failure, .id = ids.internal_failure };
+    return .{ .status = vocabulary.statusFor(exception), .id = vocabulary.diagnosticFor(exception) };
 }
 
 fn report(call: *Call, exception: Exception) u32 {
@@ -108,6 +109,13 @@ fn dispatch(envelope: *Call, response: *Node) Exception!void {
     else
         command_mask;
     const policy = compose_catalog.commandPolicyFor(profile_id, direction) orelse return error.UnsupportedException;
+    // Volume sets ride the shared archive_volumes parameter; a format
+    // answers it only where its descriptor opts in for the direction, so
+    // an unimplemented split set never reads as a partial answer.
+    const volumes_selector = comptime discovery.parameter("tar", "archive_volumes");
+    if (node_graph.findSelector(envelope.request, volumes_selector.family, volumes_selector.ordinal) != null and
+        (profile.volumes & direction) == 0)
+        return error.UnsupportedException;
     const sizing = try parseSizingMode(
         protocolParam(envelope.request, vocabulary.protocol_parameter.sizing_mode),
         policy.sizing,

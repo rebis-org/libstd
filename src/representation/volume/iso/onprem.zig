@@ -4,6 +4,7 @@ const entry_prim = @import("../../../common/entry.zig");
 const bounds = @import("../../../common/primitive/bounds.zig");
 const exception_prim = @import("../../../common/primitive/exception.zig");
 const tree_order = @import("../../../common/primitive/order.zig");
+const tree = @import("../tree.zig");
 
 pub const Entry = entry_prim.Entry;
 pub const EntryInfo = entry_prim.Sized;
@@ -287,29 +288,7 @@ fn buildIsoPlan(entries: []const Entry, alloc: std.mem.Allocator) Exception!IsoP
     for (nodes.items, 0..) |node, i| {
         if (i != 0) counts[node.parent] += 1;
     }
-    const starts = alloc.alloc(u32, nodes.items.len) catch return error.ResourceException;
-    var acc: u32 = 0;
-    for (counts, 0..) |c, i| {
-        starts[i] = acc;
-        acc += c;
-    }
-    const kids = alloc.alloc(u32, acc) catch return error.ResourceException;
-    const fill = alloc.alloc(u32, nodes.items.len) catch return error.ResourceException;
-    @memcpy(fill, starts);
-    for (nodes.items, 0..) |node, i| {
-        if (i == 0) continue;
-        kids[fill[node.parent]] = @intCast(i);
-        fill[node.parent] += 1;
-    }
-    for (nodes.items, 0..) |*node, i| {
-        node.first_child = starts[i];
-        const slice = kids[node.first_child .. node.first_child + counts[i]];
-        std.mem.sort(u32, slice, &nodes, struct {
-            fn less(ns: *std.ArrayList(IsoNode), a: u32, b: u32) bool {
-                return std.mem.order(u8, ns.items[a].name, ns.items[b].name) == .lt;
-            }
-        }.less);
-    }
+    const kids = try tree.linkChildren(IsoNode, &nodes, counts, alloc);
 
     var dir_order: std.ArrayList(u32) = .empty;
     var file_order: std.ArrayList(u32) = .empty;

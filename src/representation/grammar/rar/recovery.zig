@@ -1,5 +1,7 @@
 const std = @import("std");
 
+const seam = @import("seam");
+
 const checksum = @import("../../../common/primitive/checksum.zig");
 const exception = @import("../../../common/primitive/exception.zig");
 
@@ -79,23 +81,9 @@ fn gfInv(a: u16, exp: []const u16, log: []const u32) u16 {
     return exp[65535 - @as(usize, log[a])];
 }
 
-// RAR header checksums are CRC-64/XZ with init 0 and no xorout.
-const crc64_raw_table = blk: {
-    @setEvalBranchQuota(1 << 14);
-    var table: [256]u64 = undefined;
-    for (0..256) |i| {
-        var crc: u64 = i;
-        for (0..8) |_| {
-            if (crc & 1 != 0) {
-                crc = (crc >> 1) ^ 0xC96C5795D7870F42;
-            } else {
-                crc >>= 1;
-            }
-        }
-        table[i] = crc;
-    }
-    break :blk table;
-};
+// RAR header checksums are CRC-64/XZ with init 0 and no xorout; the
+// table is the tree-wide CRC-64 byte table.
+const crc64_raw_table = seam.byteTable(u64, 0xC96C5795D7870F42, true);
 
 pub fn crc64Raw(input: []const u8) u64 {
     var crc: u64 = 0;

@@ -142,6 +142,9 @@ pub const Descriptor = struct {
     capability_mask: u32 = 0,
     sizing: SizingMode = .unavailable,
     commit: CommitMode = .tentative,
+    // Volume-set support per command direction (read 2, write 4), carried
+    // from the component descriptor; zero means no split-set shape.
+    volumes: u32 = 0,
 };
 
 const all_commands_mask = command_mask_query | command_mask_read | command_mask_write;
@@ -264,6 +267,12 @@ pub const error_map = [_]ErrorMap{
 pub fn statusFor(failure: Exception) u32 {
     inline for (error_map) |entry| if (failure == entry.exception) return entry.status;
     return Status.internal_failure;
+}
+
+// The diagnostic id paired with the status; the map owns the only translation.
+pub fn diagnosticFor(failure: Exception) Id {
+    inline for (error_map) |entry| if (failure == entry.exception) return entry.diagnostic;
+    return ids.internal_failure;
 }
 
 pub fn eql(left: Id, right: Id) bool {

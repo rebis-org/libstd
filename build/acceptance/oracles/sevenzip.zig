@@ -6,20 +6,15 @@ const fixtures = @import("fixtures.zig");
 const harness = @import("harness.zig");
 const lib = @import("lib.zig");
 
+const EntryNodes = harness.ArchiveEntryNodes;
 const Runner = harness.Runner;
+const entryWithMethod = harness.archiveEntryMethod;
 
 const sz_caps: u64 = harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay;
 
-fn setup7z(r: *Runner, profile_id: harness.Id) void {
-    harness.setup(r, profile_id, harness.mode_archive);
+fn setup7z(r: *Runner) void {
+    harness.setup(r, harness.ids.sevenzip, harness.mode_archive);
 }
-
-const EntryNodes = struct {
-    name: harness.Node,
-    data: harness.Node,
-    method: harness.Node,
-    type: harness.Node,
-};
 
 const FilterNodes = struct {
     name: harness.Node,
@@ -39,10 +34,6 @@ const PlainNodes = struct {
 
 fn entryPlain(nodes: *PlainNodes, name: []const u8, data: []const u8) harness.Node {
     return harness.archiveEntryNode(&nodes.name, &nodes.data, name, data);
-}
-
-fn entryWithMethod(nodes: *EntryNodes, name: []const u8, data: []const u8, method: u64) harness.Node {
-    return harness.archiveEntryWithMethod(&nodes.name, &nodes.data, &nodes.method, name, data, method);
 }
 
 fn dirEntry(nodes: *EntryNodes, name: []const u8) harness.Node {
@@ -80,7 +71,7 @@ fn sevenZipWrite(r: *Runner, entries: harness.Node, archive: []u8, crypto_nodes:
     var list = harness.NodeList{ .nodes = &nodes };
     list.push(harness.paramTargetCommand(harness.ids.write));
     list.push(harness.scalarNode(harness.ids.source));
-    list.push(harness.capabilityParam(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay));
+    list.push(harness.capabilityParam(sz_caps));
     list.push(harness.sizingModeParam(harness.size_metadata_exact));
     list.push(harness.commitModeParam(harness.commit_confirmed));
     list.pushAll(crypto_nodes);
@@ -92,7 +83,7 @@ fn sevenZipWrite(r: *Runner, entries: harness.Node, archive: []u8, crypto_nodes:
     list.count = 0;
     list.push(harness.scalarNode(harness.ids.source));
     list.push(harness.sinkSpan(archive[0..size]));
-    list.push(harness.capabilityParam(harness.cap_read | harness.cap_write | harness.cap_size | harness.cap_replay));
+    list.push(harness.capabilityParam(sz_caps));
     list.push(harness.sizingModeParam(harness.size_metadata_exact));
     list.push(harness.commitModeParam(harness.commit_confirmed));
     list.pushAll(crypto_nodes);
@@ -137,7 +128,7 @@ fn sevenZipReadExpected(r: *Runner, archive: []const u8, ordinal: u64, output: [
 }
 
 fn runDecoded(r: *Runner) anyerror!void {
-    setup7z(r, harness.ids.sevenzip);
+    setup7z(r);
     corpus.fillTiled(r.corpus_index, &sz_dec_data1_buf);
     corpus.fillTiled(r.corpus_index, &sz_dec_data2_buf);
     corpus.fillTiled(r.corpus_index, &sz_dec_data3_buf);
@@ -196,7 +187,7 @@ fn runDecoded(r: *Runner) anyerror!void {
 }
 
 fn runCoded(r: *Runner) anyerror!void {
-    setup7z(r, harness.ids.sevenzip);
+    setup7z(r);
     corpus.fillTiled(r.corpus_index, &sz_coded_data2_buf);
     corpus.fillTiled(r.corpus_index, &sz_coded_data3_buf);
     corpus.fillTiled(r.corpus_index, &sz_small);
@@ -287,7 +278,7 @@ fn runCoded(r: *Runner) anyerror!void {
 }
 
 fn runEncodeAdvanced(r: *Runner) anyerror!void {
-    setup7z(r, harness.ids.sevenzip);
+    setup7z(r);
     corpus.fillTiled(r.corpus_index, &sz_adv_payload);
     corpus.fillTiled(r.corpus_index, &sz_small);
     corpus.fillTiled(r.corpus_index, &sz_solid_data);
@@ -333,7 +324,7 @@ fn runEncodeAdvanced(r: *Runner) anyerror!void {
 const sz_enc_password = "secret";
 
 fn runFilters(r: *Runner) anyerror!void {
-    setup7z(r, harness.ids.sevenzip);
+    setup7z(r);
     corpus.fillTiled(r.corpus_index, &sz_filter_payload);
     // Filter + LZMA1 folders (x86/delta under legacy LZMA) plus the modern
     // LZMA2 pairing.
@@ -358,7 +349,7 @@ fn runFilters(r: *Runner) anyerror!void {
 
 fn runEncryptedProvider(r: *Runner) anyerror!void {
     if (!harness.offprem_servable) return;
-    setup7z(r, harness.ids.sevenzip);
+    setup7z(r);
     corpus.fillTiled(r.corpus_index, &sz_enc_data);
     var store: PlainNodes = undefined;
     const entry = entryPlain(&store, "m.txt", &sz_enc_data);
@@ -376,7 +367,7 @@ fn runEncryptedProvider(r: *Runner) anyerror!void {
 }
 
 fn runEncrypted(r: *Runner) anyerror!void {
-    setup7z(r, harness.ids.sevenzip);
+    setup7z(r);
     corpus.fillTiled(r.corpus_index, &sz_enc_data);
     var store: PlainNodes = undefined;
     const entry = entryPlain(&store, "m.txt", &sz_enc_data);
@@ -477,7 +468,7 @@ fn runEncrypted(r: *Runner) anyerror!void {
 // Encoded headers ride in a packed stream: -mhe inspect needs the password,
 // and the header bytes vanish.
 fn runEncodedHeaders(r: *Runner) anyerror!void {
-    setup7z(r, harness.ids.sevenzip);
+    setup7z(r);
     corpus.fillTiled(r.corpus_index, &sz_enc_data);
     var store: PlainNodes = undefined;
     const entry = entryPlain(&store, "m.txt", &sz_enc_data);
@@ -542,7 +533,7 @@ fn runEncodedHeaders(r: *Runner) anyerror!void {
 // read its own bytes back through the shared stream, and the entry count
 // stays visible to a query.
 fn runSolid(r: *Runner) anyerror!void {
-    setup7z(r, harness.ids.sevenzip);
+    setup7z(r);
     corpus.fillTiled(r.corpus_index, &sz_solid_data);
     const parts = [_][]const u8{ sz_solid_data[0..200], sz_solid_data[200..400], sz_solid_data[400..600] };
     var stores: [3]PlainNodes = undefined;
@@ -564,7 +555,7 @@ fn runSolid(r: *Runner) anyerror!void {
 // An entry larger than the sink must fail instead of truncating, and the
 // sink must keep every byte it held.
 fn runPpmdErrors(r: *Runner) anyerror!void {
-    setup7z(r, harness.ids.sevenzip);
+    setup7z(r);
     corpus.fillTiled(r.corpus_index, &sz_ppmd_data);
     var store: EntryNodes = undefined;
     const entry = entryWithMethod(&store, "p0.bin", &sz_ppmd_data, 14);
@@ -582,7 +573,7 @@ var sz_ppmd_data: [600]u8 = undefined;
 // PPMd solid: consecutive same-method entries pack into one folder with a
 // single continuous PPMd stream.
 fn runPpmd(r: *Runner) anyerror!void {
-    setup7z(r, harness.ids.sevenzip);
+    setup7z(r);
     corpus.fillTiled(r.corpus_index, &sz_ppmd_data);
     const parts = [_][]const u8{ sz_ppmd_data[0..200], sz_ppmd_data[200..400], sz_ppmd_data[400..600] };
     var stores: [3]EntryNodes = undefined;
@@ -610,16 +601,19 @@ fn runPpmd(r: *Runner) anyerror!void {
     if (oracle == .unsupported) harness.unverified(r, "libarchive lacks solid PPMd; readback covers the archive.");
 }
 
-pub const scenarios = harness.scenarios("seven_zip", &.{
-    .{ .label = "seven_zip decoded", .run = runDecoded, .workspace_size = 65536, .output_size = 1024, .encoded_size = 65536 },
-    .{ .label = "seven_zip coded", .run = runCoded, .workspace_size = 64 * 1024 * 1024, .output_size = 1024, .encoded_size = 65536 },
-    .{ .label = "seven_zip encode advanced", .run = runEncodeAdvanced, .workspace_size = 48 * 1024 * 1024, .output_size = 1024, .encoded_size = 65536 },
-    .{ .label = "seven_zip encrypted", .run = runEncrypted, .workspace_size = 64 * 1024 * 1024, .output_size = 1024, .encoded_size = 65536 },
-    .{ .label = "seven_zip encrypted provider", .run = runEncryptedProvider, .workspace_size = 64 * 1024 * 1024, .output_size = 1024, .encoded_size = 65536 },
-    .{ .label = "seven_zip encoded headers", .run = runEncodedHeaders, .workspace_size = 64 * 1024 * 1024, .output_size = 1024, .encoded_size = 65536 },
-    .{ .label = "seven_zip filters", .run = runFilters, .workspace_size = 48 * 1024 * 1024, .output_size = 1024, .encoded_size = 65536 },
-    .{ .label = "seven_zip solid", .run = runSolid, .workspace_size = 32 * 1024 * 1024, .output_size = 1024, .encoded_size = 65536 },
-    .{ .label = "seven_zip ppmd", .run = runPpmd, .workspace_size = 32 * 1024 * 1024, .output_size = 1024, .encoded_size = 65536 },
-}, &.{
+// Output and encoded sizes repeat across every row; workspace stays per row.
+const sz_base: harness.Spec = .{ .label = "", .run = undefined, .workspace_size = undefined, .output_size = 1024, .encoded_size = 65536 };
+
+pub const scenarios = harness.scenarios("seven_zip", harness.specRows(sz_base, &.{
+    .{ .label = "seven_zip decoded", .run = runDecoded, .workspace_size = 65536 },
+    .{ .label = "seven_zip coded", .run = runCoded, .workspace_size = 64 * 1024 * 1024 },
+    .{ .label = "seven_zip encode advanced", .run = runEncodeAdvanced, .workspace_size = 48 * 1024 * 1024 },
+    .{ .label = "seven_zip encrypted", .run = runEncrypted, .workspace_size = 64 * 1024 * 1024 },
+    .{ .label = "seven_zip encrypted provider", .run = runEncryptedProvider, .workspace_size = 64 * 1024 * 1024 },
+    .{ .label = "seven_zip encoded headers", .run = runEncodedHeaders, .workspace_size = 64 * 1024 * 1024 },
+    .{ .label = "seven_zip filters", .run = runFilters, .workspace_size = 48 * 1024 * 1024 },
+    .{ .label = "seven_zip solid", .run = runSolid, .workspace_size = 32 * 1024 * 1024 },
+    .{ .label = "seven_zip ppmd", .run = runPpmd, .workspace_size = 32 * 1024 * 1024 },
+}), &.{
     .{ .name = "seven_zip ppmd errors", .run = runPpmdErrors, .workspace_size = 32 * 1024 * 1024, .output_size = 2048, .encoded_size = 16384 },
 });

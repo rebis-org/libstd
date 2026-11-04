@@ -6,9 +6,11 @@ const exception_prim = @import("../../../common/primitive/exception.zig");
 const tree_order = @import("../../../common/primitive/order.zig");
 const lz4_leaf = @import("../../leaf/lz4/onprem.zig");
 const zstd_leaf = @import("../../leaf/zstd/onprem.zig");
+const tree = @import("../tree.zig");
 
 pub const Entry = entry_prim.Entry;
 const Exception = exception_prim.Exception;
+const dwValidate = tree.validateName;
 
 pub const EntryInfo = struct {
     name: []const u8,
@@ -669,42 +671,7 @@ fn runTarget(archive: []const u8, scratch: []u8, target: Target) Exception!u64 {
 // Joined listing paths stage here; depth-bounded by max_dir_depth.
 const path_size: usize = (max_dir_depth + 1) * 257;
 
-const WalkState = struct {
-    ordinal: u64 = 0,
-    path_len: usize = 0,
-    spans: [max_dir_depth]usize = undefined,
-    path: []u8 = &.{},
-
-    fn push(self: *WalkState, name: []const u8, depth: usize) Exception!void {
-        if (depth >= max_dir_depth) return error.DataException;
-        self.spans[depth] = self.path_len;
-        const extra = if (self.path_len == 0) name.len else name.len + 1;
-        if (self.path_len + extra > self.path.len) return error.DataException;
-        if (self.path_len != 0) {
-            self.path[self.path_len] = '/';
-            self.path_len += 1;
-        }
-        @memcpy(self.path[self.path_len..][0..name.len], name);
-        self.path_len += name.len;
-    }
-
-    fn pop(self: *WalkState, depth: usize) void {
-        self.path_len = self.spans[depth];
-    }
-
-    // The joined name outlives the walk: found unwinds before any mutation.
-    fn joined(self: *WalkState, name: []const u8) Exception![]const u8 {
-        const extra = if (self.path_len == 0) name.len else name.len + 1;
-        if (self.path_len + extra > self.path.len) return error.DataException;
-        var end = self.path_len;
-        if (end != 0) {
-            self.path[end] = '/';
-            end += 1;
-        }
-        @memcpy(self.path[end..][0..name.len], name);
-        return self.path[0 .. end + name.len];
-    }
-};
+const WalkState = tree.WalkState(max_dir_depth);
 
 // One name per directory entry: names_index carries len + 1 offsets.
 fn dirEntryName(md: Metadata, entry_index: usize) Exception![]const u8 {
@@ -1019,15 +986,6 @@ fn dwBuildNodes(nodes: *std.ArrayList(DwNode), alloc: std.mem.Allocator, entries
     }
 }
 
-fn dwValidate(name: []const u8) Exception!void {
-    if (name.len == 0 or name.len > 512) return error.CallException;
-    var it = std.mem.splitScalar(u8, name, '/');
-    while (it.next()) |part| {
-        if (part.len == 0 or part.len > 256) return error.CallException;
-        if (std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return error.CallException;
-    }
-}
-
 pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Exception!usize {
     // Caller scratch backs the whole build; the scratch_size constant
     // covers the declared entry and data caps.
@@ -1046,29 +1004,7 @@ pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Exception!usi
     for (nodes.items, 0..) |node, i| {
         if (i != 0) counts[node.parent] += 1;
     }
-    const starts = alloc.alloc(u32, nodes.items.len) catch return error.ResourceException;
-    var acc: u32 = 0;
-    for (counts, 0..) |c, i| {
-        starts[i] = acc;
-        acc += c;
-    }
-    const kids = alloc.alloc(u32, acc) catch return error.ResourceException;
-    const fill = alloc.alloc(u32, nodes.items.len) catch return error.ResourceException;
-    @memcpy(fill, starts);
-    for (nodes.items, 0..) |node, i| {
-        if (i == 0) continue;
-        kids[fill[node.parent]] = @intCast(i);
-        fill[node.parent] += 1;
-    }
-    for (nodes.items, 0..) |*node, i| {
-        node.first_child = starts[i];
-        const slice = kids[node.first_child .. node.first_child + counts[i]];
-        std.mem.sort(u32, slice, &nodes, struct {
-            fn less(ns: *std.ArrayList(DwNode), a: u32, b: u32) bool {
-                return std.mem.order(u8, ns.items[a].name, ns.items[b].name) == .lt;
-            }
-        }.less);
-    }
+    const kids = try tree.linkChildren(DwNode, &nodes, counts, alloc);
 
     // Number directories before files, each group in DFS order,
     // as DwarFS requires.

@@ -1021,14 +1021,17 @@ fn runLzmaAbZerosDictionaryWrap(r: *Runner) !void {
     try abEncodeAndWrite(r, harness.ids.lzma, 64 << 10, 1, &input, "lzma_bt4.bin");
 }
 
+// Output and encoded sizes repeat across every row; workspace stays per row.
+const lzma_base: harness.Spec = .{ .label = "", .run = undefined, .workspace_size = undefined, .output_size = 256, .encoded_size = 256 };
+
 pub const scenarios = harness.scenarios(
     "lzma",
-    &.{
-        .{ .label = "lzma roundtrip", .run = runLzma, .workspace_size = 1310720, .output_size = 256, .encoded_size = 256 },
-        .{ .label = "lzma file", .run = runLzmaFile, .workspace_size = 1310720, .output_size = 256, .encoded_size = 256 },
-        .{ .label = "lzma2 roundtrip", .run = runLzma2, .workspace_size = 3670016, .output_size = 256, .encoded_size = 256 },
+    harness.specRows(lzma_base, &.{
+        .{ .label = "lzma roundtrip", .run = runLzma, .workspace_size = 1310720 },
+        .{ .label = "lzma file", .run = runLzmaFile, .workspace_size = 1310720 },
+        .{ .label = "lzma2 roundtrip", .run = runLzma2, .workspace_size = 3670016 },
         .{ .label = "lzma large dictionary", .run = runLzmaLarge, .workspace_size = 680 * 1024 * 1024, .output_size = 1 << 20, .encoded_size = (1 << 20) + 65536 },
-    },
+    }),
     &.{
         .{ .name = "lzma file declared equal", .run = runLzmaFileDeclaredEqual, .workspace_size = 1310720, .output_size = 256, .encoded_size = 512 },
         .{ .name = "lzma file declared greater", .run = runLzmaFileDeclaredGreater, .workspace_size = 1310720, .output_size = 256, .encoded_size = 512 },

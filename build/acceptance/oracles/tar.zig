@@ -5,6 +5,7 @@ const corpus = @import("corpus.zig");
 const harness = @import("harness.zig");
 const lib = @import("lib.zig");
 
+const EntryNodes = harness.ArchiveEntryNodes;
 const Runner = harness.Runner;
 
 fn setupTar(r: *Runner) void {
@@ -66,14 +67,6 @@ fn tarPaxRecord(buffer: []u8, key: []const u8, value: []const u8) usize {
     field_writer.print("{d} {s}={s}\n", .{ total, key, value }) catch return 0;
     return field_writer.buffered().len;
 }
-
-const EntryNodes = struct {
-    name: harness.Node,
-    data: harness.Node,
-    type: harness.Node,
-    link: harness.Node,
-    uid: harness.Node,
-};
 
 fn entryWithType(nodes: *EntryNodes, name: []const u8, data: []const u8, typeflag: u8, link_name: ?[]const u8, uid_value: ?u64) harness.Node {
     const entry = harness.archiveEntryNode(&nodes.name, &nodes.data, name, data);
