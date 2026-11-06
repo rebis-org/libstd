@@ -526,6 +526,23 @@ fn runXip(r: *Runner) anyerror!void {
     }, count_ctx);
     try harness.requireStatus(r, abi.Status.ok);
     if (r.response.byte_length != 2) return error.ArchiveEntryCountMismatch;
+
+    // A source that declares seek skips through the callback verb, so the
+    // wire shape of the seek offset is pinned on a real envelope call.
+    var seek_ctx = harness.SourceCursor{ .data = xip_fixture.archive[0..archive_size] };
+    const through_seek = harness.CallOpts{ .callback = harness.sourceCallback, .context = &seek_ctx };
+    _ = harness.call(r, harness.ids.read, &.{
+        harness.archiveOrdinalParam(1),
+        harness.sourceCallbackNode(0, 0),
+        harness.sinkSpan(r.output),
+        harness.capabilityParam(arc_caps | harness.cap_seek),
+        harness.sizingModeParam(harness.size_metadata_exact),
+        harness.commitModeParam(r.commit_read),
+    }, through_seek);
+    try harness.requireStatus(r, abi.Status.ok);
+    if (r.response.byte_length != arc_state.data2.len or !std.mem.eql(u8, r.output[0..arc_state.data2.len], &arc_state.data2)) {
+        return error.XipWindowMismatch;
+    }
 }
 
 pub fn runWim(r: *Runner) anyerror!void {
