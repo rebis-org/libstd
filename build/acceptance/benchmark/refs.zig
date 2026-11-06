@@ -397,9 +397,7 @@ fn addDwarfsTools(b: *std.Build) struct { mkdwarfs: *std.Build.Step.InstallFile,
     cfg.appendSlice(b.allocator, &.{
         "-DCMAKE_BUILD_TYPE=Release",
         "-DNIXPKGS_DWARFS_VERSION_OVERRIDE=v0.11.3",
-        // A restored build tree caches libcrypto's Homebrew prefix, which a
-        // keg upgrade deletes; unset it so pkg-config answers again. The
-        // resolved library lives under its own prefix, not LIBCRYPTO_*.
+        // A restored tree caches libcrypto's Homebrew prefix, which a keg upgrade deletes; unset it so pkg-config answers.
         "-ULIBCRYPTO*",
         "-Upkgcfg_lib_LIBCRYPTO*",
         "-DWITH_FUSE_DRIVER=OFF",

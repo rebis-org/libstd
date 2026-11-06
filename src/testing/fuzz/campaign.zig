@@ -1,7 +1,4 @@
-// Mutation campaigns are evidence sessions, not gate work: the iteration
-// budget comes from the operator, and a run without a budget proves nothing.
-// Decoding rejects malformed input by contract; the property under test is
-// that no rejection traps, so a trap is the only failure a campaign reports.
+// Campaigns are evidence sessions: the iteration budget comes from the operator, and the only reported failure is a trap.
 
 const std = @import("std");
 

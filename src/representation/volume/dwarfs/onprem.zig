@@ -297,8 +297,7 @@ fn castUsize(v: u64) Exception!usize {
     return std.math.cast(usize, v) orelse error.DataException;
 }
 
-// Vector element positions multiply hostile distances by 8 and stride;
-// overflow must fail closed, not wrap into a wrong in-bounds read.
+// Vector element positions multiply hostile distances by 8 and stride; overflow must fail closed, not wrap into a wrong read.
 fn elementPos(dist: usize, index: usize, stride: usize) Exception!usize {
     const base = std.math.mul(usize, dist, 8) catch return error.DataException;
     const step = std.math.mul(usize, index, stride) catch return error.DataException;

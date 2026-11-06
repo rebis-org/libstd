@@ -1,9 +1,7 @@
-const std = @import("std");
 const builtin = @import("builtin");
+const std = @import("std");
 
-// Whole-word filters convert four instructions per vector on little-endian
-// 32-bit-vector targets; aarch64_be is a different arch tag, so no endian
-// check is needed.
+// Whole-word filters convert four instructions per vector on little-endian 32-bit targets; aarch64_be is a different arch tag.
 const vector_words = if ((builtin.target.cpu.arch == .aarch64 or
     builtin.target.cpu.arch == .x86_64) and builtin.zig_backend != .stage2_c) 4 else 0;
 
@@ -268,16 +266,14 @@ fn arm64Code(code_bytes: []u8, start_offset: u32, comptime direction: Direction)
     arm64CodeScalar(code_bytes, start_offset, direction);
 }
 
-// The filter is word-local, so whole 16-byte blocks convert as one vector and
-// the tail words fall back to the scalar reference.
+// The filter is word-local, so whole 16-byte blocks convert as one vector and tail words fall back to the scalar.
 fn arm64CodeVector(code_bytes: []u8, start_offset: u32, comptime direction: Direction) void {
     const V = @Vector(4, u32);
     const size = code_bytes.len & ~@as(usize, 3);
     var index: usize = 0;
     while (index + 16 <= size) : (index += 16) {
         const instr: V = @bitCast(code_bytes[index..][0..16].*);
-        // Per-lane pc reproduces the scalar truncate: the wrapping u32 add of
-        // the truncated base and the lane offsets is the truncated sum.
+        // Per-lane pc reproduces the scalar truncate: the wrapping u32 add of truncated base and lane offsets is the truncated sum.
         const pc = @as(V, @splat(@as(u32, @truncate(index)))) +% @as(V, @bitCast([4]u32{
             start_offset, start_offset +% 4, start_offset +% 8, start_offset +% 12,
         }));
@@ -474,7 +470,7 @@ fn write32be(bytes: *[4]u8, value: u32) void {
     std.mem.writeInt(u32, bytes, value, .big);
 }
 
-test "riscv decode skips the jal forms the encoder skips" {
+test "riscv converts converting jal forms and skips the rest" {
     // A skipped-form JAL (b1 & 0x0D != 0) must survive the round trip
     // unchanged; converting it would break reference interop.
     var data = [_]u8{ 0xEF, 0x0D, 0x22, 0x11, 0xEF, 0x00, 0x00, 0x00 };
@@ -482,9 +478,25 @@ test "riscv decode skips the jal forms the encoder skips" {
     encode(.riscv, 0, &data);
     decode(.riscv, 0, &data);
     try std.testing.expectEqualSlices(u8, &saved, &data);
+
+    // The converting form (b1 & 0x0D == 0) must actually mutate under encode; identity roundtrips cannot catch a no-op filter.
+    var converting = [_]u8{ 0xEF, 0x00, 0x22, 0x11, 0xEF, 0x00, 0x00, 0x00 };
+    const original = converting;
+    encode(.riscv, 0, &converting);
+    try std.testing.expect(!std.mem.eql(u8, &original, &converting));
+    decode(.riscv, 0, &converting);
+    try std.testing.expectEqualSlices(u8, &original, &converting);
 }
 
 test "bcj filters round-trip at aligned offsets" {
+    // The reference x86 conversion: call rel32 0 becomes the absolute
+    // target now+5. Identity roundtrips alone cannot catch a no-op filter.
+    var call = [_]u8{ 0xE8, 0, 0, 0, 0 };
+    encode(.x86, 0, &call);
+    try std.testing.expectEqualSlices(u8, &.{ 0xE8, 0x05, 0, 0, 0 }, &call);
+    decode(.x86, 0, &call);
+    try std.testing.expectEqualSlices(u8, &.{ 0xE8, 0, 0, 0, 0 }, &call);
+
     var rng = std.Random.DefaultPrng.init(0xB0);
     const random = rng.random();
     var data: [8192]u8 = undefined;

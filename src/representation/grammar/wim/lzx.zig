@@ -5,11 +5,7 @@ const bits = @import("bits.zig");
 
 const Exception = exception_prim.Exception;
 
-// WIM LZX codec, ported from wimlib src/lzx_decompress.c.
-// Blocks carry precode-encoded lens for the main and length codes.
-//
-// Three recent offsets and delta-coded lens persist across blocks.
-// Decoded data passes through the E8 CALL-target filter.
+// WIM LZX codec, ported from wimlib src/lzx_decompress.c; three recent offsets and delta-coded lengths persist across blocks.
 
 const num_chars: usize = 256;
 const min_match_len: usize = 2;

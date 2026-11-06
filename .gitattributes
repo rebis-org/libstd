@@ -7,3 +7,4 @@ Makefile text eol=lf
 .gitignore text eol=lf
 .gitattributes text eol=lf
 .gitmodules text eol=lf
+*.in text eol=lf

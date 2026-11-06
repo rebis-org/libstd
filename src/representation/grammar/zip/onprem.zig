@@ -391,9 +391,7 @@ pub fn spannedVolumeExtents(total_len: usize, volume_size: u64) Exception!Volume
 
 pub const VolumePlan = struct { volumes: u64 };
 
-// Offsets resolve relative to the disk named in each field, per the
-// Info-ZIP convention verified against system zip and 7zz. The spanned
-// inspect and decode share one join-and-resolve pass.
+// Offsets resolve relative to each field's disk, per Info-ZIP, verified against zip and 7zz; inspect and decode share join-and-resolve passes.
 const SpannedSet = struct { archive: []const u8, directory: ZipDirectory, disk_starts: []const usize };
 
 fn zipSpannedSet(volumes: []const []const u8, join: []u8, disk_starts_scratch: []usize) Exception!SpannedSet {
@@ -1438,7 +1436,7 @@ test "zip kdf_rounds_limit gates winzip aes" {
 test "zip aes128 single entry fits a 512-byte buffer" {
     // A mixed provider build serves no single tag for both arms; an
     // offprem tag has no encoder.
-    if (!deflate_seam.encodeServed(checksum.default_provider) or !deflate_seam.decodeServed(checksum.default_provider)) return;
+    if (!deflate_seam.encodeServed(checksum.default_provider) or !deflate_seam.decodeServed(checksum.default_provider)) return error.SkipZigTest;
 
     const testing = std.testing;
     const data = "0123456789abcdef0123456789abcdef";
@@ -1460,12 +1458,8 @@ test "zip aes128 single entry fits a 512-byte buffer" {
 }
 
 test "zip winzip aes clears the data descriptor flag" {
-    // A descriptor cannot follow WinZip AES data, so bit 3 drops from both
-    // headers regardless of the caller's request.
-    //
-    // A mixed provider build serves no single tag for both arms; run
-    // only where the default tag serves them.
-    if (!deflate_seam.encodeServed(checksum.default_provider) or !deflate_seam.decodeServed(checksum.default_provider)) return;
+    // A descriptor cannot follow WinZip AES data, so bit 3 drops from both headers regardless of the caller's request.
+    if (!deflate_seam.encodeServed(checksum.default_provider) or !deflate_seam.decodeServed(checksum.default_provider)) return error.SkipZigTest;
     const testing = std.testing;
     const data = "aes entry that requested the streaming shape";
     const entries = [_]Entry{

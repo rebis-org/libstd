@@ -109,12 +109,7 @@ fn dispatch(envelope: *Call, response: *Node) Exception!void {
     else
         command_mask;
     const policy = compose_catalog.commandPolicyFor(profile_id, direction) orelse return error.UnsupportedException;
-    // Volume sets ride the shared archive_volumes parameter; a format
-    // answers it only where its descriptor opts in for the direction, so
-    // an unimplemented split set never reads as a partial answer. The
-    // parts name a read's input shape: a write carrying them is misuse.
-    // The write granularity names a split on a write and is misuse
-    // anywhere else, so both answer unsupported outside their shape.
+    // Volume sets ride archive_volumes; a format answers only where its descriptor opts in. Parts are read-only input.
     const volumes_selector = comptime discovery.parameter("tar", "archive_volumes");
     if (node_graph.findSelector(envelope.request, volumes_selector.family, volumes_selector.ordinal) != null and
         ((direction & command_mask_read) == 0 or (profile.volumes & command_mask_read) == 0))
@@ -173,8 +168,7 @@ fn dispatch(envelope: *Call, response: *Node) Exception!void {
     const selected = if (is_query) &source else if (direction == command_mask_read) &source else if (sink) |*sink_resource| sink_resource else return error.CallException;
     if ((selected.capabilities & policy.capabilities) != policy.capabilities) return error.UnsupportedException;
     if (direction == command_mask_read) {
-        // Read verbs publish into the sink; a sink without the write bit
-        // would fail mid-call, so reject it at the boundary.
+        // Read verbs publish into the sink; a sink without the write bit would fail mid-call, so reject it early.
         if (sink) |*sink_resource| {
             if ((sink_resource.capabilities & resource.capability_bit_write) == 0) return error.UnsupportedException;
         }

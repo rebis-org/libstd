@@ -34,8 +34,7 @@ pub fn inspectOrdinal(provider: Provider, archive: []const u8, ordinal: u64) Exc
     return onprem.inspectOrdinal(archive, ordinal);
 }
 
-// Volume sets resolve to onprem everywhere: the offprem arm has no
-// multi-volume reader, and the split write is the first-party GNU layout.
+// Volume sets resolve to onprem everywhere: the offprem arm has no multi-volume reader, and the split write is first-party.
 pub fn volumeInspectCount(provider: Provider, volumes: []const []const u8) Exception!u64 {
     return seam.dispatchOnprem(impl, provider, onprem.volumeInspectCount, .{volumes});
 }

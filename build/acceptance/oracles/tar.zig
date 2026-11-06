@@ -236,6 +236,35 @@ fn tarEncPaxUid(r: *Runner) !void {
     if (result == .mismatch) return error.TarUidListingMismatch;
 }
 
+fn tarEncMode(r: *Runner) !void {
+    setupTar(r);
+    var payload: [32]u8 = undefined;
+    corpus.fillTiled(r.corpus_index, &payload);
+    var store: EntryNodes = undefined;
+    var mode_node = harness.archiveModeParam(0o600);
+    const entry = blk: {
+        const base = harness.archiveEntryNode(&store.name, &store.data, "mode.txt", &payload);
+        store.data.next = &mode_node;
+        break :blk base;
+    };
+    const archive_size = try tarEncode(r, entry);
+    // The mode word lands in the ustar header's mode field.
+    if (!std.mem.eql(u8, tar_archive[100..107], "0000600")) return error.TarModeFieldMissing;
+    // Absence keeps the writer default.
+    const plain = harness.archiveEntryNode(&store.name, &store.data, "mode.txt", &payload);
+    _ = try tarEncode(r, plain);
+    if (!std.mem.eql(u8, tar_archive[100..107], "0000644")) return error.TarModeDefaultMissing;
+    _ = harness.call(r, harness.ids.read, &.{
+        harness.archiveOrdinalParam(0),
+        harness.sourceSpan(tar_archive[0..archive_size]),
+        harness.sinkSpan(&tar_output),
+    }, .{ .ctx = true });
+    try harness.requireStatus(r, abi.Status.ok);
+    if (r.response.byte_length != payload.len or !std.mem.eql(u8, tar_output[0..payload.len], &payload)) {
+        return error.TarModeRoundtripMismatch;
+    }
+}
+
 fn tarEncErrors(r: *Runner) !void {
     var store_bad_link: EntryNodes = undefined;
     const entry_bad_link = entryWithType(&store_bad_link, "badlink", &.{}, '2', "", null);
@@ -517,6 +546,7 @@ pub fn runSparse(r: *Runner) anyerror!void {
 }
 
 pub const scenarios = harness.scenarios("tar", &.{
+    .{ .label = "tar entry mode", .run = tarEncMode, .workspace_size = 65536, .output_size = 1024, .encoded_size = 65536 },
     .{ .label = "tar encode advanced", .run = runEncode, .workspace_size = 65536, .output_size = 1024, .encoded_size = 65536 },
 }, &.{
     .{ .name = "tar sparse", .run = runSparse, .workspace_size = 65536, .output_size = 2048, .encoded_size = 16384 },

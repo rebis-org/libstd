@@ -945,11 +945,7 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
             for (0..dist_alphabet) |symbol| dynamic_bits += dist_freq[symbol] * dist_lengths[symbol];
             for (0..cl_alphabet) |symbol| dynamic_bits += cl_freq[symbol] * cl_lengths[symbol];
             const stored_bits = 3 + (8 - (c.bit_count + 3) % 8) % 8 + 32 + 8 * span;
-            // Strategy overrides: stored forces verbatim blocks; fixed
-            // excludes dynamic Huffman (stored still wins when smaller).
-            //
-            // Stored LEN is 16 bits; deflate64 spans can exceed it.
-            // Consecutive stored chunks stay byte-identical to a single block.
+            // Strategy overrides: stored forces verbatim blocks, fixed excludes dynamic Huffman; stored LEN is 16 bits, so long spans split.
             if (c.options.strategy == .stored or (stored_bits < fixed_bits and stored_bits < dynamic_bits)) {
                 var stored_off = c.block_start;
                 const stored_end = c.finalized;

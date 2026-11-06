@@ -1,5 +1,7 @@
 const std = @import("std");
 
+const build_options = @import("options");
+
 const envelope = @import("../kernel/envelope.zig");
 const vocabulary = @import("../kernel/vocabulary.zig");
 const call = @import("call.zig");
@@ -194,8 +196,7 @@ export fn stdk_session_step(
 ) callconv(.c) u32 {
     const session = checkAlive(handle) orelse return envelope.Status.invalid_call;
     const counts = counts_out orelse return envelope.Status.invalid_call;
-    // A NULL buffer with a nonzero length is a caller defect; treating it
-    // as an empty buffer would silently misreport the transfer.
+    // A NULL buffer with nonzero length is a caller defect; treating it as empty would silently misreport the transfer.
     if (input == null and input_len != 0) return envelope.Status.invalid_call;
     if (output == null and output_len != 0) return envelope.Status.invalid_call;
     // Aliasing input, output, or the session's own storage silently corrupts
@@ -245,8 +246,7 @@ export fn stdk_session_catalog() callconv(.c) [*:0]const u8 {
     return session_catalog_text;
 }
 
-// The async completion record: caller-owned storage, like session storage.
-// The ticket is the record pointer; the library flips it to done once.
+// The async completion record: caller-owned storage like session storage; the library flips the ticket to done exactly once.
 pub const Completion = extern struct {
     structure_size: u32,
     state: u32,
@@ -307,8 +307,7 @@ fn readyRecord(record: ?*Completion) ?*Completion {
     return completion;
 }
 
-// Returns the submission verdict; the call's own status lands in the record.
-// The inline executor completes before this returns; threaded arms flip it later.
+// Returns the submission verdict; the call's own status lands in the record. The inline arm completes before returning.
 export fn stdk_submit(call_handle: ?*envelope.Call, record: ?*Completion) callconv(.c) u32 {
     const completion = readyRecord(record) orelse return envelope.Status.invalid_call;
     if (@atomicLoad(u32, &completion.state, .seq_cst) != Completion.in_progress) return envelope.Status.invalid_call;
@@ -321,9 +320,7 @@ export fn stdk_submit(call_handle: ?*envelope.Call, record: ?*Completion) callco
     return envelope.Status.ok;
 }
 
-// The general form: N caller-owned submissions through a caller-selected
-// executor; a null executor selects the inline default. One malformed
-// record fails the group before any task is scheduled.
+// N caller-owned submissions through a caller-selected executor; one malformed record fails the group before any task is scheduled.
 export fn stdk_group(
     submissions: ?[*]Submission,
     count: u64,
@@ -348,18 +345,14 @@ fn complete(completion: *Completion, status: u32) void {
     @atomicStore(u32, &completion.state, Completion.done, .seq_cst);
 }
 
-// Idempotent and non-blocking: the envelope status once done, pending
-// while a threaded executor still holds the call, invalid_call for a
-// malformed record.
+// Idempotent and non-blocking: envelope status once done, pending under a threaded executor, invalid_call for a malformed record.
 export fn stdk_poll(record: ?*Completion) callconv(.c) u32 {
     const completion = readyRecord(record) orelse return envelope.Status.invalid_call;
     if (@atomicLoad(u32, &completion.state, .seq_cst) == Completion.done) return @atomicLoad(u32, &completion.status, .seq_cst);
     return Completion.pending;
 }
 
-// Idempotent like poll. A pending cancel plants a request the task honors at
-// its start boundary; a running envelope always completes with its real
-// status, and a done record accepts cancel as a no-op.
+// A pending cancel plants a request the task honors at its start boundary; a done record treats cancel as no-op.
 export fn stdk_cancel(record: ?*Completion) callconv(.c) u32 {
     const completion = readyRecord(record) orelse return envelope.Status.invalid_call;
     while (true) {
@@ -415,3 +408,38 @@ const destroyed_ops = sessions.Ops{
         }
     }.call,
 };
+
+// The catalog publishes these numbers, so any layout change that moves one is an ABI break; the table stays append-only.
+test "session storage numbers stay pinned to the published catalog" {
+    // The numbers hold for the first-party composition: mergeable unions and vendored seam state size differently; those hosts read stdk_session_storage.
+    if (build_options.primitives_impl != .onprem or
+        build_options.leaf_impl != .onprem or
+        build_options.grammar_impl != .onprem) return error.SkipZigTest;
+    const pinned = [_]struct { component: [:0]const u8, verb: [:0]const u8, storage: u64 }{
+        .{ .component = "gzip", .verb = "decode", .storage = 255296 },
+        .{ .component = "deflate", .verb = "decode", .storage = 255232 },
+        .{ .component = "zlib", .verb = "decode", .storage = 255232 },
+        .{ .component = "deflate", .verb = "encode", .storage = 758128 },
+        .{ .component = "gzip", .verb = "encode", .storage = 758128 },
+        .{ .component = "zlib", .verb = "encode", .storage = 758128 },
+        .{ .component = "lz4", .verb = "decode", .storage = 8454496 },
+        .{ .component = "lz4", .verb = "encode", .storage = 8946032 },
+        .{ .component = "brotli", .verb = "decode", .storage = 23234112 },
+        .{ .component = "lz4-legacy", .verb = "decode", .storage = 25231856 },
+        .{ .component = "tar", .verb = "encode", .storage = 672 },
+    };
+    // The catalog must serialize these pairs in order under the version prefix, so a drifting table edit fails here.
+    comptime var expected: []const u8 = "v1:";
+    inline for (pinned, 0..) |entry, index| {
+        const piece = entry.component ++ "/" ++ entry.verb;
+        expected = if (index == 0) expected ++ piece else expected ++ "," ++ piece;
+    }
+    try std.testing.expectEqualStrings(expected, std.mem.span(stdk_session_catalog()));
+    inline for (pinned) |entry| {
+        try std.testing.expectEqual(entry.storage, stdk_session_storage(entry.component.ptr, entry.verb.ptr));
+    }
+    // Unmatched pairs and null names report zero, never a size.
+    try std.testing.expectEqual(@as(u64, 0), stdk_session_storage("nope", "decode"));
+    try std.testing.expectEqual(@as(u64, 0), stdk_session_storage(null, "decode"));
+    try std.testing.expectEqual(@as(u64, 0), stdk_session_storage("gzip", null));
+}

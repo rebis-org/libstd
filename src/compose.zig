@@ -10,11 +10,7 @@ const gzip = @import("representation/grammar/gzip/onprem.zig");
 // keeps one preemption from deciding the result.
 const throughput_rounds: usize = 5;
 
-// Both paths share one leaf; outputs and step counts must match.
-//
-// Non-periodic xorshift, because repetition hides composition defects.
-//
-// Rooted at src/: module confinement requires it for mains reaching the whole tree.
+// Both paths share one leaf; outputs and step counts must match. Non-periodic xorshift, because repetition hides composition defects.
 var failures: usize = 0;
 
 fn nowNs(io: std.Io) u64 {

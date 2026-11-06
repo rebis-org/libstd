@@ -423,11 +423,7 @@ fn hash4(value: u32) usize {
     return (value *% hash_prime) >> @intCast(32 - hash_log);
 }
 
-// Mirrors LZ4_compress_generic_validated: the carried hash prevents a
-// self-match; the reference never emits offset 0.
-//
-// Exposed for the session boundary's stepped encode: compresses one
-// independent block; the caller owns the framing.
+// Mirrors LZ4_compress_generic_validated: the carried hash prevents a self-match, and the reference never emits offset 0.
 pub fn compressBlock(input: []const u8, output: []u8, hash_table: []u32, acceleration: u32) usize {
     @memset(hash_table, 0);
     var op: usize = 0;
@@ -626,10 +622,7 @@ fn emitLastLiterals(literals: []const u8, output: []u8, op_start: usize) usize {
     return op + lit_len;
 }
 
-// The prefix is up to 64 KiB of decoded history; matches may reach
-// into it when the frame links blocks.
-//
-// Exposed for the session boundary's stepped decode.
+// The prefix is up to 64 KiB of decoded history; matches may reach into it when the frame links blocks.
 pub fn decompressBlock(input: []const u8, output: []u8, prefix: []const u8) error{ DataException, OutputTooSmall }!usize {
     var ip: usize = 0;
     var op: usize = 0;
@@ -708,7 +701,7 @@ pub fn decompressBlock(input: []const u8, output: []u8, prefix: []const u8) erro
     return op;
 }
 
-test "lz4 block roundtrip repetitive" {
+test "lz4 greedy roundtrip compresses periodic data across a full block" {
     var prng = std.Random.DefaultPrng.init(0x1234);
     const random = prng.random();
     const input = try std.testing.allocator.alloc(u8, 300000);
@@ -718,10 +711,10 @@ test "lz4 block roundtrip repetitive" {
     }
     const scratch = try std.testing.allocator.alloc(u8, @max(encodeWorkspaceSize(), decodeWorkspaceSize()));
     defer std.testing.allocator.free(scratch);
-    const bound = encodedSizeBound(input.len);
-    const encoded = try std.testing.allocator.alloc(u8, bound);
+    const encoded = try std.testing.allocator.alloc(u8, encodedSizeBound(input.len));
     defer std.testing.allocator.free(encoded);
     const encoded_len = try encode(input, encoded, scratch, .{});
+    try std.testing.expect(encoded_len < input.len);
     const decoded = try std.testing.allocator.alloc(u8, input.len);
     defer std.testing.allocator.free(decoded);
     const produced = try decode(encoded[0..encoded_len], decoded, scratch, .{});
@@ -729,7 +722,7 @@ test "lz4 block roundtrip repetitive" {
     try std.testing.expectEqualSlices(u8, input, decoded);
 }
 
-test "lz4 block roundtrip incompressible stores raw" {
+test "lz4 incompressible input is stored raw with exact framing" {
     var prng = std.Random.DefaultPrng.init(0x9e37);
     const random = prng.random();
     const input = try std.testing.allocator.alloc(u8, 100000);
@@ -740,42 +733,49 @@ test "lz4 block roundtrip incompressible stores raw" {
     const encoded = try std.testing.allocator.alloc(u8, encodedSizeBound(input.len));
     defer std.testing.allocator.free(encoded);
     const encoded_len = try encode(input, encoded, scratch, .{});
+    // Header(15) + size word(4) + raw block + endmark(4) + checksum(4).
     try std.testing.expectEqual(input.len + 27, encoded_len);
+    // The stored flag is the high bit of the little-endian size word.
+    try std.testing.expect(encoded[18] & 0x80 != 0);
     const decoded = try std.testing.allocator.alloc(u8, input.len);
     defer std.testing.allocator.free(decoded);
     const produced = try decode(encoded[0..encoded_len], decoded, scratch, .{});
-    try std.testing.expectEqualSlices(u8, input, decoded[0..produced]);
+    try std.testing.expectEqual(input.len, produced);
+    try std.testing.expectEqualSlices(u8, input, decoded);
 }
 
-test "lz4 empty input roundtrip" {
+test "lz4 empty input keeps the block stream well-formed" {
     const scratch = try std.testing.allocator.alloc(u8, @max(encodeWorkspaceSize(), decodeWorkspaceSize()));
     defer std.testing.allocator.free(scratch);
     var encoded: [64]u8 = undefined;
     const encoded_len = try encode("", &encoded, scratch, .{});
-    const produced = try decode(encoded[0..encoded_len], &.{}, scratch, .{});
+    // Header(15) + one empty block(5) + endmark(4) + checksum(4).
+    try std.testing.expectEqual(@as(usize, 28), encoded_len);
+    var output: [0]u8 = undefined;
+    const produced = try decode(encoded[0..encoded_len], &output, scratch, .{});
     try std.testing.expectEqual(@as(usize, 0), produced);
 }
 
-test "lz4 corrupt blocks rejected" {
+test "lz4 truncation checksum and version bits are named rejections" {
     const scratch = try std.testing.allocator.alloc(u8, @max(encodeWorkspaceSize(), decodeWorkspaceSize()));
     defer std.testing.allocator.free(scratch);
     var encoded: [256]u8 = undefined;
     const input = "abcabcabcabcabcabcabcabcabcabc";
     const encoded_len = try encode(input, &encoded, scratch, .{});
     var output: [64]u8 = undefined;
+    // A truncated tail cannot complete the frame.
     try std.testing.expectError(error.DataException, decode(encoded[0 .. encoded_len - 3], &output, scratch, .{}));
-    encoded[19] ^= 0xff;
-    const result = decode(encoded[0..encoded_len], &output, scratch, .{});
-    if (result) |produced| {
-        try std.testing.expect(!std.mem.eql(u8, input, output[0..produced]));
-    } else |err| {
-        // A corrupted block either fails its input-side checks or overruns
-        // the span, which surfaces as CapacityException.
-        try std.testing.expect(err == error.DataException or err == error.IntegrityException or err == error.CapacityException);
-    }
+    // A flipped content-checksum byte fails the integrity gate.
+    var flipped = encoded;
+    flipped[encoded_len - 1] ^= 0xFF;
+    try std.testing.expectError(error.IntegrityException, decode(flipped[0..encoded_len], &output, scratch, .{}));
+    // Version bits other than 01 are unsupported before any checksum runs.
+    var bad_version = encoded;
+    bad_version[4] &= 0x3F;
+    try std.testing.expectError(error.UnsupportedException, decode(bad_version[0..encoded_len], &output, scratch, .{}));
 }
 
-test "lz4 hc roundtrip beats greedy on repetitive data" {
+test "lz4 hash-chain search beats greedy on periodic data" {
     var prng = std.Random.DefaultPrng.init(0x5a);
     const random = prng.random();
     const input = try std.testing.allocator.alloc(u8, 300000);
@@ -801,7 +801,7 @@ test "lz4 hc roundtrip beats greedy on repetitive data" {
     try std.testing.expectEqualSlices(u8, input, decoded);
 }
 
-test "lz4 hc is deterministic" {
+test "lz4 hash-chain encoding is reproducible" {
     var prng = std.Random.DefaultPrng.init(0x77);
     const random = prng.random();
     const input = try std.testing.allocator.alloc(u8, 150000);
@@ -820,7 +820,7 @@ test "lz4 hc is deterministic" {
     try std.testing.expectEqualSlices(u8, first[0..first_len], second[0..second_len]);
 }
 
-test "lz4 hc roundtrip incompressible" {
+test "lz4 hash-chain incompressible roundtrip honors the work ceiling" {
     var prng = std.Random.DefaultPrng.init(0x9e37);
     const random = prng.random();
     const input = try std.testing.allocator.alloc(u8, 100000);
@@ -834,10 +834,13 @@ test "lz4 hc roundtrip incompressible" {
     const decoded = try std.testing.allocator.alloc(u8, input.len);
     defer std.testing.allocator.free(decoded);
     const produced = try decode(encoded[0..encoded_len], decoded, scratch, .{});
-    try std.testing.expectEqualSlices(u8, input, decoded[0..produced]);
+    try std.testing.expectEqual(input.len, produced);
+    try std.testing.expectEqualSlices(u8, input, decoded);
+    // Work is charged as input plus produced bytes.
+    try std.testing.expectError(error.ResourceException, decode(encoded[0..encoded_len], decoded, scratch, .{ .max_work = 100 }));
 }
 
-test "lz4 frame verifies content size and header checksum" {
+test "lz4 content size and header checksum seal the frame" {
     const allocator = std.testing.allocator;
     const input = "lz4 frame with content size and header checksum, repeated: abcabcabcabc";
     const scratch = try allocator.alloc(u8, encodeWorkspaceSize());
@@ -852,6 +855,8 @@ test "lz4 frame verifies content size and header checksum" {
     defer allocator.free(output);
     const decoded = try decode(encoded[0..encoded_len], output, decode_scratch, .{});
     try std.testing.expectEqualSlices(u8, input, output[0..decoded]);
+    // The encoder always writes Content_Size; the parse must agree with it.
+    try std.testing.expectEqual(@as(?u64, input.len), try frameContentSize(encoded[0..encoded_len]));
 
     // The encoder always writes Content_Size; corrupting it must fail.
     // Header layout: magic(4) FLG(1) BD(1) Content_Size(8) Header_Checksum(1).
@@ -867,7 +872,7 @@ test "lz4 frame verifies content size and header checksum" {
     try std.testing.expectError(error.IntegrityException, decode(bad_sum, output, decode_scratch, .{}));
 }
 
-test "lz4 dependent blocks reach into the previous block" {
+test "lz4 linked blocks resolve matches across the block boundary" {
     const allocator = std.testing.allocator;
     // Frame: linked blocks.
     // Block 0 is stored; block 1 is compressed.
@@ -916,7 +921,7 @@ test "lz4 dependent blocks reach into the previous block" {
     try std.testing.expectError(error.DataException, decode(bad[0..len], &output, decode_scratch, .{}));
 }
 
-test "lz4 dictionary id flag parses and skips" {
+test "lz4 dictionary id skips four bytes under the header checksum" {
     const allocator = std.testing.allocator;
     var frame: [128]u8 = undefined;
     var len: usize = 0;
@@ -953,7 +958,7 @@ test "lz4 dictionary id flag parses and skips" {
     try std.testing.expectError(error.IntegrityException, decode(bad[0..len], &output, decode_scratch, .{}));
 }
 
-test "lz4 legacy frame decodes eof-terminated blocks" {
+test "lz4 legacy frames end at the last complete block" {
     const allocator = std.testing.allocator;
     var block_a: [16 + 300]u8 = undefined;
     @memcpy(block_a[0..16], "legacy block a: ");
@@ -994,7 +999,7 @@ test "lz4 legacy frame decodes eof-terminated blocks" {
     try std.testing.expectError(error.DataException, decode(frame[0 .. len + 2], &output, decode_scratch, .{}));
 }
 
-test "lz4 legacy blocks are independent" {
+test "lz4 legacy blocks decode without cross-block history" {
     // Block 1's match reaches 8 bytes into block 0's content; the
     // reference decodes legacy blocks independently and rejects it.
     const block0 = "12345678";
@@ -1021,7 +1026,7 @@ test "lz4 legacy blocks are independent" {
     try std.testing.expectError(error.DataException, decode(frame[0..len], &output, decode_scratch, .{}));
 }
 
-test "lz4 legacy frame accepts the kernel zero terminator" {
+test "lz4 legacy terminator words separate blocks from frames" {
     const allocator = std.testing.allocator;
     const payload = "kernel variant terminator payload 0123456789";
     const hash_table = try allocator.alloc(u32, hash_size);
@@ -1053,7 +1058,7 @@ test "lz4 legacy frame accepts the kernel zero terminator" {
     try std.testing.expectEqual(@as(usize, 0), try decode(frame[0..4], &output, decode_scratch, .{}));
 }
 
-test "lz4 frame rejects reserved descriptor bits" {
+test "lz4 reserved descriptor bits fail under a fresh checksum" {
     const allocator = std.testing.allocator;
     const input = "reserved descriptor bit frame payload";
     const scratch = try allocator.alloc(u8, encodeWorkspaceSize());

@@ -195,11 +195,7 @@ pub const Window = struct {
     }
 };
 
-// The cursor contract is structural:
-// conformance is member existence, never an interface type.
-//
-// The name lives in caller scratch and ends at the next next();
-// reader-owned storage cannot be trusted across pulls.
+// The cursor contract is structural: conformance is member existence. The name sits in caller scratch, ending at next next().
 pub const Info = struct {
     name: []const u8,
     data_size: u64,
@@ -222,11 +218,7 @@ pub const NameScratch = struct {
     }
 };
 
-// Outer, Transform, Inner are one-way roles:
-// Outer locates, Transform changes bytes, Inner produces the cursor.
-//
-// MemberRange offsets are base-source coordinates;
-// encoding is Outer vocabulary the protocol never interprets.
+// Outer locates, Transform changes bytes, Inner produces the cursor; member offsets are base coordinates, never Outer vocabulary.
 pub fn MemberRange(comptime Encoding: type) type {
     return struct {
         offset: u64,
@@ -235,11 +227,7 @@ pub fn MemberRange(comptime Encoding: type) type {
     };
 }
 
-// The whole chain resolves at comptime:
-// one monomorphized type, no runtime dispatch anywhere.
-//
-// The transform instance lives in the caller's scratch,
-// so the scratch must outlive the returned cursor.
+// One comptime chain, no runtime dispatch. The transform lives in caller scratch, which must outlive the returned cursor.
 pub fn Nested(comptime Outer: type, comptime Transform: anytype, comptime Inner: anytype) type {
     return struct {
         // Witnesses and adapters need the derived types as first-class names;
@@ -269,6 +257,26 @@ pub fn Nested(comptime Outer: type, comptime Transform: anytype, comptime Inner:
         }
 
         pub fn open(base: anytype, name: []const u8, scratch: []align(scratch_alignment) u8) Exception!InnerCursor {
+            return openWithin(base, name, scratch, null);
+        }
+
+        // A transform that declares wrapWith receives the context; one that
+        // declares only wrap ignores it, so both chains stay identical.
+        pub fn openWith(
+            base: anytype,
+            name: []const u8,
+            scratch: []align(scratch_alignment) u8,
+            context: *const anyopaque,
+        ) Exception!InnerCursor {
+            return openWithin(base, name, scratch, context);
+        }
+
+        fn openWithin(
+            base: anytype,
+            name: []const u8,
+            scratch: []align(scratch_alignment) u8,
+            context: ?*const anyopaque,
+        ) Exception!InnerCursor {
             // A short buffer is a capacity failure, never a data error.
             if (scratch.len < scratch_size) return error.CapacityException;
             // Segment boundaries are comptime; runtime cost is three pointer adjustments.
@@ -278,8 +286,15 @@ pub fn Nested(comptime Outer: type, comptime Transform: anytype, comptime Inner:
 
             var outer = try Outer.init(base, outer_scratch);
             const located = try outer.member(name);
-            const ts = try TransformState.wrap(located, ts_scratch);
+            const ts = try instantiate(located, ts_scratch, context);
             return InnerCursor.open(ts.reader(), is_scratch);
+        }
+
+        fn instantiate(located: LocatedSource, ts_scratch: []u8, context: ?*const anyopaque) Exception!*TransformState {
+            if (@hasDecl(TransformState, "wrapWith")) {
+                if (context) |carried| return TransformState.wrapWith(located, ts_scratch, carried);
+            }
+            return TransformState.wrap(located, ts_scratch);
         }
     };
 }
@@ -292,11 +307,7 @@ pub const GroupSlot = struct {
     count: u32 = 0,
 };
 
-// Collapse wraps a finished cursor from outside the chain;
-// the one structural demand is an ino field.
-//
-// A repeat is folded inside next and its payload sinks there;
-// the group head is produced untouched.
+// Collapse wraps a finished cursor from outside the chain; the one structural demand is an ino field.
 pub fn Collapse(comptime Inner: type) type {
     return struct {
         const Self = @This();
@@ -407,6 +418,236 @@ fn recordBytes(comptime data_len: usize, comptime records: []const Record) [reco
     }
     return out;
 }
+
+// Absolute regions: comptime keeps a wrong offset from becoming a test bug.
+const MemberSpec = struct { name: []const u8, offset: u64, length: u64 };
+
+// A fixed tail pattern, distinct from any fixture byte, makes an overread unambiguous.
+const canary_bytes = [8]u8{ 0xC3, 0x5A, 0x81, 0xEE, 0x17, 0x6D, 0xB2, 0x44 };
+
+const window_fixture = "0123456789abcdefghijklmn";
+
+// Canary, counters, and sweeps carve the same fixture bytes.
+const fixed_table_bytes = recordBytes(4, &fixed_table_records);
+
+const fixed_table_members = [_]MemberSpec{
+    .{ .name = "records", .offset = 0, .length = recordBytesSize(4, &fixed_table_records) },
+};
+
+// A cut is clean exactly at record boundaries;
+// the set derives from the same list the builder reads.
+const fixed_table_clean = blk: {
+    var cuts: [fixed_table_records.len + 1]usize = undefined;
+    cuts[0] = 0;
+    var acc: usize = 0;
+    for (fixed_table_records, 0..) |r, i| {
+        acc += 2 + r.name.len + 4;
+        cuts[i + 1] = acc;
+    }
+    break :blk cuts;
+};
+
+// The canary sits directly behind the fixture, so an overread must eat into it.
+const fixed_table_canary_buffer = fixed_table_bytes ++ canary_bytes;
+
+const chunked_lp_records = [_]Record{
+    .{ .name = "manifest", .data = "0123456789" },
+    .{ .name = "tiny", .data = "ab" },
+    .{ .name = "empty", .data = "" },
+};
+
+fn lpBytesSize(comptime records: []const Record) usize {
+    comptime var size: usize = 0;
+    for (records) |r| size += 2 + r.name.len + 4 + r.data.len;
+    return size;
+}
+
+// Assembles the member stream so a wrong length field cannot sneak in.
+fn lpBytes(comptime records: []const Record) [lpBytesSize(records)]u8 {
+    var out: [lpBytesSize(records)]u8 = undefined;
+    comptime var i: usize = 0;
+    inline for (records) |r| {
+        std.mem.writeInt(u16, out[i..][0..2], r.name.len, .little);
+        i += 2;
+        @memcpy(out[i..][0..r.name.len], r.name);
+        i += r.name.len;
+        std.mem.writeInt(u32, out[i..][0..4], r.data.len, .little);
+        i += 4;
+        @memcpy(out[i..][0..r.data.len], r.data);
+        i += r.data.len;
+    }
+    return out;
+}
+
+const chunk_block_len = 8;
+
+// One key definition serves encoder and decoder, so the two cannot drift.
+fn blockKey(block_index: u64) u8 {
+    return @truncate(0x9E *% block_index +% 0x5A);
+}
+
+fn chunkedBytesSize(comptime decoded_len: usize) usize {
+    const full = decoded_len / chunk_block_len;
+    const rest = decoded_len % chunk_block_len;
+    return full * (chunk_block_len + 2) + (if (rest == 0) 0 else rest + 2);
+}
+
+// The declared block length lets discard sink a whole payload without reading it.
+fn chunkedBytes(comptime decoded: []const u8) [chunkedBytesSize(decoded.len)]u8 {
+    var out: [chunkedBytesSize(decoded.len)]u8 = undefined;
+    comptime var i: usize = 0;
+    comptime var o: usize = 0;
+    comptime var block: u64 = 0;
+    inline while (i < decoded.len) {
+        const len = @min(chunk_block_len, decoded.len - i);
+        std.mem.writeInt(u16, out[o..][0..2], len, .little);
+        o += 2;
+        inline for (0..len) |j| {
+            out[o + j] = decoded[i + j] ^ blockKey(block);
+        }
+        o += len;
+        i += len;
+        block += 1;
+    }
+    return out;
+}
+
+const chunked_lp_decoded = lpBytes(&chunked_lp_records);
+
+const chunked_lp_wire = chunkedBytes(&chunked_lp_decoded);
+
+const chunked_lp_members = [_]MemberSpec{
+    .{ .name = "payload", .offset = 0, .length = chunked_lp_wire.len },
+};
+
+// A cut inside a declared block is a truncation
+// even when the record there completed.
+const chunked_lp_clean = [_]usize{
+    0,
+    chunkedBytesSize(lpBytesSize(chunked_lp_records[0..1])),
+    chunked_lp_wire.len,
+};
+
+const chunked_lp_canary_buffer = chunked_lp_wire ++ canary_bytes;
+
+// The inner here is itself a Nested composition;
+// its coordinates are relative to the located source.
+const double_nested_manifest_records = [_]Record{
+    .{ .name = "list", .data = "01234567890123456789" },
+};
+
+const double_nested_payload_records = [_]Record{
+    .{ .name = "alpha", .data = "aaaa" },
+    .{ .name = "beta", .data = "bbbbb" },
+};
+
+// Both members decode to 30 bytes and encode to 38,
+// so one declared length serves both.
+const double_nested_manifest_decoded = lpBytes(&double_nested_manifest_records);
+const double_nested_manifest_wire = chunkedBytes(&double_nested_manifest_decoded);
+
+const double_nested_payload_decoded = lpBytes(&double_nested_payload_records);
+const double_nested_payload_wire = chunkedBytes(&double_nested_payload_decoded);
+
+// Manifest, payload, canary in one buffer: one buffer bounds the whole traversal.
+const double_nested_base = double_nested_manifest_wire ++ double_nested_payload_wire;
+const double_nested_canary_buffer = double_nested_base ++ canary_bytes;
+
+const double_nested_outer_members = [_]MemberSpec{
+    .{ .name = "manifest", .offset = 0, .length = double_nested_manifest_wire.len },
+    .{ .name = "payload", .offset = double_nested_manifest_wire.len, .length = double_nested_payload_wire.len },
+};
+
+// The inner coordinates are relative:
+// the records member starts at zero inside either parent.
+const double_nested_inner_members = [_]MemberSpec{
+    .{ .name = "records", .offset = 0, .length = double_nested_payload_wire.len },
+};
+
+// The zero pad keeps both member locations legal,
+// so the rejection comes from the inner walk.
+const double_nested_short_payload_pad: [18]u8 = @splat(0);
+const double_nested_short_payload_base = double_nested_manifest_wire ++ double_nested_payload_wire[0..20].* ++ double_nested_short_payload_pad;
+
+// The fixtures pin the fit edges:
+// exact-fit, zero-length, and one byte past.
+const name_fit_records = [_]Record{
+    .{ .name = "0123456789abcdef", .data = "zzzz" },
+    .{ .name = "", .data = "yyyy" },
+};
+
+const name_fit_bytes = recordBytes(4, &name_fit_records);
+
+const name_fit_members = [_]MemberSpec{
+    .{ .name = "records", .offset = 0, .length = name_fit_bytes.len },
+};
+
+const name_overflow_records = [_]Record{
+    .{ .name = "0123456789abcdefg", .data = "zzzz" },
+};
+
+const name_overflow_bytes = recordBytes(4, &name_overflow_records);
+
+const name_overflow_members = [_]MemberSpec{
+    .{ .name = "records", .offset = 0, .length = name_overflow_bytes.len },
+};
+
+// The inode entry model: the two-field minimum plus group key and link count,
+// so Collapse's ino demand is exercised realistically.
+const InodeInfo = struct {
+    name: []const u8,
+    data_size: u64,
+    ino: u64,
+    nlink: u32,
+};
+
+const InodeRecord = struct { name: []const u8, ino: u64, nlink: u32, data: []const u8 };
+
+fn inodeRecordBytesSize(comptime data_len: usize, comptime records: []const InodeRecord) usize {
+    comptime var size: usize = 0;
+    for (records) |r| size += 2 + r.name.len + 8 + 4 + data_len;
+    return size;
+}
+
+// Same discipline as the record builder:
+// a wrong length field cannot sneak in.
+fn inodeRecordBytes(comptime data_len: usize, comptime records: []const InodeRecord) [inodeRecordBytesSize(data_len, records)]u8 {
+    var out: [inodeRecordBytesSize(data_len, records)]u8 = undefined;
+    comptime var i: usize = 0;
+    inline for (records) |r| {
+        comptime std.debug.assert(r.data.len == data_len);
+        std.mem.writeInt(u16, out[i..][0..2], r.name.len, .little);
+        i += 2;
+        @memcpy(out[i..][0..r.name.len], r.name);
+        i += r.name.len;
+        std.mem.writeInt(u64, out[i..][0..8], r.ino, .little);
+        i += 8;
+        std.mem.writeInt(u32, out[i..][0..4], r.nlink, .little);
+        i += 4;
+        @memcpy(out[i..][0..data_len], r.data);
+        i += data_len;
+    }
+    return out;
+}
+
+// One ino, nlink=3, payloads differ so a misattributed read is unambiguous.
+const inode_repeat_records = [_]InodeRecord{
+    .{ .name = "head", .ino = 0x5A5A_5A5A_1234_5678, .nlink = 3, .data = "aaaa" },
+    .{ .name = "tail", .ino = 0x5A5A_5A5A_1234_5678, .nlink = 3, .data = "bbbb" },
+    .{ .name = "then", .ino = 0x5A5A_5A5A_1234_5678, .nlink = 3, .data = "cccc" },
+};
+
+const inode_repeat_bytes = inodeRecordBytes(4, &inode_repeat_records);
+
+// Three distinct inos, so the decorated walk must match the bare one
+// entry for entry.
+const inode_distinct_records = [_]InodeRecord{
+    .{ .name = "one", .ino = 11, .nlink = 1, .data = "aaaa" },
+    .{ .name = "two", .ino = 22, .nlink = 1, .data = "bbbb" },
+    .{ .name = "three", .ino = 33, .nlink = 1, .data = "cccc" },
+};
+
+const inode_distinct_bytes = inodeRecordBytes(4, &inode_distinct_records);
 
 // The tally forwards through std.testing.allocator, so leak checking
 // stays armed while counters move.
@@ -549,13 +790,6 @@ fn FixedRecords(comptime Source: type, comptime data_len: usize) type {
     };
 }
 
-// Absolute regions: comptime keeps a wrong offset from becoming a test bug.
-const MemberSpec = struct { name: []const u8, offset: u64, length: u64 };
-
-const fixed_table_members = [_]MemberSpec{
-    .{ .name = "records", .offset = 0, .length = recordBytesSize(4, &fixed_table_records) },
-};
-
 // Locates by name and hands out whatever Base.slice yields,
 // so one table serves both sources.
 fn TableOuter(comptime Base: type, comptime members: []const MemberSpec) type {
@@ -616,6 +850,36 @@ fn Identity(comptime Source: type) type {
         }
     };
 }
+
+// A transform that records the context openWith carried to it.
+fn Contextual(comptime Source: type) type {
+    return struct {
+        const Self = @This();
+
+        pub const scratch_size: usize = @sizeOf(Self);
+
+        source: Source,
+
+        pub fn wrap(source: Source, scratch: []u8) Exception!*Self {
+            return wrapWith(source, scratch, &wrap_without_context);
+        }
+
+        pub fn wrapWith(source: Source, scratch: []u8, context: *const anyopaque) Exception!*Self {
+            if (scratch.len < scratch_size) return error.CapacityException;
+            wrapped_context = context;
+            const self: *Self = @ptrCast(@alignCast(scratch.ptr));
+            self.* = .{ .source = source };
+            return self;
+        }
+
+        pub fn reader(self: *Self) *Source {
+            return &self.source;
+        }
+    };
+}
+
+var wrap_without_context: u8 = 0;
+var wrapped_context: ?*const anyopaque = null;
 
 // A transform whose declared scratch exceeds its instance:
 // an odd segment end no later member can assume is aligned.
@@ -692,199 +956,7 @@ fn FixedRecords4(comptime Source: type) type {
     return FixedRecords(Source, 4);
 }
 
-// A fixed tail pattern, distinct from any fixture byte, makes an overread unambiguous.
-const canary_bytes = [8]u8{ 0xC3, 0x5A, 0x81, 0xEE, 0x17, 0x6D, 0xB2, 0x44 };
-
-// The shared reader must sit exactly at the canary and hand it back undisturbed.
-fn expectReaderCanary(src: *ReaderSource) !void {
-    var got: [canary_bytes.len]u8 = undefined;
-    try testing.expectEqual(@as(usize, canary_bytes.len), try src.take(&got));
-    try testing.expectEqualSlices(u8, &canary_bytes, &got);
-    var one: [1]u8 = undefined;
-    try testing.expectEqual(@as(usize, 0), try src.take(&one));
-}
-
-// A stale name slice reads as the successor once scratch is reused;
-// the rewrite witnesses the lifetime.
-fn expectScratchRewrote(stale: []const u8, expected: []const u8) !void {
-    try testing.expectEqualSlices(u8, expected, stale);
-}
-
-// A superseded window fails the epoch equality the trap checks;
-// a fresh one passes it.
-fn expectWindowSuperseded(w: anytype) !void {
-    try testing.expect(w.born_epoch != w.src.epoch);
-}
-
-const CutClass = enum { clean, truncated };
-
-// A cut is clean where it aligns with every enclosing boundary, else a truncation.
-fn cutExpectation(clean: []const usize, cut: usize) CutClass {
-    for (clean) |c| {
-        if (c == cut) return .clean;
-    }
-    return .truncated;
-}
-
-// Clean cuts succeed; every other cut answers DataException.
-fn truncationSweep(
-    full: []const u8,
-    clean: []const usize,
-    comptime run: fn ([]const u8) Exception!void,
-) !void {
-    var cut: usize = 0;
-    while (cut <= full.len) : (cut += 1) {
-        if (cutExpectation(clean, cut) == .clean) {
-            try run(full[0..cut]);
-        } else {
-            try testing.expectError(error.DataException, run(full[0..cut]));
-        }
-    }
-}
-
-// Skip must source exactly what read sourced;
-// delivered counters differ by exactly the dropped bytes.
-fn expectSkipMirrorsRead(skip: anytype, read: anytype, dropped: usize) !void {
-    try testing.expectEqual(read.sourced_bytes, skip.sourced_bytes);
-    try testing.expectEqual(read.decoded_bytes, skip.decoded_bytes + dropped);
-}
-
-// A well-formed stream is the full fixture or empty; every other cut is a truncation.
-fn t012SweepDriver(bytes: []const u8) Exception!void {
-    if (bytes.len != 0 and bytes.len != 6) return error.DataException;
-}
-
-// Canary, counters, and sweeps carve the same fixture bytes.
-const fixed_table_bytes = recordBytes(4, &fixed_table_records);
-
-// The canary sits directly behind the fixture, so an overread must eat into it.
-const fixed_table_canary_buffer = fixed_table_bytes ++ canary_bytes;
-
-// The same body runs over both sources; only the window semantics branch.
-fn fixedTableProperties(base: anytype, tally: anytype) !void {
-    const Base = @typeInfo(@TypeOf(base)).pointer.child;
-    const N = Nested(TableOuter(Base, &fixed_table_members), Identity, FixedRecords4);
-
-    comptime {
-        // Capability is declared by existence.
-        if (Base == SliceSource) {
-            std.debug.assert(@hasDecl(N.LocatedSource, "seekTo"));
-            std.debug.assert(N.LocatedSource.seek_cost == .constant);
-        } else {
-            std.debug.assert(!@hasDecl(N.LocatedSource, "seekTo"));
-            std.debug.assert(N.LocatedSource.seek_cost == .none);
-        }
-        // Every verb unions exactly the frozen vocabulary with its payload.
-        const verbs = .{ N.open, N.InnerCursor.next, N.InnerCursor.readData, N.InnerCursor.skipData };
-        for (verbs) |v| {
-            const ret = @typeInfo(@TypeOf(v)).@"fn".return_type.?;
-            std.debug.assert(ret == (Exception!@typeInfo(ret).error_union.payload));
-        }
-    }
-
-    // The window is claimed before the open, so the open supersedes it.
-    var earlier = try base.slice(0, 8);
-
-    var scratch: [N.scratch_size]u8 align(N.scratch_alignment) = undefined;
-    var cursor = try N.open(base, "records", &scratch);
-
-    var data: [4]u8 = undefined;
-    var w = std.Io.Writer.fixed(&data);
-
-    // The name is readable while the entry is current.
-    const first = (try cursor.next()).?;
-    try testing.expectEqualStrings("alpha", first.name);
-    try testing.expectEqual(@as(u64, 4), first.data_size);
-    w.end = 0;
-    try testing.expectEqual(@as(usize, 4), try cursor.readData(&w));
-    try testing.expectEqualStrings("aaaa", w.buffer[0..w.end]);
-
-    // The successor rewrites the scratch, witnessing the name lifetime.
-    const second = (try cursor.next()).?;
-    try testing.expectEqualStrings("gamma", second.name);
-    try expectScratchRewrote(first.name, "gamma");
-    w.end = 0;
-    try testing.expectEqual(@as(usize, 4), try cursor.readData(&w));
-    try testing.expectEqualStrings("bbbb", w.buffer[0..w.end]);
-
-    // The zero-length name is a legal entry.
-    const third = (try cursor.next()).?;
-    try testing.expectEqual(@as(usize, 0), third.name.len);
-    w.end = 0;
-    try testing.expectEqual(@as(usize, 4), try cursor.readData(&w));
-    try testing.expectEqualStrings("cccc", w.buffer[0..w.end]);
-
-    // The traversal ends exactly at the member boundary.
-    try testing.expect((try cursor.next()) == null);
-
-    // The protocol cannot reach an allocator; the counters confirm silence.
-    try testing.expectEqual(@as(usize, 0), tally.allocs);
-    try testing.expectEqual(@as(usize, 0), tally.frees);
-
-    // A further read is empty, a further skip is a data failure.
-    try testing.expectEqual(@as(usize, 0), try cursor.source.take(&data));
-    try testing.expectError(error.DataException, cursor.source.discard(1));
-
-    if (comptime Base == SliceSource) {
-        // In contrast, slicing is value semantics; the earlier view stays valid.
-        var ev: [8]u8 = undefined;
-        try testing.expectEqual(@as(usize, 8), try earlier.take(&ev));
-        try testing.expectEqualSlices(u8, fixed_table_bytes[0..8], &ev);
-        try testing.expectEqual(@as(usize, 0), base.pos);
-        // The bytes behind the member stay reachable through the base.
-        var canary_view = try base.slice(fixed_table_bytes.len, canary_bytes.len);
-        var cv: [8]u8 = undefined;
-        try testing.expectEqual(@as(usize, 8), try canary_view.take(&cv));
-        try testing.expectEqualSlices(u8, &canary_bytes, &cv);
-    } else {
-        // The window born before the open is superseded.
-        try expectWindowSuperseded(&earlier);
-        // Canary: the shared reader sits at the fixture end.
-        try expectReaderCanary(base);
-    }
-}
-
-// Read and skip consume the same source bytes;
-// skip pulls only the structural bytes.
-fn fixedTableCounterPair(comptime CS: type, read_cs: *CS, skip_cs: *CS) !void {
-    var read_scratch: [16]u8 = undefined;
-    var read_cursor = try FixedRecords(CS, 4).open(read_cs, &read_scratch);
-    var data: [4]u8 = undefined;
-    var w = std.Io.Writer.fixed(&data);
-    while (try read_cursor.next()) |_| {
-        w.end = 0;
-        try testing.expectEqual(@as(usize, 4), try read_cursor.readData(&w));
-    }
-
-    var skip_scratch: [16]u8 = undefined;
-    var skip_cursor = try FixedRecords(CS, 4).open(skip_cs, &skip_scratch);
-    while (try skip_cursor.next()) |_| {
-        try testing.expectEqual(@as(usize, 4), try skip_cursor.skipData());
-    }
-
-    // The structural count derives from the record list,
-    // not a hand-picked constant.
-    const structural = comptime blk: {
-        var n: usize = 0;
-        for (fixed_table_records) |r| n += 2 + r.name.len;
-        break :blk n;
-    };
-    try testing.expectEqual(structural, skip_cs.taken_bytes);
-    try testing.expectEqual(@as(u64, 3 * 4), skip_cs.discarded_bytes);
-    // Identical total consumption, split differently.
-    try testing.expectEqual(
-        read_cs.taken_bytes + read_cs.discarded_bytes,
-        skip_cs.taken_bytes + skip_cs.discarded_bytes,
-    );
-    // The read path never sinks: every byte went through take.
-    try testing.expectEqual(@as(usize, 0), read_cs.discards);
-}
-
-// Synthetic codec: [len: u16][payload ^ key] blocks, key a pure function of
-// the block index, so encoder and decoder agree.
-//
-// Counter semantics: sourced_bytes counts everything that left the source,
-// decoded_bytes only what take delivered.
+// Synthetic codec: [len: u16][payload ^ key] blocks; sourced_bytes counts all source bytes, decoded_bytes only take's deliveries.
 fn Chunked(comptime Source: type) type {
     return struct {
         const Self = @This();
@@ -1052,84 +1124,283 @@ fn LengthPrefixed(comptime Source: type) type {
     };
 }
 
-const chunked_lp_records = [_]Record{
-    .{ .name = "manifest", .data = "0123456789" },
-    .{ .name = "tiny", .data = "ab" },
-    .{ .name = "empty", .data = "" },
-};
+// The hinge: the Inner takes the outer cursor's source, and one caller buffer backs both chains.
+fn SubNestedAsInner(comptime Source: type) type {
+    return struct {
+        const Self = @This();
 
-fn lpBytesSize(comptime records: []const Record) usize {
-    comptime var size: usize = 0;
-    for (records) |r| size += 2 + r.name.len + 4 + r.data.len;
-    return size;
-}
+        pub const N2 = Nested(TableOuter(Source, &double_nested_inner_members), Chunked, LengthPrefixed);
 
-// Assembles the member stream so a wrong length field cannot sneak in.
-fn lpBytes(comptime records: []const Record) [lpBytesSize(records)]u8 {
-    var out: [lpBytesSize(records)]u8 = undefined;
-    comptime var i: usize = 0;
-    inline for (records) |r| {
-        std.mem.writeInt(u16, out[i..][0..2], r.name.len, .little);
-        i += 2;
-        @memcpy(out[i..][0..r.name.len], r.name);
-        i += r.name.len;
-        std.mem.writeInt(u32, out[i..][0..4], r.data.len, .little);
-        i += 4;
-        @memcpy(out[i..][0..r.data.len], r.data);
-        i += r.data.len;
-    }
-    return out;
-}
+        pub const scratch_size: usize = N2.scratch_size;
+        pub const scratch_alignment: usize = N2.scratch_alignment;
 
-const chunk_block_len = 8;
+        cursor: N2.InnerCursor,
 
-// One key definition serves encoder and decoder, so the two cannot drift.
-fn blockKey(block_index: u64) u8 {
-    return @truncate(0x9E *% block_index +% 0x5A);
-}
-
-fn chunkedBytesSize(comptime decoded_len: usize) usize {
-    const full = decoded_len / chunk_block_len;
-    const rest = decoded_len % chunk_block_len;
-    return full * (chunk_block_len + 2) + (if (rest == 0) 0 else rest + 2);
-}
-
-// The declared block length lets discard sink a whole payload without reading it.
-fn chunkedBytes(comptime decoded: []const u8) [chunkedBytesSize(decoded.len)]u8 {
-    var out: [chunkedBytesSize(decoded.len)]u8 = undefined;
-    comptime var i: usize = 0;
-    comptime var o: usize = 0;
-    comptime var block: u64 = 0;
-    inline while (i < decoded.len) {
-        const len = @min(chunk_block_len, decoded.len - i);
-        std.mem.writeInt(u16, out[o..][0..2], len, .little);
-        o += 2;
-        inline for (0..len) |j| {
-            out[o + j] = decoded[i + j] ^ blockKey(block);
+        pub fn open(source: *Source, scratch: []u8) Exception!Self {
+            // The outer scratch arrives unaligned;
+            // the caller declared the raised alignment for exactly this handoff.
+            const sub_scratch: []align(N2.scratch_alignment) u8 = @alignCast(scratch);
+            return .{ .cursor = try N2.open(source, "records", sub_scratch) };
         }
-        o += len;
-        i += len;
-        block += 1;
-    }
-    return out;
+
+        pub fn next(self: *Self) Exception!?Info {
+            return self.cursor.next();
+        }
+
+        pub fn readData(self: *Self, writer: *std.Io.Writer) Exception!usize {
+            return self.cursor.readData(writer);
+        }
+
+        pub fn skipData(self: *Self) Exception!usize {
+            return self.cursor.skipData();
+        }
+    };
 }
 
-const chunked_lp_decoded = lpBytes(&chunked_lp_records);
-const chunked_lp_wire = chunkedBytes(&chunked_lp_decoded);
+// The walk reads fields positionally, so the record layout here is the wire order.
+fn InodeRecords(comptime Source: type, comptime data_len: usize) type {
+    return struct {
+        const Self = @This();
 
-const chunked_lp_members = [_]MemberSpec{
-    .{ .name = "payload", .offset = 0, .length = chunked_lp_wire.len },
-};
+        pub const scratch_size: usize = 16;
 
-// A cut inside a declared block is a truncation
-// even when the record there completed.
-const chunked_lp_clean = [_]usize{
-    0,
-    chunkedBytesSize(lpBytesSize(chunked_lp_records[0..1])),
-    chunked_lp_wire.len,
-};
+        source: *Source,
+        names: NameScratch,
+        pending: usize,
 
-const chunked_lp_canary_buffer = chunked_lp_wire ++ canary_bytes;
+        pub fn open(source: *Source, scratch: []u8) Exception!Self {
+            return .{ .source = source, .names = NameScratch.init(scratch), .pending = 0 };
+        }
+
+        pub fn next(self: *Self) Exception!?InodeInfo {
+            // An unconsumed entry is finished here so every next() starts at a record boundary.
+            if (self.pending > 0) {
+                try self.source.discard(self.pending);
+                self.pending = 0;
+            }
+            var header: [2]u8 = undefined;
+            const got = try self.source.take(&header);
+            if (got == 0) return null;
+            if (got < 2) return error.DataException;
+            const name_len: usize = std.mem.readInt(u16, &header, .little);
+            const name = try self.names.take(self.source, name_len);
+            // Both id fields ride together so one bounded pull covers the fixed tail.
+            var ids: [12]u8 = undefined;
+            const got_ids = try self.source.take(&ids);
+            if (got_ids < ids.len) return error.DataException;
+            self.pending = data_len;
+            return .{
+                .name = name,
+                .data_size = data_len,
+                .ino = std.mem.readInt(u64, ids[0..8], .little),
+                .nlink = std.mem.readInt(u32, ids[8..12], .little),
+            };
+        }
+
+        pub fn readData(self: *Self, writer: *std.Io.Writer) Exception!usize {
+            var staged: [32]u8 = undefined;
+            const budget = self.pending;
+            var total: usize = 0;
+            while (total < budget) {
+                const want = @min(budget - total, staged.len);
+                const got = try self.source.take(staged[0..want]);
+                if (got == 0) return error.DataException;
+                writer.writeAll(staged[0..got]) catch |err| switch (err) {
+                    error.WriteFailed => return error.IoException,
+                };
+                total += got;
+                self.pending -= got;
+            }
+            return total;
+        }
+
+        pub fn skipData(self: *Self) Exception!usize {
+            const n = self.pending;
+            try self.source.discard(n);
+            self.pending = 0;
+            return n;
+        }
+    };
+}
+
+// The shared reader must sit exactly at the canary and hand it back undisturbed.
+fn expectReaderCanary(src: *ReaderSource) !void {
+    var got: [canary_bytes.len]u8 = undefined;
+    try testing.expectEqual(@as(usize, canary_bytes.len), try src.take(&got));
+    try testing.expectEqualSlices(u8, &canary_bytes, &got);
+    var one: [1]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), try src.take(&one));
+}
+
+// A stale name slice reads as the successor once scratch is reused;
+// the rewrite witnesses the lifetime.
+fn expectScratchRewrote(stale: []const u8, expected: []const u8) !void {
+    try testing.expectEqualSlices(u8, expected, stale);
+}
+
+// A superseded window fails the epoch equality the trap checks;
+// a fresh one passes it.
+fn expectWindowSuperseded(w: anytype) !void {
+    try testing.expect(w.born_epoch != w.src.epoch);
+}
+
+// Skip must source exactly what read sourced;
+// delivered counters differ by exactly the dropped bytes.
+fn expectSkipMirrorsRead(skip: anytype, read: anytype, dropped: usize) !void {
+    try testing.expectEqual(read.sourced_bytes, skip.sourced_bytes);
+    try testing.expectEqual(read.decoded_bytes, skip.decoded_bytes + dropped);
+}
+
+const CutClass = enum { clean, truncated };
+
+// A cut is clean where it aligns with every enclosing boundary, else a truncation.
+fn cutExpectation(clean: []const usize, cut: usize) CutClass {
+    for (clean) |c| {
+        if (c == cut) return .clean;
+    }
+    return .truncated;
+}
+
+// Clean cuts succeed; every other cut answers DataException.
+fn truncationSweep(
+    full: []const u8,
+    clean: []const usize,
+    comptime run: fn ([]const u8) Exception!void,
+) !void {
+    var cut: usize = 0;
+    while (cut <= full.len) : (cut += 1) {
+        if (cutExpectation(clean, cut) == .clean) {
+            try run(full[0..cut]);
+        } else {
+            try testing.expectError(error.DataException, run(full[0..cut]));
+        }
+    }
+}
+
+// A well-formed stream is the full fixture or empty; every other cut is a truncation.
+fn t012SweepDriver(bytes: []const u8) Exception!void {
+    if (bytes.len != 0 and bytes.len != 6) return error.DataException;
+}
+
+// The same body runs over both sources; only the window semantics branch.
+fn fixedTableProperties(base: anytype, tally: anytype) !void {
+    const Base = @typeInfo(@TypeOf(base)).pointer.child;
+    const N = Nested(TableOuter(Base, &fixed_table_members), Identity, FixedRecords4);
+
+    comptime {
+        // Capability is declared by existence.
+        if (Base == SliceSource) {
+            std.debug.assert(@hasDecl(N.LocatedSource, "seekTo"));
+            std.debug.assert(N.LocatedSource.seek_cost == .constant);
+        } else {
+            std.debug.assert(!@hasDecl(N.LocatedSource, "seekTo"));
+            std.debug.assert(N.LocatedSource.seek_cost == .none);
+        }
+        // Every verb unions exactly the frozen vocabulary with its payload.
+        const verbs = .{ N.open, N.InnerCursor.next, N.InnerCursor.readData, N.InnerCursor.skipData };
+        for (verbs) |v| {
+            const ret = @typeInfo(@TypeOf(v)).@"fn".return_type.?;
+            std.debug.assert(ret == (Exception!@typeInfo(ret).error_union.payload));
+        }
+    }
+
+    // The window is claimed before the open, so the open supersedes it.
+    var earlier = try base.slice(0, 8);
+
+    var scratch: [N.scratch_size]u8 align(N.scratch_alignment) = undefined;
+    var cursor = try N.open(base, "records", &scratch);
+
+    var data: [4]u8 = undefined;
+    var w = std.Io.Writer.fixed(&data);
+
+    // The name is readable while the entry is current.
+    const first = (try cursor.next()).?;
+    try testing.expectEqualStrings("alpha", first.name);
+    try testing.expectEqual(@as(u64, 4), first.data_size);
+    w.end = 0;
+    try testing.expectEqual(@as(usize, 4), try cursor.readData(&w));
+    try testing.expectEqualStrings("aaaa", w.buffer[0..w.end]);
+
+    // The successor rewrites the scratch, witnessing the name lifetime.
+    const second = (try cursor.next()).?;
+    try testing.expectEqualStrings("gamma", second.name);
+    try expectScratchRewrote(first.name, "gamma");
+    w.end = 0;
+    try testing.expectEqual(@as(usize, 4), try cursor.readData(&w));
+    try testing.expectEqualStrings("bbbb", w.buffer[0..w.end]);
+
+    // The zero-length name is a legal entry.
+    const third = (try cursor.next()).?;
+    try testing.expectEqual(@as(usize, 0), third.name.len);
+    w.end = 0;
+    try testing.expectEqual(@as(usize, 4), try cursor.readData(&w));
+    try testing.expectEqualStrings("cccc", w.buffer[0..w.end]);
+
+    // The traversal ends exactly at the member boundary.
+    try testing.expect((try cursor.next()) == null);
+
+    // The protocol cannot reach an allocator; the counters confirm silence.
+    try testing.expectEqual(@as(usize, 0), tally.allocs);
+    try testing.expectEqual(@as(usize, 0), tally.frees);
+
+    // A further read is empty, a further skip is a data failure.
+    try testing.expectEqual(@as(usize, 0), try cursor.source.take(&data));
+    try testing.expectError(error.DataException, cursor.source.discard(1));
+
+    if (comptime Base == SliceSource) {
+        // In contrast, slicing is value semantics; the earlier view stays valid.
+        var ev: [8]u8 = undefined;
+        try testing.expectEqual(@as(usize, 8), try earlier.take(&ev));
+        try testing.expectEqualSlices(u8, fixed_table_bytes[0..8], &ev);
+        try testing.expectEqual(@as(usize, 0), base.pos);
+        // The bytes behind the member stay reachable through the base.
+        var canary_view = try base.slice(fixed_table_bytes.len, canary_bytes.len);
+        var cv: [8]u8 = undefined;
+        try testing.expectEqual(@as(usize, 8), try canary_view.take(&cv));
+        try testing.expectEqualSlices(u8, &canary_bytes, &cv);
+    } else {
+        // The window born before the open is superseded.
+        try expectWindowSuperseded(&earlier);
+        // Canary: the shared reader sits at the fixture end.
+        try expectReaderCanary(base);
+    }
+}
+
+// Read and skip consume the same source bytes;
+// skip pulls only the structural bytes.
+fn fixedTableCounterPair(comptime CS: type, read_cs: *CS, skip_cs: *CS) !void {
+    var read_scratch: [16]u8 = undefined;
+    var read_cursor = try FixedRecords(CS, 4).open(read_cs, &read_scratch);
+    var data: [4]u8 = undefined;
+    var w = std.Io.Writer.fixed(&data);
+    while (try read_cursor.next()) |_| {
+        w.end = 0;
+        try testing.expectEqual(@as(usize, 4), try read_cursor.readData(&w));
+    }
+
+    var skip_scratch: [16]u8 = undefined;
+    var skip_cursor = try FixedRecords(CS, 4).open(skip_cs, &skip_scratch);
+    while (try skip_cursor.next()) |_| {
+        try testing.expectEqual(@as(usize, 4), try skip_cursor.skipData());
+    }
+
+    // The structural count derives from the record list,
+    // not a hand-picked constant.
+    const structural = comptime blk: {
+        var n: usize = 0;
+        for (fixed_table_records) |r| n += 2 + r.name.len;
+        break :blk n;
+    };
+    try testing.expectEqual(structural, skip_cs.taken_bytes);
+    try testing.expectEqual(@as(u64, 3 * 4), skip_cs.discarded_bytes);
+    // Identical total consumption, split differently.
+    try testing.expectEqual(
+        read_cs.taken_bytes + read_cs.discarded_bytes,
+        skip_cs.taken_bytes + skip_cs.discarded_bytes,
+    );
+    // The read path never sinks: every byte went through take.
+    try testing.expectEqual(@as(usize, 0), read_cs.discards);
+}
 
 // The full skip witness lives in the mirror pair;
 // the window section branches over both sources.
@@ -1285,77 +1556,6 @@ fn chunkedLpSweepReader(bytes: []const u8) Exception!void {
     var fixed: std.Io.Reader = .fixed(bytes);
     const base = ReaderSource.init(&fixed, bytes.len);
     return chunkedLpSweepBody(ReaderSource, base);
-}
-
-// The inner here is itself a Nested composition;
-// its coordinates are relative to the located source.
-const double_nested_manifest_records = [_]Record{
-    .{ .name = "list", .data = "01234567890123456789" },
-};
-
-const double_nested_payload_records = [_]Record{
-    .{ .name = "alpha", .data = "aaaa" },
-    .{ .name = "beta", .data = "bbbbb" },
-};
-
-// Both members decode to 30 bytes and encode to 38,
-// so one declared length serves both.
-const double_nested_manifest_decoded = lpBytes(&double_nested_manifest_records);
-const double_nested_manifest_wire = chunkedBytes(&double_nested_manifest_decoded);
-
-const double_nested_payload_decoded = lpBytes(&double_nested_payload_records);
-const double_nested_payload_wire = chunkedBytes(&double_nested_payload_decoded);
-
-// Manifest, payload, canary in one buffer: one buffer bounds the whole traversal.
-const double_nested_base = double_nested_manifest_wire ++ double_nested_payload_wire;
-const double_nested_canary_buffer = double_nested_base ++ canary_bytes;
-
-const double_nested_outer_members = [_]MemberSpec{
-    .{ .name = "manifest", .offset = 0, .length = double_nested_manifest_wire.len },
-    .{ .name = "payload", .offset = double_nested_manifest_wire.len, .length = double_nested_payload_wire.len },
-};
-
-// The inner coordinates are relative:
-// the records member starts at zero inside either parent.
-const double_nested_inner_members = [_]MemberSpec{
-    .{ .name = "records", .offset = 0, .length = double_nested_payload_wire.len },
-};
-
-// The adapter is the hinge: the Inner takes the source
-// the outer cursor yields, and the sub-chain resolves from it.
-//
-// The outer cursor's scratch is re-carved into the sub-chain's shares,
-// so one caller buffer backs both chains.
-fn SubNestedAsInner(comptime Source: type) type {
-    return struct {
-        const Self = @This();
-
-        pub const N2 = Nested(TableOuter(Source, &double_nested_inner_members), Chunked, LengthPrefixed);
-
-        pub const scratch_size: usize = N2.scratch_size;
-        pub const scratch_alignment: usize = N2.scratch_alignment;
-
-        cursor: N2.InnerCursor,
-
-        pub fn open(source: *Source, scratch: []u8) Exception!Self {
-            // The outer scratch arrives unaligned;
-            // the caller declared the raised alignment for exactly this handoff.
-            const sub_scratch: []align(N2.scratch_alignment) u8 = @alignCast(scratch);
-            return .{ .cursor = try N2.open(source, "records", sub_scratch) };
-        }
-
-        pub fn next(self: *Self) Exception!?Info {
-            return self.cursor.next();
-        }
-
-        pub fn readData(self: *Self, writer: *std.Io.Writer) Exception!usize {
-            return self.cursor.readData(writer);
-        }
-
-        pub fn skipData(self: *Self) Exception!usize {
-            return self.cursor.skipData();
-        }
-    };
 }
 
 // Both members traverse the full stack;
@@ -1536,11 +1736,6 @@ fn doubleNestedManifestSweepReader(bytes: []const u8) Exception!void {
     return doubleNestedRun(ReaderSource, &base, "manifest");
 }
 
-// The zero pad keeps both member locations legal,
-// so the rejection comes from the inner walk.
-const double_nested_short_payload_pad: [18]u8 = @splat(0);
-const double_nested_short_payload_base = double_nested_manifest_wire ++ double_nested_payload_wire[0..20].* ++ double_nested_short_payload_pad;
-
 // The outer roles driven by hand:
 // equal content and counters prove the glue adds no behavior.
 fn doubleNestedManualOuterRun(comptime Base: type, base: *Base) !void {
@@ -1580,42 +1775,6 @@ fn doubleNestedManualOuterRun(comptime Base: type, base: *Base) !void {
     try testing.expectError(error.UnsupportedException, N2.open(t1.reader(), "manifest", &n2_scratch));
 }
 
-// The fixtures pin the fit edges:
-// exact-fit, zero-length, and one byte past.
-const name_fit_records = [_]Record{
-    .{ .name = "0123456789abcdef", .data = "zzzz" },
-    .{ .name = "", .data = "yyyy" },
-};
-
-const name_fit_bytes = recordBytes(4, &name_fit_records);
-
-const name_fit_members = [_]MemberSpec{
-    .{ .name = "records", .offset = 0, .length = name_fit_bytes.len },
-};
-
-const name_overflow_records = [_]Record{
-    .{ .name = "0123456789abcdefg", .data = "zzzz" },
-};
-
-const name_overflow_bytes = recordBytes(4, &name_overflow_records);
-
-const name_overflow_members = [_]MemberSpec{
-    .{ .name = "records", .offset = 0, .length = name_overflow_bytes.len },
-};
-
-// A cut is clean exactly at record boundaries;
-// the set derives from the same list the builder reads.
-const fixed_table_clean = blk: {
-    var cuts: [fixed_table_records.len + 1]usize = undefined;
-    cuts[0] = 0;
-    var acc: usize = 0;
-    for (fixed_table_records, 0..) |r, i| {
-        acc += 2 + r.name.len + 4;
-        cuts[i + 1] = acc;
-    }
-    break :blk cuts;
-};
-
 // Every truncation class the fixed layout can produce must answer DataException.
 fn fixedTableSweepBody(comptime S: type, source: *S) Exception!void {
     const InnerCursor = FixedRecords(S, 4);
@@ -1638,31 +1797,31 @@ fn fixedTableSweepReader(bytes: []const u8) Exception!void {
     return fixedTableSweepBody(Window, &win);
 }
 
-const window_fixture = "0123456789abcdefghijklmn";
+// One property per test block keeps a failure attributable to a single behavior.
 
-test "slice source bounds its window and keeps the parent valid" {
+test "slice source windows its bytes without moving the parent" {
     var src = SliceSource.init(window_fixture);
 
     var w = try src.slice(8, 8);
     try testing.expect(@TypeOf(w) == SliceSource);
 
-    // The last bytes inside the window are readable.
+    // The window delivers its interior in order.
     var buf: [4]u8 = undefined;
     try testing.expectEqual(@as(usize, 4), try w.take(&buf));
     try testing.expectEqualStrings("89ab", &buf);
     try testing.expectEqual(@as(usize, 4), try w.take(&buf));
     try testing.expectEqualStrings("cdef", &buf);
 
-    // Exhaustion reports 0 instead of the canary bytes.
+    // Exhaustion answers zero, never the bytes behind the window.
     try testing.expectEqual(@as(usize, 0), try w.take(&buf));
     try testing.expectError(error.DataException, w.discard(1));
 
-    // Pure value semantics: slicing did not move the parent.
+    // Slicing is value semantics: the parent never moved.
     try testing.expectEqual(@as(usize, 4), try src.take(&buf));
     try testing.expectEqualStrings("0123", &buf);
 }
 
-test "slice source discard and seekTo keep the position exact" {
+test "slice source lands discard and seekTo on the exact byte" {
     var src = SliceSource.init(window_fixture);
 
     var buf: [3]u8 = undefined;
@@ -1675,7 +1834,7 @@ test "slice source discard and seekTo keep the position exact" {
     try testing.expectEqualStrings("lmn", &buf);
     try testing.expectEqual(@as(usize, 0), try src.take(&buf));
 
-    // A read straddling the end returns the short count, not an error.
+    // A request straddling the end returns the short count, not an error.
     try src.seekTo(23);
     try testing.expectEqual(@as(usize, 1), try src.take(&buf));
     try testing.expectEqualStrings("n", buf[0..1]);
@@ -1684,19 +1843,19 @@ test "slice source discard and seekTo keep the position exact" {
     try testing.expectError(error.DataException, src.seekTo(window_fixture.len + 1));
 }
 
-test "slice source rejects an out-of-bounds slice at creation" {
+test "slice source refuses the out-of-bounds window and accepts the empty tail" {
     var src = SliceSource.init(window_fixture);
     try testing.expectError(error.DataException, src.slice(17, 8));
     try testing.expectError(error.DataException, src.slice(25, 0));
 
-    // The empty window at the very end is a legal boundary.
+    // The zero-length window at the very end is a legal boundary.
     var empty = try src.slice(window_fixture.len, 0);
     var buf: [1]u8 = undefined;
     try testing.expectEqual(@as(usize, 0), try empty.take(&buf));
     try testing.expectError(error.DataException, empty.discard(1));
 }
 
-test "reader source discards forward and leaves the canary unread" {
+test "reader source windows forward and leaves the canary unread" {
     var fixed: std.Io.Reader = .fixed(window_fixture);
     var src = ReaderSource.init(&fixed, window_fixture.len);
 
@@ -1720,13 +1879,13 @@ test "reader source discards forward and leaves the canary unread" {
     try testing.expectEqualStrings("ghijklmn", &tail);
 }
 
-test "reader source window invalidates its parent" {
+test "reader source retires every earlier window on each slice" {
     var fixed: std.Io.Reader = .fixed(window_fixture);
     var src = ReaderSource.init(&fixed, window_fixture.len);
 
     const w1 = try src.slice(0, 12);
-    // Testing here has no panic assertion facility,
-    // so the trap is observed through the very flag the trap checks.
+    // Testing has no panic facility, so the trap is observed
+    // through the very flag the trap checks.
     var w2 = try src.slice(12, 4);
     try testing.expect(w1.born_epoch != src.epoch);
     try testing.expect(w2.born_epoch == src.epoch);
@@ -1736,7 +1895,7 @@ test "reader source window invalidates its parent" {
     try testing.expectEqualStrings("cdef", &buf);
 }
 
-test "reader source rejects a backward or out-of-bounds slice" {
+test "reader source only opens windows ahead of the cursor" {
     var fixed: std.Io.Reader = .fixed(window_fixture);
     var src = ReaderSource.init(&fixed, window_fixture.len);
 
@@ -1751,7 +1910,7 @@ test "reader source rejects a backward or out-of-bounds slice" {
     try testing.expectError(error.DataException, src.slice(4, 4));
 }
 
-test "reader source fails on read when its window exceeds the underlying" {
+test "reader source exposes an over-declared length at read time" {
     var fixed: std.Io.Reader = .fixed(window_fixture[0..16]);
     var src = ReaderSource.init(&fixed, window_fixture.len);
 
@@ -1766,7 +1925,7 @@ test "reader source fails on read when its window exceeds the underlying" {
     try testing.expectError(error.DataException, src.take(&buf));
 }
 
-test "source capabilities are declared by existence" {
+test "source capabilities are the type declarations themselves" {
     try testing.expect(@hasDecl(SliceSource, "seekTo"));
     try testing.expect(!@hasDecl(ReaderSource, "seekTo"));
     try testing.expect(!@hasDecl(Window, "seekTo"));
@@ -1775,7 +1934,7 @@ test "source capabilities are declared by existence" {
     try testing.expect(Window.seek_cost == .none);
 }
 
-test "cursor yields entries in order with their data" {
+test "fixed cursor yields the table in wire order with each payload" {
     const fixture = comptime recordBytes(4, &fixed_table_records);
     var src = SliceSource.init(&fixture);
     var scratch: [16]u8 = undefined;
@@ -1794,15 +1953,15 @@ test "cursor yields entries in order with their data" {
     try testing.expectEqualStrings("gamma", second.name);
     try testing.expectEqual(@as(usize, 4), try cursor.skipData());
 
-    const third = (try cursor.next()).?;
     // A zero-length name is a legal entry.
+    const third = (try cursor.next()).?;
     try testing.expectEqualStrings("", third.name);
     try testing.expectEqual(@as(usize, 4), try cursor.skipData());
 
     try testing.expect((try cursor.next()) == null);
 }
 
-test "cursor read and skip consume the same region" {
+test "fixed cursor read and skip land on the same next record" {
     const fixture = comptime recordBytes(4, &fixed_table_records);
     var src_read = SliceSource.init(&fixture);
     var src_skip = SliceSource.init(&fixture);
@@ -1819,7 +1978,7 @@ test "cursor read and skip consume the same region" {
     try testing.expectEqualStrings("aaaa", w.buffer[0..w.end]);
     try testing.expectEqual(@as(usize, 4), try cur_skip.skipData());
 
-    // Both continue from the end of the same byte region.
+    // Both verbs continue from the end of the same byte region.
     const n_read = (try cur_read.next()).?;
     const n_skip = (try cur_skip.next()).?;
     try testing.expectEqualStrings(n_read.name, n_skip.name);
@@ -1837,7 +1996,7 @@ test "cursor read and skip consume the same region" {
     try testing.expectEqual(src_read.pos, src_skip.pos);
 }
 
-test "cursor skip sinks to the source discard path" {
+test "fixed cursor routes skipData through the source discard sink" {
     const fixture = comptime recordBytes(4, &fixed_table_records);
     var src = CountingSource(SliceSource){ .inner = SliceSource.init(&fixture) };
     var scratch: [16]u8 = undefined;
@@ -1851,7 +2010,7 @@ test "cursor skip sinks to the source discard path" {
     try testing.expectEqual(@as(usize, 1), src.discards);
 }
 
-test "cursor name lifetime ends at the next entry" {
+test "fixed cursor names die at the successor entry" {
     const fixture = comptime recordBytes(4, &fixed_table_records);
     var src = SliceSource.init(&fixture);
     var scratch: [16]u8 = undefined;
@@ -1864,7 +2023,7 @@ test "cursor name lifetime ends at the next entry" {
     try testing.expectEqualStrings("gamma", second.name);
 }
 
-test "cursor name capacity accepts an exact fit and reports overload" {
+test "fixed cursor fills the name scratch exactly or answers capacity" {
     const records = [_]Record{
         .{ .name = "abcd", .data = "xx" },
         .{ .name = "abcde", .data = "xx" },
@@ -1879,11 +2038,11 @@ test "cursor name capacity accepts an exact fit and reports overload" {
     try testing.expectEqualStrings("abcd", full_fit.name);
     try testing.expectEqual(@as(usize, 2), try cursor.skipData());
 
-    // The second record is well-formed; the buffer is too small: capacity, not data.
+    // The record is well-formed; the buffer is too small: capacity, not data.
     try testing.expectError(error.CapacityException, cursor.next());
 }
 
-test "cursor reports truncation at every record boundary" {
+test "fixed cursor reports every truncation class at its boundary" {
     const full = comptime recordBytes(4, &fixed_table_records);
 
     // Inside the length field and inside the name: next() itself fails.
@@ -1913,11 +2072,11 @@ test "cursor reports truncation at every record boundary" {
     }
 }
 
-test "nested fixed table matches direct traversal" {
+test "nested table matches the hand-run traversal entry for entry" {
     const N = Nested(TableOuter(SliceSource, &fixed_table_members), Identity, FixedRecords4);
 
     // Comptime wiring is witnessed by type identity:
-    // the cursor N.open returns InnerCursor the inner over the located source.
+    // N.open returns the inner cursor over the located source.
     comptime {
         const OpenReturn = @typeInfo(@TypeOf(N.open)).@"fn".return_type.?;
         const InnerCursor = @typeInfo(OpenReturn).error_union.payload;
@@ -1963,11 +2122,11 @@ test "nested fixed table matches direct traversal" {
     // Slicing is value semantics: the composed traversal never moved the base.
     try testing.expectEqual(@as(usize, 0), base.pos);
 
-    // An unknown member is the Outer's capability answer.
+    // An unknown member is the outer's capability answer.
     try testing.expectError(error.UnsupportedException, N.open(&base, "nope", &scratch));
 }
 
-test "nested scratch carves each member segment at its declared alignment" {
+test "nested scratch carves its segments at the declared alignments" {
     const Mixed = Nested(OddOuter(SliceSource), OddSized, AlignedCell);
 
     // The raised outer alignment enters the buffer max,
@@ -1991,9 +2150,21 @@ test "nested scratch carves each member segment at its declared alignment" {
     try testing.expectEqual(@as(usize, 0), opened.source.pos);
 }
 
-// Every battery helper is exercised here first,
-// so a battery failure points at the property.
-test "harness mechanics cover the tally, canary, cut matrix, and mirrors" {
+test "nested openWith carries the caller context into the transform" {
+    const N = Nested(TableOuter(SliceSource, &fixed_table_members), Contextual, FixedRecords4);
+    var base = SliceSource.init(&fixed_table_bytes);
+    var scratch: [N.scratch_size]u8 align(N.scratch_alignment) = undefined;
+
+    var forwarded: u32 = 7;
+    _ = try N.openWith(&base, "records", &scratch, &forwarded);
+    try testing.expectEqual(@as(?*const anyopaque, &forwarded), wrapped_context);
+
+    // The plain open keeps the wrap path, so no caller context arrives.
+    _ = try N.open(&base, "records", &scratch);
+    try testing.expectEqual(@as(?*const anyopaque, &wrap_without_context), wrapped_context);
+}
+
+test "witness helpers observe tally, cuts, canaries, epochs, and counters" {
     const t0: Tally = .{};
     try testing.expectEqual(@as(usize, 0), t0.allocs);
     try testing.expectEqual(@as(usize, 0), t0.frees);
@@ -2056,7 +2227,7 @@ test "harness mechanics cover the tally, canary, cut matrix, and mirrors" {
     );
 }
 
-test "fixed-table format passes the eight-property battery over both sources" {
+test "fixed table stack holds the eight properties over both sources" {
     var tally: Tally = .{};
 
     var slice_base = SliceSource.init(&fixed_table_canary_buffer);
@@ -2067,7 +2238,7 @@ test "fixed-table format passes the eight-property battery over both sources" {
     try fixedTableProperties(&reader_base, &tally);
 }
 
-test "fixed-table format skip mirrors read in the source counters" {
+test "fixed table skip mirrors read in the counting source" {
     // Slice side: each path gets its own base over the same fixture.
     {
         var read_cs = CountingSource(SliceSource){ .inner = SliceSource.init(&fixed_table_bytes) };
@@ -2087,7 +2258,7 @@ test "fixed-table format skip mirrors read in the source counters" {
     }
 }
 
-test "chunked length-prefixed format passes the eight-property battery over both sources" {
+test "chunked length-prefixed stack holds the eight properties over both sources" {
     var tally: Tally = .{};
 
     var slice_base = SliceSource.init(&chunked_lp_canary_buffer);
@@ -2098,7 +2269,7 @@ test "chunked length-prefixed format passes the eight-property battery over both
     try chunkedLpProperties(&reader_base, &tally);
 }
 
-test "chunked length-prefixed format skip mirrors read and never decodes the dropped payload" {
+test "chunked length-prefixed skip mirrors read and never decodes the drops" {
     // Slice side: each path gets its own base over the same wire.
     {
         var read_base = SliceSource.init(&chunked_lp_wire);
@@ -2116,12 +2287,12 @@ test "chunked length-prefixed format skip mirrors read and never decodes the dro
     }
 }
 
-test "chunked length-prefixed format truncates at every wire cut for both sources" {
+test "chunked length-prefixed answers every wire cut for both sources" {
     try truncationSweep(&chunked_lp_wire, &chunked_lp_clean, chunkedLpSweepSlice);
     try truncationSweep(&chunked_lp_wire, &chunked_lp_clean, chunkedLpSweepReader);
 }
 
-test "chunked length-prefixed format linear seek replays blocks and reopens cleanly" {
+test "chunked length-prefixed linear seek replays wire and never decodes" {
     // The replay span and its wire cost derive from the record list.
     const record1_decoded = comptime lpBytesSize(chunked_lp_records[0..1]);
     const record1_wire = comptime chunkedBytesSize(lpBytesSize(chunked_lp_records[0..1]));
@@ -2172,7 +2343,7 @@ test "chunked length-prefixed format linear seek replays blocks and reopens clea
     try testing.expectEqual(@as(u64, chunked_lp_decoded.len - record1_decoded), ts.decoded_bytes);
 }
 
-test "double-nested format passes the whole-stack battery over both sources" {
+test "double-nested stack holds the eight properties over both sources" {
     var tally: Tally = .{};
 
     var slice_base = SliceSource.init(&double_nested_canary_buffer);
@@ -2183,7 +2354,7 @@ test "double-nested format passes the whole-stack battery over both sources" {
     try doubleNestedProperties(&reader_base, &tally);
 }
 
-test "double-nested format skip mirrors read through the whole stack" {
+test "double-nested skip mirrors read through both layers" {
     // Slice side: each path gets its own base over the same bytes.
     {
         var read_base = SliceSource.init(&double_nested_base);
@@ -2201,7 +2372,7 @@ test "double-nested format skip mirrors read through the whole stack" {
     }
 }
 
-test "double-nested format truncates at every base cut per layer for both sources" {
+test "double-nested classifies every base cut per layer for both sources" {
     // Any cut short of the full base fails,
     // at the outer location or inside the inner walk.
     try truncationSweep(&double_nested_base, &.{double_nested_base.len}, doubleNestedPayloadSweepSlice);
@@ -2220,7 +2391,7 @@ test "double-nested format truncates at every base cut per layer for both source
     }
 }
 
-test "double-nested format inner chain follows the manually located source" {
+test "double-nested inner chain follows the manually located source" {
     {
         var base = SliceSource.init(&double_nested_base);
         try doubleNestedManualOuterRun(SliceSource, &base);
@@ -2232,7 +2403,7 @@ test "double-nested format inner chain follows the manually located source" {
     }
 }
 
-test "double-nested format rejects an inner layer with the outer windows intact" {
+test "double-nested rejects the broken inner with both members intact" {
     // Slice side: value semantics keep the base untouched,
     // so the manifest still opens after the rejection.
     {
@@ -2292,7 +2463,7 @@ test "double-nested format rejects an inner layer with the outer windows intact"
     }
 }
 
-test "boundary list keeps the window end exact and refuses one byte past" {
+test "window ends refuse the next byte at every nesting depth" {
     // Slice face: the window drains to its last byte and refuses the next;
     // the parent never moved.
     {
@@ -2343,7 +2514,7 @@ test "boundary list keeps the window end exact and refuses one byte past" {
     }
 }
 
-test "boundary list truncates at each layer boundary for both sources" {
+test "layer boundaries answer clean or truncated at every cut" {
     // Every cut of the plain-record member: record boundaries are clean,
     // everything else answers DataException.
     try truncationSweep(&fixed_table_bytes, &fixed_table_clean, fixedTableSweepSlice);
@@ -2382,7 +2553,7 @@ test "boundary list truncates at each layer boundary for both sources" {
     try doubleNestedManifestSweepReader(double_nested_base[0..payload_offset]);
 }
 
-test "boundary list accepts zero-length and exactly-full names" {
+test "name scratch accepts exact fits and empty names and nothing past" {
     // The legal pair: exact-fit, then zero-length. Slice face first.
     {
         var base = SliceSource.init(&name_fit_bytes);
@@ -2442,7 +2613,7 @@ test "boundary list accepts zero-length and exactly-full names" {
     }
 }
 
-test "boundary list maps an out-of-range u64 cast to DataException" {
+test "extreme sizes answer DataException without consuming a byte" {
     // The exact conversion the protocol uses refuses out-of-range values;
     // the 32-bit rows run the same sites at real widths.
     try testing.expect(std.math.cast(u32, @as(u64, 1) << 40) == null);
@@ -2476,7 +2647,7 @@ test "boundary list maps an out-of-range u64 cast to DataException" {
     }
 }
 
-test "boundary list keeps distinct types and capabilities for one transform over two sources" {
+test "one transform over two sources stays two distinct types" {
     comptime {
         // The base picks the policy, the transform derives its own answer,
         // the wrapper forwards.
@@ -2506,130 +2677,7 @@ test "boundary list keeps distinct types and capabilities for one transform over
     }
 }
 
-// The inode entry model: the two-field minimum plus group key and link count,
-// so Collapse's ino demand is exercised realistically.
-const InodeInfo = struct {
-    name: []const u8,
-    data_size: u64,
-    ino: u64,
-    nlink: u32,
-};
-
-const InodeRecord = struct { name: []const u8, ino: u64, nlink: u32, data: []const u8 };
-
-fn inodeRecordBytesSize(comptime data_len: usize, comptime records: []const InodeRecord) usize {
-    comptime var size: usize = 0;
-    for (records) |r| size += 2 + r.name.len + 8 + 4 + data_len;
-    return size;
-}
-
-// Same discipline as the record builder:
-// a wrong length field cannot sneak in.
-fn inodeRecordBytes(comptime data_len: usize, comptime records: []const InodeRecord) [inodeRecordBytesSize(data_len, records)]u8 {
-    var out: [inodeRecordBytesSize(data_len, records)]u8 = undefined;
-    comptime var i: usize = 0;
-    inline for (records) |r| {
-        comptime std.debug.assert(r.data.len == data_len);
-        std.mem.writeInt(u16, out[i..][0..2], r.name.len, .little);
-        i += 2;
-        @memcpy(out[i..][0..r.name.len], r.name);
-        i += r.name.len;
-        std.mem.writeInt(u64, out[i..][0..8], r.ino, .little);
-        i += 8;
-        std.mem.writeInt(u32, out[i..][0..4], r.nlink, .little);
-        i += 4;
-        @memcpy(out[i..][0..data_len], r.data);
-        i += data_len;
-    }
-    return out;
-}
-
-// One ino, nlink=3, payloads differ so a misattributed read is unambiguous.
-const inode_repeat_records = [_]InodeRecord{
-    .{ .name = "head", .ino = 0x5A5A_5A5A_1234_5678, .nlink = 3, .data = "aaaa" },
-    .{ .name = "tail", .ino = 0x5A5A_5A5A_1234_5678, .nlink = 3, .data = "bbbb" },
-    .{ .name = "then", .ino = 0x5A5A_5A5A_1234_5678, .nlink = 3, .data = "cccc" },
-};
-
-const inode_repeat_bytes = inodeRecordBytes(4, &inode_repeat_records);
-
-// Three distinct inos, so the decorated walk must match the bare one
-// entry for entry.
-const inode_distinct_records = [_]InodeRecord{
-    .{ .name = "one", .ino = 11, .nlink = 1, .data = "aaaa" },
-    .{ .name = "two", .ino = 22, .nlink = 1, .data = "bbbb" },
-    .{ .name = "three", .ino = 33, .nlink = 1, .data = "cccc" },
-};
-
-const inode_distinct_bytes = inodeRecordBytes(4, &inode_distinct_records);
-
-// The inode inner: [name_len: u16][name][ino: u64][nlink: u32][data: data_len].
-fn InodeRecords(comptime Source: type, comptime data_len: usize) type {
-    return struct {
-        const Self = @This();
-
-        pub const scratch_size: usize = 16;
-
-        source: *Source,
-        names: NameScratch,
-        pending: usize,
-
-        pub fn open(source: *Source, scratch: []u8) Exception!Self {
-            return .{ .source = source, .names = NameScratch.init(scratch), .pending = 0 };
-        }
-
-        pub fn next(self: *Self) Exception!?InodeInfo {
-            // An unconsumed entry is finished here so every next() starts at a record boundary.
-            if (self.pending > 0) {
-                try self.source.discard(self.pending);
-                self.pending = 0;
-            }
-            var header: [2]u8 = undefined;
-            const got = try self.source.take(&header);
-            if (got == 0) return null;
-            if (got < 2) return error.DataException;
-            const name_len: usize = std.mem.readInt(u16, &header, .little);
-            const name = try self.names.take(self.source, name_len);
-            // Both id fields ride together so one bounded pull covers the fixed tail.
-            var ids: [12]u8 = undefined;
-            const got_ids = try self.source.take(&ids);
-            if (got_ids < ids.len) return error.DataException;
-            self.pending = data_len;
-            return .{
-                .name = name,
-                .data_size = data_len,
-                .ino = std.mem.readInt(u64, ids[0..8], .little),
-                .nlink = std.mem.readInt(u32, ids[8..12], .little),
-            };
-        }
-
-        pub fn readData(self: *Self, writer: *std.Io.Writer) Exception!usize {
-            var staged: [32]u8 = undefined;
-            const budget = self.pending;
-            var total: usize = 0;
-            while (total < budget) {
-                const want = @min(budget - total, staged.len);
-                const got = try self.source.take(staged[0..want]);
-                if (got == 0) return error.DataException;
-                writer.writeAll(staged[0..got]) catch |err| switch (err) {
-                    error.WriteFailed => return error.IoException,
-                };
-                total += got;
-                self.pending -= got;
-            }
-            return total;
-        }
-
-        pub fn skipData(self: *Self) Exception!usize {
-            const n = self.pending;
-            try self.source.discard(n);
-            self.pending = 0;
-            return n;
-        }
-    };
-}
-
-test "collapse folds a three-entry group through the sink" {
+test "collapse folds the group through the sink with ordinal marks" {
     // The counting wrapper observes the fold's routing:
     // taken proves repeats never left through take, discarded proves the sink.
     var src = CountingSource(SliceSource){ .inner = SliceSource.init(&inode_repeat_bytes) };
@@ -2675,7 +2723,7 @@ test "collapse folds a three-entry group through the sink" {
     try testing.expectEqual(inode_repeat_records.len - 1, src.discards);
 }
 
-test "collapse distinct inodes match the bare cursor field by field" {
+test "collapse passes distinct inodes through untouched field by field" {
     var src = SliceSource.init(&inode_distinct_bytes);
     const Inner = InodeRecords(SliceSource, 4);
     var scratch: [Inner.scratch_size]u8 = undefined;
@@ -2717,7 +2765,7 @@ test "collapse distinct inodes match the bare cursor field by field" {
     }
 }
 
-test "collapse answers table exhaustion and bad sizes with capacity" {
+test "collapse answers table shape violations with capacity" {
     // One slot, two distinct groups: the second insert breaches the caller's bound.
     {
         var src = SliceSource.init(&inode_distinct_bytes);

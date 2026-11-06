@@ -3029,9 +3029,10 @@ test "brotli decode rejects oversubscribed cl codes" {
 
 test "brotli encode mozilla corpus" {
     const allocator = std.testing.allocator;
-    // CI unit jobs without the benchmark cache lack the Silesia corpus.
+    // The corpus is benchmark-cache state; absence skips visibly rather
+    // than passing silently.
     const input = std.Io.Dir.cwd().readFileAlloc(std.testing.io, "zig-out/benchmark/corpus/mozilla", allocator, .limited(1 << 27)) catch |err| switch (err) {
-        error.FileNotFound => return,
+        error.FileNotFound => return error.SkipZigTest,
         else => return err,
     };
     defer allocator.free(input);

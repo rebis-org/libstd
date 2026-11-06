@@ -55,9 +55,7 @@ fn report(subject: Subject, noise_t: f64, io: std.Io, pool: []u64, random: std.R
 }
 
 fn partitionT(fixed: []const u64, random: []const u64, random_gen: std.Random, pool: []u64) f64 {
-    // Pool both classes, split into two halves at random, and t-test the
-    // halves: a null probe that should stay near zero catches drift-driven
-    // artifacts the two-class test can mask.
+    // Pool both classes, split randomly, and t-test the halves: a null probe catching drift-driven artifacts the two-class test can mask.
     @memcpy(pool[0..fixed.len], fixed);
     @memcpy(pool[fixed.len..][0..random.len], random);
     const total = fixed.len + random.len;
@@ -91,10 +89,7 @@ pub fn main(init: std.process.Init) !void {
     random.bytes(&ct_fixed);
     random.bytes(&ct_random);
 
-    // Both classes walk a same-sized pool at the same index, so the memory
-    // system cost is identical and only the compared content differs:
-    // fixed compares equal halves, random compares against random bytes.
-    // Input construction stays outside the timed region.
+    // Both classes walk a same-sized pool at the same index, so memory cost matches and only compared content differs.
     var random_inputs = try alloc.alloc([32]u8, traces / 2);
     for (random_inputs) |*buf| random.bytes(buf);
     var fixed_inputs = try alloc.alloc([32]u8, traces / 2);
@@ -112,9 +107,7 @@ pub fn main(init: std.process.Init) !void {
 
     var i: usize = 0;
     while (i < traces) : (i += 1) {
-        // Fill each class to exactly half the traces: the class behind its
-        // quota takes the next draw, so binomial fluctuation cannot overrun
-        // the arrays and both classes stay interleaved.
+        // Fill each class to exactly half the traces, so binomial fluctuation cannot overrun the arrays and classes stay interleaved.
         const use_fixed = if (fixed_count == traces / 2)
             false
         else if (random_count == traces / 2)

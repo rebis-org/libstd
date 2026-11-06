@@ -339,9 +339,7 @@ fn buildIsoPlan(entries: []const Entry, alloc: std.mem.Allocator) Exception!IsoP
         .dir_lba_of = dir_lba_of,
         .file_lba_of = file_lba_of,
         .path_table_size = path_table_size,
-        // The libarchive bid reads the reserved area plus eight descriptor sectors.
-        //
-        // Shorter images never reach the parser; pad to 32 sectors.
+        // The libarchive bid reads the reserved area plus eight descriptor sectors; shorter images never reach the parser.
         .total = @as(u64, @max(lba, 32)) * sector_size,
     };
 }

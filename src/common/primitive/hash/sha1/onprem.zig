@@ -6,17 +6,7 @@ const seam = @import("seam");
 
 const merkle = @import("../merkle.zig");
 
-// FIPS 180-1.
-// RAR4's KDF and WinZIP AE-2 authentication require SHA-1.
-//
-// OpenSSL, crypto/sha/asm.
-//
-// Each sha1c, sha1p, and sha1m instruction runs four FIPS rounds, one
-// message word per Vm lane.
-//
-// The sha1h instruction (ror2 of lane 0) regenerates each group's e.
-//
-// The e for group g is rol30 of the a leaving group g-1.
+// FIPS 180-1; RAR4's KDF and WinZIP AE-2 need SHA-1. OpenSSL crypto/sha/asm: each sha1c/p/m runs four rounds per lane.
 
 const initial_state: [5]u32 = .{ 0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0 };
 
@@ -33,16 +23,7 @@ fn compressSha1(state: *align(16) [5]u32, block: *const [64]u8) void {
     compressScalar(state, block);
 }
 
-// Twenty groups, not eighty rounds: one group covers four rounds with K pre-added to the schedule.
-//
-// Zig cannot name the 32-bit S register views, so a/b/c/d stay pinned in v0 and e uses v2 and v3.
-//
-// The schedule and W+K vectors stay in free "w" registers.
-//
-// Each group's sha1h runs before its rounds, on the not-yet-updated abcd.
-// Group g consumes the sha1h computed before group g-1.
-//
-// The sha1h before the final group is the terminal e, per Polyakov's tail add.
+// Twenty groups cover four rounds each with K pre-added; Zig cannot name S-register views, so registers stay pinned.
 fn compressAarch64(state: *align(16) [5]u32, block: *const [64]u8) void {
     const V4u32 = @Vector(4, u32);
     const k4 = [4]V4u32{
@@ -168,11 +149,29 @@ fn compressScalar(state: *align(16) [5]u32, block: *const [64]u8) void {
     state[4] +%= e;
 }
 
-test "sha1 hw matches the scalar path" {
+test "sha1 hardware compression matches the scalar path" {
     if (comptime !has_arm8sha1) return error.SkipZigTest;
     try merkle.expectHwMatchesScalar(5, 20, initial_state, compressAarch64, compressScalar, 0x5A1D1);
 }
 
-test "sha1 onprem matches the stdlib oracle" {
+test "sha1 onprem pins the fips 180-1 answers and tracks the stdlib oracle" {
+    const testing = std.testing;
+
+    // FIPS 180-1 pins the empty, short, and two-block answers.
+    var empty = Sha1.init(.{});
+    var digest: [20]u8 = undefined;
+    empty.final(&digest);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xda, 0x39, 0xa3, 0xee, 0x5e, 0x6b, 0x4b, 0x0d, 0x32, 0x55, 0xbf, 0xef, 0x95, 0x60, 0x18, 0x90, 0xaf, 0xd8, 0x07, 0x09 }, &digest);
+
+    var abc = Sha1.init(.{});
+    abc.update("abc");
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xa9, 0x99, 0x3e, 0x36, 0x47, 0x06, 0x81, 0x6a, 0xba, 0x3e, 0x25, 0x71, 0x78, 0x50, 0xc2, 0x6c, 0x9c, 0xd0, 0xd8, 0x9d }, &abc.finalResult());
+
+    // Split feeds prove the second block consumes buffered state.
+    var two_block = Sha1.init(.{});
+    two_block.update("abcdbcdecdefdefgefghfghighij");
+    two_block.update("hijkijkljklmklmnlmnomnopnopq");
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x84, 0x98, 0x3e, 0x44, 0x1c, 0x3b, 0xd2, 0x6e, 0xba, 0xae, 0x4a, 0xa1, 0xf9, 0x51, 0x29, 0xe5, 0xe5, 0x46, 0x70, 0xf1 }, &two_block.finalResult());
+
     try seam.expectAgreement(Sha1.init(.{}), std.crypto.hash.Sha1.init(.{}), 0x5A1, true, null);
 }

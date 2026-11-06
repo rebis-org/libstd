@@ -124,6 +124,31 @@ pub fn writeLimitReject(comptime extra: Params, r: *Runner) !void {
     try harness.reject(r, harness.ids.write, nodes.items[0..nodes.len], .{ .ctx = true }, abi.Status.resource_limit, &sink);
 }
 
+// The scalar admits each side alone, not their sum: only the work limit
+// answers, pinning the routes that skipped it.
+pub fn workLimitReject(comptime extra: Params, r: *Runner) !void {
+    var input: [128]u8 = undefined;
+    @memset(&input, 'A');
+    var sink: [256]u8 = undefined;
+    const saved = r.caps_io;
+    r.caps_io = harness.cap_read | harness.cap_write | harness.cap_replay;
+    defer r.caps_io = saved;
+    const write_nodes = build(extra, r, &.{ harness.sourceSpan(&input), harness.sinkSpan(&sink), harness.resourceLimitParam(input.len) });
+    try harness.reject(r, harness.ids.write, write_nodes.items[0..write_nodes.len], .{ .ctx = true }, abi.Status.resource_limit, &sink);
+    if (r.encoded_len == 0) return error.NoEncodedData;
+    // The same ceiling on a query read: the size answer is refused before
+    // any sink sees a byte.
+    const read_nodes = build(extra, r, &.{
+        harness.paramTargetCommand(harness.ids.read),
+        harness.sourceSpan(r.encoded[0..r.encoded_len]),
+        harness.capabilityParam(r.caps_query),
+        harness.sizingModeParam(r.sizing),
+        harness.commitModeParam(r.commit_read),
+        harness.resourceLimitParam(@max(r.encoded_len, r.input.len)),
+    });
+    try harness.expect(r, harness.ids.query, read_nodes.items[0..read_nodes.len], .{}, abi.Status.resource_limit);
+}
+
 pub fn corruptReject(comptime extra: Params, r: *Runner) !void {
     if (r.encoded_len == 0) return error.NoEncodedData;
     @memset(r.output, 0xa5);

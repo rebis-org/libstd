@@ -126,7 +126,7 @@ test "offprem lzma payload decodes byte-identical to onprem" {
     defer alloc.free(encode_scratch);
 
     var sink = std.Io.Writer.fixed(compressed);
-    onprem.encodeToWriter(input, &sink, encode_scratch, .{ .properties = props }) catch return error.TestUnexpectedResult;
+    try onprem.encodeToWriter(input, &sink, encode_scratch, .{ .properties = props });
     const payload = compressed[0..sink.end];
 
     const offprem_scratch = try alloc.alloc(u8, scratchNeed(props));

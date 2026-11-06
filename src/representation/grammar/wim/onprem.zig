@@ -694,8 +694,7 @@ fn decodeChunk(codec: Codec, chunk_size: u64, payload: []const u8, out: []u8) Ex
     }
 }
 
-// A volume set reads resources from the part each blob-table entry names;
-// a single archive is a one-part set, so every read routes through here.
+// A volume set reads resources from the part each blob-table entry names; a single archive is a one-part set.
 const Parts = struct {
     slices: []const []const u8,
 
@@ -996,8 +995,7 @@ fn parse(parts: Parts, scratch: []u8) Exception!Parsed {
     const chunk_size = std.mem.readInt(u32, archive[20..24], .little);
     // Split-WIM identity: this part's 1-based number at 0x28, total parts at 0x2A.
     const wim_part = std.mem.readInt(u16, archive[40..42], .little);
-    // The head of a set (or a lone archive) is part 1; a later part alone
-    // carries no metadata and owns nothing by itself.
+    // The head of a set is part 1; a later part alone carries no metadata and owns nothing.
     if (wim_part != 1) return error.DataException;
     const image_count = std.mem.readInt(u32, archive[44..48], .little);
     if (image_count == 0) return error.DataException;
@@ -1238,9 +1236,7 @@ fn inspectCountParts(parts: Parts, scratch: []u8) Exception!u64 {
     return count;
 }
 
-// Split-set identity per wimlib's join: every part carries the same image
-// GUID, the part numbers run 1..N in order, and each header's total names
-// the whole set.
+// Split-set identity per wimlib's join: one shared image GUID, part numbers 1..N, and each header's total naming the set.
 pub fn volumeSetChecks(parts: []const []const u8) Exception!void {
     if (parts.len == 0) return error.DataException;
     if (parts.len > std.math.maxInt(u16)) return error.ResourceException;
@@ -1323,8 +1319,7 @@ fn decodeOrdinalExParts(parts: Parts, ordinal: u64, output: []u8, scratch: []u8,
     if (blobLookup(parsed.blobs, found.hash) catch null) |blob| {
         return readBlob(parts, parsed, blob, output);
     }
-    // Unbacked in a delta WIM: resolve from the referenced WIMs, in order.
-    // Each reparse clobbers the carve; the delta's data is no longer needed.
+    // Unbacked in a delta WIM: resolve from the referenced WIMs in order; each reparse clobbers the carve.
     for (options.references) |ref| {
         var ref_parts = [_][]const u8{ref};
         const rp = try parse(.{ .slices = &ref_parts }, carve);
@@ -1661,10 +1656,7 @@ pub const EncodeOptions = struct {
     compression: Compression = .store,
     chunk_size: u32 = 0, // 0 selects the codec default.
     solid: bool = false,
-    // Reference WIM archives, as wimlib_reference_resource_files() takes
-    // them: a blob whose SHA-1 exists in a reference stays unbacked, the
-    // delta-WIM shape. Each reference's lookup table must decode within
-    // the encode workspace.
+    // Reference WIMs, as wimlib_reference_resource_files() takes them: a blob whose SHA-1 exists in a reference stays unbacked.
     references: []const []const u8 = &.{},
 };
 
@@ -1925,11 +1917,7 @@ pub fn encodeEx(entries: []const Entry, output: []u8, scratch: []u8, options: En
 
 const zero_hash: [sha1_len]u8 = @splat(0);
 
-// ---------------------------------------------------------------------------
-// Split-set write, with wimlib's split semantics: part 1 keeps the metadata,
-// lookup table, and XML; each later part is a bare header followed by whole
-// resources. A resource never straddles a part, so the set joins, and the
-// read side needs no part-2 table.
+// Split write, wimlib's semantics: part 1 keeps metadata, lookup, and XML; later parts are a bare header plus whole resources.
 
 pub const SplitPlan = struct { count: usize, total: u64 };
 
@@ -1957,16 +1945,11 @@ fn writeSplitHeader(out: []u8, head: []const u8, part: u16, total: u16, zero_tab
     }
 }
 
-// Plans the split of an already-encoded WIM into volume_size parts, and
-// writes the contiguous set when `output` is given; part lengths land in
-// `lengths` when provided. Span list rows index-pair with parsed.blobs.
+// Plans the split of an encoded WIM into volume_size parts; span list rows index-pair with parsed.blobs.
 fn splitCore(archive: []const u8, volume_size: u64, output: ?[]u8, lengths: ?[]u64, scratch: []u8) Exception!SplitPlan {
     if (volume_size <= header_disk_size) return error.CallException;
     if (archive.len < header_disk_size) return error.DataException;
-    // Solid WIMs route chunks through a run header the split does not
-    // rewrite; the compose write path is store-only, so refuse them. The
-    // split rewrites a single-image part-1 table, so other shapes refuse
-    // rather than lose their extra images or foreign part ownership.
+    // Solid WIMs route chunks through a run header the split does not rewrite, so refuse them.
     if (std.mem.readInt(u32, archive[12..16], .little) == wim_version_solid) return error.UnsupportedException;
     if (std.mem.readInt(u32, archive[44..48], .little) != 1) return error.UnsupportedException;
     if (std.mem.readInt(u16, archive[42..44], .little) != 1) return error.UnsupportedException;
@@ -1976,9 +1959,7 @@ fn splitCore(archive: []const u8, volume_size: u64, output: ?[]u8, lengths: ?[]u
     const xml_len = xml.size_in_wim;
     const xml_end = bounds.addU64(xml.offset, xml_len) catch return error.DataException;
     if (xml_end > archive.len) return error.DataException;
-    // The span carve takes the scratch tail before parse runs; parse's
-    // leftover temp overlaps it, and the solid refusal above keeps the
-    // temp region unread.
+    // The span carve takes the scratch tail before parse runs; parse's leftover temp overlaps it but stays unread.
     const span_room = @max(table_len / blob_disk_size, 2);
     const span_bytes = std.math.mul(usize, span_room, @sizeOf(SplitSpan)) catch return error.ResourceException;
     const spans = try alignedTail(scratch, span_bytes, @alignOf(SplitSpan));
@@ -1992,23 +1973,19 @@ fn splitCore(archive: []const u8, volume_size: u64, output: ?[]u8, lengths: ?[]u
     for (parsed.blobs, 0..) |blob, index| {
         if (blob.res.flags & reshdr_flag_metadata != 0) return error.DataException;
         if (blob.res.offset < payload_start) return error.DataException;
-        // Every span must sit inside the source archive: the emit copies
-        // it, and a forged size must fail as data before any arithmetic.
+        // Every span must sit inside the source archive: the emit copies it, so a forged size must fail as data.
         const span_end = bounds.addU64(blob.res.offset, blob.res.size_in_wim) catch return error.DataException;
         if (span_end > archive.len) return error.DataException;
         span_list[index] = .{ .start = blob.res.offset, .len = blob.res.size_in_wim };
     }
     const used_spans = span_list[0..parsed.blobs.len];
-    // The table walks in resource order, so the spans are ascending and
-    // disjoint; anything else is not a layout this split rewrites.
+    // The table walks in resource order, so spans are ascending and disjoint; anything else is not a rewritable layout.
     var previous_end: u64 = payload_start;
     for (used_spans) |*span| {
         if (span.start < previous_end) return error.DataException;
         previous_end = span.start + span.len;
     }
-    // Part 1 carries the fixed overhead plus its payload share; later parts
-    // are a bare header plus payload. The table shrinks to the kept blobs,
-    // so the fixed side re-derives from this split's own table.
+    // Part 1 carries the fixed overhead plus payload; the table shrinks to kept blobs, so the fixed side re-derives.
     const new_table_len: u64 = (@as(u64, parsed.blobs.len) + 2) * blob_disk_size;
     const part1_fixed: u64 = header_disk_size + md_len + new_table_len + xml_len;
     if (volume_size <= part1_fixed) return error.CallException;
@@ -2036,8 +2013,7 @@ fn splitCore(archive: []const u8, volume_size: u64, output: ?[]u8, lengths: ?[]u
     if (lengths) |l| {
         if (l.len < count) return error.CapacityException;
     }
-    // Virtual layout: every span takes its part-relative offset before any
-    // byte moves, so the part-1 table can be written after all payloads.
+    // Every span takes its part-relative offset before any byte moves, so the part-1 table is written after all payloads.
     var part1_payload: u64 = 0;
     var cursor: u64 = header_disk_size + md_len;
     for (used_spans) |*span| {
@@ -2064,12 +2040,10 @@ fn splitCore(archive: []const u8, volume_size: u64, output: ?[]u8, lengths: ?[]u
         part_at += inner;
     }
     const out = output orelse return .{ .count = @intCast(count), .total = total };
-    // The emit replays the same layout the plan walked; a divergence is a
-    // defect in the walker, never a caller capacity problem.
+    // The emit replays the plan's layout; a divergence is a walker defect, never a caller capacity problem.
     if (out.len < total) return error.CapacityException;
     if (total != part_at) return error.InternalException;
-    // Emit part 1: head header, metadata, its payload share, the fresh
-    // table, and the XML as written (it still describes the source set).
+    // Part 1: head header, metadata, its payload share, the fresh table, and the XML as written.
     writeSplitHeader(out[0..header_disk_size], archive, 1, @intCast(count), false);
     // The lookup and XML slots point at this split's own table and XML.
     writeReshdr(out[48..72], .{ .size_in_wim = new_table_len, .flags = (try readReshdr(archive, 48)).flags, .offset = table_off, .uncompressed_size = new_table_len });
@@ -2124,8 +2098,7 @@ pub fn wimSplitPlan(archive: []const u8, volume_size: u64, scratch: []u8) Except
     return splitCore(archive, volume_size, null, null, scratch);
 }
 
-// The set leaves contiguously; `lengths` reports each part's byte length in
-// volume order so a caller can cut the stream without re-deriving the plan.
+// The set leaves contiguously; lengths reports each part's bytes so a caller can cut the stream without re-deriving the plan.
 pub fn wimSplitEmit(archive: []const u8, volume_size: u64, output: []u8, lengths: []u64, scratch: []u8) Exception!SplitPlan {
     return splitCore(archive, volume_size, output, lengths, scratch);
 }
@@ -2339,8 +2312,7 @@ test "wim split refuses a forged blob span" {
     var archive: [16 * 1024]u8 = undefined;
     var scratch: [64 * 1024]u8 = undefined;
     const written = try encode(&entries, &archive, &scratch);
-    // The first table row's stored size is forged beyond the archive; the
-    // span bound must fail as data before any layout arithmetic.
+    // The first row's stored size is forged beyond the archive; the span bound must fail as data before any arithmetic.
     const table_off = std.mem.readInt(u64, archive[56..64], .little);
     const huge: u64 = 0x0000_FFFF_FFFF_F000;
     std.mem.writeInt(u64, archive[@intCast(table_off)..][0..8], huge, .little);

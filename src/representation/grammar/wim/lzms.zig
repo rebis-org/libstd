@@ -5,11 +5,7 @@ const bits = @import("bits.zig");
 
 const Exception = exception_prim.Exception;
 
-// WIM LZMS codec, ported from wimlib src/lzms_decompress.c.
-// Range coder reads forwards; Huffman codes read backwards.
-//
-// Codes rebuild on fixed budgets with halved frequencies.
-// Ties break leaf-first, matching wimlib's tree construction.
+// WIM LZMS codec, ported from wimlib src/lzms_decompress.c; range coder reads forwards, Huffman codes backwards, codes rebuilt on fixed budgets.
 
 const num_literal_syms: usize = 256;
 const num_length_syms: usize = 54;
@@ -734,11 +730,7 @@ pub const extra_length_bits = [54]u8{
     7, 8, 9, 10, 16, 30,
 };
 
-// Decision bits feed a forwards range encoder; Huffman codewords and extra
-// bits feed a backwards bitstream in one shared buffer.
-//
-// Only literals and explicit-offset LZ matches are emitted; skipping rep and
-// delta keeps encoder and decoder states in lockstep.
+// Decision bits feed a forwards range encoder; codewords feed a backwards bitstream, keeping both states in lockstep.
 
 const lzms_window_bits: u5 = 21;
 const lzms_window: usize = 1 << lzms_window_bits;

@@ -179,7 +179,7 @@ pub fn addGenerated(b: *std.Build) Generated {
     const components_module = modules_pair.components;
     const interface_module = modules_pair.interface;
     const gen_module = b.createModule(.{
-        .root_source_file = b.path("src/catalog_gen.zig"),
+        .root_source_file = b.path("src/catalog.zig"),
         .target = b.graph.host,
         .optimize = .debug,
     });

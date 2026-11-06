@@ -11,12 +11,20 @@ pub const Options = struct {};
 // scratch, capped at one MiB.
 pub const measured_staging: usize = 1 << 20;
 
+// Matches reach back at most 0xBFFF bytes: M4 offsets top out there and
+// the encoder rejects anything deeper.
+pub const history_keep: usize = 0xBFFF;
+
+// The flush quantum in front of the retained history.
+const stream_chunk: usize = 1 << 14;
+
 pub fn decodeWorkspaceSize() usize {
-    return 0;
+    return history_keep + stream_chunk;
 }
 
 pub fn encodeWorkspaceSize() usize {
-    return encode_workspace_size;
+    // Slack for the self-aligning dict base in a misaligned scratch.
+    return encode_workspace_size + @alignOf(u16) - 1;
 }
 
 pub fn encodedSizeBound(input_len: usize) usize {
@@ -40,8 +48,11 @@ pub fn decodedSize(input: []const u8, scratch: []u8, options: Options) Exception
 
 pub fn decodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options: Options) Exception!void {
     _ = options;
-    const produced = try decodeInPlace(input, scratch, &.{}, .{});
-    writer.writeAll(scratch[0..produced]) catch return error.IoException;
+    // Streaming drives a sliding window: retained history for
+    // back-references plus a flush quantum of fresh output.
+    if (scratch.len < decodeWorkspaceSize()) return error.CapacityException;
+    var s = Stream{ .writer = writer, .produced = 0 };
+    _ = try decodeCore(.stream, input, scratch, &s);
 }
 
 // LZO1X decompression, ported from the reference decoder in vendor/lzo.
@@ -70,53 +81,107 @@ fn readExtended(input: []const u8, ip: *usize, base: usize) Exception!usize {
     }
 }
 
-fn copyLiterals(input: []const u8, output: []u8, ip: *usize, op: *usize, len: usize, count_only: bool) Exception!void {
+// One state machine serves all routes: counting walks tokens, in-place
+// decodes into the caller's buffer, streaming drives a sliding window.
+const Mode = enum { count, in_place, stream };
+
+const Stream = struct {
+    writer: *std.Io.Writer,
+    produced: usize,
+    // Window offset where unwritten output starts; the history in front
+    // of it has already been sent.
+    flushed: usize = 0,
+};
+
+// Writes the unsent window span and slides the history forward; flushes happen only when the window is full.
+fn streamFlush(window: []u8, s: *Stream, op: *usize) Exception!void {
+    s.writer.writeAll(window[s.flushed..op.*]) catch return error.IoException;
+    s.produced += op.* - s.flushed;
+    const keep_n = @min(history_keep, op.*);
+    if (keep_n > 0) {
+        std.mem.copyForwards(u8, window[0..keep_n], window[op.* - keep_n .. op.*]);
+    }
+    s.flushed = keep_n;
+    op.* = keep_n;
+}
+
+fn finish(comptime mode: Mode, output: []u8, s: ?*Stream, op: usize) Exception!usize {
+    switch (mode) {
+        .count, .in_place => return op,
+        .stream => {
+            var tail = op;
+            try streamFlush(output, s.?, &tail);
+            return s.?.produced;
+        },
+    }
+}
+
+fn copyLiterals(comptime mode: Mode, input: []const u8, output: []u8, ip: *usize, op: *usize, len: usize, s: ?*Stream) Exception!void {
     if (len > input.len - ip.*) return error.DataException;
-    if (!count_only) {
-        if (len > output.len - op.*) return error.CapacityException;
-        @memcpy(output[op.* .. op.* + len], input[ip.* .. ip.* + len]);
+    switch (mode) {
+        .count => op.* += len,
+        .in_place => {
+            if (len > output.len - op.*) return error.CapacityException;
+            @memcpy(output[op.* .. op.* + len], input[ip.* .. ip.* + len]);
+            op.* += len;
+        },
+        .stream => {
+            var done: usize = 0;
+            while (done < len) {
+                if (op.* == output.len) try streamFlush(output, s.?, op);
+                const n = @min(output.len - op.*, len - done);
+                @memcpy(output[op.* .. op.* + n], input[ip.* + done .. ip.* + done + n]);
+                op.* += n;
+                done += n;
+            }
+        },
     }
     ip.* += len;
-    op.* += len;
 }
 
 // History may overlap the cursor, so the shared ladder owns the copy;
-// the size walk skips output entirely.
-fn copyMatch(output: []u8, op: *usize, m_pos: usize, len: usize, count_only: bool) Exception!void {
-    if (count_only) {
+// the counting walk skips output entirely.
+fn copyMatch(comptime mode: Mode, output: []u8, op: *usize, m_pos: usize, len: usize, s: ?*Stream) Exception!void {
+    if (mode == .count) {
         op.* += len;
         return;
     }
-    if (len > output.len - op.*) return error.CapacityException;
+    if (mode == .in_place and len > output.len - op.*) return error.CapacityException;
     const distance = op.* - m_pos;
     // A zero distance copies each byte onto itself.
     if (distance == 0) {
         op.* += len;
         return;
     }
-    if (len <= std.math.maxInt(u32) and distance <= std.math.maxInt(u32)) {
-        kernels.copyMatch(output, op.*, @intCast(distance), @intCast(len));
-    } else {
-        var i: usize = 0;
-        while (i < len) : (i += 1) {
-            output[op.* + i] = output[m_pos + i];
+    var done: usize = 0;
+    while (done < len) {
+        if (mode == .stream and op.* == output.len) try streamFlush(output, s.?, op);
+        const n = @min(output.len - op.*, len - done);
+        if (distance <= std.math.maxInt(u32) and n <= std.math.maxInt(u32)) {
+            kernels.copyMatch(output, op.*, @intCast(distance), @intCast(n));
+        } else {
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
+                output[op.* + i] = output[op.* - distance + i];
+            }
         }
+        op.* += n;
+        done += n;
     }
-    op.* += len;
 }
 
 const Phase = enum { literal, match };
 
 // Small token after literals: three-byte M1 match.
-fn m1AfterLiteral(input: []const u8, output: []u8, ip: *usize, op: *usize, t: usize, count_only: bool) Exception!usize {
+fn m1AfterLiteral(comptime mode: Mode, input: []const u8, output: []u8, ip: *usize, op: *usize, t: usize, s: ?*Stream) Exception!usize {
     const b = try takeToken(input, ip);
     const back = (1 + m2_max_offset) + (t >> 2) + (@as(usize, b) << 2);
     if (back > op.*) return error.DataException;
-    try copyMatch(output, op, op.* - back, 3, count_only);
+    try copyMatch(mode, output, op, op.* - back, 3, s);
     if (ip.* < 2) return error.DataException;
     var bridge: usize = input[ip.* - 2] & 3;
     if (bridge == 0) return 0;
-    try copyLiterals(input, output, ip, op, bridge, count_only);
+    try copyLiterals(mode, input, output, ip, op, bridge, s);
     bridge = try takeToken(input, ip);
     return bridge;
 }
@@ -124,20 +189,20 @@ fn m1AfterLiteral(input: []const u8, output: []u8, ip: *usize, op: *usize, t: us
 pub fn decode(input: []const u8, output: []u8, scratch: []u8, options: Options) Exception!usize {
     _ = scratch;
     _ = options;
-    return decodeInPlace(input, output, &.{}, .{});
+    return decodeCore(.in_place, input, output, null);
 }
 
 pub fn decodeInPlace(input: []const u8, output: []u8, scratch: []u8, options: Options) Exception!usize {
     _ = scratch;
     _ = options;
-    return decodeInner(input, output, false);
+    return decodeCore(.in_place, input, output, null);
 }
 
 pub fn countDecoded(input: []const u8) Exception!usize {
-    return decodeInner(input, &.{}, true);
+    return decodeCore(.count, input, &.{}, null);
 }
 
-fn decodeInner(input: []const u8, output: []u8, count_only: bool) Exception!usize {
+fn decodeCore(comptime mode: Mode, input: []const u8, output: []u8, s: ?*Stream) Exception!usize {
     if (input.len == 0) return error.DataException;
     var ip: usize = 0;
     var op: usize = 0;
@@ -149,12 +214,12 @@ fn decodeInner(input: []const u8, output: []u8, count_only: bool) Exception!usiz
     if (t > 17) {
         const short_run = t < 21;
         t -= 17;
-        try copyLiterals(input, output, &ip, &op, t, count_only);
+        try copyLiterals(mode, input, output, &ip, &op, t, s);
         t = try takeToken(input, &ip);
         if (short_run) {
             phase = .match;
         } else if (t < 16) {
-            t = try m1AfterLiteral(input, output, &ip, &op, t, count_only);
+            t = try m1AfterLiteral(mode, input, output, &ip, &op, t, s);
             if (t == 0) {
                 t = try takeToken(input, &ip);
                 phase = .literal;
@@ -171,10 +236,10 @@ fn decodeInner(input: []const u8, output: []u8, count_only: bool) Exception!usiz
             if (t < 16) {
                 var len = t;
                 if (len == 0) len = try readExtended(input, &ip, 15);
-                try copyLiterals(input, output, &ip, &op, len + 3, count_only);
+                try copyLiterals(mode, input, output, &ip, &op, len + 3, s);
                 t = try takeToken(input, &ip);
                 if (t < 16) {
-                    t = try m1AfterLiteral(input, output, &ip, &op, t, count_only);
+                    t = try m1AfterLiteral(mode, input, output, &ip, &op, t, s);
                     if (t == 0) {
                         t = try takeToken(input, &ip);
                         continue;
@@ -192,7 +257,7 @@ fn decodeInner(input: []const u8, output: []u8, count_only: bool) Exception!usiz
             const back = 1 + ((t >> 2) & 7) + (@as(usize, b) << 3);
             if (back > op) return error.DataException;
             const len = (t >> 5) + 1;
-            try copyMatch(output, &op, op - back, len, count_only);
+            try copyMatch(mode, output, &op, op - back, len, s);
             t = if (ip >= 2) input[ip - 2] & 3 else return error.DataException;
         } else if (t >= 32) {
             // M3: fourteen-bit offset in the following two bytes.
@@ -202,7 +267,7 @@ fn decodeInner(input: []const u8, output: []u8, count_only: bool) Exception!usiz
             const off = (@as(usize, input[ip] >> 2) + (@as(usize, input[ip + 1]) << 6)) + 1;
             ip += 2;
             if (off > op) return error.DataException;
-            try copyMatch(output, &op, op - off, len + 2, count_only);
+            try copyMatch(mode, output, &op, op - off, len + 2, s);
             t = input[ip - 2] & 3;
         } else if (t >= 16) {
             // M4 widens the offset by 16 KiB via the third token bit.
@@ -215,18 +280,18 @@ fn decodeInner(input: []const u8, output: []u8, count_only: bool) Exception!usiz
             ip += 2;
             if (wide == 0 and off == 0) {
                 if (ip != input.len) return error.DataException;
-                return op;
+                return finish(mode, output, s, op);
             }
             const back = wide + off + m4_bias;
             if (back > op) return error.DataException;
-            try copyMatch(output, &op, op - back, len + 2, count_only);
+            try copyMatch(mode, output, &op, op - back, len + 2, s);
             t = input[ip - 2] & 3;
         } else {
             // M1 inside the chain: a two-byte copy with a short offset.
             const b = try takeToken(input, &ip);
             const back = 1 + (t >> 2) + (@as(usize, b) << 2);
             if (back > op) return error.DataException;
-            try copyMatch(output, &op, op - back, 2, count_only);
+            try copyMatch(mode, output, &op, op - back, 2, s);
             t = if (ip >= 2) input[ip - 2] & 3 else return error.DataException;
         }
         if (t == 0) {
@@ -234,7 +299,7 @@ fn decodeInner(input: []const u8, output: []u8, count_only: bool) Exception!usiz
             phase = .literal;
             continue;
         }
-        try copyLiterals(input, output, &ip, &op, t, count_only);
+        try copyLiterals(mode, input, output, &ip, &op, t, s);
         t = try takeToken(input, &ip);
     }
 }
@@ -394,9 +459,12 @@ fn compressChunk(e: *Encoder, input: []const u8, start: usize, len: usize, carry
 }
 
 fn encoder(scratch: []u8, out: []u8, count_only: bool) Exception!Encoder {
-    if (scratch.len < encode_workspace_size) return error.CapacityException;
+    // The dict is a u16 view of caller bytes, which may start misaligned;
+    // the base self-aligns inside the scratch.
+    const base = std.mem.alignForward(usize, @intFromPtr(scratch.ptr), @alignOf(u16)) - @intFromPtr(scratch.ptr);
+    if (scratch.len < base + encode_workspace_size) return error.CapacityException;
     return .{
-        .dict = @alignCast(std.mem.bytesAsSlice(u16, scratch[0..encode_workspace_size])),
+        .dict = @alignCast(std.mem.bytesAsSlice(u16, scratch[base..][0..encode_workspace_size])),
         .out = out,
         .count_only = count_only,
     };
@@ -439,7 +507,7 @@ fn encodeInner(e: *Encoder, input: []const u8) Exception!usize {
 
 test "lzo1x roundtrips reference fixtures" {
     const testing = std.testing;
-    var workspace: [encode_workspace_size]u8 = undefined;
+    var workspace: [encodeWorkspaceSize()]u8 = undefined;
     for ([_][]const u8{ fixture0_plain, fixture1_plain, fixture2_plain }) |plain| {
         var comp: [512]u8 = undefined;
         const n = try encode(plain, &comp, &workspace, .{});
@@ -464,5 +532,69 @@ test "lzo1x decodes reference short literal runs" {
         const m = try decode(case.stream, &back, &.{}, .{});
         try std.testing.expectEqualSlices(u8, case.plain, back[0..m]);
         try std.testing.expectEqual(case.plain.len, try countDecoded(case.stream));
+    }
+}
+
+test "lzo1x streams reference fixtures to a writer" {
+    const testing = std.testing;
+    var out: [128]u8 = undefined;
+    var scratch: [decodeWorkspaceSize()]u8 = undefined;
+    for ([_][]const u8{ fixture0_comp, fixture1_comp, fixture2_comp }, [_][]const u8{ fixture0_plain, fixture1_plain, fixture2_plain }) |comp, plain| {
+        @memset(&out, 0);
+        var sink = std.Io.Writer.fixed(&out);
+        try decodeToWriter(comp, &sink, &scratch, .{});
+        try testing.expectEqual(plain.len, sink.end);
+        try testing.expectEqualSlices(u8, plain, sink.buffer[0..sink.end]);
+    }
+}
+
+test "lzo1x streams past the sliding window" {
+    const testing = std.testing;
+    // 192 KiB: pseudorandom literals, a period-61 tiled span, and a zero tail forcing flushes inside a single match copy.
+    var plain: [196608]u8 = undefined;
+    var seed: u32 = 0x9e3779b9;
+    var i: usize = 0;
+    while (i < plain.len) : (i += 1) {
+        if (i < 32768) {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            plain[i] = @truncate(seed);
+        } else if (i < 131072) {
+            plain[i] = @truncate(61 + (i % 61));
+        } else {
+            plain[i] = 0;
+        }
+    }
+    var workspace: [encodeWorkspaceSize()]u8 = undefined;
+    var comp: [encodedSizeBound(plain.len)]u8 = undefined;
+    const n = try encode(&plain, &comp, &workspace, .{});
+    var scratch: [decodeWorkspaceSize()]u8 = undefined;
+    var back: [plain.len]u8 = undefined;
+    var sink = std.Io.Writer.fixed(&back);
+    try decodeToWriter(comp[0..n], &sink, &scratch, .{});
+    try testing.expectEqual(plain.len, sink.end);
+    try testing.expectEqualSlices(u8, &plain, sink.buffer[0..sink.end]);
+    try testing.expectEqual(plain.len, try countDecoded(comp[0..n]));
+}
+
+test "lzo1x streaming rejects undersized scratch" {
+    var out: [128]u8 = undefined;
+    var scratch: [decodeWorkspaceSize() - 1]u8 = undefined;
+    var sink = std.Io.Writer.fixed(&out);
+    try std.testing.expectError(error.CapacityException, decodeToWriter(fixture0_comp, &sink, &scratch, .{}));
+}
+
+test "lzo1x streaming rejects malformed input" {
+    var out: [128]u8 = undefined;
+    var scratch: [decodeWorkspaceSize()]u8 = undefined;
+    const cases = [_][]const u8{
+        &.{0x06},
+        fixture0_comp[0 .. fixture0_comp.len - 1],
+    };
+    for (cases) |bad| {
+        @memset(&out, 0);
+        var sink = std.Io.Writer.fixed(&out);
+        try std.testing.expectError(error.DataException, decodeToWriter(bad, &sink, &scratch, .{}));
     }
 }

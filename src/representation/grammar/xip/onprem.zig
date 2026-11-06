@@ -14,9 +14,7 @@ const pbzx = @import("pbzx.zig");
 pub const Entry = entry_prim.Entry;
 const Exception = exception_prim.Exception;
 
-// XIP: a XAR container whose Content member is a pbzx chunk stream of a
-// cpio archive. Each chunk states its decoded size, so a read decodes
-// only the chunks it touches.
+// XIP: a XAR container whose Content member is a pbzx chunk stream of a cpio archive; chunks state decoded sizes.
 
 pub const block_size_max: usize = 16 << 20;
 // Writer chunk size: the last chunk pads to it, so a small one is cheap.
@@ -38,6 +36,97 @@ const Chain = session.Nested(xar.Outer, pbzx.Pbzx, cpio.Inner);
 
 comptime {
     if (Chain.scratch_size != scratch_size) @compileError("xip: the session chain no longer matches the frozen scratch budget");
+}
+
+// A forward read keeps one window instead of the whole encoded archive:
+// the container head stages through it, then the chunk stream pulls
+// through it chunk by chunk. The window holds the head plus one stored
+// chunk, with margin for the xz container overhead.
+pub const window_capacity: usize = block_size_max + (1 << 20);
+// The TOC digest sits at the heap start, as every writer of this
+// container emits it, so the head staging bounds the heap head.
+pub const heap_head_slack: u64 = 1 << 16;
+
+// The pbzx stream over a forward view: offsets are member-relative, and
+// the view converts them at its own position.
+fn MemberView(comptime Forward: type) type {
+    return struct {
+        const Self = @This();
+
+        forward: *Forward,
+        member_start: u64,
+        member_len: u64,
+
+        pub fn total(self: Self) u64 {
+            return self.member_len;
+        }
+
+        pub fn window(self: Self, at: u64, length: u64) Exception![]const u8 {
+            const absolute = try bounds.addU64(self.member_start, at);
+            const position = self.forward.position();
+            // The chunk stream never rewinds.
+            if (absolute < position) return error.CallException;
+            try self.forward.skip(absolute - position);
+            return self.forward.hold(length);
+        }
+    };
+}
+
+// The Outer role over a forward view: the TOC stages through the window,
+// and the member starts where the TOC points.
+fn ViewOuter(comptime Forward: type) type {
+    return struct {
+        const Self = @This();
+
+        pub const scratch_size: usize = xar.scratch_size;
+
+        forward: *Forward,
+        scratch: []u8,
+
+        pub fn init(forward: *Forward, scratch: []u8) Exception!Self {
+            return .{ .forward = forward, .scratch = scratch };
+        }
+
+        pub fn member(self: *Self, name: []const u8) Exception!MemberView(Forward) {
+            // Staging covers header, TOC, and the heap head: the digest
+            // sits at the heap start, as every writer of this container
+            // emits it, so a bounded head staging verifies the TOC.
+            const header = try self.forward.hold(xar.header_size);
+            const hlen: u64 = std.mem.readInt(u16, header[4..6], .big);
+            const toc_compressed = std.mem.readInt(u64, header[8..16], .big);
+            const head = try bounds.addU64(try bounds.addU64(hlen, toc_compressed), heap_head_slack);
+            const staging = try self.forward.holdUpTo(head);
+            const range = try xar.declaredRange(staging, name, self.scratch);
+            // The whole-archive read bounds the member against the archive;
+            // a declared source length answers the same bound here.
+            if (self.forward.declaredTotal()) |total| {
+                if (try bounds.addU64(range.offset, range.length) > total) return error.DataException;
+            }
+            try self.forward.skip(range.offset);
+            return .{ .forward = self.forward, .member_start = range.offset, .member_len = range.length };
+        }
+    };
+}
+
+// The forward view chain reuses the whole-archive roles unchanged.
+fn ViewChain(comptime Forward: type) type {
+    return session.Nested(ViewOuter(Forward), pbzx.Pbzx, cpio.Inner);
+}
+
+pub fn viewWalker(comptime Forward: type) type {
+    return @import("../cpio/chain.zig").Walker(ViewChain(Forward), member_name);
+}
+
+pub fn inspectCountView(comptime Forward: type, forward: *Forward, scratch: []u8) Exception!u64 {
+    return viewWalker(Forward).inspectCount(forward, scratch);
+}
+
+pub fn inspectOrdinalView(comptime Forward: type, forward: *Forward, ordinal: u64, scratch: []u8) Exception!viewWalker(Forward).EntryInfo {
+    return viewWalker(Forward).inspectOrdinal(forward, ordinal, scratch);
+}
+
+pub fn decodeOrdinalView(comptime Forward: type, forward: *Forward, ordinal: u64, output: []u8, scratch: []u8) Exception!usize {
+    return viewWalker(Forward).decodeOrdinal(forward, ordinal, output, scratch);
 }
 
 // The write side needs only the XML staging area; the check keeps the
@@ -65,8 +154,7 @@ const Layout = struct {
     total: u64,
 };
 
-// The TOC holds one member. Its offsets are heap-relative.
-// The heap opens with the TOC digest, so the payload starts at 20.
+// The TOC holds one member with heap-relative offsets; the heap opens with the TOC digest, so payload starts at 20.
 fn writeToc(sink: *io.Sink, pbzx_len: u64) Exception!void {
     try sink.write(xar.xml_prolog);
     try sink.write("  <file id=\"1\">\n   <name>Content</name>\n   <type>file</type>\n   <mode>0755</mode>\n   <data>\n    <length>");
@@ -98,8 +186,7 @@ fn layoutFor(entries: []const Entry, xml_area: []u8, block_size: u64) Exception!
     return .{ .xml = xml, .toc_len = toc_len, .total = total };
 }
 
-// Stored chunks pad to the writer's block size, so each states one size.
-// The last chunk is zero-filled past the cpio trailer.
+// Stored chunks pad to the writer's block size, so each states one size; the last is zero-filled past the trailer.
 const ChunkSink = struct {
     output: []u8,
     cursor: usize,
@@ -290,8 +377,7 @@ test "xip skips chunks no read touches" {
     defer testing.allocator.free(scratch);
     const written = try encodeFor(&entries, &output, scratch, 4096);
 
-    // Corrupt the first chunk's data. A reader that decodes it anyway
-    // reports the first entry's bytes wrong, and this test reads past it.
+    // Corrupting the first chunk makes a decoding reader report the first entry's bytes wrong, and this test reads past it.
     const range = try xar.findDataRange(output[0..written], "Content", scratch[0..xar.scratch_size]);
     const payload_start: usize = @intCast(range.offset + pbzx_header_size + chunk_header_size);
     for (output[payload_start..][0..4096]) |*byte| {
@@ -379,8 +465,7 @@ test "xip decodes only the chunks a read needs" {
     try testing.expectEqual(@as(u8, 0x5A), destination[0]);
     try testing.expectEqual(@as(u8, 0x5A), destination[destination.len - 1]);
 
-    // The same pass through the public cursor: names only, and a read of
-    // the one member whose bytes the caller wants.
+    // The same pass through the public cursor: names only, and a read of the one member the caller wants.
     var cursor = try Cursor.init(output[0..written], scratch);
     var seen: usize = 0;
     while (try cursor.next()) |info| {
@@ -430,8 +515,7 @@ test "xip rejects a member that is not a pbzx stream" {
 
 test "xip reports ino and nlink and folds groups only on request" {
     const testing = std.testing;
-    // Two names, one group, and payloads that disagree: the shape a real
-    // Apple image carries, where folding rewrites what the stream says.
+    // Two names, one group, disagreeing payloads: the shape a real Apple image carries, where folding rewrites what the stream says.
     const entries = [_]Entry{
         .{ .name = "group/first.bin", .data = "first", .ino = 7, .nlink = 2 },
         .{ .name = "group/second.bin", .data = "second", .ino = 7, .nlink = 2 },
@@ -562,4 +646,82 @@ test "xip ends cleanly at the last chunk" {
     // The last chunk is short and padded; the walk decoded it once.
     try testing.expectEqual(@as(u64, 1), cursor.decodedChunks());
     try testing.expectEqual(@as(u64, 4096), cursor.decodedBytes());
+}
+
+test "xip reads the same entries through a forward view and the whole archive" {
+    const testing = std.testing;
+    var payload: [5000]u8 = undefined;
+    for (&payload, 0..) |*byte, index| byte.* = @truncate(index * 11 + 5);
+    const entries = [_]Entry{
+        .{ .name = "big.bin", .data = &payload },
+        .{ .name = "tail.txt", .data = "tail" },
+    };
+    var output: [128 * 1024]u8 = undefined;
+    const scratch = try testing.allocator.alloc(u8, scratch_size);
+    defer testing.allocator.free(scratch);
+    const written = try encodeFor(&entries, &output, scratch, 4096);
+    const archive = output[0..written];
+
+    const SliceForward = struct {
+        bytes: []const u8,
+        front: usize = 0,
+
+        pub fn position(self: *@This()) u64 {
+            return self.front;
+        }
+
+        pub fn declaredTotal(self: *@This()) ?u64 {
+            return self.bytes.len;
+        }
+
+        pub fn hold(self: *@This(), length: u64) Exception![]const u8 {
+            const want = std.math.cast(usize, length) orelse return error.ResourceException;
+            if (want > self.bytes.len - self.front) return error.DataException;
+            return self.bytes[self.front..][0..want];
+        }
+
+        pub fn holdUpTo(self: *@This(), length: u64) Exception![]const u8 {
+            const want = std.math.cast(usize, length) orelse return error.ResourceException;
+            const take = @min(want, self.bytes.len - self.front);
+            return self.bytes[self.front..][0..take];
+        }
+
+        pub fn skip(self: *@This(), count: u64) Exception!void {
+            const step = std.math.cast(usize, count) orelse return error.DataException;
+            if (step > self.bytes.len - self.front) return error.DataException;
+            self.front += step;
+        }
+    };
+
+    var forward = SliceForward{ .bytes = archive };
+    // The driver restarts the stream before each verb; the test does the same.
+    try testing.expectEqual(try inspectCount(archive, scratch), try inspectCountView(SliceForward, &forward, scratch));
+    forward.front = 0;
+    const whole_info = try inspectOrdinal(archive, 0, scratch);
+    const view_info = try inspectOrdinalView(SliceForward, &forward, 0, scratch);
+    try testing.expectEqualSlices(u8, whole_info.name, view_info.name);
+    try testing.expectEqual(whole_info.size, view_info.size);
+
+    // The entry whose data spans chunks decodes byte for byte the same.
+    var whole: [payload.len]u8 = undefined;
+    var viewed: [payload.len]u8 = undefined;
+    const whole_size = try decodeOrdinal(archive, 0, &whole, scratch);
+    forward.front = 0;
+    const view_size = try decodeOrdinalView(SliceForward, &forward, 0, &viewed, scratch);
+    try testing.expectEqual(whole_size, view_size);
+    try testing.expectEqualSlices(u8, whole[0..whole_size], viewed[0..view_size]);
+
+    // The second entry reads back the same through the rebased view.
+    var tail_whole: [8]u8 = undefined;
+    var tail_viewed: [8]u8 = undefined;
+    forward.front = 0;
+    try testing.expectEqual(
+        try decodeOrdinal(archive, 1, &tail_whole, scratch),
+        try decodeOrdinalView(SliceForward, &forward, 1, &tail_viewed, scratch),
+    );
+    try testing.expectEqualSlices(u8, &tail_whole, &tail_viewed);
+
+    // A short view is a truncated archive, like a short archive is.
+    var cut = SliceForward{ .bytes = archive[0 .. written - 100] };
+    try testing.expectError(error.DataException, inspectCountView(SliceForward, &cut, scratch));
 }

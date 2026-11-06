@@ -772,9 +772,16 @@ pub const Outer = struct {
 
 pub const DataRange = struct { offset: u64, length: u64 };
 
-// The absolute byte range of a named member: what a container that wraps
-// another container needs to find its payload without reading the heap.
+// The absolute byte range of a named member: what a wrapping container needs to find its payload.
 pub fn findDataRange(archive: []const u8, name: []const u8, scratch: []u8) Exception!DataRange {
+    const range = try declaredRange(archive, name, scratch);
+    _ = try bounds.slice(archive, range.offset, range.length);
+    return range;
+}
+
+// The TOC-declared range before the fit check: a streaming caller bounds
+// the member against the source length itself.
+pub fn declaredRange(archive: []const u8, name: []const u8, scratch: []u8) Exception!DataRange {
     const parts = try splitScratch(scratch);
     const toc = try inflateToc(archive, parts.toc, parts.history);
     const result = try scanEntries(toc.xml, null, name, parts.name);
@@ -783,7 +790,6 @@ pub fn findDataRange(archive: []const u8, name: []const u8, scratch: []u8) Excep
     if (!info.stored) return error.UnsupportedException;
     const heap_start = archive.len - toc.heap.len;
     const offset = try bounds.addU64(heap_start, info.data_offset);
-    _ = try bounds.slice(archive, offset, info.data_length);
     return .{ .offset = offset, .length = info.data_length };
 }
 

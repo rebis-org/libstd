@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const lane_driver = @import("../../../common/lanes.zig");
 const binary = @import("../../../common/primitive/binary.zig");
 const bounds = @import("../../../common/primitive/bounds.zig");
 const checksum = @import("../../../common/primitive/checksum.zig");
@@ -293,6 +294,8 @@ pub fn verifyCrc32(bytes: []const u8, expected: u32, provider: checksum.Provider
 pub const IndexRecord = struct {
     unpadded_size: u64,
     uncompressed_size: u64,
+    // Filled by the lane walk; the serial validator compares the two sizes.
+    offset: u64 = 0,
 };
 
 const max_index_records = 1024;
@@ -582,6 +585,198 @@ fn skipStreamPadding(cursor: *binary.ReadCursor) Exception!void {
     }
 }
 
+// The tail index is the boundary source: it states every block's size.
+pub const IndexInfo = struct {
+    count: u32,
+    blocks_end: usize,
+};
+
+pub fn indexBlocks(input: []const u8, records: *IndexRecordList, provider: checksum.Provider) Exception!?IndexInfo {
+    if (input.len < stream_footer_size + 8) return null;
+    const footer = input[input.len - stream_footer_size ..];
+    // A stream with no footer has no index; the serial decoder reads it.
+    if (!std.mem.eql(u8, footer[10..12], &footer_magic)) return null;
+    const footer_crc = std.mem.readInt(u32, footer[0..4], .little);
+    try verifyCrc32(footer[4..10], footer_crc, provider);
+    // Reserved flag and check bytes read zero, as the serial footer walk requires.
+    if (footer[8] != 0x00) return error.DataException;
+    if (footer[9] & 0xF0 != 0) return error.DataException;
+    const backward: usize = std.mem.readInt(u32, footer[4..8], .little);
+    const units = std.math.add(usize, backward, 1) catch return error.DataException;
+    const index_size = std.math.mul(usize, units, 4) catch return error.DataException;
+    if (index_size + stream_footer_size > input.len) return error.DataException;
+    const index_start = input.len - stream_footer_size - index_size;
+    var cursor = binary.ReadCursor.init(input[index_start .. input.len - stream_footer_size]);
+    try parseIndex(&cursor, records, provider);
+    if (cursor.remaining() != 0) return error.DataException;
+    return .{ .count = @intCast(records.len), .blocks_end = index_start };
+}
+
+// A count past the shared bound answers like the decoder: the list refuses it.
+fn parseIndex(cursor: *binary.ReadCursor, records: *IndexRecordList, provider: checksum.Provider) Exception!void {
+    const index_start = cursor.pos;
+    if (cursor.remaining() == 0 or cursor.buffer[cursor.pos] != 0x00) return error.DataException;
+    _ = try cursor.readU8();
+    const record_count = try cursor.readUleb128();
+    var index: u64 = 0;
+    while (index < record_count) : (index += 1) {
+        const unpadded = try cursor.readUleb128();
+        const uncompressed = try cursor.readUleb128();
+        try records.append(.{ .unpadded_size = unpadded, .uncompressed_size = uncompressed });
+    }
+    const content_size = cursor.pos - index_start;
+    const padding = (4 - (content_size % 4)) % 4;
+    for (0..padding) |_| {
+        if (cursor.pos >= cursor.buffer.len or cursor.buffer[cursor.pos] != 0x00) return error.DataException;
+        cursor.pos += 1;
+    }
+    const index_end = try bounds.addUsize(cursor.pos, 4);
+    if (index_end > cursor.buffer.len) return error.DataException;
+    const index_crc = std.mem.readInt(u32, cursor.buffer[cursor.pos..][0..4], .little);
+    try verifyCrc32(cursor.buffer[index_start..cursor.pos], index_crc, provider);
+    cursor.pos = index_end;
+}
+
+// One block, self-contained: the record states where it starts and ends.
+fn decodeBlockSpan(
+    input: []const u8,
+    record: IndexRecord,
+    output: []u8,
+    scratch: []u8,
+    check: CheckType,
+    provider: checksum.Provider,
+) Exception!usize {
+    const start = std.math.cast(usize, record.offset) orelse return error.ResourceException;
+    const unpadded = std.math.cast(usize, record.unpadded_size) orelse return error.ResourceException;
+    if (start > input.len or unpadded > input.len - start) return error.DataException;
+    var cursor = binary.ReadCursor.init(input[start..]);
+    const header = try decodeBlockHeader(&cursor, provider);
+    const check_bytes = checkSize(check);
+    if (unpadded < header.header_size + check_bytes) return error.DataException;
+    // The index excludes padding; the header may repeat the data size.
+    const compressed_size = unpadded - header.header_size - check_bytes;
+    if (header.compressed_size) |declared| {
+        if (declared != compressed_size) return error.IntegrityException;
+    }
+    if (header.uncompressed_size) |declared| {
+        if (declared != output.len) return error.IntegrityException;
+    }
+    const data = start + header.header_size;
+    const compressed = input[data..][0..compressed_size];
+    const check_start = data + compressed_size + blockPadding(compressed_size);
+    if (check_start > input.len or check_bytes > input.len - check_start) return error.DataException;
+    const dictionary_size = lzma2.dictionarySizeFromProperties(header.filters[header.filter_count - 1].lzma2);
+    if (dictionary_size < lzma.dictionary_min or dictionary_size > lzma.dictionary_max) return error.UnsupportedException;
+    const needed = lzma2.decodeWorkspaceSize(dictionary_size);
+    if (scratch.len < needed) return error.CapacityException;
+    var reader = std.Io.Reader.fixed(compressed);
+    var writer = std.Io.Writer.fixed(output);
+    try lzma2_seam.decodeStream(provider, &reader, &writer, scratch[0..needed], .{
+        .dictionary_size = dictionary_size,
+        .properties = lzma2.defaultProperties(dictionary_size),
+        .max_work = std.math.maxInt(u64),
+    });
+    if (writer.end != output.len) return error.IntegrityException;
+    applyDecodeFilters(header.filters[0..header.filter_count], output);
+    try verifyFilteredCheck(check, output, input[check_start..][0..check_bytes], provider);
+    return output.len;
+}
+
+// One block per lane: the index is what proves blocks independent.
+const BlockSource = struct {
+    pub const Exception = exception_prim.Exception;
+
+    input: []const u8,
+    output: []u8,
+    records: []align(1) const IndexRecord,
+    check: CheckType,
+    provider: checksum.Provider,
+    index: u32 = 0,
+    written: usize = 0,
+
+    pub fn nextUnit(self: *BlockSource, ordinal: u32, staging: []u8) exception_prim.Exception!?lane_driver.Unit {
+        _ = staging;
+        if (self.index == self.records.len) return null;
+        const record = self.records[self.index];
+        const size = std.math.cast(usize, record.uncompressed_size) orelse return error.ResourceException;
+        if (size > self.output.len - self.written) return error.CapacityException;
+        const target = self.output[self.written..][0..size];
+        self.written += size;
+        self.index += 1;
+        return .{
+            .ordinal = ordinal,
+            .input = &.{},
+            .output = target,
+            .decoded_size = record.uncompressed_size,
+        };
+    }
+
+    pub fn decode(self: *BlockSource, unit: lane_driver.Unit, scratch: []u8) exception_prim.Exception!usize {
+        return decodeBlockSpan(self.input, self.records[unit.ordinal], unit.output, scratch, self.check, self.provider);
+    }
+};
+
+// The per-lane LZMA2 workspace, sized by the largest dictionary in the stream.
+pub fn workspaceSize(dictionary_size: u32, lane_count: u8) usize {
+    return decodeWorkspaceSize(dictionary_size) * @as(usize, lane_count);
+}
+
+// Decodes every block into `output`; a stream the index cannot bound runs
+// through the serial decoder instead.
+pub fn decodeLanes(
+    input: []const u8,
+    output: []u8,
+    workspace: []u8,
+    lane_options: lane_driver.Options,
+    provider: checksum.Provider,
+) Exception!usize {
+    if (lane_options.lanes == 0 or lane_options.lanes > lane_driver.max_lanes) return error.CallException;
+    var records: IndexRecordList = .{ .records = undefined };
+    const info = (try indexBlocks(input, &records, provider)) orelse return decode(input, output, workspace, provider);
+
+    var header_cursor = binary.ReadCursor.init(input);
+    const check = try decodeStreamHeader(&header_cursor, provider);
+    // The footer check type must match the header, as the serial path requires.
+    const footer = input[input.len - stream_footer_size ..];
+    if (footer[9] != @backingInt(check)) return error.IntegrityException;
+    var max_dictionary: u32 = 0;
+    var offset: u64 = stream_header_size;
+    for (records.records[0..records.len]) |*record| {
+        record.offset = offset;
+        const start = std.math.cast(usize, offset) orelse return error.ResourceException;
+        if (start >= input.len) return error.DataException;
+        var cursor = binary.ReadCursor.init(input[start..]);
+        const header = try decodeBlockHeader(&cursor, provider);
+        const dictionary = lzma2.dictionarySizeFromProperties(header.filters[header.filter_count - 1].lzma2);
+        max_dictionary = @max(max_dictionary, dictionary);
+        const unpadded = std.math.cast(usize, record.unpadded_size) orelse return error.ResourceException;
+        // The index is hostile input; the walk adds checked, like the parser.
+        const span = std.math.add(u64, record.unpadded_size, blockPadding(unpadded)) catch return error.DataException;
+        offset = std.math.add(u64, offset, span) catch return error.DataException;
+    }
+    // A leading stream the walk cannot reach keeps the serial answer.
+    if (offset != info.blocks_end) return decode(input, output, workspace, provider);
+
+    const per_lane = decodeWorkspaceSize(max_dictionary);
+    if (workspace.len < per_lane * @as(usize, lane_options.lanes)) return error.CapacityException;
+    var buffers: [lane_driver.max_lanes]lane_driver.Lane = @splat(.{});
+    for (0..@as(usize, lane_options.lanes)) |index| buffers[index].scratch = workspace[index * per_lane ..][0..per_lane];
+
+    const source: BlockSource = .{
+        .input = input,
+        .output = output,
+        .records = records.slice(),
+        .check = check,
+        .provider = provider,
+    };
+    var decoder = try lane_driver.Decoder(BlockSource).init(source, lane_options, buffers);
+    var total: usize = 0;
+    while (try decoder.next()) |unit| {
+        total = std.math.add(usize, total, unit.output.len) catch return error.ResourceException;
+    }
+    return total;
+}
+
 fn verifyCheck(check: CheckType, crc32: u32, crc64: u64, expected: []const u8) Exception!void {
     switch (check) {
         .none => {},
@@ -856,7 +1051,7 @@ pub fn checkSize(check: CheckType) usize {
 test "xz delta filter honors the requested distance" {
     // A mixed provider build serves no single tag for both arms; run
     // only where the default tag serves them.
-    if (!deflate_seam.decodeServed(checksum.default_provider)) return;
+    if (!deflate_seam.decodeServed(checksum.default_provider)) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var input: [512]u8 = undefined;
     for (&input, 0..) |*byte, i| byte.* = @truncate(i *% 7 +% 3);
@@ -928,7 +1123,7 @@ fn expectFilterRoundtrip(input: []const u8, options: Options) !void {
 test "xz delta distance spans the wire range" {
     // Distance 1 (props 0x00, the liblzma default) and 256 (props 0xFF) were
     // unreachable before the distance semantics fix.
-    if (!deflate_seam.decodeServed(checksum.default_provider)) return;
+    if (!deflate_seam.decodeServed(checksum.default_provider)) return error.SkipZigTest;
     var input: [512]u8 = undefined;
     for (&input, 0..) |*byte, i| byte.* = @truncate(i *% 5 +% 1);
     for ([_]u16{ 1, 2, 256 }) |distance| {
@@ -943,7 +1138,7 @@ test "xz delta distance spans the wire range" {
 }
 
 test "xz multi block delta filter resets per block" {
-    if (!deflate_seam.decodeServed(checksum.default_provider)) return;
+    if (!deflate_seam.decodeServed(checksum.default_provider)) return error.SkipZigTest;
     var input: [10240]u8 = undefined;
     for (&input, 0..) |*byte, i| byte.* = @truncate(i *% 7 +% 3);
     // crc64 catches the corruption loudly; none is the silent path that only
@@ -961,7 +1156,7 @@ test "xz multi block delta filter resets per block" {
 }
 
 test "xz multi block bcj filter resets per block" {
-    if (!deflate_seam.decodeServed(checksum.default_provider)) return;
+    if (!deflate_seam.decodeServed(checksum.default_provider)) return error.SkipZigTest;
     var input: [10240]u8 = undefined;
     // Tiled x86 call instructions make the filter position-sensitive, so
     // whole-input filtering diverges from the decoder's per-block reset.
@@ -998,7 +1193,7 @@ fn findBlockHeader(stream: []const u8) ?u8 {
 test "xz multi-block output roundtrips through our decoder and the index" {
     // A mixed provider build serves no single tag for both arms; run
     // only where the default tag serves them.
-    if (!deflate_seam.decodeServed(checksum.default_provider)) return;
+    if (!deflate_seam.decodeServed(checksum.default_provider)) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var input: [100 * 1024]u8 = undefined;
     for (&input, 0..) |*byte, i| byte.* = @truncate(i *% 31 +% (i >> 7));
@@ -1060,6 +1255,9 @@ pub fn inspectBlocks(input: []const u8, records: []BlockRecord, scratch: []u8, p
 }
 
 test "decodedSize handles block headers with declared compressed sizes" {
+    // A mixed provider build serves no single tag for both arms; run
+    // only where the default tag serves them.
+    if (!deflate_seam.decodeServed(checksum.default_provider)) return error.SkipZigTest;
     // xz -T2 --block-size=64 emits headers carrying the compressed size;
     // the scanner must skip each payload, not only padding and check.
     const fixture = [_]u8{ 0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00, 0x00, 0x04, 0xe6, 0xd6, 0xb4, 0x46, 0x02, 0xc0, 0x44, 0x40, 0x21, 0x01, 0x16, 0x00, 0x17, 0x40, 0xf4, 0x22, 0x01, 0x00, 0x3f, 0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x20, 0x78, 0x7a, 0x20, 0x77, 0x6f, 0x72, 0x6c, 0x64, 0x2c, 0x20, 0x74, 0x68, 0x69, 0x73, 0x20, 0x69, 0x73, 0x20, 0x61, 0x20, 0x6d, 0x6f, 0x64, 0x65, 0x72, 0x61, 0x74, 0x65, 0x6c, 0x79, 0x20, 0x73, 0x69, 0x7a, 0x65, 0x64, 0x20, 0x70, 0x61, 0x79, 0x6c, 0x6f, 0x61, 0x64, 0x20, 0x66, 0x6f, 0x72, 0x20, 0x74, 0x65, 0x73, 0x74, 0x69, 0x6e, 0x67, 0x20, 0x64, 0x00, 0x3a, 0x2b, 0x30, 0x1c, 0xed, 0x19, 0x74, 0xd0, 0x02, 0xc0, 0x2e, 0x2a, 0x21, 0x01, 0x16, 0x00, 0xc7, 0x03, 0x19, 0x58, 0x01, 0x00, 0x29, 0x65, 0x63, 0x6c, 0x61, 0x72, 0x65, 0x64, 0x20, 0x63, 0x6f, 0x6d, 0x70, 0x72, 0x65, 0x73, 0x73, 0x65, 0x64, 0x20, 0x73, 0x69, 0x7a, 0x65, 0x73, 0x20, 0x69, 0x6e, 0x20, 0x62, 0x6c, 0x6f, 0x63, 0x6b, 0x20, 0x68, 0x65, 0x61, 0x64, 0x65, 0x72, 0x73, 0x2e, 0x00, 0x00, 0x00, 0xeb, 0xd4, 0x4e, 0xd3, 0x3d, 0x3d, 0x22, 0x57, 0x00, 0x02, 0x58, 0x40, 0x42, 0x2a, 0x00, 0x00, 0x13, 0x4f, 0x54, 0x4e, 0xb1, 0xc4, 0x67, 0xfb, 0x02, 0x00, 0x00, 0x00, 0x00, 0x04, 0x59, 0x5a };
@@ -1077,7 +1275,7 @@ test "decodedSize handles block headers with declared compressed sizes" {
 test "inspectBlocks enumerates a multi-block stream" {
     // A mixed provider build serves no single tag for both arms; run
     // only where the default tag serves them.
-    if (!deflate_seam.decodeServed(checksum.default_provider)) return;
+    if (!deflate_seam.decodeServed(checksum.default_provider)) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var input: [100 * 1024]u8 = undefined;
     for (&input, 0..) |*byte, i| byte.* = @truncate(i *% 31 +% (i >> 7));
@@ -1107,7 +1305,7 @@ test "inspectBlocks enumerates a multi-block stream" {
 }
 
 test "xz sha256 check roundtrips through decode and the measurement path" {
-    if (!deflate_seam.decodeServed(checksum.default_provider)) return;
+    if (!deflate_seam.decodeServed(checksum.default_provider)) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var input: [4096]u8 = undefined;
     for (&input, 0..) |*byte, i| byte.* = @truncate(i *% 13 +% 7);
@@ -1133,7 +1331,7 @@ test "xz sha256 check roundtrips through decode and the measurement path" {
 }
 
 test "xz decodes a liblzma-produced sha256 stream on the measurement path" {
-    if (!deflate_seam.decodeServed(checksum.default_provider)) return;
+    if (!deflate_seam.decodeServed(checksum.default_provider)) return error.SkipZigTest;
     const stream = [_]u8{
         253, 55,  122, 88,  90,  0,   0,   10,  225, 251, 12,  161, 2,   0,   33,  1,
         0,   0,   0,   0,   55,  39,  151, 214, 224, 15,  255, 1,   4,   93,  0,   8,
@@ -1168,4 +1366,46 @@ test "xz decodes a liblzma-produced sha256 stream on the measurement path" {
     var output: [input.len]u8 = undefined;
     const decoded = try decode(&stream, &output, decode_scratch, checksum.default_provider);
     try std.testing.expectEqualSlices(u8, &input, output[0..decoded]);
+}
+
+test "xz blocks decode across lanes byte for byte" {
+    // A mixed provider build serves no single tag for both arms; run
+    // only where the default tag serves them.
+    if (!deflate_seam.decodeServed(checksum.default_provider)) return error.SkipZigTest;
+    const options: Options = .{ .dictionary_size = 1 << 16, .check = .crc64, .block_size = 1 << 16 };
+    const input = try std.testing.allocator.alloc(u8, 8 * (1 << 16) + 123);
+    defer std.testing.allocator.free(input);
+    var prng = std.Random.DefaultPrng.init(0x33);
+    prng.random().bytes(input);
+    const scratch = try std.testing.allocator.alloc(
+        u8,
+        encodeWorkspaceSizeBt(options.dictionary_size) + blockRecordScratchSize(input.len, options.block_size) + 64,
+    );
+    defer std.testing.allocator.free(scratch);
+    const encoded = try std.testing.allocator.alloc(u8, try requiredSize(input, scratch, options));
+    defer std.testing.allocator.free(encoded);
+    const written = try encode(input, encoded, scratch, options);
+
+    var records: IndexRecordList = .{ .records = undefined };
+    const info = (try indexBlocks(encoded[0..written], &records, checksum.default_provider)).?;
+    // Eight full blocks and the short tail block.
+    try std.testing.expectEqual(@as(u32, 9), info.count);
+
+    const serial = try std.testing.allocator.alloc(u8, input.len);
+    defer std.testing.allocator.free(serial);
+    const decode_scratch = try std.testing.allocator.alloc(u8, decodeWorkspaceSize(options.dictionary_size));
+    defer std.testing.allocator.free(decode_scratch);
+    const serial_written = try decode(encoded[0..written], serial, decode_scratch, checksum.default_provider);
+
+    const lanes_out = try std.testing.allocator.alloc(u8, input.len);
+    defer std.testing.allocator.free(lanes_out);
+    const lane_workspace = try std.testing.allocator.alloc(u8, workspaceSize(options.dictionary_size, 1));
+    defer std.testing.allocator.free(lane_workspace);
+    const total = decodeLanes(encoded[0..written], lanes_out, lane_workspace, .{ .lanes = 1 }, checksum.default_provider) catch |err| {
+        std.debug.print("decodeLanes failed: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    try std.testing.expectEqual(input.len, total);
+    try std.testing.expectEqualSlices(u8, input, lanes_out);
+    try std.testing.expectEqualSlices(u8, serial[0..serial_written], lanes_out);
 }

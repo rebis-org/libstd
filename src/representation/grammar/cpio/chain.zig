@@ -7,10 +7,7 @@ const cpio = @import("onprem.zig");
 
 const Exception = exception_prim.Exception;
 
-// One walker serves every XAR-shell format whose payload ends in a cpio
-// archive: the chain locates the member, this walks and folds records.
-// The name stays valid until the next call; one pass beats per-ordinal
-// rescans.
+// One walker serves every XAR-shell format whose payload ends in cpio; the name stays valid until the next call.
 pub fn Walker(comptime Chain: type, comptime member_name: []const u8) type {
     return struct {
         pub const EntryInfo = struct {
@@ -42,22 +39,34 @@ pub fn Walker(comptime Chain: type, comptime member_name: []const u8) type {
             links: []Link = &.{},
             link_count: usize = 0,
 
-            pub fn init(archive: []const u8, scratch: []u8) Exception!Cursor {
-                return initWithLinks(archive, scratch, .records, &.{});
+            pub fn init(base: anytype, scratch: []u8) Exception!Cursor {
+                return initWithLinks(base, scratch, .records, &.{});
             }
 
             // `links` is the caller's table for collapsing: a power-of-two slice,
             // sized past the number of distinct groups, cleared here.
-            pub fn initWithLinks(archive: []const u8, scratch: []u8, mode: LinkMode, links: []Link) Exception!Cursor {
+            pub fn initWithLinks(base: anytype, scratch: []u8, mode: LinkMode, links: []Link) Exception!Cursor {
+                return initWithLinksContext(base, scratch, mode, links, null);
+            }
+
+            // A transform with wrapWith receives the context; null opens the
+            // plain chain, so both entry points share one instantiation.
+            pub fn initWithLinksContext(
+                base: anytype,
+                scratch: []u8,
+                mode: LinkMode,
+                links: []Link,
+                context: ?*const anyopaque,
+            ) Exception!Cursor {
                 if (mode == .collapse and (links.len == 0 or !std.math.isPowerOfTwo(links.len))) return error.CallException;
                 if (mode == .collapse) {
                     for (links) |*entry| entry.* = .{ .ino = 0, .ordinal_plus_one = 0 };
                 }
-                return .{
-                    .inner = try Chain.open(archive, member_name, scratch),
-                    .mode = mode,
-                    .links = links,
-                };
+                const inner = if (context) |carried|
+                    try Chain.openWith(base, member_name, scratch, carried)
+                else
+                    try Chain.open(base, member_name, scratch);
+                return .{ .inner = inner, .mode = mode, .links = links };
             }
 
             // An unread member is skipped here, so a caller may walk names only.
@@ -151,23 +160,33 @@ pub fn Walker(comptime Chain: type, comptime member_name: []const u8) type {
             return info.nlink > 1 and info.mode & 0o170000 != 0o040000;
         }
 
-        pub fn inspectCount(archive: []const u8, scratch: []u8) Exception!u64 {
-            var cursor = try Cursor.init(archive, scratch);
+        pub fn inspectCount(base: anytype, scratch: []u8) Exception!u64 {
+            var cursor = try Cursor.init(base, scratch);
             var count: u64 = 0;
             while (try cursor.next() != null) count = try bounds.addU64(count, 1);
             return count;
         }
 
-        pub fn inspectOrdinal(archive: []const u8, ordinal: u64, scratch: []u8) Exception!EntryInfo {
-            var cursor = try Cursor.init(archive, scratch);
+        pub fn inspectOrdinal(base: anytype, ordinal: u64, scratch: []u8) Exception!EntryInfo {
+            var cursor = try Cursor.init(base, scratch);
             while (try cursor.next()) |info| {
                 if (info.ordinal == ordinal) return info;
             }
             return error.DataException;
         }
 
-        pub fn decodeOrdinal(archive: []const u8, ordinal: u64, output: []u8, scratch: []u8) Exception!usize {
-            var cursor = try Cursor.init(archive, scratch);
+        pub fn decodeOrdinal(base: anytype, ordinal: u64, output: []u8, scratch: []u8) Exception!usize {
+            return decodeOrdinalContext(base, ordinal, output, scratch, null);
+        }
+
+        pub fn decodeOrdinalContext(
+            base: anytype,
+            ordinal: u64,
+            output: []u8,
+            scratch: []u8,
+            context: ?*const anyopaque,
+        ) Exception!usize {
+            var cursor = try Cursor.initWithLinksContext(base, scratch, .records, &.{}, context);
             while (try cursor.next()) |info| {
                 if (info.ordinal != ordinal) continue;
                 const size = std.math.cast(usize, info.size) orelse return error.ResourceException;

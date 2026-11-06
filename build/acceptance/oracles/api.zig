@@ -5,11 +5,7 @@ const corpus = @import("corpus.zig");
 const harness = @import("harness.zig");
 const steps = @import("steps.zig");
 
-// Exercises the session boundary through its C exports with caller-owned
-// storage and no envelope.
-//
-// The contract: byte-identity with the kernel-mediated decode, idempotent
-// destroy, invalid_call after destroy.
+// Exercises the session boundary through its C exports with caller-owned storage: byte-identity, idempotent destroy, invalid_call after destroy.
 
 extern fn stdk_session_storage(component: [*:0]const u8, verb: [*:0]const u8) u64;
 extern fn stdk_session_create(component: [*:0]const u8, verb: [*:0]const u8, storage: ?[*]u8, storage_len: u64) u32;
@@ -359,8 +355,7 @@ fn oracleRunInline(_: *anyopaque, task: abi.Task) callconv(.c) u32 {
     return task.invoke(task.context);
 }
 
-// A deferred executor arm: run stores the task and returns, so a record
-// stays pending until the oracle drains the queue by hand.
+// A deferred arm: run stores the task and returns, so a record stays pending until drained by hand.
 var deferred_task: ?abi.Task = null;
 
 fn oracleRunDeferred(_: *anyopaque, task: abi.Task) callconv(.c) u32 {
@@ -368,9 +363,7 @@ fn oracleRunDeferred(_: *anyopaque, task: abi.Task) callconv(.c) u32 {
     return abi.Status.ok;
 }
 
-// A withdrawing executor arm: a queued task cancelled before it starts is
-// discarded; the executor flips the host-owned record itself, and the
-// library never invokes the withdrawn task.
+// A queued task cancelled before it starts is discarded; the executor flips the record itself, and the task never runs.
 fn oracleRunWithdrawing(_: *anyopaque, task: abi.Task) callconv(.c) u32 {
     const submission: *abi.Submission = @ptrCast(@alignCast(task.context));
     const completion = submission.completion orelse return abi.Status.invalid_call;
@@ -414,8 +407,7 @@ fn runCancel(r: *harness.Runner) anyerror!void {
     if (deferred_task) |task| _ = task.invoke(task.context) else return error.DeferredTaskLost;
     if (plain_record.state != abi.Completion.done or plain_record.status != abi.Status.ok) return error.DeferredNotCompleted;
 
-    // A cancel that lands before the task runs is honored at the boundary:
-    // the envelope never executes and the record completes as cancelled.
+    // A cancel landing before the task runs is honored at the boundary: the envelope never executes the task.
     var pending_record = abi.Completion.init();
     var pending_sub: [1]abi.Submission = .{.{ .call = &envelope, .completion = &pending_record }};
     if (abi.stdk_group(&pending_sub, 1, &deferred_executor) != abi.Status.ok) return error.CancelSubmitFailed;

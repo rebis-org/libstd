@@ -457,11 +457,11 @@ test "lzma2 decodes a mid-stream dictionary reset stream" {
     // The stdlib decoder cross-validates the crafted stream first; a constant
     // position-state offset is decode-invariant, so this checks reset-path parity.
     var std_reader = std.Io.Reader.fixed(stream[0..sink.end]);
-    var std_decoder = std.compress.lzma2.Decode.init(alloc) catch return error.TestUnexpectedResult;
+    var std_decoder = try std.compress.lzma2.Decode.init(alloc);
     defer std_decoder.deinit(alloc);
     var std_sink: std.Io.Writer.Allocating = .init(alloc);
     defer std_sink.deinit();
-    _ = std_decoder.decompress(&std_reader, &std_sink) catch return error.TestUnexpectedResult;
+    _ = try std_decoder.decompress(&std_reader, &std_sink);
     try std.testing.expectEqualSlices(u8, expected, std_sink.writer.buffer[0..std_sink.writer.end]);
 
     const output = try alloc.alloc(u8, expected.len);

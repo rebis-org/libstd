@@ -1167,8 +1167,8 @@ test "created encrypted archives roundtrip through the facade reader" {
     }
 }
 
-// Test-only harnesses: the write side allocates the workspace and plan-sized
-// output; the decode side reuses one buffer set.
+// The write side needs plan-sized output, the decode side one reused buffer set,
+// so the two harnesses cannot share allocations.
 
 const VolumeTestWrite = struct {
     ws: WriteBuffers = .{
@@ -1366,9 +1366,7 @@ test "multi-volume inspect matches the single-volume shape" {
     const second = try rar.rarVolumeInspectOrdinal(w.view, 1, 128, .{});
     try testing.expectEqualSlices(u8, "i2.bin", second.name);
     try testing.expectEqual(@as(u64, data2.len), second.size);
-    // Both failure classes mirror the single-volume inspect: an ordinal
-    // inside a set over the entry budget is a resource refusal, and an
-    // ordinal past the set is data.
+    // Both failure classes mirror the single-volume inspect: an ordinal over the entry budget is resource, past the set is data.
     try testing.expectError(error.ResourceException, rar.rarVolumeInspectOrdinal(w.view, 1, 1, .{}));
     try testing.expectError(error.DataException, rar.rarVolumeInspectOrdinal(w.view, 2, 128, .{}));
 }
@@ -1418,9 +1416,7 @@ test "multi-volume encrypted splits round-trip and reject wrong passwords" {
         };
         const bufs = d.buffers(&split_parts, &packed_stage);
         try testing.expectEqual(@as(usize, 2), try rar.rarVolumeCount(w.view, 128, decode_opts));
-        // The inspect answer carries the located entry's own name; -hp
-        // re-decrypts every header into the shared scratch, so a name held
-        // across later parses would come back as a later entry's.
+        // The inspect answer carries the located entry's name; -hp re-decrypts into shared scratch, so a held name goes stale.
         const inspected = try rar.rarVolumeInspectOrdinal(w.view, 0, 128, decode_opts);
         try testing.expectEqualSlices(u8, "e1.txt", inspected.name);
         const inspected1 = try rar.rarVolumeInspectOrdinal(w.view, 1, 128, decode_opts);

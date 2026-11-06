@@ -823,7 +823,7 @@ test "length tables are the verbatim reference tables" {
     try std.testing.expectEqual(@as(u32, 3932160), dist_decode[dc - 1]);
 }
 
-test "alphabet size constants" {
+test "alphabet sizes pin the reference decode alphabets" {
     try std.testing.expectEqual(@as(usize, 299), mc);
     try std.testing.expectEqual(@as(usize, 60), dc);
     try std.testing.expectEqual(@as(usize, 17), ldc);

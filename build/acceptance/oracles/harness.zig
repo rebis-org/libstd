@@ -114,8 +114,22 @@ pub const archive_entry_link_name: u32 = 10;
 pub const archive_entry_uid: u32 = 11;
 pub const archive_entry_mtime: u32 = 12;
 pub const archive_entry_filter: u32 = 13;
+pub const archive_entry_mode: u32 = 16;
+pub const param_family_filter: u16 = 10;
+pub const delta_distance: u32 = 1;
+pub const filter_kind: u32 = 2;
+pub const filter_start_offset: u32 = 3;
+pub const bcj2_call_stream: u32 = 4;
+pub const bcj2_jump_stream: u32 = 5;
+pub const bcj2_rc_stream: u32 = 6;
+pub const bcj2_unpacked_size: u32 = 7;
+pub const param_family_ppmd: u16 = 11;
+pub const ppmd_order: u32 = 1;
+pub const ppmd_memory: u32 = 2;
+pub const ppmd_unpack_size: u32 = 3;
 pub const zstd_seekable_frame_size: u32 = 1;
 pub const zdict_sample_size: u32 = 2;
+pub const zdict_dictionary_size: u32 = 3;
 pub const gzip_modification_time: u32 = 1;
 pub const gzip_extra_flags: u32 = 2;
 pub const gzip_operating_system: u32 = 3;
@@ -326,14 +340,12 @@ pub const Runner = struct {
     invalid_status: u32 = 0,
     corrupt_status: u32 = 0,
     write_exact: bool = false,
-    // A scenario that verified only part of its property names what it could
-    // not check here; the runner reports it apart from a pass.
+    // A partially verified property names what it could not check; the runner reports it apart from a pass.
     unverified: ?[]const u8 = null,
     unverified_storage: [192]u8 = undefined,
 };
 
-// A reference oracle that cannot read a format leaves the scenario with the
-// status assertion alone. Say so where it happens so the report can count it.
+// A missing reference oracle leaves only the status assertion; say so where it happens so the report can count it.
 pub fn unverified(r: *Runner, reason: []const u8) void {
     const length = @min(reason.len, r.unverified_storage.len);
     @memcpy(r.unverified_storage[0..length], reason[0..length]);
@@ -460,6 +472,7 @@ pub fn cryptoAlgorithmParam(value: u64) Node {
 pub const zip_data_descriptor: u32 = 5;
 pub const param_family_rar: u16 = 15;
 pub const rar_header_encode: u32 = 1;
+pub const rar_recovery_percent: u32 = 2;
 pub fn rarHeaderEncodeParam(value: u64) Node {
     return paramScalar(param_family_rar, rar_header_encode, cmds, value);
 }
@@ -509,6 +522,27 @@ pub fn gzipExtraParam(bytes: []const u8) Node {
 
 pub fn archiveTypeFlagParam(value: u64) Node {
     return paramScalar(param_family_archive, archive_entry_typeflag, cmd_query_write, value);
+}
+
+pub fn archiveModeParam(value: u64) Node {
+    return paramScalar(param_family_archive, archive_entry_mode, cmd_query_write, value);
+}
+
+pub fn rarRecoveryParam(value: u64) Node {
+    return paramScalar(param_family_rar, rar_recovery_percent, cmds, value);
+}
+
+pub fn filterKindParam(value: u64) Node {
+    return paramScalar(param_family_filter, filter_kind, cmds, value);
+}
+
+pub fn deltaDistanceParam(value: u64) Node {
+    return paramScalar(param_family_filter, delta_distance, cmds, value);
+}
+
+pub fn bcj2StreamParam(comptime which: []const u8, bytes: []const u8) Node {
+    const ordinal = comptime @field(@This(), "bcj2_" ++ which ++ "_stream");
+    return paramBytes(param_family_filter, ordinal, cmds, bytes);
 }
 
 pub fn archiveLinkNameParam(bytes: []const u8) Node {
@@ -779,8 +813,7 @@ pub fn xorshiftFill(buffer: []u8, seed_base: u64) void {
     }
 }
 
-// A/B dump path: these bytes diff between builds, covering record layout,
-// parser tier, and entropy heuristic. The caller encodes; this writes.
+// A/B dump: these bytes diff between builds, covering record layout, parser tier, and entropy heuristic; the caller encodes.
 pub fn abDumpEncoded(r: *Runner, label: []const u8) !void {
     const dir = try std.Io.Dir.path.join(r.gpa, &.{
         "zig-out", "oracles", "ab", ab_variant.name, r.scenario_name,

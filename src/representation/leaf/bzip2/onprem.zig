@@ -1412,6 +1412,11 @@ test "length limited code terminates on deep skewed frequencies" {
     var codes: [max_alpha_size]u32 = undefined;
     buildLengthLimitedCode(&freq, 22, &lens, &codes);
     for (lens[0..22]) |l| try std.testing.expect(l >= 1 and l <= max_code_len);
+    // Bounded lengths alone do not make a prefix code; the limiter must
+    // not over-subscribe the code space.
+    var kraft: u64 = 0;
+    for (lens[0..22]) |l| kraft += @as(u64, 1) << @intCast(max_code_len - l);
+    try std.testing.expect(kraft <= @as(u64, 1) << max_code_len);
 }
 
 test "bzip2 decodes a randomised block" {

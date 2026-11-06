@@ -1,6 +1,4 @@
-// One runner per decode surface, shared by the fuzz smoke pass and the
-// mutation campaign. Nothing here touches std.testing, so the campaign
-// binary links the same table the smoke blocks drive.
+// One runner per decode surface, shared by smoke and campaign; nothing touches std.testing, so the campaign binary links this table.
 
 const std = @import("std");
 
@@ -31,6 +29,7 @@ const dwarfs = @import("../../representation/volume/dwarfs/onprem.zig");
 const iso = @import("../../representation/volume/iso/onprem.zig");
 const squashfs = @import("../../representation/volume/squashfs/onprem.zig");
 const corpus = @import("corpus.zig");
+const Exception = @import("../../common/primitive/exception.zig").Exception;
 
 // Input stays small so structure-aware mutation stays cheap; the bound sizes
 // only fuzz scratch (256 KiB for wrapped windows).
@@ -182,6 +181,53 @@ pub const runXar = makeRunner(xar);
 pub const runXip = makeRunner(xip);
 pub const runPkg = makeRunner(pkg);
 
+// A forward window over the fuzz bytes: the same harness shape as runXip,
+// driven through the window view entries instead of the archive slice.
+const SliceForward = struct {
+    bytes: []const u8,
+    front: usize = 0,
+
+    pub fn position(self: *SliceForward) u64 {
+        return self.front;
+    }
+
+    pub fn declaredTotal(self: *SliceForward) ?u64 {
+        return self.bytes.len;
+    }
+
+    pub fn hold(self: *SliceForward, length: u64) Exception![]const u8 {
+        const want = std.math.cast(usize, length) orelse return error.ResourceException;
+        if (want > self.bytes.len - self.front) return error.DataException;
+        return self.bytes[self.front..][0..want];
+    }
+
+    pub fn holdUpTo(self: *SliceForward, length: u64) Exception![]const u8 {
+        const want = std.math.cast(usize, length) orelse return error.ResourceException;
+        const take = @min(want, self.bytes.len - self.front);
+        return self.bytes[self.front..][0..take];
+    }
+
+    pub fn skip(self: *SliceForward, count: u64) Exception!void {
+        const step = std.math.cast(usize, count) orelse return error.DataException;
+        if (step > self.bytes.len - self.front) return error.DataException;
+        self.front += step;
+    }
+};
+
+pub fn runXipView(data: []const u8) anyerror!void {
+    const scratch = try std.heap.page_allocator.alloc(u8, xip.scratch_size);
+    defer std.heap.page_allocator.free(scratch);
+    var view = SliceForward{ .bytes = data };
+    const count = xip.inspectCountView(SliceForward, &view, scratch) catch return;
+    if (count == 0) return;
+    view.front = 0;
+    const info = xip.inspectOrdinalView(SliceForward, &view, 0, scratch) catch return;
+    const size: usize = @intCast(@min(info.size, max_output));
+    var out: [max_output]u8 = undefined;
+    view.front = 0;
+    _ = xip.decodeOrdinalView(SliceForward, &view, 0, out[0..size], scratch) catch {};
+}
+
 pub fn runAge(data: []const u8) anyerror!void {
     const scratch = try std.heap.page_allocator.alloc(u8, age.scratch_size);
     defer std.heap.page_allocator.free(scratch);
@@ -198,9 +244,7 @@ pub const runSquashfs = makeRunner(squashfs);
 pub const runDwarfs = makeRunner(dwarfs);
 pub const runApfs = makeRunner(apfs);
 
-// One table drives the evidence campaign so a codec cannot be added to the
-// smoke pass and forgotten there. Empty-corpus formats seed a signature stub,
-// which keeps the mutation inside the header walk instead of byte zero.
+// One table drives the campaign so a codec cannot join the smoke pass and be forgotten.
 pub const Target = struct {
     name: []const u8,
     seed: []const u8,
@@ -215,6 +259,12 @@ const age_magic_seed = "age-encryption.org/v1\n";
 const iso_magic_seed = "\x01CD001\x01\x00";
 const squashfs_magic_seed = "hsqs";
 const dwarfs_magic_seed = "DWARE01";
+// The APFS walk gates on the superblock magic "NXSB" at offset 0x20, so the stub carries 32 zero bytes first.
+const apfs_magic_seed = blk: {
+    var seed: [0x24]u8 = @splat(0);
+    @memcpy(seed[0x20..0x24], "NXSB");
+    break :blk seed;
+};
 
 pub const targets = [_]Target{
     .{ .name = "gzip", .seed = &corpus.gzip_empty, .run = runGzip },
@@ -233,9 +283,11 @@ pub const targets = [_]Target{
     .{ .name = "wim", .seed = wim_magic_seed, .run = runWim },
     .{ .name = "xar", .seed = xar_magic_seed, .run = runXar },
     .{ .name = "xip", .seed = xar_magic_seed, .run = runXip },
+    .{ .name = "xip_view", .seed = xar_magic_seed, .run = runXipView },
     .{ .name = "pkg", .seed = xar_magic_seed, .run = runPkg },
     .{ .name = "age", .seed = age_magic_seed, .run = runAge },
     .{ .name = "iso", .seed = iso_magic_seed, .run = runIso },
     .{ .name = "squashfs", .seed = squashfs_magic_seed, .run = runSquashfs },
     .{ .name = "dwarfs", .seed = dwarfs_magic_seed, .run = runDwarfs },
+    .{ .name = "apfs", .seed = &apfs_magic_seed, .run = runApfs },
 };

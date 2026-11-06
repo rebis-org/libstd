@@ -8,7 +8,7 @@
 
 /* The envelope status vocabulary subset this bridge needs. Kept as literals so */
 /* the bridge stays decoupled from the generated header. */
-#define STDK_STATUS_OK 0u
+#define STDK_STATUS_OK		 0u
 #define STDK_STATUS_INVALID_CALL 1u
 
 extern uint64_t stdk_session_storage(const char *component, const char *verb);

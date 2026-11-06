@@ -86,10 +86,7 @@ const literal_probs_count = 0x300;
 // mid-stream; the shared carve is never reallocated.
 const max_literal_context_count = 1 << 4;
 
-// No copy fallback: 10 bits per byte covers converged cost plus
-// transient wrongness.
-//
-// The constant absorbs the cache byte, the flush, and the end marker.
+// No copy fallback: 10 bits per byte covers converged cost plus transient wrongness, absorbing cache byte, flush, and end marker.
 pub fn encodedSizeBound(input_len: usize) usize {
     return input_len +| (input_len / 4) +| 64;
 }
