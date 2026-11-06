@@ -41,8 +41,8 @@ fn renderFrameworkModuleMap() []const u8 {
 const Replacement = struct { marker: []const u8, value: []const u8 };
 
 fn substitute(comptime template: []const u8, comptime values: []const Replacement) []const u8 {
-    // A Windows checkout carries CRLF in text files the attributes do not
-    // pin; normalization keeps the artifact byte-identical on every host.
+    // A Windows checkout carries CRLF into templates the attributes do
+    // not pin; normalization keeps the artifact byte-identical.
     const output = comptime blk: {
         var normalized: []const u8 = &.{};
         for (template) |byte| {
