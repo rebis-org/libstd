@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const abi = @import("../../kernel/envelope.zig");
+const bounds = @import("../../common/primitive/bounds.zig");
 const resource = @import("../../kernel/resource.zig");
 const vocabulary = @import("../../kernel/vocabulary.zig");
 
@@ -76,7 +77,19 @@ pub const View = struct {
             self.skipped += @intCast(count);
             return;
         }
-        // Skipped bytes drop in bulk at the next refill, never byte-wise.
+        // A source that declares seek lands at the target in one call; the
+        // budget still bills the target offset like any pulled byte.
+        if (self.source.hasCapability(resource.capability_bit_seek)) {
+            const target = try bounds.addU64(self.position(), count);
+            try self.source.seek(target);
+            self.filled = 0;
+            self.skipped = 0;
+            self.pulled = target;
+            if (self.pulled > self.limit) return error.ResourceException;
+            return;
+        }
+        // A skip past the held bytes drops the buffer and drains the rest
+        // in buffer-sized chunks, never byte-wise.
         self.filled = 0;
         self.skipped = 0;
         var remaining = count - held;
@@ -202,6 +215,41 @@ test "window rejects a hold wider than the buffer and an over-budget pull" {
     try testing.expectError(error.ResourceException, open_view.hold(30));
 }
 
+test "window skips through a declared seek without reading" {
+    var storage: [300]u8 = undefined;
+    for (&storage, 0..) |*byte, index| byte.* = @truncate(index * 3 + 1);
+    const seek_bit = resource.capability_bit_seek;
+    const source = try callbackSource(&storage, capability_read_size | seek_bit);
+    defer testing.allocator.destroy(source);
+
+    var buffer: [64]u8 = undefined;
+    var view = try View.init(source.resource(), &buffer, storage.len, std.math.maxInt(u64));
+    try testing.expectEqualSlices(u8, storage[0..20], try view.hold(20));
+
+    // The skip lands at the target with zero reads; the next hold resumes.
+    try view.skip(240);
+    try testing.expectEqual(@as(u64, 240), view.position());
+    try testing.expectEqual(@as(usize, 1), source.seeks);
+    try testing.expectEqual(@as(usize, 240), source.cursor);
+    try testing.expectEqualSlices(u8, storage[240..280], try view.hold(40));
+
+    // An in-buffer skip stays read-free and seek-free, like every window.
+    try view.restart();
+    try testing.expectEqualSlices(u8, storage[0..10], try view.hold(10));
+    const reads_after_restart = source.seeks;
+    try view.skip(4);
+    try testing.expectEqual(reads_after_restart, source.seeks);
+    try testing.expectEqualSlices(u8, storage[4..10], try view.hold(6));
+
+    // A source without the capability keeps the drain path.
+    const plain = try callbackSource(&storage, capability_read_size);
+    defer testing.allocator.destroy(plain);
+    var drained = try View.init(plain.resource(), &buffer, storage.len, std.math.maxInt(u64));
+    try drained.skip(100);
+    try testing.expectEqual(@as(usize, 0), plain.seeks);
+    try testing.expectEqual(@as(u64, 100), drained.position());
+}
+
 test "window charges a declared archive over the encoded budget up front" {
     var storage: [64]u8 = undefined;
     @memset(&storage, 0xCD);
@@ -230,6 +278,7 @@ const FixedSource = struct {
     resource_value: Resource,
     bytes: []const u8,
     cursor: usize = 0,
+    seeks: usize = 0,
 
     fn resource(self: *FixedSource) *Resource {
         return &self.resource_value;
@@ -254,6 +303,11 @@ fn fixedCallback(envelope: *abi.Call) callconv(.c) u32 {
     }
     if (vocabulary.eql(envelope.operation, vocabulary.ids.callback_rewind)) {
         source.cursor = 0;
+        return abi.Status.ok;
+    }
+    if (vocabulary.eql(envelope.operation, vocabulary.ids.callback_seek)) {
+        source.cursor = @intCast(envelope.request.?.value_low);
+        source.seeks += 1;
         return abi.Status.ok;
     }
     return abi.Status.unsupported;

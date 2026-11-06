@@ -14,6 +14,8 @@ pub const capability_bit_read = vocabulary.resource_capability_bit_read;
 pub const capability_bit_replay = vocabulary.resource_capability_bit_replay;
 pub const capability_bit_size = vocabulary.resource_capability_bit_size;
 pub const capability_bit_write = vocabulary.resource_capability_bit_write;
+pub const capability_bit_seek = vocabulary.resource_capability_bit_seek;
+pub const capability_bit_range = vocabulary.resource_capability_bit_range;
 
 pub const Resource = struct {
     call: *abi.Call,
@@ -91,6 +93,36 @@ pub const Resource = struct {
             .direct_read, .direct_write => self.offset = 0,
             .callback_read => _ = try self.invoke(vocabulary.ids.callback_rewind, null, null),
             .callback_write => {},
+        }
+    }
+
+    // A seek lands the stream at an absolute offset. The callback wire
+    // carries the offset in the request's value_low; the callback context,
+    // not the token, routes it at the host.
+    pub fn seek(self: *Resource, offset: u64) Exception!void {
+        switch (self.kind) {
+            .direct_read => |bytes| {
+                const target = std.math.cast(usize, offset) orelse return error.ResourceException;
+                if (target > bytes.len) return error.DataException;
+                self.offset = target;
+            },
+            .callback_read => {
+                const callback = self.call.callback orelse return error.CallException;
+                var request = abi.Node.init();
+                request.value_low = offset;
+                var response = abi.Node.init();
+                var callback_call = abi.Call.init();
+                callback_call.operation = vocabulary.ids.callback_seek;
+                callback_call.request = &request;
+                callback_call.response = &response;
+                callback_call.callback_context = self.call.callback_context;
+                const status = callback(&callback_call);
+                if (status != abi.Status.ok) {
+                    self.downstream_status = status;
+                    return error.IoException;
+                }
+            },
+            else => return error.UnsupportedException,
         }
     }
 
@@ -337,6 +369,10 @@ fn harnessCallback(callback_call: *abi.Call) callconv(.c) u32 {
         harness.cursor = 0;
         return abi.Status.ok;
     }
+    if (vocabulary.eql(callback_call.operation, vocabulary.ids.callback_seek)) {
+        harness.cursor = @intCast(request.value_low);
+        return abi.Status.ok;
+    }
     return abi.Status.unsupported;
 }
 
@@ -544,6 +580,50 @@ test "resource callback write accumulates committed totals through short writes"
     var full_sink = try Resource.sinkFromNode(&full_call, &full_node, capability_bit_write);
     full_sink.committed = std.math.maxInt(u64);
     try std.testing.expectError(error.ResourceException, full_sink.write("xyz"));
+}
+
+test "resource seek lands direct and callback streams at an absolute offset" {
+    const seek_bit = vocabulary.resource_capability_bit_seek;
+    var storage = [_]u8{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+    var call = abi.Call.init();
+    var node = abi.Node.init();
+    node.bytes = &storage;
+    node.byte_capacity = storage.len;
+    node.byte_length = storage.len;
+    var direct = try Resource.sourceFromNode(&call, &node, capability_bit_read | seek_bit);
+    try direct.seek(7);
+    var staging: [3]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 3), try direct.read(&staging));
+    try std.testing.expectEqualSlices(u8, storage[7..10], &staging);
+    // A seek past the stream end is a data answer, and a write window refuses.
+    try std.testing.expectError(error.DataException, direct.seek(11));
+    var destination: [4]u8 = undefined;
+    var sink_node = abi.Node.init();
+    sink_node.bytes = &destination;
+    sink_node.byte_capacity = destination.len;
+    var sink = try Resource.sinkFromNode(&call, &sink_node, capability_bit_write);
+    try std.testing.expectError(error.UnsupportedException, sink.seek(1));
+
+    // The callback wire carries the offset in the request's value_low.
+    var harness = CallbackHarness{ .data = "abcdefgh" };
+    var callback_call = abi.Call.init();
+    callback_call.callback = harnessCallback;
+    callback_call.callback_context = @ptrCast(&harness);
+    var callback_node = abi.Node.init();
+    callback_node.flags = abi.node_flag_callback_resource;
+    var callback_source = try Resource.sourceFromNode(&callback_call, &callback_node, capability_bit_read | seek_bit);
+    try callback_source.seek(5);
+    try std.testing.expectEqual(@as(usize, 3), try callback_source.read(&staging));
+    try std.testing.expectEqualSlices(u8, "fgh", &staging);
+    try std.testing.expectError(error.CallException, bare_callback_source_seek());
+}
+
+fn bare_callback_source_seek() Exception!void {
+    var bare_call = abi.Call.init();
+    var bare_node = abi.Node.init();
+    bare_node.flags = abi.node_flag_callback_resource;
+    var bare = try Resource.sourceFromNode(&bare_call, &bare_node, capability_bit_read);
+    try bare.seek(0);
 }
 
 test "resource materialize returns exact short and overflow slices" {
