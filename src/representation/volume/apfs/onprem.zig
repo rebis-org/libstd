@@ -3,18 +3,21 @@ const std = @import("std");
 const entry_prim = @import("../../../common/entry.zig");
 const bounds = @import("../../../common/primitive/bounds.zig");
 const exception_prim = @import("../../../common/primitive/exception.zig");
+const tree = @import("../tree.zig");
 
 pub const Entry = entry_prim.Entry;
-pub const EntryInfo = entry_prim.Sized;
 const Exception = exception_prim.Exception;
 
-// Layouts follow apfs_raw.h (linux-apfs/linux-apfs-rw) and ApfsHandler (vendor/7zip).
-//
-// Checksum: APFS Fletcher-64, libfsapfs_checksum.c (libyal/libfsapfs),
-// over block[8..] with initial value 0.
-//
-// The writer builds a fresh single-volume, mkfs-shaped image: one physical
-// fs tree, one container object map, no checkpoint area.
+// The metadata projection publishes the entry's full path, so the walk
+// carries a name beside the size.
+
+pub const EntryInfo = struct {
+    name: []const u8,
+    size: u64,
+    ordinal: u64,
+};
+
+// Layouts follow apfs_raw.h (linux-apfs-rw) and ApfsHandler (vendor/7zip); checksum is Fletcher-64 over block[8..] with initial value 0.
 
 pub const scratch_size: usize = 1024 * 1024;
 
@@ -267,23 +270,20 @@ const Mount = struct {
 };
 
 pub fn inspectCount(archive: []const u8, scratch: []u8) Exception!u64 {
-    _ = scratch;
-    return walk(archive, .count);
+    return walk(archive, .count, scratch);
 }
 
 pub fn inspectOrdinal(archive: []const u8, ordinal: u64, scratch: []u8) Exception!EntryInfo {
-    _ = scratch;
     var info: EntryInfo = undefined;
     var found = false;
-    _ = try walk(archive, .{ .resolve = .{ .ordinal = ordinal, .info = &info, .output = null, .found = &found } });
+    _ = try walk(archive, .{ .resolve = .{ .ordinal = ordinal, .info = &info, .output = null, .found = &found } }, scratch);
     return info;
 }
 
 pub fn decodeOrdinal(archive: []const u8, ordinal: u64, output: []u8, scratch: []u8) Exception!usize {
-    _ = scratch;
     var info: EntryInfo = undefined;
     var found = false;
-    _ = try walk(archive, .{ .resolve = .{ .ordinal = ordinal, .info = &info, .output = output, .found = &found } });
+    _ = try walk(archive, .{ .resolve = .{ .ordinal = ordinal, .info = &info, .output = output, .found = &found } }, scratch);
     return @intCast(info.size);
 }
 
@@ -292,11 +292,11 @@ const Target = union(enum) {
     resolve: struct { ordinal: u64, info: *EntryInfo, output: ?[]u8, found: *bool },
 };
 
-const WalkState = struct { ordinal: u64 = 0 };
-
-fn walk(archive: []const u8, target: Target) Exception!u64 {
+fn walk(archive: []const u8, target: Target, scratch: []u8) Exception!u64 {
     var mount = try open(archive);
-    var state = WalkState{};
+    // The path stack borrows the caller's scratch; the joined name
+    // outlives the walk because a resolve aborts before any mutation.
+    var state = tree.WalkState(max_dir_depth){ .path = scratch };
     var found = false;
     const resolved = switch (target) {
         .count => target,
@@ -482,7 +482,7 @@ fn omapLookup(mount: *const Mount, root_paddr: u64, oid: u64) Exception!?u64 {
     }
 }
 
-fn walkVolume(mount: *Mount, fs_oid: u64, target: Target, state: *WalkState) Exception!void {
+fn walkVolume(mount: *Mount, fs_oid: u64, target: Target, state: *tree.WalkState(max_dir_depth)) Exception!void {
     const vol_paddr = (try omapLookup(mount, mount.container_omap_root, fs_oid)) orelse
         return error.DataException;
     const vol = try mount.image.block(vol_paddr);
@@ -653,23 +653,28 @@ fn fsScan(
 const WalkCtx = struct {
     mount: *const Mount,
     target: Target,
-    state: *WalkState,
+    state: *tree.WalkState(max_dir_depth),
     depth: u32,
     aborted: bool = false,
 };
 
 fn drecName(key: []const u8, hashed: bool) Exception![]const u8 {
     if (key.len < 8) return error.DataException;
+    var name: []const u8 = undefined;
     if (hashed) {
         if (key.len < 0xc) return error.DataException;
         const name_len = le32(key[8..12]) & drec_len_mask;
         if (0xc + name_len > key.len) return error.DataException;
-        return key[0xc..][0..name_len];
+        name = key[0xc..][0..name_len];
+    } else {
+        if (key.len < 0xa) return error.DataException;
+        const name_len = le16(key[8..10]);
+        if (0xa + name_len > key.len) return error.DataException;
+        name = key[0xa..][0..name_len];
     }
-    if (key.len < 0xa) return error.DataException;
-    const name_len = le16(key[8..10]);
-    if (0xa + name_len > key.len) return error.DataException;
-    return key[0xa..][0..name_len];
+    // The stored length counts the terminator; a drec name is what precedes it.
+    if (name.len == 0 or name[name.len - 1] != 0) return error.DataException;
+    return name[0 .. name.len - 1];
 }
 
 fn makeLoKey(buffer: *[0x10]u8, id: u64, rec_type: u64) []const u8 {
@@ -689,7 +694,7 @@ fn makeHiKey(buffer: *[0x10]u8, id: u64, rec_type: u64) []const u8 {
     return buffer[0..8];
 }
 
-fn walkDir(mount: *const Mount, dir_ino: u64, target: Target, state: *WalkState, depth: u32) Exception!void {
+fn walkDir(mount: *const Mount, dir_ino: u64, target: Target, state: *tree.WalkState(max_dir_depth), depth: u32) Exception!void {
     if (depth > max_dir_depth) return error.DataException;
     var lo: [0x10]u8 = undefined;
     var hi: [0x10]u8 = undefined;
@@ -699,12 +704,15 @@ fn walkDir(mount: *const Mount, dir_ino: u64, target: Target, state: *WalkState,
 
 fn dirYield(walk_ctx: *WalkCtx, key: []const u8, val: []const u8) Exception!void {
     const name = try drecName(key, walk_ctx.mount.hashed_drec);
-    _ = name;
     if (val.len < 8) return error.DataException;
     const file_id = le64(val[0..8]);
     const inode = try lookupInode(walk_ctx.mount, file_id);
     const fmt = inode.mode & mode_fmt_mask;
     if (fmt == mode_dir) {
+        // Only a resolve publishes names, so only it keeps the path stack.
+        const named = walk_ctx.target == .resolve;
+        if (named) try walk_ctx.state.push(name, walk_ctx.depth);
+        defer if (named) walk_ctx.state.pop(walk_ctx.depth);
         try walkDir(walk_ctx.mount, file_id, walk_ctx.target, walk_ctx.state, walk_ctx.depth + 1);
         switch (walk_ctx.target) {
             .resolve => |res| if (res.found.*) {
@@ -722,6 +730,7 @@ fn dirYield(walk_ctx: *WalkCtx, key: []const u8, val: []const u8) Exception!void
             if (walk_ctx.state.ordinal == res.ordinal) {
                 res.info.size = inode.size;
                 res.info.ordinal = walk_ctx.state.ordinal;
+                res.info.name = try walk_ctx.state.joined(name);
                 if (res.output) |out| {
                     if (out.len < inode.size) return error.CapacityException;
                     try readFile(walk_ctx.mount, inode.private_id, inode.size, out);
@@ -788,15 +797,7 @@ fn extentYield(ctx: *FileCtx, key: []const u8, val: []const u8) Exception!void {
     ctx.written = end;
 }
 
-// Writer: a fresh single-volume image (mkfs-shaped, no checkpoint area).
-//
-// After the fixed blocks come volume omap nodes, fs tree nodes (leaves,
-// then internal levels bottom-up), then file data.
-//
-// The fs tree is virtual because 7-Zip resolves the root through the
-// volume omap unconditionally.
-//
-// Read order is depth-first with sibling names sorted bytewise.
+// Writer: a fresh single-volume, mkfs-shaped image. The fs tree is virtual because 7-Zip resolves the root through the volume omap.
 
 const writer_block_size: usize = 4096;
 const volume_oid: u64 = 100;
@@ -1279,6 +1280,12 @@ test "apfs write roundtrips nested directories" {
     const written = try encode(&entries, archive, &scratch);
     try testing.expectEqual(required, written);
     try testing.expectEqual(@as(u64, 3), try inspectCount(archive, &scratch));
+    const first = try inspectOrdinal(archive, 0, &scratch);
+    try testing.expectEqualStrings("a/b/deep.txt", first.name);
+    const second = try inspectOrdinal(archive, 1, &scratch);
+    try testing.expectEqualStrings("a/sib.txt", second.name);
+    const third = try inspectOrdinal(archive, 2, &scratch);
+    try testing.expectEqualStrings("top.txt", third.name);
     var out: [16]u8 = undefined;
     const n0 = try decodeOrdinal(archive, 0, &out, &scratch);
     try testing.expectEqualSlices(u8, "nested payload", out[0..n0]);
@@ -1906,11 +1913,12 @@ test "apfs rejects extent block numbers outside the image" {
     const phys = leaf_a[leaf_a.len - v_off + 8 ..][0..8];
     std.mem.writeInt(u64, phys, fixture_block_count, .little);
     var out: [hello_size]u8 = undefined;
-    try std.testing.expectError(error.DataException, decodeOrdinal(image, 1, &out, &.{}));
+    var path: [256]u8 = undefined;
+    try std.testing.expectError(error.DataException, decodeOrdinal(image, 1, &out, &path));
 
     // The highest possible block number must not wrap the address arithmetic.
     std.mem.writeInt(u64, phys, std.math.maxInt(u64), .little);
-    try std.testing.expectError(error.DataException, decodeOrdinal(image, 1, &out, &.{}));
+    try std.testing.expectError(error.DataException, decodeOrdinal(image, 1, &out, &path));
 }
 
 test "apfs synthetic image round trip" {
@@ -1920,23 +1928,24 @@ test "apfs synthetic image round trip" {
 
     try std.testing.expectEqual(@as(u64, 2), try inspectCount(image, &.{}));
 
-    const first = try inspectOrdinal(image, 0, &.{});
+    var path: [256]u8 = undefined;
+    const first = try inspectOrdinal(image, 0, &path);
     try std.testing.expectEqual(@as(u64, inner_size), first.size);
-    const second = try inspectOrdinal(image, 1, &.{});
+    const second = try inspectOrdinal(image, 1, &path);
     try std.testing.expectEqual(@as(u64, hello_size), second.size);
 
     var inner_out: [inner_size]u8 = undefined;
-    const inner_read = try decodeOrdinal(image, 0, &inner_out, &.{});
+    const inner_read = try decodeOrdinal(image, 0, &inner_out, &path);
     try std.testing.expectEqual(@as(usize, inner_size), inner_read);
     for (inner_out, 0..) |byte, i| try std.testing.expectEqual(@as(u8, @truncate(255 -| @as(u8, @intCast(i % 256)))), byte);
 
     var hello_out: [hello_size]u8 = undefined;
-    const hello_read = try decodeOrdinal(image, 1, &hello_out, &.{});
+    const hello_read = try decodeOrdinal(image, 1, &hello_out, &path);
     try std.testing.expectEqual(@as(usize, hello_size), hello_read);
     for (hello_out[0..4096], 0..) |byte, i| try std.testing.expectEqual(@as(u8, @truncate(i *% 31 + 7)), byte);
     for (hello_out[4096..], 0..) |byte, i| try std.testing.expectEqual(@as(u8, @truncate(i *% 13 + 5)), byte);
 
-    try std.testing.expectError(error.DataException, inspectOrdinal(image, 2, &.{}));
+    try std.testing.expectError(error.DataException, inspectOrdinal(image, 2, &path));
 }
 
 test "apfs rejects non-apfs data" {

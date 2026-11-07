@@ -44,8 +44,8 @@ pub fn commandPolicyFor(id: EnvelopeId, direction: u32) ?CommandPolicy {
     // The fixture's query verb names the read direction only.
     if (vocabulary.eql(id, vocabulary.ids.test_read)) return if (direction == command_mask_read) fixture_io else null;
     const descriptor = discovery.findById(toContractId(id)) orelse return null;
-    // Filters are ingredients, not callable profiles.
-    if (descriptor.class == .filter) return null;
+    // A filter's output spans its input exactly, so measured sizing and a
+    // replayable source serve it like any slice codec.
     if (descriptor.sizing == .metadata_exact) return io(direction, archive_capabilities, .metadata_exact, .tentative, .confirmed);
     const commit: CommitMode = if (descriptor.commit == .confirmed) .confirmed else .tentative;
     return io(direction, replay_capabilities, .measured, commit, commit);

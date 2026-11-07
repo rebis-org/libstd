@@ -41,7 +41,8 @@ const Node = extern struct {
 pub const Options = struct {
     order: u32,
     mem_size: u32,
-    unpack_size: u64,
+    // A declared decode size; encode always codes exactly its input.
+    unpack_size: ?u64 = null,
     max_work: u64 = std.math.maxInt(u64),
 };
 
@@ -64,7 +65,8 @@ pub fn encode(input: []const u8, output: []u8, scratch: []u8, options: Options) 
 }
 
 fn encodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options: Options) Exception!void {
-    const unpack_size = std.math.cast(usize, options.unpack_size) orelse return error.ResourceException;
+    // A declared size must agree with the input; absence codes the input.
+    const unpack_size = std.math.cast(usize, options.unpack_size orelse input.len) orelse return error.ResourceException;
     if (input.len != unpack_size) return error.CallException;
     try validateOptions(options, unpack_size);
     const model = try Model.prepare(scratch, options.mem_size);
@@ -79,12 +81,14 @@ fn encodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, opti
 pub fn decodedSize(input: []const u8, scratch: []u8, options: Options) Exception!usize {
     _ = input;
     _ = scratch;
-    if (options.unpack_size > std.math.maxInt(usize)) return error.ResourceException;
-    return std.math.cast(usize, options.unpack_size) orelse error.ResourceException;
+    // The stream carries no end marker, so the caller declares the size.
+    const size = options.unpack_size orelse return error.CallException;
+    if (size > std.math.maxInt(usize)) return error.ResourceException;
+    return std.math.cast(usize, size) orelse error.ResourceException;
 }
 
 pub fn decode(input: []const u8, output: []u8, scratch: []u8, options: Options) Exception!usize {
-    const unpack_size = std.math.cast(usize, options.unpack_size) orelse return error.ResourceException;
+    const unpack_size = std.math.cast(usize, options.unpack_size orelse return error.CallException) orelse return error.ResourceException;
     if (output.len < unpack_size) return error.CapacityException;
     try validateOptions(options, unpack_size);
     const model = try Model.prepare(scratch, options.mem_size);
@@ -101,9 +105,11 @@ pub fn decode(input: []const u8, output: []u8, scratch: []u8, options: Options) 
     return count;
 }
 
+// The slice decode fills a caller-sized buffer in place.
+pub const decodeInPlace = decode;
+
 pub fn decodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options: Options) Exception!void {
-    if (options.unpack_size > std.math.maxInt(usize)) return error.ResourceException;
-    const unpack_size = std.math.cast(usize, options.unpack_size) orelse return error.ResourceException;
+    const unpack_size = std.math.cast(usize, options.unpack_size orelse return error.CallException) orelse return error.ResourceException;
     try validateOptions(options, unpack_size);
     const model = try Model.prepare(scratch, options.mem_size);
     model.restart(options.order);
@@ -1100,6 +1106,23 @@ fn updateProb0(prob: u16) u16 {
 fn updateProb1(prob: u16) u16 {
     const mean = (prob + (1 << (period_bits - 2))) >> period_bits;
     return prob - mean;
+}
+
+test "ppmd leaf codes the input length when no size is declared" {
+    const testing = std.testing;
+    const backing = try testing.allocator.alloc(u8, decodeWorkspaceSize(4 << 20));
+    defer testing.allocator.free(backing);
+    const input = "repetitive payload for the undeclared-size route 0123456789";
+    const bound = try requiredSize(input, backing, .{ .order = 8, .mem_size = 4 << 20 });
+    const encoded = try testing.allocator.alloc(u8, bound);
+    defer testing.allocator.free(encoded);
+    const encoded_len = try encode(input, encoded, backing, .{ .order = 8, .mem_size = 4 << 20 });
+    try testing.expectError(error.CallException, decodedSize(encoded[0..encoded_len], backing, .{ .order = 8, .mem_size = 4 << 20 }));
+    const output = try testing.allocator.alloc(u8, input.len);
+    defer testing.allocator.free(output);
+    const produced = try decode(encoded[0..encoded_len], output, backing, .{ .order = 8, .mem_size = 4 << 20, .unpack_size = input.len });
+    try testing.expectEqual(input.len, produced);
+    try testing.expectEqualSlices(u8, input, output);
 }
 
 test "ppmd leaf roundtrip period-97 repetitive 4500" {

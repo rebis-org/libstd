@@ -6,6 +6,8 @@
     .parameters = .{
         .{ .name = "order", .family = 11, .ordinal = 1, .representation = "scalar_words" },
         .{ .name = "memory", .family = 11, .ordinal = 2, .representation = "scalar_words" },
+        // The stream carries no end marker, so a decode declares its size.
+        .{ .name = "unpack_size", .family = 11, .ordinal = 3, .representation = "scalar_words" },
     },
     .capabilities = .{ "read", "replay" },
     .sizing = "measured",

@@ -116,7 +116,8 @@ uint32_t stdk_cancel(struct stdk_completion *completion);
  * overlap each other or the session storage.
  *
  * stdk_session_create applies generous default ceilings (16 GiB encoded,
- * 16 GiB decoded, 4 GiB work, 1 Mi entries). Zip-bomb limits hold engine-
+ * 16 GiB decoded, 32 GiB work, 1 Mi entries). Work charges every step's
+ * consumed plus produced bytes. Zip-bomb limits hold engine-
  * side by default; pass explicit ceilings through stdk_session_bounded, or
  * UINT64_MAX to opt back into unbounded streaming.
  *

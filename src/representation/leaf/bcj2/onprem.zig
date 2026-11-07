@@ -106,9 +106,7 @@ fn rangeDecode(prob: *u16, range: *u32, code: *u32, stream: []const u8, pos: *us
 
 pub const EncodedSizes = struct { main: usize, call: usize, jump: usize, rc: usize };
 
-// Main, call, and jump never exceed the input.
-//
-// Each rc bit at worst halves the range, so a byte costs eight bits.
+// Main, call, and jump never exceed the input; each rc bit at worst halves the range, a byte eight bits.
 pub fn encodeSizesBound(input_len: usize) EncodedSizes {
     return .{
         .main = input_len,
@@ -384,6 +382,9 @@ test "bcj2 encode roundtrips through the decoder" {
     const sizes = try encode(&input, main_buf, call_buf, jump_buf, rc_buf);
     try std.testing.expect(sizes.call > 0);
     try std.testing.expect(sizes.jump > 0);
+    // The branch targets left main: a filter that kept every byte in the
+    // main stream would still roundtrip.
+    try std.testing.expect(sizes.main < input.len);
 
     var out: [input.len]u8 = undefined;
     const n = try decode(main_buf[0..sizes.main], call_buf[0..sizes.call], jump_buf[0..sizes.jump], rc_buf[0..sizes.rc], &out);

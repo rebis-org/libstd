@@ -31,8 +31,7 @@ pub const trailer_name = "TRAILER!!!";
 
 pub const record_header_size: usize = 110;
 
-// The fixed newc header, shared by this reader and the xip member walk:
-// both decode the same 13 hex fields from the same offsets.
+// The fixed newc header, shared by this reader and the xip member walk: both decode the same 13 hex fields.
 pub const NewcHeader = struct {
     ino: u32,
     mode: u32,
@@ -63,8 +62,7 @@ pub fn parseNewcHeader(bytes: []const u8) Exception!NewcHeader {
     };
 }
 
-// A record name carries its NUL terminator on the wire; nothing else may
-// appear before it. Newc and odc use the same name convention.
+// A record name carries its NUL terminator on the wire; nothing else may appear before it.
 pub fn parseRecordName(bytes: []const u8) Exception![]const u8 {
     if (bytes.len == 0) return error.DataException;
     const name = bytes[0 .. bytes.len - 1];
@@ -92,8 +90,7 @@ pub fn parseOdcHeader(bytes: []const u8) Exception!OdcHeader {
     if (bytes.len < odc_header_size) return error.DataException;
     if (!std.mem.eql(u8, bytes[0..6], "070707")) return error.DataException;
     var mode: u32 = @intCast(try parseOctal(bytes[18..24]));
-    // PWB archives leave inode bits above the mode field. Keep every bit
-    // a mode can hold: 0o67777 clears the type and turns symlinks into files.
+    // PWB archives leave inode bits above the mode field; 0o67777 clears the type and turns symlinks into files.
     mode &= 0o177777;
     if (mode & 0o170000 == 0) mode |= 0o100000;
     return .{
@@ -244,8 +241,7 @@ fn writeNewcHeader(sink: anytype, entry: Entry, ino: u32, comptime magic: []cons
     for (fields) |field| try writeDigits(sink, 16, 8, field);
 }
 
-// One complete newc record: the fixed header, the name, and the data.
-// The xip writer streams these straight into its chunk framing.
+// One complete newc record: fixed header, name, and data; the xip writer streams these into its framing.
 pub fn writeNewcRecord(sink: anytype, entry: Entry, ino: u32, check: u32) Exception!void {
     try validateEntry(entry);
     try writeNewcHeader(sink, entry, ino, "070701", check);

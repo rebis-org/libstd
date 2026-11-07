@@ -4,10 +4,7 @@ const exception_prim = @import("../../../common/primitive/exception.zig");
 
 const Exception = exception_prim.Exception;
 
-// Bit-level port of wimlib's input_bitstream, shared by the WIM codecs.
-// Words drain high byte first, most-significant bit first.
-//
-// Overrun reads yield zeroes, matching wimlib's contract.
+// Bit-level port of wimlib's input_bitstream: words drain high byte, MSB first; overrun reads yield zeroes.
 
 pub const Bits = struct {
     data: []const u8,

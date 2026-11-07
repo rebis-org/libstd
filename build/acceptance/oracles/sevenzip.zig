@@ -529,9 +529,7 @@ fn runEncodedHeaders(r: *Runner) anyerror!void {
     if (r.response.byte_length != 97) return error.EncryptedHeaderFixtureMismatch;
 }
 
-// Three entries of one method pack into a single folder: every ordinal must
-// read its own bytes back through the shared stream, and the entry count
-// stays visible to a query.
+// Three entries of one method pack into one folder: every ordinal reads its own bytes through the shared stream.
 fn runSolid(r: *Runner) anyerror!void {
     setup7z(r);
     corpus.fillTiled(r.corpus_index, &sz_solid_data);

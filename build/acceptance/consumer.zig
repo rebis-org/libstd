@@ -1,8 +1,6 @@
 const std = @import("std");
 
-// Package consumers import only the libstd module. Nothing below reaches
-// into src/ internal paths: every type comes from the public assembly and
-// bypass facades.
+// Consumers import only the libstd module: every type comes from the public facades, never src/ internals.
 const libstd = @import("libstd");
 
 const assembly = libstd.assembly;
@@ -25,9 +23,7 @@ test "assembly descriptor projection covers every representation descriptor" {
                 @compileError("descriptor without a public namespace: " ++ descriptor.name);
         }
     }
-    // The special mappings stay reachable: zdict is the zstd dictionary
-    // surface, hyphenated wire names map to their modules, and RAR keeps
-    // its writer alongside the reader.
+    // Special mappings stay reachable: zdict is the zstd dictionary surface; hyphenated names map to their modules.
     try std.testing.expect(assembly.leaf.zdict == assembly.leaf.zstd);
     try std.testing.expect(@hasDecl(assembly.leaf.zdict, "trainDictionary"));
     try std.testing.expect(@hasDecl(assembly.leaf.zdict, "dictionaryContent"));
@@ -158,9 +154,7 @@ test "gzip session decode and caller filter pipeline through assembly" {
     var history: [gzip.deflate_history_size]u8 = undefined;
     const compressed_len = try drivers.gzipEncode(compressed, &corpus, &history, drivers.default_encode_options, .bounded);
 
-    // Decode in steps through a session while applying a caller-built
-    // filter; the filtered output must match the filter over the raw
-    // corpus, and the plain output must match the corpus byte for byte.
+    // Stepped session decode with a caller-built filter: filtered output matches the filter, plain output matches the corpus.
     const storage_plan = drivers.gzipDecodeStorage();
     const raw_storage = try std.testing.allocator.alloc(u8, storage_plan + @alignOf(drivers.GzipDecode));
     defer std.testing.allocator.free(raw_storage);

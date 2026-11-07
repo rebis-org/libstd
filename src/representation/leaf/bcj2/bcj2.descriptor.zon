@@ -3,7 +3,13 @@
     .name = "bcj2",
     .class = "filter",
     .verbs = .{"decode"},
-    .parameters = .{},
+    .parameters = .{
+        // The source carries the main stream; the three auxiliary streams ride the request, and the decode declares its output size.
+        .{ .name = "call_stream", .family = 10, .ordinal = 4, .representation = "bytes" },
+        .{ .name = "jump_stream", .family = 10, .ordinal = 5, .representation = "bytes" },
+        .{ .name = "rc_stream", .family = 10, .ordinal = 6, .representation = "bytes" },
+        .{ .name = "unpacked_size", .family = 10, .ordinal = 7, .representation = "scalar_words" },
+    },
     .capabilities = .{},
     .sizing = "unavailable",
     .commit = "tentative",

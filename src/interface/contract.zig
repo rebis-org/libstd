@@ -95,12 +95,7 @@ pub const Descriptor = struct {
     sizing: SizingMode = .unavailable,
     commit: CommitMode = .tentative,
     limits: Limits = .{},
-    // Volume-set support per command direction, as command-mask bits
-    // (read 2, write 4). A format declares it only where its official
-    // specification defines a split-set shape and the reader implements
-    // it; dispatch refuses the archive_volumes parameter to every other
-    // format and direction, so an unimplemented set never reads as a
-    // silently partial answer.
+    // Volume-set support per direction, as command-mask bits. Declared only where the specification defines a split-set shape; dispatch refuses archive_volumes elsewhere.
     volumes: u32 = 0,
     benchmark: ?Benchmark = null,
 };

@@ -6,14 +6,23 @@ fn forceAllDecls(comptime module: type) void {
     }
 }
 
-// Module types, not path strings: @import takes literals only, so the
-// list drives both the comptime forcing and the printed count. interface.lease
-// stays forced separately, outside the counted set.
+// Module types, not path strings: @import takes literals, so the list drives comptime forcing and the printed count.
 const forced_modules = .{
     @import("compose/api.zig"),
     @import("compose/archive.zig"),
     @import("compose/call.zig"),
     @import("compose/drivers.zig"),
+    @import("compose/drivers/brotli.zig"),
+    @import("compose/drivers/deflate.zig"),
+    @import("compose/drivers/gzip.zig"),
+    @import("compose/drivers/inflate.zig"),
+    @import("compose/drivers/lz4.zig"),
+    @import("compose/drivers/lz4_legacy.zig"),
+    @import("compose/drivers/session.zig"),
+    @import("compose/drivers/stage.zig"),
+    @import("compose/drivers/step.zig"),
+    @import("compose/drivers/tar.zig"),
+    @import("compose/drivers/zlib.zig"),
     @import("compose/transform.zig"),
     @import("kernel/node.zig"),
 };

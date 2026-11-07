@@ -83,7 +83,7 @@ test "offprem zstd decodes byte-identical to onprem across shapes" {
         const workspace = try alloc.alloc(u32, onprem.encoderWorkspaceU32Count(0, 1 << 26, frame_options));
         defer alloc.free(workspace);
         var sink = std.Io.Writer.fixed(compressed);
-        _ = onprem.encodeFrame(&sink, input[0..size], workspace, frame_options, 0) catch return error.TestUnexpectedResult;
+        _ = try onprem.encodeFrame(&sink, input[0..size], workspace, frame_options, 0);
         const frame_len = sink.end;
 
         var counter = measurement.Counter.init(null);

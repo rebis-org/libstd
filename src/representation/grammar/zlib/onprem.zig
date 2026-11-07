@@ -107,7 +107,7 @@ fn writeHeader(writer: *std.Io.Writer) Exception!void {
 test "zlib round trip restores the original input" {
     // A mixed provider build serves no single tag for both arms; run
     // only where the default tag serves them.
-    if (!deflate_seam.decodeServed(checksum.default_provider)) return;
+    if (!deflate_seam.decodeServed(checksum.default_provider)) return error.SkipZigTest;
 
     const history = try std.testing.allocator.alloc(u8, deflate_history_size);
     defer std.testing.allocator.free(history);
@@ -131,7 +131,7 @@ test "zlib round trip restores the original input" {
 test "zlib rejects a preset dictionary and trailing bytes" {
     // A mixed provider build serves no single tag for both arms; run
     // only where the default tag serves them.
-    if (!deflate_seam.decodeServed(checksum.default_provider)) return;
+    if (!deflate_seam.decodeServed(checksum.default_provider)) return error.SkipZigTest;
 
     const history = try std.testing.allocator.alloc(u8, deflate_history_size);
     defer std.testing.allocator.free(history);

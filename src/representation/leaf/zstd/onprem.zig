@@ -4491,9 +4491,6 @@ test "zstd dictionary trainer selects deterministic segments" {
     var second: [24 * 1024]u8 = undefined;
     const second_len = try trainDictionary(&samples, second.len, &second, scratch, checksum.default_provider);
     try std.testing.expectEqual(first_len, second_len);
-    if (!std.mem.eql(u8, first[0..first_len], second[0..first_len])) {
-        std.debug.print("first length {d} differs at offset {d}: {x} vs {x}\n", .{ first_len, std.mem.findDiff(u8, first[0..first_len], second[0..first_len]).?, first[std.mem.findDiff(u8, first[0..first_len], second[0..first_len]).?], second[std.mem.findDiff(u8, first[0..first_len], second[0..first_len]).?] });
-    }
     try std.testing.expectEqualSlices(u8, first[0..first_len], second[0..first_len]);
 
     const content = try dictionaryContent(first[0..first_len]);
@@ -4924,6 +4921,8 @@ test "zstd price-DP tier roundtrips at full block scale" {
     var source = std.Io.Reader.fixed(input);
     var sink = std.Io.Writer.fixed(encoded);
     const encoded_len = try encodeStream(&source, &sink, history, workspace, dp_options);
+    // Sixty percent of the bytes are runs; a valid DP parse must compress.
+    try std.testing.expect(encoded_len < input.len);
 
     const decoded = try allocator.alloc(u8, input.len);
     defer allocator.free(decoded);
@@ -5089,11 +5088,7 @@ test "zstd dictionary search beats the single-pass trainer on validation" {
     const score_ws = try allocator.alloc(u8, trainSearchWorkspaceSize(max_dict, 8192, .{}));
     defer allocator.free(score_ws);
     const score = struct {
-        fn run(dict: []const u8, validate: []const []const u8, ws: []u8, alloc2: std.mem.Allocator) !u64 {
-            var f_max: usize = 1;
-            for ([_]usize{ 15, 17, 19 }) |f| f_max = @max(f_max, f);
-            const buckets = @as(usize, 1) << @intCast(f_max);
-            _ = buckets;
+        fn run(dict: []const u8, validate: []const []const u8, ws: []u8) !u64 {
             var off: usize = std.mem.alignForward(usize, 2 * (@as(usize, 1) << 19) * @sizeOf(u32), 16);
             const history = ws[off .. off + window_size_min + block_size_max + max_dict];
             off += std.mem.alignForward(usize, window_size_min + block_size_max + max_dict, 16);
@@ -5113,12 +5108,11 @@ test "zstd dictionary search beats the single-pass trainer on validation" {
                 total += written;
                 @memcpy(history[0..dict_content.len], dict_content);
             }
-            _ = alloc2;
             return total;
         }
     }.run;
-    const score_a = try score(dict_a[0..len_a], samples[train_count..], score_ws, allocator);
-    const score_b = try score(dict_b[0..len_b], samples[train_count..], score_ws, allocator);
+    const score_a = try score(dict_a[0..len_a], samples[train_count..], score_ws);
+    const score_b = try score(dict_b[0..len_b], samples[train_count..], score_ws);
     try std.testing.expect(score_b <= score_a);
 
     // The searched dictionary works end to end: encode a validation sample

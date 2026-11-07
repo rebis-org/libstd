@@ -101,6 +101,38 @@ pub const XxHash32 = struct {
     }
 };
 
-test "xxh32 onprem matches the stdlib oracle" {
+test "xxh32 onprem pins the reference catalog and tracks the stdlib oracle" {
+    const testing = std.testing;
+
+    // The reference catalog pins the short-input tail paths at seed zero.
+    var empty = XxHash32.init(0);
+    try testing.expectEqual(@as(u32, 0x02CC5D05), empty.final());
+
+    var a = XxHash32.init(0);
+    a.update("a");
+    try testing.expectEqual(@as(u32, 0x550D7456), a.final());
+
+    var abc = XxHash32.init(0);
+    abc.update("abc");
+    try testing.expectEqual(@as(u32, 0x32D153FF), abc.final());
+
+    // A split feed proves buffered bytes join later stripes.
+    var split = XxHash32.init(0);
+    split.update("ab");
+    split.update("c");
+    try testing.expectEqual(@as(u32, 0x32D153FF), split.final());
+
     try seam.expectAgreement(XxHash32.init(0), std.hash.XxHash32.init(0), 0x3232, false, null);
+
+    // A seeded sweep guards the seed arithmetic the zero-seed pins miss.
+    var buf: [271]u8 = undefined;
+    var rng = std.Random.DefaultPrng.init(0xC0FFEE);
+    rng.random().bytes(&buf);
+    for ([_]usize{ 0, 1, 3, 15, 16, 17, 31, 32, 33, 63, 64, 65, 128, 255, 256, 271 }) |len| {
+        var ours = XxHash32.init(0xC0FFEE);
+        ours.update(buf[0..len]);
+        var theirs = std.hash.XxHash32.init(0xC0FFEE);
+        theirs.update(buf[0..len]);
+        try testing.expectEqual(theirs.final(), ours.final());
+    }
 }

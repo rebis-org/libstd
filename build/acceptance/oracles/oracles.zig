@@ -23,11 +23,7 @@ const xz = @import("xz.zig");
 const zip = @import("zip.zig");
 const zstd = @import("zstd.zig");
 
-// Suites derive from the component table; removing a descriptor removes
-// its suite with no central edits.
-//
-// Harness constants duplicate the table for build-side convenience;
-// descriptors stay authoritative, drift fails the build.
+// Suites derive from the component table, so removing a descriptor removes its suite. Harness constants duplicate it; descriptors stay authoritative.
 comptime {
     const Pin = struct { component: []const u8, parameter: []const u8, family: u16, ordinal: u32 };
     const pins = [_]Pin{
@@ -62,6 +58,19 @@ comptime {
         .{ .component = "tar", .parameter = "entry_filter", .family = 2, .ordinal = 13 },
         .{ .component = "zstd-seekable", .parameter = "frame_size", .family = 13, .ordinal = 1 },
         .{ .component = "zdict", .parameter = "sample_size", .family = 13, .ordinal = 2 },
+        .{ .component = "zdict", .parameter = "dictionary_size", .family = 13, .ordinal = 3 },
+        .{ .component = "tar", .parameter = "entry_mode", .family = 2, .ordinal = 16 },
+        .{ .component = "delta", .parameter = "distance", .family = 10, .ordinal = 1 },
+        .{ .component = "bcj", .parameter = "kind", .family = 10, .ordinal = 2 },
+        .{ .component = "bcj", .parameter = "start_offset", .family = 10, .ordinal = 3 },
+        .{ .component = "bcj2", .parameter = "call_stream", .family = 10, .ordinal = 4 },
+        .{ .component = "bcj2", .parameter = "jump_stream", .family = 10, .ordinal = 5 },
+        .{ .component = "bcj2", .parameter = "rc_stream", .family = 10, .ordinal = 6 },
+        .{ .component = "bcj2", .parameter = "unpacked_size", .family = 10, .ordinal = 7 },
+        .{ .component = "ppmd", .parameter = "order", .family = 11, .ordinal = 1 },
+        .{ .component = "ppmd", .parameter = "memory", .family = 11, .ordinal = 2 },
+        .{ .component = "ppmd", .parameter = "unpack_size", .family = 11, .ordinal = 3 },
+        .{ .component = "rar", .parameter = "recovery_percent", .family = 15, .ordinal = 2 },
         .{ .component = "zip", .parameter = "password", .family = 1, .ordinal = 1 },
         .{ .component = "zip", .parameter = "algorithm", .family = 1, .ordinal = 2 },
         .{ .component = "zip", .parameter = "kdf_rounds_limit", .family = 1, .ordinal = 3 },
@@ -157,8 +166,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--scenario")) {
             filter_scenario = args.next() orelse return error.MissingScenarioArgument;
         } else if (std.mem.eql(u8, arg, "--strict")) {
-            // CI sets this where every reference tool is installed, so an
-            // unverified or skipped scenario fails the run instead of hiding.
+            // CI sets this where every reference tool is installed, so an unverified scenario fails the run instead of hiding.
             strict = true;
         } else if (catalog_path == null) {
             catalog_path = arg;

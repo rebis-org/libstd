@@ -15,10 +15,10 @@ extern "C" {
 STDAPI CreateObject(const GUID *clsid, const GUID *iid, void **outObject);
 }
 
-#define ARC_GUID(id)  \
-	{ 0x23170F69, \
-	  0x40C1,     \
-	  0x278A,     \
+#define ARC_GUID(id)                                                           \
+	{ 0x23170F69,                                                          \
+	  0x40C1,                                                              \
+	  0x278A,                                                              \
 	  { 0x10, 0x00, 0x00, 0x01, 0x10, (id), 0x00, 0x00 } }
 
 class CMemStream : public IInStream, public IOutStream, public CMyUnknownImp {

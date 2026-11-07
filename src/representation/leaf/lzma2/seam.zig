@@ -14,8 +14,7 @@ pub const Exception = offprem.Exception;
 pub const InPlaceResult = onprem.InPlaceResult;
 pub const Options = onprem.Options;
 
-// The stdlib decode shapes take no options; one shim per verb drops the
-// parameter so a single dispatch carries both arms.
+// The stdlib decode shapes take no options; one shim per verb drops the parameter so one dispatch carries both arms.
 fn offDecode(input: []const u8, output: []u8, scratch: []u8, _: Options) Exception!usize {
     return offprem.decode(input, output, scratch);
 }

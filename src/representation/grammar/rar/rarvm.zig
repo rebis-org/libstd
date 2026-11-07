@@ -80,11 +80,7 @@ pub fn readData(br: *BitReader) Exception!u32 {
     }
 }
 
-// A false result means the parameters are out of range; the caller reports
-// the entry unverifiable.
-//
-// Each filter reads from scratch: writing over the destination would
-// overwrite unread input.
+// A false result means out-of-range parameters, so the caller reports the entry unverifiable; filters read from scratch, never over input.
 pub fn applyFilter(
     filter: StandardFilter,
     data: []u8,
@@ -228,11 +224,7 @@ pub fn applyFilter(
             return true;
         },
         .rgb => {
-            // The predictor sums left, upper, and upper-left neighbors, then keeps
-            // the closest by absolute difference.
-            //
-            // The encoder stored red and blue as differences from green, so the
-            // decoder adds green back afterwards.
+            // The predictor sums left, upper, and upper-left neighbors, keeping the closest; the encoder stored red and blue as green differences.
             const width_reg = init_r[0];
             if (width_reg < 3) return false;
             const width: usize = width_reg - 3;
@@ -283,11 +275,7 @@ pub fn applyFilter(
             return true;
         },
         .itanium => {
-            // An IA-64 instruction bundle is 16 bytes that hold three 41-bit
-            // slots and one 5-bit template.
-            //
-            // Op type 5 marks a branch; the encoder made its 20-bit target
-            // absolute, so convert it back.
+            // An IA-64 bundle is 16 bytes holding three 41-bit slots and a template; the encoder made branch targets absolute.
             if (data_size < 21) return false;
             var file_offset: u32 = init_r[6] >> 4;
 

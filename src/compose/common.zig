@@ -21,6 +21,11 @@ pub fn requireSink(sink: *Resource, call: *Call, required: usize) Exception!void
     return requireSinkCapacity(sink, call, required);
 }
 
+// A read publishes tentatively, a write confirmed; the other refuses.
+pub fn requireCommit(commit: vocabulary.CommitMode, expected: vocabulary.CommitMode) Exception!void {
+    if (commit != expected) return error.UnsupportedException;
+}
+
 pub fn requireSinkCapacity(sink: *Resource, call: *Call, required: u64) Exception!void {
     const capacity = sinkCapacity(sink);
     if (required > capacity) {
@@ -50,9 +55,7 @@ pub const ExecutionPlan = struct {
     workspace_available: usize = 0,
 };
 
-// One invocation owns every piece of a single envelope call: the plan
-// with its resolved policy, the source, the optional sink, the envelope,
-// and the response. Hooks and shared helpers receive nothing twice.
+// One invocation owns each piece of one envelope call: plan, source, optional sink, envelope, response; hooks receive nothing twice.
 pub const Invocation = struct {
     plan: ExecutionPlan,
     source: *Resource,
@@ -217,31 +220,6 @@ pub fn writeWorkspaceCapacityDiagnostic(call: *Call, required: u64, available: u
 
 pub fn writeDownstreamDiagnostic(call: *Call, status: u32) void {
     writeDiagnosticScalar(call, vocabulary.ids.diagnostic_downstream_status, status);
-}
-
-fn overlapsWorkspace(workspace_ptr: usize, workspace_len: usize, ptr: usize, len: usize) Exception!void {
-    if (try spanOverlap(workspace_ptr, workspace_len, ptr, len)) return error.CallException;
-}
-
-fn workspaceRange(call: *Call) ?struct { ptr: usize, len: usize } {
-    if (call.workspace == null or call.workspace_capacity == 0) return null;
-    // A workspace larger than the address space cannot exist on this target.
-    const len = std.math.cast(usize, call.workspace_capacity) orelse return null;
-    return .{ .ptr = @intFromPtr(call.workspace.?), .len = len };
-}
-
-pub fn checkWorkspaceOverlap(call: *Call, source: *Resource, sink: *Resource) Exception!void {
-    try checkSourceWorkspaceOverlap(call, source);
-    const range = workspaceRange(call) orelse return;
-    if (sink.kind == .direct_write) {
-        try overlapsWorkspace(range.ptr, range.len, @intFromPtr(sink.kind.direct_write.ptr), sink.kind.direct_write.len);
-    }
-}
-
-pub fn checkSourceWorkspaceOverlap(call: *Call, source: *Resource) Exception!void {
-    const range = workspaceRange(call) orelse return;
-    if (source.kind != .direct_read) return;
-    try overlapsWorkspace(range.ptr, range.len, @intFromPtr(source.kind.direct_read.ptr), source.kind.direct_read.len);
 }
 
 pub fn validateBoundary(call: *Call, source_node: ?*Node, sink_node: ?*Node) Exception!void {

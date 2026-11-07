@@ -213,7 +213,7 @@ pub fn encodeUnits(
     }
 }
 
-test "gf and crc64 pins" {
+test "gf and crc64 primitives match the reference pins" {
     const allocator = std.testing.allocator;
     const exp = try allocator.alloc(u16, gf_exp_len);
     const log = try allocator.alloc(u32, gf_log_len);
@@ -240,7 +240,7 @@ test "gf and crc64 pins" {
     }
 }
 
-test "recovery layout pins" {
+test "recovery layout pins the reference chunking" {
     const Case = struct { p: usize, nd: usize, ch: usize, u: usize, last: usize, poff: usize, unit: usize, nsub: usize = 1 };
     const cases = [_]Case{
         .{ .p = 4157, .nd = 5, .ch = 832, .u = 1, .last = 829, .poff = 112, .unit = 944 },

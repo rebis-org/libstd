@@ -4,7 +4,11 @@
     .class = "slice",
     .verbs = .{ "required_size", "decoded_size", "encoded_size_bound", "encode", "decode" },
     .parameters = .{
+        // A write (or query) trains a dictionary: the source splits into equal sample_size chunks, at most 2^20 samples.
         .{ .name = "sample_size", .family = 13, .ordinal = 2, .representation = "scalar_words" },
+        // Optional cap on the trained dictionary in bytes; absence caps it
+        // at the corpus size plus the dictionary header.
+        .{ .name = "dictionary_size", .family = 13, .ordinal = 3, .representation = "scalar_words" },
     },
     .capabilities = .{ "read", "replay" },
     .sizing = "measured",

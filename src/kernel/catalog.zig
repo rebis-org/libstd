@@ -130,3 +130,102 @@ comptime {
             @compileError("released component id drifted: " ++ entry.name ++ ".");
     }
 }
+
+test "catalog sorted descriptors hold every identity exactly once in ascending order" {
+    try std.testing.expectEqual(
+        vocabulary.protocol_rows.len + discovery.enumerate().len,
+        sorted_descriptors.len,
+    );
+    // Strictly ascending by (high, low): the sort leaves no duplicates and no inversions.
+    for (sorted_descriptors[1..], 0..) |row, index| {
+        const previous = sorted_descriptors[index];
+        try std.testing.expect(row.id.high > previous.id.high or
+            (row.id.high == previous.id.high and row.id.low > previous.id.low));
+    }
+    // Every protocol row is present by identity.
+    for (vocabulary.protocol_rows) |protocol_row| {
+        const resolved = descriptorFor(protocol_row.id).?;
+        try std.testing.expectEqualStrings(protocol_row.name, resolved.name);
+    }
+    // The testing fixtures land as profile rows with their pinned identities.
+    const expected = [_]struct { name: []const u8, low: u64, high: u64 }{
+        .{ .name = "test_echo", .low = 0x6e6b_82f0_8d91_0401, .high = 0xa7a3_5105_3d6d_4001 },
+        .{ .name = "test_read", .low = 0x6e6b_82f0_8d91_0402, .high = 0xa7a3_5105_3d6d_4002 },
+        .{ .name = "crypto", .low = 0x6e6b_82f0_8d91_0410, .high = 0xa7a3_5105_3d6d_4010 },
+    };
+    for (expected) |pin| {
+        var hits: usize = 0;
+        for (sorted_descriptors) |row| {
+            if (std.mem.eql(u8, row.name, pin.name)) {
+                hits += 1;
+                try std.testing.expectEqual(vocabulary.DescriptorKind.profile, row.kind);
+                try std.testing.expectEqual(pin.low, row.id.low);
+                try std.testing.expectEqual(pin.high, row.id.high);
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 1), hits);
+    }
+}
+
+test "catalog descriptorFor resolves sorted rows and rejects stranger identities" {
+    for (sorted_descriptors) |row| {
+        const resolved = descriptorFor(row.id).?;
+        try std.testing.expectEqualStrings(row.name, resolved.name);
+    }
+    // The zero id is not a table row.
+    try std.testing.expect(descriptorFor(.{ .low = 0, .high = 0 }) == null);
+    // Strangers: a crossed word pair and a foreign prefix.
+    try std.testing.expect(descriptorFor(.{ .low = 0x6e6b_82f0_8d91_0402, .high = 0xa7a3_5105_3d6d_4001 }) == null);
+    try std.testing.expect(descriptorFor(.{ .low = 0x6e6b_82f0_8d92_0401, .high = 0xa7a3_5105_3d6d_4001 }) == null);
+}
+
+test "catalog isKnownId accepts zero as no component and rejects strangers" {
+    // An all-zero id means "no component requested", so it passes as known.
+    try std.testing.expect(isKnownId(.{ .low = 0, .high = 0 }));
+    for (sorted_descriptors) |row| {
+        try std.testing.expect(isKnownId(row.id));
+    }
+    // Strangers are unknown: a crossed word pair and a foreign prefix.
+    try std.testing.expect(!isKnownId(.{ .low = 0x6e6b_82f0_8d91_0402, .high = 0xa7a3_5105_3d6d_4001 }));
+    try std.testing.expect(!isKnownId(.{ .low = 1, .high = 1 }));
+}
+
+test "catalog profile rows carry component semantics with tar and echo pinned" {
+    const tar = descriptorFor(.{ .low = 0x6e6b_82f0_8d91_0405, .high = 0xa7a3_5105_3d6d_4005 }).?;
+    try std.testing.expectEqualStrings("tar", tar.name);
+    try std.testing.expectEqual(vocabulary.DescriptorKind.profile, tar.kind);
+    try std.testing.expectEqual(@as(u32, 7), tar.command_mask); // inspect/decode/encode verb groups
+    try std.testing.expectEqual(@as(u32, 15), tar.capability_mask); // read|write|size|replay
+    try std.testing.expectEqual(vocabulary.SizingMode.metadata_exact, tar.sizing);
+    try std.testing.expectEqual(vocabulary.CommitMode.tentative, tar.commit);
+    try std.testing.expectEqual(@as(u32, 6), tar.volumes); // read 2 | write 4
+    try std.testing.expectEqual(vocabulary.Representation.none, tar.representation);
+    try std.testing.expectEqual(vocabulary.Direction.none, tar.direction);
+
+    const echo = descriptorFor(.{ .low = 0x6e6b_82f0_8d91_0401, .high = 0xa7a3_5105_3d6d_4001 }).?;
+    try std.testing.expectEqualStrings("test_echo", echo.name);
+    try std.testing.expectEqual(@as(u32, 63), echo.capability_mask);
+    try std.testing.expectEqual(@as(u32, 0), echo.volumes);
+    try std.testing.expectEqual(vocabulary.CommitMode.confirmed, echo.commit);
+}
+
+test "catalog json pins epoch nine and full descriptor accounting" {
+    try std.testing.expect(std.mem.startsWith(u8, catalog_json, "{\n  \"epoch\": 9,\n  \"parameter_selector\": \"value_high: family(16)|ordinal(32)|attrs(8)|flags(8); value_low: scalar value\",\n  \"descriptors\": [\n"));
+    try std.testing.expect(std.mem.endsWith(u8, catalog_json, "  ]\n}\n"));
+    // One serialized row per sorted descriptor.
+    var rows: usize = 0;
+    var lines = std.mem.splitScalar(u8, catalog_json, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "    {\"id\":{\"low\":\"")) rows += 1;
+    }
+    try std.testing.expectEqual(sorted_descriptors.len, rows);
+    // The released tar row keeps its frozen identity through serialization.
+    try std.testing.expect(std.mem.find(u8, catalog_json, "\"id\":{\"low\":\"0x6e6b82f08d910405\",\"high\":\"0xa7a351053d6d4005\"},\"name\":\"tar\",\"kind\":\"profile\"") != null);
+    // The whole document parses as JSON and accounts every descriptor.
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, catalog_json, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try std.testing.expectEqual(@as(i64, 9), root.get("epoch").?.integer);
+    const descriptors = root.get("descriptors").?.array;
+    try std.testing.expectEqual(sorted_descriptors.len, descriptors.items.len);
+}

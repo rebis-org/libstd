@@ -911,6 +911,7 @@ test "tar gnu format roundtrips long names through LongLink entries" {
     var archive: [8192]u8 = undefined;
     var scratch: [4096]u8 = undefined;
     const written = try encodeGnu(&entries, &archive, &scratch);
+    try testing.expectEqual(@as(u64, written), try archiveSizeGnu(&entries));
     // The GNU magic sits in the version bytes too.
     try testing.expectEqualSlices(u8, "ustar  \x00", archive[257..265]);
     const info = try inspectOrdinal(archive[0..written], 0);
@@ -1084,12 +1085,7 @@ test "tar rejects unsafe ustar prefix fields" {
     try testing.expectEqualStrings("abc", out[0..size]);
 }
 
-// ---------------------------------------------------------------------------
-// GNU multi-volume sets. A volume ends where its bytes end: tar cuts a
-// member's data at the volume boundary and opens the next volume with an
-// 'M' header carrying the member name (truncated to the name field), the
-// remaining size, and the offset already written; intermediate volumes
-// carry no EOF blocks, only the final one does (vendor/tar buffer.c).
+// GNU multi-volume: a cut member opens the next volume under an 'M' header naming it, with remaining size and offset.
 
 pub const VolumeSegment = struct { volume: u16, offset: u64, len: u64 };
 
@@ -1101,8 +1097,7 @@ const VolumeReader = struct {
     vi: usize = 0,
     ordinal: u64 = 0,
     segments: ?[]VolumeSegment,
-    // When set, only the named member's segments are recorded; a decode
-    // walks past earlier members whose bytes it must not gather.
+    // When set, only the named member's segments are recorded; a decode walks past earlier members it must not gather.
     target: ?u64 = null,
     segment_count: usize = 0,
     cont_size: u64 = 0,
@@ -1128,9 +1123,7 @@ const VolumeReader = struct {
         self.inner.offset = 0;
     }
 
-    // One continuation volume: the 'M' header names the cut member, states
-    // its remaining size and the offset already written, and the member
-    // data follows.
+    // One continuation volume: the 'M' header names the cut member and states its remaining size and written offset.
     fn consumeContinuation(self: *VolumeReader, vol: []const u8) Exception!void {
         if (self.inner.offset + block_size > vol.len) return error.DataException;
         const entry = try self.inner.readHeader();
@@ -1239,11 +1232,7 @@ const VolumeReader = struct {
                     try tarValidateEntryName(entry);
                     entry.ordinal = self.ordinal;
                     if (!self_advanced and data_end > vol.len) {
-                        // The member is cut: record this volume's share, then
-                        // consume every continuation volume before returning,
-                        // so the member's segments are complete on return.
-                        // The continuation names the real member name
-                        // truncated to the field, as GNU writes it.
+                        // The member is cut: record this volume's share, then consume every continuation volume, so the segments are complete on return.
                         self.cont_name = entry.name[0..@min(entry.name.len, max_name_field)];
                         self.cont_size = entry.size;
                         self.cont_written = vol.len - entry.data_offset;
@@ -1326,8 +1315,7 @@ pub fn volumeDecodeOrdinal(volumes: []const []const u8, ordinal: u64, output: []
     return error.DataException;
 }
 
-// Writes one 512-byte block into the current volume; the layout keeps
-// every write a block multiple, so a full volume lands on the boundary.
+// Writes one 512-byte block into the current volume; the layout keeps every write a block multiple.
 const SplitEmitter = struct {
     out: ?[]u8,
     scratch: []u8,
@@ -1388,8 +1376,7 @@ const SplitEmitter = struct {
     }
 };
 
-// One traversal decides sizes and bytes; the emit pass replays the same
-// layout, so a plan and its set cannot disagree.
+// One traversal decides sizes and bytes; the emit pass replays the layout, so a plan and its set cannot disagree.
 fn splitLayout(entries: []const Entry, volume_size: u64, lengths: ?[]u64, scratch: []u8, output: ?[]u8) Exception!VolumePlan {
     if (volume_size == 0 or volume_size % block_size != 0 or volume_size < 2 * block_size) return error.CallException;
     if (scratch.len < scratch_size) return error.CapacityException;
@@ -1399,9 +1386,7 @@ fn splitLayout(entries: []const Entry, volume_size: u64, lengths: ?[]u64, scratc
         if (std.mem.findScalar(u8, entry.link_name, 0) != null) return error.CallException;
         if ((entry.typeflag == '1' or entry.typeflag == '2') and entry.link_name.len == 0) return error.CallException;
         const data_size = try tarDataSize(entry.typeflag, entry.data);
-        // Header units never split: they either fit whole or the member
-        // opens the next volume. Each long-name unit carries its own
-        // header block plus the padded name bytes.
+        // Header units never split: they fit whole or the member opens the next volume; each long-name unit carries a header.
         var header_bytes: u64 = block_size;
         if (entry.name.len > max_name_field) header_bytes = try bounds.addU64(header_bytes, try bounds.addU64(block_size, try tarAligned(entry.name.len + 1)));
         if (entry.link_name.len > max_name_field) header_bytes = try bounds.addU64(header_bytes, try bounds.addU64(block_size, try tarAligned(entry.link_name.len + 1)));
@@ -1445,8 +1430,7 @@ fn splitLayout(entries: []const Entry, volume_size: u64, lengths: ?[]u64, scratc
             try em.pad(long_size);
         }
         try tarWriteHeader(.gnu, &em, scratch, parts.name, &.{}, if (entry.link_name.len > max_name_field) &.{} else entry.link_name, entry.mode, entry.uid, entry.gid, entry.modification_time, entry.typeflag, data_size, entry.devmajor, entry.devminor);
-        // The member data fills volumes whole-block at a time; a cut
-        // member continues under an 'M' header on the next volume.
+        // Member data fills volumes whole-block at a time; a cut member continues under an 'M' header on the next volume.
         var written: usize = 0;
         while (written < data_size) {
             const remaining: usize = @intCast(data_size - written);
@@ -1463,8 +1447,7 @@ fn splitLayout(entries: []const Entry, volume_size: u64, lengths: ?[]u64, scratc
                 try em.write(entry.data[written..][0..take]);
                 written += take;
             }
-            // The continuation header opens the next volume; a fresh one is
-            // the widest fit, so the 'M' always lands inside it.
+            // The continuation header opens the next volume; a fresh one is the widest fit, so the 'M' always lands inside.
             try em.closeVolume();
             try em.openVolume();
             try em.writeMultivolHeader(entry.name, data_size - written, written);
@@ -1537,8 +1520,7 @@ test "tar volume set roundtrips a cut member" {
 
 test "tar volume set reassembles a cut member with a long name" {
     const testing = std.testing;
-    // The name forces an 'L' entry, and the member data crosses volumes;
-    // the continuation header names the real member name truncated.
+    // The name forces an 'L' entry and the data crosses volumes; the continuation names the real member, truncated.
     var long_name: [130]u8 = undefined;
     @memset(&long_name, 'n');
     @memcpy(long_name[126..130], ".txt");

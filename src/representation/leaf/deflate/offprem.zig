@@ -91,10 +91,7 @@ pub const Decompress = struct {
         return &self.inner.reader;
     }
 
-    // The stdlib flate cannot suspend mid-block: state persists only at
-    // `state` assignments. Fills are transactional: snapshot, restore on starvation, re-parse.
-    // A finished member serves the bytes a call staged before its end marker;
-    // the marker follows alone on the next call, matching the onprem arm.
+    // The stdlib flate cannot suspend mid-block: fills are transactional - snapshot, restore on starvation, re-parse.
     pub fn streamTo(self: *@This(), writer: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
         const reader = &self.inner.reader;
         var produced: usize = 0;
@@ -119,9 +116,7 @@ pub const Decompress = struct {
                     self.inner = saved_inner;
                     self.fixed_input = saved_input;
                 }
-                // Bytes staged this call are served before the end marker;
-                // dropping them here would drop them from the caller's
-                // accounting, for the marker carries no count.
+                // Bytes staged this call are served before the end marker; dropping them would drop them from the caller's accounting.
                 if (err == error.EndOfStream and produced != 0) break;
                 return err;
             };
@@ -129,8 +124,7 @@ pub const Decompress = struct {
             if (produced >= @backingInt(limit)) break;
             // A pull that neither moved nor staged cannot move again.
             if (emitted == 0 and reader.seek >= reader.end) {
-                // An empty member reports the end marker, never a bare zero,
-                // so the caller cannot read the zero as a livelock.
+                // An empty member reports the end marker, never a bare zero, so the caller cannot read it as a livelock.
                 if (produced == 0 and self.atEnd()) return error.EndOfStream;
                 break;
             }

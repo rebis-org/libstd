@@ -197,10 +197,14 @@ pub const SpannedResult = struct { total_len: usize, volumes: u64 };
 
 const spanning_signature: u32 = 0x0807_4b50;
 
+// Info-ZIP "zip -s" refuses granularities under 4 KiB; the sizing query
+// refuses with the same floor so the write never diverges from its query.
+const volume_floor: u64 = 4096;
+
 // Info-ZIP "zip -s" conventions, verified against system zip and 7zz:
 // record headers never straddle disk boundaries; all offsets are disk-relative.
 pub fn encodeSpanned(entries: []const Entry, archive_comment: []const u8, output: []u8, volume_size: u64, provider: crypto.Provider, history: []u8, measurement_buffer: []u8, staging: []u8, scratch: []u8, failure_cause: *crypto.FailureCause, plan_scratch: []usize) Exception!SpannedResult {
-    if (volume_size < 4096) return error.CallException;
+    if (volume_size < volume_floor) return error.CallException;
     const vs: usize = std.math.cast(usize, volume_size) orelse return error.ResourceException;
     const required = try requiredSize(entries, archive_comment, history, measurement_buffer, scratch, failure_cause);
     const total = try bounds.addUsize(required, 4);
@@ -383,7 +387,7 @@ pub fn encodeSpanned(entries: []const Entry, archive_comment: []const u8, output
 // Splits a spanned archive into its disk extents (all but the last are
 // exactly volume_size bytes).
 pub fn spannedVolumeExtents(total_len: usize, volume_size: u64) Exception!VolumePlan {
-    if (volume_size == 0) return error.CallException;
+    if (volume_size < volume_floor) return error.CallException;
     const vs: usize = std.math.cast(usize, volume_size) orelse return error.ResourceException;
     if (total_len <= vs) return .{ .volumes = 1 };
     return .{ .volumes = (total_len + vs - 1) / vs };
@@ -391,9 +395,7 @@ pub fn spannedVolumeExtents(total_len: usize, volume_size: u64) Exception!Volume
 
 pub const VolumePlan = struct { volumes: u64 };
 
-// Offsets resolve relative to the disk named in each field, per the
-// Info-ZIP convention verified against system zip and 7zz. The spanned
-// inspect and decode share one join-and-resolve pass.
+// Offsets resolve relative to each field's disk, per Info-ZIP, verified against zip and 7zz; inspect and decode share join-and-resolve passes.
 const SpannedSet = struct { archive: []const u8, directory: ZipDirectory, disk_starts: []const usize };
 
 fn zipSpannedSet(volumes: []const []const u8, join: []u8, disk_starts_scratch: []usize) Exception!SpannedSet {
@@ -1438,7 +1440,7 @@ test "zip kdf_rounds_limit gates winzip aes" {
 test "zip aes128 single entry fits a 512-byte buffer" {
     // A mixed provider build serves no single tag for both arms; an
     // offprem tag has no encoder.
-    if (!deflate_seam.encodeServed(checksum.default_provider) or !deflate_seam.decodeServed(checksum.default_provider)) return;
+    if (!deflate_seam.encodeServed(checksum.default_provider) or !deflate_seam.decodeServed(checksum.default_provider)) return error.SkipZigTest;
 
     const testing = std.testing;
     const data = "0123456789abcdef0123456789abcdef";
@@ -1460,12 +1462,8 @@ test "zip aes128 single entry fits a 512-byte buffer" {
 }
 
 test "zip winzip aes clears the data descriptor flag" {
-    // A descriptor cannot follow WinZip AES data, so bit 3 drops from both
-    // headers regardless of the caller's request.
-    //
-    // A mixed provider build serves no single tag for both arms; run
-    // only where the default tag serves them.
-    if (!deflate_seam.encodeServed(checksum.default_provider) or !deflate_seam.decodeServed(checksum.default_provider)) return;
+    // A descriptor cannot follow WinZip AES data, so bit 3 drops from both headers regardless of the caller's request.
+    if (!deflate_seam.encodeServed(checksum.default_provider) or !deflate_seam.decodeServed(checksum.default_provider)) return error.SkipZigTest;
     const testing = std.testing;
     const data = "aes entry that requested the streaming shape";
     const entries = [_]Entry{
@@ -1556,6 +1554,17 @@ test "zip winzip aes accepts every supported compression method" {
         const decoded = try zipDecodeOrdinal(archive[0..written], 0, &output, .{ .password = password, .failure_cause = &cause, .staging = &decrypt_staging, .scratch = decode_scratch });
         try testing.expectEqualSlices(u8, data, output[0..decoded]);
     }
+}
+
+test "spanned granularity floor answers the sizing query and the write alike" {
+    const testing = std.testing;
+    // Sub-floor granularities refuse the sizing query identically to the
+    // write, so a host never plans a set the write rejects.
+    try testing.expectError(error.CallException, spannedVolumeExtents(1 << 20, 0));
+    try testing.expectError(error.CallException, spannedVolumeExtents(1 << 20, 1024));
+    try testing.expectError(error.CallException, spannedVolumeExtents(1 << 20, 4095));
+    try testing.expectEqual(@as(u64, 256), (try spannedVolumeExtents(1 << 20, 4096)).volumes);
+    try testing.expectEqual(@as(u64, 1), (try spannedVolumeExtents(4096, 4096)).volumes);
 }
 
 test "zip spanned write and read roundtrip" {
