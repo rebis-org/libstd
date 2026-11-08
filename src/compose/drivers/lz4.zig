@@ -275,6 +275,11 @@ pub const lz4EncodeSession = lz4_encode_pair.session;
 pub fn lz4EncodeStep(state: *Lz4Encode, input: []const u8, output: []u8, end_of_input: bool) StepResult {
     var result = StepResult{};
     state.stage.drain(output, &result);
+    // Reject trailing input only once the finished frame's pending tail has
+    // drained; an early error would drop EndMark and checksum bytes. A step
+    // that drains nothing must still fail, or a zero-length output spins.
+    if (state.finished and input.len > 0 and (state.stage.len == 0 or result.produced == 0))
+        return encodeFailed(&result, error.DataException);
     if (input.len > 0 and !state.finished) {
         // Compress this step's input as blocks; each block's bound plus
         // size words must fit the pending tail.
@@ -417,4 +422,37 @@ test "lz4 sessions roundtrip both block shapes and reject corrupt frames" {
     var legacy: [8]u8 = undefined;
     std.mem.writeInt(u32, legacy[0..4], 0x184C2102, .little);
     try testing.expectError(error.DataException, fixtures.expectChunkedDecode(Lz4Decode, lz4DecodeInit, lz4DecodeStep, dec_holder.aligned, &legacy, &payload, legacy.len, 4096));
+}
+
+test "lz4 encode drains a finished frame before rejecting trailing input" {
+    const fixtures = @import("../../testing/support.zig");
+    const allocator = testing.allocator;
+    var payload: [600]u8 = undefined;
+    fixtures.fillPayload(&payload);
+
+    const enc_holder = try fixtures.allocStateStorage(Lz4Encode, lz4EncodeStorage(), allocator);
+    defer allocator.free(enc_holder.raw);
+    const encoder = try lz4EncodeInit(enc_holder.aligned, .{});
+
+    // An eight-byte output leaves the EndMark and checksum pending across
+    // several steps once finished is latched.
+    var frame: std.ArrayList(u8) = .empty;
+    defer frame.deinit(allocator);
+    var out: [8]u8 = undefined;
+    var rest: []const u8 = &payload;
+    while (true) {
+        const result = lz4EncodeStep(encoder, rest, &out, true);
+        try frame.appendSlice(allocator, out[0..result.produced]);
+        if (result.status == .failed) return result.exception.?;
+        rest = rest[result.consumed..];
+        if (result.status == .done) break;
+    }
+    // Header, one size word, EndMark and content checksum all arrived.
+    try testing.expect(frame.items.len >= 19);
+
+    // No pending bytes remain: trailing input is an immediate error.
+    const trailing = lz4EncodeStep(encoder, "x", &out, false);
+    try testing.expectEqual(sessions.StepStatus.failed, trailing.status);
+    try testing.expectEqual(error.DataException, trailing.exception.?);
+    try testing.expectEqual(@as(usize, 0), trailing.consumed);
 }

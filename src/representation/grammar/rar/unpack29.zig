@@ -741,7 +741,12 @@ pub const Session = struct {
         st.br = BitReader.initPadded(packed_data, bits.default_pad_bytes);
         st.written_size = 0;
 
-        if (unpacked_size == 0) return;
+        if (unpacked_size == 0) {
+            // The end-of-block marker carries the state a solid successor
+            // needs; consume it even though no bytes are emitted.
+            if (packed_data.len != 0) try st.decompressLoop(0);
+            return;
+        }
 
         const start_pos = st.window.write_pos;
 

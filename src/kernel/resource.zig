@@ -151,7 +151,8 @@ pub const Resource = struct {
         if (chunk.len == 0) return 0;
         switch (self.kind) {
             .direct_write => |destination| {
-                if (self.offset + chunk.len > destination.len) return error.CapacityException;
+                // Subtract instead of adding: offset never exceeds destination.len.
+                if (chunk.len > destination.len - self.offset) return error.CapacityException;
                 @memcpy(destination[self.offset..][0..chunk.len], chunk);
                 self.offset += chunk.len;
                 return chunk.len;

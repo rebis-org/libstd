@@ -34,13 +34,13 @@ on:
 jobs:
   build:
     name: Build
-    if: github.event_name != 'workflow_dispatch' || inputs.scope == 'ALL' || inputs.scope == 'build'
+    if: github.event_name != 'workflow_dispatch' || inputs.scope == 'ALL' || inputs.scope == 'build' || inputs.scope == 'publish'
     uses: ./.github/workflows/cache.yml
     with:
       profile: build
       impl: onprem
       portable: false
-      export: ${{ inputs.publish }}
+      export: ${{ inputs.publish || inputs.scope == 'publish' }}
       benchmark: ${{ inputs.benchmark }}
 
   suite:
@@ -111,7 +111,9 @@ jobs:
   publish:
     name: Publish
     needs: [build, suite, targets, runtime, gate]
-    if: (github.event_name == 'workflow_dispatch' && inputs.scope == 'publish') || inputs.publish
+    # With a scope-selective dispatch the other producers are skipped, so
+    # success() alone would skip this job; gate still has to be green.
+    if: ${{ !cancelled() && needs.gate.result == 'success' && ((github.event_name == 'workflow_dispatch' && inputs.scope == 'publish') || inputs.publish) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

@@ -596,7 +596,7 @@ fn spanCount(spans: []const Span) usize {
 
 fn pushSpan(spans: []Span, start: usize, len: usize) Exception!void {
     const n = spanCount(spans);
-    if (n >= spans.len) return error.ResourceException;
+    if (n >= spans.len) return error.UnsupportedException;
     spans[n] = .{ .start = @intCast(start), .len = @intCast(len) };
 }
 
@@ -715,7 +715,7 @@ fn buildInodeTableRaw(plan: *const Plan, buf: []u8, spans: []Span) Exception!usi
             try pushSpan(spans, span_start, used - span_start);
             span_start = used;
         }
-        if (used + inode_size > buf.len) return error.ResourceException;
+        if (used + inode_size > buf.len) return error.UnsupportedException;
         var raw: [32]u8 = @splat(0);
         std.mem.writeInt(u16, raw[4..6], uid_index, .little);
         std.mem.writeInt(u16, raw[6..8], guid_index, .little);
@@ -807,7 +807,7 @@ fn buildDirTableRaw(plan: *Plan, ws: *WriteWs, buf: []u8, spans: []Span) Excepti
             const rank = orderRank(plan, child_idx);
             const rel = plan.inode_block_rel[rank];
             if (chunk == 0 or chunk == max_entries or prev_block != rel) {
-                if (used + 12 > buf.len or used - span_start + 12 > metadata_size) return error.ResourceException;
+                if (used + 12 > buf.len or used - span_start + 12 > metadata_size) return error.UnsupportedException;
                 var run: u32 = 0;
                 var scan = ci;
                 while (scan < start.len and run < max_entries and plan.inode_block_rel[orderRank(plan, start[scan])] == rel) {
@@ -907,6 +907,7 @@ fn buildPlan(entries: []const Entry, ws: *WriteWs, alloc: std.mem.Allocator) Exc
             if (nodes.items[existing].kind != .dir or entry.data.len != 0) return error.CallException;
             continue;
         }
+        if (nodes.items.len >= max_nodes) return error.UnsupportedException;
         nodes.append(alloc, .{ .kind = .file, .name = leaf, .parent = parent, .data = entry.data }) catch return error.ResourceException;
         nodes.items[parent].child_count += 1;
     }
@@ -1030,6 +1031,9 @@ fn findOrCreateDir(nodes: *std.ArrayList(Node), alloc: std.mem.Allocator, parent
         if (nodes.items[existing].kind != .dir) return error.CallException;
         return existing;
     }
+    // The node count is an input-shape cap; reach it before append so the
+    // answer is unsupported, not a misleading resource_limit.
+    if (nodes.items.len >= max_nodes) return error.UnsupportedException;
     const idx: u32 = @intCast(nodes.items.len);
     nodes.append(alloc, .{ .kind = .dir, .name = name, .parent = parent }) catch return error.ResourceException;
     nodes.items[parent].child_count += 1;

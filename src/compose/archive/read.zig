@@ -58,6 +58,7 @@ fn decode(comptime F: type, running: *Run, tail: []const []const u8) Exception!v
     if (size > running.limits().decoded_bytes) return error.ResourceException;
     try common.requireSinkCapacity(sink, call, size);
     if (info.ready) |span| {
+        if (span.len != size) return error.InternalException;
         _ = try publishReady(sink, call, try bounds.slice(opened.archive, span.offset, span.len));
     } else {
         const target = try common.SinkTarget.open(sink, running.core.workspace, size);

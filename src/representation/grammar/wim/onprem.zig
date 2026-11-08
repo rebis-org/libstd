@@ -126,9 +126,11 @@ fn writeUtf16Le(out: []u8, name: []const u8) Exception!usize {
 }
 
 fn dentryWireLen(name_units: usize) usize {
-    const name_bytes = name_units * 2;
-    const raw = dentry_disk_size + (if (name_bytes != 0) name_bytes + 2 else 0);
-    return (raw + 7) & ~@as(usize, 7);
+    // A saturated bound stays a bound: callers reject it instead of taking
+    // an unchecked add into a slice length.
+    const name_bytes = name_units *| 2;
+    const raw = dentry_disk_size +| (if (name_bytes != 0) name_bytes +| 2 else 0);
+    return (raw +| 7) & ~@as(usize, 7);
 }
 
 // Dentry names are single components: each directory dentry carries its
@@ -383,7 +385,8 @@ fn writeDentry(out: []u8, name: []const u8, hash: *const [sha1_len]u8, subdir_of
     // lives in the dentry hash.
     std.mem.writeInt(u16, out[96..98], 0, .little);
     std.mem.writeInt(u16, out[98..100], 0, .little); // No short name.
-    std.mem.writeInt(u16, out[100..102], @intCast(units * 2), .little);
+    const name_bytes = std.math.mul(usize, units, 2) catch return error.CallException;
+    std.mem.writeInt(u16, out[100..102], std.math.cast(u16, name_bytes) orelse return error.CallException, .little);
     if (units != 0) {
         var pos: usize = dentry_disk_size;
         pos += writeUtf16Le(out[pos..], name) catch return error.DataException;
@@ -556,18 +559,23 @@ pub fn archiveSize(entries: []const Entry, scratch: []u8) Exception!u64 {
     return (try layoutFor(file_count, metadata_len, file_count, payload_len)).total;
 }
 
-// The write scratch carries the metadata image from the front and the tree
-// from the tail. The bound covers every dentry the entries can serialize:
-// one record per entry (leaf names only), one list marker per directory
-// plus the root, and the fixed image head. Deduplication only shrinks the
-// tree, so the bound holds for any shape the builder accepts.
+// The image bound must cover each directory's marker and record, not
+// just the per-entry leaf records.
 pub fn writeScratchLen(entries: []const Entry) Exception!usize {
     var needed: u64 = security_len + 8 + root_record_len;
+    var max_name_len: usize = 0;
     for (entries) |entry| {
         const leaf = leafName(entry.name) orelse return error.CallException;
         needed = try bounds.addU64(needed, dentryWireLen(try utf16Len(leaf)));
+        max_name_len = @max(max_name_len, entry.name.len);
     }
-    needed = try bounds.addU64(needed, @as(u64, entries.len + 1) * root_record_len);
+    // listLen adds a marker and a record per directory; the node cap bounds both.
+    const doubled = std.math.mul(u64, @as(u64, entries.len), 2) catch return error.ResourceException;
+    const node_count = std.math.add(u64, doubled, 1) catch return error.ResourceException;
+    const max_rec: u64 = dentryWireLen(max_name_len);
+    const per_node = std.math.add(u64, 8, max_rec) catch return error.ResourceException;
+    const records = std.math.mul(u64, node_count, per_node) catch return error.ResourceException;
+    needed = try bounds.addU64(needed, records);
     const regions = Tree.Regions.of(entries.len);
     needed = try bounds.addU64(needed, @as(u64, regions.total) + @alignOf(Node) - 1);
     return std.math.cast(usize, needed) orelse return error.ResourceException;
@@ -1186,6 +1194,11 @@ fn utf16NameInto(buf: []u8, units: []const u8) Exception![]const u8 {
             i += 2;
             break :blk 0x10000 + ((@as(u21, unit) - 0xD800) << 10) + (@as(u21, low) - 0xDC00);
         } else unit;
+        // A short staging buffer is an implementation shape limit, not
+        // corrupt input: report unsupported so the host does not retry with
+        // a larger workspace that cannot help.
+        const need: usize = std.unicode.utf8CodepointSequenceLength(cp) catch return error.DataException;
+        if (buf.len - out_len < need) return error.UnsupportedException;
         const n = std.unicode.utf8Encode(cp, buf[out_len..]) catch return error.DataException;
         out_len += n;
     }
@@ -1201,6 +1214,12 @@ fn securityDataLen(metadata: []const u8) Exception!usize {
 }
 
 const max_walk_depth = 64;
+const max_name_bytes = 1024; // One dentry's UTF-16 name staged on the stack.
+const max_path_bytes = 4096; // Joined path for the open directory levels.
+
+// These three are fixed implementation shapes, not caller budgets: a host
+// cannot lift them by supplying more workspace. UnsupportedException keeps
+// them distinct from corrupt metadata and from a tripped resource budget.
 
 // A WIM links children through the parent's subdir offset, so open
 // levels keep sibling cursors on a stack.
@@ -1213,23 +1232,25 @@ fn walk(metadata: []const u8, ctx: anytype, comptime visit: anytype) Exception!v
     // Start of each open level's joined path; a child's name is relative
     // to its owning directory.
     var prefix: [max_walk_depth]usize = @splat(0);
-    var path: [4096]u8 = undefined;
+    var path: [max_path_bytes]u8 = undefined;
     var depth: usize = 0;
     stack[0] = std.math.cast(usize, root_subdir) orelse return error.DataException;
     while (true) {
         const pos = stack[depth];
-        if (pos + 8 > metadata.len) return error.DataException;
+        const pos8 = std.math.add(usize, pos, 8) catch return error.DataException;
+        if (pos8 > metadata.len) return error.DataException;
         const length = std.mem.readInt(u64, metadata[pos..][0..8], .little);
-        const aligned = (length + 7) & ~@as(u64, 7);
+        const aligned = (length +% 7) & ~@as(u64, 7);
         if (aligned <= 8) {
             if (depth == 0) return;
             depth -= 1;
             continue;
         }
-        if (pos + aligned > metadata.len or aligned < dentry_disk_size) return error.DataException;
+        const dentry_end = std.math.add(u64, @intCast(pos), aligned) catch return error.DataException;
+        if (dentry_end > metadata.len or aligned < dentry_disk_size) return error.DataException;
         const stream_count = std.mem.readInt(u16, metadata[pos + 96 ..][0..2], .little);
         const name_nbytes = std.mem.readInt(u16, metadata[pos + 100 ..][0..2], .little);
-        var name_buf: [1024]u8 = undefined;
+        var name_buf: [max_name_bytes]u8 = undefined;
         var name: []const u8 = &.{};
         if (name_nbytes != 0) {
             if (pos + dentry_disk_size + name_nbytes > metadata.len) return error.DataException;
@@ -1238,7 +1259,7 @@ fn walk(metadata: []const u8, ctx: anytype, comptime visit: anytype) Exception!v
         var hash: [sha1_len]u8 = undefined;
         @memcpy(&hash, metadata[pos + 64 ..][0..sha1_len]);
         const base = prefix[depth];
-        if (base + name.len > path.len) return error.ResourceException;
+        if (base + name.len > path.len) return error.UnsupportedException;
         @memcpy(path[base..][0..name.len], name);
         const name_end = base + name.len;
         try visit(ctx, path[0..name_end], &hash);
@@ -1246,15 +1267,17 @@ fn walk(metadata: []const u8, ctx: anytype, comptime visit: anytype) Exception!v
         for (0..stream_count) |_| {
             if (next + 8 > metadata.len) return error.DataException;
             const stream_len = std.mem.readInt(u64, metadata[next..][0..8], .little);
-            const stream_aligned = (stream_len + 7) & ~@as(u64, 7);
-            if (stream_len < stream_disk_size or next + stream_aligned > metadata.len) return error.DataException;
+            const stream_aligned = (stream_len +% 7) & ~@as(u64, 7);
+            if (stream_len < stream_disk_size) return error.DataException;
+            const stream_end = std.math.add(u64, @intCast(next), stream_aligned) catch return error.DataException;
+            if (stream_end > metadata.len) return error.DataException;
             next += @intCast(stream_aligned);
         }
         stack[depth] = next;
         const subdir = std.mem.readInt(u64, metadata[pos + 16 ..][0..8], .little);
         if (subdir != 0) {
-            if (depth + 1 == max_walk_depth) return error.DataException;
-            if (name_end + 1 > path.len) return error.ResourceException;
+            if (depth + 1 == max_walk_depth) return error.UnsupportedException;
+            if (name_end + 1 > path.len) return error.UnsupportedException;
             path[name_end] = '/';
             depth += 1;
             prefix[depth] = name_end + 1;
@@ -2406,4 +2429,19 @@ test "wim split refuses a forged blob span" {
     std.mem.writeInt(u64, archive[@intCast(table_off)..][0..8], huge, .little);
     std.mem.writeInt(u64, archive[@intCast(table_off + 16)..][0..8], huge, .little);
     try testing.expectError(error.DataException, wimSplitPlan(archive[0..written], 4096, &scratch));
+}
+
+test "wim name shape limits and corrupt codepoints keep distinct error classes" {
+    const testing = std.testing;
+    var units: [8]u8 = undefined;
+    for (0..4) |i| std.mem.writeInt(u16, units[i * 2 ..][0..2], 'a', .little);
+
+    // A long but well-formed name is an implementation limit, not damage.
+    var small: [2]u8 = undefined;
+    try testing.expectError(error.UnsupportedException, utf16NameInto(&small, &units));
+
+    // An unpaired low surrogate is genuinely invalid metadata.
+    std.mem.writeInt(u16, units[0..2], 0xDC00, .little);
+    var roomy: [64]u8 = undefined;
+    try testing.expectError(error.DataException, utf16NameInto(&roomy, units[0..2]));
 }

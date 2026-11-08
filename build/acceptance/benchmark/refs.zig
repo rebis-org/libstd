@@ -411,7 +411,7 @@ fn addDwarfsTools(b: *std.Build) struct { mkdwarfs: *std.Build.Step.InstallFile,
         "-DFETCHCONTENT_SOURCE_DIR_RANGE-V3=/tmp/range-v3",
         "-DCMAKE_CXX_FLAGS=-I/tmp/date_include",
     }) catch @panic("oom");
-    const env = b.addSystemCommand(&.{ "sh", "-c", "export PKG_CONFIG_PATH=/opt/homebrew/opt/libarchive/lib/pkgconfig:$PKG_CONFIG_PATH; shift; exec cmake -S vendor/dwarfs -B zig-out/benchmark/build/dwarfs \"$@\"", "sh" });
+    const env = b.addSystemCommand(&.{ "sh", "-c", "export PKG_CONFIG_PATH=/opt/homebrew/opt/libarchive/lib/pkgconfig:$PKG_CONFIG_PATH; exec cmake -S vendor/dwarfs -B zig-out/benchmark/build/dwarfs \"$@\"", "sh" });
     env.addArgs(cfg.items);
     const build = b.addSystemCommand(&.{ "sh", "-c", "export PKG_CONFIG_PATH=/opt/homebrew/opt/libarchive/lib/pkgconfig:$PKG_CONFIG_PATH; exec cmake --build zig-out/benchmark/build/dwarfs -j4 --target mkdwarfs dwarfsck dwarfsextract", "sh" });
     build.step.dependOn(&env.step);

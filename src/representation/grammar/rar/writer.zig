@@ -678,7 +678,8 @@ fn layoutVolumes(
             if (!fits) {
                 // A fresh volume is the widest fit; if even its prefix plus
                 // this part overflows, no layout exists.
-                if (used == volumePrefixSize(volume, options)) return error.CallException;
+                const fresh_used = volumePrefixSize(volume, options) + block_writer.endBlockSize(options.encrypt_headers);
+                if (used == fresh_used) return error.CallException;
                 try onStep(ctx, .{ .end = true });
                 volume += 1;
                 used = volumePrefixSize(volume, options) + block_writer.endBlockSize(options.encrypt_headers);

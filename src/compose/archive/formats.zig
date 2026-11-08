@@ -436,6 +436,7 @@ pub const age = struct {
         pub fn count(self: *Read) Exception!u64 {
             _ = age_seam.inspectCount(self.run.provider(), self.archive, self.scratch) catch |err| switch (err) {
                 error.UnsupportedException => return error.UnsupportedException,
+                error.ResourceException => return error.ResourceException,
                 else => return error.DataException,
             };
             return 1;
@@ -443,7 +444,12 @@ pub const age = struct {
 
         pub fn locate(self: *Read, ordinal: u64) Exception!Info {
             const raw = age_seam.inspectOrdinal(self.run.provider(), self.archive, ordinal, self.options, self.scratch) catch |err| {
-                self.run.cause = .wrong_password;
+                self.run.cause = switch (err) {
+                    error.IntegrityException => .wrong_password,
+                    error.ResourceException => .kdf_limit,
+                    error.UnsupportedException => .unsupported_algorithm,
+                    else => .none,
+                };
                 return err;
             };
             return Info.from(raw);
@@ -451,7 +457,12 @@ pub const age = struct {
 
         pub fn read(self: *Read, ordinal: u64, output: []u8) Exception!usize {
             return age_seam.decodeOrdinal(self.run.provider(), self.archive, ordinal, output, self.scratch, self.options) catch |err| {
-                self.run.cause = .wrong_password;
+                self.run.cause = switch (err) {
+                    error.IntegrityException => .wrong_password,
+                    error.ResourceException => .kdf_limit,
+                    error.UnsupportedException => .unsupported_algorithm,
+                    else => .none,
+                };
                 return err;
             };
         }

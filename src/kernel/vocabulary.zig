@@ -55,7 +55,6 @@ pub const protocol_parameter = struct {
     // Provider selection for mergeable builds: value_low 0 is onprem, 1 is
     // offprem. Absent means the boundary default.
     pub const provider: u32 = 6;
-    pub const target_command: u32 = 24;
 };
 
 pub const command_mask_query: u32 = 1 << 0;
@@ -529,7 +528,6 @@ test "vocabulary protocol parameters and capability bits pin their wire values" 
     try std.testing.expectEqual(@as(u32, 4), protocol_parameter.sizing_mode);
     try std.testing.expectEqual(@as(u32, 5), protocol_parameter.commit_mode);
     try std.testing.expectEqual(@as(u32, 6), protocol_parameter.provider);
-    try std.testing.expectEqual(@as(u32, 24), protocol_parameter.target_command);
     // the resource capability bits pack into the low six bits
     try std.testing.expectEqual(@as(u32, 1), resource_capability_bit_read);
     try std.testing.expectEqual(@as(u32, 2), resource_capability_bit_write);

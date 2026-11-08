@@ -375,6 +375,8 @@ fn encodeCLSymbols(
 // table-present), the 0x5a XOR checksum, and the block size.
 fn wrapBlockHeader(block_bytes: []const u8, total_bits: usize, is_last_block: bool, out: []u8) Exception!usize {
     const block_size: u32 = @intCast(block_bytes.len);
+    // no 4-byte length form exists, so an oversized block is invalid encoder input.
+    if (block_size > 0xFFFFFF) return error.CallException;
     const last_byte_bits: u8 = @intCast(if (total_bits % 8 == 0) 8 else total_bits % 8);
     const byte_count: u8 = if (block_size <= 0xFF) 1 else if (block_size <= 0xFFFF) 2 else 3;
 

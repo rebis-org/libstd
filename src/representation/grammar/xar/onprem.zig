@@ -146,6 +146,7 @@ fn writeTocXml(sink: anytype, entries: []const Entry, order: []const u32) Except
             segment = slash + 1;
         }
         const is_dir = next_name != null and isAncestor(entry.name, next_name.?);
+        if (is_dir and entry.data.len != 0) return error.CallException;
         var digest_buf: [sha1_len * 2]u8 = undefined;
         sha1Hex(&digest_buf, entry.data);
         id += 1;
@@ -177,6 +178,7 @@ fn writeTocXml(sink: anytype, entries: []const Entry, order: []const u32) Except
             sink.write("</extracted-checksum>\n</data>\n") catch return error.CapacityException;
             offset = try bounds.addU64(offset, entry.data.len);
         }
+        if (depth == tree_depth_max) return error.UnsupportedException;
         open[depth] = entry.name;
         depth += 1;
     }

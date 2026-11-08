@@ -65,8 +65,8 @@ pub const Options = struct {
 // block. Add to the encode workspace when Options.block_size is nonzero.
 pub fn blockRecordScratchSize(input_len: usize, block_size: u32) usize {
     if (block_size == 0) return 0;
-    const blocks = (input_len + block_size - 1) / block_size;
-    return @max(1, blocks) * 16;
+    const blocks = (input_len +| block_size - 1) / block_size;
+    return @max(1, blocks) *| 16;
 }
 
 // Each extra block adds a bounded header, padding, check, and index
@@ -74,7 +74,7 @@ pub fn blockRecordScratchSize(input_len: usize, block_size: u32) usize {
 pub fn encodedSizeBound(input_len: usize, block_size: u32) usize {
     const base = lzma2.encodedSizeBound(input_len) +| 128;
     if (block_size == 0) return base;
-    const blocks = (input_len + block_size - 1) / block_size;
+    const blocks = (input_len +| block_size - 1) / block_size;
     return base +| @max(1, blocks) *| 192;
 }
 
@@ -718,7 +718,7 @@ const BlockSource = struct {
 
 // The per-lane LZMA2 workspace, sized by the largest dictionary in the stream.
 pub fn workspaceSize(dictionary_size: u32, lane_count: u8) usize {
-    return decodeWorkspaceSize(dictionary_size) * @as(usize, lane_count);
+    return decodeWorkspaceSize(dictionary_size) *| @as(usize, lane_count);
 }
 
 // Decodes every block into `output`; a stream the index cannot bound runs
@@ -758,7 +758,8 @@ pub fn decodeLanes(
     if (offset != info.blocks_end) return decode(input, output, workspace, provider);
 
     const per_lane = decodeWorkspaceSize(max_dictionary);
-    if (workspace.len < per_lane * @as(usize, lane_options.lanes)) return error.CapacityException;
+    const lane_bytes = std.math.mul(usize, per_lane, @as(usize, lane_options.lanes)) catch return error.CapacityException;
+    if (workspace.len < lane_bytes) return error.CapacityException;
     var buffers: [lane_driver.max_lanes]lane_driver.Lane = @splat(.{});
     for (0..@as(usize, lane_options.lanes)) |index| buffers[index].scratch = workspace[index * per_lane ..][0..per_lane];
 
@@ -825,7 +826,8 @@ fn encodeStream(writer: *std.Io.Writer, input: []const u8, scratch: []u8, option
     // The index needs one (unpadded, uncompressed) pair even for the
     // single-block default, so the carve is never empty.
     const record_size = @max(16, blockRecordScratchSize(input.len, options.block_size));
-    if (scratch.len < lzma_scratch_size + record_size) return error.CapacityException;
+    const scratch_needed = std.math.add(usize, lzma_scratch_size, record_size) catch return error.CapacityException;
+    if (scratch.len < scratch_needed) return error.CapacityException;
     const lzma_scratch = scratch[0..lzma_scratch_size];
     const remaining_scratch = scratch[lzma_scratch_size..];
     const records = remaining_scratch[0..record_size];
@@ -839,7 +841,8 @@ fn encodeStream(writer: *std.Io.Writer, input: []const u8, scratch: []u8, option
         .match_finder = options.match_finder,
     };
     const filter_buffer: ?[]u8 = if (options.filters != .none) blk: {
-        if (remaining_scratch.len < record_size + input.len) return error.CapacityException;
+        const filter_needed = std.math.add(usize, record_size, input.len) catch return error.CapacityException;
+        if (remaining_scratch.len < filter_needed) return error.CapacityException;
         const buffer = remaining_scratch[record_size..][0..input.len];
         @memcpy(buffer, input);
         break :blk buffer;
@@ -847,10 +850,13 @@ fn encodeStream(writer: *std.Io.Writer, input: []const u8, scratch: []u8, option
     const filtered = filter_buffer orelse input;
     try writeStreamHeader(writer, options.check, options.provider);
     const check_size = checkSize(options.check);
-    const chunk_count: usize = if (options.block_size == 0) 1 else @max(1, (input.len + options.block_size - 1) / options.block_size);
+    const chunk_count: usize = if (options.block_size == 0) 1 else blk: {
+        const rounded = std.math.add(usize, input.len, @as(usize, options.block_size - 1)) catch return error.ResourceException;
+        break :blk @max(1, rounded / options.block_size);
+    };
     var chunk_start: usize = 0;
     for (0..chunk_count) |chunk_index| {
-        const chunk_end = if (options.block_size == 0) input.len else @min(input.len, chunk_start + options.block_size);
+        const chunk_end = if (options.block_size == 0) input.len else @min(input.len, chunk_start +| @as(usize, options.block_size));
         const chunk = if (options.filters != .none) filtered[chunk_start..chunk_end] else input[chunk_start..chunk_end];
         // Each block is an independent filter unit (spec 5.3); the
         // transform must never cross a block seam.

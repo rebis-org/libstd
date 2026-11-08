@@ -158,7 +158,8 @@ pub fn tarEncodeStep(state: *TarEncode, input: []const u8, output: []u8, end_of_
     state.budgets.addEncoded(out_off) catch |exception| {
         return framingFailed(&result, in_off, exception);
     };
-    state.budgets.addWork(in_off + out_off) catch |exception| {
+    const work = std.math.add(usize, in_off, out_off) catch return framingFailed(&result, in_off, error.ResourceException);
+    state.budgets.addWork(work) catch |exception| {
         return framingFailed(&result, in_off, exception);
     };
     return result;

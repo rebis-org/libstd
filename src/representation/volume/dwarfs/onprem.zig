@@ -97,7 +97,14 @@ fn parseSections(archive: []const u8, arena: std.mem.Allocator) Exception!Sectio
 fn sectionPayload(archive: []const u8, at: u64, len: u64, compression: u16, arena: std.mem.Allocator, history: []u8) Exception![]const u8 {
     const raw = try bounds.slice(archive, at, len);
     if (compression == compression_none) return raw;
-    const out = arena.alloc(u8, raw.len * 16 + (1 << 16)) catch return error.ResourceException;
+    // The 16x + 64 KiB bound is a deliberate decompression cap: a section
+    // header declares only the compressed length, and the read scratch is a
+    // fixed 2 MiB FBA. Sections that expand past it are a documented input
+    // limit, not a decode failure; the ratio is relative to compressed bytes.
+    const scaled = std.math.mul(u64, @as(u64, raw.len), 16) catch return error.ResourceException;
+    const bound = std.math.add(u64, scaled, 1 << 16) catch return error.ResourceException;
+    const size = std.math.cast(usize, bound) orelse return error.ResourceException;
+    const out = arena.alloc(u8, size) catch return error.ResourceException;
     var writer = std.Io.Writer.fixed(out);
     switch (compression) {
         compression_zstd => {
@@ -950,6 +957,7 @@ fn dwFindOrCreateDir(nodes: *std.ArrayList(DwNode), alloc: std.mem.Allocator, pa
         if (nodes.items[existing].kind != .dir) return error.CallException;
         return existing;
     }
+    if (nodes.items.len >= max_tree_nodes) return error.UnsupportedException;
     const idx: u32 = @intCast(nodes.items.len);
     nodes.append(alloc, .{ .kind = .dir, .name = name, .parent = parent }) catch return error.ResourceException;
     nodes.items[parent].child_count += 1;
@@ -980,6 +988,7 @@ fn dwBuildNodes(nodes: *std.ArrayList(DwNode), alloc: std.mem.Allocator, entries
             if (nodes.items[existing].kind != .dir or entry.data.len != 0) return error.CallException;
             continue;
         }
+        if (nodes.items.len >= max_tree_nodes) return error.UnsupportedException;
         nodes.append(alloc, .{ .kind = .file, .name = comp, .parent = parent, .data = entry.data }) catch return error.ResourceException;
         nodes.items[parent].child_count += 1;
     }

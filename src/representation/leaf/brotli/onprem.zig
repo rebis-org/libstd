@@ -2845,7 +2845,7 @@ fn writePrefixCode(bw: *BitWriter, lens: []u8, alphabet: usize) EncodeError!bool
     var cl_freq: [18]u32 = @splat(0);
     for (lens[0..alphabet]) |l| cl_freq[l] += 1;
     var cl_lens: [18]u8 = undefined;
-    huffman.limitedLengths(cl_freq[0..18], cl_lens[0..18], 5);
+    huffman.limitedLengths(&cl_freq, &cl_lens, 5);
     var cl_codes: [18]u16 = undefined;
     canonicalCodes(cl_lens[0..18], cl_codes[0..18]);
     try bw.writeBits(0, 2); // HSKIP 0.
@@ -2877,9 +2877,9 @@ fn encodeMetaBlock(bw: *BitWriter, src: []const u8, is_last: bool, ring: *[4]u32
         const lits = src[cmd.lit_start..][0..cmd.ins_len];
         for (lits) |b| lit_freq[b] += 1;
     }
-    huffman.limitedLengths(lit_freq[0..256], lit_lens[0..256], 15);
-    huffman.limitedLengths(icode_freq[0..704], icode_lens[0..704], 15);
-    huffman.limitedLengths(dcode_freq[0..140], dcode_lens[0..140], 15);
+    huffman.limitedLengths(&lit_freq, &lit_lens, 15);
+    huffman.limitedLengths(&icode_freq, &icode_lens, 15);
+    huffman.limitedLengths(&dcode_freq, &dcode_lens, 15);
     var lit_codes: [256]u16 = undefined;
     var icode_codes: [704]u16 = undefined;
     var dcode_codes: [140]u16 = undefined;

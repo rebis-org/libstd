@@ -74,7 +74,7 @@ pub fn byLength(set: []const u8, lengths: []const u64, workspace: *Workspace) Ex
     var at: usize = 0;
     for (lengths, 0..) |len, index| {
         const take = std.math.cast(usize, len) orelse return error.ResourceException;
-        if (at + take > set.len) return error.InternalException;
+        if ((bounds.addUsize(at, take) catch return error.InternalException) > set.len) return error.InternalException;
         parts[index] = set[at..][0..take];
         at += take;
     }

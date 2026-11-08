@@ -186,7 +186,8 @@ const AdaptiveCode = struct {
     }
 
     fn rebuild(self: *AdaptiveCode) void {
-        makeCanonicalCode(self.freqs, self.lens[0..self.num_syms]);
+        // one-symbol rebuild writes lens[other]; keep two slots in bounds
+        makeCanonicalCode(self.freqs, self.lens[0..@max(self.num_syms, 2)]);
         self.code = Code.init(self.lens[0..self.num_syms]) catch unreachable;
         self.until_rebuild = self.rebuild_freq;
     }
@@ -495,7 +496,7 @@ pub fn lzmsDecode(input: []const u8, output: []u8) Exception!void {
             const match_len = try readMatchLen(&length, &stream);
             const off: usize = @intCast(offset);
             if (off > op or off == 0) return error.DataException;
-            if (match_len > output.len - op) return error.CapacityException;
+            if (match_len > output.len - op) return error.DataException;
             var i: usize = 0;
             while (i < match_len) : (i += 1) {
                 output[op + i] = output[op - off + i];
@@ -544,7 +545,7 @@ pub fn lzmsDecode(input: []const u8, output: []u8) Exception!void {
         _ = std.math.add(u32, offset, span) catch return error.DataException;
         const total: u64 = @as(u64, offset) + span;
         if (total > op) return error.DataException;
-        if (match_len > output.len - op) return error.CapacityException;
+        if (match_len > output.len - op) return error.DataException;
         const matchptr: usize = op - @as(usize, @intCast(offset));
         var i: usize = 0;
         while (i < match_len) : (i += 1) {
@@ -870,7 +871,8 @@ const EncCode = struct {
     }
 
     fn rebuild(self: *EncCode) void {
-        makeCanonicalCode(self.freqs, self.lens[0..self.num_syms]);
+        // one-symbol rebuild writes lens[other]; keep two slots in bounds
+        makeCanonicalCode(self.freqs, self.lens[0..@max(self.num_syms, 2)]);
         canonicalCodewords(self.num_syms, self.lens[0..self.num_syms], self.codes[0..self.num_syms]);
         self.until = self.rebuild_freq;
     }

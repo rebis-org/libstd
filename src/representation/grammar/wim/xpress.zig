@@ -370,7 +370,7 @@ pub fn xpressDecode(input: []const u8, output: []u8) Exception!void {
         length += min_match_len;
         const off: usize = @intCast(offset);
         if (off > op or off == 0) return error.DataException;
-        if (length > output.len - op) return error.CapacityException;
+        if (length > output.len - op) return error.DataException;
         var i: usize = 0;
         while (i < length) : (i += 1) {
             output[op + i] = output[op - off + i];

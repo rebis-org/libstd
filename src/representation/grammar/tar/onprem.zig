@@ -289,6 +289,15 @@ fn tarAligned(size: u64) Exception!u64 {
     return if (remainder == 0) size else bounds.addU64(size, block_size - remainder);
 }
 
+// An overflowing alignment on the read side is impossible archive data, not
+// a host resource limit. The write side keeps tarAligned's own answer.
+fn tarAlignedData(size: u64) Exception!u64 {
+    return tarAligned(size) catch |err| switch (err) {
+        error.ResourceException => error.DataException,
+        else => err,
+    };
+}
+
 fn tarField(field: []const u8) []const u8 {
     return field[0 .. std.mem.findScalar(u8, field, 0) orelse field.len];
 }
@@ -505,11 +514,13 @@ const Reader = struct {
     }
 
     fn advance(self: *Reader, size: u64) Exception!void {
-        self.offset = try bounds.addU64(try bounds.addU64(self.offset, block_size), try tarAligned(size));
+        self.offset = try bounds.addU64(try bounds.addU64(self.offset, block_size), try tarAlignedData(size));
         if (self.offset > self.archive.len) return error.DataException;
     }
 
-    fn parseOldGnuSparse(self: *Reader, entry: *EntryInfo) Exception!SparseInfo {
+    // The header's physical size drives the chunk sum and the reader advance;
+    // pax attributes may already have replaced entry.size by this point.
+    fn parseOldGnuSparse(self: *Reader, entry: *EntryInfo, physical_size: u64) Exception!SparseInfo {
         var info = SparseInfo{ .realsize = 0, .segment_count = 0, .segments = undefined };
         const header = try bounds.slice(self.archive, entry.header_offset, block_size);
         info.realsize = try tarNumber(header[483..495]);
@@ -525,15 +536,15 @@ const Reader = struct {
             extension_blocks += 1;
             extension_offset = try bounds.addU64(extension_offset, block_size);
         }
-        if (chunk_sum != entry.size) return error.DataException;
+        if (chunk_sum != physical_size) return error.DataException;
         if (info.realsize == 0) {
             for (info.segments[0..info.segment_count]) |segment| {
-                info.realsize = @max(info.realsize, try bounds.addU64(segment.offset, segment.num_bytes));
+                info.realsize = @max(info.realsize, bounds.addU64(segment.offset, segment.num_bytes) catch return error.DataException);
             }
         }
         try validateSparseInfo(info);
         entry.data_offset = try bounds.addU64(entry.header_offset, (extension_blocks + 1) * block_size);
-        self.offset = try bounds.addU64(entry.data_offset, try tarAligned(entry.size));
+        self.offset = try bounds.addU64(entry.data_offset, try tarAlignedData(physical_size));
         if (self.offset > self.archive.len) return error.DataException;
         return info;
     }
@@ -556,7 +567,7 @@ const Reader = struct {
             if (minor != 0) return error.UnsupportedException;
             const map_start = entry.data_offset;
             const map_bytes = try readSparseMapData(self.archive, map_start, &info);
-            const map_padded = try tarAligned(map_bytes);
+            const map_padded = try tarAlignedData(map_bytes);
             entry.data_offset = try bounds.addU64(entry.data_offset, map_padded);
             if (entry.size < map_padded) return error.DataException;
             entry.size -= map_padded;
@@ -605,7 +616,10 @@ const Reader = struct {
                     try self.advance(physical_size);
                 },
                 typeflag_gnu_sparse => {
-                    const sparse = try self.parseOldGnuSparse(&entry);
+                    // match the volume reader, which applies pax before sparse handling.
+                    try tarApplyPax(&entry, self.global_pax);
+                    try tarApplyPax(&entry, self.local_pax);
+                    const sparse = try self.parseOldGnuSparse(&entry, physical_size);
                     entry.size = sparse.realsize;
                     entry.sparse = sparse;
                     if (self.long_name) |name| {
@@ -675,14 +689,16 @@ fn addSparseSegment(info: *SparseInfo, chunk_sum: *u64, offset: u64, num_bytes: 
     if (info.segment_count >= max_sparse_segments) return error.UnsupportedException;
     info.segments[info.segment_count] = .{ .offset = offset, .num_bytes = num_bytes };
     info.segment_count += 1;
-    chunk_sum.* = try bounds.addU64(chunk_sum.*, num_bytes);
+    // overflow here is invalid archive data, not a resource limit.
+    chunk_sum.* = bounds.addU64(chunk_sum.*, num_bytes) catch return error.DataException;
 }
 
 fn validateSparseInfo(info: SparseInfo) Exception!void {
     var previous_end: u64 = 0;
     for (info.segments[0..info.segment_count]) |segment| {
         if (segment.num_bytes == 0 or segment.offset < previous_end) return error.DataException;
-        const end = try bounds.addU64(segment.offset, segment.num_bytes);
+        // overflow here is invalid archive data, not a resource limit.
+        const end = bounds.addU64(segment.offset, segment.num_bytes) catch return error.DataException;
         if (end > info.realsize) return error.DataException;
         previous_end = end;
     }
@@ -1087,7 +1103,8 @@ test "tar rejects unsafe ustar prefix fields" {
 
 // GNU multi-volume: a cut member opens the next volume under an 'M' header naming it, with remaining size and offset.
 
-pub const VolumeSegment = struct { volume: u16, offset: u64, len: u64 };
+// openVolume admits up to u32 volumes.
+pub const VolumeSegment = struct { volume: u32, offset: u64, len: u64 };
 
 pub const VolumePlan = struct { count: usize, total: u64 };
 
@@ -1140,7 +1157,7 @@ const VolumeReader = struct {
         try self.recordSegment(entry.data_offset, taken);
         self.cont_written += taken;
         if (self.cont_written == self.cont_size) {
-            self.inner.offset = try bounds.addU64(entry.data_offset, try tarAligned(entry.size));
+            self.inner.offset = try bounds.addU64(entry.data_offset, try tarAlignedData(entry.size));
             if (self.inner.offset > vol.len) return error.DataException;
         } else {
             self.inner.offset = vol.len;
@@ -1163,7 +1180,8 @@ const VolumeReader = struct {
                 return null;
             }
             var entry = try self.inner.readHeader();
-            const data_end = try bounds.addU64(entry.data_offset, try tarAligned(entry.size));
+            // overflow here is invalid archive data, not a resource limit.
+            const data_end = bounds.addU64(entry.data_offset, try tarAlignedData(entry.size)) catch return error.DataException;
             switch (entry.typeflag) {
                 typeflag_gnu_volume_label => {
                     // A volume label carries no data; anything else in the
@@ -1209,7 +1227,7 @@ const VolumeReader = struct {
                     var self_advanced = false;
                     if (entry.typeflag == typeflag_gnu_sparse) {
                         // parseOldGnuSparse moves the reader itself.
-                        const sparse = try self.inner.parseOldGnuSparse(&entry);
+                        const sparse = try self.inner.parseOldGnuSparse(&entry, physical_size);
                         entry.size = sparse.realsize;
                         entry.sparse = sparse;
                         self_advanced = true;

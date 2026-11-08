@@ -378,21 +378,29 @@ fn selectCheckpoint(mount: *Mount) Exception!void {
     const end = std.math.add(u64, desc_base, desc_blocks) catch return error.DataException;
     if (end > mount.image.block_count) return error.DataException;
 
+    // Two passes: the adopted transaction is only known after every
+    // superblock candidate has been seen. A map commonly precedes its own
+    // superblock on disk, so binding it to a running best_xid drops it.
     var best_xid = objXid(mount.superblock);
     var best_block: u64 = 0;
-    var map_xid: u64 = 0;
-    var map_entries: []const u8 = &.{};
-
     var i: u64 = 0;
     while (i < desc_blocks) : (i += 1) {
         const candidate = try mount.image.block(desc_base + i);
-        const otype = objType(candidate);
         const xid = objXid(candidate);
         if (le32(candidate[0x20..0x24]) == nx_magic and xid > best_xid and checksumValid(candidate)) {
             best_xid = xid;
             best_block = desc_base + i;
         }
-        if (otype & 0xffff == obj_type_checkpoint_map and otype & obj_flag_physical != 0 and xid > map_xid) {
+    }
+
+    var map_xid: u64 = 0;
+    var map_entries: []const u8 = &.{};
+    i = 0;
+    while (i < desc_blocks) : (i += 1) {
+        const candidate = try mount.image.block(desc_base + i);
+        const otype = objType(candidate);
+        const xid = objXid(candidate);
+        if (otype & 0xffff == obj_type_checkpoint_map and otype & obj_flag_physical != 0 and xid > map_xid and xid <= best_xid and checksumValid(candidate)) {
             map_xid = xid;
             const count = le32(candidate[0x24..0x28]);
             const begin: usize = 0x28;
@@ -498,6 +506,7 @@ fn walkVolume(mount: *Mount, fs_oid: u64, target: Target, state: *tree.WalkState
     // The root tree type carries its storage class.
     const fs_tree_type = le32(vol[0x74..0x78]);
     if (fs_tree_type & ~obj_storagetype_mask != obj_type_btree) return error.DataException;
+    if (fs_tree_type & obj_storagetype_mask == obj_storagetype_mask) return error.DataException;
     const fs_tree_flags: u32 = switch (fs_tree_type & obj_storagetype_mask) {
         obj_flag_physical => btinfo_flag_physical,
         obj_flag_ephemeral => btinfo_flag_ephemeral,
@@ -794,7 +803,7 @@ fn extentYield(ctx: *FileCtx, key: []const u8, val: []const u8) Exception!void {
     const phys_off = std.math.mul(u64, phys, block_size) catch return error.DataException;
     const data = try bounds.slice(ctx.mount.image.bytes, phys_off, take);
     @memcpy(ctx.output[@intCast(logical)..@intCast(end)], data);
-    ctx.written = end;
+    ctx.written = @max(ctx.written, end);
 }
 
 // Writer: a fresh single-volume, mkfs-shaped image. The fs tree is virtual because 7-Zip resolves the root through the volume omap.
@@ -1946,6 +1955,26 @@ test "apfs synthetic image round trip" {
     for (hello_out[4096..], 0..) |byte, i| try std.testing.expectEqual(@as(u8, @truncate(i *% 13 + 5)), byte);
 
     try std.testing.expectError(error.DataException, inspectOrdinal(image, 2, &path));
+}
+
+test "apfs accepts a checkpoint map that precedes its superblock" {
+    const alloc = std.testing.allocator;
+    const image = try fixtureImage(alloc);
+    defer alloc.free(image);
+
+    // Real APFS writes the map before the transaction's superblock. A
+    // single pass that compares against a running best_xid drops that map.
+    const older = image[fixture_block_size .. 2 * fixture_block_size];
+    const newer = image[2 * fixture_block_size .. 3 * fixture_block_size];
+    var swap: [fixture_block_size]u8 = undefined;
+    @memcpy(&swap, older);
+    @memcpy(older, newer);
+    @memcpy(newer, &swap);
+
+    try std.testing.expectEqual(@as(u64, 2), try inspectCount(image, &.{}));
+    var hello_out: [hello_size]u8 = undefined;
+    var path: [256]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, hello_size), try decodeOrdinal(image, 1, &hello_out, &path));
 }
 
 test "apfs rejects non-apfs data" {

@@ -115,18 +115,28 @@ fn createWithBudgets(
     storage_len: u64,
     budgets: sessions.Budgets,
 ) u32 {
-    const index = matchSessionIndex(component, verb) orelse return envelope.Status.unsupported;
-    const bytes = storage orelse {
-        return envelope.Status.invalid_call;
+    // A failed create poisons the storage: no later call may mistake a
+    // half-built record for a live session.
+    const index = matchSessionIndex(component, verb) orelse {
+        if (storage) |bytes| markDead(bytes, storage_len);
+        return envelope.Status.unsupported;
     };
+    const bytes = storage orelse return envelope.Status.invalid_call;
     // The Session record holds pointers and u64 words; misaligned storage would
     // be undefined behavior in release-fast.
-    if (@intFromPtr(bytes) % @alignOf(Session) != 0) return envelope.Status.invalid_call;
+    if (@intFromPtr(bytes) % @alignOf(Session) != 0) {
+        markDead(bytes, storage_len);
+        return envelope.Status.invalid_call;
+    }
     if (storage_len < driverStateOffset()) {
         markDead(bytes, storage_len);
         return envelope.Status.insufficient_capacity;
     }
-    const state_storage = bytes[driverStateOffset() .. std.math.cast(usize, storage_len) orelse return envelope.Status.insufficient_capacity];
+    const state_len = std.math.cast(usize, storage_len) orelse {
+        markDead(bytes, storage_len);
+        return envelope.Status.insufficient_capacity;
+    };
+    const state_storage = bytes[driverStateOffset()..state_len];
     const session = session_defs[index].session(state_storage, budgets) catch |exception| {
         markDead(bytes, storage_len);
         return exceptionStatus(exception);
@@ -331,7 +341,7 @@ export fn stdk_group(
     if (total == 0) return envelope.Status.invalid_call;
     for (subs[0..total]) |*submission| {
         const completion = readyRecord(submission.completion) orelse return envelope.Status.invalid_call;
-        if (completion.state != Completion.in_progress) return envelope.Status.invalid_call;
+        if (@atomicLoad(u32, &completion.state, .seq_cst) != Completion.in_progress) return envelope.Status.invalid_call;
     }
     const selected = if (exec) |e| e.* else executor.inline_executor;
     for (0..total) |index| {

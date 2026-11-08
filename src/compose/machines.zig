@@ -23,10 +23,16 @@ pub fn MachineFor(comptime Event: type, comptime Action: type) type {
             actions: []Action,
         };
 
-        pub fn step(self: @This(), event: Event, actions: []Action) Exception!StepResult {
+        pub fn step(self: *@This(), event: Event, actions: []Action) Exception!StepResult {
             if (self.failed) return error.CallException;
-            const status = try self.ops.step(self.state, event, actions);
-            if (status == .failed) return .{ .status = .failed, .actions = actions };
+            const status = self.ops.step(self.state, event, actions) catch |err| {
+                self.failed = true;
+                return err;
+            };
+            if (status == .failed) {
+                self.failed = true;
+                return .{ .status = .failed, .actions = actions };
+            }
             return .{ .status = status, .actions = actions };
         }
 
@@ -110,7 +116,6 @@ test "machine stepping consumes events emits actions and honors failure" {
     try std.testing.expectEqual(StepStatus.failed, failed.status);
     try std.testing.expectEqual(Action.halted, failed.actions[0]);
     // The host flag refuses further stepping and guards the destroy op.
-    failing.markFailed();
     try std.testing.expectError(error.CallException, failing.step(.increment, &action_slots));
     failing.destroy();
     try std.testing.expect(!destroyed);

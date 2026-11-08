@@ -419,6 +419,7 @@ fn unwrapFileKey(stanzas: []const Stanza, options: Options, scratch: []u8) Excep
     if (options.password.len != 0) {
         // A scrypt stanza must be the only stanza; anything else is not a
         // passphrase-encrypted header.
+        if (stanzas.len == 1 and stanzas[0].args.len == 0) return error.DataException;
         if (stanzas.len != 1 or !std.mem.eql(u8, stanzas[0].args[0], "scrypt")) return error.IntegrityException;
         const stanza = stanzas[0];
         if (stanza.args.len != 3) return error.DataException;

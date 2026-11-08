@@ -57,7 +57,7 @@ fn serveDeflate(running: *Run) Exception!void {
         // over-limit source here rather than mid-count as corrupt data.
         const input_len = try common.measureSource(source_resource, limits.encoded_bytes);
         const output_size = try plan.planDeflateDecode(source_resource, history, limits.encoded_bytes, limits.decoded_bytes);
-        if (input_len + output_size > limits.codec_work) return error.ResourceException;
+        if ((std.math.add(usize, input_len, output_size) catch return error.ResourceException) > limits.codec_work) return error.ResourceException;
         if (sink) |sink_resource| {
             try common.requireSink(sink_resource, call, output_size);
             var bounded_source: resource.BoundedReader = undefined;
@@ -75,7 +75,7 @@ fn serveDeflate(running: *Run) Exception!void {
             const input_len = try common.measureSource(source_resource, limits.decoded_bytes);
             const bound = deflate.encodedSizeBound(input_len);
             if (bound > limits.encoded_bytes) return error.ResourceException;
-            if (input_len + bound > limits.codec_work) return error.ResourceException;
+            if ((std.math.add(usize, input_len, bound) catch return error.ResourceException) > limits.codec_work) return error.ResourceException;
             break :blk bound;
         } else try plan.planCountedEncode(source_resource, limits.decoded_bytes, limits.encoded_bytes, limits.codec_work, true, plan.deflateEncodeStream, .{ .history = history, .options = deflate_opts });
         if (sink) |sink_resource| {
@@ -159,7 +159,7 @@ fn serveGzip(running: *Run) Exception!void {
         }
         const output_size = try gzip.decodedSize(input, history, provider);
         if (output_size > limits.decoded_bytes) return error.ResourceException;
-        if (input.len + output_size > limits.codec_work) return error.ResourceException;
+        if ((std.math.add(usize, input.len, output_size) catch return error.ResourceException) > limits.codec_work) return error.ResourceException;
         if (sink) |sink_resource| {
             try common.requireSink(sink_resource, call, output_size);
             var bounded_sink = resource.BoundedWriter.init(sink_resource, limits.decoded_bytes);
@@ -173,7 +173,7 @@ fn serveGzip(running: *Run) Exception!void {
             const input_len = try common.measureSource(source_resource, limits.decoded_bytes);
             const bound = gzip.encodedSizeBound(input_len, gzip_options);
             if (bound > limits.encoded_bytes) return error.ResourceException;
-            if (input_len + bound > limits.codec_work) return error.ResourceException;
+            if ((std.math.add(usize, input_len, bound) catch return error.ResourceException) > limits.codec_work) return error.ResourceException;
             break :blk bound;
         } else try plan.planCountedEncode(source_resource, limits.decoded_bytes, limits.encoded_bytes, limits.codec_work, true, plan.gzipEncodeStream, .{ .history = history, .options = gzip_options });
         if (sink) |sink_resource| {
@@ -214,7 +214,7 @@ fn serveZlib(running: *Run) Exception!void {
         if (input.len > limits.encoded_bytes) return error.ResourceException;
         const output_size = try zlib.decodedSize(input, history, provider);
         if (output_size > limits.decoded_bytes) return error.ResourceException;
-        if (input.len + output_size > limits.codec_work) return error.ResourceException;
+        if ((std.math.add(usize, input.len, output_size) catch return error.ResourceException) > limits.codec_work) return error.ResourceException;
         if (sink) |sink_resource| {
             try common.requireSink(sink_resource, call, output_size);
             var bounded_sink = resource.BoundedWriter.init(sink_resource, limits.decoded_bytes);
@@ -228,7 +228,7 @@ fn serveZlib(running: *Run) Exception!void {
             const input_len = try common.measureSource(source_resource, limits.decoded_bytes);
             const bound = zlib.encodedSizeBound(input_len, zlib_options);
             if (bound > limits.encoded_bytes) return error.ResourceException;
-            if (input_len + bound > limits.codec_work) return error.ResourceException;
+            if ((std.math.add(usize, input_len, bound) catch return error.ResourceException) > limits.codec_work) return error.ResourceException;
             break :blk bound;
         } else try plan.planCountedEncode(source_resource, limits.decoded_bytes, limits.encoded_bytes, limits.codec_work, true, plan.zlibEncodeStream, .{ .history = history, .options = zlib_options });
         if (sink) |sink_resource| {
@@ -279,7 +279,7 @@ fn filterHook(running: *Run, transform: anytype) Exception!void {
     if (command_mask == vocabulary.command_mask_read) {
         const input = try common.materializeSource(.require_size, source_resource, workspace, limits.encoded_bytes);
         if (input.len > limits.decoded_bytes) return error.ResourceException;
-        if (input.len + input.len > limits.codec_work) return error.ResourceException;
+        if ((std.math.add(usize, input.len, input.len) catch return error.ResourceException) > limits.codec_work) return error.ResourceException;
         if (sink) |sink_resource| {
             try common.requireSinkCapacity(sink_resource, call, input.len);
             if (sink_resource.kind == .direct_write) {
@@ -297,7 +297,7 @@ fn filterHook(running: *Run, transform: anytype) Exception!void {
     } else if (command_mask == vocabulary.command_mask_write) {
         const input = try common.materializeSource(.require_size, source_resource, workspace, limits.decoded_bytes);
         if (input.len > limits.encoded_bytes) return error.ResourceException;
-        if (input.len + input.len > limits.codec_work) return error.ResourceException;
+        if ((std.math.add(usize, input.len, input.len) catch return error.ResourceException) > limits.codec_work) return error.ResourceException;
         if (sink) |sink_resource| {
             try common.requireSink(sink_resource, call, input.len);
             const target = try common.SinkTarget.open(sink_resource, workspace, input.len);
@@ -409,10 +409,10 @@ fn serveZstdSeekable(running: *Run) Exception!void {
     if (command_mask == vocabulary.command_mask_read) {
         const input = try common.materializeSource(.budget, source_resource, workspace, limits.encoded_bytes);
         if (input.len > limits.encoded_bytes) return error.ResourceException;
-        const history = try workspace.take(u8, @as(usize, frame_options.window_size) + zstd.block_size_max);
+        const history = try workspace.take(u8, std.math.add(usize, @as(usize, frame_options.window_size), zstd.block_size_max) catch return error.ResourceException);
         const output_size = try zstd_seekable.decodedSize(input, history, seekable_options);
         if (output_size > limits.decoded_bytes) return error.ResourceException;
-        if (input.len + output_size > limits.codec_work) return error.ResourceException;
+        if ((std.math.add(usize, input.len, output_size) catch return error.ResourceException) > limits.codec_work) return error.ResourceException;
         if (sink) |sink_resource| {
             try common.requireSink(sink_resource, call, output_size);
             const target = try common.SinkTarget.open(sink_resource, workspace, output_size);
@@ -422,7 +422,7 @@ fn serveZstdSeekable(running: *Run) Exception!void {
         }
         response.byte_length = output_size;
     } else if (command_mask == vocabulary.command_mask_write) {
-        const history = try workspace.take(u8, @as(usize, frame_options.window_size) + zstd.block_size_max);
+        const history = try workspace.take(u8, std.math.add(usize, @as(usize, frame_options.window_size), zstd.block_size_max) catch return error.ResourceException);
         const workspace_u32 = try workspace.take(u32, zstd.encoderWorkspaceU32Count(0, seekable_options.frame_size, frame_options));
         const input = try common.materializeSource(.require_size, source_resource, workspace, limits.decoded_bytes);
         const entries = try workspace.take(zstd_seekable.FrameEntry, zstd_seekable.frameCountFor(input.len, seekable_options));
@@ -437,7 +437,7 @@ fn serveZstdSeekable(running: *Run) Exception!void {
             if (exact > limits.encoded_bytes) return error.ResourceException;
             break :blk exact;
         };
-        if (input.len + output_size > limits.codec_work) return error.ResourceException;
+        if ((std.math.add(usize, input.len, output_size) catch return error.ResourceException) > limits.codec_work) return error.ResourceException;
         if (sink) |sink_resource| {
             try common.requireSink(sink_resource, call, output_size);
             const target = try common.SinkTarget.open(sink_resource, workspace, output_size);
@@ -468,8 +468,9 @@ fn serveZstd(running: *Run) Exception!void {
     };
     const window = zstd_options.window_size;
     const dictionary = zstd_options.dictionary;
-    const history_base_size = @as(usize, window) + zstd.block_size_max +
-        (if (dictionary) |dict| dict.len else 0);
+    const window_history = std.math.add(usize, @as(usize, window), zstd.block_size_max) catch return error.ResourceException;
+    const dictionary_history = if (dictionary) |dict| dict.len else 0;
+    const history_base_size = std.math.add(usize, window_history, dictionary_history) catch return error.ResourceException;
     const workspace = running.workspace();
     if (command_mask == vocabulary.command_mask_read) {
         const input = try common.materializeSource(.replay, source_resource, workspace, limits.encoded_bytes);
@@ -483,15 +484,15 @@ fn serveZstd(running: *Run) Exception!void {
             else => return err,
         };
         if (output_size > limits.decoded_bytes) return error.ResourceException;
-        if (input.len + output_size > limits.codec_work) return error.ResourceException;
+        if ((std.math.add(usize, input.len, output_size) catch return error.ResourceException) > limits.codec_work) return error.ResourceException;
         if (sink) |sink_resource| {
             try common.requireSink(sink_resource, call, output_size);
             var source_reader = std.Io.Reader.fixed(input);
             if (dictionary == null and output_size >= history_base_size) {
-                if (sink_resource.kind == .direct_write and common.sinkCapacity(sink_resource) >= output_size + zstd.block_size_max) {
+                if (sink_resource.kind == .direct_write and common.sinkCapacity(sink_resource) >= (std.math.add(usize, output_size, zstd.block_size_max) catch return error.ResourceException)) {
                     // In-place decode needs output plus one block of window slack;
                     // a corrupt frame can leave a tentative prefix.
-                    const output = try common.sinkDirectBuffer(sink_resource, output_size + zstd.block_size_max);
+                    const output = try common.sinkDirectBuffer(sink_resource, std.math.add(usize, output_size, zstd.block_size_max) catch return error.ResourceException);
                     var in_place_options = zstd_options;
                     in_place_options.max_decoded_bytes = output_size;
                     _ = zstd_seam.decodeInPlace(provider, &source_reader, output, in_place_options) catch |err| {
@@ -501,7 +502,7 @@ fn serveZstd(running: *Run) Exception!void {
                         return err;
                     };
                 } else {
-                    const staging = try workspace.take(u8, output_size + zstd.block_size_max);
+                    const staging = try workspace.take(u8, std.math.add(usize, output_size, zstd.block_size_max) catch return error.ResourceException);
                     var in_place_options = zstd_options;
                     in_place_options.max_decoded_bytes = output_size;
                     _ = try zstd_seam.decodeInPlace(provider, &source_reader, staging, in_place_options);
@@ -531,7 +532,7 @@ fn serveZstd(running: *Run) Exception!void {
         const output_size = if (sizing == .bounded) blk: {
             const bound = zstd.encodedSizeBound(input_len, encode_options);
             if (bound > limits.encoded_bytes) return error.ResourceException;
-            if (input_len + bound > limits.codec_work) return error.ResourceException;
+            if ((std.math.add(usize, input_len, bound) catch return error.ResourceException) > limits.codec_work) return error.ResourceException;
             break :blk bound;
         } else try plan.planCountedEncode(source_resource, limits.decoded_bytes, limits.encoded_bytes, limits.codec_work, false, plan.zstdEncodeStream, .{ .history = history, .workspace = encoder_workspace, .options = encode_options });
         if (sink) |sink_resource| {
@@ -623,7 +624,7 @@ fn bufferCodecHook(comptime Codec: type, running: *Run, decode_workspace: usize,
                 // read leaves the sink untouched, like the counted route.
                 if (try lz4.frameContentSize(input)) |declared| {
                     const size = std.math.cast(usize, declared) orelse return error.ResourceException;
-                    if (size <= limits.decoded_bytes and input.len + size <= limits.codec_work and size <= workspace.remaining()) {
+                    if (size <= limits.decoded_bytes and (std.math.add(usize, input.len, size) catch return error.ResourceException) <= limits.codec_work and size <= workspace.remaining()) {
                         const staging = try workspace.take(u8, size);
                         if (codecDecodeDirectInPlace(Codec, input, staging, scratch, codec_options)) |produced| {
                             if (produced > limits.decoded_bytes) return error.ResourceException;
@@ -644,7 +645,7 @@ fn bufferCodecHook(comptime Codec: type, running: *Run, decode_workspace: usize,
                 // lzma2 is excluded: chunk headers give its size cheaply. The span
                 // bounds the decode, so it must fit the limit.
                 const capacity = common.sinkCapacity(sink_resource);
-                if (input.len + capacity <= limits.codec_work and capacity <= workspace.remaining()) {
+                if ((std.math.add(usize, input.len, capacity) catch return error.ResourceException) <= limits.codec_work and capacity <= workspace.remaining()) {
                     // One decode into workspace staging: a rejected read leaves the
                     // sink untouched, exactly like the counted route.
                     const staging = try workspace.take(u8, capacity);
@@ -660,7 +661,7 @@ fn bufferCodecHook(comptime Codec: type, running: *Run, decode_workspace: usize,
             if (!direct_route) {
                 const output_size = if (try codecKnownOutputSize(Codec, codec_options)) |size| size else try codecDecodedSize(Codec, input, scratch, codec_options);
                 if (output_size > limits.decoded_bytes) return error.ResourceException;
-                if (input.len + output_size > limits.codec_work) return error.ResourceException;
+                if ((std.math.add(usize, input.len, output_size) catch return error.ResourceException) > limits.codec_work) return error.ResourceException;
                 try common.requireSinkCapacity(sink_resource, call, output_size);
                 if (sink_resource.kind == .direct_write) {
                     const output = try common.sinkDirectBuffer(sink_resource, output_size);
@@ -676,7 +677,7 @@ fn bufferCodecHook(comptime Codec: type, running: *Run, decode_workspace: usize,
         } else {
             const output_size = if (try codecKnownOutputSize(Codec, codec_options)) |size| size else try codecDecodedSize(Codec, input, scratch, codec_options);
             if (output_size > limits.decoded_bytes) return error.ResourceException;
-            if (input.len + output_size > limits.codec_work) return error.ResourceException;
+            if ((std.math.add(usize, input.len, output_size) catch return error.ResourceException) > limits.codec_work) return error.ResourceException;
             response.byte_length = output_size;
         }
     } else if (command_mask == vocabulary.command_mask_write) {
@@ -689,7 +690,7 @@ fn bufferCodecHook(comptime Codec: type, running: *Run, decode_workspace: usize,
             break :blk Codec.encodedSizeBound(input.len);
         } else try Codec.requiredSize(input, scratch, codec_options);
         if (output_size > limits.encoded_bytes) return error.ResourceException;
-        if (input.len + output_size > limits.codec_work) return error.ResourceException;
+        if ((std.math.add(usize, input.len, output_size) catch return error.ResourceException) > limits.codec_work) return error.ResourceException;
         if (sink) |sink_resource| {
             try common.requireSink(sink_resource, call, output_size);
             const target = try common.SinkTarget.open(sink_resource, workspace, output_size);
@@ -756,7 +757,7 @@ fn serveLzmaFile(running: *Run) Exception!void {
         const scratch = try workspace.take(u8, lzma.decodeWorkspaceSize(decode_options.properties));
         const output_size = if (decode_options.unpack_size) |size| std.math.cast(usize, size) orelse return error.ResourceException else try lzma_file.decodedSize(input, scratch, provider);
         if (output_size > limits.decoded_bytes) return error.ResourceException;
-        if (input.len + output_size > limits.codec_work) return error.ResourceException;
+        if ((std.math.add(usize, input.len, output_size) catch return error.ResourceException) > limits.codec_work) return error.ResourceException;
         if (sink) |sink_resource| {
             try common.requireSink(sink_resource, call, output_size);
             if (sink_resource.kind == .direct_write) {
@@ -782,7 +783,7 @@ fn serveLzmaFile(running: *Run) Exception!void {
         encode_options.unpack_size = input.len;
         const output_size = if (sizing == .bounded) lzma_file.encodedSizeBound(input.len) else try lzma_file.requiredSize(input, scratch, encode_options);
         if (output_size > limits.encoded_bytes) return error.ResourceException;
-        if (input.len + output_size > limits.codec_work) return error.ResourceException;
+        if ((std.math.add(usize, input.len, output_size) catch return error.ResourceException) > limits.codec_work) return error.ResourceException;
         if (sink) |sink_resource| {
             try common.requireSink(sink_resource, call, output_size);
             const target = try common.SinkTarget.open(sink_resource, workspace, output_size);
@@ -835,7 +836,7 @@ fn serveXz(running: *Run) Exception!void {
         }
         const output_size = try xz.decodedSize(input, scratch, provider);
         if (output_size > limits.decoded_bytes) return error.ResourceException;
-        if (input.len + output_size > limits.codec_work) return error.ResourceException;
+        if ((std.math.add(usize, input.len, output_size) catch return error.ResourceException) > limits.codec_work) return error.ResourceException;
         if (sink) |sink_resource| {
             try common.requireSink(sink_resource, call, output_size);
             const staging = try workspace.take(u8, output_size);
@@ -849,7 +850,11 @@ fn serveXz(running: *Run) Exception!void {
         const encode_workspace = if (params.match_finder == .bt4) xz.encodeWorkspaceSizeBt(dictionary_size) else xz.encodeWorkspaceSize(dictionary_size);
         // Beyond the encoder workspace: index records per block, plus the
         // 1:1 filter staging when a filter chain is active.
-        const scratch = try workspace.take(u8, encode_workspace + xz.blockRecordScratchSize(input.len, block_size) + (if (filters != .none) input.len else 0));
+        const records = xz.blockRecordScratchSize(input.len, block_size);
+        const staged = std.math.add(usize, encode_workspace, records) catch return error.ResourceException;
+        const filters_size = if (filters != .none) input.len else 0;
+        const scratch_size = std.math.add(usize, staged, filters_size) catch return error.ResourceException;
+        const scratch = try workspace.take(u8, scratch_size);
         const xz_options = xz.Options{
             .dictionary_size = dictionary_size,
             .check = check,
@@ -864,7 +869,7 @@ fn serveXz(running: *Run) Exception!void {
         };
         const output_size = if (sizing == .bounded) xz.encodedSizeBound(input.len, xz_options.block_size) else try xz.requiredSize(input, scratch, xz_options);
         if (output_size > limits.encoded_bytes) return error.ResourceException;
-        if (input.len + output_size > limits.codec_work) return error.ResourceException;
+        if ((std.math.add(usize, input.len, output_size) catch return error.ResourceException) > limits.codec_work) return error.ResourceException;
         if (sink) |sink_resource| {
             try common.requireSink(sink_resource, call, output_size);
             const target = try common.SinkTarget.open(sink_resource, workspace, output_size);

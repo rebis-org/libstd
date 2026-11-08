@@ -145,7 +145,6 @@ pub const Credentials = struct {
     kdf_rounds_limit: u64 = 0,
     password_lifetime: u64 = 0,
 
-    // An absent profile is an absent password; an empty one still decrypts.
     pub fn optionalPassword(held: ?Credentials) ?[]const u8 {
         return if (held) |present| present.password else null;
     }

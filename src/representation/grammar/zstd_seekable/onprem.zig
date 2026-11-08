@@ -169,11 +169,11 @@ fn entryStride(has_checksums: bool) usize {
 
 // The per-lane history a frame decode needs.
 pub fn workspaceSize(options: Options, lane_count: u8) usize {
-    return historySize(options) * @as(usize, lane_count);
+    return historySize(options) *| @as(usize, lane_count);
 }
 
 fn historySize(options: Options) usize {
-    return @as(usize, frameOptions(options).window_size) + zstd.block_size_max;
+    return @as(usize, frameOptions(options).window_size) +| zstd.block_size_max;
 }
 
 // One frame per lane: the seek table is the proof that frames are independent.
@@ -230,7 +230,8 @@ pub fn decodeLanes(
 ) Exception!usize {
     if (lane_options.lanes == 0 or lane_options.lanes > lane_driver.max_lanes) return error.CallException;
     const history = historySize(options);
-    if (workspace.len < history * lane_options.lanes) return error.CapacityException;
+    const lane_bytes = std.math.mul(usize, history, @as(usize, lane_options.lanes)) catch return error.CapacityException;
+    if (workspace.len < lane_bytes) return error.CapacityException;
     var buffers: [lane_driver.max_lanes]lane_driver.Lane = @splat(.{});
     for (0..@as(usize, lane_options.lanes)) |index| buffers[index].scratch = workspace[index * history ..][0..history];
 

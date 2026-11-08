@@ -39,6 +39,9 @@ const central_signature: u32 = 0x0201_4b50;
 const end_signature: u32 = 0x0605_4b50;
 const zip64_end_signature: u32 = 0x0606_4b50;
 const zip64_locator_signature: u32 = 0x0706_4b50;
+const zip64_end_record_len: usize = 56;
+const zip64_locator_len: usize = 20;
+const zip64_trailer_len: usize = zip64_end_record_len + zip64_locator_len;
 const zip64_extra_id: u16 = 0x0001;
 const winzip_aes_method: u16 = 99;
 const winzip_aes_extra_id: u16 = 0x9901;
@@ -69,6 +72,14 @@ pub const Entry = struct {
     password_lifetime: u64 = 0,
 };
 
+// One predicate for the 76-byte zip64 trailer: the sizing query, the
+// single-volume emitter and the spanned layout must never disagree.
+fn zip64Needed(entry_count: usize, central_bytes: usize, local_bytes: usize) bool {
+    return entry_count >= std.math.maxInt(u16) or
+        central_bytes >= std.math.maxInt(u32) or
+        local_bytes >= std.math.maxInt(u32);
+}
+
 pub fn requiredSize(entries: []const Entry, archive_comment: []const u8, history: []u8, measurement_buffer: []u8, scratch: []u8, failure_cause: *crypto.FailureCause) Exception!usize {
     failure_cause.* = .none;
     if (archive_comment.len > std.math.maxInt(u16)) return error.ResourceException;
@@ -91,8 +102,8 @@ pub fn requiredSize(entries: []const Entry, archive_comment: []const u8, history
         central_total = try bounds.addUsize(central_total, 46 + entry.name.len + entry.extra.len + centralZip64Length(try bounds.addUsize(compressed, overhead), entry.data.len, local_offset) + (if (entry.encrypted and !entry.zipcrypto) winzip_aes_extra_record_length else 0) + entry.comment.len);
         local_total = try bounds.addUsize(local_total, try bounds.addUsize(30 + entry.name.len + entry.extra.len + localZip64Length(try bounds.addUsize(compressed, overhead), entry.data.len, descriptor) + (if (entry.encrypted and !entry.zipcrypto) winzip_aes_extra_record_length else 0) + dataDescriptorLength(try bounds.addUsize(compressed, overhead), entry.data.len, descriptor), try bounds.addUsize(compressed, overhead)));
     }
-    const needs_zip64 = entries.len >= std.math.maxInt(u16) or central_total >= std.math.maxInt(u32) or local_total >= std.math.maxInt(u32);
-    return try bounds.addUsize(try bounds.addUsize(local_total, central_total), try bounds.addUsize(22 + archive_comment.len, if (needs_zip64) 76 else 0));
+    const needs_zip64 = zip64Needed(entries.len, central_total, local_total);
+    return try bounds.addUsize(try bounds.addUsize(local_total, central_total), try bounds.addUsize(22 + archive_comment.len, if (needs_zip64) zip64_trailer_len else 0));
 }
 
 pub fn encode(entries: []const Entry, archive_comment: []const u8, output: []u8, provider: crypto.Provider, history: []u8, measurement_buffer: []u8, staging: []u8, scratch: []u8, failure_cause: *crypto.FailureCause) Exception!usize {
@@ -163,7 +174,7 @@ pub fn encode(entries: []const Entry, archive_comment: []const u8, output: []u8,
         local_offset = try bounds.addUsize(local_offset, 30 + entry.name.len + entry.extra.len + (if (entry.encrypted and !entry.zipcrypto) winzip_aes_extra_record_length else 0) + local_extra + stored_size + dataDescriptorLength(stored_size, entry.data.len, descriptor));
     }
     const central_size = sink.offset - central_offset;
-    const needs_zip64 = entries.len >= std.math.maxInt(u16) or central_size >= std.math.maxInt(u32) or central_offset >= std.math.maxInt(u32);
+    const needs_zip64 = zip64Needed(entries.len, central_size, central_offset);
     if (needs_zip64) {
         const record_offset = sink.offset;
         try putU32(&sink, zip64_end_signature);
@@ -264,10 +275,8 @@ pub fn encodeSpanned(entries: []const Entry, archive_comment: []const u8, output
         }
         return error.ResourceException; // One record larger than a whole disk.
     }
-    const eocd_len = 22 + archive_comment.len + blk: {
-        const needs_zip64 = entries.len >= std.math.maxInt(u16) or central_total >= std.math.maxInt(u32) or pos >= std.math.maxInt(u32);
-        break :blk @as(usize, if (needs_zip64) 76 else 0);
-    };
+    const needs_zip64 = zip64Needed(entries.len, central_total, pos);
+    const eocd_len = 22 + archive_comment.len + @as(usize, if (needs_zip64) zip64_trailer_len else 0);
     if (try bounds.addUsize(central_total, eocd_len) > remaining) {
         if (boundary_count >= boundaries.len) return error.CapacityException;
         boundaries[boundary_count] = pos;
@@ -356,9 +365,13 @@ pub fn encodeSpanned(entries: []const Entry, archive_comment: []const u8, output
     // Patch the EOCD (and zip64 EOCD when present) disk fields.
     const disks: u64 = boundary_count + 1;
     const eocd_pos = total - 22 - archive_comment.len;
-    const end_pos = eocd_pos - eocd_len + 22; // Start of EOCD (zip64 records precede).
+    // Probe what the emitter actually wrote instead of recomputing the
+    // predicate: a sizing/emit disagreement must never patch wrong bytes.
+    const has_locator = eocd_pos >= zip64_trailer_len and
+        readU32(output, eocd_pos - zip64_locator_len) == zip64_locator_signature;
+    if (has_locator != needs_zip64) return error.InternalException;
+    const end_pos = if (needs_zip64) eocd_pos - zip64_trailer_len else eocd_pos;
     if (readU32(output, eocd_pos) != end_signature) return error.InternalException;
-    const needs_zip64 = eocd_len != 22;
     if (entries.len >= std.math.maxInt(u16) or disks > std.math.maxInt(u16)) return error.UnsupportedException;
     const central_logical = 4 + pos;
     const central_offset_value = central_logical - (4 + central_disk_start);
@@ -374,9 +387,12 @@ pub fn encodeSpanned(entries: []const Entry, archive_comment: []const u8, output
         std.mem.writeInt(u64, output[end_pos + 24 ..][0..8], entries.len, .little);
         std.mem.writeInt(u64, output[end_pos + 32 ..][0..8], entries.len, .little);
         std.mem.writeInt(u64, output[end_pos + 48 ..][0..8], central_offset_value, .little);
-        const locator = end_pos + 56;
+        const locator = end_pos + zip64_end_record_len;
         if (readU32(output, locator) != zip64_locator_signature) return error.InternalException;
         std.mem.writeInt(u32, output[locator + 4 ..][0..4], @intCast(disks - 1), .little);
+        // APPNOTE 4.3.15: the locator names the zip64 EOCD record's offset
+        // in the archive, exactly as the single-volume encoder writes it.
+        std.mem.writeInt(u64, output[locator + 8 ..][0..8], end_pos, .little);
         std.mem.writeInt(u16, output[eocd_pos + 4 ..][0..2], std.math.maxInt(u16), .little);
         std.mem.writeInt(u16, output[eocd_pos + 6 ..][0..2], std.math.maxInt(u16), .little);
         std.mem.writeInt(u16, output[eocd_pos + 8 ..][0..2], std.math.maxInt(u16), .little);
@@ -438,11 +454,15 @@ fn zipSpannedSet(volumes: []const []const u8, join: []u8, disk_starts_scratch: [
     var count: usize = std.math.cast(usize, readU16(archive, eocd + 10)) orelse return error.ResourceException;
     if (disk_count_total == std.math.maxInt(u16)) {
         // zip64 spanned: disk numbers and 64-bit extents live in the records.
-        if (eocd < 20 or readU32(archive, eocd - 20) != zip64_locator_signature) return error.DataException;
-        const locator = eocd - 20;
-        const record_rel = std.math.cast(usize, readU64(archive, locator + 8)) orelse return error.ResourceException;
-        if (locator < 12 or record_rel > locator - 12) return error.DataException;
-        const record = try bounds.slice(archive, locator - 12 - record_rel, 56);
+        if (eocd < zip64_locator_len or readU32(archive, eocd - zip64_locator_len) != zip64_locator_signature) return error.DataException;
+        const locator = eocd - zip64_locator_len;
+        // APPNOTE 4.3.15: locator+8 names the zip64 EOCD record's offset in
+        // the joined archive. The record is 56 bytes and the locator the next
+        // 20, so its position is fully determined; no relative fudge factor.
+        const record_at = std.math.cast(usize, readU64(archive, locator + 8)) orelse return error.ResourceException;
+        const record_end = std.math.add(usize, record_at, zip64_end_record_len) catch return error.DataException;
+        if (record_end != locator) return error.DataException;
+        const record = try bounds.slice(archive, record_at, zip64_end_record_len);
         if (readU32(record, 0) != zip64_end_signature) return error.DataException;
         const cd64 = std.math.cast(usize, readU32(record, 20)) orelse return error.ResourceException;
         const off64 = std.math.cast(usize, readU64(record, 48)) orelse return error.ResourceException;
@@ -1699,7 +1719,7 @@ test "zip spanned rejects zip64 locator with out-of-range record offset" {
     std.mem.writeInt(u32, archive[0..4], spanning_signature, .little);
     const locator = eocd - 20;
     std.mem.writeInt(u32, archive[locator..][0..4], zip64_locator_signature, .little);
-    // record_rel of 100 exceeds locator - 12 (32).
+    // The named record offset does not land 56 bytes before the locator.
     std.mem.writeInt(u64, archive[locator + 8 ..][0..8], 100, .little);
     std.mem.writeInt(u32, archive[eocd..][0..4], end_signature, .little);
     std.mem.writeInt(u16, archive[eocd + 4 ..][0..2], std.math.maxInt(u16), .little);
@@ -1711,4 +1731,82 @@ test "zip spanned rejects zip64 locator with out-of-range record offset" {
     const options: ZipDecodeOptions = .{ .failure_cause = &failure_cause, .staging = staging, .scratch = scratch, .history = history, .provider = crypto.default_provider };
     var out: [1]u8 = undefined;
     try std.testing.expectError(error.DataException, zipDecodeOrdinalSpanned(&.{&archive}, 0, &out, join, disks, options));
+}
+
+fn spannedZip64Fixture(archive: []u8, locator_field: u64) void {
+    @memset(archive, 0);
+    const eocd = archive.len - 22;
+    const locator = eocd - zip64_locator_len;
+    const record_at = locator - zip64_end_record_len;
+    std.mem.writeInt(u32, archive[0..4], spanning_signature, .little);
+    std.mem.writeInt(u32, archive[record_at..][0..4], zip64_end_signature, .little);
+    std.mem.writeInt(u64, archive[record_at + 4 ..][0..8], 44, .little);
+    std.mem.writeInt(u64, archive[record_at + 24 ..][0..8], 1, .little);
+    std.mem.writeInt(u64, archive[record_at + 32 ..][0..8], 1, .little);
+    std.mem.writeInt(u64, archive[record_at + 48 ..][0..8], 4, .little);
+    std.mem.writeInt(u32, archive[locator..][0..4], zip64_locator_signature, .little);
+    std.mem.writeInt(u64, archive[locator + 8 ..][0..8], locator_field, .little);
+    std.mem.writeInt(u32, archive[eocd..][0..4], end_signature, .little);
+    std.mem.writeInt(u16, archive[eocd + 4 ..][0..2], std.math.maxInt(u16), .little);
+}
+
+test "zip spanned zip64 locator names the record offset, not a constant" {
+    const allocator = std.testing.allocator;
+    var archive: [128]u8 = undefined;
+    const locator = archive.len - 22 - zip64_locator_len;
+    const record_at = locator - zip64_end_record_len;
+    const join = try allocator.alloc(u8, archive.len);
+    defer allocator.free(join);
+    var disks: [1]usize = undefined;
+
+    spannedZip64Fixture(&archive, record_at);
+    const set = try zipSpannedSet(&.{archive[0..]}, join, &disks);
+    try std.testing.expectEqual(@as(usize, 1), set.directory.count);
+    try std.testing.expectEqual(@as(usize, 4), set.directory.offset);
+    try std.testing.expectEqual(@as(usize, 0), set.directory.base);
+
+    // The former constant-44 convention is no longer a valid record offset.
+    spannedZip64Fixture(&archive, 44);
+    try std.testing.expectError(error.DataException, zipSpannedSet(&.{archive[0..]}, join, &disks));
+}
+
+test "zip64 sizing predicate is shared by every emitter" {
+    try std.testing.expect(!zip64Needed(1, 100, 100));
+    try std.testing.expect(zip64Needed(std.math.maxInt(u16), 0, 0));
+    try std.testing.expect(zip64Needed(1, std.math.maxInt(u32), 0));
+    try std.testing.expect(zip64Needed(1, 0, std.math.maxInt(u32)));
+}
+
+test "zip64 locator names the record offset and the single-volume reader resolves it" {
+    const allocator = std.testing.allocator;
+    const entries = try allocator.alloc(Entry, std.math.maxInt(u16));
+    defer allocator.free(entries);
+    for (entries) |*entry| entry.* = .{ .name = "a", .data = &.{}, .method = 0 };
+
+    var failure_cause: crypto.FailureCause = .none;
+    const history = try allocator.alloc(u8, deflate_history_size);
+    defer allocator.free(history);
+    const measurement_buffer = try allocator.alloc(u8, deflate_measurement_buffer_size);
+    defer allocator.free(measurement_buffer);
+    const staging = try allocator.alloc(u8, 1 << 20);
+    defer allocator.free(staging);
+    const scratch = try allocator.alloc(u8, 1 << 20);
+    defer allocator.free(scratch);
+
+    const required = try requiredSize(entries, "", history, measurement_buffer, scratch, &failure_cause);
+    const output = try allocator.alloc(u8, required);
+    defer allocator.free(output);
+    const written = try encode(entries, "", output, crypto.default_provider, history, measurement_buffer, staging, scratch, &failure_cause);
+    try std.testing.expectEqual(required, written);
+
+    // The wire field is the zip64 EOCD record's own offset, not a constant.
+    const eocd_pos = written - 22;
+    const locator = eocd_pos - zip64_locator_len;
+    const record_at = locator - zip64_end_record_len;
+    try std.testing.expectEqual(@as(u64, record_at), readU64(output, locator + 8));
+    try std.testing.expectEqual(@as(u32, zip64_end_signature), readU32(output, record_at));
+
+    const directory = try zipDirectory(output[0..written]);
+    try std.testing.expectEqual(entries.len, directory.count);
+    try std.testing.expectEqual(@as(usize, 0), directory.base);
 }

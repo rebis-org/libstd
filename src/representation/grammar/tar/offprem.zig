@@ -53,7 +53,7 @@ pub fn decodeOrdinal(archive: []const u8, ordinal: u64, output: []u8) Exception!
         }
         index += 1;
     }
-    return error.CallException;
+    return error.DataException;
 }
 
 // archiveSize runs the same encode into a counting writer, so the count

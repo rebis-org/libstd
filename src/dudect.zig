@@ -35,12 +35,22 @@ const Subject = struct {
     random_ns: []u64,
 };
 
+// A non-finite statistic is no measurement at all; refuse to issue a verdict.
+fn degenerate(io: std.Io) !void {
+    try std.Io.File.stdout().writeStreamingAll(io, "non-finite t statistic; no timing measurement was made.\n");
+    std.process.exit(2);
+}
+
 fn report(subject: Subject, noise_t: f64, io: std.Io, pool: []u64, random: std.Random) !void {
     const t = welchT(subject.fixed_ns, subject.random_ns);
+    // A zero-variance pair yields a non-finite t, which every verdict comparison misses.
+    if (!std.math.isFinite(t)) try degenerate(io);
     var max_partition: f64 = 0;
     var i: usize = 0;
     while (i < partitions) : (i += 1) {
         const pt = partitionT(subject.fixed_ns, subject.random_ns, random, pool);
+        // The partition comparison ignores NaN just as the main verdict does.
+        if (!std.math.isFinite(pt)) try degenerate(io);
         if (pt > max_partition) max_partition = pt;
     }
     const mf = mean(subject.fixed_ns);

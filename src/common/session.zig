@@ -377,8 +377,9 @@ pub fn Collapse(comptime Inner: type) type {
                     return 0;
                 }
                 if (slot.ino == ino) {
-                    slot.count += 1;
-                    return slot.count - 1;
+                    const count = std.math.add(u32, slot.count, 1) catch return error.CapacityException;
+                    slot.count = count;
+                    return count - 1;
                 }
             }
             // Breaching the caller's table is a capacity answer, never a silent drop.
