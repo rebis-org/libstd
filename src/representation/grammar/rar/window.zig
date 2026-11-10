@@ -104,7 +104,7 @@ pub const Window = struct {
     }
 };
 
-test "window copy match variants" {
+test "window copy match serves valid distances and zero-fills impossible ones" {
     var buf: [16]u8 = undefined;
     var win = Window.init(&buf);
     for ("AB") |c| win.putByte(c);
@@ -112,11 +112,16 @@ test "window copy match variants" {
     try std.testing.expectEqual(@as(u64, 6), win.total_written);
     try std.testing.expectEqualSlices(u8, "ABABAB", buf[0..6]);
 
+    // Distance zero is impossible: zero-fill, never stale slots.
     win.copyMatch(0, 2);
-    try std.testing.expectEqual(@as(u8, 0), buf[6]);
+    try std.testing.expectEqual(@as(u64, 8), win.total_written);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 0 }, buf[6..8]);
 
+    // Distance one replicates the zero-filled byte forward; the buffer
+    // starts undefined, so only the copy can zero these slots.
     win.copyMatch(1, 3);
-    try std.testing.expectEqual(@as(u8, 0), buf[7]);
+    try std.testing.expectEqual(@as(u64, 11), win.total_written);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 0 }, buf[8..11]);
 }
 
 test "window emit splits across the wrap" {
@@ -139,11 +144,7 @@ test "window emit refuses overwritten history" {
 }
 
 test "window copy match crosses the physical wrap" {
-    // 24 bytes into a 16-byte window: the wrapped source takes the
-    // forward-copy path because the kernel's recomputation would underflow.
-    //
-    // Bytes 16..24 overwrite buffer[0..8], so the raw window reads
-    // QRSTUVWX MNOP before the match runs.
+    // The wrapped source takes the forward-copy path, because the kernel's recomputation would underflow; bytes 16..24 overwrite buffer[0..8].
     var buf: [16]u8 = undefined;
     var win = Window.init(&buf);
     for ("ABCDEFGHIJKLMNOPQRSTUVWX") |c| win.putByte(c);

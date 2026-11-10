@@ -31,8 +31,7 @@ pub const trailer_name = "TRAILER!!!";
 
 pub const record_header_size: usize = 110;
 
-// The fixed newc header, shared by this reader and the xip member walk:
-// both decode the same 13 hex fields from the same offsets.
+// The fixed newc header, shared by this reader and the xip member walk: both decode the same 13 hex fields.
 pub const NewcHeader = struct {
     ino: u32,
     mode: u32,
@@ -63,8 +62,7 @@ pub fn parseNewcHeader(bytes: []const u8) Exception!NewcHeader {
     };
 }
 
-// A record name carries its NUL terminator on the wire; nothing else may
-// appear before it. Newc and odc use the same name convention.
+// A record name carries its NUL terminator on the wire; nothing else may appear before it.
 pub fn parseRecordName(bytes: []const u8) Exception![]const u8 {
     if (bytes.len == 0) return error.DataException;
     const name = bytes[0 .. bytes.len - 1];
@@ -92,8 +90,7 @@ pub fn parseOdcHeader(bytes: []const u8) Exception!OdcHeader {
     if (bytes.len < odc_header_size) return error.DataException;
     if (!std.mem.eql(u8, bytes[0..6], "070707")) return error.DataException;
     var mode: u32 = @intCast(try parseOctal(bytes[18..24]));
-    // PWB archives leave inode bits above the mode field. Keep every bit
-    // a mode can hold: 0o67777 clears the type and turns symlinks into files.
+    // PWB archives leave inode bits above the mode field; 0o67777 clears the type and turns symlinks into files.
     mode &= 0o177777;
     if (mode & 0o170000 == 0) mode |= 0o100000;
     return .{
@@ -244,8 +241,7 @@ fn writeNewcHeader(sink: anytype, entry: Entry, ino: u32, comptime magic: []cons
     for (fields) |field| try writeDigits(sink, 16, 8, field);
 }
 
-// One complete newc record: the fixed header, the name, and the data.
-// The xip writer streams these straight into its chunk framing.
+// One complete newc record: fixed header, name, and data; the xip writer streams these into its framing.
 pub fn writeNewcRecord(sink: anytype, entry: Entry, ino: u32, check: u32) Exception!void {
     try validateEntry(entry);
     try writeNewcHeader(sink, entry, ino, "070701", check);
@@ -328,9 +324,15 @@ const Reader = struct {
     archive: []const u8,
     offset: u64 = 0,
     ordinal: u64 = 0,
+    trailer_seen: bool = false,
 
     fn parseHeader(self: *Reader) Exception!?EntryInfo {
-        if (self.offset >= self.archive.len) return null;
+        if (self.offset >= self.archive.len) {
+            // GNU cpio calls this a premature end of archive; the streaming
+            // reader rejects it too, so both paths must agree.
+            if (!self.trailer_seen) return error.DataException;
+            return null;
+        }
         const rest = self.archive[@intCast(self.offset)..];
         if (rest.len < 2) return error.DataException;
         var info: EntryInfo = undefined;
@@ -394,9 +396,9 @@ const Reader = struct {
         }
         if (namesize == 0) return error.DataException;
         const data_start = try alignUp(try bounds.addU64(self.offset, namesize), name_align);
-        const name = try bounds.slice(self.archive, self.offset, namesize - 1);
-        if (std.mem.findScalar(u8, name, 0) != null) return error.DataException;
-        info.name = name;
+        const name_bytes = try bounds.slice(self.archive, self.offset, namesize);
+        if (name_bytes[name_bytes.len - 1] != 0) return error.DataException;
+        info.name = try parseRecordName(name_bytes);
         info.size = data_size;
         info.data_offset = data_start;
         const data_end = try alignUp(try bounds.addU64(data_start, data_size), data_align);
@@ -412,8 +414,9 @@ const Reader = struct {
         info.ordinal = self.ordinal;
         self.ordinal = try bounds.addU64(self.ordinal, 1);
         self.offset = data_end;
-        if (std.mem.eql(u8, name, trailer_name)) {
+        if (std.mem.eql(u8, info.name, trailer_name)) {
             if (data_size != 0) return error.DataException;
+            self.trailer_seen = true;
             return null;
         }
         return info;
@@ -701,16 +704,38 @@ test "cpio reads little-endian binary archives" {
     archive[26] = 'f';
     archive[27] = 0;
     @memcpy(archive[28..32], "data");
-    const count = try inspectCount(archive[0..32]);
+    // A cpio stream ends with TRAILER!!!; the in-memory reader rejects a
+    // premature end just like the streaming one.
+    std.mem.writeInt(u16, archive[32..34], 0o070707, .little);
+    std.mem.writeInt(u16, archive[44..46], 1, .little);
+    std.mem.writeInt(u16, archive[52..54], 11, .little);
+    @memcpy(archive[58..69], "TRAILER!!!\x00");
+    const whole = archive[0..70];
+    const count = try inspectCount(whole);
     try testing.expectEqual(@as(u64, 1), count);
-    const info = try inspectOrdinal(archive[0..32], 0);
+    const info = try inspectOrdinal(whole, 0);
     try testing.expectEqualSlices(u8, "f", info.name);
     try testing.expectEqual(Format.bin_le, info.format);
     try testing.expectEqual(@as(u32, 0o100644), info.mode);
     try testing.expectEqual(@as(u32, 5), info.uid);
     var out: [4]u8 = undefined;
-    const n = try decodeOrdinal(archive[0..32], 0, &out);
+    const n = try decodeOrdinal(whole, 0, &out);
     try testing.expectEqualSlices(u8, "data", out[0..n]);
+}
+
+test "cpio in-memory reader rejects a stream without a trailer" {
+    var archive: [32]u8 = @splat(0);
+    std.mem.writeInt(u16, archive[0..2], 0o070707, .little);
+    std.mem.writeInt(u16, archive[12..14], 1, .little);
+    std.mem.writeInt(u16, archive[20..22], 2, .little);
+    archive[26] = 'f';
+    archive[27] = 0;
+    @memcpy(archive[28..32], "data");
+    try std.testing.expectError(error.DataException, inspectCount(&archive));
+
+    // A missing NUL terminator is invalid even before the trailer is reached.
+    archive[27] = 'x';
+    try std.testing.expectError(error.DataException, inspectCount(&archive));
 }
 
 test "cpio sizing matches encoder across alignment and 512 boundaries" {
@@ -760,9 +785,14 @@ test "cpio keeps non-regular type bits in odc and binary records" {
     std.mem.writeInt(u32, binary_archive[22..26], 6, .little);
     @memcpy(binary_archive[26..31], "link\x00");
     @memcpy(binary_archive[32..38], "target");
-    const count = try inspectCount(binary_archive[0..38]);
+    std.mem.writeInt(u16, binary_archive[38..40], 0o070707, .little);
+    std.mem.writeInt(u16, binary_archive[50..52], 1, .little);
+    std.mem.writeInt(u16, binary_archive[58..60], 11, .little);
+    @memcpy(binary_archive[64..75], "TRAILER!!!\x00");
+    const whole = binary_archive[0..76];
+    const count = try inspectCount(whole);
     try testing.expectEqual(@as(u64, 1), count);
-    const info = try inspectOrdinal(binary_archive[0..38], 0);
+    const info = try inspectOrdinal(whole, 0);
     try testing.expectEqual(@as(u32, 0o120755), info.mode);
 }
 

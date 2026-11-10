@@ -78,7 +78,11 @@ const block_staging_size: usize = block_size_default + 64;
 const zstd_workspace_extra: usize = 3 << 20;
 const write_staging_size: usize = block_staging_size + meta_staging_size + max_data_blocks * 4;
 const read_scratch_size: usize = 2 * metadata_size + frag_buffer_size + deflate.history_size + xz_grammar.decodeWorkspaceSize(xz_dictionary_cap) + path_size;
-pub const scratch_size: usize = read_scratch_size + zstd_workspace_extra + write_staging_size;
+// Explicit traversal frames replace the directory walk's recursion. Reserve
+// their byte cost in the sizing query so workspace_required_capacity reflects
+// the fixed cap before work starts.
+const frame_stack_bytes: usize = 16 * 1024;
+pub const scratch_size: usize = read_scratch_size + zstd_workspace_extra + write_staging_size + frame_stack_bytes;
 
 const max_entries = 256;
 const mode_file: u16 = 0o644;
@@ -368,8 +372,20 @@ fn walkDir(archive: []const u8, super: Super, scratch: *Scratch, target: DirTarg
     };
 }
 
-fn walkInodeDir(archive: []const u8, super: Super, scratch: *Scratch, ref: u64, target: DirTarget, state: *WalkState, depth: u32) Exception!void {
-    if (depth > max_dir_depth) return error.DataException;
+// An explicit frame stack replaces the directory recursion. A directory's
+// staged entries share the one scratch.frag window, so a child walk overwrites
+// the parent's parse: reopen the stream from its inode on every activation
+// rather than keeping a per-level MetaStream view.
+const SquashFrame = struct { ref: u64, i: usize, depth: u32 };
+
+const DirChildren = struct {
+    refs: [max_entries]u64,
+    types: [max_entries]u16,
+    names: [max_entries][]const u8,
+    count: usize,
+};
+
+fn stageDir(archive: []const u8, super: Super, scratch: *Scratch, ref: u64, kids: *DirChildren) Exception!void {
     const dir_inode = try readInode(archive, super, ref, scratch);
     if (dir_inode.dir_file_size < 3) return error.DataException;
     const content_len = dir_inode.dir_file_size - 3;
@@ -384,10 +400,6 @@ fn walkInodeDir(archive: []const u8, super: Super, scratch: *Scratch, ref: u64, 
     try stream.skip(dir_inode.dir_offset, scratch.history);
     try stream.read(scratch.frag[0..content_len], scratch.history);
 
-    // Collect children first: recursion would clobber staged bytes mid-parse.
-    var refs: [max_entries]u64 = undefined;
-    var types: [max_entries]u16 = undefined;
-    var names: [max_entries][]const u8 = undefined;
     var count: usize = 0;
     var remaining: u64 = content_len;
     var entries_in_header: u64 = 0;
@@ -414,7 +426,7 @@ fn walkInodeDir(archive: []const u8, super: Super, scratch: *Scratch, ref: u64, 
         remaining -= 8;
         name_len = std.mem.readInt(u16, ent[6..8], .little) + 1;
         if (name_len > 256 or remaining < name_len) return error.DataException;
-        names[count] = scratch.frag[cursor..][0..name_len];
+        kids.names[count] = scratch.frag[cursor..][0..name_len];
         cursor += name_len;
         remaining -= name_len;
         const delta = std.mem.readInt(i16, ent[2..4], .little);
@@ -424,25 +436,53 @@ fn walkInodeDir(archive: []const u8, super: Super, scratch: *Scratch, ref: u64, 
         const off_in_block = std.mem.readInt(u16, ent[0..2], .little);
         if (off_in_block >= metadata_size) return error.DataException;
         if (count >= max_entries) return error.DataException;
-        refs[count] = (header_block << 16) | @as(u64, off_in_block);
-        types[count] = std.mem.readInt(u16, ent[4..6], .little);
+        kids.refs[count] = (header_block << 16) | @as(u64, off_in_block);
+        kids.types[count] = std.mem.readInt(u16, ent[4..6], .little);
         count += 1;
         entries_in_header -= 1;
     }
+    kids.count = count;
+}
 
+fn walkInodeDir(archive: []const u8, super: Super, scratch: *Scratch, ref: u64, target: DirTarget, state: *WalkState, depth: u32) Exception!void {
     const found_ptr = switch (target) {
         .resolve => |res| res.found,
         .count => null,
     };
-    for (refs[0..count], types[0..count], names[0..count]) |child_ref, entry_type, name| {
+    var stack: [max_dir_depth + 2]SquashFrame = undefined;
+    var sp: usize = 0;
+    var kids: DirChildren = .{ .refs = undefined, .types = undefined, .names = undefined, .count = 0 };
+    if (depth > max_dir_depth) return error.DataException;
+    stack[sp] = .{ .ref = ref, .i = 0, .depth = depth };
+    sp = 1;
+    try stageDir(archive, super, scratch, ref, &kids);
+    while (sp > 0) {
         if (found_ptr) |fp| {
             if (fp.*) return;
         }
+        const frame = &stack[sp - 1];
+        if (frame.i >= kids.count) {
+            // A non-root frame had state.push done by its parent on entry.
+            if (frame.depth > 0) state.pop(frame.depth - 1);
+            sp -= 1;
+            // Reopen the parent's stream: the child reused the shared window.
+            if (sp > 0) try stageDir(archive, super, scratch, stack[sp - 1].ref, &kids);
+            continue;
+        }
+        const child_ref = kids.refs[frame.i];
+        const entry_type = kids.types[frame.i];
+        const name = kids.names[frame.i];
         switch (entry_type) {
             inode_type_dir => {
-                try state.push(name, depth);
-                try walkInodeDir(archive, super, scratch, child_ref, target, state, depth + 1);
-                state.pop(depth);
+                try state.push(name, frame.depth);
+                const child_depth = frame.depth + 1;
+                if (child_depth > max_dir_depth) return error.DataException;
+                // The child's whole subtree runs before this sibling advances.
+                frame.i += 1;
+                stack[sp] = .{ .ref = child_ref, .i = 0, .depth = child_depth };
+                sp += 1;
+                try stageDir(archive, super, scratch, child_ref, &kids);
+                continue;
             },
             inode_type_reg, inode_type_lreg => {
                 switch (target) {
@@ -463,6 +503,8 @@ fn walkInodeDir(archive: []const u8, super: Super, scratch: *Scratch, ref: u64, 
                     },
                 }
                 state.ordinal += 1;
+                frame.i += 1;
+                continue;
             },
             else => return error.UnsupportedException,
         }
@@ -596,7 +638,7 @@ fn spanCount(spans: []const Span) usize {
 
 fn pushSpan(spans: []Span, start: usize, len: usize) Exception!void {
     const n = spanCount(spans);
-    if (n >= spans.len) return error.ResourceException;
+    if (n >= spans.len) return error.UnsupportedException;
     spans[n] = .{ .start = @intCast(start), .len = @intCast(len) };
 }
 
@@ -715,7 +757,7 @@ fn buildInodeTableRaw(plan: *const Plan, buf: []u8, spans: []Span) Exception!usi
             try pushSpan(spans, span_start, used - span_start);
             span_start = used;
         }
-        if (used + inode_size > buf.len) return error.ResourceException;
+        if (used + inode_size > buf.len) return error.UnsupportedException;
         var raw: [32]u8 = @splat(0);
         std.mem.writeInt(u16, raw[4..6], uid_index, .little);
         std.mem.writeInt(u16, raw[6..8], guid_index, .little);
@@ -807,7 +849,7 @@ fn buildDirTableRaw(plan: *Plan, ws: *WriteWs, buf: []u8, spans: []Span) Excepti
             const rank = orderRank(plan, child_idx);
             const rel = plan.inode_block_rel[rank];
             if (chunk == 0 or chunk == max_entries or prev_block != rel) {
-                if (used + 12 > buf.len or used - span_start + 12 > metadata_size) return error.ResourceException;
+                if (used + 12 > buf.len or used - span_start + 12 > metadata_size) return error.UnsupportedException;
                 var run: u32 = 0;
                 var scan = ci;
                 while (scan < start.len and run < max_entries and plan.inode_block_rel[orderRank(plan, start[scan])] == rel) {
@@ -907,6 +949,7 @@ fn buildPlan(entries: []const Entry, ws: *WriteWs, alloc: std.mem.Allocator) Exc
             if (nodes.items[existing].kind != .dir or entry.data.len != 0) return error.CallException;
             continue;
         }
+        if (nodes.items.len >= max_nodes) return error.UnsupportedException;
         nodes.append(alloc, .{ .kind = .file, .name = leaf, .parent = parent, .data = entry.data }) catch return error.ResourceException;
         nodes.items[parent].child_count += 1;
     }
@@ -1030,6 +1073,9 @@ fn findOrCreateDir(nodes: *std.ArrayList(Node), alloc: std.mem.Allocator, parent
         if (nodes.items[existing].kind != .dir) return error.CallException;
         return existing;
     }
+    // The node count is an input-shape cap; reach it before append so the
+    // answer is unsupported, not a misleading resource_limit.
+    if (nodes.items.len >= max_nodes) return error.UnsupportedException;
     const idx: u32 = @intCast(nodes.items.len);
     nodes.append(alloc, .{ .kind = .dir, .name = name, .parent = parent }) catch return error.ResourceException;
     nodes.items[parent].child_count += 1;

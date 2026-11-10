@@ -1,29 +1,32 @@
 #include "abi.h"
 
-#if !defined(__cplusplus) && \
+#include <stdk.h>
+
+#include <stddef.h>
+
+#if !defined(__cplusplus) &&                                                   \
 	(!defined(__STDC_VERSION__) || __STDC_VERSION__ < 202311L)
-/* Pre-C23 has no nullptr keyword; the contract only needs the conversion. */
 #define nullptr ((void *)0)
 #endif
 
-#define STDK_C_SAME(expression, type)                             \
-	_Generic((expression),                                    \
-		type: 1, /* NOLINT(bugprone-macro-parentheses) */ \
+#define STDK_C_SAME(expression, type)                                          \
+	_Generic((expression),                                                 \
+		type: 1, /* NOLINT(bugprone-macro-parentheses) */              \
 		default: 0)
 #define STDK_C_RUN(kind, ...) STDK_C_##kind(__VA_ARGS__)
-#define STDK_C_TYPE(expression, type) \
+#define STDK_C_TYPE(expression, type)                                          \
 	_Static_assert(STDK_C_SAME(expression, type), #expression " : " #type)
-#define STDK_C_SIZE(type, expected) \
+#define STDK_C_SIZE(type, expected)                                            \
 	_Static_assert(sizeof(type) == (expected), #type " size")
-#define STDK_C_OFFSET(type, member, expected)                \
-	_Static_assert(offsetof(type, member) == (expected), \
+#define STDK_C_OFFSET(type, member, expected)                                  \
+	_Static_assert(offsetof(type, member) == (expected),                   \
 		       #type "." #member " offset")
-#define STDK_C_VALUE(expression, expected) \
+#define STDK_C_VALUE(expression, expected)                                     \
 	_Static_assert((expression) == (expected), #expression " value")
 
 STDK_ABI_CONTRACT(STDK_C_RUN)
 
-int main(void)
+int main()
 {
 	return STDK_STATUS_OK;
 }

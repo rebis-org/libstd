@@ -56,9 +56,7 @@ const ZonDescriptor = struct {
     verbs: []const []const u8,
     parameters: []const ZonParameter = &.{},
     capabilities: []const []const u8 = &.{},
-    // Command directions the format's volume-set shape serves: "read",
-    // "write". Empty means the official specification has no split set,
-    // and dispatch refuses the archive_volumes parameter.
+    // Directions the format's split-set shape serves: read, write. Empty means no split set, so dispatch refuses the parameter.
     volumes: []const []const u8 = &.{},
     sizing: []const u8 = "unavailable",
     commit: []const u8 = "tentative",

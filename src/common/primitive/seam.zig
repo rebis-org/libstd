@@ -184,8 +184,7 @@ fn Mergeable(comptime family: Family, comptime On: type, comptime Off: type) typ
     };
 }
 
-// One facade carries every family: the family fixes the construction and
-// final argument types, and lazy decl analysis drops unused constants.
+// One facade carries every family: the family fixes construction and final argument types, and lazy decl analysis drops unused constants.
 pub fn Facade(comptime family: Family, comptime mode: Mode, comptime On: type, comptime Off: type) type {
     const CoreImpl = Core(mode, family, On, Off);
     const Args = switch (family) {
@@ -265,6 +264,12 @@ pub fn defaultProvider(comptime impl: anytype) Provider {
 }
 
 pub fn dispatchOnprem(comptime impl: anytype, provider: Provider, comptime on: anytype, args: anytype) @typeInfo(@TypeOf(on)).@"fn".return_type.? {
+    return dispatchOnpremAs(@typeInfo(@TypeOf(on)).@"fn".return_type.?, impl, provider, on, args);
+}
+
+// The explicit-result form serves comptime-generic entries, whose return
+// type no uninstantiated expression can name.
+pub fn dispatchOnpremAs(comptime Result: type, comptime impl: anytype, provider: Provider, comptime on: anytype, args: anytype) Result {
     // No stdlib container exists; the offprem arm returns an explicit
     // UnsupportedException.
     return switch (impl) {

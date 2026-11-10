@@ -1,7 +1,4 @@
-// Mutation campaigns are evidence sessions, not gate work: the iteration
-// budget comes from the operator, and a run without a budget proves nothing.
-// Decoding rejects malformed input by contract; the property under test is
-// that no rejection traps, so a trap is the only failure a campaign reports.
+// Campaigns are evidence sessions: the iteration budget comes from the operator, and the only reported failure is a trap.
 
 const std = @import("std");
 
@@ -29,13 +26,6 @@ fn parseOptions(iterator: *std.process.Args.Iterator) !Options {
     }
     if (options.iterations == 0) return error.EmptyCampaign;
     return options;
-}
-
-fn findTarget(name: []const u8) ?targets.Target {
-    for (targets.targets) |target| {
-        if (std.mem.eql(u8, target.name, name)) return target;
-    }
-    return null;
 }
 
 fn mutate(rng: *u64, seed: []const u8, buffer: *[targets.max_input]u8) []const u8 {

@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const lane_driver = @import("../../../common/lanes.zig");
 const bounds = @import("../../../common/primitive/bounds.zig");
 const checksum = @import("../../../common/primitive/checksum.zig");
 const exception_prim = @import("../../../common/primitive/exception.zig");
@@ -12,7 +13,9 @@ pub const frame_size_max: u32 = zstd.encoder_frame_size_max;
 pub const frame_size_min: u32 = zstd.window_size_min;
 
 const frame_magic: u32 = 0xFD2FB528;
+// The seek table is itself a skippable frame, at the top of the range.
 const skippable_magic: u32 = 0x184D2A5E;
+const skippable_magic_min: u32 = 0x184D2A50;
 const seekable_magic: u32 = 0x8F92EAB1;
 const footer_size = 9;
 const entry_size = 8;
@@ -80,7 +83,7 @@ pub fn inspect(input: []const u8) Exception!FrameInfo {
         if (compressed_size == 0) return error.DataException;
         if (@as(u64, offset) + compressed_size > table_start - 8) return error.DataException;
         const magic = std.mem.readInt(u32, input[offset..][0..4], .little);
-        if (magic != frame_magic and !(magic >= 0x184D2A50 and magic <= 0x184D2A5F)) return error.DataException;
+        if (magic != frame_magic and !(magic >= skippable_magic_min and magic <= skippable_magic)) return error.DataException;
         offset += compressed_size;
     }
     if (offset != table_start - 8) return error.DataException;
@@ -95,6 +98,156 @@ pub fn decodedSize(input: []const u8, history: []u8, options: Options) Exception
 }
 
 pub const FrameEntry = struct { compressed_size: u32, decompressed_size: u32 };
+
+// One table entry; the frame bytes stay where they are until a lane reads.
+pub const FrameSpan = struct {
+    offset: u64,
+    compressed_size: u32,
+    decompressed_size: u32,
+    checksum: ?u32,
+};
+
+// Reads one seek-table entry at a time, so no lane holds the whole table.
+pub const FrameCursor = struct {
+    input: []const u8,
+    frame_count: u32,
+    has_checksums: bool,
+    table_start: usize,
+    index: u32 = 0,
+    offset: usize = 0,
+
+    pub fn init(input: []const u8) Exception!FrameCursor {
+        const info = try inspect(input);
+        const entries = std.math.mul(usize, info.frame_count, entryStride(info.has_checksums)) catch
+            return error.DataException;
+        return .{
+            .input = input,
+            .frame_count = info.frame_count,
+            .has_checksums = info.has_checksums,
+            .table_start = input.len - footer_size - entries,
+        };
+    }
+
+    pub fn next(self: *FrameCursor) Exception!?FrameSpan {
+        if (self.index == self.frame_count) return null;
+        const row = self.entry(self.index);
+        const compressed_size = std.mem.readInt(u32, row[0..4], .little);
+        const decompressed_size = std.mem.readInt(u32, row[4..8], .little);
+        // A skippable frame carries no payload; any other size is a guess.
+        const magic = std.mem.readInt(u32, self.input[self.offset..][0..4], .little);
+        if (magic >= skippable_magic_min and magic <= skippable_magic and decompressed_size != 0) {
+            return error.UnsupportedException;
+        }
+        const span: FrameSpan = .{
+            .offset = self.offset,
+            .compressed_size = compressed_size,
+            .decompressed_size = decompressed_size,
+            .checksum = self.checksumAt(self.index),
+        };
+        self.index += 1;
+        self.offset += compressed_size;
+        return span;
+    }
+
+    // The stored low 32 bits of XXH64 for one frame, when the table has them.
+    pub fn checksumAt(self: *FrameCursor, index: u32) ?u32 {
+        if (!self.has_checksums) return null;
+        const row = self.entry(index);
+        return std.mem.readInt(u32, row[entry_size..][0..4], .little);
+    }
+
+    fn entry(self: *FrameCursor, index: u32) []const u8 {
+        const stride = entryStride(self.has_checksums);
+        const start = self.table_start + @as(usize, index) * stride;
+        return self.input[start..][0..stride];
+    }
+};
+
+fn entryStride(has_checksums: bool) usize {
+    return entry_size + @as(usize, if (has_checksums) 4 else 0);
+}
+
+// The per-lane history a frame decode needs.
+pub fn workspaceSize(options: Options, lane_count: u8) usize {
+    return historySize(options) *| @as(usize, lane_count);
+}
+
+fn historySize(options: Options) usize {
+    return @as(usize, frameOptions(options).window_size) +| zstd.block_size_max;
+}
+
+// One frame per lane: the seek table is the proof that frames are independent.
+const FrameSource = struct {
+    pub const Exception = exception_prim.Exception;
+
+    input: []const u8,
+    output: []u8,
+    frame_options: zstd.Options,
+    cursor: FrameCursor,
+    written: usize = 0,
+
+    pub fn nextUnit(self: *FrameSource, ordinal: u32, staging: []u8) exception_prim.Exception!?lane_driver.Unit {
+        _ = staging;
+        const span = (try self.cursor.next()) orelse return null;
+        const size: usize = span.decompressed_size;
+        if (size > self.output.len - self.written) return error.CapacityException;
+        const target = self.output[self.written..][0..size];
+        self.written += size;
+        return .{
+            .ordinal = ordinal,
+            .input = self.input[span.offset..][0..span.compressed_size],
+            .output = target,
+            .decoded_size = span.decompressed_size,
+        };
+    }
+
+    pub fn decode(self: *FrameSource, unit: lane_driver.Unit, scratch: []u8) exception_prim.Exception!usize {
+        var source = std.Io.Reader.fixed(unit.input);
+        var sink = std.Io.Writer.fixed(unit.output);
+        const expected = self.cursor.checksumAt(unit.ordinal) orelse {
+            // Without stored checksums the table's size is the only bound.
+            _ = zstd.decodeStream(&source, &sink, scratch, self.frame_options) catch |err| return err;
+            // A short frame would leave the rest of the output uninitialized.
+            if (sink.end != unit.output.len) return error.IntegrityException;
+            return sink.end;
+        };
+        var frame_tee = tee.CountingTee(.{ .xxh64 = true }).init(&sink);
+        _ = zstd.decodeStream(&source, &frame_tee.writer, scratch, self.frame_options) catch |err| return err;
+        // Either a size or hash disagreement is corruption, not a format error.
+        if (frame_tee.size != unit.decoded_size) return error.IntegrityException;
+        if (@as(u32, @truncate(frame_tee.xxh64Value())) != expected) return error.IntegrityException;
+        return @intCast(frame_tee.size);
+    }
+};
+
+// Decodes every frame into `output`, one frame per lane in flight.
+pub fn decodeLanes(
+    input: []const u8,
+    output: []u8,
+    workspace: []u8,
+    options: Options,
+    lane_options: lane_driver.Options,
+) Exception!usize {
+    if (lane_options.lanes == 0 or lane_options.lanes > lane_driver.max_lanes) return error.CallException;
+    const history = historySize(options);
+    const lane_bytes = std.math.mul(usize, history, @as(usize, lane_options.lanes)) catch return error.CapacityException;
+    if (workspace.len < lane_bytes) return error.CapacityException;
+    var buffers: [lane_driver.max_lanes]lane_driver.Lane = @splat(.{});
+    for (0..@as(usize, lane_options.lanes)) |index| buffers[index].scratch = workspace[index * history ..][0..history];
+
+    const source: FrameSource = .{
+        .input = input,
+        .output = output,
+        .frame_options = frameOptions(options),
+        .cursor = try FrameCursor.init(input),
+    };
+    var decoder = try lane_driver.Decoder(FrameSource).init(source, lane_options, buffers);
+    var total: usize = 0;
+    while (try decoder.next()) |unit| {
+        total = std.math.add(usize, total, unit.output.len) catch return error.ResourceException;
+    }
+    return total;
+}
 
 pub fn frameCountFor(input_len: usize, options: Options) usize {
     // Clamping sub-minimum frame sizes keeps the count an upper bound
@@ -294,4 +447,71 @@ test "seekable sizing survives a zero frame size and a wide hash width" {
     var entries: [1]FrameEntry = undefined;
     try std.testing.expectError(error.CallException, encodeToWriter("x", &sink, &history, &workspace, &entries, options));
     try std.testing.expectError(error.CallException, encodeToWriter("x", &sink, &history, &workspace, &entries, .{ .hash_bits = 64 }));
+}
+
+test "seekable frame cursor reports the declared spans" {
+    const options: Options = .{ .frame_size = 1 << 15 };
+    const frame_options = frameOptions(options);
+    const input = try std.testing.allocator.alloc(u8, 5 * (1 << 15) + 7);
+    defer std.testing.allocator.free(input);
+    var prng = std.Random.DefaultPrng.init(0x11);
+    prng.random().bytes(input);
+    const history = try std.testing.allocator.alloc(u8, @as(usize, frame_options.window_size) + zstd.block_size_max);
+    defer std.testing.allocator.free(history);
+    const workspace = try std.testing.allocator.alloc(u32, zstd.encoderWorkspaceU32Count(0, options.frame_size, frame_options));
+    defer std.testing.allocator.free(workspace);
+    const encoded = try std.testing.allocator.alloc(u8, input.len * 2 + 65536);
+    defer std.testing.allocator.free(encoded);
+    const entries = try std.testing.allocator.alloc(FrameEntry, frameCountFor(input.len, options));
+    defer std.testing.allocator.free(entries);
+    const encoded_len = try encode(input, encoded, history, workspace, entries, options);
+
+    var cursor = try FrameCursor.init(encoded[0..encoded_len]);
+    var offset: u64 = 0;
+    var decompressed: u64 = 0;
+    var frames: u32 = 0;
+    while (try cursor.next()) |span| {
+        // The table is the only boundary source: contiguous and exact.
+        try std.testing.expectEqual(offset, span.offset);
+        try std.testing.expectEqual(entries[frames].compressed_size, span.compressed_size);
+        try std.testing.expectEqual(entries[frames].decompressed_size, span.decompressed_size);
+        offset += span.compressed_size;
+        decompressed += span.decompressed_size;
+        frames += 1;
+    }
+    try std.testing.expectEqual(@as(u32, 6), frames);
+    try std.testing.expectEqual(@as(u64, input.len), decompressed);
+    try std.testing.expectEqual(@as(u64, encoded_len - footer_size - 8 - 6 * entry_size), offset);
+}
+
+test "seekable lanes match the serial decoder byte for byte" {
+    const options: Options = .{ .frame_size = 1 << 15 };
+    const frame_options = frameOptions(options);
+    const input = try std.testing.allocator.alloc(u8, 4 * (1 << 15) + 11);
+    defer std.testing.allocator.free(input);
+    var prng = std.Random.DefaultPrng.init(0x22);
+    prng.random().bytes(input);
+    const history = try std.testing.allocator.alloc(u8, @as(usize, frame_options.window_size) + zstd.block_size_max);
+    defer std.testing.allocator.free(history);
+    const workspace = try std.testing.allocator.alloc(u32, zstd.encoderWorkspaceU32Count(0, options.frame_size, frame_options));
+    defer std.testing.allocator.free(workspace);
+    const encoded = try std.testing.allocator.alloc(u8, input.len * 2 + 65536);
+    defer std.testing.allocator.free(encoded);
+    const entries = try std.testing.allocator.alloc(FrameEntry, frameCountFor(input.len, options));
+    defer std.testing.allocator.free(entries);
+    const encoded_len = try encode(input, encoded, history, workspace, entries, options);
+
+    const serial = try std.testing.allocator.alloc(u8, input.len);
+    defer std.testing.allocator.free(serial);
+    var sink = std.Io.Writer.fixed(serial);
+    try decode(encoded[0..encoded_len], &sink, history, options);
+
+    const lanes_out = try std.testing.allocator.alloc(u8, input.len);
+    defer std.testing.allocator.free(lanes_out);
+    const lane_workspace = try std.testing.allocator.alloc(u8, workspaceSize(options, 1));
+    defer std.testing.allocator.free(lane_workspace);
+    const total = try decodeLanes(encoded[0..encoded_len], lanes_out, lane_workspace, options, .{ .lanes = 1 });
+    try std.testing.expectEqual(input.len, total);
+    try std.testing.expectEqualSlices(u8, input, lanes_out);
+    try std.testing.expectEqualSlices(u8, serial, lanes_out);
 }

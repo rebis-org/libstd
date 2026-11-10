@@ -23,8 +23,7 @@ pub const Strategy = enum(u8) {
     huffman_only,
     // Matches are limited to distance one (run-length encoding).
     rle,
-    // Filtered profile from zlib: tuned for small, weakly correlated
-    // values; clamping the search knobs at init favors Huffman over matching.
+    // Short matches are demoted to literals so Huffman coding dominates.
     filtered,
 };
 
@@ -54,6 +53,8 @@ const hash_bits = 15;
 const hash_size = 1 << hash_bits;
 // Minimum-length matches farther back than this are demoted to literals.
 const too_far = 4096;
+// Filtered data has weak correlation, so short matches cost more than literals.
+const filtered_max_match = 5;
 const no_position = std.math.maxInt(u32);
 const token_literal: u64 = 1 << 63;
 
@@ -344,15 +345,6 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
             if (options.chain == 0) return error.CallException;
             if (options.optimal and options.strategy != .default) return error.CallException;
             if (options.iterations > 1 and !options.optimal) return error.CallException;
-            var effective = options;
-            if (options.strategy == .filtered) {
-                // Filtered configuration from zlib: good 4, lazy 4, nice 16,
-                // chain 8; the search gives up sooner so literals dominate.
-                effective.good = @min(options.good, 4);
-                effective.lazy = @min(options.lazy, 4);
-                effective.nice = @min(options.nice, 16);
-                effective.chain = @min(options.chain, 8);
-            }
             var optimal: ?*OptimalScratch = null;
             if (options.optimal) {
                 const base = @intFromPtr(history.ptr) + config.history_size;
@@ -365,7 +357,7 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
             return .{
                 .writer = .{ .buffer = history[0..config.history_size], .vtable = &.{ .drain = drain, .flush = flush, .rebase = writerRebase } },
                 .downstream = downstream,
-                .options = effective,
+                .options = options,
                 .history = history[0..config.history_size],
                 .base = 0,
                 .end = 0,
@@ -796,8 +788,10 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
                 const found = c.search(pos, head_candidate);
                 current_length = found.length;
                 current_distance = found.distance;
-                // Too-far minimum match costs more than literals. Demote before lazy.
-                if (current_length == min_match and current_distance > too_far) {
+                // Short filtered matches and too-far minimum matches cost more than literals.
+                if ((c.options.strategy == .filtered and current_length >= min_match and current_length <= filtered_max_match) or
+                    (current_length == min_match and current_distance > too_far))
+                {
                     current_length = min_match - 1;
                     current_distance = 0;
                 }
@@ -945,11 +939,7 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
             for (0..dist_alphabet) |symbol| dynamic_bits += dist_freq[symbol] * dist_lengths[symbol];
             for (0..cl_alphabet) |symbol| dynamic_bits += cl_freq[symbol] * cl_lengths[symbol];
             const stored_bits = 3 + (8 - (c.bit_count + 3) % 8) % 8 + 32 + 8 * span;
-            // Strategy overrides: stored forces verbatim blocks; fixed
-            // excludes dynamic Huffman (stored still wins when smaller).
-            //
-            // Stored LEN is 16 bits; deflate64 spans can exceed it.
-            // Consecutive stored chunks stay byte-identical to a single block.
+            // Strategy overrides: stored forces verbatim blocks, fixed excludes dynamic Huffman; stored LEN is 16 bits, so long spans split.
             if (c.options.strategy == .stored or (stored_bits < fixed_bits and stored_bits < dynamic_bits)) {
                 var stored_off = c.block_start;
                 const stored_end = c.finalized;
@@ -1891,7 +1881,7 @@ test "deflate strategies roundtrip and shape blocks" {
         try std_testing.expectError(error.CallException, Compress.init(&sink, &history, .{ .good = 8, .nice = 128, .lazy = 16, .chain = 8, .optimal = true, .strategy = .rle }));
     }
 
-    // Filtered clamps the search profile and still round-trips: zlib's
+    // Filtered demotes short matches and still round-trips: zlib's
     // filtered data is mostly small values with weak correlation.
     {
         var history: [history_size]u8 = undefined;
@@ -1914,6 +1904,56 @@ test "deflate strategies roundtrip and shape blocks" {
         _ = inflater.reader.streamRemaining(&out) catch return error.DecompressStream;
         try std_testing.expectEqualSlices(u8, &payload, &decoded);
     }
+}
+
+test "deflate filtered demotes short matches and roundtrips" {
+    const std_testing = std.testing;
+    // Repeated four-byte tokens with a distinct trailing byte give the search
+    // length-four matches; zlib's Z_FILTERED discards those, default keeps them.
+    var input: [48 * 5]u8 = undefined;
+    for (0..48) |group| {
+        const at = group * 5;
+        input[at] = 'a';
+        input[at + 1] = 'b';
+        input[at + 2] = 'c';
+        input[at + 3] = 'd';
+        input[at + 4] = @intCast(group);
+    }
+
+    var default_history: [history_size]u8 = undefined;
+    var default_encoded: [encodedSizeBound(input.len) + 16]u8 = undefined;
+    var default_writer = std.Io.Writer.fixed(&default_encoded);
+    var default_compressor = try Compress.init(&default_writer, &default_history, .{ .good = 8, .nice = 128, .lazy = 16, .chain = 32, .strategy = .default });
+    var default_source = std.Io.Reader.fixed(&input);
+    _ = std.Io.Reader.streamRemaining(&default_source, &default_compressor.writer) catch return error.CompressStream;
+    try default_compressor.finish();
+
+    var filtered_history: [history_size]u8 = undefined;
+    var filtered_encoded: [encodedSizeBound(input.len) + 16]u8 = undefined;
+    var filtered_writer = std.Io.Writer.fixed(&filtered_encoded);
+    var filtered_compressor = try Compress.init(&filtered_writer, &filtered_history, .{ .good = 8, .nice = 128, .lazy = 16, .chain = 32, .strategy = .filtered });
+    // The strategy no longer rewrites the caller's search knobs.
+    try std_testing.expectEqual(@as(u16, 8), filtered_compressor.options.good);
+    try std_testing.expectEqual(@as(u16, 128), filtered_compressor.options.nice);
+    try std_testing.expectEqual(@as(u16, 16), filtered_compressor.options.lazy);
+    try std_testing.expectEqual(@as(u16, 32), filtered_compressor.options.chain);
+    var filtered_source = std.Io.Reader.fixed(&input);
+    _ = std.Io.Reader.streamRemaining(&filtered_source, &filtered_compressor.writer) catch return error.CompressStream;
+    try filtered_compressor.finish();
+
+    const default_bytes = default_encoded[0..default_writer.end];
+    const filtered_bytes = filtered_encoded[0..filtered_writer.end];
+    // Discarding the short matches changes the emitted stream.
+    try std_testing.expect(!std.mem.eql(u8, default_bytes, filtered_bytes));
+
+    // The filtered stream stays valid and decodes back to the input.
+    var decode_history: [history_size]u8 = undefined;
+    var source = std.Io.Reader.fixed(filtered_bytes);
+    var decoded: [input.len]u8 = undefined;
+    var dest_writer = std.Io.Writer.fixed(&decoded);
+    var inflater = Decompress.init(&source, &decode_history);
+    _ = inflater.reader.streamRemaining(&dest_writer) catch return error.DecompressStream;
+    try std_testing.expectEqualSlices(u8, &input, &decoded);
 }
 
 test "deflate optimal iterations improve or hold the parse cost" {

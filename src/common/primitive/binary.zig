@@ -32,18 +32,16 @@ pub const ReadCursor = struct {
         return std.mem.readInt(u32, &raw, .little);
     }
 
-    // A tenth byte would push the value past 64 bits: a resource limit,
-    // not malformed input.
+    // A tenth byte pushes past 64 bits: a resource limit, not malformed input; formats here cap varints at nine bytes.
     pub fn readUleb128(self: *ReadCursor) error{ DataException, ResourceException }!u64 {
         var decoded: u64 = 0;
         var shift: u6 = 0;
         while (true) {
             const next = try self.readU8();
             const low_bits: u64 = next & 0x7f;
-            if (shift == 63 and low_bits > 1) return error.ResourceException;
+            if (shift == 63) return error.ResourceException;
             decoded |= low_bits << shift;
             if ((next & 0x80) == 0) return decoded;
-            if (shift >= 57) return error.ResourceException;
             shift += 7;
         }
     }

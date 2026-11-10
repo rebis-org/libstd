@@ -46,6 +46,11 @@ pub const Options = struct {
     properties: Properties,
     unpack_size: ?u64 = null,
     marker_required: bool = false,
+    // With a known size, formats whose encoders may close the stream with an
+    // end-of-payload marker after the declared bytes (the alone format and
+    // 7-Zip; xz eopm_is_valid, 7-Zip checkEndMarkNow) accept the marker tail.
+    // LZMA2 chunks and strict size-only callers leave this false.
+    allow_eopm: bool = false,
     max_work: u64 = std.math.maxInt(u64),
     match_finder_depth: u32 = 32,
     lazy: bool = false,
@@ -86,10 +91,7 @@ const literal_probs_count = 0x300;
 // mid-stream; the shared carve is never reallocated.
 const max_literal_context_count = 1 << 4;
 
-// No copy fallback: 10 bits per byte covers converged cost plus
-// transient wrongness.
-//
-// The constant absorbs the cache byte, the flush, and the end marker.
+// No copy fallback: 10 bits per byte covers converged cost plus transient wrongness, absorbing cache byte, flush, and end marker.
 pub fn encodedSizeBound(input_len: usize) usize {
     return input_len +| (input_len / 4) +| 64;
 }
@@ -865,7 +867,7 @@ pub fn DecoderOf(comptime slice_input: bool) type {
             }
         }
 
-        pub fn decodeToOutput(self: *Self, output: ?[]u8, unpack_size: ?u64, marker_required: bool) Exception!void {
+        pub fn decodeToOutput(self: *Self, output: ?[]u8, unpack_size: ?u64, marker_required: bool, allow_eopm: bool) Exception!void {
             self.output_buffer = output;
             self.output_pos = 0;
             var remaining: ?u64 = unpack_size;
@@ -879,24 +881,38 @@ pub fn DecoderOf(comptime slice_input: bool) type {
                     if (remaining) |*remaining_count| {
                         if (remaining_count.* == 0) {
                             if (!marker_required) {
-                                // Size-only commit: the declared unpack size is
-                                // the authority; the coder's finish state adds no signal.
-                                try self.finishOutput();
-                                return;
+                                // Size-only streams finish the range coder exactly
+                                // at the boundary; xz rc_is_finished requires code
+                                // zero, rejecting a truncated tail.
+                                if (range_coder.isFinishedOk()) {
+                                    try self.finishOutput();
+                                    return;
+                                }
+                                // Reference (xz lzma_decoder.c, SEQ_IS_MATCH): with a
+                                // known size the stream may instead continue with an
+                                // end-of-payload marker. LZMA SDK encoders such as
+                                // mksquashfs declare the size and still write the
+                                // marker. Formats without the allowance (LZMA2
+                                // chunks, xz allow_eopm false) reject the tail here;
+                                // otherwise fall through and let the per-symbol
+                                // remaining checks reject anything but the marker.
+                                if (!allow_eopm) return error.DataException;
                             }
                         }
                     }
                     const position_state = self.total_pos & ((@as(u32, 1) << @intCast(self.properties.pb)) - 1);
                     const state2 = (self.state << num_pos_bits_max) + position_state;
                     if (range_coder.decodeBit(&self.is_match[state2]) == 0) {
+                        if (remaining) |*remaining_count| {
+                            // A literal past the declared size is corruption: xz
+                            // rejects the write at a full dictionary
+                            // (lzma_decoder.c epilogue), so the check must
+                            // precede the published byte.
+                            if (remaining_count.* == 0) return error.DataException;
+                        }
                         prev_byte = try self.decodeLiteral(&range_coder, prev_byte);
                         self.state = updateStateLiteral(self.state);
-                        if (remaining) |*remaining_count| {
-                            // With a marker required, a literal past the declared size is corruption, and
-                            // decrementing past zero would wrap the counter.
-                            if (remaining_count.* == 0) return error.DataException;
-                            remaining_count.* -= 1;
-                        }
+                        if (remaining) |*remaining_count| remaining_count.* -= 1;
                         continue;
                     }
                     // Assigned on both match branches, so `undefined` is safe.
@@ -911,7 +927,10 @@ pub fn DecoderOf(comptime slice_input: bool) type {
                         if (self.rep0 == 0xFFFFFFFF) {
                             if (range_coder.corrupted) return error.DataException;
                             if (!range_coder.isFinishedOk()) return error.DataException;
-                            if (marker_required and remaining != null and remaining.? != 0) return error.DataException;
+                            // An early marker leaves the declared size unmet, so xz reports corruption.
+                            if (remaining) |remaining_count| {
+                                if (remaining_count != 0) return error.DataException;
+                            }
                             try self.finishOutput();
                             return;
                         }
@@ -977,24 +996,38 @@ pub fn DecoderOf(comptime slice_input: bool) type {
                     if (remaining) |*remaining_count| {
                         if (remaining_count.* == 0) {
                             if (!marker_required) {
-                                // Size-only commit: the declared unpack size is
-                                // the authority; the coder's finish state adds no signal.
-                                try self.finishOutput();
-                                return;
+                                // Size-only streams finish the range coder exactly
+                                // at the boundary; xz rc_is_finished requires code
+                                // zero, rejecting a truncated tail.
+                                if (self.range_coder.isFinishedOk()) {
+                                    try self.finishOutput();
+                                    return;
+                                }
+                                // Reference (xz lzma_decoder.c, SEQ_IS_MATCH): with a
+                                // known size the stream may instead continue with an
+                                // end-of-payload marker. LZMA SDK encoders such as
+                                // mksquashfs declare the size and still write the
+                                // marker. Formats without the allowance (LZMA2
+                                // chunks, xz allow_eopm false) reject the tail here;
+                                // otherwise fall through and let the per-symbol
+                                // remaining checks reject anything but the marker.
+                                if (!allow_eopm) return error.DataException;
                             }
                         }
                     }
                     const position_state = self.total_pos & ((@as(u32, 1) << @intCast(self.properties.pb)) - 1);
                     const state2 = (self.state << num_pos_bits_max) + position_state;
                     if (try self.range_coder.decodeBit(&self.is_match[state2]) == 0) {
+                        if (remaining) |*remaining_count| {
+                            // A literal past the declared size is corruption: xz
+                            // rejects the write at a full dictionary
+                            // (lzma_decoder.c epilogue), so the check must
+                            // precede the published byte.
+                            if (remaining_count.* == 0) return error.DataException;
+                        }
                         prev_byte = try self.decodeLiteral(&self.range_coder, prev_byte);
                         self.state = updateStateLiteral(self.state);
-                        if (remaining) |*remaining_count| {
-                            // With a marker required, a literal past the declared size is corruption, and
-                            // decrementing past zero would wrap the counter.
-                            if (remaining_count.* == 0) return error.DataException;
-                            remaining_count.* -= 1;
-                        }
+                        if (remaining) |*remaining_count| remaining_count.* -= 1;
                         continue;
                     }
                     // Assigned on both match branches, so `undefined` is safe.
@@ -1009,7 +1042,10 @@ pub fn DecoderOf(comptime slice_input: bool) type {
                         if (self.rep0 == 0xFFFFFFFF) {
                             if (self.range_coder.corrupted) return error.DataException;
                             if (!self.range_coder.isFinishedOk()) return error.DataException;
-                            if (marker_required and remaining != null and remaining.? != 0) return error.DataException;
+                            // An early marker leaves the declared size unmet, so xz reports corruption.
+                            if (remaining) |remaining_count| {
+                                if (remaining_count != 0) return error.DataException;
+                            }
                             try self.finishOutput();
                             return;
                         }
@@ -1352,7 +1388,7 @@ pub fn decode(input: []const u8, output: []u8, scratch: []u8, options: Options) 
     // Output doubles as dictionary window, avoiding a separate copy.
     var decoder = try DecoderOf(true).initPropertiesInPlace(options.properties, output, scratch);
     try decoder.resetReaderSlice(input);
-    try decoder.decodeToOutput(null, options.unpack_size, options.marker_required);
+    try decoder.decodeToOutput(null, options.unpack_size, options.marker_required, options.allow_eopm);
     return std.math.cast(usize, decoder.decoded) orelse return error.ResourceException;
 }
 
@@ -1363,7 +1399,7 @@ pub fn decodeInPlace(input: []const u8, output: []u8, scratch: []u8, options: Op
     if (input.len + output.len > options.max_work) return error.ResourceException;
     var decoder = try DecoderOf(true).initPropertiesInPlace(options.properties, output, scratch);
     try decoder.resetReaderSlice(input);
-    try decoder.decodeToOutput(null, options.unpack_size, options.marker_required);
+    try decoder.decodeToOutput(null, options.unpack_size, options.marker_required, options.allow_eopm);
     return std.math.cast(usize, decoder.decoded) orelse return error.ResourceException;
 }
 
@@ -1374,11 +1410,12 @@ pub fn decodedSize(input: []const u8, scratch: []u8, options: Options) Exception
     if (input.len > options.max_work) return error.ResourceException;
     var decoder = try DecoderOf(true).initProperties(options.properties, scratch);
     try decoder.resetReaderSlice(input);
-    try decoder.decodeToOutput(null, options.unpack_size, options.marker_required);
+    try decoder.decodeToOutput(null, options.unpack_size, options.marker_required, options.allow_eopm);
     return decoder.output_pos;
 }
 
 pub fn decodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options: Options) Exception!void {
+    if (input.len > options.max_work) return error.ResourceException;
     try checkProperties(options.properties);
     var source = std.Io.Reader.fixed(input);
     try decodeStream(&source, writer, scratch, options);
@@ -1390,7 +1427,7 @@ pub fn decodeStream(reader: *std.Io.Reader, writer: *std.Io.Writer, scratch: []u
     if (scratch.len < needed) return error.CapacityException;
     var decoder = try Decoder.init(options.properties, reader, scratch);
     decoder.output_writer = writer;
-    try decoder.decodeToOutput(null, options.unpack_size, options.marker_required);
+    try decoder.decodeToOutput(null, options.unpack_size, options.marker_required, options.allow_eopm);
 }
 
 pub fn requiredSize(input: []const u8, scratch: []u8, options: Options) Exception!usize {
@@ -2672,4 +2709,112 @@ test "lzma short rep past declared size is a data error" {
     var output: [1]u8 = undefined;
     const options: Options = .{ .properties = properties, .unpack_size = 1, .marker_required = true };
     try std.testing.expectError(error.DataException, decode(crafted[0..dest.end], &output, scratch, options));
+}
+
+test "lzma eopm short declared size is a data error" {
+    const allocator = std.testing.allocator;
+    const properties = Properties{ .lc = 3, .lp = 0, .pb = 2, .dictionary_size = dictionary_min };
+    const scratch = try allocator.alloc(u8, @max(encodeWorkspaceSizeBt(properties), decodeWorkspaceSize(properties)));
+    defer allocator.free(scratch);
+    const input = "short payload";
+    const encoded = try allocator.alloc(u8, encodedSizeBound(input.len));
+    defer allocator.free(encoded);
+    const encoded_len = try encode(input, encoded, scratch, .{
+        .properties = properties,
+        .unpack_size = null,
+        .marker_required = true,
+    });
+    // A larger declared size makes the end marker corruption.
+    var output: [64]u8 = undefined;
+    @memset(&output, 0xA5);
+    try std.testing.expectError(error.DataException, decode(encoded[0..encoded_len], &output, scratch, .{
+        .properties = properties,
+        .unpack_size = output.len,
+        .marker_required = false,
+    }));
+    for (output[input.len..]) |byte| try std.testing.expectEqual(@as(u8, 0xA5), byte);
+}
+
+test "lzma decode writes only the declared prefix" {
+    const allocator = std.testing.allocator;
+    const properties = Properties{ .lc = 3, .lp = 0, .pb = 2, .dictionary_size = dictionary_min };
+    const scratch = try allocator.alloc(u8, @max(encodeWorkspaceSizeBt(properties), decodeWorkspaceSize(properties)));
+    defer allocator.free(scratch);
+    const input = "the decoded prefix is exactly this many bytes";
+    const encoded = try allocator.alloc(u8, encodedSizeBound(input.len));
+    defer allocator.free(encoded);
+    const encoded_len = try encode(input, encoded, scratch, .{
+        .properties = properties,
+        .unpack_size = input.len,
+        .marker_required = false,
+    });
+    var output: [128]u8 = undefined;
+    @memset(&output, 0xA5);
+    const produced = try decode(encoded[0..encoded_len], &output, scratch, .{
+        .properties = properties,
+        .unpack_size = input.len,
+        .marker_required = false,
+    });
+    try std.testing.expectEqual(@as(usize, input.len), produced);
+    try std.testing.expectEqualSlices(u8, input, output[0..produced]);
+    for (output[produced..]) |byte| try std.testing.expectEqual(@as(u8, 0xA5), byte);
+}
+
+test "lzma size boundary requires a finished coder or the marker allowance" {
+    const allocator = std.testing.allocator;
+    const properties = Properties{ .lc = 3, .lp = 0, .pb = 2, .dictionary_size = dictionary_min };
+    const scratch = try allocator.alloc(u8, @max(encodeWorkspaceSizeBt(properties), decodeWorkspaceSize(properties)));
+    defer allocator.free(scratch);
+    const input = "payload closed by an end marker";
+    const encoded = try allocator.alloc(u8, encodedSizeBound(input.len));
+    defer allocator.free(encoded);
+    // An end marker leaves range-coder bits pending after the last data byte.
+    const encoded_len = try encode(input, encoded, scratch, .{
+        .properties = properties,
+        .unpack_size = null,
+        .marker_required = true,
+    });
+    var output: [128]u8 = undefined;
+    // Reaching the declared size with no marker still requires code zero.
+    try std.testing.expectError(error.DataException, decode(encoded[0..encoded_len], &output, scratch, .{
+        .properties = properties,
+        .unpack_size = input.len,
+        .marker_required = false,
+    }));
+    // With the marker allowance the same stream closes on its marker
+    // (xz FINISHED_WITH_MARK path after SEQ_IS_MATCH).
+    const marker_tail = try decode(encoded[0..encoded_len], &output, scratch, .{
+        .properties = properties,
+        .unpack_size = input.len,
+        .marker_required = false,
+        .allow_eopm = true,
+    });
+    try std.testing.expectEqual(@as(usize, input.len), marker_tail);
+    try std.testing.expectEqualSlices(u8, input, output[0..marker_tail]);
+
+    // A clean size-only stream finishes at code zero across many symbols.
+    var large: [8192]u8 = undefined;
+    var rng: u64 = 0x9E3779B97F4A7C15;
+    for (&large) |*byte| {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        byte.* = @as(u8, @truncate(rng)) & 7;
+    }
+    const large_encoded = try allocator.alloc(u8, encodedSizeBound(large.len));
+    defer allocator.free(large_encoded);
+    const large_len = try encode(&large, large_encoded, scratch, .{
+        .properties = properties,
+        .unpack_size = large.len,
+        .marker_required = false,
+    });
+    const large_out = try allocator.alloc(u8, large.len);
+    defer allocator.free(large_out);
+    const produced = try decode(large_encoded[0..large_len], large_out, scratch, .{
+        .properties = properties,
+        .unpack_size = large.len,
+        .marker_required = false,
+    });
+    try std.testing.expectEqual(large.len, produced);
+    try std.testing.expectEqualSlices(u8, &large, large_out);
 }

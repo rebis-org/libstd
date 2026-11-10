@@ -89,7 +89,7 @@ pub fn requireDisjoint(first: ConstSpan, second: ConstSpan, context: []const u8)
     if (hasOverlap(@intFromPtr(first.ptr), first.len, @intFromPtr(second.ptr), second.len)) trap(.overlap, context);
 }
 
-test "span algebra reads, writes, and subs round trip" {
+test "span algebra reads writes and subs through shared storage" {
     var backing: [16]u8 = .{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
     const span: Span = .{ .ptr = &backing, .len = backing.len };
     try std.testing.expectEqual(@as(usize, 16), span.len);
@@ -97,15 +97,46 @@ test "span algebra reads, writes, and subs round trip" {
     span.write(5, &.{ 99, 98 });
     try std.testing.expectEqual(@as(u8, 99), backing[5]);
     try std.testing.expectEqual(@as(u8, 98), backing[6]);
+    // A subspan aliases the backing, so writes through it land there.
     const tail = span.sub(8, 8);
-    try std.testing.expectEqual(@as(usize, 8), tail.len);
-    try std.testing.expectEqual(@as(u8, 8), tail.bytes()[0]);
+    tail.write(0, &.{42});
+    try std.testing.expectEqual(@as(u8, 42), backing[8]);
+    try std.testing.expectEqualSlices(u8, backing[8..16], tail.bytes());
+    // Zero-length subs stay legal at both edges.
+    try std.testing.expectEqual(@as(usize, 0), span.sub(16, 0).len);
+    try std.testing.expectEqual(@as(usize, 0), span.sub(0, 0).len);
 }
 
-test "const span mirrors span reads" {
+test "const span mirrors span reads without any copy" {
     const backing = [_]u8{ 1, 2, 3 };
     const span: ConstSpan = .{ .ptr = &backing, .len = backing.len };
     try std.testing.expectEqual(@as(u8, 2), span.read(1, 1)[0]);
     const head = span.sub(0, 2);
     try std.testing.expectEqualSlices(u8, &.{ 1, 2 }, head.bytes());
+    // The view aliases the backing array, not a copy of it.
+    try std.testing.expectEqual(@as(usize, @intFromPtr(&backing[0])), @intFromPtr(head.ptr));
+    var mutable: [3]u8 = .{ 7, 8, 9 };
+    const viewed: ConstSpan = .{ .ptr = &mutable, .len = mutable.len };
+    mutable[1] = 0x5A;
+    try std.testing.expectEqual(@as(u8, 0x5A), viewed.read(1, 1)[0]);
+}
+
+test "span constructors reject null bases and oversized lengths" {
+    var storage: [4]u8 = .{ 9, 8, 7, 6 };
+    // Zero length never dereferences, so a null base is still accepted.
+    const empty = try mutSpan(null, 0);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+    const frozen_empty = try constSpan(null, 0);
+    try std.testing.expectEqual(@as(usize, 0), frozen_empty.len);
+    // A live base answers with its exact bytes.
+    const live = try mutSpan(&storage, storage.len);
+    try std.testing.expectEqualSlices(u8, &.{ 9, 8, 7, 6 }, live.bytes());
+    // Nonzero length demands a base.
+    try std.testing.expectError(error.CallException, mutSpan(null, 4));
+    try std.testing.expectError(error.CallException, constSpan(null, 4));
+    // A length beyond the address space can only exist on narrow targets.
+    if (comptime @sizeOf(usize) < @sizeOf(u64)) {
+        try std.testing.expectError(error.ResourceException, mutSpan(&storage, std.math.maxInt(u64)));
+        try std.testing.expectError(error.ResourceException, constSpan(&storage, std.math.maxInt(u64)));
+    }
 }

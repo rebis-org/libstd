@@ -5,19 +5,19 @@ const components = @import("components");
 pub const interface = @import("interface");
 const contract = @import("interface").contract;
 
+pub const lanes = @import("common/lanes.zig");
 // Session and driver composition primitives for caller-assembled work.
 pub const composition = @import("compose/composition.zig");
 pub const drivers = @import("compose/drivers.zig");
 pub const executor = @import("compose/executor.zig");
 pub const machines = @import("compose/machines.zig");
 pub const sessions = @import("compose/sessions.zig");
+pub const threaded = @import("compose/threaded.zig");
 
 pub const ProfileTag = components.ProfileTag;
 pub const Descriptor = contract.Descriptor;
 
-// The representation descriptors behind the namespaces below, read-only.
-// This is the same generated table the catalog document serves, so the
-// two cannot drift. The protocol fixtures stay out of the projection.
+// The generated table behind the namespaces, so it cannot drift from the catalog document; protocol fixtures stay out.
 
 pub const descriptors = blk: {
     @setEvalBranchQuota(50_000);
@@ -42,8 +42,7 @@ fn isProtocolFixture(comptime name: []const u8) bool {
         std.mem.eql(u8, name, "crypto");
 }
 
-// Format implementations by layer. Entries are the existing onprem modules;
-// nothing is re-wrapped, so every format keeps its own types and verbs.
+// Format implementations by layer: existing onprem modules, never re-wrapped, so each format keeps its own types and verbs.
 pub const leaf = struct {
     pub const bcj = @import("representation/leaf/bcj/onprem.zig");
     pub const bcj2 = @import("representation/leaf/bcj2/onprem.zig");
@@ -117,8 +116,7 @@ pub const seam = struct {
     pub const squashfs = @import("representation/volume/squashfs/seam.zig");
 };
 
-// The projection from a profile tag to its public namespace. Protocol
-// fixtures resolve to null: they stay outside the format namespace.
+// Profile tag to public namespace; protocol fixtures resolve to null, staying outside the format namespace.
 pub fn namespaceFor(comptime tag: components.ProfileTag) ?type {
     return switch (tag) {
         .age => grammar.age,
@@ -161,9 +159,7 @@ pub fn namespaceFor(comptime tag: components.ProfileTag) ?type {
 
 comptime {
     @setEvalBranchQuota(100_000);
-    // Every representation descriptor resolves to a public namespace. A new
-    // descriptor without an assembly entry, a renamed entry, or a stale one
-    // all fail compilation here or in the switch above.
+    // A new, renamed, or stale descriptor fails compilation here or in the switch above.
     for (components.descriptors) |descriptor| {
         if (isProtocolFixture(descriptor.name)) continue;
         const tag = components.tagForName(descriptor.name) orelse

@@ -1,1 +1,3 @@
-/* Empty shim: the JNI bridge never touches FILE, and zig ships no libc headers for the android target. */
+#ifndef STDK_JNI_STDIO_SHIM
+#define STDK_JNI_STDIO_SHIM
+#endif

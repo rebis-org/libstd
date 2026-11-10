@@ -219,7 +219,7 @@ fn addOracles(b: *std.Build, ctx: *common.Settings, refs: reference.Refs) void {
     addAbComparison(b, app.exe, skip_app.exe, ctx.generated.catalog);
 
     const compose_ab_module = b.createModule(.{
-        .root_source_file = b.path("src/compose_ab.zig"),
+        .root_source_file = b.path("src/compose.zig"),
         .target = modules.withKernelFeatures(ctx.target, ctx.kernel_isa),
         .optimize = ctx.optimize,
     });

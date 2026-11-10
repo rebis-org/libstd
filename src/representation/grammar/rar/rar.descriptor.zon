@@ -11,14 +11,15 @@
         .{ .name = "kdf_rounds_limit", .family = 1, .ordinal = 3, .representation = "scalar_words" },
         .{ .name = "password_lifetime", .family = 1, .ordinal = 4, .representation = "scalar_words" },
         .{ .name = "header_encode", .family = 15, .ordinal = 1, .representation = "scalar_words" },
+        // Write-side recovery redundancy in percent; the reference caps
+        // it at 1000 and refuses it with volumes or header encryption.
+        .{ .name = "recovery_percent", .family = 15, .ordinal = 2, .representation = "scalar_words" },
         .{ .name = "ordinal", .family = 2, .ordinal = 1, .representation = "scalar_words" },
         .{ .name = "entry_count", .family = 2, .ordinal = 2, .representation = "scalar_words" },
         .{ .name = "entry_size", .family = 2, .ordinal = 4, .representation = "scalar_words" },
     },
     .capabilities = .{ "read", "write", "size", "replay" },
-    // The RAR specification defines split sets on the read side for both
-    // families; the volume writer is the first-party RAR5 packer, so the
-    // write direction answers RAR5 sets and RAR4 stays read-only.
+    // The spec defines split reads for both families; the writer is first-party RAR5, so RAR4 stays read-only.
     .volumes = .{ "read", "write" },
     .sizing = "metadata_exact",
     .commit = "tentative",

@@ -654,7 +654,9 @@ fn layoutVolumes(
 ) Exception!void {
     const data_encryption = options.password.len != 0;
     var volume: usize = 0;
-    var used: usize = volumePrefixSize(0, options);
+    // Every volume closes with an end block inside its own budget, so the
+    // reservation rides the prefix from the first part on.
+    var used: usize = volumePrefixSize(0, options) + block_writer.endBlockSize(options.encrypt_headers);
     if (used > options.volume_size) return error.CallException;
     try onStep(ctx, .{ .volume = 0 });
     var stream_base: usize = 0;
@@ -676,10 +678,11 @@ fn layoutVolumes(
             if (!fits) {
                 // A fresh volume is the widest fit; if even its prefix plus
                 // this part overflows, no layout exists.
-                if (used == volumePrefixSize(volume, options)) return error.CallException;
+                const fresh_used = volumePrefixSize(volume, options) + block_writer.endBlockSize(options.encrypt_headers);
+                if (used == fresh_used) return error.CallException;
                 try onStep(ctx, .{ .end = true });
                 volume += 1;
-                used = volumePrefixSize(volume, options);
+                used = volumePrefixSize(volume, options) + block_writer.endBlockSize(options.encrypt_headers);
                 if (used > options.volume_size) return error.CallException;
                 try onStep(ctx, .{ .volume = volume });
                 continue;
@@ -701,7 +704,7 @@ fn layoutVolumes(
             // Stream remains, so this volume is done; open the next one.
             try onStep(ctx, .{ .end = true });
             volume += 1;
-            used = volumePrefixSize(volume, options);
+            used = volumePrefixSize(volume, options) + block_writer.endBlockSize(options.encrypt_headers);
             if (used > options.volume_size) return error.CallException;
             try onStep(ctx, .{ .volume = volume });
         }
@@ -1167,8 +1170,8 @@ test "created encrypted archives roundtrip through the facade reader" {
     }
 }
 
-// Test-only harnesses: the write side allocates the workspace and plan-sized
-// output; the decode side reuses one buffer set.
+// The write side needs plan-sized output, the decode side one reused buffer set,
+// so the two harnesses cannot share allocations.
 
 const VolumeTestWrite = struct {
     ws: WriteBuffers = .{
@@ -1337,6 +1340,46 @@ test "multi-volume archives round-trip through the volume reader" {
     try testing.expectEqual(@as(usize, 0), try rar.rarVolumeDecodeOrdinal(w.view, 2, &.{}, @constCast(&bufs), .{}));
 }
 
+test "volume plan and emit agree across entry and granularity shapes" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    // A stored entry larger than one volume, plus a compressed entry and a
+    // multi-entry corpus: the plan walk and the emit walk must agree byte
+    // for byte because the target opens at the plan's total.
+    var stored: [16384]u8 = undefined;
+    for (&stored, 0..) |*byte, i| byte.* = @truncate(i *% 31 +% (i >> 3));
+    var compressed_data: [600]u8 = undefined;
+    var seed: u32 = 0x9E3779B9;
+    for (&compressed_data) |*byte| {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        byte.* = @truncate(seed);
+    }
+    const corpora = [_][]const RarEntry{
+        &[_]RarEntry{.{ .name = "big.bin", .data = &stored, .method = 0 }},
+        &[_]RarEntry{.{ .name = "c.bin", .data = &compressed_data, .method = 3 }},
+        &[_]RarEntry{
+            .{ .name = "a.txt", .data = "hello rar5 stored", .method = 0 },
+            .{ .name = "b.bin", .data = &stored, .method = 0 },
+        },
+    };
+    const granularities = [_]usize{ 4096, 8192, 65536 };
+    for (corpora) |entries| {
+        for (granularities) |granularity| {
+            var w = try VolumeTestWrite.init(allocator, entries, .{ .volume_size = granularity });
+            defer w.deinit(allocator);
+            try testing.expectEqual(w.plan.count, w.written);
+            var total: usize = 0;
+            for (w.volume_slices) |slice| total += slice.len;
+            try testing.expectEqual(w.plan.total, total);
+            // Every volume holds its end block inside the declared budget,
+            // so a host sizing buffers at the granularity never overflows.
+            for (w.volume_slices) |slice| try testing.expect(slice.len <= granularity);
+        }
+    }
+}
+
 test "multi-volume inspect matches the single-volume shape" {
     const testing = std.testing;
     const allocator = testing.allocator;
@@ -1366,9 +1409,7 @@ test "multi-volume inspect matches the single-volume shape" {
     const second = try rar.rarVolumeInspectOrdinal(w.view, 1, 128, .{});
     try testing.expectEqualSlices(u8, "i2.bin", second.name);
     try testing.expectEqual(@as(u64, data2.len), second.size);
-    // Both failure classes mirror the single-volume inspect: an ordinal
-    // inside a set over the entry budget is a resource refusal, and an
-    // ordinal past the set is data.
+    // Both failure classes mirror the single-volume inspect: an ordinal over the entry budget is resource, past the set is data.
     try testing.expectError(error.ResourceException, rar.rarVolumeInspectOrdinal(w.view, 1, 1, .{}));
     try testing.expectError(error.DataException, rar.rarVolumeInspectOrdinal(w.view, 2, 128, .{}));
 }
@@ -1418,9 +1459,7 @@ test "multi-volume encrypted splits round-trip and reject wrong passwords" {
         };
         const bufs = d.buffers(&split_parts, &packed_stage);
         try testing.expectEqual(@as(usize, 2), try rar.rarVolumeCount(w.view, 128, decode_opts));
-        // The inspect answer carries the located entry's own name; -hp
-        // re-decrypts every header into the shared scratch, so a name held
-        // across later parses would come back as a later entry's.
+        // The inspect answer carries the located entry's name; -hp re-decrypts into shared scratch, so a held name goes stale.
         const inspected = try rar.rarVolumeInspectOrdinal(w.view, 0, 128, decode_opts);
         try testing.expectEqualSlices(u8, "e1.txt", inspected.name);
         const inspected1 = try rar.rarVolumeInspectOrdinal(w.view, 1, 128, decode_opts);

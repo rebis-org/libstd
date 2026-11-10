@@ -1,0 +1,69 @@
+---
+Checks: >
+  bugprone-*,
+  cert-*,
+  clang-analyzer-*,
+  clang-diagnostic-*,
+  concurrency-*,
+  cppcoreguidelines-*,
+  google-*,
+  llvm-*,
+  darwin-*,
+  misc-*,
+  modernize-*,
+  performance-*,
+  portability-*,
+  readability-*,
+  -llvm-header-guard,
+  -modernize-use-trailing-return-type
+
+WarningsAsErrors: '*'
+
+HeaderFilterRegex: 'build/(acceptance|templates)/.*'
+SystemHeaders: false
+
+FormatStyle: file
+
+CheckOptions:
+  misc-include-cleaner.IgnoreHeaders: 'jni_md\.h;jni\.h'
+  readability-identifier-naming.ClassCase: CamelCase
+  readability-identifier-naming.StructCase: CamelCase
+  readability-identifier-naming.UnionCase: CamelCase
+  readability-identifier-naming.EnumCase: CamelCase
+  readability-identifier-naming.EnumConstantCase: CamelCase
+  readability-identifier-naming.EnumConstantPrefix: 'k'
+  readability-identifier-naming.FunctionCase: lower_case
+  readability-identifier-naming.MethodCase: lower_case
+  readability-identifier-naming.VariableCase: lower_case
+  readability-identifier-naming.LocalVariableCase: lower_case
+  readability-identifier-naming.ParameterCase: lower_case
+  readability-identifier-naming.ClassMemberCase: lower_case
+  readability-identifier-naming.ClassMemberSuffix: '_'
+  readability-identifier-naming.MemberCase: lower_case
+  readability-identifier-naming.StaticVariableCase: lower_case
+  readability-identifier-naming.StaticVariableSuffix: '_'
+  readability-identifier-naming.GlobalVariableCase: lower_case
+  readability-identifier-naming.GlobalVariablePrefix: 'g_'
+  readability-identifier-naming.NamespaceCase: lower_case
+  readability-identifier-naming.MacroDefinitionCase: UPPER_CASE
+  readability-identifier-naming.TypedefCase: lower_case
+  readability-identifier-naming.TypeTemplateParameterCase: CamelCase
+  readability-identifier-naming.ValueTemplateParameterCase: CamelCase
+  readability-identifier-naming.TemplateTemplateParameterCase: CamelCase
+  readability-identifier-naming.ConstantCase: CamelCase
+  readability-identifier-naming.ConstantPrefix: 'k'
+  readability-identifier-naming.GlobalConstantCase: CamelCase
+  readability-identifier-naming.GlobalConstantPrefix: 'k'
+  readability-identifier-naming.StaticConstantCase: CamelCase
+  readability-identifier-naming.StaticConstantPrefix: 'k'
+
+  readability-function-size.LineThreshold: 120
+  readability-function-size.StatementThreshold: 80
+  readability-function-size.BranchThreshold: 20
+  readability-function-cognitive-complexity.Threshold: 25
+
+  readability-simplify-boolean-expr.ChainedConditionalReturn: false
+  readability-simplify-boolean-expr.ChainedConditionalAssignment: false
+
+  readability-redundant-member-init.IgnoreBaseInCopyConstructors: false
+  performance-move-const-arg.CheckTriviallyCopyableMove: true

@@ -2,10 +2,7 @@ const std = @import("std");
 
 const scalar = @import("../sha256/onprem.zig");
 
-// Multi-buffer SHA-256 in the ISA-L shape: N independent lanes advanced
-// together, one compress pass per call.
-// The portable arm streams each lane through the scalar core; hardware arms
-// interleave rounds at the compress site.
+// Multi-buffer SHA-256 in the ISA-L shape: N independent lanes advanced together, one compress pass per call.
 
 pub const lanes_max: usize = 8;
 
@@ -49,30 +46,50 @@ pub fn Sha256Mb(comptime lanes: usize) type {
     };
 }
 
-test "sha256_mb portable matches per-lane scalar digests" {
+test "sha256_mb keeps every lane independent across split feeds" {
     const testing = std.testing;
-    var rng = std.Random.DefaultPrng.init(0x51a256);
+    var rng = std.Random.DefaultPrng.init(0x51A256);
     const random = rng.random();
-    inline for ([_]usize{ 1, 2, 4, 8 }) |lanes| {
+    inline for (1..9) |lanes| {
         const Mb = Sha256Mb(lanes);
         var mb = Mb.init();
         var expected: [lanes][32]u8 = undefined;
         var messages: [lanes][1024]u8 = undefined;
         var lengths: [lanes]usize = undefined;
+        var cuts: [lanes]usize = undefined;
         for (0..lanes) |lane| {
             lengths[lane] = random.uintLessThan(usize, messages[lane].len + 1);
             random.bytes(messages[lane][0..lengths[lane]]);
             std.crypto.hash.sha2.Sha256.hash(messages[lane][0..lengths[lane]], &expected[lane], .{});
         }
-        // Split updates exercise the per-lane staging, not just whole messages.
+        // All first halves land before any second half, so shared staging
+        // between lanes would corrupt at least one digest.
         for (0..lanes) |lane| {
             const whole = messages[lane][0..lengths[lane]];
-            const cut = @min(whole.len, random.uintLessThan(usize, whole.len + 1));
-            mb.update(lane, whole[0..cut]);
-            mb.update(lane, whole[cut..]);
+            cuts[lane] = @min(whole.len, random.uintLessThan(usize, whole.len + 1));
+            mb.update(lane, whole[0..cuts[lane]]);
         }
         for (0..lanes) |lane| {
-            try testing.expectEqualSlices(u8, &expected[lane], &mb.finalResult(lane));
+            const whole = messages[lane][0..lengths[lane]];
+            mb.update(lane, whole[cuts[lane]..]);
+        }
+        // Both finalizers answer; odd lanes exercise the copying final.
+        for (0..lanes) |lane| {
+            if (lane % 2 == 0) {
+                try testing.expectEqualSlices(u8, &expected[lane], &mb.finalResult(lane));
+            } else {
+                var out: [32]u8 = undefined;
+                mb.final(lane, &out);
+                try testing.expectEqualSlices(u8, &expected[lane], &out);
+            }
         }
     }
+
+    // The wrapper still answers the published fips vector on any lane.
+    var pin = Sha256Mb(2).init();
+    pin.update(0, "abc");
+    try testing.expectEqualSlices(u8, &[_]u8{
+        0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
+        0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad,
+    }, &pin.finalResult(0));
 }

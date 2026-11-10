@@ -54,10 +54,7 @@ pub const RarInfo = struct {
     // replay from their group start.
     mtime: u64 = 0,
     solid: bool = false,
-    // The largest dictionary the entry's solid group needs, with the v29/36
-    // streaming floor already applied per member, so one window serves the
-    // whole replay; a predecessor may exceed this entry's own declaration.
-    // Equals the floored window_bytes outside a solid chain.
+    // The largest dictionary the entry's solid group needs, streaming floor already applied, so one window serves the whole replay.
     group_window_bytes: u64 = 0,
 };
 
@@ -806,12 +803,7 @@ fn rar5FileEntry(header: Rar5Block, ordinal: usize, packed_total: u64, crypt: ?C
     return entry;
 }
 
-// A locate-style context that already holds its answer ends the walk:
-// later headers cannot change that answer, and stopping keeps every view
-// the visit retained valid. An -hp header name is one such view - each
-// encrypted parse re-decrypts into the shared scratch, so a name stored
-// before later parses would read the wrong entry (unrar hands each header
-// its own allocation). Counting walks keep parsing to the last block.
+// A context holding its answer ends the walk; -hp parses re-decrypt shared scratch, so an early name would go stale.
 fn walkComplete(ctx: anytype) bool {
     const Ctx = @typeInfo(@TypeOf(ctx)).pointer.child;
     if (comptime !std.meta.hasFn(Ctx, "complete")) return false;
@@ -1076,9 +1068,7 @@ const Rar4HeaderCrypt = struct {
     keys: Rar4Keys = undefined,
 };
 
-// The entry's data-crypt record, shared by the single and volume walks:
-// LHD_PASSWORD with the versions 13, 15, and 20 refused, which use the
-// retired proprietary ciphers.
+// The entry's data-crypt record, shared by single and volume walks; versions 13, 15, and 20 use retired proprietary ciphers.
 fn rar4DataCrypt(file: Rar4File) Exception!?Crypt {
     if (file.header.flags & rar4_lhd_password == 0) return null;
     if (file.unpack_version != 29 and file.unpack_version != 36) return error.UnsupportedException;
@@ -1289,9 +1279,7 @@ const FindCtx = struct {
     last_group_start: usize = 0,
     group_max_window: u64 = 0,
 
-    // The walk ends once the target is held: entries past it cannot change
-    // the answer, and an -hp name the answer carries stays the one its own
-    // parse staged. Pub so the walk probe can see the declaration.
+    // The walk ends once the target is held; -hp names must stay the one their own parse staged.
     pub fn complete(self: *const FindCtx) bool {
         return self.found != null;
     }
@@ -1300,8 +1288,7 @@ const FindCtx = struct {
 fn findVisit(ctx: *FindCtx, entry: Entry) Exception!void {
     if (entry.is_directory) return;
     if (ctx.ordinal >= ctx.max_entries) return error.ResourceException;
-    // Entries past the target cannot affect its group; the ceiling still
-    // counts them, so the budget holds over the whole walk.
+    // Entries past the target cannot affect its group; the ceiling still counts them, so the budget holds.
     if (ctx.ordinal <= ctx.target) {
         if (!entry.solid) {
             ctx.last_group_start = ctx.ordinal;
@@ -1343,10 +1330,7 @@ const LocateCtx = struct {
     group_start: usize = 0,
 };
 
-// The replay window one entry needs. Vendor unrar floors the v29/36
-// dictionary at twice the max filter block so any unpacked size can stream
-// (unpack.cpp MinAllocSize); the group maximum inherits that floor so one
-// session window serves every member, not only the target.
+// Vendor unrar floors the v29/36 dictionary so any unpacked size can stream (MinAllocSize); the group maximum inherits that floor.
 fn replayWindowBytes(entry: Entry) u64 {
     if (entry.family == .rar4 and (entry.unpack_version == 29 or entry.unpack_version == 36))
         return @max(entry.info.window_bytes, unpack29_min_window);
@@ -1745,9 +1729,7 @@ fn walkRar5Volumes(
                         chain = null;
                         ordinal = try bounds.addUsize(ordinal, 1);
                         try visit(ctx, entry);
-                        // The part that completed this entry was already
-                        // bounds-checked by its parse, so stopping here
-                        // skips only volumes past the answer.
+                        // The completing part was already bounds-checked by its parse, so stopping skips only volumes past the answer.
                         if (walkComplete(ctx)) return;
                     }
                 },
@@ -1767,10 +1749,7 @@ fn walkRar5Volumes(
     return error.DataException;
 }
 
-// The legacy split chain's head identity. A continuation repeats its head's
-// name and coding fields; the split bits differ per part and stay out of
-// the comparison, and the unpacked size rides the head because unrar sizes
-// the destination from the first part's header (extract.cpp SetDestSize).
+// A continuation repeats its head's name and coding fields; the unpacked size rides the head, per unrar's SetDestSize.
 const Rar4VolumeChain = struct {
     name_hash: u32,
     name_len: usize,
@@ -1783,13 +1762,7 @@ const Rar4VolumeChain = struct {
     total_packed: usize = 0,
 };
 
-// Walk an ordered RAR4 volume set. The legacy format stores no volume
-// number and no per-volume end marker (unrar orders parts by file name),
-// so the set is the request order and the only in-archive identity is the
-// chain itself. Each part's header carries that part's packed size, and
-// the completing part's CRC covers the unpacked data: vendor MergeArchive
-// compares the packed hash only for parts still split after, so a final
-// part carries the file hash like a whole archive does.
+// Legacy volumes carry no number or end marker, so request order is the set; the final part's CRC covers data.
 fn walkRar4Volumes(
     volumes: []const []const u8,
     parts_scratch: []SplitPart,
@@ -1800,8 +1773,7 @@ fn walkRar4Volumes(
     if (volumes.len == 0) return error.DataException;
     var ordinal: usize = 0;
     var chain: ?Rar4VolumeChain = null;
-    // Hoisted across volumes so the repeated -hp main header pays the KDF
-    // once; the salt memo inside rejects a changed salt.
+    // Hoisted across volumes so the repeated -hp main header pays the KDF once; the salt memo rejects a changed salt.
     var header_crypt: ?Rar4HeaderCrypt = null;
     for (volumes, 0..) |archive, volume_index| {
         if (archive.len < rar4_signature.len or
@@ -1829,9 +1801,7 @@ fn walkRar4Volumes(
             switch (header.header_type) {
                 rar4_mark => {},
                 rar4_main => {
-                    // Every volume of a multi-part set carries MHD_VOLUME;
-                    // a lone archive without it is still a valid one-part
-                    // set. Encryption flags every volume or none.
+                    // Every multi-part volume carries MHD_VOLUME; a lone archive without it is still a valid one-part set.
                     if (header.flags & rar4_mhd_password != 0) {
                         const password = opts.password orelse return error.UnsupportedException;
                         if (header_crypt == null) {
@@ -1930,16 +1900,12 @@ fn walkRar4Volumes(
             cursor = data_end;
         }
         if (!seen_main) return error.DataException;
-        // A chain may continue past an EOF, which is the legacy format's
-        // only end-of-volume shape; the final volume must complete it.
+        // A chain may continue past an EOF, the legacy format's only end-of-volume shape; the final volume must complete it.
         if (volume_index + 1 == volumes.len and chain != null) return error.DataException;
     }
 }
 
-// Gather a split entry's parts; encrypted chains decrypt as one CBC
-// stream across parts (unrar extract.cpp). The entry's family routes the
-// part layout: the legacy set stores the same part shape with the crypt
-// stream continued across parts the same way.
+// Encrypted chains decrypt as one CBC stream across parts (unrar extract.cpp); the entry's family routes the part layout.
 fn volumeGather(
     entry: Entry,
     volumes: []const []const u8,
@@ -1952,9 +1918,7 @@ fn volumeGather(
     };
 }
 
-// The legacy gather: parts concatenate, and an encrypted chain continues
-// the KDF key's CBC stream across parts, each part a whole block multiple
-// (vendor rdwrfn.cpp aligns volume ends to CRYPT_BLOCK_SIZE).
+// Parts concatenate, and an encrypted chain continues the CBC stream across parts, each ending on a CRYPT_BLOCK_SIZE boundary.
 fn volumeGatherRar4(
     entry: Entry,
     volumes: []const []const u8,
@@ -2096,9 +2060,7 @@ const VolumeStoreCtx = struct {
     }
 };
 
-// Compressed replay of a volume set: parts are gathered at each entry's
-// own visit, before the scratch is reused. The session type follows the
-// target's family; the gather routes by entry family.
+// Parts are gathered at each entry's own visit, before the scratch is reused; the session type follows the target's family.
 fn VolumeReplayCtx(comptime Session: type) type {
     return struct {
         session: *Session,
@@ -2249,10 +2211,7 @@ pub fn rarVolumeCount(volumes: []const []const u8, max_entries: u64, opts: Decod
     return ctx.count;
 }
 
-// Inspect one entry of an ordered multi-volume set. The locate pass needs
-// no parts, and the ceiling and not-found classes mirror
-// rarInspectOrdinalOpts: a set with more readable entries than the budget
-// fails per entry, and an ordinal past the set is data, not resource.
+// The locate pass needs no parts; ceiling and not-found classes mirror rarInspectOrdinalOpts, with an ordinal past the set as data.
 pub fn rarVolumeInspectOrdinal(
     volumes: []const []const u8,
     ordinal: usize,
@@ -2790,9 +2749,7 @@ test "replay window floors the v29 dictionary and reports the group maximum" {
     entry.unpack_version = 50;
     try testing.expectEqual(@as(u64, 1 << 16), replayWindowBytes(entry));
 
-    // A solid pair where the predecessor declares a larger dictionary: both
-    // ordinals report the group maximum, which the replay window must cover.
-    // compression = solid bit | method 1 | window bits 3, then window bits 0.
+    // A solid pair where the predecessor declares a larger dictionary: both ordinals report the group maximum.
     var archive: [96]u8 = @splat(0);
     var body: [32]u8 = undefined;
     var at: usize = 0;
@@ -3150,9 +3107,7 @@ test "rar5 file crypt record keeps the pswcheck only on a valid csum" {
     try std.testing.expectEqual(@as(?[8]u8, null), damaged_entries.pswchecks[0]);
 }
 
-// RAR4 volume-set fixtures: a main head with chosen flags and a file head
-// with the fields a volume layout varies, both fully CRC-covered like a
-// real producer.
+// Volume-set fixtures: a main head with chosen flags and a file head with the fields a layout varies, both CRC-covered.
 fn rar4VolumeMainHead(out: []u8, flags: u16) []u8 {
     @memset(out[0..13], 0);
     out[2] = rar4_main;

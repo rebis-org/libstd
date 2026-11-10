@@ -15,10 +15,10 @@ extern "C" {
 STDAPI CreateObject(const GUID *clsid, const GUID *iid, void **outObject);
 }
 
-#define ARC_GUID(id)  \
-	{ 0x23170F69, \
-	  0x40C1,     \
-	  0x278A,     \
+#define ARC_GUID(id)                                                           \
+	{ 0x23170F69,                                                          \
+	  0x40C1,                                                              \
+	  0x278A,                                                              \
 	  { 0x10, 0x00, 0x00, 0x01, 0x10, (id), 0x00, 0x00 } }
 
 class CMemStream : public IInStream, public IOutStream, public CMyUnknownImp {
@@ -46,10 +46,12 @@ class CMemStream : public IInStream, public IOutStream, public CMyUnknownImp {
 		, writable_(writable)
 	{
 	}
+
 	size_t GetSize() const
 	{
 		return size_;
 	}
+
 	const Byte *GetBuffer() const
 	{
 		return writable_ ? (const Byte *)buffer_ : data_;
@@ -138,6 +140,7 @@ class CMemStream : public IInStream, public IOutStream, public CMyUnknownImp {
 		}
 		return S_OK;
 	}
+
 	Z7_COM7F_IMF(SetSize(UInt64 newSize)) Z7_override
 	{
 		if (!writable_) {
@@ -172,6 +175,7 @@ class CCallbackBase : public Interface, public CMyUnknownImp {
 	{
 		return S_OK;
 	}
+
 	Z7_COM7F_IMF(SetCompleted(const UInt64 *)) Z7_override
 	{
 		return S_OK;
@@ -191,14 +195,17 @@ class CExtractCallback Z7_final
 		: spec_(NULL)
 	{
 	}
+
 	UInt64 Written() const
 	{
 		return written_;
 	}
+
 	bool Ok() const
 	{
 		return ok_;
 	}
+
 	const Byte *Buffer() const
 	{
 		return spec_ != NULL ? spec_->GetBuffer() : NULL;
@@ -218,10 +225,12 @@ class CExtractCallback Z7_final
 		*outStream = streamPtr.Detach();
 		return S_OK;
 	}
+
 	Z7_COM7F_IMF(PrepareOperation(Int32)) Z7_override
 	{
 		return S_OK;
 	}
+
 	Z7_COM7F_IMF(SetOperationResult(Int32 operationResult)) Z7_override
 	{
 		ok_ = (operationResult ==
@@ -285,6 +294,7 @@ class CUpdateCallback Z7_final
 		*inStream = streamPtr.Detach();
 		return S_OK;
 	}
+
 	Z7_COM7F_IMF(SetOperationResult(Int32)) Z7_override
 	{
 		return S_OK;

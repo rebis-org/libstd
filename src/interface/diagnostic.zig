@@ -8,10 +8,7 @@ pub const has_libc: bool = switch (builtin.target.abi) {
     else => true,
 };
 
-// The std.debug default handler instantiates std.Io.Threaded, which fails to
-// compile for the Apple embedded targets (ziglang/zig#37061, unreleased).
-//
-// A raw stderr write keeps every diagnostic path off that handler.
+// std.debug's handler instantiates std.Io.Threaded, which fails to compile for Apple embedded targets; raw stderr writes stay off it.
 extern "kernel32" fn GetStdHandle(n_std_handle: c_ulong) callconv(.winapi) std.os.windows.HANDLE;
 extern "kernel32" fn WriteFile(
     file: std.os.windows.HANDLE,

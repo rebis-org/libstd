@@ -33,6 +33,7 @@ fn runRoundtrip(r: *Runner, profile_id: harness.Id) anyerror!void {
 pub fn runDeflate(r: *Runner) anyerror!void {
     try runRoundtrip(r, harness.ids.deflate);
     try steps.writeLimitReject(&steps.noParams, r);
+    try steps.workLimitReject(&steps.noParams, r);
 }
 
 pub fn runBrotli(r: *Runner) anyerror!void {
@@ -77,6 +78,7 @@ pub fn runGzip(r: *Runner) anyerror!void {
     try runRoundtrip(r, harness.ids.gzip);
     try steps.truncateReject(&steps.noParams, r);
     try steps.writeLimitReject(&steps.noParams, r);
+    try steps.workLimitReject(&steps.noParams, r);
     try steps.foreignTool(r);
 }
 
@@ -362,6 +364,223 @@ fn runBrotliReference(r: *Runner) anyerror!void {
     if (r.response.byte_length != 0) return error.OracleContentMismatch;
 }
 
+fn runLzo(r: *Runner) anyerror!void {
+    setupProfile(r, harness.ids.lzo);
+    try steps.roundtrip(&steps.noParams, r);
+}
+
+fn runZlib(r: *Runner) anyerror!void {
+    setupProfile(r, harness.ids.zlib);
+    try steps.roundtrip(&steps.noParams, r);
+    try steps.workLimitReject(&steps.noParams, r);
+    // Adler mismatch is an integrity failure, not silent corruption.
+    r.encoded[r.encoded_len - 1] ^= 0xff;
+    try harness.reject(r, harness.ids.read, &.{
+        harness.sourceSpan(r.encoded[0..r.encoded_len]),
+        harness.sinkSpan(r.output),
+    }, .{ .ctx = true }, abi.Status.integrity_failure, r.output);
+}
+
+fn runLz4(r: *Runner) anyerror!void {
+    setupProfile(r, harness.ids.lz4);
+    try steps.roundtrip(&steps.noParams, r);
+    // A source that reaches into the session workspace is rejected before
+    // the codec can treat its own scratch as input.
+    @memcpy(r.workspace[0..r.encoded_len], r.encoded[0..r.encoded_len]);
+    try harness.reject(r, harness.ids.read, &.{
+        harness.sourceSpan(r.workspace[0..r.encoded_len]),
+        harness.sinkSpan(r.output),
+    }, .{ .ctx = true }, abi.Status.invalid_call, r.output);
+    // Content-checksum mismatch is an integrity failure.
+    r.encoded[r.encoded_len - 1] ^= 0xff;
+    try harness.reject(r, harness.ids.read, &.{
+        harness.sourceSpan(r.encoded[0..r.encoded_len]),
+        harness.sinkSpan(r.output),
+    }, .{ .ctx = true }, abi.Status.integrity_failure, r.output);
+}
+
+fn runZstdSeekable(r: *Runner) anyerror!void {
+    setupProfile(r, harness.ids.zstd_seekable);
+    try steps.roundtrip(&steps.noParams, r);
+    // The seek table footer magic must be the file's last bytes.
+    r.encoded[r.encoded_len - 1] ^= 0xff;
+    try harness.reject(r, harness.ids.read, &.{
+        harness.sourceSpan(r.encoded[0..r.encoded_len]),
+        harness.sinkSpan(r.output),
+    }, .{ .ctx = true }, abi.Status.invalid_data, r.output);
+}
+
+const lzma2_invalid = [_]u8{0x03};
+const lzma_file_invalid = [_]u8{ 0x5d, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+var lzma_file_input: [48]u8 = undefined;
+
+fn dictParams(r: *Runner, out: *[steps.max_extra]harness.Node) usize {
+    out[0] = harness.lzmaDictionaryParam(r.lzma_dictionary);
+    return 1;
+}
+
+fn setupLzmaFamily(r: *Runner, profile_id: harness.Id, input: []const u8, invalid: []const u8) void {
+    harness.setup(r, profile_id, harness.mode_stream);
+    r.lzma_dictionary = 4096;
+    r.sink_accept = 3;
+    r.input = input;
+    r.invalid = invalid;
+    r.invalid_status = abi.Status.invalid_data;
+}
+
+fn runLzma2(r: *Runner) anyerror!void {
+    corpus.fillTiled(r.corpus_index, r.corpus_buffer[0..]);
+    setupLzmaFamily(r, harness.ids.lzma2, r.corpus_buffer[0..32], &lzma2_invalid);
+    try steps.roundtrip(&dictParams, r);
+}
+
+fn runLzmaFile(r: *Runner) anyerror!void {
+    corpus.fillTiled(r.corpus_index, &lzma_file_input);
+    setupLzmaFamily(r, harness.ids.lzma_file, &lzma_file_input, &lzma_file_invalid);
+    try steps.roundtrip(&dictParams, r);
+}
+
+var zdict_sample_data: [8 * 2048]u8 = undefined;
+
+fn runZdict(r: *Runner) anyerror!void {
+    harness.setup(r, harness.ids.zdict, harness.mode_stream);
+    // Deterministic sample corpus: shared sentence structure so the trained
+    // content is genuinely referenceable by later encodes.
+    const phrases = [_][]const u8{
+        "the quick brown fox jumps over the lazy dog and runs through the forest. ",
+        "pack my box with five dozen liquor jugs then seal the box with tape. ",
+        "how vexingly quick daft zebras jump over the lazy dogs in the meadow. ",
+    };
+    for (&zdict_sample_data, 0..) |*byte, i| {
+        const phrase = phrases[(i / 128) % phrases.len];
+        byte.* = phrase[i % phrase.len];
+    }
+    // Training without a sample size is an invalid call.
+    try harness.reject(r, harness.ids.write, &.{
+        harness.sourceSpan(&zdict_sample_data),
+        harness.sinkSpan(r.encoded),
+    }, .{ .ctx = true }, abi.Status.invalid_call, r.encoded);
+    const sample_size = 2048;
+    _ = harness.call(r, harness.ids.write, &.{
+        harness.paramScalar(harness.param_family_seekable, harness.zdict_sample_size, harness.cmd_query_write, sample_size),
+        harness.sourceSpan(&zdict_sample_data),
+        harness.sinkSpan(r.encoded),
+        harness.capabilityParam(r.caps_io),
+        harness.sizingModeParam(r.sizing),
+        harness.commitModeParam(r.commit_write),
+    }, .{});
+    try harness.requireStatus(r, abi.Status.ok);
+    const dictionary = r.encoded[0..@intCast(r.response.byte_length)];
+    const dictionary_header_size = 28; // Magic/id (8), huffman (2), 3 FSE tables (6), rep offsets (12).
+    if (dictionary.len <= dictionary_header_size or std.mem.readInt(u32, dictionary[0..4], .little) != 0xEC30A437) return error.DictionaryShapeInvalid;
+    // Reading the dictionary extracts its content (the window bytes).
+    var content_out: [8 * 2048]u8 = undefined;
+    _ = harness.call(r, harness.ids.read, &.{
+        harness.sourceSpan(dictionary),
+        harness.sinkSpan(&content_out),
+    }, .{ .ctx = true });
+    try harness.requireStatus(r, abi.Status.ok);
+    if (r.response.byte_length != dictionary.len - dictionary_header_size) return error.DictionaryShapeInvalid;
+    // An explicit cap serves a small dictionary from the same corpus.
+    _ = harness.call(r, harness.ids.write, &.{
+        harness.paramScalar(harness.param_family_seekable, harness.zdict_sample_size, harness.cmd_query_write, sample_size),
+        harness.paramScalar(harness.param_family_seekable, harness.zdict_dictionary_size, harness.cmd_query_write, 512),
+        harness.sourceSpan(&zdict_sample_data),
+        harness.sinkSpan(r.encoded),
+        harness.capabilityParam(r.caps_io),
+        harness.sizingModeParam(r.sizing),
+        harness.commitModeParam(r.commit_write),
+    }, .{});
+    try harness.requireStatus(r, abi.Status.ok);
+    if (r.response.byte_length > 512 or r.response.byte_length <= dictionary_header_size) return error.DictionaryShapeInvalid;
+}
+
+fn ppmdParams(r: *Runner, out: *[steps.max_extra]harness.Node) usize {
+    out[0] = harness.paramScalar(harness.param_family_ppmd, harness.ppmd_order, harness.cmds, 8);
+    out[1] = harness.paramScalar(harness.param_family_ppmd, harness.ppmd_memory, harness.cmds, 4 << 20);
+    out[2] = harness.paramScalar(harness.param_family_ppmd, harness.ppmd_unpack_size, harness.cmds, r.input.len);
+    return 3;
+}
+
+fn runPpmd(r: *Runner) anyerror!void {
+    setupProfile(r, harness.ids.ppmd);
+    // A ppmd stream carries no checksum, so corruption is undetectable; the roundtrip skips the framed codecs' invalid probe.
+    try steps.roundtripHead(&ppmdParams, r);
+    try steps.readCallbackSink(&ppmdParams, r);
+    try steps.capacitySmallSink(&ppmdParams, r);
+}
+
+fn bcjParams(r: *Runner, out: *[steps.max_extra]harness.Node) usize {
+    _ = r;
+    out[0] = harness.filterKindParam(0x0A);
+    return 1;
+}
+
+fn runBcj(r: *Runner) anyerror!void {
+    setupProfile(r, harness.ids.bcj);
+    // The descriptor declares encode and decode only; the lossless in-place filter hides corruption, so no invalid probe runs.
+    r.write_exact = false;
+    try steps.writeSpan(&bcjParams, r);
+    try steps.readSpan(&bcjParams, r);
+    try steps.writeCallbackSource(&bcjParams, r);
+    try steps.readCallbackSink(&bcjParams, r);
+    try steps.capacitySmallSink(&bcjParams, r);
+    // The scalar admits the input but not the doubled span; only the work limit answers.
+    var work_input: [128]u8 = undefined;
+    @memset(&work_input, 'A');
+    var work_sink: [256]u8 = undefined;
+    try harness.reject(r, harness.ids.write, &.{
+        harness.filterKindParam(0x0A),
+        harness.sourceSpan(&work_input),
+        harness.sinkSpan(&work_sink),
+        harness.resourceLimitParam(work_input.len),
+    }, .{ .ctx = true }, abi.Status.resource_limit, &work_sink);
+}
+
+fn deltaParams(r: *Runner, out: *[steps.max_extra]harness.Node) usize {
+    _ = r;
+    out[0] = harness.deltaDistanceParam(5);
+    return 1;
+}
+
+fn runDelta(r: *Runner) anyerror!void {
+    setupProfile(r, harness.ids.delta);
+    r.write_exact = false;
+    try steps.writeSpan(&deltaParams, r);
+    try steps.readSpan(&deltaParams, r);
+    try steps.writeCallbackSource(&deltaParams, r);
+    try steps.readCallbackSink(&deltaParams, r);
+    try steps.capacitySmallSink(&deltaParams, r);
+    var work_input: [128]u8 = undefined;
+    @memset(&work_input, 'A');
+    var work_sink: [256]u8 = undefined;
+    try harness.reject(r, harness.ids.write, &.{
+        harness.deltaDistanceParam(5),
+        harness.sourceSpan(&work_input),
+        harness.sinkSpan(&work_sink),
+        harness.resourceLimitParam(work_input.len),
+    }, .{ .ctx = true }, abi.Status.resource_limit, &work_sink);
+}
+
+fn runBcj2(r: *Runner) anyerror!void {
+    harness.setup(r, harness.ids.bcj2, harness.mode_stream);
+    // The aux streams and the output size are required; absence is misuse.
+    try harness.reject(r, harness.ids.read, &.{
+        harness.sourceSpan(r.corpus_buffer[0..16]),
+        harness.sinkSpan(r.encoded),
+    }, .{ .ctx = true }, abi.Status.invalid_call, r.encoded);
+    try harness.reject(r, harness.ids.read, &.{
+        harness.paramScalar(harness.param_family_filter, harness.bcj2_unpacked_size, harness.cmds, 16),
+        harness.sourceSpan(r.corpus_buffer[0..16]),
+        harness.sinkSpan(r.encoded),
+    }, .{ .ctx = true }, abi.Status.invalid_call, r.encoded);
+    // The descriptor declares decode only.
+    try harness.reject(r, harness.ids.write, &.{
+        harness.sourceSpan(r.corpus_buffer[0..16]),
+        harness.sinkSpan(r.encoded),
+    }, .{ .ctx = true }, abi.Status.unsupported, r.encoded);
+}
+
 pub const scenarios = harness.scenarios("transform", &.{
     .{ .label = "deflate roundtrip", .run = runDeflate, .workspace_size = 65536 + 4096, .output_size = 256, .encoded_size = 256 },
     .{ .label = "deflate optimal", .run = runDeflateOptimal, .workspace_size = 2 * 1024 * 1024, .output_size = 256, .encoded_size = 256 },
@@ -375,4 +594,15 @@ pub const scenarios = harness.scenarios("transform", &.{
     .{ .label = "gzip large", .run = runGzipLarge, .workspace_size = 65536 + 4096, .output_size = 64 * 1024, .encoded_size = 64 * 1024 + 4096 },
     .{ .label = "gzip oracle", .run = runGzipOracleFixture, .workspace_size = 65536 + 4096, .output_size = 64 * 1024, .encoded_size = 64 * 1024 + 4096 },
     .{ .label = "gzip single-pass", .run = runGzipSinglePass, .workspace_size = 65536 + 4096, .output_size = 64 * 1024, .encoded_size = 64 * 1024 + 4096 },
+    .{ .label = "lzo roundtrip", .run = runLzo, .workspace_size = 131072, .output_size = 256, .encoded_size = 256 },
+    .{ .label = "zlib roundtrip", .run = runZlib, .workspace_size = 8 * 1024 * 1024, .output_size = 256, .encoded_size = 256 },
+    .{ .label = "lz4 roundtrip", .run = runLz4, .workspace_size = 16 * 1024 * 1024, .output_size = 256, .encoded_size = 256 },
+    .{ .label = "zstd seekable roundtrip", .run = runZstdSeekable, .workspace_size = 16 * 1024 * 1024, .output_size = 256, .encoded_size = 256 },
+    .{ .label = "lzma2 roundtrip", .run = runLzma2, .workspace_size = 3670016, .output_size = 256, .encoded_size = 256 },
+    .{ .label = "lzma file roundtrip", .run = runLzmaFile, .workspace_size = 1310720, .output_size = 256, .encoded_size = 256 },
+    .{ .label = "zdict train", .run = runZdict, .workspace_size = 8 * 1024 * 1024, .output_size = 4096, .encoded_size = 24 * 1024 },
+    .{ .label = "ppmd roundtrip", .run = runPpmd, .workspace_size = 16 * 1024 * 1024, .output_size = 256, .encoded_size = 256 },
+    .{ .label = "bcj roundtrip", .run = runBcj, .workspace_size = 65536, .output_size = 256, .encoded_size = 256 },
+    .{ .label = "delta roundtrip", .run = runDelta, .workspace_size = 65536, .output_size = 256, .encoded_size = 256 },
+    .{ .label = "bcj2 rejects", .run = runBcj2, .workspace_size = 65536, .output_size = 256, .encoded_size = 256 },
 }, &.{});

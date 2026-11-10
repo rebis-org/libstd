@@ -1252,7 +1252,7 @@ const Model = struct {
             }
             if (count >= freq_sum2) return error.DataException;
             rc.decode(hi_cnt, freq_sum2 - hi_cnt);
-            esc.see.summ = @intCast(esc.see.summ + freq_sum);
+            esc.see.summ = @truncate(esc.see.summ + freq_sum);
             s = self.statsOf(mc);
             const s2 = s + mc.num_stats + 1;
             while (self.ref(s) != self.ref(s2)) {
@@ -1370,7 +1370,7 @@ const Model = struct {
                 if (i == 0) break;
             }
             var total = sum + esc.esc_freq;
-            esc.see.summ = @intCast(esc.see.summ + total);
+            esc.see.summ = @truncate(esc.see.summ + total);
             if (total > rc.range) total = rc.range;
             rc.encode(sum, total - sum, total);
             var scan = self.statsOf(mc);
@@ -1382,3 +1382,61 @@ const Model = struct {
         }
     }
 };
+
+test "see summ overflow wraps without panic during encode" {
+    const testing = std.testing;
+    const mem = 1 << 20;
+    const scratch = try testing.allocator.alloc(u8, decodeWorkspaceSize(mem));
+    defer testing.allocator.free(scratch);
+    const model = try Model.prepare(scratch, mem);
+    model.restart(6, restore_cut_off);
+    // Force See contexts to the u16 ceiling so the escape-loop sum must wrap,
+    // not panic, as the sibling's @truncate does.
+    for (0..24) |m| {
+        for (0..32) |k| model.tables.see[m][k].summ = 0xFFFF;
+    }
+    model.tables.dummy_see.summ = 0xFFFF;
+    var buffer: [1 << 16]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    var rc = RangeEncoder.init(&writer);
+    var state: u64 = 0x9E3779B97F4A7C15;
+    var input: [256]u8 = undefined;
+    for (&input) |*byte| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        byte.* = @truncate(state >> 24);
+    }
+    // Distinct symbols build higher-order contexts, driving the escape loop
+    // that adds a frequency sum to the seeded See.Summ. A pre-fix @intCast
+    // panicked here in safe builds; @truncate wraps.
+    for (input) |byte| try model.encodeSymbol(&rc, byte);
+    try model.encodeSymbol(&rc, -1);
+    try rc.flush();
+    try testing.expect(writer.end > 4);
+}
+
+test "see summ overflow roundtrips byte identical" {
+    const testing = std.testing;
+    const mem = 4 << 20;
+    const options = Options{ .order = 8, .mem_size = mem, .restore_method = restore_restart };
+    const scratch = try testing.allocator.alloc(u8, decodeWorkspaceSize(mem));
+    defer testing.allocator.free(scratch);
+    var input: [1 << 17]u8 = undefined;
+    var state: u64 = 0x9E3779B97F4A7C15;
+    for (&input) |*byte| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        byte.* = @truncate(state >> 24);
+    }
+    const bound = try requiredSize(&input, scratch, options);
+    const encoded = try testing.allocator.alloc(u8, bound);
+    defer testing.allocator.free(encoded);
+    const encoded_len = try encode(&input, encoded, scratch, options);
+    const output = try testing.allocator.alloc(u8, input.len);
+    defer testing.allocator.free(output);
+    const result = try decode(encoded[0..encoded_len], output, scratch, options);
+    try testing.expectEqual(input.len, result.decoded);
+    try testing.expectEqualSlices(u8, &input, output[0..result.decoded]);
+}

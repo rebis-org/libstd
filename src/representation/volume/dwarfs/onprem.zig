@@ -21,7 +21,12 @@ pub const EntryInfo = struct {
 // DwarFS v2 slice: one root directory of regular files.
 // Fidelity target is mkdwarfs output, verified with dwarfsck.
 
-pub const scratch_size: usize = 2 * 1024 * 1024;
+// Explicit traversal frames replace the directory walk's recursion. Reserve
+// their byte cost in the sizing query so workspace_required_capacity reflects
+// the fixed cap before work starts.
+const frame_stack_bytes: usize = 16 * 1024;
+
+pub const scratch_size: usize = 2 * 1024 * 1024 + frame_stack_bytes;
 
 const section_type_block: u16 = 0;
 const section_type_schema: u16 = 7;
@@ -97,7 +102,14 @@ fn parseSections(archive: []const u8, arena: std.mem.Allocator) Exception!Sectio
 fn sectionPayload(archive: []const u8, at: u64, len: u64, compression: u16, arena: std.mem.Allocator, history: []u8) Exception![]const u8 {
     const raw = try bounds.slice(archive, at, len);
     if (compression == compression_none) return raw;
-    const out = arena.alloc(u8, raw.len * 16 + (1 << 16)) catch return error.ResourceException;
+    // The 16x + 64 KiB bound is a deliberate decompression cap: a section
+    // header declares only the compressed length, and the read scratch is a
+    // fixed 2 MiB FBA. Sections that expand past it are a documented input
+    // limit, not a decode failure; the ratio is relative to compressed bytes.
+    const scaled = std.math.mul(u64, @as(u64, raw.len), 16) catch return error.ResourceException;
+    const bound = std.math.add(u64, scaled, 1 << 16) catch return error.ResourceException;
+    const size = std.math.cast(usize, bound) orelse return error.ResourceException;
+    const out = arena.alloc(u8, size) catch return error.ResourceException;
     var writer = std.Io.Writer.fixed(out);
     switch (compression) {
         compression_zstd => {
@@ -297,8 +309,7 @@ fn castUsize(v: u64) Exception!usize {
     return std.math.cast(usize, v) orelse error.DataException;
 }
 
-// Vector element positions multiply hostile distances by 8 and stride;
-// overflow must fail closed, not wrap into a wrong in-bounds read.
+// Vector element positions multiply hostile distances by 8 and stride; overflow must fail closed, not wrap into a wrong read.
 fn elementPos(dist: usize, index: usize, stride: usize) Exception!usize {
     const base = std.math.mul(usize, dist, 8) catch return error.DataException;
     const step = std.math.mul(usize, index, stride) catch return error.DataException;
@@ -684,26 +695,56 @@ fn dirEntryName(md: Metadata, entry_index: usize) Exception![]const u8 {
     return md.names_buffer[start..end];
 }
 
+// An explicit frame stack replaces the directory recursion. Each frame keeps
+// its own cursor, so a child is pushed and its whole subtree runs before the
+// parent resumes at e + 1, exactly as the recursive `continue` did.
+const DwarfsFrame = struct {
+    dir_index: usize,
+    cursor: usize,
+    end: usize,
+    depth: u32,
+};
+
 fn walkDwarfsDir(md: Metadata, store: *BlockStore, dir_index: usize, file_off: u32, target: Target, state: *WalkState, depth: u32) Exception!void {
-    if (depth > max_dir_depth) return error.DataException;
-    const start = md.directories[dir_index];
-    const end = md.directories[dir_index + 1];
-    if (end < start or end > md.dir_entries.len) return error.DataException;
     const found_ptr = switch (target) {
         .resolve => |res| res.found,
         .count => null,
     };
-    var e = start;
-    while (e < end) : (e += 1) {
+    var stack: [max_dir_depth + 2]DwarfsFrame = undefined;
+    var sp: usize = 0;
+    if (depth > max_dir_depth) return error.DataException;
+    const root_start: usize = md.directories[dir_index];
+    const root_end: usize = md.directories[dir_index + 1];
+    if (root_end < root_start or root_end > md.dir_entries.len) return error.DataException;
+    stack[sp] = .{ .dir_index = dir_index, .cursor = root_start, .end = root_end, .depth = depth };
+    sp = 1;
+    while (sp > 0) {
         if (found_ptr) |fp| {
             if (fp.*) return;
         }
+        const frame = &stack[sp - 1];
+        if (frame.cursor >= frame.end) {
+            // A non-root frame had state.push done by its parent on entry.
+            if (frame.depth > 0) state.pop(frame.depth - 1);
+            sp -= 1;
+            continue;
+        }
+        const e = frame.cursor;
         const entry = md.dir_entries[e];
         if (entry.inode_num < file_off) {
             if (@as(u64, entry.inode_num) + 1 >= md.directories.len) return error.DataException;
-            try state.push(try dirEntryName(md, e), depth);
-            try walkDwarfsDir(md, store, entry.inode_num, file_off, target, state, depth + 1);
-            state.pop(depth);
+            // push/pop bracket exactly the child subtree, as the call did.
+            try state.push(try dirEntryName(md, e), frame.depth);
+            const child_depth = frame.depth + 1;
+            if (child_depth > max_dir_depth) return error.DataException;
+            const child_dir: usize = entry.inode_num;
+            const child_start: usize = md.directories[child_dir];
+            const child_end: usize = md.directories[child_dir + 1];
+            if (child_end < child_start or child_end > md.dir_entries.len) return error.DataException;
+            // The recursive `continue` advanced e; resume at e + 1 on pop.
+            frame.cursor = e + 1;
+            stack[sp] = .{ .dir_index = child_dir, .cursor = child_start, .end = child_end, .depth = child_depth };
+            sp += 1;
             continue;
         }
         if (entry.inode_num >= md.inodes.len) return error.DataException;
@@ -747,6 +788,7 @@ fn walkDwarfsDir(md: Metadata, store: *BlockStore, dir_index: usize, file_off: u
             },
         }
         state.ordinal += 1;
+        frame.cursor = e + 1;
     }
 }
 
@@ -951,6 +993,7 @@ fn dwFindOrCreateDir(nodes: *std.ArrayList(DwNode), alloc: std.mem.Allocator, pa
         if (nodes.items[existing].kind != .dir) return error.CallException;
         return existing;
     }
+    if (nodes.items.len >= max_tree_nodes) return error.UnsupportedException;
     const idx: u32 = @intCast(nodes.items.len);
     nodes.append(alloc, .{ .kind = .dir, .name = name, .parent = parent }) catch return error.ResourceException;
     nodes.items[parent].child_count += 1;
@@ -981,6 +1024,7 @@ fn dwBuildNodes(nodes: *std.ArrayList(DwNode), alloc: std.mem.Allocator, entries
             if (nodes.items[existing].kind != .dir or entry.data.len != 0) return error.CallException;
             continue;
         }
+        if (nodes.items.len >= max_tree_nodes) return error.UnsupportedException;
         nodes.append(alloc, .{ .kind = .file, .name = comp, .parent = parent, .data = entry.data }) catch return error.ResourceException;
         nodes.items[parent].child_count += 1;
     }

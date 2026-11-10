@@ -19,11 +19,15 @@ pub fn decodeOptions(input: []const u8) Exception!lzma.Options {
     if (dictionary_size > lzma.dictionary_max) return error.UnsupportedException;
     const unpack_size = std.mem.readInt(u64, header[5..13], .little);
     // The lzma alone format marks an unknown size with the maximum u64 value, which requires the end marker.
+    // A declared size still allows a redundant end marker (xz alone_decoder.c
+    // sets ALLOW_EOPM unconditionally): mksquashfs and the LZMA SDK declare
+    // the size and write the marker anyway.
     const marker_required = unpack_size == std.math.maxInt(u64);
     return .{
         .properties = try lzma.Properties.decode(header[0], dictionary_size),
         .unpack_size = if (marker_required) null else unpack_size,
         .marker_required = marker_required,
+        .allow_eopm = !marker_required,
     };
 }
 
@@ -79,14 +83,25 @@ pub fn decodedSize(input: []const u8, scratch: []u8, provider: lzma_seam.Provide
     return lzma_seam.decodedSize(provider, input[header_size..], scratch, options);
 }
 
+// A declared size is the authority, so a short decode is corruption.
+fn guardDecodedCount(options: lzma.Options, produced: usize) Exception!void {
+    const declared = options.unpack_size orelse return;
+    const expected = std.math.cast(usize, declared) orelse return error.ResourceException;
+    if (produced != expected) return error.DataException;
+}
+
 pub fn decode(input: []const u8, output: []u8, scratch: []u8, provider: lzma_seam.Provider) Exception!usize {
     const options = try decodeOptions(input);
-    return lzma_seam.decode(provider, input[header_size..], output, scratch, options);
+    const produced = try lzma_seam.decode(provider, input[header_size..], output, scratch, options);
+    try guardDecodedCount(options, produced);
+    return produced;
 }
 
 pub fn decodeInPlace(input: []const u8, output: []u8, scratch: []u8, provider: lzma_seam.Provider) Exception!usize {
     const options = try decodeOptions(input);
-    return lzma_seam.decodeInPlace(provider, input[header_size..], output, scratch, options);
+    const produced = try lzma_seam.decodeInPlace(provider, input[header_size..], output, scratch, options);
+    try guardDecodedCount(options, produced);
+    return produced;
 }
 
 pub fn decodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, provider: lzma_seam.Provider) Exception!void {
@@ -158,4 +173,13 @@ test "inspect parses the lzma-alone header" {
     try std.testing.expect(!info.has_marker);
     try std.testing.expectEqual(default_dictionary, info.dictionary_size);
     try std.testing.expectEqual(@as(u8, 3), info.properties.lc);
+}
+
+test "decode count guard rejects a short decode" {
+    const properties: lzma.Properties = .{ .lc = 3, .lp = 0, .pb = 2, .dictionary_size = default_dictionary };
+    const declared: lzma.Options = .{ .properties = properties, .unpack_size = 32 };
+    try std.testing.expectError(error.DataException, guardDecodedCount(declared, 16));
+    try guardDecodedCount(declared, 32);
+    const marker: lzma.Options = .{ .properties = properties, .unpack_size = null };
+    try guardDecodedCount(marker, 7);
 }

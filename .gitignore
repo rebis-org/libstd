@@ -309,3 +309,6 @@ zig-pkg/
 !src/testing/
 .cache/
 tools/
+!.clang-tidy
+!.clang-format
+!.editorconfig

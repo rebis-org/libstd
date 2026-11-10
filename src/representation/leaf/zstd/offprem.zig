@@ -2,8 +2,16 @@ const std = @import("std");
 
 const onprem = @import("onprem.zig");
 
-// The stdlib's verify_checksum panics instead of verifying, so the arm leaves
-// checksums off; dictionaries are unsupported. Both pick onprem.
+// Accepted incompleteness of the Zig 0.17.0 stdlib zstd arm (seam.zig).
+// Checksums: setting Decompress.Options.verify_checksum=true panics at
+// Decompress.zig:373 as soon as any output byte is written, so it stays off.
+// With it off the decoder consumes a frame checksum but never compares it: a
+// frame with a wrong checksum is not detected. onprem is the verifying arm.
+// Dictionaries: Decompress.init has no dictionary parameter, and Frame.init
+// returns error.DictionaryIdFlagUnsupported for any dictID-bearing frame.
+// preflight rejects options.dictionary; dictID frames fail as DataException.
+// Neither gap is fixed here: enabling verification would panic, and the
+// stdlib offers no dictionary hook. This arm never claims a verified checksum.
 
 // The reader vtable folds decoder errors into ReadFailed; WriteFailed is the
 // sink rejecting bytes, an I/O fault.
@@ -83,7 +91,7 @@ test "offprem zstd decodes byte-identical to onprem across shapes" {
         const workspace = try alloc.alloc(u32, onprem.encoderWorkspaceU32Count(0, 1 << 26, frame_options));
         defer alloc.free(workspace);
         var sink = std.Io.Writer.fixed(compressed);
-        _ = onprem.encodeFrame(&sink, input[0..size], workspace, frame_options, 0) catch return error.TestUnexpectedResult;
+        _ = try onprem.encodeFrame(&sink, input[0..size], workspace, frame_options, 0);
         const frame_len = sink.end;
 
         var counter = measurement.Counter.init(null);
@@ -105,5 +113,55 @@ test "offprem zstd decodes byte-identical to onprem across shapes" {
         try std.testing.expectEqual(size, produced_on);
         try std.testing.expectEqualSlices(u8, input[0..size], offprem_out[0..produced_off]);
         try std.testing.expectEqualSlices(u8, onprem_out[0..produced_on], offprem_out[0..produced_off]);
+    }
+}
+
+test "offprem zstd limitations stay explicit" {
+    const alloc = std.testing.allocator;
+    const options = onprem.Options{ .window_size = 1 << 20 };
+    const history = try alloc.alloc(u8, @as(usize, options.window_size) + onprem.block_size_max + 16);
+    defer alloc.free(history);
+    // A dictionary option has no stdlib hook and is rejected up front.
+    {
+        var src = std.Io.Reader.fixed(&[_]u8{});
+        var out: [16]u8 = undefined;
+        var sink = std.Io.Writer.fixed(&out);
+        try std.testing.expectError(error.UnsupportedException, decodeStream(&src, &sink, history, .{ .window_size = options.window_size, .dictionary = "x" }));
+    }
+    // Frame.init rejects any dictID-bearing frame; it surfaces as DataException.
+    {
+        const frame = [_]u8{ 0x28, 0xb5, 0x2f, 0xfd, 0x21, 0x2a, 0x04, 0x21, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04 };
+        var src = std.Io.Reader.fixed(&frame);
+        var out: [16]u8 = undefined;
+        var sink = std.Io.Writer.fixed(&out);
+        try std.testing.expectError(error.DataException, decodeStream(&src, &sink, history, options));
+    }
+    // Recorded gap: this arm cannot verify checksums, so a corrupted one is
+    // accepted. onprem, the verifying arm, rejects the same frame.
+    {
+        var input: [256]u8 = undefined;
+        for (&input, 0..) |*byte, i| byte.* = 'a' + @as(u8, @intCast(i % 7));
+        const ws = try alloc.alloc(u32, onprem.encoderWorkspaceU32Count(0, 1 << 20, options));
+        defer alloc.free(ws);
+        const encoded = try alloc.alloc(u8, 1 << 16);
+        defer alloc.free(encoded);
+        var writer = std.Io.Writer.fixed(encoded);
+        const len = try onprem.encodeFrame(&writer, &input, ws, options, 0);
+        encoded[len - 1] ^= 0xFF;
+        {
+            var src = std.Io.Reader.fixed(encoded[0..len]);
+            const out = try alloc.alloc(u8, input.len + 16);
+            defer alloc.free(out);
+            var sink = std.Io.Writer.fixed(out);
+            const produced = try decodeStream(&src, &sink, history, options);
+            try std.testing.expectEqual(input.len, produced);
+        }
+        {
+            var src = std.Io.Reader.fixed(encoded[0..len]);
+            const out = try alloc.alloc(u8, input.len + 16);
+            defer alloc.free(out);
+            var sink = std.Io.Writer.fixed(out);
+            try std.testing.expectError(error.IntegrityException, onprem.decodeStream(&src, &sink, history, options));
+        }
     }
 }

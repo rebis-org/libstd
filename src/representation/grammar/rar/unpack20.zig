@@ -570,7 +570,12 @@ pub const Session = struct {
         st.written_size = 0;
         st.unpacked_size = unpacked_size;
 
-        if (unpacked_size == 0) return;
+        if (unpacked_size == 0) {
+            // A trailing table refresh belongs to the solid chain, not to
+            // the emitted bytes; consume it before yielding no output.
+            readLastTables(st);
+            return;
+        }
 
         const start_pos = st.window.write_pos;
 

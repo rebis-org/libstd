@@ -18,8 +18,11 @@ pub const Options = struct {
     // RFC 7932 large-window extension (vendor BROTLI_PARAM_LARGE_WINDOW):
     // decode accepts the reserved WBITS form; encode may emit past 2^24.
     large_window: bool = false,
-    // Raw LZ77 shared-dictionary prefix (vendor BrotliDecoderAttachDictionary):
-    // bytes are addressable history before the first stream position.
+    // Raw LZ77 shared-dictionary prefix (vendor BrotliDecoderAttachDictionary).
+    // Decode uses the vendor compound-dictionary distance bands, so vendor
+    // streams decode correctly.
+    // Residual: the encoder still emits prefix-model distances whose copies
+    // span into produced output; such streams are not vendor-decodable.
     custom_dictionary: ?[]const u8 = null,
     // Encode-side window cap in bytes; zero picks the smallest window that
     // covers the input (and dictionary), clamped by large_window.
@@ -960,11 +963,19 @@ fn decodeMetaBlock(
                 push_ring = true;
             }
         }
-        const max_backward = @min(window_size, (produced.* - stream_base) + dict.len);
-        if (distance > max_backward) {
+        const in_stream = produced.* - stream_base;
+        // Compound-dictionary bands (vendor decode.c 2195-2241): LZ77 history
+        // is capped at min(produced, window); the attached raw dictionary takes
+        // the band just above that cap, and the static dictionary starts after
+        // it. Folding the dictionary into the window cap instead misroutes
+        // distances once produced + dict.len exceeds the window.
+        const max_distance: usize = @min(@as(usize, window_size), in_stream);
+        const compound_limit: usize = max_distance + dict.len;
+        const distance_wide: usize = @intCast(distance);
+        if (distance_wide > compound_limit) {
             // RFC 8 static dictionary reference. Implicit dist0 before
             // four produced bytes lands here too (vendor decode.c 2202).
-            const dict_len = try copyDictionaryWord(output, produced, copy_len, distance, max_backward, p1, p2);
+            const dict_len = try copyDictionaryWord(output, produced, copy_len, distance, @intCast(compound_limit), p1, p2);
             if (pos + dict_len > mlen) return error.DataException;
             pos += dict_len;
             continue;
@@ -977,11 +988,10 @@ fn decodeMetaBlock(
         }
         if (pos + copy_len > mlen) return error.DataException;
         if (produced.* + copy_len > output.len) return error.CapacityException;
-        const in_stream = produced.* - stream_base;
-        if (distance > in_stream) {
+        if (distance_wide > max_distance) {
             // Dictionary-prefix match: the dictionary tail is emitted first,
             // so the remaining copy at the same distance stays within produced output.
-            const from_dict = distance - in_stream;
+            const from_dict = distance_wide - max_distance;
             const dict_part = @min(copy_len, from_dict);
             @memcpy(output[produced.*..][0..dict_part], dict[dict.len - from_dict ..][0..dict_part]);
             produced.* += dict_part;
@@ -2452,11 +2462,18 @@ pub const Incremental = struct {
                     self.cmd.phase = .dist_extra;
                 },
                 .dist_extra => {
-                    const max_backward = @min(self.window_size, self.stream_produced + self.dict.len);
-                    if (self.cmd.distance > max_backward) {
+                    const in_stream = self.stream_produced;
+                    // Compound-dictionary bands (vendor decode.c 2195-2241): LZ77
+                    // history is capped at min(produced, window); the attached
+                    // raw dictionary takes the band just above that cap, and the
+                    // static dictionary starts after it.
+                    const max_distance: usize = @min(@as(usize, self.window_size), in_stream);
+                    const compound_limit: usize = max_distance + self.dict.len;
+                    const distance_wide: usize = @intCast(self.cmd.distance);
+                    if (distance_wide > compound_limit) {
                         // Static dictionary reference: build and bound-check the
                         // word first (no input consumed), then emit with drain suspension.
-                        self.cmd.word_len = try self.buildDictionaryWord(self.cmd.copy_len, self.cmd.distance, max_backward);
+                        self.cmd.word_len = try self.buildDictionaryWord(self.cmd.copy_len, self.cmd.distance, @intCast(compound_limit));
                         if (self.mb_pos + self.cmd.word_len > self.mlen) return error.DataException;
                         self.cmd.word_off = 0;
                         self.cmd.phase = .word;
@@ -2468,10 +2485,10 @@ pub const Incremental = struct {
                             self.ring4[0] = self.cmd.distance;
                         }
                         if (self.mb_pos + self.cmd.copy_len > self.mlen) return error.DataException;
-                        const in_stream = self.stream_produced;
-                        if (self.cmd.distance > in_stream) {
-                            self.cmd.copy_from_dict = @min(self.cmd.copy_len, self.cmd.distance - in_stream);
-                            self.cmd.copy_dict_off = self.dict.len - (self.cmd.distance - in_stream);
+                        if (distance_wide > max_distance) {
+                            const from_dict = distance_wide - max_distance;
+                            self.cmd.copy_from_dict = @min(self.cmd.copy_len, from_dict);
+                            self.cmd.copy_dict_off = self.dict.len - from_dict;
                         } else {
                             self.cmd.copy_from_dict = 0;
                         }
@@ -2845,7 +2862,7 @@ fn writePrefixCode(bw: *BitWriter, lens: []u8, alphabet: usize) EncodeError!bool
     var cl_freq: [18]u32 = @splat(0);
     for (lens[0..alphabet]) |l| cl_freq[l] += 1;
     var cl_lens: [18]u8 = undefined;
-    huffman.limitedLengths(cl_freq[0..18], cl_lens[0..18], 5);
+    huffman.limitedLengths(&cl_freq, &cl_lens, 5);
     var cl_codes: [18]u16 = undefined;
     canonicalCodes(cl_lens[0..18], cl_codes[0..18]);
     try bw.writeBits(0, 2); // HSKIP 0.
@@ -2877,9 +2894,9 @@ fn encodeMetaBlock(bw: *BitWriter, src: []const u8, is_last: bool, ring: *[4]u32
         const lits = src[cmd.lit_start..][0..cmd.ins_len];
         for (lits) |b| lit_freq[b] += 1;
     }
-    huffman.limitedLengths(lit_freq[0..256], lit_lens[0..256], 15);
-    huffman.limitedLengths(icode_freq[0..704], icode_lens[0..704], 15);
-    huffman.limitedLengths(dcode_freq[0..140], dcode_lens[0..140], 15);
+    huffman.limitedLengths(&lit_freq, &lit_lens, 15);
+    huffman.limitedLengths(&icode_freq, &icode_lens, 15);
+    huffman.limitedLengths(&dcode_freq, &dcode_lens, 15);
     var lit_codes: [256]u16 = undefined;
     var icode_codes: [704]u16 = undefined;
     var dcode_codes: [140]u16 = undefined;
@@ -3029,9 +3046,10 @@ test "brotli decode rejects oversubscribed cl codes" {
 
 test "brotli encode mozilla corpus" {
     const allocator = std.testing.allocator;
-    // CI unit jobs without the benchmark cache lack the Silesia corpus.
+    // The corpus is benchmark-cache state; absence skips visibly rather
+    // than passing silently.
     const input = std.Io.Dir.cwd().readFileAlloc(std.testing.io, "zig-out/benchmark/corpus/mozilla", allocator, .limited(1 << 27)) catch |err| switch (err) {
-        error.FileNotFound => return,
+        error.FileNotFound => return error.SkipZigTest,
         else => return err,
     };
     defer allocator.free(input);
@@ -3539,4 +3557,53 @@ test "brotli large window distance code limit" {
         try std.testing.expectEqualSlices(u16, &want_syms, t.symbols[0..4]);
         try std.testing.expectEqual(@as(usize, 1), inc.sc.trees_used);
     }
+}
+
+test "brotli compound dictionary bands near the window bound" {
+    // Vendor brotli 1.2.1 stream (-w 10, -D raw dictionary): the reference
+    // encoder emits compound-dictionary distances in the band above
+    // min(produced, window). Folding the dictionary into the window cap
+    // instead misroutes those distances once produced + dict.len > window.
+    const dict =
+        "The quick brown fox jumps over the lazy dog. PACK number 0123456789 abcdefghij. The quick brown fox " ++
+        "jumps over the lazy dog. PACK number 0123456789 abcdefghij. The quick brown fox jumps over the lazy " ++
+        "dog. PACK number 0123456789 abcdefghij. The quick brown fox jumps over the lazy dog. PACK number 012";
+    const stream = [_]u8{ 0xa1, 0xb8, 0x2b, 0x40, 0x2f, 0x89, 0x95, 0xa5, 0x05, 0x13, 0x39, 0x71, 0x2b, 0x49, 0xd8, 0xbe, 0x83, 0x87, 0x6c, 0x7f, 0x92, 0x2b, 0xde, 0x53, 0xe0, 0x3e, 0x57, 0x0e, 0xeb, 0x28, 0xde, 0x3e, 0xfa, 0x02 };
+    var expected: [1400]u8 = undefined;
+    @memset(expected[0..900], 'X');
+    @memcpy(expected[900..950], dict[10..60]);
+    @memset(expected[950..1250], 'Y');
+    @memcpy(expected[1250..1310], dict[100..160]);
+    @memcpy(expected[1310..1370], dict[200..260]);
+    @memset(expected[1370..1400], 'Z');
+
+    const allocator = std.testing.allocator;
+    const scratch = try allocator.alloc(u8, decodeWorkspaceSize(.{}));
+    defer allocator.free(scratch);
+    const output = try allocator.alloc(u8, expected.len + 16);
+    defer allocator.free(output);
+    const n = try decode(&stream, output, scratch, .{ .custom_dictionary = dict });
+    try std.testing.expectEqual(expected.len, n);
+    try std.testing.expectEqualSlices(u8, &expected, output[0..n]);
+
+    // The incremental decoder shares the same band boundaries.
+    const inc_scratch = try allocator.alloc(u8, incrementalWorkspaceSize(.{}));
+    defer allocator.free(inc_scratch);
+    const inc_out = try allocator.alloc(u8, expected.len + 16);
+    defer allocator.free(inc_out);
+    var inc = try incrementalInit(inc_scratch, .{ .custom_dictionary = dict });
+    var fed: usize = 0;
+    var produced: usize = 0;
+    var guard: usize = 0;
+    while (true) {
+        const end = @min(fed + 3, stream.len);
+        const out_end = @min(produced + 5, inc_out.len);
+        const res = try inc.run(stream[fed..end], inc_out[produced..out_end], end == stream.len);
+        fed += res.consumed;
+        produced += res.produced;
+        guard += 1;
+        if (guard > 8 * (stream.len + expected.len) or res.status == .done) break;
+    }
+    try std.testing.expectEqual(expected.len, produced);
+    try std.testing.expectEqualSlices(u8, &expected, inc_out[0..produced]);
 }

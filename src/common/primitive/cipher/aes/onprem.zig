@@ -3,12 +3,7 @@ const std = @import("std");
 
 const options = @import("options");
 
-// FIPS-197.
-// AES-192 needs the classic word expansion because the vectorized schedule requires 16-byte key groups.
-//
-// OpenSSL, crypto/aes/asm.
-//
-// Mode-level batch pipelines (aesni-mb, vpaes, bsaes) belong to callers.
+// FIPS-197. AES-192 needs the classic word expansion; the vectorized schedule requires 16-byte key groups. OpenSSL crypto/aes/asm.
 
 pub const block_length = 16;
 
@@ -768,49 +763,62 @@ comptime {
     }
 }
 
-test "aes onprem matches the stdlib oracle" {
+test "aes onprem reproduces the fips 197 catalog in both directions" {
+    const testing = std.testing;
     const pt = [16]u8{ 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff };
     const key128 = [16]u8{ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f };
     const key192 = [24]u8{ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17 };
     const key256 = [32]u8{ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f };
-
-    const ours128 = Aes128.initEnc(key128);
-    var std128 = std.crypto.core.aes.Aes128.initEnc(key128);
+    const ct128 = [16]u8{ 0x69, 0xc4, 0xe0, 0xd8, 0x6a, 0x7b, 0x04, 0x30, 0xd8, 0xcd, 0xb7, 0x80, 0x70, 0xb4, 0xc5, 0x5a };
+    const ct192 = [16]u8{ 0xdd, 0xa9, 0x7c, 0xa4, 0x86, 0x4c, 0xdf, 0xe0, 0x6e, 0xaf, 0x70, 0xa0, 0xec, 0x0d, 0x71, 0x91 };
+    const ct256 = [16]u8{ 0x8e, 0xa2, 0xb7, 0xca, 0x51, 0x67, 0x45, 0xbf, 0xea, 0xfc, 0x49, 0x90, 0x4b, 0x49, 0x60, 0x89 };
     var out: [16]u8 = undefined;
-    var expected: [16]u8 = undefined;
-    ours128.encrypt(&out, &pt);
-    std128.encrypt(&expected, &pt);
-    try std.testing.expectEqualSlices(u8, &expected, &out);
-    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x69, 0xc4, 0xe0, 0xd8, 0x6a, 0x7b, 0x04, 0x30, 0xd8, 0xcd, 0xb7, 0x80, 0x70, 0xb4, 0xc5, 0x5a }, &out);
-    const dec128 = Aes128.initDec(key128);
     var back: [16]u8 = undefined;
-    dec128.decrypt(&back, &out);
-    try std.testing.expectEqualSlices(u8, &pt, &back);
+    var expected: [16]u8 = undefined;
 
-    const ours256 = Aes256.initEnc(key256);
-    var std256 = std.crypto.core.aes.Aes256.initEnc(key256);
-    ours256.encrypt(&out, &pt);
-    std256.encrypt(&expected, &pt);
-    try std.testing.expectEqualSlices(u8, &expected, &out);
-    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x8e, 0xa2, 0xb7, 0xca, 0x51, 0x67, 0x45, 0xbf, 0xea, 0xfc, 0x49, 0x90, 0x4b, 0x49, 0x60, 0x89 }, &out);
-    // Decrypting the FIPS-197 C.3 ciphertext pins the inverted schedule: the
-    // plaintext is the known answer.
-    const dec256 = Aes256.initDec(key256);
-    dec256.decrypt(&back, &out);
-    try std.testing.expectEqualSlices(u8, &pt, &back);
-    var std_back: [16]u8 = undefined;
-    std.crypto.core.aes.Aes256.initDec(key256).decrypt(&std_back, &out);
-    try std.testing.expectEqualSlices(u8, &std_back, &back);
+    // Every size pins the catalog answer, inverts it, and agrees with
+    // the stdlib schedule on the same key.
+    const enc128 = Aes128.initEnc(key128);
+    enc128.encrypt(&out, &pt);
+    try testing.expectEqualSlices(u8, &ct128, &out);
+    var std128 = std.crypto.core.aes.Aes128.initEnc(key128);
+    std128.encrypt(&expected, &pt);
+    try testing.expectEqualSlices(u8, &expected, &out);
+    const dec128 = Aes128.initDec(key128);
+    dec128.decrypt(&back, &ct128);
+    try testing.expectEqualSlices(u8, &pt, &back);
 
-    const ours192 = Aes192.initEnc(key192);
-    ours192.encrypt(&out, &pt);
-    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xdd, 0xa9, 0x7c, 0xa4, 0x86, 0x4c, 0xdf, 0xe0, 0x6e, 0xaf, 0x70, 0xa0, 0xec, 0x0d, 0x71, 0x91 }, &out);
+    const enc192 = Aes192.initEnc(key192);
+    enc192.encrypt(&out, &pt);
+    try testing.expectEqualSlices(u8, &ct192, &out);
+    // The stdlib ships no 192-bit core, so only the catalog pins this size.
     const dec192 = Aes192.initDec(key192);
-    dec192.decrypt(&back, &out);
-    try std.testing.expectEqualSlices(u8, &pt, &back);
+    dec192.decrypt(&back, &ct192);
+    try testing.expectEqualSlices(u8, &pt, &back);
+
+    const enc256 = Aes256.initEnc(key256);
+    enc256.encrypt(&out, &pt);
+    try testing.expectEqualSlices(u8, &ct256, &out);
+    var std256 = std.crypto.core.aes.Aes256.initEnc(key256);
+    std256.encrypt(&expected, &pt);
+    try testing.expectEqualSlices(u8, &expected, &out);
+    const dec256 = Aes256.initDec(key256);
+    dec256.decrypt(&back, &ct256);
+    try testing.expectEqualSlices(u8, &pt, &back);
+
+    // Appendix B pins a second 128-bit schedule beyond the ascending key.
+    const b_key = [16]u8{ 0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c };
+    const b_pt = [16]u8{ 0x32, 0x43, 0xf6, 0xa8, 0x88, 0x5a, 0x30, 0x8d, 0x31, 0x31, 0x98, 0xa2, 0xe0, 0x37, 0x07, 0x34 };
+    const b_ct = [16]u8{ 0x39, 0x25, 0x84, 0x1d, 0x02, 0xdc, 0x09, 0xfb, 0xdc, 0x11, 0x85, 0x97, 0x19, 0x6a, 0x0b, 0x32 };
+    const enc_b = Aes128.initEnc(b_key);
+    enc_b.encrypt(&out, &b_pt);
+    try testing.expectEqualSlices(u8, &b_ct, &out);
+    const dec_b = Aes128.initDec(b_key);
+    dec_b.decrypt(&back, &b_ct);
+    try testing.expectEqualSlices(u8, &b_pt, &back);
 }
 
-test "aesni block rounds match the software tables" {
+test "aesni rounds agree with the software tables" {
     if (comptime !has_aesni) return error.SkipZigTest;
     var rng = std.Random.DefaultPrng.init(0xAE51);
     var i: usize = 0;
@@ -858,12 +866,12 @@ fn expectScheduleAgreesWithWordExpansion() !void {
     }
 }
 
-test "aesni schedule matches the word expansion" {
+test "aesni schedule agrees with the word expansion" {
     if (comptime !has_aesni) return error.SkipZigTest;
     try expectScheduleAgreesWithWordExpansion();
 }
 
-test "arm schedule matches the word expansion" {
+test "arm schedule agrees with the word expansion" {
     if (comptime !has_arm8) return error.SkipZigTest;
     try expectScheduleAgreesWithWordExpansion();
 }
@@ -879,20 +887,23 @@ fn expectWide4Agrees(ctx: anytype, comptime single: []const u8, comptime wide: [
     try std.testing.expectEqualSlices(u8, &single_out, &wide_out);
 }
 
-test "wide4 agrees with the per-block rounds" {
+test "wide4 batches agree with the per-block rounds" {
     var rng = std.Random.DefaultPrng.init(0xAE57);
-    var src: [64]u8 = undefined;
-    var key128: [16]u8 = undefined;
-    var key192: [24]u8 = undefined;
-    var key256: [32]u8 = undefined;
-    rng.random().bytes(&src);
-    rng.random().bytes(&key128);
-    rng.random().bytes(&key192);
-    rng.random().bytes(&key256);
-    try expectWide4Agrees(Aes128.initEnc(key128), "encrypt", "encryptWide4", &src);
-    try expectWide4Agrees(Aes128.initDec(key128), "decrypt", "decryptWide4", &src);
-    try expectWide4Agrees(Aes192.initEnc(key192), "encrypt", "encryptWide4", &src);
-    try expectWide4Agrees(Aes192.initDec(key192), "decrypt", "decryptWide4", &src);
-    try expectWide4Agrees(Aes256.initEnc(key256), "encrypt", "encryptWide4", &src);
-    try expectWide4Agrees(Aes256.initDec(key256), "decrypt", "decryptWide4", &src);
+    var iteration: usize = 0;
+    while (iteration < 16) : (iteration += 1) {
+        var src: [64]u8 = undefined;
+        var key128: [16]u8 = undefined;
+        var key192: [24]u8 = undefined;
+        var key256: [32]u8 = undefined;
+        rng.random().bytes(&src);
+        rng.random().bytes(&key128);
+        rng.random().bytes(&key192);
+        rng.random().bytes(&key256);
+        try expectWide4Agrees(Aes128.initEnc(key128), "encrypt", "encryptWide4", &src);
+        try expectWide4Agrees(Aes128.initDec(key128), "decrypt", "decryptWide4", &src);
+        try expectWide4Agrees(Aes192.initEnc(key192), "encrypt", "encryptWide4", &src);
+        try expectWide4Agrees(Aes192.initDec(key192), "decrypt", "decryptWide4", &src);
+        try expectWide4Agrees(Aes256.initEnc(key256), "encrypt", "encryptWide4", &src);
+        try expectWide4Agrees(Aes256.initDec(key256), "decrypt", "decryptWide4", &src);
+    }
 }

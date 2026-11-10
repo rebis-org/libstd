@@ -106,7 +106,7 @@ jobs:
           path: |
             zig-out/benchmark/bin/pkgs
             zig-out/benchmark/corpus
-          key: benchmark-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-${{ hashFiles('build/acceptance/benchmark/command.zig', 'build/acceptance/benchmark/env.zig') }}
+          key: benchmark-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-${{ hashFiles('build/acceptance/benchmark/refs.zig', 'build/acceptance/benchmark/cmd.zig', 'build/acceptance/benchmark/binary.zig', 'build/acceptance/benchmark/env.zig') }}
           restore-keys: |
             benchmark-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}-
       - name: Materialize the corpus
@@ -194,9 +194,6 @@ jobs:
           esac
           zig build unit -Dprimitives_impl=${{ inputs.impl }} -Dportable=${{ inputs.portable }}
           zig build oracles -Dprimitives_impl=${{ inputs.impl }} -Dportable=${{ inputs.portable }} -Doptimize=safe
-          brew list --versions llvm >/dev/null 2>&1 || brew install llvm
-          llvm_bin="$(brew --prefix llvm)/bin"
-          export PATH="$llvm_bin:$PATH"
       - id: ubsan
         name: Restore the UBSan cache
         if: inputs.profile == 'suite' && inputs.sanitizer == 'ubsan'

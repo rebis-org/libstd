@@ -200,6 +200,26 @@ pub const Adler32 = struct {
     }
 };
 
-test "adler32 onprem matches the stdlib oracle" {
+test "adler32 onprem pins published checksums and tracks the stdlib oracle" {
+    const testing = std.testing;
+
+    // Published checksums pin absolute answers the oracle sweep cannot.
+    var empty = Adler32.init();
+    try testing.expectEqual(@as(u32, 1), empty.final());
+
+    var whole = Adler32.init();
+    whole.update("Wikipedia");
+    try testing.expectEqual(@as(u32, 0x11E60398), whole.final());
+
+    // A split feed proves buffered bytes rejoin the fold untouched.
+    var split = Adler32.init();
+    split.update("Wiki");
+    split.update("pedia");
+    try testing.expectEqual(@as(u32, 0x11E60398), split.final());
+
+    var digits = Adler32.init();
+    digits.update("123456789");
+    try testing.expectEqual(@as(u32, 0x091E01DE), digits.final());
+
     try seam.expectAgreement(Adler32.init(), std.hash.Adler32{}, 0xA012, false, "adler");
 }

@@ -15,6 +15,10 @@ pub const block_size_max: u32 = 4 * 1024 * 1024;
 pub const block_size_default: u32 = block_size_max;
 
 const magic: u32 = 0x184D2204;
+// Skippable-frame magic covers the sixteen values 0x184D2A50..0x184D2A5F;
+// the low nibble is user-defined, so the mask keeps only the shared prefix.
+const skippable_magic: u32 = 0x184D2A50;
+const skippable_magic_mask: u32 = 0xFFFFFFF0;
 // The pre-1.8 legacy format: magic (low nibble carried a version digit),
 // then independent raw LZ4 blocks, no header descriptor.
 const legacy_magic: u32 = 0x184C2102;
@@ -114,11 +118,22 @@ fn blockCompressBound(block_len: usize) usize {
 
 pub fn frameContentSize(input: []const u8) Exception!?u64 {
     if (input.len < 7) return error.DataException;
-    if (std.mem.readInt(u32, input[0..4], .little) != magic) return error.DataException;
-    const flags = input[4];
+    var start: usize = 0;
+    // Leading skippable frames carry no content; scan to the first data frame.
+    while (input.len - start >= 4) {
+        const magic_value = std.mem.readInt(u32, input[start..][0..4], .little);
+        if (!isSkippableMagic(magic_value)) break;
+        start += try skippableFrameSize(input[start..]);
+    }
+    // A stream of only skippable frames declares no content size.
+    if (start == input.len) return null;
+    const frame = input[start..];
+    if (frame.len < 7) return error.DataException;
+    if (std.mem.readInt(u32, frame[0..4], .little) != magic) return error.DataException;
+    const flags = frame[4];
     if (flags & flag_content_size == 0) return null;
-    if (input.len < 14) return error.DataException;
-    return std.mem.readInt(u64, input[6..14], .little);
+    if (frame.len < 14) return error.DataException;
+    return std.mem.readInt(u64, frame[6..14], .little);
 }
 
 pub fn decodedSize(input: []const u8, scratch: []u8, options: Options) Exception!usize {
@@ -193,102 +208,149 @@ fn readFrameDescriptor(input: []const u8, provider: checksum.Provider) Exception
     };
 }
 
+fn isSkippableMagic(value: u32) bool {
+    return (value & skippable_magic_mask) == skippable_magic;
+}
+
+fn isLegacyMagic(value: u32) bool {
+    return value >= legacy_magic and value <= legacy_magic + 7;
+}
+
+// A following frame magic ends a legacy frame; its four bytes belong to the
+// next frame and stay unconsumed.
+fn isFrameMagic(value: u32) bool {
+    return value == magic or isSkippableMagic(value) or isLegacyMagic(value);
+}
+
+// A skippable frame is an eight-byte header (magic plus user-data size) and
+// that many bytes of user data.
+fn skippableFrameSize(frame: []const u8) Exception!usize {
+    if (frame.len < 8) return error.DataException;
+    const user_size: usize = std.mem.readInt(u32, frame[4..8], .little);
+    if (user_size > frame.len - 8) return error.DataException;
+    return 8 + user_size;
+}
+
 // A span overrun answers insufficient_capacity: the adapter re-runs the
 // measured route, separating a too-small sink from a corrupt stream.
+// Frames concatenate: each iteration decodes one frame (skippable, legacy,
+// or modern) and leaves the cursor at the next frame magic.
 fn decodeBlocksInto(input: []const u8, output: []u8, options: Options) Exception!usize {
     if (input.len < 4) return error.DataException;
-    const magic_value = std.mem.readInt(u32, input[0..4], .little);
-    // The legacy frame format (pre-1.8): fixed magic, then independent LZ4
-    // blocks with no header fields, checksums, or block-size descriptor.
-    if (magic_value >= legacy_magic and magic_value <= legacy_magic + 7)
-        return decodeLegacyBlocksInto(input, output, options);
-    const header = try readFrameDescriptor(input, options.provider);
-    const flags = header.flags;
-    const max_block = header.max_block;
-    var offset = header.offset;
-    const content_size = header.content_size;
-    var content_hasher = checksum.XxHash32.bind(options.provider, 0);
+    var frame_start: usize = 0;
     var total: usize = 0;
-    while (true) {
-        if (input.len < offset + 4) return error.DataException;
-        const block_size_field = std.mem.readInt(u32, input[offset..][0..4], .little);
-        offset += 4;
-        if (block_size_field == 0) break;
-        const is_stored = (block_size_field & uncompressed_block) != 0;
-        const block_len: usize = @intCast(block_size_field & ~uncompressed_block);
-        if (input.len < offset + block_len) return error.DataException;
-        const block_data = input[offset .. offset + block_len];
-        offset += block_len;
-        if (flags & flag_block_checksum != 0) {
-            if (input.len < offset + 4) return error.DataException;
-            const stored_sum = std.mem.readInt(u32, input[offset..][0..4], .little);
-            if (stored_sum != checksum.xxh32With(options.provider, block_data)) return error.IntegrityException;
+    while (frame_start < input.len) {
+        const frame = input[frame_start..];
+        if (frame.len < 4) return error.DataException;
+        const magic_value = std.mem.readInt(u32, frame[0..4], .little);
+        if (isSkippableMagic(magic_value)) {
+            frame_start += try skippableFrameSize(frame);
+            continue;
+        }
+        // The pre-1.8 legacy format ends at a following frame magic or EOF.
+        if (isLegacyMagic(magic_value)) {
+            frame_start += try decodeLegacyFrameInto(frame, output, &total, input.len, options);
+            continue;
+        }
+        if (magic_value != magic) return error.DataException;
+        const header = try readFrameDescriptor(frame, options.provider);
+        const flags = header.flags;
+        const max_block = header.max_block;
+        const content_size = header.content_size;
+        // Concatenated frames are independent: matches stay within this frame.
+        const frame_base = total;
+        var content_hasher = checksum.XxHash32.bind(options.provider, 0);
+        var offset = header.offset;
+        while (true) {
+            if (frame.len < offset + 4) return error.DataException;
+            const block_size_field = std.mem.readInt(u32, frame[offset..][0..4], .little);
+            offset += 4;
+            if (block_size_field == 0) break;
+            const is_stored = (block_size_field & uncompressed_block) != 0;
+            const block_len: usize = @intCast(block_size_field & ~uncompressed_block);
+            if (frame.len < offset + block_len) return error.DataException;
+            const block_data = frame[offset .. offset + block_len];
+            offset += block_len;
+            if (flags & flag_block_checksum != 0) {
+                if (frame.len < offset + 4) return error.DataException;
+                const stored_sum = std.mem.readInt(u32, frame[offset..][0..4], .little);
+                if (stored_sum != checksum.xxh32With(options.provider, block_data)) return error.IntegrityException;
+                offset += 4;
+            }
+            const room = output.len - total;
+            const prefix_len = if (header.linked) @min(total - frame_base, window_size) else 0;
+            const prefix = output[total - prefix_len .. total];
+            if (is_stored) {
+                if (block_len > max_block) return error.DataException;
+                if (block_len > room) return error.CapacityException;
+                @memcpy(output[total..][0..block_len], block_data);
+                content_hasher.update(block_data);
+                total += block_len;
+            } else {
+                // The Block_Size field is bounded by Block_MaxSize whether the
+                // block is stored or compressed, as in the reference.
+                if (block_len > max_block) return error.DataException;
+                // Cap the output slice by the work budget so amplification stops at the ceiling.
+                const work_cap: usize = std.math.cast(usize, options.max_work) orelse std.math.maxInt(usize);
+                const spent = try bounds.addUsize(input.len, total);
+                if (spent > work_cap) return error.ResourceException;
+                const budget = @min(room, work_cap - spent);
+                const produced = decompressBlock(block_data, output[total..][0..budget], prefix) catch |err| {
+                    if (err == error.OutputTooSmall and budget < room) return error.ResourceException;
+                    return switch (err) {
+                        error.DataException => error.DataException,
+                        error.OutputTooSmall => error.CapacityException,
+                    };
+                };
+                content_hasher.update(output[total .. total + produced]);
+                total += produced;
+            }
+            if (try bounds.addUsize(input.len, total) > options.max_work) return error.ResourceException;
+        }
+        if (flags & flag_content_checksum != 0) {
+            if (frame.len < offset + 4) return error.DataException;
+            const stored_sum = std.mem.readInt(u32, frame[offset..][0..4], .little);
+            if (stored_sum != content_hasher.final({})) return error.IntegrityException;
             offset += 4;
         }
-        const room = output.len - total;
-        const prefix_len = if (header.linked) @min(total, window_size) else 0;
-        const prefix = output[total - prefix_len .. total];
-        if (is_stored) {
-            if (block_len > max_block) return error.DataException;
-            if (block_len > room) return error.CapacityException;
-            @memcpy(output[total..][0..block_len], block_data);
-            content_hasher.update(block_data);
-            total += block_len;
-        } else {
-            // The Block_Size field is bounded by Block_MaxSize whether the
-            // block is stored or compressed, as in the reference.
-            if (block_len > max_block) return error.DataException;
-            const produced = decompressBlock(block_data, output[total..], prefix) catch |err| return switch (err) {
-                error.DataException => error.DataException,
-                error.OutputTooSmall => error.CapacityException,
-            };
-            content_hasher.update(output[total .. total + produced]);
-            total += produced;
+        if (content_size) |expected| {
+            if (expected != total - frame_base) return error.IntegrityException;
         }
-        if (try bounds.addUsize(input.len, total) > options.max_work) return error.ResourceException;
-    }
-    if (flags & flag_content_checksum != 0) {
-        if (input.len < offset + 4) return error.DataException;
-        const stored_sum = std.mem.readInt(u32, input[offset..][0..4], .little);
-        if (stored_sum != content_hasher.final({})) return error.IntegrityException;
-        offset += 4;
-    }
-    if (offset != input.len) return error.DataException;
-    if (content_size) |expected| {
-        if (expected != total) return error.IntegrityException;
+        frame_start += offset;
     }
     return total;
 }
 
 // Pre-1.8 interop: raw blocks up to 8 MiB, no descriptor, no checksums,
-// fresh history per block. Decode-only.
-fn decodeLegacyBlocksInto(input: []const u8, output: []u8, options: Options) Exception!usize {
+// fresh history per block. Decode-only; returns consumed input bytes and
+// adds produced output to total.
+fn decodeLegacyFrameInto(frame: []const u8, output: []u8, total: *usize, input_work: usize, options: Options) Exception!usize {
     var offset: usize = 4;
-    var total: usize = 0;
     while (true) {
-        // Real legacy files end at the last block; fewer than four trailing
-        // bytes cannot start another one.
-        if (input.len < offset + 4) break;
-        const block_len: usize = std.mem.readInt(u32, input[offset..][0..4], .little);
+        // A following frame magic starts the next frame; its bytes stay
+        // unconsumed. Fewer than four trailing bytes end the frame at EOF.
+        if (frame.len < offset + 4) break;
+        const next = std.mem.readInt(u32, frame[offset..][0..4], .little);
+        if (isFrameMagic(next)) break;
         offset += 4;
-        if (block_len == 0) break;
+        if (next == 0) break; // Linux-kernel terminator.
+        const block_len: usize = next;
         if (block_len > blockCompressBound(legacy_block_size)) return error.DataException;
-        if (input.len < offset + block_len) return error.DataException;
-        const block_data = input[offset .. offset + block_len];
+        if (frame.len < offset + block_len) return error.DataException;
+        const block_data = frame[offset .. offset + block_len];
         offset += block_len;
-        const room = output.len - total;
+        const room = output.len - total.*;
         const cap = @min(room, legacy_block_size);
-        const produced = decompressBlock(block_data, output[total..][0..cap], &[_]u8{}) catch |err| return switch (err) {
+        const produced = decompressBlock(block_data, output[total.*..][0..cap], &[_]u8{}) catch |err| return switch (err) {
             error.DataException => error.DataException,
             // With full 8 MiB headroom an overrun breaks the format's
             // block-size limit; below it the output is merely short.
             error.OutputTooSmall => if (room >= legacy_block_size) error.DataException else error.CapacityException,
         };
-        total += produced;
-        if (try bounds.addUsize(input.len, total) > options.max_work) return error.ResourceException;
+        total.* += produced;
+        if (try bounds.addUsize(input_work, total.*) > options.max_work) return error.ResourceException;
     }
-    if (offset != input.len) return error.DataException;
-    return total;
+    return offset;
 }
 
 pub fn encodeToWriter(input: []const u8, output: *std.Io.Writer, scratch: []u8, options: Options) Exception!void {
@@ -346,75 +408,89 @@ pub fn decodeToWriter(input: []const u8, output: *std.Io.Writer, scratch: []u8, 
     _ = try decodeBlocks(input, output, scratch, options.provider, options.max_work);
 }
 
-// Modern frames only: this route lacks the 8 MiB legacy staging, so
-// callers use decode or decodeInPlace.
+// Modern and skippable frames only: this route lacks the 8 MiB legacy
+// staging, so legacy frames go through decode or decodeInPlace.
 fn decodeBlocks(input: []const u8, output: *std.Io.Writer, scratch: []u8, provider: checksum.Provider, max_work: u64) Exception!usize {
     if (scratch.len < decodeWorkspaceSize()) return error.CapacityException;
-    const header = try readFrameDescriptor(input, provider);
-    const flags = header.flags;
-    const max_block = header.max_block;
-    var offset = header.offset;
-    const content_size = header.content_size;
-    var content_hasher = checksum.XxHash32.bind(provider, 0);
-    const block_buffer = scratch[0..max_block];
-    const history = scratch[max_block..][0..window_size];
-    var history_len: usize = 0;
+    if (input.len < 4) return error.DataException;
+    var frame_start: usize = 0;
     var total: usize = 0;
-    while (true) {
-        if (input.len < offset + 4) return error.DataException;
-        const block_size_field = std.mem.readInt(u32, input[offset..][0..4], .little);
-        offset += 4;
-        if (block_size_field == 0) break;
-        const is_stored = (block_size_field & uncompressed_block) != 0;
-        const block_len: usize = @intCast(block_size_field & ~uncompressed_block);
-        if (input.len < offset + block_len) return error.DataException;
-        const block_data = input[offset .. offset + block_len];
-        offset += block_len;
-        if (flags & flag_block_checksum != 0) {
-            if (input.len < offset + 4) return error.DataException;
-            const stored_sum = std.mem.readInt(u32, input[offset..][0..4], .little);
-            if (stored_sum != checksum.xxh32With(provider, block_data)) return error.IntegrityException;
+    while (frame_start < input.len) {
+        const frame = input[frame_start..];
+        if (frame.len < 4) return error.DataException;
+        const magic_value = std.mem.readInt(u32, frame[0..4], .little);
+        if (isSkippableMagic(magic_value)) {
+            frame_start += try skippableFrameSize(frame);
+            continue;
+        }
+        if (magic_value != magic) return error.DataException;
+        const header = try readFrameDescriptor(frame, provider);
+        const flags = header.flags;
+        const max_block = header.max_block;
+        const content_size = header.content_size;
+        // Concatenated frames are independent: history resets each frame.
+        const frame_base = total;
+        var content_hasher = checksum.XxHash32.bind(provider, 0);
+        const block_buffer = scratch[0..max_block];
+        const history = scratch[max_block..][0..window_size];
+        var history_len: usize = 0;
+        var offset = header.offset;
+        while (true) {
+            if (frame.len < offset + 4) return error.DataException;
+            const block_size_field = std.mem.readInt(u32, frame[offset..][0..4], .little);
+            offset += 4;
+            if (block_size_field == 0) break;
+            const is_stored = (block_size_field & uncompressed_block) != 0;
+            const block_len: usize = @intCast(block_size_field & ~uncompressed_block);
+            if (frame.len < offset + block_len) return error.DataException;
+            const block_data = frame[offset .. offset + block_len];
+            offset += block_len;
+            if (flags & flag_block_checksum != 0) {
+                if (frame.len < offset + 4) return error.DataException;
+                const stored_sum = std.mem.readInt(u32, frame[offset..][0..4], .little);
+                if (stored_sum != checksum.xxh32With(provider, block_data)) return error.IntegrityException;
+                offset += 4;
+            }
+            const produced: usize = blk: {
+                if (is_stored) {
+                    if (block_len > max_block) return error.DataException;
+                    output.writeAll(block_data) catch return error.IoException;
+                    content_hasher.update(block_data);
+                    break :blk block_len;
+                }
+                // The Block_Size field is bounded by Block_MaxSize whether the
+                // block is stored or compressed, as in the reference.
+                if (block_len > max_block) return error.DataException;
+                const decoded = decompressBlock(block_data, block_buffer, history[0..history_len]) catch return error.DataException;
+                output.writeAll(block_buffer[0..decoded]) catch return error.IoException;
+                content_hasher.update(block_buffer[0..decoded]);
+                break :blk decoded;
+            };
+            total = try bounds.addUsize(total, produced);
+            if (try bounds.addUsize(input.len, total) > max_work) return error.ResourceException;
+            if (header.linked) {
+                const produced_bytes = if (is_stored) block_data else block_buffer[0..produced];
+                if (produced_bytes.len >= window_size) {
+                    @memcpy(history, produced_bytes[produced_bytes.len - window_size ..][0..window_size]);
+                    history_len = window_size;
+                } else {
+                    const keep = @min(history_len, window_size - produced_bytes.len);
+                    std.mem.copyForwards(u8, history[0..keep], history[history_len - keep ..][0..keep]);
+                    @memcpy(history[keep..][0..produced_bytes.len], produced_bytes);
+                    history_len = keep + produced_bytes.len;
+                }
+            }
+        }
+        if (flags & flag_content_checksum != 0) {
+            if (frame.len < offset + 4) return error.DataException;
+            const stored_sum = std.mem.readInt(u32, frame[offset..][0..4], .little);
+            if (stored_sum != content_hasher.final({})) return error.IntegrityException;
             offset += 4;
         }
-        const produced: usize = blk: {
-            if (is_stored) {
-                if (block_len > max_block) return error.DataException;
-                output.writeAll(block_data) catch return error.IoException;
-                content_hasher.update(block_data);
-                break :blk block_len;
-            }
-            // The Block_Size field is bounded by Block_MaxSize whether the
-            // block is stored or compressed, as in the reference.
-            if (block_len > max_block) return error.DataException;
-            const decoded = decompressBlock(block_data, block_buffer, history[0..history_len]) catch return error.DataException;
-            output.writeAll(block_buffer[0..decoded]) catch return error.IoException;
-            content_hasher.update(block_buffer[0..decoded]);
-            break :blk decoded;
-        };
-        total = try bounds.addUsize(total, produced);
-        if (try bounds.addUsize(input.len, total) > max_work) return error.ResourceException;
-        if (header.linked) {
-            const produced_bytes = if (is_stored) block_data else block_buffer[0..produced];
-            if (produced_bytes.len >= window_size) {
-                @memcpy(history, produced_bytes[produced_bytes.len - window_size ..][0..window_size]);
-                history_len = window_size;
-            } else {
-                const keep = @min(history_len, window_size - produced_bytes.len);
-                std.mem.copyForwards(u8, history[0..keep], history[history_len - keep ..][0..keep]);
-                @memcpy(history[keep..][0..produced_bytes.len], produced_bytes);
-                history_len = keep + produced_bytes.len;
-            }
+        if (content_size) |expected| {
+            if (expected != total - frame_base) return error.IntegrityException;
         }
-    }
-    if (flags & flag_content_checksum != 0) {
-        if (input.len < offset + 4) return error.DataException;
-        const stored_sum = std.mem.readInt(u32, input[offset..][0..4], .little);
-        if (stored_sum != content_hasher.final({})) return error.IntegrityException;
-        offset += 4;
-    }
-    if (offset != input.len) return error.DataException;
-    if (content_size) |expected| {
-        if (expected != total) return error.IntegrityException;
+        frame_start += offset;
     }
     return total;
 }
@@ -423,11 +499,7 @@ fn hash4(value: u32) usize {
     return (value *% hash_prime) >> @intCast(32 - hash_log);
 }
 
-// Mirrors LZ4_compress_generic_validated: the carried hash prevents a
-// self-match; the reference never emits offset 0.
-//
-// Exposed for the session boundary's stepped encode: compresses one
-// independent block; the caller owns the framing.
+// Mirrors LZ4_compress_generic_validated: the carried hash prevents a self-match, and the reference never emits offset 0.
 pub fn compressBlock(input: []const u8, output: []u8, hash_table: []u32, acceleration: u32) usize {
     @memset(hash_table, 0);
     var op: usize = 0;
@@ -577,7 +649,8 @@ fn hcSearch(input: []const u8, head: []u32, chain: []u32, ip: usize, attempts: *
         candidate = chain[index & hc_mask];
         if (index + distance_max < ip) break;
         if (std.mem.readInt(u32, input[index..][0..4], .little) != needle) continue;
-        const extra = kernels.matchLen8(input, index + min_match, ip + min_match, match_limit - ip);
+        // Subtract min_match so the match ends at match_limit and leaves five trailing literals.
+        const extra = kernels.matchLen8(input, index + min_match, ip + min_match, match_limit - ip - min_match);
         if (min_match + extra > best.match_len) {
             best = .{ .match_index = index, .match_len = min_match + extra };
             if (ip + best.match_len >= match_limit) break;
@@ -626,10 +699,7 @@ fn emitLastLiterals(literals: []const u8, output: []u8, op_start: usize) usize {
     return op + lit_len;
 }
 
-// The prefix is up to 64 KiB of decoded history; matches may reach
-// into it when the frame links blocks.
-//
-// Exposed for the session boundary's stepped decode.
+// The prefix is up to 64 KiB of decoded history; matches may reach into it when the frame links blocks.
 pub fn decompressBlock(input: []const u8, output: []u8, prefix: []const u8) error{ DataException, OutputTooSmall }!usize {
     var ip: usize = 0;
     var op: usize = 0;
@@ -704,11 +774,13 @@ pub fn decompressBlock(input: []const u8, output: []u8, prefix: []const u8) erro
             }
         }
         op += match_len;
+        // The last five bytes of a block must stay literals.
+        if (output.len - op < last_literals) return error.DataException;
     }
     return op;
 }
 
-test "lz4 block roundtrip repetitive" {
+test "lz4 greedy roundtrip compresses periodic data across a full block" {
     var prng = std.Random.DefaultPrng.init(0x1234);
     const random = prng.random();
     const input = try std.testing.allocator.alloc(u8, 300000);
@@ -718,10 +790,10 @@ test "lz4 block roundtrip repetitive" {
     }
     const scratch = try std.testing.allocator.alloc(u8, @max(encodeWorkspaceSize(), decodeWorkspaceSize()));
     defer std.testing.allocator.free(scratch);
-    const bound = encodedSizeBound(input.len);
-    const encoded = try std.testing.allocator.alloc(u8, bound);
+    const encoded = try std.testing.allocator.alloc(u8, encodedSizeBound(input.len));
     defer std.testing.allocator.free(encoded);
     const encoded_len = try encode(input, encoded, scratch, .{});
+    try std.testing.expect(encoded_len < input.len);
     const decoded = try std.testing.allocator.alloc(u8, input.len);
     defer std.testing.allocator.free(decoded);
     const produced = try decode(encoded[0..encoded_len], decoded, scratch, .{});
@@ -729,7 +801,7 @@ test "lz4 block roundtrip repetitive" {
     try std.testing.expectEqualSlices(u8, input, decoded);
 }
 
-test "lz4 block roundtrip incompressible stores raw" {
+test "lz4 incompressible input is stored raw with exact framing" {
     var prng = std.Random.DefaultPrng.init(0x9e37);
     const random = prng.random();
     const input = try std.testing.allocator.alloc(u8, 100000);
@@ -740,42 +812,49 @@ test "lz4 block roundtrip incompressible stores raw" {
     const encoded = try std.testing.allocator.alloc(u8, encodedSizeBound(input.len));
     defer std.testing.allocator.free(encoded);
     const encoded_len = try encode(input, encoded, scratch, .{});
+    // Header(15) + size word(4) + raw block + endmark(4) + checksum(4).
     try std.testing.expectEqual(input.len + 27, encoded_len);
+    // The stored flag is the high bit of the little-endian size word.
+    try std.testing.expect(encoded[18] & 0x80 != 0);
     const decoded = try std.testing.allocator.alloc(u8, input.len);
     defer std.testing.allocator.free(decoded);
     const produced = try decode(encoded[0..encoded_len], decoded, scratch, .{});
-    try std.testing.expectEqualSlices(u8, input, decoded[0..produced]);
+    try std.testing.expectEqual(input.len, produced);
+    try std.testing.expectEqualSlices(u8, input, decoded);
 }
 
-test "lz4 empty input roundtrip" {
+test "lz4 empty input keeps the block stream well-formed" {
     const scratch = try std.testing.allocator.alloc(u8, @max(encodeWorkspaceSize(), decodeWorkspaceSize()));
     defer std.testing.allocator.free(scratch);
     var encoded: [64]u8 = undefined;
     const encoded_len = try encode("", &encoded, scratch, .{});
-    const produced = try decode(encoded[0..encoded_len], &.{}, scratch, .{});
+    // Header(15) + one empty block(5) + endmark(4) + checksum(4).
+    try std.testing.expectEqual(@as(usize, 28), encoded_len);
+    var output: [0]u8 = undefined;
+    const produced = try decode(encoded[0..encoded_len], &output, scratch, .{});
     try std.testing.expectEqual(@as(usize, 0), produced);
 }
 
-test "lz4 corrupt blocks rejected" {
+test "lz4 truncation checksum and version bits are named rejections" {
     const scratch = try std.testing.allocator.alloc(u8, @max(encodeWorkspaceSize(), decodeWorkspaceSize()));
     defer std.testing.allocator.free(scratch);
     var encoded: [256]u8 = undefined;
     const input = "abcabcabcabcabcabcabcabcabcabc";
     const encoded_len = try encode(input, &encoded, scratch, .{});
     var output: [64]u8 = undefined;
+    // A truncated tail cannot complete the frame.
     try std.testing.expectError(error.DataException, decode(encoded[0 .. encoded_len - 3], &output, scratch, .{}));
-    encoded[19] ^= 0xff;
-    const result = decode(encoded[0..encoded_len], &output, scratch, .{});
-    if (result) |produced| {
-        try std.testing.expect(!std.mem.eql(u8, input, output[0..produced]));
-    } else |err| {
-        // A corrupted block either fails its input-side checks or overruns
-        // the span, which surfaces as CapacityException.
-        try std.testing.expect(err == error.DataException or err == error.IntegrityException or err == error.CapacityException);
-    }
+    // A flipped content-checksum byte fails the integrity gate.
+    var flipped = encoded;
+    flipped[encoded_len - 1] ^= 0xFF;
+    try std.testing.expectError(error.IntegrityException, decode(flipped[0..encoded_len], &output, scratch, .{}));
+    // Version bits other than 01 are unsupported before any checksum runs.
+    var bad_version = encoded;
+    bad_version[4] &= 0x3F;
+    try std.testing.expectError(error.UnsupportedException, decode(bad_version[0..encoded_len], &output, scratch, .{}));
 }
 
-test "lz4 hc roundtrip beats greedy on repetitive data" {
+test "lz4 hash-chain search beats greedy on periodic data" {
     var prng = std.Random.DefaultPrng.init(0x5a);
     const random = prng.random();
     const input = try std.testing.allocator.alloc(u8, 300000);
@@ -801,7 +880,7 @@ test "lz4 hc roundtrip beats greedy on repetitive data" {
     try std.testing.expectEqualSlices(u8, input, decoded);
 }
 
-test "lz4 hc is deterministic" {
+test "lz4 hash-chain encoding is reproducible" {
     var prng = std.Random.DefaultPrng.init(0x77);
     const random = prng.random();
     const input = try std.testing.allocator.alloc(u8, 150000);
@@ -820,7 +899,7 @@ test "lz4 hc is deterministic" {
     try std.testing.expectEqualSlices(u8, first[0..first_len], second[0..second_len]);
 }
 
-test "lz4 hc roundtrip incompressible" {
+test "lz4 hash-chain incompressible roundtrip honors the work ceiling" {
     var prng = std.Random.DefaultPrng.init(0x9e37);
     const random = prng.random();
     const input = try std.testing.allocator.alloc(u8, 100000);
@@ -834,10 +913,13 @@ test "lz4 hc roundtrip incompressible" {
     const decoded = try std.testing.allocator.alloc(u8, input.len);
     defer std.testing.allocator.free(decoded);
     const produced = try decode(encoded[0..encoded_len], decoded, scratch, .{});
-    try std.testing.expectEqualSlices(u8, input, decoded[0..produced]);
+    try std.testing.expectEqual(input.len, produced);
+    try std.testing.expectEqualSlices(u8, input, decoded);
+    // Work is charged as input plus produced bytes.
+    try std.testing.expectError(error.ResourceException, decode(encoded[0..encoded_len], decoded, scratch, .{ .max_work = 100 }));
 }
 
-test "lz4 frame verifies content size and header checksum" {
+test "lz4 content size and header checksum seal the frame" {
     const allocator = std.testing.allocator;
     const input = "lz4 frame with content size and header checksum, repeated: abcabcabcabc";
     const scratch = try allocator.alloc(u8, encodeWorkspaceSize());
@@ -852,6 +934,8 @@ test "lz4 frame verifies content size and header checksum" {
     defer allocator.free(output);
     const decoded = try decode(encoded[0..encoded_len], output, decode_scratch, .{});
     try std.testing.expectEqualSlices(u8, input, output[0..decoded]);
+    // The encoder always writes Content_Size; the parse must agree with it.
+    try std.testing.expectEqual(@as(?u64, input.len), try frameContentSize(encoded[0..encoded_len]));
 
     // The encoder always writes Content_Size; corrupting it must fail.
     // Header layout: magic(4) FLG(1) BD(1) Content_Size(8) Header_Checksum(1).
@@ -867,7 +951,7 @@ test "lz4 frame verifies content size and header checksum" {
     try std.testing.expectError(error.IntegrityException, decode(bad_sum, output, decode_scratch, .{}));
 }
 
-test "lz4 dependent blocks reach into the previous block" {
+test "lz4 linked blocks resolve matches across the block boundary" {
     const allocator = std.testing.allocator;
     // Frame: linked blocks.
     // Block 0 is stored; block 1 is compressed.
@@ -880,7 +964,7 @@ test "lz4 dependent blocks reach into the previous block" {
     len += 1;
     frame[len] = 4 << 4; // BD: 64 KiB max block.
     len += 1;
-    std.mem.writeInt(u64, frame[len..][0..8], 77, .little);
+    std.mem.writeInt(u64, frame[len..][0..8], 81, .little);
     len += 8;
     frame[len] = @truncate(checksum.xxh32With(checksum.default_provider, frame[4..len]) >> 8);
     len += 1;
@@ -889,8 +973,8 @@ test "lz4 dependent blocks reach into the previous block" {
     @memset(frame[len..][0..64], 0x11);
     len += 64;
     // Sequence 1: an 8-byte match reaching 68 back into block 0.
-    // Sequence 2 (final): one literal, as the format requires.
-    const block1 = [_]u8{ 0x44, 'a', 'b', 'c', 'd', 68, 0, 0x10, 'z' };
+    // Sequence 2 (final): five literals, as the format requires.
+    const block1 = [_]u8{ 0x44, 'a', 'b', 'c', 'd', 68, 0, 0x50, 'v', 'w', 'x', 'y', 'z' };
     std.mem.writeInt(u32, frame[len..][0..4], block1.len, .little);
     len += 4;
     @memcpy(frame[len..][0..block1.len], &block1);
@@ -900,12 +984,12 @@ test "lz4 dependent blocks reach into the previous block" {
 
     const decode_scratch = try allocator.alloc(u8, decodeWorkspaceSize());
     defer allocator.free(decode_scratch);
-    var output: [77]u8 = undefined;
+    var output: [81]u8 = undefined;
     const decoded = try decode(frame[0..len], &output, decode_scratch, .{});
-    try std.testing.expectEqual(@as(usize, 77), decoded);
+    try std.testing.expectEqual(@as(usize, 81), decoded);
     try std.testing.expectEqualSlices(u8, "abcd", output[64..68]);
     for (output[68..76]) |byte| try std.testing.expectEqual(@as(u8, 0x11), byte);
-    try std.testing.expectEqual(@as(u8, 'z'), output[76]);
+    try std.testing.expectEqualSlices(u8, "vwxyz", output[76..81]);
     const expected_block0: [64]u8 = @splat(0x11);
     try std.testing.expectEqualSlices(u8, &expected_block0, output[0..64]);
 
@@ -916,7 +1000,7 @@ test "lz4 dependent blocks reach into the previous block" {
     try std.testing.expectError(error.DataException, decode(bad[0..len], &output, decode_scratch, .{}));
 }
 
-test "lz4 dictionary id flag parses and skips" {
+test "lz4 dictionary id skips four bytes under the header checksum" {
     const allocator = std.testing.allocator;
     var frame: [128]u8 = undefined;
     var len: usize = 0;
@@ -953,7 +1037,7 @@ test "lz4 dictionary id flag parses and skips" {
     try std.testing.expectError(error.IntegrityException, decode(bad[0..len], &output, decode_scratch, .{}));
 }
 
-test "lz4 legacy frame decodes eof-terminated blocks" {
+test "lz4 legacy frames end at the last complete block" {
     const allocator = std.testing.allocator;
     var block_a: [16 + 300]u8 = undefined;
     @memcpy(block_a[0..16], "legacy block a: ");
@@ -994,7 +1078,7 @@ test "lz4 legacy frame decodes eof-terminated blocks" {
     try std.testing.expectError(error.DataException, decode(frame[0 .. len + 2], &output, decode_scratch, .{}));
 }
 
-test "lz4 legacy blocks are independent" {
+test "lz4 legacy blocks decode without cross-block history" {
     // Block 1's match reaches 8 bytes into block 0's content; the
     // reference decodes legacy blocks independently and rejects it.
     const block0 = "12345678";
@@ -1021,7 +1105,7 @@ test "lz4 legacy blocks are independent" {
     try std.testing.expectError(error.DataException, decode(frame[0..len], &output, decode_scratch, .{}));
 }
 
-test "lz4 legacy frame accepts the kernel zero terminator" {
+test "lz4 legacy terminator words separate blocks from frames" {
     const allocator = std.testing.allocator;
     const payload = "kernel variant terminator payload 0123456789";
     const hash_table = try allocator.alloc(u32, hash_size);
@@ -1044,8 +1128,8 @@ test "lz4 legacy frame accepts the kernel zero terminator" {
     const produced = try decode(frame[0..len], &output, decode_scratch, .{});
     try std.testing.expectEqualSlices(u8, payload, output[0..produced]);
 
-    // A magic-sized size word is the next frame's start, not a block: this
-    // buffer API takes exactly one frame.
+    // A magic-sized size word starts a new frame, but no bytes follow to
+    // complete its header, so the trailing frame is rejected.
     std.mem.writeInt(u32, frame[len - 4 ..][0..4], magic, .little);
     try std.testing.expectError(error.DataException, decode(frame[0..len], &output, decode_scratch, .{}));
 
@@ -1053,7 +1137,7 @@ test "lz4 legacy frame accepts the kernel zero terminator" {
     try std.testing.expectEqual(@as(usize, 0), try decode(frame[0..4], &output, decode_scratch, .{}));
 }
 
-test "lz4 frame rejects reserved descriptor bits" {
+test "lz4 reserved descriptor bits fail under a fresh checksum" {
     const allocator = std.testing.allocator;
     const input = "reserved descriptor bit frame payload";
     const scratch = try allocator.alloc(u8, encodeWorkspaceSize());
@@ -1088,4 +1172,229 @@ test "lz4 frame rejects reserved descriptor bits" {
         frame[14] = @truncate(checksum.xxh32With(checksum.default_provider, frame[4..14]) >> 8);
         try std.testing.expectError(error.DataException, decode(frame, &output, decode_scratch, .{}));
     }
+}
+
+test "lz4 hash-chain search keeps the last five bytes as literals" {
+    const allocator = std.testing.allocator;
+    const input_len = 96;
+    var input: [input_len]u8 = undefined;
+    @memset(input[0..], 'A');
+    const head = try allocator.alloc(u32, hc_hash_size);
+    defer allocator.free(head);
+    const chain = try allocator.alloc(u32, hc_hash_size);
+    defer allocator.free(chain);
+    var compressed: [blockCompressBound(input_len)]u8 = undefined;
+    const compressed_len = compressBlockHc(&input, &compressed, head, chain, 256);
+
+    // The last sequence must be a literal run of at least five bytes.
+    var ip: usize = 0;
+    var last_lit: usize = 0;
+    while (ip < compressed_len) {
+        const token = compressed[ip];
+        ip += 1;
+        var ll: usize = token >> 4;
+        if (ll == lit_len_mask) {
+            while (compressed[ip] == 255) {
+                ll += 255;
+                ip += 1;
+            }
+            ll += compressed[ip];
+            ip += 1;
+        }
+        last_lit = ll;
+        ip += ll;
+        if (ip == compressed_len) break;
+        ip += 2;
+        if ((token & match_len_mask) == match_len_mask) {
+            while (compressed[ip] == 255) ip += 1;
+            ip += 1;
+        }
+    }
+    try std.testing.expect(last_lit >= last_literals);
+
+    var output: [input_len]u8 = undefined;
+    const produced = try decompressBlock(compressed[0..compressed_len], &output, &[_]u8{});
+    try std.testing.expectEqual(@as(usize, input_len), produced);
+    try std.testing.expectEqualSlices(u8, &input, &output);
+}
+
+test "lz4 decoder rejects a match reaching the last five bytes" {
+    // A match must stop five bytes before the block end so the tail stays literals.
+    const malformed = [_]u8{ 0x40, 'a', 'b', 'c', 'd', 4, 0, 0x10, 'z' };
+    var small: [9]u8 = undefined;
+    try std.testing.expectError(error.DataException, decompressBlock(&malformed, &small, &[_]u8{}));
+
+    const well_formed = [_]u8{ 0x40, 'a', 'b', 'c', 'd', 4, 0, 0x50, 'v', 'w', 'x', 'y', 'z' };
+    var full: [13]u8 = undefined;
+    const produced = try decompressBlock(&well_formed, &full, &[_]u8{});
+    try std.testing.expectEqual(@as(usize, 13), produced);
+    try std.testing.expectEqualSlices(u8, "abcdabcdvwxyz", &full);
+}
+
+test "lz4 decode caps amplified output at the work ceiling" {
+    const allocator = std.testing.allocator;
+    const input_len = 4096;
+    const input = try allocator.alloc(u8, input_len);
+    defer allocator.free(input);
+    @memset(input, 0x5A);
+    const scratch = try allocator.alloc(u8, @max(encodeWorkspaceSize(), decodeWorkspaceSize()));
+    defer allocator.free(scratch);
+    const encoded = try allocator.alloc(u8, encodedSizeBound(input_len));
+    defer allocator.free(encoded);
+    const encoded_len = try encode(input, encoded, scratch, .{});
+    const decoded = try allocator.alloc(u8, input_len);
+    defer allocator.free(decoded);
+    try std.testing.expectError(error.ResourceException, decode(encoded[0..encoded_len], decoded, scratch, .{ .max_work = @as(u64, @intCast(encoded_len + 16)) }));
+    const produced = try decode(encoded[0..encoded_len], decoded, scratch, .{});
+    try std.testing.expectEqual(@as(usize, input_len), produced);
+    try std.testing.expectEqualSlices(u8, input, decoded);
+}
+
+test "lz4 concatenated frames decode in order" {
+    const allocator = std.testing.allocator;
+    const scratch = try allocator.alloc(u8, @max(encodeWorkspaceSize(), decodeWorkspaceSize()));
+    defer allocator.free(scratch);
+    const a = "concatenated ";
+    const b = "frames decode in order";
+    const buf_a = try allocator.alloc(u8, encodedSizeBound(a.len));
+    defer allocator.free(buf_a);
+    const buf_b = try allocator.alloc(u8, encodedSizeBound(b.len));
+    defer allocator.free(buf_b);
+    const len_a = try encode(a, buf_a, scratch, .{});
+    const len_b = try encode(b, buf_b, scratch, .{});
+
+    const stream = try allocator.alloc(u8, len_a + len_b);
+    defer allocator.free(stream);
+    @memcpy(stream[0..len_a], buf_a[0..len_a]);
+    @memcpy(stream[len_a..], buf_b[0..len_b]);
+
+    const out = try allocator.alloc(u8, a.len + b.len);
+    defer allocator.free(out);
+    const produced = try decode(stream, out, scratch, .{});
+    try std.testing.expectEqual(a.len + b.len, produced);
+    try std.testing.expectEqualSlices(u8, a, out[0..a.len]);
+    try std.testing.expectEqualSlices(u8, b, out[a.len..produced]);
+    // The measured route counts the same combined total.
+    try std.testing.expectEqual(a.len + b.len, try decodedSize(stream, scratch, .{}));
+
+    // Trailing bytes too short to form a frame still fail.
+    const trailing = try allocator.alloc(u8, len_a + len_b + 2);
+    defer allocator.free(trailing);
+    @memcpy(trailing[0 .. len_a + len_b], stream);
+    trailing[len_a + len_b] = 0xAA;
+    trailing[len_a + len_b + 1] = 0xBB;
+    try std.testing.expectError(error.DataException, decode(trailing, out, scratch, .{}));
+}
+
+test "lz4 skippable frames are skipped before and between frames" {
+    const allocator = std.testing.allocator;
+    const scratch = try allocator.alloc(u8, @max(encodeWorkspaceSize(), decodeWorkspaceSize()));
+    defer allocator.free(scratch);
+    const a = "leading skippable ";
+    const b = "and trailing skippable";
+    const buf_a = try allocator.alloc(u8, encodedSizeBound(a.len));
+    defer allocator.free(buf_a);
+    const buf_b = try allocator.alloc(u8, encodedSizeBound(b.len));
+    defer allocator.free(buf_b);
+    const len_a = try encode(a, buf_a, scratch, .{});
+    const len_b = try encode(b, buf_b, scratch, .{});
+
+    // Three skippable headers with distinct magic nibbles and user data.
+    const skip_a = [_]u8{ 0x50, 0x2A, 0x4D, 0x18, 5, 0, 0, 0, 'h', 'e', 'l', 'l', 'o' };
+    const skip_b = [_]u8{ 0x5F, 0x2A, 0x4D, 0x18, 3, 0, 0, 0, 'x', 'y', 'z' };
+    const skip_c = [_]u8{ 0x51, 0x2A, 0x4D, 0x18, 0, 0, 0, 0 };
+    const stream = try allocator.alloc(u8, skip_a.len + len_a + skip_b.len + len_b + skip_c.len);
+    defer allocator.free(stream);
+    var p: usize = 0;
+    @memcpy(stream[p..][0..skip_a.len], &skip_a);
+    p += skip_a.len;
+    @memcpy(stream[p..][0..len_a], buf_a[0..len_a]);
+    p += len_a;
+    @memcpy(stream[p..][0..skip_b.len], &skip_b);
+    p += skip_b.len;
+    @memcpy(stream[p..][0..len_b], buf_b[0..len_b]);
+    p += len_b;
+    @memcpy(stream[p..][0..skip_c.len], &skip_c);
+    p += skip_c.len;
+
+    const out = try allocator.alloc(u8, a.len + b.len);
+    defer allocator.free(out);
+    const produced = try decode(stream, out, scratch, .{});
+    try std.testing.expectEqual(a.len + b.len, produced);
+    try std.testing.expectEqualSlices(u8, a, out[0..a.len]);
+    try std.testing.expectEqualSlices(u8, b, out[a.len..produced]);
+    // The leading skippable frame does not hide the first frame's size.
+    try std.testing.expectEqual(@as(?u64, a.len), try frameContentSize(stream));
+    try std.testing.expectEqual(a.len + b.len, try decodedSize(stream, scratch, .{}));
+
+    // A stream of only skippable frames decodes to nothing.
+    const only = try allocator.alloc(u8, skip_a.len + skip_c.len);
+    defer allocator.free(only);
+    @memcpy(only[0..skip_a.len], &skip_a);
+    @memcpy(only[skip_a.len..], &skip_c);
+    try std.testing.expectEqual(@as(usize, 0), try decode(only, out, scratch, .{}));
+    try std.testing.expectEqual(@as(?u64, null), try frameContentSize(only));
+}
+
+test "lz4 concatenated frames honor the work ceiling" {
+    const allocator = std.testing.allocator;
+    const scratch = try allocator.alloc(u8, @max(encodeWorkspaceSize(), decodeWorkspaceSize()));
+    defer allocator.free(scratch);
+    const a = "first frame payload";
+    const b = "second frame payload";
+    const buf_a = try allocator.alloc(u8, encodedSizeBound(a.len));
+    defer allocator.free(buf_a);
+    const buf_b = try allocator.alloc(u8, encodedSizeBound(b.len));
+    defer allocator.free(buf_b);
+    const len_a = try encode(a, buf_a, scratch, .{});
+    const len_b = try encode(b, buf_b, scratch, .{});
+    const stream = try allocator.alloc(u8, len_a + len_b);
+    defer allocator.free(stream);
+    @memcpy(stream[0..len_a], buf_a[0..len_a]);
+    @memcpy(stream[len_a..], buf_b[0..len_b]);
+    const out = try allocator.alloc(u8, a.len + b.len);
+    defer allocator.free(out);
+
+    // The first frame fits within the budget, the second pushes past it.
+    const budget: u64 = @intCast(stream.len + a.len);
+    try std.testing.expectError(error.ResourceException, decode(stream, out, scratch, .{ .max_work = budget }));
+    try std.testing.expectError(error.ResourceException, decodedSize(stream, scratch, .{ .max_work = budget }));
+    // A budget for both frames succeeds on the same stream.
+    const produced = try decode(stream, out, scratch, .{ .max_work = @intCast(stream.len + a.len + b.len) });
+    try std.testing.expectEqual(a.len + b.len, produced);
+}
+
+test "lz4 legacy frame concatenates with a modern frame" {
+    const allocator = std.testing.allocator;
+    const scratch = try allocator.alloc(u8, @max(encodeWorkspaceSize(), decodeWorkspaceSize()));
+    defer allocator.free(scratch);
+    const legacy_payload = "legacy frame prefix 0123456789";
+    const modern_payload = "modern frame suffix";
+    const hash_table = try allocator.alloc(u32, hash_size);
+    defer allocator.free(hash_table);
+    var comp: [blockCompressBound(legacy_payload.len)]u8 = undefined;
+    const compressed = compressBlock(legacy_payload, &comp, hash_table, 1);
+    const modern_buf = try allocator.alloc(u8, encodedSizeBound(modern_payload.len));
+    defer allocator.free(modern_buf);
+    const modern_len = try encode(modern_payload, modern_buf, scratch, .{});
+
+    // Legacy frame has no terminator: the modern magic ends it.
+    const stream = try allocator.alloc(u8, 4 + 4 + compressed + modern_len);
+    defer allocator.free(stream);
+    var p: usize = 0;
+    std.mem.writeInt(u32, stream[p..][0..4], legacy_magic, .little);
+    p += 4;
+    std.mem.writeInt(u32, stream[p..][0..4], @intCast(compressed), .little);
+    p += 4;
+    @memcpy(stream[p..][0..compressed], comp[0..compressed]);
+    p += compressed;
+    @memcpy(stream[p..][0..modern_len], modern_buf[0..modern_len]);
+    p += modern_len;
+
+    const out = try allocator.alloc(u8, legacy_payload.len + modern_payload.len);
+    defer allocator.free(out);
+    const produced = try decode(stream, out, scratch, .{});
+    try std.testing.expectEqual(legacy_payload.len + modern_payload.len, produced);
+    try std.testing.expectEqualSlices(u8, legacy_payload, out[0..legacy_payload.len]);
+    try std.testing.expectEqualSlices(u8, modern_payload, out[legacy_payload.len..]);
 }

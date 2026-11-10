@@ -72,7 +72,9 @@ pub const ShufflingAllocator = struct {
             return std.mem.Allocator.rawAlloc(self.underlying, len, alignment, ret_addr);
         };
         const class = self.shuffledClass(info) orelse {
-            return std.mem.Allocator.rawAlloc(self.underlying, len, alignment, ret_addr);
+            // A prefill failure leaves the class inactive, but the block may
+            // still reach its pool later; give it the full class size.
+            return std.mem.Allocator.rawAlloc(self.underlying, info.size, shuffle_alignment, ret_addr);
         };
         const replacement = std.mem.Allocator.rawAlloc(self.underlying, info.size, shuffle_alignment, ret_addr) orelse return null;
         const slot = self.randomIndex(pool_slots_per_class);
@@ -108,7 +110,9 @@ pub const ShufflingAllocator = struct {
         };
         const class = &self.size_classes[info.index];
         if (!class.active) {
-            std.mem.Allocator.rawFree(self.underlying, memory, alignment, ret_addr);
+            // Only the prefill-failure fallback reaches here: it was given
+            // info.size bytes at shuffle_alignment, not the requested len.
+            std.mem.Allocator.rawFree(self.underlying, memory.ptr[0..info.size], shuffle_alignment, ret_addr);
             return;
         }
         std.debug.assert(class.size == info.size);

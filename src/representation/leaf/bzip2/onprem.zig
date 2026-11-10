@@ -58,7 +58,8 @@ const max_groups = 6;
 const group_size = 50;
 const max_alpha_size = 258;
 const max_code_len = 20;
-const max_selectors = 32768;
+// BZ_MAX_SELECTORS = 2 + (900000 / BZ_G_SIZE); caps the 15-bit selector field.
+const max_selectors = 2 + block_size_max / group_size;
 pub fn decodedSize(input: []const u8, scratch: []u8, provider: checksum.Provider) Exception!usize {
     var counter = measurement.Counter.init(null);
     try decodeInner(input, &counter.writer, scratch, provider);
@@ -140,7 +141,7 @@ fn decodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, provide
             const n_groups = std.math.cast(u32, n_groups_u) orelse return error.DataException;
             if (n_groups < 2 or n_groups > max_groups) return error.DataException;
             const n_selectors_u = try br.readBits(15);
-            const n_selectors = std.math.cast(u32, n_selectors_u) orelse return error.DataException;
+            var n_selectors = std.math.cast(u32, n_selectors_u) orelse return error.DataException;
             if (n_selectors == 0) return error.DataException;
             var selectors: [max_selectors]u8 = undefined;
             {
@@ -163,7 +164,9 @@ fn decodeInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, provide
                     if (i < max_selectors) selectors[i] = selected;
                 }
             }
-            if (n_selectors > max_selectors) return error.DataException;
+            // Vendor decompress.c:305-306 clamps instead of rejecting extra
+            // selectors; all their MTF values were still consumed above.
+            if (n_selectors > max_selectors) n_selectors = max_selectors;
             var lens: [max_groups][max_alpha_size]u8 = undefined;
             var tables: [max_groups]HuffTable = undefined;
             {
@@ -1412,6 +1415,11 @@ test "length limited code terminates on deep skewed frequencies" {
     var codes: [max_alpha_size]u32 = undefined;
     buildLengthLimitedCode(&freq, 22, &lens, &codes);
     for (lens[0..22]) |l| try std.testing.expect(l >= 1 and l <= max_code_len);
+    // Bounded lengths alone do not make a prefix code; the limiter must
+    // not over-subscribe the code space.
+    var kraft: u64 = 0;
+    for (lens[0..22]) |l| kraft += @as(u64, 1) << @intCast(max_code_len - l);
+    try std.testing.expect(kraft <= @as(u64, 1) << max_code_len);
 }
 
 test "bzip2 decodes a randomised block" {
@@ -1483,4 +1491,12 @@ test "bzip2 decodes a randomised block" {
     const decoded = try decode(patched, output, decode_scratch, checksum.default_provider);
     try std.testing.expectEqual(data.len, decoded);
     try std.testing.expectEqualSlices(u8, &data, output);
+}
+
+test "bzip2 selector cap matches the vendor bound" {
+    // BZ_MAX_SELECTORS = 2 + (900000 / BZ_G_SIZE); decompress.c:305-306 clamps
+    // the 15-bit count to it. Our cap equals that value for the largest block.
+    try std.testing.expectEqual(@as(usize, 18002), max_selectors);
+    // The largest block plus its EOB mark must still fit the capped array.
+    try std.testing.expect(@divCeil(block_size_max + 1, group_size) <= max_selectors);
 }

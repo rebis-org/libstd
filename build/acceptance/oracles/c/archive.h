@@ -10,7 +10,7 @@ typedef struct archive_entry archive_entry;
 typedef long la_ssize_t;
 typedef int64_t la_int64_t;
 
-#define ARCHIVE_OK 0
+#define ARCHIVE_OK  0
 #define ARCHIVE_EOF 1
 
 extern archive *archive_write_new(void);

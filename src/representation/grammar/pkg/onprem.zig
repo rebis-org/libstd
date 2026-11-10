@@ -9,6 +9,8 @@ const gzip = @import("../gzip/onprem.zig");
 const xar = @import("../xar/onprem.zig");
 const xz = @import("../xz/onprem.zig");
 const payload = @import("payload.zig");
+pub const EntryInfo = @import("../cpio/chain.zig").EntryInfo;
+pub const ManifestSink = @import("../cpio/chain.zig").Sink;
 
 pub const Entry = entry_prim.Entry;
 const Exception = exception_prim.Exception;
@@ -58,11 +60,11 @@ const xz_write_options: xz.Options = .{
 // the only per-format input.
 const records_walker = @import("../cpio/chain.zig").Walker(Chain, member_name);
 
-pub const EntryInfo = records_walker.EntryInfo;
 pub const LinkMode = records_walker.LinkMode;
 pub const Link = records_walker.Link;
 pub const Cursor = records_walker.Cursor;
 pub const inspectCount = records_walker.inspectCount;
+pub const inspectAll = records_walker.inspectAll;
 pub const inspectOrdinal = records_walker.inspectOrdinal;
 pub const decodeOrdinal = records_walker.decodeOrdinal;
 

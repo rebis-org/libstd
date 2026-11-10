@@ -67,6 +67,7 @@ fn addAbi(b: *std.Build, ctx: *common.Settings) void {
         }
     }
     abi.dependOn(&ctx.host.dynamic_library.step);
+    addThreadedGate(b, abi);
     const abi_exports = b.addExecutable(.{
         .name = "abi_exports",
         .root_module = modules.create(b, modules.abi_exports, ctx),
@@ -74,6 +75,22 @@ fn addAbi(b: *std.Build, ctx: *common.Settings) void {
     const abi_exports_run = b.addRunArtifact(abi_exports);
     abi_exports_run.addFileArg2(ctx.host.dynamic_library.getEmittedBin(), .{});
     abi.dependOn(&abi_exports_run.step);
+}
+
+// std.Io.Threaded fails to build for the Apple embedded targets; these probes fail if the gate goes away.
+fn addThreadedGate(b: *std.Build, abi: *std.Build.Step) void {
+    const os_tags = [_]std.Target.Os.Tag{ .ios, .tvos, .visionos, .watchos };
+    inline for (os_tags) |os_tag| {
+        const module = b.createModule(.{
+            .root_source_file = b.path("src/threaded.zig"),
+            .target = b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = os_tag }),
+        });
+        const probe = b.addObject(.{
+            .name = b.fmt("threaded_gate_{s}", .{@tagName(os_tag)}),
+            .root_module = module,
+        });
+        abi.dependOn(&probe.step);
+    }
 }
 
 fn addExe(b: *std.Build, ctx: *common.Settings) void {
