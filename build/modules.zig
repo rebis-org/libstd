@@ -17,7 +17,8 @@ pub const Module = struct {
 pub const seam = Module{ .name = "seam", .root = "src/common/primitive/seam.zig" };
 pub const checksum = Module{ .name = "checksum", .root = "src/common/primitive/checksum.zig", .imports = &.{.{ .name = "seam", .module = "seam" }}, .crc_kernel = true };
 pub const crypto = Module{ .name = "crypto", .root = "src/common/primitive/crypto.zig", .imports = &.{.{ .name = "seam", .module = "seam" }} };
-pub const bench_shim = Module{ .name = "bench_shim", .root = "src/bench_shim.zig" };
+// The micro entry owns the primitive modules the cases reach, so a file never lands in two modules.
+pub const bench_shim = Module{ .name = "bench_shim", .root = "src/bench.zig", .imports = &.{.{ .name = "seam", .module = "seam" }}, .crc_kernel = true };
 
 pub const library = Module{ .name = "library", .root = "src/root.zig", .imports = &.{.{ .name = "seam", .module = "seam" }}, .crc_kernel = true };
 // Package-manager entry: the same import closure as the
@@ -74,8 +75,6 @@ pub const micro = Module{
     .root = "build/micro/main.zig",
     .imports = &.{
         .{ .name = "bench_shim", .module = "bench_shim" },
-        .{ .name = "checksum", .module = "checksum" },
-        .{ .name = "crypto", .module = "crypto" },
     },
 };
 

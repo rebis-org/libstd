@@ -289,6 +289,15 @@ fn tarAligned(size: u64) Exception!u64 {
     return if (remainder == 0) size else bounds.addU64(size, block_size - remainder);
 }
 
+// Read-side alignment overflow is impossible archive data, not a
+// host limit; the write side keeps tarAligned's answer.
+fn tarAlignedData(size: u64) Exception!u64 {
+    return tarAligned(size) catch |err| switch (err) {
+        error.ResourceException => error.DataException,
+        else => err,
+    };
+}
+
 fn tarField(field: []const u8) []const u8 {
     return field[0 .. std.mem.findScalar(u8, field, 0) orelse field.len];
 }
@@ -505,11 +514,13 @@ const Reader = struct {
     }
 
     fn advance(self: *Reader, size: u64) Exception!void {
-        self.offset = try bounds.addU64(try bounds.addU64(self.offset, block_size), try tarAligned(size));
+        self.offset = try bounds.addU64(try bounds.addU64(self.offset, block_size), try tarAlignedData(size));
         if (self.offset > self.archive.len) return error.DataException;
     }
 
-    fn parseOldGnuSparse(self: *Reader, entry: *EntryInfo) Exception!SparseInfo {
+    // The header's physical size drives the chunk sum and advance;
+    // pax may already have replaced entry.size.
+    fn parseOldGnuSparse(self: *Reader, entry: *EntryInfo, physical_size: u64) Exception!SparseInfo {
         var info = SparseInfo{ .realsize = 0, .segment_count = 0, .segments = undefined };
         const header = try bounds.slice(self.archive, entry.header_offset, block_size);
         info.realsize = try tarNumber(header[483..495]);
@@ -525,15 +536,15 @@ const Reader = struct {
             extension_blocks += 1;
             extension_offset = try bounds.addU64(extension_offset, block_size);
         }
-        if (chunk_sum != entry.size) return error.DataException;
+        if (chunk_sum != physical_size) return error.DataException;
         if (info.realsize == 0) {
             for (info.segments[0..info.segment_count]) |segment| {
-                info.realsize = @max(info.realsize, try bounds.addU64(segment.offset, segment.num_bytes));
+                info.realsize = @max(info.realsize, bounds.addU64(segment.offset, segment.num_bytes) catch return error.DataException);
             }
         }
         try validateSparseInfo(info);
         entry.data_offset = try bounds.addU64(entry.header_offset, (extension_blocks + 1) * block_size);
-        self.offset = try bounds.addU64(entry.data_offset, try tarAligned(entry.size));
+        self.offset = try bounds.addU64(entry.data_offset, try tarAlignedData(physical_size));
         if (self.offset > self.archive.len) return error.DataException;
         return info;
     }
@@ -556,7 +567,7 @@ const Reader = struct {
             if (minor != 0) return error.UnsupportedException;
             const map_start = entry.data_offset;
             const map_bytes = try readSparseMapData(self.archive, map_start, &info);
-            const map_padded = try tarAligned(map_bytes);
+            const map_padded = try tarAlignedData(map_bytes);
             entry.data_offset = try bounds.addU64(entry.data_offset, map_padded);
             if (entry.size < map_padded) return error.DataException;
             entry.size -= map_padded;
@@ -605,7 +616,10 @@ const Reader = struct {
                     try self.advance(physical_size);
                 },
                 typeflag_gnu_sparse => {
-                    const sparse = try self.parseOldGnuSparse(&entry);
+                    // Match the volume reader, which applies pax before sparse handling.
+                    try tarApplyPax(&entry, self.global_pax);
+                    try tarApplyPax(&entry, self.local_pax);
+                    const sparse = try self.parseOldGnuSparse(&entry, physical_size);
                     entry.size = sparse.realsize;
                     entry.sparse = sparse;
                     if (self.long_name) |name| {
@@ -675,14 +689,16 @@ fn addSparseSegment(info: *SparseInfo, chunk_sum: *u64, offset: u64, num_bytes: 
     if (info.segment_count >= max_sparse_segments) return error.UnsupportedException;
     info.segments[info.segment_count] = .{ .offset = offset, .num_bytes = num_bytes };
     info.segment_count += 1;
-    chunk_sum.* = try bounds.addU64(chunk_sum.*, num_bytes);
+    // Overflow here is invalid archive data, not a resource limit.
+    chunk_sum.* = bounds.addU64(chunk_sum.*, num_bytes) catch return error.DataException;
 }
 
 fn validateSparseInfo(info: SparseInfo) Exception!void {
     var previous_end: u64 = 0;
     for (info.segments[0..info.segment_count]) |segment| {
         if (segment.num_bytes == 0 or segment.offset < previous_end) return error.DataException;
-        const end = try bounds.addU64(segment.offset, segment.num_bytes);
+        // Overflow here is invalid archive data, not a resource limit.
+        const end = bounds.addU64(segment.offset, segment.num_bytes) catch return error.DataException;
         if (end > info.realsize) return error.DataException;
         previous_end = end;
     }
@@ -911,6 +927,7 @@ test "tar gnu format roundtrips long names through LongLink entries" {
     var archive: [8192]u8 = undefined;
     var scratch: [4096]u8 = undefined;
     const written = try encodeGnu(&entries, &archive, &scratch);
+    try testing.expectEqual(@as(u64, written), try archiveSizeGnu(&entries));
     // The GNU magic sits in the version bytes too.
     try testing.expectEqualSlices(u8, "ustar  \x00", archive[257..265]);
     const info = try inspectOrdinal(archive[0..written], 0);
@@ -1084,14 +1101,10 @@ test "tar rejects unsafe ustar prefix fields" {
     try testing.expectEqualStrings("abc", out[0..size]);
 }
 
-// ---------------------------------------------------------------------------
-// GNU multi-volume sets. A volume ends where its bytes end: tar cuts a
-// member's data at the volume boundary and opens the next volume with an
-// 'M' header carrying the member name (truncated to the name field), the
-// remaining size, and the offset already written; intermediate volumes
-// carry no EOF blocks, only the final one does (vendor/tar buffer.c).
+// GNU multi-volume: a cut member opens the next volume under an 'M' header naming it, with remaining size and offset.
 
-pub const VolumeSegment = struct { volume: u16, offset: u64, len: u64 };
+// The openVolume verb admits up to u32 volumes.
+pub const VolumeSegment = struct { volume: u32, offset: u64, len: u64 };
 
 pub const VolumePlan = struct { count: usize, total: u64 };
 
@@ -1101,8 +1114,7 @@ const VolumeReader = struct {
     vi: usize = 0,
     ordinal: u64 = 0,
     segments: ?[]VolumeSegment,
-    // When set, only the named member's segments are recorded; a decode
-    // walks past earlier members whose bytes it must not gather.
+    // When set, only the named member's segments are recorded; a decode walks past earlier members it must not gather.
     target: ?u64 = null,
     segment_count: usize = 0,
     cont_size: u64 = 0,
@@ -1128,9 +1140,7 @@ const VolumeReader = struct {
         self.inner.offset = 0;
     }
 
-    // One continuation volume: the 'M' header names the cut member, states
-    // its remaining size and the offset already written, and the member
-    // data follows.
+    // One continuation volume: the 'M' header names the cut member and states its remaining size and written offset.
     fn consumeContinuation(self: *VolumeReader, vol: []const u8) Exception!void {
         if (self.inner.offset + block_size > vol.len) return error.DataException;
         const entry = try self.inner.readHeader();
@@ -1147,7 +1157,7 @@ const VolumeReader = struct {
         try self.recordSegment(entry.data_offset, taken);
         self.cont_written += taken;
         if (self.cont_written == self.cont_size) {
-            self.inner.offset = try bounds.addU64(entry.data_offset, try tarAligned(entry.size));
+            self.inner.offset = try bounds.addU64(entry.data_offset, try tarAlignedData(entry.size));
             if (self.inner.offset > vol.len) return error.DataException;
         } else {
             self.inner.offset = vol.len;
@@ -1170,7 +1180,8 @@ const VolumeReader = struct {
                 return null;
             }
             var entry = try self.inner.readHeader();
-            const data_end = try bounds.addU64(entry.data_offset, try tarAligned(entry.size));
+            // Overflow here is invalid archive data, not a resource limit.
+            const data_end = bounds.addU64(entry.data_offset, try tarAlignedData(entry.size)) catch return error.DataException;
             switch (entry.typeflag) {
                 typeflag_gnu_volume_label => {
                     // A volume label carries no data; anything else in the
@@ -1216,7 +1227,7 @@ const VolumeReader = struct {
                     var self_advanced = false;
                     if (entry.typeflag == typeflag_gnu_sparse) {
                         // parseOldGnuSparse moves the reader itself.
-                        const sparse = try self.inner.parseOldGnuSparse(&entry);
+                        const sparse = try self.inner.parseOldGnuSparse(&entry, physical_size);
                         entry.size = sparse.realsize;
                         entry.sparse = sparse;
                         self_advanced = true;
@@ -1239,11 +1250,7 @@ const VolumeReader = struct {
                     try tarValidateEntryName(entry);
                     entry.ordinal = self.ordinal;
                     if (!self_advanced and data_end > vol.len) {
-                        // The member is cut: record this volume's share, then
-                        // consume every continuation volume before returning,
-                        // so the member's segments are complete on return.
-                        // The continuation names the real member name
-                        // truncated to the field, as GNU writes it.
+                        // The member is cut: record this volume's share, then consume every continuation volume, so the segments are complete on return.
                         self.cont_name = entry.name[0..@min(entry.name.len, max_name_field)];
                         self.cont_size = entry.size;
                         self.cont_written = vol.len - entry.data_offset;
@@ -1326,8 +1333,7 @@ pub fn volumeDecodeOrdinal(volumes: []const []const u8, ordinal: u64, output: []
     return error.DataException;
 }
 
-// Writes one 512-byte block into the current volume; the layout keeps
-// every write a block multiple, so a full volume lands on the boundary.
+// Writes one 512-byte block into the current volume; the layout keeps every write a block multiple.
 const SplitEmitter = struct {
     out: ?[]u8,
     scratch: []u8,
@@ -1388,8 +1394,7 @@ const SplitEmitter = struct {
     }
 };
 
-// One traversal decides sizes and bytes; the emit pass replays the same
-// layout, so a plan and its set cannot disagree.
+// One traversal decides sizes and bytes; the emit pass replays the layout, so a plan and its set cannot disagree.
 fn splitLayout(entries: []const Entry, volume_size: u64, lengths: ?[]u64, scratch: []u8, output: ?[]u8) Exception!VolumePlan {
     if (volume_size == 0 or volume_size % block_size != 0 or volume_size < 2 * block_size) return error.CallException;
     if (scratch.len < scratch_size) return error.CapacityException;
@@ -1399,9 +1404,7 @@ fn splitLayout(entries: []const Entry, volume_size: u64, lengths: ?[]u64, scratc
         if (std.mem.findScalar(u8, entry.link_name, 0) != null) return error.CallException;
         if ((entry.typeflag == '1' or entry.typeflag == '2') and entry.link_name.len == 0) return error.CallException;
         const data_size = try tarDataSize(entry.typeflag, entry.data);
-        // Header units never split: they either fit whole or the member
-        // opens the next volume. Each long-name unit carries its own
-        // header block plus the padded name bytes.
+        // Header units never split: they fit whole or the member opens the next volume; each long-name unit carries a header.
         var header_bytes: u64 = block_size;
         if (entry.name.len > max_name_field) header_bytes = try bounds.addU64(header_bytes, try bounds.addU64(block_size, try tarAligned(entry.name.len + 1)));
         if (entry.link_name.len > max_name_field) header_bytes = try bounds.addU64(header_bytes, try bounds.addU64(block_size, try tarAligned(entry.link_name.len + 1)));
@@ -1445,8 +1448,7 @@ fn splitLayout(entries: []const Entry, volume_size: u64, lengths: ?[]u64, scratc
             try em.pad(long_size);
         }
         try tarWriteHeader(.gnu, &em, scratch, parts.name, &.{}, if (entry.link_name.len > max_name_field) &.{} else entry.link_name, entry.mode, entry.uid, entry.gid, entry.modification_time, entry.typeflag, data_size, entry.devmajor, entry.devminor);
-        // The member data fills volumes whole-block at a time; a cut
-        // member continues under an 'M' header on the next volume.
+        // Member data fills volumes whole-block at a time; a cut member continues under an 'M' header on the next volume.
         var written: usize = 0;
         while (written < data_size) {
             const remaining: usize = @intCast(data_size - written);
@@ -1463,8 +1465,7 @@ fn splitLayout(entries: []const Entry, volume_size: u64, lengths: ?[]u64, scratc
                 try em.write(entry.data[written..][0..take]);
                 written += take;
             }
-            // The continuation header opens the next volume; a fresh one is
-            // the widest fit, so the 'M' always lands inside it.
+            // The continuation header opens the next volume; a fresh one is the widest fit, so the 'M' always lands inside.
             try em.closeVolume();
             try em.openVolume();
             try em.writeMultivolHeader(entry.name, data_size - written, written);
@@ -1537,8 +1538,7 @@ test "tar volume set roundtrips a cut member" {
 
 test "tar volume set reassembles a cut member with a long name" {
     const testing = std.testing;
-    // The name forces an 'L' entry, and the member data crosses volumes;
-    // the continuation header names the real member name truncated.
+    // The name forces an 'L' entry and the data crosses volumes; the continuation names the real member, truncated.
     var long_name: [130]u8 = undefined;
     @memset(&long_name, 'n');
     @memcpy(long_name[126..130], ".txt");

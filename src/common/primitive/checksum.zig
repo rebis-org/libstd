@@ -495,36 +495,40 @@ fn TableCrc(comptime T: type, comptime poly: T, comptime reflected: bool) type {
     };
 }
 
-test "xxh32 matches the published vectors" {
+test "xxh32 reproduces the published sanity vectors" {
     try std.testing.expectEqual(@as(u32, 0x02CC5D05), xxh32(""));
     try std.testing.expectEqual(@as(u32, 0x550D7456), xxh32("a"));
     try std.testing.expectEqual(@as(u32, 0x32D153FF), xxh32("abc"));
     try std.testing.expectEqual(@as(u32, 0xE2293B2F), xxh32("Nobody inspects the spammish repetition"));
+    // The streaming feed must land on the same one-shot value.
+    var hasher = XxHash32.init(0);
+    hasher.update("Nobody ");
+    hasher.update("inspects the spammish repetition");
+    try std.testing.expectEqual(@as(u32, 0xE2293B2F), hasher.final({}));
 }
 
-test "adler32 matches the published vectors" {
+test "adler32 reproduces the published vectors across split feeds" {
     try std.testing.expectEqual(@as(u32, 0x00000001), adler32(""));
     try std.testing.expectEqual(@as(u32, 0x091E01DE), adler32("123456789"));
     try std.testing.expectEqual(@as(u32, 0x11E60398), adler32("Wikipedia"));
     var hasher = Adler32.init({});
-    hasher.update("1234");
-    hasher.update("56789");
-    try std.testing.expectEqual(@as(u32, 0x091E01DE), hasher.final({}));
+    hasher.update("Wiki");
+    hasher.update("pedia");
+    try std.testing.expectEqual(@as(u32, 0x11E60398), hasher.final({}));
 }
 
-test "crc32 matches the published vectors" {
+test "crc32 reproduces the catalog check value across split feeds" {
     try std.testing.expectEqual(@as(u32, 0x00000000), crc32(""));
     try std.testing.expectEqual(@as(u32, 0xCBF43926), crc32("123456789"));
     var hash = Crc32.init({});
-    hash.update("1234");
-    hash.update("56789");
-    try std.testing.expectEqual(crc32("123456789"), hash.final({}));
+    hash.update("12345");
+    hash.update("6789");
+    try std.testing.expectEqual(@as(u32, 0xCBF43926), hash.final({}));
 }
 
-test "crc32 matches std.hash.Crc32 across sizes" {
-    // Sizes hit every tail bucket, and the split update exercises the streaming state
-    // across kernel switches.
-    var rng = std.Random.DefaultPrng.init(0xC32C);
+test "crc32 agrees with the std implementation at every tail size" {
+    // Sizes hit every tail bucket; std is the independent oracle.
+    var rng = std.Random.DefaultPrng.init(0xC32D);
     const allocator = std.testing.allocator;
     var size: usize = 0;
     while (size <= 1024) : (size += 1) {
@@ -533,6 +537,7 @@ test "crc32 matches std.hash.Crc32 across sizes" {
         try std.testing.expectEqual(std.hash.Crc32.hash(buf), crc32(buf));
         allocator.free(buf);
     }
+    // The split feed exercises streaming state across kernel switches.
     var big: usize = 4096;
     while (big <= 1 << 20) : (big += 65521) {
         const buf = try allocator.alloc(u8, big);
@@ -546,38 +551,39 @@ test "crc32 matches std.hash.Crc32 across sizes" {
     }
 }
 
-test "xxh64 matches the published vectors" {
+test "xxh64 reproduces the published vectors and its streaming self" {
     try std.testing.expectEqual(@as(u64, 0xEF46DB3751D8E999), xxh64(""));
     try std.testing.expectEqual(@as(u64, 0xD24EC4F1A98C6E5B), xxh64("a"));
+    try std.testing.expectEqual(@as(u64, 0x44BC2CF5AD770999), xxh64("abc"));
     var hasher = XxHash64.init(0);
     hasher.update("hello ");
     hasher.update("world");
     try std.testing.expectEqual(xxh64("hello world"), hasher.final({}));
 }
 
-test "crc64 xz matches the reference vectors" {
+test "crc64 xz reproduces the catalog check value" {
     var hash = XzCrc64.init({});
-    hash.update("123456789");
+    hash.update("1234567");
+    hash.update("89");
     try std.testing.expectEqual(@as(u64, 0x995DC9BBDF1939FA), hash.final({}));
-    var hasher = XzCrc64.init({});
-    hasher.update("1234");
-    hasher.update("56789");
-    try std.testing.expectEqual(@as(u64, 0x995DC9BBDF1939FA), hasher.final({}));
+    var whole = XzCrc64.init({});
+    whole.update("123456789");
+    try std.testing.expectEqual(@as(u64, 0x995DC9BBDF1939FA), whole.final({}));
 }
 
-test "bzip2 crc32 matches the published check value" {
+test "bzip2 crc32 reproduces the catalog check value" {
     var hash = Bzip2Crc32.init({});
-    hash.update("123456789");
+    hash.update("12345");
+    hash.update("6789");
     try std.testing.expectEqual(@as(u32, 0xFC891918), hash.final({}));
-    var hasher = Bzip2Crc32.init({});
-    hasher.update("1234");
-    hasher.update("56789");
-    try std.testing.expectEqual(@as(u32, 0xFC891918), hasher.final({}));
+    var whole = Bzip2Crc32.init({});
+    whole.update("123456789");
+    try std.testing.expectEqual(@as(u32, 0xFC891918), whole.final({}));
 }
 
-test "crc64 xz fold matches the byte table across sizes" {
+test "crc64 xz folding matches the portable byte table" {
     // The portable byte table is the target-independent reference.
-    var rng = std.Random.DefaultPrng.init(0xC64C);
+    var rng = std.Random.DefaultPrng.init(0xC64D);
     const allocator = std.testing.allocator;
     const table = comptime seam.byteTable(u64, crc64_poly, true);
     var size: usize = 0;
@@ -605,7 +611,7 @@ test "crc64 xz fold matches the byte table across sizes" {
     }
 }
 
-test "checksum capabilities agree across providers when mergeable" {
+test "checksum providers agree on every input when merged" {
     const all_mergeable = options.crc32_impl == .mergeable and
         options.crc64xz_impl == .mergeable and
         options.bzip2crc32_impl == .mergeable and
@@ -613,7 +619,7 @@ test "checksum capabilities agree across providers when mergeable" {
         options.xxh64_impl == .mergeable and
         options.adler32_impl == .mergeable;
     if (!all_mergeable) return error.SkipZigTest;
-    var rng = std.Random.DefaultPrng.init(0xCC4C);
+    var rng = std.Random.DefaultPrng.init(0xCC4D);
     const allocator = std.testing.allocator;
     const pairs = .{
         .{ Crc32, {} },
@@ -628,7 +634,7 @@ test "checksum capabilities agree across providers when mergeable" {
         const buf = try allocator.alloc(u8, size);
         defer allocator.free(buf);
         rng.random().bytes(buf);
-        // The split feed exercises streaming state; the unsplit arm is the control.
+        // Whichever side splits, the two providers must land on one value.
         inline for (pairs) |pair| {
             var on = pair[0].bind(.onprem, pair[1]);
             on.update(buf[0 .. buf.len / 2]);
@@ -636,6 +642,12 @@ test "checksum capabilities agree across providers when mergeable" {
             var off = pair[0].bind(.offprem, pair[1]);
             off.update(buf);
             try std.testing.expectEqual(on.final({}), off.final({}));
+            var whole = pair[0].bind(.onprem, pair[1]);
+            whole.update(buf);
+            var split = pair[0].bind(.offprem, pair[1]);
+            split.update(buf[0 .. buf.len / 3]);
+            split.update(buf[buf.len / 3 ..]);
+            try std.testing.expectEqual(whole.final({}), split.final({}));
         }
     }
 }

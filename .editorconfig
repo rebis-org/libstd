@@ -1,0 +1,104 @@
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 2
+tab_width = 2
+
+[*.{c,h,cc,cpp,cxx,c++,hpp,hxx,hh,inc}]
+indent_style = tab
+indent_size = 8
+tab_width = 8
+max_line_length = 80
+
+[Makefile]
+indent_style = tab
+indent_size = 4
+tab_width = 4
+
+[*.go]
+indent_style = tab
+indent_size = 4
+tab_width = 4
+max_line_length = off
+
+[*.{kt,kts}]
+indent_style = space
+indent_size = 4
+tab_width = 4
+max_line_length = 100
+ktlint_code_style = android_studio
+ktlint_standard_no-wildcard-imports = enabled
+ktlint_standard_trailing-comma-on-call-site = enabled
+ktlint_standard_trailing-comma-on-declaration-site = enabled
+
+[*.swift]
+indent_style = space
+indent_size = 4
+tab_width = 4
+max_line_length = off
+
+[*.cs]
+indent_style = space
+indent_size = 4
+tab_width = 4
+max_line_length = 120
+
+[*.{js,jsx,ts,tsx,astro,vue,svelte}]
+indent_style = tab
+indent_size = 2
+tab_width = 2
+max_line_length = 80
+
+[*.{json,jsonc}]
+indent_style = space
+indent_size = 2
+tab_width = 2
+max_line_length = off
+
+[*.css]
+indent_style = space
+indent_size = 2
+tab_width = 2
+max_line_length = 80
+
+[*.{html,htm}]
+indent_style = space
+indent_size = 2
+tab_width = 2
+max_line_length = 120
+
+[*.{yml,yaml,toml}]
+indent_style = space
+indent_size = 2
+tab_width = 2
+max_line_length = 100
+
+[*.py]
+indent_style = space
+indent_size = 4
+tab_width = 4
+max_line_length = 79
+
+[*.rs]
+indent_style = space
+indent_size = 4
+tab_width = 4
+max_line_length = 100
+
+[*.{sh,bash}]
+indent_style = space
+indent_size = 2
+tab_width = 2
+max_line_length = 80
+
+[*.{tex,texi}]
+indent_style = space
+indent_size = 2
+tab_width = 2
+
+[*.md]
+trim_trailing_whitespace = false
+max_line_length = off

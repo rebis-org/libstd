@@ -5,11 +5,7 @@ const bits = @import("bits.zig");
 
 const Exception = exception_prim.Exception;
 
-// WIM XPRESS codec, ported from wimlib src/xpress_decompress.c.
-// Nibble header carries canonical Huffman lengths for 512 symbols.
-//
-// Symbols 0..255 are literals; 256..511 are matches.
-// Length bytes after a 0xff marker come from the raw cursor.
+// WIM XPRESS codec, ported from wimlib src/xpress_decompress.c; nibble header carries canonical Huffman lengths for 512 symbols.
 
 const num_symbols: usize = 512;
 const num_chars: usize = 256;
@@ -374,7 +370,7 @@ pub fn xpressDecode(input: []const u8, output: []u8) Exception!void {
         length += min_match_len;
         const off: usize = @intCast(offset);
         if (off > op or off == 0) return error.DataException;
-        if (length > output.len - op) return error.CapacityException;
+        if (length > output.len - op) return error.DataException;
         var i: usize = 0;
         while (i < length) : (i += 1) {
             output[op + i] = output[op - off + i];

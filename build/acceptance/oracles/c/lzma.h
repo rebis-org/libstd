@@ -65,14 +65,14 @@ typedef struct lzma_options_delta {
 	uint32_t dist;
 } lzma_options_delta;
 
-#define LZMA_OK 0
+#define LZMA_OK		0
 #define LZMA_STREAM_END 1
-#define LZMA_FINISH 3
+#define LZMA_FINISH	3
 
 #define LZMA_FILTER_DELTA 0x03
 #define LZMA_FILTER_LZMA1 0x4000000000000001ULL
 #define LZMA_FILTER_LZMA2 0x21
-#define LZMA_VLI_UNKNOWN UINT64_MAX
+#define LZMA_VLI_UNKNOWN  UINT64_MAX
 
 #define LZMA_DELTA_TYPE_BYTE 0
 

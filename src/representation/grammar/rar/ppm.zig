@@ -1113,6 +1113,8 @@ pub const PpmModel = struct {
         while (true) {
             while (true) {
                 p +%= state_size;
+                // Stay inside this context's states; past them lies another context.
+                if (p >= cctx.stats + @as(u32, cctx.num_stats) * state_size) return error.DataException;
                 if (p + state_size > heap.len) return error.DataException;
                 if (self.char_mask[stAt(heap, p).sym] != self.esc_count) break;
             }

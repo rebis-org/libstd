@@ -21,7 +21,11 @@ pub const EntryInfo = struct {
 // DwarFS v2 slice: one root directory of regular files.
 // Fidelity target is mkdwarfs output, verified with dwarfsck.
 
-pub const scratch_size: usize = 2 * 1024 * 1024;
+// Traversal frames live in the caller workspace, never the C stack.
+// The sizing query names the reserved tail.
+const frame_stack_bytes: usize = 16 * 1024;
+
+pub const scratch_size: usize = 2 * 1024 * 1024 + frame_stack_bytes;
 
 const section_type_block: u16 = 0;
 const section_type_schema: u16 = 7;
@@ -97,7 +101,12 @@ fn parseSections(archive: []const u8, arena: std.mem.Allocator) Exception!Sectio
 fn sectionPayload(archive: []const u8, at: u64, len: u64, compression: u16, arena: std.mem.Allocator, history: []u8) Exception![]const u8 {
     const raw = try bounds.slice(archive, at, len);
     if (compression == compression_none) return raw;
-    const out = arena.alloc(u8, raw.len * 16 + (1 << 16)) catch return error.ResourceException;
+    // The 16x + 64 KiB cap is deliberate; sections past it are
+    // an input limit, not a decode failure.
+    const scaled = std.math.mul(u64, @as(u64, raw.len), 16) catch return error.ResourceException;
+    const bound = std.math.add(u64, scaled, 1 << 16) catch return error.ResourceException;
+    const size = std.math.cast(usize, bound) orelse return error.ResourceException;
+    const out = arena.alloc(u8, size) catch return error.ResourceException;
     var writer = std.Io.Writer.fixed(out);
     switch (compression) {
         compression_zstd => {
@@ -297,8 +306,7 @@ fn castUsize(v: u64) Exception!usize {
     return std.math.cast(usize, v) orelse error.DataException;
 }
 
-// Vector element positions multiply hostile distances by 8 and stride;
-// overflow must fail closed, not wrap into a wrong in-bounds read.
+// Vector element positions multiply hostile distances by 8 and stride; overflow must fail closed, not wrap into a wrong read.
 fn elementPos(dist: usize, index: usize, stride: usize) Exception!usize {
     const base = std.math.mul(usize, dist, 8) catch return error.DataException;
     const step = std.math.mul(usize, index, stride) catch return error.DataException;
@@ -635,8 +643,11 @@ fn runTarget(archive: []const u8, scratch: []u8, target: Target) Exception!u64 {
         .resolve => |res| Target{ .resolve = .{ .ordinal = res.ordinal, .info = res.info, .output = res.output, .found = &found } },
     };
     if (scratch.len < scratch_size) return error.CapacityException;
-    // Joined listing paths live outside the metadata arena.
-    var fba = std.heap.FixedBufferAllocator.init(scratch[path_size..]);
+    // The reserved tail holds the traversal frames.
+    const usable = scratch[0 .. scratch.len - frame_stack_bytes];
+    var frame_fba = std.heap.FixedBufferAllocator.init(scratch[scratch.len - frame_stack_bytes ..]);
+    const frames = frame_fba.allocator().alloc(DwarfsFrame, max_dir_depth + 2) catch return error.ResourceException;
+    var fba = std.heap.FixedBufferAllocator.init(usable[path_size..]);
     const arena = fba.allocator();
     // One zstd history buffer serves every sequential stream decode
     // (schema, metadata, blocks); peak scratch stays at one window.
@@ -660,8 +671,8 @@ fn runTarget(archive: []const u8, scratch: []u8, target: Target) Exception!u64 {
     var store = BlockStore{ .archive = archive, .refs = sections.blocks, .chunks = md.chunks, .arena = arena, .block_size = md.block_size, .history = history };
     const dir_count = md.directories.len - 1;
     const file_off: u32 = std.math.cast(u32, dir_count) orelse return error.DataException;
-    var state = WalkState{ .path = scratch[0..path_size] };
-    try walkDwarfsDir(md, &store, 0, file_off, resolved, &state, 0);
+    var state = WalkState{ .path = usable[0..path_size] };
+    try walkDwarfsDir(md, &store, 0, file_off, resolved, &state, 0, frames);
     return switch (target) {
         .count => state.ordinal,
         .resolve => if (found) state.ordinal else error.DataException,
@@ -684,26 +695,54 @@ fn dirEntryName(md: Metadata, entry_index: usize) Exception![]const u8 {
     return md.names_buffer[start..end];
 }
 
-fn walkDwarfsDir(md: Metadata, store: *BlockStore, dir_index: usize, file_off: u32, target: Target, state: *WalkState, depth: u32) Exception!void {
-    if (depth > max_dir_depth) return error.DataException;
-    const start = md.directories[dir_index];
-    const end = md.directories[dir_index + 1];
-    if (end < start or end > md.dir_entries.len) return error.DataException;
+// A frame stack replaces the recursion; each frame keeps its
+// cursor, so a subtree finishes before its parent resumes.
+const DwarfsFrame = struct {
+    dir_index: usize,
+    cursor: usize,
+    end: usize,
+    depth: u32,
+};
+
+fn walkDwarfsDir(md: Metadata, store: *BlockStore, dir_index: usize, file_off: u32, target: Target, state: *WalkState, depth: u32, stack: []DwarfsFrame) Exception!void {
     const found_ptr = switch (target) {
         .resolve => |res| res.found,
         .count => null,
     };
-    var e = start;
-    while (e < end) : (e += 1) {
+    var sp: usize = 0;
+    if (depth > max_dir_depth) return error.DataException;
+    const root_start: usize = md.directories[dir_index];
+    const root_end: usize = md.directories[dir_index + 1];
+    if (root_end < root_start or root_end > md.dir_entries.len) return error.DataException;
+    stack[sp] = .{ .dir_index = dir_index, .cursor = root_start, .end = root_end, .depth = depth };
+    sp = 1;
+    while (sp > 0) {
         if (found_ptr) |fp| {
             if (fp.*) return;
         }
+        const frame = &stack[sp - 1];
+        if (frame.cursor >= frame.end) {
+            // A non-root frame had state.push done by its parent on entry.
+            if (frame.depth > 0) state.pop(frame.depth - 1);
+            sp -= 1;
+            continue;
+        }
+        const e = frame.cursor;
         const entry = md.dir_entries[e];
         if (entry.inode_num < file_off) {
             if (@as(u64, entry.inode_num) + 1 >= md.directories.len) return error.DataException;
-            try state.push(try dirEntryName(md, e), depth);
-            try walkDwarfsDir(md, store, entry.inode_num, file_off, target, state, depth + 1);
-            state.pop(depth);
+            // The push/pop pair brackets the child subtree, as the call did.
+            try state.push(try dirEntryName(md, e), frame.depth);
+            const child_depth = frame.depth + 1;
+            if (child_depth > max_dir_depth) return error.DataException;
+            const child_dir: usize = entry.inode_num;
+            const child_start: usize = md.directories[child_dir];
+            const child_end: usize = md.directories[child_dir + 1];
+            if (child_end < child_start or child_end > md.dir_entries.len) return error.DataException;
+            // The recursive `continue` advanced e; resume at e + 1 on pop.
+            frame.cursor = e + 1;
+            stack[sp] = .{ .dir_index = child_dir, .cursor = child_start, .end = child_end, .depth = child_depth };
+            sp += 1;
             continue;
         }
         if (entry.inode_num >= md.inodes.len) return error.DataException;
@@ -747,6 +786,7 @@ fn walkDwarfsDir(md: Metadata, store: *BlockStore, dir_index: usize, file_off: u
             },
         }
         state.ordinal += 1;
+        frame.cursor = e + 1;
     }
 }
 
@@ -951,6 +991,7 @@ fn dwFindOrCreateDir(nodes: *std.ArrayList(DwNode), alloc: std.mem.Allocator, pa
         if (nodes.items[existing].kind != .dir) return error.CallException;
         return existing;
     }
+    if (nodes.items.len >= max_tree_nodes) return error.UnsupportedException;
     const idx: u32 = @intCast(nodes.items.len);
     nodes.append(alloc, .{ .kind = .dir, .name = name, .parent = parent }) catch return error.ResourceException;
     nodes.items[parent].child_count += 1;
@@ -981,6 +1022,7 @@ fn dwBuildNodes(nodes: *std.ArrayList(DwNode), alloc: std.mem.Allocator, entries
             if (nodes.items[existing].kind != .dir or entry.data.len != 0) return error.CallException;
             continue;
         }
+        if (nodes.items.len >= max_tree_nodes) return error.UnsupportedException;
         nodes.append(alloc, .{ .kind = .file, .name = comp, .parent = parent, .data = entry.data }) catch return error.ResourceException;
         nodes.items[parent].child_count += 1;
     }
@@ -1637,4 +1679,77 @@ test "dwarfs dir entry name rejects wrapped name index" {
         .names_buffer = "x",
     };
     try std.testing.expectError(error.DataException, dirEntryName(md, 0));
+}
+
+// The writer has no depth cap, so the reader alone decides where to stop.
+fn depthChainName(buf: []u8, dirs: usize, leaf: []const u8) []const u8 {
+    var pos: usize = 0;
+    for (0..dirs) |_| {
+        if (pos != 0) {
+            buf[pos] = '/';
+            pos += 1;
+        }
+        buf[pos] = 'a';
+        pos += 1;
+    }
+    if (pos != 0) {
+        buf[pos] = '/';
+        pos += 1;
+    }
+    @memcpy(buf[pos..][0..leaf.len], leaf);
+    return buf[0 .. pos + leaf.len];
+}
+
+// Enumeration must stay identical one frame below and at the limit.
+test "dwarfs reader pins enumeration at depths 63 and 64" {
+    const testing = std.testing;
+    var scratch: [scratch_size]u8 = undefined;
+    for ([_]usize{ 63, 64 }) |dirs| {
+        var name_buf: [256]u8 = undefined;
+        const deep = depthChainName(&name_buf, dirs, "leaf.bin");
+        const entries = [_]Entry{
+            .{ .name = deep, .data = "deep payload" },
+            .{ .name = "z.txt", .data = "root payload" },
+        };
+        const required = try archiveSize(&entries);
+        const image = try testing.allocator.alloc(u8, @intCast(required));
+        defer testing.allocator.free(image);
+        const written = try encode(&entries, image, &scratch);
+        try testing.expectEqual(required, @as(u64, @intCast(written)));
+        try testing.expectEqual(@as(u64, 2), try inspectCount(image, &scratch));
+
+        // DFS pre-order: the directory chain resolves before the root file.
+        const names = [_][]const u8{ deep, "z.txt" };
+        const bytes = [_][]const u8{ "deep payload", "root payload" };
+        for (names, 0..) |name, ordinal| {
+            const info = try inspectOrdinal(image, ordinal, &scratch);
+            try testing.expectEqual(@as(u64, @intCast(ordinal)), info.ordinal);
+            try testing.expectEqualStrings(name, info.name);
+            try testing.expectEqual(@as(u64, bytes[ordinal].len), info.size);
+            var out: [16]u8 = undefined;
+            const n = try decodeOrdinal(image, ordinal, &out, &scratch);
+            try testing.expectEqualSlices(u8, bytes[ordinal], out[0..n]);
+        }
+        try testing.expectError(error.DataException, inspectOrdinal(image, 2, &scratch));
+    }
+}
+
+// One directory past the cap fails on both the count and resolve walks.
+test "dwarfs reader rejects a 65-deep directory chain" {
+    const testing = std.testing;
+    var scratch: [scratch_size]u8 = undefined;
+    var name_buf: [256]u8 = undefined;
+    const deep = depthChainName(&name_buf, 65, "leaf.bin");
+    const entries = [_]Entry{
+        .{ .name = deep, .data = "deep payload" },
+        .{ .name = "z.txt", .data = "root payload" },
+    };
+    const required = try archiveSize(&entries);
+    const image = try testing.allocator.alloc(u8, @intCast(required));
+    defer testing.allocator.free(image);
+    const written = try encode(&entries, image, &scratch);
+    try testing.expectEqual(required, @as(u64, @intCast(written)));
+    var out: [16]u8 = undefined;
+    try testing.expectError(error.DataException, inspectCount(image, &scratch));
+    try testing.expectError(error.DataException, decodeOrdinal(image, 0, &out, &scratch));
 }

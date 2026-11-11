@@ -339,7 +339,7 @@ fn inspectMember(input: []const u8, history: []u8, provider: checksum.Provider) 
 test "inspectMembers enumerates concatenated members with their fields" {
     // A mixed provider build serves no single tag for both arms; run
     // only where the default tag serves them.
-    if (!deflate_seam.decodeServed(checksum.default_provider)) return;
+    if (!deflate_seam.decodeServed(checksum.default_provider)) return error.SkipZigTest;
 
     var first: [256]u8 = undefined;
     var second: [256]u8 = undefined;
@@ -397,7 +397,7 @@ test "inspectMembers enumerates concatenated members with their fields" {
 test "decodeSinglePass defers to the two-pass route when the decoded limit excludes the member" {
     // A mixed provider build serves no single tag for both arms; run
     // only where the default tag serves them.
-    if (!deflate_seam.decodeServed(checksum.default_provider)) return;
+    if (!deflate_seam.decodeServed(checksum.default_provider)) return error.SkipZigTest;
 
     const payload = "single pass payload that a decoded limit must exclude";
     const options: Options = .{

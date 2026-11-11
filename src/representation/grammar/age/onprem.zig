@@ -419,6 +419,7 @@ fn unwrapFileKey(stanzas: []const Stanza, options: Options, scratch: []u8) Excep
     if (options.password.len != 0) {
         // A scrypt stanza must be the only stanza; anything else is not a
         // passphrase-encrypted header.
+        if (stanzas.len == 1 and stanzas[0].args.len == 0) return error.DataException;
         if (stanzas.len != 1 or !std.mem.eql(u8, stanzas[0].args[0], "scrypt")) return error.IntegrityException;
         const stanza = stanzas[0];
         if (stanza.args.len != 3) return error.DataException;
@@ -518,8 +519,7 @@ fn encryptPayload(file_key: [file_key_len]u8, source: []const u8, dest: []u8) Ex
     }
 }
 
-// Invert P = plain + 16n with plain <= chunk_size * n: P tiles as
-// [65552(n-1) + 17, 65552n]; gaps between the tiles are invalid streams.
+// Inverting P = plain + 16n tiles P as [65552(n-1)+17, 65552n]; gaps between tiles are invalid streams.
 fn chunkCount(ciphertext_payload: usize) Exception!usize {
     if (ciphertext_payload < 16) return error.DataException;
     if (ciphertext_payload == 16) return 1;
@@ -968,8 +968,6 @@ test "armor round trip and garbage rejection" {
     const entries = [_]Entry{.{ .name = "payload", .data = "armored payload" }};
     var scratch: [256 * 1024]u8 = undefined;
     var out: [4096]u8 = undefined;
-    const options = Options{ .recipient = "", .password = "pw", .work_factor = 4, .armor = true };
-    _ = options;
     const id = randomIdentity();
     var id_buf: [80]u8 = undefined;
     var rec_buf: [100]u8 = undefined;

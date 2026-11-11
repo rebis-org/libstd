@@ -3,20 +3,27 @@ const std = @import("std");
 const entry_prim = @import("../../../common/entry.zig");
 const bounds = @import("../../../common/primitive/bounds.zig");
 const exception_prim = @import("../../../common/primitive/exception.zig");
+const tree = @import("../tree.zig");
 
 pub const Entry = entry_prim.Entry;
-pub const EntryInfo = entry_prim.Sized;
 const Exception = exception_prim.Exception;
 
-// Layouts follow apfs_raw.h (linux-apfs/linux-apfs-rw) and ApfsHandler (vendor/7zip).
-//
-// Checksum: APFS Fletcher-64, libfsapfs_checksum.c (libyal/libfsapfs),
-// over block[8..] with initial value 0.
-//
-// The writer builds a fresh single-volume, mkfs-shaped image: one physical
-// fs tree, one container object map, no checkpoint area.
+// The metadata projection publishes the entry's full path, so the walk
+// carries a name beside the size.
 
-pub const scratch_size: usize = 1024 * 1024;
+pub const EntryInfo = struct {
+    name: []const u8,
+    size: u64,
+    ordinal: u64,
+};
+
+// Layouts follow apfs_raw.h (linux-apfs-rw) and ApfsHandler (vendor/7zip); checksum is Fletcher-64 over block[8..] with initial value 0.
+
+// Traversal frames live in the caller's workspace, never the C stack.
+// The sizing query names this reserved tail.
+const frame_stack_bytes: usize = 16 * 1024;
+
+pub const scratch_size: usize = 1024 * 1024 + frame_stack_bytes;
 
 const max_dir_depth: u32 = 64;
 const max_descriptor_blocks = 10000;
@@ -267,23 +274,20 @@ const Mount = struct {
 };
 
 pub fn inspectCount(archive: []const u8, scratch: []u8) Exception!u64 {
-    _ = scratch;
-    return walk(archive, .count);
+    return walk(archive, .count, scratch);
 }
 
 pub fn inspectOrdinal(archive: []const u8, ordinal: u64, scratch: []u8) Exception!EntryInfo {
-    _ = scratch;
     var info: EntryInfo = undefined;
     var found = false;
-    _ = try walk(archive, .{ .resolve = .{ .ordinal = ordinal, .info = &info, .output = null, .found = &found } });
+    _ = try walk(archive, .{ .resolve = .{ .ordinal = ordinal, .info = &info, .output = null, .found = &found } }, scratch);
     return info;
 }
 
 pub fn decodeOrdinal(archive: []const u8, ordinal: u64, output: []u8, scratch: []u8) Exception!usize {
-    _ = scratch;
     var info: EntryInfo = undefined;
     var found = false;
-    _ = try walk(archive, .{ .resolve = .{ .ordinal = ordinal, .info = &info, .output = output, .found = &found } });
+    _ = try walk(archive, .{ .resolve = .{ .ordinal = ordinal, .info = &info, .output = output, .found = &found } }, scratch);
     return @intCast(info.size);
 }
 
@@ -292,11 +296,32 @@ const Target = union(enum) {
     resolve: struct { ordinal: u64, info: *EntryInfo, output: ?[]u8, found: *bool },
 };
 
-const WalkState = struct { ordinal: u64 = 0 };
+// A scan and its inode lookup nest, so each owns a disjoint
+// frame stack; the nesting never exceeds two.
+const DecodeFrames = struct {
+    scan: []ScanFrame,
+    inner: []ScanFrame,
+    dir: []DirFrame,
+};
 
-fn walk(archive: []const u8, target: Target) Exception!u64 {
+fn carveDecodeFrames(scratch: []u8) Exception!DecodeFrames {
+    if (scratch.len < frame_stack_bytes) return error.CapacityException;
+    var fba = std.heap.FixedBufferAllocator.init(scratch[scratch.len - frame_stack_bytes ..]);
+    const alloc = fba.allocator();
+    return .{
+        .scan = alloc.alloc(ScanFrame, max_tree_depth + 2) catch return error.ResourceException,
+        .inner = alloc.alloc(ScanFrame, max_tree_depth + 2) catch return error.ResourceException,
+        .dir = alloc.alloc(DirFrame, max_dir_depth + 2) catch return error.ResourceException,
+    };
+}
+
+fn walk(archive: []const u8, target: Target, scratch: []u8) Exception!u64 {
+    if (scratch.len < scratch_size) return error.CapacityException;
+    const frames = try carveDecodeFrames(scratch);
     var mount = try open(archive);
-    var state = WalkState{};
+    // The joined name outlives the walk because a resolve aborts before
+    // any mutation. The reserved tail holds every traversal frame.
+    var state = tree.WalkState(max_dir_depth){ .path = scratch[0 .. scratch.len - frame_stack_bytes] };
     var found = false;
     const resolved = switch (target) {
         .count => target,
@@ -307,7 +332,7 @@ fn walk(archive: []const u8, target: Target) Exception!u64 {
     for (0..max_volumes) |index| {
         const fs_oid = le64(mount.superblock[0xb8 + 8 * index ..][0..8]);
         if (fs_oid == 0) continue;
-        try walkVolume(&mount, fs_oid, resolved, &state);
+        try walkVolume(&mount, fs_oid, resolved, &state, &frames);
         switch (resolved) {
             .resolve => |res| if (res.found.*) return state.ordinal,
             .count => {},
@@ -378,21 +403,28 @@ fn selectCheckpoint(mount: *Mount) Exception!void {
     const end = std.math.add(u64, desc_base, desc_blocks) catch return error.DataException;
     if (end > mount.image.block_count) return error.DataException;
 
+    // Two passes: a map commonly precedes its own superblock, so a
+    // running best_xid binding would drop it.
     var best_xid = objXid(mount.superblock);
     var best_block: u64 = 0;
-    var map_xid: u64 = 0;
-    var map_entries: []const u8 = &.{};
-
     var i: u64 = 0;
     while (i < desc_blocks) : (i += 1) {
         const candidate = try mount.image.block(desc_base + i);
-        const otype = objType(candidate);
         const xid = objXid(candidate);
         if (le32(candidate[0x20..0x24]) == nx_magic and xid > best_xid and checksumValid(candidate)) {
             best_xid = xid;
             best_block = desc_base + i;
         }
-        if (otype & 0xffff == obj_type_checkpoint_map and otype & obj_flag_physical != 0 and xid > map_xid) {
+    }
+
+    var map_xid: u64 = 0;
+    var map_entries: []const u8 = &.{};
+    i = 0;
+    while (i < desc_blocks) : (i += 1) {
+        const candidate = try mount.image.block(desc_base + i);
+        const otype = objType(candidate);
+        const xid = objXid(candidate);
+        if (otype & 0xffff == obj_type_checkpoint_map and otype & obj_flag_physical != 0 and xid > map_xid and xid <= best_xid and checksumValid(candidate)) {
             map_xid = xid;
             const count = le32(candidate[0x24..0x28]);
             const begin: usize = 0x28;
@@ -482,7 +514,7 @@ fn omapLookup(mount: *const Mount, root_paddr: u64, oid: u64) Exception!?u64 {
     }
 }
 
-fn walkVolume(mount: *Mount, fs_oid: u64, target: Target, state: *WalkState) Exception!void {
+fn walkVolume(mount: *Mount, fs_oid: u64, target: Target, state: *tree.WalkState(max_dir_depth), frames: *const DecodeFrames) Exception!void {
     const vol_paddr = (try omapLookup(mount, mount.container_omap_root, fs_oid)) orelse
         return error.DataException;
     const vol = try mount.image.block(vol_paddr);
@@ -498,6 +530,7 @@ fn walkVolume(mount: *Mount, fs_oid: u64, target: Target, state: *WalkState) Exc
     // The root tree type carries its storage class.
     const fs_tree_type = le32(vol[0x74..0x78]);
     if (fs_tree_type & ~obj_storagetype_mask != obj_type_btree) return error.DataException;
+    if (fs_tree_type & obj_storagetype_mask == obj_storagetype_mask) return error.DataException;
     const fs_tree_flags: u32 = switch (fs_tree_type & obj_storagetype_mask) {
         obj_flag_physical => btinfo_flag_physical,
         obj_flag_ephemeral => btinfo_flag_ephemeral,
@@ -505,7 +538,7 @@ fn walkVolume(mount: *Mount, fs_oid: u64, target: Target, state: *WalkState) Exc
     };
     mount.fs_root = try resolveNode(mount, fs_tree_flags, mount.volume_omap_root, le64(vol[0x88..0x90]));
 
-    try walkDir(mount, root_dir_ino, target, state, 0);
+    try walkDir(mount, root_dir_ino, target, state, frames);
 }
 
 const Inode = struct {
@@ -585,43 +618,87 @@ fn fsKey(node: Node, index: u32, footer: Footer) Exception![]const u8 {
     return k;
 }
 
+// The explicit frame stack stores the footer per frame; ctx.footer
+// stays the inheritance channel a pop does not reset.
+const ScanPhase = enum { enter, descend, after_child };
+const ScanFrame = struct {
+    paddr: u64,
+    depth: u32,
+    index: u32 = 0,
+    footer: Footer = .{ .flags = 0, .node_size = 0, .key_size = 0, .val_size = 0 },
+    phase: ScanPhase = .enter,
+};
+
 // In-order enumeration of fs-tree records with keys in [lo, hi) per fsKeyCompare.
-fn fsScanNode(ctx: *ScanCtx, paddr: u64, depth: u32) Exception!void {
-    if (depth >= max_tree_depth) return error.DataException;
-    const node = try Node.parse(try ctx.mount.image.block(paddr), obj_subtype_fs_tree);
-    // A rootless fs-tree root would read ctx.footer before it is set.
-    const footer = if (node.isRoot()) try node.footer() else if (depth == 0) return error.DataException else ctx.footer;
-    ctx.footer = footer;
-    var i: u32 = 0;
-    if (node.isLeaf()) {
-        // The first leaf record at or above the lower bound.
-        while (i < node.nkeys) : (i += 1) {
-            const k = try fsKey(node, i, footer);
-            if (fsKeyCompare(k, ctx.lo, ctx.mount.hashed_drec) != .lt) break;
-        }
-        while (i < node.nkeys) : (i += 1) {
-            const k = try fsKey(node, i, footer);
-            if (fsKeyCompare(k, ctx.hi, ctx.mount.hashed_drec) != .lt) break;
-            const v = try node.value(i, footer);
-            try ctx.yield(ctx, k, v);
-            if (ctx.aborted) return;
-        }
-        return;
-    }
-    // Each entry holds its child's first key: descend the last entry at or
-    // below the lower bound, else the first.
-    while (i + 1 < node.nkeys) : (i += 1) {
-        const k = try fsKey(node, i + 1, footer);
-        if (fsKeyCompare(k, ctx.lo, ctx.mount.hashed_drec) == .gt) break;
-    }
-    while (i < node.nkeys) : (i += 1) {
-        const v = try node.value(i, footer);
-        if (v.len < 8) return error.DataException;
-        const child = try resolveNode(ctx.mount, footer.flags, ctx.mount.volume_omap_root, le64(v[0..8]));
-        try fsScanNode(ctx, child, depth + 1);
+fn fsScanNode(ctx: *ScanCtx, paddr: u64, depth: u32, stack: []ScanFrame) Exception!void {
+    var sp: usize = 0;
+    stack[sp] = .{ .paddr = paddr, .depth = depth };
+    sp = 1;
+    while (sp > 0) {
         if (ctx.aborted) return;
-        const k = try fsKey(node, i, footer);
-        if (fsKeyCompare(k, ctx.hi, ctx.mount.hashed_drec) != .lt) break;
+        const frame = &stack[sp - 1];
+        if (frame.depth >= max_tree_depth) return error.DataException;
+        const node = try Node.parse(try ctx.mount.image.block(frame.paddr), obj_subtype_fs_tree);
+        switch (frame.phase) {
+            .enter => {
+                // A rootless fs-tree root would read ctx.footer before it is set.
+                const ft = if (node.isRoot()) try node.footer() else if (frame.depth == 0) return error.DataException else ctx.footer;
+                frame.footer = ft;
+                ctx.footer = ft;
+                if (node.isLeaf()) {
+                    var i: u32 = 0;
+                    // The first leaf record at or above the lower bound.
+                    while (i < node.nkeys) : (i += 1) {
+                        const k = try fsKey(node, i, ft);
+                        if (fsKeyCompare(k, ctx.lo, ctx.mount.hashed_drec) != .lt) break;
+                    }
+                    while (i < node.nkeys) : (i += 1) {
+                        const k = try fsKey(node, i, ft);
+                        if (fsKeyCompare(k, ctx.hi, ctx.mount.hashed_drec) != .lt) break;
+                        const v = try node.value(i, ft);
+                        try ctx.yield(ctx, k, v);
+                        if (ctx.aborted) return;
+                    }
+                    sp -= 1;
+                    continue;
+                }
+                // Each entry holds its child's first key: descend the last
+                // entry at or below the lower bound, else the first.
+                var i: u32 = 0;
+                while (i + 1 < node.nkeys) : (i += 1) {
+                    const k = try fsKey(node, i + 1, ft);
+                    if (fsKeyCompare(k, ctx.lo, ctx.mount.hashed_drec) == .gt) break;
+                }
+                frame.index = i;
+                frame.phase = .descend;
+                continue;
+            },
+            .descend => {
+                if (frame.index >= node.nkeys) {
+                    sp -= 1;
+                    continue;
+                }
+                const v = try node.value(frame.index, frame.footer);
+                if (v.len < 8) return error.DataException;
+                const child = try resolveNode(ctx.mount, frame.footer.flags, ctx.mount.volume_omap_root, le64(v[0..8]));
+                // The child runs to completion before this sibling advances.
+                frame.phase = .after_child;
+                stack[sp] = .{ .paddr = child, .depth = frame.depth + 1 };
+                sp += 1;
+                continue;
+            },
+            .after_child => {
+                if (ctx.aborted) return;
+                const k = try fsKey(node, frame.index, frame.footer);
+                if (fsKeyCompare(k, ctx.hi, ctx.mount.hashed_drec) != .lt) {
+                    sp -= 1;
+                    continue;
+                }
+                frame.index += 1;
+                frame.phase = .descend;
+                continue;
+            },
+        }
     }
 }
 
@@ -629,6 +706,7 @@ fn fsScan(
     mount: *const Mount,
     lo: []const u8,
     hi: []const u8,
+    frames: []ScanFrame,
     comptime Ctx: type,
     user: *Ctx,
     comptime yieldFn: fn (ctx: *Ctx, key: []const u8, val: []const u8) Exception!void,
@@ -647,29 +725,47 @@ fn fsScan(
             }
         }.call,
     };
-    try fsScanNode(&ctx, mount.fs_root, 0);
+    try fsScanNode(&ctx, mount.fs_root, 0, frames);
 }
+
+// One directory per frame. resume_key points into the image (no
+// copy); pushed_at is the pushed depth, or -1 for none.
+const DirFrame = struct {
+    dir_ino: u64,
+    depth: u32,
+    pushed_at: i32 = -1,
+    resume_key: []const u8 = &.{},
+};
 
 const WalkCtx = struct {
     mount: *const Mount,
     target: Target,
-    state: *WalkState,
+    state: *tree.WalkState(max_dir_depth),
     depth: u32,
     aborted: bool = false,
+    frames: []DirFrame,
+    inner: []ScanFrame,
+    sp: usize = 0,
+    descend: bool = false,
 };
 
 fn drecName(key: []const u8, hashed: bool) Exception![]const u8 {
     if (key.len < 8) return error.DataException;
+    var name: []const u8 = undefined;
     if (hashed) {
         if (key.len < 0xc) return error.DataException;
         const name_len = le32(key[8..12]) & drec_len_mask;
         if (0xc + name_len > key.len) return error.DataException;
-        return key[0xc..][0..name_len];
+        name = key[0xc..][0..name_len];
+    } else {
+        if (key.len < 0xa) return error.DataException;
+        const name_len = le16(key[8..10]);
+        if (0xa + name_len > key.len) return error.DataException;
+        name = key[0xa..][0..name_len];
     }
-    if (key.len < 0xa) return error.DataException;
-    const name_len = le16(key[8..10]);
-    if (0xa + name_len > key.len) return error.DataException;
-    return key[0xa..][0..name_len];
+    // The stored length counts the terminator; a drec name is what precedes it.
+    if (name.len == 0 or name[name.len - 1] != 0) return error.DataException;
+    return name[0 .. name.len - 1];
 }
 
 fn makeLoKey(buffer: *[0x10]u8, id: u64, rec_type: u64) []const u8 {
@@ -689,30 +785,73 @@ fn makeHiKey(buffer: *[0x10]u8, id: u64, rec_type: u64) []const u8 {
     return buffer[0..8];
 }
 
-fn walkDir(mount: *const Mount, dir_ino: u64, target: Target, state: *WalkState, depth: u32) Exception!void {
-    if (depth > max_dir_depth) return error.DataException;
+// A LIFO frame stack, not callback re-entry: records keep their
+// fsScan order, so pre-order, ordinals, and early exit hold.
+fn walkDir(mount: *const Mount, dir_ino: u64, target: Target, state: *tree.WalkState(max_dir_depth), frames: *const DecodeFrames) Exception!void {
+    const dir_frames = frames.dir;
+    dir_frames[0] = .{ .dir_ino = dir_ino, .depth = 0 };
+    var ctx = WalkCtx{ .mount = mount, .target = target, .state = state, .depth = 0, .frames = dir_frames, .inner = frames.inner, .sp = 1 };
     var lo: [0x10]u8 = undefined;
     var hi: [0x10]u8 = undefined;
-    var ctx = WalkCtx{ .mount = mount, .target = target, .state = state, .depth = depth };
-    try fsScan(mount, makeLoKey(&lo, dir_ino, rec_type_dir_rec), makeHiKey(&hi, dir_ino, rec_type_dir_rec), WalkCtx, &ctx, dirYield);
-}
-
-fn dirYield(walk_ctx: *WalkCtx, key: []const u8, val: []const u8) Exception!void {
-    const name = try drecName(key, walk_ctx.mount.hashed_drec);
-    _ = name;
-    if (val.len < 8) return error.DataException;
-    const file_id = le64(val[0..8]);
-    const inode = try lookupInode(walk_ctx.mount, file_id);
-    const fmt = inode.mode & mode_fmt_mask;
-    if (fmt == mode_dir) {
-        try walkDir(walk_ctx.mount, file_id, walk_ctx.target, walk_ctx.state, walk_ctx.depth + 1);
-        switch (walk_ctx.target) {
+    while (ctx.sp > 0) {
+        const frame = &dir_frames[ctx.sp - 1];
+        ctx.depth = frame.depth;
+        ctx.descend = false;
+        ctx.aborted = false;
+        const lo_key = if (frame.resume_key.len != 0)
+            frame.resume_key
+        else
+            makeLoKey(&lo, frame.dir_ino, rec_type_dir_rec);
+        try fsScan(mount, lo_key, makeHiKey(&hi, frame.dir_ino, rec_type_dir_rec), frames.scan, WalkCtx, &ctx, dirYield);
+        if (ctx.descend) continue;
+        // The frame's scan ended without suspending: its directory is done.
+        ctx.sp -= 1;
+        if (frame.pushed_at >= 0) state.pop(@intCast(frame.pushed_at));
+        switch (ctx.target) {
             .resolve => |res| if (res.found.*) {
-                walk_ctx.aborted = true;
+                // The resolve unwinds the remaining frames exactly as the
+                // recursive defers did; no later sibling is visited.
+                while (ctx.sp > 0) {
+                    ctx.sp -= 1;
+                    const done = &dir_frames[ctx.sp];
+                    if (done.pushed_at >= 0) state.pop(@intCast(done.pushed_at));
+                }
                 return;
             },
             .count => {},
         }
+    }
+}
+
+fn dirYield(walk_ctx: *WalkCtx, key: []const u8, val: []const u8) Exception!void {
+    const frame = &walk_ctx.frames[walk_ctx.sp - 1];
+    // The resumed record was already processed; skip it. Later
+    // duplicates process normally.
+    if (frame.resume_key.len != 0 and std.mem.eql(u8, key, frame.resume_key)) {
+        frame.resume_key = &.{};
+        return;
+    }
+    const name = try drecName(key, walk_ctx.mount.hashed_drec);
+    if (val.len < 8) return error.DataException;
+    const file_id = le64(val[0..8]);
+    const inode = try lookupInode(walk_ctx.mount, file_id, walk_ctx.inner);
+    const fmt = inode.mode & mode_fmt_mask;
+    if (fmt == mode_dir) {
+        // Only a resolve publishes names, so only it keeps the path stack.
+        const named = walk_ctx.target == .resolve;
+        if (named) try walk_ctx.state.push(name, walk_ctx.depth);
+        if (walk_ctx.depth + 1 > max_dir_depth) return error.DataException;
+        // Suspend this scan at the record and descend into the child frame.
+        frame.resume_key = key;
+        const child = &walk_ctx.frames[walk_ctx.sp];
+        child.* = .{
+            .dir_ino = file_id,
+            .depth = walk_ctx.depth + 1,
+            .pushed_at = if (named) @intCast(walk_ctx.depth) else -1,
+        };
+        walk_ctx.sp += 1;
+        walk_ctx.descend = true;
+        walk_ctx.aborted = true;
         return;
     }
     if (fmt != mode_reg) return;
@@ -722,9 +861,10 @@ fn dirYield(walk_ctx: *WalkCtx, key: []const u8, val: []const u8) Exception!void
             if (walk_ctx.state.ordinal == res.ordinal) {
                 res.info.size = inode.size;
                 res.info.ordinal = walk_ctx.state.ordinal;
+                res.info.name = try walk_ctx.state.joined(name);
                 if (res.output) |out| {
                     if (out.len < inode.size) return error.CapacityException;
-                    try readFile(walk_ctx.mount, inode.private_id, inode.size, out);
+                    try readFile(walk_ctx.mount, inode.private_id, inode.size, out, walk_ctx.inner);
                 }
                 res.found.* = true;
                 walk_ctx.aborted = true;
@@ -735,12 +875,12 @@ fn dirYield(walk_ctx: *WalkCtx, key: []const u8, val: []const u8) Exception!void
     walk_ctx.state.ordinal += 1;
 }
 
-fn lookupInode(mount: *const Mount, ino: u64) Exception!Inode {
+fn lookupInode(mount: *const Mount, ino: u64, frames: []ScanFrame) Exception!Inode {
     var result: ?Inode = null;
     var lo: [0x10]u8 = undefined;
     var hi: [0x10]u8 = undefined;
     var ctx = InodeCtx{ .result = &result };
-    try fsScan(mount, makeLoKey(&lo, ino, rec_type_inode), makeHiKey(&hi, ino, rec_type_inode), InodeCtx, &ctx, inodeYield);
+    try fsScan(mount, makeLoKey(&lo, ino, rec_type_inode), makeHiKey(&hi, ino, rec_type_inode), frames, InodeCtx, &ctx, inodeYield);
     return result orelse error.DataException;
 }
 
@@ -752,11 +892,11 @@ fn inodeYield(ctx: *InodeCtx, key: []const u8, val: []const u8) Exception!void {
     ctx.aborted = true;
 }
 
-fn readFile(mount: *const Mount, private_id: u64, size: u64, output: []u8) Exception!void {
+fn readFile(mount: *const Mount, private_id: u64, size: u64, output: []u8, frames: []ScanFrame) Exception!void {
     var lo: [0x10]u8 = undefined;
     var hi: [0x10]u8 = undefined;
     var ctx = FileCtx{ .mount = mount, .size = size, .output = output, .written = 0 };
-    try fsScan(mount, makeLoKey(&lo, private_id, rec_type_file_extent), makeHiKey(&hi, private_id, rec_type_file_extent), FileCtx, &ctx, extentYield);
+    try fsScan(mount, makeLoKey(&lo, private_id, rec_type_file_extent), makeHiKey(&hi, private_id, rec_type_file_extent), frames, FileCtx, &ctx, extentYield);
     if (ctx.written < size) {
         @memset(output[@intCast(ctx.written)..@intCast(size)], 0);
     }
@@ -785,18 +925,10 @@ fn extentYield(ctx: *FileCtx, key: []const u8, val: []const u8) Exception!void {
     const phys_off = std.math.mul(u64, phys, block_size) catch return error.DataException;
     const data = try bounds.slice(ctx.mount.image.bytes, phys_off, take);
     @memcpy(ctx.output[@intCast(logical)..@intCast(end)], data);
-    ctx.written = end;
+    ctx.written = @max(ctx.written, end);
 }
 
-// Writer: a fresh single-volume image (mkfs-shaped, no checkpoint area).
-//
-// After the fixed blocks come volume omap nodes, fs tree nodes (leaves,
-// then internal levels bottom-up), then file data.
-//
-// The fs tree is virtual because 7-Zip resolves the root through the
-// volume omap unconditionally.
-//
-// Read order is depth-first with sibling names sorted bytewise.
+// Writer: a fresh single-volume, mkfs-shaped image. The fs tree is virtual because 7-Zip resolves the root through the volume omap.
 
 const writer_block_size: usize = 4096;
 const volume_oid: u64 = 100;
@@ -903,7 +1035,7 @@ fn buildTree(entries: []const Entry, alloc: std.mem.Allocator) Exception!*PlanNo
     // Inodes 0..15 are reserved (root 2, private dir 3); 7-Zip drops any
     // file whose id lands in the private-dir slot.
     var next_ino: u64 = 16;
-    rankNode(root, &next_ino, true);
+    try rankNode(root, &next_ino, true, alloc);
     return root;
 }
 
@@ -914,30 +1046,54 @@ fn isKid(parent: *PlanNode, name: []const u8) ?*PlanNode {
     return null;
 }
 
-fn rankNode(node: *PlanNode, next_ino: *u64, is_root: bool) void {
-    node.ino = if (is_root) root_ino else blk: {
-        const ino = next_ino.*;
-        next_ino.* += 1;
-        break :blk ino;
-    };
+// Each frame holds one pending sibling cursor, so peak depth is
+// the tree depth, not the child count.
+const RankFrame = struct { node: *PlanNode, index: usize };
+
+fn sortKids(node: *PlanNode) void {
     std.mem.sort(*PlanNode, node.kids.items, {}, struct {
         fn lessThan(_: void, a: *PlanNode, b: *PlanNode) bool {
             return std.mem.order(u8, a.name, b.name) == .lt;
         }
     }.lessThan);
-    for (node.kids.items) |kid| {
+}
+
+fn rankNode(node: *PlanNode, next_ino: *u64, is_root: bool, alloc: std.mem.Allocator) Exception!void {
+    node.ino = if (is_root) root_ino else blk: {
+        const ino = next_ino.*;
+        next_ino.* += 1;
+        break :blk ino;
+    };
+    // The frame stack borrows the caller's workspace, never the C stack.
+    const stack = alloc.alloc(RankFrame, max_dir_depth + 1) catch return error.ResourceException;
+    var sp: usize = 0;
+    sortKids(node);
+    stack[sp] = .{ .node = node, .index = 0 };
+    sp = 1;
+    while (sp > 0) {
+        const frame = &stack[sp - 1];
+        if (frame.index >= frame.node.kids.items.len) {
+            sp -= 1;
+            continue;
+        }
+        const kid = frame.node.kids.items[frame.index];
+        frame.index += 1;
+        kid.ino = next_ino.*;
+        next_ino.* += 1;
         if (kid.is_dir) {
-            rankNode(kid, next_ino, false);
-        } else {
-            kid.ino = next_ino.*;
-            next_ino.* += 1;
+            sortKids(kid);
+            stack[sp] = .{ .node = kid, .index = 0 };
+            sp += 1;
         }
     }
 }
 
 // Pre-order generation over increasing inode numbers matches fsKeyCompare,
-// so records need no sort. `files` parallels `extent_idx`.
-fn emitNodeRecords(
+// so records need no sort. `files` parallels `extent_idx`. A node emits its
+// own two append phases when first visited; the frame stack then walks kids.
+const EmitFrame = struct { node: *PlanNode, index: usize };
+
+fn emitNodeEntry(
     node: *PlanNode,
     records: *std.ArrayList(FsRec),
     files: *std.ArrayList(*PlanNode),
@@ -949,15 +1105,43 @@ fn emitNodeRecords(
         for (node.kids.items) |kid| {
             records.append(alloc, .{ .id = node.ino, .rec_type = rec_type_dir_rec, .name = kid.name, .val_kind = .drec, .file_id = kid.ino }) catch return error.ResourceException;
         }
-        for (node.kids.items) |kid| {
-            try emitNodeRecords(kid, records, files, extent_idx, alloc);
-        }
     } else {
         records.append(alloc, .{ .id = node.ino, .rec_type = rec_type_inode, .val_kind = .inode_file, .size = node.data.len }) catch return error.ResourceException;
         if (node.data.len != 0) {
             files.append(alloc, node) catch return error.ResourceException;
             records.append(alloc, .{ .id = node.ino, .rec_type = rec_type_file_extent, .val_kind = .extent, .size = node.data.len }) catch return error.ResourceException;
             extent_idx.append(alloc, records.items.len - 1) catch return error.ResourceException;
+        }
+    }
+}
+
+fn emitNodeRecords(
+    node: *PlanNode,
+    records: *std.ArrayList(FsRec),
+    files: *std.ArrayList(*PlanNode),
+    extent_idx: *std.ArrayList(usize),
+    alloc: std.mem.Allocator,
+) Exception!void {
+    // The frame stack borrows the caller's workspace, never the C stack.
+    const stack = alloc.alloc(EmitFrame, max_dir_depth + 1) catch return error.ResourceException;
+    var sp: usize = 0;
+    try emitNodeEntry(node, records, files, extent_idx, alloc);
+    if (node.is_dir) {
+        stack[sp] = .{ .node = node, .index = 0 };
+        sp = 1;
+    }
+    while (sp > 0) {
+        const frame = &stack[sp - 1];
+        if (frame.index >= frame.node.kids.items.len) {
+            sp -= 1;
+            continue;
+        }
+        const kid = frame.node.kids.items[frame.index];
+        frame.index += 1;
+        try emitNodeEntry(kid, records, files, extent_idx, alloc);
+        if (kid.is_dir) {
+            stack[sp] = .{ .node = kid, .index = 0 };
+            sp += 1;
         }
     }
 }
@@ -1170,13 +1354,15 @@ fn fsPairCount(span: LevelSpan) usize {
 }
 
 pub fn archiveSize(entries: []const Entry, scratch: []u8) Exception!u64 {
-    var fba = std.heap.FixedBufferAllocator.init(scratch);
+    if (scratch.len < scratch_size) return error.CapacityException;
+    var fba = std.heap.FixedBufferAllocator.init(scratch[0 .. scratch.len - frame_stack_bytes]);
     const plan = try makePlan(entries, fba.allocator());
     return std.math.mul(u64, plan.blocks, writer_block_size) catch return error.DataException;
 }
 
 pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Exception!usize {
-    var fba = std.heap.FixedBufferAllocator.init(scratch);
+    if (scratch.len < scratch_size) return error.CapacityException;
+    var fba = std.heap.FixedBufferAllocator.init(scratch[0 .. scratch.len - frame_stack_bytes]);
     const plan = try makePlan(entries, fba.allocator());
     const total_bytes = std.math.mul(u64, plan.blocks, writer_block_size) catch return error.DataException;
     if (output.len < total_bytes) return error.CapacityException;
@@ -1279,6 +1465,12 @@ test "apfs write roundtrips nested directories" {
     const written = try encode(&entries, archive, &scratch);
     try testing.expectEqual(required, written);
     try testing.expectEqual(@as(u64, 3), try inspectCount(archive, &scratch));
+    const first = try inspectOrdinal(archive, 0, &scratch);
+    try testing.expectEqualStrings("a/b/deep.txt", first.name);
+    const second = try inspectOrdinal(archive, 1, &scratch);
+    try testing.expectEqualStrings("a/sib.txt", second.name);
+    const third = try inspectOrdinal(archive, 2, &scratch);
+    try testing.expectEqualStrings("top.txt", third.name);
     var out: [16]u8 = undefined;
     const n0 = try decodeOrdinal(archive, 0, &out, &scratch);
     try testing.expectEqualSlices(u8, "nested payload", out[0..n0]);
@@ -1782,6 +1974,21 @@ fn inodeValCommon(out: []u8, private_id: u64, mode: u16, nchildren: u32, size: u
     return 0x60;
 }
 
+// Even a count walk needs the published scratch for its traversal frames.
+fn fixtureInspectCount(image: []const u8) Exception!u64 {
+    var workspace: [scratch_size]u8 = undefined;
+    return inspectCount(image, &workspace);
+}
+
+// A short scratch fails closed before any frame is carved.
+test "apfs traversal frames require caller workspace" {
+    const alloc = std.testing.allocator;
+    const image = try fixtureImage(alloc);
+    defer alloc.free(image);
+    try std.testing.expectError(error.CapacityException, inspectCount(image, &.{}));
+    try std.testing.expectEqual(@as(u64, 2), try fixtureInspectCount(image));
+}
+
 test "apfs rejects undersized keys and inode values" {
     const alloc = std.testing.allocator;
     const image = try fixtureImage(alloc);
@@ -1790,12 +1997,12 @@ test "apfs rejects undersized keys and inode values" {
     // The first record key loses its packed header.
     const leaf_a = image[12 * fixture_block_size .. 13 * fixture_block_size];
     std.mem.writeInt(u16, leaf_a[0x3a..0x3c], 4, .little);
-    try std.testing.expectError(error.DataException, inspectCount(image, &.{}));
+    try std.testing.expectError(error.DataException, fixtureInspectCount(image));
 
     // The file inode value loses its extended-field header.
     std.mem.writeInt(u16, leaf_a[0x3a..0x3c], 8, .little);
     std.mem.writeInt(u16, leaf_a[0x56..0x58], 0x5c, .little);
-    try std.testing.expectError(error.DataException, inspectCount(image, &.{}));
+    try std.testing.expectError(error.DataException, fixtureInspectCount(image));
 }
 
 test "apfs rejects nodes that contradict their tree" {
@@ -1806,12 +2013,12 @@ test "apfs rejects nodes that contradict their tree" {
     // The fs tree root claims to be a non-root b-tree node.
     const fs_root = image[6 * fixture_block_size .. 7 * fixture_block_size];
     std.mem.writeInt(u32, fs_root[24..28], obj_type_btree_node, .little);
-    try std.testing.expectError(error.DataException, inspectCount(image, &.{}));
+    try std.testing.expectError(error.DataException, fixtureInspectCount(image));
 
     // Restore the type and give the fs tree root a foreign subtype.
     std.mem.writeInt(u32, fs_root[24..28], obj_type_btree, .little);
     std.mem.writeInt(u32, fs_root[28..32], obj_subtype_omap, .little);
-    try std.testing.expectError(error.DataException, inspectCount(image, &.{}));
+    try std.testing.expectError(error.DataException, fixtureInspectCount(image));
 }
 
 test "apfs rejects an object map without the physical tree flag" {
@@ -1827,7 +2034,7 @@ test "apfs rejects an object map without the physical tree flag" {
     std.mem.writeInt(u32, vol_omap_tree[footer_base..][0..4], flags, .little);
     seal(vol_omap_tree);
 
-    try std.testing.expectError(error.DataException, inspectCount(image, &.{}));
+    try std.testing.expectError(error.DataException, fixtureInspectCount(image));
 }
 
 test "apfs rejects object map objects that contradict their address" {
@@ -1838,18 +2045,18 @@ test "apfs rejects object map objects that contradict their address" {
     // The container object map loses its physical storage class.
     const omap = image[3 * fixture_block_size .. 4 * fixture_block_size];
     std.mem.writeInt(u32, omap[24..28], obj_type_omap, .little);
-    try std.testing.expectError(error.DataException, inspectCount(image, &.{}));
+    try std.testing.expectError(error.DataException, fixtureInspectCount(image));
     std.mem.writeInt(u32, omap[24..28], obj_flag_physical | obj_type_omap, .little);
 
     // The volume object map claims an object identifier other than its block.
     const vol_omap = image[7 * fixture_block_size .. 8 * fixture_block_size];
     std.mem.writeInt(u64, vol_omap[8..16], 8, .little);
-    try std.testing.expectError(error.DataException, inspectCount(image, &.{}));
+    try std.testing.expectError(error.DataException, fixtureInspectCount(image));
     std.mem.writeInt(u64, vol_omap[8..16], 7, .little);
 
     // The container object map names a tree that is not physical.
     std.mem.writeInt(u32, omap[0x28..0x2c], obj_type_btree, .little);
-    try std.testing.expectError(error.DataException, inspectCount(image, &.{}));
+    try std.testing.expectError(error.DataException, fixtureInspectCount(image));
 }
 
 test "apfs rejects checkpoint area b-trees" {
@@ -1860,17 +2067,17 @@ test "apfs rejects checkpoint area b-trees" {
     const nx = image[0..fixture_block_size];
     std.mem.writeInt(u32, nx[0x68..0x6c], 0x80000004, .little);
     seal(nx);
-    try std.testing.expectError(error.UnsupportedException, inspectCount(image, &.{}));
+    try std.testing.expectError(error.UnsupportedException, fixtureInspectCount(image));
     std.mem.writeInt(u32, nx[0x68..0x6c], 4, .little);
 
     std.mem.writeInt(u32, nx[0x6c..0x70], 0x80000000, .little);
     seal(nx);
-    try std.testing.expectError(error.UnsupportedException, inspectCount(image, &.{}));
+    try std.testing.expectError(error.UnsupportedException, fixtureInspectCount(image));
     std.mem.writeInt(u32, nx[0x6c..0x70], 0, .little);
 
     std.mem.writeInt(u64, nx[0x78..0x80], @as(u64, 1) << 63, .little);
     seal(nx);
-    try std.testing.expectError(error.UnsupportedException, inspectCount(image, &.{}));
+    try std.testing.expectError(error.UnsupportedException, fixtureInspectCount(image));
 }
 
 test "apfs rejects an unresolvable file system tree root" {
@@ -1882,17 +2089,17 @@ test "apfs rejects an unresolvable file system tree root" {
     // read as a physical address.
     const vol = image[5 * fixture_block_size .. 6 * fixture_block_size];
     std.mem.writeInt(u64, vol[0x88..0x90], 6, .little);
-    try std.testing.expectError(error.DataException, inspectCount(image, &.{}));
+    try std.testing.expectError(error.DataException, fixtureInspectCount(image));
 
     // An ephemeral root resolves through the checkpoint map alone, which is
     // empty, despite the object map entry.
     std.mem.writeInt(u64, vol[0x88..0x90], 300, .little);
     std.mem.writeInt(u32, vol[0x74..0x78], obj_flag_ephemeral | obj_type_btree, .little);
-    try std.testing.expectError(error.DataException, inspectCount(image, &.{}));
+    try std.testing.expectError(error.DataException, fixtureInspectCount(image));
 
     // A root tree type without the b-tree bits is not a tree.
     std.mem.writeInt(u32, vol[0x74..0x78], obj_flag_physical, .little);
-    try std.testing.expectError(error.DataException, inspectCount(image, &.{}));
+    try std.testing.expectError(error.DataException, fixtureInspectCount(image));
 }
 
 test "apfs rejects extent block numbers outside the image" {
@@ -1906,11 +2113,12 @@ test "apfs rejects extent block numbers outside the image" {
     const phys = leaf_a[leaf_a.len - v_off + 8 ..][0..8];
     std.mem.writeInt(u64, phys, fixture_block_count, .little);
     var out: [hello_size]u8 = undefined;
-    try std.testing.expectError(error.DataException, decodeOrdinal(image, 1, &out, &.{}));
+    var path: [scratch_size]u8 = undefined;
+    try std.testing.expectError(error.DataException, decodeOrdinal(image, 1, &out, &path));
 
     // The highest possible block number must not wrap the address arithmetic.
     std.mem.writeInt(u64, phys, std.math.maxInt(u64), .little);
-    try std.testing.expectError(error.DataException, decodeOrdinal(image, 1, &out, &.{}));
+    try std.testing.expectError(error.DataException, decodeOrdinal(image, 1, &out, &path));
 }
 
 test "apfs synthetic image round trip" {
@@ -1918,25 +2126,46 @@ test "apfs synthetic image round trip" {
     const image = try fixtureImage(alloc);
     defer alloc.free(image);
 
-    try std.testing.expectEqual(@as(u64, 2), try inspectCount(image, &.{}));
+    try std.testing.expectEqual(@as(u64, 2), try fixtureInspectCount(image));
 
-    const first = try inspectOrdinal(image, 0, &.{});
+    var path: [scratch_size]u8 = undefined;
+    const first = try inspectOrdinal(image, 0, &path);
     try std.testing.expectEqual(@as(u64, inner_size), first.size);
-    const second = try inspectOrdinal(image, 1, &.{});
+    const second = try inspectOrdinal(image, 1, &path);
     try std.testing.expectEqual(@as(u64, hello_size), second.size);
 
     var inner_out: [inner_size]u8 = undefined;
-    const inner_read = try decodeOrdinal(image, 0, &inner_out, &.{});
+    const inner_read = try decodeOrdinal(image, 0, &inner_out, &path);
     try std.testing.expectEqual(@as(usize, inner_size), inner_read);
     for (inner_out, 0..) |byte, i| try std.testing.expectEqual(@as(u8, @truncate(255 -| @as(u8, @intCast(i % 256)))), byte);
 
     var hello_out: [hello_size]u8 = undefined;
-    const hello_read = try decodeOrdinal(image, 1, &hello_out, &.{});
+    const hello_read = try decodeOrdinal(image, 1, &hello_out, &path);
     try std.testing.expectEqual(@as(usize, hello_size), hello_read);
     for (hello_out[0..4096], 0..) |byte, i| try std.testing.expectEqual(@as(u8, @truncate(i *% 31 + 7)), byte);
     for (hello_out[4096..], 0..) |byte, i| try std.testing.expectEqual(@as(u8, @truncate(i *% 13 + 5)), byte);
 
-    try std.testing.expectError(error.DataException, inspectOrdinal(image, 2, &.{}));
+    try std.testing.expectError(error.DataException, inspectOrdinal(image, 2, &path));
+}
+
+test "apfs accepts a checkpoint map that precedes its superblock" {
+    const alloc = std.testing.allocator;
+    const image = try fixtureImage(alloc);
+    defer alloc.free(image);
+
+    // Real APFS writes the map before the transaction's superblock. A
+    // single pass against a running best_xid drops that map.
+    const older = image[fixture_block_size .. 2 * fixture_block_size];
+    const newer = image[2 * fixture_block_size .. 3 * fixture_block_size];
+    var swap: [fixture_block_size]u8 = undefined;
+    @memcpy(&swap, older);
+    @memcpy(older, newer);
+    @memcpy(newer, &swap);
+
+    try std.testing.expectEqual(@as(u64, 2), try fixtureInspectCount(image));
+    var hello_out: [hello_size]u8 = undefined;
+    var path: [scratch_size]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, hello_size), try decodeOrdinal(image, 1, &hello_out, &path));
 }
 
 test "apfs rejects non-apfs data" {
@@ -1944,5 +2173,189 @@ test "apfs rejects non-apfs data" {
     const image = try alloc.alloc(u8, 4 * fixture_block_size);
     defer alloc.free(image);
     @memset(image, 0);
-    try std.testing.expectError(error.DataException, inspectCount(image, &.{}));
+    try std.testing.expectError(error.DataException, fixtureInspectCount(image));
+}
+
+// The inode number is the whole output of the rank pass: pin the exact
+// assignment order the recursive walk produced.
+test "apfs rankNode assigns inodes in dfs pre-order" {
+    const testing = std.testing;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const root = try buildTree(&[_]Entry{
+        .{ .name = "dir_a/a1", .data = "" },
+        .{ .name = "dir_a/a2", .data = "" },
+        .{ .name = "dir_b/b1", .data = "" },
+    }, arena.allocator());
+    try testing.expectEqual(@as(u64, root_ino), root.ino);
+    const dir_a = isKid(root, "dir_a").?;
+    const dir_b = isKid(root, "dir_b").?;
+    try testing.expectEqual(@as(u64, 16), dir_a.ino);
+    try testing.expectEqual(@as(u64, 19), dir_b.ino);
+    try testing.expectEqual(@as(u64, 17), isKid(dir_a, "a1").?.ino);
+    try testing.expectEqual(@as(u64, 18), isKid(dir_a, "a2").?.ino);
+    try testing.expectEqual(@as(u64, 20), isKid(dir_b, "b1").?.ino);
+}
+
+// A directory emits its inode and every dir_rec before any child record,
+// and children follow in sorted pre-order.
+test "apfs emitNodeRecords emits own records before descending" {
+    const testing = std.testing;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const root = try buildTree(&[_]Entry{
+        .{ .name = "dir_a/a1", .data = "" },
+        .{ .name = "dir_a/a2", .data = "" },
+        .{ .name = "dir_b/b1", .data = "" },
+    }, alloc);
+    var records: std.ArrayList(FsRec) = .empty;
+    var files: std.ArrayList(*PlanNode) = .empty;
+    var extent_idx: std.ArrayList(usize) = .empty;
+    try emitNodeRecords(root, &records, &files, &extent_idx, alloc);
+    const items = records.items;
+    try testing.expectEqual(@as(usize, 11), items.len);
+    try testing.expectEqual(rec_type_inode, items[0].rec_type);
+    try testing.expectEqual(@as(u64, root_ino), items[0].id);
+    try testing.expectEqual(rec_type_dir_rec, items[1].rec_type);
+    try testing.expectEqualStrings("dir_a", items[1].name);
+    try testing.expectEqual(rec_type_dir_rec, items[2].rec_type);
+    try testing.expectEqualStrings("dir_b", items[2].name);
+    try testing.expectEqual(@as(u64, 16), items[3].id);
+    try testing.expectEqual(rec_type_dir_rec, items[4].rec_type);
+    try testing.expectEqual(rec_type_dir_rec, items[5].rec_type);
+    try testing.expectEqual(@as(u64, 17), items[6].id);
+    try testing.expectEqual(@as(u64, 18), items[7].id);
+    try testing.expectEqual(@as(u64, 19), items[8].id);
+    try testing.expectEqual(@as(u64, 20), items[10].id);
+}
+
+// DecodeOrdinal/resolve enumerate in DFS pre-order; three sibling
+// dirs with two children each pin that order end to end.
+test "apfs write pins dfs enumeration order for sibling directories" {
+    const testing = std.testing;
+    const entries = [_]Entry{
+        .{ .name = "dir_a/a1", .data = "a1" },
+        .{ .name = "dir_a/a2", .data = "a2" },
+        .{ .name = "dir_b/b1", .data = "b1" },
+        .{ .name = "dir_b/b2", .data = "b2" },
+        .{ .name = "dir_c/c1", .data = "c1" },
+        .{ .name = "dir_c/c2", .data = "c2" },
+    };
+    var scratch: [scratch_size]u8 = undefined;
+    const required = try archiveSize(&entries, &scratch);
+    const archive = try testing.allocator.alloc(u8, required);
+    defer testing.allocator.free(archive);
+    const written = try encode(&entries, archive, &scratch);
+    try testing.expectEqual(required, written);
+    try testing.expectEqual(@as(u64, 6), try inspectCount(archive, &scratch));
+    const names = [_][]const u8{ "dir_a/a1", "dir_a/a2", "dir_b/b1", "dir_b/b2", "dir_c/c1", "dir_c/c2" };
+    const data = [_][]const u8{ "a1", "a2", "b1", "b2", "c1", "c2" };
+    var out: [8]u8 = undefined;
+    var ordinal: u64 = 0;
+    for (names, data) |name, payload| {
+        const info = try inspectOrdinal(archive, ordinal, &scratch);
+        try testing.expectEqualStrings(name, info.name);
+        try testing.expectEqual(ordinal, info.ordinal);
+        const n = try decodeOrdinal(archive, ordinal, &out, &scratch);
+        try testing.expectEqualSlices(u8, payload, out[0..n]);
+        ordinal += 1;
+    }
+}
+
+// The encode-side depth cap must not move: 64 components still drive
+// the frame stacks near their bound; 65 are rejected.
+test "apfs write keeps the tree depth cap at the boundary" {
+    const testing = std.testing;
+    var scratch: [scratch_size]u8 = undefined;
+
+    var ok_buf: [127]u8 = undefined;
+    var pos: usize = 0;
+    for (0..64) |_| {
+        if (pos != 0) {
+            ok_buf[pos] = '/';
+            pos += 1;
+        }
+        ok_buf[pos] = 'a';
+        pos += 1;
+    }
+    const ok_entries = [_]Entry{.{ .name = ok_buf[0..pos], .data = "x" }};
+    try testing.expect((try archiveSize(&ok_entries, &scratch)) > 0);
+
+    var deep_buf: [129]u8 = undefined;
+    pos = 0;
+    for (0..65) |_| {
+        if (pos != 0) {
+            deep_buf[pos] = '/';
+            pos += 1;
+        }
+        deep_buf[pos] = 'a';
+        pos += 1;
+    }
+    const deep_entries = [_]Entry{.{ .name = deep_buf[0..pos], .data = "x" }};
+    try testing.expectError(error.UnsupportedException, archiveSize(&deep_entries, &scratch));
+}
+
+// A matching resolve must stop before later siblings: a corrupted
+// later drec name (no checksum catches it) fails an over-walk.
+test "apfs resolve stops the walk before later siblings" {
+    const testing = std.testing;
+    const entries = [_]Entry{
+        .{ .name = "za0/zf0", .data = "p0" },
+        .{ .name = "zb1/zf1", .data = "p1" },
+    };
+    var scratch: [scratch_size]u8 = undefined;
+    const required = try archiveSize(&entries, &scratch);
+    const archive = try testing.allocator.alloc(u8, required);
+    defer testing.allocator.free(archive);
+    const written = try encode(&entries, archive, &scratch);
+    try testing.expectEqual(required, written);
+    // Break the later sibling's drec name terminator: a walk that
+    // reaches it fails; a stopped walk never parses it.
+    const needle = "zb1\x00";
+    var pos: usize = 0;
+    var hits: usize = 0;
+    while (std.mem.findPos(u8, archive[0..written], pos, needle)) |at| {
+        archive[at + needle.len - 1] = 'X';
+        pos = at + needle.len;
+        hits += 1;
+    }
+    try testing.expect(hits > 0);
+    const info = try inspectOrdinal(archive, 0, &scratch);
+    try testing.expectEqualStrings("za0/zf0", info.name);
+    var out: [4]u8 = undefined;
+    const n = try decodeOrdinal(archive, 0, &out, &scratch);
+    try testing.expectEqualSlices(u8, "p0", out[0..n]);
+    // The corrupted record is on ordinal 1's visited path, so that
+    // resolve must fail; the corruption is load-bearing.
+    try testing.expectError(error.DataException, inspectOrdinal(archive, 1, &scratch));
+}
+
+// A 64-component path drives the dir frame stack to its bound:
+// encode, resolve, and decode it end to end.
+test "apfs resolve and decode a 64-deep path" {
+    const testing = std.testing;
+    var name_buf: [127]u8 = undefined;
+    var pos: usize = 0;
+    for (0..64) |_| {
+        if (pos != 0) {
+            name_buf[pos] = '/';
+            pos += 1;
+        }
+        name_buf[pos] = 'a';
+        pos += 1;
+    }
+    const entries = [_]Entry{.{ .name = name_buf[0..pos], .data = "x" }};
+    var scratch: [scratch_size]u8 = undefined;
+    const required = try archiveSize(&entries, &scratch);
+    const archive = try testing.allocator.alloc(u8, required);
+    defer testing.allocator.free(archive);
+    const written = try encode(&entries, archive, &scratch);
+    try testing.expectEqual(required, written);
+    try testing.expectEqual(@as(u64, 1), try inspectCount(archive, &scratch));
+    const info = try inspectOrdinal(archive, 0, &scratch);
+    try testing.expectEqualStrings(name_buf[0..pos], info.name);
+    var out: [4]u8 = undefined;
+    const n = try decodeOrdinal(archive, 0, &out, &scratch);
+    try testing.expectEqualSlices(u8, "x", out[0..n]);
 }

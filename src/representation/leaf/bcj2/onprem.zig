@@ -15,6 +15,8 @@ const top: u32 = 1 << 24;
 
 pub fn decode(main_stream: []const u8, call_stream: []const u8, jump_stream: []const u8, rc_stream: []const u8, output: []u8) Exception!usize {
     if (rc_stream.len < rc_init_bytes) return error.DataException;
+    // The vendor requires the discarded init byte to be zero.
+    if (rc_stream[0] != 0) return error.DataException;
 
     var probs: [num_probs]u16 = undefined;
     for (&probs) |*prob| prob.* = bit_model_total / 2;
@@ -22,6 +24,8 @@ pub fn decode(main_stream: []const u8, call_stream: []const u8, jump_stream: []c
     var rc_pos: usize = rc_init_bytes;
     var range: u32 = 0xFFFFFFFF;
     var code: u32 = std.mem.readInt(u32, rc_stream[1..5], .big);
+    // The vendor rejects a full-scale initial code.
+    if (code == 0xFFFFFFFF) return error.DataException;
 
     var main_pos: usize = 0;
     var call_pos: usize = 0;
@@ -48,7 +52,7 @@ pub fn decode(main_stream: []const u8, call_stream: []const u8, jump_stream: []c
         }
 
         if (prob_index) |index| {
-            const bit = rangeDecode(&probs[index], &range, &code, rc_stream, &rc_pos);
+            const bit = try rangeDecode(&probs[index], &range, &code, rc_stream, &rc_pos);
             if (bit == 1) {
                 // The call and jump streams store the target address big-endian; the
                 // decode subtracts the byte-after-operand address.
@@ -77,10 +81,13 @@ pub fn decode(main_stream: []const u8, call_stream: []const u8, jump_stream: []c
         prev_byte = byte;
     }
 
+    // A finished stream leaves the range coder at code zero; 7-Zip's
+    // Bcj2Dec_IsMaybeFinished_code rejects any other final state.
+    if (code != 0) return error.DataException;
     return out_pos;
 }
 
-fn rangeDecode(prob: *u16, range: *u32, code: *u32, stream: []const u8, pos: *usize) u1 {
+fn rangeDecode(prob: *u16, range: *u32, code: *u32, stream: []const u8, pos: *usize) Exception!u1 {
     const bound: u32 = (range.* >> 11) *% @as(u32, prob.*);
     var bit: u1 = undefined;
     if (code.* < bound) {
@@ -94,11 +101,11 @@ fn rangeDecode(prob: *u16, range: *u32, code: *u32, stream: []const u8, pos: *us
         bit = 1;
     }
     if (range.* < top) {
+        // 7-Zip stops when the rc stream runs dry; a one-shot stream
+        // needing another byte is truncated, not zero padded.
+        if (pos.* >= stream.len) return error.DataException;
         range.* <<= 8;
-        // The vendor/7zip decoders read a missing byte of a short
-        // range-code stream as zero.
-        const next_byte: u32 = if (pos.* < stream.len) stream[pos.*] else 0;
-        code.* = (code.* << 8) | next_byte;
+        code.* = (code.* << 8) | stream[pos.*];
         pos.* += 1;
     }
     return bit;
@@ -106,9 +113,7 @@ fn rangeDecode(prob: *u16, range: *u32, code: *u32, stream: []const u8, pos: *us
 
 pub const EncodedSizes = struct { main: usize, call: usize, jump: usize, rc: usize };
 
-// Main, call, and jump never exceed the input.
-//
-// Each rc bit at worst halves the range, so a byte costs eight bits.
+// Main, call, and jump never exceed the input; each rc bit at worst halves the range, a byte eight bits.
 pub fn encodeSizesBound(input_len: usize) EncodedSizes {
     return .{
         .main = input_len,
@@ -134,14 +139,15 @@ const RangeEncoder = struct {
         const low32: u32 = @truncate(self.low);
         const high: u32 = @truncate(self.low >> 32);
         if (low32 < 0xFF000000 or high != 0) {
-            const carry_byte: u8 = self.cache +% @as(u8, @truncate(high));
+            const carry: u8 = @truncate(high);
             if (self.len >= self.out.len) return error.CapacityException;
-            self.out[self.len] = carry_byte;
+            self.out[self.len] = self.cache +% carry;
             self.len += 1;
             var remaining = self.cache_size - 1;
             while (remaining > 0) : (remaining -= 1) {
                 if (self.len >= self.out.len) return error.CapacityException;
-                self.out[self.len] = 0xFF;
+                // The carry reaches every pending byte, not only the first.
+                self.out[self.len] = 0xFF +% carry;
                 self.len += 1;
             }
             self.cache_size = 1;
@@ -232,6 +238,11 @@ pub fn encode(input: []const u8, main_out: []u8, call_out: []u8, jump_out: []u8,
     return .{ .main = main_len, .call = call_len, .jump = jump_len, .rc = rc.len };
 }
 
+// A finished tail sets code to the sum of decoded bounds, so
+// code ends at zero (7-Zip finished state).
+const finished_rc_one = [_]u8{ 0, 0x7F, 0xFF, 0xFC, 0x00 };
+const finished_rc_two = [_]u8{ 0, 0xBF, 0xFF, 0xFC, 0x00 };
+
 test "bcj2 no-branch passthrough" {
     const rc = [_]u8{ 0, 0, 0, 0, 0 };
     var out: [12]u8 = undefined;
@@ -248,7 +259,7 @@ test "bcj2 single E8 call branch" {
     main_buf[10] = 0xE8;
     for (main_buf[11..28]) |*b| b.* = 0x90;
     const call_buf = [_]u8{ 0, 0, 0, 0x64 };
-    const rc_buf = [_]u8{ 0, 0xFF, 0xFF, 0xFF, 0xFF }; // The initial code decodes every bit as 1.
+    const rc_buf = finished_rc_one; // The initial code decodes the branch bit as 1 and finishes at code zero.
 
     var out: [32]u8 = undefined;
     const n = try decode(&main_buf, &call_buf, &.{}, &rc_buf, &out);
@@ -270,7 +281,7 @@ test "bcj2 single E9 jump branch" {
     main_buf[4] = 0xE9;
     for (main_buf[5..8]) |*b| b.* = 0x90;
     const jump_buf = [_]u8{ 0, 0, 0, 0x0C }; // The absolute target address 12 becomes 3, since 12 - (5 + 4).
-    const rc_buf = [_]u8{ 0, 0xFF, 0xFF, 0xFF, 0xFF };
+    const rc_buf = finished_rc_one;
 
     var out: [12]u8 = undefined;
     const n = try decode(&main_buf, &.{}, &jump_buf, &rc_buf, &out);
@@ -290,7 +301,7 @@ test "bcj2 single 0F 8x conditional jump" {
     // A Jcc (0x0F 0x85) draws from the jump stream through context 257.
     const main_buf = [_]u8{ 0x0F, 0x85 };
     const jump_buf = [_]u8{ 0, 0, 0, 0x0B }; // The absolute target address 11 becomes 5, since 11 - (2 + 4).
-    const rc_buf = [_]u8{ 0, 0xFF, 0xFF, 0xFF, 0xFF };
+    const rc_buf = finished_rc_one;
 
     var out: [6]u8 = undefined;
     const n = try decode(&main_buf, &.{}, &jump_buf, &rc_buf, &out);
@@ -313,7 +324,7 @@ test "bcj2 truncations are errors" {
     var main_buf: [4]u8 = undefined;
     for (&main_buf) |*b| b.* = 0x90;
     main_buf[0] = 0xE8;
-    const rc_buf = [_]u8{ 0, 0xFF, 0xFF, 0xFF, 0xFF };
+    const rc_buf = finished_rc_one;
     var out: [16]u8 = undefined;
     // The rc stream is shorter than the five initialization bytes.
     try std.testing.expectError(error.DataException, decode(&main_buf, &.{}, &.{}, rc_buf[0..4], &out));
@@ -332,7 +343,7 @@ test "bcj2 call then jump through one range-code word" {
     main_buf[5] = 0xE9;
     const call_buf = [_]u8{ 0, 0, 0, 0x10 }; // The absolute target address 0x10 becomes 0x0B.
     const jump_buf = [_]u8{ 0, 0, 0, 0x20 }; // The absolute target address 0x20 becomes 0x12.
-    const rc_buf = [_]u8{ 0, 0xFF, 0xFF, 0xFF, 0xFF };
+    const rc_buf = finished_rc_two;
 
     var out: [18]u8 = undefined;
     const n = try decode(&main_buf, &call_buf, &jump_buf, &rc_buf, &out);
@@ -384,6 +395,9 @@ test "bcj2 encode roundtrips through the decoder" {
     const sizes = try encode(&input, main_buf, call_buf, jump_buf, rc_buf);
     try std.testing.expect(sizes.call > 0);
     try std.testing.expect(sizes.jump > 0);
+    // The branch targets left main: a filter that kept every byte in the
+    // main stream would still roundtrip.
+    try std.testing.expect(sizes.main < input.len);
 
     var out: [input.len]u8 = undefined;
     const n = try decode(main_buf[0..sizes.main], call_buf[0..sizes.call], jump_buf[0..sizes.jump], rc_buf[0..sizes.rc], &out);
@@ -416,4 +430,115 @@ test "bcj2 encode stream sizes respect their bounds" {
     // E8 at position 0 cannot convert (the ip guard requires ip > 0); the
     // relative limit rejects the zero-paged offsets.
     try std.testing.expect(sizes.main == 64);
+}
+
+test "bcj2 shiftLow propagates carry through pending bytes" {
+    var out: [8]u8 = undefined;
+    var rc = RangeEncoder{
+        .cache = 0x12,
+        .cache_size = 3,
+        .low = 0x0000_0001_FF00_0000, // High is 1, low32 is 0xFF000000.
+        .out = &out,
+    };
+    try rc.shiftLow();
+    try std.testing.expectEqual(@as(usize, 3), rc.len);
+    // Without the carry, the two pending bytes stay 0xFF.
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x13, 0x00, 0x00 }, out[0..rc.len]);
+}
+
+test "bcj2 encode roundtrips across range-coder carries" {
+    const allocator = std.testing.allocator;
+    var input: [512]u8 = undefined;
+    var rng: u64 = 0x9E3779B97F4A7C15;
+
+    const bounds = encodeSizesBound(input.len);
+    const main_buf = try allocator.alloc(u8, bounds.main);
+    defer allocator.free(main_buf);
+    const call_buf = try allocator.alloc(u8, bounds.call);
+    defer allocator.free(call_buf);
+    const jump_buf = try allocator.alloc(u8, bounds.jump);
+    defer allocator.free(jump_buf);
+    const rc_buf = try allocator.alloc(u8, bounds.rc);
+    defer allocator.free(rc_buf);
+    var out: [input.len]u8 = undefined;
+
+    // Plant markers with varied offsets so the range coder reaches carry states.
+    for (0..256) |_| {
+        for (&input) |*b| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            b.* = @truncate(rng);
+        }
+        var i: usize = 2;
+        while (i + 5 <= input.len) : (i += 8) {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            input[i] = switch (@as(u8, @truncate(rng)) & 3) {
+                0 => 0xE8,
+                1 => 0xE9,
+                else => 0x0F,
+            };
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            std.mem.writeInt(u32, input[i + 1 ..][0..4], @truncate(rng), .little);
+        }
+
+        const sizes = try encode(&input, main_buf, call_buf, jump_buf, rc_buf);
+        const n = try decode(main_buf[0..sizes.main], call_buf[0..sizes.call], jump_buf[0..sizes.jump], rc_buf[0..sizes.rc], &out);
+        try std.testing.expectEqual(input.len, n);
+        try std.testing.expectEqualSlices(u8, &input, out[0..n]);
+    }
+}
+
+test "bcj2 decode rejects nonzero init byte" {
+    var out: [8]u8 = undefined;
+    try std.testing.expectError(error.DataException, decode("hi", &.{}, &.{}, &[_]u8{ 1, 0, 0, 0, 0 }, &out));
+    const n = try decode("hi", &.{}, &.{}, &[_]u8{ 0, 0, 0, 0, 0 }, &out);
+    try std.testing.expectEqual(@as(usize, 2), n);
+}
+
+test "bcj2 decode rejects full-scale initial code" {
+    var out: [8]u8 = undefined;
+    try std.testing.expectError(error.DataException, decode("hi", &.{}, &.{}, &[_]u8{ 0, 0xFF, 0xFF, 0xFF, 0xFF }, &out));
+    // A completed no-branch stream carries a zero initial code.
+    const n = try decode("hi", &.{}, &.{}, &[_]u8{ 0, 0, 0, 0, 0 }, &out);
+    try std.testing.expectEqual(@as(usize, 2), n);
+}
+
+test "bcj2 decode rejects non-finished final range-coder state" {
+    // A truncated-in-spirit stream decodes its branch bit but ends
+    // with non-zero code; 7-Zip rejects that state.
+    const main_buf = [_]u8{ 0xE8, 0x90, 0x90, 0x90 };
+    const rc_buf = [_]u8{ 0, 0xFF, 0xFF, 0xFF, 0xFE };
+    var out: [16]u8 = undefined;
+    try std.testing.expectError(error.DataException, decode(&main_buf, &[_]u8{ 0, 0, 0, 0x10 }, &.{}, &rc_buf, &out));
+}
+
+test "bcj2 truncated range-coder stream is rejected" {
+    const allocator = std.testing.allocator;
+    // Many E8 candidates drive the range coder into normalization, so the
+    // rc stream runs past the five initialization bytes.
+    var input: [256]u8 = undefined;
+    for (&input) |*b| b.* = 0xE8;
+    const bounds = encodeSizesBound(input.len);
+    const main_buf = try allocator.alloc(u8, bounds.main);
+    defer allocator.free(main_buf);
+    const call_buf = try allocator.alloc(u8, bounds.call);
+    defer allocator.free(call_buf);
+    const jump_buf = try allocator.alloc(u8, bounds.jump);
+    defer allocator.free(jump_buf);
+    const rc_buf = try allocator.alloc(u8, bounds.rc);
+    defer allocator.free(rc_buf);
+    const sizes = try encode(&input, main_buf, call_buf, jump_buf, rc_buf);
+    try std.testing.expect(sizes.rc > rc_init_bytes);
+
+    var out: [input.len]u8 = undefined;
+    const n = try decode(main_buf[0..sizes.main], call_buf[0..sizes.call], jump_buf[0..sizes.jump], rc_buf[0..sizes.rc], &out);
+    try std.testing.expectEqual(input.len, n);
+    // Cutting the last rc byte leaves normalization without a byte;
+    // the decoder must error, not pad with zero.
+    try std.testing.expectError(error.DataException, decode(main_buf[0..sizes.main], call_buf[0..sizes.call], jump_buf[0..sizes.jump], rc_buf[0 .. sizes.rc - 1], &out));
 }

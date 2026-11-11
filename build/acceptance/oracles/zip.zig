@@ -66,6 +66,19 @@ var zip_trad_archive: [16384]u8 = undefined;
 var zip_trad_archive_size: usize = 0;
 var zip_methods_archive: [65536]u8 = undefined;
 
+// Archive-family ordinals 14 and 15 reach zip through the tar
+// convention: tail parts and split granularity.
+const archive_volumes: u32 = 14;
+const archive_volume_size: u32 = 15;
+
+// The split granularity doubles as the volume size: a full head
+// volume, then a short tail with the directory.
+const zip_span_volume: u64 = 4096;
+
+var zip_span_a: [32]u8 = undefined;
+var zip_span_b: [6144]u8 = undefined;
+var zip_span_archive: [16384]u8 = undefined;
+
 fn zipWrapOne(out: []u8, name: []const u8, method: u16, flags: u16, compressed: []const u8, crc: u32, uncompressed_size: u32) usize {
     @memset(out[0..512], 0);
     var pos: usize = 0;
@@ -520,7 +533,9 @@ fn runMethods(r: *Runner) anyerror!void {
         }
     }
     if (zip_methods_saved_sizes[0] != 0) {
-        const archive_size = zipWrapOne(&zip_methods_archive, "in.txt", 14, 0, zip_methods_saved[0][0..zip_methods_saved_sizes[0]], crc, @intCast(zip_large.len));
+        // The compose write emits a marker-terminated stream; the wrap sets
+        // the method-14 end-marker flag so the entry matches its payload.
+        const archive_size = zipWrapOne(&zip_methods_archive, "in.txt", 14, 0x0002, zip_methods_saved[0][0..zip_methods_saved_sizes[0]], crc, @intCast(zip_large.len));
         try zipReadOrdinal0(r, zip_methods_archive[0..archive_size], &output, &zip_large);
     }
     var damaged: [2048]u8 = undefined;
@@ -706,6 +721,191 @@ fn runDataDescriptor(r: *Runner) anyerror!void {
     if (oracle != .ok) return error.DescriptorOracleRejected;
 }
 
+fn zipSpannedRead(r: *Runner, head: []const u8, volume_nodes: []const harness.Node, ordinal: u64, expected: []const u8) !void {
+    var read_req: [8]harness.Node = @splat(abi.Node.init());
+    var count: usize = 0;
+    read_req[count] = harness.archiveOrdinalParam(ordinal);
+    count += 1;
+    read_req[count] = harness.sourceSpan(head);
+    count += 1;
+    for (volume_nodes) |volume_node| {
+        read_req[count] = volume_node;
+        count += 1;
+    }
+    read_req[count] = harness.sinkSpan(r.output);
+    count += 1;
+    _ = harness.call(r, harness.ids.read, read_req[0..count], .{ .ctx = true });
+    try harness.requireStatus(r, abi.Status.ok);
+    if (r.response.byte_length != expected.len or !std.mem.eql(u8, r.output[0..expected.len], expected)) {
+        return error.SpannedReadMismatch;
+    }
+}
+
+fn zipSpannedForeignFile(r: *Runner, out_path: []const u8, name: []const u8, expected: []const u8) !void {
+    const oracle_io = harness.oracle_io;
+    const got_path = try r.gpa.print("{s}/{s}", .{ out_path, name });
+    defer r.gpa.free(got_path);
+    const got = try std.Io.Dir.cwd().readFileAlloc(oracle_io, got_path, r.gpa, .limited(1 << 20));
+    defer r.gpa.free(got);
+    if (!std.mem.eql(u8, got, expected)) return error.SpannedForeignExtractMismatch;
+}
+
+// A spanned set under the full ABI: the sizing answers the set total;
+// the response children carry the tail volumes.
+
+// The byte fields pin the directory to its volume; the read joins
+// the parts and 7-Zip extracts them.
+fn runZipSpannedSet(r: *Runner) anyerror!void {
+    setupZip(r);
+    corpus.fillTiled(r.corpus_index, &zip_span_a);
+    corpus.fillTiled(r.corpus_index, &zip_span_b);
+    var store1: EntryNodes = undefined;
+    var store2: EntryNodes = undefined;
+    const entry1 = entryWithMethod(&store1, "span-a.txt", &zip_span_a, 0);
+    const entry2 = entryWithMethod(&store2, "span-b.txt", &zip_span_b, 0);
+    var entries = [_]harness.Node{ entry1, entry2 };
+    harness.linkNodes(entries[0..]);
+
+    // The granularity rides the write sizing query as well as the write, so
+    // the mask spans both directions.
+    const gran = harness.paramScalar(harness.param_family_archive, archive_volume_size, harness.cmds, zip_span_volume);
+    _ = harness.call(r, harness.ids.query, &.{
+        harness.paramTargetCommand(harness.ids.write),
+        harness.scalarNode(harness.ids.source),
+        harness.capabilityParam(zip_caps),
+        harness.sizingModeParam(harness.size_metadata_exact),
+        harness.commitModeParam(harness.commit_confirmed),
+        gran,
+        entries[0],
+    }, .{});
+    try harness.requireStatus(r, abi.Status.ok);
+    const total: usize = @intCast(r.response.byte_length);
+    if (total <= zip_span_volume or total > zip_span_archive.len) return error.SpannedQueryShape;
+    r.required = total;
+
+    // A granularity under the writer's floor answers invalid_call; the set
+    // never gets emitted.
+    const under_floor = harness.paramScalar(harness.param_family_archive, archive_volume_size, harness.cmds, zip_span_volume / 4);
+    try harness.expect(r, harness.ids.query, &.{
+        harness.paramTargetCommand(harness.ids.write),
+        harness.scalarNode(harness.ids.source),
+        harness.capabilityParam(zip_caps),
+        harness.sizingModeParam(harness.size_metadata_exact),
+        harness.commitModeParam(harness.commit_confirmed),
+        under_floor,
+        entries[0],
+    }, .{}, abi.Status.invalid_call);
+
+    // The write leaves the set contiguous in the sink; the response children
+    // carry the tail volumes as bytes.
+    var tail_buffers: [4][4096]u8 = undefined;
+    var tail_nodes: [4]harness.Node = undefined;
+    for (&tail_nodes, &tail_buffers) |*t, *buf| {
+        t.* = harness.node(buf, buf.len);
+        t.*.id = harness.ids.parameter;
+        // Repeated out-bytes selector: the response carries one node per
+        // tail volume under the same ordinal.
+        t.*.value_high = harness.paramSelector(harness.param_family_archive, archive_volumes, 0x26, 0);
+    }
+    harness.linkNodes(&tail_nodes);
+    var response = abi.Node.init();
+    response.child = &tail_nodes[0];
+
+    var req: [8]harness.Node = undefined;
+    req[0] = harness.paramProfile(harness.ids.zip);
+    req[1] = harness.scalarNode(harness.ids.source);
+    req[2] = harness.sinkSpan(zip_span_archive[0..total]);
+    req[3] = harness.capabilityParam(zip_caps);
+    req[4] = harness.sizingModeParam(harness.size_metadata_exact);
+    req[5] = harness.commitModeParam(r.commit_write);
+    req[6] = gran;
+    req[7] = entries[0];
+    harness.linkNodes(&req);
+    const status = harness.invoke(harness.ids.write, &req[0], &response, r.workspace.ptr, r.workspace.len, null, null, null);
+    if (status != abi.Status.ok) return error.SpannedWriteFailed;
+    if (response.byte_length != total) return error.SpannedWriteLengthMismatch;
+
+    var parts: [5][]const u8 = undefined;
+    var tails: usize = 0;
+    var tail_bytes: usize = 0;
+    for (tail_nodes) |t| {
+        if (t.byte_length == 0) break;
+        parts[1 + tails] = t.bytes.?[0..@intCast(t.byte_length)];
+        tail_bytes += @intCast(t.byte_length);
+        tails += 1;
+    }
+    if (tails == 0 or total <= tail_bytes) return error.SpannedShapeMismatch;
+    parts[0] = zip_span_archive[0 .. total - tail_bytes];
+    // The physical model: every volume but the last holds exactly the
+    // requested granularity.
+    if (parts[0].len != zip_span_volume) return error.SpannedHeadVolumeMismatch;
+
+    // The fields share one coordinate system: the spanning marker opens
+    // the set and the EOCD sits on the last volume.
+
+    // The directory's (disk, relative) pair lands on the first central
+    // record in the joined stream.
+    const set = zip_span_archive[0..total];
+    if (std.mem.readInt(u32, set[0..4], .little) != 0x0807_4b50) return error.SpanningSignatureMismatch;
+    const eocd = total - 22;
+    if (std.mem.readInt(u32, set[eocd..][0..4], .little) != 0x0605_4b50) return error.EocdSignatureMismatch;
+    if (std.mem.readInt(u16, set[eocd + 4 ..][0..2], .little) != tails) return error.EocdDiskMismatch;
+    const cd_disk: usize = std.mem.readInt(u16, set[eocd + 6 ..][0..2], .little);
+    if (cd_disk != 1) return error.CentralDiskMismatch;
+    const cd_relative: usize = std.mem.readInt(u32, set[eocd + 16 ..][0..4], .little);
+    const cd_absolute = cd_disk * @as(usize, @intCast(zip_span_volume)) + cd_relative;
+    if (cd_absolute + 4 > eocd) return error.CentralPositionMismatch;
+    if (std.mem.readInt(u32, set[cd_absolute..][0..4], .little) != 0x0201_4b50) return error.CentralPositionMismatch;
+
+    // The read rides the tail parts back in volume order, decoding both
+    // entries as a single archive would.
+    var volume_nodes: [4]harness.Node = undefined;
+    for (0..tails) |index| {
+        // Repeated in-bytes selector: one parameter per tail volume.
+        volume_nodes[index] = harness.paramBytesWithAttributes(harness.param_family_archive, archive_volumes, 0x16, harness.cmd_read, parts[1 + index]);
+    }
+    try zipSpannedRead(r, parts[0], volume_nodes[0..tails], 0, &zip_span_a);
+    try zipSpannedRead(r, parts[0], volume_nodes[0..tails], 1, &zip_span_b);
+
+    // 7-Zip extracts the set like a foreign reader: parts land under
+    // split naming; the walk starts at the last volume.
+    const bin = "zig-out/benchmark/bin/7zz";
+    const oracle_io = harness.oracle_io;
+    std.Io.Dir.cwd().access(oracle_io, bin, .{}) catch return error.ReferenceToolUnavailable;
+    std.Io.Dir.cwd().createDirPath(oracle_io, "zig-out/oracles") catch {};
+    const stem = try r.gpa.print("zig-out/oracles/zip-span-{d}", .{r.corpus_index});
+    defer r.gpa.free(stem);
+    const out_path = try r.gpa.print("zig-out/oracles/zip-span-out-{d}", .{r.corpus_index});
+    defer r.gpa.free(out_path);
+    _ = std.Io.Dir.cwd().deleteTree(oracle_io, out_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(oracle_io, out_path);
+    var part_paths: [5][]const u8 = @splat("");
+    defer {
+        for (part_paths) |path| {
+            if (path.len != 0) r.gpa.free(path);
+        }
+    }
+    for (0..tails) |index| {
+        const part_path = try r.gpa.print("{s}.z{d:0>2}", .{ stem, index + 1 });
+        part_paths[index] = part_path;
+        try std.Io.Dir.cwd().writeFile(oracle_io, .{ .sub_path = part_path, .data = parts[index] });
+    }
+    const last_path = try r.gpa.print("{s}.zip", .{stem});
+    part_paths[tails] = last_path;
+    try std.Io.Dir.cwd().writeFile(oracle_io, .{ .sub_path = last_path, .data = parts[tails] });
+    const out_arg = try r.gpa.print("-o{s}", .{out_path});
+    defer r.gpa.free(out_arg);
+    var child = try std.process.spawn(oracle_io, .{ .argv = &.{ bin, "x", "-y", out_arg, last_path } });
+    const term = try child.wait(oracle_io);
+    if (term != .exited or term.exited != 0) return error.ReferenceToolExtractFailed;
+    try zipSpannedForeignFile(r, out_path, "span-a.txt", &zip_span_a);
+    try zipSpannedForeignFile(r, out_path, "span-b.txt", &zip_span_b);
+    _ = std.Io.Dir.cwd().deleteTree(oracle_io, out_path) catch {};
+    for (part_paths) |path| {
+        if (path.len != 0) _ = std.Io.Dir.cwd().deleteFile(oracle_io, path) catch {};
+    }
+}
+
 // Only output_size repeats across every row; workspace and encoded stay per row.
 const zip_base: harness.Spec = .{ .label = "", .run = undefined, .workspace_size = undefined, .output_size = 1024, .encoded_size = undefined };
 
@@ -717,4 +917,5 @@ pub const scenarios = harness.scenarios("zip", harness.specRows(zip_base, &.{
     .{ .label = "zip methods", .run = runMethods, .workspace_size = 48 * 1024 * 1024, .encoded_size = 65536 },
     .{ .label = "zip encode methods", .run = runEncodeMethods, .workspace_size = 48 * 1024 * 1024, .encoded_size = 65536 },
     .{ .label = "zip robustness", .run = runRobust, .workspace_size = 32 * 1024 * 1024, .encoded_size = 65536 },
+    .{ .label = "zip spanned set", .run = runZipSpannedSet, .workspace_size = 72 * 1024, .output_size = 8192, .encoded_size = 16384 },
 }), &.{});

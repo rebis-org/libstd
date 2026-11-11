@@ -97,6 +97,13 @@ pub fn build(b: *std.Build) void {
         const selected = test_filter == null or std.mem.find(u8, spec.name, test_filter.?) != null;
         if (selected) {
             const test_module = modules.createFor(b, spec, ctx.target, ctx.optimize, &ctx);
+            // api.zig's export closure reaches kernel discovery and vocabulary,
+            // which import the generated catalog and the interface contract.
+            if (comptime std.mem.eql(u8, spec.name, "implementations")) {
+                const modules_pair = modules.componentsWithInterface(b, &ctx, ctx.target, ctx.target, ctx.optimize);
+                test_module.addImport("components", modules_pair.components);
+                test_module.addImport("interface", modules_pair.interface);
+            }
             const unit_tests = b.addTest(.{ .root_module = test_module });
             const run_unit = b.addRunArtifact(unit_tests);
             unit_step.dependOn(&run_unit.step);

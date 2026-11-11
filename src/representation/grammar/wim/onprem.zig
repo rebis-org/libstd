@@ -126,9 +126,11 @@ fn writeUtf16Le(out: []u8, name: []const u8) Exception!usize {
 }
 
 fn dentryWireLen(name_units: usize) usize {
-    const name_bytes = name_units * 2;
-    const raw = dentry_disk_size + (if (name_bytes != 0) name_bytes + 2 else 0);
-    return (raw + 7) & ~@as(usize, 7);
+    // A saturated bound stays a bound: callers reject it instead of taking
+    // an unchecked add into a slice length.
+    const name_bytes = name_units *| 2;
+    const raw = dentry_disk_size +| (if (name_bytes != 0) name_bytes +| 2 else 0);
+    return (raw +| 7) & ~@as(usize, 7);
 }
 
 // Dentry names are single components: each directory dentry carries its
@@ -383,7 +385,8 @@ fn writeDentry(out: []u8, name: []const u8, hash: *const [sha1_len]u8, subdir_of
     // lives in the dentry hash.
     std.mem.writeInt(u16, out[96..98], 0, .little);
     std.mem.writeInt(u16, out[98..100], 0, .little); // No short name.
-    std.mem.writeInt(u16, out[100..102], @intCast(units * 2), .little);
+    const name_bytes = std.math.mul(usize, units, 2) catch return error.CallException;
+    std.mem.writeInt(u16, out[100..102], std.math.cast(u16, name_bytes) orelse return error.CallException, .little);
     if (units != 0) {
         var pos: usize = dentry_disk_size;
         pos += writeUtf16Le(out[pos..], name) catch return error.DataException;
@@ -556,6 +559,64 @@ pub fn archiveSize(entries: []const Entry, scratch: []u8) Exception!u64 {
     return (try layoutFor(file_count, metadata_len, file_count, payload_len)).total;
 }
 
+// The image bound must cover each directory's marker and record, not
+// just the per-entry leaf records.
+pub fn writeScratchLen(entries: []const Entry) Exception!usize {
+    var needed: u64 = security_len + 8 + root_record_len;
+    var max_name_len: usize = 0;
+    for (entries) |entry| {
+        const leaf = leafName(entry.name) orelse return error.CallException;
+        needed = try bounds.addU64(needed, dentryWireLen(try utf16Len(leaf)));
+        max_name_len = @max(max_name_len, entry.name.len);
+    }
+    // The listLen term adds a marker and a record per directory; the node cap bounds both.
+    const doubled = std.math.mul(u64, @as(u64, entries.len), 2) catch return error.ResourceException;
+    const node_count = std.math.add(u64, doubled, 1) catch return error.ResourceException;
+    const max_rec: u64 = dentryWireLen(max_name_len);
+    const per_node = std.math.add(u64, 8, max_rec) catch return error.ResourceException;
+    const records = std.math.mul(u64, node_count, per_node) catch return error.ResourceException;
+    needed = try bounds.addU64(needed, records);
+    const regions = Tree.Regions.of(entries.len);
+    needed = try bounds.addU64(needed, @as(u64, regions.total) + @alignOf(Node) - 1);
+    return std.math.cast(usize, needed) orelse return error.ResourceException;
+}
+
+// Parse carves the table, one blob entry per row, and the metadata
+// image; the need grows with the blob count.
+pub fn parseScratchLen(archive: []const u8) Exception!usize {
+    if (archive.len < header_disk_size) return error.DataException;
+    const table_hdr = try readReshdr(archive, 48);
+    const table_len = std.math.cast(usize, table_hdr.uncompressed_size) orelse return error.ResourceException;
+    var need: u64 = table_len;
+    need = try bounds.addU64(need, @as(u64, table_len / blob_disk_size) * @sizeOf(BlobEntry));
+    // Store-mode tables carry the image verbatim, so the scan reads its
+    // true size; compressed tables keep the default.
+    var md_size: u64 = archive.len;
+    if (table_hdr.size_in_wim == table_hdr.uncompressed_size) {
+        const table = try bounds.slice(archive, table_hdr.offset, table_len);
+        var at: usize = 0;
+        while (at + blob_disk_size <= table.len) : (at += blob_disk_size) {
+            const disk = try readBlobEntry(table, at);
+            if (disk.res.flags & reshdr_flag_metadata != 0) md_size = disk.res.uncompressed_size;
+        }
+    }
+    need = try bounds.addU64(need, md_size);
+    need = try bounds.addU64(need, scratch_size);
+    return std.math.cast(usize, need) orelse return error.ResourceException;
+}
+
+// The split scratch adds the span rows to what parse needs; the
+// span table scales with the blob count.
+pub fn splitScratchLen(archive: []const u8) Exception!usize {
+    if (archive.len < header_disk_size) return error.DataException;
+    const table_hdr = try readReshdr(archive, 48);
+    const table_len = std.math.cast(usize, table_hdr.uncompressed_size) orelse return error.ResourceException;
+    const span_room = @max(table_len / blob_disk_size, 2);
+    const span_bytes = std.math.mul(usize, span_room, @sizeOf(SplitSpan)) catch return error.ResourceException;
+    const parse_need = try parseScratchLen(archive);
+    return span_bytes + @alignOf(SplitSpan) - 1 + parse_need;
+}
+
 pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Exception!usize {
     return encodeStored(entries, output, scratch, &.{});
 }
@@ -694,8 +755,7 @@ fn decodeChunk(codec: Codec, chunk_size: u64, payload: []const u8, out: []u8) Ex
     }
 }
 
-// A volume set reads resources from the part each blob-table entry names;
-// a single archive is a one-part set, so every read routes through here.
+// A volume set reads resources from the part each blob-table entry names; a single archive is a one-part set.
 const Parts = struct {
     slices: []const []const u8,
 
@@ -996,8 +1056,7 @@ fn parse(parts: Parts, scratch: []u8) Exception!Parsed {
     const chunk_size = std.mem.readInt(u32, archive[20..24], .little);
     // Split-WIM identity: this part's 1-based number at 0x28, total parts at 0x2A.
     const wim_part = std.mem.readInt(u16, archive[40..42], .little);
-    // The head of a set (or a lone archive) is part 1; a later part alone
-    // carries no metadata and owns nothing by itself.
+    // The head of a set is part 1; a later part alone carries no metadata and owns nothing.
     if (wim_part != 1) return error.DataException;
     const image_count = std.mem.readInt(u32, archive[44..48], .little);
     if (image_count == 0) return error.DataException;
@@ -1134,6 +1193,10 @@ fn utf16NameInto(buf: []u8, units: []const u8) Exception![]const u8 {
             i += 2;
             break :blk 0x10000 + ((@as(u21, unit) - 0xD800) << 10) + (@as(u21, low) - 0xDC00);
         } else unit;
+        // A short staging buffer is an implementation shape limit, not
+        // corrupt input: report unsupported; a larger workspace cannot help.
+        const need: usize = std.unicode.utf8CodepointSequenceLength(cp) catch return error.DataException;
+        if (buf.len - out_len < need) return error.UnsupportedException;
         const n = std.unicode.utf8Encode(cp, buf[out_len..]) catch return error.DataException;
         out_len += n;
     }
@@ -1149,6 +1212,11 @@ fn securityDataLen(metadata: []const u8) Exception!usize {
 }
 
 const max_walk_depth = 64;
+const max_name_bytes = 1024; // One dentry's UTF-16 name staged on the stack.
+const max_path_bytes = 4096; // Joined path for the open directory levels.
+
+// These three are fixed shapes: more workspace cannot lift them.
+// UnsupportedException separates them from corrupt metadata and resource limits.
 
 // A WIM links children through the parent's subdir offset, so open
 // levels keep sibling cursors on a stack.
@@ -1161,23 +1229,25 @@ fn walk(metadata: []const u8, ctx: anytype, comptime visit: anytype) Exception!v
     // Start of each open level's joined path; a child's name is relative
     // to its owning directory.
     var prefix: [max_walk_depth]usize = @splat(0);
-    var path: [4096]u8 = undefined;
+    var path: [max_path_bytes]u8 = undefined;
     var depth: usize = 0;
     stack[0] = std.math.cast(usize, root_subdir) orelse return error.DataException;
     while (true) {
         const pos = stack[depth];
-        if (pos + 8 > metadata.len) return error.DataException;
+        const pos8 = std.math.add(usize, pos, 8) catch return error.DataException;
+        if (pos8 > metadata.len) return error.DataException;
         const length = std.mem.readInt(u64, metadata[pos..][0..8], .little);
-        const aligned = (length + 7) & ~@as(u64, 7);
+        const aligned = (length +% 7) & ~@as(u64, 7);
         if (aligned <= 8) {
             if (depth == 0) return;
             depth -= 1;
             continue;
         }
-        if (pos + aligned > metadata.len or aligned < dentry_disk_size) return error.DataException;
+        const dentry_end = std.math.add(u64, @intCast(pos), aligned) catch return error.DataException;
+        if (dentry_end > metadata.len or aligned < dentry_disk_size) return error.DataException;
         const stream_count = std.mem.readInt(u16, metadata[pos + 96 ..][0..2], .little);
         const name_nbytes = std.mem.readInt(u16, metadata[pos + 100 ..][0..2], .little);
-        var name_buf: [1024]u8 = undefined;
+        var name_buf: [max_name_bytes]u8 = undefined;
         var name: []const u8 = &.{};
         if (name_nbytes != 0) {
             if (pos + dentry_disk_size + name_nbytes > metadata.len) return error.DataException;
@@ -1186,7 +1256,7 @@ fn walk(metadata: []const u8, ctx: anytype, comptime visit: anytype) Exception!v
         var hash: [sha1_len]u8 = undefined;
         @memcpy(&hash, metadata[pos + 64 ..][0..sha1_len]);
         const base = prefix[depth];
-        if (base + name.len > path.len) return error.ResourceException;
+        if (base + name.len > path.len) return error.UnsupportedException;
         @memcpy(path[base..][0..name.len], name);
         const name_end = base + name.len;
         try visit(ctx, path[0..name_end], &hash);
@@ -1194,15 +1264,17 @@ fn walk(metadata: []const u8, ctx: anytype, comptime visit: anytype) Exception!v
         for (0..stream_count) |_| {
             if (next + 8 > metadata.len) return error.DataException;
             const stream_len = std.mem.readInt(u64, metadata[next..][0..8], .little);
-            const stream_aligned = (stream_len + 7) & ~@as(u64, 7);
-            if (stream_len < stream_disk_size or next + stream_aligned > metadata.len) return error.DataException;
+            const stream_aligned = (stream_len +% 7) & ~@as(u64, 7);
+            if (stream_len < stream_disk_size) return error.DataException;
+            const stream_end = std.math.add(u64, @intCast(next), stream_aligned) catch return error.DataException;
+            if (stream_end > metadata.len) return error.DataException;
             next += @intCast(stream_aligned);
         }
         stack[depth] = next;
         const subdir = std.mem.readInt(u64, metadata[pos + 16 ..][0..8], .little);
         if (subdir != 0) {
-            if (depth + 1 == max_walk_depth) return error.DataException;
-            if (name_end + 1 > path.len) return error.ResourceException;
+            if (depth + 1 == max_walk_depth) return error.UnsupportedException;
+            if (name_end + 1 > path.len) return error.UnsupportedException;
             path[name_end] = '/';
             depth += 1;
             prefix[depth] = name_end + 1;
@@ -1238,9 +1310,7 @@ fn inspectCountParts(parts: Parts, scratch: []u8) Exception!u64 {
     return count;
 }
 
-// Split-set identity per wimlib's join: every part carries the same image
-// GUID, the part numbers run 1..N in order, and each header's total names
-// the whole set.
+// Split-set identity per wimlib's join: one shared image GUID, part numbers 1..N, and each header's total naming the set.
 pub fn volumeSetChecks(parts: []const []const u8) Exception!void {
     if (parts.len == 0) return error.DataException;
     if (parts.len > std.math.maxInt(u16)) return error.ResourceException;
@@ -1323,8 +1393,7 @@ fn decodeOrdinalExParts(parts: Parts, ordinal: u64, output: []u8, scratch: []u8,
     if (blobLookup(parsed.blobs, found.hash) catch null) |blob| {
         return readBlob(parts, parsed, blob, output);
     }
-    // Unbacked in a delta WIM: resolve from the referenced WIMs, in order.
-    // Each reparse clobbers the carve; the delta's data is no longer needed.
+    // Unbacked in a delta WIM: resolve from the referenced WIMs in order; each reparse clobbers the carve.
     for (options.references) |ref| {
         var ref_parts = [_][]const u8{ref};
         const rp = try parse(.{ .slices = &ref_parts }, carve);
@@ -1661,10 +1730,7 @@ pub const EncodeOptions = struct {
     compression: Compression = .store,
     chunk_size: u32 = 0, // 0 selects the codec default.
     solid: bool = false,
-    // Reference WIM archives, as wimlib_reference_resource_files() takes
-    // them: a blob whose SHA-1 exists in a reference stays unbacked, the
-    // delta-WIM shape. Each reference's lookup table must decode within
-    // the encode workspace.
+    // Reference WIMs, as wimlib_reference_resource_files() takes them: a blob whose SHA-1 exists in a reference stays unbacked.
     references: []const []const u8 = &.{},
 };
 
@@ -1925,11 +1991,7 @@ pub fn encodeEx(entries: []const Entry, output: []u8, scratch: []u8, options: En
 
 const zero_hash: [sha1_len]u8 = @splat(0);
 
-// ---------------------------------------------------------------------------
-// Split-set write, with wimlib's split semantics: part 1 keeps the metadata,
-// lookup table, and XML; each later part is a bare header followed by whole
-// resources. A resource never straddles a part, so the set joins, and the
-// read side needs no part-2 table.
+// Split write, wimlib's semantics: part 1 keeps metadata, lookup, and XML; later parts are a bare header plus whole resources.
 
 pub const SplitPlan = struct { count: usize, total: u64 };
 
@@ -1957,16 +2019,11 @@ fn writeSplitHeader(out: []u8, head: []const u8, part: u16, total: u16, zero_tab
     }
 }
 
-// Plans the split of an already-encoded WIM into volume_size parts, and
-// writes the contiguous set when `output` is given; part lengths land in
-// `lengths` when provided. Span list rows index-pair with parsed.blobs.
+// Plans the split of an encoded WIM into volume_size parts; span list rows index-pair with parsed.blobs.
 fn splitCore(archive: []const u8, volume_size: u64, output: ?[]u8, lengths: ?[]u64, scratch: []u8) Exception!SplitPlan {
     if (volume_size <= header_disk_size) return error.CallException;
     if (archive.len < header_disk_size) return error.DataException;
-    // Solid WIMs route chunks through a run header the split does not
-    // rewrite; the compose write path is store-only, so refuse them. The
-    // split rewrites a single-image part-1 table, so other shapes refuse
-    // rather than lose their extra images or foreign part ownership.
+    // Solid WIMs route chunks through a run header the split does not rewrite, so refuse them.
     if (std.mem.readInt(u32, archive[12..16], .little) == wim_version_solid) return error.UnsupportedException;
     if (std.mem.readInt(u32, archive[44..48], .little) != 1) return error.UnsupportedException;
     if (std.mem.readInt(u16, archive[42..44], .little) != 1) return error.UnsupportedException;
@@ -1976,9 +2033,7 @@ fn splitCore(archive: []const u8, volume_size: u64, output: ?[]u8, lengths: ?[]u
     const xml_len = xml.size_in_wim;
     const xml_end = bounds.addU64(xml.offset, xml_len) catch return error.DataException;
     if (xml_end > archive.len) return error.DataException;
-    // The span carve takes the scratch tail before parse runs; parse's
-    // leftover temp overlaps it, and the solid refusal above keeps the
-    // temp region unread.
+    // The span carve takes the scratch tail before parse runs; parse's leftover temp overlaps it but stays unread.
     const span_room = @max(table_len / blob_disk_size, 2);
     const span_bytes = std.math.mul(usize, span_room, @sizeOf(SplitSpan)) catch return error.ResourceException;
     const spans = try alignedTail(scratch, span_bytes, @alignOf(SplitSpan));
@@ -1992,23 +2047,19 @@ fn splitCore(archive: []const u8, volume_size: u64, output: ?[]u8, lengths: ?[]u
     for (parsed.blobs, 0..) |blob, index| {
         if (blob.res.flags & reshdr_flag_metadata != 0) return error.DataException;
         if (blob.res.offset < payload_start) return error.DataException;
-        // Every span must sit inside the source archive: the emit copies
-        // it, and a forged size must fail as data before any arithmetic.
+        // Every span must sit inside the source archive: the emit copies it, so a forged size must fail as data.
         const span_end = bounds.addU64(blob.res.offset, blob.res.size_in_wim) catch return error.DataException;
         if (span_end > archive.len) return error.DataException;
         span_list[index] = .{ .start = blob.res.offset, .len = blob.res.size_in_wim };
     }
     const used_spans = span_list[0..parsed.blobs.len];
-    // The table walks in resource order, so the spans are ascending and
-    // disjoint; anything else is not a layout this split rewrites.
+    // The table walks in resource order, so spans are ascending and disjoint; anything else is not a rewritable layout.
     var previous_end: u64 = payload_start;
     for (used_spans) |*span| {
         if (span.start < previous_end) return error.DataException;
         previous_end = span.start + span.len;
     }
-    // Part 1 carries the fixed overhead plus its payload share; later parts
-    // are a bare header plus payload. The table shrinks to the kept blobs,
-    // so the fixed side re-derives from this split's own table.
+    // Part 1 carries the fixed overhead plus payload; the table shrinks to kept blobs, so the fixed side re-derives.
     const new_table_len: u64 = (@as(u64, parsed.blobs.len) + 2) * blob_disk_size;
     const part1_fixed: u64 = header_disk_size + md_len + new_table_len + xml_len;
     if (volume_size <= part1_fixed) return error.CallException;
@@ -2036,8 +2087,7 @@ fn splitCore(archive: []const u8, volume_size: u64, output: ?[]u8, lengths: ?[]u
     if (lengths) |l| {
         if (l.len < count) return error.CapacityException;
     }
-    // Virtual layout: every span takes its part-relative offset before any
-    // byte moves, so the part-1 table can be written after all payloads.
+    // Every span takes its part-relative offset before any byte moves, so the part-1 table is written after all payloads.
     var part1_payload: u64 = 0;
     var cursor: u64 = header_disk_size + md_len;
     for (used_spans) |*span| {
@@ -2064,12 +2114,10 @@ fn splitCore(archive: []const u8, volume_size: u64, output: ?[]u8, lengths: ?[]u
         part_at += inner;
     }
     const out = output orelse return .{ .count = @intCast(count), .total = total };
-    // The emit replays the same layout the plan walked; a divergence is a
-    // defect in the walker, never a caller capacity problem.
+    // The emit replays the plan's layout; a divergence is a walker defect, never a caller capacity problem.
     if (out.len < total) return error.CapacityException;
     if (total != part_at) return error.InternalException;
-    // Emit part 1: head header, metadata, its payload share, the fresh
-    // table, and the XML as written (it still describes the source set).
+    // Part 1: head header, metadata, its payload share, the fresh table, and the XML as written.
     writeSplitHeader(out[0..header_disk_size], archive, 1, @intCast(count), false);
     // The lookup and XML slots point at this split's own table and XML.
     writeReshdr(out[48..72], .{ .size_in_wim = new_table_len, .flags = (try readReshdr(archive, 48)).flags, .offset = table_off, .uncompressed_size = new_table_len });
@@ -2124,8 +2172,7 @@ pub fn wimSplitPlan(archive: []const u8, volume_size: u64, scratch: []u8) Except
     return splitCore(archive, volume_size, null, null, scratch);
 }
 
-// The set leaves contiguously; `lengths` reports each part's byte length in
-// volume order so a caller can cut the stream without re-deriving the plan.
+// The set leaves contiguously; lengths reports each part's bytes so a caller can cut the stream without re-deriving the plan.
 pub fn wimSplitEmit(archive: []const u8, volume_size: u64, output: []u8, lengths: []u64, scratch: []u8) Exception!SplitPlan {
     return splitCore(archive, volume_size, output, lengths, scratch);
 }
@@ -2311,6 +2358,40 @@ test "wim split set roundtrips through the volume reader" {
     try testing.expectError(error.DataException, volumeSetChecks(volumes[0 .. volumes.len - 1]));
 }
 
+test "write scratch bound covers the tree and the metadata image" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    // A wide entry set drives the tree past the fixed read scratch;
+    // the bound must cover the size pass.
+    const count = 300;
+    var names: [count][32]u8 = undefined;
+    var entries: [count]Entry = undefined;
+    for (0..count) |i| {
+        const name = std.mem.print(&names[i], "dir{d:0>2}/file{d:0>3}.bin", .{ i % 30, i }) catch unreachable;
+        entries[i] = .{ .name = name, .data = "" };
+    }
+    const bound = try writeScratchLen(&entries);
+    try testing.expect(bound > scratch_size);
+    const area = try allocator.alloc(u8, bound);
+    defer allocator.free(area);
+    _ = try archiveSize(&entries, area);
+}
+
+test "split scratch sizing scales with the source blob table" {
+    const testing = std.testing;
+    const entries = [_]Entry{
+        .{ .name = "a.bin", .data = "first payload" },
+        .{ .name = "b.bin", .data = "second payload" },
+    };
+    var archive: [16 * 1024]u8 = undefined;
+    var scratch: [64 * 1024]u8 = undefined;
+    const written = try encode(&entries, &archive, &scratch);
+    // Four blob rows plus the parse temp: the span rows ride above the
+    // fixed read scratch floor.
+    const need = try splitScratchLen(archive[0..written]);
+    try testing.expect(need > scratch_size);
+}
+
 test "wim split refuses a blob larger than a whole volume" {
     const testing = std.testing;
     var huge: [4096]u8 = @splat(0x11);
@@ -2339,11 +2420,25 @@ test "wim split refuses a forged blob span" {
     var archive: [16 * 1024]u8 = undefined;
     var scratch: [64 * 1024]u8 = undefined;
     const written = try encode(&entries, &archive, &scratch);
-    // The first table row's stored size is forged beyond the archive; the
-    // span bound must fail as data before any layout arithmetic.
+    // The first row's stored size is forged beyond the archive; the span bound must fail as data before any arithmetic.
     const table_off = std.mem.readInt(u64, archive[56..64], .little);
     const huge: u64 = 0x0000_FFFF_FFFF_F000;
     std.mem.writeInt(u64, archive[@intCast(table_off)..][0..8], huge, .little);
     std.mem.writeInt(u64, archive[@intCast(table_off + 16)..][0..8], huge, .little);
     try testing.expectError(error.DataException, wimSplitPlan(archive[0..written], 4096, &scratch));
+}
+
+test "wim name shape limits and corrupt codepoints keep distinct error classes" {
+    const testing = std.testing;
+    var units: [8]u8 = undefined;
+    for (0..4) |i| std.mem.writeInt(u16, units[i * 2 ..][0..2], 'a', .little);
+
+    // A long but well-formed name is an implementation limit, not damage.
+    var small: [2]u8 = undefined;
+    try testing.expectError(error.UnsupportedException, utf16NameInto(&small, &units));
+
+    // An unpaired low surrogate is genuinely invalid metadata.
+    std.mem.writeInt(u16, units[0..2], 0xDC00, .little);
+    var roomy: [64]u8 = undefined;
+    try testing.expectError(error.DataException, utf16NameInto(&roomy, units[0..2]));
 }

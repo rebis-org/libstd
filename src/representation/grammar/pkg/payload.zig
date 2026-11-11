@@ -365,7 +365,7 @@ const XzState = struct {
             const packed_data = try bounds.slice(self.input, self.pos, pack);
             self.pos += pack;
             try self.decoder[0].resetReaderSlice(packed_data);
-            try self.decoder[0].decodeToOutput(self.serve[0..unpack], unpack, false);
+            try self.decoder[0].decodeToOutput(self.serve[0..unpack], unpack, false, false);
             self.serve_pos = 0;
             self.serve_len = unpack;
             // The control, the two size fields, the properties byte, and

@@ -11,6 +11,16 @@ pub const Entry = onprem.Entry;
 pub const EntryInfo = onprem.EntryInfo;
 pub const scratch_size = onprem.scratch_size;
 
+pub fn writeScratchLen(entries: []const Entry) Exception!usize {
+    return onprem.writeScratchLen(entries);
+}
+pub fn parseScratchLen(archive: []const u8) Exception!usize {
+    return onprem.parseScratchLen(archive);
+}
+pub fn splitScratchLen(archive: []const u8) Exception!usize {
+    return onprem.splitScratchLen(archive);
+}
+
 pub const default_provider: Provider = seam.defaultProvider(impl);
 pub fn inspectCount(provider: Provider, archive: []const u8, scratch: []u8) Exception!u64 {
     return seam.dispatchOnprem(impl, provider, onprem.inspectCount, .{ archive, scratch });

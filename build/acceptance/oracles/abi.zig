@@ -85,9 +85,7 @@ pub const Call = extern struct {
 
 pub extern fn stdk_call(call: *Call) callconv(.c) u32;
 
-// The async submission boundary: the completion record is caller-owned
-// storage and the ticket is its pointer. The submission descriptor and the
-// executor vtable are C-representable shapes for host thread pools.
+// The completion record is caller-owned storage and the ticket its pointer; both shapes are C-representable for host pools.
 pub const Completion = extern struct {
     structure_size: u32,
     state: u32,

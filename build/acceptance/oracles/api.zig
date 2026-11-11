@@ -5,11 +5,7 @@ const corpus = @import("corpus.zig");
 const harness = @import("harness.zig");
 const steps = @import("steps.zig");
 
-// Exercises the session boundary through its C exports with caller-owned
-// storage and no envelope.
-//
-// The contract: byte-identity with the kernel-mediated decode, idempotent
-// destroy, invalid_call after destroy.
+// Exercises the session boundary through its C exports with caller-owned storage: byte-identity, idempotent destroy, invalid_call after destroy.
 
 extern fn stdk_session_storage(component: [*:0]const u8, verb: [*:0]const u8) u64;
 extern fn stdk_session_create(component: [*:0]const u8, verb: [*:0]const u8, storage: ?[*]u8, storage_len: u64) u32;
@@ -145,6 +141,48 @@ fn run(r: *harness.Runner) anyerror!void {
     if (!bounded_failed) return error.BudgetNotEnforced;
     if (stdk_session_failure(storage, &detail_status, &detail) != abi.Status.ok) return error.FailureReadback;
     if (detail_status != abi.Status.resource_limit) return error.BudgetDetail;
+    if (stdk_session_destroy(storage) != abi.Status.ok) return error.DestroyFailed;
+
+    // The work ceiling charges consumed plus produced, tripping at step
+    // one: a gzip member is never shorter than its header.
+    if (stdk_session_bounded(
+        "gzip",
+        "decode",
+        storage,
+        storage_len,
+        std.math.maxInt(u64),
+        std.math.maxInt(u64),
+        8,
+        std.math.maxInt(u64),
+    ) != abi.Status.ok) return error.BoundedCreateFailed;
+    var work_failed = false;
+    pos = 0;
+    while (pos < r.encoded_len) {
+        const take = @min(4096, r.encoded_len - pos);
+        const chunk3 = r.encoded[pos..][0..take];
+        const end3 = pos + take == r.encoded_len;
+        const step_status = stdk_session_step(
+            storage,
+            chunk3.ptr,
+            chunk3.len,
+            decoded[0..].ptr,
+            decoded.len,
+            @intFromBool(end3),
+            &counts,
+            &state,
+        );
+        pos += @intCast(counts[0]);
+        if (step_status == abi.Status.resource_limit) {
+            work_failed = true;
+            break;
+        }
+        if (step_status != abi.Status.ok) return error.BoundedStepFailed;
+        if (state == 1) break;
+        if (state < 0) return error.BoundedStepCorrupt;
+    }
+    if (!work_failed) return error.WorkBudgetNotEnforced;
+    if (stdk_session_failure(storage, &detail_status, &detail) != abi.Status.ok) return error.FailureReadback;
+    if (detail_status != abi.Status.resource_limit) return error.WorkBudgetDetail;
     if (stdk_session_destroy(storage) != abi.Status.ok) return error.DestroyFailed;
 
     // Raw DEFLATE session: a deflate-profile stream decodes chunked through
@@ -359,8 +397,7 @@ fn oracleRunInline(_: *anyopaque, task: abi.Task) callconv(.c) u32 {
     return task.invoke(task.context);
 }
 
-// A deferred executor arm: run stores the task and returns, so a record
-// stays pending until the oracle drains the queue by hand.
+// A deferred arm: run stores the task and returns, so a record stays pending until drained by hand.
 var deferred_task: ?abi.Task = null;
 
 fn oracleRunDeferred(_: *anyopaque, task: abi.Task) callconv(.c) u32 {
@@ -368,9 +405,7 @@ fn oracleRunDeferred(_: *anyopaque, task: abi.Task) callconv(.c) u32 {
     return abi.Status.ok;
 }
 
-// A withdrawing executor arm: a queued task cancelled before it starts is
-// discarded; the executor flips the host-owned record itself, and the
-// library never invokes the withdrawn task.
+// A queued task cancelled before it starts is discarded; the executor flips the record itself, and the task never runs.
 fn oracleRunWithdrawing(_: *anyopaque, task: abi.Task) callconv(.c) u32 {
     const submission: *abi.Submission = @ptrCast(@alignCast(task.context));
     const completion = submission.completion orelse return abi.Status.invalid_call;
@@ -414,8 +449,7 @@ fn runCancel(r: *harness.Runner) anyerror!void {
     if (deferred_task) |task| _ = task.invoke(task.context) else return error.DeferredTaskLost;
     if (plain_record.state != abi.Completion.done or plain_record.status != abi.Status.ok) return error.DeferredNotCompleted;
 
-    // A cancel that lands before the task runs is honored at the boundary:
-    // the envelope never executes and the record completes as cancelled.
+    // A cancel landing before the task runs is honored at the boundary: the envelope never executes the task.
     var pending_record = abi.Completion.init();
     var pending_sub: [1]abi.Submission = .{.{ .call = &envelope, .completion = &pending_record }};
     if (abi.stdk_group(&pending_sub, 1, &deferred_executor) != abi.Status.ok) return error.CancelSubmitFailed;

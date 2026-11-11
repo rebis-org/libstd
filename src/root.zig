@@ -5,10 +5,8 @@ const diagnostic = @import("interface").diagnostic;
 const invoke = @import("compose/call.zig").invoke;
 const Call = @import("kernel/envelope.zig").Call;
 
-// Keep panics off std.debug's handler: debug_io instantiates std.Io.Threaded,
-// failing to compile for Apple embedded targets (ziglang/zig#37061; fixed upstream, unreleased).
-//
-// The library traps like every other contract violation.
+// The std.debug handler instantiates std.Io.Threaded, which fails
+// to compile for Apple embedded targets; panics stay off it.
 pub const panic = std.debug.FullPanic(struct {
     fn panicFn(msg: []const u8, first_trace_addr: ?usize) noreturn {
         _ = first_trace_addr;

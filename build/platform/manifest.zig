@@ -13,8 +13,7 @@ pub const FormSpec = struct {
     arches: []const []const u8 = &.{},
 };
 
-// One arch table feeds both the archive specs and the slice picker, so a
-// new arch cannot drift between them. The darwin order is arm-first.
+// One arch table feeds both the archive specs and the slice picker, so a new arch cannot drift between them.
 pub const desktop_arches = [_][]const u8{ "x86_64", "aarch64" };
 pub const apple_arches = [_][]const u8{ "aarch64", "x86_64" };
 pub const linux_arches = [_][]const u8{ "x86_64", "aarch64", "riscv64", "loongarch64" };

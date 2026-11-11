@@ -248,8 +248,10 @@ fn parseFilterDescriptor(st: *Unpacker) Exception!void {
     const block_start_delta = try filters.readFilterSize(br);
     const block_start = @as(usize, @intCast(st.window.write_pos)) +% block_start_delta;
 
-    const block_length = try filters.readFilterSize(br);
+    var block_length = try filters.readFilterSize(br);
     if (block_length == 0) return error.DataException;
+    // The vendor zeroes oversized filters so downstream skips them.
+    if (block_length > filters.max_filter_block) block_length = 0;
 
     const raw_filter_type: u3 = @intCast(try br.readBits(3));
     const filter_type = filters.filterTypeFromRaw(raw_filter_type) orelse return error.UnsupportedException;
@@ -474,7 +476,12 @@ pub const Session = struct {
         st.br = BitReader.init(packed_data);
         st.written_size = 0;
 
-        if (unpacked_size == 0) return;
+        if (unpacked_size == 0) {
+            // An empty solid predecessor still carries its block tables into
+            // the next entry. Consume the header without producing bytes.
+            if (packed_data.len != 0) _ = try decodeBlock(st, 0);
+            return;
+        }
 
         const start_pos = st.window.write_pos;
 

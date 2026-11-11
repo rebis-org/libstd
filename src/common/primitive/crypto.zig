@@ -17,10 +17,10 @@ pub const default_provider = seam.default_provider;
 pub const HmacSha1 = hmac_seam.HmacSha1;
 pub const HmacSha256 = hmac_seam.HmacSha256;
 pub const Sha1 = sha1_seam.Sha1;
-pub const Sha256Mb = sha256_mb_seam.Sha256Mb;
 // Capability seams keep every block primitive swappable; this glue never
 // names an implementation directly.
 pub const Sha256 = sha256_seam.Sha256;
+pub const Sha256Mb = sha256_mb_seam.Sha256Mb;
 
 pub const block_length = 16;
 pub const hmac_sha1_length = 20;
@@ -365,18 +365,6 @@ pub fn fillRandom(bytes: []u8) Exception!void {
     return error.UnsupportedException;
 }
 
-test "fill random accepts every length class" {
-    // Lengths cover the syscall-chunked, zero-request, and arc4random paths,
-    // so a broken retry or gate fails here.
-    var buf: [65]u8 = undefined;
-    for (0..buf.len + 1) |len| try fillRandom(buf[0..len]);
-    try fillRandom(&buf);
-    // A stubbed or repeated fill repeats; real entropy does not.
-    var again: [65]u8 = undefined;
-    try fillRandom(&again);
-    try std.testing.expect(!std.mem.eql(u8, &buf, &again));
-}
-
 // ZipCrypto (PKWARE traditional cipher): the CRC-32-based key ladder has no
 // stdlib equivalent; it reuses the shared reflected CRC-32 table.
 const zip_crc_table = seam.byteTable(u32, 0xEDB8_8320, true);
@@ -428,55 +416,79 @@ pub const ZipCryptoKeys = struct {
 // Glue KATs: FIPS 197, NIST SP 800-38A, RFC 2202, RFC 4231, RFC 6070,
 // scrypt draft, SHA-256, 7z KDF (7-Zip).
 
-test "mergeable digest binds both providers to the same contract" {
-    if (options.sha256_impl != .mergeable) return error.SkipZigTest;
-    const input = "the seam carries both providers";
-    var bound_onprem = sha256_seam.Sha256.bind(.onprem, .{});
-    bound_onprem.update(input);
-    var bound_offprem = sha256_seam.Sha256.bind(.offprem, .{});
-    bound_offprem.update(input);
-    try std.testing.expectEqualSlices(u8, &bound_onprem.finalResult(), &bound_offprem.finalResult());
+test "fill random answers every length class without repeating" {
+    // Lengths zero through the chunk boundary cross the syscall,
+    // getentropy, and arc4random paths.
+    var buf: [65]u8 = undefined;
+    for (0..buf.len + 1) |len| try fillRandom(buf[0..len]);
+    // A repeated buffer means the RNG answered twice with one call.
+    var again: [65]u8 = undefined;
+    try fillRandom(&again);
+    try std.testing.expect(!std.mem.eql(u8, &buf, &again));
 }
 
-test "fixed digest bind rejects the other provider" {
+test "mergeable digest binds one contract across providers" {
+    if (options.sha256_impl != .mergeable) return error.SkipZigTest;
+    const input = "the seam carries both providers";
+    // A split feed must reach the same digest as one whole feed.
+    var split_feed = sha256_seam.Sha256.bind(.onprem, .{});
+    split_feed.update(input[0..12]);
+    split_feed.update(input[12..]);
+    var whole_feed = sha256_seam.Sha256.bind(.offprem, .{});
+    whole_feed.update(input);
+    try std.testing.expectEqualSlices(u8, &split_feed.finalResult(), &whole_feed.finalResult());
+}
+
+test "fixed digest build pins its compiled provider" {
     if (options.sha256_impl == .mergeable) return error.SkipZigTest;
-    const fixed_tag: Provider = switch (options.sha256_impl) {
+    const pinned: Provider = switch (options.sha256_impl) {
         .onprem => .onprem,
         .offprem => .offprem,
         else => unreachable,
     };
-    var bound = sha256_seam.Sha256.bind(fixed_tag, .{});
+    // Only the compiled provider exists in a fixed build.
+    var bound = sha256_seam.Sha256.bind(pinned, .{});
     bound.update("abc");
-    const via_bind = bound.finalResult();
     var plain = sha256_seam.Sha256.init(.{});
     plain.update("abc");
-    try std.testing.expectEqualSlices(u8, &plain.finalResult(), &via_bind);
+    try std.testing.expectEqualSlices(u8, &plain.finalResult(), &bound.finalResult());
 }
 
-test "sha256 matches fips vectors" {
-    var h = Sha256.init(.{});
-    h.update("");
+test "sha256 reproduces the fips 180 catalog across split feeds" {
+    var whole = Sha256.init(.{});
+    whole.update("");
     try std.testing.expectEqualSlices(u8, &[_]u8{
         0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9,
         0x24, 0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52,
         0xb8, 0x55,
-    }, &h.finalResult());
-    h = Sha256.init(.{});
-    h.update("abc");
+    }, &whole.finalResult());
+    // The digest must not depend on how the feed is chunked.
+    var split = Sha256.init(.{});
+    split.update("ab");
+    split.update("c");
     try std.testing.expectEqualSlices(u8, &[_]u8{
         0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22,
         0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00,
         0x15, 0xad,
-    }, &h.finalResult());
+    }, &split.finalResult());
 }
 
-test "hmac matches rfc 2202 vectors" {
-    var out: [32]u8 = undefined;
+test "hmac reproduces the rfc 2202 catalog" {
+    var out: [hmac_sha256_length]u8 = undefined;
     const key20: [20]u8 = @splat(0x0b);
-    hmacSha1(default_provider, out[0..20], "Hi There", &key20);
-    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xb6, 0x17, 0x31, 0x86, 0x55, 0x05, 0x72, 0x64, 0xe2, 0x8b, 0xc0, 0xb6, 0xfb, 0x37, 0x8c, 0x8e, 0xf1, 0x46, 0xbe, 0x00 }, out[0..20]);
-    hmacSha1(default_provider, out[0..20], "what do ya want for nothing?", "Jefe");
-    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xef, 0xfc, 0xdf, 0x6a, 0xe5, 0xeb, 0x2f, 0xa2, 0xd2, 0x74, 0x16, 0xd5, 0xf1, 0x84, 0xdf, 0x9c, 0x25, 0x9a, 0x7c, 0x79 }, out[0..20]);
+    hmacSha1(default_provider, out[0..hmac_sha1_length], "Hi There", &key20);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xb6, 0x17, 0x31, 0x86, 0x55, 0x05, 0x72, 0x64, 0xe2, 0x8b, 0xc0, 0xb6, 0xfb, 0x37, 0x8c, 0x8e, 0xf1, 0x46, 0xbe, 0x00 }, out[0..hmac_sha1_length]);
+    hmacSha1(default_provider, out[0..hmac_sha1_length], "what do ya want for nothing?", "Jefe");
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xef, 0xfc, 0xdf, 0x6a, 0xe5, 0xeb, 0x2f, 0xa2, 0xd2, 0x74, 0x16, 0xd5, 0xf1, 0x84, 0xdf, 0x9c, 0x25, 0x9a, 0x7c, 0x79 }, out[0..hmac_sha1_length]);
+    // Key and data both sit at the block boundary.
+    const data50: [50]u8 = @splat(0xdd);
+    const key_aa20: [20]u8 = @splat(0xaa);
+    hmacSha1(default_provider, out[0..hmac_sha1_length], &data50, &key_aa20);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x12, 0x5d, 0x73, 0x42, 0xb9, 0xac, 0x11, 0xcd, 0x91, 0xa3, 0x9a, 0xf4, 0x8a, 0xa1, 0x7b, 0x4f, 0x63, 0xf1, 0x75, 0xd3 }, out[0..hmac_sha1_length]);
+    // A key longer than the block is hashed before use.
+    const long_key: [131]u8 = @splat(0xaa);
+    hmacSha1(default_provider, out[0..hmac_sha1_length], "Test Using Larger Than Block-Size Key - Hash Key First", &long_key);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x90, 0xd0, 0xda, 0xce, 0x1c, 0x1b, 0xdc, 0x95, 0x73, 0x39, 0x30, 0x78, 0x03, 0x16, 0x03, 0x35, 0xbd, 0xe6, 0xdf, 0x2b }, out[0..hmac_sha1_length]);
     const key32: [32]u8 = @splat(0x0b);
     hmacSha256(default_provider, &out, "Hi There", &key32);
     try std.testing.expectEqualSlices(u8, &[_]u8{
@@ -486,72 +498,7 @@ test "hmac matches rfc 2202 vectors" {
     }, &out);
 }
 
-test "pbkdf2 matches rfc 6070 vectors" {
-    var out: [64]u8 = undefined;
-    try pbkdf2HmacSha1(default_provider, out[0..20], "password", "salt", 1);
-    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x0c, 0x60, 0xc8, 0x0f, 0x96, 0x1f, 0x0e, 0x71, 0xf3, 0xa9, 0xb5, 0x24, 0xaf, 0x60, 0x12, 0x06, 0x2f, 0xe0, 0x37, 0xa6 }, out[0..20]);
-    try pbkdf2HmacSha1(default_provider, out[0..20], "password", "salt", 2);
-    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xea, 0x6c, 0x01, 0x4d, 0xc7, 0x2d, 0x6f, 0x8c, 0xcd, 0x1e, 0xd9, 0x2a, 0xce, 0x1d, 0x41, 0xf0, 0xd8, 0xde, 0x89, 0x57 }, out[0..20]);
-    try pbkdf2HmacSha256(default_provider, out[0..32], "password", "salt", 1);
-    try std.testing.expectEqualSlices(u8, &[_]u8{
-        0x12, 0x0f, 0xb6, 0xcf, 0xfc, 0xf8, 0xb3, 0x2c, 0x43, 0xe7, 0x22, 0x52, 0x56, 0xc4, 0xf8,
-        0x37, 0xa8, 0x65, 0x48, 0xc9, 0x2c, 0xcc, 0x35, 0x48, 0x08, 0x05, 0x98, 0x7c, 0xb7, 0x0b,
-        0xe1, 0x7b,
-    }, out[0..32]);
-}
-
-test "seven zip kdf matches vendor vectors" {
-    var utf16_buf: [32]u16 = undefined;
-    var key: [seven_zip_key_length]u8 = undefined;
-    const pw_len = std.unicode.utf8ToUtf16Le(&utf16_buf, "password123") catch unreachable;
-    sevenZipKdf(default_provider, std.mem.sliceAsBytes(utf16_buf[0..pw_len]), &[_]u8{ 0xde, 0xad, 0xbe, 0xef }, 8, &key);
-    try std.testing.expectEqualSlices(u8, &[_]u8{
-        0x32, 0xd1, 0x8a, 0x13, 0x38, 0xaa, 0x7e, 0x60, 0xaa, 0x32, 0x37, 0x66, 0xfc, 0xe9, 0x25,
-        0x08, 0xda, 0xa2, 0xc5, 0x47, 0x28, 0xba, 0x3b, 0x45, 0x0c, 0xce, 0xb1, 0x93, 0x35, 0xd0,
-        0xa9, 0x94,
-    }, &key);
-    sevenZipKdf(default_provider, &.{}, &.{}, 0, &key);
-    try std.testing.expectEqualSlices(u8, &[_]u8{
-        0xaf, 0x55, 0x70, 0xf5, 0xa1, 0x81, 0x0b, 0x7a, 0xf7, 0x8c, 0xaf, 0x4b, 0xc7, 0x0a, 0x66,
-        0x0f, 0x0d, 0xf5, 0x1e, 0x42, 0xba, 0xf9, 0x1d, 0x4d, 0xe5, 0xb2, 0x32, 0x8d, 0xe0, 0xe8,
-        0x3d, 0xfc,
-    }, &key);
-}
-
-test "aes matches fips 197 vectors" {
-    const pt = [16]u8{ 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff };
-    const key128 = [16]u8{ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f };
-    const ct128 = try aesEncryptBlock(default_provider, &key128, pt);
-    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x69, 0xc4, 0xe0, 0xd8, 0x6a, 0x7b, 0x04, 0x30, 0xd8, 0xcd, 0xb7, 0x80, 0x70, 0xb4, 0xc5, 0x5a }, &ct128);
-    try std.testing.expectEqualSlices(u8, &pt, &(try aesDecryptBlock(default_provider, &key128, ct128)));
-    const key192 = [24]u8{ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17 };
-    const ct192 = try aesEncryptBlock(default_provider, &key192, pt);
-    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xdd, 0xa9, 0x7c, 0xa4, 0x86, 0x4c, 0xdf, 0xe0, 0x6e, 0xaf, 0x70, 0xa0, 0xec, 0x0d, 0x71, 0x91 }, &ct192);
-    try std.testing.expectEqualSlices(u8, &pt, &(try aesDecryptBlock(default_provider, &key192, ct192)));
-    const key256 = [32]u8{ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f };
-    const ct256 = try aesEncryptBlock(default_provider, &key256, pt);
-    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x8e, 0xa2, 0xb7, 0xca, 0x51, 0x67, 0x45, 0xbf, 0xea, 0xfc, 0x49, 0x90, 0x4b, 0x49, 0x60, 0x89 }, &ct256);
-    try std.testing.expectEqualSlices(u8, &pt, &(try aesDecryptBlock(default_provider, &key256, ct256)));
-}
-
-test "aes cbc matches sp800-38a vectors" {
-    const key = [32]u8{
-        0x60, 0x3d, 0xeb, 0x10, 0x15, 0xca, 0x71, 0xbe, 0x2b, 0x73, 0xae, 0xf0, 0x85, 0x7d, 0x77,
-        0x81, 0x1f, 0x35, 0x2c, 0x07, 0x3b, 0x61, 0x08, 0xd7, 0x2d, 0x98, 0x10, 0xa3, 0x09, 0x14,
-        0xdf, 0xf4,
-    };
-    const iv = [16]u8{ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f };
-    const plain = [32]u8{ 0x6b, 0xc1, 0xbe, 0xe2, 0x2e, 0x40, 0x9f, 0x96, 0xe9, 0x3d, 0x7e, 0x11, 0x73, 0x93, 0x17, 0x2a, 0xae, 0x2d, 0x8a, 0x57, 0x1e, 0x03, 0xac, 0x9c, 0x9e, 0xb7, 0x6f, 0xac, 0x45, 0xaf, 0x8e, 0x51 };
-    const expected = [32]u8{ 0xf5, 0x8c, 0x4c, 0x04, 0xd6, 0xe5, 0xf1, 0xba, 0x77, 0x9e, 0xab, 0xfb, 0x5f, 0x7b, 0xfb, 0xd6, 0x9c, 0xfc, 0x4e, 0x96, 0x7e, 0xdb, 0x80, 0x8d, 0x67, 0x9f, 0x77, 0x7b, 0xc6, 0x70, 0x2c, 0x7d };
-    var out: [32]u8 = undefined;
-    try aesCbcEncrypt(default_provider, &key, iv, &out, &plain);
-    try std.testing.expectEqualSlices(u8, &expected, &out);
-    var back: [32]u8 = undefined;
-    try aesCbcDecrypt(default_provider, &key, iv, &back, &out);
-    try std.testing.expectEqualSlices(u8, &plain, &back);
-}
-
-test "hmac matches wycheproof vectors" {
+test "hmac survives the wycheproof tag battery" {
     // Source: wycheproof testvectors_v1 (google-wycheproof):
     // hmac_sha256_test.json, hmac_sha1_test.json. Truncated-tag cases compare the tag prefix.
     const Case = struct { key: []const u8, msg: []const u8, tag: []const u8 };
@@ -760,7 +707,114 @@ test "hmac matches wycheproof vectors" {
     }
 }
 
-test "aes cbc matches wycheproof raw vectors" {
+test "pbkdf2 derives the rfc 6070 keys and refuses weak rounds" {
+    var out: [64]u8 = undefined;
+    try pbkdf2HmacSha1(default_provider, out[0..20], "password", "salt", 1);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x0c, 0x60, 0xc8, 0x0f, 0x96, 0x1f, 0x0e, 0x71, 0xf3, 0xa9, 0xb5, 0x24, 0xaf, 0x60, 0x12, 0x06, 0x2f, 0xe0, 0x37, 0xa6 }, out[0..20]);
+    try pbkdf2HmacSha1(default_provider, out[0..20], "password", "salt", 2);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xea, 0x6c, 0x01, 0x4d, 0xc7, 0x2d, 0x6f, 0x8c, 0xcd, 0x1e, 0xd9, 0x2a, 0xce, 0x1d, 0x41, 0xf0, 0xd8, 0xde, 0x89, 0x57 }, out[0..20]);
+    // Forty hundred rounds cross the block-count boundary of the PRF.
+    try pbkdf2HmacSha1(default_provider, out[0..20], "password", "salt", 4096);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x4b, 0x00, 0x79, 0x01, 0xb7, 0x65, 0x48, 0x9a, 0xbe, 0xad, 0x49, 0xd9, 0x26, 0xf7, 0x21, 0xd0, 0x65, 0xa4, 0x29, 0xc1 }, out[0..20]);
+    // A 25-byte key forces the multi-block tail of the PRF output.
+    try pbkdf2HmacSha1(default_provider, out[0..25], "passwordPASSWORDpassword", "saltSALTsaltSALTsaltSALTsaltSALTsalt", 4096);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x3d, 0x2e, 0xec, 0x4f, 0xe4, 0x1c, 0x84, 0x9b, 0x80, 0xc8, 0xd8, 0x36, 0x62, 0xc0, 0xe4, 0x4a, 0x8b, 0x29, 0x1a, 0x96, 0x4c, 0xf2, 0xf0, 0x70, 0x38 }, out[0..25]);
+    try pbkdf2HmacSha256(default_provider, out[0..32], "password", "salt", 1);
+    try std.testing.expectEqualSlices(u8, &[_]u8{
+        0x12, 0x0f, 0xb6, 0xcf, 0xfc, 0xf8, 0xb3, 0x2c, 0x43, 0xe7, 0x22, 0x52, 0x56, 0xc4, 0xf8,
+        0x37, 0xa8, 0x65, 0x48, 0xc9, 0x2c, 0xcc, 0x35, 0x48, 0x08, 0x05, 0x98, 0x7c, 0xb7, 0x0b,
+        0xe1, 0x7b,
+    }, out[0..32]);
+    // Zero rounds would leak the raw PRF state instead of stretching it.
+    try std.testing.expectError(error.CallException, pbkdf2HmacSha1(default_provider, out[0..20], "password", "salt", 0));
+    try std.testing.expectError(error.CallException, pbkdf2HmacSha256(default_provider, out[0..32], "password", "salt", 0));
+}
+
+test "seven zip kdf reproduces both vendor vectors" {
+    var utf16_buf: [32]u16 = undefined;
+    var key: [seven_zip_key_length]u8 = undefined;
+    const pw_len = std.unicode.utf8ToUtf16Le(&utf16_buf, "password123") catch unreachable;
+    sevenZipKdf(default_provider, std.mem.sliceAsBytes(utf16_buf[0..pw_len]), &[_]u8{ 0xde, 0xad, 0xbe, 0xef }, 8, &key);
+    try std.testing.expectEqualSlices(u8, &[_]u8{
+        0x32, 0xd1, 0x8a, 0x13, 0x38, 0xaa, 0x7e, 0x60, 0xaa, 0x32, 0x37, 0x66, 0xfc, 0xe9, 0x25,
+        0x08, 0xda, 0xa2, 0xc5, 0x47, 0x28, 0xba, 0x3b, 0x45, 0x0c, 0xce, 0xb1, 0x93, 0x35, 0xd0,
+        0xa9, 0x94,
+    }, &key);
+    // Zero cycles collapse the loop to one hash of salt, password, counter.
+    sevenZipKdf(default_provider, &.{}, &.{}, 0, &key);
+    try std.testing.expectEqualSlices(u8, &[_]u8{
+        0xaf, 0x55, 0x70, 0xf5, 0xa1, 0x81, 0x0b, 0x7a, 0xf7, 0x8c, 0xaf, 0x4b, 0xc7, 0x0a, 0x66,
+        0x0f, 0x0d, 0xf5, 0x1e, 0x42, 0xba, 0xf9, 0x1d, 0x4d, 0xe5, 0xb2, 0x32, 0x8d, 0xe0, 0xe8,
+        0x3d, 0xfc,
+    }, &key);
+}
+
+test "winzip strength tables answer every derived length" {
+    // The AES-embedded strength nibble owns three values.
+    try std.testing.expectEqual(@as(usize, 16), try winzipKeyLength(1));
+    try std.testing.expectEqual(@as(usize, 24), try winzipKeyLength(2));
+    try std.testing.expectEqual(@as(usize, 32), try winzipKeyLength(3));
+    try std.testing.expectEqual(@as(usize, 8), try winzipSaltLength(1));
+    try std.testing.expectEqual(@as(usize, 12), try winzipSaltLength(2));
+    try std.testing.expectEqual(@as(usize, 16), try winzipSaltLength(3));
+    try std.testing.expectError(error.UnsupportedException, winzipKeyLength(0));
+    try std.testing.expectError(error.UnsupportedException, winzipKeyLength(4));
+    try std.testing.expectError(error.UnsupportedException, winzipSaltLength(0));
+    try std.testing.expectError(error.UnsupportedException, winzipSaltLength(4));
+    // The derived buffer carries the key plus a two-byte verifier.
+    var derived: [2 * 16 + winzip_verify_length]u8 = undefined;
+    try winzipDeriveKey(default_provider, "secret", &[_]u8{ 0x01, 0x02 }, 16, &derived);
+    var direct: [2 * 16 + winzip_verify_length]u8 = undefined;
+    try pbkdf2HmacSha1(default_provider, &direct, "secret", &[_]u8{ 0x01, 0x02 }, winzip_pbkdf2_rounds);
+    try std.testing.expectEqualSlices(u8, &direct, &derived);
+    // One byte short of key plus verifier is a caller error.
+    try std.testing.expectError(error.CallException, winzipDeriveKey(default_provider, "secret", &[_]u8{ 0x01, 0x02 }, 16, derived[0 .. derived.len - 1]));
+}
+
+test "aes covers every key size in the fips 197 catalog" {
+    const pt = [16]u8{ 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff };
+    const key128 = [16]u8{ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f };
+    const ct128 = try aesEncryptBlock(default_provider, &key128, pt);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x69, 0xc4, 0xe0, 0xd8, 0x6a, 0x7b, 0x04, 0x30, 0xd8, 0xcd, 0xb7, 0x80, 0x70, 0xb4, 0xc5, 0x5a }, &ct128);
+    try std.testing.expectEqualSlices(u8, &pt, &(try aesDecryptBlock(default_provider, &key128, ct128)));
+    const key192 = [24]u8{ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17 };
+    const ct192 = try aesEncryptBlock(default_provider, &key192, pt);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xdd, 0xa9, 0x7c, 0xa4, 0x86, 0x4c, 0xdf, 0xe0, 0x6e, 0xaf, 0x70, 0xa0, 0xec, 0x0d, 0x71, 0x91 }, &ct192);
+    try std.testing.expectEqualSlices(u8, &pt, &(try aesDecryptBlock(default_provider, &key192, ct192)));
+    const key256 = [32]u8{ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f };
+    const ct256 = try aesEncryptBlock(default_provider, &key256, pt);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x8e, 0xa2, 0xb7, 0xca, 0x51, 0x67, 0x45, 0xbf, 0xea, 0xfc, 0x49, 0x90, 0x4b, 0x49, 0x60, 0x89 }, &ct256);
+    try std.testing.expectEqualSlices(u8, &pt, &(try aesDecryptBlock(default_provider, &key256, ct256)));
+    // Seventeen bytes fit no AES schedule.
+    const ragged_key: [17]u8 = @splat(0);
+    try std.testing.expectError(error.CallException, aesEncryptBlock(default_provider, &ragged_key, pt));
+    try std.testing.expectError(error.CallException, aesDecryptBlock(default_provider, &ragged_key, pt));
+}
+
+test "aes cbc chains the sp800-38a vector and rejects ragged input" {
+    const key = [32]u8{
+        0x60, 0x3d, 0xeb, 0x10, 0x15, 0xca, 0x71, 0xbe, 0x2b, 0x73, 0xae, 0xf0, 0x85, 0x7d, 0x77,
+        0x81, 0x1f, 0x35, 0x2c, 0x07, 0x3b, 0x61, 0x08, 0xd7, 0x2d, 0x98, 0x10, 0xa3, 0x09, 0x14,
+        0xdf, 0xf4,
+    };
+    const iv = [16]u8{ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f };
+    const plain = [32]u8{ 0x6b, 0xc1, 0xbe, 0xe2, 0x2e, 0x40, 0x9f, 0x96, 0xe9, 0x3d, 0x7e, 0x11, 0x73, 0x93, 0x17, 0x2a, 0xae, 0x2d, 0x8a, 0x57, 0x1e, 0x03, 0xac, 0x9c, 0x9e, 0xb7, 0x6f, 0xac, 0x45, 0xaf, 0x8e, 0x51 };
+    const expected = [32]u8{ 0xf5, 0x8c, 0x4c, 0x04, 0xd6, 0xe5, 0xf1, 0xba, 0x77, 0x9e, 0xab, 0xfb, 0x5f, 0x7b, 0xfb, 0xd6, 0x9c, 0xfc, 0x4e, 0x96, 0x7e, 0xdb, 0x80, 0x8d, 0x67, 0x9f, 0x77, 0x7b, 0xc6, 0x70, 0x2c, 0x7d };
+    var out: [32]u8 = undefined;
+    try aesCbcEncrypt(default_provider, &key, iv, &out, &plain);
+    try std.testing.expectEqualSlices(u8, &expected, &out);
+    var back: [32]u8 = undefined;
+    try aesCbcDecrypt(default_provider, &key, iv, &back, &out);
+    try std.testing.expectEqualSlices(u8, &plain, &back);
+    // CBC moves whole blocks; a ragged tail is a caller error.
+    const ragged = plain[0..31];
+    try std.testing.expectError(error.CallException, aesCbcEncrypt(default_provider, &key, iv, back[0..31], ragged));
+    try std.testing.expectError(error.CallException, aesCbcDecrypt(default_provider, &key, iv, back[0..31], ragged));
+    // A destination shorter than the source would silently truncate.
+    try std.testing.expectError(error.CallException, aesCbcEncrypt(default_provider, &key, iv, back[0..16], &plain));
+}
+
+test "aes cbc survives the wycheproof raw battery" {
     // Source: wycheproof aes_cbc_pkcs5_test.json tcIds 2..4 (AES-128), 146..148
     // (AES-256): block-aligned messages with the final PKCS padding block stripped to raw CBC.
     const Case = struct { key: []const u8, iv: [16]u8, msg: []const u8, ct: []const u8 };
@@ -857,12 +911,11 @@ test "aes cbc matches wycheproof raw vectors" {
     }
 }
 
-test "cbc decrypt propagates a tampered block per chaining" {
-    // CBC malleability: a one-bit flip in ciphertext block i garbles
-    // plaintext block i and flips that bit in block i+1.
-    var key: [16]u8 = undefined;
-    for (&key, 0..) |*b, i| b.* = @intCast(i *% 3 +% 1);
-    const iv = [16]u8{ 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 10, 11, 12, 13, 14, 15 };
+test "cbc chaining confines ciphertext damage to two blocks" {
+    // CBC decryption localises a ciphertext edit to blocks i and i+1.
+    var key: [32]u8 = undefined;
+    for (&key, 0..) |*b, i| b.* = @intCast(i *% 8 +% 5);
+    const iv = [16]u8{ 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0 };
     const plain = [64]u8{
         0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
         0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa, 0x99, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x00,
@@ -871,24 +924,41 @@ test "cbc decrypt propagates a tampered block per chaining" {
     };
     var cipher: [64]u8 = undefined;
     try aesCbcEncrypt(default_provider, &key, iv, &cipher, &plain);
-    cipher[20] ^= 0x01; // Second ciphertext block, fifth byte.
+    // Flip one bit inside the third ciphertext block, fifth byte.
+    cipher[36] ^= 0x01;
     var out: [64]u8 = undefined;
     try aesCbcDecrypt(default_provider, &key, iv, &out, &cipher);
-    // Blocks before the tamper are untouched.
-    try std.testing.expectEqualSlices(u8, plain[0..16], out[0..16]);
-    // The tampered block decrypts to garbage.
-    try std.testing.expect(!std.mem.eql(u8, plain[16..32], out[16..32]));
-    // The next block carries the same bit flip at the same offset.
-    try std.testing.expectEqual(plain[36] ^ 0x01, out[36]);
-    for ([_]usize{ 32, 33, 34, 35, 37, 38, 39 }) |index| {
-        try std.testing.expectEqual(plain[index], out[index]);
-    }
-    // Blocks after i+1 are untouched.
-    try std.testing.expectEqualSlices(u8, plain[48..64], out[48..64]);
+    // Blocks before the edit decrypt untouched.
+    try std.testing.expectEqualSlices(u8, plain[0..32], out[0..32]);
+    // The edited block decrypts to garbage.
+    try std.testing.expect(!std.mem.eql(u8, plain[32..48], out[32..48]));
+    // The following block inherits the flip at the same offset and
+    // nothing else.
+    try std.testing.expectEqual(plain[52] ^ 0x01, out[52]);
+    try std.testing.expectEqualSlices(u8, plain[48..52], out[48..52]);
+    try std.testing.expectEqualSlices(u8, plain[53..64], out[53..64]);
 }
-test "mode glue matches pre-delegation behavior" {
-    // These vectors pin the mode glue (counter layout, CBC chaining,
-    // AES-192); any behavior change in the dispatch fails here.
+
+test "cbc decrypt returns the same plaintext in place" {
+    var key: [32]u8 = undefined;
+    for (&key, 0..) |*b, i| b.* = @intCast(i *% 7 +% 3);
+    var iv: [16]u8 = undefined;
+    for (&iv, 0..) |*b, i| b.* = @intCast(i *% 11 +% 5);
+    const plain = "0123456789ABCDEFGHIJKLMNOPQRSTUV";
+    var buf: [32]u8 = undefined;
+    try aesCbcEncrypt(default_provider, &key, iv, &buf, plain);
+    const ciphertext = buf;
+    var isolated: [32]u8 = undefined;
+    try aesCbcDecrypt(default_provider, &key, iv, &isolated, &ciphertext);
+    // Destination aliasing source must match the isolated result.
+    try aesCbcDecrypt(default_provider, &key, iv, &buf, &buf);
+    try std.testing.expectEqualSlices(u8, &isolated, &buf);
+    try std.testing.expectEqualSlices(u8, plain, &buf);
+}
+
+test "winzip ctr reproduces the pinned counter stream" {
+    // The stream starts at counter 1 and increments little-endian; this
+    // vector pins both the layout and the ragged tail path.
     const msg = "The quick brown fox jumps over the lazy dog. PACK!";
     var key16: [16]u8 = undefined;
     for (&key16, 0..) |*b, i| b.* = @intCast(i *% 7 +% 16);
@@ -900,44 +970,57 @@ test "mode glue matches pre-delegation behavior" {
         0xf1, 0xe2, 0x0d, 0x19, 0x24, 0x5e, 0x85, 0xdc, 0x00, 0xad, 0x71, 0x2f, 0xb9, 0x45, 0x8c,
         0x22, 0x41, 0x55, 0x8c, 0x3b,
     }, &dst);
+    // The same keystream cancels itself: CTR is its own inverse.
+    var back: [msg.len]u8 = undefined;
+    try winzipCtr(default_provider, &key16, &back, &dst);
+    try std.testing.expectEqualSlices(u8, msg, &back);
+    // Lengths 63, 64, 65 straddle the four-counter chunk boundary.
+    const pattern: [65]u8 = @splat(0xA5);
+    for ([_]usize{ 63, 64, 65 }) |len| {
+        var mid: [65]u8 = undefined;
+        var ret: [65]u8 = undefined;
+        try winzipCtr(default_provider, &key16, mid[0..len], pattern[0..len]);
+        try winzipCtr(default_provider, &key16, ret[0..len], mid[0..len]);
+        try std.testing.expectEqualSlices(u8, pattern[0..len], ret[0..len]);
+    }
+    // A destination shorter than the source must refuse the stream.
+    var short_dst: [8]u8 = undefined;
+    try std.testing.expectError(error.CallException, winzipCtr(default_provider, &key16, &short_dst, pattern[0..9]));
 }
 
-test "cbc decrypt operates in place" {
-    var key: [32]u8 = undefined;
-    for (&key, 0..) |*b, i| b.* = @intCast(i *% 3 +% 1);
-    var iv: [16]u8 = undefined;
-    for (&iv, 0..) |*b, i| b.* = @intCast(i *% 5 +% 2);
-    const plain = "0123456789ABCDEFGHIJKLMNOPQRSTUV";
-    var buf: [32]u8 = undefined;
-    try aesCbcEncrypt(default_provider, &key, iv, &buf, plain);
-    const ciphertext = buf;
-    var isolated: [32]u8 = undefined;
-    try aesCbcDecrypt(default_provider, &key, iv, &isolated, &ciphertext);
-    try aesCbcDecrypt(default_provider, &key, iv, &buf, &buf);
-    try std.testing.expectEqualSlices(u8, &isolated, &buf);
-    try std.testing.expectEqualSlices(u8, plain, &buf);
-}
-
-test "zipcrypto round trips through its own inverse" {
-    var keys = ZipCryptoKeys.init("password");
+test "zipcrypto keeps its key ladder invertible" {
+    // An empty password leaves the PKWARE seed ladder untouched.
+    const seeds = ZipCryptoKeys{};
+    const empty = ZipCryptoKeys.init("");
+    try std.testing.expectEqual(seeds.key0, empty.key0);
+    try std.testing.expectEqual(seeds.key1, empty.key1);
+    try std.testing.expectEqual(seeds.key2, empty.key2);
+    try std.testing.expectEqual(@as(u32, 0x1234_5678), empty.key0);
+    try std.testing.expectEqual(@as(u32, 0x2345_6789), empty.key1);
+    try std.testing.expectEqual(@as(u32, 0x3456_7890), empty.key2);
+    // Encryption then decryption through the same ladder restores the
+    // plaintext; the ladder is its own inverse.
     const msg = "hello world, zip crypto!";
     var cipher: [msg.len]u8 = undefined;
-    var keys_enc = keys;
+    var keys_enc = ZipCryptoKeys.init("password");
     keys_enc.encrypt(&cipher, msg);
     var plain: [msg.len]u8 = undefined;
-    keys.decrypt(&plain, &cipher);
+    var keys_dec = ZipCryptoKeys.init("password");
+    keys_dec.decrypt(&plain, &cipher);
     try std.testing.expectEqualSlices(u8, msg, &plain);
 }
 
-test "constant time eql distinguishes inputs" {
+test "constant time eql reports only full byte equality" {
     try std.testing.expect(constantTimeEql("abc", "abc"));
     try std.testing.expect(!constantTimeEql("abc", "abd"));
     try std.testing.expect(!constantTimeEql("abc", "abcd"));
+    try std.testing.expect(!constantTimeEql("abcd", "abc"));
     try std.testing.expect(!constantTimeEql("", "a"));
+    try std.testing.expect(!constantTimeEql("a", ""));
     try std.testing.expect(constantTimeEql("", ""));
 }
 
-test "both providers agree on the mode glue when mergeable" {
+test "mode glue agrees between providers when fully mergeable" {
     const all_mergeable = options.aes_impl == .mergeable and
         options.sha256_impl == .mergeable and
         options.hmac_impl == .mergeable and

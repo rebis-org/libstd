@@ -116,23 +116,23 @@ fn writeSubBlock(
     unit_index: usize,
     sub_index: usize,
     sb: []u8,
-) void {
+) Exception!void {
     const j = sub_index;
     const slice_len: usize = @min(@as(usize, 65536), layout.ch - j * 65536);
     const sub_size = layout.poff + slice_len;
     std.mem.writeInt(u32, sb[0..4], 0x7d42527b, .little);
-    std.mem.writeInt(u32, sb[12..16], @intCast(sub_size), .little);
-    std.mem.writeInt(u32, sb[16..20], @intCast(layout.poff), .little);
+    std.mem.writeInt(u32, sb[12..16], std.math.cast(u32, sub_size) orelse return error.CallException, .little);
+    std.mem.writeInt(u32, sb[16..20], std.math.cast(u32, layout.poff) orelse return error.CallException, .little);
     sb[20] = 1;
     sb[21] = 1;
     std.mem.writeInt(u64, sb[22..30], @as(u64, j) * 65536, .little);
-    std.mem.writeInt(u32, sb[30..34], @intCast(layout.last_chunk -| j * 65536), .little);
+    std.mem.writeInt(u32, sb[30..34], std.math.cast(u32, layout.last_chunk -| j * 65536) orelse return error.CallException, .little);
     std.mem.writeInt(u64, sb[34..42], layout.p, .little);
     std.mem.writeInt(u64, sb[42..50], layout.ch, .little);
     std.mem.writeInt(u64, sb[50..58], layout.unit_size, .little);
-    std.mem.writeInt(u16, sb[58..60], @intCast(layout.nd), .little);
-    std.mem.writeInt(u16, sb[60..62], @intCast(layout.u), .little);
-    std.mem.writeInt(u16, sb[62..64], @intCast(unit_index), .little);
+    std.mem.writeInt(u16, sb[58..60], std.math.cast(u16, layout.nd) orelse return error.CallException, .little);
+    std.mem.writeInt(u16, sb[60..62], std.math.cast(u16, layout.u) orelse return error.CallException, .little);
+    std.mem.writeInt(u16, sb[62..64], std.math.cast(u16, unit_index) orelse return error.CallException, .little);
     var k: usize = 0;
     while (k < layout.nd) : (k += 1) {
         const clen = if (k == layout.nd - 1) layout.last_chunk else layout.ch;
@@ -208,12 +208,12 @@ pub fn encodeUnits(
             const base = m * layout.unit_size + j * (65536 + layout.poff);
             const end = base + sub_size;
             if (end > out.len) return error.InternalException;
-            writeSubBlock(protected, layout, mx[0..layout.nd], slot, exp, log, m, j, out[base..end]);
+            try writeSubBlock(protected, layout, mx[0..layout.nd], slot, exp, log, m, j, out[base..end]);
         }
     }
 }
 
-test "gf and crc64 pins" {
+test "gf and crc64 primitives match the reference pins" {
     const allocator = std.testing.allocator;
     const exp = try allocator.alloc(u16, gf_exp_len);
     const log = try allocator.alloc(u32, gf_log_len);
@@ -240,7 +240,7 @@ test "gf and crc64 pins" {
     }
 }
 
-test "recovery layout pins" {
+test "recovery layout pins the reference chunking" {
     const Case = struct { p: usize, nd: usize, ch: usize, u: usize, last: usize, poff: usize, unit: usize, nsub: usize = 1 };
     const cases = [_]Case{
         .{ .p = 4157, .nd = 5, .ch = 832, .u = 1, .last = 829, .poff = 112, .unit = 944 },

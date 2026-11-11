@@ -30,10 +30,7 @@ pub const Sized = struct {
     ordinal: u64,
 };
 
-// Every container enforces this before writing a name: nothing escapes the
-// destination, and names stay C strings on the wire.
-//
-// A path component that names something: empty and dot segments name nothing.
+// Every container enforces this before writing a name: nothing escapes the destination, and names stay C strings on the wire.
 pub fn isComponent(name: []const u8) bool {
     return name.len != 0 and !std.mem.eql(u8, name, ".") and !std.mem.eql(u8, name, "..");
 }
@@ -53,11 +50,17 @@ pub fn validateName(name: []const u8) Exception!void {
     if (bounds.isAbsoluteOrTraversal(name)) return error.CallException;
 }
 
-test "entry name rule rejects escaping and embedded terminators" {
-    try validateName("dir/file.txt");
+test "entry accepts plain relative names and rejects every escape" {
+    try validateName("docs/readme.md");
+    try validateName("a/b/c.txt");
+    // An empty name names nothing.
     try std.testing.expectError(error.CallException, validateName(""));
-    try std.testing.expectError(error.CallException, validateName("/etc/passwd"));
-    try std.testing.expectError(error.CallException, validateName("a/../../b"));
+    // An absolute path leaves the destination.
+    try std.testing.expectError(error.CallException, validateName("/tmp/hosts"));
+    // A traversal climbs out.
+    try std.testing.expectError(error.CallException, validateName("up/../../out"));
+    // A backslash is a separator on some hosts, never a name byte.
     try std.testing.expectError(error.CallException, validateName("a\\b"));
+    // An embedded terminator would not stay a C string.
     try std.testing.expectError(error.CallException, validateName("a\x00b"));
 }

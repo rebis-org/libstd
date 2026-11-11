@@ -2685,25 +2685,6 @@ const BitWriter = struct {
         return .{ .buf = buf, .pos = 0, .used = 0 };
     }
 
-    fn writeBit(self: *BitWriter, value: u1) error{OutOfSpace}!void {
-        if (self.pos >= self.buf.len) return error.OutOfSpace;
-        self.buf[self.pos] |= @as(u8, value) << @intCast(7 - self.used);
-        self.used += 1;
-        if (self.used == 8) {
-            self.used = 0;
-            self.pos += 1;
-        }
-    }
-
-    fn writeBits(self: *BitWriter, value: u64, count: u5) error{OutOfSpace}!void {
-        if (count == 0) return;
-        var i: u5 = count;
-        while (i > 0) {
-            i -= 1;
-            try self.writeBit(@intCast((value >> @intCast(i)) & 1));
-        }
-    }
-
     fn writeBitsFast(self: *BitWriter, value: u64, count: u5) error{OutOfSpace}!void {
         if (count == 0) return;
         self.acc = (self.acc << count) | (value & ((@as(u64, 1) << count) - 1));
@@ -2943,6 +2924,15 @@ const DictionaryView = struct {
     repcodes: [3]u32,
 };
 
+// Dictionary FSE log caps match ZSTD_loadDEntropy (vendor
+// zstd_decompress.c:1485/1500/1515 -> OffFSELog/MLFSELog/LLFSELog in common/zstd_internal.h).
+
+// Trained vendor dictionaries use logs up to these values; a smaller
+// cap rejects valid dictionaries.
+const off_fse_log_max: u4 = 8;
+const ml_fse_log_max: u4 = 9;
+const ll_fse_log_max: u4 = 9;
+
 fn dictionaryView(dictionary: []const u8) DecodeError!DictionaryView {
     if (dictionary.len < 8)
         return .{ .content = dictionary, .repcodes = .{ start_repeated_offset_1, start_repeated_offset_2, start_repeated_offset_3 } };
@@ -2955,17 +2945,17 @@ fn dictionaryView(dictionary: []const u8) DecodeError!DictionaryView {
     try decodeHuffmanTree(&cursor, &tree);
     var offset_entries: [1 << 8]DecodeEntry = undefined;
     {
-        const decoded = try decodeFseTable(cursor.remainingSlice(), 32, 8, &offset_entries, .offset);
+        const decoded = try decodeFseTable(cursor.remainingSlice(), 32, off_fse_log_max, &offset_entries, .offset);
         cursor.pos += decoded.consumed;
     }
     var match_entries: [1 << 9]DecodeEntry = undefined;
     {
-        const decoded = try decodeFseTable(cursor.remainingSlice(), 53, 9, &match_entries, .match);
+        const decoded = try decodeFseTable(cursor.remainingSlice(), 53, ml_fse_log_max, &match_entries, .match);
         cursor.pos += decoded.consumed;
     }
     var literal_entries: [1 << 9]DecodeEntry = undefined;
     {
-        const decoded = try decodeFseTable(cursor.remainingSlice(), 36, 9, &literal_entries, .literal);
+        const decoded = try decodeFseTable(cursor.remainingSlice(), 36, ll_fse_log_max, &literal_entries, .literal);
         cursor.pos += decoded.consumed;
     }
     const recent_offset_1 = try cursor.readU32Le();
@@ -3099,19 +3089,19 @@ const Decoder = struct {
         d.huffman_tree = .{ .nodes = undefined };
         try decodeHuffmanTree(&cursor, &d.huffman_tree.?);
         {
-            const decoded = try decodeFseTable(cursor.remainingSlice(), 32, 8, &d.offset_state.entries, .offset);
+            const decoded = try decodeFseTable(cursor.remainingSlice(), 32, off_fse_log_max, &d.offset_state.entries, .offset);
             cursor.pos += decoded.consumed;
             d.offset_state.accuracy_log = @intCast(std.math.log2_int(usize, decoded.table_size));
             d.offset_state.table = .{ .fse = d.offset_state.entries[0..decoded.table_size] };
         }
         {
-            const decoded = try decodeFseTable(cursor.remainingSlice(), 53, 9, &d.match_state.entries, .match);
+            const decoded = try decodeFseTable(cursor.remainingSlice(), 53, ml_fse_log_max, &d.match_state.entries, .match);
             cursor.pos += decoded.consumed;
             d.match_state.accuracy_log = @intCast(std.math.log2_int(usize, decoded.table_size));
             d.match_state.table = .{ .fse = d.match_state.entries[0..decoded.table_size] };
         }
         {
-            const decoded = try decodeFseTable(cursor.remainingSlice(), 36, 9, &d.literal_state.entries, .literal);
+            const decoded = try decodeFseTable(cursor.remainingSlice(), 36, ll_fse_log_max, &d.literal_state.entries, .literal);
             cursor.pos += decoded.consumed;
             d.literal_state.accuracy_log = @intCast(std.math.log2_int(usize, decoded.table_size));
             d.literal_state.table = .{ .fse = d.literal_state.entries[0..decoded.table_size] };
@@ -3310,6 +3300,10 @@ const Decoder = struct {
                                 .one => break,
                                 .four => |streams| {
                                     if (stream_index.* + 1 >= streams.len) break;
+                                    // HUF_decompress4X1 decodes each stream into exactly one regenerated
+                                    // segment; a stream ending off the boundary crosses streams.
+                                    const segment_size = (literals.regenerated_size + 3) / 4;
+                                    if (start + emitted != segment_size * (stream_index.* + 1)) return error.DataException;
                                     stream_index.* += 1;
                                     const next = streams[stream_index.*];
                                     if (next.len == 0) return error.DataException;
@@ -3534,6 +3528,9 @@ const Decoder = struct {
                 d.literal_window |= @as(u64, byte) << @intCast(@as(u7, 64) - d.literal_window_bits - 8);
                 d.literal_window_bits += 8;
             } else if (literals.streams == .four and d.literal_stream_index + 1 < d.literal_stream_count) {
+                // A stream must end on a symbol boundary; leftover window
+                // bits would join the next stream into one cross-stream symbol.
+                if (d.literal_window_bits != 0) return error.DataException;
                 d.literal_stream_index += 1;
                 try d.literalInitStream(literals.streams.four[d.literal_stream_index]);
             } else {
@@ -3790,8 +3787,8 @@ const HuffmanTree = struct {
     max_bits: u4 = 0,
     symbol_count: u16 = 0,
     nodes: [256]PrefixedSymbol,
-    lookup: [2048]u16 = @splat(0xFFFF),
-    lookup_two: [2048]u32 = @splat(0),
+    lookup: [4096]u16 = @splat(0xFFFF),
+    lookup_two: [4096]u32 = @splat(0),
 };
 
 const PrefixedSymbol = struct {
@@ -3814,6 +3811,7 @@ const ReverseBitReader = struct {
             .count = 0,
         };
         if (bytes.len == 0) return self;
+        if (bytes[bytes.len - 1] == 0) return error.DataException;
         while (self.remaining > 0 or self.count > 0) {
             const bit = self.readBitsAny(u1, 1) catch return error.DataException;
             if (bit.count == 0) return error.DataException;
@@ -4156,7 +4154,8 @@ fn buildHuffmanTree(weights: []const u4, symbol_count: usize, tree: *HuffmanTree
     for (weights[0 .. symbol_count - 1]) |value| {
         weight_power_sum += (@as(u16, 1) << @intCast(value)) >> 1;
     }
-    if (weight_power_sum == 0 or weight_power_sum >= 1 << 11) return error.DataException;
+    // HUF_TABLELOG_MAX limits tableLog to 12, hence the 4096-slot table.
+    if (weight_power_sum == 0 or weight_power_sum >= 1 << 12) return error.DataException;
     const max_bits: u4 = @intCast(std.math.log2_int(u32, weight_power_sum) + 1);
     const next_power = @as(u32, 1) << max_bits;
     const last_weight_value = next_power - weight_power_sum;
@@ -4355,7 +4354,8 @@ fn decodeFseTable(
     }
     if (remaining != 1) return error.DataException;
     if (charnum > expected_symbol_count) return error.DataException;
-    if (charnum < 2) return error.DataException;
+    // FSE_readNCount accepts a single present symbol; its whole table then
+    // carries zero-bit entries that leave the state unchanged.
     const table_size = @as(usize, 1) << accuracy_log;
     buildFseTable(norm[0..charnum], entries[0..table_size], kind) catch return error.DataException;
     return .{ .table_size = table_size, .consumed = (window.total + 7) / 8 };
@@ -4491,9 +4491,6 @@ test "zstd dictionary trainer selects deterministic segments" {
     var second: [24 * 1024]u8 = undefined;
     const second_len = try trainDictionary(&samples, second.len, &second, scratch, checksum.default_provider);
     try std.testing.expectEqual(first_len, second_len);
-    if (!std.mem.eql(u8, first[0..first_len], second[0..first_len])) {
-        std.debug.print("first length {d} differs at offset {d}: {x} vs {x}\n", .{ first_len, std.mem.findDiff(u8, first[0..first_len], second[0..first_len]).?, first[std.mem.findDiff(u8, first[0..first_len], second[0..first_len]).?], second[std.mem.findDiff(u8, first[0..first_len], second[0..first_len]).?] });
-    }
     try std.testing.expectEqualSlices(u8, first[0..first_len], second[0..first_len]);
 
     const content = try dictionaryContent(first[0..first_len]);
@@ -4924,6 +4921,8 @@ test "zstd price-DP tier roundtrips at full block scale" {
     var source = std.Io.Reader.fixed(input);
     var sink = std.Io.Writer.fixed(encoded);
     const encoded_len = try encodeStream(&source, &sink, history, workspace, dp_options);
+    // Sixty percent of the bytes are runs; a valid DP parse must compress.
+    try std.testing.expect(encoded_len < input.len);
 
     const decoded = try allocator.alloc(u8, input.len);
     defer allocator.free(decoded);
@@ -5034,6 +5033,31 @@ test "zstd huffman tree completion and rank gates" {
     try t.expectError(error.DataException, decodeHuffmanTree(&bad_cursor, &tree));
 }
 
+test "zstd huffman tree accepts tableLog 12 weights" {
+    const t = std.testing;
+    var tree: HuffmanTree = .{ .nodes = undefined };
+    var weights: [256]u4 = undefined;
+    // A full-depth tree: one symbol per level plus two deepest leaves.
+    @memset(&weights, 0);
+    const comb = [_]u4{ 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1 };
+    @memcpy(weights[0..comb.len], comb[0..]);
+    try buildHuffmanTree(&weights, comb.len + 1, &tree);
+    try t.expectEqual(@as(u4, 12), tree.max_bits);
+    try t.expectEqual(@as(u16, 13), tree.symbol_count);
+    // A weight past the tableLog-12 maximum stays rejected.
+    @memset(&weights, 0);
+    weights[0] = 13;
+    try t.expectError(error.DataException, buildHuffmanTree(&weights, 2, &tree));
+}
+
+test "zstd huffman weights reject trailing zero byte" {
+    const t = std.testing;
+    try t.expectError(error.DataException, ReverseBitReader.init(&[_]u8{ 0x01, 0x00 }));
+    try t.expectError(error.DataException, ReverseBitReader.init(&[_]u8{0x00}));
+    const reader = try ReverseBitReader.init(&[_]u8{ 0x01, 0x80 });
+    try t.expectEqual(@as(usize, 1), reader.remaining);
+}
+
 test "zstd dictionary search beats the single-pass trainer on validation" {
     const allocator = std.testing.allocator;
     // Structured samples with shared substrings so a good dictionary pays.
@@ -5089,11 +5113,7 @@ test "zstd dictionary search beats the single-pass trainer on validation" {
     const score_ws = try allocator.alloc(u8, trainSearchWorkspaceSize(max_dict, 8192, .{}));
     defer allocator.free(score_ws);
     const score = struct {
-        fn run(dict: []const u8, validate: []const []const u8, ws: []u8, alloc2: std.mem.Allocator) !u64 {
-            var f_max: usize = 1;
-            for ([_]usize{ 15, 17, 19 }) |f| f_max = @max(f_max, f);
-            const buckets = @as(usize, 1) << @intCast(f_max);
-            _ = buckets;
+        fn run(dict: []const u8, validate: []const []const u8, ws: []u8) !u64 {
             var off: usize = std.mem.alignForward(usize, 2 * (@as(usize, 1) << 19) * @sizeOf(u32), 16);
             const history = ws[off .. off + window_size_min + block_size_max + max_dict];
             off += std.mem.alignForward(usize, window_size_min + block_size_max + max_dict, 16);
@@ -5113,12 +5133,11 @@ test "zstd dictionary search beats the single-pass trainer on validation" {
                 total += written;
                 @memcpy(history[0..dict_content.len], dict_content);
             }
-            _ = alloc2;
             return total;
         }
     }.run;
-    const score_a = try score(dict_a[0..len_a], samples[train_count..], score_ws, allocator);
-    const score_b = try score(dict_b[0..len_b], samples[train_count..], score_ws, allocator);
+    const score_a = try score(dict_a[0..len_a], samples[train_count..], score_ws);
+    const score_b = try score(dict_b[0..len_b], samples[train_count..], score_ws);
     try std.testing.expect(score_b <= score_a);
 
     // The searched dictionary works end to end: encode a validation sample
@@ -5149,4 +5168,82 @@ test "zstd dictionary search beats the single-pass trainer on validation" {
     const dec_len = try decodeStream(&dec_src, &dec_out, dec_history, .{ .window_size = window_size_min, .dictionary = dict_b[0..len_b], .provider = checksum.default_provider });
     try std.testing.expectEqual(sample.len, dec_len);
     try std.testing.expectEqualSlices(u8, sample, decoded_buf[0..dec_len]);
+}
+
+test "zstd single symbol FSE table has zero bit entries" {
+    var buf: [64]u8 = undefined;
+    var entries: [1 << 8]DecodeEntry = undefined;
+    // FSE_readNCount accepts one present symbol; a log-8 single-symbol
+    // ncount puts all probability on that symbol.
+    const norm = [_]i16{1 << 8};
+    const nc = writeNCounts(&buf, &norm, 8) orelse return error.DataException;
+    const result = try decodeFseTable(nc, 32, 8, &entries, .offset);
+    try std.testing.expectEqual(@as(usize, 256), result.table_size);
+    // Zero-bit entries leave the state unchanged: baseline equals the index.
+    for (entries[0..result.table_size], 0..) |entry, index| {
+        try std.testing.expectEqual(@as(u8, 0), entry.bits);
+        try std.testing.expectEqual(@as(u16, @intCast(index)), entry.baseline);
+    }
+}
+
+test "zstd dictionary FSE log caps accept vendor range tables" {
+    // ZSTD_loadDEntropy caps the three dictionary tables at OffFSELog 8,
+    // MLFSELog 9, LLFSELog 9; a smaller cap rejects trained dictionaries.
+    var off_buf: [64]u8 = undefined;
+    var ml_buf: [64]u8 = undefined;
+    var ll_buf: [64]u8 = undefined;
+    var entries: [1 << 9]DecodeEntry = undefined;
+    const off_nc = writeNCounts(&off_buf, &[_]i16{ 128, 128 }, 8) orelse return error.DataException;
+    const ml_nc = writeNCounts(&ml_buf, &[_]i16{ 256, 256 }, 9) orelse return error.DataException;
+    const ll_nc = writeNCounts(&ll_buf, &[_]i16{ 256, 256 }, 9) orelse return error.DataException;
+    const off = try decodeFseTable(off_nc, 32, off_fse_log_max, &entries, .offset);
+    try std.testing.expectEqual(@as(usize, 256), off.table_size);
+    const ml = try decodeFseTable(ml_nc, 53, ml_fse_log_max, &entries, .match);
+    try std.testing.expectEqual(@as(usize, 512), ml.table_size);
+    const ll = try decodeFseTable(ll_nc, 36, ll_fse_log_max, &entries, .literal);
+    try std.testing.expectEqual(@as(usize, 512), ll.table_size);
+}
+
+test "zstd four stream literals reject a shifted stream boundary" {
+    const allocator = std.testing.allocator;
+    var input: [4096]u8 = undefined;
+    var rng: u64 = 0x9E3779B97F4A7C15;
+    for (&input) |*byte| {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        byte.* = @as(u8, 'a') + @as(u8, @truncate(rng)) % 8;
+    }
+    const opts = Options{ .window_size = 1 << 20 };
+    const ws = try allocator.alloc(u32, encoderWorkspaceU32Count(0, 1 << 20, opts));
+    defer allocator.free(ws);
+    const encoded = try allocator.alloc(u8, 1 << 20);
+    defer allocator.free(encoded);
+    var writer = std.Io.Writer.fixed(encoded);
+    const len = try encodeFrame(&writer, &input, ws, opts, 0);
+    // Compressed literals with size_format 2 use four jump-table streams.
+    try std.testing.expectEqual(@as(u8, 2), encoded[10] & 3);
+    try std.testing.expectEqual(@as(u8, 2), (encoded[10] >> 2) & 3);
+
+    const history = try allocator.alloc(u8, @as(usize, opts.window_size) + block_size_max + 16);
+    defer allocator.free(history);
+    const output = try allocator.alloc(u8, input.len + 16);
+    defer allocator.free(output);
+    {
+        var src = std.Io.Reader.fixed(encoded[0..len]);
+        var sink = std.Io.Writer.fixed(output);
+        const produced = try decodeStream(&src, &sink, history, opts);
+        try std.testing.expectEqual(input.len, produced);
+        try std.testing.expectEqualSlices(u8, &input, output[0..produced]);
+    }
+    // The jump table sits after frame header (7), block header (3),
+    // literals header (4), and the Huffman tree (9).
+
+    // Shifting the first stream size crosses a segment boundary and
+    // must be rejected.
+    try std.testing.expectEqual(@as(u8, 0x37), encoded[23]);
+    encoded[23] +%= 4;
+    var bad_src = std.Io.Reader.fixed(encoded[0..len]);
+    var bad_sink = std.Io.Writer.fixed(output);
+    try std.testing.expectError(error.DataException, decodeStream(&bad_src, &bad_sink, history, opts));
 }

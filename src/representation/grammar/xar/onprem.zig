@@ -146,6 +146,7 @@ fn writeTocXml(sink: anytype, entries: []const Entry, order: []const u32) Except
             segment = slash + 1;
         }
         const is_dir = next_name != null and isAncestor(entry.name, next_name.?);
+        if (is_dir and entry.data.len != 0) return error.CallException;
         var digest_buf: [sha1_len * 2]u8 = undefined;
         sha1Hex(&digest_buf, entry.data);
         id += 1;
@@ -177,6 +178,7 @@ fn writeTocXml(sink: anytype, entries: []const Entry, order: []const u32) Except
             sink.write("</extracted-checksum>\n</data>\n") catch return error.CapacityException;
             offset = try bounds.addU64(offset, entry.data.len);
         }
+        if (depth == tree_depth_max) return error.UnsupportedException;
         open[depth] = entry.name;
         depth += 1;
     }
@@ -772,9 +774,16 @@ pub const Outer = struct {
 
 pub const DataRange = struct { offset: u64, length: u64 };
 
-// The absolute byte range of a named member: what a container that wraps
-// another container needs to find its payload without reading the heap.
+// The absolute byte range of a named member: what a wrapping container needs to find its payload.
 pub fn findDataRange(archive: []const u8, name: []const u8, scratch: []u8) Exception!DataRange {
+    const range = try declaredRange(archive, name, scratch);
+    _ = try bounds.slice(archive, range.offset, range.length);
+    return range;
+}
+
+// The TOC-declared range before the fit check: a streaming caller bounds
+// the member against the source length itself.
+pub fn declaredRange(archive: []const u8, name: []const u8, scratch: []u8) Exception!DataRange {
     const parts = try splitScratch(scratch);
     const toc = try inflateToc(archive, parts.toc, parts.history);
     const result = try scanEntries(toc.xml, null, name, parts.name);
@@ -783,7 +792,6 @@ pub fn findDataRange(archive: []const u8, name: []const u8, scratch: []u8) Excep
     if (!info.stored) return error.UnsupportedException;
     const heap_start = archive.len - toc.heap.len;
     const offset = try bounds.addU64(heap_start, info.data_offset);
-    _ = try bounds.slice(archive, offset, info.data_length);
     return .{ .offset = offset, .length = info.data_length };
 }
 

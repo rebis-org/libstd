@@ -18,6 +18,7 @@ static int CALLBACK unrar_callback(UINT msg, LPARAM user, LPARAM p1, LPARAM p2)
 		       0 :
 		       -1;
 }
+
 /* NOLINTEND */
 
 int ref_unrar_extract(const unsigned char *data, size_t size,

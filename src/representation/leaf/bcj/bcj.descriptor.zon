@@ -3,7 +3,11 @@
     .name = "bcj",
     .class = "filter",
     .verbs = .{ "encode", "decode" },
-    .parameters = .{},
+    .parameters = .{
+        // Wire ids are frozen: x86 0x04 through riscv 0x0B.
+        .{ .name = "kind", .family = 10, .ordinal = 2, .representation = "scalar_words" },
+        .{ .name = "start_offset", .family = 10, .ordinal = 3, .representation = "scalar_words" },
+    },
     .capabilities = .{},
     .sizing = "unavailable",
     .commit = "tentative",

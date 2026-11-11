@@ -74,11 +74,7 @@ pub fn compressBlock(
     var finder = try MatchFinder.init(ws.hash, ws.hash2, ws.hash3, MatchFinder.dictionary_window, level);
     const tokens = try finder.compress(input, ws.tokens, ws.bt_left, ws.bt_right);
 
-    // The decoder adds the distance-dependent bonus back, so an adjusted length
-    // below 2 has no slot.
-    //
-    // An in-place pre-pass is unsafe: a demotion can expand past the
-    // not-yet-read tail of the token buffer.
+    // An adjusted length below 2 has no slot; an in-place pre-pass can demote past the unread token tail.
     var ld_freq: [nc]u32 = @splat(0);
     var dd_freq: [dc]u32 = @splat(0);
     var ldd_freq: [ldc]u32 = @splat(0);
@@ -173,9 +169,7 @@ pub fn compressBlock(
     var cl_codes: [code_length_symbols]u32 = undefined;
     computeCanonicalCodes(&cl_lengths, &cl_codes);
 
-    // Stage 1 writes the 20 CL lengths in 4 bits each.
-    //
-    // A 15 escape takes 0 for a real 15, or a zero-run count of value + 2.
+    // Stage 1 writes the 20 CL lengths in 4 bits each; an escape of 15 encodes zero runs.
     {
         var i: usize = 0;
         while (i < code_length_symbols) {
@@ -381,6 +375,8 @@ fn encodeCLSymbols(
 // table-present), the 0x5a XOR checksum, and the block size.
 fn wrapBlockHeader(block_bytes: []const u8, total_bits: usize, is_last_block: bool, out: []u8) Exception!usize {
     const block_size: u32 = @intCast(block_bytes.len);
+    // No 4-byte length form exists, so an oversized block is invalid encoder input.
+    if (block_size > 0xFFFFFF) return error.CallException;
     const last_byte_bits: u8 = @intCast(if (total_bits % 8 == 0) 8 else total_bits % 8);
     const byte_count: u8 = if (block_size <= 0xFF) 1 else if (block_size <= 0xFFFF) 2 else 3;
 

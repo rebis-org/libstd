@@ -75,6 +75,7 @@ pub fn encodedSizeBound(input_len: usize) usize {
 }
 
 pub fn decode(input: []const u8, output: []u8, scratch: []u8, options: Options) Exception!usize {
+    if (input.len + output.len > options.max_work) return error.ResourceException;
     var source = std.Io.Reader.fixed(input);
     var dest = std.Io.Writer.fixed(output);
     try decodeStream(&source, &dest, scratch, options);
@@ -82,6 +83,7 @@ pub fn decode(input: []const u8, output: []u8, scratch: []u8, options: Options) 
 }
 
 pub fn decodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, options: Options) Exception!void {
+    if (input.len > options.max_work) return error.ResourceException;
     var source = std.Io.Reader.fixed(input);
     _ = try decodeStreamImpl(&source, writer, &.{}, scratch, options, false);
 }
@@ -93,6 +95,7 @@ pub fn decodeStream(reader: *std.Io.Reader, writer: *std.Io.Writer, scratch: []u
 pub const InPlaceResult = struct { produced: usize, consumed: usize };
 
 pub fn decodeInPlace(input: []const u8, output: []u8, scratch: []u8, options: Options) Exception!InPlaceResult {
+    if (input.len + output.len > options.max_work) return error.ResourceException;
     var source = std.Io.Reader.fixed(input);
     const produced = try decodeStreamImpl(&source, null, output, scratch, options, true);
     return .{ .produced = produced, .consumed = source.seek };
@@ -115,6 +118,8 @@ fn decodeStreamImpl(reader: *std.Io.Reader, writer: ?*std.Io.Writer, output: []u
     while (true) {
         const control = try io.readByte(reader);
         if (control == control_end) return std.math.cast(usize, decoder.decoded) orelse return error.ResourceException;
+        // A stream opens with a dict-reset chunk; a non-reset control
+        // while a reset is pending is corrupt.
         if (control >= control_lzma_new_props_reset_dict or control == control_copy_reset_dict) {
             need_properties = true;
             need_dictionary_reset = true;
@@ -141,14 +146,12 @@ fn decodeStreamImpl(reader: *std.Io.Reader, writer: ?*std.Io.Writer, output: []u
                     need_dictionary_reset = false;
                 }
             } else {
+                // The top guard cleared need_dictionary_reset for 0x80..0xBF
+                // chunks, so no dictionary reset is reachable here.
                 if (need_properties) return error.DataException;
                 if (control >= control_lzma_reset_state) {
                     decoder.resetState();
                     decoder.resetProbabilities();
-                }
-                if (need_dictionary_reset) {
-                    decoder.resetDictionary();
-                    need_dictionary_reset = false;
                 }
             }
             var chunk_buffer: [max_pack_size]u8 = undefined;
@@ -156,7 +159,7 @@ fn decodeStreamImpl(reader: *std.Io.Reader, writer: ?*std.Io.Writer, output: []u
             const pack_read = reader.readVec(&pack_iovecs) catch return error.IoException;
             if (pack_read != pack_size) return error.IoException;
             try decoder.resetReaderSlice(chunk_buffer[0..pack_size]);
-            try decoder.decodeToOutput(null, unpack_size, false);
+            try decoder.decodeToOutput(null, unpack_size, false, false);
         } else {
             if (control != control_copy_reset_dict and control != control_copy) return error.DataException;
             const unpack_size = try readCopyUnpackSize(reader);
@@ -208,6 +211,7 @@ fn readPackSize(reader: *std.Io.Reader) Exception!usize {
 }
 
 pub fn decodedSize(input: []const u8, scratch: []u8, options: Options) Exception!usize {
+    if (input.len > options.max_work) return error.ResourceException;
     if (try scanDecodedSize(input)) |size| return size;
     var source = std.Io.Reader.fixed(input);
     var counter = measurement.Counter.init(null);
@@ -457,11 +461,11 @@ test "lzma2 decodes a mid-stream dictionary reset stream" {
     // The stdlib decoder cross-validates the crafted stream first; a constant
     // position-state offset is decode-invariant, so this checks reset-path parity.
     var std_reader = std.Io.Reader.fixed(stream[0..sink.end]);
-    var std_decoder = std.compress.lzma2.Decode.init(alloc) catch return error.TestUnexpectedResult;
+    var std_decoder = try std.compress.lzma2.Decode.init(alloc);
     defer std_decoder.deinit(alloc);
     var std_sink: std.Io.Writer.Allocating = .init(alloc);
     defer std_sink.deinit();
-    _ = std_decoder.decompress(&std_reader, &std_sink) catch return error.TestUnexpectedResult;
+    _ = try std_decoder.decompress(&std_reader, &std_sink);
     try std.testing.expectEqualSlices(u8, expected, std_sink.writer.buffer[0..std_sink.writer.end]);
 
     const output = try alloc.alloc(u8, expected.len);
@@ -471,4 +475,112 @@ test "lzma2 decodes a mid-stream dictionary reset stream" {
     const produced = try decode(stream[0..sink.end], output, decode_scratch, options);
     try std.testing.expectEqual(expected.len, produced);
     try std.testing.expectEqualSlices(u8, expected, output);
+}
+
+test "lzma2 rejects an end marker inside a chunk" {
+    const alloc = std.testing.allocator;
+    const dictionary: u32 = 1 << 20;
+    const props = defaultProperties(dictionary);
+    const options: Options = .{ .dictionary_size = dictionary, .properties = props };
+    const input: []const u8 = "eopm inside a chunk";
+
+    const encoder_scratch = try alloc.alloc(u8, lzma.encodeWorkspaceSizeBt(props));
+    defer alloc.free(encoder_scratch);
+    var payload_buffer: [1024]u8 = undefined;
+    const payload_len = try lzma.encode(input, &payload_buffer, encoder_scratch, .{
+        .properties = props,
+        .unpack_size = null,
+        .marker_required = true,
+    });
+
+    // An unmet chunk size makes the end marker corruption.
+    const declared = input.len + 32;
+    const raw_unpack = declared - 1;
+    const raw_pack = payload_len - 1;
+    var stream_buffer: [1024]u8 = undefined;
+    var stream = std.Io.Writer.fixed(&stream_buffer);
+    const control: u8 = control_lzma_new_props_reset_dict |
+        @as(u8, @intCast((raw_unpack >> 16) & 0x1F));
+    try io.writeByte(&stream, control);
+    try io.writeByte(&stream, @intCast((raw_unpack >> 8) & 0xFF));
+    try io.writeByte(&stream, @intCast(raw_unpack & 0xFF));
+    try io.writeByte(&stream, @intCast((raw_pack >> 8) & 0xFF));
+    try io.writeByte(&stream, @intCast(raw_pack & 0xFF));
+    try io.writeByte(&stream, props.encode());
+    try io.writeBytes(&stream, payload_buffer[0..payload_len]);
+    try io.writeByte(&stream, control_end);
+
+    const decode_scratch = try alloc.alloc(u8, decodeWorkspaceSize(dictionary));
+    defer alloc.free(decode_scratch);
+    var output: [256]u8 = undefined;
+    @memset(&output, 0xA5);
+    try std.testing.expectError(error.DataException, decode(stream_buffer[0..stream.end], &output, decode_scratch, options));
+    for (output[input.len..]) |byte| try std.testing.expectEqual(@as(u8, 0xA5), byte);
+}
+
+test "lzma2 chunk rejects a non-finished range coder at its size boundary" {
+    const alloc = std.testing.allocator;
+    const dictionary: u32 = 1 << 20;
+    const props = defaultProperties(dictionary);
+    const options: Options = .{ .dictionary_size = dictionary, .properties = props };
+    const input: []const u8 = "chunk closed by an end marker";
+
+    const encoder_scratch = try alloc.alloc(u8, lzma.encodeWorkspaceSizeBt(props));
+    defer alloc.free(encoder_scratch);
+    var payload_buffer: [1024]u8 = undefined;
+    // An end marker leaves range-coder bits pending after the last data byte.
+    const payload_len = try lzma.encode(input, &payload_buffer, encoder_scratch, .{
+        .properties = props,
+        .unpack_size = null,
+        .marker_required = true,
+    });
+
+    // Declared size equals the data, so the size-only commit runs with
+    // the marker's bits pending: xz rc_is_finished requires code zero.
+    const raw_unpack = input.len - 1;
+    const raw_pack = payload_len - 1;
+    var stream_buffer: [1024]u8 = undefined;
+    var stream = std.Io.Writer.fixed(&stream_buffer);
+    const control: u8 = control_lzma_new_props_reset_dict |
+        @as(u8, @intCast((raw_unpack >> 16) & 0x1F));
+    try io.writeByte(&stream, control);
+    try io.writeByte(&stream, @intCast((raw_unpack >> 8) & 0xFF));
+    try io.writeByte(&stream, @intCast(raw_unpack & 0xFF));
+    try io.writeByte(&stream, @intCast((raw_pack >> 8) & 0xFF));
+    try io.writeByte(&stream, @intCast(raw_pack & 0xFF));
+    try io.writeByte(&stream, props.encode());
+    try io.writeBytes(&stream, payload_buffer[0..payload_len]);
+    try io.writeByte(&stream, control_end);
+
+    const decode_scratch = try alloc.alloc(u8, decodeWorkspaceSize(dictionary));
+    defer alloc.free(decode_scratch);
+    var output: [256]u8 = undefined;
+    @memset(&output, 0xA5);
+    try std.testing.expectError(error.DataException, decode(stream_buffer[0..stream.end], &output, decode_scratch, options));
+}
+
+test "lzma2 decodes only produced bytes into the sink" {
+    const alloc = std.testing.allocator;
+    const dictionary: u32 = 1 << 20;
+    const props = defaultProperties(dictionary);
+    const options: Options = .{ .dictionary_size = dictionary, .properties = props };
+    const input = "the quick brown fox jumps over the lazy dog, again and again";
+
+    const encoder_scratch = try alloc.alloc(u8, lzma.encodeWorkspaceSizeBt(props));
+    defer alloc.free(encoder_scratch);
+    const stream = try alloc.alloc(u8, encodedSizeBound(input.len) + 32);
+    defer alloc.free(stream);
+    var sink = std.Io.Writer.fixed(stream);
+    try appendResetChunk(&sink, props, input, encoder_scratch);
+    try io.writeByte(&sink, control_end);
+
+    const output = try alloc.alloc(u8, input.len + 64);
+    defer alloc.free(output);
+    @memset(output, 0xA5);
+    const decode_scratch = try alloc.alloc(u8, decodeWorkspaceSize(dictionary));
+    defer alloc.free(decode_scratch);
+    const produced = try decode(stream[0..sink.end], output, decode_scratch, options);
+    try std.testing.expectEqual(@as(usize, input.len), produced);
+    try std.testing.expectEqualSlices(u8, input, output[0..produced]);
+    for (output[produced..]) |byte| try std.testing.expectEqual(@as(u8, 0xA5), byte);
 }

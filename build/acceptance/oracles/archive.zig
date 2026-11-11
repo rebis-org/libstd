@@ -238,9 +238,7 @@ pub fn runCpio(r: *Runner) anyerror!void {
 
 pub fn runInspectMetadata(r: *Runner) anyerror!void {
     if (isOffpremUnsupported()) return;
-    // The metadata projection answers an ordinal query with the entry fields
-    // published into the response child graph; name bytes land in host memory.
-    // The volume passes name a nested entry to prove joined listing paths.
+    // Projection answers ordinal queries from the child graph; name bytes land in host memory; a nested entry proves joined listing.
     inline for (.{ .{ harness.ids.xar, false, "m1.txt" }, .{ harness.ids.tar, true, "m1.txt" }, .{ harness.ids.squashfs, false, "sub/m1.txt" }, .{ harness.ids.dwarfs, false, "sub/m1.txt" } }) |pair| {
         const profile_id = pair[0];
         const is_tar = pair[1];
@@ -329,15 +327,12 @@ pub fn runInspectMetadata(r: *Runner) anyerror!void {
 const archive_volumes: u32 = 14;
 const archive_volume_size: u32 = 15;
 
-// A tar split set crosses the boundary twice: the write carries the
-// granularity and reports each volume's bytes in the response children,
-// and the read rides the parts back in volume order.
+// A split set crosses the boundary twice: writes report each volume's bytes; reads ride the parts back in order.
 pub fn runTarVolumeSet(r: *Runner) anyerror!void {
+    if (isOffpremUnsupported()) return;
     setupArchive(r, harness.ids.tar);
     const volume_size: u64 = 1024;
-    // The selector carries the command scope: the granularity rides the
-    // write sizing query as well as the write itself, so the mask spans
-    // both directions.
+    // The granularity rides the write sizing query as well as the write, so the mask spans both directions.
     const gran = harness.paramScalar(harness.param_family_archive, archive_volume_size, harness.cmds, volume_size);
 
     // The size pass answers the set total; the plain size would answer the
@@ -397,8 +392,7 @@ pub fn runTarVolumeSet(r: *Runner) anyerror!void {
     if (tails == 0 or total <= tail_bytes) return error.VolumeShapeMismatch;
     parts[0] = arc_state.archive[0 .. total - tail_bytes];
 
-    // The read rides the tail parts back in volume order and decodes the
-    // first entry exactly as the single-archive path would.
+    // The read rides the tail parts back in volume order, decoding the first entry as a single archive would.
     var volume_nodes: [8]harness.Node = undefined;
     for (0..tails) |index| {
         // Repeated in-bytes selector: one parameter per tail volume.
@@ -448,6 +442,106 @@ pub fn runTarVolumeSet(r: *Runner) anyerror!void {
 pub fn runXar(r: *Runner) anyerror!void {
     if (isOffpremUnsupported()) return;
     try runArchive(r, harness.ids.xar);
+}
+
+// The xip driver answers the same read twice: a whole-archive span
+// and a forward-window callback must agree.
+const XipFixture = struct {
+    // One write-sized chunk of stored payload puts every small archive
+    // past a megabyte.
+    archive: [1400 * 1024]u8,
+};
+
+var xip_fixture: XipFixture = .{ .archive = undefined };
+
+fn xipReadDirect(r: *Runner, archive_size: usize, ordinal: u64, expected: []const u8) !void {
+    _ = harness.call(r, harness.ids.read, &.{
+        harness.archiveOrdinalParam(ordinal),
+        harness.sourceSpan(xip_fixture.archive[0..archive_size]),
+        harness.sinkSpan(r.output),
+    }, .{ .ctx = true });
+    try harness.requireStatus(r, abi.Status.ok);
+    if (r.response.byte_length != expected.len or !std.mem.eql(u8, r.output[0..expected.len], expected)) {
+        return error.XipWholeArchiveMismatch;
+    }
+}
+
+fn runXip(r: *Runner) anyerror!void {
+    if (isOffpremUnsupported()) return;
+    setupArchive(r, harness.ids.xip);
+    _ = harness.call(r, harness.ids.query, &.{
+        harness.paramTargetCommand(harness.ids.write),
+        harness.scalarNode(harness.ids.source),
+        harness.capabilityParam(arc_caps),
+        harness.sizingModeParam(harness.size_metadata_exact),
+        harness.commitModeParam(harness.commit_confirmed),
+        arc_state.entry1,
+    }, .{});
+    try harness.requireStatus(r, abi.Status.ok);
+    const archive_size: usize = @intCast(r.response.byte_length);
+    if (archive_size == 0 or archive_size > xip_fixture.archive.len) return error.ArchiveQueryCapacity;
+    _ = harness.call(r, harness.ids.write, &.{
+        harness.scalarNode(harness.ids.source),
+        harness.sinkSpan(xip_fixture.archive[0..archive_size]),
+        harness.capabilityParam(arc_caps),
+        harness.sizingModeParam(harness.size_metadata_exact),
+        harness.commitModeParam(r.commit_write),
+        arc_state.entry1,
+    }, .{});
+    try harness.requireStatus(r, abi.Status.ok);
+    if (r.response.byte_length != archive_size) return error.ArchiveWriteLengthMismatch;
+
+    // The whole-archive path reads a direct span.
+    try xipReadDirect(r, archive_size, 0, &arc_state.data1);
+    try xipReadDirect(r, archive_size, 1, &arc_state.data2);
+
+    // The window path reads the same archive through a callback source.
+    var source_ctx = harness.SourceCursor{ .data = xip_fixture.archive[0..archive_size] };
+    const through_window = harness.CallOpts{ .ctx = true, .callback = harness.sourceCallback, .context = &source_ctx };
+    for ([_]struct { ordinal: u64, expected: []const u8 }{
+        .{ .ordinal = 0, .expected = &arc_state.data1 },
+        .{ .ordinal = 1, .expected = &arc_state.data2 },
+    }) |want| {
+        _ = harness.call(r, harness.ids.read, &.{
+            harness.archiveOrdinalParam(want.ordinal),
+            harness.sourceCallbackNode(0, 0),
+            harness.sinkSpan(r.output),
+        }, through_window);
+        try harness.requireStatus(r, abi.Status.ok);
+        if (r.response.byte_length != want.expected.len or !std.mem.eql(u8, r.output[0..want.expected.len], want.expected)) {
+            return error.XipWindowMismatch;
+        }
+    }
+
+    // The count agrees on both paths; the context options already carry
+    // the capabilities, sizing, and commit selectors.
+    const count_ctx = harness.CallOpts{ .callback = harness.sourceCallback, .context = &source_ctx };
+    _ = harness.call(r, harness.ids.query, &.{
+        harness.paramTargetCommand(harness.ids.read),
+        harness.sourceCallbackNode(0, 0),
+        harness.capabilityParam(arc_caps),
+        harness.sizingModeParam(harness.size_metadata_exact),
+        harness.commitModeParam(r.commit_read),
+    }, count_ctx);
+    try harness.requireStatus(r, abi.Status.ok);
+    if (r.response.byte_length != 2) return error.ArchiveEntryCountMismatch;
+
+    // A source that declares seek skips through the callback verb,
+    // pinning the seek offset's wire shape on an envelope call.
+    var seek_ctx = harness.SourceCursor{ .data = xip_fixture.archive[0..archive_size] };
+    const through_seek = harness.CallOpts{ .callback = harness.sourceCallback, .context = &seek_ctx };
+    _ = harness.call(r, harness.ids.read, &.{
+        harness.archiveOrdinalParam(1),
+        harness.sourceCallbackNode(0, 0),
+        harness.sinkSpan(r.output),
+        harness.capabilityParam(arc_caps | harness.cap_seek),
+        harness.sizingModeParam(harness.size_metadata_exact),
+        harness.commitModeParam(r.commit_read),
+    }, through_seek);
+    try harness.requireStatus(r, abi.Status.ok);
+    if (r.response.byte_length != arc_state.data2.len or !std.mem.eql(u8, r.output[0..arc_state.data2.len], &arc_state.data2)) {
+        return error.XipWindowMismatch;
+    }
 }
 
 pub fn runWim(r: *Runner) anyerror!void {
@@ -1423,10 +1517,7 @@ pub fn runRar(r: *Runner) anyerror!void {
         harness.sinkSpan(r.output),
     }, .{ .ctx = true }, r.output);
     try rarExpectUnsupported(r, &rar_fixture_multi_volume);
-    // QuickOpen service blocks carry no payload we expose.
-    //
-    // The walk ends cleanly with zero entries and invalid_data on any ordinal
-    // read — the reference's observable shape.
+    // QuickOpen service blocks carry no exposed payload: the walk ends with zero entries and invalid_data on ordinal reads.
     _ = harness.call(r, harness.ids.query, &.{
         harness.paramTargetCommand(harness.ids.read),
         harness.sourceSpan(&rar_fixture_service),
@@ -1531,6 +1622,7 @@ pub fn runRarOfficial(r: *Runner) anyerror!void {
 
 var rarw_payload: [445]u8 = undefined;
 var rarw_archive: [16384]u8 = undefined;
+var rarvs_archive: [24576]u8 = undefined;
 const rarw_password = "PASS";
 
 fn rarwWrite(r: *Runner, entry: harness.Node, archive: []u8, extra: []const harness.Node) !usize {
@@ -1614,7 +1706,349 @@ fn runRarWriteEncrypted(r: *Runner) anyerror!void {
     if (!harness.allBytesEqual(&out2, 0xa5)) return error.RarWriteWrongPasswordWroteSink;
 }
 
+fn runRarWriteRecovery(r: *Runner) anyerror!void {
+    setupRar(r);
+    corpus.fillTiled(r.corpus_index, &rarw_payload);
+    var store: harness.ArchiveEntryNodes = undefined;
+    const entry = harness.archiveEntryMethod(&store, "rr.txt", &rarw_payload, 3);
+
+    const plain_size = try rarwWrite(r, entry, &rarw_archive, &.{});
+    const rr_extra = [_]harness.Node{harness.rarRecoveryParam(3)};
+    const rr_size = try rarwWrite(r, entry, &rarw_archive, &rr_extra);
+    // The recovery record rides behind the file blocks.
+    if (rr_size <= plain_size) return error.RarRecoveryRecordMissing;
+    try rarwReadBack(r, rarw_archive[0..rr_size], &rarw_payload, &.{});
+
+    // The reference caps recovery at 1000 percent, before any output.
+    var too_much_nodes: [8]harness.Node = undefined;
+    var too_much = harness.NodeList{ .nodes = &too_much_nodes };
+    too_much.push(harness.scalarNode(harness.ids.source));
+    too_much.push(harness.sinkSpan(r.output));
+    too_much.push(harness.capabilityParam(arc_caps));
+    too_much.push(harness.sizingModeParam(harness.size_metadata_exact));
+    too_much.push(harness.commitModeParam(harness.commit_confirmed));
+    too_much.push(harness.rarRecoveryParam(1001));
+    too_much.push(entry);
+    @memset(r.output, 0xa5);
+    try harness.reject(r, harness.ids.write, too_much.items(), .{ .ctx = true }, abi.Status.invalid_call, r.output);
+}
+
+// An entry larger than one volume, tail volumes on the response
+// children. A tight workspace refuses; the retry starts fresh.
+pub fn runRarVolumeSet(r: *Runner) anyerror!void {
+    if (isOffpremUnsupported()) return;
+    setupRar(r);
+    var stored: [16384]u8 = undefined;
+    corpus.fillTiled(r.corpus_index, &stored);
+    const granularity: u64 = 4096;
+    var store: harness.ArchiveEntryNodes = undefined;
+    const entry = harness.archiveEntryMethod(&store, "split.bin", &stored, 0);
+    const gran = harness.paramScalar(harness.param_family_archive, archive_volume_size, harness.cmds, granularity);
+
+    // The size pass answers the set total, not the single-archive length.
+    var qnodes: [10]harness.Node = undefined;
+    var q = harness.NodeList{ .nodes = &qnodes };
+    q.push(harness.paramTargetCommand(harness.ids.write));
+    q.push(harness.scalarNode(harness.ids.source));
+    q.push(harness.capabilityParam(arc_caps));
+    q.push(harness.sizingModeParam(harness.size_metadata_exact));
+    q.push(harness.commitModeParam(harness.commit_confirmed));
+    q.push(gran);
+    q.push(entry);
+    _ = harness.call(r, harness.ids.query, q.items(), .{});
+    try harness.requireStatus(r, abi.Status.ok);
+    const total: usize = @intCast(r.response.byte_length);
+    if (total <= granularity or total > rarvs_archive.len) return error.ArchiveQueryCapacity;
+
+    var req: [8]harness.Node = undefined;
+    req[0] = harness.paramProfile(harness.ids.rar);
+    req[1] = harness.scalarNode(harness.ids.source);
+    req[2] = harness.sinkSpan(rarvs_archive[0..total]);
+    req[3] = harness.capabilityParam(arc_caps);
+    req[4] = harness.sizingModeParam(harness.size_metadata_exact);
+    req[5] = harness.commitModeParam(harness.commit_confirmed);
+    req[6] = gran;
+    req[7] = entry;
+    harness.linkNodes(&req);
+
+    // A workspace under the pack50 tables refuses with the workspace pair
+    // before any output byte lands.
+    const tight = r.workspace[0 .. 64 * 1024];
+    try harness.expectWorkspaceCapacity(r, harness.ids.write, req[1..], .{ .workspace = tight }, null, tight.len, rarvs_archive[0..total]);
+
+    // The retry behaves like a first attempt: the set lands contiguous
+    // in the sink, the tails ride the response children.
+    var tail_buffers: [8][4096]u8 = undefined;
+    var tail_nodes: [8]harness.Node = undefined;
+    for (&tail_nodes, &tail_buffers) |*t, *buf| {
+        t.* = harness.node(buf, buf.len);
+        t.*.id = harness.ids.parameter;
+        t.*.value_high = harness.paramSelector(harness.param_family_archive, archive_volumes, 0x26, 0);
+    }
+    harness.linkNodes(&tail_nodes);
+    var response = abi.Node.init();
+    response.child = &tail_nodes[0];
+    const status = harness.invoke(harness.ids.write, &req[0], &response, r.workspace.ptr, r.workspace.len, null, null, null);
+    if (status != abi.Status.ok) return error.VolumeWriteFailed;
+    if (response.byte_length != total) return error.VolumeWriteLengthMismatch;
+
+    var parts: [9][]const u8 = undefined;
+    var tails: usize = 0;
+    var tail_bytes: usize = 0;
+    for (tail_nodes) |t| {
+        if (t.byte_length == 0) break;
+        parts[1 + tails] = t.bytes.?[0..@intCast(t.byte_length)];
+        tail_bytes += @intCast(t.byte_length);
+        tails += 1;
+    }
+    if (tails == 0 or total <= tail_bytes) return error.VolumeShapeMismatch;
+    parts[0] = rarvs_archive[0 .. total - tail_bytes];
+
+    var volume_nodes: [8]harness.Node = undefined;
+    for (0..tails) |index| {
+        volume_nodes[index] = harness.paramBytesWithAttributes(harness.param_family_archive, archive_volumes, 0x16, harness.cmd_read, parts[1 + index]);
+    }
+    var read_req: [16]harness.Node = @splat(abi.Node.init());
+    var count: usize = 0;
+    read_req[count] = harness.archiveOrdinalParam(0);
+    count += 1;
+    read_req[count] = harness.sourceSpan(parts[0]);
+    count += 1;
+    for (0..tails) |index| {
+        read_req[count] = volume_nodes[index];
+        count += 1;
+    }
+    read_req[count] = harness.sinkSpan(r.output);
+    count += 1;
+    _ = harness.call(r, harness.ids.read, read_req[0..count], .{ .ctx = true });
+    try harness.requireStatus(r, abi.Status.ok);
+    if (r.response.byte_length != stored.len or !std.mem.eql(u8, r.output[0..stored.len], &stored)) {
+        return error.VolumeReadMismatch;
+    }
+}
+
+var wimvs_names: [240][40]u8 = undefined;
+var wimvs_name_slices: [240][]const u8 = undefined;
+var wimvs_payloads: [240][1024]u8 = undefined;
+var wimvs_stores: [240]harness.ArchiveEntryNodes = undefined;
+var wimvs_entries: [240]harness.Node = undefined;
+var wimvs_archive: [512 * 1024]u8 = undefined;
+
+// The tree and metadata image outgrow the fixed read scratch. A
+// tight workspace refuses; the retry starts fresh.
+pub fn runWimVolumeSet(r: *Runner) anyerror!void {
+    if (isOffpremUnsupported()) return;
+    harness.setup(r, harness.ids.wim, harness.mode_archive);
+    const granularity: u64 = 65536;
+    for (&wimvs_payloads, 0..) |*payload, i| {
+        for (payload, 0..) |*b, j| b.* = @truncate(i * 31 + j);
+    }
+    for (&wimvs_names, 0..) |*name, i| {
+        // The print captures the exact slice: the buffer tail stays
+        // undefined and never rides the request.
+        wimvs_name_slices[i] = std.mem.print(name, "file{d:0>3}-payload-image-entry.bin", .{i}) catch unreachable;
+    }
+    const entry_count: usize = 240;
+    for (wimvs_entries[0..entry_count], 0..) |*entry, i| {
+        entry.* = harness.archiveEntryMethod(&wimvs_stores[i], wimvs_name_slices[i], &wimvs_payloads[i], 0);
+        if (i > 0) wimvs_entries[i - 1].next = entry;
+    }
+    const gran = harness.paramScalar(harness.param_family_archive, archive_volume_size, harness.cmds, granularity);
+
+    var qnodes: [12]harness.Node = undefined;
+    var q = harness.NodeList{ .nodes = &qnodes };
+    q.push(harness.paramTargetCommand(harness.ids.write));
+    q.push(harness.scalarNode(harness.ids.source));
+    q.push(harness.capabilityParam(arc_caps));
+    q.push(harness.sizingModeParam(harness.size_metadata_exact));
+    q.push(harness.commitModeParam(harness.commit_confirmed));
+    q.push(gran);
+    q.push(wimvs_entries[0]);
+    _ = harness.call(r, harness.ids.query, q.items(), .{});
+    try harness.requireStatus(r, abi.Status.ok);
+    const total: usize = @intCast(r.response.byte_length);
+    if (total <= granularity or total > wimvs_archive.len) return error.ArchiveQueryCapacity;
+
+    var req: [8]harness.Node = undefined;
+    req[0] = harness.paramProfile(harness.ids.wim);
+    req[1] = harness.scalarNode(harness.ids.source);
+    req[2] = harness.sinkSpan(wimvs_archive[0..total]);
+    req[3] = harness.capabilityParam(arc_caps);
+    req[4] = harness.sizingModeParam(harness.size_metadata_exact);
+    req[5] = harness.commitModeParam(harness.commit_confirmed);
+    req[6] = gran;
+    req[7] = wimvs_entries[0];
+    harness.linkNodes(&req);
+
+    const tight = r.workspace[0 .. 320 * 1024];
+    try harness.expectWorkspaceCapacity(r, harness.ids.write, req[1..], .{ .workspace = tight }, null, tight.len, wimvs_archive[0..total]);
+
+    var tail_buffers: [8][65536]u8 = undefined;
+    var tail_nodes: [8]harness.Node = undefined;
+    for (&tail_nodes, &tail_buffers) |*t, *buf| {
+        t.* = harness.node(buf, buf.len);
+        t.*.id = harness.ids.parameter;
+        t.*.value_high = harness.paramSelector(harness.param_family_archive, archive_volumes, 0x26, 0);
+    }
+    harness.linkNodes(&tail_nodes);
+    var response = abi.Node.init();
+    response.child = &tail_nodes[0];
+    const status = harness.invoke(harness.ids.write, &req[0], &response, r.workspace.ptr, r.workspace.len, null, null, null);
+    if (status != abi.Status.ok) return error.VolumeWriteFailed;
+    if (response.byte_length != total) return error.VolumeWriteLengthMismatch;
+
+    var parts: [9][]const u8 = undefined;
+    var tails: usize = 0;
+    var tail_bytes: usize = 0;
+    for (tail_nodes) |t| {
+        if (t.byte_length == 0) break;
+        parts[1 + tails] = t.bytes.?[0..@intCast(t.byte_length)];
+        tail_bytes += @intCast(t.byte_length);
+        tails += 1;
+    }
+    if (tails == 0 or total <= tail_bytes) return error.VolumeShapeMismatch;
+    parts[0] = wimvs_archive[0 .. total - tail_bytes];
+
+    var volume_nodes: [8]harness.Node = undefined;
+    for (0..tails) |index| {
+        volume_nodes[index] = harness.paramBytesWithAttributes(harness.param_family_archive, archive_volumes, 0x16, harness.cmd_read, parts[1 + index]);
+    }
+    var read_req: [16]harness.Node = @splat(abi.Node.init());
+    var count: usize = 0;
+    read_req[count] = harness.archiveOrdinalParam(0);
+    count += 1;
+    read_req[count] = harness.sourceSpan(parts[0]);
+    count += 1;
+    for (0..tails) |index| {
+        read_req[count] = volume_nodes[index];
+        count += 1;
+    }
+    read_req[count] = harness.sinkSpan(r.output);
+    count += 1;
+    _ = harness.call(r, harness.ids.read, read_req[0..count], .{ .ctx = true });
+    try harness.requireStatus(r, abi.Status.ok);
+    if (r.response.byte_length != wimvs_payloads[0].len or !std.mem.eql(u8, r.output[0..wimvs_payloads[0].len], &wimvs_payloads[0])) {
+        return error.VolumeReadMismatch;
+    }
+}
+
+var xipm_names: [240][40]u8 = undefined;
+var xipm_name_slices: [240][]const u8 = undefined;
+var xipm_payloads: [240][64]u8 = undefined;
+var xipm_stores: [240]harness.ArchiveEntryNodes = undefined;
+var xipm_entries: [240]harness.Node = undefined;
+var xipm_archive: [2 * 1024 * 1024]u8 = undefined;
+
+// The whole-set projection: 240 groups chain 1,200 response nodes;
+// a short chain answers as capacity, naming the true count.
+pub fn runXipManifest(r: *Runner) anyerror!void {
+    if (isOffpremUnsupported()) return;
+    harness.setup(r, harness.ids.xip, harness.mode_archive);
+    for (&xipm_payloads, 0..) |*payload, i| {
+        for (payload, 0..) |*b, j| b.* = @truncate(i * 13 + j);
+    }
+    for (&xipm_names, 0..) |*name, i| {
+        // The print captures the exact slice: the buffer tail stays
+        // undefined and never rides the request.
+        xipm_name_slices[i] = std.mem.print(name, "file{d:0>3}-manifest-entry.bin", .{i}) catch unreachable;
+    }
+    for (&xipm_entries, 0..) |*entry, i| {
+        entry.* = harness.archiveEntryMethod(&xipm_stores[i], xipm_name_slices[i], &xipm_payloads[i], 0);
+        if (i > 0) xipm_entries[i - 1].next = entry;
+    }
+
+    var wreq: [7]harness.Node = undefined;
+    wreq[0] = harness.paramProfile(harness.ids.xip);
+    wreq[1] = harness.scalarNode(harness.ids.source);
+    wreq[2] = harness.sinkSpan(xipm_archive[0..]);
+    wreq[3] = harness.capabilityParam(arc_caps);
+    wreq[4] = harness.sizingModeParam(harness.size_metadata_exact);
+    wreq[5] = harness.commitModeParam(harness.commit_confirmed);
+    wreq[6] = xipm_entries[0];
+    harness.linkNodes(&wreq);
+    var wresp = abi.Node.init();
+    const wstatus = harness.invoke(harness.ids.write, &wreq[0], &wresp, r.workspace.ptr, r.workspace.len, null, null, null);
+    if (wstatus != abi.Status.ok) {
+        std.debug.print("manifest write status {d}\n", .{wstatus});
+        return error.ManifestWriteFailed;
+    }
+    const archive = xipm_archive[0..@intCast(wresp.byte_length)];
+
+    // The count rides one walk; the manifest answers a second.
+    _ = harness.call(r, harness.ids.query, &.{
+        harness.paramTargetCommand(harness.ids.read),
+        harness.sourceSpan(archive),
+        harness.capabilityParam(arc_caps),
+        harness.sizingModeParam(harness.size_metadata_exact),
+        harness.commitModeParam(harness.commit_tentative),
+    }, .{});
+    try harness.requireStatus(r, abi.Status.ok);
+    if (r.response.byte_length != 240) return error.ManifestBareCountMismatch;
+
+    var groups: [240]harness.Node = undefined;
+    var name_bufs: [240][64]u8 = undefined;
+    var name_nodes: [240]harness.Node = undefined;
+    var size_nodes: [240]harness.Node = undefined;
+    var uid_nodes: [240]harness.Node = undefined;
+    var mtime_nodes: [240]harness.Node = undefined;
+    for (0..240) |i| {
+        groups[i] = harness.scalarNode(harness.ids.parameter);
+        groups[i].value_high = harness.paramSelector(harness.param_family_archive, harness.archive_entry, 0x27, 0);
+        name_nodes[i] = harness.node(&name_bufs[i], name_bufs[i].len);
+        name_nodes[i].id = harness.ids.parameter;
+        name_nodes[i].value_high = harness.paramSelector(harness.param_family_archive, harness.archive_entry_name, 0x22, 0);
+        size_nodes[i] = harness.scalarNode(harness.ids.parameter);
+        size_nodes[i].value_high = harness.paramSelector(harness.param_family_archive, harness.archive_entry_size, 0x21, 0);
+        uid_nodes[i] = harness.scalarNode(harness.ids.parameter);
+        uid_nodes[i].value_high = harness.paramSelector(harness.param_family_archive, harness.archive_entry_uid, 0x21, 0);
+        mtime_nodes[i] = harness.scalarNode(harness.ids.parameter);
+        mtime_nodes[i].value_high = harness.paramSelector(harness.param_family_archive, harness.archive_entry_mtime, 0x21, 0);
+        groups[i].child = &name_nodes[i];
+        name_nodes[i].next = &size_nodes[i];
+        size_nodes[i].next = &uid_nodes[i];
+        uid_nodes[i].next = &mtime_nodes[i];
+        if (i > 0) groups[i - 1].next = &groups[i];
+    }
+    var response = abi.Node.init();
+    response.child = &groups[0];
+    var mreq: [7]harness.Node = undefined;
+    mreq[0] = harness.paramProfile(harness.ids.xip);
+    mreq[1] = harness.paramTargetCommand(harness.ids.read);
+    mreq[2] = harness.sourceSpan(archive);
+    mreq[3] = harness.capabilityParam(r.caps_query);
+    mreq[4] = harness.sizingModeParam(r.sizing);
+    mreq[5] = harness.commitModeParam(r.commit_read);
+    mreq[6] = harness.scalarNode(harness.ids.parameter);
+    mreq[6].value_high = harness.paramSelector(harness.param_family_archive, harness.archive_entry, 0x13, harness.cmd_query);
+    harness.linkNodes(&mreq);
+    const mstatus = harness.invoke(harness.ids.query, &mreq[0], &response, r.workspace.ptr, r.workspace.len, null, null, null);
+    if (mstatus != abi.Status.ok) return error.ManifestQueryFailed;
+    if (response.byte_length != 240) return error.ManifestCountMismatch;
+    for (0..240) |i| {
+        const want = xipm_name_slices[i];
+        if (name_nodes[i].byte_length != want.len or !std.mem.eql(u8, name_bufs[i][0..want.len], want)) return error.ManifestNameMismatch;
+        if (size_nodes[i].value_low != xipm_payloads[i].len) return error.ManifestSizeMismatch;
+        // The entries carry no uid or mtime parameters, so the walk answers
+        // the zero defaults the fill writes.
+        if (uid_nodes[i].value_low != 0 or mtime_nodes[i].value_low != 0) return error.ManifestScalarMismatch;
+    }
+
+    // A short group chain refuses with the capacity pair naming the count.
+    groups[9].next = null;
+    var short_response = abi.Node.init();
+    short_response.child = &groups[0];
+    var diag_required: harness.Node = undefined;
+    var diag_available: harness.Node = undefined;
+    var diagnostic = harness.capacityDiagnostic(harness.ids.diagnostic_required_capacity, harness.ids.diagnostic_available_capacity, &diag_required, &diag_available);
+    const short_status = harness.invoke(harness.ids.query, &mreq[0], &short_response, r.workspace.ptr, r.workspace.len, null, null, &diagnostic);
+    groups[9].next = &groups[10];
+    if (short_status != abi.Status.insufficient_capacity) return error.ManifestShortfallAccepted;
+    if (diag_required.value_low != 240 or diag_available.value_low != 10) return error.ManifestShortfallPair;
+}
+
 pub const scenarios = harness.scenarios("archive", &.{
+    .{ .label = "archive rar write recovery", .run = runRarWriteRecovery, .workspace_size = 48 * 1024 * 1024, .output_size = 1024, .encoded_size = 16384 },
+    .{ .label = "archive rar volume set", .run = runRarVolumeSet, .workspace_size = 16 * 1024 * 1024, .output_size = 20480, .encoded_size = 65536 },
     .{ .label = "archive rar write encrypted", .run = runRarWriteEncrypted, .workspace_size = 48 * 1024 * 1024, .output_size = 1024, .encoded_size = 16384 },
     .{ .label = "archive tar", .run = runTar, .workspace_size = 65536, .output_size = 512, .encoded_size = 4096 },
     .{ .label = "archive cpio", .run = runCpio, .workspace_size = 65536, .output_size = 512, .encoded_size = 4096 },
@@ -1624,7 +2058,10 @@ pub const scenarios = harness.scenarios("archive", &.{
     .{ .label = "archive tar volume set", .run = runTarVolumeSet, .workspace_size = 65536, .output_size = 512, .encoded_size = 8192 },
     .{ .label = "archive xar", .run = runXar, .workspace_size = 3 * 1024 * 1024, .output_size = 512, .encoded_size = 4096 },
     .{ .label = "archive xar foreign", .run = runXarForeign(.xar), .workspace_size = 3 * 1024 * 1024, .output_size = 512, .encoded_size = 4096 },
+    .{ .label = "archive xip", .run = runXip, .workspace_size = 48 * 1024 * 1024, .output_size = 512, .encoded_size = 4 * 1024 * 1024 },
+    .{ .label = "archive xip manifest", .run = runXipManifest, .workspace_size = 48 * 1024 * 1024, .output_size = 512, .encoded_size = 4 * 1024 * 1024 },
     .{ .label = "archive wim", .run = runWim, .workspace_size = 128 * 1024, .output_size = 512, .encoded_size = 4096 },
+    .{ .label = "archive wim volume set", .run = runWimVolumeSet, .workspace_size = 8 * 1024 * 1024, .output_size = 2048, .encoded_size = 1024 * 1024 },
     .{ .label = "archive wim foreign", .run = runWimForeign, .workspace_size = 128 * 1024, .output_size = 512, .encoded_size = 4096 },
     .{ .label = "archive wim foreign xpress", .run = runWimForeignXpress, .workspace_size = 256 * 1024, .output_size = 512, .encoded_size = 4096 },
     .{ .label = "archive wim foreign lzx", .run = runWimForeignLzx, .workspace_size = 256 * 1024, .output_size = 512, .encoded_size = 4096 },

@@ -467,6 +467,10 @@ pub fn runMixedChunks(r: *Runner) anyerror!void {
 
 const lzma_alone_header_size = 13;
 
+// A marker-terminated stream-profile payload under an alone header
+// that declares the given size, unknown when null.
+
+// A non-null size that disagrees with the payload's end is a deliberate corruption.
 fn lzmaAloneEncode(r: *Runner, input: []const u8, declared_size: ?usize, out: []u8) !usize {
     const dict: u64 = @max(input.len, 4096);
     const saved_profile = r.profile_id;
@@ -495,13 +499,19 @@ fn lzmaAloneEncode(r: *Runner, input: []const u8, declared_size: ?usize, out: []
     return lzma_alone_header_size + payload_len;
 }
 
-fn lzmaDeclaredRead(r: *Runner, input: []const u8, declared: usize, output: []u8, encoded: *[512]u8) !usize {
-    setupLzma(r, harness.ids.lzma_file, 4096);
-    const encoded_len = try lzmaAloneEncode(r, input, declared, encoded);
-    @memset(output, 0xa5);
-    try harness.spanCall(r, harness.ids.read, encoded[0..encoded_len], output);
-    if (r.response.byte_length != declared) return error.DeclaredByteLengthMismatch;
-    return encoded_len;
+// The lzma-file write emits the whole container: a 13-byte size
+// header, then the markerless stream the size closes.
+fn lzmaAloneEncodeSized(r: *Runner, input: []const u8, out: []u8) !usize {
+    _ = harness.call(r, harness.ids.write, &.{
+        harness.lzmaDictionaryParam(r.lzma_dictionary),
+        harness.sourceSpan(input),
+        harness.sinkSpan(out),
+        harness.capabilityParam(r.caps_io),
+        harness.sizingModeParam(r.sizing),
+        harness.commitModeParam(r.commit_write),
+    }, .{});
+    try harness.requireStatus(r, abi.Status.ok);
+    return @intCast(r.response.byte_length);
 }
 
 fn runLzmaFileDeclaredEqual(r: *Runner) !void {
@@ -509,7 +519,7 @@ fn runLzmaFileDeclaredEqual(r: *Runner) !void {
     var encoded: [512]u8 = undefined;
     var output: [input.len]u8 = undefined;
     setupLzma(r, harness.ids.lzma_file, 4096);
-    const encoded_len = try lzmaAloneEncode(r, input, input.len, &encoded);
+    const encoded_len = try lzmaAloneEncodeSized(r, input, &encoded);
     _ = harness.call(r, harness.ids.query, &.{
         harness.paramTargetCommand(harness.ids.read),
         harness.sourceSpan(encoded[0..encoded_len]),
@@ -525,23 +535,92 @@ fn runLzmaFileDeclaredEqual(r: *Runner) !void {
     }
 }
 
+// Foreign encoders (LZMA SDK, mksquashfs) declare the size in the
+// alone header and still end with a marker.
+
+// The reference decoder accepts both shapes; the declared count must
+// publish and the marker must finish the range coder cleanly.
+fn runLzmaFileDeclaredEqualMarker(r: *Runner) !void {
+    const input = "declared size with redundant end marker payload";
+    var encoded: [512]u8 = undefined;
+    var output: [input.len]u8 = undefined;
+    setupLzma(r, harness.ids.lzma_file, 4096);
+    const encoded_len = try lzmaAloneEncode(r, input, input.len, &encoded);
+    @memset(&output, 0xa5);
+    const nodes = steps.build(&lzmaParams, r, &.{
+        harness.sourceSpan(encoded[0..encoded_len]),
+        harness.sinkSpan(&output),
+    });
+    _ = harness.call(r, harness.ids.read, nodes.items[0..nodes.len], .{ .ctx = true });
+    try harness.requireStatus(r, abi.Status.ok);
+    if (r.response.byte_length != input.len) return error.EqualByteLengthMismatch;
+    if (!std.mem.eql(u8, &output, input)) return error.EqualReadMismatch;
+}
+
+// A declared size is authoritative: a stream that ends its marker
+// with declared bytes still outstanding is corrupt.
+
+// The read must fail rather than publish the stale sink tail as
+// file content.
+
+// The decoder writes the valid prefix before the marker, so only
+// the tail is pinned.
 fn runLzmaFileDeclaredGreater(r: *Runner) !void {
     const input = "declared greater than actual decoded count pattern";
     const actual = input.len;
     const declared = actual + 100;
     var encoded: [512]u8 = undefined;
     var output: [declared]u8 = undefined;
-    _ = try lzmaDeclaredRead(r, input, declared, &output, &encoded);
+    setupLzma(r, harness.ids.lzma_file, 4096);
+    const encoded_len = try lzmaAloneEncode(r, input, declared, &encoded);
+    @memset(&output, 0xa5);
+    const nodes = steps.build(&lzmaParams, r, &.{
+        harness.sourceSpan(encoded[0..encoded_len]),
+        harness.sinkSpan(&output),
+    });
+    _ = harness.call(r, harness.ids.read, nodes.items[0..nodes.len], .{ .ctx = true });
+    try harness.requireStatus(r, abi.Status.invalid_data);
     if (!std.mem.eql(u8, output[0..actual], input)) return error.GreaterPrefixMismatch;
     if (!harness.allBytesEqual(output[actual..declared], 0xa5)) return error.GreaterTailChanged;
 }
 
+// A correct declared size publishes exactly the decoded count even when the
+// sink is larger, leaving the unused tail untouched.
+fn runLzmaFileDeclaredSinkLarger(r: *Runner) !void {
+    const input = "declared count is published with a larger sink";
+    const declared = input.len;
+    var encoded: [512]u8 = undefined;
+    var output: [declared + 64]u8 = undefined;
+    setupLzma(r, harness.ids.lzma_file, 4096);
+    const encoded_len = try lzmaAloneEncodeSized(r, input, &encoded);
+    @memset(&output, 0xa5);
+    const nodes = steps.build(&lzmaParams, r, &.{
+        harness.sourceSpan(encoded[0..encoded_len]),
+        harness.sinkSpan(&output),
+    });
+    _ = harness.call(r, harness.ids.read, nodes.items[0..nodes.len], .{ .ctx = true });
+    try harness.requireStatus(r, abi.Status.ok);
+    if (r.response.byte_length != declared) return error.DeclaredByteLengthMismatch;
+    if (!std.mem.eql(u8, output[0..declared], input)) return error.EqualReadMismatch;
+    if (!harness.allBytesEqual(output[declared..], 0xa5)) return error.GreaterTailChanged;
+}
+
+// A declared size is authoritative: an under-reporting header cuts
+// the range coder short, so the read must fail.
 fn runLzmaFileDeclaredLess(r: *Runner) !void {
     const input = "declared less than actual decoded count pattern";
     const declared = input.len - 1;
     var encoded: [512]u8 = undefined;
     var output: [declared]u8 = undefined;
-    _ = try lzmaDeclaredRead(r, input, declared, &output, &encoded);
+    setupLzma(r, harness.ids.lzma_file, 4096);
+    const encoded_len = try lzmaAloneEncode(r, input, declared, &encoded);
+    @memset(&output, 0xa5);
+    const nodes = steps.build(&lzmaParams, r, &.{
+        harness.sourceSpan(encoded[0..encoded_len]),
+        harness.sinkSpan(&output),
+    });
+    _ = harness.call(r, harness.ids.read, nodes.items[0..nodes.len], .{ .ctx = true });
+    try harness.requireStatus(r, abi.Status.invalid_data);
     if (!std.mem.eql(u8, &output, input[0..declared])) return error.LessPrefixMismatch;
 }
 
@@ -586,7 +665,7 @@ fn runLzmaFileSourceOnce(r: *Runner) !void {
     const input = "callback source consumed exactly once";
     var encoded: [512]u8 = undefined;
     setupLzma(r, harness.ids.lzma_file, 4096);
-    const encoded_len = try lzmaAloneEncode(r, input, input.len, &encoded);
+    const encoded_len = try lzmaAloneEncodeSized(r, input, &encoded);
     var output: [input.len]u8 = undefined;
     var ctx = CountingSource{ .data = encoded[0..encoded_len] };
     _ = harness.call(r, harness.ids.read, &.{
@@ -1034,7 +1113,9 @@ pub const scenarios = harness.scenarios(
     }),
     &.{
         .{ .name = "lzma file declared equal", .run = runLzmaFileDeclaredEqual, .workspace_size = 1310720, .output_size = 256, .encoded_size = 512 },
+        .{ .name = "lzma file declared equal marker", .run = runLzmaFileDeclaredEqualMarker, .workspace_size = 1310720, .output_size = 256, .encoded_size = 512 },
         .{ .name = "lzma file declared greater", .run = runLzmaFileDeclaredGreater, .workspace_size = 1310720, .output_size = 256, .encoded_size = 512 },
+        .{ .name = "lzma file declared sink larger", .run = runLzmaFileDeclaredSinkLarger, .workspace_size = 1310720, .output_size = 256, .encoded_size = 512 },
         .{ .name = "lzma file declared less", .run = runLzmaFileDeclaredLess, .workspace_size = 1310720, .output_size = 256, .encoded_size = 512 },
         .{ .name = "lzma file source once", .run = runLzmaFileSourceOnce, .workspace_size = 1310720, .output_size = 256, .encoded_size = 512 },
         .{ .name = "lzma file marker mode", .run = runLzmaFileMarkerMode, .workspace_size = 1310720, .output_size = 256, .encoded_size = 512 },

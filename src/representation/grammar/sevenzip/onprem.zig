@@ -179,7 +179,8 @@ fn coderAttributeSize(method: CoderMethod) usize {
     };
 }
 
-const PackedEntry = struct {
+// The compose driver names this record across its size and write calls.
+pub const PackedEntry = struct {
     method: CoderMethod,
     data: []const u8,
     crc: u32,
@@ -257,7 +258,7 @@ fn packEntry(entry: Entry, provider: crypto.Provider, workspace: *Workspace, lim
         .bzip2 => try packBuffer(bzip2, .bzip2, source, unpacked_crc, workspace, limits, bzip2.encodeWorkspaceSize(default_bzip2_block), .{ .block_size = default_bzip2_block }),
         .lzma => blk: {
             const properties = lzma2.defaultProperties(default_dictionary);
-            const options: lzma.Options = .{ .properties = properties, .unpack_size = source.len, .marker_required = false, .max_work = limits.codec_work };
+            const options: lzma.Options = .{ .properties = properties, .unpack_size = source.len, .marker_required = false, .allow_eopm = true, .max_work = limits.codec_work };
             break :blk try packBuffer(lzma, .lzma, source, unpacked_crc, workspace, limits, lzma.encodeWorkspaceSizeBt(properties), options);
         },
         .lzma2 => blk: {
@@ -490,7 +491,7 @@ fn encodeHeaderBytes(entries: []const Entry, packed_entries: []const PackedEntry
         };
     }
     const properties = lzma2.defaultProperties(default_dictionary);
-    const lzma_options: lzma.Options = .{ .properties = properties, .unpack_size = header_size, .marker_required = false, .max_work = limits.codec_work };
+    const lzma_options: lzma.Options = .{ .properties = properties, .unpack_size = header_size, .marker_required = false, .allow_eopm = true, .max_work = limits.codec_work };
     const scratch = try workspace.take(u8, lzma.encodeWorkspaceSizeBt(properties));
     const packed_size = try lzma.requiredSize(header_bytes, scratch, lzma_options);
     const compressed = try workspace.take(u8, packed_size);
@@ -562,11 +563,7 @@ fn writeNextHeader(writer: *std.Io.Writer, header: *const HeaderEncode, pack_off
         try writeUint64(writer, 0);
     }
     try io.writeBytes(writer, &.{0x0C});
-    // A lone AES coder records the real header size; the reader strips
-    // the padding.
-    //
-    // An AES coder feeding a compressor records its padded output, as in
-    // file-data folders.
+    // A lone AES coder records the real header size; one feeding a compressor records its padded output.
     if (header.encrypted and header.compressed) try writeUint64(writer, header.pack_size);
     try writeUint64(writer, header.unpack_size);
     try io.writeBytes(writer, &.{0x0A});
@@ -631,9 +628,7 @@ pub fn sevenZipWritePackedVolumes(entries: []const Entry, packed_entries: []cons
     return try sevenZipVolumeExtents(total, volume_size);
 }
 
-// Concatenates the volume payloads behind volume 1's start header into the
-// equivalent single archive; the loader and the inspect surface run over the
-// result, so a volume set needs no separate inspect path.
+// Concatenates the volume payloads behind volume 1's start header, so loader and inspect run over one equivalent archive.
 pub fn sevenZipJoinVolumes(volumes: []const []const u8, workspace: *Workspace, limits: Limits) Exception![]const u8 {
     if (volumes.len == 0) return error.DataException;
     var total: usize = 0;
@@ -737,7 +732,7 @@ pub fn sevenZipDecodeOrdinal(archive_bytes: []const u8, workspace: *Workspace, l
         },
         .lzma => {
             const properties = try parseLzmaProperties(entry.attributes);
-            const options: lzma.Options = .{ .properties = properties, .unpack_size = decode_target_len, .marker_required = false, .max_work = limits.codec_work };
+            const options: lzma.Options = .{ .properties = properties, .unpack_size = decode_target_len, .marker_required = false, .allow_eopm = true, .max_work = limits.codec_work };
             const scratch = try workspace.take(u8, lzma.decodeWorkspaceSize(properties));
             const decoded = try lzma_seam.decode(decode_options.provider, decrypted_packed, decode_output, scratch, options);
             if (decoded != decode_target_len) return error.DataException;
@@ -1057,7 +1052,7 @@ fn decodeFolderStream(folder: *const Folder, packed_data: []const u8, output: []
         },
         .lzma => {
             const properties = try parseLzmaProperties(folder.attributes);
-            const lzma_options: lzma.Options = .{ .properties = properties, .unpack_size = output.len, .marker_required = false, .max_work = limits.codec_work };
+            const lzma_options: lzma.Options = .{ .properties = properties, .unpack_size = output.len, .marker_required = false, .allow_eopm = true, .max_work = limits.codec_work };
             const scratch = try workspace.take(u8, lzma.decodeWorkspaceSize(properties));
             const decoded = try lzma_seam.decode(options.provider, decrypted, output, scratch, lzma_options);
             if (decoded != output.len) return error.DataException;
@@ -2382,7 +2377,7 @@ test "sevenzip StreamsInfo enforces vendor section order" {
 test "sevenzip ppmd solid grouping roundtrip" {
     // Mixed provider builds serve no single tag for both arms; run where
     // the default tag serves the codec.
-    if (!deflate_seam.decodeServed(checksum.default_provider)) return;
+    if (!deflate_seam.decodeServed(checksum.default_provider)) return error.SkipZigTest;
     const testing = std.testing;
     const allocator = testing.allocator;
     const backing = try allocator.alloc(u8, 64 * 1024 * 1024);
@@ -2423,7 +2418,7 @@ test "sevenzip ppmd solid grouping roundtrip" {
 test "sevenzip filter chain roundtrips lzma and lzma2" {
     // Mixed provider builds serve no single tag for both arms; run where
     // the default tag serves the codec.
-    if (!deflate_seam.decodeServed(checksum.default_provider)) return;
+    if (!deflate_seam.decodeServed(checksum.default_provider)) return error.SkipZigTest;
     const testing = std.testing;
     const allocator = testing.allocator;
     const backing = try allocator.alloc(u8, 96 * 1024 * 1024);
@@ -2465,7 +2460,7 @@ test "sevenzip filter chain roundtrips lzma and lzma2" {
 test "sevenzip primary filter methods encode the filter coder" {
     // Mixed provider builds serve no single tag for both arms; run where
     // the default tag serves the codec.
-    if (!deflate_seam.decodeServed(checksum.default_provider)) return;
+    if (!deflate_seam.decodeServed(checksum.default_provider)) return error.SkipZigTest;
     const testing = std.testing;
     const allocator = testing.allocator;
     const backing = try allocator.alloc(u8, 96 * 1024 * 1024);
@@ -2509,7 +2504,7 @@ test "sevenzip primary filter methods encode the filter coder" {
 test "sevenzip rejects filters outside lzma coders" {
     // Mixed provider builds serve no single tag for both arms; run where
     // the default tag serves the codec.
-    if (!deflate_seam.decodeServed(checksum.default_provider)) return;
+    if (!deflate_seam.decodeServed(checksum.default_provider)) return error.SkipZigTest;
     const testing = std.testing;
     const allocator = testing.allocator;
     const backing = try allocator.alloc(u8, 16 * 1024 * 1024);
@@ -2535,7 +2530,7 @@ test "sevenzip rejects filters outside lzma coders" {
 test "sevenzip filtered entries pack outside solid runs" {
     // Mixed provider builds serve no single tag for both arms; run where
     // the default tag serves the codec.
-    if (!deflate_seam.decodeServed(checksum.default_provider)) return;
+    if (!deflate_seam.decodeServed(checksum.default_provider)) return error.SkipZigTest;
     const testing = std.testing;
     const allocator = testing.allocator;
     const backing = try allocator.alloc(u8, 96 * 1024 * 1024);
@@ -2770,7 +2765,7 @@ test "sevenzip buildEntries skips trailing zero-substream folders" {
 test "sevenzip encrypted roundtrip with salt and custom cycles" {
     // Mixed provider builds serve no single tag for both arms; run where
     // the default tag serves the codec.
-    if (!deflate_seam.decodeServed(checksum.default_provider)) return;
+    if (!deflate_seam.decodeServed(checksum.default_provider)) return error.SkipZigTest;
     const testing = std.testing;
     const allocator = testing.allocator;
     const backing = try allocator.alloc(u8, 64 * 1024 * 1024);
@@ -2813,7 +2808,7 @@ test "sevenzip encrypted roundtrip with salt and custom cycles" {
 test "sevenzip folder plan stays consistent across directory and encryption breaks" {
     // Mixed provider builds serve no single tag for both arms; run where
     // the default tag serves the codec.
-    if (!deflate_seam.decodeServed(checksum.default_provider)) return;
+    if (!deflate_seam.decodeServed(checksum.default_provider)) return error.SkipZigTest;
     const testing = std.testing;
     const allocator = testing.allocator;
     const backing = try allocator.alloc(u8, 96 * 1024 * 1024);
@@ -2872,7 +2867,7 @@ test "sevenzip folder plan stays consistent across directory and encryption brea
 test "sevenzip encrypted lzma2 entry roundtrips" {
     // Mixed provider builds serve no single tag for both arms; run where
     // the default tag serves the codec.
-    if (!deflate_seam.decodeServed(checksum.default_provider)) return;
+    if (!deflate_seam.decodeServed(checksum.default_provider)) return error.SkipZigTest;
     const testing = std.testing;
     const allocator = testing.allocator;
     const backing = try allocator.alloc(u8, 96 * 1024 * 1024);
@@ -2902,7 +2897,7 @@ test "sevenzip encrypted lzma2 entry roundtrips" {
 test "sevenzip encoded headers roundtrip in both modes" {
     // Mixed provider builds serve no single tag for both arms; run where
     // the default tag serves the codec.
-    if (!deflate_seam.decodeServed(checksum.default_provider)) return;
+    if (!deflate_seam.decodeServed(checksum.default_provider)) return error.SkipZigTest;
     const testing = std.testing;
     const allocator = testing.allocator;
     const backing = try allocator.alloc(u8, 96 * 1024 * 1024);
@@ -2967,7 +2962,7 @@ test "sevenzip encoded headers roundtrip in both modes" {
 test "sevenzip decode captured failing encrypted archive" {
     // Mixed provider builds serve no single tag for both arms; run where
     // the default tag serves the codec.
-    if (!deflate_seam.decodeServed(checksum.default_provider)) return;
+    if (!deflate_seam.decodeServed(checksum.default_provider)) return error.SkipZigTest;
     const testing = std.testing;
     const allocator = testing.allocator;
     const hex = "377abcaf271c0004b264b2a5300000000000000061000000000000008558bbbb2b72c63fac9cfd34eaca9f16e66742cea052cbb171699629473766c1fb2c5dbf512f7ea0868dbd6dbb3fc9357fc34c640104060001093000070b0100022406f1070112530fb5ab02e1850647c55791b562eef5860f2121011001000c306100080a011ccdcb5000000501110f006c0032002e007400780074000000140a0100000000000000000015060100200000000000";
@@ -3092,7 +3087,7 @@ const aes_plain_txt_hex =
 test "sevenzip decodes 7zz BCJ2 + LZMA2 folder" {
     // Mixed provider builds serve no single tag for both arms; run where
     // the default tag serves the codec.
-    if (!deflate_seam.decodeServed(checksum.default_provider)) return;
+    if (!deflate_seam.decodeServed(checksum.default_provider)) return error.SkipZigTest;
     // Four packed streams: LZMA2 main, call, and jump coders bonded into
     // BCJ2, plus the raw bitmap.
     const testing = std.testing;
@@ -3119,7 +3114,7 @@ test "sevenzip decodes 7zz BCJ2 + LZMA2 folder" {
 test "sevenzip decodes 7zz AES-256 encrypted archive" {
     // Mixed provider builds serve no single tag for both arms; run where
     // the default tag serves the codec.
-    if (!deflate_seam.decodeServed(checksum.default_provider)) return;
+    if (!deflate_seam.decodeServed(checksum.default_provider)) return error.SkipZigTest;
     // Captured from `7zz a -ppassword123` (7zAES, 2^19 KDF rounds, LZMA2).
     const testing = std.testing;
     const allocator = testing.allocator;
@@ -3136,7 +3131,7 @@ test "sevenzip decodes 7zz AES-256 encrypted archive" {
     try testing.expectEqual(expected.len, produced);
     try testing.expectEqualSlices(u8, &expected, out);
 
-    // A wrong password must fail instead of returning unauthenticated bytes.
+    // A wrong password must fail, not return unauthenticated bytes; only the header-folder path pins wrong_password, so the contract is rejection.
     var bad_ws = try Workspace.init(backing.ptr, backing.len);
     if (sevenZipDecodeOrdinal(&archive_bytes, &bad_ws, .{}, 0, out, .{ .password = "wrong", .failure_cause = &cause })) |_| {
         try testing.expect(false);
@@ -3146,6 +3141,9 @@ test "sevenzip decodes 7zz AES-256 encrypted archive" {
 }
 
 test "sevenzip compound filter chain roundtrips" {
+    // Mixed provider builds serve no single tag for both arms; run where
+    // the default tag serves the codec.
+    if (!deflate_seam.decodeServed(checksum.default_provider)) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
     var executable: [8192]u8 = undefined;
@@ -3184,6 +3182,9 @@ test "sevenzip compound filter chain roundtrips" {
 }
 
 test "sevenzip multi-volume write and read" {
+    // Mixed provider builds serve no single tag for both arms; run where
+    // the default tag serves the codec.
+    if (!deflate_seam.decodeServed(checksum.default_provider)) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
     var payload: [300000]u8 = undefined;

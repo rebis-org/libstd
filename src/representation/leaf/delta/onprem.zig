@@ -3,10 +3,7 @@ const std = @import("std");
 
 pub const Direction = enum { encode, decode };
 
-// The wire semantics follow the ring below: decode folds
-// out[i] = in[i] + out[i - D], encode folds out[i] = in[i] - in[i - D], with
-// D = distance + 1 and out[j < 0] = 0. The leaf's parameter is the format's
-// distance minus one (xz passes `delta_distance - 1`, 7-Zip the props byte).
+// Decode: out[i] = in[i] + out[i-D]. Encode: out[i] = in[i] - in[i-D]. The parameter is distance minus one.
 
 // Distances with comptime vector arms; everything else runs the ring.
 const scanned_distances = [_]usize{ 1, 2, 4, 8 };
@@ -25,8 +22,7 @@ fn apply(code: []u8, distance: u8, comptime dir: Direction) void {
 const vector_width = if ((builtin.target.cpu.arch == .aarch64 or
     builtin.target.cpu.arch == .x86_64) and builtin.zig_backend != .stage2_c) 16 else 0;
 
-// The ring reference of record: decode keeps decoded bytes, encode keeps raw
-// input bytes, both wrapped at 256 because D never exceeds it.
+// The ring reference of record: decode keeps decoded bytes, encode keeps raw input, wrapped at 256.
 fn applyRing(code: []u8, distance: u8, comptime dir: Direction) void {
     var history: [256]u8 = @splat(0);
     var pos: u8 = 0;
@@ -50,11 +46,7 @@ fn Scan(comptime D: usize) type {
         const V = @Vector(16, u8);
         const zeros: V = @splat(0);
 
-        // Decode unfolds out[i] = in[i] + out[i-D] into an in-block stride-D
-        // prefix sum plus one boundary byte per residue chain.
-        //
-        // Encode unfolds out[i] = in[i] - in[i-D] into a plain stride-D
-        // difference whose lookback reaches the saved raw tail.
+        // Decode unfolds into a stride-D prefix sum plus one boundary byte per residue chain; encode into a plain stride-D difference.
 
         // Scan steps double the folded terms: s runs D, 2D, 4D, ... < 16.
         const steps = blk: {
@@ -64,8 +56,7 @@ fn Scan(comptime D: usize) type {
             break :blk count;
         };
 
-        // mask[k] = k - s: lanes at or above s fold lane k - s, lanes below s
-        // read the zero operand (negative picks the second vector).
+        // Lanes at or above s fold lane k - s; lower lanes read the zero operand.
         fn scanShift(v: V, comptime s: usize) V {
             const mask = comptime blk: {
                 var m: [16]i32 = undefined;
@@ -76,8 +67,8 @@ fn Scan(comptime D: usize) type {
             return @shuffle(u8, v, zeros, shuffle_mask);
         }
 
-        // Decode boundary[k] = out[p + (k % D) - D]: the one already-written
-        // byte each residue chain crosses below the block start.
+        // The boundary[k] = out[p + (k % D) - D] mask reads the
+        // already-written byte each residue chain crosses.
         const boundary_mask = blk: {
             var m: [16]i32 = undefined;
             for (0..16) |k| m[k] = @intCast(16 + (k % D) - D);
@@ -99,9 +90,8 @@ fn Scan(comptime D: usize) type {
             return scanned;
         }
 
-        // Encode pred[k] = in[p + k - D]: in-block raw for lanes at or above D,
-        // the previous block's raw tail below D. A negative mask reads the
-        // second operand from its start, so raw_tail index j is mask -j-1.
+        // The pred[k] = in[p + k - D] mask: in-block raw at or above D,
+        // the previous block's tail below.
         const pred_mask = blk: {
             var m: [16]i32 = undefined;
             for (0..16) |k| m[k] = if (k >= D)
