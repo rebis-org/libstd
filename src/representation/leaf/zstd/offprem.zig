@@ -2,7 +2,7 @@ const std = @import("std");
 
 const onprem = @import("onprem.zig");
 
-// Accepted gap in the Zig 0.17.0 stdlib arm: enabling verification panics
+// Accepted gap in the Zig 0.17.1 stdlib arm: enabling verification panics
 // (Decompress.zig:373); no dictionary hook; onprem verifies and carries dictionaries.
 
 // The reader vtable folds decoder errors into ReadFailed; WriteFailed is the

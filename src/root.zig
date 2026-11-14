@@ -5,8 +5,8 @@ const diagnostic = @import("interface").diagnostic;
 const invoke = @import("compose/call.zig").invoke;
 const Call = @import("kernel/envelope.zig").Call;
 
-// The std.debug handler instantiates std.Io.Threaded, which fails
-// to compile for Apple embedded targets; panics stay off it.
+// The default handler needs libc-backed Io; panics use the diagnostic
+// channel and trap so libc-less ABIs keep a deterministic failure.
 pub const panic = std.debug.FullPanic(struct {
     fn panicFn(msg: []const u8, first_trace_addr: ?usize) noreturn {
         _ = first_trace_addr;
