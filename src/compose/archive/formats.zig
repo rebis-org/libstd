@@ -401,7 +401,13 @@ pub const age = struct {
         var selected = age_seam.Options{ .password = request.Credentials.passwordOrEmpty(credentials) };
         if (try request.componentBytes(nodes, "age", "identity")) |bytes| selected.identity = bytes;
         if (try request.componentBytes(nodes, "age", "recipient")) |bytes| selected.recipient = bytes;
-        if (request.componentField(nodes, "age", "work_factor")) |field| selected.work_factor = try request.narrow(u8, field.value_low);
+        if (request.componentField(nodes, "age", "work_factor")) |field| {
+            const value = try request.narrow(u8, field.value_low);
+            // The scratch carve shifts by the factor before the seam can refuse;
+            // a value past the scrypt ceiling answers unsupported here.
+            if (value > age_seam.scrypt_work_factor_max) return error.UnsupportedException;
+            selected.work_factor = value;
+        }
         if (request.componentField(nodes, "age", "armor")) |field| selected.armor = field.value_low != 0;
         return selected;
     }
@@ -510,13 +516,18 @@ pub const wim = struct {
         scratch: []u8,
 
         pub fn init(running: *Run, archive: []const u8, tail: []const []const u8) Exception!Read {
+            const parts: []const []const u8 = if (tail.len == 0) &.{} else try volumes.list(archive, tail, running.core.workspace);
+            // The sizing walk sees the same parts the parse walk will, so
+            // a solid run may name the part that holds its chunk header.
+            var one = [_][]const u8{archive};
             return .{
                 .run = running,
                 .archive = archive,
-                .parts = if (tail.len == 0) &.{} else try volumes.list(archive, tail, running.core.workspace),
-                // The parse carve scales with the blob count and the
-                // metadata image; the tracked take reports the need.
-                .scratch = try running.core.workspace.take(u8, try wim_seam.parseScratchLen(archive)),
+                .parts = parts,
+                // The parse carve scales with the blob count, the metadata
+                // image, and the largest solid chunk; the tracked take
+                // reports the need.
+                .scratch = try running.core.workspace.take(u8, try wim_seam.parseScratchLen(if (parts.len == 0) one[0..] else parts)),
             };
         }
 
@@ -1165,3 +1176,18 @@ pub const rar = struct {
         }
     };
 };
+
+test "age work factor selector past the scrypt ceiling refuses before the carve" {
+    const discovery = @import("../../kernel/discovery.zig");
+    const parameter = comptime discovery.parameter("age", "work_factor");
+    var node = abi.Node.init();
+    node.id = vocabulary.ids.parameter;
+    node.value_high = (@as(u64, parameter.family) << 48) | (@as(u64, parameter.ordinal) << 16);
+    // Sixty-four and above would shift the scratch peak past the u6 width;
+    // the ceiling refuses before the carve instead.
+    node.value_low = 64;
+    try std.testing.expectError(error.UnsupportedException, age.parseOptions(null, &node));
+    node.value_low = age_seam.scrypt_work_factor_max;
+    const selected = try age.parseOptions(null, &node);
+    try std.testing.expectEqual(age_seam.scrypt_work_factor_max, selected.work_factor);
+}

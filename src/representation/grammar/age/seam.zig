@@ -10,6 +10,8 @@ pub const EntryInfo = onprem.EntryInfo;
 pub const Exception = onprem.Exception;
 pub const Options = onprem.Options;
 pub const scratch_size = onprem.scratch_size;
+// The scrypt peak a caller must budget; sizing scratch before the seam can refuse needs the ceiling.
+pub const scrypt_work_factor_max = onprem.scrypt_work_factor_max;
 
 pub const default_provider: Provider = seam.defaultProvider(impl);
 pub fn inspectCount(provider: Provider, archive: []const u8, scratch: []u8) Exception!u64 {

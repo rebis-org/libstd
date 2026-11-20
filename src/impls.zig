@@ -49,6 +49,7 @@ test {
     _ = @import("compose/machines.zig");
     _ = @import("compose/threaded.zig");
     _ = @import("compose/archive/window.zig");
+    _ = @import("compose/archive/formats.zig");
     _ = @import("compose/call.zig");
     _ = @import("kernel/root.zig");
     _ = @import("kernel/envelope.zig");

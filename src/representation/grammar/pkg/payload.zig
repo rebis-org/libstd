@@ -258,7 +258,9 @@ const XzState = struct {
         const header_start = self.pos;
         if (self.pos >= self.input.len) return error.DataException;
         const size_byte = self.input[self.pos];
-        const header_size = (@as(usize, size_byte & 0x3F) + 1) * 4;
+        // All eight bits carry the size; masking would misparse headers the
+        // spec permits up to 1024 bytes.
+        const header_size = (@as(usize, size_byte) + 1) * 4;
         if (header_size < 8) return error.DataException;
         const header_end = try bounds.addUsize(header_start, header_size);
         if (header_end > self.input.len) return error.DataException;
@@ -709,4 +711,33 @@ pub fn Payload(comptime Located: type) type {
             return self.state().decoded_bytes;
         }
     };
+}
+
+test "xz block header size byte uses all eight bits" {
+    // A header padded past 256 bytes sets the size byte's high pair;
+    // masking would misread it and fail the CRC.
+    const allocator = std.testing.allocator;
+    const header_size = 264;
+    var stream: [xz.stream_header_size + header_size]u8 = undefined;
+    @memset(&stream, 0);
+    @memcpy(stream[0..xz.header_magic.len], &xz.header_magic);
+    var crc = checksum.Crc32.bind(checksum.default_provider, {});
+    crc.update(stream[6..8]);
+    std.mem.writeInt(u32, stream[8..12], crc.final({}), .little);
+    const block_at = xz.stream_header_size;
+    stream[block_at] = @intCast((header_size / 4) - 1);
+    stream[block_at + 1] = 0x00;
+    stream[block_at + 2] = filter_id_lzma2;
+    stream[block_at + 3] = 1;
+    stream[block_at + 4] = 0x16;
+    crc = checksum.Crc32.bind(checksum.default_provider, {});
+    crc.update(stream[block_at .. block_at + header_size - 4]);
+    std.mem.writeInt(u32, stream[block_at + header_size - 4 ..][0..4], crc.final({}), .little);
+
+    const segment = try allocator.alloc(u8, segmentSize());
+    defer allocator.free(segment);
+    var state = try State.init(&stream, segment);
+    try state.leg.xz.startBlock();
+    try std.testing.expectEqual(header_size, state.leg.xz.header_size);
+    try std.testing.expectEqual(@as(u32, 8 << 20), state.leg.xz.dict_size);
 }

@@ -426,7 +426,9 @@ fn decodeBlock(cursor: *binary.ReadCursor, sink: *Sink, scratch: []u8, check: Ch
 fn decodeBlockHeader(cursor: *binary.ReadCursor, provider: checksum.Provider) Exception!BlockInfo {
     const header_start = cursor.pos;
     const size_byte = try cursor.readU8();
-    const header_size = (@as(usize, size_byte & 0x3F) + 1) * 4;
+    // All eight bits carry the size; masking would misparse headers the
+    // spec permits up to 1024 bytes.
+    const header_size = (@as(usize, size_byte) + 1) * 4;
     if (header_size < 8) return error.DataException;
     // The CRC covers the size byte, so a rewritten header size fails verification.
     const header_end = try bounds.addUsize(header_start, header_size);
@@ -1414,4 +1416,44 @@ test "xz blocks decode across lanes byte for byte" {
     try std.testing.expectEqual(input.len, total);
     try std.testing.expectEqualSlices(u8, input, lanes_out);
     try std.testing.expectEqualSlices(u8, serial[0..serial_written], lanes_out);
+}
+
+test "block header size byte uses all eight bits" {
+    // A header padded past 256 bytes sets the size byte's high pair;
+    // masking would misread it and fail the CRC.
+    const header_size = 264;
+    var header: [header_size]u8 = undefined;
+    @memset(&header, 0);
+    header[0] = @intCast((header_size / 4) - 1);
+    header[1] = 0x00;
+    header[2] = 0x21;
+    header[3] = 1;
+    header[4] = 0x16;
+    var crc = checksum.Crc32.bind(checksum.default_provider, {});
+    crc.update(header[0 .. header_size - 4]);
+    std.mem.writeInt(u32, header[header_size - 4 ..][0..4], crc.final({}), .little);
+
+    var cursor = binary.ReadCursor.init(&header);
+    const info = try decodeBlockHeader(&cursor, checksum.default_provider);
+    try std.testing.expectEqual(header_size, info.header_size);
+    try std.testing.expectEqual(@as(usize, 1), info.filter_count);
+    try std.testing.expectEqual(@as(u8, 0x16), info.filters[0].lzma2);
+    try std.testing.expectEqual(cursor.buffer.len, cursor.pos);
+
+    // A size byte whose high pair falls outside the alphabet size byte's
+    // own value still parses to the declared length.
+    const small_size = 12;
+    var small: [small_size]u8 = undefined;
+    @memset(&small, 0);
+    small[0] = @intCast((small_size / 4) - 1);
+    small[1] = 0x00;
+    small[2] = 0x21;
+    small[3] = 1;
+    small[4] = 0x16;
+    crc = checksum.Crc32.bind(checksum.default_provider, {});
+    crc.update(small[0 .. small_size - 4]);
+    std.mem.writeInt(u32, small[small_size - 4 ..][0..4], crc.final({}), .little);
+    var small_cursor = binary.ReadCursor.init(&small);
+    const small_info = try decodeBlockHeader(&small_cursor, checksum.default_provider);
+    try std.testing.expectEqual(small_size, small_info.header_size);
 }

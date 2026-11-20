@@ -211,11 +211,15 @@ const Tree = struct {
         // Parents resolve first, so an entry naming a directory states the
         // directory, not a file.
         for (entries, 0..) |entry, index| {
+            // A terminator would truncate the name for any C-string consumer.
+            if (std.mem.findScalar(u8, entry.name, 0) != null) return error.CallException;
             self.entry_nodes[index] = try self.resolveParent(entry.name);
         }
         for (entries, 0..) |entry, index| {
             const parent = self.entry_nodes[index];
             const leaf = leafName(entry.name) orelse return error.CallException;
+            // Intermediates validated in resolveParent; the leaf needs its own check.
+            if (!isComponent(leaf)) return error.CallException;
             if (self.find(parent, leaf)) |existing| {
                 if (!self.nodes[existing].is_dir or entry.data.len != 0) return error.CallException;
                 self.entry_nodes[index] = existing;
@@ -582,8 +586,13 @@ pub fn writeScratchLen(entries: []const Entry) Exception!usize {
 }
 
 // Parse carves the table, one blob entry per row, and the metadata
-// image; the need grows with the blob count.
-pub fn parseScratchLen(archive: []const u8) Exception!usize {
+// image; the need grows with the blob count. A solid run decodes a
+// partial chunk hit through a temp buffer, so the largest solid chunk
+// rides above the fixed floor; the parts list lets a run in a split
+// set name the part that holds its header.
+pub fn parseScratchLen(parts: []const []const u8) Exception!usize {
+    if (parts.len == 0) return error.DataException;
+    const archive = parts[0];
     if (archive.len < header_disk_size) return error.DataException;
     const table_hdr = try readReshdr(archive, 48);
     const table_len = std.math.cast(usize, table_hdr.uncompressed_size) orelse return error.ResourceException;
@@ -592,16 +601,34 @@ pub fn parseScratchLen(archive: []const u8) Exception!usize {
     // Store-mode tables carry the image verbatim, so the scan reads its
     // true size; compressed tables keep the default.
     var md_size: u64 = archive.len;
+    var temp_need: u64 = 0;
     if (table_hdr.size_in_wim == table_hdr.uncompressed_size) {
         const table = try bounds.slice(archive, table_hdr.offset, table_len);
+        // Parse clears the solid flag unless the header states the solid
+        // version, so only that version can raise the temp need.
+        const solid_wim = std.mem.readInt(u32, archive[12..16], .little) == wim_version_solid;
         var at: usize = 0;
         while (at + blob_disk_size <= table.len) : (at += blob_disk_size) {
             const disk = try readBlobEntry(table, at);
             if (disk.res.flags & reshdr_flag_metadata != 0) md_size = disk.res.uncompressed_size;
+            if (solid_wim and disk.res.flags & reshdr_flag_solid != 0 and disk.res.uncompressed_size == solid_resource_magic) {
+                const sr = try loadSolidRes(.{ .slices = parts }, disk.part, disk.res);
+                temp_need = @max(temp_need, @min(sr.chunk_size, sr.uncompressed_size));
+            }
         }
+    } else if (std.mem.readInt(u32, archive[12..16], .little) == wim_version_solid) {
+        // A compressed table hides the rows; every chunk the parse will
+        // accept stays under the header codec's cap.
+        temp_need = switch (try headerCodec(archive)) {
+            .xpress => xpress_chunk_max,
+            .lzx => lzx_chunk_max,
+            .lzms => lzms_chunk_max,
+            .store, .unsupported => 0,
+        };
     }
     need = try bounds.addU64(need, md_size);
     need = try bounds.addU64(need, scratch_size);
+    need = try bounds.addU64(need, temp_need);
     return std.math.cast(usize, need) orelse return error.ResourceException;
 }
 
@@ -613,7 +640,8 @@ pub fn splitScratchLen(archive: []const u8) Exception!usize {
     const table_len = std.math.cast(usize, table_hdr.uncompressed_size) orelse return error.ResourceException;
     const span_room = @max(table_len / blob_disk_size, 2);
     const span_bytes = std.math.mul(usize, span_room, @sizeOf(SplitSpan)) catch return error.ResourceException;
-    const parse_need = try parseScratchLen(archive);
+    const one = [_][]const u8{archive};
+    const parse_need = try parseScratchLen(&one);
     return span_bytes + @alignOf(SplitSpan) - 1 + parse_need;
 }
 
@@ -1252,6 +1280,9 @@ fn walk(metadata: []const u8, ctx: anytype, comptime visit: anytype) Exception!v
         if (name_nbytes != 0) {
             if (pos + dentry_disk_size + name_nbytes > metadata.len) return error.DataException;
             name = try utf16NameInto(&name_buf, metadata[pos + dentry_disk_size ..][0..name_nbytes]);
+            // Hosts join dentry names into extraction paths: a dot segment
+            // or embedded terminator escapes the destination directory.
+            if (!isComponent(name) or std.mem.findScalar(u8, name, 0) != null) return error.DataException;
         }
         var hash: [sha1_len]u8 = undefined;
         @memcpy(&hash, metadata[pos + 64 ..][0..sha1_len]);
@@ -1426,6 +1457,60 @@ test "wim store roundtrips flat files" {
     var out: [16]u8 = undefined;
     const n = try decodeOrdinal(archive[0..written], 1, &out, &scratch);
     try testing.expectEqualSlices(u8, "payload", out[0..n]);
+}
+
+test "wim write rejects dot and empty leaf components" {
+    const testing = std.testing;
+    // The leaf validated here is the component resolveParent never sees.
+    for ([_][]const u8{ "dir/.", "dir/..", "dir//", ".", ".." }) |name| {
+        const entries = [_]Entry{.{ .name = name, .data = "x" }};
+        var scratch: [8192]u8 = undefined;
+        // The sizing path is name-shape-blind; the tree build owns the refusal.
+        try testing.expectError(error.CallException, archiveSize(&entries, &scratch));
+    }
+    // A terminator would truncate the name for C-string consumers.
+    const entries = [_]Entry{.{ .name = "a\x00b/c.txt", .data = "x" }};
+    var archive: [8192]u8 = undefined;
+    var scratch: [8192]u8 = undefined;
+    try testing.expectError(error.CallException, encode(&entries, &archive, &scratch));
+}
+
+test "wim read walk rejects dot segments and terminators in dentry names" {
+    const testing = std.testing;
+    // Security block (8), root dentry (102 aligned to 104), one child, one
+    // zeroed list terminator.
+    var metadata: [232]u8 = @splat(0);
+    std.mem.writeInt(u32, metadata[0..4], security_len, .little);
+    const root_at = security_len;
+    const child_at: u64 = root_at + 104;
+    std.mem.writeInt(u64, metadata[root_at..][0..8], 102, .little);
+    std.mem.writeInt(u64, metadata[root_at + 16 ..][0..8], child_at, .little);
+    std.mem.writeInt(u16, metadata[root_at + 96 ..][0..2], 0, .little);
+    std.mem.writeInt(u16, metadata[root_at + 100 ..][0..2], 0, .little);
+    // Child: ".." in UTF-16LE, one stream slot, no children.
+    const name_units: usize = 2;
+    std.mem.writeInt(u64, metadata[@intCast(child_at)..][0..8], @intCast(102 + name_units * 2 + 2), .little);
+    std.mem.writeInt(u16, metadata[@intCast(child_at + 96)..][0..2], 0, .little);
+    std.mem.writeInt(u16, metadata[@intCast(child_at + 100)..][0..2], @intCast(name_units * 2), .little);
+    metadata[@intCast(child_at + 102)] = '.';
+    metadata[@intCast(child_at + 103)] = 0;
+    metadata[@intCast(child_at + 104)] = '.';
+    metadata[@intCast(child_at + 105)] = 0;
+
+    const Ctx = struct {
+        seen: usize = 0,
+        fn visit(c: *@This(), _: []const u8, _: *const [sha1_len]u8) Exception!void {
+            c.seen += 1;
+        }
+    };
+    var ctx: Ctx = .{};
+    try testing.expectError(error.DataException, walk(&metadata, &ctx, Ctx.visit));
+
+    // A well-formed component name walks through to the visitor.
+    metadata[@intCast(child_at + 102)] = 'o';
+    metadata[@intCast(child_at + 104)] = 'k';
+    try walk(&metadata, &ctx, Ctx.visit);
+    try testing.expectEqual(@as(usize, 1), ctx.seen);
 }
 
 test "wim header part and image count offsets" {
@@ -1720,6 +1805,38 @@ test "wim vendor solid and chunked fixtures" {
         try testing.expectEqual(@as(usize, 5), try decodeOrdinal(archive, 1, &small, &scratch));
         try testing.expectEqualSlices(u8, "hello", small[0..5]);
     }
+}
+
+test "wim solid parse sizing covers the largest solid chunk" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    // A 128 KiB solid chunk over a 150 KiB member: the second chunk is a
+    // partial hit, so the read decodes it through the temp buffer.
+    var payload: [150 * 1024]u8 = undefined;
+    for (&payload, 0..) |*b, i| b.* = @truncate(i * 11 + 5);
+    const entries = [_]Entry{
+        .{ .name = "big.bin", .data = &payload },
+        .{ .name = "tail.bin", .data = "tail payload" },
+    };
+    const options: EncodeOptions = .{ .compression = .lzms, .solid = true, .chunk_size = 128 * 1024 };
+    const write_scratch = try allocator.alloc(u8, try encodeWorkspaceSize(&entries, options));
+    defer allocator.free(write_scratch);
+    var archive: [1 << 20]u8 = undefined;
+    const written = try encodeEx(&entries, &archive, write_scratch, options);
+    const one = [_][]const u8{archive[0..written]};
+    const bound = try parseScratchLen(&one);
+    // The solid chunk rides above the fixed read scratch floor.
+    try testing.expect(bound > scratch_size + 128 * 1024);
+    // The exactly-sized workspace reads every member back.
+    const scratch = try allocator.alloc(u8, bound);
+    defer allocator.free(scratch);
+    try testing.expectEqual(@as(u64, 2), try inspectCount(archive[0..written], scratch));
+    var out: [150 * 1024]u8 = undefined;
+    const n = try decodeOrdinal(archive[0..written], 0, &out, scratch);
+    try testing.expectEqualSlices(u8, &payload, out[0..n]);
+    var tail: [16]u8 = undefined;
+    const m = try decodeOrdinal(archive[0..written], 1, &tail, scratch);
+    try testing.expectEqualSlices(u8, "tail payload", tail[0..m]);
 }
 
 // Compressed write side: the same emitter, fed by the XPRESS/LZX/LZMS encoders.
@@ -2027,7 +2144,11 @@ fn splitCore(archive: []const u8, volume_size: u64, output: ?[]u8, lengths: ?[]u
     if (std.mem.readInt(u32, archive[12..16], .little) == wim_version_solid) return error.UnsupportedException;
     if (std.mem.readInt(u32, archive[44..48], .little) != 1) return error.UnsupportedException;
     if (std.mem.readInt(u16, archive[42..44], .little) != 1) return error.UnsupportedException;
-    const table_len = std.math.cast(usize, (try readReshdr(archive, 48)).uncompressed_size) orelse return error.ResourceException;
+    const table_hdr = try readReshdr(archive, 48);
+    // The split writes table entries raw; a compressed-table source would
+    // make part 1 claim compressed bytes it does not carry.
+    if (table_hdr.flags & reshdr_flag_compressed != 0) return error.UnsupportedException;
+    const table_len = std.math.cast(usize, table_hdr.uncompressed_size) orelse return error.ResourceException;
     const xml = try readReshdr(archive, 72);
     if (xml.flags & reshdr_flag_compressed != 0) return error.UnsupportedException;
     const xml_len = xml.size_in_wim;

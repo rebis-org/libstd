@@ -98,7 +98,15 @@ fn parseSections(archive: []const u8, arena: std.mem.Allocator) Exception!Sectio
     return out;
 }
 
-fn sectionPayload(archive: []const u8, at: u64, len: u64, compression: u16, arena: std.mem.Allocator, history: []u8) Exception![]const u8 {
+// The lz4 frame decoder stages every block and window in its own workspace;
+// the decode destination must never double as that scratch.
+fn lz4Scratch(arena: std.mem.Allocator, cache: *[]u8) Exception![]u8 {
+    if (cache.*.len != 0) return cache.*;
+    cache.* = arena.alloc(u8, lz4_leaf.decodeWorkspaceSize()) catch return error.ResourceException;
+    return cache.*;
+}
+
+fn sectionPayload(archive: []const u8, at: u64, len: u64, compression: u16, arena: std.mem.Allocator, history: []u8, lz4_cache: *[]u8) Exception![]const u8 {
     const raw = try bounds.slice(archive, at, len);
     if (compression == compression_none) return raw;
     // The 16x + 64 KiB cap is deliberate; sections past it are
@@ -114,7 +122,8 @@ fn sectionPayload(archive: []const u8, at: u64, len: u64, compression: u16, aren
             _ = zstd_leaf.decodeStream(&reader, &writer, history, .{ .window_size = zstd_window }) catch return error.DataException;
         },
         compression_lz4 => {
-            lz4_leaf.decodeToWriter(raw, &writer, out, .{}) catch return error.DataException;
+            const lz4_scratch = try lz4Scratch(arena, lz4_cache);
+            lz4_leaf.decodeToWriter(raw, &writer, lz4_scratch, .{}) catch return error.DataException;
         },
         else => return error.UnsupportedException,
     }
@@ -129,6 +138,7 @@ const BlockStore = struct {
     arena: std.mem.Allocator,
     block_size: u32,
     history: []u8 = &.{},
+    lz4_cache: *[]u8 = undefined,
     buf: ?[]u8 = null,
     cached_index: u32 = std.math.maxInt(u32),
     cached: []const u8 = &.{},
@@ -169,7 +179,8 @@ const BlockStore = struct {
                 };
             },
             compression_lz4 => {
-                lz4_leaf.decodeToWriter(raw, &writer, store.buf.?, .{}) catch {
+                const lz4_scratch = try lz4Scratch(store.arena, store.lz4_cache);
+                lz4_leaf.decodeToWriter(raw, &writer, lz4_scratch, .{}) catch {
                     if (writer.end != buf.len) return error.DataException;
                 };
             },
@@ -651,11 +662,13 @@ fn runTarget(archive: []const u8, scratch: []u8, target: Target) Exception!u64 {
     const arena = fba.allocator();
     // One zstd history buffer serves every sequential stream decode
     // (schema, metadata, blocks); peak scratch stays at one window.
+    // The lz4 workspace rides the same arena but only the lz4 arms allocate it.
+    var lz4_cache: []u8 = &.{};
     const history = arena.alloc(u8, zstd_history) catch return error.ResourceException;
     const sections = try parseSections(archive, arena);
-    const schema_raw = try sectionPayload(archive, sections.schema_at, sections.schema_len, sections.schema_compression, arena, history);
+    const schema_raw = try sectionPayload(archive, sections.schema_at, sections.schema_len, sections.schema_compression, arena, history, &lz4_cache);
     const schema = try parseSchema(schema_raw, arena);
-    const meta_raw = try sectionPayload(archive, sections.metadata_at, sections.metadata_len, sections.metadata_compression, arena, history);
+    const meta_raw = try sectionPayload(archive, sections.metadata_at, sections.metadata_len, sections.metadata_compression, arena, history, &lz4_cache);
     const md = try decodeMetadata(meta_raw, schema, arena);
     if (md.block_size == 0 or md.names_index.len == 0) return error.DataException;
     // Vendor requires a power-of-two block size.
@@ -668,7 +681,7 @@ fn runTarget(archive: []const u8, scratch: []u8, target: Target) Exception!u64 {
         if (@as(u64, chunk.offset) + chunk.size > md.block_size) return error.DataException;
     }
     if (md.directories.len < 2) return error.DataException;
-    var store = BlockStore{ .archive = archive, .refs = sections.blocks, .chunks = md.chunks, .arena = arena, .block_size = md.block_size, .history = history };
+    var store = BlockStore{ .archive = archive, .refs = sections.blocks, .chunks = md.chunks, .arena = arena, .block_size = md.block_size, .history = history, .lz4_cache = &lz4_cache };
     const dir_count = md.directories.len - 1;
     const file_off: u32 = std.math.cast(u32, dir_count) orelse return error.DataException;
     var state = WalkState{ .path = usable[0..path_size] };
@@ -1353,6 +1366,34 @@ test "dwarfs reads a mkdwarfs image" {
     try testing.expectEqualSlices(u8, "ABCABCABCABC", out[0..n]);
     const n1 = try decodeOrdinal(&mkdwarfs_fixture, 1, &out, &scratch);
     try testing.expectEqualSlices(u8, "hello dwarfs\n", out[0..n1]);
+}
+
+test "lz4 section decode keeps its destination and staging apart" {
+    // A compressed section smaller than the lz4 workspace must still decode:
+    // the destination buffer never doubles as the codec's staging, so the
+    // decoded stream and the arena stay intact.
+    const testing = std.testing;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var payload: [4096]u8 = undefined;
+    for (&payload, 0..) |*byte, i| byte.* = @truncate(i % 251);
+    // A tiled span gives the encoder real matches.
+    @memcpy(payload[1024..2048], payload[0..1024]);
+
+    const frame = try testing.allocator.alloc(u8, lz4_leaf.encodedSizeBound(payload.len));
+    defer testing.allocator.free(frame);
+    const encode_scratch = try testing.allocator.alloc(u8, lz4_leaf.encodeWorkspaceSize());
+    defer testing.allocator.free(encode_scratch);
+    const frame_len = try lz4_leaf.encode(&payload, frame, encode_scratch, .{});
+
+    var lz4_cache: []u8 = &.{};
+    const decoded = try sectionPayload(frame[0..frame_len], 0, frame_len, compression_lz4, arena.allocator(), &.{}, &lz4_cache);
+    try testing.expectEqual(payload.len, decoded.len);
+    try testing.expectEqualSlices(u8, &payload, decoded);
+    // The same arena serves a second section; the cache answers without reallocating.
+    const again = try sectionPayload(frame[0..frame_len], 0, frame_len, compression_lz4, arena.allocator(), &.{}, &lz4_cache);
+    try testing.expectEqualSlices(u8, &payload, again);
 }
 
 test "dwarfs write roundtrips and mirrors the fixture shape" {

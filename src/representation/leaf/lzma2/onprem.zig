@@ -384,11 +384,13 @@ fn encodeStreamInner(input: []const u8, writer: *std.Io.Writer, scratch: []u8, o
 }
 
 fn writeCopyChunk(writer: *std.Io.Writer, chunk: []const u8, reset_dictionary: bool) Exception!void {
-    const control: u8 = if (reset_dictionary) control_copy_reset_dict else control_copy;
     var copy_offset: usize = 0;
     while (copy_offset < chunk.len) {
         const batch_len = @min(chunk.len - copy_offset, max_pack_size);
         const raw_size = batch_len - 1;
+        // A later reset would wipe the decoder dictionary the encoder still
+        // references; only the first batch resets.
+        const control: u8 = if (reset_dictionary and copy_offset == 0) control_copy_reset_dict else control_copy;
         try io.writeByte(writer, control);
         try io.writeByte(writer, @intCast((raw_size >> 8) & 0xFF));
         try io.writeByte(writer, @intCast(raw_size & 0xFF));
@@ -557,6 +559,38 @@ test "lzma2 chunk rejects a non-finished range coder at its size boundary" {
     var output: [256]u8 = undefined;
     @memset(&output, 0xA5);
     try std.testing.expectError(error.DataException, decode(stream_buffer[0..stream.end], &output, decode_scratch, options));
+}
+
+test "lzma2 copy chunk reset stamps only the first batch" {
+    const alloc = std.testing.allocator;
+    const dictionary: u32 = 1 << 20;
+    const options: Options = .{ .dictionary_size = dictionary, .properties = defaultProperties(dictionary) };
+
+    // Three batches: two full 64 KiB runs plus a three-byte tail.
+    const chunk_len = 2 * max_pack_size + 3;
+    const chunk = try alloc.alloc(u8, chunk_len);
+    defer alloc.free(chunk);
+    for (chunk, 0..) |*byte, index| byte.* = @truncate(index);
+
+    const wire = try alloc.alloc(u8, encodedSizeBound(chunk_len) + 32);
+    defer alloc.free(wire);
+    var sink = std.Io.Writer.fixed(wire);
+    try writeCopyChunk(&sink, chunk, true);
+    try io.writeByte(&sink, control_end);
+
+    // The first batch carries the reset; a later one would wipe decoder
+    // history the encoder still references.
+    try std.testing.expectEqual(control_copy_reset_dict, wire[0]);
+    try std.testing.expectEqual(control_copy, wire[max_pack_size + 3]);
+    try std.testing.expectEqual(control_copy, wire[2 * (max_pack_size + 3)]);
+
+    const decode_scratch = try alloc.alloc(u8, decodeWorkspaceSize(dictionary));
+    defer alloc.free(decode_scratch);
+    const output = try alloc.alloc(u8, chunk_len);
+    defer alloc.free(output);
+    const produced = try decode(wire[0..sink.end], output, decode_scratch, options);
+    try std.testing.expectEqual(chunk_len, produced);
+    try std.testing.expectEqualSlices(u8, chunk, output);
 }
 
 test "lzma2 decodes only produced bytes into the sink" {
