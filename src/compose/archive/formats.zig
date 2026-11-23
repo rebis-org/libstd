@@ -695,13 +695,37 @@ pub const zip = struct {
     pub const credential_component = "zip";
 
     pub fn fill(entry: *Entry, node: *Node, running: *Run) Exception!void {
+        const name = try request.bytes(node.child, "entry_name");
+        const directory = zip_archive.isDirectoryName(name);
+        // The mode word carries permission bits alone; the file type and
+        // the MS-DOS marker derive from the entry's shape.
+        const permissions: u32 = if (request.find(node.child, "entry_mode")) |field|
+            try request.narrow(u32, field.value_low)
+        else if (directory)
+            0o755
+        else
+            0o644;
+        // A directory has no payload to compress, so it stores.
+        const method: u16 = if (directory)
+            0
+        else if (request.find(node.child, "entry_method")) |field|
+            try request.narrow(u16, field.value_low)
+        else
+            8;
+        const stamp = zip_archive.dosStamp(request.scalar(node.child, "entry_mtime"));
         entry.* = .{
-            .name = try request.bytes(node.child, "entry_name"),
+            .name = name,
             .data = try request.bytes(node.child, "entry_data"),
-            .method = if (request.find(node.child, "entry_method")) |field| try request.narrow(u16, field.value_low) else 8,
+            .method = method,
+            .dos_time = stamp.time,
+            .dos_date = stamp.date,
+            .external_attributes = zip_archive.externalAttributes(permissions, directory),
         };
         // A nonzero value streams: zeroed local sizes and a trailing descriptor.
-        if (request.componentScalar(node.child, "zip", "data_descriptor") != 0) entry.flags |= 0x0008;
+        // A directory has no payload to stream, so its sizes stay stated.
+        if (request.componentScalar(node.child, "zip", "data_descriptor") != 0 and !directory) entry.flags |= 0x0008;
+        // A directory has no payload to hide, so it stays in the clear.
+        if (directory) return;
         const credentials = running.credentials orelse return;
         entry.encrypted = true;
         entry.password = credentials.password;

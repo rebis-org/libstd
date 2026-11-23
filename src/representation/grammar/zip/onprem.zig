@@ -72,6 +72,55 @@ pub const Entry = struct {
     password_lifetime: u64 = 0,
 };
 
+// The earliest instant a DOS timestamp can state: 1980-01-01T00:00:00Z.
+const dos_epoch_floor: u64 = 315_532_800;
+// The latest instant a DOS timestamp can state: 2107-12-31T23:59:58Z.
+const dos_epoch_ceiling: u64 = 4_354_819_198;
+
+pub const DosStamp = struct { time: u16, date: u16 };
+
+// A zero DOS date is month zero and day zero, which extractors refuse.
+// A pre-epoch timestamp takes the floor instead.
+pub fn dosStamp(unix_seconds: u64) DosStamp {
+    const seconds = if (unix_seconds < dos_epoch_floor) dos_epoch_floor else @min(unix_seconds, dos_epoch_ceiling);
+    const civil = civilFromDays(seconds / 86_400);
+    const clock = seconds % 86_400;
+    const year: u32 = @intCast(civil.year - 1980);
+    return .{
+        .time = @intCast(((clock / 3600) << 11) | (((clock % 3600) / 60) << 5) | ((clock % 60) / 2)),
+        .date = @intCast((year << 9) | (@as(u32, @intCast(civil.month)) << 5) | @as(u32, @intCast(civil.day))),
+    };
+}
+
+// A zero word states no permissions, and an extractor that honors it
+// writes a file the owner cannot read.
+pub fn externalAttributes(permissions: u32, directory: bool) u32 {
+    const kind: u32 = if (directory) 0o040000 else 0o100000;
+    const dos_directory: u32 = if (directory) 0x0010 else 0;
+    return ((kind | (permissions & 0o7777)) << 16) | dos_directory;
+}
+
+// The stored formats mark a directory by a trailing slash.
+pub fn isDirectoryName(name: []const u8) bool {
+    return name.len != 0 and name[name.len - 1] == '/';
+}
+
+const Civil = struct { year: u64, month: u64, day: u64 };
+
+// Days since 1970-01-01 to a proleptic Gregorian date (Hinnant's algorithm).
+fn civilFromDays(days: u64) Civil {
+    const shifted = days + 719_468;
+    const era = shifted / 146_097;
+    const day_of_era = shifted - era * 146_097;
+    const year_of_era = (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    const year = year_of_era + era * 400;
+    const day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    const month_index = (5 * day_of_year + 2) / 153;
+    const day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    const month = if (month_index < 10) month_index + 3 else month_index - 9;
+    return .{ .year = if (month <= 2) year + 1 else year, .month = month, .day = day };
+}
+
 // One predicate for the 76-byte zip64 trailer: the sizing query, the
 // single-volume emitter and the spanned layout must never disagree.
 fn zip64Needed(entry_count: usize, central_bytes: usize, local_bytes: usize) bool {
@@ -1830,4 +1879,25 @@ test "zip64 locator names the record offset and the single-volume reader resolve
     const directory = try zipDirectory(output[0..written]);
     try std.testing.expectEqual(entries.len, directory.count);
     try std.testing.expectEqual(@as(usize, 0), directory.base);
+}
+
+test "zip dos stamp states a calendar date for every input" {
+    // A zero date states month zero and day zero, which no extractor accepts.
+    try std.testing.expectEqual(DosStamp{ .time = 0, .date = 0x0021 }, dosStamp(0));
+    // 2026-11-23T12:00:00Z is year 46, month 11, day 23, noon.
+    try std.testing.expectEqual(DosStamp{ .time = 0x6000, .date = 0x5d77 }, dosStamp(1_795_435_200));
+    // A leap day survives the civil conversion.
+    try std.testing.expectEqual(DosStamp{ .time = 0xbf7d, .date = 0x585d }, dosStamp(1_709_251_198));
+    // A timestamp past 2107 clamps to the last instant the field states.
+    try std.testing.expectEqual(dosStamp(dos_epoch_ceiling), dosStamp(dos_epoch_ceiling + 86_400));
+}
+
+test "zip external attributes state the file type and the permissions" {
+    // A regular file with 0o644: type word 0o100644 in the high half.
+    try std.testing.expectEqual(@as(u32, 0x81a4_0000), externalAttributes(0o644, false));
+    // A directory with 0o755: type word 0o040755, plus the MS-DOS marker.
+    try std.testing.expectEqual(@as(u32, 0x41ed_0010), externalAttributes(0o755, true));
+    // The type bits never come from the caller, so the file type survives
+    // a zero word.
+    try std.testing.expectEqual(@as(u32, 0x8000_0000), externalAttributes(0, false));
 }
