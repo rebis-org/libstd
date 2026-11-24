@@ -288,7 +288,7 @@ fn packEntry(entry: Entry, provider: crypto.Provider, workspace: *Workspace, lim
     const password_utf16 = try passwordToUtf16(entry.password, workspace);
     const cycles = if (entry.num_cycles_power == 0) crypto.seven_zip_default_cycles else entry.num_cycles_power;
     var key: [crypto.seven_zip_key_length]u8 = undefined;
-    crypto.sevenZipKdf(provider, password_utf16, entry.salt[0..entry.salt_length], cycles, &key);
+    try crypto.sevenZipKdf(provider, password_utf16, entry.salt[0..entry.salt_length], cycles, &key);
     const padded_size = std.mem.alignForward(usize, compressed_entry.data.len, crypto.block_length);
     if (entry.password_lifetime != 0 and padded_size > entry.password_lifetime) {
         failure_cause.* = .password_lifetime;
@@ -448,7 +448,7 @@ fn encryptHeaderBytes(cleartext: []const u8, workspace: *Workspace, provider: cr
     }
     const password_utf16 = try passwordToUtf16(header_options.password, workspace);
     var key: [crypto.seven_zip_key_length]u8 = undefined;
-    crypto.sevenZipKdf(provider, password_utf16, &.{}, cycles, &key);
+    try crypto.sevenZipKdf(provider, password_utf16, &.{}, cycles, &key);
     const padded_size = std.mem.alignForward(usize, cleartext.len, crypto.block_length);
     if (header_options.password_lifetime != 0 and padded_size > header_options.password_lifetime) {
         if (header_options.failure_cause) |cause| cause.* = .password_lifetime;
@@ -1102,7 +1102,7 @@ fn aesDecryptStream(encrypted: bool, num_cycles: u8, salt: []const u8, iv: [16]u
         @memcpy(key_material[salt.len..][0..password_utf16.len], password_utf16);
         @memcpy(&key, key_material[0..32]);
     } else {
-        crypto.sevenZipKdf(options.provider, password_utf16, salt, num_cycles, &key);
+        try crypto.sevenZipKdf(options.provider, password_utf16, salt, num_cycles, &key);
     }
     const decrypted = try workspace.take(u8, packed_data.len);
     try crypto.aesCbcDecrypt(options.provider, &key, iv, decrypted, packed_data);

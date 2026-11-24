@@ -16,9 +16,6 @@ pub const supported = switch (builtin.os.tag) {
     else => true,
 };
 
-// A wave that did not finish is an internal fault; no unit result is sound.
-const unscheduled: u32 = 1;
-
 // The caller owns this executor; one instance serves one lane driver,
 // because a Group is not threadsafe.
 pub const Threaded = struct {
@@ -75,7 +72,10 @@ pub const Threaded = struct {
 
     fn waitAll(ptr: *anyopaque) callconv(.c) u32 {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        self.group.await(self.io_instance.io()) catch return unscheduled;
+        // A wave that did not finish is an internal fault; no unit result is
+        // sound, so the failure verdict names it instead of aliasing a
+        // caller-error status value.
+        self.group.await(self.io_instance.io()) catch return status.internal_failure;
         return status.ok;
     }
 };

@@ -369,7 +369,9 @@ test "tar encode sessions frame headers data and pax spill like the slice oracle
     defer allocator.free(pax_produced);
     var pax_in: usize = 0;
     var pax_out_pos: usize = 0;
-    while (true) {
+    var pax_guard: usize = 0;
+    while (true) : (pax_guard += 1) {
+        try testing.expect(pax_guard < 4_000_000);
         const take = @min(97, pax_logical.len - pax_in);
         const result = tar_driver.tarEncodeStep(pax_state, pax_logical[pax_in..][0..take], pax_out, pax_in + take == pax_logical.len);
         try testing.expect(result.status != .failed);

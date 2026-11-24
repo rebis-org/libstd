@@ -34,7 +34,7 @@ pub fn orderTree(comptime Node: type, nodes: *std.ArrayList(Node), kids: []const
 fn visit(comptime Node: type, nodes: *std.ArrayList(Node), kids: []const u32, dir: u32, trunk: *std.ArrayList(u32), alloc: std.mem.Allocator) Exception!Frame {
     trunk.append(alloc, dir) catch return error.ResourceException;
     const start = nodes.items[dir].first_child;
-    const end = start + nodes.items[dir].child_count;
+    const end = std.math.add(u32, start, nodes.items[dir].child_count) catch return error.ResourceException;
     if (@hasField(Node, "subdir_count")) {
         var subdirs: u32 = 0;
         for (kids[start..end]) |child| {

@@ -113,13 +113,14 @@ fn rangeDecode(prob: *u16, range: *u32, code: *u32, stream: []const u8, pos: *us
 
 pub const EncodedSizes = struct { main: usize, call: usize, jump: usize, rc: usize };
 
-// Main, call, and jump never exceed the input; each rc bit at worst halves the range, a byte eight bits.
+// Main, call, and jump never exceed the input; every byte can need a
+// range-coded conversion bit, so rc grows with the input itself.
 pub fn encodeSizesBound(input_len: usize) EncodedSizes {
     return .{
         .main = input_len,
         .call = input_len,
         .jump = input_len,
-        .rc = input_len / 4 + 64,
+        .rc = input_len + 64,
     };
 }
 

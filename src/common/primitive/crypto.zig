@@ -269,9 +269,8 @@ pub fn winzipDeriveKey(provider: Provider, password: []const u8, salt: []const u
     return;
 }
 
-fn sevenZipKdfWith(comptime Sha: type, password_utf16: []const u8, salt: []const u8, num_cycles_power: u8, out_key: *[seven_zip_key_length]u8) void {
-    // The 7z writer format caps this at 24; beyond 63 the shift is undefined.
-    std.debug.assert(num_cycles_power <= seven_zip_cycles_max);
+fn sevenZipKdfWith(comptime Sha: type, password_utf16: []const u8, salt: []const u8, num_cycles_power: u8, out_key: *[seven_zip_key_length]u8) Exception!void {
+    if (num_cycles_power > seven_zip_cycles_max) return error.CallException;
     var sha = Sha.init(.{});
     const rounds: u64 = @as(u64, 1) << @intCast(num_cycles_power);
     var counter: [8]u8 = @splat(0);
@@ -285,7 +284,7 @@ fn sevenZipKdfWith(comptime Sha: type, password_utf16: []const u8, salt: []const
     out_key.* = sha.finalResult();
 }
 
-pub fn sevenZipKdf(provider: Provider, password_utf16: []const u8, salt: []const u8, num_cycles_power: u8, out_key: *[seven_zip_key_length]u8) void {
+pub fn sevenZipKdf(provider: Provider, password_utf16: []const u8, salt: []const u8, num_cycles_power: u8, out_key: *[seven_zip_key_length]u8) Exception!void {
     return forBothArms(options.sha256_impl, provider, sevenZipKdfWith, sha256_seam.Sha256, sha256_seam.Onprem, sha256_seam.Offprem, .{ password_utf16, salt, num_cycles_power, out_key });
 }
 
@@ -734,14 +733,14 @@ test "seven zip kdf reproduces both vendor vectors" {
     var utf16_buf: [32]u16 = undefined;
     var key: [seven_zip_key_length]u8 = undefined;
     const pw_len = std.unicode.utf8ToUtf16Le(&utf16_buf, "password123") catch unreachable;
-    sevenZipKdf(default_provider, std.mem.sliceAsBytes(utf16_buf[0..pw_len]), &[_]u8{ 0xde, 0xad, 0xbe, 0xef }, 8, &key);
+    try sevenZipKdf(default_provider, std.mem.sliceAsBytes(utf16_buf[0..pw_len]), &[_]u8{ 0xde, 0xad, 0xbe, 0xef }, 8, &key);
     try std.testing.expectEqualSlices(u8, &[_]u8{
         0x32, 0xd1, 0x8a, 0x13, 0x38, 0xaa, 0x7e, 0x60, 0xaa, 0x32, 0x37, 0x66, 0xfc, 0xe9, 0x25,
         0x08, 0xda, 0xa2, 0xc5, 0x47, 0x28, 0xba, 0x3b, 0x45, 0x0c, 0xce, 0xb1, 0x93, 0x35, 0xd0,
         0xa9, 0x94,
     }, &key);
     // Zero cycles collapse the loop to one hash of salt, password, counter.
-    sevenZipKdf(default_provider, &.{}, &.{}, 0, &key);
+    try sevenZipKdf(default_provider, &.{}, &.{}, 0, &key);
     try std.testing.expectEqualSlices(u8, &[_]u8{
         0xaf, 0x55, 0x70, 0xf5, 0xa1, 0x81, 0x0b, 0x7a, 0xf7, 0x8c, 0xaf, 0x4b, 0xc7, 0x0a, 0x66,
         0x0f, 0x0d, 0xf5, 0x1e, 0x42, 0xba, 0xf9, 0x1d, 0x4d, 0xe5, 0xb2, 0x32, 0x8d, 0xe0, 0xe8,
@@ -1048,8 +1047,8 @@ test "mode glue agrees between providers when fully mergeable" {
     const pw_len = std.unicode.utf8ToUtf16Le(&utf16_buf, "password123") catch unreachable;
     var kdf_onprem: [seven_zip_key_length]u8 = undefined;
     var kdf_offprem: [seven_zip_key_length]u8 = undefined;
-    sevenZipKdf(.onprem, std.mem.sliceAsBytes(utf16_buf[0..pw_len]), &[_]u8{ 0xde, 0xad, 0xbe, 0xef }, 8, &kdf_onprem);
-    sevenZipKdf(.offprem, std.mem.sliceAsBytes(utf16_buf[0..pw_len]), &[_]u8{ 0xde, 0xad, 0xbe, 0xef }, 8, &kdf_offprem);
+    try sevenZipKdf(.onprem, std.mem.sliceAsBytes(utf16_buf[0..pw_len]), &[_]u8{ 0xde, 0xad, 0xbe, 0xef }, 8, &kdf_onprem);
+    try sevenZipKdf(.offprem, std.mem.sliceAsBytes(utf16_buf[0..pw_len]), &[_]u8{ 0xde, 0xad, 0xbe, 0xef }, 8, &kdf_offprem);
     try std.testing.expectEqualSlices(u8, &kdf_onprem, &kdf_offprem);
     var mac_onprem: [hmac_sha1_length]u8 = undefined;
     var mac_offprem: [hmac_sha1_length]u8 = undefined;

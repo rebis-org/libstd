@@ -205,6 +205,32 @@ pub fn frameContentSize(input: []const u8, max_window: u32) DecodeError!usize {
     return try scanContentSize(&source, max_window);
 }
 
+// The declared window of the first frame in a stream; skippable frames
+// step aside. Volume adapters probe with this to size one history buffer
+// per stream instead of carrying a fixed acceptance cap.
+pub fn frameWindowSize(input: []const u8, window_limit: u32) DecodeError!u32 {
+    var source = std.Io.Reader.fixed(input);
+    while (true) {
+        const magic = readU32Le(&source) catch |err| switch (err) {
+            error.EndOfStream => return error.DataException,
+            error.ReadFailed => return error.IoException,
+        };
+        if (magic == frame_magic) {
+            const header = try decodeFrameHeader(&source, window_limit);
+            return std.math.cast(u32, header.window_size) orelse return error.ResourceException;
+        }
+        if (magic >= skippable_magic_min and magic <= skippable_magic_max) {
+            const size = readU32Le(&source) catch |err| switch (err) {
+                error.EndOfStream => return error.DataException,
+                error.ReadFailed => return error.IoException,
+            };
+            try skipBytes(&source, size);
+            continue;
+        }
+        return error.DataException;
+    }
+}
+
 pub fn decodedSize(input: []const u8, history: []u8, options: Options) DecodeError!usize {
     var source = std.Io.Reader.fixed(input);
     var counter = tee.CountingTee(.{}).init(null);

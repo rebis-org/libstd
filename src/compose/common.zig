@@ -98,7 +98,7 @@ pub fn materializeSource(comptime sizing: SourceSizing, source: *Resource, works
                     while (true) {
                         const bytes_read = try source.read(&buffer);
                         if (bytes_read == 0) break;
-                        total += bytes_read;
+                        total = std.math.add(u64, total, bytes_read) catch return error.ResourceException;
                         if (total > limit) return error.ResourceException;
                     }
                     try source.rewind();
@@ -225,7 +225,7 @@ pub fn writeDownstreamDiagnostic(call: *Call, status: u32) void {
 pub fn validateBoundary(call: *Call, source_node: ?*Node, sink_node: ?*Node) Exception!void {
     if (call.workspace) |workspace| {
         const workspace_ptr = @intFromPtr(workspace);
-        const workspace_len = std.math.cast(usize, call.workspace_capacity) orelse return error.CallException;
+        const workspace_len = std.math.cast(usize, call.workspace_capacity) orelse return error.ResourceException;
         if (source_node) |node| {
             if ((node.flags & abi.node_flag_callback_resource) == 0 and node.byte_length != 0) {
                 const bytes = try resource.checkedConstBytes(node.bytes, node.byte_length);

@@ -36,9 +36,6 @@ const compression_lz4: u16 = 3;
 const section_header_size: usize = 64;
 const section_magic = "DWARFS";
 
-const zstd_window: u32 = 256 * 1024;
-const zstd_history: usize = zstd_window + zstd_leaf.block_size_max;
-
 const BlockRef = struct {
     at: u64,
     len: u64,
@@ -106,7 +103,23 @@ fn lz4Scratch(arena: std.mem.Allocator, cache: *[]u8) Exception![]u8 {
     return cache.*;
 }
 
-fn sectionPayload(archive: []const u8, at: u64, len: u64, compression: u16, arena: std.mem.Allocator, history: []u8, lz4_cache: *[]u8) Exception![]const u8 {
+// The zstd history follows the frame's declared window instead of a fixed
+// cap: mkdwarfs compresses sections with windows from 512 KiB upward, so
+// the probe sizes one shared, grow-on-demand cache across every stream.
+fn zstdHistory(arena: std.mem.Allocator, cache: *[]u8, raw: []const u8) Exception!struct { history: []u8, window: u32 } {
+    const window = zstd_leaf.frameWindowSize(raw, zstd_leaf.window_size_max) catch return error.DataException;
+    // A single-segment frame may declare less than the decoder's window
+    // floor; the decode limit clamps up so small sections stay accepted.
+    const clamped = @max(window, zstd_leaf.window_size_min);
+    const needed: usize = @as(usize, clamped) + zstd_leaf.block_size_max;
+    if (cache.*.len < needed) {
+        const grown: usize = if (cache.*.len == 0) needed else @max(needed, cache.*.len *| 2);
+        cache.* = arena.alloc(u8, grown) catch return error.ResourceException;
+    }
+    return .{ .history = cache.*[0..needed], .window = clamped };
+}
+
+fn sectionPayload(archive: []const u8, at: u64, len: u64, compression: u16, arena: std.mem.Allocator, zstd_cache: *[]u8, lz4_cache: *[]u8) Exception![]const u8 {
     const raw = try bounds.slice(archive, at, len);
     if (compression == compression_none) return raw;
     // The 16x + 64 KiB cap is deliberate; sections past it are
@@ -118,8 +131,9 @@ fn sectionPayload(archive: []const u8, at: u64, len: u64, compression: u16, aren
     var writer = std.Io.Writer.fixed(out);
     switch (compression) {
         compression_zstd => {
+            const probe = try zstdHistory(arena, zstd_cache, raw);
             var reader = std.Io.Reader.fixed(raw);
-            _ = zstd_leaf.decodeStream(&reader, &writer, history, .{ .window_size = zstd_window }) catch return error.DataException;
+            _ = zstd_leaf.decodeStream(&reader, &writer, probe.history, .{ .window_size = probe.window }) catch return error.DataException;
         },
         compression_lz4 => {
             const lz4_scratch = try lz4Scratch(arena, lz4_cache);
@@ -137,7 +151,7 @@ const BlockStore = struct {
     chunks: []const Chunk,
     arena: std.mem.Allocator,
     block_size: u32,
-    history: []u8 = &.{},
+    zstd_cache: *[]u8 = undefined,
     lz4_cache: *[]u8 = undefined,
     buf: ?[]u8 = null,
     cached_index: u32 = std.math.maxInt(u32),
@@ -171,8 +185,9 @@ const BlockStore = struct {
         var writer = std.Io.Writer.fixed(buf);
         switch (ref.compression) {
             compression_zstd => {
+                const probe = try zstdHistory(store.arena, store.zstd_cache, raw);
                 var reader = std.Io.Reader.fixed(raw);
-                _ = zstd_leaf.decodeStream(&reader, &writer, store.history, .{ .window_size = zstd_window }) catch {
+                _ = zstd_leaf.decodeStream(&reader, &writer, probe.history, .{ .window_size = probe.window }) catch {
                     // The buffer spans every chunk range, so a full writer
                     // means surplus output no chunk reaches.
                     if (writer.end != buf.len) return error.DataException;
@@ -195,9 +210,14 @@ const BlockStore = struct {
 // DwarFS thrift dialect: map size precedes the key/value type byte.
 // Booleans ride inline in field headers.
 const Compact = struct {
+    // Real schema nesting stays under half a dozen levels; the cap turns a
+    // crafted deep nesting into data rejection instead of stack exhaustion.
+    const max_nesting_depth: usize = 16;
+
     data: []const u8,
     pos: usize = 0,
     partial: u64 = 0,
+    depth: usize = 0,
 
     fn take(c: *Compact) Exception!u8 {
         if (c.pos >= c.data.len) return error.DataException;
@@ -211,7 +231,9 @@ const Compact = struct {
         var result: u64 = 0;
         while (true) {
             const b = try c.take();
-            if (shift > 63) return error.DataException;
+            // The tenth byte carries only bit 63; a larger low byte would be
+            // silently truncated by the shift, so reject it as data instead.
+            if (shift == 63 and (b & 0x7f) > 1) return error.DataException;
             result |= @as(u64, b & 0x7f) << shift;
             if (b & 0x80 == 0) return result;
             if (shift == 63) return error.DataException;
@@ -253,6 +275,9 @@ const Compact = struct {
                 return .{ .bytes = s };
             },
             9, 10 => {
+                if (c.depth >= max_nesting_depth) return error.DataException;
+                c.depth += 1;
+                defer c.depth -= 1;
                 const b = try c.take();
                 const n = try c.listSize(b >> 4);
                 if (b & 0x0f == 0 or b & 0x0f == 1 or b & 0x0f == 2) return error.UnsupportedException;
@@ -260,12 +285,20 @@ const Compact = struct {
                 return .{ .map = items.map };
             },
             11 => {
+                if (c.depth >= max_nesting_depth) return error.DataException;
+                c.depth += 1;
+                defer c.depth -= 1;
                 const n = try castUsize(try c.varint());
                 if (n == 0) return .{ .map = &.{} };
                 const b = try c.take();
                 return .{ .map = try c.mapEntries(arena, b >> 4, b & 0x0f, n) };
             },
-            12 => return .{ .structure = try c.structure(arena) },
+            12 => {
+                if (c.depth >= max_nesting_depth) return error.DataException;
+                c.depth += 1;
+                defer c.depth -= 1;
+                return .{ .structure = try c.structure(arena) };
+            },
             else => return error.UnsupportedException,
         }
     }
@@ -660,15 +693,15 @@ fn runTarget(archive: []const u8, scratch: []u8, target: Target) Exception!u64 {
     const frames = frame_fba.allocator().alloc(DwarfsFrame, max_dir_depth + 2) catch return error.ResourceException;
     var fba = std.heap.FixedBufferAllocator.init(usable[path_size..]);
     const arena = fba.allocator();
-    // One zstd history buffer serves every sequential stream decode
-    // (schema, metadata, blocks); peak scratch stays at one window.
-    // The lz4 workspace rides the same arena but only the lz4 arms allocate it.
+    // Codec caches ride the arena and only their compression arms allocate:
+    // the zstd history sizes itself from each stream's declared window, the
+    // lz4 workspace only when an lz4 section appears.
     var lz4_cache: []u8 = &.{};
-    const history = arena.alloc(u8, zstd_history) catch return error.ResourceException;
+    var zstd_cache: []u8 = &.{};
     const sections = try parseSections(archive, arena);
-    const schema_raw = try sectionPayload(archive, sections.schema_at, sections.schema_len, sections.schema_compression, arena, history, &lz4_cache);
+    const schema_raw = try sectionPayload(archive, sections.schema_at, sections.schema_len, sections.schema_compression, arena, &zstd_cache, &lz4_cache);
     const schema = try parseSchema(schema_raw, arena);
-    const meta_raw = try sectionPayload(archive, sections.metadata_at, sections.metadata_len, sections.metadata_compression, arena, history, &lz4_cache);
+    const meta_raw = try sectionPayload(archive, sections.metadata_at, sections.metadata_len, sections.metadata_compression, arena, &zstd_cache, &lz4_cache);
     const md = try decodeMetadata(meta_raw, schema, arena);
     if (md.block_size == 0 or md.names_index.len == 0) return error.DataException;
     // Vendor requires a power-of-two block size.
@@ -681,7 +714,7 @@ fn runTarget(archive: []const u8, scratch: []u8, target: Target) Exception!u64 {
         if (@as(u64, chunk.offset) + chunk.size > md.block_size) return error.DataException;
     }
     if (md.directories.len < 2) return error.DataException;
-    var store = BlockStore{ .archive = archive, .refs = sections.blocks, .chunks = md.chunks, .arena = arena, .block_size = md.block_size, .history = history, .lz4_cache = &lz4_cache };
+    var store = BlockStore{ .archive = archive, .refs = sections.blocks, .chunks = md.chunks, .arena = arena, .block_size = md.block_size, .zstd_cache = &zstd_cache, .lz4_cache = &lz4_cache };
     const dir_count = md.directories.len - 1;
     const file_off: u32 = std.math.cast(u32, dir_count) orelse return error.DataException;
     var state = WalkState{ .path = usable[0..path_size] };
@@ -1387,12 +1420,49 @@ test "lz4 section decode keeps its destination and staging apart" {
     defer testing.allocator.free(encode_scratch);
     const frame_len = try lz4_leaf.encode(&payload, frame, encode_scratch, .{});
 
+    var zstd_cache: []u8 = &.{};
     var lz4_cache: []u8 = &.{};
-    const decoded = try sectionPayload(frame[0..frame_len], 0, frame_len, compression_lz4, arena.allocator(), &.{}, &lz4_cache);
+    const decoded = try sectionPayload(frame[0..frame_len], 0, frame_len, compression_lz4, arena.allocator(), &zstd_cache, &lz4_cache);
     try testing.expectEqual(payload.len, decoded.len);
     try testing.expectEqualSlices(u8, &payload, decoded);
     // The same arena serves a second section; the cache answers without reallocating.
-    const again = try sectionPayload(frame[0..frame_len], 0, frame_len, compression_lz4, arena.allocator(), &.{}, &lz4_cache);
+    const again = try sectionPayload(frame[0..frame_len], 0, frame_len, compression_lz4, arena.allocator(), &zstd_cache, &lz4_cache);
+    try testing.expectEqualSlices(u8, &payload, again);
+}
+
+test "zstd section decode follows the frame's declared window" {
+    // mkdwarfs emits zstd frames with windows from 512 KiB upward; the
+    // decode limit and history must come from the frame header, not a
+    // fixed cap that rejects real images.
+    const testing = std.testing;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    // Content past the single-segment bound forces an explicit window
+    // descriptor, so the frame declares the full 1 MiB window.
+    var payload: [96 * 1024]u8 = undefined;
+    var rng: u64 = 0x9E3779B97F4A7C15;
+    for (&payload) |*byte| {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        byte.* = @truncate(rng >> 32);
+    }
+    const opts = zstd_leaf.Options{ .window_size = 1024 * 1024 };
+    const ws = try testing.allocator.alloc(u32, zstd_leaf.encoderWorkspaceU32Count(0, 1024 * 1024, opts));
+    defer testing.allocator.free(ws);
+    const frame = try testing.allocator.alloc(u8, zstd_leaf.encodedSizeBound(payload.len, opts));
+    defer testing.allocator.free(frame);
+    var writer = std.Io.Writer.fixed(frame);
+    const frame_len = try zstd_leaf.encodeFrame(&writer, &payload, ws, opts, 0);
+    try testing.expectEqual(@as(u32, 1024 * 1024), try zstd_leaf.frameWindowSize(frame[0..frame_len], zstd_leaf.window_size_max));
+
+    var zstd_cache: []u8 = &.{};
+    var lz4_cache: []u8 = &.{};
+    const decoded = try sectionPayload(frame[0..frame_len], 0, frame_len, compression_zstd, arena.allocator(), &zstd_cache, &lz4_cache);
+    try testing.expectEqualSlices(u8, &payload, decoded);
+    // The same cache serves a second section without reallocating.
+    const again = try sectionPayload(frame[0..frame_len], 0, frame_len, compression_zstd, arena.allocator(), &zstd_cache, &lz4_cache);
     try testing.expectEqualSlices(u8, &payload, again);
 }
 
@@ -1793,4 +1863,55 @@ test "dwarfs reader rejects a 65-deep directory chain" {
     var out: [16]u8 = undefined;
     try testing.expectError(error.DataException, inspectCount(image, &scratch));
     try testing.expectError(error.DataException, decodeOrdinal(image, 0, &out, &scratch));
+}
+
+// A schema nests structures one per level; the guard fires when a
+// structure at the cap reads one more nested-structure field header.
+test "dwarfs thrift structure rejects nesting past the cap" {
+    const testing = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A well-formed document one level past the cap: only the depth guard
+    // can reject it, never a short read.
+    var over: [37]u8 = undefined;
+    @memset(over[0..17], 0x1C);
+    over[17] = 0x13;
+    over[18] = 0x42;
+    @memset(over[19..], 0x00);
+    var capped = Compact{ .data = &over };
+    try testing.expectError(error.DataException, capped.value(arena, 12));
+
+    // One level under the cap parses: the root structure plus fifteen nested
+    // structures carry a scalar at the floor and one terminator per level.
+    var deep: [33]u8 = undefined;
+    @memset(deep[0..15], 0x1C);
+    deep[15] = 0x13;
+    deep[16] = 0x42;
+    @memset(deep[17..], 0x00);
+    var ok = Compact{ .data = &deep };
+    var v = try ok.value(arena, 12);
+    for (0..15) |_| {
+        try testing.expectEqual(@as(usize, 1), v.structure.len);
+        v = v.structure[0].val;
+    }
+    try testing.expectEqual(@as(usize, 1), v.structure.len);
+    try testing.expectEqual(@as(u64, 0x42), v.structure[0].val.int);
+}
+
+// The tenth varint byte carries only bit 63; a larger low byte used to be
+// silently truncated by the shift instead of rejected as data.
+test "dwarfs thrift varint rejects a truncated tenth byte" {
+    const testing = std.testing;
+
+    var good: [10]u8 = @splat(0xFF);
+    good[9] = 0x01;
+    var c = Compact{ .data = &good };
+    try testing.expectEqual(@as(u64, 0xFFFFFFFFFFFFFFFF), try c.varint());
+
+    var bad: [10]u8 = @splat(0xFF);
+    bad[9] = 0x02;
+    var d = Compact{ .data = &bad };
+    try testing.expectError(error.DataException, d.varint());
 }

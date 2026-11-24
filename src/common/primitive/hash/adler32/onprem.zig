@@ -23,6 +23,8 @@ const nmax: usize = 5552;
 pub const Adler32 = struct {
     const Self = @This();
     const base: u32 = 65521;
+    const digest_length: usize = 4;
+    const mac_length: usize = 0;
 
     adler: u32 = 1,
 

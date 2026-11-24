@@ -24,6 +24,9 @@ pub const XxHash64 = struct {
     const prime_4: u64 = 0x85EBCA77C2B2AE63;
     const prime_5: u64 = 0x27D4EB2F165667C5;
 
+    const digest_length: usize = 8;
+    const mac_length: usize = 0;
+
     pub fn init(seed: u64) Self {
         return .{
             .seed = seed,

@@ -61,7 +61,7 @@ fn validateNode(siblings: ?*abi.Node, traversal: *Traversal, depth: usize) Excep
                 else => return error.UnsupportedException,
             }
             try validateRepresentation(node, entry.representation, false);
-            if (entry.cardinality == .singleton and hasDuplicateSibling(siblings, node)) return error.CallException;
+            if (entry.cardinality == .singleton and hasDuplicateSibling(siblings, node, traversal.count)) return error.CallException;
             representation = entry.representation;
         }
         if (representation == .node_chain) {
@@ -128,9 +128,11 @@ fn validateParameter(node: *abi.Node, siblings: ?*abi.Node, traversal: *Traversa
     if (!isDirectionAccepted(vocabulary.directionOf(selector), traversal.direction)) return error.UnsupportedException;
     if (traversal.direction == .in and (selector.flags & traversal.command_mask) == 0) return error.UnsupportedException;
     try validateRepresentation(node, vocabulary.representationOf(selector), true);
-    if (vocabulary.cardinalityOf(selector) == .singleton and hasDuplicateSibling(siblings, node)) return error.CallException;
+    if (vocabulary.cardinalityOf(selector) == .singleton and hasDuplicateSibling(siblings, node, traversal.count)) return error.CallException;
 }
 
+// The sibling chain must be finite; every caller passes a graph that
+// validateGraph already accepted, so the scan terminates.
 fn findIf(siblings: ?*abi.Node, context: anytype, comptime matches: fn (*abi.Node, @TypeOf(context)) bool) ?*abi.Node {
     var cursor = siblings;
     while (cursor) |node| : (cursor = node.next) {
@@ -156,12 +158,18 @@ fn isSelectorMatch(node: *abi.Node, query: SelectorQuery) bool {
     return selector.family == query.family and selector.ordinal == query.ordinal;
 }
 
-fn hasDuplicateSibling(siblings: ?*abi.Node, target: *abi.Node) bool {
+// The scan is capped at the traversal count budget: the chain being walked is
+// the one validateNode is counting, so a well-formed scan never needs more.
+fn hasDuplicateSibling(siblings: ?*abi.Node, target: *abi.Node, budget: usize) bool {
     const wanted = siblingKey(target);
     var cursor = siblings;
-    while (cursor) |node| : (cursor = node.next) {
+    var remaining = budget;
+    while (cursor) |node| {
         if (node == target) return false;
         if (isDuplicateCandidate(node, wanted)) return true;
+        if (remaining == 0) return false;
+        remaining -= 1;
+        cursor = node.next;
     }
     return false;
 }

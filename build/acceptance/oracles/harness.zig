@@ -347,6 +347,9 @@ pub const Runner = struct {
 
 // A missing reference oracle leaves only the status assertion; say so where it happens so the report can count it.
 pub fn unverified(r: *Runner, reason: []const u8) void {
+    // The first recorded reason wins: a second call before the runner reads
+    // the record must not overwrite what the report counts.
+    if (r.unverified != null) return;
     const length = @min(reason.len, r.unverified_storage.len);
     @memcpy(r.unverified_storage[0..length], reason[0..length]);
     r.unverified = r.unverified_storage[0..length];

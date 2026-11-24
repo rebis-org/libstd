@@ -403,6 +403,9 @@ inline fn fold4(comptime T: type, comptime tables: *const [8][256]T, crc: T, chu
 fn TableCrc(comptime T: type, comptime poly: T, comptime reflected: bool) type {
     const bits = @bitSizeOf(T);
     return struct {
+        const digest_length: usize = @bitSizeOf(T) / 8;
+        const mac_length: usize = 0;
+
         state: T,
 
         pub fn init() @This() {
