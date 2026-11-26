@@ -81,7 +81,7 @@ pub fn decode(input: []const u8, output: *std.Io.Writer, history: []u8, provider
     source.streamExact(&trailer_sink, trailer_size) catch return error.DataException;
     if (source.seek != input.len) return error.DataException;
     const stored_adler32 = std.mem.readInt(u32, &trailer, .big);
-    if (stored_adler32 != tee_writer.adler32Value()) return error.IntegrityException;
+    if (stored_adler32 != try tee_writer.adler32Value()) return error.IntegrityException;
     return produced;
 }
 

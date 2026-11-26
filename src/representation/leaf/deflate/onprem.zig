@@ -417,6 +417,15 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
         fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
             const compressor: *@This() = @alignCast(@fieldParentPtr("writer", w));
             if (compressor.failed or compressor.finished) return error.WriteFailed;
+            // The vtable contract counts every slice plus the splatted tail;
+            // under-reporting makes callers resend already-consumed bytes.
+            if (data.len == 0) return 0;
+            var total: usize = 0;
+            for (data[0 .. data.len - 1]) |part| {
+                total = std.math.add(usize, total, part.len) catch return error.WriteFailed;
+            }
+            const tail = std.math.mul(usize, data[data.len - 1].len, splat) catch return error.WriteFailed;
+            total = std.math.add(usize, total, tail) catch return error.WriteFailed;
             errdefer compressor.writer = .failing;
             compressor.end = w.end;
             try compressor.tokenize(false);
@@ -424,7 +433,7 @@ pub fn CompressOf(comptime variant: enum { deflate, deflate64 }) type {
             const last = data[data.len - 1];
             for (0..splat) |_| try compressor.consume(last);
             w.end = compressor.end;
-            return std.math.mul(usize, last.len, splat) catch return error.WriteFailed;
+            return total;
         }
 
         fn flush(w: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -2020,4 +2029,44 @@ test "deflate optimal iterations improve or hold the parse cost" {
         var sink = std.Io.Writer.fixed(&sink_buf);
         try std.testing.expectError(error.CallException, Compress.init(&sink, &history, .{ .good = 8, .nice = 128, .lazy = 16, .chain = 8, .iterations = 3 }));
     }
+}
+
+test "deflate writer drain consumes and reports every slice" {
+    // Regression: drain once returned only the last slice's splatted
+    // length, so writeVec/writeSplat under-reported and multi-slice
+    // callers such as sendFileHeader duplicated already-consumed bytes.
+    var input: [80_000]u8 = undefined;
+    var rng: u64 = 0x9E3779B97F4A7C15;
+    for (&input) |*b| {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        b.* = @as(u8, @truncate(rng));
+    }
+
+    var history: [history_size]u8 = undefined;
+    var encoded: [encodedSizeBound(150_000) + 16]u8 = undefined;
+    var w = std.Io.Writer.fixed(&encoded);
+    var c = try Compress.init(&w, &history, .{ .good = 8, .nice = 128, .lazy = 16, .chain = 8 });
+
+    // Both calls exceed the 64 KiB writer buffer, so each takes the
+    // vtable drain with a multi-slice vector.
+    const n = try c.writer.writeVec(&.{ input[0..40_000], input[40_000..] });
+    try std.testing.expectEqual(@as(usize, 80_000), n);
+    const m = try c.writer.writeSplat(&.{ input[0..30_000], input[30_000..40_000] }, 4);
+    try std.testing.expectEqual(@as(usize, 70_000), m);
+    try c.finish();
+
+    var expected: [150_000]u8 = undefined;
+    @memcpy(expected[0..80_000], &input);
+    @memcpy(expected[80_000..110_000], input[0..30_000]);
+    for (0..4) |i| @memcpy(expected[110_000 + i * 10_000 ..][0..10_000], input[30_000..40_000]);
+
+    var decode_history: [history_size]u8 = undefined;
+    var source = std.Io.Reader.fixed(encoded[0..w.end]);
+    var decoded: [150_000]u8 = undefined;
+    var dest = std.Io.Writer.fixed(&decoded);
+    var inflater = Decompress.init(&source, &decode_history);
+    _ = inflater.reader.streamRemaining(&dest) catch return error.InflateStream;
+    try std.testing.expectEqualSlices(u8, &expected, &decoded);
 }

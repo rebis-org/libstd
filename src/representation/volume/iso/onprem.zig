@@ -353,6 +353,11 @@ pub fn archiveSize(entries: []const Entry) Exception!u64 {
 
 fn validateName(name: []const u8) Exception!void {
     if (name.len == 0 or name.len > 250) return error.CallException;
+    // The dot-dot and escape rules match every other writer; the semicolon
+    // rule is ISO's own version-separator ban.
+    if (bounds.isAbsoluteOrTraversal(name)) return error.CallException;
+    // Names stay C strings on the wire.
+    if (std.mem.findScalar(u8, name, 0) != null) return error.CallException;
     var it = std.mem.splitScalar(u8, name, '/');
     while (it.next()) |part| {
         if (part.len == 0) return error.CallException;
@@ -796,6 +801,18 @@ test "iso rejects oversized directory records at planning time" {
     var archive: [64 * sector_size]u8 = undefined;
     var scratch: [scratch_size]u8 = undefined;
     try testing.expectError(error.UnsupportedException, encode(&entries, &archive, &scratch));
+}
+
+test "iso rejects escape names at planning time" {
+    const testing = std.testing;
+    const dotdot = [_]Entry{.{ .name = "../x.txt", .data = "one" }};
+    try testing.expectError(error.CallException, archiveSize(&dotdot));
+    const backslash = [_]Entry{.{ .name = "a\\b.txt", .data = "one" }};
+    try testing.expectError(error.CallException, archiveSize(&backslash));
+    const drive = [_]Entry{.{ .name = "C:/x.txt", .data = "one" }};
+    try testing.expectError(error.CallException, archiveSize(&drive));
+    const nul = [_]Entry{.{ .name = "a\x00b.txt", .data = "one" }};
+    try testing.expectError(error.CallException, archiveSize(&nul));
 }
 
 test "iso write depth stays within the reader walk limit" {

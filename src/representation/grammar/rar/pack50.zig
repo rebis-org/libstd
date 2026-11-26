@@ -182,12 +182,13 @@ pub fn compressBlock(
                 var run: usize = 0;
                 while (i + run < code_length_symbols and cl_lengths[i + run] == 0) : (run += 1) {}
                 if (run >= 3) {
-                    // One escape covers 3 to 18 zeros, so the field holds
-                    // count - 2.
+                    // One escape covers 3 to 17 zeros: the decoder reads a
+                    // 4-bit count and adds 2, so a longer run splits across
+                    // escapes.
                     try bw.writeBits(15, 4);
-                    const count_raw: u8 = @intCast(@min(run, 18) - 2);
+                    const count_raw: u8 = @intCast(@min(run, 17) - 2);
                     try bw.writeBits(count_raw, 4);
-                    i += @min(run, 18);
+                    i += @min(run, 17);
                 } else {
                     try bw.writeBits(0, 4);
                     i += 1;
@@ -374,9 +375,9 @@ fn encodeCLSymbols(
 // Block header layout: a flags byte (valid-bits count, size width, last-block,
 // table-present), the 0x5a XOR checksum, and the block size.
 fn wrapBlockHeader(block_bytes: []const u8, total_bits: usize, is_last_block: bool, out: []u8) Exception!usize {
-    const block_size: u32 = @intCast(block_bytes.len);
     // No 4-byte length form exists, so an oversized block is invalid encoder input.
-    if (block_size > 0xFFFFFF) return error.CallException;
+    if (block_bytes.len > 0xFFFFFF) return error.CallException;
+    const block_size: u32 = @intCast(block_bytes.len);
     const last_byte_bits: u8 = @intCast(if (total_bits % 8 == 0) 8 else total_bits % 8);
     const byte_count: u8 = if (block_size <= 0xFF) 1 else if (block_size <= 0xFFFF) 2 else 3;
 

@@ -22,7 +22,7 @@ pub fn planCountedEncode(source: *resource.Resource, decoded_limit: u64, encoded
     } else {
         try encode_fn(&bounded_source.reader, &counter.writer, args);
     }
-    const output_size = counter.written();
+    const output_size = try counter.written();
     if (output_size > encoded_limit) return error.ResourceException;
     const consumed = decoded_limit - bounded_source.limit;
     if (consumed + output_size > work_limit) return error.ResourceException;
@@ -40,7 +40,7 @@ pub fn planDeflateDecode(source: *resource.Resource, history: []u8, encoded_limi
     var inflater = deflate.Decompress.init(&bounded_source.reader, history);
     _ = inflater.reader.streamRemaining(&counter.writer) catch return error.DataException;
     try source.rewind();
-    const output_size = counter.written();
+    const output_size = try counter.written();
     if (output_size > decoded_limit) return error.ResourceException;
     return std.math.cast(usize, output_size) orelse error.ResourceException;
 }

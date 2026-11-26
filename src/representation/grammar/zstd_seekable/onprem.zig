@@ -51,7 +51,12 @@ fn tableSize(frame_count: usize) usize {
 }
 
 pub fn encodedSizeBound(input_len: usize, options: Options) usize {
-    return zstd.encodedSizeBound(input_len, frameOptions(options)) + tableSize(frameCountFor(input_len, options));
+    // The grammar splits at frame_size, which the caller can set finer than
+    // the leaf's own window-bound split; bound with the finer split so every
+    // grammar frame carries its header overhead, plus the seek table.
+    var bound_options = frameOptions(options);
+    bound_options.window_size = @min(bound_options.window_size, options.frame_size);
+    return zstd.encodedSizeBound(input_len, bound_options) +| tableSize(frameCountFor(input_len, options));
 }
 
 pub const FrameInfo = struct {
@@ -214,9 +219,9 @@ const FrameSource = struct {
         var frame_tee = tee.CountingTee(.{ .xxh64 = true }).init(&sink);
         _ = zstd.decodeStream(&source, &frame_tee.writer, scratch, self.frame_options) catch |err| return err;
         // Either a size or hash disagreement is corruption, not a format error.
-        if (frame_tee.size != unit.decoded_size) return error.IntegrityException;
-        if (@as(u32, @truncate(frame_tee.xxh64Value())) != expected) return error.IntegrityException;
-        return @intCast(frame_tee.size);
+        if (try frame_tee.written() != unit.decoded_size) return error.IntegrityException;
+        if (@as(u32, @truncate(try frame_tee.xxh64Value())) != expected) return error.IntegrityException;
+        return @intCast(try frame_tee.written());
     }
 };
 
@@ -270,7 +275,7 @@ pub fn encodeToWriter(input: []const u8, output: *std.Io.Writer, history: []u8, 
         const chunk = input[offset .. offset + chunk_len];
         const written = zstd.encodeFrame(output, chunk, workspace, frame_options, 0) catch |err| switch (err) {
             error.DataException => return error.CallException,
-            error.ResourceException, error.IoException => |e| return e,
+            error.CallException, error.CapacityException, error.ResourceException, error.IoException => |e| return e,
         };
         entries[frame_count] = .{
             .compressed_size = std.math.cast(u32, written) orelse return error.ResourceException,
@@ -322,8 +327,8 @@ pub fn decode(input: []const u8, output: *std.Io.Writer, history: []u8, options:
         _ = zstd.decodeStream(&frame_source, &frame_tee.writer, history, frame_options) catch |err| return err;
         // Either a size or hash disagreement is corruption, not a format
         // error.
-        if (frame_tee.size != expected_size) return error.IntegrityException;
-        if (@as(u32, @truncate(frame_tee.xxh64Value())) != expected_hash) return error.IntegrityException;
+        if (try frame_tee.written() != expected_size) return error.IntegrityException;
+        if (@as(u32, @truncate(try frame_tee.xxh64Value())) != expected_hash) return error.IntegrityException;
         offset += compressed_size;
     }
 }
@@ -514,4 +519,30 @@ test "seekable lanes match the serial decoder byte for byte" {
     try std.testing.expectEqual(input.len, total);
     try std.testing.expectEqualSlices(u8, input, lanes_out);
     try std.testing.expectEqualSlices(u8, serial, lanes_out);
+}
+
+test "encodedSizeBound covers a frame split finer than the window" {
+    // The leaf bound charges per-frame overhead only for its own
+    // window-bound split; the grammar splits at frame_size, which the
+    // caller can set below the window. The bound must still cover every
+    // frame header plus the seek table, or a caller sizing by it fails.
+    const options: Options = .{ .frame_size = 32 * 1024 };
+    const frame_options = frameOptions(options);
+    var input: [300 * 1024]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(0x77);
+    prng.random().bytes(&input);
+    const history = try std.testing.allocator.alloc(u8, @as(usize, frame_options.window_size) + zstd.block_size_max);
+    defer std.testing.allocator.free(history);
+    const workspace = try std.testing.allocator.alloc(u32, zstd.encoderWorkspaceU32Count(0, options.frame_size, frame_options));
+    defer std.testing.allocator.free(workspace);
+    const bound = encodedSizeBound(input.len, options);
+    const encoded = try std.testing.allocator.alloc(u8, bound);
+    defer std.testing.allocator.free(encoded);
+    const entries = try std.testing.allocator.alloc(FrameEntry, frameCountFor(input.len, options));
+    defer std.testing.allocator.free(entries);
+    const encoded_len = try encode(&input, encoded, history, workspace, entries, options);
+    var decoded: [300 * 1024]u8 = undefined;
+    var sink = std.Io.Writer.fixed(&decoded);
+    try decode(encoded[0..encoded_len], &sink, history, options);
+    try std.testing.expectEqualSlices(u8, &input, decoded[0..sink.end]);
 }

@@ -1,11 +1,21 @@
 const std = @import("std");
 
+const entry_prim = @import("../../common/entry.zig");
+const bounds = @import("../../common/primitive/bounds.zig");
 const exception_prim = @import("../../common/primitive/exception.zig");
 
 const Exception = exception_prim.Exception;
 
 // Shared volume-tree machinery: the walk path stack, the name rule, and
 // the children-linking pass.
+
+// One directory level, whether written or read back: NUL-free,
+// separator-free, neither dot nor dot-dot, and clear of the shared
+// escape rules, within the per-segment byte cap.
+fn componentSafe(name: []const u8) bool {
+    if (name.len > 256) return false;
+    return entry_prim.isSafeComponent(name);
+}
 
 // A joined-path stack: pop rewinds to a depth span; joined borrows the
 // path without committing it.
@@ -19,6 +29,9 @@ pub fn WalkState(comptime max_dir_depth: u32) type {
         path: []u8 = &.{},
 
         pub fn push(self: *Self, name: []const u8, depth: usize) Exception!void {
+            // Components come from the image, so hostile names fail as
+            // data, not as caller error.
+            if (!componentSafe(name)) return error.DataException;
             if (depth >= max_dir_depth) return error.DataException;
             self.spans[depth] = self.path_len;
             const extra = if (self.path_len == 0) name.len else name.len + 1;
@@ -37,6 +50,7 @@ pub fn WalkState(comptime max_dir_depth: u32) type {
 
         // The joined name outlives the walk: found unwinds before any mutation.
         pub fn joined(self: *Self, name: []const u8) Exception![]const u8 {
+            if (!componentSafe(name)) return error.DataException;
             const extra = if (self.path_len == 0) name.len else name.len + 1;
             if (self.path_len + extra > self.path.len) return error.DataException;
             var end = self.path_len;
@@ -54,10 +68,12 @@ pub fn WalkState(comptime max_dir_depth: u32) type {
 // the whole path and each segment.
 pub fn validateName(name: []const u8) Exception!void {
     if (name.len == 0 or name.len > 512) return error.CallException;
+    // The same escape rules as every other writer: backslash and Windows
+    // drive prefixes refuse here, not at extraction time.
+    if (bounds.isAbsoluteOrTraversal(name)) return error.CallException;
     var it = std.mem.splitScalar(u8, name, '/');
     while (it.next()) |part| {
-        if (part.len == 0 or part.len > 256) return error.CallException;
-        if (std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return error.CallException;
+        if (!componentSafe(part)) return error.CallException;
     }
 }
 
@@ -88,4 +104,29 @@ pub fn linkChildren(comptime Node: type, nodes: *std.ArrayList(Node), counts: []
         }.less);
     }
     return kids;
+}
+
+test "walk state rejects hostile image components" {
+    const testing = std.testing;
+    const State = WalkState(4);
+    var path: [64]u8 = undefined;
+    var state: State = .{ .path = &path };
+    try state.push("dir", 0);
+    const hostile = [_][]const u8{
+        "..", ".", "", "a\\b", "C:/x", "a\x00b", "a/b",
+    };
+    for (hostile) |name| {
+        try testing.expectError(error.DataException, state.push(name, 1));
+        try testing.expectError(error.DataException, state.joined(name));
+    }
+    // A rejected push leaves the committed path untouched.
+    try testing.expectEqualStrings("dir", state.path[0..state.path_len]);
+    const joined = try state.joined("file.txt");
+    try testing.expectEqualStrings("dir/file.txt", joined);
+}
+
+test "volume tree rejects NUL in written names" {
+    const testing = std.testing;
+    try testing.expectError(error.CallException, validateName("a\x00b.txt"));
+    try validateName("a/b/c.txt");
 }

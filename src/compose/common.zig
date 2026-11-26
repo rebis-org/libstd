@@ -16,7 +16,7 @@ const Resource = resource.Resource;
 const Exception = vocabulary.Exception;
 
 // Every hook needs a writable sink with room before producing a single byte.
-pub fn requireSink(sink: *Resource, call: *Call, required: usize) Exception!void {
+pub fn requireSink(sink: *Resource, call: *Call, required: u64) Exception!void {
     if (!sink.hasCapability(resource.capability_bit_write)) return error.UnsupportedException;
     return requireSinkCapacity(sink, call, required);
 }
@@ -98,7 +98,7 @@ pub fn materializeSource(comptime sizing: SourceSizing, source: *Resource, works
                     while (true) {
                         const bytes_read = try source.read(&buffer);
                         if (bytes_read == 0) break;
-                        total += bytes_read;
+                        total = std.math.add(u64, total, bytes_read) catch return error.ResourceException;
                         if (total > limit) return error.ResourceException;
                     }
                     try source.rewind();
@@ -137,7 +137,7 @@ pub fn measureSource(source: *Resource, limit: u64) Exception!usize {
     var bounded_source: resource.BoundedReader = undefined;
     bounded_source.init(source, limit);
     _ = std.Io.Reader.streamRemaining(&bounded_source.reader, &counter.writer) catch |exception| return mapStreamError(exception);
-    const total = counter.written();
+    const total = try counter.written();
     try rejectOverLimit(source, total == limit);
     try source.rewind();
     return std.math.cast(usize, total) orelse error.ResourceException;
@@ -225,7 +225,7 @@ pub fn writeDownstreamDiagnostic(call: *Call, status: u32) void {
 pub fn validateBoundary(call: *Call, source_node: ?*Node, sink_node: ?*Node) Exception!void {
     if (call.workspace) |workspace| {
         const workspace_ptr = @intFromPtr(workspace);
-        const workspace_len = std.math.cast(usize, call.workspace_capacity) orelse return error.CallException;
+        const workspace_len = std.math.cast(usize, call.workspace_capacity) orelse return error.ResourceException;
         if (source_node) |node| {
             if ((node.flags & abi.node_flag_callback_resource) == 0 and node.byte_length != 0) {
                 const bytes = try resource.checkedConstBytes(node.bytes, node.byte_length);

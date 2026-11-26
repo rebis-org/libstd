@@ -7,6 +7,7 @@ pub const status = struct {
     pub const ok: u32 = 0;
     pub const unsupported: u32 = 2;
     pub const resource_limit: u32 = 7;
+    pub const internal_failure: u32 = 8;
 };
 
 pub const Task = extern struct {

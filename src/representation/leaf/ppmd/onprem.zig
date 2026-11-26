@@ -101,6 +101,7 @@ pub fn decode(input: []const u8, output: []u8, scratch: []u8, options: Options) 
         const symbol = model.decodeSymbol(&range_coder) catch return error.DataException;
         try io.writeByte(&dest, @intCast(symbol));
     }
+    if (range_coder.pos != input.len) return error.DataException;
     if (range_coder.code != 0) return error.DataException;
     return count;
 }
@@ -120,6 +121,7 @@ pub fn decodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, 
         const symbol = model.decodeSymbol(&range_coder) catch return error.DataException;
         try io.writeByte(writer, @intCast(symbol));
     }
+    if (range_coder.pos != input.len) return error.DataException;
     if (range_coder.code != 0) return error.DataException;
 }
 
@@ -282,6 +284,11 @@ const Model = struct {
         const buf_addr = std.mem.alignForward(usize, model_addr + @sizeOf(Model), 4);
         if (buf_addr + mem_size + unit_size > @intFromPtr(scratch.ptr) + scratch.len) return error.CapacityException;
         model.construct();
+        // Vendor zeroes the whole model struct once per stream; `restart` below
+        // must preserve these two across mid-stream model restarts, so they are
+        // initialised here, per stream, instead.
+        model.init_esc = 0;
+        model.hi_bits_flag = 0;
         model.base = @ptrFromInt(buf_addr);
         model.size = mem_size;
         return model;
@@ -500,8 +507,6 @@ const Model = struct {
         self.tables.dummy_see.summ = 0;
         self.tables.dummy_see.count = 64;
         self.max_order = max_order;
-        self.init_esc = 0;
-        self.hi_bits_flag = 0;
     }
 
     fn binSumm(self: *Model) *u16 {
@@ -1168,4 +1173,24 @@ test "ppmd leaf roundtrip allocator stress glue and large indexes" {
     const produced = try decode(encoded[0..encoded_len], output, backing, .{ .order = 8, .mem_size = mem, .unpack_size = input.len });
     try testing.expectEqual(input.len, produced);
     try testing.expectEqualSlices(u8, input, output);
+}
+
+test "ppmd leaf rejects truncated and trailing-garbage streams" {
+    const testing = std.testing;
+    const backing = try testing.allocator.alloc(u8, decodeWorkspaceSize(4 << 20));
+    defer testing.allocator.free(backing);
+    const input = "truncation and trailing garbage rejection probe";
+    const options: Options = .{ .order = 8, .mem_size = 4 << 20, .unpack_size = input.len };
+    const bound = try requiredSize(input, backing, options);
+    const encoded = try testing.allocator.alloc(u8, bound + 1);
+    defer testing.allocator.free(encoded);
+    const encoded_len = try encode(input, encoded, backing, options);
+    const output = try testing.allocator.alloc(u8, input.len);
+    defer testing.allocator.free(output);
+    // The decoder consumes a well-formed stream exactly, so cutting the
+    // flush tail starves the final normalize of its input bytes.
+    try testing.expectError(error.DataException, decode(encoded[0 .. encoded_len - 1], output, backing, options));
+    // Bytes beyond the exact stream must not be silently accepted either.
+    encoded[encoded_len] = 0x5a;
+    try testing.expectError(error.DataException, decode(encoded[0 .. encoded_len + 1], output, backing, options));
 }

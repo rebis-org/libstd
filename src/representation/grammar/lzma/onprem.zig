@@ -28,17 +28,21 @@ pub fn decodeOptions(input: []const u8) Exception!lzma.Options {
         .unpack_size = if (marker_required) null else unpack_size,
         .marker_required = marker_required,
         .allow_eopm = !marker_required,
+        // The alone format owns the whole payload buffer: bytes the stream
+        // leaves behind are corruption, the same verdict the xz CLI reports.
+        .reject_trailing = true,
     };
 }
 
-// A declared size means a markerless stream; a caller sizing later
-// passes null and gets the end marker.
+// The header writes the maximum u64 for an unknown size, so the default
+// stream ends with the marker; a caller that knows the size sets
+// unpack_size and clears marker_required for a markerless stream.
 pub fn encodeOptions(dictionary: u32) Exception!lzma.Options {
     if (dictionary < lzma.dictionary_min or dictionary > lzma.dictionary_max) return error.CallException;
     return .{
         .properties = .{ .lc = 3, .lp = 0, .pb = 2, .dictionary_size = dictionary },
         .unpack_size = null,
-        .marker_required = false,
+        .marker_required = true,
     };
 }
 
@@ -182,4 +186,85 @@ test "decode count guard rejects a short decode" {
     try guardDecodedCount(declared, 32);
     const marker: lzma.Options = .{ .properties = properties, .unpack_size = null };
     try guardDecodedCount(marker, 7);
+}
+
+test "encodeOptions default marker form round trips through every verb" {
+    const allocator = std.testing.allocator;
+    const options = try encodeOptions(1 << 12);
+    try std.testing.expectEqual(@as(?u64, null), options.unpack_size);
+    try std.testing.expect(options.marker_required);
+    const input = "the default alone stream closes with the end marker, not a declared size";
+    const scratch_size = @max(
+        @max(lzma.encodeWorkspaceSize(options.properties), lzma.encodeWorkspaceSizeBt(options.properties)),
+        @max(lzma.decodeWorkspaceSize(options.properties), lzma.decodeInPlaceWorkspaceSize(options.properties)),
+    );
+    const scratch = try allocator.alloc(u8, scratch_size);
+    defer allocator.free(scratch);
+    const bound = encodedSizeBound(input.len);
+    const encoded = try allocator.alloc(u8, bound);
+    defer allocator.free(encoded);
+    const encoded_len = try encode(input, encoded, scratch, options);
+
+    // The unknown-size header form: no declared size, marker mandatory.
+    const header = try decodeOptions(encoded[0..encoded_len]);
+    try std.testing.expectEqual(@as(?u64, null), header.unpack_size);
+    try std.testing.expect(header.marker_required);
+
+    const decoded = try allocator.alloc(u8, input.len);
+    defer allocator.free(decoded);
+    @memset(decoded, 0xa5);
+    const produced = try decode(encoded[0..encoded_len], decoded, scratch, lzma_seam.default_provider);
+    try std.testing.expectEqual(input.len, produced);
+    try std.testing.expectEqualSlices(u8, input, decoded);
+
+    @memset(decoded, 0xa5);
+    try std.testing.expectEqual(input.len, try decodeInPlace(encoded[0..encoded_len], decoded, scratch, lzma_seam.default_provider));
+    try std.testing.expectEqualSlices(u8, input, decoded);
+
+    try std.testing.expectEqual(input.len, try decodedSize(encoded[0..encoded_len], scratch, lzma_seam.default_provider));
+
+    @memset(decoded, 0xa5);
+    var writer = std.Io.Writer.fixed(decoded);
+    try decodeToWriter(encoded[0..encoded_len], &writer, scratch, lzma_seam.default_provider);
+    try std.testing.expectEqual(input.len, writer.end);
+    try std.testing.expectEqualSlices(u8, input, decoded[0..writer.end]);
+}
+
+test "alone container rejects trailing garbage in both framings" {
+    const allocator = std.testing.allocator;
+    const input = "bytes after the stream close are corruption, not padding";
+    const properties: lzma.Properties = .{ .lc = 3, .lp = 0, .pb = 2, .dictionary_size = 1 << 12 };
+    const scratch_size = @max(
+        @max(lzma.encodeWorkspaceSize(properties), lzma.encodeWorkspaceSizeBt(properties)),
+        @max(lzma.decodeWorkspaceSize(properties), lzma.decodeInPlaceWorkspaceSize(properties)),
+    );
+    const scratch = try allocator.alloc(u8, scratch_size);
+    defer allocator.free(scratch);
+    const encoded = try allocator.alloc(u8, encodedSizeBound(input.len) + 4);
+    defer allocator.free(encoded);
+    const decoded = try allocator.alloc(u8, input.len);
+    defer allocator.free(decoded);
+
+    // Both framings: the unknown-size marker form and the declared
+    // markerless form.
+    const marker_form: lzma.Options = .{ .properties = properties, .marker_required = true };
+    const declared_form: lzma.Options = .{ .properties = properties, .unpack_size = input.len, .marker_required = false };
+
+    for ([_]lzma.Options{ marker_form, declared_form }) |form| {
+        const encoded_len = try encode(input, encoded, scratch, form);
+
+        // The clean stream decodes.
+        @memset(decoded, 0xa5);
+        const produced = try decode(encoded[0..encoded_len], decoded, scratch, lzma_seam.default_provider);
+        try std.testing.expectEqualSlices(u8, input, decoded[0..produced]);
+
+        // Four trailing bytes turn every verb away.
+        @memset(encoded[encoded_len..][0..4], 0xa5);
+        const tainted = encoded[0 .. encoded_len + 4];
+        try std.testing.expectError(error.DataException, decode(tainted, decoded, scratch, lzma_seam.default_provider));
+        try std.testing.expectError(error.DataException, decodeInPlace(tainted, decoded, scratch, lzma_seam.default_provider));
+        try std.testing.expectError(error.DataException, decodedSize(tainted, scratch, lzma_seam.default_provider));
+        var sink = std.Io.Writer.Discarding.init(&.{});
+        try std.testing.expectError(error.DataException, decodeToWriter(tainted, &sink.writer, scratch, lzma_seam.default_provider));
+    }
 }

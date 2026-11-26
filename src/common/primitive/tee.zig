@@ -3,6 +3,9 @@ const std = @import("std");
 const seam = @import("seam");
 
 const checksum = @import("checksum.zig");
+const exception = @import("exception.zig");
+
+const Exception = exception.Exception;
 
 // A new checksum adds one field here and one on the tee, not a bool per
 // call site.
@@ -17,6 +20,7 @@ pub fn CountingTee(comptime kinds: Kinds) type {
     return struct {
         writer: std.Io.Writer,
         downstream: ?*std.Io.Writer,
+        poisoned: bool,
         crc32: checksum.Crc32,
         crc64: checksum.XzCrc64,
         adler32: checksum.Adler32,
@@ -31,6 +35,7 @@ pub fn CountingTee(comptime kinds: Kinds) type {
             return .{
                 .writer = .{ .vtable = &vtable, .buffer = &.{}, .end = 0 },
                 .downstream = downstream,
+                .poisoned = false,
                 .crc32 = checksum.Crc32.bind(provider, {}),
                 .crc64 = checksum.XzCrc64.bind(provider, {}),
                 .adler32 = checksum.Adler32.bind(provider, {}),
@@ -39,28 +44,42 @@ pub fn CountingTee(comptime kinds: Kinds) type {
             };
         }
 
-        pub fn written(self: *const @This()) u64 {
+        // A partial downstream write desynchronizes every tally from what the
+        // sink actually consumed, so each reading accessor refuses a poisoned
+        // tee rather than return a count that no longer describes the sink.
+        // The refusal is an error, not an assert: ReleaseFast must never read
+        // a stale tally silently, and the downstream WriteFailed is capacity
+        // per exception.fromStd.
+        pub fn written(self: *const @This()) Exception!u64 {
+            if (self.poisoned) return error.CapacityException;
             return self.size;
         }
 
-        pub fn crc32Value(self: *const @This()) u32 {
+        pub fn crc32Value(self: *const @This()) Exception!u32 {
+            if (self.poisoned) return error.CapacityException;
             return self.crc32.final({});
         }
 
-        pub fn adler32Value(self: *const @This()) u32 {
+        pub fn adler32Value(self: *const @This()) Exception!u32 {
+            if (self.poisoned) return error.CapacityException;
             return self.adler32.final({});
         }
 
-        pub fn crc64Value(self: *const @This()) u64 {
+        pub fn crc64Value(self: *const @This()) Exception!u64 {
+            if (self.poisoned) return error.CapacityException;
             return self.crc64.final({});
         }
 
-        pub fn xxh64Value(self: *const @This()) u64 {
+        pub fn xxh64Value(self: *const @This()) Exception!u64 {
+            if (self.poisoned) return error.CapacityException;
             return self.xxh64.final({});
         }
 
         fn feed(self: *@This(), part: []const u8) std.Io.Writer.Error!void {
-            if (self.downstream) |out| out.writeAll(part) catch return error.WriteFailed;
+            if (self.downstream) |out| out.writeAll(part) catch {
+                self.poisoned = true;
+                return error.WriteFailed;
+            };
             inline for (comptime @typeInfo(Kinds).@"struct".field_names) |name| {
                 if (@field(kinds, name)) @field(self, name).update(part);
             }
@@ -94,3 +113,46 @@ pub fn CountingTee(comptime kinds: Kinds) type {
 }
 
 pub const Tee = CountingTee(.{ .crc32 = true, .crc64 = true });
+
+const FailingSink = struct {
+    writer: std.Io.Writer,
+
+    fn drain(writer: *std.Io.Writer, chunks: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        _ = writer;
+        _ = chunks;
+        _ = splat;
+        return error.WriteFailed;
+    }
+
+    const vtable = std.Io.Writer.VTable{
+        .drain = drain,
+        .flush = std.Io.Writer.noopFlush,
+        .rebase = std.Io.Writer.failingRebase,
+    };
+};
+
+test "counting tee tallies a healthy flow" {
+    var tee = Tee.init(null);
+    try tee.writer.writeAll("hello ");
+    try tee.writer.writeAll("world");
+    try std.testing.expectEqual(@as(u64, 11), try tee.written());
+    try std.testing.expectEqual(std.hash.Crc32.hash("hello world"), try tee.crc32Value());
+    try std.testing.expect(!tee.poisoned);
+}
+
+test "counting tee poisons after a downstream failure" {
+    var failing: FailingSink = .{ .writer = .{ .vtable = &FailingSink.vtable, .buffer = &.{}, .end = 0 } };
+    var tee = Tee.init(&failing.writer);
+    try std.testing.expectError(error.WriteFailed, tee.writer.writeAll("hello"));
+    try std.testing.expect(tee.poisoned);
+}
+
+test "counting tee accessors refuse a poisoned tally" {
+    var failing: FailingSink = .{ .writer = .{ .vtable = &FailingSink.vtable, .buffer = &.{}, .end = 0 } };
+    var tee = Tee.init(&failing.writer);
+    try std.testing.expectError(error.WriteFailed, tee.writer.writeAll("hello"));
+    try std.testing.expectError(error.CapacityException, tee.written());
+    try std.testing.expectError(error.CapacityException, tee.crc32Value());
+    try std.testing.expectError(error.CapacityException, tee.adler32Value());
+    try std.testing.expectError(error.CapacityException, tee.crc64Value());
+}

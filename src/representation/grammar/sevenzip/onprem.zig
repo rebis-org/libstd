@@ -243,7 +243,7 @@ fn packEntry(entry: Entry, provider: crypto.Provider, workspace: *Workspace, lim
             var measure_source = std.Io.Reader.fixed(source);
             _ = std.Io.Reader.streamRemaining(&measure_source, &measure_compressor.writer) catch return error.IoException;
             measure_compressor.finish() catch return error.IoException;
-            const packed_size = std.math.cast(usize, counter.written()) orelse return error.ResourceException;
+            const packed_size = std.math.cast(usize, try counter.written()) orelse return error.ResourceException;
             if (packed_size > limits.encoded_bytes) return error.ResourceException;
             if (source.len + packed_size > limits.codec_work) return error.ResourceException;
             const packed_data = try workspace.take(u8, packed_size);
@@ -288,7 +288,7 @@ fn packEntry(entry: Entry, provider: crypto.Provider, workspace: *Workspace, lim
     const password_utf16 = try passwordToUtf16(entry.password, workspace);
     const cycles = if (entry.num_cycles_power == 0) crypto.seven_zip_default_cycles else entry.num_cycles_power;
     var key: [crypto.seven_zip_key_length]u8 = undefined;
-    crypto.sevenZipKdf(provider, password_utf16, entry.salt[0..entry.salt_length], cycles, &key);
+    try crypto.sevenZipKdf(provider, password_utf16, entry.salt[0..entry.salt_length], cycles, &key);
     const padded_size = std.mem.alignForward(usize, compressed_entry.data.len, crypto.block_length);
     if (entry.password_lifetime != 0 and padded_size > entry.password_lifetime) {
         failure_cause.* = .password_lifetime;
@@ -448,7 +448,7 @@ fn encryptHeaderBytes(cleartext: []const u8, workspace: *Workspace, provider: cr
     }
     const password_utf16 = try passwordToUtf16(header_options.password, workspace);
     var key: [crypto.seven_zip_key_length]u8 = undefined;
-    crypto.sevenZipKdf(provider, password_utf16, &.{}, cycles, &key);
+    try crypto.sevenZipKdf(provider, password_utf16, &.{}, cycles, &key);
     const padded_size = std.mem.alignForward(usize, cleartext.len, crypto.block_length);
     if (header_options.password_lifetime != 0 and padded_size > header_options.password_lifetime) {
         if (header_options.failure_cause) |cause| cause.* = .password_lifetime;
@@ -1102,7 +1102,7 @@ fn aesDecryptStream(encrypted: bool, num_cycles: u8, salt: []const u8, iv: [16]u
         @memcpy(key_material[salt.len..][0..password_utf16.len], password_utf16);
         @memcpy(&key, key_material[0..32]);
     } else {
-        crypto.sevenZipKdf(options.provider, password_utf16, salt, num_cycles, &key);
+        try crypto.sevenZipKdf(options.provider, password_utf16, salt, num_cycles, &key);
     }
     const decrypted = try workspace.take(u8, packed_data.len);
     try crypto.aesCbcDecrypt(options.provider, &key, iv, decrypted, packed_data);
@@ -2035,6 +2035,11 @@ fn writeCoderAttributes(writer: *std.Io.Writer, method: CoderMethod, unpacked_cr
 }
 
 fn writeFilesInfo(writer: *std.Io.Writer, entries: []const Entry, workspace: *Workspace) Exception!void {
+    // The writer refuses the names the reader refuses: no escape and no
+    // embedded NUL ever reaches the kNames property.
+    for (entries) |entry| {
+        if (bounds.isAbsoluteOrTraversal(entry.name) or std.mem.findScalar(u8, entry.name, 0) != null) return error.CallException;
+    }
     try io.writeBytes(writer, &.{0x05});
     try writeUint64(writer, entries.len);
     const empty_count = emptyCount(entries);
@@ -2107,7 +2112,7 @@ fn writeFilesInfo(writer: *std.Io.Writer, entries: []const Entry, workspace: *Wo
 fn writeSizedProperty(writer: *std.Io.Writer, workspace: *Workspace, id: u8, ctx: anytype) Exception!void {
     var counter = measurement.Counter.init(null);
     try ctx.write(&counter.writer);
-    const size = counter.written();
+    const size = try counter.written();
     if (size == 0) {
         try io.writeBytes(writer, &.{id});
         try writeUint64(writer, 0);
@@ -2412,6 +2417,26 @@ test "sevenzip ppmd solid grouping roundtrip" {
         const produced = try sevenZipDecodeOrdinal(archive, &decode_ws, .{}, i, out, .{ .failure_cause = &cause });
         try testing.expectEqual(data.len, produced);
         try testing.expectEqualSlices(u8, data, out);
+    }
+}
+
+test "sevenzip rejects escape names before writing" {
+    // Mixed provider builds serve no single tag for both arms; run where
+    // the default tag serves the codec.
+    if (!deflate_seam.decodeServed(checksum.default_provider)) return error.SkipZigTest;
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const backing = try allocator.alloc(u8, 1024 * 1024);
+    defer allocator.free(backing);
+    // Packing only compresses payloads, so it succeeds; the name gate must
+    // fire before any archive bytes are produced.
+    const cases = [_][]const u8{ "../evil.txt", "a\\b.txt", "C:/evil.txt", "a\x00b.txt" };
+    for (cases) |bad_name| {
+        const entries = [_]Entry{.{ .name = bad_name, .data = "payload" }};
+        var workspace = try Workspace.init(backing.ptr, backing.len);
+        var cause: crypto.FailureCause = .none;
+        const packed_entries = try sevenZipPack(&entries, crypto.default_provider, &workspace, .{}, &cause);
+        try testing.expectError(error.CallException, sevenZipPackedSize(&entries, packed_entries, &workspace, crypto.default_provider, .{}, .{}));
     }
 }
 

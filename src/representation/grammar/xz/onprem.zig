@@ -78,20 +78,26 @@ pub fn encodedSizeBound(input_len: usize, block_size: u32) usize {
     return base +| @max(1, blocks) *| 192;
 }
 
+// The workspace slack beyond the lzma2 need. The decode and encode
+// paths carve only the lzma2 portion, so a consumer may stash its own
+// state in the front of the headroom before handing the rest over;
+// pbzx keeps its chunk state there.
+pub const workspace_headroom: usize = 65536;
+
 pub fn decodeWorkspaceSize(dictionary_size: u32) usize {
-    return lzma2.decodeWorkspaceSize(dictionary_size) + 65536;
+    return lzma2.decodeWorkspaceSize(dictionary_size) + workspace_headroom;
 }
 
 pub fn decodeInPlaceWorkspaceSize(dictionary_size: u32) usize {
-    return lzma2.decodeInPlaceWorkspaceSize(dictionary_size) + 65536;
+    return lzma2.decodeInPlaceWorkspaceSize(dictionary_size) + workspace_headroom;
 }
 
 pub fn encodeWorkspaceSize(dictionary_size: u32) usize {
-    return lzma2.encodeWorkspaceSize(dictionary_size) + 65536;
+    return lzma2.encodeWorkspaceSize(dictionary_size) + workspace_headroom;
 }
 
 pub fn encodeWorkspaceSizeBt(dictionary_size: u32) usize {
-    return lzma2.encodeWorkspaceSizeBt(dictionary_size) + 65536;
+    return lzma2.encodeWorkspaceSizeBt(dictionary_size) + workspace_headroom;
 }
 
 pub fn decodedSize(input: []const u8, scratch: []u8, provider: checksum.Provider) Exception!usize {
@@ -412,7 +418,7 @@ fn decodeBlock(cursor: *binary.ReadCursor, sink: *Sink, scratch: []u8, check: Ch
             // The check covers filtered bytes never materialized here;
             // staging would defeat bounded memory, so decode entry points verify.
             if (block_header.filter_count == 1 and check != .sha256) {
-                try verifyCheck(check, dt.crc32Value(), dt.crc64Value(), check_bytes);
+                try verifyCheck(check, try dt.crc32Value(), try dt.crc64Value(), check_bytes);
             }
         }
     }
@@ -606,8 +612,9 @@ pub fn indexBlocks(input: []const u8, records: *IndexRecordList, provider: check
     const backward: usize = std.mem.readInt(u32, footer[4..8], .little);
     const units = std.math.add(usize, backward, 1) catch return error.DataException;
     const index_size = std.math.mul(usize, units, 4) catch return error.DataException;
-    if (index_size + stream_footer_size > input.len) return error.DataException;
-    const index_start = input.len - stream_footer_size - index_size;
+    const index_span = std.math.add(usize, index_size, stream_footer_size) catch return error.DataException;
+    if (index_span > input.len) return error.DataException;
+    const index_start = input.len - index_span;
     var cursor = binary.ReadCursor.init(input[index_start .. input.len - stream_footer_size]);
     try parseIndex(&cursor, records, provider);
     if (cursor.remaining() != 0) return error.DataException;
@@ -868,7 +875,7 @@ fn encodeStream(writer: *std.Io.Writer, input: []const u8, scratch: []u8, option
         try io.writeBytes(writer, block_header.slice());
         var count_tee = tee.Tee.initWithProvider(writer, options.provider);
         try lzma2.encodeToWriter(chunk, &count_tee.writer, lzma_scratch, lzma_options);
-        const compressed_size = std.math.cast(usize, count_tee.size) orelse return error.ResourceException;
+        const compressed_size = std.math.cast(usize, try count_tee.written()) orelse return error.ResourceException;
         const block_padding = blockPadding(compressed_size);
         if (block_padding > 0) {
             const zeroes: [3]u8 = @splat(0);
@@ -883,7 +890,7 @@ fn encodeStream(writer: *std.Io.Writer, input: []const u8, scratch: []u8, option
             digest = sha.finalResult();
             try io.writeBytes(writer, &digest);
         } else {
-            try writeCheck(writer, options.check, tee_writer.crc32Value(), tee_writer.crc64Value());
+            try writeCheck(writer, options.check, try tee_writer.crc32Value(), try tee_writer.crc64Value());
         }
         const unpadded = try bounds.addUsize(block_header.slice().len, try bounds.addUsize(compressed_size, check_size));
         std.mem.writeInt(u64, records[chunk_index * 16 ..][0..8], std.math.cast(u64, unpadded) orelse return error.ResourceException, .little);

@@ -8,7 +8,7 @@ const lzms = @import("lzms.zig");
 const lzx = @import("lzx.zig");
 const xpress = @import("xpress.zig");
 
-const isComponent = entry_prim.isComponent;
+const isSafeComponent = entry_prim.isSafeComponent;
 const leafName = entry_prim.leafName;
 const Exception = exception_prim.Exception;
 
@@ -82,15 +82,17 @@ fn writeReshdr(out: []u8, res: Reshdr) void {
     std.mem.writeInt(u64, out[16..24], res.uncompressed_size, .little);
 }
 
+// Names come from the caller's entries, so a malformed sequence is a
+// bad call, not bad data.
 fn nextCodepoint(name: []const u8, i: *usize) Exception!u21 {
-    const len = std.unicode.utf8ByteSequenceLength(name[i.*]) catch return error.DataException;
-    if (i.* + len > name.len) return error.DataException;
+    const len = std.unicode.utf8ByteSequenceLength(name[i.*]) catch return error.CallException;
+    if (i.* + len > name.len) return error.CallException;
     const bytes = name[i.*..][0..len];
     const cp: u21 = switch (len) {
         1 => bytes[0],
-        2 => std.unicode.utf8Decode2(bytes[0..2].*) catch return error.DataException,
-        3 => std.unicode.utf8Decode3(bytes[0..3].*) catch return error.DataException,
-        4 => std.unicode.utf8Decode4(bytes[0..4].*) catch return error.DataException,
+        2 => std.unicode.utf8Decode2(bytes[0..2].*) catch return error.CallException,
+        3 => std.unicode.utf8Decode3(bytes[0..3].*) catch return error.CallException,
+        4 => std.unicode.utf8Decode4(bytes[0..4].*) catch return error.CallException,
         else => unreachable,
     };
     i.* += len;
@@ -174,9 +176,8 @@ const Tree = struct {
         backed: usize,
         total: usize,
 
-        fn of(entry_count: usize) Regions {
-            const node_count = entry_count *| 2 + 1;
-            const nodes_bytes = node_count * @sizeOf(Node);
+        fn of(entry_count: usize, node_count: usize) Regions {
+            const nodes_bytes = node_count *| @sizeOf(Node);
             const queue = std.mem.alignForward(usize, nodes_bytes +| entry_count * @sizeOf(u32), 8);
             const pieces = std.mem.alignForward(usize, queue +| node_count * @sizeOf(u32), 8);
             const backed = std.mem.alignForward(usize, pieces +| (entry_count + 1) * @sizeOf(Piece), 8);
@@ -190,11 +191,10 @@ const Tree = struct {
         }
     };
 
-    fn init(scratch: []u8, entry_count: usize) Exception!Tree {
-        const regions = Regions.of(entry_count);
+    fn init(scratch: []u8, entry_count: usize, node_count: usize) Exception!Tree {
+        const regions = Regions.of(entry_count, node_count);
         const area = try alignedTail(scratch, regions.total, @alignOf(Node));
         const count = entry_count;
-        const node_count = count *| 2 + 1;
         return .{
             .nodes = @alignCast(std.mem.bytesAsSlice(Node, area[0 .. node_count * @sizeOf(Node)])),
             .entry_nodes = @alignCast(std.mem.bytesAsSlice(u32, area[regions.entry_nodes..][0 .. count * @sizeOf(u32)])),
@@ -219,7 +219,7 @@ const Tree = struct {
             const parent = self.entry_nodes[index];
             const leaf = leafName(entry.name) orelse return error.CallException;
             // Intermediates validated in resolveParent; the leaf needs its own check.
-            if (!isComponent(leaf)) return error.CallException;
+            if (!isSafeComponent(leaf)) return error.CallException;
             if (self.find(parent, leaf)) |existing| {
                 if (!self.nodes[existing].is_dir or entry.data.len != 0) return error.CallException;
                 self.entry_nodes[index] = existing;
@@ -249,11 +249,11 @@ const Tree = struct {
         var components = std.mem.splitScalar(u8, name, '/');
         var current = components.next() orelse return error.CallException;
         while (components.next()) |next| {
-            if (!isComponent(current)) return error.CallException;
+            if (!isSafeComponent(current)) return error.CallException;
             parent = try self.directory(parent, current);
             current = next;
         }
-        if (!isComponent(current)) return error.CallException;
+        if (!isSafeComponent(current)) return error.CallException;
         return parent;
     }
 
@@ -393,7 +393,7 @@ fn writeDentry(out: []u8, name: []const u8, hash: *const [sha1_len]u8, subdir_of
     std.mem.writeInt(u16, out[100..102], std.math.cast(u16, name_bytes) orelse return error.CallException, .little);
     if (units != 0) {
         var pos: usize = dentry_disk_size;
-        pos += writeUtf16Le(out[pos..], name) catch return error.DataException;
+        pos += try writeUtf16Le(out[pos..], name);
         // ImageX writes the terminator, DISM does not; a reader accepts both.
         std.mem.writeInt(u16, out[pos..][0..2], 0, .little);
     }
@@ -549,8 +549,26 @@ fn storedPieces(entries: []const Entry, tree: *const Tree, out: []Piece) usize {
     return count;
 }
 
+// Worst-case tree nodes: the root plus every component of every entry
+// path; shared directories only lower the count. The old 2N+1 cap
+// under-counted deep unique paths (for example a/b/c/d) and failed a
+// caller that honored the published scratch bound.
+fn worstCaseNodes(entries: []const Entry) Exception!u64 {
+    var total: u64 = 1;
+    for (entries) |entry| {
+        total = try bounds.addU64(total, 1);
+        total = try bounds.addU64(total, std.mem.count(u8, entry.name, "/"));
+    }
+    return total;
+}
+
+fn treeOf(entries: []const Entry, scratch: []u8) Exception!Tree {
+    const node_count = std.math.cast(usize, try worstCaseNodes(entries)) orelse return error.ResourceException;
+    return Tree.init(scratch, entries.len, node_count);
+}
+
 pub fn archiveSize(entries: []const Entry, scratch: []u8) Exception!u64 {
-    var tree = try Tree.init(scratch, entries.len);
+    var tree = try treeOf(entries, scratch);
     try tree.build(entries);
     const metadata_len = try tree.layout();
     var payload_len: u64 = 0;
@@ -574,13 +592,12 @@ pub fn writeScratchLen(entries: []const Entry) Exception!usize {
         max_name_len = @max(max_name_len, entry.name.len);
     }
     // The listLen term adds a marker and a record per directory; the node cap bounds both.
-    const doubled = std.math.mul(u64, @as(u64, entries.len), 2) catch return error.ResourceException;
-    const node_count = std.math.add(u64, doubled, 1) catch return error.ResourceException;
+    const node_count = try worstCaseNodes(entries);
     const max_rec: u64 = dentryWireLen(max_name_len);
     const per_node = std.math.add(u64, 8, max_rec) catch return error.ResourceException;
     const records = std.math.mul(u64, node_count, per_node) catch return error.ResourceException;
     needed = try bounds.addU64(needed, records);
-    const regions = Tree.Regions.of(entries.len);
+    const regions = Tree.Regions.of(entries.len, std.math.cast(usize, node_count) orelse return error.ResourceException);
     needed = try bounds.addU64(needed, @as(u64, regions.total) + @alignOf(Node) - 1);
     return std.math.cast(usize, needed) orelse return error.ResourceException;
 }
@@ -598,9 +615,7 @@ pub fn parseScratchLen(parts: []const []const u8) Exception!usize {
     const table_len = std.math.cast(usize, table_hdr.uncompressed_size) orelse return error.ResourceException;
     var need: u64 = table_len;
     need = try bounds.addU64(need, @as(u64, table_len / blob_disk_size) * @sizeOf(BlobEntry));
-    // Store-mode tables carry the image verbatim, so the scan reads its
-    // true size; compressed tables keep the default.
-    var md_size: u64 = archive.len;
+    var md_size: u64 = 0;
     var temp_need: u64 = 0;
     if (table_hdr.size_in_wim == table_hdr.uncompressed_size) {
         const table = try bounds.slice(archive, table_hdr.offset, table_len);
@@ -610,21 +625,37 @@ pub fn parseScratchLen(parts: []const []const u8) Exception!usize {
         var at: usize = 0;
         while (at + blob_disk_size <= table.len) : (at += blob_disk_size) {
             const disk = try readBlobEntry(table, at);
-            if (disk.res.flags & reshdr_flag_metadata != 0) md_size = disk.res.uncompressed_size;
-            if (solid_wim and disk.res.flags & reshdr_flag_solid != 0 and disk.res.uncompressed_size == solid_resource_magic) {
+            const entry_solid = solid_wim and disk.res.flags & reshdr_flag_solid != 0;
+            if (entry_solid and disk.res.uncompressed_size == solid_resource_magic) {
                 const sr = try loadSolidRes(.{ .slices = parts }, disk.part, disk.res);
                 temp_need = @max(temp_need, @min(sr.chunk_size, sr.uncompressed_size));
+                continue;
             }
+            // The drop chain mirrors parse's first pass, so only a row the
+            // chain keeps can become the metadata image. The scan sizes to
+            // the largest survivor: parse decodes the first one, and a
+            // later image may name a smaller tree.
+            if (isZeroHash(&disk.hash)) continue;
+            if (disk.part == 0 or disk.part > parts.len) continue;
+            if (disk.res.flags & reshdr_flag_metadata != 0 and !entry_solid)
+                md_size = @max(md_size, disk.res.uncompressed_size);
         }
+        // A table with no surviving metadata row leaves the image to the
+        // header slot; the archive length stays the stand-in bound.
+        if (md_size == 0) md_size = archive.len;
     } else if (std.mem.readInt(u32, archive[12..16], .little) == wim_version_solid) {
-        // A compressed table hides the rows; every chunk the parse will
-        // accept stays under the header codec's cap.
+        // A compressed table hides the rows; the archive length stands in
+        // for the metadata image, and every chunk the parse will accept
+        // stays under the header codec's cap.
+        md_size = archive.len;
         temp_need = switch (try headerCodec(archive)) {
             .xpress => xpress_chunk_max,
             .lzx => lzx_chunk_max,
             .lzms => lzms_chunk_max,
             .store, .unsupported => 0,
         };
+    } else {
+        md_size = archive.len;
     }
     need = try bounds.addU64(need, md_size);
     need = try bounds.addU64(need, scratch_size);
@@ -652,7 +683,7 @@ pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Exception!usi
 // The store path, shared by the plain encode and the delta (reference)
 // variants; refs stay empty for a standalone WIM.
 fn encodeStored(entries: []const Entry, output: []u8, scratch: []u8, refs: []const []const u8) Exception!usize {
-    var tree = try Tree.init(scratch, entries.len);
+    var tree = try treeOf(entries, scratch);
     try tree.build(entries);
     if (refs.len != 0) try tree.markBacked(refs, scratch[0..tree.front]);
     const metadata_len = try tree.layout();
@@ -1282,7 +1313,7 @@ fn walk(metadata: []const u8, ctx: anytype, comptime visit: anytype) Exception!v
             name = try utf16NameInto(&name_buf, metadata[pos + dentry_disk_size ..][0..name_nbytes]);
             // Hosts join dentry names into extraction paths: a dot segment
             // or embedded terminator escapes the destination directory.
-            if (!isComponent(name) or std.mem.findScalar(u8, name, 0) != null) return error.DataException;
+            if (!isSafeComponent(name)) return error.DataException;
         }
         var hash: [sha1_len]u8 = undefined;
         @memcpy(&hash, metadata[pos + 64 ..][0..sha1_len]);
@@ -1462,7 +1493,7 @@ test "wim store roundtrips flat files" {
 test "wim write rejects dot and empty leaf components" {
     const testing = std.testing;
     // The leaf validated here is the component resolveParent never sees.
-    for ([_][]const u8{ "dir/.", "dir/..", "dir//", ".", ".." }) |name| {
+    for ([_][]const u8{ "dir/.", "dir/..", "dir//", ".", "..", "../evil", "a\\b.txt", "C:/evil", "c:relative" }) |name| {
         const entries = [_]Entry{.{ .name = name, .data = "x" }};
         var scratch: [8192]u8 = undefined;
         // The sizing path is name-shape-blind; the tree build owns the refusal.
@@ -1511,6 +1542,15 @@ test "wim read walk rejects dot segments and terminators in dentry names" {
     metadata[@intCast(child_at + 104)] = 'k';
     try walk(&metadata, &ctx, Ctx.visit);
     try testing.expectEqual(@as(usize, 1), ctx.seen);
+
+    // A backslash dentry name is a separator on Windows hosts, never a
+    // name byte; the walk refuses it as data.
+    std.mem.writeInt(u64, metadata[@intCast(child_at)..][0..8], @intCast(102 + 3 * 2 + 2), .little);
+    std.mem.writeInt(u16, metadata[@intCast(child_at + 100)..][0..2], 3 * 2, .little);
+    metadata[@intCast(child_at + 102)] = 'a';
+    metadata[@intCast(child_at + 104)] = '\\';
+    metadata[@intCast(child_at + 106)] = 'b';
+    try testing.expectError(error.DataException, walk(&metadata, &ctx, Ctx.visit));
 }
 
 test "wim header part and image count offsets" {
@@ -1914,7 +1954,9 @@ pub fn encodeWorkspaceSize(entries: []const Entry, options: EncodeOptions) Excep
         .store => 0,
     };
     const room = try bounds.addU64(try metadataUpperBound(entries), codec_ws + 3 * (cs + 16));
-    return std.math.cast(usize, try bounds.addU64(room, try bounds.addU64(staged, try bounds.addU64(Tree.Regions.of(entries.len).total, @alignOf(Node))))) orelse error.ResourceException;
+    const nodes: usize = std.math.cast(usize, try worstCaseNodes(entries)) orelse return error.ResourceException;
+    const tree_room: u64 = Tree.Regions.of(entries.len, nodes).total;
+    return std.math.cast(usize, try bounds.addU64(room, try bounds.addU64(staged, try bounds.addU64(tree_room, @alignOf(Node))))) orelse error.ResourceException;
 }
 
 // An upper bound: each separator may open a list and cost a terminator.
@@ -1975,7 +2017,7 @@ pub fn encodeEx(entries: []const Entry, output: []u8, scratch: []u8, options: En
         .store => 0,
     };
 
-    var tree = try Tree.init(scratch, entries.len);
+    var tree = try treeOf(entries, scratch);
     try tree.build(entries);
     if (options.references.len != 0) try tree.markBacked(options.references, scratch[0..tree.front]);
     const metadata_len = try tree.layout();
@@ -2263,7 +2305,16 @@ fn splitCore(archive: []const u8, volume_size: u64, output: ?[]u8, lengths: ?[]u
         const at = table_off + @as(u64, index) * blob_disk_size;
         @memcpy(out[@intCast(at)..][0..blob_disk_size], &entry);
     }
-    writeSplitBlobEntry(&entry, parsed.md_res, 1, &parsed.md_hash);
+    // Part 1 carries the metadata decoded and uncompressed right after
+    // the header; the row must describe that copy, not the source
+    // resource (wimlib compresses metadata by default, and the source
+    // need not place it at offset 208).
+    writeSplitBlobEntry(&entry, .{
+        .size_in_wim = md_len,
+        .flags = reshdr_flag_metadata,
+        .offset = header_disk_size,
+        .uncompressed_size = md_len,
+    }, 1, &parsed.md_hash);
     const md_at = table_off + @as(u64, parsed.blobs.len) * blob_disk_size;
     @memcpy(out[@intCast(md_at)..][0..blob_disk_size], &entry);
     const zeros: [blob_disk_size]u8 = @splat(0);
@@ -2562,4 +2613,151 @@ test "wim name shape limits and corrupt codepoints keep distinct error classes" 
     std.mem.writeInt(u16, units[0..2], 0xDC00, .little);
     var roomy: [64]u8 = undefined;
     try testing.expectError(error.DataException, utf16NameInto(&roomy, units[0..2]));
+}
+
+test "wim write bound covers deep unique paths" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    // One entry spans five nodes (root, a, b, c, leaf); the old 2N+1
+    // cap fit three and failed the caller that honored the bound.
+    const entries = [_]Entry{.{ .name = "a/b/c/d", .data = "deep payload" }};
+    const bound = try writeScratchLen(&entries);
+    const scratch = try allocator.alloc(u8, bound);
+    defer allocator.free(scratch);
+    const size = try archiveSize(&entries, scratch);
+    const archive = try allocator.alloc(u8, @intCast(size));
+    defer allocator.free(archive);
+    const written = try encode(&entries, archive, scratch);
+    try testing.expectEqual(size, @as(u64, written));
+    // The walk visits the directory dentries too.
+    var read_scratch: [64 * 1024]u8 = undefined;
+    const count = try inspectCount(archive, &read_scratch);
+    try testing.expectEqual(@as(u64, 4), count);
+    var found: ?u64 = null;
+    var index: u64 = 0;
+    while (index < count) : (index += 1) {
+        const probe = try inspectOrdinal(archive, index, &read_scratch);
+        if (std.mem.eql(u8, probe.name, "a/b/c/d")) found = index;
+    }
+    var out: [64]u8 = undefined;
+    const n = try decodeOrdinal(archive, found.?, &out, &read_scratch);
+    try testing.expectEqualSlices(u8, "deep payload", out[0..n]);
+}
+
+test "wim encode rejects a malformed utf-8 entry name as a bad call" {
+    const testing = std.testing;
+    const entries = [_]Entry{.{ .name = "bad\xff", .data = "x" }};
+    try testing.expectError(error.CallException, writeScratchLen(&entries));
+    var archive: [16 * 1024]u8 = undefined;
+    var scratch: [64 * 1024]u8 = undefined;
+    try testing.expectError(error.CallException, encode(&entries, &archive, &scratch));
+}
+
+test "wim parse scratch sizing keeps the largest metadata image" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    // A stored table naming two metadata images: image 1's tree dwarfs
+    // image 2's and the fixed fudge, so sizing to the last row starves
+    // the metadata carve parse needs for image 1.
+    var tree: [222]u8 = @splat(0);
+    // Security data: a u32 total that counts itself.
+    std.mem.writeInt(u32, tree[0..4], 8, .little);
+    // Root dentry at 8; its subdir offset at +16 names the child.
+    std.mem.writeInt(u64, tree[8..16], dentry_disk_size, .little);
+    std.mem.writeInt(u64, tree[24..32], 110, .little);
+    // Child dentry at 110: a 104-byte record (102 plus a two-unit name),
+    // zero hash, no subdir, one stream entry with a zero hash.
+    std.mem.writeInt(u64, tree[110..118], 104, .little);
+    std.mem.writeInt(u16, tree[206..208], 0, .little);
+    std.mem.writeInt(u16, tree[210..212], 2, .little);
+    tree[212] = 'a';
+    tree[213] = 0;
+    const table_off: usize = header_disk_size;
+    const table_len: usize = 2 * blob_disk_size;
+    const md1_off: usize = table_off + table_len;
+    const md1_len: usize = 70000;
+    const md2_off: usize = md1_off + md1_len;
+    const archive = try allocator.alloc(u8, md2_off + tree.len);
+    defer allocator.free(archive);
+    @memset(archive, 0);
+    std.mem.writeInt(u64, archive[0..8], wim_magic, .little);
+    std.mem.writeInt(u32, archive[12..16], wim_version, .little);
+    std.mem.writeInt(u16, archive[40..42], 1, .little);
+    std.mem.writeInt(u32, archive[44..48], 2, .little);
+    writeReshdr(archive[48..72], .{ .size_in_wim = table_len, .flags = 0, .offset = table_off, .uncompressed_size = table_len });
+    @memcpy(archive[md1_off..][0..tree.len], &tree);
+    @memcpy(archive[md2_off..][0..tree.len], &tree);
+    var row: [blob_disk_size]u8 = @splat(0);
+    writeReshdr(row[0..24], .{ .size_in_wim = md1_len, .flags = reshdr_flag_metadata, .offset = md1_off, .uncompressed_size = md1_len });
+    std.mem.writeInt(u16, row[24..26], 1, .little);
+    std.mem.writeInt(u32, row[26..30], 1, .little);
+    @memset(row[30..50], 1);
+    @memcpy(archive[table_off..][0..blob_disk_size], &row);
+    @memset(&row, 0);
+    writeReshdr(row[0..24], .{ .size_in_wim = tree.len, .flags = reshdr_flag_metadata, .offset = md2_off, .uncompressed_size = tree.len });
+    std.mem.writeInt(u16, row[24..26], 1, .little);
+    std.mem.writeInt(u32, row[26..30], 1, .little);
+    @memset(row[30..50], 2);
+    @memcpy(archive[table_off + blob_disk_size ..][0..blob_disk_size], &row);
+    // The bound must cover the metadata carve for image 1, not image 2.
+    var one = [_][]const u8{archive};
+    const need = try parseScratchLen(&one);
+    const scratch = try allocator.alloc(u8, need);
+    defer allocator.free(scratch);
+    try testing.expectEqual(@as(u64, 1), try inspectCount(archive, scratch));
+    const info = try inspectOrdinal(archive, 0, scratch);
+    try testing.expectEqualStrings("a", info.name);
+    try testing.expectEqual(@as(u64, 0), info.size);
+}
+
+test "wim split rewrites the metadata row for the emitted part" {
+    const testing = std.testing;
+    // A single-image store archive whose metadata resource sits past the
+    // header. The split copies the decoded tree to offset 208, so the
+    // emitted row must describe that copy; copying the source row
+    // verbatim would point part 1's reader at the wrong offset (and a
+    // wimlib-style compressed row would describe bytes the part never
+    // carries).
+    var tree: [222]u8 = @splat(0);
+    std.mem.writeInt(u32, tree[0..4], 8, .little);
+    std.mem.writeInt(u64, tree[8..16], dentry_disk_size, .little);
+    std.mem.writeInt(u64, tree[24..32], 110, .little);
+    std.mem.writeInt(u64, tree[110..118], 104, .little);
+    std.mem.writeInt(u16, tree[206..208], 0, .little);
+    std.mem.writeInt(u16, tree[210..212], 2, .little);
+    tree[212] = 'a';
+    tree[213] = 0;
+    const md_off: usize = header_disk_size + blob_disk_size;
+    var row: [blob_disk_size]u8 = @splat(0);
+    writeReshdr(row[0..24], .{ .size_in_wim = tree.len, .flags = reshdr_flag_metadata, .offset = md_off, .uncompressed_size = tree.len });
+    std.mem.writeInt(u16, row[24..26], 1, .little);
+    std.mem.writeInt(u32, row[26..30], 1, .little);
+    @memset(row[30..50], 1);
+    var archive: [1024]u8 = @splat(0);
+    std.mem.writeInt(u64, archive[0..8], wim_magic, .little);
+    std.mem.writeInt(u32, archive[12..16], wim_version, .little);
+    std.mem.writeInt(u16, archive[40..42], 1, .little);
+    std.mem.writeInt(u16, archive[42..44], 1, .little);
+    std.mem.writeInt(u32, archive[44..48], 1, .little);
+    writeReshdr(archive[48..72], .{ .size_in_wim = blob_disk_size, .flags = 0, .offset = header_disk_size, .uncompressed_size = blob_disk_size });
+    @memcpy(archive[header_disk_size..][0..blob_disk_size], &row);
+    @memcpy(archive[md_off..][0..tree.len], &tree);
+    const source = archive[0 .. md_off + tree.len];
+
+    var scratch: [64 * 1024]u8 = undefined;
+    var lengths: [8]u64 = @splat(0);
+    var set: [8 * 1024]u8 = undefined;
+    const plan = try wimSplitPlan(source, 4096, &scratch);
+    try testing.expectEqual(@as(u64, 1), plan.count);
+    const emitted = try wimSplitEmit(source, 4096, &set, &lengths, &scratch);
+    try testing.expectEqual(@as(u64, 1), emitted.count);
+
+    var parts: [8][]const u8 = undefined;
+    parts[0] = set[0..@intCast(lengths[0])];
+    const volumes = parts[0..1];
+    try volumeSetChecks(volumes);
+    try testing.expectEqual(@as(u64, 1), try volumeInspectCount(volumes, &scratch));
+    const info = try volumeInspectOrdinal(volumes, 0, &scratch, .{});
+    try testing.expectEqualStrings("a", info.name);
+    try testing.expectEqual(@as(u64, 0), info.size);
 }

@@ -44,6 +44,7 @@ pub const Decompress = struct {
     // Resume a fresh member at a byte position the framing read
     // ahead to (session drivers). Both fields are fresh-construction state.
     pub fn setFramePos(self: *@This(), pos: usize) void {
+        std.debug.assert(self.slice_bound);
         self.inner.input.seek = pos;
         self.inner.consumed_bits = 0;
     }
@@ -51,10 +52,12 @@ pub const Decompress = struct {
     // Session-driver surface mirroring the onprem arm, over the fixed
     // reader stdlib flate reads from.
     pub fn streamPosition(self: *const @This()) usize {
+        std.debug.assert(self.slice_bound);
         return self.inner.input.seek;
     }
 
     pub fn restage(self: *@This(), data: []const u8, pos: usize) void {
+        std.debug.assert(self.slice_bound);
         // Mid-member restage: consumed_bits belongs to the byte at `pos`
         // after compaction and must survive (see the onprem arm).
         self.inner.input.buffer = @constCast(data);

@@ -213,7 +213,7 @@ fn isSkippableMagic(value: u32) bool {
 }
 
 fn isLegacyMagic(value: u32) bool {
-    return value >= legacy_magic and value <= legacy_magic + 7;
+    return value == legacy_magic;
 }
 
 // A following frame magic ends a legacy frame; its four bytes belong to the
@@ -728,8 +728,13 @@ pub fn decompressBlock(input: []const u8, output: []u8, prefix: []const u8) erro
         }
         op += lit_len;
         ip += lit_len;
-        if (ip == input.len) break;
-        if (input.len - ip < 2) return error.DataException;
+        // A sequence that is not final must leave room for its offset, a
+        // successor token, and the five trailing literal bytes the format
+        // reserves: eight bytes. Fewer is final, and only an exact end counts.
+        if (input.len - ip < 2 + 1 + last_literals) {
+            if (ip != input.len) return error.DataException;
+            break;
+        }
         const offset = std.mem.readInt(u16, input[ip..][0..2], .little);
         ip += 2;
         var match_len: usize = (token & 0x0f) + min_match;
@@ -1137,6 +1142,21 @@ test "lz4 legacy terminator words separate blocks from frames" {
     try std.testing.expectEqual(@as(usize, 0), try decode(frame[0..4], &output, decode_scratch, .{}));
 }
 
+test "lz4 legacy magic matches exactly" {
+    // Only 0x184C2102 names a legacy frame; adjacent values are unknown
+    // magic numbers, not tolerated versions.
+    const allocator = std.testing.allocator;
+    const decode_scratch = try allocator.alloc(u8, decodeWorkspaceSize());
+    defer allocator.free(decode_scratch);
+    var output: [64]u8 = undefined;
+    inline for (1..8) |delta| {
+        var stream: [8]u8 = undefined;
+        std.mem.writeInt(u32, stream[0..4], legacy_magic + delta, .little);
+        std.mem.writeInt(u32, stream[4..8], 0, .little);
+        try std.testing.expectError(error.DataException, decode(&stream, &output, decode_scratch, .{}));
+    }
+}
+
 test "lz4 reserved descriptor bits fail under a fresh checksum" {
     const allocator = std.testing.allocator;
     const input = "reserved descriptor bit frame payload";
@@ -1229,6 +1249,22 @@ test "lz4 decoder rejects a match reaching the last five bytes" {
     const produced = try decompressBlock(&well_formed, &full, &[_]u8{});
     try std.testing.expectEqual(@as(usize, 13), produced);
     try std.testing.expectEqualSlices(u8, "abcdabcdvwxyz", &full);
+}
+
+test "lz4 decoder rejects sequences crowding the block end" {
+    // Literals leaving one to seven bytes once parsed as a phantom offset
+    // and match; the format makes that sequence final instead, so the
+    // reference decoder rejects what this reader used to accept.
+    const three_left = [_]u8{ 0x20, 'a', 'b', 1, 0, 0x00 };
+    const five_left = [_]u8{ 0x20, 'a', 'b', 1, 0, 0x20, 'x', 'y' };
+    var room: [16]u8 = undefined;
+    try std.testing.expectError(error.DataException, decompressBlock(&three_left, &room, &[_]u8{}));
+    try std.testing.expectError(error.DataException, decompressBlock(&five_left, &room, &[_]u8{}));
+
+    // Eight leftover bytes keep the mid-block sequence valid.
+    const eight_left = [_]u8{ 0x20, 'a', 'b', 1, 0, 0x50, 'v', 'w', 'x', 'y', 'z' };
+    const produced = try decompressBlock(&eight_left, &room, &[_]u8{});
+    try std.testing.expectEqualSlices(u8, "abbbbbvwxyz", room[0..produced]);
 }
 
 test "lz4 decode caps amplified output at the work ceiling" {

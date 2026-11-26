@@ -158,6 +158,20 @@ fn readOnlyReject(r: *Runner) !void {
     }, .{ .profile = false }, abi.Status.unsupported, &output);
 }
 
+// A write whose sink never declared the write bit must refuse before the
+// hook stages or publishes a single byte.
+fn sinkWriteBitReject(r: *Runner) !void {
+    const input = "no write bit";
+    var output: [16]u8 = @splat(0xa5);
+    try harness.reject(r, harness.ids.write, &.{
+        harness.sourceSpan(input),
+        harness.sinkSpan(&output),
+        harness.capabilityParam(harness.cap_read | harness.cap_size | harness.cap_replay),
+        harness.sizingModeParam(harness.size_metadata_exact),
+        harness.commitModeParam(harness.commit_tentative),
+    }, .{}, abi.Status.unsupported, &output);
+}
+
 fn missingSource(r: *Runner) !void {
     var output: [16]u8 = @splat(0xa5);
     try harness.reject(r, harness.ids.read, &.{
@@ -345,6 +359,7 @@ pub fn run(r: *Runner) anyerror!void {
     try limitReject(r);
     try callbackDownstream(r);
     try readOnlyReject(r);
+    try sinkWriteBitReject(r);
     try missingSource(r);
     try missingSink(r);
     try duplicateProfile(r);

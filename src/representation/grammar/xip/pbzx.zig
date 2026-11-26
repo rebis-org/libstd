@@ -148,10 +148,10 @@ pub fn Pbzx(comptime Located: type) type {
 
         const state_size: usize = @sizeOf(ChunkState);
 
-        // The in-place formula always leaves this much slack;
+        // The xz workspace formula always leaves this much slack;
         // the state must fit inside it.
         comptime {
-            if (state_size > 65536) @compileError("pbzx: the chunk state outgrew the workspace slack");
+            if (state_size > xz.workspace_headroom) @compileError("pbzx: the chunk state outgrew the workspace slack");
         }
 
         raw: [state_size]u8,

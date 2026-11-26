@@ -49,6 +49,10 @@ pub const Options = struct {
     // Some formats (alone, 7-Zip) may close the stream with an
     // end-of-payload marker after the declared bytes.
     allow_eopm: bool = false,
+    // Formats that own the whole payload buffer reject bytes the stream
+    // leaves behind; embedded framings keep this off and decode only the
+    // leading bytes of a larger buffer.
+    reject_trailing: bool = false,
     max_work: u64 = std.math.maxInt(u64),
     match_finder_depth: u32 = 32,
     lazy: bool = false,
@@ -1356,20 +1360,19 @@ fn initProbs(probs: []Prob) void {
 // Direct callers can construct Properties without Properties.decode; the
 // grammar paths validate there, so the leaf re-checks its own contract.
 fn checkProperties(properties: Properties) Exception!void {
-    if (properties.lc + properties.lp > 4) return error.UnsupportedException;
+    // Widen before adding: u4 + u4 would trap on overflow instead of
+    // converting the contract violation to an exception.
+    if (@as(u32, properties.lc) + properties.lp > 4) return error.UnsupportedException;
+    // pb > 4 would read past is_match, is_rep0_long, and the len coders,
+    // which are sized for num_pos_bits_max.
+    if (properties.pb > 4) return error.UnsupportedException;
     if (properties.dictionary_size < dictionary_min or properties.dictionary_size > dictionary_max) return error.UnsupportedException;
 }
 
 pub fn decode(input: []const u8, output: []u8, scratch: []u8, options: Options) Exception!usize {
-    try checkProperties(options.properties);
-    const needed = decodeWorkspaceSize(options.properties);
-    if (scratch.len < needed) return error.CapacityException;
-    if (input.len + output.len > options.max_work) return error.ResourceException;
-    // Output doubles as dictionary window, avoiding a separate copy.
-    var decoder = try DecoderOf(true).initPropertiesInPlace(options.properties, output, scratch);
-    try decoder.resetReaderSlice(input);
-    try decoder.decodeToOutput(null, options.unpack_size, options.marker_required, options.allow_eopm);
-    return std.math.cast(usize, decoder.decoded) orelse return error.ResourceException;
+    // The standard decode already runs in place: the output doubles as the
+    // dictionary window, so the measured scratch need is the model size.
+    return decodeInPlace(input, output, scratch, options);
 }
 
 pub fn decodeInPlace(input: []const u8, output: []u8, scratch: []u8, options: Options) Exception!usize {
@@ -1380,6 +1383,7 @@ pub fn decodeInPlace(input: []const u8, output: []u8, scratch: []u8, options: Op
     var decoder = try DecoderOf(true).initPropertiesInPlace(options.properties, output, scratch);
     try decoder.resetReaderSlice(input);
     try decoder.decodeToOutput(null, options.unpack_size, options.marker_required, options.allow_eopm);
+    if (options.reject_trailing and decoder.range_coder.input.position != input.len) return error.DataException;
     return std.math.cast(usize, decoder.decoded) orelse return error.ResourceException;
 }
 
@@ -1391,6 +1395,7 @@ pub fn decodedSize(input: []const u8, scratch: []u8, options: Options) Exception
     var decoder = try DecoderOf(true).initProperties(options.properties, scratch);
     try decoder.resetReaderSlice(input);
     try decoder.decodeToOutput(null, options.unpack_size, options.marker_required, options.allow_eopm);
+    if (options.reject_trailing and decoder.range_coder.input.position != input.len) return error.DataException;
     return decoder.output_pos;
 }
 
@@ -1399,6 +1404,7 @@ pub fn decodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, 
     try checkProperties(options.properties);
     var source = std.Io.Reader.fixed(input);
     try decodeStream(&source, writer, scratch, options);
+    if (options.reject_trailing and source.seek != input.len) return error.DataException;
 }
 
 pub fn decodeStream(reader: *std.Io.Reader, writer: *std.Io.Writer, scratch: []u8, options: Options) Exception!void {
@@ -1850,26 +1856,30 @@ pub const Encoder = struct {
         var ptr1: *u32 = &self.son[slot * 2];
         ptr0.* = 0;
         ptr1.* = 0;
+        // Tree entries store the position plus one, as the hash-chain finder
+        // does, so zero marks an empty slot and position zero stays reachable.
         var cur = self.head[hash];
-        self.head[hash] = @intCast(abs_pos);
+        self.head[hash] = @intCast(abs_pos + 1);
         var length0: usize = 0;
         var length1: usize = 0;
-        const oldest_position = if (abs_pos < self.chain_window) 0 else abs_pos - self.chain_window;
+        // The smallest entry still inside the window; one keeps every
+        // candidate while the window has yet to cover position zero.
+        const oldest_entry: u32 = if (abs_pos < self.chain_window) 1 else @intCast(abs_pos - self.chain_window + 2);
         var depth: u32 = self.match_finder_depth *% 4;
         const input = self.input;
         const input_base = self.input_base;
-        while (cur != 0 and depth != 0 and oldest_position < cur) : (depth -= 1) {
-            if (cur == abs_pos) break;
-            const distance = abs_pos - cur;
+        while (cur >= oldest_entry and depth != 0) : (depth -= 1) {
+            if (cur - 1 == abs_pos) break;
+            const distance = abs_pos - (cur - 1);
             const pair_slot = if (slot >= distance) slot - distance else self.chain_window + slot - distance;
             const pair = pair_slot * 2;
             var length = @min(length0, length1);
-            if (cur >= input_base) {
-                const candidate_offset = @as(usize, cur) - input_base;
+            if (cur - 1 >= input_base) {
+                const candidate_offset = @as(usize, cur - 1) - input_base;
                 if (input[candidate_offset + length] == input[position + length]) {
                     length += 1;
                     if (length != length_limit and input[candidate_offset + length] == input[position + length]) {
-                        length = self.matchLen(cur, abs_pos, length_limit);
+                        length = self.matchLen(cur - 1, abs_pos, length_limit);
                     }
                 }
                 if (input[candidate_offset + length] < input[position + length]) {
@@ -1886,16 +1896,16 @@ pub const Encoder = struct {
                 continue;
             }
             const input_byte = input[position + length];
-            if (self.byteAt(cur + length) == input_byte) {
+            if (self.byteAt(cur - 1 + length) == input_byte) {
                 length += 1;
                 if (length != length_limit) {
                     const next_input_byte = input[position + length];
-                    if (self.byteAt(cur + length) == next_input_byte) {
-                        length = self.matchLen(cur, abs_pos, length_limit);
+                    if (self.byteAt(cur - 1 + length) == next_input_byte) {
+                        length = self.matchLen(cur - 1, abs_pos, length_limit);
                     }
                 }
             }
-            if (self.byteAt(cur + length) < input[position + length]) {
+            if (self.byteAt(cur - 1 + length) < input[position + length]) {
                 ptr1.* = cur;
                 cur = self.son[pair + 1];
                 ptr1 = &self.son[pair + 1];
@@ -2395,22 +2405,26 @@ pub const Encoder = struct {
         var ptr1: *u32 = &self.son[slot * 2];
         ptr0.* = 0;
         ptr1.* = 0;
+        // Tree entries store the position plus one, as the hash-chain finder
+        // does, so zero marks an empty slot and position zero stays reachable.
         var cur = self.head[hash];
-        self.head[hash] = @intCast(abs_pos);
+        self.head[hash] = @intCast(abs_pos + 1);
         var length0: usize = 0;
         var length1: usize = 0;
         var count: usize = self.shortMatches(position, matches);
         var best_length: usize = if (count > 0) matches[count - 1].length else 0;
-        const oldest_position = if (abs_pos < self.chain_window) 0 else abs_pos - self.chain_window;
+        // The smallest entry still inside the window; one keeps every
+        // candidate while the window has yet to cover position zero.
+        const oldest_entry: u32 = if (abs_pos < self.chain_window) 1 else @intCast(abs_pos - self.chain_window + 2);
         var depth: u32 = self.match_finder_depth;
         const input = self.input;
         const input_base = self.input_base;
-        while (cur != 0 and depth != 0 and oldest_position < cur) : (depth -= 1) {
-            if (cur == abs_pos) break;
-            const distance = abs_pos - cur;
+        while (cur >= oldest_entry and depth != 0) : (depth -= 1) {
+            if (cur - 1 == abs_pos) break;
+            const distance = abs_pos - (cur - 1);
             const pair_slot = if (slot >= distance) slot - distance else self.chain_window + slot - distance;
             const pair = pair_slot * 2;
-            const candidate_position = cur;
+            const candidate_position = cur - 1;
             var length = @min(length0, length1);
             if (candidate_position >= input_base) {
                 const candidate_offset = @as(usize, candidate_position) - input_base;
@@ -2797,4 +2811,45 @@ test "lzma size boundary requires a finished coder or the marker allowance" {
     });
     try std.testing.expectEqual(large.len, produced);
     try std.testing.expectEqualSlices(u8, &large, large_out);
+}
+
+test "lzma bt4 match finder reaches absolute position zero" {
+    const allocator = std.testing.allocator;
+    const properties = Properties{ .lc = 0, .lp = 0, .pb = 0, .dictionary_size = dictionary_min };
+    const scratch = try allocator.alloc(u8, encodeWorkspaceSizeBt(properties));
+    defer allocator.free(scratch);
+    var drain = std.Io.Writer.fixed(&.{});
+    const options: Options = .{ .properties = properties, .match_finder = .bt4 };
+    var encoder = try Encoder.init(properties, &drain, scratch, options);
+    // The pattern repeats at distance 16. Only the tree index pairs the
+    // second period with absolute position zero, whose stored entry value
+    // would otherwise double as the empty-slot sentinel.
+    var input_buffer: [320]u8 = undefined;
+    const pattern = "abcdefghijklmnop";
+    @memcpy(input_buffer[0..pattern.len], pattern);
+    @memcpy(input_buffer[pattern.len .. 2 * pattern.len], pattern);
+    @memset(input_buffer[2 * pattern.len ..], 0xEE);
+    encoder.input = &input_buffer;
+    encoder.input_base = 0;
+    var inserted: [match_list_max]MatchPair = undefined;
+    _ = encoder.findMatches(0, &inserted);
+    var matches: [match_list_max]MatchPair = undefined;
+    const count = encoder.findMatches(16, &matches);
+    var found = false;
+    for (matches[0..count]) |match| {
+        if (match.distance == 16 and match.length >= pattern.len) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "lzma rejects out-of-range properties without trapping" {
+    var output: [16]u8 = undefined;
+    var scratch: [4096]u8 = undefined;
+    // pb beyond the model ceiling would index the state tables out of
+    // bounds, and lc plus lp saturating their u4 fields would overflow
+    // before the comparison; both must surface as rejections instead.
+    const oversize_pb = Properties{ .lc = 0, .lp = 0, .pb = 5, .dictionary_size = dictionary_min };
+    try std.testing.expectError(error.UnsupportedException, decode("", &output, &scratch, .{ .properties = oversize_pb }));
+    const saturating_lc_lp = Properties{ .lc = 15, .lp = 15, .pb = 0, .dictionary_size = dictionary_min };
+    try std.testing.expectError(error.UnsupportedException, decode("", &output, &scratch, .{ .properties = saturating_lc_lp }));
 }

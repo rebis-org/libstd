@@ -109,14 +109,26 @@ pub const DecodeOptions = struct {
     failure_cause: ?*crypto.FailureCause = null,
     // Optional single-entry KDF memo shared across passes; see Rar5KdfMemo.
     kdf_memo: ?*Rar5KdfMemo = null,
+    // RAR4 name-conversion stage: stored '\' separators join the library's
+    // '/'-separated projection here. It must outlive the call because the
+    // ordinal query returns a name slice into it; a missing or short stage
+    // fails a backslash name closed (CapacityException) instead of passing
+    // it raw. rar4_name_stage_max covers every RAR4 name.
+    name_scratch: []u8 = &.{},
     // The primitive provider for KDF and block decryption on this call.
     provider: crypto.Provider = crypto.default_provider,
 };
 
 const rar5_kdf_lg2_count_max = 24;
 
+// The u16 name_size bound covers every RAR4 name, so a stage of this size
+// converts any backslash name the format can store.
+pub const rar4_name_stage_max: usize = 65535;
+
 pub const rar4_signature = [7]u8{ 0x52, 0x61, 0x72, 0x21, 0x1a, 0x07, 0x00 };
-const sfx_scan_limit: usize = 1024 * 1024;
+// Vendor IsArchive scans MAXSFXSIZE (4 MiB) from the file start for a
+// signature when the file does not open with one.
+const sfx_scan_limit: usize = 0x400000;
 
 // Decode-side buffers carved from the call workspace. One engine state is
 // live at a time.
@@ -161,19 +173,26 @@ fn detectFamily(archive: []const u8, provider: crypto.Provider) Exception!struct
     if (archive.len >= rar4_signature.len and
         std.mem.eql(u8, archive[0..rar4_signature.len], &rar4_signature))
         return .{ .family = .rar4, .offset = 0 };
+    if (archive.len >= rar5_signature.len and
+        std.mem.eql(u8, archive[0..rar5_signature.len], &rar5_signature))
+        return .{ .family = .rar5, .offset = 0 };
 
     // An SFX prefix moves the signature off offset 0; the scan confirms a
-    // main block follows.
-    const signature = rar5_signature;
-    if (archive.len < signature.len) return error.DataException;
+    // main block follows the marker before either family is accepted.
+    if (archive.len < rar4_signature.len) return error.DataException;
     const limit = @min(archive.len, sfx_scan_limit);
     var offset: usize = 0;
-    while (offset <= limit - signature.len) : (offset += 1) {
-        if (!std.mem.eql(u8, archive[offset..][0..signature.len], &signature)) continue;
-        if (offset == 0) return .{ .family = .rar5, .offset = 0 };
-        var cursor = offset + signature.len;
-        const header = parseRar5Block(archive, &cursor, provider) catch continue;
-        if (header.header_type == rar5_type_main) return .{ .family = .rar5, .offset = offset };
+    while (offset <= limit - rar4_signature.len) : (offset += 1) {
+        if (offset <= limit - rar5_signature.len and
+            std.mem.eql(u8, archive[offset..][0..rar5_signature.len], &rar5_signature))
+        {
+            var cursor = offset + rar5_signature.len;
+            const header = parseRar5Block(archive, &cursor, provider) catch continue;
+            if (header.header_type == rar5_type_main) return .{ .family = .rar5, .offset = offset };
+        } else if (std.mem.eql(u8, archive[offset..][0..rar4_signature.len], &rar4_signature)) {
+            const header = parseRar4Header(archive, offset + rar4_signature.len, provider) catch continue;
+            if (header.header_type == rar4_main) return .{ .family = .rar4, .offset = offset };
+        }
     }
     return error.DataException;
 }
@@ -735,6 +754,8 @@ fn parseRar5BlockEncrypted(
 // File-entry construction shared by both walks; the caller supplies the
 // packed total and opening crypt record.
 fn rar5FileEntry(header: Rar5Block, ordinal: usize, packed_total: u64, crypt: ?Crypt) Exception!Entry {
+    // Names come from the archive, so hostile paths fail as data.
+    if (bounds.isAbsoluteOrTraversal(header.name) or std.mem.findScalar(u8, header.name, 0) != null) return error.DataException;
     var entry: Entry = .{
         .info = .{
             .name = header.name,
@@ -1078,11 +1099,33 @@ fn rar4DataCrypt(file: Rar4File) Exception!?Crypt {
 
 // File-entry construction shared by the single and volume walks; the
 // caller supplies the packed total and the entry's data offset.
-fn rar4FileEntry(file: Rar4File, ordinal: usize, packed_total: u64, data_offset: u64) Exception!Entry {
+// RAR 4.x uses '\' as the path separator on every host (vendor
+// arcread.cpp: "RAR 4.x uses backslashes as path separator even in
+// Unix"), so a stored name converts to the library's '/'-separated
+// projection before the safety gate: "sub\deeper" reads as sub/deeper
+// while "..\evil" still converts to a traversal the gate rejects. RAR5
+// differs — '/' is its only separator, so a backslash name is
+// nonconforming there and stays rejected at the rar5 constructor.
+fn rar4DisplayName(name: []const u8, stage: []u8) Exception![]const u8 {
+    if (std.mem.findScalar(u8, name, '\\') == null) return name;
+    if (stage.len < name.len) return error.CapacityException;
+    @memcpy(stage[0..name.len], name);
+    for (stage[0..name.len]) |*byte| {
+        if (byte.* == '\\') byte.* = '/';
+    }
+    return stage[0..name.len];
+}
+
+fn rar4FileEntry(file: Rar4File, name: []const u8, ordinal: usize, packed_total: u64, data_offset: u64) Exception!Entry {
+    // The caller converts stored '\' separators first (rar4DisplayName);
+    // names come from the archive, so hostile paths fail as data.
+    if (bounds.isAbsoluteOrTraversal(name) or std.mem.findScalar(u8, name, 0) != null) {
+        return error.DataException;
+    }
     const header = file.header;
     var entry: Entry = .{
         .info = .{
-            .name = file.name,
+            .name = name,
             .size = file.unpacked_size,
             .data_offset = data_offset,
             .packed_size = packed_total,
@@ -1175,8 +1218,8 @@ fn parseRar4HeaderEncrypted(
     };
 }
 
-fn walkRar4(archive: []const u8, opts: DecodeOptions, ctx: anytype, comptime visit: fn (@TypeOf(ctx), Entry) Exception!void) Exception!void {
-    var cursor: usize = 0;
+fn walkRar4(archive: []const u8, offset: usize, opts: DecodeOptions, ctx: anytype, comptime visit: fn (@TypeOf(ctx), Entry) Exception!void) Exception!void {
+    var cursor: usize = offset;
     var seen_main = false;
     var ordinal: usize = 0;
     var header_crypt: ?Rar4HeaderCrypt = null;
@@ -1211,7 +1254,7 @@ fn walkRar4(archive: []const u8, opts: DecodeOptions, ctx: anytype, comptime vis
                 if (header.flags & (rar4_lhd_split_before | rar4_lhd_split_after) != 0)
                     return error.UnsupportedException;
                 const file = try parseRar4File(header_source, header);
-                const entry = try rar4FileEntry(file, ordinal, file.packed_size, @intCast(cursor + header.enc_len));
+                const entry = try rar4FileEntry(file, try rar4DisplayName(file.name, opts.name_scratch), ordinal, file.packed_size, @intCast(cursor + header.enc_len));
                 // See the RAR5 walk: directories are never exposed and do not
                 // consume ordinals.
                 if (!entry.is_directory) {
@@ -1254,7 +1297,7 @@ fn countVisit(ctx: *CountCtx, entry: Entry) Exception!void {
 fn walkEntriesOpts(archive: []const u8, opts: DecodeOptions, ctx: anytype, comptime visit: fn (@TypeOf(ctx), Entry) Exception!void) Exception!void {
     const located = try detectFamily(archive, opts.provider);
     switch (located.family) {
-        .rar4 => try walkRar4(archive, opts, ctx, visit),
+        .rar4 => try walkRar4(archive, located.offset, opts, ctx, visit),
         .rar5 => try walkRar5(archive, located.offset, opts, ctx, visit),
     }
 }
@@ -1876,7 +1919,7 @@ fn walkRar4Volumes(
                         chain.?.part_count = try bounds.addUsize(chain.?.part_count, 1);
                         if (!split_after) {
                             const head = chain.?;
-                            var entry = try rar4FileEntry(file, ordinal, head.total_packed, @intCast(cursor + header.enc_len));
+                            var entry = try rar4FileEntry(file, try rar4DisplayName(file.name, opts.name_scratch), ordinal, head.total_packed, @intCast(cursor + header.enc_len));
                             // The head part carries the full unpacked size.
                             entry.info.size = head.first_unpacked;
                             if (parts_scratch.len > 0) {
@@ -2290,6 +2333,75 @@ pub fn rarVolumeDecodeOrdinal(
     return size;
 }
 
+test "rar entry construction rejects escape names from hostile archives" {
+    const testing = std.testing;
+    // RAR5: the walk hands parse results straight to the entry, so the
+    // constructor owns the refusal; a benign directory name passes.
+    const benign5 = Rar5Block{ .header_type = 2, .flags = 0, .name = "dir", .is_directory = true };
+    const entry5 = try rar5FileEntry(benign5, 0, 0, null);
+    try testing.expectEqualStrings("dir", entry5.info.name);
+    for ([_][]const u8{ "../evil", "a\\b", "C:/evil", "a\x00b", "" }) |name| {
+        const hostile = Rar5Block{ .header_type = 2, .flags = 0, .name = name, .is_directory = true };
+        try testing.expectError(error.DataException, rar5FileEntry(hostile, 0, 0, null));
+    }
+    // RAR4: the same rule at its entry constructor, over the converted
+    // name the walks hand it (rar4DisplayName).
+    const benign4 = Rar4File{
+        .header = .{ .header_type = 3, .flags = 0, .head_size = 0, .data_size = 0, .header_offset = 0, .enc_len = 0 },
+        .packed_size = 0,
+        .unpacked_size = 0,
+        .file_crc = 0,
+        .unpack_version = 20,
+        .method = 0,
+        .name = "dir",
+        .is_directory = true,
+        .host_os = 0,
+        .mtime = 0,
+        .salt = null,
+    };
+    const entry4 = try rar4FileEntry(benign4, "dir", 0, 0, 0);
+    try testing.expectEqualStrings("dir", entry4.info.name);
+    for ([_][]const u8{ "../evil", "C:/evil", "a\x00b", "" }) |name| {
+        var hostile = benign4;
+        hostile.name = name;
+        try testing.expectError(error.DataException, rar4FileEntry(hostile, name, 0, 0, 0));
+    }
+}
+
+test "rar4 name conversion separates windows paths from escape attempts" {
+    const testing = std.testing;
+    // A name without a backslash aliases through untouched.
+    const plain = try rar4DisplayName("dir/file", &.{});
+    try testing.expectEqualStrings("dir/file", plain);
+    var stage: [16]u8 = undefined;
+    // Stored '\' is a separator on every RAR4 host, so it joins the
+    // '/'-separated projection.
+    const joined = try rar4DisplayName("sub\\deeper", &stage);
+    try testing.expectEqualStrings("sub/deeper", joined);
+    // A traversal stays one after conversion and the gate rejects it.
+    const escaped = try rar4DisplayName("..\\evil", &stage);
+    try testing.expectEqualStrings("../evil", escaped);
+    try testing.expectError(error.DataException, blk: {
+        var hostile = Rar4File{
+            .header = .{ .header_type = 3, .flags = 0, .head_size = 0, .data_size = 0, .header_offset = 0, .enc_len = 0 },
+            .packed_size = 0,
+            .unpacked_size = 0,
+            .file_crc = 0,
+            .unpack_version = 20,
+            .method = 0,
+            .name = "",
+            .is_directory = true,
+            .host_os = 0,
+            .mtime = 0,
+            .salt = null,
+        };
+        hostile.name = escaped;
+        break :blk rar4FileEntry(hostile, escaped, 0, 0, 0);
+    });
+    // A short stage fails closed rather than passing the raw name.
+    try testing.expectError(error.CapacityException, rar4DisplayName("sub\\deeper", stage[0..4]));
+}
+
 test "rar4 kdf reproduces the unrar sha1_process_rar29 self-modification" {
     // Expected bytes transcribe vendor/unrar/sha1.cpp and crypt3.cpp SetKey30;
     // a plain SHA-1 KDF would yield 1ac08ded32dd4d33dcae099781825ea5 here.
@@ -2578,6 +2690,34 @@ test "rar4 file header add size is unconditional" {
     try std.testing.expectEqualStrings("a", entries.name(0));
     try std.testing.expectEqual(@as(u64, 53), entries.data_offsets[0]);
     try std.testing.expectEqual(@as(u64, 5), entries.packed_sizes[0]);
+}
+
+test "rar4 sfx prefix offsets the walk" {
+    // An SFX stub precedes the marker; the scan accepts it only when a
+    // main header follows, like vendor IsArchive.
+    var archive: [81]u8 = @splat(0xCC);
+    @memcpy(archive[16..23], &rar4_signature);
+    _ = rar4FixtureHeader(archive[23..36], rar4_main, 0x0000, 13, 13);
+    var plain: [64]u8 = @splat(0);
+    @memcpy(archive[36..69], rar4FixtureFileHead(&plain, 0x0000, 5, "a"));
+    @memcpy(archive[69..74], "hello");
+    _ = rar4FixtureHeader(archive[74..81], rar4_end, 0x0000, 7, 7);
+
+    var entries: TestEntries = .{};
+    try walkEntriesOpts(&archive, .{}, &entries, testEntryVisit);
+    try std.testing.expectEqual(@as(usize, 1), entries.count);
+    try std.testing.expectEqualStrings("a", entries.name(0));
+    try std.testing.expectEqual(@as(u64, 69), entries.data_offsets[0]);
+    try std.testing.expectEqual(@as(u64, 5), entries.packed_sizes[0]);
+
+    // A marker with no main header after it stays a reject.
+    var negative: [32]u8 = @splat(0xCC);
+    @memcpy(negative[16..23], &rar4_signature);
+    var negative_entries: TestEntries = .{};
+    try std.testing.expectError(
+        error.DataException,
+        walkEntriesOpts(&negative, .{}, &negative_entries, testEntryVisit),
+    );
 }
 
 test "rar4 unknown unpacked size is refused" {

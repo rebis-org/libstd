@@ -66,7 +66,7 @@ test "bzip2 decode survives arbitrary input without trapping" {
     try smoke("bzip2");
 }
 
-test "sevenzip header walk survives arbitrary input without trapping" {
+test "sevenzip walk survives arbitrary input without trapping" {
     try smoke("sevenzip");
 }
 

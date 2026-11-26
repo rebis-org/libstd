@@ -420,7 +420,7 @@ fn recordBytes(comptime data_len: usize, comptime records: []const Record) [reco
     return out;
 }
 
-// Absolute regions: comptime keeps a wrong offset from becoming a test bug.
+// Absolute regions: comptime keeps a wrong offset from becoming a test defect.
 const MemberSpec = struct { name: []const u8, offset: u64, length: u64 };
 
 // A fixed tail pattern, distinct from any fixture byte, makes an overread unambiguous.
@@ -2094,7 +2094,7 @@ test "nested table matches the hand-run traversal entry for entry" {
     var scratch: [N.scratch_size]u8 align(N.scratch_alignment) = undefined;
     var nested = try N.open(&base, "records", &scratch);
 
-    // The hand-run of the same traversal: any divergence is a Nested bug.
+    // The hand-run of the same traversal: any divergence is a defect in Nested.
     var direct_src = try base.slice(0, fixture.len);
     var inner_scratch: [16]u8 = undefined;
     var direct = try FixedRecords(SliceSource, 4).open(&direct_src, &inner_scratch);

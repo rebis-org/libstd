@@ -75,7 +75,6 @@ pub fn decode(input: []const u8, output: []u8, scratch: []u8, options: Options) 
             finished = true;
             break;
         }
-        if (symbol < 0) return error.DataException;
         output[count] = @intCast(symbol);
         count += 1;
     }

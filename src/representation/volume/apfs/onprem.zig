@@ -995,7 +995,8 @@ fn buildTree(entries: []const Entry, alloc: std.mem.Allocator) Exception!*PlanNo
     const parents = alloc.alloc(*PlanNode, entries.len) catch return error.ResourceException;
     for (entries, 0..) |entry, index| {
         if (entry.name.len == 0 or entry.name[0] == '/' or
-            std.mem.findScalar(u8, entry.name, 0) != null) return error.UnsupportedException;
+            std.mem.findScalar(u8, entry.name, 0) != null or
+            bounds.isAbsoluteOrTraversal(entry.name)) return error.UnsupportedException;
         var parent = root;
         var it = std.mem.splitScalar(u8, entry.name, '/');
         var depth: u32 = 1;
@@ -1574,6 +1575,12 @@ test "apfs write rejects duplicate and malformed names" {
     try testing.expectError(error.UnsupportedException, archiveSize(&dot, &scratch));
     const absolute = [_]Entry{.{ .name = "/x.txt", .data = "one" }};
     try testing.expectError(error.UnsupportedException, archiveSize(&absolute, &scratch));
+    const backslash = [_]Entry{.{ .name = "a\\b.txt", .data = "one" }};
+    try testing.expectError(error.UnsupportedException, archiveSize(&backslash, &scratch));
+    const drive = [_]Entry{.{ .name = "C:/x.txt", .data = "one" }};
+    try testing.expectError(error.UnsupportedException, archiveSize(&drive, &scratch));
+    const nul = [_]Entry{.{ .name = "a\x00b.txt", .data = "one" }};
+    try testing.expectError(error.UnsupportedException, archiveSize(&nul, &scratch));
 }
 
 test "apfs empty archive roundtrips" {

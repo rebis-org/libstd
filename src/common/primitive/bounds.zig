@@ -24,11 +24,14 @@ pub fn slice(bytes: []const u8, offset: u64, length: u64) Exception![]const u8 {
 }
 
 // Archive members must stay inside the destination directory: no empty
-// name, no absolute path, no backslash separator, no parent traversal.
+// name, no absolute path, no Windows drive prefix, no backslash
+// separator, no parent traversal.
 pub fn isAbsoluteOrTraversal(name: []const u8) bool {
     if (name.len == 0) return true;
     if (name[0] == '/') return true;
     if (std.mem.findScalar(u8, name, '\\') != null) return true;
+    // A drive prefix is absolute on Windows even with forward slashes.
+    if (name.len >= 2 and std.ascii.isAlphabetic(name[0]) and name[1] == ':') return true;
     var segments = std.mem.splitScalar(u8, name, '/');
     while (segments.next()) |segment| {
         if (std.mem.eql(u8, segment, "..")) return true;

@@ -63,7 +63,7 @@ const max_selectors = 2 + block_size_max / group_size;
 pub fn decodedSize(input: []const u8, scratch: []u8, provider: checksum.Provider) Exception!usize {
     var counter = measurement.Counter.init(null);
     try decodeInner(input, &counter.writer, scratch, provider);
-    return @intCast(counter.written());
+    return @intCast(try counter.written());
 }
 
 pub fn decode(input: []const u8, output: []u8, scratch: []u8, provider: checksum.Provider) Exception!usize {
@@ -79,7 +79,7 @@ pub fn decodeToWriter(input: []const u8, writer: *std.Io.Writer, scratch: []u8, 
 pub fn requiredSize(input: []const u8, scratch: []u8, options: Options) Exception!usize {
     var counter = measurement.Counter.init(null);
     try encodeInner(input, &counter.writer, scratch, options);
-    return @intCast(counter.written());
+    return @intCast(try counter.written());
 }
 
 pub fn encode(input: []const u8, output: []u8, scratch: []u8, options: Options) Exception!usize {

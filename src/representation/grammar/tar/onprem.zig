@@ -329,7 +329,7 @@ fn tarNumber(field: []const u8) Exception!u64 {
     return value;
 }
 
-fn tarWriteNumber(field: []u8, value: u64) void {
+fn tarWriteNumber(field: []u8, value: u64) Exception!void {
     @memset(field, 0);
     const octal_bits = (field.len - 1) * 3;
     if (octal_bits < 64 and value < (@as(u64, 1) << @intCast(octal_bits))) {
@@ -342,6 +342,11 @@ fn tarWriteNumber(field: []u8, value: u64) void {
         }
         return;
     }
+    // GNU base-256 gives the flag byte seven value bits: the 0x40 sign bit
+    // and the bits a truncate would drop never round-trip through the
+    // reader, so a value past the field's range fails the call instead of
+    // writing a field the reader rejects or misreads.
+    if (field.len < 9 and value >> @intCast(8 * field.len - 2) != 0) return error.CallException;
     var remaining = value;
     var index = field.len;
     while (index > 1) {
@@ -414,11 +419,11 @@ fn tarWriteHeader(format: Format, sink: anytype, scratch: []u8, name: []const u8
     const block = scratch[0..scratch_size];
     @memset(block, 0);
     tarWriteField(block[0..100], name);
-    tarWriteNumber(block[100..108], mode);
-    tarWriteNumber(block[108..116], uid);
-    tarWriteNumber(block[116..124], gid);
-    tarWriteNumber(block[124..136], size);
-    tarWriteNumber(block[136..148], modification_time);
+    try tarWriteNumber(block[100..108], mode);
+    try tarWriteNumber(block[108..116], uid);
+    try tarWriteNumber(block[116..124], gid);
+    try tarWriteNumber(block[124..136], size);
+    try tarWriteNumber(block[136..148], modification_time);
     block[156] = typeflag;
     tarWriteField(block[157..257], link_name);
     if (format == .posix) {
@@ -428,8 +433,8 @@ fn tarWriteHeader(format: Format, sink: anytype, scratch: []u8, name: []const u8
         tarWriteField(block[257..265], "ustar  ");
     }
     if (typeflag == '3' or typeflag == '4') {
-        tarWriteNumber(block[329..337], devmajor);
-        tarWriteNumber(block[337..345], devminor);
+        try tarWriteNumber(block[329..337], devmajor);
+        try tarWriteNumber(block[337..345], devminor);
     }
     if (format == .posix) tarWriteField(block[345..500], prefix);
     tarSealHeader(block);
@@ -946,11 +951,11 @@ test "tar reads V7 headers without the ustar magic" {
     var block: [512]u8 = @splat(0);
     const name = "v7file.txt";
     @memcpy(block[0..name.len], name);
-    tarWriteNumber(block[100..108], 0o644);
-    tarWriteNumber(block[108..116], 7);
-    tarWriteNumber(block[116..124], 8);
-    tarWriteNumber(block[124..136], 6);
-    tarWriteNumber(block[136..148], 9);
+    try tarWriteNumber(block[100..108], 0o644);
+    try tarWriteNumber(block[108..116], 7);
+    try tarWriteNumber(block[116..124], 8);
+    try tarWriteNumber(block[124..136], 6);
+    try tarWriteNumber(block[136..148], 9);
     block[157] = 0;
     block[156] = 0;
     // Deliberately hostile prefix and device fields for a V7 reader.
@@ -1070,8 +1075,8 @@ test "tar rejects unsafe ustar prefix fields" {
     const testing = std.testing;
     var block: [512]u8 = @splat(0);
     @memcpy(block[0..6], "ok.txt");
-    tarWriteNumber(block[100..108], 0o644);
-    tarWriteNumber(block[124..136], 3);
+    try tarWriteNumber(block[100..108], 0o644);
+    try tarWriteNumber(block[124..136], 3);
     block[156] = '0';
     @memcpy(block[257..262], "ustar");
     block[262] = 0;
@@ -1347,7 +1352,12 @@ const SplitEmitter = struct {
 
     fn write(self: *SplitEmitter, bytes: []const u8) Exception!void {
         if (self.cursor + bytes.len > self.volume_size) return error.InternalException;
-        if (self.out) |out| @memcpy(out[@intCast(self.pos)..][0..bytes.len], bytes);
+        if (self.out) |out| {
+            // The output carries the whole spanned set, so an undersized
+            // buffer is a capacity failure, not a silent out-of-bounds write.
+            if (self.pos + bytes.len > out.len) return error.CapacityException;
+            @memcpy(out[@intCast(self.pos)..][0..bytes.len], bytes);
+        }
         self.pos += bytes.len;
         self.cursor += bytes.len;
         self.total += bytes.len;
@@ -1386,7 +1396,7 @@ const SplitEmitter = struct {
         var sink = io.Sink{ .bytes = &block };
         const shown = name[0..@min(name.len, max_name_field)];
         try tarWriteHeader(.gnu, &sink, self.scratch, shown, &.{}, &.{}, 0o644, 0, 0, 0, typeflag_gnu_multivol, remaining, 0, 0);
-        tarWriteNumber(block[gnu_offset_field..][0..12], written);
+        try tarWriteNumber(block[gnu_offset_field..][0..12], written);
         // The offset lands after the seal, so the checksum is recomputed
         // over the patched block.
         tarSealHeader(&block);
@@ -1573,4 +1583,39 @@ test "tar volume set reassembles a cut member with a long name" {
     try testing.expectEqualSlices(u8, &payload, out[0..n]);
     const last = try volumeDecodeOrdinal(parts, 1, &out, &segments);
     try testing.expectEqualSlices(u8, "end", out[0..last]);
+}
+
+test "tar encodes the full u64 mtime range through base-256" {
+    const testing = std.testing;
+    var scratch: [4096]u8 = undefined;
+    var out: [4096]u8 = undefined;
+    var entries = [_]Entry{.{ .name = "a.txt", .data = "b" }};
+    // The 12-byte mtime field holds every u64 in GNU base-256.
+    entries[0].modification_time = 1 << 63;
+    const written = try encode(&entries, &out, &scratch);
+    const info = try inspectOrdinal(out[0..written], 0);
+    try testing.expectEqual(@as(u64, 1 << 63), info.modification_time);
+    // An 8-byte field gives the flag byte seven value bits; values at or
+    // past 2^62 would trip the 0x40 sign bit or truncate, so the call fails.
+    var field: [8]u8 = undefined;
+    try tarWriteNumber(&field, (1 << 62) - 1);
+    try testing.expectError(error.CallException, tarWriteNumber(&field, 1 << 62));
+    try testing.expectError(error.CallException, tarWriteNumber(&field, 1 << 63));
+}
+
+test "tar volume encode rejects an undersized output buffer" {
+    const testing = std.testing;
+    var payload: [3000]u8 = undefined;
+    for (&payload, 0..) |*b, i| b.* = @truncate(i * 7 + 1);
+    const entries = [_]Entry{
+        .{ .name = "big.bin", .data = &payload },
+    };
+    var lengths: [8]u64 = @splat(0);
+    var scratch: [4096]u8 = undefined;
+    const plan = try volumeSizeGnu(&entries, 2048);
+    // One block short of the plan: the emit pass must fail with capacity,
+    // not write past the buffer.
+    var set: [4096]u8 = undefined;
+    try testing.expect(set.len < plan.total);
+    try testing.expectError(error.CapacityException, volumeEncodeGnu(&entries, &set, &lengths, 2048, &scratch));
 }

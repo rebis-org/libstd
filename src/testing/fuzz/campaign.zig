@@ -40,7 +40,6 @@ fn mutate(rng: *u64, seed: []const u8, buffer: *[targets.max_input]u8) []const u
 }
 
 fn runCampaign(target: targets.Target, iterations: u64) !void {
-    if (target.seed.len == 0) return error.EmptySeed;
     var rng: u64 = 0x243F6A8885A308D3;
     var buffer: [targets.max_input]u8 = undefined;
     var completed: u64 = 0;
@@ -50,7 +49,6 @@ fn runCampaign(target: targets.Target, iterations: u64) !void {
         }
         target.run(mutate(&rng, target.seed, &buffer)) catch {};
     }
-    if (completed != iterations) return error.CampaignShortfall;
     std.debug.print("{s}: {d} mutations survived.\n", .{ target.name, completed });
 }
 

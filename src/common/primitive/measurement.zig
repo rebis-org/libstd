@@ -10,5 +10,5 @@ pub const Counter = tee.CountingTee(.{});
 // Narrows a measured count to usize once; every decoder shares the
 // resource-limit policy.
 pub fn measuredLength(counter: *const Counter) Exception!usize {
-    return std.math.cast(usize, counter.written()) orelse error.ResourceException;
+    return std.math.cast(usize, try counter.written()) orelse error.ResourceException;
 }

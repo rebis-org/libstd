@@ -67,7 +67,9 @@ pub fn parseRecordName(bytes: []const u8) Exception![]const u8 {
     if (bytes.len == 0) return error.DataException;
     const name = bytes[0 .. bytes.len - 1];
     if (std.mem.findScalar(u8, name, 0) != null) return error.DataException;
-    try entry_prim.validateName(name);
+    // The name comes from the archive, so a violation is corrupt data,
+    // not a caller error.
+    entry_prim.validateName(name) catch return error.DataException;
     return name;
 }
 
@@ -217,7 +219,7 @@ fn writeDigits(sink: anytype, comptime base: u8, width: usize, value: u64) Excep
         buf[i] = digits[@intCast(v % base)];
         v /= base;
     }
-    if (v != 0) return error.UnsupportedException;
+    if (v != 0) return error.CallException;
     sink.write(buf[0..width]) catch return error.CapacityException;
 }
 
@@ -518,7 +520,9 @@ pub fn Inner(comptime Source: type) type {
             var magic: [6]u8 = undefined;
             try self.readExact(&magic);
             const header = try self.readHeader(magic);
-            if (header.namesize == 0 or header.namesize > self.name_buf.len) return error.DataException;
+            if (header.namesize == 0) return error.DataException;
+            // A name beyond the buffer is a capability gap; the archive itself stays valid.
+            if (header.namesize > self.name_buf.len) return error.UnsupportedException;
             const name_bytes = self.name_buf[0..@intCast(header.namesize)];
             try self.readExact(name_bytes);
             if (name_bytes[name_bytes.len - 1] != 0) return error.DataException;
@@ -758,10 +762,11 @@ test "cpio sizing matches encoder across alignment and 512 boundaries" {
 
 test "cpio rejects a header field that does not fit its width" {
     // A newc number field carries 32 bits; an odc date field carries 33.
+    // The value is a caller error, like the name gates in validateEntry.
     const entries = [_]Entry{.{ .name = "f", .data = "x", .modification_time = 1 << 36 }};
     var archive: [512]u8 = undefined;
-    try std.testing.expectError(error.UnsupportedException, encode(&entries, &archive));
-    try std.testing.expectError(error.UnsupportedException, encodeOdc(&entries, &archive));
+    try std.testing.expectError(error.CallException, encode(&entries, &archive));
+    try std.testing.expectError(error.CallException, encodeOdc(&entries, &archive));
 }
 
 test "cpio keeps non-regular type bits in odc and binary records" {
@@ -939,4 +944,18 @@ test "cpio Inner rejects a short scratch" {
     var source = TestSource{ .bytes = archive[0..written] };
     var short: [16]u8 = undefined;
     try testing.expectError(error.CapacityException, Inner(TestSource).open(&source, &short));
+}
+
+test "cpio Inner reports a name beyond the buffer as a capability gap" {
+    const testing = std.testing;
+    var name: [5000]u8 = @splat('n');
+    const entries = [_]Entry{.{ .name = &name, .data = "x" }};
+    var archive: [8192]u8 = undefined;
+    const written = try encode(&entries, &archive);
+    // The in-memory reader walks the long name without a buffer limit.
+    try testing.expectEqual(@as(u64, 1), try inspectCount(archive[0..written]));
+    var source = TestSource{ .bytes = archive[0..written] };
+    var scratch: [Inner(TestSource).scratch_size]u8 = undefined;
+    var cursor = try Inner(TestSource).open(&source, &scratch);
+    try testing.expectError(error.UnsupportedException, cursor.next());
 }

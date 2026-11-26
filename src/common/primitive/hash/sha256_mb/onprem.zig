@@ -27,19 +27,21 @@ pub fn Sha256Mb(comptime lanes: usize) type {
             return self;
         }
 
+        // The lane index is caller-supplied on published surface; the trap
+        // stays on in release modes where debug asserts and bounds checks do not.
         pub fn update(self: *Self, lane: usize, input: []const u8) void {
-            std.debug.assert(lane < lanes);
+            if (lane >= lanes) @panic("sha256_mb: lane index out of range");
             self.lanes[lane].update(input);
         }
 
         pub fn final(self: *const Self, lane: usize, out: *[digest_length]u8) void {
-            std.debug.assert(lane < lanes);
+            if (lane >= lanes) @panic("sha256_mb: lane index out of range");
             var copy = self.lanes[lane];
             copy.final(out);
         }
 
         pub fn finalResult(self: *const Self, lane: usize) [digest_length]u8 {
-            std.debug.assert(lane < lanes);
+            if (lane >= lanes) @panic("sha256_mb: lane index out of range");
             var copy = self.lanes[lane];
             return copy.finalResult();
         }

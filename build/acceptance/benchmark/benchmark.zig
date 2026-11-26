@@ -233,8 +233,9 @@ pub fn main(init: std.process.Init) !void {
             if (gate_cfg.enabled) try results.append(env.allocator, gate.classify(row, totals, available, gate_cfg));
         }
     }
-    // Filtered runs must not overwrite the full-matrix baseline.
-    const row_report: ?[]u8 = if (gate_cfg.enabled and env.row != null)
+    // Filtered runs must not overwrite the full-matrix baseline, whether or
+    // not the gate runs: a row-filtered report holds selected rows only.
+    const row_report: ?[]u8 = if (env.row != null)
         try env.allocator.print("zig-out/benchmark/report_{s}.txt", .{env.row.?})
     else
         null;

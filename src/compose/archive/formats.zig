@@ -412,13 +412,16 @@ pub const age = struct {
         return selected;
     }
 
-    // The scrypt peak is 1024 * N bytes in the split buffer's back half.
-    fn scratchTake(workspace: *resource.Workspace, selected: age_seam.Options) Exception![]u8 {
+    // The scrypt peak is 1024 * N bytes in the split buffer's back half;
+    // dearmor and armored encode stage whole archives in the front half.
+    fn scratchTake(workspace: *resource.Workspace, selected: age_seam.Options, staging: usize) Exception![]u8 {
         const peak = if (selected.password.len != 0)
             @as(usize, 4096) + (@as(usize, 1024) << @intCast(selected.work_factor))
         else
             0;
-        return workspace.take(u8, @max(age_seam.scratch_size, peak) * 2);
+        const base = @max(@max(age_seam.scratch_size, peak), staging);
+        const total = std.math.mul(usize, base, 2) catch return error.ResourceException;
+        return workspace.take(u8, total);
     }
 
     pub const Read = struct {
@@ -430,11 +433,18 @@ pub const age = struct {
         pub fn init(running: *Run, archive: []const u8, tail: []const []const u8) Exception!Read {
             _ = tail;
             const selected = try parseOptions(running.credentials, running.requestNode());
+            // Armored input stages the cleaned and decoded archive in the
+            // front half during dearmor; the carve doubles the ask so the
+            // front half alone covers it.
+            const staging: usize = if (age_seam.isArmored(archive))
+                std.math.mul(usize, 2, archive.len) catch return error.ResourceException
+            else
+                0;
             return .{
                 .run = running,
                 .archive = archive,
                 .options = selected,
-                .scratch = try scratchTake(running.core.workspace, selected),
+                .scratch = try scratchTake(running.core.workspace, selected, staging),
             };
         }
 
@@ -482,11 +492,18 @@ pub const age = struct {
 
         pub fn init(running: *Run, entries: []const Entry) Exception!Write {
             const selected = try parseOptions(running.credentials, running.requestNode());
+            // Armored encode stages the binary archive in the front half
+            // before wrapping it.
+            var staging: usize = 0;
+            if (selected.armor and entries.len != 0) {
+                const head = std.math.add(usize, entries[0].data.len, 4096) catch return error.ResourceException;
+                staging = std.math.mul(usize, 2, head) catch return error.ResourceException;
+            }
             return .{
                 .run = running,
                 .entries = entries,
                 .options = selected,
-                .scratch = try scratchTake(running.core.workspace, selected),
+                .scratch = try scratchTake(running.core.workspace, selected, staging),
             };
         }
 
@@ -1049,6 +1066,11 @@ pub const rar = struct {
                     .password_lifetime = request.Credentials.lifetime(running.credentials),
                     .failure_cause = &running.cause,
                     .provider = running.provider(),
+                    // RAR4 '\' separators convert into this stage; it must
+                    // outlive the call because the ordinal query returns a
+                    // name slice into it. A name lives in one header in one
+                    // part, so the largest part bounds it.
+                    .name_scratch = try running.core.workspace.take(u8, @min(rar_archive.rar4_name_stage_max, volumes.largest(archive, tail))),
                 },
             };
         }
@@ -1214,4 +1236,22 @@ test "age work factor selector past the scrypt ceiling refuses before the carve"
     node.value_low = age_seam.scrypt_work_factor_max;
     const selected = try age.parseOptions(null, &node);
     try std.testing.expectEqual(age_seam.scrypt_work_factor_max, selected.work_factor);
+}
+
+test "age scratch take covers armor staging" {
+    // Plain input takes the fixed floor.
+    var plain_bytes: [1 * 1024 * 1024]u8 = undefined;
+    var plain_workspace = try resource.Workspace.init(&plain_bytes, plain_bytes.len);
+    const selected = try age.parseOptions(null, null);
+    const plain_take = try age.scratchTake(&plain_workspace, selected, 0);
+    try std.testing.expectEqual(@as(usize, age_seam.scratch_size * 2), plain_take.len);
+    // Armored input sizes the carve by the archive: dearmor stages the
+    // cleaned and decoded text in the front half, so the take doubles the
+    // staging ask rather than stopping at the scrypt peak or the floor.
+    const armor_bytes = try std.testing.allocator.alloc(u8, 4 * 1024 * 1024);
+    defer std.testing.allocator.free(armor_bytes);
+    var armor_workspace = try resource.Workspace.init(armor_bytes.ptr, armor_bytes.len);
+    const staging: usize = 2 * 1024 * 1024;
+    const armor_take = try age.scratchTake(&armor_workspace, selected, staging);
+    try std.testing.expectEqual(staging * 2, armor_take.len);
 }

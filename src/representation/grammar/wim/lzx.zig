@@ -126,10 +126,13 @@ fn readCodewordLens(stream: *bits.Bits, lens: []u8, num_lens: usize, pre_lens: *
     }
 }
 
-// E8 translation is undone because wimlib applies it unconditionally on encode.
+// E8 translation is undone because wimlib applies it unconditionally on
+// encode. wimlib's filter plants a 6-byte 0xE8 trap, which also rejects any
+// call starting in the last 10 bytes (its target's high byte reads as the
+// trap): the translated set is exactly p <= len - 11 (lzx_common.c:156-159).
 fn e8Postprocess(data: []u8) void {
     if (data.len <= 10) return;
-    const tail = data.len - 6;
+    const tail = data.len - 10;
     var p: usize = 0;
     while (p < tail) : (p += 1) {
         if (data[p] != 0xE8) continue;
@@ -275,9 +278,11 @@ pub fn encodeWorkspaceSize(chunk_size: usize) usize {
 
 // Forward E8 translation (wimlib do_translate_target): turns relative CALL
 // targets into absolute ones; the decoder's e8Postprocess inverts this.
+// Same effective bound as e8Postprocess: calls starting in the last 10
+// bytes stay untranslated, matching wimlib's trap semantics.
 fn e8Forward(data: []u8) void {
     if (data.len <= 10) return;
-    const tail = data.len - 6;
+    const tail = data.len - 10;
     var p: usize = 0;
     while (p < tail) : (p += 1) {
         if (data[p] != 0xE8) continue;
@@ -775,4 +780,37 @@ test "lzx lens section roundtrip" {
     var pre_lens: [precode_num_symbols]u8 = @splat(0);
     try readCodewordLens(&stream, &dec_len, num_len, &pre_lens);
     try std.testing.expectEqualSlices(u8, &enc_lens_len, &dec_len);
+}
+
+test "lzx e8 filters leave calls starting in the last ten bytes untranslated" {
+    // wimlib's trap semantics reject any call whose 4-byte target touches
+    // the last 6 bytes, so a call starting at len-10 (all-real target) is
+    // still left alone. Both directions must match that effective bound.
+    var data: [20]u8 = @splat(0);
+    data[10] = 0xE8;
+    std.mem.writeInt(i32, data[11..][0..4], 5, .little);
+    e8Postprocess(&data);
+    try std.testing.expectEqual(@as(u8, 0xE8), data[10]);
+    try std.testing.expectEqual(@as(i32, 5), std.mem.readInt(i32, data[11..][0..4], .little));
+
+    var fwd: [20]u8 = @splat(0);
+    fwd[10] = 0xE8;
+    std.mem.writeInt(i32, fwd[11..][0..4], 5, .little);
+    e8Forward(&fwd);
+    try std.testing.expectEqual(@as(u8, 0xE8), fwd[10]);
+    try std.testing.expectEqual(@as(i32, 5), std.mem.readInt(i32, fwd[11..][0..4], .little));
+}
+
+test "lzx e8 filters translate calls above the tail" {
+    var data: [20]u8 = @splat(0);
+    data[9] = 0xE8;
+    std.mem.writeInt(i32, data[10..][0..4], 5, .little);
+    e8Postprocess(&data);
+    try std.testing.expectEqual(@as(i32, 5 - 9), std.mem.readInt(i32, data[10..][0..4], .little));
+
+    var fwd: [20]u8 = @splat(0);
+    fwd[9] = 0xE8;
+    std.mem.writeInt(i32, fwd[10..][0..4], 5, .little);
+    e8Forward(&fwd);
+    try std.testing.expectEqual(@as(i32, 5 + 9), std.mem.readInt(i32, fwd[10..][0..4], .little));
 }

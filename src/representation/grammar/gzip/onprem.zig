@@ -98,6 +98,10 @@ const Member = struct {
 // Every path resolves a member here, so decode passes and the inspector
 // cannot disagree on member boundaries or verification.
 fn readMember(input: []const u8, at: usize, history: []u8, output: *std.Io.Writer, provider: checksum.Provider) Exception!Member {
+    // A tag the deflate seam cannot serve is a capability gap: fail it here,
+    // before the checksum binds, so it never reads as corrupt data through
+    // the inflate catch-all below.
+    if (!deflate_seam.decodeServed(provider)) return error.UnsupportedException;
     const header = try parseHeader(input[at..], provider);
     const data_start = at + header.len;
     var tee_writer = Crc32Tee.initWithProvider(output, provider);
@@ -109,14 +113,14 @@ fn readMember(input: []const u8, at: usize, history: []u8, output: *std.Io.Write
     if (input.len - trailer_at < trailer_len) return error.DataException;
     const stored_crc = std.mem.readInt(u32, input[trailer_at..][0..4], .little);
     const stored_size = std.mem.readInt(u32, input[trailer_at + 4 ..][0..4], .little);
-    if (stored_crc != tee_writer.crc32Value() or stored_size != @as(u32, @truncate(tee_writer.size))) return error.IntegrityException;
+    if (stored_crc != try tee_writer.crc32Value() or stored_size != @as(u32, @truncate(try tee_writer.written()))) return error.IntegrityException;
     // ISIZE wraps modulo 2^32 (RFC 1952), so the check accepts the claim
     // plus multiples; decoded_size carries the tee's true count.
     return .{
         .header = header,
         .data_start = data_start,
         .data_size = inflated.consumed,
-        .decoded_size = std.math.cast(usize, tee_writer.size) orelse return error.ResourceException,
+        .decoded_size = std.math.cast(usize, try tee_writer.written()) orelse return error.ResourceException,
         .crc32 = stored_crc,
     };
 }
@@ -430,4 +434,34 @@ test "decodeSinglePass defers to the two-pass route when the decoded limit exclu
         .fallback => return error.LimitRejectedFit,
     }
     try std.testing.expectEqualSlices(u8, payload, output[0..payload.len]);
+}
+
+test "decode reports an unservable provider as a capability gap, not corruption" {
+    // Runs where the deflate seam declines the offprem tag (the onprem-leaf
+    // builds, including the default): a valid member under that tag must
+    // fail as UnsupportedException before the checksum binds, never as
+    // DataException through the inflate catch-all. Where the tag is served
+    // (offprem or mergeable leaf) decode legitimately succeeds, so skip.
+    if (deflate_seam.decodeServed(.offprem)) return error.SkipZigTest;
+
+    const payload = "a valid member under an unservable tag is not corrupt";
+    const options: Options = .{
+        .modification_time = 0,
+        .extra_flags = 0,
+        .operating_system = 3,
+        .text = false,
+        .header_crc = false,
+        .extra = &.{},
+        .name = "",
+        .comment = "",
+        .deflate = .{ .good = 8, .nice = 128, .lazy = 16, .chain = 8 },
+    };
+    var history: [deflate_history_size]u8 = undefined;
+    var encoded: [128]u8 = undefined;
+    var reader = std.Io.Reader.fixed(payload);
+    var writer = std.Io.Writer.fixed(&encoded);
+    try encodeStream(&reader, &writer, &history, options);
+    const input = encoded[0..writer.end];
+
+    try std.testing.expectError(error.UnsupportedException, decodedSize(input, &history, .offprem));
 }

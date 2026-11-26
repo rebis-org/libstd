@@ -187,7 +187,9 @@ pub fn encodeUnits(
     if (head >= layout.p) return error.InternalException;
     const tail = std.math.add(usize, head, layout.last_chunk) catch return error.InternalException;
     if (tail != layout.p) return error.InternalException;
-    if (layout.poff < 72 + layout.nd * 8) return error.InternalException;
+    // Equality, not a floor: a larger poff would leave the gap between the
+    // header and the ECC words uninitialized in the output.
+    if (layout.poff != 72 + layout.nd * 8) return error.InternalException;
     if (layout.poff > std.math.maxInt(u32) - 65536) return error.InternalException;
     const nsub_poff = std.math.mul(usize, layout.nsub, layout.poff) catch return error.InternalException;
     const unit_expect = std.math.add(usize, nsub_poff, layout.ch) catch return error.InternalException;
@@ -397,6 +399,14 @@ test "encode guards reject fabricated layouts and short surfaces" {
     const big_out = try allocator.alloc(u8, 256);
     defer allocator.free(big_out);
     try std.testing.expectError(error.InternalException, encodeUnits(protected, bad, 0, big_out, exp, log));
+    // A padded poff passes every derived check but would leave the gap
+    // bytes uninitialized; equality rejects it.
+    var pad = layout;
+    pad.poff = 82;
+    pad.unit_size = 110;
+    const pad_out = try allocator.alloc(u8, 110);
+    defer allocator.free(pad_out);
+    try std.testing.expectError(error.InternalException, encodeUnits(protected, pad, 0, pad_out, exp, log));
     // Zeroed tables fail the content probe; do this last because it mutates exp.
     @memset(exp, 0);
     try std.testing.expectError(error.InternalException, encodeUnits(protected, layout, 0, out, exp, log));

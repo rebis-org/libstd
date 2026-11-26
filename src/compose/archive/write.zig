@@ -30,7 +30,7 @@ pub fn serve(comptime F: type, running: *Run) Exception!void {
         return;
     }
     const sink = running.sink().?;
-    try common.requireSinkCapacity(sink, call, required);
+    try common.requireSink(sink, call, required);
     const target = try common.SinkTarget.open(sink, running.core.workspace, required);
     const written = try writer.encode(target.output);
     running.response().byte_length = try target.publish(sink, call, written);
@@ -45,7 +45,7 @@ fn split(comptime F: type, running: *Run, writer: *F.Write, volume_size: u64) Ex
     }
     const total = std.math.cast(usize, extent.total) orelse return error.ResourceException;
     const sink = running.sink().?;
-    try common.requireSinkCapacity(sink, call, total);
+    try common.requireSink(sink, call, total);
     const target = try common.SinkTarget.open(sink, running.core.workspace, total);
     const parts = try writer.volumeEmit(target.output, volume_size, extent);
     if (parts.len != extent.count) return error.InternalException;

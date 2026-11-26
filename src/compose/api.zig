@@ -82,16 +82,22 @@ fn markDead(bytes: [*]u8, storage_len: u64) void {
 
 // One classifier owns handle-state knowledge: never-created or misaligned
 // storage is invalid, destroyed storage reports dead, the rest is live.
+// Step, destroy, and failure require the create storage extent; the cookie
+// leads the record, so classification itself reads only the first word.
 const Classified = union(enum) { invalid, dead, live: *Session };
 
 fn classifyHandle(handle: ?*anyopaque) Classified {
     const raw = handle orelse return .invalid;
     // Create checks alignment, but step and destroy take opaque handles;
-    // refuse a misaligned pointer before the cast.
+    // refuse a misaligned pointer before any read.
     if (@intFromPtr(raw) % @alignOf(Session) != 0) return .invalid;
+    // The cookie sits at offset 0: a non-live marker refuses or reports dead
+    // before ops or state are read past an undersized buffer.
+    const cookie: *const u64 = @ptrCast(@alignCast(raw));
+    if (cookie.* == dead_cookie) return .dead;
+    if (cookie.* != alive_cookie) return .invalid;
     const session: *Session = @ptrCast(@alignCast(raw));
-    if (session.cookie == dead_cookie or session.ops == &destroyed_ops) return .dead;
-    if (session.cookie != alive_cookie) return .invalid;
+    if (session.ops == &destroyed_ops) return .dead;
     return .{ .live = session };
 }
 
@@ -189,6 +195,8 @@ fn driverStateOffset() usize {
 // u128 arithmetic keeps end computations overflow-free against hostile
 // lengths. The C boundary reports no failure, so the check stays infallible.
 fn rangesOverlap(a: ?[*]const u8, a_len: u64, b: ?[*]const u8, b_len: u64) bool {
+    // An empty range aliases nothing, whatever its start pointer.
+    if (a_len == 0 or b_len == 0) return false;
     const a_start = if (a) |ptr| @as(u128, @intFromPtr(ptr)) else return false;
     const b_start = if (b) |ptr| @as(u128, @intFromPtr(ptr)) else return false;
     return a_start < b_start + b_len and b_start < a_start + a_len;
@@ -280,8 +288,10 @@ pub const Completion = extern struct {
     }
 
     fn isValid(self: *const Completion) bool {
+        // Refuse an undersized record before any state read.
+        if (self.structure_size < @sizeOf(Completion)) return false;
         const state = @atomicLoad(u32, &self.state, .seq_cst);
-        return self.structure_size >= @sizeOf(Completion) and self.reserved == 0 and
+        return self.reserved == 0 and
             (state == in_progress or state == done or state == cancelling);
     }
 };

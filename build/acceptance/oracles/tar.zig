@@ -545,9 +545,29 @@ pub fn runSparse(r: *Runner) anyerror!void {
     try tarSparseMalformed(r);
 }
 
+// An archive write whose sink never declared the write bit must refuse
+// before the encoder produces a single byte.
+pub fn runWriteCapability(r: *Runner) anyerror!void {
+    setupTar(r);
+    var nodes = EntryNodes{};
+    const entry = harness.archiveEntryNode(&nodes.name, &nodes.data, "cap.txt", "denied");
+    var sink: [1024]u8 = @splat(0xa5);
+    const list = [_]harness.Node{
+        harness.scalarNode(harness.ids.source),
+        harness.sinkSpan(&sink),
+        harness.capabilityParam(harness.cap_read | harness.cap_size | harness.cap_replay),
+        harness.sizingModeParam(harness.size_metadata_exact),
+        harness.commitModeParam(harness.commit_confirmed),
+        entry,
+    };
+    try harness.expect(r, harness.ids.write, &list, .{}, abi.Status.unsupported);
+    if (!harness.allBytesEqual(&sink, 0xa5)) return error.SinkModified;
+}
+
 pub const scenarios = harness.scenarios("tar", &.{
     .{ .label = "tar entry mode", .run = tarEncMode, .workspace_size = 65536, .output_size = 1024, .encoded_size = 65536 },
     .{ .label = "tar encode advanced", .run = runEncode, .workspace_size = 65536, .output_size = 1024, .encoded_size = 65536 },
 }, &.{
     .{ .name = "tar sparse", .run = runSparse, .workspace_size = 65536, .output_size = 2048, .encoded_size = 16384 },
+    .{ .name = "tar write capability", .run = runWriteCapability, .workspace_size = 65536, .output_size = 1024, .encoded_size = 65536 },
 });

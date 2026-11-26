@@ -68,7 +68,9 @@ pub fn writeNum(sink: anytype, comptime fmt: []const u8, value: anytype) Excepti
 // Times in xar are ISO 8601 with a Z suffix; vendor writes strftime("%FT%TZ")
 // and libarchive requires exactly that 20-character shape.
 fn writeTimeIso(sink: anytype, epoch: u64) Exception!void {
-    if (epoch > epoch_max_iso) return error.UnsupportedException;
+    // A time the wire format cannot carry is a caller value, not a
+    // capability gap: the caller chose it.
+    if (epoch > epoch_max_iso) return error.CallException;
     const days: i64 = @intCast(epoch / 86400);
     const secs = epoch % 86400;
     const z = days + 719468;
@@ -336,7 +338,7 @@ fn inflateToc(archive: []const u8, scratch: []u8, history: []u8) Exception!Toc {
     if (heap_start > archive.len) return error.DataException;
     const toc_bytes = try bounds.slice(archive, hlen, toc_comp);
     const uncomp_len = std.math.cast(usize, toc_uncomp) orelse return error.ResourceException;
-    if (scratch.len < uncomp_len) return error.ResourceException;
+    if (scratch.len < uncomp_len) return error.CapacityException;
     const xml_len = try inflateInto(toc_bytes, scratch[0..uncomp_len], history);
     if (xml_len != uncomp_len) return error.DataException;
     const toc = Toc{
@@ -528,6 +530,10 @@ fn findFileElementEnd(xml: []const u8, start: usize, limit: usize) Exception!usi
 
 const Span = struct { start: usize, end: usize };
 
+// Extended-attribute blocks are skipped, not parsed. The skip list is
+// fixed-size: a file with more blocks exceeds what the reader carries.
+const ea_span_max = 16;
+
 // Field order is not fixed and attribute blocks reuse tag names; searches
 // span the element and skip the blocks.
 fn attributeSpans(xml: []const u8, from: usize, limit: usize, out: []Span) Exception![]Span {
@@ -536,7 +542,7 @@ fn attributeSpans(xml: []const u8, from: usize, limit: usize, out: []Span) Excep
     while (std.mem.findPos(u8, xml[0..limit], pos, "<ea")) |at| {
         const open_end = std.mem.findScalarPos(u8, xml[0..limit], at, '>') orelse return error.DataException;
         const close = std.mem.findPos(u8, xml[0..limit], open_end, "</ea>") orelse return error.DataException;
-        if (count == out.len) return error.DataException;
+        if (count == out.len) return error.UnsupportedException;
         out[count] = .{ .start = at, .end = close + "</ea>".len };
         count += 1;
         pos = close + "</ea>".len;
@@ -575,7 +581,7 @@ const ScanState = struct {
     count: u64 = 0,
     found: ?EntryInfo = null,
     depth: usize = 0,
-    segments: [64][]const u8 = undefined,
+    segments: [tree_depth_max][]const u8 = undefined,
 
     fn walk(self: *ScanState, start: usize, limit: usize) Exception!void {
         var cursor = XmlCursor{ .data = self.xml, .pos = start, .limit = limit };
@@ -592,7 +598,7 @@ const ScanState = struct {
         // A file's own elements precede any child; bound the field scan so
         // a child's fields cannot leak into the parent.
         const field_limit = std.mem.findPos(u8, self.xml[0..file_end], file_start, "<file") orelse file_end;
-        var span_storage: [16]Span = undefined;
+        var span_storage: [ea_span_max]Span = undefined;
         const spans = try attributeSpans(self.xml, file_start, field_limit, &span_storage);
         var info: EntryInfo = undefined;
         info.ordinal = self.count;
@@ -662,7 +668,9 @@ const ScanState = struct {
         if (field_limit == file_end) return;
         // Children nest inside the parent element in xar; walk them
         // with this file's name as the next path segment.
-        if (self.depth == self.segments.len) return error.DataException;
+        // The segment stack shares the writer's depth bound: an archive
+        // nested deeper than the writer emits is a capability gap.
+        if (self.depth == self.segments.len) return error.UnsupportedException;
         self.segments[self.depth] = name_raw;
         self.depth += 1;
         defer self.depth -= 1;
@@ -673,7 +681,9 @@ const ScanState = struct {
         const buf = self.name_buf orelse return name_raw;
         var len: usize = name_raw.len;
         for (self.segments[0..self.depth]) |segment| len += segment.len + 1;
-        if (buf.len < len) return error.CapacityException;
+        // The buffer is a fixed carve: no caller scratch size reaches it,
+        // so an oversized name is a capability gap, not a caller shortage.
+        if (buf.len < len) return error.UnsupportedException;
         var w: usize = 0;
         for (self.segments[0..self.depth]) |segment| {
             @memcpy(buf[w..][0..segment.len], segment);
@@ -683,7 +693,11 @@ const ScanState = struct {
         }
         @memcpy(buf[w..][0..name_raw.len], name_raw);
         w += name_raw.len;
-        return try unescapeXmlInPlace(buf[0..w]);
+        const joined = try unescapeXmlInPlace(buf[0..w]);
+        // The writer rejects names that escape the destination; a TOC that
+        // carries one is bad data, not a caller error.
+        entry_prim.validateName(joined) catch return error.DataException;
+        return joined;
     }
 };
 
@@ -697,10 +711,13 @@ fn scanEntries(xml: []const u8, want: ?u64, want_name: ?[]const u8, name_buf: ?[
 
 // The TOC, the history, and the name buffer share one caller slice;
 // history first: the deflate framing owns it whole.
+const min_toc_area = 4096;
+const name_buf_size = 512;
+
 fn splitScratch(scratch: []u8) Exception!struct { history: []u8, toc: []u8, name: []u8 } {
     const history_len = zlib.deflate_history_size;
-    if (scratch.len < history_len + 4096 + 512) return error.ResourceException;
-    const name_at = scratch.len - 512;
+    if (scratch.len < history_len + min_toc_area + name_buf_size) return error.CapacityException;
+    const name_at = scratch.len - name_buf_size;
     return .{
         .history = scratch[0..history_len],
         .toc = scratch[history_len..name_at],
@@ -842,7 +859,7 @@ test "xar formats and parses iso 8601 times" {
     try testing.expectEqual(@as(u64, 0), parseTimeValue("2005-13-09T16:26:21Z"));
     try testing.expectEqual(@as(u64, 0), parseTimeValue("bogus"));
     sink = .{ .bytes = &buf };
-    try testing.expectError(error.UnsupportedException, writeTimeIso(&sink, epoch_max_iso + 1));
+    try testing.expectError(error.CallException, writeTimeIso(&sink, epoch_max_iso + 1));
     sink = .{ .bytes = &buf };
     try writeTimeIso(&sink, epoch_max_iso);
     try testing.expectEqualSlices(u8, "9999-12-31T23:59:59Z", buf[0..sink.offset]);
@@ -908,6 +925,27 @@ test "xar rejects malformed headers and corrupted toc digests" {
     try testing.expectError(error.DataException, decodeOrdinal(archive[0 .. written - 2], 0, &out, &scratch));
 }
 
+// Test scaffolding: wrap a TOC in the header/digest envelope the reader
+// expects, with optional heap bytes.
+fn archiveWithToc(xml: []const u8, heap: []const u8, out: []u8) Exception!usize {
+    var toc_buf: [16384]u8 = undefined;
+    var toc_sink = io.Sink{ .bytes = &toc_buf };
+    try writeZlibStored(&toc_sink, xml, checksum.adler32With(checksum.default_provider, xml));
+    const toc_comp = toc_sink.offset;
+    @memcpy(out[0..4], "xar!");
+    std.mem.writeInt(u16, out[4..6], header_size, .big);
+    std.mem.writeInt(u16, out[6..8], 1, .big);
+    std.mem.writeInt(u64, out[8..16], toc_comp, .big);
+    std.mem.writeInt(u64, out[16..24], xml.len, .big);
+    std.mem.writeInt(u32, out[24..28], cksum_sha1, .big);
+    @memcpy(out[28..][0..toc_comp], toc_buf[0..toc_comp]);
+    var digest: [sha1_len]u8 = undefined;
+    sha1Digest(&digest, out[28..][0..toc_comp]);
+    @memcpy(out[28 + toc_comp ..][0..sha1_len], &digest);
+    @memcpy(out[28 + toc_comp + sha1_len ..][0..heap.len], heap);
+    return 28 + toc_comp + sha1_len + heap.len;
+}
+
 test "xar rejects out of range uid and gid without trapping" {
     const testing = std.testing;
     const xml =
@@ -919,23 +957,8 @@ test "xar rejects out of range uid and gid without trapping" {
         \\  </file>
         \\</toc></xar>
     ;
-    var toc_buf: [4096]u8 = undefined;
-    var toc_sink = io.Sink{ .bytes = &toc_buf };
-    try writeZlibStored(&toc_sink, xml, checksum.adler32With(checksum.default_provider, xml));
-    const toc_comp = toc_sink.offset;
     var archive: [8192]u8 = undefined;
-    @memcpy(archive[0..4], "xar!");
-    std.mem.writeInt(u16, archive[4..6], header_size, .big);
-    std.mem.writeInt(u16, archive[6..8], 1, .big);
-    std.mem.writeInt(u64, archive[8..16], toc_comp, .big);
-    std.mem.writeInt(u64, archive[16..24], xml.len, .big);
-    std.mem.writeInt(u32, archive[24..28], cksum_sha1, .big);
-    @memcpy(archive[28..][0..toc_comp], toc_buf[0..toc_comp]);
-    var digest: [sha1_len]u8 = undefined;
-    sha1Digest(&digest, archive[28..][0..toc_comp]);
-    @memcpy(archive[28 + toc_comp ..][0..sha1_len], &digest);
-    archive[28 + toc_comp + sha1_len] = 'x';
-    const total = 29 + toc_comp + sha1_len;
+    const total = try archiveWithToc(xml, "x", &archive);
     var scratch: [96 * 1024]u8 = undefined;
     try testing.expectError(error.DataException, inspectOrdinal(archive[0..total], 0, &scratch));
 }
@@ -974,23 +997,8 @@ test "xar decodes libarchive-style nested and empty-file tocs" {
         \\</xar>
         \\
     ;
-    var toc_buf: [4096]u8 = undefined;
-    var toc_sink = io.Sink{ .bytes = &toc_buf };
-    try writeZlibStored(&toc_sink, xml, checksum.adler32With(checksum.default_provider, xml));
-    const toc_comp = toc_sink.offset;
     var archive: [8192]u8 = undefined;
-    @memcpy(archive[0..4], "xar!");
-    std.mem.writeInt(u16, archive[4..6], header_size, .big);
-    std.mem.writeInt(u16, archive[6..8], 1, .big);
-    std.mem.writeInt(u64, archive[8..16], toc_comp, .big);
-    std.mem.writeInt(u64, archive[16..24], xml.len, .big);
-    std.mem.writeInt(u32, archive[24..28], cksum_sha1, .big);
-    @memcpy(archive[28..][0..toc_comp], toc_buf[0..toc_comp]);
-    var digest: [sha1_len]u8 = undefined;
-    sha1Digest(&digest, archive[28..][0..toc_comp]);
-    @memcpy(archive[28 + toc_comp ..][0..sha1_len], &digest);
-    @memcpy(archive[28 + toc_comp + sha1_len ..][0..4], "data");
-    const total = 28 + toc_comp + sha1_len + 4;
+    const total = try archiveWithToc(xml, "data", &archive);
     var scratch: [96 * 1024]u8 = undefined;
 
     try testing.expectEqual(@as(u64, 3), try inspectCount(archive[0..total], &scratch));
@@ -1029,4 +1037,78 @@ test "xar Outer locates members without reading across them" {
     try testing.expectEqualSlices(u8, "payload bytes", located);
     // A missing member is a data failure.
     try testing.expectError(error.DataException, outer.member("missing"));
+}
+
+test "xar rejects member names that escape the destination" {
+    const testing = std.testing;
+    const hostile = [_][]const u8{ "../escape", "/absolute", "with\x00nul", "zero&#0;ref" };
+    for (hostile) |bad| {
+        var xml_buf: [512]u8 = undefined;
+        var xml_sink = io.Sink{ .bytes = &xml_buf };
+        try xml_sink.write("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<xar><toc><checksum style=\"sha1\"><offset>0</offset><size>20</size></checksum><file id=\"1\"><name>");
+        try xml_sink.write(bad);
+        try xml_sink.write("</name></file></toc></xar>");
+        var archive: [4096]u8 = undefined;
+        const total = try archiveWithToc(xml_buf[0..xml_sink.offset], "x", &archive);
+        var scratch: [96 * 1024]u8 = undefined;
+        try testing.expectError(error.DataException, inspectOrdinal(archive[0..total], 0, &scratch));
+    }
+}
+
+test "xar reports a name beyond the join buffer as a capability gap" {
+    const testing = std.testing;
+    var xml_buf: [2048]u8 = undefined;
+    var xml_sink = io.Sink{ .bytes = &xml_buf };
+    try xml_sink.write("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<xar><toc><checksum style=\"sha1\"><offset>0</offset><size>20</size></checksum><file id=\"1\"><name>");
+    var a: usize = 0;
+    while (a < name_buf_size + 88) : (a += 1) try xml_sink.write("a");
+    try xml_sink.write("</name></file></toc></xar>");
+    var archive: [4096]u8 = undefined;
+    const total = try archiveWithToc(xml_buf[0..xml_sink.offset], "", &archive);
+    var scratch: [96 * 1024]u8 = undefined;
+    try testing.expectError(error.UnsupportedException, inspectOrdinal(archive[0..total], 0, &scratch));
+}
+
+test "xar reports nesting beyond the segment stack as a capability gap" {
+    const testing = std.testing;
+    var xml_buf: [8192]u8 = undefined;
+    var xml_sink = io.Sink{ .bytes = &xml_buf };
+    try xml_sink.write("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<xar><toc><checksum style=\"sha1\"><offset>0</offset><size>20</size></checksum>");
+    var i: usize = 0;
+    while (i < tree_depth_max + 2) : (i += 1) try xml_sink.write("<file><name>n</name>");
+    i = 0;
+    while (i < tree_depth_max + 2) : (i += 1) try xml_sink.write("</file>");
+    try xml_sink.write("</toc></xar>");
+    var archive: [16384]u8 = undefined;
+    const total = try archiveWithToc(xml_buf[0..xml_sink.offset], "", &archive);
+    var scratch: [96 * 1024]u8 = undefined;
+    try testing.expectError(error.UnsupportedException, inspectCount(archive[0..total], &scratch));
+}
+
+test "xar reports more than sixteen ea blocks as a capability gap" {
+    const testing = std.testing;
+    var xml_buf: [4096]u8 = undefined;
+    var xml_sink = io.Sink{ .bytes = &xml_buf };
+    try xml_sink.write("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<xar><toc><checksum style=\"sha1\"><offset>0</offset><size>20</size></checksum><file id=\"1\"><name>a</name>");
+    var i: usize = 0;
+    while (i < ea_span_max + 1) : (i += 1) try xml_sink.write("<ea><key>k</key></ea>");
+    try xml_sink.write("</file></toc></xar>");
+    var archive: [8192]u8 = undefined;
+    const total = try archiveWithToc(xml_buf[0..xml_sink.offset], "", &archive);
+    var scratch: [96 * 1024]u8 = undefined;
+    try testing.expectError(error.UnsupportedException, inspectCount(archive[0..total], &scratch));
+}
+
+test "xar reports an undersized scratch as insufficient capacity" {
+    const testing = std.testing;
+    const entries = [_]Entry{.{ .name = "a.txt", .data = "data" }};
+    var archive: [8192]u8 = undefined;
+    var scratch: [96 * 1024]u8 = undefined;
+    const written = try encode(&entries, &archive, &scratch);
+    var small: [4096]u8 = undefined;
+    try testing.expectError(error.CapacityException, inspectCount(archive[0..written], &small));
+    try testing.expectError(error.CapacityException, inspectOrdinal(archive[0..written], 0, &small));
+    var out: [16]u8 = undefined;
+    try testing.expectError(error.CapacityException, decodeOrdinal(archive[0..written], 0, &out, &small));
+    try testing.expectError(error.CapacityException, Outer.init(archive[0..written], &small));
 }

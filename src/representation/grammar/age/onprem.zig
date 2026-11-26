@@ -397,7 +397,8 @@ fn wrapStanzas(file_key: [file_key_len]u8, options: Options, alloc: std.mem.Allo
     var ephemeral: [32]u8 = undefined;
     try crypto_prim.fillRandom(&ephemeral);
     const share = X25519.recoverPublicKey(ephemeral);
-    const shared = X25519.scalarmult(ephemeral, recipient.public) catch return error.InternalException;
+    // A low-order recipient is a degenerate caller value, not a library fault.
+    const shared = X25519.scalarmult(ephemeral, recipient.public) catch return error.CallException;
     const wrap_key = x25519WrapKey(shared, share, recipient.public);
     var share_b64: [b64Len(32)]u8 = undefined;
     const args = alloc.alloc([]const u8, 2) catch return error.ResourceException;
@@ -411,16 +412,20 @@ fn wrapStanzas(file_key: [file_key_len]u8, options: Options, alloc: std.mem.Allo
 fn unwrapX25519(stanza: Stanza, identity: [32]u8) Exception![file_key_len]u8 {
     if (stanza.args.len != 2) return error.DataException;
     const share = try decodeB64Fixed(32, stanza.args[1]);
-    const shared = X25519.scalarmult(identity, share) catch return error.IntegrityException;
+    // A low-order share is malformed archive data; IntegrityException here
+    // would be swallowed by the ownership loop as a miss.
+    const shared = X25519.scalarmult(identity, share) catch return error.DataException;
     return openFileKey(stanza.body, x25519WrapKey(shared, share, X25519.recoverPublicKey(identity)));
 }
 
+// Dispatch follows the header shape, not which credential the caller
+// supplied: a lone scrypt stanza is a passphrase header, anything else is
+// a recipient header. A request carrying both a password and an identity
+// still routes by what the archive actually is.
 fn unwrapFileKey(stanzas: []const Stanza, options: Options, scratch: []u8) Exception![file_key_len]u8 {
-    if (options.password.len != 0) {
-        // A scrypt stanza must be the only stanza; anything else is not a
-        // passphrase-encrypted header.
-        if (stanzas.len == 1 and stanzas[0].args.len == 0) return error.DataException;
-        if (stanzas.len != 1 or !std.mem.eql(u8, stanzas[0].args[0], "scrypt")) return error.IntegrityException;
+    if (stanzas.len == 1 and stanzas[0].args.len == 0) return error.DataException;
+    if (stanzas.len == 1 and std.mem.eql(u8, stanzas[0].args[0], "scrypt")) {
+        if (options.password.len == 0) return error.IntegrityException;
         const stanza = stanzas[0];
         if (stanza.args.len != 3) return error.DataException;
         const salt = try decodeB64Fixed(16, stanza.args[1]);
@@ -442,6 +447,7 @@ fn unwrapFileKey(stanzas: []const Stanza, options: Options, scratch: []u8) Excep
         }
         return error.IntegrityException;
     }
+    if (options.password.len != 0) return error.IntegrityException;
     return error.CallException;
 }
 
@@ -554,10 +560,14 @@ fn decryptPayload(file_key: [file_key_len]u8, source: []const u8, dest: []u8) Ex
     return out;
 }
 
+// armorEncode wraps 48 input bytes per 64-char line; the tail line is the
+// padded short encoding, so the line count and the tail length both come
+// from the binary length directly.
 fn armoredLen(binary_len: usize) usize {
-    const b64_len = b64_pad.Encoder.calcSize(binary_len);
-    const lines = (b64_len + 63) / 64;
-    return armor_begin.len + 1 + lines * 65 + armor_end.len + 1;
+    const full_lines = binary_len / 48;
+    const rem = binary_len % 48;
+    const tail = if (rem == 0) 0 else b64_pad.Encoder.calcSize(rem) + 1;
+    return armor_begin.len + 1 + full_lines * 65 + tail + armor_end.len + 1;
 }
 
 fn armorEncode(binary: []const u8, dest: []u8) Exception!usize {
@@ -614,6 +624,12 @@ fn dearmor(input: []const u8, alloc: std.mem.Allocator) Exception![]const u8 {
     return input;
 }
 
+// The consumer sizes its scratch carve by whether dearmor will stage the
+// cleaned and decoded archive; this mirrors dearmor's recognition exactly.
+pub fn isArmored(input: []const u8) bool {
+    return std.mem.startsWith(u8, std.mem.trim(u8, input, " \t\n\r"), armor_begin);
+}
+
 // Parse-time allocations take an arena over the front half of the caller
 // scratch.
 fn peelAndParse(input: []const u8, scratch: []u8) Exception!struct { binary: []const u8, header: Header, scrypt_scratch: []u8 } {
@@ -641,7 +657,9 @@ pub fn archiveSize(entries: []const Entry, options: Options, scratch: []u8) Exce
     if (entries.len != 1) return error.CallException;
     const binary_len = headerSize(options) + payloadCiphertextLen(entries[0].data.len);
     if (!options.armor) return binary_len;
-    return armoredLen(@intCast(binary_len));
+    // The armored length addresses memory, so it must fit the target width.
+    const binary = std.math.cast(usize, binary_len) orelse return error.ResourceException;
+    return armoredLen(binary);
 }
 
 pub fn encode(entries: []const Entry, output: []u8, scratch: []u8, options: Options) Exception!usize {
@@ -1036,4 +1054,80 @@ test "empty payload round trip" {
     var plain: [1]u8 = undefined;
     const n = try decodeOrdinal(out[0..written], 0, &plain, &scratch, .{ .identity = try id.toString(&id_buf) });
     try testing.expectEqual(@as(usize, 0), n);
+}
+
+test "low order archive share rejects as data" {
+    // A zero share is a degenerate X25519 point: the header is malformed
+    // data, not an ownership miss the identity loop may skip past.
+    var hostile = vec_x25519;
+    const share_at = version_line.len + 1 + "-> ".len + "X25519".len + 1;
+    @memset(hostile[share_at .. share_at + b64Len(32)], 'A');
+    var scratch: [256 * 1024]u8 = undefined;
+    var out: [64]u8 = undefined;
+    try testing.expectError(error.DataException, decodeOrdinal(&hostile, 0, &out, &scratch, .{ .identity = meta_x25519_identity }));
+}
+
+test "low order recipient refuses the call" {
+    // The zero point is a valid bech32 payload but a degenerate recipient;
+    // the caller supplied it, so the call refuses.
+    const zero_point = std.mem.zeroes([32]u8);
+    var rec_buf: [100]u8 = undefined;
+    const degenerate = try bech32Encode("age", &zero_point, &rec_buf);
+    const entries = [_]Entry{.{ .name = "payload", .data = "x" }};
+    var scratch: [256 * 1024]u8 = undefined;
+    var out: [4096]u8 = undefined;
+    try testing.expectError(error.CallException, encode(&entries, &out, &scratch, .{ .recipient = degenerate }));
+}
+
+test "mixed credentials dispatch by header shape" {
+    // A request carrying both a password and an identity routes by the
+    // archive: recipient headers use the identity, scrypt headers the
+    // passphrase; neither credential wins by being set.
+    var id_buf: [80]u8 = undefined;
+    var rec_buf: [100]u8 = undefined;
+    const id = randomIdentity();
+    const identity_text = try id.toString(&id_buf);
+    const entries = [_]Entry{.{ .name = "payload", .data = "dispatch me" }};
+    var scratch: [8 * 1024 * 1024]u8 = undefined;
+    var out: [4096]u8 = undefined;
+    var plain: [64]u8 = undefined;
+    const written = try encode(&entries, &out, &scratch, .{ .recipient = try id.recipientString(&rec_buf) });
+    const mixed = Options{ .password = "not the passphrase", .identity = identity_text };
+    const n = try decodeOrdinal(out[0..written], 0, &plain, &scratch, mixed);
+    try testing.expectEqualStrings("dispatch me", plain[0..n]);
+    // Password-only against a recipient header stays an integrity miss.
+    try testing.expectError(error.IntegrityException, decodeOrdinal(out[0..written], 0, &plain, &scratch, .{ .password = "x" }));
+    // The scrypt side mirrors: mixed credentials still take the passphrase.
+    const scrypt_options = Options{ .password = "correct horse", .work_factor = 4 };
+    var out_scrypt: [4096]u8 = undefined;
+    const written_scrypt = try encode(&entries, &out_scrypt, &scratch, scrypt_options);
+    const mixed_scrypt = Options{ .password = "correct horse", .identity = identity_text, .work_factor = 4 };
+    const n_scrypt = try decodeOrdinal(out_scrypt[0..written_scrypt], 0, &plain, &scratch, mixed_scrypt);
+    try testing.expectEqualStrings("dispatch me", plain[0..n_scrypt]);
+    // Identity-only against a scrypt header stays an integrity miss.
+    try testing.expectError(error.IntegrityException, decodeOrdinal(out_scrypt[0..written_scrypt], 0, &plain, &scratch, .{ .identity = identity_text }));
+    // Neither secret is a call error.
+    try testing.expectError(error.CallException, decodeOrdinal(out[0..written], 0, &plain, &scratch, .{}));
+}
+
+test "armored multi chunk round trip sizes the staging budget" {
+    var payload: [200 * 1024]u8 = undefined;
+    for (&payload, 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
+    const entries = [_]Entry{.{ .name = "payload", .data = &payload }};
+    // Dearmor stages the cleaned and decoded text in the front half, so an
+    // armored archive needs well past the fixed 64 KiB floor.
+    const scratch = try testing.allocator.alloc(u8, 2560 * 1024);
+    defer testing.allocator.free(scratch);
+    var out: [320 * 1024]u8 = undefined;
+    const id = randomIdentity();
+    var id_buf: [80]u8 = undefined;
+    var rec_buf: [100]u8 = undefined;
+    const options = Options{ .recipient = try id.recipientString(&rec_buf), .armor = true };
+    const written = try encode(&entries, &out, scratch, options);
+    try testing.expect(isArmored(out[0..written]));
+    try testing.expectEqual(try archiveSize(&entries, options, scratch), written);
+    var plain: [200 * 1024]u8 = undefined;
+    const n = try decodeOrdinal(out[0..written], 0, &plain, scratch, .{ .identity = try id.toString(&id_buf) });
+    try testing.expectEqual(payload.len, n);
+    try testing.expectEqualSlices(u8, &payload, plain[0..n]);
 }

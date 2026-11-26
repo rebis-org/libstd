@@ -160,6 +160,10 @@ fn decodeStreamImpl(reader: *std.Io.Reader, writer: ?*std.Io.Writer, output: []u
             if (pack_read != pack_size) return error.IoException;
             try decoder.resetReaderSlice(chunk_buffer[0..pack_size]);
             try decoder.decodeToOutput(null, unpack_size, false, false);
+            // xz (compressed_size) and the SDK (packSize) both close a chunk
+            // only with the range coder exactly consumed; trailing packed
+            // bytes inside the declared size are corruption.
+            if (decoder.range_coder.input.position != pack_size) return error.DataException;
         } else {
             if (control != control_copy_reset_dict and control != control_copy) return error.DataException;
             const unpack_size = try readCopyUnpackSize(reader);
@@ -559,6 +563,72 @@ test "lzma2 chunk rejects a non-finished range coder at its size boundary" {
     var output: [256]u8 = undefined;
     @memset(&output, 0xA5);
     try std.testing.expectError(error.DataException, decode(stream_buffer[0..stream.end], &output, decode_scratch, options));
+}
+
+test "lzma2 chunk rejects leftover packed bytes" {
+    const alloc = std.testing.allocator;
+    const dictionary: u32 = 1 << 20;
+    const props = defaultProperties(dictionary);
+    const options: Options = .{ .dictionary_size = dictionary, .properties = props };
+    const input: []const u8 = "leftover packed bytes inside a chunk";
+
+    const encoder_scratch = try alloc.alloc(u8, lzma.encodeWorkspaceSizeBt(props));
+    defer alloc.free(encoder_scratch);
+    var payload_buffer: [1024]u8 = undefined;
+    // A size-terminated, markerless payload is what a real chunk carries:
+    // the range coder finishes with code zero exactly at the boundary.
+    const payload_len = try lzma.encode(input, &payload_buffer, encoder_scratch, .{
+        .properties = props,
+        .unpack_size = input.len,
+        .marker_required = false,
+    });
+
+    const raw_unpack = input.len - 1;
+
+    const decode_scratch = try alloc.alloc(u8, decodeWorkspaceSize(dictionary));
+    defer alloc.free(decode_scratch);
+    var output: [256]u8 = undefined;
+
+    // Positive control: the exact payload decodes.
+    {
+        const raw_pack = payload_len - 1;
+        var stream_buffer: [1024]u8 = undefined;
+        var stream = std.Io.Writer.fixed(&stream_buffer);
+        const control: u8 = control_lzma_new_props_reset_dict |
+            @as(u8, @intCast((raw_unpack >> 16) & 0x1F));
+        try io.writeByte(&stream, control);
+        try io.writeByte(&stream, @intCast((raw_unpack >> 8) & 0xFF));
+        try io.writeByte(&stream, @intCast(raw_unpack & 0xFF));
+        try io.writeByte(&stream, @intCast((raw_pack >> 8) & 0xFF));
+        try io.writeByte(&stream, @intCast(raw_pack & 0xFF));
+        try io.writeByte(&stream, props.encode());
+        try io.writeBytes(&stream, payload_buffer[0..payload_len]);
+        try io.writeByte(&stream, control_end);
+        const produced = try decode(stream_buffer[0..stream.end], &output, decode_scratch, options);
+        try std.testing.expectEqualSlices(u8, input, output[0..produced]);
+    }
+
+    // One garbage byte rides inside the declared pack size; the range coder
+    // finishes without consuming it, so the chunk must be rejected.
+    {
+        const raw_pack = payload_len;
+        var stream_buffer: [1024]u8 = undefined;
+        var stream = std.Io.Writer.fixed(&stream_buffer);
+        const control: u8 = control_lzma_new_props_reset_dict |
+            @as(u8, @intCast((raw_unpack >> 16) & 0x1F));
+        try io.writeByte(&stream, control);
+        try io.writeByte(&stream, @intCast((raw_unpack >> 8) & 0xFF));
+        try io.writeByte(&stream, @intCast(raw_unpack & 0xFF));
+        try io.writeByte(&stream, @intCast((raw_pack >> 8) & 0xFF));
+        try io.writeByte(&stream, @intCast(raw_pack & 0xFF));
+        try io.writeByte(&stream, props.encode());
+        try io.writeBytes(&stream, payload_buffer[0..payload_len]);
+        try io.writeByte(&stream, 0xA5);
+        try io.writeByte(&stream, control_end);
+        @memset(&output, 0xA5);
+        try std.testing.expectError(error.DataException, decode(stream_buffer[0..stream.end], &output, decode_scratch, options));
+        for (output[input.len..]) |byte| try std.testing.expectEqual(@as(u8, 0xA5), byte);
+    }
 }
 
 test "lzma2 copy chunk reset stamps only the first batch" {

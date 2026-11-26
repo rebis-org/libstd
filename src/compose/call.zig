@@ -67,11 +67,14 @@ fn runTask(context: *anyopaque) callconv(.c) u32 {
 }
 
 fn runInner(envelope: *Call) u32 {
-    if (!envelope.isValid()) return if (envelope.structure_size >= @sizeOf(Call)) report(envelope, error.CallException) else Status.invalid_call;
+    // The size field is the first four bytes; a record too small to be a
+    // Call is refused before isValid reads past it.
+    if (envelope.structure_size < @sizeOf(Call)) return Status.invalid_call;
+    if (!envelope.isValid()) return report(envelope, error.CallException);
     const response = envelope.response orelse return report(envelope, error.CallException);
     if (!response.isValid() or !isZero(response.id)) return report(envelope, error.CallException);
     if (envelope.diagnostic) |diagnostic| {
-        node_graph.validateGraph(diagnostic.child, .out, 0) catch |exception| return mapException(exception).status;
+        node_graph.validateGraph(diagnostic.child, .out, 0) catch |exception| return report(envelope, exception);
     }
     response.value_low = 0;
     response.value_high = 0;

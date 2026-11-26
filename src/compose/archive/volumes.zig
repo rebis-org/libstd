@@ -57,6 +57,9 @@ pub fn checkOverlap(workspace: *Workspace, sink: ?*Resource, parts: []const []co
 // Every part but the last is exactly the granularity (zip, 7z).
 pub fn byChunk(set: []const u8, volume_size: u64, workspace: *Workspace) Exception![]const []const u8 {
     const width = std.math.cast(usize, volume_size) orelse return error.ResourceException;
+    // A zero width would divide below; the only caller guards it, this
+    // keeps the helper fail-closed on its own contract.
+    if (width == 0) return error.CallException;
     const count = if (set.len == 0) 1 else 1 + (set.len - 1) / width;
     const parts = try workspace.take([]const u8, count);
     var at: usize = 0;
@@ -128,6 +131,8 @@ test "volume chunking cuts every set shape at the fixed width" {
     var tiny: [16]u8 align(@alignOf([]const u8)) = undefined;
     var small_workspace = try Workspace.init(&tiny, tiny.len);
     try std.testing.expectError(error.CapacityException, byChunk(&set, 4, &small_workspace));
+    // A zero width is refused before it reaches the division.
+    try std.testing.expectError(error.CallException, byChunk(&set, 0, &workspace));
 }
 
 test "volume length cutting walks the plan and rejects both miss classes" {

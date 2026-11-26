@@ -52,15 +52,16 @@ pub const Ops = struct {
 };
 
 pub const Session = struct {
+    // The class marker leads the record: the C boundary reads it at offset 0
+    // to classify a handle without touching any later field, so even
+    // undersized storage never gets an out-of-bounds read past the marker.
+    cookie: u64 = 0,
     state: *anyopaque,
     ops: *const Ops,
     alive: bool = true,
     // Sticky failure state machine: once a step fails, later steps fail with
     // CallException instead of depending on per-driver recovery conventions.
     failed: bool = false,
-    // The boundary sets the cookie on create and clears it on destroy,
-    // so garbage ops pointers never dispatch.
-    cookie: u64 = 0,
     // The caller-declared storage extent, for overlap validation at step time.
     storage_len: u64 = 0,
     // The boundary records the last failure's envelope status and driver

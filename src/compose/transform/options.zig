@@ -155,6 +155,10 @@ pub fn parseBrotliOptions(request: ?*Node, command_mask: u32) Exception!brotli.O
     if (command_mask == vocabulary.command_mask_write or command_mask == vocabulary.command_mask_query) {
         if (try optCast(request, "brotli", "quality", u32)) |quality| {
             if (quality > 11) return error.CallException;
+            // The encoder implements one strategy, tuned against the vendor's
+            // quality 5; other levels stay format-valid but unimplemented, so
+            // they answer unsupported instead of silently ignoring the knob.
+            if (quality != 5) return error.UnsupportedException;
             options.quality = quality;
         }
     }

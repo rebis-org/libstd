@@ -9,6 +9,8 @@ pub const Entry = onprem.Entry;
 pub const EntryInfo = onprem.EntryInfo;
 pub const Exception = onprem.Exception;
 pub const Options = onprem.Options;
+// Armor recognition so the consumer can budget dearmor's staging.
+pub const isArmored = onprem.isArmored;
 pub const scratch_size = onprem.scratch_size;
 // The scrypt peak a caller must budget; sizing scratch before the seam can refuse needs the ceiling.
 pub const scrypt_work_factor_max = onprem.scrypt_work_factor_max;

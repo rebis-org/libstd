@@ -172,18 +172,19 @@ fn copyMatch(comptime mode: Mode, output: []u8, op: *usize, m_pos: usize, len: u
 
 const Phase = enum { literal, match };
 
-// Small token after literals: three-byte M1 match.
-fn m1AfterLiteral(comptime mode: Mode, input: []const u8, output: []u8, ip: *usize, op: *usize, t: usize, s: ?*Stream) Exception!usize {
+// Small token after literals: three-byte M1 match. Returns null when the
+// literal bridge is empty and the next token is a literal-run token;
+// otherwise returns the chain token that follows the bridge literals,
+// which may legitimately be zero (M1 inside the chain).
+fn m1AfterLiteral(comptime mode: Mode, input: []const u8, output: []u8, ip: *usize, op: *usize, t: usize, s: ?*Stream) Exception!?usize {
     const b = try takeToken(input, ip);
     const back = (1 + m2_max_offset) + (t >> 2) + (@as(usize, b) << 2);
     if (back > op.*) return error.DataException;
     try copyMatch(mode, output, op, op.* - back, 3, s);
-    if (ip.* < 2) return error.DataException;
-    var bridge: usize = input[ip.* - 2] & 3;
-    if (bridge == 0) return 0;
+    const bridge: usize = input[ip.* - 2] & 3;
+    if (bridge == 0) return null;
     try copyLiterals(mode, input, output, ip, op, bridge, s);
-    bridge = try takeToken(input, ip);
-    return bridge;
+    return try takeToken(input, ip);
 }
 
 pub fn decode(input: []const u8, output: []u8, scratch: []u8, options: Options) Exception!usize {
@@ -219,12 +220,12 @@ fn decodeCore(comptime mode: Mode, input: []const u8, output: []u8, s: ?*Stream)
         if (short_run) {
             phase = .match;
         } else if (t < 16) {
-            t = try m1AfterLiteral(mode, input, output, &ip, &op, t, s);
-            if (t == 0) {
+            if (try m1AfterLiteral(mode, input, output, &ip, &op, t, s)) |chain| {
+                t = chain;
+                phase = .match;
+            } else {
                 t = try takeToken(input, &ip);
                 phase = .literal;
-            } else {
-                phase = .match;
             }
         } else {
             phase = .match;
@@ -239,8 +240,9 @@ fn decodeCore(comptime mode: Mode, input: []const u8, output: []u8, s: ?*Stream)
                 try copyLiterals(mode, input, output, &ip, &op, len + 3, s);
                 t = try takeToken(input, &ip);
                 if (t < 16) {
-                    t = try m1AfterLiteral(mode, input, output, &ip, &op, t, s);
-                    if (t == 0) {
+                    if (try m1AfterLiteral(mode, input, output, &ip, &op, t, s)) |chain| {
+                        t = chain;
+                    } else {
                         t = try takeToken(input, &ip);
                         continue;
                     }
@@ -533,6 +535,53 @@ test "lzo1x decodes reference short literal runs" {
         try std.testing.expectEqualSlices(u8, case.plain, back[0..m]);
         try std.testing.expectEqual(case.plain.len, try countDecoded(case.stream));
     }
+}
+
+test "lzo1x decodes a zero chain token after a bridged M1" {
+    // A chain token of zero is a valid M1-in-chain (offset 1, two bytes);
+    // it must not be confused with the empty-bridge sentinel. The vendor
+    // decoder keeps them apart by control flow (match_done breaks the
+    // inner loop only on an empty bridge; match_next reads the chain
+    // token unconditionally).
+    const stream = blk: {
+        var buf: [1 + 238 + 7 * 4 + 1 + 4 + 2 + 1 + 2 + 3]u8 = undefined;
+        var at: usize = 0;
+        buf[at] = 255;
+        at += 1;
+        @memset(buf[at .. at + 238], 'A');
+        at += 238;
+        var group: usize = 0;
+        while (group < 7) : (group += 1) {
+            buf[at] = 32;
+            buf[at + 1] = 255;
+            buf[at + 2] = 0;
+            buf[at + 3] = 0;
+            at += 4;
+        }
+        buf[at] = 1;
+        at += 1;
+        @memset(buf[at .. at + 4], 'B');
+        at += 4;
+        buf[at] = 1;
+        buf[at + 1] = 0;
+        at += 2;
+        buf[at] = 'C';
+        at += 1;
+        buf[at] = 0;
+        buf[at + 1] = 0;
+        at += 2;
+        buf[at] = 17;
+        buf[at + 1] = 0;
+        buf[at + 2] = 0;
+        at += 3;
+        break :blk buf;
+    };
+    var back: [2264]u8 = undefined;
+    const m = try decode(&stream, &back, &.{}, .{});
+    try std.testing.expectEqual(2264, m);
+    try std.testing.expect(std.mem.allEqual(u8, back[0..2254], 'A'));
+    try std.testing.expectEqualSlices(u8, "BBBBAAACCC", back[2254..2264]);
+    try std.testing.expectEqual(2264, try countDecoded(&stream));
 }
 
 test "lzo1x streams reference fixtures to a writer" {

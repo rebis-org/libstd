@@ -77,7 +77,11 @@ pub fn limitedLengths(freqs: anytype, lengths: anytype, comptime limit: u8) void
     while (overflow > 0) {
         var width: usize = limit - 1;
         while (width > 0 and bl_count[width] == 0) width -= 1;
-        std.debug.assert(width > 0);
+        // Fail closed: a Kraft-complete tree keeps the scan off zero; a
+        // zero width means the caller's frequencies cannot form a complete
+        // code at the limit, so stop repairing instead of corrupting the
+        // histogram (the final loop would otherwise run on a garbage count).
+        if (width == 0) break;
         bl_count[width] -= 1;
         bl_count[width + 1] += 2;
         bl_count[limit] -= 1;

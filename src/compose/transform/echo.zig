@@ -16,7 +16,7 @@ pub fn hook(running: *run.Run) Exception!void {
     const workspace = running.workspace();
     const sink_resource = sink orelse return error.CallException;
     const output_size = try common.planOutputSize(source_resource, sizing, limits, workspace);
-    try common.requireSinkCapacity(sink_resource, call, output_size);
+    try common.requireSink(sink_resource, call, output_size);
     const staging_required: usize = if (commit == .confirmed) output_size else 0;
     if (workspace.bytes.len < staging_required) {
         common.writeCapacityDiagnostic(call, staging_required, workspace.bytes.len);

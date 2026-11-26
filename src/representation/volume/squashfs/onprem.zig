@@ -1118,6 +1118,19 @@ test "squashfs zstd write roundtrips flat files" {
     try testing.expectEqualSlices(u8, entries[0].data, out1[0..n1]);
 }
 
+test "squashfs rejects escape names before writing" {
+    const testing = std.testing;
+    var scratch: [scratch_size]u8 = undefined;
+    const dotdot = [_]Entry{.{ .name = "../x.txt", .data = "one" }};
+    try testing.expectError(error.CallException, archiveSize(&dotdot, &scratch));
+    const backslash = [_]Entry{.{ .name = "a\\b.txt", .data = "one" }};
+    try testing.expectError(error.CallException, archiveSize(&backslash, &scratch));
+    const drive = [_]Entry{.{ .name = "C:/x.txt", .data = "one" }};
+    try testing.expectError(error.CallException, archiveSize(&drive, &scratch));
+    const nul = [_]Entry{.{ .name = "a\x00b.txt", .data = "one" }};
+    try testing.expectError(error.CallException, archiveSize(&nul, &scratch));
+}
+
 const mksquashfs_fixture = [_]u8{
     0x68, 0x73, 0x71, 0x73, 0x03, 0x00, 0x00, 0x00, 0xf7, 0x54, 0xd0, 0x6a, 0x00, 0x00, 0x02, 0x00,
     0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x11, 0x00, 0xc0, 0x00, 0x02, 0x00, 0x04, 0x00, 0x00, 0x00,

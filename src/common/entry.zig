@@ -35,6 +35,17 @@ pub fn isComponent(name: []const u8) bool {
     return name.len != 0 and !std.mem.eql(u8, name, ".") and !std.mem.eql(u8, name, "..");
 }
 
+// One directory level, whether split from a written path or read back
+// from an image: no separator or terminator bytes, no dot or dot-dot,
+// and clear of the shared escape rules.
+pub fn isSafeComponent(name: []const u8) bool {
+    if (name.len == 0) return false;
+    if (std.mem.findScalar(u8, name, 0) != null) return false;
+    if (std.mem.findScalar(u8, name, '/') != null) return false;
+    if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return false;
+    return !bounds.isAbsoluteOrTraversal(name);
+}
+
 // The trailing component of a path, or null when the path ends in a separator.
 pub fn leafName(name: []const u8) ?[]const u8 {
     var index: usize = name.len;
@@ -61,6 +72,22 @@ test "entry accepts plain relative names and rejects every escape" {
     try std.testing.expectError(error.CallException, validateName("up/../../out"));
     // A backslash is a separator on some hosts, never a name byte.
     try std.testing.expectError(error.CallException, validateName("a\\b"));
+    // A Windows drive prefix is absolute on that host, slash or not.
+    try std.testing.expectError(error.CallException, validateName("C:/hosts"));
+    try std.testing.expectError(error.CallException, validateName("c:relative"));
     // An embedded terminator would not stay a C string.
     try std.testing.expectError(error.CallException, validateName("a\x00b"));
+}
+
+test "safe components reject every escape at one directory level" {
+    try std.testing.expect(isSafeComponent("readme.md"));
+    try std.testing.expect(isSafeComponent("a.txt"));
+    try std.testing.expect(!isSafeComponent(""));
+    try std.testing.expect(!isSafeComponent("."));
+    try std.testing.expect(!isSafeComponent(".."));
+    try std.testing.expect(!isSafeComponent("a/b"));
+    try std.testing.expect(!isSafeComponent("a\\b"));
+    try std.testing.expect(!isSafeComponent("C:"));
+    try std.testing.expect(!isSafeComponent("c:x"));
+    try std.testing.expect(!isSafeComponent("a\x00b"));
 }

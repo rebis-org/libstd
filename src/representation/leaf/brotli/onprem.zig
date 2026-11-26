@@ -2976,6 +2976,11 @@ fn pickWindow(input_len: usize, dict_len: usize, options: Options) struct { wbit
 }
 
 fn encodeBits(input: []const u8, bw: *BitWriter, ws: []u8, options: Options) EncodeError!void {
+    // The compose paths validate against the descriptor; the leaf re-checks
+    // its own contract for direct callers. One strategy exists, tuned against
+    // the vendor's quality 5, so any other level answers unsupported rather
+    // than silently ignoring the knob.
+    if (options.quality != 5) return error.UnsupportedException;
     const dict = options.custom_dictionary orelse &.{};
     const window = pickWindow(input.len, dict.len, options);
     const dist_cap: u32 = (@as(u32, 1) << window.wbits) - 16;
@@ -3090,6 +3095,18 @@ test "brotli encode roundtrips multi-block" {
         try std.testing.expectEqual(big.len, n);
         try std.testing.expectEqualSlices(u8, big, output[0..n]);
     }
+}
+
+test "brotli encode rejects unimplemented quality" {
+    const allocator = std.testing.allocator;
+    const scratch = try allocator.alloc(u8, encode_workspace_size);
+    defer allocator.free(scratch);
+    var encoded: [64]u8 = undefined;
+    // Quality 5 is the only implemented strategy; other levels answer
+    // unsupported instead of silently producing quality-5 output.
+    try std.testing.expectError(error.UnsupportedException, encode("abcd", &encoded, scratch, .{ .quality = 1 }));
+    try std.testing.expectError(error.UnsupportedException, encode("abcd", &encoded, scratch, .{ .quality = 11 }));
+    try std.testing.expect((try encode("abcd", &encoded, scratch, .{ .quality = 5 })) > 0);
 }
 
 test "brotli encode roundtrips" {

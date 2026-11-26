@@ -184,7 +184,9 @@ pub fn Decoder(comptime Source: type) type {
         }
 
         fn runLane(self: *Self, slot: *Slot(Source)) void {
-            // A lane decode runs on any thread and reads only its own lane.
+            // A lane decode runs on any thread and touches only its own
+            // lane's buffers; waves overlap, so decode calls on one source
+            // can run concurrently and must not mutate shared source state.
             const produced = self.source.decode(slot.unit, self.lanes[slot.index].scratch) catch |err| {
                 slot.failure = err;
                 slot.state = .failed;

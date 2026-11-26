@@ -205,6 +205,32 @@ pub fn frameContentSize(input: []const u8, max_window: u32) DecodeError!usize {
     return try scanContentSize(&source, max_window);
 }
 
+// The declared window of the first frame in a stream; skippable frames
+// step aside. Volume adapters probe with this to size one history buffer
+// per stream instead of carrying a fixed acceptance cap.
+pub fn frameWindowSize(input: []const u8, window_limit: u32) DecodeError!u32 {
+    var source = std.Io.Reader.fixed(input);
+    while (true) {
+        const magic = readU32Le(&source) catch |err| switch (err) {
+            error.EndOfStream => return error.DataException,
+            error.ReadFailed => return error.IoException,
+        };
+        if (magic == frame_magic) {
+            const header = try decodeFrameHeader(&source, window_limit);
+            return std.math.cast(u32, header.window_size) orelse return error.ResourceException;
+        }
+        if (magic >= skippable_magic_min and magic <= skippable_magic_max) {
+            const size = readU32Le(&source) catch |err| switch (err) {
+                error.EndOfStream => return error.DataException,
+                error.ReadFailed => return error.IoException,
+            };
+            try skipBytes(&source, size);
+            continue;
+        }
+        return error.DataException;
+    }
+}
+
 pub fn decodedSize(input: []const u8, history: []u8, options: Options) DecodeError!usize {
     var source = std.Io.Reader.fixed(input);
     var counter = tee.CountingTee(.{}).init(null);
@@ -474,17 +500,22 @@ pub fn trainDictionarySearch(samples: []const []const u8, max_size: usize, outpu
 }
 
 pub const EncodeError = error{
+    CallException,
+    CapacityException,
     DataException,
     ResourceException,
     IoException,
 };
 
 pub fn encodeStream(input: *std.Io.Reader, output: *std.Io.Writer, history: []u8, workspace: []u32, options: Options) EncodeError!usize {
-    if (options.window_size < window_size_min or options.window_size > window_size_max) return error.DataException;
-    if (options.hash_bits < 10 or options.hash_bits > 17) return error.DataException;
-    if (options.max_chain == 0) return error.DataException;
-    if (options.nice_len < min_match_len) return error.DataException;
-    if (options.search_window == 0) return error.DataException;
+    // Option contract violations answer invalid_call, matching the trainer
+    // checks above and the deflate and bzip2 encoders; a too-small caller
+    // buffer answers insufficient_capacity, matching deflate Compress.init.
+    if (options.window_size < window_size_min or options.window_size > window_size_max) return error.CallException;
+    if (options.hash_bits < 10 or options.hash_bits > 17) return error.CallException;
+    if (options.max_chain == 0) return error.CallException;
+    if (options.nice_len < min_match_len) return error.CallException;
+    if (options.search_window == 0) return error.CallException;
     const dictionary = options.dictionary orelse &.{};
     // The match finder needs only the content region: offsets seed per frame
     // in encodeBlocks, entropy tables stay decoder-side.
@@ -493,12 +524,12 @@ pub fn encodeStream(input: *std.Io.Reader, output: *std.Io.Writer, history: []u8
     else
         dictionary;
     const needed_history = @as(usize, options.window_size) + block_size_max + dict_content.len;
-    if (history.len < needed_history) return error.DataException;
+    if (history.len < needed_history) return error.CapacityException;
     const frame_cap = if (useFixedTables(options))
         @min(history.len - dict_content.len - block_size_max, encoder_frame_size_max)
     else
         @min(options.window_size, encoder_frame_size_max);
-    if (workspace.len < encoderWorkspaceU32Count(dict_content.len, frame_cap, options)) return error.DataException;
+    if (workspace.len < encoderWorkspaceU32Count(dict_content.len, frame_cap, options)) return error.CapacityException;
     var total_encoded: u64 = 0;
     var total_input: u64 = 0;
     var is_empty = true;
@@ -558,7 +589,7 @@ pub fn encodeFrame(output: *std.Io.Writer, content: []const u8, workspace: []u32
     var hasher = checksum.XxHash64.bind(options.provider, 0);
     try encodeBlocks(&counted.writer, content, content_start, workspace, options, &hasher);
     try writeU32le(&counted.writer, @truncate(hasher.final({})));
-    return std.math.cast(usize, counted.written()) orelse error.ResourceException;
+    return std.math.cast(usize, counted.written() catch return error.CapacityException) orelse error.ResourceException;
 }
 
 fn writeFrameHeader(writer: *std.Io.Writer, content_size: usize, window_size: u32, dictionary_id: u32) EncodeError!void {
@@ -4957,6 +4988,23 @@ test "zstd encoder window descriptor covers the search window" {
             try std.testing.expect(computeWindowSize(encodeWindowDescriptor(window_size)) >= window_size);
         }
     }
+}
+
+test "zstd encodeStream option and buffer contract" {
+    // Option values answer invalid_call; short caller buffers answer
+    // insufficient_capacity; neither blames the data.
+    var source = std.Io.Reader.fixed(&.{});
+    var sink = std.Io.Writer.fixed(&.{});
+    var history: [0]u8 = .{};
+    var workspace: [0]u32 = .{};
+    try std.testing.expectError(error.CallException, encodeStream(&source, &sink, &history, &workspace, .{ .window_size = 512, .hash_bits = 10, .max_chain = 1, .nice_len = 3, .search_window = 1 }));
+    try std.testing.expectError(error.CallException, encodeStream(&source, &sink, &history, &workspace, .{ .window_size = 1024, .hash_bits = 9, .max_chain = 1, .nice_len = 3, .search_window = 1 }));
+    try std.testing.expectError(error.CallException, encodeStream(&source, &sink, &history, &workspace, .{ .window_size = 1024, .hash_bits = 10, .max_chain = 0, .nice_len = 3, .search_window = 1 }));
+    try std.testing.expectError(error.CallException, encodeStream(&source, &sink, &history, &workspace, .{ .window_size = 1024, .hash_bits = 10, .max_chain = 1, .nice_len = 2, .search_window = 1 }));
+    try std.testing.expectError(error.CallException, encodeStream(&source, &sink, &history, &workspace, .{ .window_size = 1024, .hash_bits = 10, .max_chain = 1, .nice_len = 3, .search_window = 0 }));
+    // Valid options with an empty history: needed_history is window + block
+    // + dict, never zero, so the buffer check answers insufficient_capacity.
+    try std.testing.expectError(error.CapacityException, encodeStream(&source, &sink, &history, &workspace, .{ .window_size = 1024, .hash_bits = 10, .max_chain = 1, .nice_len = 3, .search_window = 1 }));
 }
 
 test "zstd zero-sequence block preserves repeat-mode tables" {

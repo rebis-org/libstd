@@ -153,7 +153,13 @@ fn serveGzip(running: *Run) Exception!void {
                         response.byte_length = produced;
                         return;
                     },
-                    .fallback => |tentative| @memset(sink_resource.kind.direct_write[0..tentative], 0),
+                    .fallback => |tentative| {
+                        // The leaf contract keeps tentative within the sink
+                        // slice; a violation is an internal fault, not a
+                        // reason to memset past a host buffer.
+                        if (tentative > sink_resource.kind.direct_write.len) return error.InternalException;
+                        @memset(sink_resource.kind.direct_write[0..tentative], 0);
+                    },
                 }
             }
         }
@@ -788,6 +794,8 @@ fn serveLzmaFile(running: *Run) Exception!void {
         const scratch = try workspace.take(u8, encode_workspace);
         const input = try common.materializeSource(.require_size, source_resource, workspace, limits.decoded_bytes);
         encode_options.unpack_size = input.len;
+        // The source length is known, so the stream stays markerless.
+        encode_options.marker_required = false;
         const output_size = if (sizing == .bounded) lzma_file.encodedSizeBound(input.len) else try lzma_file.requiredSize(input, scratch, encode_options);
         if (output_size > limits.encoded_bytes) return error.ResourceException;
         if ((std.math.add(usize, input.len, output_size) catch return error.ResourceException) > limits.codec_work) return error.ResourceException;
@@ -847,7 +855,11 @@ fn serveXz(running: *Run) Exception!void {
         if (sink) |sink_resource| {
             try common.requireSink(sink_resource, call, output_size);
             const staging = try workspace.take(u8, output_size);
-            _ = try xz.decodeInPlace(input, staging, scratch, provider);
+            // The leaf's anchored-success contract makes produced equal the
+            // declared size; a short success would publish stale staging
+            // bytes, so the mismatch is an internal fault.
+            const produced = try xz.decodeInPlace(input, staging, scratch, provider);
+            if (produced != output_size) return error.InternalException;
             try common.commitBytesToSink(sink_resource, call, staging);
         }
         response.byte_length = output_size;

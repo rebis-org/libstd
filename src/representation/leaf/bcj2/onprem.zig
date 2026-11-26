@@ -82,8 +82,12 @@ pub fn decode(main_stream: []const u8, call_stream: []const u8, jump_stream: []c
     }
 
     // A finished stream leaves the range coder at code zero; 7-Zip's
-    // Bcj2Dec_IsMaybeFinished_code rejects any other final state.
+    // Bcj2Dec_IsMaybeFinished_code rejects any other final state, and its
+    // CDecoder::Code rejects unconsumed call, jump, or rc bytes.
     if (code != 0) return error.DataException;
+    if (call_pos != call_stream.len) return error.DataException;
+    if (jump_pos != jump_stream.len) return error.DataException;
+    if (rc_pos != rc_stream.len) return error.DataException;
     return out_pos;
 }
 
@@ -113,13 +117,14 @@ fn rangeDecode(prob: *u16, range: *u32, code: *u32, stream: []const u8, pos: *us
 
 pub const EncodedSizes = struct { main: usize, call: usize, jump: usize, rc: usize };
 
-// Main, call, and jump never exceed the input; each rc bit at worst halves the range, a byte eight bits.
+// Main, call, and jump never exceed the input; every byte can need a
+// range-coded conversion bit, so rc grows with the input itself.
 pub fn encodeSizesBound(input_len: usize) EncodedSizes {
     return .{
         .main = input_len,
         .call = input_len,
         .jump = input_len,
-        .rc = input_len / 4 + 64,
+        .rc = input_len + 64,
     };
 }
 
@@ -427,8 +432,9 @@ test "bcj2 encode stream sizes respect their bounds" {
     var jump: [64]u8 = undefined;
     var rc: [16 + 64]u8 = undefined;
     const sizes = try encode(&input, &main, &call, &jump, &rc);
-    // E8 at position 0 cannot convert (the ip guard requires ip > 0); the
-    // relative limit rejects the zero-paged offsets.
+    // No E8 converts: the ip guard passes even at position 0 (ip is
+    // already 1 by the check), so the relative limit is what rejects the
+    // E8E8E8E8 offsets.
     try std.testing.expect(sizes.main == 64);
 }
 
@@ -515,6 +521,17 @@ test "bcj2 decode rejects non-finished final range-coder state" {
     const rc_buf = [_]u8{ 0, 0xFF, 0xFF, 0xFF, 0xFE };
     var out: [16]u8 = undefined;
     try std.testing.expectError(error.DataException, decode(&main_buf, &[_]u8{ 0, 0, 0, 0x10 }, &.{}, &rc_buf, &out));
+}
+
+test "bcj2 decode rejects unconsumed stream bytes" {
+    // 7-Zip's CDecoder::Code fails on unconsumed input; trailing bytes in
+    // a substream are corruption, not padding.
+    var out: [16]u8 = undefined;
+    try std.testing.expectError(error.DataException, decode(&[_]u8{0x90}, &.{}, &.{}, &[_]u8{ 0, 0, 0, 0, 0, 0 }, &out));
+    var main_buf: [6]u8 = @splat(0x90);
+    main_buf[0] = 0xE8;
+    const rc_buf = finished_rc_one;
+    try std.testing.expectError(error.DataException, decode(&main_buf, &[_]u8{ 0, 0, 0, 0x10, 0 }, &.{}, &rc_buf, &out));
 }
 
 test "bcj2 truncated range-coder stream is rejected" {

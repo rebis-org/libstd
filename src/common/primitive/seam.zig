@@ -54,6 +54,15 @@ fn hashFinal(comptime Impl: type) type {
     return @typeInfo(@TypeOf(Impl.final)).@"fn".return_type.?;
 }
 
+// The foreign digest arm default-constructs its Options; that is sound only
+// while the option set is provably empty, so a fielded Options traps here
+// instead of silently dropping the caller's arguments.
+fn assertEmptyDigestOptions(comptime on: type, comptime off: type) void {
+    if (@typeInfo(on) != .@"struct" or @typeInfo(off) != .@"struct" or
+        @typeInfo(on).@"struct".field_names.len != 0 or @typeInfo(off).@"struct".field_names.len != 0)
+        @compileError("distinct digest Options must both be empty: " ++ @typeName(off));
+}
+
 // A mutable copy keeps `final` pure and matches the stdlib signature
 // without forwarding the wrapper's constness.
 fn finish(comptime family: Family, inner: anytype, args: anytype) hashFinal(@TypeOf(inner.*)) {
@@ -151,7 +160,10 @@ fn Mergeable(comptime family: Family, comptime On: type, comptime Off: type) typ
                 .checksum => Impl.init(),
                 // The stdlib Options type is nominally distinct from the on-prem
                 // one; both are empty today, so the foreign arm default-constructs.
-                .digest => if (Impl.Options == On.Options) Impl.init(args) else Impl.init(.{}),
+                .digest => if (Impl.Options == On.Options) Impl.init(args) else blk: {
+                    assertEmptyDigestOptions(On.Options, Impl.Options);
+                    break :blk Impl.init(.{});
+                },
                 .hash, .mac => Impl.init(args),
             };
         }

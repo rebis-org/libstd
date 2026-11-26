@@ -221,7 +221,10 @@ pub fn lz4DecodeStep(state: *Lz4Decode, input: []const u8, output: []u8, end_of_
         }
     }
     result.consumed = input.len;
-    if (end_of_input and state.phase != .done) {
+    // Only a starvation exit is truncation: the block_drain stall means the
+    // caller's output filled mid-block and the session must stay open so the
+    // host can keep draining, exactly as the gzip and brotli sessions do.
+    if (end_of_input and !stalled and state.phase != .done) {
         return framingFailed(&result, input.len, error.DataException);
     }
     result.status = .open;
@@ -366,6 +369,15 @@ test "lz4 sessions roundtrip both block shapes and reject corrupt frames" {
     inline for (1..17) |chunk| {
         try fixtures.expectChunkedDecode(Lz4Decode, lz4DecodeInit, lz4DecodeStep, dec_holder.aligned, frame.items, &payload, chunk, 4096);
     }
+
+    // end_of_input with a caller output smaller than the decoded block keeps
+    // the session open across the block_drain stall until every byte drains;
+    // the final-poll trap must not read that stall as truncation.
+    try fixtures.expectChunkedDecode(Lz4Decode, lz4DecodeInit, lz4DecodeStep, dec_holder.aligned, frame.items, &payload, frame.items.len, 64);
+    try fixtures.expectChunkedDecode(Lz4Decode, lz4DecodeInit, lz4DecodeStep, dec_holder.aligned, frame.items, &payload, frame.items.len, 1);
+
+    // A genuinely truncated frame still fails framing under end_of_input.
+    try testing.expectError(error.DataException, fixtures.expectChunkedDecode(Lz4Decode, lz4DecodeInit, lz4DecodeStep, dec_holder.aligned, frame.items[0 .. frame.items.len - 5], &payload, frame.items.len - 5, 4096));
 
     // Incompressible input takes the stored-block shape and still roundtrips.
     {

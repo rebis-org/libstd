@@ -62,7 +62,7 @@ pub fn archiveSize(entries: []const Entry) Exception!u64 {
     const measurement = @import("../../../common/primitive/measurement.zig");
     var counter = measurement.Counter.init(null);
     try encodeTo(entries, &counter.writer);
-    return counter.written();
+    return try counter.written();
 }
 
 pub fn encode(entries: []const Entry, output: []u8, scratch: []u8) Exception!usize {

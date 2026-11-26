@@ -418,10 +418,12 @@ fn zipSpannedSet(volumes: []const []const u8, join: []u8, disk_starts_scratch: [
         at += v.len;
     }
     const archive = join[0..total];
+    // The signature read and the EOCD scan both need a minimum length;
+    // a hostile volume set cannot shorten the archive under the guard.
+    if (archive.len < 22) return error.DataException;
     if (readU32(archive, 0) != spanning_signature) return error.DataException;
 
     // EOCD scan over the tail (same walk as the single-volume reader).
-    if (archive.len < 22) return error.DataException;
     const earliest = if (archive.len > 22 + std.math.maxInt(u16)) archive.len - (22 + std.math.maxInt(u16)) else 0;
     var position = archive.len - 22;
     var eocd_pos: ?usize = null;
@@ -513,7 +515,7 @@ fn validateEntry(entry: Entry) Exception!void {
     // Only UTF-8 names (0x0800), the descriptor marker (0x0008), and the
     // level hint (0x0002, advisory) are writable; all else stays rejected.
     if (entry.flags & ~@as(u16, 0x0800 | 0x0008 | 0x0002) != 0 or (entry.flags & 0x0800 != 0 and !std.unicode.utf8ValidateSlice(entry.name))) return error.UnsupportedException;
-    try validatePath(entry.name, entry.flags);
+    try validatePath(entry.name, entry.flags, error.CallException);
     switch (entry.method) {
         0, 8, 9, 12, 14, 93, 95, 98 => {},
         else => return error.UnsupportedException,
@@ -669,11 +671,13 @@ fn writeCentralZip64(sink: *io.Sink, compressed: usize, uncompressed: usize, loc
     if (local_offset >= std.math.maxInt(u32)) try putU64(sink, local_offset);
 }
 
-fn validatePath(name: []const u8, flags: u16) Exception!void {
-    if (bounds.isAbsoluteOrTraversal(name) or (name.len >= 2 and std.ascii.isAlphabetic(name[0]) and name[1] == ':')) return error.DataException;
+// Encode validates caller names as call errors; the decode walk runs the
+// same shape test over archive records and classifies failures as data.
+fn validatePath(name: []const u8, flags: u16, bad: Exception) Exception!void {
+    if (bounds.isAbsoluteOrTraversal(name)) return bad;
     // An embedded NUL would truncate the name for any C-string consumer.
-    if (std.mem.findScalar(u8, name, 0) != null) return error.DataException;
-    if (flags & 0x0800 != 0 and !std.unicode.utf8ValidateSlice(name)) return error.DataException;
+    if (std.mem.findScalar(u8, name, 0) != null) return bad;
+    if (flags & 0x0800 != 0 and !std.unicode.utf8ValidateSlice(name)) return bad;
 }
 
 pub fn compressedSize(entry: Entry, history: []u8, measurement_buffer: []u8, scratch: []u8) Exception!usize {
@@ -776,11 +780,13 @@ fn writeData(sink: *io.Sink, entry: Entry, provider: crypto.Provider, history: [
     try sink.write(derived[2 * key_length ..][0..winzip_aes_verify_length]);
     if (entry.method == 0) {
         if (entry.password_lifetime != 0 and entry.data.len > entry.password_lifetime) return error.ResourceException;
+        if (sink.bytes.len - sink.offset < entry.data.len) return error.CapacityException;
         try crypto.winzipCtr(provider, derived[0..key_length], sink.bytes[sink.offset..][0..entry.data.len], entry.data);
         sink.offset = try bounds.addUsize(sink.offset, entry.data.len);
     } else {
         const compressed = try zipCompressEntry(entry, provider, history, staging, scratch);
         if (entry.password_lifetime != 0 and compressed.len > entry.password_lifetime) return error.ResourceException;
+        if (sink.bytes.len - sink.offset < compressed.len) return error.CapacityException;
         try crypto.winzipCtr(provider, derived[0..key_length], sink.bytes[sink.offset..][0..compressed.len], compressed);
         sink.offset = try bounds.addUsize(sink.offset, compressed.len);
     }
@@ -860,6 +866,8 @@ fn zipCompressEntry(entry: Entry, provider: crypto.Provider, history: []u8, outp
 
 fn encodeMap(err: zstd.EncodeError) Exception {
     return switch (err) {
+        error.CallException => error.CallException,
+        error.CapacityException => error.CapacityException,
         error.DataException => error.DataException,
         error.ResourceException => error.ResourceException,
         error.IoException => error.IoException,
@@ -1257,7 +1265,7 @@ fn zipNext(archive: []const u8, directory: ZipDirectory, cursor: *usize, ordinal
     const record_length = try bounds.addUsize(46 + name_length, @as(usize, extra_length) + comment_length);
     if (record_length > end - cursor.*) return error.DataException;
     const name = try bounds.slice(archive, cursor.* + 46, name_length);
-    try validatePath(name, readU16(record, 8));
+    try validatePath(name, readU16(record, 8), error.DataException);
     const extra = try bounds.slice(archive, cursor.* + 46 + name_length, extra_length);
     var compressed: u64 = readU32(record, 20);
     var uncompressed: u64 = readU32(record, 24);
@@ -1353,6 +1361,16 @@ fn readU64(data: []const u8, offset: usize) u64 {
     return std.mem.readInt(u64, data[offset..][0..8], .little);
 }
 
+test "zip encode classifies hostile caller names as call errors" {
+    // Encode-side name shape failures are caller errors, not data errors;
+    // the decode walk keeps the data classification for archive records.
+    var cause: crypto.FailureCause = .none;
+    const traversal = [_]Entry{.{ .name = "../escape.txt", .data = "x", .method = 0 }};
+    try std.testing.expectError(error.CallException, requiredSize(&traversal, "", &.{}, &.{}, &.{}, &cause));
+    const embedded_nul = [_]Entry{.{ .name = "a\x00b", .data = "x", .method = 0 }};
+    try std.testing.expectError(error.CallException, requiredSize(&embedded_nul, "", &.{}, &.{}, &.{}, &cause));
+}
+
 test "zip central directory rejects hostile extra comment lengths" {
     const allocator = std.testing.allocator;
     const entries = [_]Entry{.{ .name = "a.bin", .data = "payload", .method = 0 }};
@@ -1434,6 +1452,16 @@ test "zip wrong password reports wrong_password cause" {
             if (err == error.DataException) try testing.expectEqual(crypto.FailureCause.wrong_password, cause);
         }
     }
+}
+
+test "zip winzip aes write gates an undersized sink" {
+    // The CTR destination bypasses Sink.write, so a sink too small for
+    // the payload must fail closed instead of slicing past its end.
+    const entry = Entry{ .name = "a", .data = "xy", .method = 0, .encrypted = true, .password = "pw", .aes_strength = 1 };
+    var buffer: [11]u8 = undefined; // salt (8) + verify (2) + one payload byte
+    var sink = io.Sink{ .bytes = &buffer };
+    try std.testing.expectError(error.CapacityException, writeData(&sink, entry, crypto.default_provider, &.{}, &.{}, &.{}));
+    try std.testing.expectEqual(@as(usize, 10), sink.offset);
 }
 
 test "zip kdf_rounds_limit gates winzip aes" {
@@ -1801,6 +1829,17 @@ test "zip spanned rejects zip64 locator with out-of-range record offset" {
     const options: ZipDecodeOptions = .{ .failure_cause = &failure_cause, .staging = staging, .scratch = scratch, .history = history, .provider = crypto.default_provider };
     var out: [1]u8 = undefined;
     try std.testing.expectError(error.DataException, zipDecodeOrdinalSpanned(&.{&archive}, 0, &out, join, disks, options));
+}
+
+test "zip spanned set rejects a join too short for the signature read" {
+    // A hostile volume set whose joined length cannot hold the spanning
+    // signature or the EOCD scan must fail closed before any read.
+    var join: [64]u8 = undefined;
+    var disks: [1]usize = undefined;
+    const tiny = [_][]const u8{&[_]u8{ 0x50, 0x4b }};
+    try std.testing.expectError(error.DataException, zipSpannedSet(&tiny, &join, &disks));
+    const empty = [_][]const u8{&[_]u8{}};
+    try std.testing.expectError(error.DataException, zipSpannedSet(&empty, &join, &disks));
 }
 
 fn spannedZip64Fixture(archive: []u8, locator_field: u64) void {

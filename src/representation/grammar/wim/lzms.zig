@@ -245,7 +245,7 @@ fn makeCanonicalCode(freqs: []const u32, lens: []u8) void {
     buildTree(sorted[0..used]);
     var len_counts: [max_codeword_len + 1]u32 = @splat(0);
     computeLengthCounts(sorted[0..used], &len_counts);
-    genCodewords(sorted[0..used], lens, &len_counts);
+    assignLengths(sorted[0..used], lens, &len_counts);
 }
 
 fn buildTree(a: []u32) void {
@@ -301,13 +301,9 @@ fn computeLengthCounts(a: []u32, len_counts: *[max_codeword_len + 1]u32) void {
     }
 }
 
-fn genCodewords(a: []const u32, lens: []u8, len_counts: *const [max_codeword_len + 1]u32) void {
-    var next: [max_codeword_len + 1]u32 = undefined;
-    next[0] = 0;
-    next[1] = 0;
-    for (2..max_codeword_len + 1) |len| {
-        next[len] = (next[len - 1] + len_counts[len - 1]) << 1;
-    }
+// Assigns canonical codeword lengths; the codewords themselves
+// are derived from the lengths by Code.init.
+fn assignLengths(a: []const u32, lens: []u8, len_counts: *const [max_codeword_len + 1]u32) void {
     var i: usize = 0;
     var len: usize = max_codeword_len;
     while (len >= 1) : (len -= 1) {
