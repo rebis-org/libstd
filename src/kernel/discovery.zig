@@ -130,7 +130,7 @@ test "discovery findById and findByName agree on the same descriptors" {
 test "discovery maxOrdinalFor scans the declared parameter ceilings" {
     try std.testing.expectEqual(@as(u32, 0), maxOrdinalFor(0)); // No descriptor declares family-zero parameters.
     try std.testing.expectEqual(@as(u32, 8), maxOrdinalFor(1));
-    try std.testing.expectEqual(@as(u32, 16), maxOrdinalFor(2)); // The tar entry_mode is the family-2 ceiling.
+    try std.testing.expectEqual(@as(u32, 17), maxOrdinalFor(2)); // The tar entry_encrypted is the family-2 ceiling.
     try std.testing.expectEqual(@as(u32, 8), maxOrdinalFor(3));
     try std.testing.expectEqual(@as(u32, 12), maxOrdinalFor(4));
     try std.testing.expectEqual(@as(u32, 0), maxOrdinalFor(9)); // A family with no declared parameters.
@@ -138,9 +138,9 @@ test "discovery maxOrdinalFor scans the declared parameter ceilings" {
     const tar = findByName("tar").?;
     var found = false;
     for (tar.parameters) |entry| {
-        if (entry.ordinal == 16) {
+        if (entry.ordinal == 17) {
             found = true;
-            try std.testing.expectEqualStrings("entry_mode", entry.name);
+            try std.testing.expectEqualStrings("entry_encrypted", entry.name);
             try std.testing.expectEqual(@as(u16, 2), entry.family);
             try std.testing.expectEqual(contract.Representation.scalar_words, entry.representation);
         }
@@ -159,7 +159,8 @@ test "discovery isSelectorKnown pins family zero protocol and descriptor familie
     try std.testing.expect(!isSelectorKnown(2, 0));
     try std.testing.expect(isSelectorKnown(2, 1));
     try std.testing.expect(isSelectorKnown(2, 16));
-    try std.testing.expect(!isSelectorKnown(2, 17));
+    try std.testing.expect(isSelectorKnown(2, 17));
+    try std.testing.expect(!isSelectorKnown(2, 18));
     // A family with no declared parameters knows no selector.
     try std.testing.expect(!isSelectorKnown(9, 1));
 }

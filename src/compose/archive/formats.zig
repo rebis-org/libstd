@@ -1255,3 +1255,66 @@ test "age scratch take covers armor staging" {
     const armor_take = try age.scratchTake(&armor_workspace, selected, staging);
     try std.testing.expectEqual(staging * 2, armor_take.len);
 }
+
+test "entry encryption maps from every archive info" {
+    const testing = std.testing;
+    // zip: the general-purpose flag bit 0 record.
+    const zip_info = zip_archive.Info{
+        .name = "a",
+        .method = 0,
+        .flags = 1,
+        .dos_time = 0,
+        .crc = 0,
+        .compressed_size = 0,
+        .uncompressed_size = 0,
+        .local_offset = 0,
+        .ordinal = 0,
+        .version_made_by = 0,
+        .internal_attributes = 0,
+        .external_attributes = 0,
+        .encrypted = true,
+    };
+    try testing.expect(response.Info.from(zip_info).encrypted.?);
+    // RAR: the walk-carried record.
+    const rar_info = rar_archive.RarInfo{
+        .name = "b",
+        .size = 1,
+        .data_offset = 0,
+        .packed_size = 1,
+        .crc = 0,
+        .ordinal = 0,
+        .encrypted = true,
+    };
+    try testing.expect(response.Info.from(rar_info).encrypted.?);
+    // 7z: the property record.
+    const sevenzip_info = sevenzip_archive.Info{
+        .name = "c",
+        .size = 1,
+        .is_directory = false,
+        .data_offset = 0,
+        .pack_size = 1,
+        .crc = null,
+        .method = .copy,
+        .attributes = "",
+        .encrypted = true,
+    };
+    try testing.expect(response.Info.from(sevenzip_info).encrypted.?);
+    // A record without the field leaves the state unset.
+    const tar_info = tar_archive.EntryInfo{
+        .name = "d",
+        .prefix = "",
+        .link_name = "",
+        .mode = 0,
+        .uid = 0,
+        .gid = 0,
+        .size = 1,
+        .modification_time = 0,
+        .typeflag = 0,
+        .devmajor = 0,
+        .devminor = 0,
+        .ordinal = 0,
+        .header_offset = 0,
+        .data_offset = 0,
+    };
+    try testing.expect(response.Info.from(tar_info).encrypted == null);
+}

@@ -24,6 +24,8 @@
         .{ .name = "archive_volume_size", .family = 2, .ordinal = 15, .representation = "scalar_words" },
         // A write-side entry permission bits word; absent reads as 0o644.
         .{ .name = "entry_mode", .family = 2, .ordinal = 16, .representation = "scalar_words" },
+        // An inspect-side encryption state: 1 marks encrypted payload bytes.
+        .{ .name = "entry_encrypted", .family = 2, .ordinal = 17, .representation = "scalar_words" },
     },
     .capabilities = .{ "read", "write", "size", "replay" },
     // Members cut at a volume boundary continue under 'M' headers; reads walk the chain and reassemble the member.

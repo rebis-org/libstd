@@ -56,6 +56,9 @@ pub const RarInfo = struct {
     solid: bool = false,
     // The largest dictionary the entry's solid group needs, streaming floor already applied, so one window serves the whole replay.
     group_window_bytes: u64 = 0,
+    // True when the entry carries data-encryption material: the RAR5 crypt
+    // extra or the RAR4 LHD_PASSWORD salt.
+    encrypted: bool = false,
 };
 
 pub const Entry = struct {
@@ -766,6 +769,7 @@ fn rar5FileEntry(header: Rar5Block, ordinal: usize, packed_total: u64, crypt: ?C
             .has_crc = header.file_flags & rar5_file_crc32 != 0,
             .ordinal = ordinal,
             .mtime = header.mtime,
+            .encrypted = crypt != null,
         },
         .family = .rar5,
         .is_directory = header.is_directory,
@@ -1123,6 +1127,7 @@ fn rar4FileEntry(file: Rar4File, name: []const u8, ordinal: usize, packed_total:
         return error.DataException;
     }
     const header = file.header;
+    const crypt = try rar4DataCrypt(file);
     var entry: Entry = .{
         .info = .{
             .name = name,
@@ -1132,6 +1137,7 @@ fn rar4FileEntry(file: Rar4File, name: []const u8, ordinal: usize, packed_total:
             .crc = file.file_crc,
             .ordinal = ordinal,
             .mtime = if (file.host_os == rar4_host_unix) file.mtime else 0,
+            .encrypted = crypt != null,
         },
         .family = .rar4,
         .is_directory = file.is_directory,
@@ -1141,7 +1147,7 @@ fn rar4FileEntry(file: Rar4File, name: []const u8, ordinal: usize, packed_total:
         .file_flags = header.flags,
         .dict_bits = 0,
         .blake2 = null,
-        .crypt = try rar4DataCrypt(file),
+        .crypt = crypt,
     };
     if (!file.is_directory) {
         if (file.method > 5) return error.UnsupportedException;
@@ -2456,6 +2462,7 @@ const TestEntries = struct {
     unpack_versions: [4]u8 = @splat(0),
     window_bytes: [4]u64 = @splat(0),
     pswchecks: [4]?[8]u8 = @splat(null),
+    encrypted: [4]bool = @splat(false),
 
     fn name(self: *const TestEntries, index: usize) []const u8 {
         return self.names[index][0..self.name_lens[index]];
@@ -2474,6 +2481,7 @@ fn testEntryVisit(ctx: *TestEntries, entry: Entry) Exception!void {
     ctx.packed_sizes[index] = entry.info.packed_size;
     ctx.unpack_versions[index] = entry.info.unpack_version;
     ctx.window_bytes[index] = entry.info.window_bytes;
+    ctx.encrypted[index] = entry.info.encrypted;
     ctx.pswchecks[index] = if (entry.crypt) |crypt| switch (crypt) {
         .rar5 => |state| state.pswcheck,
         .rar4 => null,
@@ -2617,6 +2625,9 @@ test "rar4 hp archives salt every encrypted header block" {
     try std.testing.expectEqual(@as(u64, 5), entries.sizes[0]);
     try std.testing.expectEqual(@as(u64, 76), entries.data_offsets[0]);
     try std.testing.expectEqual(@as(u64, 5), entries.packed_sizes[0]);
+    // -hp encrypts the headers; this fixture's file data stays plaintext
+    // (no LHD_PASSWORD), so the entry reports not encrypted.
+    try std.testing.expect(!entries.encrypted[0]);
 
     var negative: [97]u8 = @splat(0);
     @memcpy(negative[0..81], archive[0..81]);
@@ -2656,6 +2667,7 @@ test "rar4 header crc coverage follows the raw read size" {
     try std.testing.expectEqualStrings("a", entries.name(0));
     try std.testing.expectEqual(@as(u64, 101), entries.data_offsets[0]);
     try std.testing.expectEqual(@as(u64, 5), entries.packed_sizes[0]);
+    try std.testing.expect(!entries.encrypted[0]);
 
     var negative: [40]u8 = @splat(0);
     @memcpy(negative[0..7], &rar4_signature);
@@ -3237,6 +3249,7 @@ test "rar5 file crypt record keeps the pswcheck only on a valid csum" {
     try walkEntriesOpts(archive[0..len], .{}, &entries, testEntryVisit);
     try std.testing.expectEqual(@as(usize, 1), entries.count);
     try std.testing.expectEqual(@as(?[8]u8, check), entries.pswchecks[0]);
+    try std.testing.expect(entries.encrypted[0]);
 
     // A broken csum drops the check without touching the entry.
     try rar5FixtureCryptRecord(&record, &salt, check, @splat(0xAA));
@@ -3245,6 +3258,8 @@ test "rar5 file crypt record keeps the pswcheck only on a valid csum" {
     try walkEntriesOpts(archive[0..len], .{}, &damaged_entries, testEntryVisit);
     try std.testing.expectEqual(@as(usize, 1), damaged_entries.count);
     try std.testing.expectEqual(@as(?[8]u8, null), damaged_entries.pswchecks[0]);
+    // The entry stays encrypted; only the check is gone.
+    try std.testing.expect(damaged_entries.encrypted[0]);
 }
 
 // Volume-set fixtures: a main head with chosen flags and a file head with the fields a layout varies, both CRC-covered.
@@ -3381,6 +3396,9 @@ test "rar4 volume set decodes an encrypted split store entry" {
     const decode_opts: DecodeOptions = .{ .password = password };
     try testing.expectEqual(data.len, try rarVolumeDecodeOrdinal(&set, 0, &out, &bufs, decode_opts));
     try testing.expectEqualSlices(u8, &data, out[0..data.len]);
+    // The locate pass reports the encryption state.
+    const located = try rarVolumeInspectOrdinal(&set, 0, 128, .{});
+    try testing.expect(located.encrypted);
 
     // The wrong password decrypts to garbage and fails the integrity tail.
     var cause: crypto.FailureCause = .none;

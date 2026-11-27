@@ -1259,6 +1259,10 @@ fn zipNext(archive: []const u8, directory: ZipDirectory, cursor: *usize, ordinal
     if (cursor.* >= end or readU32(record, 0) != central_signature) return error.DataException;
     const method = readU16(record, 10);
     const flags = readU16(record, 8);
+    // Bit 13 masks central-directory fields behind SES encryption; the
+    // reader never decrypts a directory, so it refuses the record instead
+    // of parsing masked bytes as fields.
+    if (flags & 0x2000 != 0) return error.UnsupportedException;
     const name_length = readU16(record, 28);
     const extra_length = readU16(record, 30);
     const comment_length = readU16(record, 32);
@@ -1396,6 +1400,27 @@ test "zip central directory rejects hostile extra comment lengths" {
     std.mem.writeInt(u16, archive[position + 30 ..][0..2], std.math.maxInt(u16), .little);
     std.mem.writeInt(u16, archive[position + 32 ..][0..2], std.math.maxInt(u16), .little);
     try std.testing.expectError(error.DataException, zipInspectCount(archive));
+}
+
+test "zip central directory refuses the ses mask bit" {
+    const testing = std.testing;
+    const entries = [_]Entry{.{ .name = "a.bin", .data = "plain bytes", .method = 0 }};
+    var cause: crypto.FailureCause = .none;
+    var archive: [4096]u8 = undefined;
+    const written = try encode(&entries, "", &archive, crypto.default_provider, &.{}, &.{}, &.{}, &.{}, &cause);
+    const slice = archive[0..written];
+    const plain = try zipInspectOrdinal(slice, 0);
+    try testing.expect(!plain.encrypted);
+    var position: usize = 0;
+    while (position + 4 <= slice.len) : (position += 1) {
+        if (readU32(slice, position) == central_signature) break;
+    }
+    try testing.expect(position + 46 <= slice.len);
+    // Bit 13 marks a SES-masked central directory; the reader refuses the
+    // record instead of parsing masked fields.
+    std.mem.writeInt(u16, slice[position + 8 ..][0..2], 0x2000, .little);
+    try testing.expectError(error.UnsupportedException, zipInspectCount(slice));
+    try testing.expectError(error.UnsupportedException, zipInspectOrdinal(slice, 0));
 }
 
 test "zip encryption roundtrips zipcrypto and winzip aes strengths" {

@@ -19,6 +19,7 @@ pub const Info = struct {
     uid: ?u64 = null,
     typeflag: ?u64 = null,
     link_name: ?[]const u8 = null,
+    encrypted: ?bool = null,
     // Where the archive already holds the entry's bytes.
     ready: ?Span = null,
 
@@ -31,6 +32,7 @@ pub const Info = struct {
         if (@hasField(Raw, "uid")) info.uid = raw.uid;
         if (@hasField(Raw, "typeflag")) info.typeflag = raw.typeflag;
         if (@hasField(Raw, "link_name")) info.link_name = raw.link_name;
+        if (@hasField(Raw, "encrypted")) info.encrypted = raw.encrypted;
         return info;
     }
 
@@ -71,6 +73,8 @@ fn fillInfo(call: *Call, start: ?*Node, info: Info) Exception!void {
             if (info.uid) |value| node.value_low = value;
         } else if (row == request.row("entry_typeflag")) {
             if (info.typeflag) |value| node.value_low = value;
+        } else if (row == request.row("entry_encrypted")) {
+            if (info.encrypted) |value| node.value_low = @intFromBool(value);
         }
     }
 }
