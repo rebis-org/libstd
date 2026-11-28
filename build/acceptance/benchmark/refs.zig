@@ -369,12 +369,13 @@ fn addWimlib(b: *std.Build, dummy_dir: std.Build.LazyPath) *std.Build.Step.Insta
 
 fn addSquashfsTools(b: *std.Build) struct { mksquashfs: *std.Build.Step.InstallFile, unsquashfs: *std.Build.Step.InstallFile } {
     // Reference implementation with every compressor built in.
-    // The vendored compressor.c line 61 stub swaps COMPRESSOR_DEF arguments.
+    // 4.7.5 clears the atime through the Linux-only st_atim member; the
+    // patch ports the upstream __APPLE__ branch that uses st_atimespec.
 
     // The patch carries the fix; reset-then-apply keeps reruns idempotent.
     const apply_patch = b.addSystemCommand(&.{
         "sh",                                                                                                                                                     "-c",
-        "git -C vendor/squashfs-tools checkout -- squashfs-tools/compressor.c && git -C vendor/squashfs-tools apply ../../patch/squashfs-tools/compressor.patch",
+        "git -C vendor/squashfs-tools checkout -- squashfs-tools/mksquashfs.c && git -C vendor/squashfs-tools apply ../../patch/squashfs-tools/mksquashfs.patch",
     });
     const make_tools = make(b, "vendor/squashfs-tools/squashfs-tools", &.{
         "sh",                                                                                                                                                                                                               "-c",
