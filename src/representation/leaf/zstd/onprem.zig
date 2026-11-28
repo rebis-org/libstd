@@ -1331,6 +1331,8 @@ fn encodeBlockDfast(output: *std.Io.Writer, content: []const u8, block_start: us
                 }
                 if (!stored) {
                     hl1 = hash8At(content, block_start + ip1, long_bits);
+                    // Range before value: the vendor's value-first reorder must measure
+                    // faster on this benchmark before it ships.
                     if (idxl0 != encoder_no_position and idxl0 >= min_abs and idxl0 < pos_abs and readU64At(content, idxl0) == readU64At(content, pos_abs)) {
                         var mlen = 8 + countMatchLen(content, idxl0 + 8, pos_abs + 8, block_end);
                         var mip = ip;
